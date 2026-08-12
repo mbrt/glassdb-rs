@@ -1,18 +1,18 @@
 //! Shared deterministic execution, failure/delay injection, replay, and PCT harness.
 
 mod client;
+mod nemesis;
 
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
 use glassdb_backend::memory::MemoryBackend;
 #[cfg(sim)]
 use glassdb_backend::middleware::OpRecord;
-use glassdb_backend::middleware::{FaultBackend, FaultOptions, OpLog, RecordingBackend};
+use glassdb_backend::middleware::{OpLog, RecordingBackend};
 use glassdb_concurr::{Tape, rt};
 use glassdb_storage::{InlinePolicy, SplitPolicy};
 use tokio_util::sync::CancellationToken;
@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{Database, Error, PersistentCacheConfig, ProtocolTiming};
 
 use self::client::ClientRunner;
+use self::nemesis::{FaultTransports, NemesisRunner};
 use super::slow_backend;
 use super::trace::*;
 use super::{MAX_CLIENTS, MediaFaultProfile, SimMedia};
@@ -117,82 +118,6 @@ pub(crate) async fn open_det_db(
     };
     builder.open().await
 }
-/// The crash nemesis: cancels a few clients' abort signals at deterministic
-/// virtual times, modelling an abrupt client stop mid-transaction. Each cancelled
-/// client drops its `Database` (without calling `shutdown`), so its in-flight locks
-/// are recovered later via lease expiry during the final reads. Crash timing and
-/// targets are drawn from `tape` (the fuzzer-guided fault schedule), falling back
-/// to the tape's seeded PRNG once its bytes run out.
-async fn crash_nemesis(
-    signals: Vec<CancellationToken>,
-    intensity: u8,
-    mut tape: Tape,
-    trace: TraceSink,
-) {
-    let crashes = (intensity as usize % 3).min(signals.len());
-    for _ in 0..crashes {
-        let gap = tape.below(40) + 1;
-        rt::sleep(Duration::from_millis(gap)).await;
-        let idx = tape.below(signals.len() as u64) as usize;
-        signals[idx].cancel();
-        trace.nemesis(
-            TraceNemesis::Crash,
-            TraceNemesisAction::Crash,
-            Some(idx),
-            Some(gap),
-        );
-    }
-}
-
-/// Number of sustained outage windows the outage nemesis opens at `intensity`.
-fn outage_count(intensity: u8) -> usize {
-    match intensity {
-        0..=47 => 0,
-        48..=127 => 1,
-        _ => 2,
-    }
-}
-
-/// The outage nemesis: takes a whole client's transport down for a sustained
-/// span and then heals it, modelling a node that disconnects/clogs and later
-/// recovers. While one client is down its peers keep reaching storage and can
-/// recover its orphaned locks via lease expiry — the path coincident i.i.d.
-/// rolls reach only by luck. The target client, start gap, and duration are
-/// drawn from `tape` (the fuzzer-guided fault schedule).
-async fn outage_nemesis(
-    transports: Vec<Arc<FaultBackend>>,
-    intensity: u8,
-    mut tape: Tape,
-    trace: TraceSink,
-) {
-    if transports.is_empty() {
-        return;
-    }
-    for _ in 0..outage_count(intensity) {
-        let gap = tape.below(30) + 1;
-        rt::sleep(Duration::from_millis(gap)).await;
-        let idx = tape.below(transports.len() as u64) as usize;
-        transports[idx].down();
-        trace.nemesis(
-            TraceNemesis::Outage,
-            TraceNemesisAction::Down,
-            Some(idx),
-            Some(gap),
-        );
-        // Sustained: long enough that retries during the window keep failing,
-        // so recovery happens via lease expiry rather than a lucky retry.
-        let span = tape.below(80) + 20;
-        rt::sleep(Duration::from_millis(span)).await;
-        transports[idx].heal();
-        trace.nemesis(
-            TraceNemesis::Outage,
-            TraceNemesisAction::Heal,
-            Some(idx),
-            Some(span),
-        );
-    }
-}
-
 /// Deinterleaves a fault tape into `N` independent byte streams (byte `i` goes to
 /// stream `i % N`). Keeping the streams disjoint means a single mutated byte maps
 /// to exactly one fault decision, which is what makes the fault schedule
@@ -268,72 +193,32 @@ fn make_backbone() -> (Arc<dyn Backend>, OpLog) {
     (backbone, log)
 }
 
-/// One transport per client over `backbone`. With transport failures enabled,
-/// each is an active, tape-guided [`FaultBackend`]; otherwise each client shares
-/// the backbone directly. Returns the transports (for the outage nemesis and
-/// final healing) and the per-client backends, in client order.
-fn build_transports(
-    backbone: &Arc<dyn Backend>,
-    faults: FaultConfig,
-    seed: u64,
-    streams: &[Vec<u8>; FAULT_STREAMS],
-    nclients: usize,
-) -> (Vec<Arc<FaultBackend>>, Vec<Arc<dyn Backend>>) {
-    let mut transports: Vec<Arc<FaultBackend>> = Vec::new();
-    let mut client_backends: Vec<Arc<dyn Backend>> = Vec::with_capacity(nclients);
-    if faults.failures_enabled() {
-        let fopts = FaultOptions::from_intensity(faults.intensity);
-        for i in 0..nclients {
-            let tape = streams[CLIENT_STREAM_BASE + i % MAX_CLIENTS].clone();
-            let t = FaultBackend::with_tape(backbone.clone(), tape, client_seed(seed, i), fopts);
-            t.set_active(true);
-            transports.push(t.clone());
-            client_backends.push(t);
-        }
-    } else {
-        for _ in 0..nclients {
-            client_backends.push(backbone.clone());
-        }
-    }
-    (transports, client_backends)
-}
-
 /// Spawns the crash and outage nemeses when transport failures are enabled,
 /// each on its own fault-tape stream and a distinct fallback seed. The caller
-/// spawns the client tasks first, so the fixed spawn order (clients, then crash,
-/// then outage) keeps task ids — and thus the schedule — deterministic. Returns
-/// their join handles (both `None` without transport failures).
-#[allow(clippy::type_complexity)]
+/// spawns the client tasks and optional observer first, so the fixed spawn order
+/// (clients, observer when enabled, crash, then outage) keeps task ids — and
+/// thus the schedule — deterministic.
 fn spawn_nemeses(
     faults: FaultConfig,
     seed: u64,
     streams: &[Vec<u8>; FAULT_STREAMS],
     signals: &[CancellationToken],
-    transports: &[Arc<FaultBackend>],
+    transports: &FaultTransports,
     trace: &TraceSink,
-) -> (Option<rt::JoinHandle<()>>, Option<rt::JoinHandle<()>>) {
+) -> NemesisRunner {
+    let mut nemeses = NemesisRunner::new();
     if !faults.failures_enabled() {
         trace.spawn(TraceSpawnRole::CrashNemesis, false);
         trace.spawn(TraceSpawnRole::OutageNemesis, false);
-        return (None, None);
+        return nemeses;
     }
     let crash_tape = Tape::new(streams[CRASH_STREAM].clone(), seed ^ 0x00C0_FFEE_C0DE_BEEF);
     trace.spawn(TraceSpawnRole::CrashNemesis, true);
-    let crash = rt::spawn(crash_nemesis(
-        signals.to_vec(),
-        faults.intensity,
-        crash_tape,
-        trace.clone(),
-    ));
+    nemeses.spawn_crash(signals, faults.intensity, crash_tape, trace);
     let outage_tape = Tape::new(streams[OUTAGE_STREAM].clone(), seed ^ 0xFEED_FACE_DEAD_5EED);
     trace.spawn(TraceSpawnRole::OutageNemesis, true);
-    let outage = rt::spawn(outage_nemesis(
-        transports.to_vec(),
-        faults.intensity,
-        outage_tape,
-        trace.clone(),
-    ));
-    (Some(crash), Some(outage))
+    nemeses.spawn_outage(transports, faults.intensity, outage_tape, trace);
+    nemeses
 }
 
 // ===========================================================================
@@ -348,7 +233,7 @@ fn spawn_nemeses(
 // methods. Each workload owns its own collection(s) behind those methods, so the
 // harness works purely with `Database` handles. The run context owns the
 // backbone, media, model state, and per-client transports; `ClientRunner` owns
-// client crash/restart lifecycles while the harness retains the nemesis tasks.
+// client crash/restart lifecycles, and `NemesisRunner` owns the nemesis tasks.
 // ===========================================================================
 
 /// A deterministic-simulation workload the shared harness ([`run_generic`]) can
@@ -505,8 +390,19 @@ impl<W: SimWorkload> RunPlan<W> {
         } else {
             backbone.clone()
         };
-        let (transports, client_backends) =
-            build_transports(&client_backbone, faults, seed, &fault_streams, nclients);
+        let transports = if faults.failures_enabled() {
+            let schedules = (0..nclients)
+                .map(|client| {
+                    (
+                        fault_streams[CLIENT_STREAM_BASE + client % MAX_CLIENTS].clone(),
+                        client_seed(seed, client),
+                    )
+                })
+                .collect();
+            FaultTransports::faulting(&client_backbone, faults.intensity, schedules)
+        } else {
+            FaultTransports::faultless(&client_backbone, nclients)
+        };
 
         RunContext {
             workload,
@@ -520,7 +416,6 @@ impl<W: SimWorkload> RunPlan<W> {
             state,
             client_backbone,
             transports,
-            client_backends,
         }
     }
 }
@@ -537,15 +432,14 @@ struct RunContext<W: SimWorkload> {
     run_media: Option<RunMedia>,
     state: Arc<W::State>,
     client_backbone: Arc<dyn Backend>,
-    transports: Vec<Arc<FaultBackend>>,
-    client_backends: Vec<Arc<dyn Backend>>,
+    transports: FaultTransports,
 }
 
 impl<W: SimWorkload> RunContext<W> {
     fn start_clients(&mut self, trace: &TraceSink) -> ClientRunner {
         ClientRunner::spawn::<W>(
             std::mem::take(&mut self.client_ops),
-            std::mem::take(&mut self.client_backends),
+            self.transports.take_client_backends(),
             self.run_media.as_ref(),
             &self.state,
             self.faults,
@@ -556,15 +450,7 @@ impl<W: SimWorkload> RunContext<W> {
     async fn teardown(self, trace: &TraceSink) -> OpLog {
         // Heal every transport before verifying so recovery reads cannot themselves
         // fail.
-        for (client, transport) in self.transports.iter().enumerate() {
-            transport.set_active(false);
-            trace.nemesis(
-                TraceNemesis::Harness,
-                TraceNemesisAction::FinalHeal,
-                Some(client),
-                None,
-            );
-        }
+        self.transports.final_heal(trace);
 
         // The workload reads the final committed state (driving recovery of any
         // crashed client's locks via lease expiry) and asserts its invariant.
@@ -634,7 +520,7 @@ async fn run_generic_with_trace<W: SimWorkload>(
             .map(|media| media.observer.clone()),
     );
     trace.spawn(TraceSpawnRole::Observer, observer.is_some());
-    let (crash, outage) = spawn_nemeses(
+    let nemeses = spawn_nemeses(
         context.faults,
         context.seed,
         &context.fault_streams,
@@ -647,12 +533,7 @@ async fn run_generic_with_trace<W: SimWorkload>(
     if let Some(h) = observer {
         h.await.expect("observer task failed");
     }
-    if let Some(h) = crash {
-        h.await.expect("crash nemesis task failed");
-    }
-    if let Some(h) = outage {
-        h.await.expect("outage nemesis task failed");
-    }
+    nemeses.join().await;
 
     context.teardown(&trace).await
 }

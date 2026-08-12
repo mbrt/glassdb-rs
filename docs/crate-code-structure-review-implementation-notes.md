@@ -1131,3 +1131,25 @@ working document and is intentionally not committed with these changes.
   order. No migration-only test, dependency, public API, persistent format,
   runtime policy, or ADR was added; there were no deviations from the staged
   finding.
+## F29-F — Extract nemesis behavior
+
+- Added a private `harness::nemesis` module. `FaultTransports` now owns creation
+  and activation of per-client fault injectors, the client backend views, outage
+  targets, and ordered final healing. `NemesisRunner` owns crash/outage task
+  handles, execution, and crash-before-outage result collection.
+- The harness deliberately still selects enablement, deinterleaved fault streams,
+  fallback seeds, and spawn decisions. It records each role immediately before
+  asking the runner to spawn it, retaining the established client, observer,
+  crash, and outage task/event order for the later F29-G scheduling extraction.
+- `ClientRunner` remains the owner of the uncancellable restart and request-stream
+  accounting established by F29-E; the nemesis module owns the cancellation that
+  triggers that lifecycle. Moving restart back would split one client task's
+  state machine across owners.
+- The three tape and two PCT canonical trace baselines stayed byte-identical
+  without digest changes, covering transport faults, crash/restart, outage
+  down/heal, final-heal order, entropy consumption, and task spawn/selection.
+  Those permanent migration guards already cover the requested behavior, so no
+  structural or duplicate test was added.
+- Backend operations, retry/error boundaries, cancellation and panic propagation,
+  persistent bytes, public APIs, and schedule decisions are unchanged. No ADR was
+  needed because this only changes private code ownership.
