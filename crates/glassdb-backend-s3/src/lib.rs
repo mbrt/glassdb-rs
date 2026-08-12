@@ -17,7 +17,7 @@ use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use glassdb_backend::{
     Backend, BackendError, Cause, ListCursor, ListLimit, ListPage, ReadReply, Version,
-    validate_list_args,
+    bind_list_cursor, validate_list_args_and_cursor,
 };
 
 const MAX_LIST_PAGE_SIZE: usize = 1_000;
@@ -418,7 +418,7 @@ impl Backend for S3Backend {
         cursor: Option<&ListCursor>,
         limit: ListLimit,
     ) -> Result<ListPage, BackendError> {
-        validate_list_args(prefix, cursor, limit)?;
+        let provider_cursor = validate_list_args_and_cursor(prefix, cursor, limit)?;
         let max_keys = i32::try_from(limit.get().min(MAX_LIST_PAGE_SIZE)).unwrap();
         let mut op = self
             .client
@@ -426,8 +426,8 @@ impl Backend for S3Backend {
             .bucket(&self.bucket)
             .prefix(prefix)
             .max_keys(max_keys);
-        if let Some(cursor) = cursor {
-            op = op.continuation_token(cursor.as_str());
+        if let Some(provider_cursor) = provider_cursor {
+            op = op.continuation_token(provider_cursor);
         }
         let out = op
             .customize()
@@ -449,7 +449,7 @@ impl Backend for S3Backend {
                         "List({prefix}): truncated response has no continuation token"
                     ))
                 })?;
-            Some(ListCursor::new(token))
+            Some(bind_list_cursor(prefix, token)?)
         } else {
             None
         };

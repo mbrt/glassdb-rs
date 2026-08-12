@@ -141,7 +141,7 @@ pub struct ReadReply {
     pub version: Version,
 }
 
-/// A provider-issued continuation token for a paginated listing.
+/// An opaque continuation token for a paginated listing.
 ///
 /// The token has no engine-level meaning. Callers may only retain it and pass it
 /// back to the same backend with the same prefix.
@@ -149,12 +149,12 @@ pub struct ReadReply {
 pub struct ListCursor(Arc<str>);
 
 impl ListCursor {
-    /// Wraps the provider token returned by a backend implementation.
+    /// Reconstructs an opaque cursor previously returned by a backend.
     pub fn new(token: impl Into<Arc<str>>) -> Self {
         ListCursor(token.into())
     }
 
-    /// Returns the provider token for forwarding to the underlying store.
+    /// Returns the opaque cursor representation.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -163,16 +163,49 @@ impl ListCursor {
 /// A positive upper bound on the objects returned by one listing call.
 pub type ListLimit = NonZeroUsize;
 
+const LIST_CURSOR_PREFIX: &str = "glassdb-list-v1:";
+
 /// Validates the provider-independent arguments to [`Backend::list`].
 ///
-/// A [`ListLimit`] is positive by construction. Cursors remain provider-opaque;
-/// implementations reject tokens they cannot continue from as
-/// [`BackendError::InvalidCursor`].
+/// A [`ListLimit`] is positive by construction. Cursors remain opaque to
+/// callers and are rejected when malformed or bound to another prefix.
 pub fn validate_list_args(
     prefix: &str,
-    _cursor: Option<&ListCursor>,
-    _limit: ListLimit,
+    cursor: Option<&ListCursor>,
+    limit: ListLimit,
 ) -> Result<(), BackendError> {
+    validate_list_args_and_cursor(prefix, cursor, limit).map(|_| ())
+}
+
+/// Binds a provider continuation token to its listing prefix.
+#[doc(hidden)]
+pub fn bind_list_cursor(prefix: &str, provider_token: &str) -> Result<ListCursor, BackendError> {
+    validate_list_prefix(prefix)?;
+    if provider_token.is_empty() {
+        return Err(BackendError::other(
+            "list provider returned an empty continuation token",
+        ));
+    }
+    Ok(ListCursor::new(format!(
+        "{LIST_CURSOR_PREFIX}{}:{prefix}{provider_token}",
+        prefix.len()
+    )))
+}
+
+/// Validates listing arguments and unwraps the provider continuation token.
+#[doc(hidden)]
+pub fn validate_list_args_and_cursor<'a>(
+    prefix: &str,
+    cursor: Option<&'a ListCursor>,
+    _limit: ListLimit,
+) -> Result<Option<&'a str>, BackendError> {
+    validate_list_prefix(prefix)?;
+    cursor
+        .map(|cursor| decode_list_cursor(prefix, cursor))
+        .transpose()
+}
+
+fn validate_list_prefix(prefix: &str) -> Result<(), BackendError> {
     if prefix.is_empty() || prefix.ends_with('/') {
         Ok(())
     } else {
@@ -180,6 +213,26 @@ pub fn validate_list_args(
             "list prefix must be empty or end in '/': {prefix:?}"
         )))
     }
+}
+
+fn decode_list_cursor<'a>(prefix: &str, cursor: &'a ListCursor) -> Result<&'a str, BackendError> {
+    let encoded = cursor
+        .as_str()
+        .strip_prefix(LIST_CURSOR_PREFIX)
+        .ok_or(BackendError::InvalidCursor)?;
+    let (prefix_len, body) = encoded.split_once(':').ok_or(BackendError::InvalidCursor)?;
+    let prefix_len = prefix_len
+        .parse::<usize>()
+        .map_err(|_| BackendError::InvalidCursor)?;
+    let stored_prefix = body.get(..prefix_len).ok_or(BackendError::InvalidCursor)?;
+    let provider_token = body
+        .get(prefix_len..)
+        .filter(|token| !token.is_empty())
+        .ok_or(BackendError::InvalidCursor)?;
+    if stored_prefix != prefix {
+        return Err(BackendError::InvalidCursor);
+    }
+    Ok(provider_token)
 }
 
 /// One page of object paths returned by [`Backend::list`].
@@ -311,23 +364,28 @@ mod tests {
 
     #[test]
     fn list_argument_boundaries() {
-        let cursor = ListCursor::new("opaque");
         let one = ListLimit::new(1).unwrap();
         let largest = ListLimit::new(usize::MAX).unwrap();
+        let root_cursor = bind_list_cursor("", "root-token").unwrap();
+        let slash_cursor = bind_list_cursor("/", "slash-token").unwrap();
+        let nested_cursor = bind_list_cursor("a/b/", "nested-token").unwrap();
 
-        for (prefix, cursor, limit) in [
-            ("", None, one),
-            ("/", Some(&cursor), one),
-            ("a/", None, largest),
-            ("a/b/", Some(&cursor), largest),
+        for (prefix, cursor, limit, provider_token) in [
+            ("", None, one, None),
+            ("", Some(&root_cursor), one, Some("root-token")),
+            ("/", Some(&slash_cursor), one, Some("slash-token")),
+            ("a/", None, largest, None),
+            ("a/b/", Some(&nested_cursor), largest, Some("nested-token")),
         ] {
-            assert!(
-                validate_list_args(prefix, cursor, limit).is_ok(),
+            assert_eq!(
+                validate_list_args_and_cursor(prefix, cursor, limit).unwrap(),
+                provider_token,
                 "prefix {prefix:?}"
             );
         }
 
-        for (prefix, cursor) in [("a", None), ("a/b", Some(&cursor))] {
+        let malformed_cursor = ListCursor::new("opaque");
+        for (prefix, cursor) in [("a", None), ("a/b", Some(&malformed_cursor))] {
             let error = validate_list_args(prefix, cursor, one).unwrap_err();
             match error {
                 BackendError::Other { msg, source } => {
@@ -341,6 +399,53 @@ mod tests {
             }
         }
 
+        let unicode_cursor = bind_list_cursor("é/", "provider-token").unwrap();
+        assert_eq!(
+            unicode_cursor.as_str(),
+            "glassdb-list-v1:3:é/provider-token"
+        );
+        assert_eq!(
+            validate_list_args_and_cursor("é/", Some(&unicode_cursor), one).unwrap(),
+            Some("provider-token")
+        );
+
+        let wrong_prefix = bind_list_cursor("other/", "provider-token").unwrap();
+        for (case, cursor) in [
+            ("empty", ListCursor::new("")),
+            ("raw provider token", ListCursor::new("provider-token")),
+            (
+                "unknown version",
+                ListCursor::new("glassdb-list-v2:2:a/provider-token"),
+            ),
+            (
+                "invalid length",
+                ListCursor::new("glassdb-list-v1:x:a/provider-token"),
+            ),
+            (
+                "truncated prefix",
+                ListCursor::new("glassdb-list-v1:20:a/provider-token"),
+            ),
+            (
+                "non-character boundary",
+                ListCursor::new("glassdb-list-v1:1:é/provider-token"),
+            ),
+            (
+                "empty provider token",
+                ListCursor::new("glassdb-list-v1:2:a/"),
+            ),
+            ("wrong prefix", wrong_prefix),
+        ] {
+            let error = validate_list_args("a/", Some(&cursor), one).unwrap_err();
+            assert!(
+                matches!(error, BackendError::InvalidCursor),
+                "{case} returned {error:?}"
+            );
+        }
+
+        assert!(matches!(
+            bind_list_cursor("a/", ""),
+            Err(BackendError::Other { .. })
+        ));
         assert!(ListLimit::new(0).is_none());
     }
 }

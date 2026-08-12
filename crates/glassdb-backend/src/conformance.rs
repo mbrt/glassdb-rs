@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::{Backend, BackendError, ListCursor, ListLimit};
+use crate::{Backend, BackendError, ListCursor, ListLimit, bind_list_cursor};
 
 const PREFIX: &str = "__glassdb_list_conformance__/target/";
 const EMPTY_PREFIX: &str = "__glassdb_list_conformance__/empty/";
@@ -43,6 +43,7 @@ pub async fn assert_list_conformance(backend: &dyn Backend) {
     let mut objects = HashSet::new();
     let mut cursors = HashSet::new();
     let mut cursor = None;
+    let mut first_cursor = None;
     let mut pages = 0;
     let mut terminated = false;
 
@@ -74,6 +75,7 @@ pub async fn assert_list_conformance(backend: &dyn Backend) {
             "listing repeated cursor {:?}",
             next.as_str()
         );
+        first_cursor.get_or_insert_with(|| next.clone());
         cursor = Some(next);
     }
 
@@ -84,6 +86,16 @@ pub async fn assert_list_conformance(backend: &dyn Backend) {
     assert!(pages > 1, "fixture did not exercise pagination");
     assert_eq!(objects, expected, "recursive listing membership differed");
 
+    let first_cursor = first_cursor.expect("paginated fixture returned no cursor");
+    let error = backend
+        .list(EMPTY_PREFIX, Some(&first_cursor), limit)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, BackendError::InvalidCursor),
+        "cursor reused under another prefix returned {error:?}"
+    );
+
     let empty_page = backend.list(EMPTY_PREFIX, None, limit).await.unwrap();
     assert!(
         empty_page.objects.is_empty(),
@@ -93,6 +105,7 @@ pub async fn assert_list_conformance(backend: &dyn Backend) {
 
     let invalid_cursor = ListCursor::new("invalid");
     let empty_cursor = ListCursor::new("");
+    let invalid_provider_cursor = bind_list_cursor(PREFIX, "invalid").unwrap();
     for cursor in [None, Some(&invalid_cursor), Some(&empty_cursor)] {
         let error = backend
             .list(INVALID_PREFIX, cursor, limit)
@@ -103,7 +116,7 @@ pub async fn assert_list_conformance(backend: &dyn Backend) {
             "invalid prefix returned {error:?}"
         );
     }
-    for cursor in [&invalid_cursor, &empty_cursor] {
+    for cursor in [&invalid_cursor, &empty_cursor, &invalid_provider_cursor] {
         let error = backend.list(PREFIX, Some(cursor), limit).await.unwrap_err();
         assert!(
             matches!(&error, BackendError::InvalidCursor),

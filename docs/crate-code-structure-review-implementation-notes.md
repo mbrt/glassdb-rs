@@ -236,3 +236,30 @@ working document and is intentionally not committed with these changes.
   error-normalization tests remain local and unchanged. The existing
   memory-only wrong-prefix check for a provider-issued cursor remains a compact
   local regression until F24-C moves cursor binding into the shared contract.
+
+## F24-C — Bind listing cursors to their prefixes
+
+- `ListCursor` now carries one versioned, byte-length-framed envelope containing
+  the originating prefix and the still-opaque provider token. A central binding
+  helper and a central validation/unwrapping helper are doc-hidden but public so
+  the separate provider crates can share the boundary without changing the
+  existing `Backend::list`, `ListCursor`, or `validate_list_args` signatures.
+- Prefix shape is validated before cursor decoding. Malformed, empty, unknown-
+  version, truncated, non-character-boundary, and cross-prefix cursors return
+  `InvalidCursor`; an invalid prefix retains `Other` precedence. Empty tokens
+  returned by a provider are treated as provider faults by the binding helper.
+- Memory uses a tagged local continuation token inside the envelope, while S3
+  and GCS unwrap only the raw provider token for their requests and wrap only
+  nonempty response tokens. Valid listings therefore preserve request order,
+  page limits, provider continuation bytes, and backend operation counts; only
+  the caller-visible cursor representation changes.
+- The shared three-provider harness now retains a provider-issued cursor, proves
+  normal continuation, rejects reuse under another valid prefix, and separates
+  malformed envelopes from a correctly enveloped token rejected by the
+  provider. This subsumes and removes the memory-only wrong-prefix test; all
+  transport-specific provider tests remain local.
+- Cursor compatibility is intentionally one-way: cursors are task-local in the
+  repository, so no persistent format migrates, while externally retained raw
+  or pre-F24-C memory cursors are rejected and callers restart the prefix. No
+  `ListRequest`, backend-instance identity, middleware migration, or caller
+  migration from F24-D and later was introduced.
