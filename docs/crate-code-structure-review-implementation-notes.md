@@ -973,3 +973,26 @@ working document and is intentionally not committed with these changes.
   replay fallback, public visibility, persistent bytes, backend operations, and
   runtime error behavior are unchanged. No ADR was needed for this mechanical
   ownership move.
+## F26-C — Extract and own the GCS test server
+
+- Moved the in-process GCS store, HTTP lifecycle, JSON-API handlers, multipart
+  and query codecs, and fault controls from the behavioral test module into
+  `tests/support.rs`. `FakeGcs::backend` is now the single factory used by the
+  provider and shared listing-conformance tests.
+- `FakeGcs` owns a one-shot shutdown signal and the accept-task handle. The
+  accept task owns every Hyper connection through a `JoinSet`; explicit
+  shutdown stops acceptance, aborts and drains connections, and joins the task.
+  Defensive `Drop` signals shutdown and aborts the owned task because it cannot
+  await, which also drops the listener and aborts the connection set.
+- Listener binding remains an ephemeral IPv4 loopback socket, and accepted
+  connections still use one Tokio task and the same HTTP/1 service. Every
+  request route, parser, response/status mapping, mutation order, generation,
+  fault counter, and provider-visible error stayed byte-for-byte unchanged.
+- Added one long-term lifecycle regression that repeatedly serves a real
+  provider request, exercises both explicit shutdown and defensive drop,
+  proves no task retains server state, and rebinds the exact listener address.
+  The existing 17 provider behavior and conformance tests remain unchanged in
+  substance; no migration-only parity suite was added.
+- No production dependency, public API, persistent byte, backend operation,
+  retry policy, authentication behavior, or ADR changed. There were no
+  deviations from the staged finding.
