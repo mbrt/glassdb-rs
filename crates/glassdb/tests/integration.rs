@@ -873,6 +873,9 @@ async fn list_keys() {
         .await
         .unwrap();
 
+    let empty = coll.iter_keys().await.unwrap();
+    assert_eq!(empty.len(), 0);
+
     let keys: Vec<Vec<u8>> = (0u32..100).map(|i| i.to_be_bytes().to_vec()).collect();
     let test_val = b"val";
     let coll_ref = &coll;
@@ -886,12 +889,20 @@ async fn list_keys() {
     .await
     .unwrap();
 
-    let got: Vec<Vec<u8>> = coll
+    let legacy: Vec<Vec<u8>> = coll
         .keys()
         .await
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
+
+    let mut plain = coll.iter_keys().await.unwrap();
+    assert_eq!(plain.len(), keys.len());
+    let first = plain.next().unwrap();
+    assert_eq!(plain.len(), keys.len() - 1);
+    drop(coll);
+    let got: Vec<Vec<u8>> = std::iter::once(first).chain(plain).collect();
+    assert_eq!(got, legacy);
 
     assert_eq!(got.len(), keys.len());
     let got_set: std::collections::HashSet<Vec<u8>> = got.iter().cloned().collect();

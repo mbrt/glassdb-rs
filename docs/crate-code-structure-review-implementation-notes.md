@@ -190,3 +190,28 @@ working document and is intentionally not committed with these changes.
 - Adversarial review found no receipt-completeness, ordering, cleanup, evidence,
   or test-pruning issue. No persistent bytes, backend operations, retry behavior,
   or public API changed.
+
+## F28-A — Add infallible materialized iterators
+
+- Added `KeyIter` and `CollectionIter` plus `iter_keys` and
+  `iter_collections` entry points on the public collection/transaction surfaces.
+  All fallible I/O and decoding finish before an owned iterator is returned;
+  per-item iteration is now truthfully infallible. Transaction-scoped directory
+  observations are still validated when their enclosing attempt completes.
+- One private generic materialized iterator owns each vector. The legacy
+  `KeysIter` and `CollectionsIter` remain API-compatible adapters over the same
+  plain iterators, so there is no second listing, materialization, or ordering
+  implementation.
+- The plain iterators expose exact remaining length and fused exhaustion, while
+  deliberately avoiding reverse traversal or borrowed lifetimes that were not
+  part of the existing contract. Child handles remain bound to their listed
+  incarnations after the source handle or transaction scope ends.
+- Existing key-order and child-incarnation tests now also cover empty results,
+  owned lifetime, exact remaining length, and ordered old/new parity. The
+  existing directory-retry test covers transaction-level parity using a returned
+  transaction error rather than asserting inside the body. These parity checks
+  are temporary through F28-C; long-term ordering, ownership, empty, paging, and
+  incarnation behavior remains.
+- No legacy method/type was deprecated or migrated in this finding. Backend
+  operations, transaction retry behavior, persistent bytes, and public failure
+  boundaries are unchanged.

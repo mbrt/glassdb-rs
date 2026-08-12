@@ -29,7 +29,7 @@ pub use collection::{Collection, CollectionPath};
 pub use db::{Database, DatabaseBuilder};
 pub use diagnostics::Diagnostics;
 pub use error::Error;
-pub use iter::{CollectionEntry, CollectionsIter, KeysIter};
+pub use iter::{CollectionEntry, CollectionIter, CollectionsIter, KeyIter, KeysIter};
 pub use scan::{KeyPage, KeyScan};
 pub use stats::{Stats, TransactionStats};
 pub use tx::Transaction;
