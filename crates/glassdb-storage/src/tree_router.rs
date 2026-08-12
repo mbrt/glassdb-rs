@@ -19,7 +19,8 @@ use glassdb_data::{CollectionAddress, KeyRef, NodeToken, ObjectPath};
 use crate::cached_store::Requirement;
 use crate::error::StorageError;
 use crate::node::{Node, NodeBody};
-use crate::shard_store::{LeafObservation, ShardStore};
+use crate::node_store::LeafObservation;
+use crate::shard_store::ShardStore;
 
 /// The leaf that owns a key (or range endpoint), with everything needed to read
 /// or compare-and-swap it: its object `path` and retained physical observation.

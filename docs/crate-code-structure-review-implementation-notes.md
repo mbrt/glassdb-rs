@@ -1,0 +1,23 @@
+# Crate code-structure review implementation notes
+
+This file records implementation details, deviations, and review points for the
+checkboxes in `crate-code-structure-review.md`. The review checklist remains a
+working document and is intentionally not committed with these changes.
+
+## F16-A — Extract `NodeStore`
+
+- Moved the node codec, node/root/leaf persistence, and observation-bound
+  `LeafEdit` into `node_store.rs`. `ShardStore` retains explicit one-line node
+  delegates and exposes `nodes()` for the staged migration; it does not use
+  `Deref` or a generic compatibility conversion.
+- The extracted store is built from a clone of the same `CachedStore`, preserving
+  cache evidence, timeline ordering, warm-read operation counts, and CAS error
+  mappings.
+- Moved the six existing node-store behavior tests to the new owner and kept
+  their semantic and operation-count assertions. Added one long-term pagination
+  regression covering a listing larger than the 128-object backend page.
+- No persistent bytes, retry policy, deterministic scheduling, or public runtime
+  behavior changed. The only compatibility surface added is `NodeStore` plus
+  `ShardStore::nodes()`, as required by the migration plan.
+- Adversarial review found no correctness, operation-count, format, scope, or
+  long-term test-value issues.
