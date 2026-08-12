@@ -214,3 +214,25 @@ working document and is intentionally not committed with these changes.
   feature surface.
 - No ADR was added: this is a temporary migration guard plus long-term replay
   diagnostic, not a production protocol or architecture decision.
+
+## F29-B — Freeze tape-scheduled harness traces
+
+- Froze three small inputs copied from the committed `concurrent_tx`, `history`,
+  and `api_correctness` corpora. Their source basenames are the SHA-1 of the
+  copied bytes, so reviewers can verify provenance without coupling the guard to
+  later corpus minimization.
+- One table-driven simulation test runs every input twice, compares the complete
+  schema-v1 canonical bytes, and then checks a reviewed SHA-256 digest. It also
+  asserts cache-free/cached run boundaries and final verification semantically.
+- The normal RMW and API fixtures perform successful operations without enabled
+  fault nemeses. The History fixture records an admissible failure, crash and
+  same-client restart work, outage down/heal, final healing, and successful final
+  verification. Every fixture consumes supplied scheduler-tape bytes.
+- These exact digests are migration guards through F25-D, F29-K, and F31-D.
+  F25-A/B and structural/runtime extractions must not refresh them; an F25-C
+  entropy-source migration may update only an affected digest after its first
+  divergent event is reviewed and documented. After all three endpoints land,
+  exact digests may retire while same-input replay and semantic boundaries stay.
+- Hashing is confined to the simulation integration test through a dev-only
+  dependency. No production path, persistent bytes, backend operation, retry,
+  or scheduling decision changed, and no baseline update mode was added.
