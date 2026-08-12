@@ -185,12 +185,6 @@ impl DirectCommit {
         }
     }
 
-    /// Returns the inline-pressure sink used by direct resolver folds.
-    #[cfg(test)]
-    pub(super) fn split_hints_for_test(&self) -> SplitHintSink {
-        self.split_hints.clone()
-    }
-
     /// Resolves the committed predecessor and the leaf owning the key.
     ///
     /// Resolution uses the transaction body's cached shard (`Any`). A stale
@@ -236,15 +230,15 @@ impl DirectCommit {
 /// transaction body under the same id (ADR-053); `Moved` means nothing was
 /// written but only the locked protocol can resolve the entry's state;
 /// `InDoubt` means the CAS may have committed and must not be re-run.
-pub(super) struct DirectCommitResolver {
-    pub(super) id: TxId,
-    pub(super) raw_key: Vec<u8>,
-    pub(super) leaf_path: ObjectPath,
-    pub(super) key: KeyRef,
-    pub(super) value: Arc<[u8]>,
-    pub(super) read_version: Option<TxId>,
-    pub(super) inline: InlinePolicy,
-    pub(super) split_hints: SplitHintSink,
+struct DirectCommitResolver {
+    id: TxId,
+    raw_key: Vec<u8>,
+    leaf_path: ObjectPath,
+    key: KeyRef,
+    value: Arc<[u8]>,
+    read_version: Option<TxId>,
+    inline: InlinePolicy,
+    split_hints: SplitHintSink,
 }
 
 #[async_trait]
@@ -458,7 +452,7 @@ fn single_rw_shape(data: &Data) -> Option<SingleRw> {
 /// Why a direct attempt cannot publish over an entry, and therefore what the
 /// engine may do about it (ADR-053).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Ineligible {
+enum Ineligible {
     /// The read this write depends on is definitively superseded. Nothing
     /// durable was staged, so the read-modify-write body can be reevaluated
     /// against the winner under the same id.
@@ -478,7 +472,7 @@ pub(super) enum Ineligible {
 /// Only a superseded read is [`Ineligible::Replay`], and the checks are ordered
 /// so a stronger reason wins: a key read as deleted names the same writer that
 /// deleted it, so testing existence first keeps it on the locked path (ADR-053).
-pub(super) fn eligible_writer(
+fn eligible_writer(
     res: &HolderResolution,
     read_version: Option<&TxId>,
 ) -> Result<TxId, Ineligible> {
@@ -500,3 +494,6 @@ pub(super) fn eligible_writer(
         _ => Ok(writer),
     }
 }
+
+#[cfg(test)]
+mod tests;

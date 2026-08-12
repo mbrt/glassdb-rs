@@ -284,3 +284,25 @@ working document and is intentionally not committed with these changes.
 - No tests were added, removed, renamed, or relocated. Existing normal,
   uncertain-CAS, replay, same-key loser, fallback, statistics, inline-pressure,
   and cancellation coverage remains the durable acceptance suite.
+
+## F21-C — Relocate direct-path tests
+
+- Moved the 18 existing direct-commit eligibility, landing, replay,
+  uncertain-CAS, batching, cache-reuse, and locked-fallback tests unchanged into
+  `algo::direct_commit::tests`. Their names and assertions are unchanged; the
+  30 general transaction tests remain in `algo::tests`, including CAS/deadlock
+  retry, locked orchestration, and point/scan read validation.
+- Moved only direct-specific fixtures with that suite: the deterministic fold
+  driver, coordinator seed gate, in-doubt CAS hook, same-leaf sibling and store
+  counter helpers, and the deliberately over-inline-budget value. The common
+  engine/transaction setup and operation-count helpers remain single-sourced in
+  `algo::tests` and expose only the members consumed by the relocated tests as
+  test-only `pub(super)` support.
+- Removed the temporary sibling-test visibility on the direct resolver,
+  eligibility classifier, and their fields, along with the test-only split-hint
+  accessor introduced during F21-B. The colocated child test module can inspect
+  those private implementation details without widening the collaborator's
+  boundary.
+- This is a test ownership change only: no durable tests were added, removed, or
+  renamed, and no production control flow, backend operations, retry behavior,
+  persistent bytes, randomness, or task lifetime changed.
