@@ -10,7 +10,9 @@ use async_trait::async_trait;
 use glassdb_concurr::rt::{self, Instant};
 use rand_distr::{Distribution, StandardNormal};
 
-use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
+use crate::{
+    Backend, BackendError, ListCursor, ListLimit, ListPage, ListRequest, ReadReply, Version,
+};
 
 /// Typical latency values observed with Google Cloud Storage.
 pub fn gcs_delays() -> DelayOptions {
@@ -273,9 +275,20 @@ impl Backend for DelayBackend {
         cursor: Option<&ListCursor>,
         limit: ListLimit,
     ) -> Result<ListPage, BackendError> {
-        self.prefix_read_wait(prefix).await;
+        match ListRequest::new(prefix, cursor, limit) {
+            Ok(request) => self.list_request(request).await,
+            Err(_) => {
+                self.prefix_read_wait(prefix).await;
+                self.delay(&self.list).await;
+                self.inner.list(prefix, cursor, limit).await
+            }
+        }
+    }
+
+    async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
+        self.prefix_read_wait(request.prefix()).await;
         self.delay(&self.list).await;
-        self.inner.list(prefix, cursor, limit).await
+        self.inner.list_request(request).await
     }
 }
 

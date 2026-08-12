@@ -11,7 +11,7 @@ use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::SdkBody;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::http::StatusCode;
-use glassdb_backend::{Backend, BackendError, ListCursor, ListLimit, Version};
+use glassdb_backend::{Backend, BackendError, Version};
 use hyper::Method;
 
 use crate::fake_server::FakeS3;
@@ -683,25 +683,7 @@ async fn read_not_found() {
 async fn list_is_recursive_and_paginated() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
-    for name in ["d/a/1", "d/a/2", "d/a/b/1", "d/c/1", "d/root"] {
-        b.write_if_not_exists(name, name.as_bytes().to_vec())
-            .await
-            .unwrap();
-    }
-    let limit = ListLimit::new(2).unwrap();
-    let first = b.list("d/", None, limit).await.unwrap();
-    assert_eq!(first.objects, vec!["d/a/1", "d/a/2"]);
-    let second = b.list("d/", first.next.as_ref(), limit).await.unwrap();
-    assert_eq!(second.objects, vec!["d/a/b/1", "d/c/1"]);
-    let third = b.list("d/", second.next.as_ref(), limit).await.unwrap();
-    assert_eq!(third.objects, vec!["d/root"]);
-    assert!(third.next.is_none());
-
-    let err = b
-        .list("d/", Some(&ListCursor::new("invalid")), limit)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, BackendError::InvalidCursor));
+    glassdb_backend::conformance::assert_list_conformance(&b).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

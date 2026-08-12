@@ -345,3 +345,146 @@ working document and is intentionally not committed with these changes.
   policy. The F18-B migration-only transition table was pruned because the model
   now exercises its complete flow matrix; deferred-effects and async interface
   regressions remain. No production behavior or public API changed.
+## F24-A — Centralize list argument validation
+
+- Added one provider-independent listing validator in `glassdb-backend` and
+  migrated the memory, S3, and GCS implementations to call it before cursor
+  decoding or provider request construction. Invalid prefixes retain the exact
+  `BackendError::Other` message and source shape.
+- Prefix shape is the only raw argument rule requiring a runtime check today:
+  `ListLimit` is positive by construction, while provider-issued cursors remain
+  opaque and provider-rejected tokens remain `BackendError::InvalidCursor`.
+- Cursor/prefix binding, a validated request value, middleware/caller migration,
+  and provider page-size clamping intentionally remain unchanged for F24-C
+  through F24-F. No backend request, pagination, or transport behavior changed.
+- A compact shared boundary table covers valid and invalid prefix shapes,
+  cursor presence, minimum/maximum limits, the zero-limit type boundary, and the
+  exact public error. Existing provider pagination tests now also prove all
+  three concrete backends invoke the shared invalid-prefix boundary; no copied
+  standalone test suite was added ahead of F24-B.
+- Adversarial review found that the initial provider smoke assertions did not
+  fully demonstrate cursor classification or validation precedence. Each
+  existing provider pagination test now runs the same compact boundary rows:
+  malformed prefixes return `Other` regardless of cursor presence, while an
+  arbitrary or empty cursor under a valid prefix returns `InvalidCursor`. This
+  remains local characterization rather than introducing F24-B's reusable
+  conformance suite early.
+
+## F24-B — Share backend list conformance coverage
+
+- Added a doc-hidden `glassdb_backend::conformance` module behind tests or the
+  additive `test-support` feature. Its single async harness exercises the public
+  `Backend` interface and is enabled for the S3 and GCS crates only as a dev
+  dependency feature; production dependency graphs remain unchanged.
+- One deliberately unordered fixture covers recursive descendants, a sibling,
+  and a near-prefix key. Traversal compares membership rather than order, caps
+  every page at the requested limit, rejects duplicate objects and cursors,
+  bounds total progress, requires termination, and checks an empty terminal
+  listing.
+- Invalid-prefix validation precedence and provider-rejected arbitrary or empty
+  cursor classifications now live in the same conformance harness. Cursor
+  binding and request normalization remain deferred to F24-C; no `ListRequest`
+  type or ordering guarantee was introduced.
+- Replaced the three copied recursive-pagination tests with thin memory, S3,
+  and GCS invocations. Provider transport, retry, conditional-operation, and
+  error-normalization tests remain local and unchanged. The existing
+  memory-only wrong-prefix check for a provider-issued cursor remains a compact
+  local regression until F24-C moves cursor binding into the shared contract.
+
+## F24-C — Bind listing cursors to their prefixes
+
+- `ListCursor` now carries one versioned, byte-length-framed envelope containing
+  the originating prefix and the still-opaque provider token. A central binding
+  helper and a central validation/unwrapping helper are doc-hidden but public so
+  the separate provider crates can share the boundary without changing the
+  existing `Backend::list`, `ListCursor`, or `validate_list_args` signatures.
+- Prefix shape is validated before cursor decoding. Malformed, empty, unknown-
+  version, truncated, non-character-boundary, and cross-prefix cursors return
+  `InvalidCursor`; an invalid prefix retains `Other` precedence. Empty tokens
+  returned by a provider are treated as provider faults by the binding helper.
+- Memory uses a tagged local continuation token inside the envelope, while S3
+  and GCS unwrap only the raw provider token for their requests and wrap only
+  nonempty response tokens. Valid listings therefore preserve request order,
+  page limits, provider continuation bytes, and backend operation counts; only
+  the caller-visible cursor representation changes.
+- The shared three-provider harness now retains a provider-issued cursor, proves
+  normal continuation, rejects reuse under another valid prefix, and separates
+  malformed envelopes from a correctly enveloped token rejected by the
+  provider. This subsumes and removes the memory-only wrong-prefix test; all
+  transport-specific provider tests remain local.
+- Cursor compatibility is intentionally one-way: cursors are task-local in the
+  repository, so no persistent format migrates, while externally retained raw
+  or pre-F24-C memory cursors are rejected and callers restart the prefix. No
+  `ListRequest`, backend-instance identity, middleware migration, or caller
+  migration from F24-D and later was introduced.
+
+## F24-D — Add `ListRequest` additively
+
+- Added a field-private, borrowed `ListRequest` that validates prefix, cursor,
+  and positive limit together without allocating. Its constructor preserves the
+  existing prefix-first error precedence, and accessors expose only the already
+  validated arguments.
+- Added an object-safe request-taking `Backend` entry point whose default calls
+  the existing required `list` method. The blanket `Arc<B>` implementation
+  forwards it explicitly so type erasure remains transparent to future
+  middleware overrides.
+- Existing providers, middleware, storage, and transaction callers remain on
+  the old signature for F24-E/F. No provider request, cursor bytes, page result,
+  operation count, or public error classification changed.
+- The existing validation table now exercises `ListRequest` construction and
+  accessors at the same boundaries. One compact trait-object test pins default
+  forwarding, prefix isolation, limit/cursor continuation, and termination;
+  this compatibility check may retire with the old signature in F24-G.
+
+## F24-E — Migrate backend middleware
+
+- Delay, fault, hook, logging, recording, scheduled-delay, and statistics
+  decorators (including the benchmark's role-attribution counters) now implement
+  the request-taking entry point and forward the same borrowed request through
+  every layer. Their old methods remain compatibility boundaries that construct
+  one validated request; providers and higher-level callers are intentionally
+  unchanged until F24-F/G.
+- Valid listing requests preserve decorator order, delay/fault decisions, hook
+  fields, log/record bytes, result pages, and the single list-operation count.
+  Compatibility calls with invalid raw arguments deliberately continue through
+  the legacy path, preserving every decorator effect and Hook/Fault error
+  precedence before the provider rejects the request.
+- Two composed forwarding tests cover the backend crate's seven decorators
+  without duplicating a suite per wrapper. They carry a real prefix-bound cursor
+  and limit through both compatibility and erased request dispatch, and pin
+  delays, hook fields and counts, exact recording bytes, provider-facing/outer
+  statistics, result pages, plus invalid-call effects and error override
+  behavior. The benchmark attribution test separately pins its compatibility,
+  request-pagination, invalid-input, and exact-count contracts.
+- No provider, storage, transaction, benchmark workload, or conformance caller
+  was migrated. Persistent bytes, provider requests, valid-operation counts,
+  scheduling order, and random draws are unchanged.
+
+## F24-F — Migrate storage and transaction callers
+
+- `CachedStore` adds a request-taking entry point and its private typed facade
+  accepts only a constructed `ListRequest`; node, structural-recovery, and
+  transaction-log listing boundaries construct that validated value immediately
+  before each page read. Raw prefix/cursor/limit triples therefore no longer
+  cross production storage layers or reach the legacy backend entry point.
+- The existing public `CachedStore::list` signature remains as an additive
+  compatibility wrapper. Like backend middleware, its invalid-input branch
+  deliberately retains the old raw call so validation failures preserve
+  invocation ordering and arbitrary wrapped-backend effects; production callers
+  use only `list_request`.
+- Valid pagination loops retain the same prefixes, page limits, cursors,
+  sequential page/read ordering, invocation watermarks, filtering, and error
+  mapping. The migration adds no backend operation, retry, task, random draw, or
+  persistent byte change to requests that reach a provider.
+- Deliberate deviation: storage-owned malformed or cross-prefix cursors are now
+  rejected while constructing the request, before allocating a cache invocation
+  watermark or entering middleware. This is the validated-boundary behavior
+  introduced by F24-D; the existing GC invalid-cursor contract still restarts
+  the affected shard. `CachedStore::list` retains legacy effects only for
+  external compatibility callers that still pass raw invalid arguments.
+- Existing node, structural-log, and transaction-log pagination tests remain the
+  long-term behavior coverage; no old-vs-new migration test was retained. The
+  one split recovery assertion that calls `CachedStore` directly was updated to
+  construct the same request rather than keeping a test-only raw storage API.
+- Providers and compatibility tests deliberately retain the old method until
+  F24-G. That release-gated removal remains outside this finding.

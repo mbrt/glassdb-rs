@@ -2717,17 +2717,14 @@ mod tests {
                 .is_empty()
         );
         let transaction_prefix = format!("{}/_t/", db_root("db"));
+        let request = glassdb_backend::ListRequest::new(
+            &transaction_prefix,
+            None,
+            glassdb_backend::ListLimit::new(2).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            s.objects
-                .list(
-                    &transaction_prefix,
-                    None,
-                    glassdb_backend::ListLimit::new(2).unwrap(),
-                )
-                .await
-                .unwrap()
-                .objects
-                .len(),
+            s.objects.list_request(request).await.unwrap().objects.len(),
             1,
             "the topology participant remains recoverable until GC"
         );

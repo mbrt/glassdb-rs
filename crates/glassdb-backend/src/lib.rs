@@ -12,6 +12,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod conformance;
 pub mod memory;
 pub mod middleware;
 mod stats;
@@ -138,7 +141,7 @@ pub struct ReadReply {
     pub version: Version,
 }
 
-/// A provider-issued continuation token for a paginated listing.
+/// An opaque continuation token for a paginated listing.
 ///
 /// The token has no engine-level meaning. Callers may only retain it and pass it
 /// back to the same backend with the same prefix.
@@ -146,12 +149,12 @@ pub struct ReadReply {
 pub struct ListCursor(Arc<str>);
 
 impl ListCursor {
-    /// Wraps the provider token returned by a backend implementation.
+    /// Reconstructs an opaque cursor previously returned by a backend.
     pub fn new(token: impl Into<Arc<str>>) -> Self {
         ListCursor(token.into())
     }
 
-    /// Returns the provider token for forwarding to the underlying store.
+    /// Returns the opaque cursor representation.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -159,6 +162,121 @@ impl ListCursor {
 
 /// A positive upper bound on the objects returned by one listing call.
 pub type ListLimit = NonZeroUsize;
+
+/// Validated arguments for listing one page of object paths.
+///
+/// The request borrows its prefix and cursor, so validation does not add an
+/// allocation to listing. Construct it at the boundary where raw listing
+/// arguments enter the backend contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListRequest<'a> {
+    prefix: &'a str,
+    cursor: Option<&'a ListCursor>,
+    limit: ListLimit,
+}
+
+impl<'a> ListRequest<'a> {
+    /// Validates and groups the arguments for one listing call.
+    pub fn new(
+        prefix: &'a str,
+        cursor: Option<&'a ListCursor>,
+        limit: ListLimit,
+    ) -> Result<Self, BackendError> {
+        validate_list_args(prefix, cursor, limit)?;
+        Ok(Self {
+            prefix,
+            cursor,
+            limit,
+        })
+    }
+
+    /// Returns the recursive object-path prefix.
+    pub fn prefix(&self) -> &str {
+        self.prefix
+    }
+
+    /// Returns the continuation cursor, when listing a subsequent page.
+    pub fn cursor(&self) -> Option<&ListCursor> {
+        self.cursor
+    }
+
+    /// Returns the positive page-size limit.
+    pub fn limit(&self) -> ListLimit {
+        self.limit
+    }
+}
+
+const LIST_CURSOR_PREFIX: &str = "glassdb-list-v1:";
+
+/// Validates the provider-independent arguments to [`Backend::list`].
+///
+/// A [`ListLimit`] is positive by construction. Cursors remain opaque to
+/// callers and are rejected when malformed or bound to another prefix.
+pub fn validate_list_args(
+    prefix: &str,
+    cursor: Option<&ListCursor>,
+    limit: ListLimit,
+) -> Result<(), BackendError> {
+    validate_list_args_and_cursor(prefix, cursor, limit).map(|_| ())
+}
+
+/// Binds a provider continuation token to its listing prefix.
+#[doc(hidden)]
+pub fn bind_list_cursor(prefix: &str, provider_token: &str) -> Result<ListCursor, BackendError> {
+    validate_list_prefix(prefix)?;
+    if provider_token.is_empty() {
+        return Err(BackendError::other(
+            "list provider returned an empty continuation token",
+        ));
+    }
+    Ok(ListCursor::new(format!(
+        "{LIST_CURSOR_PREFIX}{}:{prefix}{provider_token}",
+        prefix.len()
+    )))
+}
+
+/// Validates listing arguments and unwraps the provider continuation token.
+#[doc(hidden)]
+pub fn validate_list_args_and_cursor<'a>(
+    prefix: &str,
+    cursor: Option<&'a ListCursor>,
+    _limit: ListLimit,
+) -> Result<Option<&'a str>, BackendError> {
+    validate_list_prefix(prefix)?;
+    cursor
+        .map(|cursor| decode_list_cursor(prefix, cursor))
+        .transpose()
+}
+
+fn validate_list_prefix(prefix: &str) -> Result<(), BackendError> {
+    if prefix.is_empty() || prefix.ends_with('/') {
+        Ok(())
+    } else {
+        Err(BackendError::other(format!(
+            "list prefix must be empty or end in '/': {prefix:?}"
+        )))
+    }
+}
+
+fn decode_list_cursor<'a>(prefix: &str, cursor: &'a ListCursor) -> Result<&'a str, BackendError> {
+    let encoded = cursor
+        .as_str()
+        .strip_prefix(LIST_CURSOR_PREFIX)
+        .ok_or(BackendError::InvalidCursor)?;
+    let (prefix_len, body) = encoded.split_once(':').ok_or(BackendError::InvalidCursor)?;
+    let prefix_len = prefix_len
+        .parse::<usize>()
+        .map_err(|_| BackendError::InvalidCursor)?;
+    let stored_prefix = body.get(..prefix_len).ok_or(BackendError::InvalidCursor)?;
+    let provider_token = body
+        .get(prefix_len..)
+        .filter(|token| !token.is_empty())
+        .ok_or(BackendError::InvalidCursor)?;
+    if stored_prefix != prefix {
+        return Err(BackendError::InvalidCursor);
+    }
+    Ok(provider_token)
+}
 
 /// One page of object paths returned by [`Backend::list`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -231,6 +349,16 @@ pub trait Backend: Send + Sync {
         cursor: Option<&ListCursor>,
         limit: ListLimit,
     ) -> Result<ListPage, BackendError>;
+
+    /// Lists one page using arguments validated at construction.
+    ///
+    /// The default preserves compatibility with existing backend
+    /// implementations. Providers may continue implementing [`Backend::list`]
+    /// until the request-taking method becomes the required contract.
+    async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
+        self.list(request.prefix(), request.cursor(), request.limit())
+            .await
+    }
 }
 
 /// Transparent delegation so any `Arc<B: Backend>` (including
@@ -280,5 +408,138 @@ impl<B: Backend + ?Sized + 'static> Backend for std::sync::Arc<B> {
         limit: ListLimit,
     ) -> Result<ListPage, BackendError> {
         (**self).list(prefix, cursor, limit).await
+    }
+
+    async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
+        (**self).list_request(request).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_request_and_cursor_boundaries() {
+        let one = ListLimit::new(1).unwrap();
+        let largest = ListLimit::new(usize::MAX).unwrap();
+        let root_cursor = bind_list_cursor("", "root-token").unwrap();
+        let slash_cursor = bind_list_cursor("/", "slash-token").unwrap();
+        let nested_cursor = bind_list_cursor("a/b/", "nested-token").unwrap();
+
+        for (prefix, cursor, limit, provider_token) in [
+            ("", None, one, None),
+            ("", Some(&root_cursor), one, Some("root-token")),
+            ("/", Some(&slash_cursor), one, Some("slash-token")),
+            ("a/", None, largest, None),
+            ("a/b/", Some(&nested_cursor), largest, Some("nested-token")),
+        ] {
+            let request = ListRequest::new(prefix, cursor, limit).unwrap();
+            assert_eq!(request.prefix(), prefix);
+            assert_eq!(request.cursor(), cursor);
+            assert_eq!(request.limit(), limit);
+            assert_eq!(
+                validate_list_args_and_cursor(prefix, cursor, limit).unwrap(),
+                provider_token,
+                "prefix {prefix:?}"
+            );
+        }
+
+        let malformed_cursor = ListCursor::new("opaque");
+        for (prefix, cursor) in [("a", None), ("a/b", Some(&malformed_cursor))] {
+            let error = ListRequest::new(prefix, cursor, one).unwrap_err();
+            match error {
+                BackendError::Other { msg, source } => {
+                    assert_eq!(
+                        msg,
+                        format!("list prefix must be empty or end in '/': {prefix:?}")
+                    );
+                    assert!(source.is_none());
+                }
+                error => panic!("prefix {prefix:?} returned {error:?}"),
+            }
+        }
+
+        let unicode_cursor = bind_list_cursor("é/", "provider-token").unwrap();
+        assert_eq!(
+            unicode_cursor.as_str(),
+            "glassdb-list-v1:3:é/provider-token"
+        );
+        assert_eq!(
+            validate_list_args_and_cursor("é/", Some(&unicode_cursor), one).unwrap(),
+            Some("provider-token")
+        );
+
+        let wrong_prefix = bind_list_cursor("other/", "provider-token").unwrap();
+        for (case, cursor) in [
+            ("empty", ListCursor::new("")),
+            ("raw provider token", ListCursor::new("provider-token")),
+            (
+                "unknown version",
+                ListCursor::new("glassdb-list-v2:2:a/provider-token"),
+            ),
+            (
+                "invalid length",
+                ListCursor::new("glassdb-list-v1:x:a/provider-token"),
+            ),
+            (
+                "truncated prefix",
+                ListCursor::new("glassdb-list-v1:20:a/provider-token"),
+            ),
+            (
+                "non-character boundary",
+                ListCursor::new("glassdb-list-v1:1:é/provider-token"),
+            ),
+            (
+                "empty provider token",
+                ListCursor::new("glassdb-list-v1:2:a/"),
+            ),
+            ("wrong prefix", wrong_prefix),
+        ] {
+            let error = ListRequest::new("a/", Some(&cursor), one).unwrap_err();
+            assert!(
+                matches!(error, BackendError::InvalidCursor),
+                "{case} returned {error:?}"
+            );
+        }
+
+        assert!(matches!(
+            bind_list_cursor("a/", ""),
+            Err(BackendError::Other { .. })
+        ));
+        assert!(ListLimit::new(0).is_none());
+    }
+
+    #[tokio::test]
+    async fn list_request_default_delegates_through_a_trait_object() {
+        let backend: Arc<dyn Backend> = Arc::new(memory::MemoryBackend::new());
+        backend
+            .write_if_not_exists("a/one", Vec::new())
+            .await
+            .unwrap();
+        backend
+            .write_if_not_exists("a/two", Vec::new())
+            .await
+            .unwrap();
+        backend
+            .write_if_not_exists("b/other", Vec::new())
+            .await
+            .unwrap();
+
+        let limit = ListLimit::new(1).unwrap();
+        let first = backend
+            .list_request(ListRequest::new("a/", None, limit).unwrap())
+            .await
+            .unwrap();
+        let second = backend
+            .list_request(ListRequest::new("a/", first.next.as_ref(), limit).unwrap())
+            .await
+            .unwrap();
+
+        let mut objects = first.objects;
+        objects.extend(second.objects);
+        objects.sort();
+        assert_eq!(objects, ["a/one", "a/two"]);
+        assert!(second.next.is_none());
     }
 }
