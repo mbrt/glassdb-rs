@@ -131,10 +131,8 @@ impl StructuralLogStore {
         let mut cursor = None;
         let mut records = Vec::new();
         loop {
-            let page = self
-                .structural_logs
-                .list(prefix, cursor.as_ref(), limit)
-                .await?;
+            let request = backend::ListRequest::new(prefix, cursor.as_ref(), limit)?;
+            let page = self.structural_logs.list_request(request).await?;
             for path in page.objects {
                 let ObjectPath::StructuralRecord { record_id, .. } = path.object_path() else {
                     return Err(StorageError::other(

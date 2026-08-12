@@ -305,3 +305,32 @@ working document and is intentionally not committed with these changes.
 - No provider, storage, transaction, benchmark workload, or conformance caller
   was migrated. Persistent bytes, provider requests, valid-operation counts,
   scheduling order, and random draws are unchanged.
+
+## F24-F — Migrate storage and transaction callers
+
+- `CachedStore` adds a request-taking entry point and its private typed facade
+  accepts only a constructed `ListRequest`; node, structural-recovery, and
+  transaction-log listing boundaries construct that validated value immediately
+  before each page read. Raw prefix/cursor/limit triples therefore no longer
+  cross production storage layers or reach the legacy backend entry point.
+- The existing public `CachedStore::list` signature remains as an additive
+  compatibility wrapper. Like backend middleware, its invalid-input branch
+  deliberately retains the old raw call so validation failures preserve
+  invocation ordering and arbitrary wrapped-backend effects; production callers
+  use only `list_request`.
+- Valid pagination loops retain the same prefixes, page limits, cursors,
+  sequential page/read ordering, invocation watermarks, filtering, and error
+  mapping. The migration adds no backend operation, retry, task, random draw, or
+  persistent byte change to requests that reach a provider.
+- Deliberate deviation: storage-owned malformed or cross-prefix cursors are now
+  rejected while constructing the request, before allocating a cache invocation
+  watermark or entering middleware. This is the validated-boundary behavior
+  introduced by F24-D; the existing GC invalid-cursor contract still restarts
+  the affected shard. `CachedStore::list` retains legacy effects only for
+  external compatibility callers that still pass raw invalid arguments.
+- Existing node, structural-log, and transaction-log pagination tests remain the
+  long-term behavior coverage; no old-vs-new migration test was retained. The
+  one split recovery assertion that calls `CachedStore` directly was updated to
+  construct the same request rather than keeping a test-only raw storage API.
+- Providers and compatibility tests deliberately retain the old method until
+  F24-G. That release-gated removal remains outside this finding.

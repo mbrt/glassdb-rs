@@ -326,10 +326,8 @@ impl NodeStore {
         let mut cursor = None;
         let mut nodes = Vec::new();
         loop {
-            let page = self
-                .nodes
-                .list(&list_prefix, cursor.as_ref(), limit)
-                .await?;
+            let request = backend::ListRequest::new(&list_prefix, cursor.as_ref(), limit)?;
+            let page = self.nodes.list_request(request).await?;
             for path in page.objects {
                 let ObjectPath::Node {
                     collection: listed_collection,
