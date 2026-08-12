@@ -239,3 +239,23 @@ working document and is intentionally not committed with these changes.
 - Builder documentation now includes same-identity lock reacquisition in the
   existing retry options. Defaults, persistent bytes, backend-operation order,
   retry classification, and random draws on contention-free paths are unchanged.
+
+## F21-A — Move direct-commit vocabulary mechanically
+
+- Moved the direct-commit resolver, attempt/result vocabulary, shape recognizer,
+  predecessor value, and eligibility policy into the private
+  `algo::direct_commit` module. `Algo` still owns predecessor lookup, execution,
+  counters, GC hinting, coordination, and attempt transitions for the later
+  collaborator extraction.
+- Temporary `pub(super)` visibility is limited to the values and fields the
+  parent algorithm already constructs or consumes. The new module has no
+  dependency on `Algo`, `Handle`, `Gc`, or the coordinator owner, so ownership
+  remains one-way without a compatibility abstraction or public re-export.
+- Resolver bodies, eligibility ordering, requirements, admission policy,
+  split-hint behavior, outcome classification, and one-CAS commit point are
+  unchanged. Production imports moved with their code; test-only coordination
+  imports remain local to the existing test module.
+- No tests were added, removed, or relocated. Existing direct-path and fallback
+  behavior coverage remains in `algo.rs` until F21-C; this finding changes no
+  persistent bytes, backend operations, retries, random draws, task spawning,
+  statistics, or public API.
