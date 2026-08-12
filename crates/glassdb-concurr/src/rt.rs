@@ -11,133 +11,23 @@
 //! branch-poll RNG; see `exec::block_on_with`).
 
 use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
-use futures::FutureExt;
-use tokio_util::sync::CancellationToken;
+mod dedicated;
+
+pub use dedicated::{DedicatedJoinError, DedicatedJoinHandle, SpawnError, spawn_dedicated};
 
 /// Error returned when a runtime-seam deadline expires.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("operation timed out")]
 pub struct TimedOut;
 
-/// Error returned when a dedicated task cannot be started.
-#[derive(Debug, thiserror::Error)]
-pub enum SpawnError {
-    /// No Tokio runtime is active to drive the dedicated future.
-    #[error("no runtime is available")]
-    RuntimeUnavailable,
-    /// The operating-system thread could not be created.
-    #[error("dedicated thread could not be started: {0}")]
-    Thread(#[source] std::io::Error),
-}
-
-/// Failure reported when joining a dedicated task.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum DedicatedJoinError {
-    /// The task was cooperatively cancelled.
-    #[error("dedicated task was cancelled")]
-    Cancelled,
-    /// The task panicked while being polled.
-    #[error("dedicated task panicked")]
-    Panicked,
-}
-
-enum DedicatedOutcome<T> {
-    Completed(T),
-    Cancelled,
-    Panicked,
-}
-
-/// A handle to a task driven by a dedicated production thread or a simulated
-/// executor task.
-///
-/// Dropping the handle detaches the task. Call [`DedicatedJoinHandle::abort`]
-/// to request cooperative cancellation.
-pub struct DedicatedJoinHandle<T> {
-    result: tokio::sync::oneshot::Receiver<DedicatedOutcome<T>>,
-    abort: CancellationToken,
-}
-
-impl<T> DedicatedJoinHandle<T> {
-    /// Requests cancellation. The future is dropped when its driver can next
-    /// poll the cancellation signal.
-    pub fn abort(&self) {
-        self.abort.cancel();
-    }
-}
-
-impl<T> Future for DedicatedJoinHandle<T> {
-    type Output = Result<T, DedicatedJoinError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.get_mut().result)
-            .poll(cx)
-            .map(|outcome| match outcome {
-                Ok(DedicatedOutcome::Completed(value)) => Ok(value),
-                Ok(DedicatedOutcome::Cancelled) => Err(DedicatedJoinError::Cancelled),
-                Ok(DedicatedOutcome::Panicked) | Err(_) => Err(DedicatedJoinError::Panicked),
-            })
-    }
-}
-
-async fn drive_dedicated<F>(future: F, abort: CancellationToken) -> DedicatedOutcome<F::Output>
-where
-    F: Future,
-{
-    let future = std::panic::AssertUnwindSafe(future).catch_unwind();
-    tokio::pin!(future);
-    tokio::select! {
-        biased;
-        _ = abort.cancelled() => DedicatedOutcome::Cancelled,
-        result = &mut future => {
-            if abort.is_cancelled() {
-                DedicatedOutcome::Cancelled
-            } else {
-                match result {
-                    Ok(value) => DedicatedOutcome::Completed(value),
-                    Err(_) => DedicatedOutcome::Panicked,
-                }
-            }
-        },
-    }
-}
-
-fn spawn_dedicated_native<N, F>(
-    name: N,
-    future: F,
-) -> Result<DedicatedJoinHandle<F::Output>, SpawnError>
-where
-    N: Into<String>,
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    let runtime =
-        tokio::runtime::Handle::try_current().map_err(|_| SpawnError::RuntimeUnavailable)?;
-    let abort = CancellationToken::new();
-    let abort_inner = abort.clone();
-    let (sender, result) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new()
-        .name(name.into())
-        .spawn(move || {
-            let outcome = runtime.block_on(drive_dedicated(future, abort_inner));
-            let _ = sender.send(outcome);
-        })
-        .map_err(SpawnError::Thread)?;
-    Ok(DedicatedJoinHandle { result, abort })
-}
-
 #[cfg(not(sim))]
 mod imp {
     use std::ops::Add;
     use std::sync::OnceLock;
 
-    use super::{
-        DedicatedJoinHandle, Duration, Future, SpawnError, SystemTime, TimedOut,
-        spawn_dedicated_native,
-    };
+    use super::{Duration, Future, SystemTime, TimedOut};
 
     pub use tokio::task::JoinHandle;
     pub use tokio::task::yield_now;
@@ -291,19 +181,6 @@ mod imp {
         tokio::spawn(f)
     }
 
-    /// Drives `future` on one newly created, named operating-system thread.
-    pub fn spawn_dedicated<N, F>(
-        name: N,
-        future: F,
-    ) -> Result<DedicatedJoinHandle<F::Output>, SpawnError>
-    where
-        N: Into<String>,
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        spawn_dedicated_native(name, future)
-    }
-
     /// Runs `future` until it completes or `duration` elapses.
     pub async fn timeout<F>(duration: Duration, future: F) -> Result<F::Output, TimedOut>
     where
@@ -324,10 +201,7 @@ mod imp {
 
     use crate::exec;
 
-    use super::{
-        DedicatedJoinHandle, Duration, Future, SpawnError, SystemTime, TimedOut, drive_dedicated,
-        spawn_dedicated_native,
-    };
+    use super::{Duration, Future, SystemTime, TimedOut};
 
     pub use crate::exec::{
         PctScheduler, RandomScheduler, RuntimeEntropySource, RuntimeTraceEvent,
@@ -515,26 +389,6 @@ mod imp {
             JoinHandle::Tokio(tokio::spawn(f))
         }
     }
-
-    /// Drives `future` as an ordinary deterministic task when simulation is
-    /// active, or on one named operating-system thread otherwise.
-    pub fn spawn_dedicated<N, F>(
-        name: N,
-        future: F,
-    ) -> Result<DedicatedJoinHandle<F::Output>, SpawnError>
-    where
-        N: Into<String>,
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        if exec::in_sim() {
-            let abort = CancellationToken::new();
-            let result = exec::det_spawn(drive_dedicated(future, abort.clone()));
-            Ok(DedicatedJoinHandle { result, abort })
-        } else {
-            spawn_dedicated_native(name, future)
-        }
-    }
 }
 
 pub use imp::*;
@@ -614,15 +468,67 @@ mod dedicated_tests {
 
     #[cfg(sim)]
     #[test]
-    fn active_simulation_uses_an_executor_task() {
+    fn active_simulation_preserves_dedicated_lifecycle_and_spawn_order() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct DropNotice(Arc<AtomicBool>);
+
+        impl Drop for DropNotice {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
         let caller = std::thread::current().id();
-        super::block_on_with(super::TapeScheduler::new(Vec::new()), 0, async move {
-            let task = spawn_dedicated("not-a-native-thread", async move {
-                super::yield_now().await;
-                std::thread::current().id()
+        let dropped_at_shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_notice = dropped_at_shutdown.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_sink = trace.clone();
+        super::block_on_with_trace(
+            super::TapeScheduler::new(Vec::new()),
+            0,
+            Arc::new(move |event| trace_sink.lock().unwrap().push(event)),
+            async move {
+                let success = spawn_dedicated("not-a-native-thread", async move {
+                    super::yield_now().await;
+                    std::thread::current().id()
+                })
+                .unwrap();
+                let panicked = spawn_dedicated("simulated-panic", async move {
+                    panic!("dedicated test panic");
+                })
+                .unwrap();
+                let cancelled = spawn_dedicated("simulated-cancellation", async move {
+                    std::future::pending::<()>().await;
+                })
+                .unwrap();
+                cancelled.abort();
+
+                let notice = DropNotice(shutdown_notice);
+                let detached = spawn_dedicated("simulated-shutdown", async move {
+                    let _notice = notice;
+                    std::future::pending::<()>().await;
+                })
+                .unwrap();
+                drop(detached);
+
+                assert_eq!(success.await.unwrap(), caller);
+                assert!(matches!(panicked.await, Err(DedicatedJoinError::Panicked)));
+                assert_eq!(cancelled.await, Err(DedicatedJoinError::Cancelled));
+            },
+        );
+
+        assert!(dropped_at_shutdown.load(Ordering::SeqCst));
+        let spawned: Vec<_> = trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                super::RuntimeTraceEvent::TaskSpawned { task_id } => Some(*task_id),
+                _ => None,
             })
-            .unwrap();
-            assert_eq!(task.await.unwrap(), caller);
-        });
+            .collect();
+        assert_eq!(spawned, [0, 1, 2, 3, 4]);
     }
 }

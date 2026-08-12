@@ -1110,3 +1110,24 @@ working document and is intentionally not committed with these changes.
 - No persistent bytes, backend result, public signature, or dependency changed,
   and no ADR was warranted for routing an existing middleware draw through the
   already-selected entropy policy.
+## F31-C — Isolate dedicated-task mechanics
+
+- Added the private `rt::dedicated` module as the single owner of the worker
+  outcome state, join handle and errors, cooperative abort driver, native named
+  thread startup, and simulation/native dispatch. `rt` re-exports the same
+  public function and types, so callers and crate-visible paths do not change.
+- The native and simulated branches retain their original operations and order.
+  The native path still validates the ambient runtime before allocating worker
+  state; each path then starts exactly one native thread or simulated executor
+  task. Panic normalization, cancellation precedence, join-channel failure
+  handling, and detached-handle shutdown behavior are unchanged.
+- Kept the existing lifecycle tests at the `rt` facade instead of copying them
+  into the implementation module. The existing active-simulation case now
+  compactly covers success, panic, cancellation, executor shutdown, and exact
+  wrapper-task spawn order; the runtime-seam source guard recognizes only the
+  reviewed native thread/runtime operations at their new owner path.
+- All reviewed tape and PCT harness traces remain byte-identical without a
+  baseline edit, independently covering production-style task IDs and spawn
+  order. No migration-only test, dependency, public API, persistent format,
+  runtime policy, or ADR was added; there were no deviations from the staged
+  finding.
