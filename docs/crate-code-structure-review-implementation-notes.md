@@ -208,3 +208,24 @@ working document and is intentionally not committed with these changes.
 - Existing node and configuration tests now cover exact and one-byte-over soft
   caps for leaves and indexes, equal/over-cap headroom, the public error class,
   and zero backend operations on invalid open. No migration-only test was added.
+
+## F23-B — Add codec-owned wire-size calculations
+
+- Exposed the 16-byte maximum for transaction IDs minted or renewed by GlassDB
+  and reused the validated node token's existing 22-byte encoded maximum.
+  `TxId::from_bytes` intentionally accepts arbitrary persisted IDs, so the new
+  constant is named `MAX_GENERATED_ENCODED_LEN` rather than claiming a false
+  bound; exact entry sizing continues to honor those IDs' actual lengths.
+- Added allocation-free protobuf field arithmetic beside the storage codecs.
+  `ShardEntry` now reports its exact canonical encoded length, and `Node`
+  reports the exact one-entry leaf content length plus worst-case generated-ID
+  leaf and maximum-token parent shapes.
+- The leaf bound models one generated write holder and one external writer. The
+  parent bound models the leftmost child plus the candidate separator, except
+  for the empty separator where the map can contain only that one entry.
+- One compact entry-state matrix and one boundary table compare the calculations
+  with prost's actual encoded lengths across absent/external/inline/tombstone
+  states, maximum components, and every relevant nested varint-width change.
+- Split-policy callers and their synthetic probes remain deliberately unchanged
+  for F23-C. This finding changes no admission decision, persisted bytes,
+  backend operation, or retry behavior.

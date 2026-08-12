@@ -26,7 +26,15 @@ use prost::Message;
 use crate::error::StorageError;
 use crate::lock::{ExclusiveGate, LockType, SharedExclusiveLock};
 use crate::shard::{CurrentState, Shard, ShardEntry};
-use glassdb_data::TxId;
+use crate::wire_size::{length_delimited_field, nonempty_length_delimited_field};
+use glassdb_data::{NodeToken as ValidatedNodeToken, TxId};
+
+const SHARD_ENTRIES_TAG: u32 = 1;
+const INDEX_ENTRIES_TAG: u32 = 1;
+const INDEX_SEPARATOR_TAG: u32 = 1;
+const INDEX_CHILD_TAG: u32 = 2;
+const NODE_LEAF_TAG: u32 = 3;
+const NODE_INDEX_TAG: u32 = 4;
 
 /// The opaque identity token of a non-root node (`{prefix}/_n/<token>`). The
 /// root has no token; it lives at the fixed `_r` path.
@@ -487,16 +495,46 @@ impl Node {
         self.locks.membership_version()
     }
 
-    /// Clears node locks before a split-created node becomes visible.
-    pub(crate) fn clear_node_locks(&mut self) {
-        self.locks.clear_holders();
-    }
-
     /// Returns the canonical encoded size without transient node locks.
     pub fn content_encoded_len(&self) -> usize {
         let mut content = self.clone();
         content.clear_node_locks();
         content.encoded_len()
+    }
+
+    /// Returns the exact node-content size of a leaf containing only `entry`.
+    pub fn leaf_entry_content_encoded_len(entry: &ShardEntry) -> usize {
+        let shard_len = length_delimited_field(SHARD_ENTRIES_TAG, entry.encoded_len());
+        length_delimited_field(NODE_LEAF_TAG, shard_len)
+    }
+
+    /// Returns the node-content size of a leaf containing the largest fixed
+    /// coordination shape GlassDB can add for a key of `key_len` bytes.
+    pub fn worst_case_leaf_entry_len(key_len: usize) -> usize {
+        let shard_len = length_delimited_field(
+            SHARD_ENTRIES_TAG,
+            ShardEntry::worst_case_encoded_len(key_len),
+        );
+        length_delimited_field(NODE_LEAF_TAG, shard_len)
+    }
+
+    /// Returns the node-content size of the smallest parent that can contain a
+    /// separator of `key_len` bytes, using maximum-length validated child tokens.
+    pub fn worst_case_parent_separator_len(key_len: usize) -> usize {
+        let child_len =
+            length_delimited_field(INDEX_CHILD_TAG, ValidatedNodeToken::MAX_ENCODED_LEN);
+        let entry_len = |separator_len| {
+            nonempty_length_delimited_field(INDEX_SEPARATOR_TAG, separator_len) + child_len
+        };
+        let candidate_len = length_delimited_field(INDEX_ENTRIES_TAG, entry_len(key_len));
+        let index_len = if key_len == 0 {
+            // The candidate is itself the leftmost separator; a BTreeMap cannot
+            // contain a second entry with the same empty key.
+            candidate_len
+        } else {
+            length_delimited_field(INDEX_ENTRIES_TAG, entry_len(0)) + candidate_len
+        };
+        length_delimited_field(NODE_INDEX_TAG, index_len)
     }
 
     /// The leaf body, or `None` if this is an index node.
@@ -606,6 +644,11 @@ impl Node {
         let raw = pb::Node::decode(buf)
             .map_err(|e| StorageError::with_source("unmarshalling node", e))?;
         Node::from_pb(raw)
+    }
+
+    /// Clears node locks before a split-created node becomes visible.
+    pub(crate) fn clear_node_locks(&mut self) {
+        self.locks.clear_holders();
     }
 
     pub(crate) fn to_pb(&self) -> pb::Node {
@@ -1003,6 +1046,49 @@ mod tests {
             (b"m".to_vec(), "L2".to_string()),
         ]));
         assert_eq!(a.encode(), b.encode());
+    }
+
+    #[test]
+    fn codec_size_predictions_match_varint_boundaries() {
+        let id = TxId::from_bytes(vec![0; TxId::MAX_GENERATED_ENCODED_LEN]);
+        let token = ValidatedNodeToken::from_bytes([0; 16]).to_string();
+        assert_eq!(token.len(), ValidatedNodeToken::MAX_ENCODED_LEN);
+
+        for key_len in [
+            0, 1, 81, 82, 83, 84, 127, 128, 16_335, 16_336, 16_338, 16_339, 16_383, 16_384,
+        ] {
+            let mut entry = ShardEntry::new(vec![b'k'; key_len])
+                .with_current(CurrentState::External { writer: id.clone() });
+            entry.replace_write_lock(id.clone());
+            let actual = Node::leaf(Shard::from_entries([entry.clone()])).content_encoded_len();
+
+            assert_eq!(
+                Node::leaf_entry_content_encoded_len(&entry),
+                actual,
+                "exact leaf entry with {key_len}-byte key"
+            );
+            assert_eq!(
+                Node::worst_case_leaf_entry_len(key_len),
+                actual,
+                "worst-case leaf entry with {key_len}-byte key"
+            );
+        }
+
+        for key_len in [
+            0, 1, 73, 74, 101, 102, 127, 128, 16_327, 16_328, 16_356, 16_357, 16_383, 16_384,
+        ] {
+            let actual = Node::index(IndexNode::from_children([
+                (Vec::new(), token.clone()),
+                (vec![b'k'; key_len], token.clone()),
+            ]))
+            .content_encoded_len();
+
+            assert_eq!(
+                Node::worst_case_parent_separator_len(key_len),
+                actual,
+                "parent separator with {key_len}-byte key"
+            );
+        }
     }
 
     #[test]

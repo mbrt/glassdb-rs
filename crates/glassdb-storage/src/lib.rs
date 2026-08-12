@@ -20,6 +20,7 @@ pub mod transaction;
 mod tree_router;
 pub mod txobject;
 mod version;
+mod wire_size;
 
 /// Persistent-cache media and harnesses for deterministic simulation.
 #[cfg(feature = "sim")]
