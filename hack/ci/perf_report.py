@@ -34,6 +34,7 @@ class ReportError(ValueError):
 @dataclass(frozen=True)
 class ScoreRun:
     score: float
+    backend_latency_ms: int
     workloads: dict[str, float]
     secondary: dict[str, float]
 
@@ -52,6 +53,12 @@ def _nonnegative(value: Any, field: str) -> float:
     if result < 0:
         raise ReportError(f"{field} must be nonnegative")
     return result
+
+
+def _positive_integer(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ReportError(f"{field} must be a positive integer")
+    return value
 
 
 def _object(value: Any, field: str) -> dict[str, Any]:
@@ -114,6 +121,10 @@ def load_score_runs(path: Path) -> list[ScoreRun]:
         runs.append(
             ScoreRun(
                 score=_nonnegative(raw.get("score"), f"{result_path}: score"),
+                backend_latency_ms=_positive_integer(
+                    raw.get("backendLatencyMs"),
+                    f"{result_path}: backendLatencyMs",
+                ),
                 workloads=workloads,
                 secondary=secondary,
             )
@@ -149,6 +160,15 @@ def _escape(value: str) -> str:
 def render_report(input_dir: Path, base_label: str, candidate_label: str) -> str:
     base_scores = load_score_runs(input_dir / "score" / "main")
     candidate_scores = load_score_runs(input_dir / "score" / "pr")
+    backend_latencies = {
+        run.backend_latency_ms for run in [*base_scores, *candidate_scores]
+    }
+    if len(backend_latencies) != 1:
+        raise ReportError(
+            "score runs must use one backend latency; "
+            f"found {sorted(backend_latencies)} ms"
+        )
+    backend_latency_ms = next(iter(backend_latencies))
 
     base_score_values = _values(base_scores, "score")
     candidate_score_values = _values(candidate_scores, "score")
@@ -157,6 +177,7 @@ def render_report(input_dir: Path, base_label: str, candidate_label: str) -> str
         "",
         f"- Base: `{_escape(base_label)}`",
         f"- Candidate: `{_escape(candidate_label)}`",
+        f"- Backend model: fixed {backend_latency_ms} ms operation latency over memory.",
         "- Numeric changes are informational and never fail the PR check.",
         "",
         "## Backend-operation score",
@@ -181,12 +202,12 @@ def render_report(input_dir: Path, base_label: str, candidate_label: str) -> str
     lines.extend(
         [
             "",
-            "> The primary is count-based, but background protocol work currently "
-            "gives it an observed noise floor of roughly 1%; small changes should be "
-            "treated as unchanged.",
+            "> The fixed backend latency runs on a single-thread runtime so deferred "
+            "protocol work is scheduled consistently; the primary remains "
+            "operation-count based.",
             "",
             "<details>",
-            "<summary>In-memory secondary metrics (informational)</summary>",
+            "<summary>Latency-stabilized in-memory secondary metrics (informational)</summary>",
             "",
             "Lower is better. These values use the same interleaved runs; their "
             "observed ranges show the run-to-run variability.",

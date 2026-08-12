@@ -33,9 +33,9 @@ Artifacts are written under `hack/perf/` (and are gitignored): `flamegraph.svg`
 ## Targets
 
 - **`autoresearch`** - the single-client scoring harness
-  (`glassdb-bench-score`), run against the in-memory backend. Best for the
-  CPU/allocation hot spots that show up as the loop's secondary axes. See the
-  caveat below.
+  (`glassdb-bench-score`), run against a latency-stabilized in-memory backend.
+  Best for the CPU/allocation hot spots that show up as the loop's secondary
+  axes. See the caveat below.
 - **`bench`** - the `transactions` Criterion microbenchmark (`glassdb`), whose
   `DelayBackend` injects a compressed S3/GCS latency profile. Its profile is
   closer to the real, round-trip-bound cost model. The profiler attaches to the
@@ -43,13 +43,14 @@ Artifacts are written under `hack/perf/` (and are gitignored): `flamegraph.svg`
 
 ## The in-memory caveat
 
-The `autoresearch` harness uses the in-memory backend, while real glassdb cost
-is dominated by object-storage round-trips (the metric weights each backend op
-at ~31-70ms). An in-memory flamegraph therefore over-weights the codec,
-allocator, and harness machinery and under-represents the paths that actually
-dominate in production. Read an `autoresearch` profile as a guide to the
-CPU/allocation tie-breakers only; for a production-shaped picture, profile the
-`bench` target instead.
+The `autoresearch` harness injects a fixed 1 ms delay over the in-memory backend
+to stabilize deferred work, while real glassdb cost is dominated by much longer
+and variable object-storage round-trips (the metric weights each backend op at
+~31-70ms). Its flamegraph therefore still over-weights the codec, allocator,
+and harness machinery and under-represents the paths that actually dominate in
+production. Read an `autoresearch` profile as a guide to the CPU/allocation
+tie-breakers only; for a production-shaped picture, profile the `bench` target
+instead.
 
 ## Profiler
 

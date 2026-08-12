@@ -24,6 +24,7 @@ class PerfReportTest(unittest.TestCase):
     def _write_score(self, side: str, repetition: int, score: float) -> None:
         result = {
             "score": score,
+            "backendLatencyMs": 1,
             "secondary": {
                 "allocBytesPerTx": score * 100,
                 "allocsPerTx": score,
@@ -48,7 +49,10 @@ class PerfReportTest(unittest.TestCase):
         self.assertIn("95.00 (90.00–100.00)", report)
         self.assertIn("-9.52%", report)
         self.assertIn("`batchWrite100` cost/tx", report)
-        self.assertIn("In-memory secondary metrics (informational)", report)
+        self.assertIn("fixed 1 ms operation latency over memory", report)
+        self.assertIn(
+            "Latency-stabilized in-memory secondary metrics (informational)", report
+        )
         self.assertIn("10,500 (10,000–11,000)", report)
         self.assertIn("| Allocations/tx | 105.0 (100.0–110.0)", report)
         self.assertIn("| Wall ns/tx | 105,000 (100,000–110,000)", report)
@@ -78,6 +82,15 @@ class PerfReportTest(unittest.TestCase):
         path.write_text(json.dumps(result))
 
         with self.assertRaisesRegex(perf_report.ReportError, "cpuNsPerTx"):
+            perf_report.render_report(self.root, "main", "PR")
+
+    def test_mismatched_backend_latency_is_rejected(self) -> None:
+        path = self.root / "score" / "pr" / "01.json"
+        result = json.loads(path.read_text())
+        result["backendLatencyMs"] = 2
+        path.write_text(json.dumps(result))
+
+        with self.assertRaisesRegex(perf_report.ReportError, "one backend latency"):
             perf_report.render_report(self.root, "main", "PR")
 
 

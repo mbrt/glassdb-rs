@@ -18,7 +18,7 @@ and the `madsim` serializability fuzzer.
 | File | Role | Editable by the agent? |
 |------|------|------------------------|
 | [`program.md`](program.md) | The instructions the agent follows (the "brain") | No - the human edits this |
-| [`crates/glassdb-bench-score`](../../crates/glassdb-bench-score) | Lightweight in-memory benchmark crate; the `autoresearch` binary is the scoring harness that defines the primary + secondary metrics (`glassdb-bench-scale` holds the separate cloud throughput tools) | No (whole crate off-limits) |
+| [`crates/glassdb-bench-score`](../../crates/glassdb-bench-score) | Lightweight, latency-stabilized in-memory benchmark crate; the `autoresearch` binary is the scoring harness that defines the primary + secondary metrics (`glassdb-bench-scale` holds the separate cloud throughput tools) | No (whole crate off-limits) |
 | [`check.sh`](check.sh) | Correctness gate (workspace tests + serializability fuzzer) | No (off-limits) |
 | [`evaluate.sh`](evaluate.sh) + [`evaluator.md`](evaluator.md) | Read-only judge sub-agent enforcing the off-limits set | No (off-limits) |
 | Verification/oracle tests (`crates/glassdb/src/sim.rs`, `crates/glassdb/tests/{concurrent_sim,proptest_concurrent,integration}.rs`, `crates/glassdb/benches/transactions.rs`, `fuzz/**`) | The correctness contract | No (off-limits) |
@@ -36,9 +36,12 @@ the verification/oracle tests and the infrastructure above are frozen.
 
 The primary score is a weighted count of backend operations per transaction
 (object/metadata reads and writes), aggregated as a geomean over a fixed suite
-of single-client workloads. It is deterministic and reflects the real cost
-driver - object-storage round-trips. Secondary axes (memory, CPU/runtime) are
-tie-breakers. Lower is better.
+of single-client workloads. A current-thread runtime and a fixed 1 ms delay on
+the in-memory backend keep deferred protocol work on a reproducible schedule;
+the delay is deliberately much shorter than provider latency so repeated CI
+runs remain practical. The score reflects the real cost driver - object-storage
+round-trips. Secondary axes (memory, CPU/runtime) are tie-breakers. Lower is
+better.
 
 ```bash
 cargo run --release -p glassdb-bench-score --bin autoresearch -- --json --count 3   # machine-readable median

@@ -51,6 +51,12 @@ jobs:
     - name: Test performance report generator
       run: python3 -m unittest hack.ci.test_perf_report
 
+    - name: Use candidate benchmark harness for both revisions
+      run: |
+        # Harness changes must not appear as engine performance changes.
+        rsync --archive --delete crates/glassdb-bench-score/ \
+          .perf-main/crates/glassdb-bench-score/
+
     - name: Build baseline and candidate benchmarks
       env:
         PERF_BIN: ${{ runner.temp }}/glassdb-performance-bin

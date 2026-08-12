@@ -1,11 +1,10 @@
 //! The autoresearch scoring harness for glassdb-rs.
 //!
-//! It runs a fixed suite of single-client workloads against the in-memory
-//! backend and reports a single primary score plus secondary axes. The primary
-//! score is a weighted count of backend operations per transaction (lower is
-//! better) and is deterministic for these single-client workloads, so it is
-//! comparable across machines and runs. The secondary axes (memory, CPU /
-//! runtime) are softer, noisier signals used as tie-breakers.
+//! It runs a fixed suite of single-client workloads against a latency-stabilized
+//! in-memory backend and reports a single primary score plus secondary axes. The
+//! primary score is a weighted count of backend operations per transaction
+//! (lower is better). The secondary axes (memory, CPU / runtime) are softer,
+//! noisier signals used as tie-breakers.
 //!
 //! Ported from the Go `hack/autoresearch/bench`. Go's `mutexWaitNsPerTx`
 //! (from `runtime/metrics`) has no portable Rust equivalent and is dropped.
@@ -20,12 +19,16 @@ use std::cmp::Ordering;
 use std::error::Error;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use serde::Serialize;
 
 use glassdb::backend::memory::MemoryBackend;
+use glassdb::backend::middleware::{
+    DelayBackend, DelayOptions, Latency, ProviderLatencyProfile, RateLimit, WriteRateLimits,
+};
 use glassdb::{Database, Stats};
 
 use crate::metrics::Sample;
@@ -33,6 +36,11 @@ use crate::metrics::Sample;
 /// Path (relative to the repo root, where the harness is run from) of the log
 /// the `--record` flag appends a score line to.
 const LOG_PATH: &str = "hack/autoresearch/log.md";
+
+// A short fixed delay makes background-operation batching depend on protocol
+// behavior rather than small code-layout and runner-speed differences. Keeping
+// it well below provider latency makes the 11-run CI comparison practical.
+const BACKEND_LATENCY_MS: u64 = 1;
 
 /// Converts backend operation counts into a single cost. The values are the
 /// mean object-storage latencies (in milliseconds): object read ~57ms, object
@@ -91,6 +99,7 @@ struct Secondary {
 #[serde(rename_all = "camelCase")]
 struct SuiteResult {
     score: f64,
+    backend_latency_ms: u64,
     secondary: Secondary,
     weights: Weights,
     workloads: Vec<WorkloadResult>,
@@ -119,10 +128,7 @@ fn main() {
     let args = Args::parse();
     let count = args.count.max(1);
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
+    let rt = benchmark_runtime();
 
     let mut runs = Vec::with_capacity(count);
     let mut scores = Vec::with_capacity(count);
@@ -154,12 +160,20 @@ fn main() {
     }
 }
 
+/// Builds the single-thread runtime that gives timer wakeups a stable order.
+fn benchmark_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime")
+}
+
 /// Runs every workload once (each on a fresh database and backend) and aggregates the
 /// per-workload results into a single suite score.
 async fn run_suite() -> Result<SuiteResult, Box<dyn Error>> {
     let mut results = Vec::with_capacity(workloads::NAMES.len());
     for &name in workloads::NAMES {
-        let db = Database::open("autoresearch", MemoryBackend::new()).await?;
+        let db = Database::open("autoresearch", benchmark_backend()).await?;
         let sample = workloads::run(name, &db).await?;
         db.shutdown().await;
         results.push(to_result(sample)?);
@@ -173,6 +187,7 @@ async fn run_suite() -> Result<SuiteResult, Box<dyn Error>> {
 
     Ok(SuiteResult {
         score: geomean(&costs),
+        backend_latency_ms: BACKEND_LATENCY_MS,
         secondary: Secondary {
             alloc_bytes_per_tx: geomean(&alloc_bytes),
             allocs_per_tx: geomean(&allocs),
@@ -183,6 +198,29 @@ async fn run_suite() -> Result<SuiteResult, Box<dyn Error>> {
         workloads: results,
         scores: Vec::new(),
     })
+}
+
+/// Builds the latency-stabilized in-memory backend used by every workload.
+fn benchmark_backend() -> DelayBackend {
+    let latency = Latency::new(BACKEND_LATENCY_MS, 0);
+    let options = DelayOptions {
+        latency: ProviderLatencyProfile {
+            meta_read: latency,
+            meta_write: latency,
+            obj_read: latency,
+            obj_write: latency,
+            list: latency,
+        },
+        rate_limits: WriteRateLimits {
+            same_obj_write_ps: RateLimit::Unlimited,
+            same_obj_write_retry_delay: Duration::ZERO,
+            prefix_read_ps: RateLimit::Unlimited,
+            prefix_write_ps: RateLimit::Unlimited,
+            prefix_depth: 0,
+        },
+    };
+    DelayBackend::new(Arc::new(MemoryBackend::new()), options)
+        .expect("fixed benchmark delay options are valid")
 }
 
 /// Turns a raw [`Sample`] into a per-transaction-normalized [`WorkloadResult`].
@@ -274,4 +312,37 @@ fn append_record(res: &SuiteResult) -> std::io::Result<()> {
         res.secondary.ns_per_tx,
         res.secondary.cpu_ns_per_tx,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use glassdb::Backend;
+    use tokio::runtime::RuntimeFlavor;
+
+    use super::*;
+
+    #[test]
+    fn benchmark_runtime_is_single_threaded() {
+        assert_eq!(
+            benchmark_runtime().handle().runtime_flavor(),
+            RuntimeFlavor::CurrentThread
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn benchmark_backend_applies_fixed_latency() {
+        let backend = benchmark_backend();
+        let delay = Duration::from_millis(BACKEND_LATENCY_MS);
+        let before_delay = delay
+            .checked_sub(Duration::from_nanos(1))
+            .expect("benchmark delay must be positive");
+        let mut write = Box::pin(backend.write_if_not_exists("benchmark/key", Vec::new()));
+
+        assert!(futures::poll!(write.as_mut()).is_pending());
+        tokio::time::advance(before_delay).await;
+        assert!(futures::poll!(write.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_nanos(1)).await;
+
+        write.await.expect("fixed-latency write");
+    }
 }

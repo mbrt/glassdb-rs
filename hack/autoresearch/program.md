@@ -81,15 +81,16 @@ cargo run --release -p glassdb-bench-score --bin autoresearch -- --json --count 
 
 - **Primary** `score`: geometric mean across a fixed suite of single-client
   workloads of the weighted backend-operation cost per transaction. Lower is
-  better. It is deterministic (op counts do not depend on timing), so it is the
-  number that decides keep/discard. Treat deltas under ~1% as noise.
+  better. A current-thread runtime and fixed backend latency make background
+  operation batching reproducible, so it is the number that decides
+  keep/discard.
 - **Secondary** `secondary`: `allocBytesPerTx`, `allocsPerTx`, `nsPerTx`,
   `cpuNsPerTx`. These are noisier (they include background-task work); use wider
   noise bands and only as tie-breakers.
 
 Always run with `--count 3` (median) so a single noisy run does not mislead you.
-Use `--release`: the deterministic primary is unaffected, but the secondary axes
-are only meaningful on an optimized build.
+Use `--release`: the fixed latency is calibrated for optimized code, and the
+secondary axes are only meaningful on an optimized build.
 
 ## Setup (do this once, at the start of a session)
 
