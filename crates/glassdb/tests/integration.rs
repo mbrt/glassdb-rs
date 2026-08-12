@@ -1,44 +1,24 @@
 //! Integration tests ported from the Go `glassdb_test.go` (memory-backend
 //! subset). Time-sensitive paths use `tokio::time::pause` for determinism.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use glassdb::backend::memory::MemoryBackend;
-use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
 use glassdb::{
-    Backend, Collection, CollectionPath, Database, Error, InlinePolicy, ProtocolTiming,
-    SplitPolicy, Transaction,
+    Backend, CollectionPath, Database, Error, InlinePolicy, ProtocolTiming, SplitPolicy,
 };
 use glassdb_data::TxId;
-use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{CurrentState, Node, Shard, ShardEntry};
-use tokio::sync::{Barrier, Notify, oneshot};
+use tokio::sync::Barrier;
 
-async fn init_db(b: Arc<dyn Backend>) -> Database {
-    Database::open("example", b).await.unwrap()
-}
+mod integration_support;
 
-async fn create_top(db: &Database, name: &[u8]) -> Collection {
-    db.create_collection_if_absent(&CollectionPath::new(name).unwrap())
-        .await
-        .unwrap()
-}
-
-async fn open_top(db: &Database, name: &[u8]) -> Collection {
-    db.open_collection(&CollectionPath::new(name).unwrap())
-        .await
-        .unwrap()
-}
-
-fn mem() -> Arc<dyn Backend> {
-    Arc::new(MemoryBackend::new())
-}
-
-fn write_int(n: i64) -> Vec<u8> {
-    n.to_le_bytes().to_vec()
-}
+use integration_support::{
+    LoglessCommitControl, ParentWriteControl, PauseControl, create_top, incremented_value, init_db,
+    list_collections_of, mem, multiple_rmw, open_top, read_int, read_int_from_tx, rmw,
+    try_read_int, write_int,
+};
 
 fn split_unsafe_boundary_key(policy: &SplitPolicy, value: &[u8], fill: u8) -> Vec<u8> {
     let writer = TxId::with_priority(1, b"boundary");
@@ -54,42 +34,6 @@ fn split_unsafe_boundary_key(policy: &SplitPolicy, value: &[u8], fill: u8) -> Ve
         }
     }
     boundary.expect("test policy has no accepted key whose inline form exceeds its split budget")
-}
-
-fn try_read_int(b: &[u8]) -> Option<i64> {
-    Some(i64::from_le_bytes(b.try_into().ok()?))
-}
-
-fn read_int(b: &[u8]) -> i64 {
-    try_read_int(b).expect("integer value has the wrong width")
-}
-
-async fn read_int_from_tx(tx: &Transaction, c: &Collection, k: &[u8]) -> Result<i64, Error> {
-    match tx.read(c, k).await {
-        Ok(Some(v)) => try_read_int(&v)
-            .ok_or_else(|| Error::internal(format!("key {k:?} has invalid integer value {v:?}"))),
-        // Treat a missing value as zero (i.e. initialize it).
-        Ok(None) => Ok(0),
-        Err(e) => Err(e),
-    }
-}
-
-fn incremented_value(key: &[u8], current: i64, amount: i64) -> Result<Vec<u8>, Error> {
-    current
-        .checked_add(amount)
-        .map(write_int)
-        .ok_or_else(|| Error::internal(format!("integer overflow for key {key:?}")))
-}
-
-async fn rmw(db: &Database, coll: &Collection, key: &[u8], iters: usize) -> Result<(), Error> {
-    for _ in 0..iters {
-        db.tx(|tx| async move {
-            let num = read_int_from_tx(&tx, coll, key).await?;
-            tx.write(coll, key, &incremented_value(key, num, 1)?)
-        })
-        .await?;
-    }
-    Ok(())
 }
 
 #[tokio::test(start_paused = true)]
@@ -550,25 +494,6 @@ async fn rmw_single() {
 
     let val = coll.read(key).await.unwrap().unwrap();
     assert_eq!(read_int(&val), 30);
-}
-
-async fn multiple_rmw(
-    db: &Database,
-    coll: &Collection,
-    key1: &[u8],
-    key2: &[u8],
-    iters: usize,
-) -> Result<(), Error> {
-    for _ in 0..iters {
-        db.tx(|tx| async move {
-            let n1 = read_int_from_tx(&tx, coll, key1).await?;
-            tx.write(coll, key1, &incremented_value(key1, n1, 1)?)?;
-            let n2 = read_int_from_tx(&tx, coll, key2).await?;
-            tx.write(coll, key2, &incremented_value(key2, n2, 1)?)
-        })
-        .await?;
-    }
-    Ok(())
 }
 
 #[tokio::test(start_paused = true)]
@@ -1146,8 +1071,7 @@ async fn keys_listing_is_phantom_safe() {
 // invisible to a listing — an aborted create never becomes a phantom member.
 #[tokio::test]
 async fn listing_hides_keys_from_aborted_transactions() {
-    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let (backend, pause) = PauseControl::wrap(mem);
+    let (backend, pause) = PauseControl::wrap(mem());
     let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db
         .root_collection()
@@ -1225,14 +1149,6 @@ async fn list_collections() {
     assert_eq!(got, sorted);
 }
 
-async fn list_collections_of(coll: &Collection) -> Vec<Vec<u8>> {
-    coll.iter_collections()
-        .await
-        .unwrap()
-        .map(|entry| entry.name)
-        .collect()
-}
-
 // The subcollection directory lives in the parent root (ADR-031), so listing is
 // driven by that directory, not a backend prefix scan. A collection with no
 // children lists nothing, and create-if-absent returns the existing binding.
@@ -1261,79 +1177,42 @@ async fn subcollection_listing_is_root_driven_and_create_if_absent_is_idempotent
 // path and converge without introducing structural holders.
 #[tokio::test]
 async fn concurrent_subcollection_registration_is_serialized_and_converges() {
-    let mem = Arc::new(MemoryBackend::new());
-    let backend = HookBackend::new(mem.clone());
-    let db = init_db(backend.clone() as Arc<dyn Backend>).await;
+    let writes = ParentWriteControl::new();
+    let db = init_db(writes.backend()).await;
     let parent = create_top(&db, b"parent").await;
-
-    let entered = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    let parent_writes = Arc::new(AtomicUsize::new(0));
-    let parent_record = Arc::new(Mutex::new(None::<String>));
-    backend.set_before({
-        let parent_record = parent_record.clone();
-        let entered = entered.clone();
-        let release = release.clone();
-        let parent_writes = parent_writes.clone();
-        move |op| {
-            let parent_cas = matches!(op, BackendOp::WriteIf { path, .. } if path.ends_with("/_i"));
-            if let BackendOp::WriteIf { path, .. } = op
-                && parent_cas
-            {
-                parent_record
-                    .lock()
-                    .unwrap()
-                    .get_or_insert_with(|| (*path).to_owned());
-            }
-            let block = parent_cas && parent_writes.fetch_add(1, Ordering::SeqCst) == 0;
-            let entered = entered.clone();
-            let release = release.clone();
-            let future: HookFuture = Box::pin(async move {
-                if block {
-                    entered.notify_one();
-                    release.notified().await;
-                }
-                Ok(())
-            });
-            future
-        }
-    });
+    writes.arm();
 
     let left_parent = parent.clone();
     let right_parent = parent.clone();
     let left_create = tokio::spawn(async move { left_parent.create_collection(b"left").await });
     let right_create = tokio::spawn(async move { right_parent.create_collection(b"right").await });
 
-    entered.notified().await;
+    writes.wait_until_entered().await;
     for _ in 0..64 {
         tokio::task::yield_now().await;
     }
     assert_eq!(
-        parent_writes.load(Ordering::SeqCst),
+        writes.writes(),
         1,
         "only one same-path backend CAS may be active"
     );
-    release.notify_one();
+    writes.release();
     left_create.await.unwrap().unwrap();
     right_create.await.unwrap().unwrap();
 
-    assert!(parent_writes.load(Ordering::SeqCst) >= 2);
+    assert!(writes.writes() >= 2);
     assert_eq!(
         list_collections_of(&parent).await,
         vec![b"left".to_vec(), b"right".to_vec()]
     );
-    let parent_record = parent_record
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("parent CAS path was recorded");
+    let parent_record = writes.recorded_path();
     let parent_root = format!(
         "{}_r",
         parent_record
             .strip_suffix("_i")
             .expect("collection record path ends in _i")
     );
-    let stored = mem.read(&parent_root).await.unwrap();
+    let stored = writes.inner().read(&parent_root).await.unwrap();
     let root = Node::decode(&stored.contents).unwrap();
     assert!(
         root.structural_gate().holders().is_empty(),
@@ -1450,42 +1329,8 @@ async fn cancelled_tx_future_does_not_block_followups() {
 async fn cancelled_logless_commit_writes_no_aborted_object() {
     use std::time::Duration;
 
-    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let backend = HookBackend::new(mem);
-    let aborted_writes = Arc::new(AtomicUsize::new(0));
-    type LeafCasGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
-    let gate: Arc<Mutex<Option<LeafCasGate>>> = Arc::new(Mutex::new(None));
-    backend.set_before({
-        let aborted_writes = aborted_writes.clone();
-        let gate = gate.clone();
-        move |op| {
-            let mut parked = None;
-            match op {
-                // The commit point of the logless path: one conditional leaf
-                // write, parked once armed so the transaction's future is dropped
-                // mid-commit — the window the abort guard exists for.
-                BackendOp::WriteIf { path, .. } if path.ends_with("/_r") => {
-                    parked = gate.lock().unwrap().take();
-                }
-                BackendOp::WriteIf { path, value, .. }
-                | BackendOp::WriteIfNotExists { path, value }
-                    if path.contains("/_t/") && is_abort_side_tx_log(value) =>
-                {
-                    aborted_writes.fetch_add(1, Ordering::SeqCst);
-                }
-                _ => {}
-            }
-            let future: HookFuture = Box::pin(async move {
-                if let Some((arrived, released)) = parked {
-                    let _ = arrived.send(());
-                    let _ = released.await;
-                }
-                Ok(())
-            });
-            future
-        }
-    });
-    let db = Database::open("example", backend.clone()).await.unwrap();
+    let control = LoglessCommitControl::wrap(mem());
+    let db = Database::open("example", control.backend()).await.unwrap();
     let coll = db
         .root_collection()
         .create_collection_if_absent(b"c")
@@ -1496,9 +1341,7 @@ async fn cancelled_logless_commit_writes_no_aborted_object() {
     // under test rather than a lingering leaf CAS.
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let (arrived_tx, arrived) = oneshot::channel();
-    let (release, released) = oneshot::channel();
-    *gate.lock().unwrap() = Some((arrived_tx, released));
+    let (arrived, release) = control.arm();
 
     // A lone small overwrite of an existing key: eligible for the logless path,
     // whose commit is the parked leaf CAS.
@@ -1521,166 +1364,10 @@ async fn cancelled_logless_commit_writes_no_aborted_object() {
     db.shutdown().await;
 
     assert_eq!(
-        aborted_writes.load(Ordering::SeqCst),
+        control.aborted_writes(),
         0,
         "a cancelled logless attempt must not invent an aborted transaction"
     );
-}
-
-/// Controls hooks that pause writes at known points in the commit pipeline, and
-/// report when a leaf write has landed.
-struct PauseControl {
-    trap: Mutex<Option<Trap>>,
-    wound_write_gate: Mutex<Option<WoundWriteGate>>,
-    leaf_write_gate: Mutex<Option<LeafWriteGate>>,
-}
-
-struct Trap {
-    path_contains: &'static str,
-    arrived: oneshot::Sender<()>,
-}
-
-struct WoundWriteGate {
-    arrived: oneshot::Sender<()>,
-    release: oneshot::Receiver<()>,
-}
-
-struct LeafWriteGate {
-    arrived: oneshot::Sender<()>,
-    release: oneshot::Receiver<()>,
-}
-
-impl PauseControl {
-    fn wrap(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
-        let control = Arc::new(Self {
-            trap: Mutex::new(None),
-            wound_write_gate: Mutex::new(None),
-            leaf_write_gate: Mutex::new(None),
-        });
-        let backend = HookBackend::new(inner);
-        backend.set_after({
-            let control = control.clone();
-            move |op, outcome| {
-                let gate = match op {
-                    BackendOp::WriteIf { path, .. }
-                        if outcome.is_success() && is_leaf_path(path) =>
-                    {
-                        control.leaf_write_gate.lock().unwrap().take()
-                    }
-                    _ => None,
-                };
-                let future: HookFuture = Box::pin(async move {
-                    if let Some(gate) = gate {
-                        let _ = gate.arrived.send(());
-                        let _ = gate.release.await;
-                    }
-                    Ok(())
-                });
-                future
-            }
-        });
-        backend.set_before({
-            let control = control.clone();
-            move |op| {
-                let (wound_gate, path) = match op {
-                    BackendOp::WriteIfNotExists { path, value } => (
-                        control.take_wound_write_gate(path, value),
-                        Some((*path).to_owned()),
-                    ),
-                    _ => (None, None),
-                };
-                let control = control.clone();
-                let future: HookFuture = Box::pin(async move {
-                    if let Some(gate) = wound_gate {
-                        let _ = gate.arrived.send(());
-                        let _ = gate.release.await;
-                    }
-                    if let Some(arrived) = path.as_deref().and_then(|path| control.take_match(path))
-                    {
-                        let _ = arrived.send(());
-                        std::future::pending::<()>().await;
-                        unreachable!("pause should outlive any future that hits it");
-                    }
-                    Ok(())
-                });
-                future
-            }
-        });
-        (backend, control)
-    }
-
-    /// Arms the (one-shot) trap. Returns a receiver that is fired when the
-    /// next matching `write_if_not_exists` enters the wrapper and parks.
-    fn arm(&self, path_contains: &'static str) -> oneshot::Receiver<()> {
-        let (tx, rx) = oneshot::channel();
-        *self.trap.lock().unwrap() = Some(Trap {
-            path_contains,
-            arrived: tx,
-        });
-        rx
-    }
-
-    /// Parks the next successful coordination-leaf CAS after it has landed but
-    /// before its caller observes completion.
-    fn arm_leaf_write_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
-        let (arrived_tx, arrived_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        *self.leaf_write_gate.lock().unwrap() = Some(LeafWriteGate {
-            arrived: arrived_tx,
-            release: release_rx,
-        });
-        (arrived_rx, release_tx)
-    }
-
-    fn arm_wound_write_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
-        let (arrived_tx, arrived_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        *self.wound_write_gate.lock().unwrap() = Some(WoundWriteGate {
-            arrived: arrived_tx,
-            release: release_rx,
-        });
-        (arrived_rx, release_tx)
-    }
-
-    fn take_match(&self, path: &str) -> Option<oneshot::Sender<()>> {
-        let mut t = self.trap.lock().unwrap();
-        if let Some(trap) = t.as_ref()
-            && path.contains(trap.path_contains)
-        {
-            return t.take().map(|trap| trap.arrived);
-        }
-        None
-    }
-
-    fn take_wound_write_gate(&self, path: &str, value: &[u8]) -> Option<WoundWriteGate> {
-        // With the tagless backend (ADR-023) the commit status is in the object
-        // body, so decode it to recognize the pinned wound written for a
-        // cancelled owner whose in-flight mutation did not acknowledge return.
-        if !path.contains("/_t/") || !is_wounded_tx_log(value) {
-            return None;
-        }
-        self.wound_write_gate.lock().unwrap().take()
-    }
-}
-
-/// Reports whether `path` addresses a coordination leaf: a small collection's
-/// root (`_r`) or a standalone node (`_n`).
-fn is_leaf_path(path: &str) -> bool {
-    path.ends_with("/_r") || path.contains("/_n/")
-}
-
-/// Reports whether `body` is an abort-side terminal transaction object.
-fn is_abort_side_tx_log(body: &[u8]) -> bool {
-    glassdb_storage::txobject::status(body)
-        .map(|status| matches!(status, TxCommitStatus::Aborted | TxCommitStatus::Wounded))
-        .unwrap_or(false)
-}
-
-/// Reports whether `body` is a pinned transaction wound.
-fn is_wounded_tx_log(body: &[u8]) -> bool {
-    glassdb_storage::txobject::status(body)
-        .map(|status| status == TxCommitStatus::Wounded)
-        .unwrap_or(false)
 }
 
 /// When a `Database::tx` future is dropped after a lock CAS lands but before
@@ -1690,8 +1377,7 @@ fn is_wounded_tx_log(body: &[u8]) -> bool {
 async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
     use std::time::Duration;
 
-    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let (backend, pause) = PauseControl::wrap(mem);
+    let (backend, pause) = PauseControl::wrap(mem());
     let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db
         .root_collection()
@@ -1773,8 +1459,7 @@ async fn cancelled_single_rw_commit_unblocks_peer_promptly() {
         vec![tag; 2048]
     }
 
-    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let (backend, pause) = PauseControl::wrap(mem);
+    let (backend, pause) = PauseControl::wrap(mem());
     let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db
         .root_collection()
@@ -1829,8 +1514,7 @@ async fn cancelled_single_rw_commit_unblocks_peer_promptly() {
 async fn shutdown_waits_for_cancelled_tx_async_abort() {
     use std::time::Duration;
 
-    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let (backend, pause) = PauseControl::wrap(mem);
+    let (backend, pause) = PauseControl::wrap(mem());
     let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db
         .root_collection()

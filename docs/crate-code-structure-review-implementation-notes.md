@@ -643,3 +643,27 @@ working document and is intentionally not committed with these changes.
   compatibility assertions retire with F28-C.
 - This migration changes no listing I/O, ordering, snapshots, transaction
   validation, persistent bytes, retries, random draws, or task scheduling.
+
+## F33-A — Extract shared integration fixtures
+
+- Added a focused `tests/integration_support` module rather than mixing these
+  Tokio integration fixtures into deterministic-simulation `sim_support`.
+  Database and collection setup, integer/RMW helpers, collection-listing setup,
+  and the commit-pipeline `PauseControl` now have one reusable owner for the
+  behavior-oriented targets introduced by F33-B/C.
+- Replaced the two remaining inline hook closures with typed
+  `ParentWriteControl` and `LoglessCommitControl` fixtures. Their public test
+  surface exposes only the backend, synchronization points, and observations
+  consumed by the existing assertions; hook matching and channel state remain
+  private.
+- The parent-write control is armed explicitly after database and parent setup,
+  at the same point as the original hook installation. This ordering is
+  essential: arming it during construction would intercept the setup CAS rather
+  than the concurrent registrations under test.
+- No test was added, removed, renamed, or moved, and all 39 original integration
+  tests still run in the original target. Existing assertions, paused-clock
+  choices, transaction-error handling, hook predicates, CAS landing points, and
+  cancellation/release ordering remain unchanged.
+- This test-only extraction changes no production API, persistent bytes,
+  backend-operation behavior, retry policy, random draws, task spawning, or
+  shutdown semantics. No migration-only coverage was introduced.
