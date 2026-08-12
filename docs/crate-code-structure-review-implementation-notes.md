@@ -714,3 +714,76 @@ working document and is intentionally not committed with these changes.
   entropy accounting, and distribution vectors remain long term.
 - No production implementation, harness behavior, scheduling decision, or ADR
   changed, and there is no baseline update mode.
+## F33-A — Extract shared integration fixtures
+
+- Added a focused `tests/integration_support` module rather than mixing these
+  Tokio integration fixtures into deterministic-simulation `sim_support`.
+  Database and collection setup, integer/RMW helpers, collection-listing setup,
+  and the commit-pipeline `PauseControl` now have one reusable owner for the
+  behavior-oriented targets introduced by F33-B/C.
+- Replaced the two remaining inline hook closures with typed
+  `ParentWriteControl` and `LoglessCommitControl` fixtures. Their public test
+  surface exposes only the backend, synchronization points, and observations
+  consumed by the existing assertions; hook matching and channel state remain
+  private.
+- The parent-write control is armed explicitly after database and parent setup,
+  at the same point as the original hook installation. This ordering is
+  essential: arming it during construction would intercept the setup CAS rather
+  than the concurrent registrations under test.
+- No test was added, removed, renamed, or moved, and all 39 original integration
+  tests still run in the original target. Existing assertions, paused-clock
+  choices, transaction-error handling, hook predicates, CAS landing points, and
+  cancellation/release ordering remain unchanged.
+- This test-only extraction changes no production API, persistent bytes,
+  backend-operation behavior, retry policy, random draws, task spawning, or
+  shutdown semantics. No migration-only coverage was introduced.
+
+## F33-B — Move basic, stats, and scan tests
+
+- Created three behavior-oriented integration targets: `integration_basic`
+  owns 15 database and transaction tests, `integration_stats` owns five
+  statistics/diagnostics tests, and `integration_scan` owns 12 key-scan and
+  collection-listing tests. The seven shutdown/cancellation tests remain in the
+  original `integration` target for F33-C.
+- Moved each test body, name, Tokio test attribute, deprecated allowance, and
+  behavior comment mechanically. The targets reuse F33-A's support module;
+  making that module public only within each standalone test crate prevents
+  target-local dead-code warnings without adding a library or production API.
+- Focused Cargo discovery reports 15 + 5 + 12 + 7 = 39 tests. Its sorted union
+  exactly matches all 39 names from the pre-move target, with 39 unique names,
+  so no behavior test was duplicated or lost.
+- The source-name/count/location and Cargo exactly-once comparisons were run as
+  shell audits only; no migration-only test or manifest machinery was added.
+  These migration audits are complete for F33-B and should not be retained as
+  long-term tests. F33-C must repeat the repository-level exactly-once discovery
+  audit after moving the last seven tests and deleting `integration.rs`.
+- Test bodies, Tokio attributes, paused-clock choices, hook arm points, and
+  in-test task scheduling are unchanged. Libtest process grouping intentionally
+  changes from one target to four; every target constructs its own backend,
+  hook controls, and synchronization fixtures, so the groups remain isolated
+  and safe to run in parallel.
+- Production behavior, transaction-error handling, backend operations,
+  persistent bytes, retries, randomness, and task lifetimes are unchanged.
+
+## F33-C — Move shutdown and cancellation tests and retire the monolith
+
+- Moved the remaining seven shutdown, cancellation, logless-abort, abandoned-
+  holder, and async-wound behaviors verbatim into `integration_shutdown` and
+  deleted the now-empty `tests/integration.rs` monolith. Test names, Tokio
+  attributes, comments, paused-clock choices, hook arm points, assertions, and
+  in-test task scheduling are unchanged.
+- The durable integration suite now consists of four focused targets: 15 basic
+  database/transaction tests, five statistics/diagnostics tests, 12 scan and
+  listing tests, and seven shutdown/cancellation tests. All behavior coverage
+  remains; no test was added, removed, merged, or renamed.
+- Package-wide Cargo discovery finds every one of the original 39 test names
+  exactly once, and attempting to select the retired `integration` target
+  fails. This was a one-time migration audit only; no name/count/location test
+  or auxiliary manifest machinery remains in the repository.
+- Each target passes independently, and all four also pass when launched as
+  concurrent test processes. Shared support is compiled target-locally, while
+  every test constructs its own in-memory backend, hook controls, channels,
+  and synchronization state; there is no cross-process mutable fixture.
+- This completes the behavior-oriented ownership change without modifying
+  production APIs, persistent bytes, backend operations, retry policy,
+  randomness, runtime task lifetimes, or shutdown/cancellation semantics.
