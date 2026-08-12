@@ -1131,3 +1131,27 @@ working document and is intentionally not committed with these changes.
   order. No migration-only test, dependency, public API, persistent format,
   runtime policy, or ADR was added; there were no deviations from the staged
   finding.
+
+## F31-D — Split native and simulated runtime adapters
+
+- Moved the native clock, model-time, task, timeout, yield, and parallelism
+  adapters verbatim into `rt/native.rs`, and the deterministic-or-Tokio clock,
+  task, timeout, yield, entropy hook, and simulation API re-exports into
+  `rt/sim.rs`. `rt.rs` is now the stable facade selecting and re-exporting one
+  adapter plus the dedicated-task API and shared timeout error.
+- Public and crate-visible paths and signatures are unchanged. Native speedup
+  conversion, simulated fallback behavior outside the executor, virtual wall
+  epoch, cancellation precedence, task wrapping, timer arming, and scheduler
+  interactions retain their prior branches and operation order.
+- Added one shared facade contract rather than cfg-specific duplicate tests. It
+  exercises time advancement, timeout, spawning and joining, entropy bounds,
+  and dedicated completion under the ambient runtime in both builds; the
+  active-simulation lifecycle regression reuses it and still pins every wrapper
+  task ID while retaining panic, cancellation, and shutdown coverage.
+- Tightened the runtime-seam source audit: raw runtime calls are now admitted at
+  the two concrete adapter files, not wholesale at the facade. The dedicated
+  and executor exceptions remain limited to their previously reviewed APIs.
+- All three tape and both PCT harness trace digests remain byte-identical without
+  a baseline or corpus refresh. No persistent bytes, backend operations, retry
+  policy, entropy draw sites, spawn order, public API, dependency, or ADR
+  changed, and no migration-only coverage was retained.

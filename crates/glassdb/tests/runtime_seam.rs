@@ -74,7 +74,16 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn is_allowed_runtime_use(path: &Path, pattern: &str) -> bool {
-    path.ends_with("crates/glassdb-concurr/src/rt.rs")
+    (path.ends_with("crates/glassdb-concurr/src/rt/native.rs")
+        && matches!(
+            pattern,
+            "tokio::spawn" | "tokio::task" | "tokio::time" | "std::thread" | "SystemTime::now("
+        ))
+        || (path.ends_with("crates/glassdb-concurr/src/rt/sim.rs")
+            && matches!(
+                pattern,
+                "tokio::spawn" | "tokio::task" | "tokio::time" | "SystemTime::now("
+            ))
         || (path.ends_with("crates/glassdb-concurr/src/rt/dedicated.rs")
             && matches!(pattern, "tokio::runtime" | "std::thread"))
         || (path.ends_with("crates/glassdb-concurr/src/sim/executor.rs")
@@ -127,6 +136,23 @@ fn unreviewed_tokio_apis_are_forbidden_by_default() {
             "`{forbidden}` escaped the forbidden Tokio inventory"
         );
     }
+
+    for adapter in [
+        Path::new("crates/glassdb-concurr/src/rt/native.rs"),
+        Path::new("crates/glassdb-concurr/src/rt/sim.rs"),
+    ] {
+        for forbidden in ["tokio::sync::Mutex", "tokio::runtime", "std::fs"] {
+            assert!(
+                !is_allowed_runtime_use(adapter, forbidden),
+                "{} unexpectedly admits `{forbidden}`",
+                adapter.display()
+            );
+        }
+    }
+    assert!(!is_allowed_runtime_use(
+        Path::new("crates/glassdb-concurr/src/rt/sim.rs"),
+        "std::thread"
+    ));
 }
 
 #[test]
