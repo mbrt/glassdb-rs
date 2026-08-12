@@ -1466,139 +1466,6 @@ mod tests {
         (Member { request, done }, result)
     }
 
-    #[test]
-    fn key_machine_transition_action_table() {
-        fn phase(machine: &KeyMachine<TestRequest, ()>) -> &'static str {
-            match &machine.phase {
-                KeyPhase::Driven {
-                    driver:
-                        Driver {
-                            kind: DriverKind::Inline,
-                            ..
-                        },
-                    round: RoundPhase::Ready,
-                } => "inline-ready",
-                KeyPhase::Driven {
-                    driver:
-                        Driver {
-                            kind: DriverKind::Inline,
-                            ..
-                        },
-                    round: RoundPhase::Running(_),
-                } => "inline-running",
-                KeyPhase::Driven {
-                    driver:
-                        Driver {
-                            kind: DriverKind::Owner,
-                            ..
-                        },
-                    round: RoundPhase::Ready,
-                } => "owner-ready",
-                KeyPhase::Driven {
-                    driver:
-                        Driver {
-                            kind: DriverKind::Owner,
-                            ..
-                        },
-                    round: RoundPhase::Running(_),
-                } => "owner-running",
-                KeyPhase::Completing {
-                    driver:
-                        Driver {
-                            kind: DriverKind::Inline,
-                            ..
-                        },
-                } => "inline-completing",
-                KeyPhase::Completing {
-                    driver:
-                        Driver {
-                            kind: DriverKind::Owner,
-                            ..
-                        },
-                } => "owner-completing",
-                KeyPhase::Handoff { .. } => "handoff",
-            }
-        }
-        fn action(action: &MachineAction) -> &'static str {
-            match action {
-                MachineAction::Keep => "keep",
-                MachineAction::Remove => "remove",
-                MachineAction::SpawnOwner(_) => "spawn-owner",
-            }
-        }
-
-        let inline = DriverId(1);
-        let owner = DriverId(2);
-        let stale = DriverId(3);
-        let (seed, _seed_result) = test_member(mergeable(1));
-        let mut machine = KeyMachine::new(seed, inline);
-        let mut actual = Vec::new();
-
-        let (first_waiter, _first_result) = test_member(reorderable(2));
-        let step = machine.submit(first_waiter, true);
-        actual.push(("Submit", phase(&machine), action(&step.action)));
-        step.effects.apply();
-
-        let step = machine.start_round(inline, false);
-        actual.push(("StartRound", phase(&machine), action(&step.action)));
-        assert!(step.value.is_some());
-        step.effects.apply();
-
-        let step = machine.refresh(inline);
-        actual.push(("Refresh", phase(&machine), action(&step.action)));
-        assert!(step.value.is_some());
-        step.effects.apply();
-
-        let step = machine.waiter_dropped();
-        actual.push(("WaiterDropped", phase(&machine), action(&step.action)));
-        step.effects.apply();
-
-        let step = machine.round_finished(inline, MachineRoundOutcome::Done(Ok(())));
-        actual.push(("RoundFinished", phase(&machine), action(&step.action)));
-        assert!(step.value);
-
-        // No successor existed when the round finished. A submission arriving
-        // before deferred delivery remains queued behind the completing round.
-        let (barrier, _barrier_result) = test_member(unmergeable(4));
-        let submitted = machine.submit(barrier, false);
-        actual.push(("Submit", phase(&machine), action(&submitted.action)));
-        submitted.effects.apply();
-        let recycled_batch = step.effects.apply_recycling();
-
-        let step = machine.finalize_completion(inline, recycled_batch, || owner);
-        actual.push(("FinalizeCompletion", phase(&machine), action(&step.action)));
-        step.effects.apply();
-
-        let step = machine.driver_dropped(inline, false, || stale);
-        actual.push(("DriverDropped", phase(&machine), action(&step.action)));
-        step.effects.apply();
-
-        let step = machine.owner_started(owner);
-        actual.push(("OwnerStarted", phase(&machine), action(&step.action)));
-        assert!(step.value);
-        step.effects.apply();
-
-        let step = machine.close();
-        actual.push(("Close", phase(&machine), action(&step.action)));
-        step.effects.apply();
-
-        assert_eq!(
-            actual,
-            [
-                ("Submit", "inline-ready", "keep"),
-                ("StartRound", "inline-running", "keep"),
-                ("Refresh", "inline-running", "keep"),
-                ("WaiterDropped", "inline-running", "keep"),
-                ("RoundFinished", "inline-completing", "keep"),
-                ("Submit", "inline-completing", "keep"),
-                ("FinalizeCompletion", "handoff", "spawn-owner"),
-                ("DriverDropped", "handoff", "keep"),
-                ("OwnerStarted", "owner-ready", "keep"),
-                ("Close", "owner-ready", "remove"),
-            ]
-        );
-    }
-
     #[tokio::test]
     async fn machine_effects_are_deferred() {
         let (seed, mut result) = test_member(mergeable(1));
@@ -1679,6 +1546,7 @@ mod tests {
             vec![4, 2],
         );
     }
+    mod model;
 
     /// Records the merged counter of each batch it serves. Its first invocation
     /// blocks on `release`, so tests can register waiters before the batch is

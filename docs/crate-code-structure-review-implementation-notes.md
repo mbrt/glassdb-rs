@@ -205,3 +205,31 @@ working document and is intentionally not committed with these changes.
   fallback. Inline and owner drivers each reuse one handle for their lifetime,
   so ordinary rounds add neither that request clone nor a per-owner-round key
   allocation.
+
+## F18-C — Add deterministic cancellation model coverage
+
+- Added one synchronous state-machine model over the private `KeyMachine`
+  transitions in a dedicated test module. The crate's shared deterministic
+  `Rng` drives three named regression seeds plus a bounded 64-seed, 120-step
+  sweep without Tokio task scheduling.
+- Independent phase, driver-id, receiver, member, and delivery bookkeeping checks
+  every transition for exact live-work accounting, one driver or one identified
+  reserved owner, no orphan or duplicate member, and strict FIFO order through
+  cancellation and requeue. A non-close `Remove` is valid only with zero live
+  members, and all four inline/owner completion-flow outcomes are checked.
+- Completion effects can remain pending while enqueue, cancellation, or close
+  interleaves. Closing in that window retires only queued work; the already
+  completed batch must still receive its success or error exactly once afterward.
+  Owner and inline driver drops are generated in both ready and running phases;
+  running drops must defer cancellation, preserve batch-before-queue FIFO, and
+  reserve exactly the reported successor id.
+- A required 21-bit coverage mask includes distinct success/error and post-close
+  delivery, pending-delivery close, both phases of both driver kinds, owner-drop
+  requeue, and the full completion-flow matrix. Failures print the replay seed,
+  step, expected and actual phase, member ledger, coverage, and recent event
+  trace.
+- The model deliberately submits only strict FIFO mergeable/barrier requests;
+  the compact queue regression remains the single owner of reorderable merge
+  policy. The F18-B migration-only transition table was pruned because the model
+  now exercises its complete flow matrix; deferred-effects and async interface
+  regressions remain. No production behavior or public API changed.
