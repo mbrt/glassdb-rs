@@ -92,6 +92,15 @@ fn is_allowed_runtime_use(path: &Path, pattern: &str) -> bool {
             && matches!(pattern, "std::fs" | "std::os::unix::fs" | "rustix::fs"))
 }
 
+fn is_s3_drop_deadline_use(path: &Path, lines: &[&str], index: usize, pattern: &str) -> bool {
+    path.ends_with("crates/glassdb-backend-s3/src/fake_server.rs")
+        && pattern == "std::time::Instant::now("
+        && lines.get(index.wrapping_sub(1)).map(|line| line.trim())
+            == Some("fn drop_deadline_now() -> std::time::Instant {")
+        && lines.get(index).map(|line| line.trim()) == Some("std::time::Instant::now()")
+        && lines.get(index + 1).map(|line| line.trim()) == Some("}")
+}
+
 fn unclassified_tokio_use(line: &str) -> Option<&str> {
     line.match_indices("tokio::")
         .map(|(index, _)| &line[index..])
@@ -153,6 +162,30 @@ fn unreviewed_tokio_apis_are_forbidden_by_default() {
         Path::new("crates/glassdb-concurr/src/rt/sim.rs"),
         "std::thread"
     ));
+
+    let fake_path = Path::new("crates/glassdb-backend-s3/src/fake_server.rs");
+    let approved = [
+        "fn drop_deadline_now() -> std::time::Instant {",
+        "    std::time::Instant::now()",
+        "}",
+    ];
+    assert!(is_s3_drop_deadline_use(
+        fake_path,
+        &approved,
+        1,
+        "std::time::Instant::now("
+    ));
+    let unrelated = [
+        "fn request_started() -> std::time::Instant {",
+        "    std::time::Instant::now()",
+        "}",
+    ];
+    assert!(!is_s3_drop_deadline_use(
+        fake_path,
+        &unrelated,
+        1,
+        "std::time::Instant::now("
+    ));
 }
 
 #[test]
@@ -176,8 +209,9 @@ fn sim_controlled_code_uses_only_reviewed_runtime_apis() {
         let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
             panic!("read source file {}: {e}", path.display());
         });
+        let lines: Vec<_> = contents.lines().collect();
         let mut test_attribute = false;
-        for (idx, line) in contents.lines().enumerate() {
+        for (idx, line) in lines.iter().copied().enumerate() {
             let trimmed = line.trim_start();
             if trimmed == "#[cfg(test)]" {
                 test_attribute = true;
@@ -194,7 +228,9 @@ fn sim_controlled_code_uses_only_reviewed_runtime_apis() {
                 continue;
             }
             if let Some(pattern) = FORBIDDEN.iter().find(|pattern| trimmed.contains(**pattern)) {
-                if is_allowed_runtime_use(&path, pattern) {
+                if is_allowed_runtime_use(&path, pattern)
+                    || is_s3_drop_deadline_use(&path, &lines, idx, pattern)
+                {
                     continue;
                 }
                 let rel = path.strip_prefix(&workspace).unwrap_or(&path);
@@ -237,16 +273,25 @@ fn synthetic_s3_time_uses_the_model_time_seam() {
         "std::time::Instant::now(",
     ];
     let mut violations = Vec::new();
+    let mut allowed_host_deadlines = 0;
     for path in files {
         let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
             panic!("read source file {}: {e}", path.display());
         });
-        for (idx, line) in contents.lines().enumerate() {
+        let lines: Vec<_> = contents.lines().collect();
+        for (idx, line) in lines.iter().copied().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("//") {
                 continue;
             }
             if let Some(pattern) = timing.iter().find(|pattern| trimmed.contains(**pattern)) {
+                // Defensive Drop must use host time so a paused simulation
+                // cannot wedge cleanup. Keep the exception to this one helper;
+                // all request timing remains on the model-time seam.
+                if is_s3_drop_deadline_use(&path, &lines, idx, pattern) {
+                    allowed_host_deadlines += 1;
+                    continue;
+                }
                 let rel = path.strip_prefix(&workspace).unwrap_or(&path);
                 violations.push(format!(
                     "{}:{} contains `{pattern}`",
@@ -256,6 +301,10 @@ fn synthetic_s3_time_uses_the_model_time_seam() {
             }
         }
     }
+    assert_eq!(
+        allowed_host_deadlines, 1,
+        "expected exactly one reviewed host-time Drop deadline"
+    );
     assert!(
         violations.is_empty(),
         "synthetic S3 timing must use process-wide model time:\n{}",

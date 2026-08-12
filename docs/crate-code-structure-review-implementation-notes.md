@@ -1286,3 +1286,36 @@ working document and is intentionally not committed with these changes.
   task selection, public API, production dependency, or ADR changed. The
   test-only `sha2` removal is the intentional migration-guard retirement noted
   above; there was no deviation from the staged finding.
+## F26-A — Own and stop the S3 fake thread
+
+- `FakeS3` now owns its dedicated server thread, a one-shot shutdown sender,
+  and a completion receiver. Its accept loop gives shutdown priority, tracks
+  connection tasks in a `JoinSet`, reaps completed tasks during service, and
+  cancels the remainder before dropping the four-worker runtime; completion is
+  reported only after the runtime has joined its worker threads.
+- Added consuming `FakeS3::shutdown`, which signals and joins without a timeout
+  so a server-thread panic is reported. Defensive `Drop` sends the same signal,
+  waits at most one second, and joins without panicking only after the thread
+  handle reports completion. The timeout path detaches only to keep a wedged
+  destructor bounded; normal drop is verified to complete and leave no thread.
+- The Drop deadline deliberately uses host monotonic time: model time may be
+  paused while a value is destroyed and therefore cannot bound a destructor.
+  The runtime-seam source audit admits only the fake's named deadline helper;
+  request latency and provider timestamps remain required to use model time.
+- One durable lifecycle test repeatedly starts the public fake, performs a
+  write and read through the real SDK transport, alternates explicit shutdown
+  and drop, verifies the old address refuses connections, observes the
+  individual server thread terminate, and rebinds the exact released port. It
+  covers active pooled connections without duplicating the existing S3
+  behavior matrix.
+- The private `perfbench` backend factory now retains the fake owner beside its
+  SDK client. Before this finding it could discard the handle because the
+  detached thread leaked for the process lifetime; retaining it preserves the
+  public `fakes3` feature behavior under the new owned lifetime. Real S3 uses
+  the same factory path with no fake owner.
+- Routing, request parsing, object/fault state, latency and entropy sampling,
+  request/await order, wire responses, retry classifications, and the exported
+  fake-server feature paths are otherwise unchanged. All 30 S3 tests, its
+  doctest, S3 all-target/all-feature clippy, and the perfbench build/clippy pass;
+  no dependency version, persistent format, or ADR changed. F26-B's internal
+  responsibility split remains untouched.

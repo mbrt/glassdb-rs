@@ -54,6 +54,7 @@ fake-server = [
     "tokio/net",
     "tokio/io-util",
     "tokio/rt-multi-thread",
+    "tokio/sync",
 ]
 
 [dev-dependencies]
