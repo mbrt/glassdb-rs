@@ -169,3 +169,24 @@ working document and is intentionally not committed with these changes.
 - No new tests were added. The committed F17-A matrix already owns three-leaf
   order, middle-bound/no-prefetch, warm/cold cumulative evidence, stale-link, and
   absence behavior.
+
+## F19-A — Thread `ShardLockReceipt` directly into `LockedTx`
+
+- Successful shard acquisition now returns a complete receipt containing the
+  coordinator's exact CAS precondition and the entry/membership strengths that
+  actually landed. `LockedTx` groups are assembled only after every requested
+  path pairs with exactly one receipt.
+- Validation and write-back consume retained receipt observations directly.
+  `held_membership` and the successful-path lookup in `tlocks` are removed, so a
+  complete lock result no longer reconstructs proof from cleanup bookkeeping.
+- `tlocks` remains for synchronous landed-lock recording, partial-acquisition and
+  cancellation cleanup, deterministic release/fallback, and diagnostics. There
+  is still no await between a successful coordinator result and recording the
+  landed lock.
+- The existing scan-plus-write regression now asserts the durable receipt carries
+  both an entry `Write` and the actual membership `Read`; no migration-only test
+  was added. Existing cancellation, snapshot, validation, and operation-count
+  coverage remains unchanged.
+- Adversarial review found no receipt-completeness, ordering, cleanup, evidence,
+  or test-pruning issue. No persistent bytes, backend operations, retry behavior,
+  or public API changed.
