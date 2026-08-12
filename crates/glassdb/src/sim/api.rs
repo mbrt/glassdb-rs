@@ -11,9 +11,16 @@ use glassdb_backend::Backend;
 use crate::{Collection, CollectionPath, Database, Error, Transaction};
 
 mod generator;
+mod model;
+
+pub use model::ApiAcct;
 
 use super::harness::{SimWorkload, open_det_db};
 use super::{SimMedia, assert_valid_listing, key_name, tiny_split_policy};
+use model::{
+    ApiChildModel, ApiCollectionModel, ApiModel, expected_catalog_states,
+    expected_collection_states, possible_values,
+};
 // ===========================================================================
 // Transaction API workload (inspired by FoundationDB FuzzApiCorrectness).
 //
@@ -85,118 +92,6 @@ impl Default for ApiWorkload {
             clients: vec![Vec::new(), Vec::new()],
         }
     }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
-struct ApiChildModel {
-    value: Option<u8>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
-struct ApiCollectionModel {
-    value: Option<u8>,
-    child: Option<ApiChildModel>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct ApiModel {
-    values: Vec<Option<u8>>,
-    collections: Vec<Option<ApiCollectionModel>>,
-}
-
-impl ApiModel {
-    fn new() -> Self {
-        Self {
-            values: vec![None; API_KEYS],
-            collections: vec![None; API_COLLECTION_SLOTS],
-        }
-    }
-
-    fn apply(&mut self, action: &ApiAction) {
-        match action {
-            ApiAction::Read(_) | ApiAction::ReadCollection(_) | ApiAction::InspectCollections => {}
-            ApiAction::Write(key, value) => self.values[*key] = Some(*value),
-            ApiAction::Delete(key) => self.values[*key] = None,
-            ApiAction::CreateCollection(slot) | ApiAction::CreateCollectionIfAbsent(slot) => {
-                self.collections[*slot].get_or_insert_with(Default::default);
-            }
-            ApiAction::WriteCollection(slot, value) => {
-                self.collections[*slot]
-                    .get_or_insert_with(Default::default)
-                    .value = Some(*value);
-            }
-            ApiAction::CreateNestedCollection(slot) => {
-                self.collections[*slot]
-                    .get_or_insert_with(Default::default)
-                    .child
-                    .get_or_insert_with(Default::default);
-            }
-            ApiAction::WriteNestedCollection(slot, value) => {
-                self.collections[*slot]
-                    .get_or_insert_with(Default::default)
-                    .child
-                    .get_or_insert_with(Default::default)
-                    .value = Some(*value);
-            }
-            ApiAction::DropNestedCollection(slot) => {
-                if let Some(collection) = &mut self.collections[*slot] {
-                    collection.child = None;
-                }
-            }
-            ApiAction::DropCollection(slot) => {
-                if self.collections[*slot]
-                    .as_ref()
-                    .is_some_and(|collection| collection.child.is_none())
-                {
-                    self.collections[*slot] = None;
-                }
-            }
-        }
-    }
-}
-
-/// Exact reachable states for each client's disjoint key slice.
-pub struct ApiAcct {
-    possible: Vec<BTreeSet<ApiModel>>,
-}
-
-impl ApiAcct {
-    fn new(nclients: usize) -> Self {
-        let initial = BTreeSet::from([ApiModel::new()]);
-        ApiAcct {
-            possible: vec![initial; nclients],
-        }
-    }
-
-    fn apply(model: &ApiModel, program: &ApiTransaction) -> ApiModel {
-        let mut next = model.clone();
-        for action in &program.actions {
-            next.apply(action);
-        }
-        next
-    }
-
-    fn project(before: &BTreeSet<ApiModel>, program: &ApiTransaction) -> BTreeSet<ApiModel> {
-        before
-            .iter()
-            .map(|model| Self::apply(model, program))
-            .collect()
-    }
-
-    fn begin(&mut self, program: &ApiTransaction) -> (BTreeSet<ApiModel>, BTreeSet<ApiModel>) {
-        let before = self.possible[program.client].clone();
-        let after = Self::project(&before, program);
-        self.possible[program.client].extend(after.iter().cloned());
-        (before, after)
-    }
-
-    fn confirm(&mut self, client: usize, after: BTreeSet<ApiModel>) {
-        self.possible[client] = after;
-    }
-}
-
-fn possible_values(models: &BTreeSet<ApiModel>, key: usize) -> BTreeSet<Option<u8>> {
-    models.iter().map(|model| model.values[key]).collect()
 }
 
 /// Marks an oracle failure that must first pass transaction read validation.
@@ -366,7 +261,7 @@ async fn inspect_collection(
             path_value == value,
             format!("direct and path opens disagree for nested child of {name:?}"),
         )?;
-        Some(ApiChildModel { value })
+        Some(ApiChildModel::new(value))
     } else {
         match tx.open_collection(&collection, API_NESTED_COLLECTION).await {
             Err(Error::NotFound) => {}
@@ -389,7 +284,7 @@ async fn inspect_collection(
         None
     };
 
-    Ok(Some(ApiCollectionModel { value, child }))
+    Ok(Some(ApiCollectionModel::new(value, child)))
 }
 
 async fn ensure_dropped_handle_is_stale(
@@ -419,16 +314,6 @@ async fn ensure_collection(
         format!("create-if-absent reported the wrong outcome for {name:?}"),
     )?;
     Ok(collection)
-}
-
-fn expected_collection_states(
-    models: &BTreeSet<ApiModel>,
-    slot: usize,
-) -> BTreeSet<Option<ApiCollectionModel>> {
-    models
-        .iter()
-        .map(|model| model.collections[slot].clone())
-        .collect()
 }
 
 async fn run_collection_action(
@@ -578,10 +463,7 @@ async fn run_collection_action(
         for slot in 0..API_COLLECTION_SLOTS {
             actual.push(inspect_collection(tx, client, slot).await?);
         }
-        let allowed: BTreeSet<Vec<Option<ApiCollectionModel>>> = after
-            .iter()
-            .map(|model| model.collections.clone())
-            .collect();
+        let allowed = expected_catalog_states(after);
         if !allowed.contains(&actual) {
             return Err(api_invariant_error(format!(
                 "collection catalog observed {actual:?} outside modeled states {allowed:?}"
@@ -597,7 +479,7 @@ async fn run_api_program(
     state: &Mutex<ApiAcct>,
 ) -> Result<(), Error> {
     let (before, after) = if program.abort {
-        let before = state.lock().unwrap().possible[program.client].clone();
+        let before = state.lock().unwrap().possible(program.client).clone();
         let after = ApiAcct::project(&before, program);
         (before, after)
     } else {
@@ -774,7 +656,7 @@ impl SimWorkload for ApiWorkload {
                 }
                 Err(error) => panic!("final API read failed for k{key}: {error}"),
             };
-            actual[key % nclients].values[key] = value;
+            actual[key % nclients].set_value(key, value);
         }
 
         let catalogs = db
@@ -803,16 +685,16 @@ impl SimWorkload for ApiWorkload {
             .await
             .expect("verify final collection catalog");
         for (model, catalog) in actual.iter_mut().zip(catalogs) {
-            model.collections = catalog;
+            model.set_collections(catalog);
         }
 
         let acct = state.lock().unwrap();
         for (client, actual) in actual.iter().enumerate() {
             assert!(
-                acct.possible[client].contains(actual),
+                acct.contains(client, actual),
                 "client {client} final API state {:?} is not reachable; expected one of {:?}",
                 actual,
-                acct.possible[client]
+                acct.possible(client)
             );
         }
     }

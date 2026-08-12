@@ -735,3 +735,24 @@ working document and is intentionally not committed with these changes.
   persistent bytes, backend operations, retry semantics, runtime entropy,
   spawn order, executor/model/oracle behavior, compatibility shim, or ADR
   changed.
+
+## F29-I — Extract the exact API model
+
+- Moved the API child, collection, and client-state models, reachable-state
+  accounting, per-action transitions, and pure state projections into the
+  private `sim::api::model` module. The existing opaque `sim::ApiAcct` path is
+  retained; its representation remains inaccessible.
+- `ApiAction`, `ApiTransaction`, and `ApiWorkload` remain in `api.rs`, and the
+  F29-H decoder remains in `generator.rs`. All database-backed action handlers,
+  the transaction program loop, invariant error translation, and final-state
+  reads and verification remain in `api.rs` for F29-J/F29-K.
+- A table-driven transition suite covers every key and collection action,
+  including absent and present lifecycle branches and the existing
+  `AlreadyExists` and `NotEmpty` outcomes. A second focused suite pins initial,
+  projected, in-doubt, confirmed, per-client, and non-mutating abort-projection
+  state sets.
+- The nine deterministic API simulation tests pass unchanged, the reviewed API
+  tape-trace digest remains byte-identical, and all 1,509 committed
+  `api_correctness` corpus inputs still replay successfully. No generated
+  program, backend operation, retry, trace event, entropy draw, spawn order,
+  executor/oracle behavior, persistent byte, dependency, or ADR changed.
