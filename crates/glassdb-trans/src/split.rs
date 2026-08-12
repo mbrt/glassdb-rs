@@ -521,10 +521,7 @@ impl SeparatorPublisher {
             }
             let mut updated = locked_parent.clone();
             updated.set_index(new_index)?;
-            let content_limit = self
-                .policy
-                .node_max_bytes
-                .saturating_sub(self.policy.split_headroom_bytes);
+            let content_limit = self.policy.content_limit();
             if updated.content_encoded_len() > content_limit
                 || updated.encoded_len() > self.policy.node_max_bytes
             {
@@ -1961,11 +1958,7 @@ impl Splitter {
         ]);
         let index = Node::index(root_index);
         let sized_root = index.clone();
-        let content_limit = self
-            .candidates
-            .policy()
-            .node_max_bytes
-            .saturating_sub(self.candidates.policy().split_headroom_bytes);
+        let content_limit = self.candidates.policy().content_limit();
         if sized_root.content_encoded_len() > content_limit
             || sized_root.encoded_len() > self.candidates.policy().node_max_bytes
         {

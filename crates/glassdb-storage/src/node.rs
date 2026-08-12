@@ -141,7 +141,8 @@ impl IndexNode {
 pub struct SplitPolicy {
     /// Maximum leaf entries before it is a split candidate.
     pub leaf_max_entries: usize,
-    /// Maximum encoded leaf bytes before it is a split candidate.
+    /// Maximum encoded content bytes before either a leaf or index node is a
+    /// split candidate. The leaf-oriented name is retained for compatibility.
     pub leaf_max_bytes: usize,
     /// Maximum index children (fan-out) before it is a split candidate.
     pub index_max_children: usize,
@@ -151,12 +152,40 @@ pub struct SplitPolicy {
     pub split_headroom_bytes: usize,
 }
 
+/// A split policy whose reserved headroom exceeds its hard node cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "split headroom ({split_headroom_bytes} bytes) exceeds the node hard cap ({node_max_bytes} bytes)"
+)]
+pub struct InvalidSplitPolicy {
+    node_max_bytes: usize,
+    split_headroom_bytes: usize,
+}
+
 impl SplitPolicy {
+    /// Validates the sizing relationship required by all split-budget checks.
+    pub fn validate(&self) -> Result<(), InvalidSplitPolicy> {
+        if self.split_headroom_bytes <= self.node_max_bytes {
+            Ok(())
+        } else {
+            Err(InvalidSplitPolicy {
+                node_max_bytes: self.node_max_bytes,
+                split_headroom_bytes: self.split_headroom_bytes,
+            })
+        }
+    }
+
     /// The encoded content size a node's entries must stay under, reserving
     /// headroom for transient locks and the split's shrink CAS.
+    ///
+    /// # Panics
+    ///
+    /// Panics when reserved headroom exceeds the hard node cap. Configuration
+    /// entry points reject that relationship before the policy reaches runtime.
     pub fn content_limit(&self) -> usize {
         self.node_max_bytes
-            .saturating_sub(self.split_headroom_bytes)
+            .checked_sub(self.split_headroom_bytes)
+            .expect("split policy must be valid before computing its content limit")
     }
 
     /// Reports whether one exact leaf entry fits the per-entry budget that
@@ -871,6 +900,21 @@ mod tests {
             entry(b"c", 3),
         ]));
         assert!(three.over_soft_cap(&tiny));
+        let two_index = Node::index(IndexNode::from_children([
+            (b"".to_vec(), "L0".to_string()),
+            (b"m".to_vec(), "L1".to_string()),
+        ]));
+        assert!(
+            !two_index.over_soft_cap(&tiny),
+            "index at the child cap is not over it"
+        );
+        let three_index = Node::index(IndexNode::from_children([
+            (b"".to_vec(), "L0".to_string()),
+            (b"m".to_vec(), "L1".to_string()),
+            (b"t".to_vec(), "L2".to_string()),
+        ]));
+        assert!(three_index.over_soft_cap(&tiny));
+
         // A single oversized entry is never a candidate: it cannot be split.
         let byte_policy = SplitPolicy {
             leaf_max_entries: 1000,
@@ -879,14 +923,45 @@ mod tests {
             ..SplitPolicy::default()
         };
         assert!(!Node::leaf(Shard::from_entries([entry(b"solo", 1)])).over_soft_cap(&byte_policy));
-        assert!(
-            three.over_soft_cap(&byte_policy),
-            "multi-entry over the byte cap splits"
-        );
+        for (kind, node) in [("leaf", two), ("index", two_index)] {
+            let at_limit = SplitPolicy {
+                leaf_max_entries: usize::MAX,
+                leaf_max_bytes: node.content_encoded_len(),
+                index_max_children: usize::MAX,
+                ..SplitPolicy::default()
+            };
+            assert!(
+                !node.over_soft_cap(&at_limit),
+                "{kind} at the encoded-content cap is not over it"
+            );
+            assert!(
+                node.over_soft_cap(&SplitPolicy {
+                    leaf_max_bytes: at_limit.leaf_max_bytes - 1,
+                    ..at_limit
+                }),
+                "{kind} one byte over the encoded-content cap splits"
+            );
+        }
     }
 
     #[test]
     fn exact_entry_split_budget_is_half_the_content_limit() {
+        let exact_headroom = SplitPolicy {
+            node_max_bytes: 128,
+            split_headroom_bytes: 128,
+            ..SplitPolicy::default()
+        };
+        assert!(exact_headroom.validate().is_ok());
+        assert_eq!(exact_headroom.content_limit(), 0);
+        assert!(
+            SplitPolicy {
+                split_headroom_bytes: 129,
+                ..exact_headroom
+            }
+            .validate()
+            .is_err()
+        );
+
         let entry = entry(b"boundary", 1);
         let entry_len = Node::leaf(Shard::from_entries([entry.clone()])).content_encoded_len();
         let admitting = SplitPolicy {

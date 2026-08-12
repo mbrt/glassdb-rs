@@ -190,3 +190,21 @@ working document and is intentionally not committed with these changes.
 - Adversarial review found no receipt-completeness, ordering, cleanup, evidence,
   or test-pruning issue. No persistent bytes, backend operations, retry behavior,
   or public API changed.
+
+## F23-A — Clarify and validate the shared node soft limit
+
+- Clarified that the compatibility-named `leaf_max_bytes` field is the encoded-
+  content soft cap for both leaf and index nodes. Public fields and downstream
+  struct-literal construction remain available.
+- Added one checked `SplitPolicy` invariant: reserved split headroom may equal,
+  but not exceed, the hard node cap. The public database builder maps violations
+  to `InvalidInput` before metadata/backend work, while `Engine::open` repeats
+  validation before persistent-cache or permanent-root assembly for direct
+  internal callers.
+- `content_limit` now treats an unvalidated underflow as an invariant violation,
+  and split publication/root sizing reuse that checked calculation instead of
+  independently saturating to zero. Valid policies retain identical limits,
+  encoded bytes, backend operations, retries, and background behavior.
+- Existing node and configuration tests now cover exact and one-byte-over soft
+  caps for leaves and indexes, equal/over-cap headroom, the public error class,
+  and zero backend operations on invalid open. No migration-only test was added.
