@@ -140,6 +140,12 @@ impl LockState {
         self.typ = LockType::Write;
     }
 
+    /// Replaces the lock with one exclusive creator.
+    pub(crate) fn set_creator(&mut self, id: TxId) {
+        self.holders.replace(id);
+        self.typ = LockType::Create;
+    }
+
     /// Removes one holder and unlocks an empty state.
     pub(crate) fn remove(&mut self, id: &TxId) -> bool {
         let removed = self.holders.remove(id);
@@ -182,6 +188,88 @@ impl LockState {
             | (LockType::Write | LockType::Create, [_]) => Ok(Self { typ, holders }),
             _ => Err(LockStateError::InvalidShape),
         }
+    }
+}
+
+/// A valid lock state for one shard entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EntryLockState {
+    state: LockState,
+}
+
+impl EntryLockState {
+    /// Creates a shared-read state held by `holder`.
+    pub fn read(holder: TxId) -> Self {
+        let mut lock = Self::default();
+        lock.acquire_read(holder);
+        lock
+    }
+
+    /// Creates an exclusive-write state held by `holder`.
+    pub fn write(holder: TxId) -> Self {
+        let mut lock = Self::default();
+        lock.replace_write(holder);
+        lock
+    }
+
+    /// Creates an exclusive-create state held by `holder`.
+    pub fn create(holder: TxId) -> Self {
+        let mut lock = Self::default();
+        lock.replace_create(holder);
+        lock
+    }
+
+    /// Returns the held lock type.
+    pub fn lock_type(&self) -> LockType {
+        self.state.lock_type()
+    }
+
+    /// Returns the transactions holding the lock.
+    pub fn holders(&self) -> &[TxId] {
+        self.state.holders()
+    }
+
+    /// Reports whether `id` holds this lock.
+    pub fn contains(&self, id: &TxId) -> bool {
+        self.state.contains(id)
+    }
+
+    /// Reports whether no transaction holds this lock.
+    pub fn is_unlocked(&self) -> bool {
+        self.state.is_empty()
+    }
+
+    /// Makes `holder` one of the shared readers.
+    pub fn acquire_read(&mut self, holder: TxId) {
+        self.state.add_reader(holder);
+    }
+
+    /// Replaces all holders with one exclusive writer.
+    pub fn replace_write(&mut self, holder: TxId) {
+        self.state.set_writer(holder);
+    }
+
+    /// Replaces all holders with one exclusive creator.
+    pub fn replace_create(&mut self, holder: TxId) {
+        self.state.set_creator(holder);
+    }
+
+    /// Releases `holder`, unlocking the state when it was the last holder.
+    pub fn release(&mut self, holder: &TxId) -> bool {
+        self.state.remove(holder)
+    }
+
+    pub(crate) fn from_wire(
+        lock_type: i32,
+        locked_by: Vec<Vec<u8>>,
+    ) -> Result<Self, LockStateError> {
+        Ok(Self {
+            state: LockState::from_wire(lock_type, locked_by)?,
+        })
+    }
+
+    pub(crate) fn into_parts(self) -> (LockType, Vec<TxId>) {
+        self.state.into_parts()
     }
 }
 

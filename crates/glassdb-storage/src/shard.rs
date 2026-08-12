@@ -6,9 +6,8 @@
 //! compare-and-swap unit, so the encoding is canonical (entries sorted by key,
 //! holder sets sorted) and golden-anchored.
 //!
-//! This module defines an inert data type plus encode/decode and a pure
-//! [`Shard::lookup`]. It has no mutation policy and does no I/O; lock
-//! transitions, the protocol, and GC are added by later ADRs.
+//! This module defines inert data types, their pure lock transitions, and
+//! canonical encoding. It contains no conflict policy and performs no I/O.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -18,7 +17,7 @@ use glassdb_proto as pb;
 use prost::Message;
 
 use crate::error::StorageError;
-use crate::lock::{LockState, LockType, holders_to_proto, lock_type_to_proto};
+use crate::lock::{EntryLockState, LockType, holders_to_proto, lock_type_to_proto};
 
 /// A key's committed current value (ADR-051): the writer that produced it plus
 /// where the value itself lives.
@@ -108,6 +107,58 @@ impl ShardEntry {
         }
     }
 
+    /// Returns the lock type currently held on this entry.
+    pub fn lock_type(&self) -> LockType {
+        self.lock_type
+    }
+
+    /// Returns the transactions holding this entry's lock.
+    pub fn lock_holders(&self) -> &[TxId] {
+        &self.locked_by
+    }
+
+    /// Reports whether `id` holds this entry's lock.
+    pub fn is_locked_by(&self, id: &TxId) -> bool {
+        self.locked_by.contains(id)
+    }
+
+    /// Acquires a shared-read hold for `holder`.
+    pub fn acquire_read_lock(&mut self, holder: TxId) {
+        let mut lock = EntryLockState::read(holder);
+        for existing in std::mem::take(&mut self.locked_by) {
+            lock.acquire_read(existing);
+        }
+        self.replace_lock(lock);
+    }
+
+    /// Replaces the entry lock with one exclusive writer.
+    pub fn replace_write_lock(&mut self, holder: TxId) {
+        self.replace_lock(EntryLockState::write(holder));
+    }
+
+    /// Replaces the entry lock with one exclusive creator.
+    pub fn replace_create_lock(&mut self, holder: TxId) {
+        self.replace_lock(EntryLockState::create(holder));
+    }
+
+    /// Replaces the entry lock with a validated state.
+    pub fn replace_lock(&mut self, lock: EntryLockState) {
+        (self.lock_type, self.locked_by) = lock.into_parts();
+    }
+
+    /// Releases `holder` from this entry's lock.
+    pub fn release_lock(&mut self, holder: &TxId) -> bool {
+        let previous_len = self.locked_by.len();
+        self.locked_by.retain(|existing| existing != holder);
+        if self.locked_by.len() == previous_len {
+            return false;
+        }
+        if self.locked_by.is_empty() {
+            self.lock_type = LockType::None;
+        }
+        true
+    }
+
     /// Reports whether the key exists: it has a committed value and is not
     /// tombstoned.
     pub fn exists(&self) -> bool {
@@ -119,7 +170,7 @@ impl ShardEntry {
     /// writer). Such an entry names no transaction and is indistinguishable
     /// from an absent one, so a mutation that leaves it this way may drop it.
     pub fn is_vestigial(&self) -> bool {
-        self.locked_by.is_empty() && matches!(self.current, CurrentState::Absent)
+        self.lock_holders().is_empty() && matches!(self.current, CurrentState::Absent)
     }
 }
 
@@ -247,7 +298,7 @@ fn entry_to_proto(e: &ShardEntry) -> pb::ShardEntry {
 }
 
 fn entry_from_proto(e: pb::ShardEntry) -> Result<ShardEntry, StorageError> {
-    let (lock_type, locked_by) = LockState::from_wire(e.lock_type, e.locked_by)
+    let (lock_type, locked_by) = EntryLockState::from_wire(e.lock_type, e.locked_by)
         .map_err(|_| StorageError::other("shard entry has an invalid lock"))?
         .into_parts();
     Ok(ShardEntry {
@@ -311,6 +362,84 @@ mod tests {
 
     fn tx(bytes: &[u8]) -> TxId {
         TxId::from_bytes(bytes.to_vec())
+    }
+
+    fn encode_entry(entry: &ShardEntry) -> Vec<u8> {
+        Shard::from_entries([entry.clone()]).encode()
+    }
+
+    #[test]
+    fn shared_entry_lock_acquisition_is_canonical_and_idempotent() {
+        let first = tx(&[1]);
+        let second = tx(&[2]);
+        let mut entry = ShardEntry::new(b"key");
+
+        entry.acquire_read_lock(second.clone());
+        entry.acquire_read_lock(first.clone());
+        assert_eq!(entry.lock_type(), LockType::Read);
+        assert_eq!(entry.lock_holders(), &[first.clone(), second.clone()]);
+        assert!(entry.is_locked_by(&first));
+
+        let encoded = encode_entry(&entry);
+        entry.acquire_read_lock(first.clone());
+        assert_eq!(encode_entry(&entry), encoded);
+
+        let mut reverse = ShardEntry::new(b"key");
+        reverse.acquire_read_lock(first.clone());
+        reverse.acquire_read_lock(second.clone());
+        assert_eq!(encode_entry(&reverse), encoded);
+
+        let mut replacement = EntryLockState::read(second);
+        replacement.acquire_read(first.clone());
+        assert_eq!(replacement.lock_type(), LockType::Read);
+        assert!(replacement.contains(&first));
+        assert!(replacement.release(&first));
+        assert!(!replacement.is_unlocked());
+        replacement.acquire_read(first.clone());
+        reverse.replace_lock(replacement);
+        assert_eq!(encode_entry(&reverse), encoded);
+
+        assert!(reverse.release_lock(&first));
+        assert_eq!(reverse.lock_type(), LockType::Read);
+        assert_eq!(reverse.lock_holders(), &[tx(&[2])]);
+        let released_encoded = encode_entry(&reverse);
+        assert!(!reverse.release_lock(&first));
+        assert_eq!(encode_entry(&reverse), released_encoded);
+    }
+
+    #[test]
+    fn exclusive_entry_lock_replacement_and_release_are_idempotent() {
+        let writer = tx(&[3]);
+        let creator = tx(&[4]);
+        let unrelated = tx(&[5]);
+        let mut entry = ShardEntry::new(b"key");
+
+        entry.replace_write_lock(writer.clone());
+        assert_eq!(entry.lock_type(), LockType::Write);
+        assert_eq!(entry.lock_holders(), std::slice::from_ref(&writer));
+        let write_encoded = encode_entry(&entry);
+        entry.replace_write_lock(writer.clone());
+        assert_eq!(encode_entry(&entry), write_encoded);
+        assert!(entry.release_lock(&writer));
+        assert_eq!(entry.lock_type(), LockType::None);
+        assert!(entry.lock_holders().is_empty());
+        assert!(!entry.release_lock(&writer));
+
+        entry.replace_create_lock(creator.clone());
+        assert_eq!(entry.lock_type(), LockType::Create);
+        assert_eq!(entry.lock_holders(), std::slice::from_ref(&creator));
+        let create_encoded = encode_entry(&entry);
+        entry.replace_create_lock(creator.clone());
+        assert_eq!(encode_entry(&entry), create_encoded);
+
+        assert!(!entry.release_lock(&unrelated));
+        assert_eq!(encode_entry(&entry), create_encoded);
+        assert!(entry.release_lock(&creator));
+        assert_eq!(entry.lock_type(), LockType::None);
+        assert!(entry.lock_holders().is_empty());
+        let unlocked_encoded = encode_entry(&entry);
+        assert!(!entry.release_lock(&creator));
+        assert_eq!(encode_entry(&entry), unlocked_encoded);
     }
 
     #[test]
