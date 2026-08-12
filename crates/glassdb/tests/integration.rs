@@ -13,7 +13,7 @@ use glassdb::{
 };
 use glassdb_data::TxId;
 use glassdb_storage::transaction::TxCommitStatus;
-use glassdb_storage::{CurrentState, LockType, Node, Shard, ShardEntry};
+use glassdb_storage::{CurrentState, Node, Shard, ShardEntry};
 use tokio::sync::{Barrier, Notify, oneshot};
 
 async fn init_db(b: Arc<dyn Backend>) -> Database {
@@ -165,11 +165,8 @@ async fn boundary_inline_falls_back_before_it_can_strand_a_leaf() {
         },
         ..ShardEntry::new(first.clone())
     };
-    let create_entry = ShardEntry {
-        lock_type: LockType::Create,
-        locked_by: vec![TxId::with_priority(2, b"creator")],
-        ..ShardEntry::new(second.clone())
-    };
+    let mut create_entry = ShardEntry::new(second.clone());
+    create_entry.replace_create_lock(TxId::with_priority(2, b"creator"));
     assert!(
         Node::leaf(Shard::from_entries([inline_entry, create_entry])).content_encoded_len()
             > policy.content_limit(),

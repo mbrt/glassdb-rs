@@ -170,12 +170,11 @@ impl SplitPolicy {
     /// eventual parent separator under this policy.
     pub fn key_fits(&self, key: &[u8]) -> bool {
         let id = TxId::with_priority(0, &[]);
-        let entry = ShardEntry {
-            lock_type: LockType::Write,
-            locked_by: vec![id.clone()],
-            current: CurrentState::External { writer: id },
+        let mut entry = ShardEntry {
+            current: CurrentState::External { writer: id.clone() },
             ..ShardEntry::new(key)
         };
+        entry.replace_write_lock(id);
         let content_limit = self.content_limit();
         let token = "x".repeat(24);
         let index_len = Node::index(IndexNode::from_children([
@@ -638,7 +637,6 @@ mod tests {
 
     use glassdb_data::TxId;
 
-    use crate::lock::LockType;
     use crate::shard::ShardEntry;
 
     fn entry(key: &[u8], writer: u8) -> ShardEntry {
@@ -651,14 +649,14 @@ mod tests {
     }
 
     fn golden_entry() -> ShardEntry {
-        ShardEntry {
-            lock_type: LockType::Write,
-            locked_by: vec![TxId::from_bytes(vec![1, 2, 3, 4])],
+        let mut entry = ShardEntry {
             current: CurrentState::External {
                 writer: TxId::from_bytes(vec![0xaa, 0xbb]),
             },
             ..ShardEntry::new(b"Hello")
-        }
+        };
+        entry.replace_write_lock(TxId::from_bytes(vec![1, 2, 3, 4]));
+        entry
     }
 
     #[test]

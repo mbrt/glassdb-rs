@@ -2710,8 +2710,7 @@ mod tests {
 
     fn leaf_with_locked_entry(keys: &[&[u8]], holder: &TxId) -> Node {
         let mut entries: Vec<_> = keys.iter().map(|key| live(key)).collect();
-        entries[0].lock_type = LockType::Write;
-        entries[0].locked_by.push(holder.clone());
+        entries[0].replace_write_lock(holder.clone());
         Node::leaf(Shard::from_entries(entries))
     }
 
@@ -3693,7 +3692,7 @@ mod tests {
                 node.as_leaf()
                     .unwrap()
                     .entries()
-                    .all(|entry| !entry.locked_by.contains(&younger))
+                    .all(|entry| !entry.is_locked_by(&younger))
             );
         }
     }
@@ -3721,8 +3720,7 @@ mod tests {
             .map(|key| live(key))
             .collect();
         let upper = entries.last_mut().unwrap();
-        upper.lock_type = LockType::Write;
-        upper.locked_by.push(holder.clone());
+        upper.replace_write_lock(holder.clone());
         let node = Node::leaf(Shard::from_entries(entries));
         s.store_node(COLL, "L", &node, None).await.unwrap();
         let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
@@ -3749,8 +3747,8 @@ mod tests {
                 writer: holder.clone()
             }
         );
-        assert!(entry.locked_by.is_empty());
-        assert_eq!(entry.lock_type, LockType::None);
+        assert!(entry.lock_holders().is_empty());
+        assert_eq!(entry.lock_type(), LockType::None);
 
         // A different instance still targeting the pre-split source must
         // re-descend and converge without recreating the removed holder.
@@ -3805,7 +3803,7 @@ mod tests {
             .lookup(b"d")
             .unwrap();
         assert_eq!(current.current, CurrentState::External { writer: holder });
-        assert!(current.locked_by.is_empty());
+        assert!(current.lock_holders().is_empty());
     }
 
     #[tokio::test]

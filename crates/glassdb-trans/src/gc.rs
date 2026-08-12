@@ -471,9 +471,9 @@ impl Gc {
                         CheckKind::Writer => {
                             leaf.lookup(raw_key).and_then(|e| e.current.writer()) == Some(tid)
                         }
-                        CheckKind::Holder => leaf
-                            .lookup(raw_key)
-                            .is_some_and(|e| e.locked_by.contains(tid)),
+                        CheckKind::Holder => {
+                            leaf.lookup(raw_key).is_some_and(|e| e.is_locked_by(tid))
+                        }
                     };
                     if referenced {
                         return Ok(true);
@@ -790,11 +790,9 @@ mod tests {
     }
 
     fn locked_entry(key: &[u8], holder: &TxId) -> ShardEntry {
-        ShardEntry {
-            lock_type: LockType::Write,
-            locked_by: vec![holder.clone()],
-            ..ShardEntry::new(key)
-        }
+        let mut entry = ShardEntry::new(key);
+        entry.replace_write_lock(holder.clone());
+        entry
     }
 
     async fn is_gone(tl: &TLogger, id: &TxId) -> bool {
@@ -1120,7 +1118,7 @@ mod tests {
         assert_eq!(got.status, TxCommitStatus::Pending);
         // Its lock is untouched.
         let e = lookup_entry(&ctx, b"k").await.unwrap();
-        assert_eq!(e.locked_by, vec![t]);
+        assert_eq!(e.lock_holders(), std::slice::from_ref(&t));
     }
 
     // A dead pending object past the horizon is pinned as wounded and its locks
@@ -1179,7 +1177,7 @@ mod tests {
 
         assert!(!is_gone(&ctx.tl, &t).await);
         let e = lookup_entry(&ctx, b"k").await.unwrap();
-        assert_eq!(e.locked_by, vec![t]);
+        assert_eq!(e.lock_holders(), std::slice::from_ref(&t));
     }
 
     // An aborted object past its tombstone lease has its recorded lock pruned
@@ -1344,7 +1342,10 @@ mod tests {
             lookup_entry(&ctx, &ka).await.is_none(),
             "GC released and pruned the dead holder's entry"
         );
-        assert_eq!(lookup_entry(&ctx, &kb).await.unwrap().locked_by, vec![live]);
+        assert_eq!(
+            lookup_entry(&ctx, &kb).await.unwrap().lock_holders(),
+            std::slice::from_ref(&live)
+        );
     }
 
     /// Counts the CAS stores (conditional write / create) issued against `path`.

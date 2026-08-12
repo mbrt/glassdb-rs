@@ -290,7 +290,7 @@ impl CollectionLifecycle {
         holders.extend(node.membership_lock().holders().iter().cloned());
         if let Some(leaf) = node.as_leaf() {
             for entry in leaf.entries() {
-                holders.extend(entry.locked_by.iter().cloned());
+                holders.extend(entry.lock_holders().iter().cloned());
             }
         }
         holders.remove(own);
