@@ -714,3 +714,22 @@ working document and is intentionally not committed with these changes.
   entropy accounting, and distribution vectors remain long term.
 - No production implementation, harness behavior, scheduling decision, or ADR
   changed, and there is no baseline update mode.
+
+## F29-D — Extract `RunPlan` and `RunContext`
+
+- Added private `RunPlan` and `RunContext` types in the simulation harness.
+  `RunPlan` owns the immutable workload, fault, seed, and tape inputs; consuming
+  it performs the existing seeding path and produces a context that owns the
+  backbone, operation log, media, oracle state, client inputs, and transports.
+- `run_generic_with_trace` still contains client crash/restart behavior, spawn
+  order, nemesis scheduling, and join order. It now delegates resource setup to
+  `RunPlan::setup` and final healing, invariant verification, database shutdown,
+  and log return to `RunContext::teardown`.
+- The three tape-scheduled and two PCT-scheduled canonical trace baselines remain
+  byte-identical without a digest update. Existing harness tests also retain
+  traced/untraced operation parity and client-panic propagation, so no temporary
+  structural or duplicate regression test was added.
+- Backend operations, persistent bytes, retry/error boundaries, entropy draw
+  order, task selection, client/nemesis behavior, cache-media ownership, and
+  public APIs are unchanged. No deviation from the finding plan and no ADR were
+  needed.
