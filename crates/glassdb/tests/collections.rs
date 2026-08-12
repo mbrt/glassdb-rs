@@ -257,7 +257,7 @@ async fn bound_handle_data_access_does_not_revalidate_its_logical_path() {
 }
 
 #[tokio::test]
-async fn collection_names_are_validated_before_io() {
+async fn names_and_split_policy_are_validated_before_io() {
     assert!(matches!(
         CollectionPath::new([] as [u8; 0]),
         Err(Error::InvalidInput(_))
@@ -267,6 +267,21 @@ async fn collection_names_are_validated_before_io() {
         CollectionPath::new([0u8; MAX_COLLECTION_NAME_BYTES + 1]),
         Err(Error::InvalidInput(_))
     ));
+
+    let recorder = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
+    let operations = recorder.log();
+    let error = Database::builder("example", recorder)
+        .split_policy(SplitPolicy {
+            node_max_bytes: 64,
+            split_headroom_bytes: 65,
+            ..SplitPolicy::default()
+        })
+        .open()
+        .await
+        .err()
+        .expect("invalid split policy must fail to open");
+    assert!(matches!(error, Error::InvalidInput(_)));
+    assert!(operations.lock().unwrap().is_empty());
 
     let db = Database::open("example", MemoryBackend::new())
         .await

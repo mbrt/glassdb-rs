@@ -106,6 +106,9 @@ impl DatabaseBuilder {
                 "name must be alphanumeric, got {name:?}"
             )));
         }
+        engine_config
+            .validate()
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
         let backend = Arc::new(glassdb_backend::StatsBackend::new(b));
         let database_id = check_or_create_db_meta(&backend, &name).await?;
         let engine = Engine::open(&name, database_id, backend, engine_config)

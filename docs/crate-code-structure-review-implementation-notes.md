@@ -190,3 +190,60 @@ working document and is intentionally not committed with these changes.
 - Adversarial review found no receipt-completeness, ordering, cleanup, evidence,
   or test-pruning issue. No persistent bytes, backend operations, retry behavior,
   or public API changed.
+
+## F23-A — Clarify and validate the shared node soft limit
+
+- Clarified that the compatibility-named `leaf_max_bytes` field is the encoded-
+  content soft cap for both leaf and index nodes. Public fields and downstream
+  struct-literal construction remain available.
+- Added one checked `SplitPolicy` invariant: reserved split headroom may equal,
+  but not exceed, the hard node cap. The public database builder maps violations
+  to `InvalidInput` before metadata/backend work, while `Engine::open` repeats
+  validation before persistent-cache or permanent-root assembly for direct
+  internal callers.
+- `content_limit` now treats an unvalidated underflow as an invariant violation,
+  and split publication/root sizing reuse that checked calculation instead of
+  independently saturating to zero. Valid policies retain identical limits,
+  encoded bytes, backend operations, retries, and background behavior.
+- Existing node and configuration tests now cover exact and one-byte-over soft
+  caps for leaves and indexes, equal/over-cap headroom, the public error class,
+  and zero backend operations on invalid open. No migration-only test was added.
+
+## F23-B — Add codec-owned wire-size calculations
+
+- Exposed the 16-byte maximum for transaction IDs minted or renewed by GlassDB
+  and reused the validated node token's existing 22-byte encoded maximum.
+  `TxId::from_bytes` intentionally accepts arbitrary persisted IDs, so the new
+  constant is named `MAX_GENERATED_ENCODED_LEN` rather than claiming a false
+  bound; exact entry sizing continues to honor those IDs' actual lengths.
+- Added allocation-free protobuf field arithmetic beside the storage codecs.
+  `ShardEntry` now reports its exact canonical encoded length, and `Node`
+  reports the exact one-entry leaf content length plus worst-case generated-ID
+  leaf and maximum-token parent shapes.
+- The leaf bound models one generated write holder and one external writer. The
+  parent bound models the leftmost child plus the candidate separator, except
+  for the empty separator where the map can contain only that one entry.
+- One compact entry-state matrix and one boundary table compare the calculations
+  with prost's actual encoded lengths across absent/external/inline/tombstone
+  states, maximum components, and every relevant nested varint-width change.
+- Split-policy callers and their synthetic probes remain deliberately unchanged
+  for F23-C. This finding changes no admission decision, persisted bytes,
+  backend operation, or retry behavior.
+
+## F23-C — Remove synthetic budget probes
+
+- `SplitPolicy` now delegates exact entry admission and worst-case key admission
+  to the codec-owned wire-size calculations. The fake transaction, cloned shard,
+  temporary index, allocation-heavy key copies, and magic 24-character token
+  have been removed from the validation path.
+- Entry admission still reserves half of the checked content limit, rounded
+  down, while a key's parent separator may use the full limit. Both boundaries
+  remain inclusive; the key calculation uses generated 16-byte transaction IDs
+  and validated maximum-length 22-byte node tokens.
+- A compact real-node test constructs the maximum admitted key's canonical leaf
+  and two-child parent. It pins exact-limit acceptance, rejection when that same
+  shape is one byte over budget, and rejection of the next longer key.
+- Existing public `InvalidInput` mapping, pre-lock rejection, inline fallback,
+  capacity retry, split hints, persisted bytes, and backend operation ordering
+  are unchanged. The compatibility-named public policy fields remain for the
+  separately authorized F23-D breaking release.

@@ -17,7 +17,20 @@ use glassdb_proto as pb;
 use prost::Message;
 
 use crate::error::StorageError;
-use crate::lock::{EntryLockState, LockType};
+use crate::lock::{EntryLockState, LockType, lock_type_to_proto};
+use crate::wire_size::{
+    length_delimited_field, nonempty_length_delimited_field, nonzero_varint_field,
+    present_varint_field,
+};
+
+const ENTRY_KEY_TAG: u32 = 1;
+const ENTRY_LOCK_TYPE_TAG: u32 = 2;
+const ENTRY_LOCKED_BY_TAG: u32 = 3;
+const ENTRY_CURRENT_TAG: u32 = 4;
+const CURRENT_WRITER_TAG: u32 = 1;
+const CURRENT_EXTERNAL_TAG: u32 = 2;
+const CURRENT_INLINE_TAG: u32 = 3;
+const CURRENT_TOMBSTONE_TAG: u32 = 4;
 
 /// A key's committed current value (ADR-051): the writer that produced it plus
 /// where the value itself lives.
@@ -155,6 +168,20 @@ impl ShardEntry {
         self.current.exists()
     }
 
+    /// Returns this entry's exact canonical protobuf size without allocating a
+    /// protobuf message.
+    pub fn encoded_len(&self) -> usize {
+        let lock_type = lock_type_to_proto(self.lock_type()) as u64;
+        nonempty_length_delimited_field(ENTRY_KEY_TAG, self.key.len())
+            + nonzero_varint_field(ENTRY_LOCK_TYPE_TAG, lock_type)
+            + self
+                .lock_holders()
+                .iter()
+                .map(|holder| length_delimited_field(ENTRY_LOCKED_BY_TAG, holder.as_bytes().len()))
+                .sum::<usize>()
+            + current_state_field_len(&self.current)
+    }
+
     /// Reports whether the entry records nothing worth keeping: no lock holder
     /// and no committed value (not even a tombstone, which always names a
     /// writer). Such an entry names no transaction and is indistinguishable
@@ -162,6 +189,42 @@ impl ShardEntry {
     pub fn is_vestigial(&self) -> bool {
         self.lock_holders().is_empty() && matches!(self.current, CurrentState::Absent)
     }
+
+    /// Returns the encoded size of the largest fixed coordination shape GlassDB
+    /// can add for `key_len`: one generated write holder and an external current
+    /// writer. Inline payloads and arbitrary compatibility IDs are sized exactly
+    /// through [`ShardEntry::encoded_len`] instead.
+    pub(crate) fn worst_case_encoded_len(key_len: usize) -> usize {
+        let id_len = TxId::MAX_GENERATED_ENCODED_LEN;
+        let current_len = nonempty_length_delimited_field(CURRENT_WRITER_TAG, id_len)
+            + present_varint_field(CURRENT_EXTERNAL_TAG, 1);
+        nonempty_length_delimited_field(ENTRY_KEY_TAG, key_len)
+            + nonzero_varint_field(
+                ENTRY_LOCK_TYPE_TAG,
+                lock_type_to_proto(LockType::Write) as u64,
+            )
+            + length_delimited_field(ENTRY_LOCKED_BY_TAG, id_len)
+            + length_delimited_field(ENTRY_CURRENT_TAG, current_len)
+    }
+}
+
+fn current_state_field_len(current: &CurrentState) -> usize {
+    let (writer, state_len) = match current {
+        CurrentState::Absent => return 0,
+        CurrentState::External { writer } => {
+            (writer, present_varint_field(CURRENT_EXTERNAL_TAG, 1))
+        }
+        CurrentState::Inline { writer, value } => (
+            writer,
+            length_delimited_field(CURRENT_INLINE_TAG, value.len()),
+        ),
+        CurrentState::Tombstone { writer } => {
+            (writer, present_varint_field(CURRENT_TOMBSTONE_TAG, 1))
+        }
+    };
+    let current_len =
+        nonempty_length_delimited_field(CURRENT_WRITER_TAG, writer.as_bytes().len()) + state_len;
+    length_delimited_field(ENTRY_CURRENT_TAG, current_len)
 }
 
 /// A decoded shard: the coordination directory for the keys that map to it.
@@ -362,6 +425,65 @@ mod tests {
     fn with_lock(mut entry: ShardEntry, lock: EntryLockState) -> ShardEntry {
         entry.replace_lock(lock);
         entry
+    }
+
+    #[test]
+    fn entry_size_matches_proto_state_matrix() {
+        let generated = TxId::with_priority(1, b"maximum");
+        assert_eq!(generated.as_bytes().len(), TxId::MAX_GENERATED_ENCODED_LEN);
+        let short = TxId::from_bytes(vec![1]);
+        let boundary_127 = TxId::from_bytes(vec![2; 127]);
+        let boundary_128 = TxId::from_bytes(vec![3; 128]);
+
+        let mut normalized_none = ShardEntry::new(b"none");
+        normalized_none.replace_write_lock(short.clone());
+        assert!(normalized_none.release_lock(&short));
+
+        let mut shared = ShardEntry::new(b"shared");
+        shared.acquire_read_lock(short.clone());
+        shared.acquire_read_lock(boundary_128.clone());
+
+        let mut maximum = ShardEntry::new(b"external").with_current(CurrentState::External {
+            writer: generated.clone(),
+        });
+        maximum.replace_write_lock(generated.clone());
+
+        let mut inline_empty = ShardEntry::new(Vec::new()).with_current(CurrentState::Inline {
+            writer: boundary_127,
+            value: Arc::from(b"".as_slice()),
+        });
+        inline_empty.replace_create_lock(boundary_128.clone());
+
+        let cases = [
+            ("absent", ShardEntry::new(Vec::new())),
+            ("normalized-none", normalized_none),
+            ("shared", shared),
+            ("external", maximum.clone()),
+            ("inline-empty", inline_empty),
+            (
+                "inline-boundary",
+                ShardEntry::new(b"inline").with_current(CurrentState::Inline {
+                    writer: boundary_128,
+                    value: Arc::from(vec![4; 128]),
+                }),
+            ),
+            (
+                "tombstone",
+                ShardEntry::new(b"tombstone")
+                    .with_current(CurrentState::Tombstone { writer: short }),
+            ),
+        ];
+        for (name, entry) in cases {
+            assert_eq!(
+                entry.encoded_len(),
+                entry_to_proto(&entry).encoded_len(),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            maximum.encoded_len(),
+            ShardEntry::worst_case_encoded_len(maximum.key.len())
+        );
     }
 
     #[test]

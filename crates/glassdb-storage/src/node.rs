@@ -25,8 +25,16 @@ use prost::Message;
 
 use crate::error::StorageError;
 use crate::lock::{ExclusiveGate, LockType, SharedExclusiveLock};
-use crate::shard::{CurrentState, Shard, ShardEntry};
-use glassdb_data::TxId;
+use crate::shard::{Shard, ShardEntry};
+use crate::wire_size::{length_delimited_field, nonempty_length_delimited_field};
+use glassdb_data::{NodeToken as ValidatedNodeToken, TxId};
+
+const SHARD_ENTRIES_TAG: u32 = 1;
+const INDEX_ENTRIES_TAG: u32 = 1;
+const INDEX_SEPARATOR_TAG: u32 = 1;
+const INDEX_CHILD_TAG: u32 = 2;
+const NODE_LEAF_TAG: u32 = 3;
+const NODE_INDEX_TAG: u32 = 4;
 
 /// The opaque identity token of a non-root node (`{prefix}/_n/<token>`). The
 /// root has no token; it lives at the fixed `_r` path.
@@ -141,7 +149,8 @@ impl IndexNode {
 pub struct SplitPolicy {
     /// Maximum leaf entries before it is a split candidate.
     pub leaf_max_entries: usize,
-    /// Maximum encoded leaf bytes before it is a split candidate.
+    /// Maximum encoded content bytes before either a leaf or index node is a
+    /// split candidate. The leaf-oriented name is retained for compatibility.
     pub leaf_max_bytes: usize,
     /// Maximum index children (fan-out) before it is a split candidate.
     pub index_max_children: usize,
@@ -151,36 +160,58 @@ pub struct SplitPolicy {
     pub split_headroom_bytes: usize,
 }
 
+/// A split policy whose reserved headroom exceeds its hard node cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "split headroom ({split_headroom_bytes} bytes) exceeds the node hard cap ({node_max_bytes} bytes)"
+)]
+pub struct InvalidSplitPolicy {
+    node_max_bytes: usize,
+    split_headroom_bytes: usize,
+}
+
 impl SplitPolicy {
+    /// Validates the sizing relationship required by all split-budget checks.
+    pub fn validate(&self) -> Result<(), InvalidSplitPolicy> {
+        if self.split_headroom_bytes <= self.node_max_bytes {
+            Ok(())
+        } else {
+            Err(InvalidSplitPolicy {
+                node_max_bytes: self.node_max_bytes,
+                split_headroom_bytes: self.split_headroom_bytes,
+            })
+        }
+    }
+
     /// The encoded content size a node's entries must stay under, reserving
     /// headroom for transient locks and the split's shrink CAS.
+    ///
+    /// # Panics
+    ///
+    /// Panics when reserved headroom exceeds the hard node cap. Configuration
+    /// entry points reject that relationship before the policy reaches runtime.
     pub fn content_limit(&self) -> usize {
         self.node_max_bytes
-            .saturating_sub(self.split_headroom_bytes)
+            .checked_sub(self.split_headroom_bytes)
+            .expect("split policy must be valid before computing its content limit")
     }
 
     /// Reports whether one exact leaf entry fits the per-entry budget that
     /// preserves room for another independently admissible entry.
     pub fn entry_fits_split_budget(&self, entry: &ShardEntry) -> bool {
-        Node::leaf(Shard::from_entries([entry.clone()])).content_encoded_len()
-            <= self.content_limit() / 2
+        Node::leaf_entry_content_encoded_len(entry) <= self.content_limit() / 2
     }
 
     /// Reports whether `key` can fit in both a splittable leaf entry and its
     /// eventual parent separator under this policy.
     pub fn key_fits(&self, key: &[u8]) -> bool {
-        let id = TxId::with_priority(0, &[]);
-        let mut entry =
-            ShardEntry::new(key).with_current(CurrentState::External { writer: id.clone() });
-        entry.replace_write_lock(id);
         let content_limit = self.content_limit();
-        let token = "x".repeat(24);
-        let index_len = Node::index(IndexNode::from_children([
-            (Vec::new(), token.clone()),
-            (key.to_vec(), token),
-        ]))
-        .content_encoded_len();
-        self.entry_fits_split_budget(&entry) && index_len <= content_limit
+        Node::worst_case_leaf_entry_len(key.len()) <= content_limit / 2
+            && self.parent_separator_fits(key)
+    }
+
+    fn parent_separator_fits(&self, key: &[u8]) -> bool {
+        Node::worst_case_parent_separator_len(key.len()) <= self.content_limit()
     }
 }
 
@@ -458,16 +489,46 @@ impl Node {
         self.locks.membership_version()
     }
 
-    /// Clears node locks before a split-created node becomes visible.
-    pub(crate) fn clear_node_locks(&mut self) {
-        self.locks.clear_holders();
-    }
-
     /// Returns the canonical encoded size without transient node locks.
     pub fn content_encoded_len(&self) -> usize {
         let mut content = self.clone();
         content.clear_node_locks();
         content.encoded_len()
+    }
+
+    /// Returns the exact node-content size of a leaf containing only `entry`.
+    pub fn leaf_entry_content_encoded_len(entry: &ShardEntry) -> usize {
+        let shard_len = length_delimited_field(SHARD_ENTRIES_TAG, entry.encoded_len());
+        length_delimited_field(NODE_LEAF_TAG, shard_len)
+    }
+
+    /// Returns the node-content size of a leaf containing the largest fixed
+    /// coordination shape GlassDB can add for a key of `key_len` bytes.
+    pub fn worst_case_leaf_entry_len(key_len: usize) -> usize {
+        let shard_len = length_delimited_field(
+            SHARD_ENTRIES_TAG,
+            ShardEntry::worst_case_encoded_len(key_len),
+        );
+        length_delimited_field(NODE_LEAF_TAG, shard_len)
+    }
+
+    /// Returns the node-content size of the smallest parent that can contain a
+    /// separator of `key_len` bytes, using maximum-length validated child tokens.
+    pub fn worst_case_parent_separator_len(key_len: usize) -> usize {
+        let child_len =
+            length_delimited_field(INDEX_CHILD_TAG, ValidatedNodeToken::MAX_ENCODED_LEN);
+        let entry_len = |separator_len| {
+            nonempty_length_delimited_field(INDEX_SEPARATOR_TAG, separator_len) + child_len
+        };
+        let candidate_len = length_delimited_field(INDEX_ENTRIES_TAG, entry_len(key_len));
+        let index_len = if key_len == 0 {
+            // The candidate is itself the leftmost separator; a BTreeMap cannot
+            // contain a second entry with the same empty key.
+            candidate_len
+        } else {
+            length_delimited_field(INDEX_ENTRIES_TAG, entry_len(0)) + candidate_len
+        };
+        length_delimited_field(NODE_INDEX_TAG, index_len)
     }
 
     /// The leaf body, or `None` if this is an index node.
@@ -579,6 +640,11 @@ impl Node {
         Node::from_pb(raw)
     }
 
+    /// Clears node locks before a split-created node becomes visible.
+    pub(crate) fn clear_node_locks(&mut self) {
+        self.locks.clear_holders();
+    }
+
     pub(crate) fn to_pb(&self) -> pb::Node {
         let body = match &self.body {
             NodeBody::Leaf(shard) => pb::node::Body::Leaf(shard.to_pb()),
@@ -635,7 +701,7 @@ mod tests {
 
     use glassdb_data::TxId;
 
-    use crate::shard::ShardEntry;
+    use crate::shard::{CurrentState, ShardEntry};
 
     fn entry(key: &[u8], writer: u8) -> ShardEntry {
         ShardEntry::new(key).with_current(CurrentState::External {
@@ -871,6 +937,21 @@ mod tests {
             entry(b"c", 3),
         ]));
         assert!(three.over_soft_cap(&tiny));
+        let two_index = Node::index(IndexNode::from_children([
+            (b"".to_vec(), "L0".to_string()),
+            (b"m".to_vec(), "L1".to_string()),
+        ]));
+        assert!(
+            !two_index.over_soft_cap(&tiny),
+            "index at the child cap is not over it"
+        );
+        let three_index = Node::index(IndexNode::from_children([
+            (b"".to_vec(), "L0".to_string()),
+            (b"m".to_vec(), "L1".to_string()),
+            (b"t".to_vec(), "L2".to_string()),
+        ]));
+        assert!(three_index.over_soft_cap(&tiny));
+
         // A single oversized entry is never a candidate: it cannot be split.
         let byte_policy = SplitPolicy {
             leaf_max_entries: 1000,
@@ -879,14 +960,45 @@ mod tests {
             ..SplitPolicy::default()
         };
         assert!(!Node::leaf(Shard::from_entries([entry(b"solo", 1)])).over_soft_cap(&byte_policy));
-        assert!(
-            three.over_soft_cap(&byte_policy),
-            "multi-entry over the byte cap splits"
-        );
+        for (kind, node) in [("leaf", two), ("index", two_index)] {
+            let at_limit = SplitPolicy {
+                leaf_max_entries: usize::MAX,
+                leaf_max_bytes: node.content_encoded_len(),
+                index_max_children: usize::MAX,
+                ..SplitPolicy::default()
+            };
+            assert!(
+                !node.over_soft_cap(&at_limit),
+                "{kind} at the encoded-content cap is not over it"
+            );
+            assert!(
+                node.over_soft_cap(&SplitPolicy {
+                    leaf_max_bytes: at_limit.leaf_max_bytes - 1,
+                    ..at_limit
+                }),
+                "{kind} one byte over the encoded-content cap splits"
+            );
+        }
     }
 
     #[test]
     fn exact_entry_split_budget_is_half_the_content_limit() {
+        let exact_headroom = SplitPolicy {
+            node_max_bytes: 128,
+            split_headroom_bytes: 128,
+            ..SplitPolicy::default()
+        };
+        assert!(exact_headroom.validate().is_ok());
+        assert_eq!(exact_headroom.content_limit(), 0);
+        assert!(
+            SplitPolicy {
+                split_headroom_bytes: 129,
+                ..exact_headroom
+            }
+            .validate()
+            .is_err()
+        );
+
         let entry = entry(b"boundary", 1);
         let entry_len = Node::leaf(Shard::from_entries([entry.clone()])).content_encoded_len();
         let admitting = SplitPolicy {
@@ -901,6 +1013,70 @@ mod tests {
             ..admitting
         };
         assert!(!rejecting.entry_fits_split_budget(&entry));
+    }
+
+    #[test]
+    fn maximum_key_admission_matches_real_nodes_at_the_exact_limit() {
+        let maximum_key = vec![b'k'; 128];
+        let id = TxId::with_priority(7, b"maximum");
+        let mut entry = ShardEntry::new(maximum_key.clone())
+            .with_current(CurrentState::External { writer: id.clone() });
+        entry.replace_write_lock(id);
+        let leaf = Node::leaf(Shard::from_entries([entry]));
+
+        let parent = Node::index(IndexNode::from_children([
+            (
+                Vec::new(),
+                ValidatedNodeToken::from_bytes([1; 16]).to_string(),
+            ),
+            (
+                maximum_key.clone(),
+                ValidatedNodeToken::from_bytes([2; 16]).to_string(),
+            ),
+        ]));
+        assert_eq!(parent.as_index().unwrap().len(), 2);
+
+        let leaf_requirement = leaf
+            .content_encoded_len()
+            .checked_mul(2)
+            .expect("test leaf size fits usize");
+        let required_limit = leaf_requirement.max(parent.content_encoded_len());
+        let headroom = 17;
+        let exact = SplitPolicy {
+            node_max_bytes: required_limit
+                .checked_add(headroom)
+                .expect("test node size fits usize"),
+            split_headroom_bytes: headroom,
+            ..SplitPolicy::default()
+        };
+        assert_eq!(exact.content_limit(), required_limit);
+        assert!(exact.key_fits(&maximum_key));
+
+        let parent_limit = parent.content_encoded_len();
+        let parent_exact = SplitPolicy {
+            node_max_bytes: parent_limit,
+            split_headroom_bytes: 0,
+            ..SplitPolicy::default()
+        };
+        assert!(parent_exact.parent_separator_fits(&maximum_key));
+        assert!(
+            !SplitPolicy {
+                node_max_bytes: parent_limit - 1,
+                ..parent_exact
+            }
+            .parent_separator_fits(&maximum_key)
+        );
+
+        let one_byte_over = SplitPolicy {
+            node_max_bytes: exact.node_max_bytes - 1,
+            ..exact
+        };
+        assert_eq!(one_byte_over.content_limit(), required_limit - 1);
+        assert!(!one_byte_over.key_fits(&maximum_key));
+
+        let mut above_maximum = maximum_key;
+        above_maximum.push(b'k');
+        assert!(!exact.key_fits(&above_maximum));
     }
 
     #[test]
@@ -928,6 +1104,49 @@ mod tests {
             (b"m".to_vec(), "L2".to_string()),
         ]));
         assert_eq!(a.encode(), b.encode());
+    }
+
+    #[test]
+    fn codec_size_predictions_match_varint_boundaries() {
+        let id = TxId::from_bytes(vec![0; TxId::MAX_GENERATED_ENCODED_LEN]);
+        let token = ValidatedNodeToken::from_bytes([0; 16]).to_string();
+        assert_eq!(token.len(), ValidatedNodeToken::MAX_ENCODED_LEN);
+
+        for key_len in [
+            0, 1, 81, 82, 83, 84, 127, 128, 16_335, 16_336, 16_338, 16_339, 16_383, 16_384,
+        ] {
+            let mut entry = ShardEntry::new(vec![b'k'; key_len])
+                .with_current(CurrentState::External { writer: id.clone() });
+            entry.replace_write_lock(id.clone());
+            let actual = Node::leaf(Shard::from_entries([entry.clone()])).content_encoded_len();
+
+            assert_eq!(
+                Node::leaf_entry_content_encoded_len(&entry),
+                actual,
+                "exact leaf entry with {key_len}-byte key"
+            );
+            assert_eq!(
+                Node::worst_case_leaf_entry_len(key_len),
+                actual,
+                "worst-case leaf entry with {key_len}-byte key"
+            );
+        }
+
+        for key_len in [
+            0, 1, 73, 74, 101, 102, 127, 128, 16_327, 16_328, 16_356, 16_357, 16_383, 16_384,
+        ] {
+            let actual = Node::index(IndexNode::from_children([
+                (Vec::new(), token.clone()),
+                (vec![b'k'; key_len], token.clone()),
+            ]))
+            .content_encoded_len();
+
+            assert_eq!(
+                Node::worst_case_parent_separator_len(key_len),
+                actual,
+                "parent separator with {key_len}-byte key"
+            );
+        }
     }
 
     #[test]
