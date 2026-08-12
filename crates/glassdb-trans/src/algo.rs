@@ -4529,6 +4529,10 @@ mod tests {
             .await
             .unwrap();
         let log = log.value().unwrap();
+        assert!(log.locks.contains(&TxLock::Entry {
+            key: key_path,
+            typ: LockType::Write,
+        }));
         let leaf = LeafRef::root(test_collection());
         assert!(log.locks.contains(&TxLock::Membership {
             leaf,
