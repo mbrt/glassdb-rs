@@ -259,3 +259,28 @@ working document and is intentionally not committed with these changes.
   behavior coverage remains in `algo.rs` until F21-C; this finding changes no
   persistent bytes, backend operations, retries, random draws, task spawning,
   statistics, or public API.
+
+## F21-B — Introduce the concrete `DirectCommit` collaborator
+
+- Added one private concrete collaborator owning the direct path's shared
+  resolver, shard coordinator, inline policy, split-hint sink, GC hint clone,
+  and counters. `Algo` retains its own resolver and GC clones for general read
+  validation, abort, locked write-back, and cleanup; its public constructor and
+  every caller remain unchanged.
+- Moved predecessor lookup and direct execution behind `DirectCommit::try_commit`.
+  The boundary receives only the transaction id, data, and F20's validated
+  `AttemptState`; collection eligibility and dispatch among committed, replay,
+  and locked fallback remain architectural policy in `Algo`.
+- Candidate and landed counter points, `Requirement::Any` cache behavior,
+  eligibility order, inline admission, split-pressure hints, coordinator outcome
+  mapping, and one-CAS semantics are unchanged. After a landed coordinator
+  result, the collaborator still increments `landed`, commits the attempt state,
+  and enqueues the predecessor GC hint synchronously with no intervening await.
+- `DirectCommitStats` and its arithmetic moved with the counters and are
+  re-exported from `algo` at the existing path. Resolver construction and
+  eligibility visibility remains `pub(super)` only for the unchanged tests that
+  stay in `algo.rs` until F21-C; a test-only split-hint accessor serves the same
+  temporary boundary.
+- No tests were added, removed, renamed, or relocated. Existing normal,
+  uncertain-CAS, replay, same-key loser, fallback, statistics, inline-pressure,
+  and cancellation coverage remains the durable acceptance suite.

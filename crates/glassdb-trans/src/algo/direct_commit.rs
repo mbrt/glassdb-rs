@@ -1,16 +1,226 @@
+use std::ops::{AddAssign, Sub};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use glassdb_data::{KeyRef, ObjectPath, TxId};
-use glassdb_storage::{CurrentState, InlinePolicy, LockType, NodeLocks, ShardEntry};
+use glassdb_storage::{
+    CurrentState, InlinePolicy, LockType, NodeLocks, Requirement, ShardEntry, StorageError,
+};
 
+use super::attempt::AttemptState;
 use crate::access::{Data, WriteOp};
 use crate::error::TransError;
+use crate::gc::Gc;
+use crate::key_resolver::KeyResolver;
 use crate::key_state_resolver::HolderResolution;
 use crate::shard_coord::{
-    FoldOutcome, ReloadCause, ResolveCtx, ShardResolver, StageAdmission, Step,
+    CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver,
+    StageAdmission, Step,
 };
 use crate::split::SplitHintSink;
+
+/// Direct single-key commit coverage for one snapshot or accumulated interval.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DirectCommitStats {
+    /// Mutation attempts shaped for the direct path.
+    pub candidates: u64,
+    /// Candidates that committed directly.
+    pub landed: u64,
+}
+
+impl AddAssign for DirectCommitStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.candidates += rhs.candidates;
+        self.landed += rhs.landed;
+    }
+}
+
+impl Sub for DirectCommitStats {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self {
+            candidates: self.candidates.saturating_sub(rhs.candidates),
+            landed: self.landed.saturating_sub(rhs.landed),
+        }
+    }
+}
+
+#[derive(Default)]
+struct DirectCommitCounters {
+    candidates: AtomicU64,
+    landed: AtomicU64,
+}
+
+/// Owns the logless single-key commit subprotocol.
+#[derive(Clone)]
+pub(super) struct DirectCommit {
+    resolver: KeyResolver,
+    coord: ShardCoordinator,
+    inline_policy: InlinePolicy,
+    split_hints: SplitHintSink,
+    gc: Gc,
+    counters: Arc<DirectCommitCounters>,
+}
+
+impl DirectCommit {
+    /// Creates the direct-commit path over the engine's shared collaborators.
+    pub(super) fn new(
+        resolver: KeyResolver,
+        coord: ShardCoordinator,
+        inline_policy: InlinePolicy,
+        split_hints: SplitHintSink,
+        gc: Gc,
+    ) -> Self {
+        DirectCommit {
+            resolver,
+            coord,
+            inline_policy,
+            split_hints,
+            gc,
+            counters: Arc::new(DirectCommitCounters::default()),
+        }
+    }
+
+    /// Returns and resets direct single-key commit coverage counters.
+    pub(super) fn stats_and_reset(&self) -> DirectCommitStats {
+        DirectCommitStats {
+            candidates: self.counters.candidates.swap(0, Ordering::Relaxed),
+            landed: self.counters.landed.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    /// Attempts the logless single read-write commit path (ADR-051).
+    ///
+    /// An eligible overwrite commits in one conditional leaf CAS. A certified
+    /// loss is replayable under the same unengaged identity; other non-landing
+    /// outcomes defer to the regular locked protocol. An uncertain CAS is never
+    /// replayed because it may already have committed.
+    pub(super) async fn try_commit(
+        &self,
+        id: &TxId,
+        data: &Data,
+        state: &mut AttemptState,
+    ) -> Result<DirectAttempt, TransError> {
+        let Some(SingleRw {
+            key,
+            value,
+            read_version,
+        }) = single_rw_shape(data)
+        else {
+            return Ok(DirectAttempt::Locked);
+        };
+        self.counters.candidates.fetch_add(1, Ordering::Relaxed);
+        let inline = self.inline_policy;
+        // Reject values no partition could admit before routing; aggregate
+        // pressure from other keys needs the folded leaf (ADR-056).
+        if !inline.admits_value(value.len()) {
+            return Ok(DirectAttempt::Locked);
+        }
+        let raw_key = key.key().to_vec();
+        let Predecessor { leaf_path, writer } = match self
+            .single_rw_predecessor(&key, read_version.as_ref())
+            .await?
+        {
+            Ok(predecessor) => predecessor,
+            // A read superseded before anything was staged is the second
+            // certified body-replay case (ADR-053).
+            Err(Ineligible::Replay) => return Ok(DirectAttempt::Replay),
+            Err(Ineligible::Locked) => return Ok(DirectAttempt::Locked),
+        };
+
+        let resolver = Arc::new(DirectCommitResolver {
+            id: id.clone(),
+            raw_key,
+            leaf_path: leaf_path.clone(),
+            key,
+            value,
+            read_version,
+            inline,
+            split_hints: self.split_hints.clone(),
+        });
+        let outcome = self
+            .coord
+            .submit_shard(&leaf_path, id, resolver, Requirement::Any)
+            .await?;
+        match outcome {
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Landed,
+                ..
+            }) => {
+                self.counters.landed.fetch_add(1, Ordering::Relaxed);
+                state.commit();
+                // The predecessor lost its reference, so it may now be
+                // collectable. Only a hint: it was resolved before the CAS, and
+                // a logless predecessor has no object to collect at all.
+                self.gc.schedule_tx_cleanup(writer);
+                Ok(DirectAttempt::Committed)
+            }
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::InDoubt(msg),
+                ..
+            }) => Err(TransError::Storage(StorageError::Unavailable(msg))),
+            // The round certified that this read-modify-write staged nothing
+            // durable, so its body is reevaluated instead of publishing a holder
+            // merely because it shared a coordinator round (ADR-053).
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Replay,
+                ..
+            }) => Ok(DirectAttempt::Replay),
+            // These outcomes staged nothing either, but none of them certifies
+            // the replay case, so the locked protocol takes over under the same
+            // id: the entry moved or is genuinely contended (`Moved`), the inline
+            // node did not fit or the round was exhausted (`Conflict`), a split
+            // moved the key (`Reroute`), or a shutdown ran no CAS at all
+            // (`None`).
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Moved | FoldOutcome::Conflict | FoldOutcome::Reroute,
+                ..
+            })
+            | None => Ok(DirectAttempt::Locked),
+            Some(_) => Err(TransError::other(
+                "direct commit produced a non-commit outcome",
+            )),
+        }
+    }
+
+    /// Returns the inline-pressure sink used by direct resolver folds.
+    #[cfg(test)]
+    pub(super) fn split_hints_for_test(&self) -> SplitHintSink {
+        self.split_hints.clone()
+    }
+
+    /// Resolves the committed predecessor and the leaf owning the key.
+    ///
+    /// Resolution uses the transaction body's cached shard (`Any`). A stale
+    /// snapshot remains safe because a missed conditional CAS invalidates it and
+    /// re-folds over the winning state.
+    async fn single_rw_predecessor(
+        &self,
+        key: &KeyRef,
+        read_version: Option<&TxId>,
+    ) -> Result<Result<Predecessor, Ineligible>, TransError> {
+        let (lock_state, locator) = self
+            .resolver
+            .resolve_key_holders(key, None, Requirement::Any)
+            .await?;
+        if locator
+            .node()
+            .is_some_and(|node| node.structural_gate().lock_type() == LockType::Write)
+        {
+            return Ok(Err(Ineligible::Locked));
+        }
+        Ok(
+            eligible_writer(&lock_state, read_version).map(|writer| Predecessor {
+                // The leaf that owns this key comes from descent (ADR-031), so
+                // the fold targets it directly instead of recomputing a shard.
+                leaf_path: locator.path,
+                writer,
+            }),
+        )
+    }
+}
 
 /// Commits an eligible single read-write transaction in one conditional leaf
 /// CAS (ADR-051): it publishes `Inline { writer, value }` over the resolved
@@ -207,23 +417,23 @@ pub(super) enum DirectAttempt {
 
 /// A transaction shaped like a single read-write overwrite: the value it puts
 /// and, for a read-modify-write, the version its read observed.
-pub(super) struct SingleRw {
-    pub(super) key: KeyRef,
-    pub(super) value: Arc<[u8]>,
-    pub(super) read_version: Option<TxId>,
+struct SingleRw {
+    key: KeyRef,
+    value: Arc<[u8]>,
+    read_version: Option<TxId>,
 }
 
 /// The predecessor a direct commit builds on and the leaf that owns its key.
-pub(super) struct Predecessor {
-    pub(super) leaf_path: ObjectPath,
-    pub(super) writer: TxId,
+struct Predecessor {
+    leaf_path: ObjectPath,
+    writer: TxId,
 }
 
 /// Recognizes a transaction the direct commit path can publish: exactly one put,
 /// no scans, and every read of that same key and found. A delete publishes a
 /// tombstone and a read that found nothing makes this a create; neither has a
 /// predecessor for a direct commit to build on.
-pub(super) fn single_rw_shape(data: &Data) -> Option<SingleRw> {
+fn single_rw_shape(data: &Data) -> Option<SingleRw> {
     if data.writes.len() != 1 || !data.scans.is_empty() {
         return None;
     }
