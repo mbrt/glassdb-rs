@@ -160,6 +160,25 @@ impl ListCursor {
 /// A positive upper bound on the objects returned by one listing call.
 pub type ListLimit = NonZeroUsize;
 
+/// Validates the provider-independent arguments to [`Backend::list`].
+///
+/// A [`ListLimit`] is positive by construction. Cursors remain provider-opaque;
+/// implementations reject tokens they cannot continue from as
+/// [`BackendError::InvalidCursor`].
+pub fn validate_list_args(
+    prefix: &str,
+    _cursor: Option<&ListCursor>,
+    _limit: ListLimit,
+) -> Result<(), BackendError> {
+    if prefix.is_empty() || prefix.ends_with('/') {
+        Ok(())
+    } else {
+        Err(BackendError::other(format!(
+            "list prefix must be empty or end in '/': {prefix:?}"
+        )))
+    }
+}
+
 /// One page of object paths returned by [`Backend::list`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ListPage {
@@ -280,5 +299,45 @@ impl<B: Backend + ?Sized + 'static> Backend for std::sync::Arc<B> {
         limit: ListLimit,
     ) -> Result<ListPage, BackendError> {
         (**self).list(prefix, cursor, limit).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_argument_boundaries() {
+        let cursor = ListCursor::new("opaque");
+        let one = ListLimit::new(1).unwrap();
+        let largest = ListLimit::new(usize::MAX).unwrap();
+
+        for (prefix, cursor, limit) in [
+            ("", None, one),
+            ("/", Some(&cursor), one),
+            ("a/", None, largest),
+            ("a/b/", Some(&cursor), largest),
+        ] {
+            assert!(
+                validate_list_args(prefix, cursor, limit).is_ok(),
+                "prefix {prefix:?}"
+            );
+        }
+
+        for (prefix, cursor) in [("a", None), ("a/b", Some(&cursor))] {
+            let error = validate_list_args(prefix, cursor, one).unwrap_err();
+            match error {
+                BackendError::Other { msg, source } => {
+                    assert_eq!(
+                        msg,
+                        format!("list prefix must be empty or end in '/': {prefix:?}")
+                    );
+                    assert!(source.is_none());
+                }
+                error => panic!("prefix {prefix:?} returned {error:?}"),
+            }
+        }
+
+        assert!(ListLimit::new(0).is_none());
     }
 }

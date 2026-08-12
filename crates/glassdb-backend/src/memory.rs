@@ -10,7 +10,9 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
+use crate::{
+    Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version, validate_list_args,
+};
 
 #[derive(Clone, Default)]
 struct Object {
@@ -145,7 +147,7 @@ impl Backend for MemoryBackend {
         cursor: Option<&ListCursor>,
         limit: ListLimit,
     ) -> Result<ListPage, BackendError> {
-        validate_list_prefix(prefix)?;
+        validate_list_args(prefix, cursor, limit)?;
         let after = cursor
             .map(|cursor| decode_list_cursor(prefix, cursor))
             .transpose()?;
@@ -171,16 +173,6 @@ impl Backend for MemoryBackend {
             None
         };
         Ok(ListPage { objects, next })
-    }
-}
-
-fn validate_list_prefix(prefix: &str) -> Result<(), BackendError> {
-    if prefix.is_empty() || prefix.ends_with('/') {
-        Ok(())
-    } else {
-        Err(BackendError::other(format!(
-            "list prefix must be empty or end in '/': {prefix:?}"
-        )))
     }
 }
 
@@ -276,11 +268,26 @@ mod tests {
         assert_eq!(second.objects, vec!["d/sub/x", "d/sub/y"]);
         assert!(second.next.is_none());
 
-        let err = b
+        let error = b
             .list("other/", first.next.as_ref(), limit)
             .await
             .unwrap_err();
-        assert!(matches!(err, BackendError::InvalidCursor));
+        assert!(matches!(error, BackendError::InvalidCursor));
+
+        let invalid = ListCursor::new("invalid");
+        let empty = ListCursor::new("");
+        for cursor in [None, Some(&invalid), Some(&empty)] {
+            assert!(matches!(
+                b.list("invalid", cursor, limit).await,
+                Err(BackendError::Other { .. })
+            ));
+        }
+        for cursor in [&invalid, &empty] {
+            assert!(matches!(
+                b.list("d/", Some(cursor), limit).await,
+                Err(BackendError::InvalidCursor)
+            ));
+        }
     }
 
     #[tokio::test]

@@ -697,11 +697,20 @@ async fn list_is_recursive_and_paginated() {
     assert_eq!(third.objects, vec!["d/root"]);
     assert!(third.next.is_none());
 
-    let err = b
-        .list("d/", Some(&ListCursor::new("invalid")), limit)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, BackendError::InvalidCursor));
+    let invalid = ListCursor::new("invalid");
+    let empty = ListCursor::new("");
+    for cursor in [None, Some(&invalid), Some(&empty)] {
+        assert!(matches!(
+            b.list("invalid", cursor, limit).await,
+            Err(BackendError::Other { .. })
+        ));
+    }
+    for cursor in [&invalid, &empty] {
+        assert!(matches!(
+            b.list("d/", Some(cursor), limit).await,
+            Err(BackendError::InvalidCursor)
+        ));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

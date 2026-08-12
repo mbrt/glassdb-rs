@@ -17,6 +17,7 @@ use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use glassdb_backend::{
     Backend, BackendError, Cause, ListCursor, ListLimit, ListPage, ReadReply, Version,
+    validate_list_args,
 };
 
 const MAX_LIST_PAGE_SIZE: usize = 1_000;
@@ -417,7 +418,7 @@ impl Backend for S3Backend {
         cursor: Option<&ListCursor>,
         limit: ListLimit,
     ) -> Result<ListPage, BackendError> {
-        validate_list_prefix(prefix)?;
+        validate_list_args(prefix, cursor, limit)?;
         let max_keys = i32::try_from(limit.get().min(MAX_LIST_PAGE_SIZE)).unwrap();
         let mut op = self
             .client
@@ -663,14 +664,4 @@ fn in_doubt(op: &str, path: &str) -> BackendError {
 /// from 25ms, capped at one second.
 fn conflict_backoff(attempt: u32) -> Duration {
     Duration::from_millis(25u64.saturating_mul(1u64 << attempt)).min(Duration::from_secs(1))
-}
-
-fn validate_list_prefix(prefix: &str) -> Result<(), BackendError> {
-    if prefix.is_empty() || prefix.ends_with('/') {
-        Ok(())
-    } else {
-        Err(BackendError::other(format!(
-            "list prefix must be empty or end in '/': {prefix:?}"
-        )))
-    }
 }

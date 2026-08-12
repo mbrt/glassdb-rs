@@ -11,6 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use glassdb_backend::{
     Backend, BackendError, Cause, ListCursor, ListLimit, ListPage, ReadReply, Version,
+    validate_list_args,
 };
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::header::CONTENT_TYPE;
@@ -351,7 +352,7 @@ impl Backend for GcsBackend {
         cursor: Option<&ListCursor>,
         limit: ListLimit,
     ) -> Result<ListPage, BackendError> {
-        validate_list_prefix(prefix)?;
+        validate_list_args(prefix, cursor, limit)?;
         let max_results = u32::try_from(limit.get().min(MAX_LIST_PAGE_SIZE)).unwrap();
         let mut query = vec![
             ("prefix", prefix.to_string()),
@@ -530,14 +531,4 @@ fn multipart_body(json: &str, value: &[u8]) -> Vec<u8> {
     body.extend_from_slice(value);
     body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
     body
-}
-
-fn validate_list_prefix(prefix: &str) -> Result<(), BackendError> {
-    if prefix.is_empty() || prefix.ends_with('/') {
-        Ok(())
-    } else {
-        Err(BackendError::other(format!(
-            "list prefix must be empty or end in '/': {prefix:?}"
-        )))
-    }
 }

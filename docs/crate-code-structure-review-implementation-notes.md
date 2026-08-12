@@ -190,3 +190,28 @@ working document and is intentionally not committed with these changes.
 - Adversarial review found no receipt-completeness, ordering, cleanup, evidence,
   or test-pruning issue. No persistent bytes, backend operations, retry behavior,
   or public API changed.
+
+## F24-A — Centralize list argument validation
+
+- Added one provider-independent listing validator in `glassdb-backend` and
+  migrated the memory, S3, and GCS implementations to call it before cursor
+  decoding or provider request construction. Invalid prefixes retain the exact
+  `BackendError::Other` message and source shape.
+- Prefix shape is the only raw argument rule requiring a runtime check today:
+  `ListLimit` is positive by construction, while provider-issued cursors remain
+  opaque and provider-rejected tokens remain `BackendError::InvalidCursor`.
+- Cursor/prefix binding, a validated request value, middleware/caller migration,
+  and provider page-size clamping intentionally remain unchanged for F24-C
+  through F24-F. No backend request, pagination, or transport behavior changed.
+- A compact shared boundary table covers valid and invalid prefix shapes,
+  cursor presence, minimum/maximum limits, the zero-limit type boundary, and the
+  exact public error. Existing provider pagination tests now also prove all
+  three concrete backends invoke the shared invalid-prefix boundary; no copied
+  standalone test suite was added ahead of F24-B.
+- Adversarial review found that the initial provider smoke assertions did not
+  fully demonstrate cursor classification or validation precedence. Each
+  existing provider pagination test now runs the same compact boundary rows:
+  malformed prefixes return `Other` regardless of cursor presence, while an
+  arbitrary or empty cursor under a valid prefix returns `InvalidCursor`. This
+  remains local characterization rather than introducing F24-B's reusable
+  conformance suite early.
