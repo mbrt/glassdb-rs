@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use glassdb_data::{CollectionId, MAX_COLLECTION_NAME_BYTES, TxId, paths};
+use glassdb_data::{CollectionAddress, CollectionId, MAX_COLLECTION_NAME_BYTES, ObjectPath, TxId};
 use glassdb_proto as pb;
 use prost::Message;
 
@@ -271,11 +271,11 @@ impl Default for CollectionRecord {
 impl Codec for CollectionRecord {
     type Value = CollectionRecord;
 
-    fn decode(_path: &str, body: &[u8]) -> Result<Self::Value, StorageError> {
+    fn decode(_path: &ObjectPath, body: &[u8]) -> Result<Self::Value, StorageError> {
         CollectionRecord::decode(body)
     }
 
-    fn encode(record: &Self::Value) -> Result<Vec<u8>, StorageError> {
+    fn encode(_path: &ObjectPath, record: &Self::Value) -> Result<Vec<u8>, StorageError> {
         Ok(record.encode())
     }
 
@@ -283,8 +283,8 @@ impl Codec for CollectionRecord {
         record.encoded_len()
     }
 
-    fn valid_path(path: &str) -> bool {
-        paths::is_collection_record(path)
+    fn accepts(path: &ObjectPath) -> bool {
+        matches!(path, ObjectPath::CollectionRecord { .. })
     }
 
     fn name() -> &'static str {
@@ -309,10 +309,10 @@ impl CollectionStore {
     /// Loads a collection record, or returns [`StorageError::NotFound`].
     pub async fn load_record(
         &self,
-        prefix: &str,
+        collection: &CollectionAddress,
         requirement: Requirement,
     ) -> Result<(CollectionRecord, Observation<CollectionRecord>), StorageError> {
-        let observed = self.load_record_state(prefix, requirement).await?;
+        let observed = self.load_record_state(collection, requirement).await?;
         let record = observed
             .value()
             .map(|record| record.as_ref().clone())
@@ -323,11 +323,16 @@ impl CollectionStore {
     /// Loads the exact record observation, including observed absence.
     pub async fn load_record_state(
         &self,
-        prefix: &str,
+        collection: &CollectionAddress,
         requirement: Requirement,
     ) -> Result<Observation<CollectionRecord>, StorageError> {
         self.records
-            .read(&paths::collection_record(prefix), requirement)
+            .read(
+                ObjectPath::CollectionRecord {
+                    collection: collection.clone(),
+                },
+                requirement,
+            )
             .await
     }
 
@@ -351,25 +356,27 @@ impl CollectionStore {
     /// Creates a collection record if absent.
     pub async fn create_record(
         &self,
-        prefix: &str,
+        collection: &CollectionAddress,
         record: &CollectionRecord,
     ) -> Result<bool, StorageError> {
-        Ok(self.create_record_observed(prefix, record).await?.is_some())
+        Ok(self
+            .create_record_observed(collection, record)
+            .await?
+            .is_some())
     }
 
     /// Creates a record and returns its installed observation.
     pub async fn create_record_observed(
         &self,
-        prefix: &str,
+        collection: &CollectionAddress,
         record: &CollectionRecord,
     ) -> Result<Option<Observation<CollectionRecord>>, StorageError> {
+        let path = ObjectPath::CollectionRecord {
+            collection: collection.clone(),
+        };
         match self
             .records
-            .create(
-                &paths::collection_record(prefix),
-                None,
-                Arc::new(record.clone()),
-            )
+            .create(path, None, Arc::new(record.clone()))
             .await?
         {
             CasResult::Committed(observed) => Ok(Some(observed)),
@@ -544,27 +551,27 @@ mod tests {
         );
         let records = CollectionStore::new(objects.clone());
         let shards = ShardStore::new(objects);
-        let prefix = "db/_c/collection";
+        let collection = CollectionAddress::new("db", collection_id(9));
 
         assert!(
             records
-                .create_record(prefix, &CollectionRecord::new())
+                .create_record(&collection, &CollectionRecord::new())
                 .await
                 .unwrap()
         );
         assert!(
             shards
-                .create_root(prefix, &Node::leaf(Shard::new()))
+                .create_root(&collection, &Node::leaf(Shard::new()))
                 .await
                 .unwrap()
         );
 
         let (mut record, record_before) = records
-            .load_record(prefix, Requirement::AtLeast(timeline.now()))
+            .load_record(&collection, Requirement::AtLeast(timeline.now()))
             .await
             .unwrap();
         let (mut root, root_before) = shards
-            .load_root(prefix, Requirement::AtLeast(timeline.now()))
+            .load_root(&collection, Requirement::AtLeast(timeline.now()))
             .await
             .unwrap();
 
@@ -572,11 +579,11 @@ mod tests {
         assert!(record.add_child(b"child".to_vec(), child).unwrap());
         assert!(records.store_record(&record, &record_before).await.unwrap());
         let (_, record_after) = records
-            .load_record(prefix, Requirement::AtLeast(timeline.now()))
+            .load_record(&collection, Requirement::AtLeast(timeline.now()))
             .await
             .unwrap();
         let (_, root_after_record_write) = shards
-            .load_root(prefix, Requirement::AtLeast(timeline.now()))
+            .load_root(&collection, Requirement::AtLeast(timeline.now()))
             .await
             .unwrap();
         assert_ne!(record_before.revision(), record_after.revision());
@@ -589,12 +596,12 @@ mod tests {
         root.add_membership_reader(TxId::from_bytes(vec![1]));
         assert!(
             shards
-                .store_root(prefix, &root, &root_after_record_write)
+                .store_root(&collection, &root, &root_after_record_write)
                 .await
                 .unwrap()
         );
         let (_, record_after_root_write) = records
-            .load_record(prefix, Requirement::AtLeast(timeline.now()))
+            .load_record(&collection, Requirement::AtLeast(timeline.now()))
             .await
             .unwrap();
         assert_eq!(

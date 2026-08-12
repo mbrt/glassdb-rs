@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use glassdb_data::{CollectionAddress, KeyRef, LeafRef, TxId};
+use glassdb_data::{CollectionAddress, KeyRef, ObjectPath, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{LockType, NodeLocks, Requirement, ShardEntry};
 
@@ -250,11 +250,11 @@ impl<'a> NodeLockReconciler<'a> {
 /// The leaf-coordinator resolver for structural-gate acquisition.
 pub(crate) struct StructuralGateResolver {
     id: TxId,
-    path: String,
+    path: ObjectPath,
 }
 
 impl StructuralGateResolver {
-    pub(crate) fn new(id: TxId, path: String) -> Self {
+    pub(crate) fn new(id: TxId, path: ObjectPath) -> Self {
         Self { id, path }
     }
 }
@@ -267,10 +267,12 @@ impl ShardResolver for StructuralGateResolver {
         staged: &BTreeMap<Vec<u8>, ShardEntry>,
         staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
-        let collection = LeafRef::from_physical_path(&self.path)
-            .map_err(|e| TransError::with_source("parsing leaf path", e))?
-            .collection()
-            .clone();
+        let collection = match &self.path {
+            ObjectPath::TreeRoot { collection } | ObjectPath::Node { collection, .. } => {
+                collection.clone()
+            }
+            _ => return Err(TransError::other("structural gate target is not a leaf")),
+        };
         let reconciler = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id);
         let entries = match reconciler
             .quiesce_entries(&collection, staged, ctx.requirement)

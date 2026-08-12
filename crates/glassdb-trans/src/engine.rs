@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use glassdb_backend::{Backend, BackendError, BackendStats, StatsBackend};
 use glassdb_concurr::{Background, DedupKeySnapshot, RetryConfig};
-use glassdb_data::{CollectionAddress, DatabaseId, KeyRef, TxId, paths};
+use glassdb_data::{CollectionAddress, CollectionId, DatabaseId, DbRoot, KeyRef, ObjectPath, TxId};
 use glassdb_storage::transaction::TLogger;
 use glassdb_storage::{
     CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, Node,
@@ -169,6 +169,8 @@ impl Engine {
             inline_policy,
             protocol_timing,
         } = config;
+        let db_root = DbRoot::try_from(name)
+            .map_err(|error| StorageError::with_source("validating database root", error))?;
         let dyn_backend: Arc<dyn Backend> = backend.clone();
         let (persistent, timeline) = match persistent_cache {
             Some(setup) => {
@@ -184,9 +186,9 @@ impl Engine {
         let objects = CachedStore::new(dyn_backend, cache_size, timeline.clone(), persistent);
         let records = CollectionStore::new(objects.clone());
         let shards = ShardStore::new(objects.clone());
-        Self::verify_permanent_collection(name, &records, &shards, &timeline).await?;
+        Self::verify_permanent_collection(&db_root, &records, &shards, &timeline).await?;
 
-        let tlogger = TLogger::new(objects.clone(), name);
+        let tlogger = TLogger::new(objects.clone(), db_root.clone());
         let background = Arc::new(Background::new());
         let background_weak = Arc::downgrade(&background);
         let monitor = Monitor::with_config(
@@ -210,7 +212,7 @@ impl Engine {
             monitor.clone(),
             key_state,
             retry,
-            name,
+            db_root,
             split_policy,
             inline_policy,
         );
@@ -282,9 +284,14 @@ impl Engine {
     where
         B: Backend + ?Sized,
     {
-        let prefix = CollectionAddress::root(name).physical_prefix();
-        Self::ensure_collection_record(backend, &paths::collection_record(&prefix)).await?;
-        Self::ensure_tree_root(backend, &paths::tree_root(&prefix)).await
+        let collection = CollectionAddress::root(name);
+        let record_path = ObjectPath::CollectionRecord {
+            collection: collection.clone(),
+        }
+        .to_string();
+        Self::ensure_collection_record(backend, &record_path).await?;
+        let root_path = ObjectPath::TreeRoot { collection }.to_string();
+        Self::ensure_tree_root(backend, &root_path).await
     }
 
     /// Reads one logical key with the requested staleness allowance.
@@ -389,14 +396,14 @@ impl Engine {
     }
 
     async fn verify_permanent_collection(
-        name: &str,
+        db_root: &DbRoot,
         records: &CollectionStore,
         shards: &ShardStore,
         timeline: &Timeline,
     ) -> Result<(), StorageError> {
-        let prefix = CollectionAddress::root(name).physical_prefix();
+        let collection = CollectionAddress::from_db_root(db_root.clone(), CollectionId::root());
         let requirement = Requirement::AtLeast(timeline.now());
-        match records.load_record(&prefix, requirement).await {
+        match records.load_record(&collection, requirement).await {
             Ok(_) => {}
             Err(StorageError::NotFound) => {
                 return Err(StorageError::other(
@@ -405,7 +412,7 @@ impl Engine {
             }
             Err(error) => return Err(error),
         }
-        match shards.load_root(&prefix, requirement).await {
+        match shards.load_root(&collection, requirement).await {
             Ok(_) => Ok(()),
             Err(StorageError::NotFound) => Err(StorageError::other(
                 "initialized database is missing its permanent tree root",

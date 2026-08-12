@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glassdb_data::{
-    CollectionAddress, CollectionId, KeyRef, LeafRef, MAX_COLLECTION_NAME_BYTES, TxId, paths,
+    CollectionAddress, CollectionId, KeyRef, LeafRef, MAX_COLLECTION_NAME_BYTES, NodeToken,
+    ObjectPath, TxId,
 };
 use glassdb_proto as pb;
 use prost::Message;
@@ -19,13 +20,20 @@ pub(crate) struct TxLogCodec;
 impl TxLogCodec {
     /// Encodes a transaction log as its canonical persisted body.
     pub(crate) fn encode(log: &TxLog) -> Result<Vec<u8>, StorageError> {
+        Self::encode_for_database(log, None)
+    }
+
+    fn encode_for_database(
+        log: &TxLog,
+        expected_db_root: Option<&str>,
+    ) -> Result<Vec<u8>, StorageError> {
         let timestamp = log
             .timestamp
             .ok_or_else(|| StorageError::other("transaction log has no persisted timestamp"))?;
         if log.id.is_unset() {
             return Err(StorageError::other("empty transaction ID"));
         }
-        validate_single_database(log)?;
+        validate_database_membership(log, expected_db_root)?;
 
         let mut collection_writes: BTreeMap<CollectionAddress, pb::CollectionWrites> =
             BTreeMap::new();
@@ -94,14 +102,27 @@ impl TxLogCodec {
 impl Codec for TxLogCodec {
     type Value = TxLog;
 
-    fn decode(path: &str, body: &[u8]) -> Result<Self::Value, StorageError> {
-        let id = paths::transaction_id_of(path)
-            .map_err(|error| StorageError::with_source("parsing transaction path", error))?;
-        TxLogCodec::decode(paths::db_root_of(path), &id, body)
+    fn decode(path: &ObjectPath, body: &[u8]) -> Result<Self::Value, StorageError> {
+        let ObjectPath::Transaction { db_root, id } = path else {
+            return Err(StorageError::other(
+                "transaction log has a non-transaction path",
+            ));
+        };
+        TxLogCodec::decode(db_root.as_str(), id, body)
     }
 
-    fn encode(log: &Self::Value) -> Result<Vec<u8>, StorageError> {
-        TxLogCodec::encode(log)
+    fn encode(path: &ObjectPath, log: &Self::Value) -> Result<Vec<u8>, StorageError> {
+        let ObjectPath::Transaction { db_root, id } = path else {
+            return Err(StorageError::other(
+                "transaction log has a non-transaction path",
+            ));
+        };
+        if id != &log.id {
+            return Err(StorageError::other(
+                "transaction-log path does not match its ID",
+            ));
+        }
+        TxLogCodec::encode_for_database(log, Some(db_root.as_str()))
     }
 
     fn size(log: &Self::Value) -> usize {
@@ -116,7 +137,9 @@ impl Codec for TxLogCodec {
                 .iter()
                 .map(|lock| match lock {
                     TxLock::Entry { key, .. } => key.key().len(),
-                    TxLock::Membership { leaf, .. } => leaf.node_token().map_or(0, str::len),
+                    TxLock::Membership { leaf, .. } => {
+                        leaf.node_token().map_or(0, |token| token.as_str().len())
+                    }
                     TxLock::Directory { .. } | TxLock::Topology { .. } => 0,
                 })
                 .sum::<usize>()
@@ -129,8 +152,8 @@ impl Codec for TxLogCodec {
             + std::mem::size_of::<TxLog>()
     }
 
-    fn valid_path(path: &str) -> bool {
-        paths::transaction_id_of(path).is_ok()
+    fn accepts(path: &ObjectPath) -> bool {
+        matches!(path, ObjectPath::Transaction { .. })
     }
 
     fn name() -> &'static str {
@@ -227,7 +250,10 @@ fn decode_membership_locks(
             let leaf = match lock.target.as_ref() {
                 Some(pb::membership_lock::Target::Root(true)) => LeafRef::root(collection.clone()),
                 Some(pb::membership_lock::Target::Node(token)) if !token.is_empty() => {
-                    LeafRef::node(collection.clone(), token.as_str())
+                    let token = NodeToken::try_from(token.as_str()).map_err(|error| {
+                        StorageError::with_source("parsing membership-lock node token", error)
+                    })?;
+                    LeafRef::node(collection.clone(), token)
                 }
                 _ => {
                     return Err(StorageError::other(
@@ -386,9 +412,17 @@ fn decode_collection_id(
     Ok(CollectionAddress::new(db_root, id))
 }
 
-fn validate_single_database(log: &TxLog) -> Result<(), StorageError> {
+fn validate_database_membership(
+    log: &TxLog,
+    expected_db_root: Option<&str>,
+) -> Result<(), StorageError> {
     let mut db_root: Option<String> = None;
     let mut check = |collection: &CollectionAddress| -> Result<(), StorageError> {
+        if expected_db_root.is_some_and(|expected| expected != collection.db_root()) {
+            return Err(StorageError::other(
+                "transaction-log path does not match its database root",
+            ));
+        }
         match db_root.as_deref() {
             Some(root) if root != collection.db_root() => Err(StorageError::other(
                 "transaction log spans multiple database roots",
@@ -512,7 +546,7 @@ mod tests {
                     typ: LockType::Read,
                 },
                 TxLock::Membership {
-                    leaf: LeafRef::node(parent.clone(), "node-token"),
+                    leaf: LeafRef::node(parent.clone(), NodeToken::from_bytes([7; 16])),
                     typ: LockType::Create,
                 },
                 TxLock::Directory {

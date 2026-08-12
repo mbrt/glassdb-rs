@@ -34,7 +34,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::future::join_all;
 use glassdb_concurr::{RetryConfig, rt, shard::Sharded};
-use glassdb_data::{KeyRef, LeafRef, TxId, paths};
+use glassdb_data::{KeyRef, LeafRef, ObjectPath, TxId};
 use glassdb_storage::transaction::TxLock;
 use glassdb_storage::{
     CurrentState, LeafObservation, LockType, NodeLocks, Requirement, ShardEntry, TreeRouter,
@@ -53,7 +53,7 @@ use crate::wound_wait::{Reclaim, try_reclaim};
 
 /// One independent partition of the per-transaction held-lock bookkeeping: the
 /// shard/root paths each transaction holds and their lock type.
-type LockerShard = Mutex<HashMap<TxId, HashMap<String, HeldLeaf>>>;
+type LockerShard = Mutex<HashMap<TxId, HashMap<ObjectPath, HeldLeaf>>>;
 
 #[derive(Clone, Copy)]
 struct HeldLeaf {
@@ -64,7 +64,7 @@ struct HeldLeaf {
 /// Aggregate lock strengths locally held by one transaction on one leaf.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldLeafSnapshot {
-    pub path: String,
+    pub path: ObjectPath,
     pub entry_lock: LockType,
     pub membership_lock: LockType,
 }
@@ -128,7 +128,7 @@ struct ShardGroup {
     /// The leaf's object path: the collection root `_r` for a small collection's
     /// single leaf, else a standalone node `_n`, resolved by descent. This is
     /// the coordinator submit target and the recorded held-lock path.
-    path: String,
+    path: ObjectPath,
     leaf: LeafRef,
     /// Per-key intentions, in ascending raw-key order.
     intents: Vec<KeyIntent>,
@@ -139,8 +139,8 @@ struct ShardGroup {
 /// the per-leaf key groups this transaction holds and is later passed back for
 /// write-back.
 pub(crate) struct LockedTx {
-    groups: BTreeMap<String, ShardGroup>,
-    validations: BTreeMap<String, LeafObservation>,
+    groups: BTreeMap<ObjectPath, ShardGroup>,
+    validations: BTreeMap<ObjectPath, LeafObservation>,
 }
 
 impl LockedTx {
@@ -191,7 +191,7 @@ async fn build_groups(
     router: &TreeRouter,
     data: &Data,
     scan_requirement: Requirement,
-) -> Result<BTreeMap<String, ShardGroup>, TransError> {
+) -> Result<BTreeMap<ObjectPath, ShardGroup>, TransError> {
     let mut by_key: BTreeMap<KeyRef, Desired> = BTreeMap::new();
     for w in &data.writes {
         let desired = match &w.op {
@@ -222,11 +222,9 @@ async fn build_groups(
         .await
         .map_err(|error| TransError::from(error).context("grouping keys by leaf"))?;
 
-    let mut groups: BTreeMap<String, ShardGroup> = BTreeMap::new();
+    let mut groups: BTreeMap<ObjectPath, ShardGroup> = BTreeMap::new();
     for group in grouped {
-        let leaf = LeafRef::from_physical_path(&group.path).map_err(|e| {
-            TransError::with_source(format!("parsing leaf path {:?}", group.path), e)
-        })?;
+        let leaf = leaf_ref(&group.path)?;
         let mut intents: Vec<KeyIntent> = group
             .keys
             .into_iter()
@@ -237,10 +235,11 @@ async fn build_groups(
             })
             .collect();
         intents.sort_by(|a, b| a.raw_key.cmp(&b.raw_key));
+        let path = group.path;
         groups.insert(
-            group.path.clone(),
+            path.clone(),
             ShardGroup {
-                path: group.path,
+                path,
                 leaf,
                 intents,
                 membership: LockType::None,
@@ -256,7 +255,7 @@ async fn build_groups(
         }
         for leaf in router
             .leaves_through(
-                &scan.collection.physical_prefix(),
+                &scan.collection,
                 &scan.range.start,
                 scan.frontier(),
                 scan_requirement,
@@ -267,8 +266,7 @@ async fn build_groups(
             let group = groups
                 .entry(leaf.path.clone())
                 .or_insert_with(|| ShardGroup {
-                    leaf: LeafRef::from_physical_path(&leaf.path)
-                        .expect("directory returned a physical leaf path"),
+                    leaf: leaf_ref(&leaf.path).expect("router returned a physical leaf path"),
                     path: leaf.path,
                     intents: Vec::new(),
                     membership: LockType::None,
@@ -279,6 +277,16 @@ async fn build_groups(
         }
     }
     Ok(groups)
+}
+
+fn leaf_ref(path: &ObjectPath) -> Result<LeafRef, TransError> {
+    match path {
+        ObjectPath::TreeRoot { collection } => Ok(LeafRef::root(collection.clone())),
+        ObjectPath::Node { collection, token } => {
+            Ok(LeafRef::node(collection.clone(), token.clone()))
+        }
+        _ => Err(TransError::other("router returned a non-leaf object path")),
+    }
 }
 
 // --- Shard resolvers (the locking policy the Locker installs, ADR-028) ------
@@ -715,7 +723,7 @@ pub(crate) enum LockOutcome {
 
 /// Outcome of acquiring locks across all touched shards.
 enum ShardsOutcome {
-    Locked(BTreeMap<String, LeafObservation>),
+    Locked(BTreeMap<ObjectPath, LeafObservation>),
     Conflict,
     LeafFull,
 }
@@ -866,21 +874,10 @@ impl KeyLocker {
     /// Idempotent and best-effort.
     pub(crate) async fn release_locks(&self, id: &TxId) -> Result<(), TransError> {
         for path in self.held_paths(id) {
-            let pr = paths::parse(&path).map_err(|e| {
-                TransError::with_source(format!("parsing held lock path {path:?}"), e)
-            })?;
-            match pr.typ {
-                // The collection root `_r` is the small collection's single leaf
-                // (ADR-031); a standalone `_n` node is a leaf too. Both carry
-                // only key entries, so releasing the leaf clears every hold.
-                paths::Type::TreeRoot | paths::Type::Node => {
-                    // Release is an idempotent CAS loop: a stale seed can only
-                    // lose its precondition and reload the winner.
-                    self.release_leaf_at(id, &path, Requirement::Any).await?
-                }
-                // Only leaves carry transaction locks.
-                _ => {}
-            }
+            // Every recorded hold came from a routed leaf. Release is an
+            // idempotent CAS loop: a stale seed can only lose its precondition
+            // and reload the winner.
+            self.release_leaf_at(id, &path, Requirement::Any).await?
         }
         self.clear_tx_locks(id);
         Ok(())
@@ -936,7 +933,7 @@ impl KeyLocker {
     pub(crate) async fn write_back_one_put(
         &self,
         id: &TxId,
-        leaf_path: &str,
+        leaf_path: &ObjectPath,
         raw_key: &[u8],
         key: &KeyRef,
     ) -> Vec<TxId> {
@@ -951,7 +948,11 @@ impl KeyLocker {
     }
 
     /// Releases `id` from one exact leaf path.
-    pub(crate) async fn release_leaf(&self, id: &TxId, path: &str) -> Result<(), TransError> {
+    pub(crate) async fn release_leaf(
+        &self,
+        id: &TxId,
+        path: &ObjectPath,
+    ) -> Result<(), TransError> {
         // A release stages no decision that can become unsafe from a stale
         // seed; its CAS arbitrates with any newer leaf and retries on conflict.
         self.release_leaf_at(id, path, Requirement::Any).await
@@ -1008,7 +1009,7 @@ impl KeyLocker {
     async fn lock_shards_at(
         &self,
         id: &TxId,
-        groups: &BTreeMap<String, ShardGroup>,
+        groups: &BTreeMap<ObjectPath, ShardGroup>,
         serial: bool,
         requirement: Requirement,
     ) -> Result<ShardsOutcome, TransError> {
@@ -1061,7 +1062,7 @@ impl KeyLocker {
     async fn acquire(
         &self,
         id: &TxId,
-        path: &str,
+        path: &ObjectPath,
         intents: Arc<Vec<KeyIntent>>,
         membership: LockType,
         requirement: Requirement,
@@ -1096,11 +1097,11 @@ impl KeyLocker {
     async fn write_back_routed(
         &self,
         id: &TxId,
-        path: &str,
+        path: &ObjectPath,
         intents: Arc<Vec<KeyIntent>>,
         requirement: Requirement,
     ) -> Result<Vec<TxId>, TransError> {
-        let mut pending = vec![(path.to_string(), intents)];
+        let mut pending = vec![(path.clone(), intents)];
         let mut superseded = Vec::new();
         while let Some((path, intents)) = pending.pop() {
             match self
@@ -1136,7 +1137,7 @@ impl KeyLocker {
     async fn write_back_shard(
         &self,
         id: &TxId,
-        path: &str,
+        path: &ObjectPath,
         intents: Arc<Vec<KeyIntent>>,
         requirement: Requirement,
     ) -> Result<WriteBackOutcome, TransError> {
@@ -1173,7 +1174,7 @@ impl KeyLocker {
     async fn release_leaf_at(
         &self,
         id: &TxId,
-        path: &str,
+        path: &ObjectPath,
         requirement: Requirement,
     ) -> Result<(), TransError> {
         let resolver = Arc::new(ReleaseResolver { id: id.clone() });
@@ -1284,10 +1285,10 @@ impl KeyLocker {
     }
 
     /// Records the aggregate entry and membership strengths held on one leaf.
-    fn record_leaf_lock(&self, id: &TxId, path: &str, typ: LockType, membership: LockType) {
+    fn record_leaf_lock(&self, id: &TxId, path: &ObjectPath, typ: LockType, membership: LockType) {
         let mut tlocks = self.tlocks.for_key(id.as_bytes()).lock().unwrap();
         tlocks.entry(id.clone()).or_default().insert(
-            path.to_string(),
+            path.clone(),
             HeldLeaf {
                 entry_lock: typ,
                 membership,
@@ -1295,7 +1296,7 @@ impl KeyLocker {
         );
     }
 
-    fn held_membership(&self, id: &TxId, path: &str) -> LockType {
+    fn held_membership(&self, id: &TxId, path: &ObjectPath) -> LockType {
         self.tlocks
             .for_key(id.as_bytes())
             .lock()
@@ -1309,9 +1310,9 @@ impl KeyLocker {
     /// The leaf paths `id` currently holds, sorted ascending for a
     /// deterministic release order (the simulation op-stream oracle requires the
     /// backend CAS sequence to be reproducible).
-    fn held_paths(&self, id: &TxId) -> Vec<String> {
+    fn held_paths(&self, id: &TxId) -> Vec<ObjectPath> {
         let tlocks = self.tlocks.for_key(id.as_bytes()).lock().unwrap();
-        let mut paths: Vec<String> = tlocks
+        let mut paths: Vec<ObjectPath> = tlocks
             .get(id)
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
@@ -1338,7 +1339,7 @@ mod tests {
     };
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::{CollectionAddress, paths};
+    use glassdb_data::{CollectionAddress, DbRoot, ObjectPath};
     use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, Node, Shard, ShardEntry, ShardStore,
@@ -1352,7 +1353,7 @@ mod tests {
     struct NoSplitHints;
 
     impl SplitHinter for NoSplitHints {
-        fn observe_leaf(&self, _path: &str, _shard: &Shard) {}
+        fn observe_leaf(&self, _path: &ObjectPath, _shard: &Shard) {}
     }
 
     struct TlCtx {
@@ -1373,7 +1374,7 @@ mod tests {
     ) -> (Locker, TlCtx) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(b.clone(), 1024, timeline.clone(), None);
-        let tl = TLogger::new(objects.clone(), "test");
+        let tl = TLogger::new(objects.clone(), DbRoot::try_from("test").unwrap());
         let bg = Arc::new(Background::new());
         let mon = Monitor::with_config(
             tl.clone(),
@@ -1386,13 +1387,13 @@ mod tests {
         let shards = ShardStore::new(objects.clone());
         assert!(
             records
-                .create_record(COLL, &CollectionRecord::new())
+                .create_record(&collection(), &CollectionRecord::new())
                 .await
                 .unwrap()
         );
         assert!(
             shards
-                .create_root(COLL, &Node::leaf(Shard::new()))
+                .create_root(&collection(), &Node::leaf(Shard::new()))
                 .await
                 .unwrap()
         );
@@ -1435,10 +1436,14 @@ mod tests {
         TxId::with_priority(order * 1_000_000_000, name.as_bytes())
     }
 
-    const COLL: &str = "test/_c/0000000000000000000000";
-
     fn collection() -> CollectionAddress {
         CollectionAddress::root("test")
+    }
+
+    fn root_path() -> ObjectPath {
+        ObjectPath::TreeRoot {
+            collection: collection(),
+        }
     }
 
     fn key_ref(key: &[u8]) -> KeyRef {
@@ -1481,13 +1486,13 @@ mod tests {
     // Routes an intent to the collection's single leaf `_r` (ADR-031: with split
     // deferred, every key coordinates on the root leaf). The `key` is carried by
     // the intent itself, so it is only used for readability at call sites.
-    fn group_of(_key: &[u8], intent: KeyIntent) -> BTreeMap<String, ShardGroup> {
+    fn group_of(_key: &[u8], intent: KeyIntent) -> BTreeMap<ObjectPath, ShardGroup> {
         group_of_intents(vec![intent])
     }
 
     // Several intents held by one transaction on that same leaf.
-    fn group_of_intents(intents: Vec<KeyIntent>) -> BTreeMap<String, ShardGroup> {
-        let path = paths::tree_root(COLL);
+    fn group_of_intents(intents: Vec<KeyIntent>) -> BTreeMap<ObjectPath, ShardGroup> {
+        let path = root_path();
         let mut g = BTreeMap::new();
         g.insert(
             path.clone(),
@@ -1504,10 +1509,7 @@ mod tests {
     async fn entry_of(ctx: &TlCtx, key: &[u8]) -> Option<ShardEntry> {
         let loaded = ctx
             .shards
-            .load_leaf(
-                &paths::tree_root(COLL),
-                Requirement::AtLeast(ctx.timeline.now()),
-            )
+            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         loaded.entries().lookup(key).cloned()
@@ -1516,14 +1518,19 @@ mod tests {
     async fn replace_root(ctx: &TlCtx, root: &Node) {
         let (_, observed) = ctx
             .shards
-            .load_root(COLL, Requirement::AtLeast(ctx.timeline.now()))
+            .load_root(&collection(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
-        assert!(ctx.shards.store_root(COLL, root, &observed).await.unwrap());
+        assert!(
+            ctx.shards
+                .store_root(&collection(), root, &observed)
+                .await
+                .unwrap()
+        );
     }
 
     // Acquires shard locks in parallel mode, asserting success.
-    async fn lock_ok(locker: &Locker, id: &TxId, groups: &BTreeMap<String, ShardGroup>) {
+    async fn lock_ok(locker: &Locker, id: &TxId, groups: &BTreeMap<ObjectPath, ShardGroup>) {
         match locker
             .keys()
             .lock_shards_at(id, groups, false, Requirement::Any)
@@ -1553,10 +1560,7 @@ mod tests {
         assert_eq!(e.locked_by, vec![tx.clone()]);
         let loaded = ctx
             .shards
-            .load_leaf(
-                &paths::tree_root(COLL),
-                Requirement::AtLeast(ctx.timeline.now()),
-            )
+            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
@@ -1584,7 +1588,11 @@ mod tests {
 
         lock_ok(&locker, &tx, &group_of(b"target", put_intent(b"target"))).await;
 
-        let unrelated_path = paths::from_transaction("test", &unrelated);
+        let unrelated_path = ObjectPath::Transaction {
+            db_root: DbRoot::try_from("test").unwrap(),
+            id: unrelated,
+        }
+        .to_string();
         assert!(
             log.lock()
                 .unwrap()
@@ -1634,10 +1642,7 @@ mod tests {
         ));
         let loaded = ctx
             .shards
-            .load_leaf(
-                &paths::tree_root(COLL),
-                Requirement::AtLeast(ctx.timeline.now()),
-            )
+            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
@@ -1689,10 +1694,7 @@ mod tests {
         assert!(entry_of(&ctx, b"z").await.is_none());
         let loaded = ctx
             .shards
-            .load_leaf(
-                &paths::tree_root(COLL),
-                Requirement::AtLeast(ctx.timeline.now()),
-            )
+            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
@@ -1710,10 +1712,7 @@ mod tests {
         lock_ok(&locker, &tx, &group_of(key, put_intent(key))).await;
         let loaded = ctx
             .shards
-            .load_leaf(
-                &paths::tree_root(COLL),
-                Requirement::AtLeast(ctx.timeline.now()),
-            )
+            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
@@ -1730,10 +1729,10 @@ mod tests {
         ctx.monitor.begin_tx(&tx);
 
         let mut groups = group_of(key, put_intent(key));
-        groups.get_mut(&paths::tree_root(COLL)).unwrap().membership = LockType::Read;
+        groups.get_mut(&root_path()).unwrap().membership = LockType::Read;
         lock_ok(&locker, &tx, &groups).await;
 
-        let path = paths::tree_root(COLL);
+        let path = root_path();
         let loaded = ctx
             .shards
             .load_leaf(&path, Requirement::AtLeast(ctx.timeline.now()))
@@ -1939,10 +1938,7 @@ mod tests {
         assert_eq!(e.current, CurrentState::External { writer: tx });
         let loaded = ctx
             .shards
-            .load_leaf(
-                &paths::tree_root(COLL),
-                Requirement::AtLeast(ctx.timeline.now()),
-            )
+            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
@@ -1963,10 +1959,7 @@ mod tests {
         ctx.monitor.begin_tx(&gate);
         let loaded = ctx
             .shards
-            .load_leaf(
-                &paths::tree_root(COLL),
-                Requirement::AtLeast(ctx.timeline.now()),
-            )
+            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         let mut node = loaded.node().clone();
@@ -1983,10 +1976,7 @@ mod tests {
 
         let loaded = ctx
             .shards
-            .load_leaf(
-                &paths::tree_root(COLL),
-                Requirement::AtLeast(ctx.timeline.now()),
-            )
+            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         assert_eq!(loaded.node().structural_gate().holders(), &[gate]);
@@ -2261,7 +2251,7 @@ mod tests {
         assert_eq!(snap[0].tx_id, tx);
         // A write intention records the held leaf (the small collection's root
         // `_r`) as a write lock.
-        let shard_path = paths::tree_root(COLL);
+        let shard_path = root_path();
         assert!(snap[0].leaves.iter().any(|leaf| {
             leaf.path == shard_path
                 && leaf.entry_lock == LockType::Write
@@ -2285,7 +2275,7 @@ mod tests {
         ctx.monitor.commit_tx(tl).await.unwrap();
 
         // Install the committed pointer directly in the collection's leaf `_r`.
-        let path = paths::tree_root(COLL);
+        let path = root_path();
         let loaded = ctx
             .shards
             .load_leaf(&path, Requirement::AtLeast(ctx.timeline.now()))
@@ -2468,7 +2458,7 @@ mod tests {
             ShardsOutcome::Locked(_)
         ));
 
-        let shard_path = paths::tree_root(COLL);
+        let shard_path = root_path().to_string();
         assert_eq!(
             count_stores(&log, &shard_path),
             1,
@@ -2522,7 +2512,7 @@ mod tests {
             ShardsOutcome::Locked(_)
         ));
 
-        let shard_path = paths::tree_root(COLL);
+        let shard_path = root_path().to_string();
         assert_eq!(
             count_stores(&log, &shard_path),
             1,
@@ -2593,7 +2583,7 @@ mod tests {
         let (locker, ctx, log, gate) = gated_locker_with(false).await;
         let ka = b"key-a".to_vec();
         let kb = same_shard_sibling(&ka);
-        let shard_path = paths::tree_root(COLL);
+        let shard_path = root_path().to_string();
 
         let tx1 = mk_tid(1, "w1");
         let tx2 = mk_tid(2, "w2");
@@ -2635,7 +2625,7 @@ mod tests {
         let (locker, ctx, log, gate) = gated_locker_with(false).await;
         let ka = b"key-a".to_vec();
         let kb = same_shard_sibling(&ka);
-        let shard_path = paths::tree_root(COLL);
+        let shard_path = root_path().to_string();
 
         let tx1 = mk_tid(1, "w1");
         let lt1 = lock_commit(&locker, &ctx, &tx1, &ka).await;
@@ -2761,7 +2751,7 @@ mod tests {
         let writer = mk_tid(1, "writer");
         let locked = Arc::new(lock_commit(&locker, &ctx, &writer, key).await);
         let landed = Arc::new(Notify::new());
-        let leaf_path = paths::tree_root(COLL);
+        let leaf_path = root_path().to_string();
         hook.set_after({
             let landed = landed.clone();
             move |operation, outcome| {
@@ -2812,7 +2802,7 @@ mod tests {
         let (locker, ctx, log, gate) = gated_locker_with(false).await;
         let ka = b"key-a".to_vec();
         let kb = same_shard_sibling(&ka);
-        let shard_path = paths::tree_root(COLL);
+        let shard_path = root_path().to_string();
 
         let tx1 = mk_tid(1, "r1");
         let tx2 = mk_tid(2, "r2");
@@ -2892,7 +2882,7 @@ mod tests {
         rt::sleep(Duration::from_millis(50)).await;
         assert!(!hy.is_finished(), "the younger waits for the older holder");
 
-        let shard_path = paths::tree_root(COLL);
+        let shard_path = root_path().to_string();
         assert_eq!(
             count_stores(&log, &shard_path),
             1,
@@ -2958,7 +2948,7 @@ mod tests {
         // A load per poll, but only three CAS stores: the older's acquire, the
         // older's release, then the younger's acquire. The younger's waiting
         // rounds stage nothing, so they add no stores.
-        let shard_path = paths::tree_root(COLL);
+        let shard_path = root_path().to_string();
         assert_eq!(count_stores(&log, &shard_path), 3);
     }
 
@@ -3025,7 +3015,7 @@ mod tests {
 
         // Three CAS stores: the winner's acquire, its release, then the loser's
         // acquire. The loser's waiting rounds stage nothing.
-        let shard_path = paths::tree_root(COLL);
+        let shard_path = root_path().to_string();
         assert_eq!(count_stores(&log, &shard_path), 3);
     }
 
@@ -3039,7 +3029,7 @@ mod tests {
         for (wb_order, acq_order) in [(1u64, 2u64), (2u64, 1u64)] {
             let (locker, ctx, log, gate) = gated_locker_with(false).await;
             let key = b"key";
-            let shard_path = paths::tree_root(COLL);
+            let shard_path = root_path().to_string();
 
             // A committed holder leaves its write lock held pending write-back.
             let committer = mk_tid(wb_order, "wb");

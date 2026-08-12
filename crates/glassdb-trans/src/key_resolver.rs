@@ -100,10 +100,9 @@ impl KeyResolver {
         cap: Option<&[u8]>,
         requirement: Requirement,
     ) -> Result<ScanResult, StorageError> {
-        let prefix = collection.physical_prefix();
         let Some(mut loc) = self
             .router
-            .first_leaf_at(&prefix, &range.start, requirement)
+            .first_leaf_at(collection, &range.start, requirement)
             .await
             .map_err(|error| error.classify_collection_absence(collection))?
         else {
@@ -190,7 +189,7 @@ impl KeyResolver {
             }
             let Some(next) = self
                 .router
-                .next_leaf(&prefix, &loc, requirement)
+                .next_leaf(collection, &loc, requirement)
                 .await
                 .map_err(|error| error.classify_collection_absence(collection))?
             else {
@@ -213,11 +212,10 @@ impl KeyResolver {
         own_lock_holder: Option<&TxId>,
         requirement: Requirement,
     ) -> Result<Vec<LeafCoverage>, StorageError> {
-        let prefix = collection.physical_prefix();
         if range.is_empty() {
             if self
                 .router
-                .first_leaf_at(&prefix, &range.start, requirement)
+                .first_leaf_at(collection, &range.start, requirement)
                 .await
                 .map_err(|error| error.classify_collection_absence(collection))?
                 .is_none()
@@ -229,7 +227,7 @@ impl KeyResolver {
 
         let leaves = self
             .router
-            .leaves_through(&prefix, &range.start, frontier, requirement)
+            .leaves_through(collection, &range.start, frontier, requirement)
             .await
             .map_err(|error| error.classify_collection_absence(collection))?;
         let mut covered = Vec::with_capacity(leaves.len());
@@ -261,7 +259,7 @@ impl KeyResolver {
             None => Vec::new(),
         };
         Ok(LeafCoverage {
-            path: loc.path.as_str().into(),
+            path: loc.path.to_string().into(),
             membership_version: node.map_or(0, |node| node.membership_version()),
             pending_membership,
             observation: loc.observation.clone(),
@@ -358,14 +356,13 @@ impl KeyResolver {
         key: &KeyRef,
         requirement: Requirement,
     ) -> Result<LeafLocator, TransError> {
-        let prefix = key.collection().physical_prefix();
         // Interior index nodes are served from cache (ADR-031 hot-path
         // invariant); only the terminal leaf honors the caller's `requirement`
         // (the fast path's `Any` reuse, else a current lower bound), so the root `_r`
         // is not revalidated on every commit.
         let loc = self
             .router
-            .leaf_for_fresh(&prefix, key.key(), Requirement::Any, requirement)
+            .leaf_for_fresh(key.collection(), key.key(), Requirement::Any, requirement)
             .await
             .map_err(|error| error.classify_collection_absence(key.collection()))?;
         if let Some(node) = loc.node() {
@@ -408,7 +405,7 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::{CollectionId, paths};
+    use glassdb_data::{CollectionId, DbRoot, ObjectPath};
     use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
         CachedStore, CurrentState, LockType, Node, Shard, ShardEntry, ShardStore, Timeline,
@@ -419,10 +416,14 @@ mod tests {
     use crate::reader::Reader;
 
     const DB: &str = "db";
-    const COLL: &str = "db/_c/0000000000000000000000";
-
     fn collection() -> CollectionAddress {
         CollectionAddress::root(DB)
+    }
+
+    fn root_path() -> ObjectPath {
+        ObjectPath::TreeRoot {
+            collection: collection(),
+        }
     }
 
     fn key_ref(key: &[u8]) -> KeyRef {
@@ -442,7 +443,7 @@ mod tests {
     ) -> (KeyResolver, Monitor, Timeline, Arc<Background>) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        let tl = TLogger::new(objects.clone(), DB);
+        let tl = TLogger::new(objects.clone(), DbRoot::try_from(DB).unwrap());
         let bg = Arc::new(Background::new());
         let mon = Monitor::with_config(
             tl,
@@ -453,7 +454,7 @@ mod tests {
         );
         let shards = ShardStore::new(objects);
         shards
-            .create_root(COLL, &Node::leaf(Shard::new()))
+            .create_root(&collection(), &Node::leaf(Shard::new()))
             .await
             .unwrap();
         let state = KeyStateResolver::new(mon.clone());
@@ -482,7 +483,7 @@ mod tests {
         let timeline = Timeline::new();
         let shards = ShardStore::new(CachedStore::new(backend, 1 << 20, timeline.clone(), None));
         shards
-            .create_root(COLL, &Node::leaf(Shard::new()))
+            .create_root(&collection(), &Node::leaf(Shard::new()))
             .await
             .unwrap();
         TestStore { shards, timeline }
@@ -501,7 +502,7 @@ mod tests {
     // `_r` (no lock holders), so the entry resolves to `writer` regardless of
     // whether that writer recorded a live value or tombstone.
     async fn seed_writer(store: &TestStore, key: &[u8], writer: &TxId, deleted: bool) {
-        let path = paths::tree_root(COLL);
+        let path = root_path();
         let loaded = store
             .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
             .await
@@ -555,10 +556,7 @@ mod tests {
     // current value the entry already records.
     async fn seed_hold(store: &TestStore, key: &[u8], holder: &TxId) {
         let existing = store
-            .load_leaf(
-                &paths::tree_root(COLL),
-                Requirement::AtLeast(store.timeline.now()),
-            )
+            .load_leaf(&root_path(), Requirement::AtLeast(store.timeline.now()))
             .await
             .unwrap();
         let mut entry = existing.entries().lookup(key).cloned().unwrap();
@@ -569,7 +567,7 @@ mod tests {
 
     // Replaces `key`'s entry in the collection's leaf `_r` with `entry`.
     async fn seed_entry(store: &TestStore, key: &[u8], entry: ShardEntry) {
-        let path = paths::tree_root(COLL);
+        let path = root_path();
         let loaded = store
             .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
             .await
@@ -607,7 +605,7 @@ mod tests {
     // case: the effective writer must be discovered from the committed holder,
     // not the (stale, empty) pointer.
     async fn seed_locked(store: &TestStore, key: &[u8], holder: &TxId) {
-        let path = paths::tree_root(COLL);
+        let path = root_path();
         let loaded = store
             .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
             .await

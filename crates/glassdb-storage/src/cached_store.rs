@@ -35,6 +35,7 @@ use crate::disk_cache::PersistentCache;
 use crate::error::StorageError;
 use crate::timeline::{SequencePoint, Timeline};
 use glassdb_backend::{self as backend, Backend, BackendError};
+use glassdb_data::{ObjectPath, PathError};
 
 mod knowledge;
 mod mutation;
@@ -46,6 +47,79 @@ use mutation::{MutationOutcome, MutationRound};
 use path_lane::{FlightOutcome, PathCoordinator, PathState, ReadAdmission};
 use persistent_bridge::PersistentBridge;
 
+/// A physical object address carried in both its semantic and backend forms.
+///
+/// Storage constructs keys from typed paths. Raw strings enter only through
+/// backend listings, where they are parsed once before reaching typed stores.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ObjectKey {
+    object: ObjectPath,
+    encoded: Arc<str>,
+}
+
+impl ObjectKey {
+    /// Parses one object name returned by a backend listing.
+    pub(crate) fn parse(encoded: impl Into<Arc<str>>) -> Result<Self, PathError> {
+        let encoded = encoded.into();
+        let object = ObjectPath::try_from(encoded.as_ref())?;
+        Ok(Self { object, encoded })
+    }
+
+    /// Returns the classified physical object path.
+    pub(crate) fn object_path(&self) -> &ObjectPath {
+        &self.object
+    }
+
+    /// Returns the exact canonical name used at backend boundaries.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.encoded
+    }
+
+    fn encoded(&self) -> &Arc<str> {
+        &self.encoded
+    }
+}
+
+impl From<ObjectPath> for ObjectKey {
+    fn from(object: ObjectPath) -> Self {
+        let encoded = Arc::from(object.to_string());
+        Self { object, encoded }
+    }
+}
+
+impl From<&ObjectPath> for ObjectKey {
+    fn from(object: &ObjectPath) -> Self {
+        Self::from(object.clone())
+    }
+}
+
+impl From<&ObjectKey> for ObjectKey {
+    fn from(key: &ObjectKey) -> Self {
+        key.clone()
+    }
+}
+
+// Cached-store protocol tests intentionally exercise arbitrary opaque keys.
+// Production callers have no raw-string conversion and must use ObjectPath.
+#[cfg(test)]
+impl From<&str> for ObjectKey {
+    fn from(encoded: &str) -> Self {
+        Self {
+            object: ObjectPath::DatabaseMetadata {
+                db_root: glassdb_data::DbRoot::try_from("test").unwrap(),
+            },
+            encoded: Arc::from(encoded),
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<&String> for ObjectKey {
+    fn from(encoded: &String) -> Self {
+        Self::from(encoded.as_str())
+    }
+}
+
 /// Encoding, decoding, and decoded-size accounting for one physical object type.
 ///
 /// Each typed store supplies its own codec; the cache holds the decoded value
@@ -55,17 +129,17 @@ pub(crate) trait Codec: Send + Sync + 'static {
     type Value: Send + Sync + 'static;
 
     /// Decodes an object body into its cached value.
-    fn decode(path: &str, bytes: &[u8]) -> Result<Self::Value, StorageError>;
+    fn decode(path: &ObjectPath, bytes: &[u8]) -> Result<Self::Value, StorageError>;
 
     /// Encodes a cached value back into its object body (the CAS unit).
-    fn encode(value: &Self::Value) -> Result<Vec<u8>, StorageError>;
+    fn encode(path: &ObjectPath, value: &Self::Value) -> Result<Vec<u8>, StorageError>;
 
     /// Estimates the decoded value's in-memory size in bytes, governing
     /// eviction.
     fn size(value: &Self::Value) -> usize;
 
     /// Reports whether `path` names an object handled by this codec.
-    fn valid_path(path: &str) -> bool;
+    fn accepts(path: &ObjectPath) -> bool;
 
     /// Describes this physical object type in diagnostics.
     fn name() -> &'static str;
@@ -189,7 +263,7 @@ impl Evidence {
 /// state is evicted or invalidated as the current cache entry.
 #[derive(Debug, Clone)]
 pub struct Observation<V> {
-    path: Arc<str>,
+    key: ObjectKey,
     value: Option<Arc<V>>,
     revision: Option<Revision>,
     evidence: Evidence,
@@ -227,9 +301,9 @@ impl<V> Observation<V> {
         self.evidence.get()
     }
 
-    /// The object path this observation refers to.
-    pub fn path(&self) -> &str {
-        &self.path
+    /// The parsed physical object path this observation refers to.
+    pub fn path(&self) -> &ObjectPath {
+        self.key.object_path()
     }
 
     /// Reports whether the observation reused a cached decoded body.
@@ -248,7 +322,7 @@ impl<V> Observation<V> {
             return true;
         }
         match (&self.revision, &other.revision) {
-            (Some(mine), Some(theirs)) => self.path == other.path && mine == theirs,
+            (Some(mine), Some(theirs)) => self.key == other.key && mine == theirs,
             _ => false,
         }
     }
@@ -333,26 +407,27 @@ impl CachedStore {
     /// never returns a positively known-obsolete value from uncertain state.
     async fn read<C: Codec>(
         &self,
-        path: &str,
+        key: ObjectKey,
         req: Requirement,
     ) -> Result<Observation<C::Value>, StorageError> {
-        let key: Arc<str> = Arc::from(path);
         if let Some(obs) = self.try_hit::<C>(&key, req)? {
             self.metrics.l1_hit();
             return Ok(obs);
         }
         self.metrics.l1_miss();
         let fetched = self.fetch::<C>(&key, req, None).await?;
-        self.knowledge.to_observation::<C>(&key, fetched)
+        self.knowledge.to_observation::<C>(key, fetched)
     }
 
     /// Returns the cached observation for `path` without contacting the backend,
     /// or `None` when it is not cached. A committed/aborted object is immutable,
     /// so its cached copy is authoritative indefinitely; callers use this to
     /// serve terminal objects without a currentness-check round-trip.
-    fn peek<C: Codec>(&self, path: &str) -> Result<Option<Observation<C::Value>>, StorageError> {
-        let key: Arc<str> = Arc::from(path);
-        self.try_hit::<C>(&key, Requirement::Any)
+    fn peek<C: Codec>(
+        &self,
+        key: &ObjectKey,
+    ) -> Result<Option<Observation<C::Value>>, StorageError> {
+        self.try_hit::<C>(key, Requirement::Any)
     }
 
     /// Checks whether a previously returned observation is current under `req`.
@@ -368,16 +443,16 @@ impl CachedStore {
         if satisfies(obs.evidence.get(), req) {
             return Ok(ObservationCheck::Current);
         }
-        let path = Arc::clone(&obs.path);
-        if let Some(current) = self.try_hit::<C>(&path, req)? {
+        let key = obs.key.clone();
+        if let Some(current) = self.try_hit::<C>(&key, req)? {
             if current.revision == obs.revision {
                 obs.evidence.advance(current.current_after());
                 return Ok(ObservationCheck::Current);
             }
             return Ok(ObservationCheck::Changed(current));
         }
-        let fetched = self.fetch::<C>(&path, req, Some(obs)).await?;
-        let current = self.knowledge.to_observation::<C>(&path, fetched)?;
+        let fetched = self.fetch::<C>(&key, req, Some(obs)).await?;
+        let current = self.knowledge.to_observation::<C>(key, fetched)?;
         if same_observed_state(obs, &current) {
             let merged = obs.current_after().max(current.current_after());
             obs.evidence.advance(merged);
@@ -394,13 +469,13 @@ impl CachedStore {
     /// uncertain and surfaces `Unavailable`.
     async fn create<C: Codec>(
         &self,
-        path: &str,
+        key: ObjectKey,
         expected_absence: Option<&Observation<C::Value>>,
         value: Arc<C::Value>,
     ) -> Result<CasResult<C::Value>, StorageError> {
-        let bytes = C::encode(&value)?;
+        let bytes = C::encode(key.object_path(), &value)?;
         let size = C::size(&value);
-        let path: Arc<str> = Arc::from(path);
+        let path = key.encoded().clone();
         let expected = self.knowledge.expected_absent(expected_absence);
         let permit = self.coordinator.acquire(&path).await;
         let round = MutationRound::new(
@@ -418,7 +493,7 @@ impl CachedStore {
         };
         let committed = round.finish(outcome, |version| {
             self.knowledge
-                .install_mutation::<C>(path, value, size, Revision(version), invoked)
+                .install_mutation::<C>(key, value, size, Revision(version), invoked)
         })?;
         Ok(committed.map_or(CasResult::Conflict, CasResult::Committed))
     }
@@ -433,9 +508,10 @@ impl CachedStore {
         value: Arc<C::Value>,
         expected: &Observation<C::Value>,
     ) -> Result<CasResult<C::Value>, StorageError> {
-        let bytes = C::encode(&value)?;
+        let bytes = C::encode(expected.path(), &value)?;
         let size = C::size(&value);
-        let path = expected.path.clone();
+        let key = expected.key.clone();
+        let path = key.encoded().clone();
         let revision = expected
             .revision
             .clone()
@@ -462,7 +538,7 @@ impl CachedStore {
         };
         let completed = round.finish(outcome, |version| match version {
             Some(version) => CasResult::Committed(self.knowledge.install_mutation::<C>(
-                path,
+                key,
                 value,
                 size,
                 Revision(version),
@@ -470,7 +546,7 @@ impl CachedStore {
             )),
             None => {
                 self.knowledge
-                    .install_absent_observation::<C::Value>(path, invoked);
+                    .install_absent_observation::<C::Value>(key, invoked);
                 CasResult::Conflict
             }
         })?;
@@ -489,7 +565,8 @@ impl CachedStore {
             .revision
             .clone()
             .ok_or_else(|| StorageError::other("delete requires a present observation"))?;
-        let path = expected.path.clone();
+        let key = expected.key.clone();
+        let path = key.encoded().clone();
         let expected_state = self.knowledge.expected_present(revision.clone(), expected);
         let permit = self.coordinator.acquire(&path).await;
         let round = MutationRound::new(
@@ -509,7 +586,7 @@ impl CachedStore {
         round
             .finish(outcome, |()| {
                 self.knowledge
-                    .install_absent_observation::<C::Value>(path, invoked)
+                    .install_absent_observation::<C::Value>(key, invoked)
             })?
             .ok_or(StorageError::Precondition)
     }
@@ -536,13 +613,13 @@ impl CachedStore {
     /// path is missing or the entry is too stale for the bound.
     fn try_hit<C: Codec>(
         &self,
-        path: &Arc<str>,
+        key: &ObjectKey,
         req: Requirement,
     ) -> Result<Option<Observation<C::Value>>, StorageError> {
-        let observed = self.knowledge.peek::<C>(path, req)?;
+        let observed = self.knowledge.peek::<C>(key, req)?;
         if observed.as_ref().is_some_and(Observation::exists) && self.persistent.is_configured() {
-            let state = self.coordinator.state(path);
-            self.persistent.record_present_hit(path, &state);
+            let state = self.coordinator.state(key.encoded());
+            self.persistent.record_present_hit(key.encoded(), &state);
         }
         Ok(observed)
     }
@@ -551,12 +628,12 @@ impl CachedStore {
     /// path when that check's invocation satisfies `req`.
     async fn fetch<C: Codec>(
         &self,
-        path: &Arc<str>,
+        key: &ObjectKey,
         req: Requirement,
         fallback: Option<&Observation<C::Value>>,
     ) -> Result<FetchResult, StorageError> {
         loop {
-            match self.coordinator.admit_read(path, req).await {
+            match self.coordinator.admit_read(key.encoded(), req).await {
                 ReadAdmission::Join(flight) => match flight.wait().await {
                     FlightOutcome::Success(fetched) => return Ok(fetched),
                     FlightOutcome::Error(error) => return Err(error),
@@ -568,15 +645,15 @@ impl CachedStore {
                     {
                         return Ok(self.knowledge.result_from_observation(observed, true));
                     }
-                    if let Some(observed) = self.try_hit::<C>(path, req)? {
+                    if let Some(observed) = self.try_hit::<C>(key, req)? {
                         return Ok(self.knowledge.result_from_observation(&observed, true));
                     }
                     let state = permit.state().clone();
-                    let mut seed = self.knowledge.present_seed::<C>(path, fallback)?;
+                    let mut seed = self.knowledge.present_seed::<C>(key, fallback)?;
                     if seed.is_none()
                         && let Some(persistent_seed) = self
                             .persistent
-                            .load::<C>(&self.knowledge, path, &state)
+                            .load::<C>(&self.knowledge, key, &state)
                             .await
                     {
                         if req == Requirement::Any {
@@ -586,7 +663,7 @@ impl CachedStore {
                     }
                     let invoked = self.next_invocation();
                     let leader = permit.lead_read(invoked);
-                    let result = self.do_fetch::<C>(path, invoked, seed, &state).await;
+                    let result = self.do_fetch::<C>(key, invoked, seed, &state).await;
                     leader.complete(match &result {
                         Ok(fetched) => FlightOutcome::Success(fetched.clone()),
                         Err(error) => FlightOutcome::Error(error.clone()),
@@ -601,7 +678,7 @@ impl CachedStore {
     /// a present revision is known, else an ordinary read.
     async fn do_fetch<C: Codec>(
         &self,
-        path: &str,
+        key: &ObjectKey,
         invoked: SequencePoint,
         seed: Option<PresentSeed>,
         state: &Arc<PathState>,
@@ -609,21 +686,27 @@ impl CachedStore {
         match seed {
             Some(seed) => match self
                 .backend
-                .read_if_modified(path, seed.revision().version())
+                .read_if_modified(key.as_str(), seed.revision().version())
                 .await
             {
                 Ok(reply) => {
-                    self.publish_present::<C>(path, reply.contents, reply.version, invoked, state)
+                    self.publish_present::<C>(key, reply.contents, reply.version, invoked, state)
                 }
-                Err(BackendError::Precondition) => Ok(self.publish_unchanged(path, seed, invoked)),
-                Err(BackendError::NotFound) => Ok(self.publish_absent(path, invoked, state)),
+                Err(BackendError::Precondition) => {
+                    Ok(self.publish_unchanged(key.as_str(), seed, invoked))
+                }
+                Err(BackendError::NotFound) => {
+                    Ok(self.publish_absent(key.as_str(), invoked, state))
+                }
                 Err(e) => Err(e.into()),
             },
-            None => match self.backend.read(path).await {
+            None => match self.backend.read(key.as_str()).await {
                 Ok(reply) => {
-                    self.publish_present::<C>(path, reply.contents, reply.version, invoked, state)
+                    self.publish_present::<C>(key, reply.contents, reply.version, invoked, state)
                 }
-                Err(BackendError::NotFound) => Ok(self.publish_absent(path, invoked, state)),
+                Err(BackendError::NotFound) => {
+                    Ok(self.publish_absent(key.as_str(), invoked, state))
+                }
                 Err(e) => Err(e.into()),
             },
         }
@@ -632,19 +715,19 @@ impl CachedStore {
     /// Decodes and publishes a freshly read body as a present entry.
     fn publish_present<C: Codec>(
         &self,
-        path: &str,
+        key: &ObjectKey,
         bytes: Vec<u8>,
         version: backend::Version,
         invoked: SequencePoint,
         state: &Arc<PathState>,
     ) -> Result<FetchResult, StorageError> {
         self.body_reads.fetch_add(1, Ordering::SeqCst);
-        let decoded = match C::decode(path, &bytes) {
+        let decoded = match C::decode(key.object_path(), &bytes) {
             Ok(decoded) => decoded,
             Err(error) => {
                 let change = self.persistent.begin_change(state);
-                self.knowledge.invalidate(path);
-                change.invalidate(Arc::from(path));
+                self.knowledge.invalidate(key.as_str());
+                change.invalidate(key.encoded().clone());
                 return Err(error);
             }
         };
@@ -652,10 +735,14 @@ impl CachedStore {
         let value = Arc::new(decoded);
         let revision = Revision(version);
         let change = self.persistent.begin_change(state);
-        let fetched =
-            self.knowledge
-                .install_fetched::<C>(path, value, size, revision.clone(), invoked);
-        change.replace(Arc::from(path), &revision, bytes, invoked);
+        let fetched = self.knowledge.install_fetched::<C>(
+            key.as_str(),
+            value,
+            size,
+            revision.clone(),
+            invoked,
+        );
+        change.replace(key.encoded().clone(), &revision, bytes, invoked);
         Ok(fetched)
     }
 
@@ -690,6 +777,12 @@ pub(crate) struct TypedCachedStore<C: Codec> {
     codec: PhantomData<fn() -> C>,
 }
 
+/// One typed backend listing page with every object path parsed at ingress.
+pub(crate) struct TypedListPage {
+    pub(crate) objects: Vec<ObjectKey>,
+    pub(crate) next: Option<backend::ListCursor>,
+}
+
 impl<C: Codec> Clone for TypedCachedStore<C> {
     fn clone(&self) -> Self {
         Self {
@@ -700,31 +793,37 @@ impl<C: Codec> Clone for TypedCachedStore<C> {
 }
 
 impl<C: Codec> TypedCachedStore<C> {
-    fn check_path(path: &str) -> Result<(), StorageError> {
-        if C::valid_path(path) {
+    fn check_path(key: &ObjectKey) -> Result<(), StorageError> {
+        if C::accepts(key.object_path()) {
             Ok(())
         } else {
             Err(StorageError::other(format!(
-                "path {path:?} does not name a {} object",
+                "path {:?} does not name a {} object",
+                key.as_str(),
                 C::name()
             )))
         }
     }
 
     /// Returns a cached observation without backend I/O.
-    pub(crate) fn peek(&self, path: &str) -> Result<Option<Observation<C::Value>>, StorageError> {
-        Self::check_path(path)?;
-        self.store.peek::<C>(path)
+    pub(crate) fn peek(
+        &self,
+        key: impl Into<ObjectKey>,
+    ) -> Result<Option<Observation<C::Value>>, StorageError> {
+        let key = key.into();
+        Self::check_path(&key)?;
+        self.store.peek::<C>(&key)
     }
 
     /// Reads the current state with the requested freshness requirement.
     pub(crate) async fn read(
         &self,
-        path: &str,
+        key: impl Into<ObjectKey>,
         requirement: Requirement,
     ) -> Result<Observation<C::Value>, StorageError> {
-        Self::check_path(path)?;
-        self.store.read::<C>(path, requirement).await
+        let key = key.into();
+        Self::check_path(&key)?;
+        self.store.read::<C>(key, requirement).await
     }
 
     /// Lists one page of object paths belonging to this typed store.
@@ -733,12 +832,19 @@ impl<C: Codec> TypedCachedStore<C> {
         prefix: &str,
         cursor: Option<&backend::ListCursor>,
         limit: backend::ListLimit,
-    ) -> Result<backend::ListPage, StorageError> {
+    ) -> Result<TypedListPage, StorageError> {
         let page = self.store.list(prefix, cursor, limit).await?;
-        for path in &page.objects {
-            Self::check_path(path)?;
+        let mut objects = Vec::with_capacity(page.objects.len());
+        for encoded in page.objects {
+            let key = ObjectKey::parse(Arc::<str>::from(encoded))
+                .map_err(|error| StorageError::with_source("parsing listed object path", error))?;
+            Self::check_path(&key)?;
+            objects.push(key);
         }
-        Ok(page)
+        Ok(TypedListPage {
+            objects,
+            next: page.next,
+        })
     }
 
     /// Checks whether an exact retained observation is current after `bound`.
@@ -747,7 +853,7 @@ impl<C: Codec> TypedCachedStore<C> {
         observed: &Observation<C::Value>,
         bound: SequencePoint,
     ) -> Result<ObservationCheck<C::Value>, StorageError> {
-        Self::check_path(observed.path())?;
+        Self::check_path(&observed.key)?;
         self.store
             .check_current::<C>(observed, Requirement::AtLeast(bound))
             .await
@@ -756,19 +862,20 @@ impl<C: Codec> TypedCachedStore<C> {
     /// Creates a decoded object if it is absent.
     pub(crate) async fn create(
         &self,
-        path: &str,
+        key: impl Into<ObjectKey>,
         expected_absence: Option<&Observation<C::Value>>,
         value: Arc<C::Value>,
     ) -> Result<CasResult<C::Value>, StorageError> {
-        Self::check_path(path)?;
+        let key = key.into();
+        Self::check_path(&key)?;
         if let Some(expected) = expected_absence
-            && (!expected.is_absent() || expected.path() != path)
+            && (!expected.is_absent() || expected.key != key)
         {
             return Err(StorageError::other(
                 "create requires an absence observation for the same path",
             ));
         }
-        self.store.create::<C>(path, expected_absence, value).await
+        self.store.create::<C>(key, expected_absence, value).await
     }
 
     /// Conditionally replaces the exact observed revision.
@@ -777,7 +884,7 @@ impl<C: Codec> TypedCachedStore<C> {
         expected: &Observation<C::Value>,
         value: Arc<C::Value>,
     ) -> Result<CasResult<C::Value>, StorageError> {
-        Self::check_path(expected.path())?;
+        Self::check_path(&expected.key)?;
         if expected.revision().is_none() {
             return Err(StorageError::other("CAS requires a present observation"));
         }
@@ -789,7 +896,7 @@ impl<C: Codec> TypedCachedStore<C> {
         &self,
         expected: &Observation<C::Value>,
     ) -> Result<Observation<C::Value>, StorageError> {
-        Self::check_path(expected.path())?;
+        Self::check_path(&expected.key)?;
         if expected.is_absent() {
             return Err(StorageError::other("delete requires a present observation"));
         }
@@ -806,7 +913,7 @@ fn satisfies(evidence: SequencePoint, req: Requirement) -> bool {
 }
 
 fn same_observed_state<V>(left: &Observation<V>, right: &Observation<V>) -> bool {
-    left.path == right.path && left.revision == right.revision
+    left.key == right.key && left.revision == right.revision
 }
 
 #[cfg(test)]
@@ -839,16 +946,16 @@ mod tests {
 
     impl Codec for Bytes {
         type Value = Vec<u8>;
-        fn decode(_path: &str, bytes: &[u8]) -> Result<Vec<u8>, StorageError> {
+        fn decode(_path: &ObjectPath, bytes: &[u8]) -> Result<Vec<u8>, StorageError> {
             Ok(bytes.to_vec())
         }
-        fn encode(value: &Vec<u8>) -> Result<Vec<u8>, StorageError> {
+        fn encode(_path: &ObjectPath, value: &Vec<u8>) -> Result<Vec<u8>, StorageError> {
             Ok(value.clone())
         }
         fn size(value: &Vec<u8>) -> usize {
             value.len()
         }
-        fn valid_path(_: &str) -> bool {
+        fn accepts(_: &ObjectPath) -> bool {
             true
         }
         fn name() -> &'static str {
@@ -953,19 +1060,19 @@ mod tests {
 
     impl Codec for Ints {
         type Value = u64;
-        fn decode(_path: &str, bytes: &[u8]) -> Result<u64, StorageError> {
+        fn decode(_path: &ObjectPath, bytes: &[u8]) -> Result<u64, StorageError> {
             let arr: [u8; 8] = bytes
                 .try_into()
                 .map_err(|_| StorageError::other("bad int"))?;
             Ok(u64::from_le_bytes(arr))
         }
-        fn encode(value: &u64) -> Result<Vec<u8>, StorageError> {
+        fn encode(_path: &ObjectPath, value: &u64) -> Result<Vec<u8>, StorageError> {
             Ok(value.to_le_bytes().to_vec())
         }
         fn size(_: &u64) -> usize {
             8
         }
-        fn valid_path(_: &str) -> bool {
+        fn accepts(_: &ObjectPath) -> bool {
             true
         }
         fn name() -> &'static str {

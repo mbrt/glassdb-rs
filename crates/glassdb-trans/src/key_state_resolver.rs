@@ -310,7 +310,7 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::CollectionAddress;
+    use glassdb_data::{CollectionAddress, DbRoot};
     use glassdb_storage::transaction::{TLogger, TxLock, TxLog, TxWrite};
     use glassdb_storage::{CachedStore, Timeline};
 
@@ -322,7 +322,7 @@ mod tests {
     fn monitor_over(backend: Arc<dyn Backend>) -> (Monitor, Arc<Background>) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        let transactions = TLogger::new(objects, "db");
+        let transactions = TLogger::new(objects, DbRoot::try_from("db").unwrap());
         let background = Arc::new(Background::new());
         let monitor = Monitor::with_config(
             transactions,
@@ -351,7 +351,7 @@ mod tests {
             let backend: Arc<dyn Backend> = Arc::new(recorder);
             let timeline = Timeline::new();
             let objects = CachedStore::new(backend.clone(), 1 << 20, timeline, None);
-            let transactions = TLogger::new(objects, "db");
+            let transactions = TLogger::new(objects, DbRoot::try_from("db").unwrap());
             Self {
                 backend,
                 operations,

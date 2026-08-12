@@ -112,10 +112,9 @@ impl CollectionLocker {
     /// Releases every recorded directory lock held by `id`.
     pub(crate) async fn release(&self, id: &TxId, locks: &[TxLock]) -> Result<(), TransError> {
         for parent in Self::locked_collections(locks) {
-            let prefix = parent.physical_prefix();
             loop {
                 let (mut record, observed) =
-                    match self.records.load_record(&prefix, Requirement::Any).await {
+                    match self.records.load_record(parent, Requirement::Any).await {
                         Ok(record) => record,
                         Err(StorageError::NotFound) => break,
                         Err(error) => return Err(error.into()),
@@ -139,10 +138,7 @@ impl CollectionLocker {
         requirement: Requirement,
     ) -> Result<bool, TransError> {
         for collection in Self::locked_collections(locks) {
-            if let Ok((record, _)) = self
-                .records
-                .load_record(&collection.physical_prefix(), requirement)
-                .await
+            if let Ok((record, _)) = self.records.load_record(collection, requirement).await
                 && record.directory_lock().contains(id)
             {
                 return Ok(true);
@@ -157,10 +153,9 @@ impl CollectionLocker {
         collection: &CollectionAddress,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let prefix = collection.physical_prefix();
         loop {
             let (mut record, observed) =
-                match self.records.load_record(&prefix, Requirement::Any).await {
+                match self.records.load_record(collection, Requirement::Any).await {
                     Ok(record) => record,
                     Err(StorageError::NotFound) => return Ok(()),
                     Err(error) => return Err(error.into()),
@@ -264,12 +259,11 @@ impl CollectionStateResolver {
         own: Option<&TxId>,
         requirement: Requirement,
     ) -> Result<(CollectionRecord, Observation<CollectionRecord>), TransError> {
-        let prefix = parent.physical_prefix();
         let mut backoff = self.retry.backoff();
         loop {
             let (mut record, observed) = self
                 .records
-                .load_record(&prefix, requirement)
+                .load_record(parent, requirement)
                 .await
                 .map_err(|error| error.classify_collection_absence(parent))?;
             if let Some(holder) = record.topology_freeze().cloned()
@@ -317,11 +311,10 @@ impl CollectionStateResolver {
         id: &TxId,
         changes: &[CollectionChange],
     ) -> Result<(), TransError> {
-        let prefix = parent.physical_prefix();
         let mut backoff = self.retry.backoff();
         loop {
             let (mut record, observed) =
-                match self.records.load_record(&prefix, Requirement::Any).await {
+                match self.records.load_record(parent, Requirement::Any).await {
                     Ok(record) => record,
                     Err(StorageError::NotFound) => return Ok(()),
                     Err(error) => return Err(error.into()),
@@ -417,6 +410,7 @@ mod tests {
 
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_concurr::Background;
+    use glassdb_data::DbRoot;
     use glassdb_storage::{CachedStore, Timeline};
 
     use super::*;
@@ -431,7 +425,7 @@ mod tests {
             None,
         );
         let records = CollectionStore::new(objects.clone());
-        let transactions = TLogger::new(objects, "db");
+        let transactions = TLogger::new(objects, DbRoot::try_from("db").unwrap());
         let background = Arc::new(Background::new());
         let monitor = Monitor::with_config(
             transactions.clone(),
@@ -453,10 +447,9 @@ mod tests {
     async fn sole_reader_can_upgrade_to_writer() {
         let (locker, records, _background) = new_locker();
         let parent = CollectionAddress::root("db");
-        let prefix = parent.physical_prefix();
         assert!(
             records
-                .create_record(&prefix, &CollectionRecord::new())
+                .create_record(&parent, &CollectionRecord::new())
                 .await
                 .unwrap()
         );
@@ -466,7 +459,7 @@ mod tests {
         locker.acquire(&parent, &id, LockType::Write).await.unwrap();
 
         let (record, _) = records
-            .load_record(&prefix, Requirement::Any)
+            .load_record(&parent, Requirement::Any)
             .await
             .unwrap();
         assert_eq!(record.directory_lock().lock_type(), LockType::Write);

@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use glassdb_concurr::{Background, Backoff, RetryConfig, rt};
-use glassdb_data::{KeyRef, TxId};
+use glassdb_data::{KeyRef, ObjectPath, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxLog, TxWrite};
 use glassdb_storage::{
     CurrentState, InlinePolicy, LeafObservationCheck, LockType, NodeLocks, Requirement,
@@ -212,7 +212,7 @@ impl<'a> ValidationContext<'a> {
 struct DirectCommitResolver {
     id: TxId,
     raw_key: Vec<u8>,
-    leaf_path: String,
+    leaf_path: ObjectPath,
     key: KeyRef,
     value: Arc<[u8]>,
     read_version: Option<TxId>,
@@ -401,7 +401,7 @@ struct SingleRw {
 
 /// The predecessor a direct commit builds on and the leaf that owns its key.
 struct Predecessor {
-    leaf_path: String,
+    leaf_path: ObjectPath,
     writer: TxId,
 }
 
@@ -1529,7 +1529,7 @@ mod tests {
     };
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::{CollectionAddress, CollectionId, LeafRef, paths};
+    use glassdb_data::{CollectionAddress, CollectionId, DbRoot, LeafRef, NodeToken, ObjectPath};
     use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, CurrentState, Node, Shard, ShardEntry,
@@ -1537,10 +1537,19 @@ mod tests {
     };
 
     const TEST_DB: &str = "testp";
-    const TEST_COLL: &str = "testp/_c/0000000000000000000000";
 
     fn test_collection() -> CollectionAddress {
         CollectionAddress::root(TEST_DB)
+    }
+
+    fn test_db_root() -> DbRoot {
+        DbRoot::try_from(TEST_DB).unwrap()
+    }
+
+    fn test_root_path() -> ObjectPath {
+        ObjectPath::TreeRoot {
+            collection: test_collection(),
+        }
     }
 
     fn key_ref(key: &[u8]) -> KeyRef {
@@ -1584,7 +1593,7 @@ mod tests {
     ) -> (Algo, Tctx) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(b.clone(), cache_bytes, timeline.clone(), None);
-        let tlogger = TLogger::new(objects.clone(), TEST_DB);
+        let tlogger = TLogger::new(objects.clone(), test_db_root());
         let bg = Arc::new(Background::new());
         let bg_weak = Arc::downgrade(&bg);
         // Leak the background so spawned async aborts can run for the test's
@@ -1616,7 +1625,7 @@ mod tests {
             tmon.clone(),
             key_state,
             RetryConfig::default(),
-            TEST_COLL,
+            test_db_root(),
             split_policy,
             glassdb_storage::InlinePolicy::default(),
         );
@@ -1652,11 +1661,11 @@ mod tests {
 
         // Create the collection root so the test collection exists up front.
         records
-            .create_record(TEST_COLL, &CollectionRecord::new())
+            .create_record(&test_collection(), &CollectionRecord::new())
             .await
             .unwrap();
         shards
-            .create_root(TEST_COLL, &Node::leaf(Shard::new()))
+            .create_root(&test_collection(), &Node::leaf(Shard::new()))
             .await
             .unwrap();
 
@@ -1777,10 +1786,7 @@ mod tests {
     async fn entry(tctx: &Tctx, key: &[u8]) -> Option<ShardEntry> {
         let loaded = tctx
             .shards
-            .load_leaf(
-                &paths::tree_root(TEST_COLL),
-                Requirement::AtLeast(tctx.timeline.now()),
-            )
+            .load_leaf(&test_root_path(), Requirement::AtLeast(tctx.timeline.now()))
             .await
             .unwrap();
         loaded.entries().lookup(key).cloned()
@@ -2005,11 +2011,11 @@ mod tests {
         tm.end(&mut handle).await.unwrap();
 
         tctx.records
-            .load_record(&prepared.physical_prefix(), Requirement::Any)
+            .load_record(&prepared, Requirement::Any)
             .await
             .expect("committed collection record must survive cleanup");
         tctx.shards
-            .load_root(&prepared.physical_prefix(), Requirement::Any)
+            .load_root(&prepared, Requirement::Any)
             .await
             .expect("committed collection tree root must survive cleanup");
     }
@@ -2023,13 +2029,13 @@ mod tests {
         );
         assert!(
             tctx.records
-                .create_record(&dropped.physical_prefix(), &CollectionRecord::new())
+                .create_record(&dropped, &CollectionRecord::new())
                 .await
                 .unwrap()
         );
         assert!(
             tctx.shards
-                .create_root(&dropped.physical_prefix(), &Node::leaf(Shard::new()))
+                .create_root(&dropped, &Node::leaf(Shard::new()))
                 .await
                 .unwrap()
         );
@@ -2060,16 +2066,13 @@ mod tests {
 
         let (root, _) = tctx
             .shards
-            .load_root(
-                &dropped.physical_prefix(),
-                Requirement::AtLeast(tctx.timeline.now()),
-            )
+            .load_root(&dropped, Requirement::AtLeast(tctx.timeline.now()))
             .await
             .unwrap();
         assert_eq!(root.collection_delete_intent(), None);
         let (record, _) = tctx
             .records
-            .load_record(&dropped.physical_prefix(), Requirement::Any)
+            .load_record(&dropped, Requirement::Any)
             .await
             .unwrap();
         assert_eq!(record.topology_freeze(), None);
@@ -2333,7 +2336,7 @@ mod tests {
             "the grandfathered singleton itself must remain storable"
         );
 
-        let path = paths::tree_root(TEST_COLL);
+        let path = test_root_path();
         let loaded = tctx
             .shards
             .load_leaf(&path, Requirement::AtLeast(tctx.timeline.now()))
@@ -2555,7 +2558,7 @@ mod tests {
         let txb = TxId::with_priority(2_000_000_000, b"acquire");
         tctx.tmon.begin_tx(&txb);
 
-        let shard_path = paths::tree_root(TEST_COLL);
+        let shard_path = test_root_path().to_string();
         log.lock().unwrap().clear();
         gate.arm();
 
@@ -2803,10 +2806,10 @@ mod tests {
             if o.op != "write_if" && o.op != "write_if_not_exists" {
                 continue;
             }
-            if let Ok(parsed) = paths::parse(&o.path) {
-                match parsed.typ {
-                    paths::Type::TreeRoot | paths::Type::Node => c.leaf += 1,
-                    paths::Type::Transaction => c.tx += 1,
+            if let Ok(path) = ObjectPath::try_from(o.path.as_str()) {
+                match path {
+                    ObjectPath::TreeRoot { .. } | ObjectPath::Node { .. } => c.leaf += 1,
+                    ObjectPath::Transaction { .. } => c.tx += 1,
                     _ => {}
                 }
             }
@@ -2821,7 +2824,11 @@ mod tests {
     #[test]
     fn write_counts_parses_transaction_shard_named_like_node() {
         let id = TxId::from_bytes(vec![0x97, 0x30]);
-        let path = paths::from_transaction(TEST_DB, &id);
+        let path = ObjectPath::Transaction {
+            db_root: test_db_root(),
+            id,
+        }
+        .to_string();
         assert!(path.contains("/_t/_n/"), "test id mapped to {path:?}");
         let log = Arc::new(std::sync::Mutex::new(vec![OpRecord {
             op: "write_if_not_exists",
@@ -2839,7 +2846,10 @@ mod tests {
     fn shard_reads(log: &OpLog) -> (usize, usize) {
         let (mut full, mut revalidate) = (0, 0);
         for o in log.lock().unwrap().iter() {
-            if !(o.path.contains("/_n/") || o.path.ends_with("/_r")) {
+            if !matches!(
+                ObjectPath::try_from(o.path.as_str()),
+                Ok(ObjectPath::TreeRoot { .. } | ObjectPath::Node { .. })
+            ) {
                 continue;
             }
             if o.op == "read" {
@@ -2927,13 +2937,13 @@ mod tests {
         tctx.tmon.begin_tx(&gate);
         let (mut root, version) = tctx
             .shards
-            .load_root(TEST_COLL, Requirement::Any)
+            .load_root(&test_collection(), Requirement::Any)
             .await
             .unwrap();
         root.set_structural_gate(gate.clone());
         assert!(
             tctx.shards
-                .store_root(TEST_COLL, &root, &version)
+                .store_root(&test_collection(), &root, &version)
                 .await
                 .unwrap()
         );
@@ -3054,7 +3064,7 @@ mod tests {
     async fn a_committed_holder_keeps_the_next_writer_on_the_direct_path() {
         let (tm, tctx) = new_algo().await;
         let keyp = key_ref(b"k");
-        let leaf_path = paths::tree_root(TEST_COLL);
+        let leaf_path = test_root_path();
         let raw = b"k".to_vec();
 
         // H0 publishes v1; H1 overwrites through the locked path (its value
@@ -3202,7 +3212,7 @@ mod tests {
     async fn direct_commit_replaces_a_committed_holder() {
         let (tm, tctx) = new_algo().await;
         let keyp = key_ref(b"k");
-        let leaf_path = paths::tree_root(TEST_COLL);
+        let leaf_path = test_root_path();
         let raw = b"k".to_vec();
 
         let h0 = commit_writes(&tm, vec![wa(&keyp, b"v1")])
@@ -3278,7 +3288,7 @@ mod tests {
         let resolver = DirectCommitResolver {
             id: TxId::with_priority(2, b"direct"),
             raw_key: b"k".to_vec(),
-            leaf_path: paths::tree_root(TEST_COLL),
+            leaf_path: test_root_path(),
             key: keyp.clone(),
             value: Arc::from(b"v2".as_slice()),
             read_version: seed.current.writer().cloned(),
@@ -3333,7 +3343,7 @@ mod tests {
         let direct = |read_version| DirectCommitResolver {
             id: TxId::with_priority(9, b"direct"),
             raw_key: b"k".to_vec(),
-            leaf_path: paths::tree_root(TEST_COLL),
+            leaf_path: test_root_path(),
             key: keyp.clone(),
             value: Arc::from(b"v2".as_slice()),
             read_version,
@@ -4130,7 +4140,7 @@ mod tests {
             external_timeline.clone(),
             None,
         ));
-        let leaf_path = paths::tree_root(TEST_COLL);
+        let leaf_path = test_root_path();
         let loaded = external
             .load_leaf(&leaf_path, Requirement::AtLeast(external_timeline.now()))
             .await
@@ -4327,7 +4337,7 @@ mod tests {
     // root leaf `_r` (no lock holders or pending write-back), giving scan tests a
     // stable membership baseline.
     async fn seed_live_keys(tctx: &Tctx, keys: &[&[u8]]) {
-        let path = paths::tree_root(TEST_COLL);
+        let path = test_root_path();
         let loaded = tctx
             .shards
             .load_leaf(&path, Requirement::AtLeast(tctx.timeline.now()))
@@ -4584,7 +4594,10 @@ mod tests {
             .await
             .unwrap();
         let log = log.value().unwrap();
-        for token in ["S0", "S1"] {
+        for token in [
+            NodeToken::from_bytes([0; 16]),
+            NodeToken::from_bytes([1; 16]),
+        ] {
             assert!(log.locks.contains(&TxLock::Membership {
                 leaf: LeafRef::node(test_collection(), token),
                 typ: LockType::Read,
@@ -4637,6 +4650,8 @@ mod tests {
     async fn scan_detects_boundary_membership_change() {
         use glassdb_storage::{IndexNode, Node};
         let (tm, tctx) = new_algo().await;
+        let s0_token = NodeToken::from_bytes([0; 16]);
+        let s1_token = NodeToken::from_bytes([1; 16]);
 
         // Two-leaf tree: index root over S0(a,c | high "m") -> S1(m,p).
         let leaf = |ks: &[&[u8]], high: Option<&[u8]>, right: Option<&str>| {
@@ -4651,31 +4666,33 @@ mod tests {
         };
         tctx.shards
             .store_node(
-                TEST_COLL,
-                "S0",
-                &leaf(&[b"a", b"c"], Some(b"m"), Some("S1")),
+                &test_collection(),
+                &s0_token,
+                &leaf(&[b"a", b"c"], Some(b"m"), Some(s1_token.as_str())),
                 None,
             )
             .await
             .unwrap();
         tctx.shards
-            .store_node(TEST_COLL, "S1", &leaf(&[b"m", b"p"], None, None), None)
-            .await
-            .unwrap();
-        let root = Node::index(IndexNode::from_children([
-            (b"".to_vec(), "S0".to_string()),
-            (b"m".to_vec(), "S1".to_string()),
-        ]));
-        let cur = tctx
-            .shards
-            .load_leaf(
-                &paths::tree_root(TEST_COLL),
-                Requirement::AtLeast(tctx.timeline.now()),
+            .store_node(
+                &test_collection(),
+                &s1_token,
+                &leaf(&[b"m", b"p"], None, None),
+                None,
             )
             .await
             .unwrap();
+        let root = Node::index(IndexNode::from_children([
+            (b"".to_vec(), s0_token.to_string()),
+            (b"m".to_vec(), s1_token.to_string()),
+        ]));
+        let cur = tctx
+            .shards
+            .load_leaf(&test_root_path(), Requirement::AtLeast(tctx.timeline.now()))
+            .await
+            .unwrap();
         tctx.shards
-            .store_root(TEST_COLL, &root, cur.observation())
+            .store_root(&test_collection(), &root, cur.observation())
             .await
             .unwrap();
 
@@ -4689,7 +4706,11 @@ mod tests {
         // leaf S1, bumping its version.
         let (s1, ver) = tctx
             .shards
-            .load_node(TEST_COLL, "S1", Requirement::AtLeast(tctx.timeline.now()))
+            .load_node(
+                &test_collection(),
+                &s1_token,
+                Requirement::AtLeast(tctx.timeline.now()),
+            )
             .await
             .unwrap();
         let mut entries: Vec<ShardEntry> = s1.as_leaf().unwrap().entries().cloned().collect();
@@ -4704,7 +4725,7 @@ mod tests {
         new_s1.set_membership_writer(membership_writer.clone());
         new_s1.remove_membership_holder(&membership_writer);
         tctx.shards
-            .store_node(TEST_COLL, "S1", &new_s1, Some(&ver))
+            .store_node(&test_collection(), &s1_token, &new_s1, Some(&ver))
             .await
             .unwrap();
 
@@ -4719,13 +4740,12 @@ mod tests {
     // linearization point, mirroring the in-place root split (ADR-031).
     async fn split_root_in_place(tctx: &Tctx) {
         use glassdb_storage::{IndexNode, Node};
+        let s0_token = NodeToken::from_bytes([0; 16]);
+        let s1_token = NodeToken::from_bytes([1; 16]);
 
         let loaded = tctx
             .shards
-            .load_leaf(
-                &paths::tree_root(TEST_COLL),
-                Requirement::AtLeast(tctx.timeline.now()),
-            )
+            .load_leaf(&test_root_path(), Requirement::AtLeast(tctx.timeline.now()))
             .await
             .unwrap();
         let entries: Vec<ShardEntry> = loaded.entries().entries().cloned().collect();
@@ -4735,24 +4755,24 @@ mod tests {
 
         let s0 = Node::leaf(Shard::from_entries(lower))
             .with_high_key(Some(b"m".to_vec()))
-            .with_right_sibling(Some("S1".to_string()));
+            .with_right_sibling(Some(s1_token.to_string()));
         tctx.shards
-            .store_node(TEST_COLL, "S0", &s0, None)
+            .store_node(&test_collection(), &s0_token, &s0, None)
             .await
             .unwrap();
         let s1 = Node::leaf(Shard::from_entries(upper));
         tctx.shards
-            .store_node(TEST_COLL, "S1", &s1, None)
+            .store_node(&test_collection(), &s1_token, &s1, None)
             .await
             .unwrap();
 
         let root = Node::index(IndexNode::from_children([
-            (b"".to_vec(), "S0".to_string()),
-            (b"m".to_vec(), "S1".to_string()),
+            (b"".to_vec(), s0_token.to_string()),
+            (b"m".to_vec(), s1_token.to_string()),
         ]));
         assert!(
             tctx.shards
-                .store_root(TEST_COLL, &root, loaded.observation())
+                .store_root(&test_collection(), &root, loaded.observation())
                 .await
                 .unwrap(),
             "root split CAS must win"

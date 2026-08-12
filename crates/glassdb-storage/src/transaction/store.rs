@@ -7,11 +7,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use glassdb_backend as backend;
 use glassdb_concurr::rt;
-use glassdb_data::{TxId, paths};
+use glassdb_data::{DbRoot, ObjectPath, TxId};
 
-use crate::cached_store::{CachedStore, CasResult, Observation, Requirement};
+use crate::cached_store::{CachedStore, CasResult, ObjectKey, Observation, Requirement};
 use crate::error::StorageError;
 use crate::transaction::{TxCommitStatus, TxLifecycleRelation, TxLog, TxLogCodec, TxRecordState};
+
+const TRANSACTION_SHARD_COUNT: usize = 64 * 64;
 
 /// The commit status of a transaction along with its timestamp and version.
 #[derive(Debug, Clone)]
@@ -46,15 +48,15 @@ pub struct TxListPage {
 /// Reads and writes transaction logs under a path prefix.
 #[derive(Clone)]
 pub struct TLogger {
-    prefix: String,
+    db_root: DbRoot,
     logs: crate::cached_store::TypedCachedStore<TxLogCodec>,
 }
 
 impl TLogger {
-    /// Creates a logger storing logs under `prefix`.
-    pub fn new(objects: CachedStore, prefix: impl Into<String>) -> Self {
+    /// Creates a logger storing logs under `db_root`.
+    pub fn new(objects: CachedStore, db_root: DbRoot) -> Self {
         TLogger {
-            prefix: prefix.into(),
+            db_root,
             logs: objects.typed(),
         }
     }
@@ -65,10 +67,13 @@ impl TLogger {
         id: &TxId,
         requirement: Requirement,
     ) -> Result<TxStatus, StorageError> {
-        let path = paths::from_transaction(&self.prefix, id);
+        let path = ObjectKey::from(ObjectPath::Transaction {
+            db_root: self.db_root.clone(),
+            id: id.clone(),
+        });
         let observation = match self.cached_final(&path)? {
             Some(observation) => observation,
-            None => self.logs.read(&path, requirement).await?,
+            None => self.logs.read(path, requirement).await?,
         };
         Ok(TxStatus::from_observation(observation))
     }
@@ -79,10 +84,13 @@ impl TLogger {
         id: &TxId,
         requirement: Requirement,
     ) -> Result<Observation<TxLog>, StorageError> {
-        let path = paths::from_transaction(&self.prefix, id);
+        let path = ObjectKey::from(ObjectPath::Transaction {
+            db_root: self.db_root.clone(),
+            id: id.clone(),
+        });
         let observation = match self.cached_final(&path)? {
             Some(observation) => observation,
-            None => self.logs.read(&path, requirement).await?,
+            None => self.logs.read(path, requirement).await?,
         };
         if observation.is_absent() {
             Err(StorageError::NotFound)
@@ -97,15 +105,11 @@ impl TLogger {
         let ts = l.timestamp.unwrap_or_else(rt::system_now);
         let mut persisted = l.clone();
         persisted.timestamp = Some(ts);
-        match self
-            .logs
-            .create(
-                &paths::from_transaction(&self.prefix, &l.id),
-                None,
-                Arc::new(persisted),
-            )
-            .await?
-        {
+        let path = ObjectPath::Transaction {
+            db_root: self.db_root.clone(),
+            id: l.id.clone(),
+        };
+        match self.logs.create(path, None, Arc::new(persisted)).await? {
             CasResult::Committed(observed) => Ok(observed),
             CasResult::Conflict => Err(StorageError::Precondition),
         }
@@ -137,6 +141,16 @@ impl TLogger {
         }
     }
 
+    /// Returns every physical transaction-log shard.
+    pub fn transaction_shards(&self) -> impl Iterator<Item = usize> {
+        0..TRANSACTION_SHARD_COUNT
+    }
+
+    /// Returns the physical shard containing `id`.
+    pub fn transaction_shard(&self, id: &TxId) -> usize {
+        ObjectPath::transaction_shard(id)
+    }
+
     /// Lists one page of transaction IDs from `shard`.
     pub async fn list_transaction_ids(
         &self,
@@ -144,12 +158,17 @@ impl TLogger {
         cursor: Option<&backend::ListCursor>,
         limit: backend::ListLimit,
     ) -> Result<TxListPage, StorageError> {
-        let prefix = paths::transaction_shard_prefix(&self.prefix, shard);
+        let prefix = ObjectPath::transaction_shard_prefix(&self.db_root, shard);
         let page = self.logs.list(&prefix, cursor, limit).await?;
         let ids = page
             .objects
             .iter()
-            .filter_map(|path| paths::transaction_id_of(path).ok())
+            .filter_map(|path| match path.object_path() {
+                ObjectPath::Transaction { db_root, id } if db_root == &self.db_root => {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
             .collect();
         Ok(TxListPage {
             ids,
@@ -170,7 +189,7 @@ impl TLogger {
         Ok(())
     }
 
-    fn cached_final(&self, path: &str) -> Result<Option<Observation<TxLog>>, StorageError> {
+    fn cached_final(&self, path: &ObjectKey) -> Result<Option<Observation<TxLog>>, StorageError> {
         Ok(self.logs.peek(path)?.filter(|observation| {
             observation
                 .value()
@@ -224,11 +243,15 @@ mod tests {
     use glassdb_data::{CollectionAddress, CollectionId, KeyRef, LeafRef};
     use tokio::sync::Notify;
 
+    fn db_root() -> DbRoot {
+        DbRoot::try_from("db").unwrap()
+    }
+
     fn new_tlogger() -> TLogger {
         let backend = Arc::new(MemoryBackend::new());
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        TLogger::new(objects, "db")
+        TLogger::new(objects, db_root())
     }
 
     fn test_collection(db_root: &str, byte: u8) -> CollectionAddress {
@@ -239,7 +262,7 @@ mod tests {
         let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let operations = backend.log();
         let objects = CachedStore::new(Arc::new(backend), 1 << 20, Timeline::new(), None);
-        (TLogger::new(objects, "db"), operations)
+        (TLogger::new(objects, db_root()), operations)
     }
 
     fn assert_operations(operations: &OpLog, expected: &[&str]) {
@@ -247,6 +270,40 @@ mod tests {
         let actual: Vec<_> = operations.iter().map(|operation| operation.op).collect();
         assert_eq!(actual, expected);
         operations.clear();
+    }
+
+    #[tokio::test]
+    async fn mutations_reject_transaction_identity_mismatches_before_backend_io() {
+        let (logger, operations) = new_recording_tlogger();
+        let id = TxId::from_bytes(vec![1, 2, 3, 4]);
+        let observed = logger
+            .set(&TxLog::new(id, TxCommitStatus::Pending))
+            .await
+            .unwrap();
+        assert_operations(&operations, &["write_if_not_exists"]);
+
+        let different_id = TxId::from_bytes(vec![4, 3, 2, 1]);
+        assert!(
+            logger
+                .set_if(
+                    &TxLog::new(different_id, TxCommitStatus::Pending),
+                    &observed,
+                )
+                .await
+                .is_err()
+        );
+        assert_operations(&operations, &[]);
+
+        let mut wrong_database =
+            TxLog::new(TxId::from_bytes(vec![5, 6, 7, 8]), TxCommitStatus::Pending);
+        wrong_database.writes.push(TxWrite {
+            key: KeyRef::new(test_collection("other", 1), b"key"),
+            value: Arc::from(&b"value"[..]),
+            deleted: false,
+            prev_writer: TxId::default(),
+        });
+        assert!(logger.set(&wrong_database).await.is_err());
+        assert_operations(&operations, &[]);
     }
 
     #[tokio::test]
@@ -511,7 +568,11 @@ mod tests {
     #[tokio::test]
     async fn commit_status_waits_for_in_flight_create() {
         let id = TxId::from_bytes(vec![1, 2, 3, 4]);
-        let transaction_path = paths::from_transaction("db", &id);
+        let transaction_path = ObjectPath::Transaction {
+            db_root: db_root(),
+            id: id.clone(),
+        }
+        .to_string();
         let create_started = Arc::new(Notify::new());
         let release_create = Arc::new(Notify::new());
         let reads = Arc::new(AtomicUsize::new(0));
@@ -547,7 +608,7 @@ mod tests {
         });
 
         let objects = CachedStore::new(backend, 1 << 20, Timeline::new(), None);
-        let logger = TLogger::new(objects, "db");
+        let logger = TLogger::new(objects, db_root());
         let log = TxLog::new(id.clone(), TxCommitStatus::Ok);
 
         let creating = tokio::spawn({
@@ -614,7 +675,7 @@ mod tests {
         let operations = backend.log();
         let timeline = Timeline::new();
         let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone(), None);
-        let logger = TLogger::new(objects, "db");
+        let logger = TLogger::new(objects, db_root());
         let id = TxId::from_bytes(vec![4, 3, 2, 1]);
         logger
             .set(&TxLog::new(id.clone(), TxCommitStatus::Aborted))
@@ -640,7 +701,7 @@ mod tests {
         let operations = backend.log();
         let timeline = Timeline::new();
         let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone(), None);
-        let logger = TLogger::new(objects, "db");
+        let logger = TLogger::new(objects, db_root());
         let id = TxId::from_bytes(vec![4, 3, 2, 2]);
         logger
             .set(&TxLog::new(id.clone(), TxCommitStatus::Pending))
@@ -672,7 +733,7 @@ mod tests {
         let operations = backend.log();
         let timeline = Timeline::new();
         let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone(), None);
-        let logger = TLogger::new(objects, "db");
+        let logger = TLogger::new(objects, db_root());
         let id = TxId::from_bytes(vec![4, 3, 2, 3]);
         logger
             .set(&TxLog::new(id.clone(), TxCommitStatus::Wounded))
@@ -711,8 +772,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let shard = paths::transaction_shard(&ids[0]);
-        assert!(ids.iter().all(|id| paths::transaction_shard(id) == shard));
+        let shard = t.transaction_shard(&ids[0]);
+        assert!(ids.iter().all(|id| t.transaction_shard(id) == shard));
         let limit = backend::ListLimit::new(2).unwrap();
         let first = t.list_transaction_ids(shard, None, limit).await.unwrap();
         assert_eq!(first.ids.len(), 2);

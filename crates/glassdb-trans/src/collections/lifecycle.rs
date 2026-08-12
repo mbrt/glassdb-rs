@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use glassdb_concurr::{RetryConfig, rt};
-use glassdb_data::{CollectionAddress, TxId};
+use glassdb_data::{CollectionAddress, NodeToken, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
     CollectionRecord, CollectionStore, Node, Requirement, Shard, ShardStore, StorageError,
@@ -69,24 +69,23 @@ impl CollectionLifecycle {
             .iter()
             .filter(|change| change.op == CollectionOp::Create)
         {
-            let prefix = change.collection.physical_prefix();
             if !self
                 .records
-                .create_record(&prefix, &CollectionRecord::new())
+                .create_record(&change.collection, &CollectionRecord::new())
                 .await?
             {
                 self.records
-                    .load_record(&prefix, Requirement::Any)
+                    .load_record(&change.collection, Requirement::Any)
                     .await
                     .map_err(TransError::from)?;
             }
             if !self
                 .shards
-                .create_root(&prefix, &Node::leaf(Shard::new()))
+                .create_root(&change.collection, &Node::leaf(Shard::new()))
                 .await?
             {
                 self.shards
-                    .load_root(&prefix, Requirement::Any)
+                    .load_root(&change.collection, Requirement::Any)
                     .await
                     .map_err(TransError::from)?;
             }
@@ -106,10 +105,9 @@ impl CollectionLifecycle {
             .map(|change| &change.collection)
         {
             self.freeze_topology(collection, id).await?;
-            let prefix = collection.physical_prefix();
-            let nodes = self.shards.list_nodes(&prefix, Requirement::Any).await?;
+            let nodes = self.shards.list_nodes(collection, Requirement::Any).await?;
             for (token, _) in nodes {
-                self.fence_node(&prefix, &token, id).await?;
+                self.fence_node(collection, &token, id).await?;
             }
             self.fence_root(collection, id).await?;
         }
@@ -123,10 +121,9 @@ impl CollectionLifecycle {
         collections: &[CollectionAddress],
     ) -> Result<(), TransError> {
         for collection in collections {
-            let prefix = collection.physical_prefix();
-            let nodes = self.shards.list_nodes(&prefix, Requirement::Any).await?;
+            let nodes = self.shards.list_nodes(collection, Requirement::Any).await?;
             for (token, _) in nodes {
-                self.clear_node_fence(&prefix, &token, id).await?;
+                self.clear_node_fence(collection, &token, id).await?;
             }
             self.clear_root_fence(collection, id).await?;
         }
@@ -139,21 +136,20 @@ impl CollectionLifecycle {
         collections: &[CollectionAddress],
     ) -> Result<(), TransError> {
         for collection in collections {
-            let prefix = collection.physical_prefix();
-            let nodes = self.shards.list_nodes(&prefix, Requirement::Any).await?;
+            let nodes = self.shards.list_nodes(collection, Requirement::Any).await?;
             for (_, observed) in nodes {
                 self.shards.delete_node(&observed).await?;
             }
             let observed = self
                 .shards
-                .load_root_state(&prefix, Requirement::Any)
+                .load_root_state(collection, Requirement::Any)
                 .await?;
             if observed.exists() {
                 self.shards.delete_root(&observed).await?;
             }
             let observed = self
                 .records
-                .load_record_state(&prefix, Requirement::Any)
+                .load_record_state(collection, Requirement::Any)
                 .await?;
             if observed.exists() {
                 self.records.delete_record(&observed).await?;
@@ -167,11 +163,12 @@ impl CollectionLifecycle {
         collection: &CollectionAddress,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let prefix = collection.physical_prefix();
         let mut backoff = self.retry.backoff();
         loop {
-            let (mut record, observed) =
-                self.records.load_record(&prefix, Requirement::Any).await?;
+            let (mut record, observed) = self
+                .records
+                .load_record(collection, Requirement::Any)
+                .await?;
             if record.topology_freeze() != Some(id)
                 && let Some(holder) = record.topology_freeze().cloned()
             {
@@ -210,15 +207,23 @@ impl CollectionLifecycle {
         }
     }
 
-    async fn fence_node(&self, prefix: &str, token: &str, id: &TxId) -> Result<(), TransError> {
+    async fn fence_node(
+        &self,
+        collection: &CollectionAddress,
+        token: &NodeToken,
+        id: &TxId,
+    ) -> Result<(), TransError> {
         let mut backoff = self.retry.backoff();
         loop {
-            let (mut node, observed) =
-                match self.shards.load_node(prefix, token, Requirement::Any).await {
-                    Ok(node) => node,
-                    Err(StorageError::NotFound) => return Ok(()),
-                    Err(error) => return Err(error.into()),
-                };
+            let (mut node, observed) = match self
+                .shards
+                .load_node(collection, token, Requirement::Any)
+                .await
+            {
+                Ok(node) => node,
+                Err(StorageError::NotFound) => return Ok(()),
+                Err(error) => return Err(error.into()),
+            };
             if node.collection_delete_intent() == Some(id) {
                 return Ok(());
             }
@@ -237,7 +242,7 @@ impl CollectionLifecycle {
             node.set_collection_delete_intent(id.clone());
             if self
                 .shards
-                .store_node(prefix, token, &node, Some(&observed))
+                .store_node(collection, token, &node, Some(&observed))
                 .await?
             {
                 return Ok(());
@@ -251,10 +256,9 @@ impl CollectionLifecycle {
         collection: &CollectionAddress,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let prefix = collection.physical_prefix();
         let mut backoff = self.retry.backoff();
         loop {
-            let (mut root, observed) = self.shards.load_root(&prefix, Requirement::Any).await?;
+            let (mut root, observed) = self.shards.load_root(collection, Requirement::Any).await?;
             if root.collection_delete_intent() == Some(id) {
                 return Ok(());
             }
@@ -269,7 +273,7 @@ impl CollectionLifecycle {
             // As for standalone nodes, the exact-revision rewrite closes the
             // final race without leaving a separate gate to recover on abort.
             root.set_collection_delete_intent(id.clone());
-            if self.shards.store_root(&prefix, &root, &observed).await? {
+            if self.shards.store_root(collection, &root, &observed).await? {
                 return Ok(());
             }
             rt::sleep(backoff.next_delay()).await;
@@ -317,21 +321,21 @@ impl CollectionLifecycle {
 
     async fn clear_node_fence(
         &self,
-        prefix: &str,
-        token: &str,
+        collection: &CollectionAddress,
+        token: &NodeToken,
         id: &TxId,
     ) -> Result<(), TransError> {
         loop {
             let (mut node, observed) = self
                 .shards
-                .load_node(prefix, token, Requirement::Any)
+                .load_node(collection, token, Requirement::Any)
                 .await?;
             if !node.remove_collection_delete_intent(id) {
                 return Ok(());
             }
             if self
                 .shards
-                .store_node(prefix, token, &node, Some(&observed))
+                .store_node(collection, token, &node, Some(&observed))
                 .await?
             {
                 return Ok(());
@@ -344,24 +348,23 @@ impl CollectionLifecycle {
         collection: &CollectionAddress,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let prefix = collection.physical_prefix();
         loop {
-            let (mut root, observed) = match self.shards.load_root(&prefix, Requirement::Any).await
-            {
-                Ok(root) => root,
-                Err(StorageError::NotFound) => return Ok(()),
-                Err(error) => return Err(error.into()),
-            };
+            let (mut root, observed) =
+                match self.shards.load_root(collection, Requirement::Any).await {
+                    Ok(root) => root,
+                    Err(StorageError::NotFound) => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                };
             if !root.remove_collection_delete_intent(id) {
                 break;
             }
-            if self.shards.store_root(&prefix, &root, &observed).await? {
+            if self.shards.store_root(collection, &root, &observed).await? {
                 break;
             }
         }
         loop {
             let (mut record, observed) =
-                match self.records.load_record(&prefix, Requirement::Any).await {
+                match self.records.load_record(collection, Requirement::Any).await {
                     Ok(record) => record,
                     Err(StorageError::NotFound) => return Ok(()),
                     Err(error) => return Err(error.into()),
@@ -386,7 +389,7 @@ mod tests {
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture};
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::Background;
-    use glassdb_data::paths;
+    use glassdb_data::{DbRoot, NodeToken, ObjectPath};
     use glassdb_storage::transaction::TLogger;
     use glassdb_storage::{CachedStore, CurrentState, Shard, ShardEntry, Timeline};
     use tokio::sync::Notify;
@@ -394,7 +397,16 @@ mod tests {
     use super::*;
 
     const COLLECTION: &str = "db/_c/0000000000000000000000";
-    const SOURCE_TOKEN: &str = "L";
+    const SOURCE_TOKEN: &str = "0000000000000000000000";
+    const RIGHT_TOKEN: &str = "0F410F410F410F410F410F";
+
+    fn collection() -> CollectionAddress {
+        CollectionAddress::from_physical_prefix(COLLECTION).unwrap()
+    }
+
+    fn node_token(value: &str) -> NodeToken {
+        NodeToken::try_from(value).unwrap()
+    }
 
     struct UnexpectedTopologySettler;
 
@@ -417,7 +429,11 @@ mod tests {
 
     impl FirstSourceWriteGate {
         fn wrap(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
-            let source_path = paths::from_node(COLLECTION, SOURCE_TOKEN);
+            let source_path = ObjectPath::Node {
+                collection: collection(),
+                token: node_token(SOURCE_TOKEN),
+            }
+            .to_string();
             let gate = Arc::new(Self {
                 armed: AtomicBool::new(false),
                 entered: Notify::new(),
@@ -494,7 +510,7 @@ mod tests {
         let peer = store(backend.clone());
         let background = Arc::new(Background::new());
         let monitor = Monitor::with_config(
-            TLogger::new(primary.objects.clone(), "db"),
+            TLogger::new(primary.objects.clone(), DbRoot::try_from("db").unwrap()),
             primary.timeline.clone(),
             Arc::downgrade(&background),
             RetryConfig::default(),
@@ -526,21 +542,21 @@ mod tests {
         assert!(
             primary
                 .shards
-                .store_node(COLLECTION, SOURCE_TOKEN, &source, None)
+                .store_node(&collection(), &node_token(SOURCE_TOKEN), &source, None,)
                 .await
                 .unwrap()
         );
         let (mut shrunk, source_version) = primary
             .shards
-            .load_node(COLLECTION, SOURCE_TOKEN, Requirement::Any)
+            .load_node(&collection(), &node_token(SOURCE_TOKEN), Requirement::Any)
             .await
             .unwrap();
-        let (right, _) = shrunk.split("R").unwrap();
+        let (right, _) = shrunk.split(RIGHT_TOKEN).unwrap();
         shrunk.remove_structural_gate(&split_id);
         assert!(
             primary
                 .shards
-                .store_node(COLLECTION, "R", &right, None)
+                .store_node(&collection(), &node_token(RIGHT_TOKEN), &right, None)
                 .await
                 .unwrap()
         );
@@ -554,14 +570,19 @@ mod tests {
                 let drop_id = drop_id.clone();
                 async move {
                     lifecycle
-                        .fence_node(COLLECTION, SOURCE_TOKEN, &drop_id)
+                        .fence_node(&collection(), &node_token(SOURCE_TOKEN), &drop_id)
                         .await
                 }
             });
             gate.wait_until_entered().await;
             let shrink_landed = peer
                 .shards
-                .store_node(COLLECTION, SOURCE_TOKEN, &shrunk, Some(&source_version))
+                .store_node(
+                    &collection(),
+                    &node_token(SOURCE_TOKEN),
+                    &shrunk,
+                    Some(&source_version),
+                )
                 .await
                 .unwrap();
             gate.release();
@@ -574,13 +595,18 @@ mod tests {
                 let source_version = source_version.clone();
                 async move {
                     shards
-                        .store_node(COLLECTION, SOURCE_TOKEN, &shrunk, Some(&source_version))
+                        .store_node(
+                            &collection(),
+                            &node_token(SOURCE_TOKEN),
+                            &shrunk,
+                            Some(&source_version),
+                        )
                         .await
                 }
             });
             gate.wait_until_entered().await;
             let fence_result = peer_lifecycle
-                .fence_node(COLLECTION, SOURCE_TOKEN, &drop_id)
+                .fence_node(&collection(), &node_token(SOURCE_TOKEN), &drop_id)
                 .await;
             gate.release();
             let shrink_landed = shrinking.await.unwrap().unwrap();
@@ -592,11 +618,14 @@ mod tests {
         let verifier = store(backend);
         let (final_source, _) = verifier
             .shards
-            .load_node(COLLECTION, SOURCE_TOKEN, Requirement::Any)
+            .load_node(&collection(), &node_token(SOURCE_TOKEN), Requirement::Any)
             .await
             .unwrap();
         assert_eq!(final_source.collection_delete_intent(), Some(&drop_id));
-        assert_eq!(final_source.right_sibling(), shrink_landed.then_some("R"));
+        assert_eq!(
+            final_source.right_sibling(),
+            shrink_landed.then_some(RIGHT_TOKEN)
+        );
     }
 
     #[tokio::test]

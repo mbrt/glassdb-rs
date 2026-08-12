@@ -21,6 +21,7 @@ workspace = true
 glassdb = { path = "../glassdb", features = ["s3", "gcs", "s3-fake-server"] }
 glassdb-backend = { workspace = true }
 glassdb-concurr = { workspace = true }
+glassdb-data = { workspace = true }
 # A real tokio runtime drives the binaries.
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 clap = { version = "4", features = ["derive"] }

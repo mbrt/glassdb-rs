@@ -8,7 +8,7 @@ use glassdb_concurr::rt;
 
 use super::knowledge::{Knowledge, PresentSeed};
 use super::path_lane::PathState;
-use super::{Codec, Revision};
+use super::{Codec, ObjectKey, Revision};
 use crate::cache_stats::CacheMetrics;
 use crate::disk_cache::{EncodedBody, FenceContext, FenceGuard, PathFence, PersistentCache};
 use crate::timeline::SequencePoint;
@@ -64,7 +64,7 @@ impl PersistentBridge {
     pub(super) async fn load<C: Codec>(
         &self,
         knowledge: &Knowledge,
-        path: &Arc<str>,
+        key: &ObjectKey,
         state: &Arc<PathState>,
     ) -> Option<PresentSeed> {
         let cache = self.cache.as_ref()?;
@@ -72,14 +72,14 @@ impl PersistentBridge {
         if lease.fence().is_active() || !cache.is_enabled() {
             return None;
         }
-        let encoded = match rt::timeout(LOOKUP_TIMEOUT, cache.lookup(path.clone())).await {
+        let encoded = match rt::timeout(LOOKUP_TIMEOUT, cache.lookup(key.encoded().clone())).await {
             Ok(encoded) => encoded?,
             Err(_) => {
                 cache.disable_slow_lookup();
                 return None;
             }
         };
-        self.decode_candidate::<C>(knowledge, path, cache, lease, encoded)
+        self.decode_candidate::<C>(knowledge, key, cache, lease, encoded)
     }
 
     /// Starts a path-changing L2 transition before its corresponding L1 change.
@@ -98,7 +98,7 @@ impl PersistentBridge {
     fn decode_candidate<C: Codec>(
         &self,
         knowledge: &Knowledge,
-        path: &Arc<str>,
+        key: &ObjectKey,
         cache: &PersistentCache,
         lease: Arc<PathLease>,
         encoded: EncodedBody,
@@ -106,25 +106,30 @@ impl PersistentBridge {
         let token = match String::from_utf8(encoded.revision) {
             Ok(token) => token,
             Err(error) => {
-                tracing::warn!(path = %path, %error, "discarding invalid persistent-cache revision");
-                cache.reject_corrupt_candidate(path.clone(), lease);
+                tracing::warn!(path = %key.as_str(), %error, "discarding invalid persistent-cache revision");
+                cache.reject_corrupt_candidate(key.encoded().clone(), lease);
                 return None;
             }
         };
-        let decoded = match C::decode(path, &encoded.body) {
+        let decoded = match C::decode(key.object_path(), &encoded.body) {
             Ok(decoded) => decoded,
             Err(error) => {
-                tracing::warn!(path = %path, %error, "discarding undecodable persistent-cache body");
-                cache.reject_corrupt_candidate(path.clone(), lease);
+                tracing::warn!(path = %key.as_str(), %error, "discarding undecodable persistent-cache body");
+                cache.reject_corrupt_candidate(key.encoded().clone(), lease);
                 return None;
             }
         };
         let size = C::size(&decoded);
         let value = Arc::new(decoded);
         let revision = Revision(backend::Version::new(token));
-        let seed =
-            knowledge.install_persistent::<C>(path, value, size, revision, encoded.current_after);
-        cache.record_present_hit(path, lease);
+        let seed = knowledge.install_persistent::<C>(
+            key.as_str(),
+            value,
+            size,
+            revision,
+            encoded.current_after,
+        );
+        cache.record_present_hit(key.encoded(), lease);
         Some(seed)
     }
 }
