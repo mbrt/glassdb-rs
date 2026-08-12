@@ -7,7 +7,7 @@ use crate::cache::{Cache, Weighable};
 use crate::error::StorageError;
 use crate::timeline::SequencePoint;
 
-use super::{Codec, Evidence, Observation, Requirement, Revision, satisfies};
+use super::{Codec, Evidence, ObjectKey, Observation, Requirement, Revision, satisfies};
 
 type ErasedValue = Arc<dyn Any + Send + Sync>;
 
@@ -188,10 +188,10 @@ impl Knowledge {
     /// Returns a cached observation that satisfies `req` without backend I/O.
     pub(super) fn peek<C: Codec>(
         &self,
-        path: &Arc<str>,
+        key: &ObjectKey,
         req: Requirement,
     ) -> Result<Option<Observation<C::Value>>, StorageError> {
-        let Some(entry) = self.cache.get(path) else {
+        let Some(entry) = self.cache.get(key.as_str()) else {
             return Ok(None);
         };
         match entry.state {
@@ -204,9 +204,9 @@ impl Knowledge {
                 if !satisfies(evidence.get(), req) {
                     return Ok(None);
                 }
-                let value = downcast::<C>(path, value)?;
+                let value = downcast::<C>(key.as_str(), value)?;
                 Ok(Some(Observation {
-                    path: path.clone(),
+                    key: key.clone(),
                     value: Some(value),
                     revision: Some(revision),
                     evidence,
@@ -218,7 +218,7 @@ impl Knowledge {
                     return Ok(None);
                 }
                 Ok(Some(Observation {
-                    path: path.clone(),
+                    key: key.clone(),
                     value: None,
                     revision: None,
                     evidence,
@@ -230,7 +230,7 @@ impl Knowledge {
 
     pub(super) fn present_seed<C: Codec>(
         &self,
-        path: &Arc<str>,
+        key: &ObjectKey,
         fallback: Option<&Observation<C::Value>>,
     ) -> Result<Option<PresentSeed>, StorageError> {
         if let Some(CacheEntry {
@@ -241,9 +241,9 @@ impl Knowledge {
                     revision,
                     evidence,
                 },
-        }) = self.cache.get(path)
+        }) = self.cache.get(key.as_str())
         {
-            downcast::<C>(path, value.clone())?;
+            downcast::<C>(key.as_str(), value.clone())?;
             return Ok(Some(PresentSeed {
                 value,
                 size,
@@ -342,7 +342,7 @@ impl Knowledge {
 
     pub(super) fn install_mutation<C: Codec>(
         &self,
-        path: Arc<str>,
+        key: ObjectKey,
         value: Arc<C::Value>,
         size: usize,
         revision: Revision,
@@ -350,14 +350,14 @@ impl Knowledge {
     ) -> Observation<C::Value> {
         let erased: ErasedValue = value.clone();
         let evidence = self.install_present(
-            &path,
+            key.as_str(),
             erased,
             size,
             revision.clone(),
             Evidence::new(current_after),
         );
         Observation {
-            path,
+            key,
             value: Some(value),
             revision: Some(revision),
             evidence,
@@ -380,12 +380,12 @@ impl Knowledge {
 
     pub(super) fn install_absent_observation<V>(
         &self,
-        path: Arc<str>,
+        key: ObjectKey,
         current_after: SequencePoint,
     ) -> Observation<V> {
-        let evidence = self.install_absent(&path, current_after);
+        let evidence = self.install_absent(key.as_str(), current_after);
         Observation {
-            path,
+            key,
             value: None,
             revision: None,
             evidence,
@@ -417,15 +417,15 @@ impl Knowledge {
 
     pub(super) fn to_observation<C: Codec>(
         &self,
-        path: &Arc<str>,
+        key: ObjectKey,
         fetched: FetchResult,
     ) -> Result<Observation<C::Value>, StorageError> {
         let value = match fetched.value {
-            Some(any) => Some(downcast::<C>(path, any)?),
+            Some(any) => Some(downcast::<C>(key.as_str(), any)?),
             None => None,
         };
         Ok(Observation {
-            path: path.clone(),
+            key,
             value,
             revision: fetched.revision,
             evidence: fetched.evidence,

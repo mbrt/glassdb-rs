@@ -9,7 +9,7 @@ use glassdb_backend as backend;
 use glassdb_concurr::rt;
 use glassdb_data::{DbRoot, ObjectPath, TxId};
 
-use crate::cached_store::{CachedStore, CasResult, Observation, Requirement};
+use crate::cached_store::{CachedStore, CasResult, ObjectKey, Observation, Requirement};
 use crate::error::StorageError;
 use crate::transaction::{TxCommitStatus, TxLifecycleRelation, TxLog, TxLogCodec, TxRecordState};
 
@@ -67,14 +67,13 @@ impl TLogger {
         id: &TxId,
         requirement: Requirement,
     ) -> Result<TxStatus, StorageError> {
-        let path = ObjectPath::Transaction {
+        let path = ObjectKey::from(ObjectPath::Transaction {
             db_root: self.db_root.clone(),
             id: id.clone(),
-        }
-        .to_string();
+        });
         let observation = match self.cached_final(&path)? {
             Some(observation) => observation,
-            None => self.logs.read(&path, requirement).await?,
+            None => self.logs.read(path, requirement).await?,
         };
         Ok(TxStatus::from_observation(observation))
     }
@@ -85,14 +84,13 @@ impl TLogger {
         id: &TxId,
         requirement: Requirement,
     ) -> Result<Observation<TxLog>, StorageError> {
-        let path = ObjectPath::Transaction {
+        let path = ObjectKey::from(ObjectPath::Transaction {
             db_root: self.db_root.clone(),
             id: id.clone(),
-        }
-        .to_string();
+        });
         let observation = match self.cached_final(&path)? {
             Some(observation) => observation,
-            None => self.logs.read(&path, requirement).await?,
+            None => self.logs.read(path, requirement).await?,
         };
         if observation.is_absent() {
             Err(StorageError::NotFound)
@@ -110,9 +108,8 @@ impl TLogger {
         let path = ObjectPath::Transaction {
             db_root: self.db_root.clone(),
             id: l.id.clone(),
-        }
-        .to_string();
-        match self.logs.create(&path, None, Arc::new(persisted)).await? {
+        };
+        match self.logs.create(path, None, Arc::new(persisted)).await? {
             CasResult::Committed(observed) => Ok(observed),
             CasResult::Conflict => Err(StorageError::Precondition),
         }
@@ -166,8 +163,10 @@ impl TLogger {
         let ids = page
             .objects
             .iter()
-            .filter_map(|path| match ObjectPath::try_from(path.as_str()) {
-                Ok(ObjectPath::Transaction { db_root, id }) if db_root == self.db_root => Some(id),
+            .filter_map(|path| match path.object_path() {
+                ObjectPath::Transaction { db_root, id } if db_root == &self.db_root => {
+                    Some(id.clone())
+                }
                 _ => None,
             })
             .collect();
@@ -190,7 +189,7 @@ impl TLogger {
         Ok(())
     }
 
-    fn cached_final(&self, path: &str) -> Result<Option<Observation<TxLog>>, StorageError> {
+    fn cached_final(&self, path: &ObjectKey) -> Result<Option<Observation<TxLog>>, StorageError> {
         Ok(self.logs.peek(path)?.filter(|observation| {
             observation
                 .value()
@@ -271,6 +270,40 @@ mod tests {
         let actual: Vec<_> = operations.iter().map(|operation| operation.op).collect();
         assert_eq!(actual, expected);
         operations.clear();
+    }
+
+    #[tokio::test]
+    async fn mutations_reject_transaction_identity_mismatches_before_backend_io() {
+        let (logger, operations) = new_recording_tlogger();
+        let id = TxId::from_bytes(vec![1, 2, 3, 4]);
+        let observed = logger
+            .set(&TxLog::new(id, TxCommitStatus::Pending))
+            .await
+            .unwrap();
+        assert_operations(&operations, &["write_if_not_exists"]);
+
+        let different_id = TxId::from_bytes(vec![4, 3, 2, 1]);
+        assert!(
+            logger
+                .set_if(
+                    &TxLog::new(different_id, TxCommitStatus::Pending),
+                    &observed,
+                )
+                .await
+                .is_err()
+        );
+        assert_operations(&operations, &[]);
+
+        let mut wrong_database =
+            TxLog::new(TxId::from_bytes(vec![5, 6, 7, 8]), TxCommitStatus::Pending);
+        wrong_database.writes.push(TxWrite {
+            key: KeyRef::new(test_collection("other", 1), b"key"),
+            value: Arc::from(&b"value"[..]),
+            deleted: false,
+            prev_writer: TxId::default(),
+        });
+        assert!(logger.set(&wrong_database).await.is_err());
+        assert_operations(&operations, &[]);
     }
 
     #[tokio::test]

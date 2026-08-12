@@ -271,11 +271,11 @@ impl Default for CollectionRecord {
 impl Codec for CollectionRecord {
     type Value = CollectionRecord;
 
-    fn decode(_path: &str, body: &[u8]) -> Result<Self::Value, StorageError> {
+    fn decode(_path: &ObjectPath, body: &[u8]) -> Result<Self::Value, StorageError> {
         CollectionRecord::decode(body)
     }
 
-    fn encode(record: &Self::Value) -> Result<Vec<u8>, StorageError> {
+    fn encode(_path: &ObjectPath, record: &Self::Value) -> Result<Vec<u8>, StorageError> {
         Ok(record.encode())
     }
 
@@ -283,11 +283,8 @@ impl Codec for CollectionRecord {
         record.encoded_len()
     }
 
-    fn valid_path(path: &str) -> bool {
-        matches!(
-            ObjectPath::try_from(path),
-            Ok(ObjectPath::CollectionRecord { .. })
-        )
+    fn accepts(path: &ObjectPath) -> bool {
+        matches!(path, ObjectPath::CollectionRecord { .. })
     }
 
     fn name() -> &'static str {
@@ -329,11 +326,14 @@ impl CollectionStore {
         collection: &CollectionAddress,
         requirement: Requirement,
     ) -> Result<Observation<CollectionRecord>, StorageError> {
-        let path = ObjectPath::CollectionRecord {
-            collection: collection.clone(),
-        }
-        .to_string();
-        self.records.read(&path, requirement).await
+        self.records
+            .read(
+                ObjectPath::CollectionRecord {
+                    collection: collection.clone(),
+                },
+                requirement,
+            )
+            .await
     }
 
     /// Compare-and-swaps a collection record.
@@ -373,11 +373,10 @@ impl CollectionStore {
     ) -> Result<Option<Observation<CollectionRecord>>, StorageError> {
         let path = ObjectPath::CollectionRecord {
             collection: collection.clone(),
-        }
-        .to_string();
+        };
         match self
             .records
-            .create(&path, None, Arc::new(record.clone()))
+            .create(path, None, Arc::new(record.clone()))
             .await?
         {
             CasResult::Committed(observed) => Ok(Some(observed)),

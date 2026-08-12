@@ -50,7 +50,7 @@ pub type LeafObservationCheck = ObservationCheck<Node>;
 
 impl LoadedLeaf {
     /// Returns the object path of this loaded leaf.
-    pub fn path(&self) -> &str {
+    pub fn path(&self) -> &ObjectPath {
         self.edit.path()
     }
 
@@ -89,7 +89,7 @@ impl LoadedLeaf {
 
 impl LeafEdit {
     /// Returns the immutable object path to which this edit is bound.
-    pub fn path(&self) -> &str {
+    pub fn path(&self) -> &ObjectPath {
         self.observation.path()
     }
 
@@ -136,11 +136,11 @@ impl LeafEdit {
 impl Codec for Node {
     type Value = Node;
 
-    fn decode(_path: &str, body: &[u8]) -> Result<Self::Value, StorageError> {
+    fn decode(_path: &ObjectPath, body: &[u8]) -> Result<Self::Value, StorageError> {
         Node::decode(body)
     }
 
-    fn encode(node: &Self::Value) -> Result<Vec<u8>, StorageError> {
+    fn encode(_path: &ObjectPath, node: &Self::Value) -> Result<Vec<u8>, StorageError> {
         Ok(node.encode())
     }
 
@@ -148,11 +148,8 @@ impl Codec for Node {
         node.encoded_len()
     }
 
-    fn valid_path(path: &str) -> bool {
-        matches!(
-            ObjectPath::try_from(path),
-            Ok(ObjectPath::TreeRoot { .. } | ObjectPath::Node { .. })
-        )
+    fn accepts(path: &ObjectPath) -> bool {
+        matches!(path, ObjectPath::TreeRoot { .. } | ObjectPath::Node { .. })
     }
 
     fn name() -> &'static str {
@@ -163,16 +160,14 @@ impl Codec for Node {
 impl Codec for StructuralLog {
     type Value = StructuralLog;
 
-    fn decode(path: &str, body: &[u8]) -> Result<Self::Value, StorageError> {
+    fn decode(path: &ObjectPath, body: &[u8]) -> Result<Self::Value, StorageError> {
         let record = StructuralLog::decode(body)?;
-        let ObjectPath::StructuralRecord { participant, .. } = ObjectPath::try_from(path)
-            .map_err(|error| StorageError::with_source("parsing structural-log path", error))?
-        else {
+        let ObjectPath::StructuralRecord { participant, .. } = path else {
             return Err(StorageError::other(
                 "structural log has a non-structural path",
             ));
         };
-        if participant != record.participant_id {
+        if participant != &record.participant_id {
             return Err(StorageError::other(
                 "structural-log path does not match its participant",
             ));
@@ -180,7 +175,17 @@ impl Codec for StructuralLog {
         Ok(record)
     }
 
-    fn encode(record: &Self::Value) -> Result<Vec<u8>, StorageError> {
+    fn encode(path: &ObjectPath, record: &Self::Value) -> Result<Vec<u8>, StorageError> {
+        let ObjectPath::StructuralRecord { participant, .. } = path else {
+            return Err(StorageError::other(
+                "structural log has a non-structural path",
+            ));
+        };
+        if participant != &record.participant_id {
+            return Err(StorageError::other(
+                "structural-log path does not match its participant",
+            ));
+        }
         Ok(record.encode())
     }
 
@@ -188,11 +193,8 @@ impl Codec for StructuralLog {
         record.encode().len()
     }
 
-    fn valid_path(path: &str) -> bool {
-        matches!(
-            ObjectPath::try_from(path),
-            Ok(ObjectPath::StructuralRecord { .. })
-        )
+    fn accepts(path: &ObjectPath) -> bool {
+        matches!(path, ObjectPath::StructuralRecord { .. })
     }
 
     fn name() -> &'static str {
@@ -250,8 +252,8 @@ impl ShardStore {
         path: &ObjectPath,
         requirement: Requirement,
     ) -> Result<LeafObservation, StorageError> {
-        let path = node_path(path)?;
-        self.nodes.read(&path, requirement).await
+        validate_node_path(path)?;
+        self.nodes.read(path, requirement).await
     }
 
     /// Loads an existing node at an exact `_r` or `_n/<token>` path.
@@ -275,12 +277,16 @@ impl ShardStore {
         token: &NodeToken,
         requirement: Requirement,
     ) -> Result<LeafObservation, StorageError> {
-        let path = ObjectPath::Node {
-            collection: collection.clone(),
-            token: token.clone(),
-        }
-        .to_string();
-        let observed = self.nodes.read(&path, requirement).await?;
+        let observed = self
+            .nodes
+            .read(
+                ObjectPath::Node {
+                    collection: collection.clone(),
+                    token: token.clone(),
+                },
+                requirement,
+            )
+            .await?;
         if observed.is_absent() {
             return Err(StorageError::NotFound);
         }
@@ -319,16 +325,15 @@ impl ShardStore {
         let path = ObjectPath::Node {
             collection: collection.clone(),
             token: token.clone(),
-        }
-        .to_string();
+        };
         let res = match expected {
-            Some(observed) if observed.path() == path => {
+            Some(observed) if observed.path() == &path => {
                 self.nodes
                     .compare_and_swap(observed, Arc::new(node.clone()))
                     .await
             }
             Some(_) => return Err(StorageError::other("node observation path changed")),
-            None => self.nodes.create(&path, None, Arc::new(node.clone())).await,
+            None => self.nodes.create(path, None, Arc::new(node.clone())).await,
         };
         match res {
             Ok(CasResult::Committed(_)) => Ok(true),
@@ -344,7 +349,7 @@ impl ShardStore {
         node: &Node,
         expected: &LeafObservation,
     ) -> Result<bool, StorageError> {
-        let path = node_path(path)?;
+        validate_node_path(path)?;
         if expected.path() != path {
             return Err(StorageError::other("node observation path changed"));
         }
@@ -385,17 +390,17 @@ impl ShardStore {
                 let ObjectPath::Node {
                     collection: listed_collection,
                     token,
-                } = ObjectPath::try_from(path.as_str())
-                    .map_err(|error| StorageError::with_source("parsing node path", error))?
+                } = path.object_path()
                 else {
                     return Err(StorageError::other("node listing returned a non-node path"));
                 };
-                if listed_collection != *collection {
+                if listed_collection != collection {
                     return Err(StorageError::other(
                         "node listing returned a different collection",
                     ));
                 }
-                let observed = self.nodes.read(&path, requirement).await?;
+                let token = token.clone();
+                let observed = self.nodes.read(path, requirement).await?;
                 if observed.exists() {
                     nodes.push((token, observed));
                 }
@@ -418,11 +423,10 @@ impl ShardStore {
             db_root: db_root.clone(),
             participant: record.participant_id.clone(),
             record_id: record_id.clone(),
-        }
-        .to_string();
+        };
         match self
             .structural_logs
-            .create(&path, None, Arc::new(record.clone()))
+            .create(path, None, Arc::new(record.clone()))
             .await
         {
             Ok(CasResult::Committed(observed)) => Ok(observed),
@@ -437,19 +441,6 @@ impl ShardStore {
         expected: &Observation<StructuralLog>,
         record: &StructuralLog,
     ) -> Result<Option<Observation<StructuralLog>>, StorageError> {
-        let ObjectPath::StructuralRecord { participant, .. } =
-            ObjectPath::try_from(expected.path())
-                .map_err(|error| StorageError::with_source("parsing structural-log path", error))?
-        else {
-            return Err(StorageError::other(
-                "structural log has a non-structural path",
-            ));
-        };
-        if participant != record.participant_id {
-            return Err(StorageError::other(
-                "structural-log update changes its participant",
-            ));
-        }
         match self
             .structural_logs
             .compare_and_swap(expected, Arc::new(record.clone()))
@@ -497,8 +488,8 @@ impl ShardStore {
         path: &ObjectPath,
         requirement: Requirement,
     ) -> Result<LoadedLeaf, StorageError> {
-        let path = node_path(path)?;
-        let observed = self.nodes.read(&path, requirement).await?;
+        validate_node_path(path)?;
+        let observed = self.nodes.read(path, requirement).await?;
         match observed.value() {
             Some(node) => {
                 let node = node.as_ref().clone();
@@ -569,9 +560,8 @@ impl ShardStore {
     ) -> Result<bool, StorageError> {
         let path = ObjectPath::TreeRoot {
             collection: collection.clone(),
-        }
-        .to_string();
-        match self.nodes.create(&path, None, Arc::new(root.clone())).await {
+        };
+        match self.nodes.create(path, None, Arc::new(root.clone())).await {
             Ok(CasResult::Committed(_)) => Ok(true),
             Ok(CasResult::Conflict) => Ok(false),
             Err(e) => Err(e),
@@ -587,11 +577,10 @@ impl ShardStore {
     ) -> Result<Option<Observation<Node>>, StorageError> {
         let path = ObjectPath::TreeRoot {
             collection: collection.clone(),
-        }
-        .to_string();
+        };
         match self
             .nodes
-            .create(&path, None, Arc::new(root.clone()))
+            .create(path, None, Arc::new(root.clone()))
             .await?
         {
             CasResult::Committed(observed) => Ok(Some(observed)),
@@ -618,16 +607,13 @@ impl ShardStore {
                 .list(prefix, cursor.as_ref(), limit)
                 .await?;
             for path in page.objects {
-                let ObjectPath::StructuralRecord { record_id, .. } =
-                    ObjectPath::try_from(path.as_str()).map_err(|error| {
-                        StorageError::with_source("parsing structural-log path", error)
-                    })?
-                else {
+                let ObjectPath::StructuralRecord { record_id, .. } = path.object_path() else {
                     return Err(StorageError::other(
                         "structural listing returned a non-structural path",
                     ));
                 };
-                let observed = self.structural_logs.read(&path, requirement).await?;
+                let record_id = record_id.clone();
+                let observed = self.structural_logs.read(path, requirement).await?;
                 if observed.exists() {
                     records.push((record_id, observed));
                 }
@@ -640,9 +626,9 @@ impl ShardStore {
     }
 }
 
-fn node_path(path: &ObjectPath) -> Result<String, StorageError> {
+fn validate_node_path(path: &ObjectPath) -> Result<(), StorageError> {
     match path {
-        ObjectPath::TreeRoot { .. } | ObjectPath::Node { .. } => Ok(path.to_string()),
+        ObjectPath::TreeRoot { .. } | ObjectPath::Node { .. } => Ok(()),
         _ => Err(StorageError::other("expected a tree-node object path")),
     }
 }
@@ -702,6 +688,26 @@ mod tests {
 
     fn record_id(byte: u8) -> StructuralRecordId {
         StructuralRecordId::from(token(byte))
+    }
+
+    #[test]
+    fn structural_codec_rejects_a_different_path_participant() {
+        let path = ObjectPath::StructuralRecord {
+            db_root: db_root(),
+            participant: TxId::from_bytes(b"path-participant".to_vec()),
+            record_id: record_id(1),
+        };
+        let record = StructuralLog {
+            collection: CollectionAddress::root("db"),
+            source_token: None,
+            source_version: String::new(),
+            created_tokens: Vec::new(),
+            split_key: Vec::new(),
+            participant_id: TxId::from_bytes(b"body-participant".to_vec()),
+            phase: StructuralLogPhase::Preparing,
+        };
+
+        assert!(<StructuralLog as Codec>::encode(&path, &record).is_err());
     }
 
     // Seeds an empty node leaf at `path` through a separate store so a later
@@ -859,7 +865,7 @@ mod tests {
         locks.set_membership_writer(holder.clone());
 
         let mut edit = loaded.into_edit();
-        assert_eq!(edit.path(), path.to_string());
+        assert_eq!(edit.path(), &path);
         assert_eq!(edit.node().high_key(), Some(b"m".as_slice()));
         assert_eq!(edit.node().right_sibling(), Some("right"));
         edit.set_entries(entries.clone());
@@ -893,7 +899,7 @@ mod tests {
         edit.set_entries(Shard::from_entries([ShardEntry::new(
             b"left-key".as_slice(),
         )]));
-        assert_eq!(edit.path(), left_path.to_string());
+        assert_eq!(edit.path(), &left_path);
         assert!(store.commit_leaf(edit).await.unwrap());
 
         let left = store.load_leaf(&left_path, Requirement::Any).await.unwrap();
