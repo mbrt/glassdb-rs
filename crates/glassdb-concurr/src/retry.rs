@@ -60,36 +60,12 @@ impl Backoff {
     }
 }
 
-/// Returns a value in `[0, 1)`, drawn from the OS RNG in normal builds and from
-/// the deterministic executor's seeded entropy under `--cfg sim` so replays stay
-/// byte-identical.
-#[cfg(not(sim))]
-fn rand_unit() -> f64 {
-    use rand::RngExt;
-    rand::rng().random::<f64>()
-}
-
-#[cfg(sim)]
-fn rand_unit() -> f64 {
-    // Inside the executor draw from its seeded entropy; outside it (e.g. ordinary
-    // tokio tests built with `--cfg sim`) fall back to the OS RNG.
-    if crate::rt::in_sim() {
-        let mut b = [0u8; 8];
-        crate::rt::fill_random(&mut b);
-        // Map the 53 high bits to [0, 1), as rand's StandardUniform does for f64.
-        ((u64::from_le_bytes(b) >> 11) as f64) / ((1u64 << 53) as f64)
-    } else {
-        use rand::RngExt;
-        rand::rng().random::<f64>()
-    }
-}
-
 /// Perturbs `d` by +/-[`JITTER_FACTOR`], uniformly in `[0.5*d, 1.5*d]`.
 fn jittered(d: Duration) -> Duration {
     let base = d.as_secs_f64();
     let min = base * (1.0 - JITTER_FACTOR);
     let span = base * (2.0 * JITTER_FACTOR);
-    Duration::from_secs_f64(min + rand_unit() * span)
+    Duration::from_secs_f64(min + crate::entropy::uniform_unit() * span)
 }
 
 #[cfg(test)]

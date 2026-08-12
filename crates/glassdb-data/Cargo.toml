@@ -10,11 +10,6 @@ description = "Low level data types for GlassDB (internal crate)."
 workspace = true
 
 [dependencies]
-rand = "0.10.1"
-
-# Under `--cfg sim` transaction-id prefixes are drawn from the deterministic
-# executor's seeded RNG instead of the OS, so per-seed replays are byte-identical.
-[target.'cfg(sim)'.dependencies]
 glassdb-concurr = { version = "0.1.0", path = "../glassdb-concurr" }
 
 [dev-dependencies]

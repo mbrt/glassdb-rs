@@ -1,6 +1,6 @@
 //! Stable identity for one collection incarnation.
 
-use crate::entropy::fill_random;
+use glassdb_concurr::entropy::fill_bytes;
 
 /// Number of bytes in a collection ID.
 const COLLECTION_ID_BYTES: usize = 16;
@@ -25,7 +25,7 @@ impl CollectionId {
     pub fn new_random() -> Self {
         loop {
             let mut bytes = [0; COLLECTION_ID_BYTES];
-            fill_random(&mut bytes);
+            fill_bytes(&mut bytes);
             if bytes != [0; COLLECTION_ID_BYTES] {
                 return Self(bytes);
             }

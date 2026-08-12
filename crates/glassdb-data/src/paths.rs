@@ -79,7 +79,7 @@ impl NodeToken {
     /// high-entropy prefix. The entropy source is simulation-aware.
     pub fn new_random() -> Self {
         let mut bytes = [0u8; NODE_TOKEN_BYTES];
-        crate::entropy::fill_random(&mut bytes);
+        glassdb_concurr::entropy::fill_bytes(&mut bytes);
         Self::from_bytes(bytes)
     }
 

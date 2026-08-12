@@ -1,6 +1,6 @@
 //! Persistent identity for one logical GlassDB database.
 
-use crate::entropy::fill_random;
+use glassdb_concurr::entropy::fill_bytes;
 
 /// Number of bytes in a database ID.
 pub const DATABASE_ID_BYTES: usize = 16;
@@ -14,7 +14,7 @@ impl DatabaseId {
     /// Generates a random 128-bit database ID.
     pub fn new_random() -> Self {
         let mut bytes = [0; DATABASE_ID_BYTES];
-        fill_random(&mut bytes);
+        fill_bytes(&mut bytes);
         Self(bytes)
     }
 
