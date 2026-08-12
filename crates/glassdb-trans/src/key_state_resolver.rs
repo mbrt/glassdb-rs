@@ -552,10 +552,7 @@ mod tests {
             assert_eq!(typ, LockType::Read, "only read locks may be shared");
             lock.acquire_read(holder);
         }
-        let mut entry = ShardEntry {
-            current,
-            ..ShardEntry::new(key)
-        };
+        let mut entry = ShardEntry::new(key).with_current(current);
         entry.replace_lock(lock);
         entry
     }

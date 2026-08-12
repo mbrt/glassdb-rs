@@ -495,12 +495,9 @@ mod tests {
     }
 
     fn live_entry(key: &[u8]) -> ShardEntry {
-        ShardEntry {
-            current: CurrentState::External {
-                writer: TxId::from_bytes(vec![9]),
-            },
-            ..ShardEntry::new(key)
-        }
+        ShardEntry::new(key).with_current(CurrentState::External {
+            writer: TxId::from_bytes(vec![9]),
+        })
     }
 
     async fn run_fence_shrink_race(fence_waits: bool) {

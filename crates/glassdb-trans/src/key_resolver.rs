@@ -521,13 +521,7 @@ mod tests {
                 writer: writer.clone(),
             }
         };
-        entries.insert(
-            key.to_vec(),
-            ShardEntry {
-                current,
-                ..ShardEntry::new(key)
-            },
-        );
+        entries.insert(key.to_vec(), ShardEntry::new(key).with_current(current));
         let new_shard = Shard::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
         edit.set_entries(new_shard);
@@ -540,13 +534,10 @@ mod tests {
         seed_entry(
             store,
             key,
-            ShardEntry {
-                current: CurrentState::Inline {
-                    writer: writer.clone(),
-                    value: Arc::from(value),
-                },
-                ..ShardEntry::new(key)
-            },
+            ShardEntry::new(key).with_current(CurrentState::Inline {
+                writer: writer.clone(),
+                value: Arc::from(value),
+            }),
         )
         .await;
     }

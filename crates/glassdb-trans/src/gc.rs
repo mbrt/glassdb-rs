@@ -781,12 +781,9 @@ mod tests {
     }
 
     fn writer_entry(key: &[u8], writer: &TxId) -> ShardEntry {
-        ShardEntry {
-            current: CurrentState::External {
-                writer: writer.clone(),
-            },
-            ..ShardEntry::new(key)
-        }
+        ShardEntry::new(key).with_current(CurrentState::External {
+            writer: writer.clone(),
+        })
     }
 
     fn locked_entry(key: &[u8], holder: &TxId) -> ShardEntry {
@@ -850,13 +847,10 @@ mod tests {
         store_entry(
             &ctx,
             b"k",
-            ShardEntry {
-                current: CurrentState::Inline {
-                    writer: logless.clone(),
-                    value: Arc::from(&b"v2"[..]),
-                },
-                ..ShardEntry::new(b"k")
-            },
+            ShardEntry::new(b"k").with_current(CurrentState::Inline {
+                writer: logless.clone(),
+                value: Arc::from(&b"v2"[..]),
+            }),
         )
         .await;
         let mut scan = test_scan(vec![ctx.tl.transaction_shard(&old)], None);

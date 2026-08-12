@@ -2604,22 +2604,16 @@ mod tests {
 
     // A committed live key, so it counts as existing under a descent lookup.
     fn live(key: &[u8]) -> ShardEntry {
-        ShardEntry {
-            current: CurrentState::External {
-                writer: TxId::from_bytes(vec![1]),
-            },
-            ..ShardEntry::new(key)
-        }
+        ShardEntry::new(key).with_current(CurrentState::External {
+            writer: TxId::from_bytes(vec![1]),
+        })
     }
 
     fn inline_live(key: &[u8], value: &[u8]) -> ShardEntry {
-        ShardEntry {
-            current: CurrentState::Inline {
-                writer: TxId::from_bytes(vec![1]),
-                value: Arc::from(value),
-            },
-            ..ShardEntry::new(key)
-        }
+        ShardEntry::new(key).with_current(CurrentState::Inline {
+            writer: TxId::from_bytes(vec![1]),
+            value: Arc::from(value),
+        })
     }
 
     fn pressure_inline() -> InlinePolicy {
@@ -2750,12 +2744,11 @@ mod tests {
     async fn a_split_carries_inline_values_to_the_new_leaf() {
         let s = store();
         let keys: [&[u8]; 4] = [b"a", b"b", b"c", b"d"];
-        let inlined = |key: &[u8]| ShardEntry {
-            current: CurrentState::Inline {
+        let inlined = |key: &[u8]| {
+            ShardEntry::new(key).with_current(CurrentState::Inline {
                 writer: TxId::from_bytes(vec![1]),
                 value: Arc::from(key),
-            },
-            ..ShardEntry::new(key)
+            })
         };
         s.create_root(COLL, &Node::leaf(Shard::from_entries(keys.map(inlined))))
             .await

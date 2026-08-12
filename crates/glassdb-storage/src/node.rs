@@ -170,10 +170,8 @@ impl SplitPolicy {
     /// eventual parent separator under this policy.
     pub fn key_fits(&self, key: &[u8]) -> bool {
         let id = TxId::with_priority(0, &[]);
-        let mut entry = ShardEntry {
-            current: CurrentState::External { writer: id.clone() },
-            ..ShardEntry::new(key)
-        };
+        let mut entry =
+            ShardEntry::new(key).with_current(CurrentState::External { writer: id.clone() });
         entry.replace_write_lock(id);
         let content_limit = self.content_limit();
         let token = "x".repeat(24);
@@ -640,21 +638,15 @@ mod tests {
     use crate::shard::ShardEntry;
 
     fn entry(key: &[u8], writer: u8) -> ShardEntry {
-        ShardEntry {
-            current: CurrentState::External {
-                writer: TxId::from_bytes(vec![writer]),
-            },
-            ..ShardEntry::new(key)
-        }
+        ShardEntry::new(key).with_current(CurrentState::External {
+            writer: TxId::from_bytes(vec![writer]),
+        })
     }
 
     fn golden_entry() -> ShardEntry {
-        let mut entry = ShardEntry {
-            current: CurrentState::External {
-                writer: TxId::from_bytes(vec![0xaa, 0xbb]),
-            },
-            ..ShardEntry::new(b"Hello")
-        };
+        let mut entry = ShardEntry::new(b"Hello").with_current(CurrentState::External {
+            writer: TxId::from_bytes(vec![0xaa, 0xbb]),
+        });
         entry.replace_write_lock(TxId::from_bytes(vec![1, 2, 3, 4]));
         entry
     }

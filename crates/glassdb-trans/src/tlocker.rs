@@ -1643,10 +1643,7 @@ mod tests {
     async fn create_at_content_cap_reports_leaf_full_without_staging() {
         let writer = mk_tid(0, "seed");
         let tx = mk_tid(1, "tx");
-        let existing = ShardEntry {
-            current: CurrentState::External { writer },
-            ..ShardEntry::new(b"a")
-        };
+        let existing = ShardEntry::new(b"a").with_current(CurrentState::External { writer });
         let mut created = ShardEntry::new(b"z");
         created.replace_create_lock(tx.clone());
         let mut node = Node::leaf(Shard::from_entries([existing, created]));
@@ -2061,10 +2058,9 @@ mod tests {
         };
         replace_root(
             &ctx,
-            &Node::leaf(Shard::from_entries([ShardEntry {
-                current: inlined.clone(),
-                ..ShardEntry::new(key)
-            }])),
+            &Node::leaf(Shard::from_entries([
+                ShardEntry::new(key).with_current(inlined.clone())
+            ])),
         )
         .await;
 
@@ -2090,10 +2086,7 @@ mod tests {
             writer: tx.clone(),
             value: Arc::from(b"kept".as_slice()),
         };
-        let mut entry = ShardEntry {
-            current: inlined.clone(),
-            ..ShardEntry::new(key)
-        };
+        let mut entry = ShardEntry::new(key).with_current(inlined.clone());
         entry.replace_write_lock(tx.clone());
         replace_root(&ctx, &Node::leaf(Shard::from_entries([entry]))).await;
 
@@ -2127,17 +2120,11 @@ mod tests {
             writer: writer.clone(),
             value: Arc::from(b"kept".as_slice()),
         };
-        let seeded = ShardEntry {
-            current: inlined.clone(),
-            ..ShardEntry::new(key)
-        };
+        let seeded = ShardEntry::new(key).with_current(inlined.clone());
         // A cap with room for the read lock over a pointer, but not over the
         // inline bytes the entry actually carries: demoting the payload is the
         // only way this acquisition could fit.
-        let mut demoted = ShardEntry {
-            current: CurrentState::External { writer },
-            ..ShardEntry::new(key)
-        };
+        let mut demoted = ShardEntry::new(key).with_current(CurrentState::External { writer });
         demoted.acquire_read_lock(reader.clone());
         let policy = SplitPolicy {
             node_max_bytes: Node::leaf(Shard::from_entries([demoted])).encoded_len(),
@@ -2268,10 +2255,7 @@ mod tests {
             .collect();
         entries.insert(
             key.to_vec(),
-            ShardEntry {
-                current: CurrentState::External { writer },
-                ..ShardEntry::new(key)
-            },
+            ShardEntry::new(key).with_current(CurrentState::External { writer }),
         );
         let new_shard = Shard::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();

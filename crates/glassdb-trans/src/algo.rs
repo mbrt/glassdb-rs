@@ -287,13 +287,10 @@ impl ShardResolver for DirectCommitResolver {
         // replaced here (its own write-back becomes a no-op). Leaving it in
         // place would resolve the entry *backwards* to it, behind the value
         // this CAS publishes.
-        let e = ShardEntry {
-            current: CurrentState::Inline {
-                writer: self.id.clone(),
-                value: self.value.clone(),
-            },
-            ..ShardEntry::new(self.raw_key.clone())
-        };
+        let e = ShardEntry::new(self.raw_key.clone()).with_current(CurrentState::Inline {
+            writer: self.id.clone(),
+            value: self.value.clone(),
+        });
         Ok(Step::Stage {
             entries: vec![(self.raw_key.clone(), e)],
             locks: staged_locks.clone(),
@@ -2311,13 +2308,10 @@ mod tests {
         assert!(policy.key_fits(&second));
 
         let writer = TxId::with_priority(1, b"old");
-        let unsafe_entry = ShardEntry {
-            current: CurrentState::Inline {
-                writer,
-                value: Arc::from(vec![b'v'; 128]),
-            },
-            ..ShardEntry::new(first.clone())
-        };
+        let unsafe_entry = ShardEntry::new(first.clone()).with_current(CurrentState::Inline {
+            writer,
+            value: Arc::from(vec![b'v'; 128]),
+        });
         assert!(!policy.entry_fits_split_budget(&unsafe_entry));
         let creator = TxId::with_priority(2, b"new");
         let mut create_entry = ShardEntry::new(second.clone());
@@ -3392,12 +3386,9 @@ mod tests {
         // read is *not* superseded. Testing existence before the read version is
         // what keeps this unsupported shape off the replay path.
         let deleter = TxId::with_priority(1, b"deleter");
-        let buried = ShardEntry {
-            current: CurrentState::Tombstone {
-                writer: deleter.clone(),
-            },
-            ..seed.clone()
-        };
+        let buried = seed.clone().with_current(CurrentState::Tombstone {
+            writer: deleter.clone(),
+        });
         let outcome = fold(
             &direct(Some(deleter)),
             &tctx,
@@ -3426,13 +3417,10 @@ mod tests {
             (b"k".to_vec(), seed),
             (
                 b"other".to_vec(),
-                ShardEntry {
-                    current: CurrentState::Inline {
-                        writer: other_writer,
-                        value: Arc::from(b"four".as_slice()),
-                    },
-                    ..ShardEntry::new(b"other")
-                },
+                ShardEntry::new(b"other").with_current(CurrentState::Inline {
+                    writer: other_writer,
+                    value: Arc::from(b"four".as_slice()),
+                }),
             ),
         ]);
         assert!(matches!(
@@ -4346,10 +4334,7 @@ mod tests {
             let w = TxId::with_priority((i as u64) + 1, b"seed");
             entries.insert(
                 k.to_vec(),
-                ShardEntry {
-                    current: CurrentState::External { writer: w },
-                    ..ShardEntry::new(*k)
-                },
+                ShardEntry::new(*k).with_current(CurrentState::External { writer: w }),
             );
         }
         let shard = Shard::from_entries(entries.into_values());
@@ -4648,11 +4633,10 @@ mod tests {
 
         // Two-leaf tree: index root over S0(a,c | high "m") -> S1(m,p).
         let leaf = |ks: &[&[u8]], high: Option<&[u8]>, right: Option<&str>| {
-            Node::leaf(Shard::from_entries(ks.iter().map(|k| ShardEntry {
-                current: CurrentState::External {
+            Node::leaf(Shard::from_entries(ks.iter().map(|k| {
+                ShardEntry::new(*k).with_current(CurrentState::External {
                     writer: TxId::with_priority(1, b"seed"),
-                },
-                ..ShardEntry::new(*k)
+                })
             })))
             .with_high_key(high.map(<[u8]>::to_vec))
             .with_right_sibling(right.map(str::to_string))
@@ -4707,12 +4691,9 @@ mod tests {
             .await
             .unwrap();
         let mut entries: Vec<ShardEntry> = s1.as_leaf().unwrap().entries().cloned().collect();
-        entries.push(ShardEntry {
-            current: CurrentState::External {
-                writer: TxId::with_priority(2, b"boundary"),
-            },
-            ..ShardEntry::new(b"z")
-        });
+        entries.push(ShardEntry::new(b"z").with_current(CurrentState::External {
+            writer: TxId::with_priority(2, b"boundary"),
+        }));
         let mut new_s1 = Node::leaf(Shard::from_entries(entries));
         let membership_writer = TxId::with_priority(2, b"membership");
         new_s1.set_membership_writer(membership_writer.clone());

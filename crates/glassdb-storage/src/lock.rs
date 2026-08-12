@@ -74,10 +74,6 @@ impl HolderSet {
         self.holders.is_empty()
     }
 
-    fn into_vec(self) -> Vec<TxId> {
-        self.holders
-    }
-
     fn to_wire(&self) -> Vec<Vec<u8>> {
         self.holders
             .iter()
@@ -164,11 +160,6 @@ impl LockState {
     /// Reports whether the lock has no holders.
     pub(crate) fn is_empty(&self) -> bool {
         self.typ == LockType::None && self.holders.is_empty()
-    }
-
-    /// Splits the neutral state into compatibility fields.
-    pub(crate) fn into_parts(self) -> (LockType, Vec<TxId>) {
-        (self.typ, self.holders.into_vec())
     }
 
     /// Builds the canonical protobuf fields for this lock.
@@ -268,8 +259,8 @@ impl EntryLockState {
         })
     }
 
-    pub(crate) fn into_parts(self) -> (LockType, Vec<TxId>) {
-        self.state.into_parts()
+    pub(crate) fn to_wire(&self) -> (i32, Vec<Vec<u8>>) {
+        self.state.to_wire()
     }
 }
 
@@ -387,9 +378,6 @@ impl ExclusiveGate {
     }
 }
 
-/// Compatibility name for a node's former scope-neutral lock type.
-pub type NodeLock = SharedExclusiveLock;
-
 /// Why persisted lock fields could not form a neutral lock state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LockStateError {
@@ -417,13 +405,6 @@ pub(crate) fn lock_type_from_proto(typ: i32) -> LockType {
         Ok(pb::lock::LockType::Create) => LockType::Create,
         _ => LockType::Unknown,
     }
-}
-
-/// Encodes compatibility holders in canonical order.
-pub(crate) fn holders_to_proto(holders: &[TxId]) -> Vec<Vec<u8>> {
-    let mut locked_by: Vec<Vec<u8>> = holders.iter().map(|id| id.as_bytes().to_vec()).collect();
-    locked_by.sort();
-    locked_by
 }
 
 fn lock_state_from_pb(raw: Option<pb::NodeLock>) -> Result<LockState, LockStateError> {

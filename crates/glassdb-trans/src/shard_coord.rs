@@ -1062,12 +1062,12 @@ mod tests {
         holder: Option<&TxId>,
         writer: Option<&TxId>,
     ) -> ShardEntry {
-        let mut entry = ShardEntry {
-            current: writer.map_or(CurrentState::Absent, |writer| CurrentState::External {
-                writer: writer.clone(),
-            }),
-            ..ShardEntry::new(key)
-        };
+        let mut entry =
+            ShardEntry::new(key).with_current(writer.map_or(CurrentState::Absent, |writer| {
+                CurrentState::External {
+                    writer: writer.clone(),
+                }
+            }));
         match (typ, holder) {
             (LockType::None | LockType::Unknown, None) => {}
             (LockType::Read, Some(holder)) => entry.acquire_read_lock(holder.clone()),
@@ -2005,13 +2005,10 @@ mod tests {
             _staged: &BTreeMap<Vec<u8>, ShardEntry>,
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
-            let e = ShardEntry {
-                current: CurrentState::Inline {
-                    writer: self.tx.clone(),
-                    value: self.value.clone(),
-                },
-                ..ShardEntry::new(self.key.clone())
-            };
+            let e = ShardEntry::new(self.key.clone()).with_current(CurrentState::Inline {
+                writer: self.tx.clone(),
+                value: self.value.clone(),
+            });
             Ok(Step::Stage {
                 entries: vec![(self.key.clone(), e)],
                 locks: staged_locks.clone(),
@@ -2492,13 +2489,10 @@ mod tests {
             _staged: &BTreeMap<Vec<u8>, ShardEntry>,
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
-            let e = ShardEntry {
-                current: CurrentState::Inline {
-                    writer: self.tx.clone(),
-                    value: self.value.clone(),
-                },
-                ..ShardEntry::new(self.key.clone())
-            };
+            let e = ShardEntry::new(self.key.clone()).with_current(CurrentState::Inline {
+                writer: self.tx.clone(),
+                value: self.value.clone(),
+            });
             Ok(Step::Stage {
                 entries: vec![(self.key.clone(), e)],
                 locks: staged_locks.clone(),
@@ -2523,17 +2517,12 @@ mod tests {
     // A policy whose hard cap admits an external pointer for `key` but not the
     // same entry carrying `value` inline.
     fn policy_rejecting_inline(key: &[u8], tx: &TxId, value: &[u8]) -> SplitPolicy {
-        let external = ShardEntry {
-            current: CurrentState::External { writer: tx.clone() },
-            ..ShardEntry::new(key)
-        };
-        let inline = ShardEntry {
-            current: CurrentState::Inline {
-                writer: tx.clone(),
-                value: Arc::from(value),
-            },
-            ..ShardEntry::new(key)
-        };
+        let external =
+            ShardEntry::new(key).with_current(CurrentState::External { writer: tx.clone() });
+        let inline = ShardEntry::new(key).with_current(CurrentState::Inline {
+            writer: tx.clone(),
+            value: Arc::from(value),
+        });
         let external_len = Node::leaf(Shard::from_entries([external])).encoded_len();
         let inline_len = Node::leaf(Shard::from_entries([inline])).encoded_len();
         assert!(
@@ -2588,13 +2577,10 @@ mod tests {
     async fn a_logless_inline_entry_must_preserve_the_split_budget() {
         let tx = TxId::with_priority(1, b"t");
         let value = b"inline";
-        let inline = ShardEntry {
-            current: CurrentState::Inline {
-                writer: tx.clone(),
-                value: Arc::from(value.as_slice()),
-            },
-            ..ShardEntry::new(b"k")
-        };
+        let inline = ShardEntry::new(b"k").with_current(CurrentState::Inline {
+            writer: tx.clone(),
+            value: Arc::from(value.as_slice()),
+        });
         let entry_len = Node::leaf(Shard::from_entries([inline.clone()])).content_encoded_len();
         let policy = SplitPolicy {
             node_max_bytes: entry_len * 2 + 64,
@@ -2602,13 +2588,14 @@ mod tests {
             ..SplitPolicy::default()
         };
         assert!(Node::leaf(Shard::from_entries([inline])).encoded_len() <= policy.node_max_bytes);
-        assert!(!policy.entry_fits_split_budget(&ShardEntry {
-            current: CurrentState::Inline {
-                writer: tx.clone(),
-                value: Arc::from(value.as_slice()),
-            },
-            ..ShardEntry::new(b"k")
-        }));
+        assert!(
+            !policy.entry_fits_split_budget(&ShardEntry::new(b"k").with_current(
+                CurrentState::Inline {
+                    writer: tx.clone(),
+                    value: Arc::from(value.as_slice()),
+                },
+            ))
+        );
 
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let hints = Arc::new(HintCounter::default());
@@ -2656,13 +2643,10 @@ mod tests {
             } else {
                 Arc::from(vec![b'x'; 128])
             };
-            let entry = ShardEntry {
-                current: CurrentState::Inline {
-                    writer: self.tx.clone(),
-                    value,
-                },
-                ..ShardEntry::new(self.key.clone())
-            };
+            let entry = ShardEntry::new(self.key.clone()).with_current(CurrentState::Inline {
+                writer: self.tx.clone(),
+                value,
+            });
             Ok(Step::Stage {
                 entries: vec![(self.key.clone(), entry)],
                 locks: staged_locks.clone(),
@@ -2691,20 +2675,14 @@ mod tests {
     async fn capacity_rejection_after_in_doubt_preserves_uncertainty() {
         let tx = TxId::with_priority(1, b"t");
         let skipped = TxId::with_priority(2, b"skipped");
-        let small = ShardEntry {
-            current: CurrentState::Inline {
-                writer: tx.clone(),
-                value: Arc::from(b"x".as_slice()),
-            },
-            ..ShardEntry::new(b"k")
-        };
-        let large = ShardEntry {
-            current: CurrentState::Inline {
-                writer: tx.clone(),
-                value: Arc::from(vec![b'x'; 128]),
-            },
-            ..ShardEntry::new(b"k")
-        };
+        let small = ShardEntry::new(b"k").with_current(CurrentState::Inline {
+            writer: tx.clone(),
+            value: Arc::from(b"x".as_slice()),
+        });
+        let large = ShardEntry::new(b"k").with_current(CurrentState::Inline {
+            writer: tx.clone(),
+            value: Arc::from(vec![b'x'; 128]),
+        });
         let small_len = Node::leaf(Shard::from_entries([small])).encoded_len();
         let large_len = Node::leaf(Shard::from_entries([large])).encoded_len();
         assert!(large_len > small_len);
