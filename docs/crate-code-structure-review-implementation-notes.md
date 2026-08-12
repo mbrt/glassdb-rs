@@ -215,3 +215,24 @@ working document and is intentionally not committed with these changes.
   arbitrary or empty cursor under a valid prefix returns `InvalidCursor`. This
   remains local characterization rather than introducing F24-B's reusable
   conformance suite early.
+
+## F24-B — Share backend list conformance coverage
+
+- Added a doc-hidden `glassdb_backend::conformance` module behind tests or the
+  additive `test-support` feature. Its single async harness exercises the public
+  `Backend` interface and is enabled for the S3 and GCS crates only as a dev
+  dependency feature; production dependency graphs remain unchanged.
+- One deliberately unordered fixture covers recursive descendants, a sibling,
+  and a near-prefix key. Traversal compares membership rather than order, caps
+  every page at the requested limit, rejects duplicate objects and cursors,
+  bounds total progress, requires termination, and checks an empty terminal
+  listing.
+- Invalid-prefix validation precedence and provider-rejected arbitrary or empty
+  cursor classifications now live in the same conformance harness. Cursor
+  binding and request normalization remain deferred to F24-C; no `ListRequest`
+  type or ordering guarantee was introduced.
+- Replaced the three copied recursive-pagination tests with thin memory, S3,
+  and GCS invocations. Provider transport, retry, conditional-operation, and
+  error-normalization tests remain local and unchanged. The existing
+  memory-only wrong-prefix check for a provider-issued cursor remains a compact
+  local regression until F24-C moves cursor binding into the shared contract.

@@ -12,6 +12,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod conformance;
 pub mod memory;
 pub mod middleware;
 mod stats;

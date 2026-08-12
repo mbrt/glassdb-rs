@@ -7,7 +7,7 @@ use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use glassdb_backend::{Backend, BackendError, ListCursor, ListLimit, Version};
+use glassdb_backend::{Backend, BackendError, Version};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -691,34 +691,7 @@ async fn read_not_found() {
 async fn list_is_recursive_and_paginated() {
     let fake = FakeGcs::start().await;
     let b = backend(&fake);
-    for name in ["d/a/1", "d/a/2", "d/a/b/1", "d/c/1", "d/root"] {
-        b.write_if_not_exists(name, name.as_bytes().to_vec())
-            .await
-            .unwrap();
-    }
-    let limit = ListLimit::new(2).unwrap();
-    let first = b.list("d/", None, limit).await.unwrap();
-    assert_eq!(first.objects, vec!["d/a/1", "d/a/2"]);
-    let second = b.list("d/", first.next.as_ref(), limit).await.unwrap();
-    assert_eq!(second.objects, vec!["d/a/b/1", "d/c/1"]);
-    let third = b.list("d/", second.next.as_ref(), limit).await.unwrap();
-    assert_eq!(third.objects, vec!["d/root"]);
-    assert!(third.next.is_none());
-
-    let invalid = ListCursor::new("invalid");
-    let empty = ListCursor::new("");
-    for cursor in [None, Some(&invalid), Some(&empty)] {
-        assert!(matches!(
-            b.list("invalid", cursor, limit).await,
-            Err(BackendError::Other { .. })
-        ));
-    }
-    for cursor in [&invalid, &empty] {
-        assert!(matches!(
-            b.list("d/", Some(cursor), limit).await,
-            Err(BackendError::InvalidCursor)
-        ));
-    }
+    glassdb_backend::conformance::assert_list_conformance(&b).await;
 }
 
 // In-doubt contract (ADR-009): a conditional write whose outcome is uncertain

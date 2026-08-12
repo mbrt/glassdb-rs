@@ -258,36 +258,23 @@ mod tests {
     #[tokio::test]
     async fn list_is_recursive_and_paginated() {
         let b = MemoryBackend::new();
-        for p in ["d/b", "d/a", "d/sub/x", "d/sub/y", "other/z"] {
-            b.write_if_not_exists(p, b"v".to_vec()).await.unwrap();
+        crate::conformance::assert_list_conformance(&b).await;
+    }
+
+    #[tokio::test]
+    async fn list_cursor_rejects_wrong_prefix() {
+        let b = MemoryBackend::new();
+        for path in ["d/a", "d/b"] {
+            b.write_if_not_exists(path, b"v".to_vec()).await.unwrap();
         }
-        let limit = ListLimit::new(2).unwrap();
+        let limit = ListLimit::new(1).unwrap();
         let first = b.list("d/", None, limit).await.unwrap();
-        assert_eq!(first.objects, vec!["d/a", "d/b"]);
-        let second = b.list("d/", first.next.as_ref(), limit).await.unwrap();
-        assert_eq!(second.objects, vec!["d/sub/x", "d/sub/y"]);
-        assert!(second.next.is_none());
+        let cursor = first.next.expect("fixture must produce another page");
 
-        let error = b
-            .list("other/", first.next.as_ref(), limit)
-            .await
-            .unwrap_err();
-        assert!(matches!(error, BackendError::InvalidCursor));
-
-        let invalid = ListCursor::new("invalid");
-        let empty = ListCursor::new("");
-        for cursor in [None, Some(&invalid), Some(&empty)] {
-            assert!(matches!(
-                b.list("invalid", cursor, limit).await,
-                Err(BackendError::Other { .. })
-            ));
-        }
-        for cursor in [&invalid, &empty] {
-            assert!(matches!(
-                b.list("d/", Some(cursor), limit).await,
-                Err(BackendError::InvalidCursor)
-            ));
-        }
+        assert!(matches!(
+            b.list("other/", Some(&cursor), limit).await,
+            Err(BackendError::InvalidCursor)
+        ));
     }
 
     #[tokio::test]
