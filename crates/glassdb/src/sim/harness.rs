@@ -2,6 +2,8 @@
 
 mod client;
 mod nemesis;
+#[cfg(sim)]
+mod scheduling;
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -10,8 +12,6 @@ use std::sync::Arc;
 use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
 use glassdb_backend::memory::MemoryBackend;
-#[cfg(sim)]
-use glassdb_backend::middleware::OpRecord;
 use glassdb_backend::middleware::{OpLog, RecordingBackend};
 use glassdb_concurr::{Tape, rt};
 use glassdb_storage::{InlinePolicy, SplitPolicy};
@@ -21,6 +21,13 @@ use crate::{Database, Error, PersistentCacheConfig, ProtocolTiming};
 
 use self::client::ClientRunner;
 use self::nemesis::{FaultTransports, NemesisRunner};
+#[cfg(sim)]
+pub use self::scheduling::{
+    PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS, pct_assert, pct_record, pct_sweep, pct_trace,
+    record_input, replay_input, trace_input,
+};
+#[cfg(all(test, sim))]
+use self::scheduling::{run_fuzz_mode, run_fuzz_mode_traced, run_pct_mode_traced};
 use super::slow_backend;
 use super::trace::*;
 use super::{MAX_CLIENTS, MediaFaultProfile, SimMedia};
@@ -577,279 +584,6 @@ pub async fn run_and_record_with_faults<W: SimWorkload>(
     fault_tape: Vec<u8>,
 ) -> OpLog {
     run_generic(workload.clone(), faults, seed, fault_tape, None).await
-}
-
-// ---------------------------------------------------------------------------
-// PCT seed-breadth run mode (ADR-011). Only under `--cfg sim`: these drive the
-// harness on the deterministic executor with a `PctScheduler` instead of a
-// fuzzer tape, so they complement (rather than replace) the coverage-guided
-// `fuzz/` target. Each run is a pure function of `seed`, so a failure reproduces
-// exactly by re-running that seed.
-// ---------------------------------------------------------------------------
-
-/// Default bug depth the PCT scheduler targets (preemption points + 1).
-#[cfg(sim)]
-pub const PCT_DEFAULT_DEPTH: usize = 3;
-
-/// Rough estimate of the scheduling steps a workload run makes; affects only the
-/// distribution of PCT change points, not correctness.
-#[cfg(sim)]
-pub const PCT_DEFAULT_STEPS: u64 = 2048;
-
-#[cfg(sim)]
-struct DecodedFuzzInput<W> {
-    seed: u64,
-    workload: W,
-    faults: FaultConfig,
-    schedule_tape: Vec<u8>,
-    fault_tape: Vec<u8>,
-    media_tape: Vec<u8>,
-}
-
-#[cfg(sim)]
-fn decode_fuzz_input<W>(data: &[u8]) -> DecodedFuzzInput<W>
-where
-    W: for<'a> Arbitrary<'a> + Default,
-{
-    let mut u = Unstructured::new(data);
-    let seed: u64 = u.arbitrary().unwrap_or(0);
-    let workload = W::arbitrary(&mut u).unwrap_or_default();
-    let faults = FaultConfig::arbitrary(&mut u).unwrap_or_default();
-    // Each remaining byte guides exactly one of scheduling, backend faults, or
-    // cache-media faults, keeping mutations local to one decision stream.
-    let [schedule_tape, fault_tape, media_tape] = deinterleave::<3>(u.take_rest());
-    DecodedFuzzInput {
-        seed,
-        workload,
-        faults,
-        schedule_tape,
-        fault_tape,
-        media_tape,
-    }
-}
-
-#[cfg(sim)]
-fn run_fuzz_mode<W: SimWorkload>(
-    workload: W,
-    faults: FaultConfig,
-    seed: u64,
-    schedule_tape: Vec<u8>,
-    fault_tape: Vec<u8>,
-    media_tape: Option<Vec<u8>>,
-) -> OpLog {
-    rt::block_on_with(rt::TapeScheduler::new(schedule_tape), seed, async move {
-        run_generic(workload, faults, seed, fault_tape, media_tape).await
-    })
-}
-
-#[cfg(sim)]
-fn run_fuzz_mode_traced<W: SimWorkload>(
-    workload: W,
-    faults: FaultConfig,
-    seed: u64,
-    schedule_tape: Vec<u8>,
-    fault_tape: Vec<u8>,
-    media_tape: Option<Vec<u8>>,
-) -> (OpLog, HarnessTrace) {
-    run_scheduled_mode_traced(
-        workload,
-        faults,
-        seed,
-        fault_tape,
-        media_tape,
-        move |trace| rt::TapeScheduler::new_traced(schedule_tape, trace),
-    )
-}
-
-#[cfg(sim)]
-fn run_scheduled_mode_traced<W, S>(
-    workload: W,
-    faults: FaultConfig,
-    seed: u64,
-    fault_tape: Vec<u8>,
-    media_tape: Option<Vec<u8>>,
-    scheduler: impl FnOnce(rt::RuntimeTraceObserver) -> S,
-) -> (OpLog, HarnessTrace)
-where
-    W: SimWorkload,
-    S: rt::Scheduler + 'static,
-{
-    let cached = media_tape.is_some();
-    let trace = TraceSink::enabled();
-    trace.record(HarnessTraceEvent::Run {
-        cached,
-        phase: TraceRunPhase::Started,
-    });
-    let runtime_trace = trace.runtime_observer();
-    let run_trace = trace.clone();
-    let scheduler = scheduler(runtime_trace.clone());
-    let log = rt::block_on_with_trace(scheduler, seed, runtime_trace, async move {
-        run_generic_with_trace(workload, faults, seed, fault_tape, media_tape, run_trace).await
-    });
-    trace.record(HarnessTraceEvent::Run {
-        cached,
-        phase: TraceRunPhase::Finished,
-    });
-    (log, trace.finish())
-}
-
-/// Decodes one libFuzzer input for workload `W` exactly as its target does and
-/// runs it on fresh deterministic executors without and with the persistent
-/// cache, asserting the invariant in both modes. The cached run injects only
-/// basic media delays and pre-effect failures. Panics on any violation. Shared
-/// by the fuzz target and the corpus-replay test so the two can never diverge.
-#[cfg(sim)]
-pub fn replay_input<W: SimWorkload + for<'a> Arbitrary<'a>>(data: &[u8]) {
-    let DecodedFuzzInput {
-        seed,
-        workload,
-        faults,
-        schedule_tape,
-        fault_tape,
-        media_tape,
-    } = decode_fuzz_input::<W>(data);
-    run_fuzz_mode(
-        workload.clone(),
-        faults,
-        seed,
-        schedule_tape.clone(),
-        fault_tape.clone(),
-        None,
-    );
-    run_fuzz_mode(
-        workload,
-        faults,
-        seed,
-        schedule_tape,
-        fault_tape,
-        Some(media_tape),
-    );
-}
-
-/// Decodes one libFuzzer input exactly as [`replay_input`] does, runs it, and
-/// returns the cache-free and cache-enabled backend op streams concatenated.
-/// Used by corpus replay tests to prove committed inputs replay byte-for-byte,
-/// not just invariant-cleanly.
-#[cfg(sim)]
-pub fn record_input<W: SimWorkload + for<'a> Arbitrary<'a>>(data: &[u8]) -> Vec<OpRecord> {
-    let DecodedFuzzInput {
-        seed,
-        workload,
-        faults,
-        schedule_tape,
-        fault_tape,
-        media_tape,
-    } = decode_fuzz_input::<W>(data);
-    let without_cache = run_fuzz_mode(
-        workload.clone(),
-        faults,
-        seed,
-        schedule_tape.clone(),
-        fault_tape.clone(),
-        None,
-    );
-    let with_cache = run_fuzz_mode(
-        workload,
-        faults,
-        seed,
-        schedule_tape,
-        fault_tape,
-        Some(media_tape),
-    );
-    let mut recorded = without_cache.lock().unwrap().clone();
-    recorded.extend(with_cache.lock().unwrap().iter().cloned());
-    recorded
-}
-
-/// Decodes and runs one fuzzer input like [`record_input`], returning the
-/// structured cache-free and cache-enabled harness observations as one trace.
-/// No digest or corpus baseline is imposed here; callers choose what to retain.
-#[cfg(sim)]
-pub fn trace_input<W: SimWorkload + for<'a> Arbitrary<'a>>(data: &[u8]) -> HarnessTrace {
-    let DecodedFuzzInput {
-        seed,
-        workload,
-        faults,
-        schedule_tape,
-        fault_tape,
-        media_tape,
-    } = decode_fuzz_input::<W>(data);
-    let (_, without_cache) = run_fuzz_mode_traced(
-        workload.clone(),
-        faults,
-        seed,
-        schedule_tape.clone(),
-        fault_tape.clone(),
-        None,
-    );
-    let (_, with_cache) = run_fuzz_mode_traced(
-        workload,
-        faults,
-        seed,
-        schedule_tape,
-        fault_tape,
-        Some(media_tape),
-    );
-    let mut events = without_cache.events;
-    events.extend(with_cache.events);
-    HarnessTrace { events }
-}
-
-/// Runs `workload` once under a PCT schedule seeded by `seed`, asserting its
-/// invariant. Panics on any violation.
-#[cfg(sim)]
-pub fn pct_assert<W: SimWorkload>(workload: &W, faults: FaultConfig, seed: u64) {
-    let w = workload.clone();
-    rt::block_on_with(
-        rt::PctScheduler::new(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS),
-        seed,
-        // Empty fault tape: PCT explores the seed-breadth fault space.
-        async move { run_and_assert_with_faults(w, faults, seed, Vec::new()).await },
-    );
-}
-
-/// Runs `workload` under a PCT schedule and returns the recorded backend op
-/// stream, for per-seed determinism comparison.
-#[cfg(sim)]
-pub fn pct_record<W: SimWorkload>(workload: &W, faults: FaultConfig, seed: u64) -> OpLog {
-    let w = workload.clone();
-    rt::block_on_with(
-        rt::PctScheduler::new(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS),
-        seed,
-        async move { run_and_record_with_faults(&w, faults, seed, Vec::new()).await },
-    )
-}
-
-/// Runs `workload` under a traced PCT schedule without imposing a digest
-/// baseline. The scheduler's change-point and spawn-priority draws are included.
-#[cfg(sim)]
-pub fn pct_trace<W: SimWorkload>(workload: &W, faults: FaultConfig, seed: u64) -> HarnessTrace {
-    run_pct_mode_traced(workload.clone(), faults, seed).1
-}
-
-#[cfg(sim)]
-fn run_pct_mode_traced<W: SimWorkload>(
-    workload: W,
-    faults: FaultConfig,
-    seed: u64,
-) -> (OpLog, HarnessTrace) {
-    run_scheduled_mode_traced(workload, faults, seed, Vec::new(), None, move |trace| {
-        rt::PctScheduler::new_traced(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS, trace)
-    })
-}
-
-/// Seed-breadth sweep: runs `workload` under one PCT schedule per seed, asserting
-/// the invariant on each. This is the seed-loop entry that complements the
-/// coverage-guided tape fuzzer.
-#[cfg(sim)]
-pub fn pct_sweep<W: SimWorkload>(
-    workload: &W,
-    faults: FaultConfig,
-    seeds: impl IntoIterator<Item = u64>,
-) {
-    for seed in seeds {
-        pct_assert(workload, faults, seed);
-    }
 }
 
 #[cfg(test)]
