@@ -667,3 +667,30 @@ working document and is intentionally not committed with these changes.
 - This test-only extraction changes no production API, persistent bytes,
   backend-operation behavior, retry policy, random draws, task spawning, or
   shutdown semantics. No migration-only coverage was introduced.
+
+## F33-B — Move basic, stats, and scan tests
+
+- Created three behavior-oriented integration targets: `integration_basic`
+  owns 15 database and transaction tests, `integration_stats` owns five
+  statistics/diagnostics tests, and `integration_scan` owns 12 key-scan and
+  collection-listing tests. The seven shutdown/cancellation tests remain in the
+  original `integration` target for F33-C.
+- Moved each test body, name, Tokio test attribute, deprecated allowance, and
+  behavior comment mechanically. The targets reuse F33-A's support module;
+  making that module public only within each standalone test crate prevents
+  target-local dead-code warnings without adding a library or production API.
+- Focused Cargo discovery reports 15 + 5 + 12 + 7 = 39 tests. Its sorted union
+  exactly matches all 39 names from the pre-move target, with 39 unique names,
+  so no behavior test was duplicated or lost.
+- The source-name/count/location and Cargo exactly-once comparisons were run as
+  shell audits only; no migration-only test or manifest machinery was added.
+  These migration audits are complete for F33-B and should not be retained as
+  long-term tests. F33-C must repeat the repository-level exactly-once discovery
+  audit after moving the last seven tests and deleting `integration.rs`.
+- Test bodies, Tokio attributes, paused-clock choices, hook arm points, and
+  in-test task scheduling are unchanged. Libtest process grouping intentionally
+  changes from one target to four; every target constructs its own backend,
+  hook controls, and synchronization fixtures, so the groups remain isolated
+  and safe to run in parallel.
+- Production behavior, transaction-error handling, backend operations,
+  persistent bytes, retries, randomness, and task lifetimes are unchanged.
