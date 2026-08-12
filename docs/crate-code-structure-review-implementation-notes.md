@@ -134,3 +134,21 @@ working document and is intentionally not committed with these changes.
 - Adversarial review found no semantic, currentness, cache-hit, or operation-
   ordering issue. Its only finding was an avoidable temporary `String` allocation
   on stale right hops; the cursor now parses the borrowed token directly.
+
+## F17-C — Reuse the cursor for topology queries
+
+- `token_reachable_at_key` and `parent_index_for` now use one cursor-owned
+  traversal loop with synchronous stopping policies. Target reachability compares
+  the normalized path before leaf termination; parent lookup retains the deepest
+  normalized index only after its selected child loads successfully.
+- The policies preserve their intentionally different absence contracts:
+  reachability maps a dangling selected link to `false`, while parent lookup
+  propagates `NotFound`. Neither query loads a requested target directly, and the
+  returned parent evidence excludes the terminal child read as before.
+- Public APIs, requirements, error messages, cache-hit aggregation, and backend
+  operation order are unchanged. Sibling-chain traversal remains separate for
+  F17-D, and no migration-only test was added.
+- Adversarial review found the production extraction clean but identified missing
+  long-term coverage for absent roots/targets and dangling links. One compact
+  interface test now pins those results, the asymmetric errors, and the absence
+  of a direct target read.
