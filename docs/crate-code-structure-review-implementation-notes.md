@@ -21,3 +21,21 @@ working document and is intentionally not committed with these changes.
   `ShardStore::nodes()`, as required by the migration plan.
 - Adversarial review found no correctness, operation-count, format, scope, or
   long-term test-value issues.
+
+## F16-B — Extract `StructuralLogStore`
+
+- Moved the structural-log codec, path/participant validation, conditional CRUD,
+  and paginated listings into `structural_log_store.rs`. `ShardStore` keeps
+  explicit delegates and exposes `structural_logs()` until F16-D migrates the
+  protocol owners.
+- Both typed stores are still derived from the same `CachedStore`, preserving
+  cache coordination, observations, sequence points, and backend operation
+  ordering.
+- Moved the existing participant and pagination regressions to the new owner.
+  Added one compact long-term lifecycle test for the successful phase update,
+  stale-observation conflict, and deletion path.
+- Persistent bytes, page size, prefix scope, retry behavior, and CAS error
+  mappings are unchanged.
+- Adversarial review found no correctness, safety, API, pagination, or excessive-
+  test issue; generic cached-store coverage already owns missing-delete
+  convergence, so it was not duplicated here.

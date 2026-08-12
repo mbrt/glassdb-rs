@@ -14,6 +14,7 @@ mod node_store;
 mod shard;
 mod shard_store;
 mod structlog;
+mod structural_log_store;
 mod timeline;
 pub mod transaction;
 mod tree_router;
@@ -50,6 +51,7 @@ pub use node_store::{LeafEdit, LeafObservation, LeafObservationCheck, LoadedLeaf
 pub use shard::{CurrentState, Shard, ShardEntry};
 pub use shard_store::ShardStore;
 pub use structlog::{StructuralLog, StructuralLogPhase};
+pub use structural_log_store::StructuralLogStore;
 pub use timeline::{SequencePoint, Timeline};
 pub use tree_router::{LeafGroup, LeafLocator, TreeRouter};
 pub use version::Version;
