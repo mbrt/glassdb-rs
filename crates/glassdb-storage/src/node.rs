@@ -25,7 +25,7 @@ use prost::Message;
 
 use crate::error::StorageError;
 use crate::lock::{ExclusiveGate, LockType, SharedExclusiveLock};
-use crate::shard::{CurrentState, Shard, ShardEntry};
+use crate::shard::{Shard, ShardEntry};
 use crate::wire_size::{length_delimited_field, nonempty_length_delimited_field};
 use glassdb_data::{NodeToken as ValidatedNodeToken, TxId};
 
@@ -199,25 +199,19 @@ impl SplitPolicy {
     /// Reports whether one exact leaf entry fits the per-entry budget that
     /// preserves room for another independently admissible entry.
     pub fn entry_fits_split_budget(&self, entry: &ShardEntry) -> bool {
-        Node::leaf(Shard::from_entries([entry.clone()])).content_encoded_len()
-            <= self.content_limit() / 2
+        Node::leaf_entry_content_encoded_len(entry) <= self.content_limit() / 2
     }
 
     /// Reports whether `key` can fit in both a splittable leaf entry and its
     /// eventual parent separator under this policy.
     pub fn key_fits(&self, key: &[u8]) -> bool {
-        let id = TxId::with_priority(0, &[]);
-        let mut entry =
-            ShardEntry::new(key).with_current(CurrentState::External { writer: id.clone() });
-        entry.replace_write_lock(id);
         let content_limit = self.content_limit();
-        let token = "x".repeat(24);
-        let index_len = Node::index(IndexNode::from_children([
-            (Vec::new(), token.clone()),
-            (key.to_vec(), token),
-        ]))
-        .content_encoded_len();
-        self.entry_fits_split_budget(&entry) && index_len <= content_limit
+        Node::worst_case_leaf_entry_len(key.len()) <= content_limit / 2
+            && self.parent_separator_fits(key)
+    }
+
+    fn parent_separator_fits(&self, key: &[u8]) -> bool {
+        Node::worst_case_parent_separator_len(key.len()) <= self.content_limit()
     }
 }
 
@@ -707,7 +701,7 @@ mod tests {
 
     use glassdb_data::TxId;
 
-    use crate::shard::ShardEntry;
+    use crate::shard::{CurrentState, ShardEntry};
 
     fn entry(key: &[u8], writer: u8) -> ShardEntry {
         ShardEntry::new(key).with_current(CurrentState::External {
@@ -1019,6 +1013,70 @@ mod tests {
             ..admitting
         };
         assert!(!rejecting.entry_fits_split_budget(&entry));
+    }
+
+    #[test]
+    fn maximum_key_admission_matches_real_nodes_at_the_exact_limit() {
+        let maximum_key = vec![b'k'; 128];
+        let id = TxId::with_priority(7, b"maximum");
+        let mut entry = ShardEntry::new(maximum_key.clone())
+            .with_current(CurrentState::External { writer: id.clone() });
+        entry.replace_write_lock(id);
+        let leaf = Node::leaf(Shard::from_entries([entry]));
+
+        let parent = Node::index(IndexNode::from_children([
+            (
+                Vec::new(),
+                ValidatedNodeToken::from_bytes([1; 16]).to_string(),
+            ),
+            (
+                maximum_key.clone(),
+                ValidatedNodeToken::from_bytes([2; 16]).to_string(),
+            ),
+        ]));
+        assert_eq!(parent.as_index().unwrap().len(), 2);
+
+        let leaf_requirement = leaf
+            .content_encoded_len()
+            .checked_mul(2)
+            .expect("test leaf size fits usize");
+        let required_limit = leaf_requirement.max(parent.content_encoded_len());
+        let headroom = 17;
+        let exact = SplitPolicy {
+            node_max_bytes: required_limit
+                .checked_add(headroom)
+                .expect("test node size fits usize"),
+            split_headroom_bytes: headroom,
+            ..SplitPolicy::default()
+        };
+        assert_eq!(exact.content_limit(), required_limit);
+        assert!(exact.key_fits(&maximum_key));
+
+        let parent_limit = parent.content_encoded_len();
+        let parent_exact = SplitPolicy {
+            node_max_bytes: parent_limit,
+            split_headroom_bytes: 0,
+            ..SplitPolicy::default()
+        };
+        assert!(parent_exact.parent_separator_fits(&maximum_key));
+        assert!(
+            !SplitPolicy {
+                node_max_bytes: parent_limit - 1,
+                ..parent_exact
+            }
+            .parent_separator_fits(&maximum_key)
+        );
+
+        let one_byte_over = SplitPolicy {
+            node_max_bytes: exact.node_max_bytes - 1,
+            ..exact
+        };
+        assert_eq!(one_byte_over.content_limit(), required_limit - 1);
+        assert!(!one_byte_over.key_fits(&maximum_key));
+
+        let mut above_maximum = maximum_key;
+        above_maximum.push(b'k');
+        assert!(!exact.key_fits(&above_maximum));
     }
 
     #[test]

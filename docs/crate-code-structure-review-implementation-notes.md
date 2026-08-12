@@ -229,3 +229,21 @@ working document and is intentionally not committed with these changes.
 - Split-policy callers and their synthetic probes remain deliberately unchanged
   for F23-C. This finding changes no admission decision, persisted bytes,
   backend operation, or retry behavior.
+
+## F23-C — Remove synthetic budget probes
+
+- `SplitPolicy` now delegates exact entry admission and worst-case key admission
+  to the codec-owned wire-size calculations. The fake transaction, cloned shard,
+  temporary index, allocation-heavy key copies, and magic 24-character token
+  have been removed from the validation path.
+- Entry admission still reserves half of the checked content limit, rounded
+  down, while a key's parent separator may use the full limit. Both boundaries
+  remain inclusive; the key calculation uses generated 16-byte transaction IDs
+  and validated maximum-length 22-byte node tokens.
+- A compact real-node test constructs the maximum admitted key's canonical leaf
+  and two-child parent. It pins exact-limit acceptance, rejection when that same
+  shape is one byte over budget, and rejection of the next longer key.
+- Existing public `InvalidInput` mapping, pre-lock rejection, inline fallback,
+  capacity retry, split hints, persisted bytes, and backend operation ordering
+  are unchanged. The compatibility-named public policy fields remain for the
+  separately authorized F23-D breaking release.
