@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
+use crate::{
+    Backend, BackendError, ListCursor, ListLimit, ListPage, ListRequest, ReadReply, Version,
+};
 
 /// A backend operation presented to a hook before and after it is forwarded.
 #[derive(Debug, Clone, Copy)]
@@ -212,13 +214,30 @@ impl Backend for HookBackend {
         cursor: Option<&ListCursor>,
         limit: ListLimit,
     ) -> Result<ListPage, BackendError> {
+        match ListRequest::new(prefix, cursor, limit) {
+            Ok(request) => self.list_request(request).await,
+            Err(_) => {
+                self.hooked(
+                    BackendOp::List {
+                        path: prefix,
+                        cursor,
+                        limit,
+                    },
+                    || self.inner.list(prefix, cursor, limit),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
         self.hooked(
             BackendOp::List {
-                path: prefix,
-                cursor,
-                limit,
+                path: request.prefix(),
+                cursor: request.cursor(),
+                limit: request.limit(),
             },
-            || self.inner.list(prefix, cursor, limit),
+            || self.inner.list_request(request),
         )
         .await
     }

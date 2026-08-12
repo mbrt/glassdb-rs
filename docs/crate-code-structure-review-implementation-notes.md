@@ -281,3 +281,27 @@ working document and is intentionally not committed with these changes.
   accessors at the same boundaries. One compact trait-object test pins default
   forwarding, prefix isolation, limit/cursor continuation, and termination;
   this compatibility check may retire with the old signature in F24-G.
+
+## F24-E — Migrate backend middleware
+
+- Delay, fault, hook, logging, recording, scheduled-delay, and statistics
+  decorators (including the benchmark's role-attribution counters) now implement
+  the request-taking entry point and forward the same borrowed request through
+  every layer. Their old methods remain compatibility boundaries that construct
+  one validated request; providers and higher-level callers are intentionally
+  unchanged until F24-F/G.
+- Valid listing requests preserve decorator order, delay/fault decisions, hook
+  fields, log/record bytes, result pages, and the single list-operation count.
+  Compatibility calls with invalid raw arguments deliberately continue through
+  the legacy path, preserving every decorator effect and Hook/Fault error
+  precedence before the provider rejects the request.
+- Two composed forwarding tests cover the backend crate's seven decorators
+  without duplicating a suite per wrapper. They carry a real prefix-bound cursor
+  and limit through both compatibility and erased request dispatch, and pin
+  delays, hook fields and counts, exact recording bytes, provider-facing/outer
+  statistics, result pages, plus invalid-call effects and error override
+  behavior. The benchmark attribution test separately pins its compatibility,
+  request-pagination, invalid-input, and exact-count contracts.
+- No provider, storage, transaction, benchmark workload, or conformance caller
+  was migrated. Persistent bytes, provider requests, valid-operation counts,
+  scheduling order, and random draws are unchanged.

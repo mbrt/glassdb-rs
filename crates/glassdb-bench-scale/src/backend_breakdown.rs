@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use glassdb_backend::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
+use glassdb_backend::{
+    Backend, BackendError, ListCursor, ListLimit, ListPage, ListRequest, ReadReply, Version,
+};
 use glassdb_data::ObjectPath;
 
 /// Reads, mutations, and lists attributed to one physical object role.
@@ -288,8 +290,17 @@ impl Backend for ClassifiedBackend {
         cursor: Option<&ListCursor>,
         limit: ListLimit,
     ) -> Result<ListPage, BackendError> {
+        let Ok(request) = ListRequest::new(prefix, cursor, limit) else {
+            self.count_list(prefix);
+            return self.inner.list(prefix, cursor, limit).await;
+        };
+        self.list_request(request).await
+    }
+
+    async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
+        let prefix = request.prefix();
         self.count_list(prefix);
-        self.inner.list(prefix, cursor, limit).await
+        self.inner.list_request(request).await
     }
 }
 
@@ -377,8 +388,13 @@ mod tests {
     async fn every_backend_method_counts_and_preserves_results() {
         const COLLECTION_RECORD: &str = "db/_c/0000000000000000000000/_i";
         const COLLECTION_PREFIX: &str = "db/_c/0000000000000000000000/";
+        const SECOND_OBJECT: &str = "db/_c/0000000000000000000000/_n/0000000000000000000000";
 
         let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        inner
+            .write_if_not_exists(SECOND_OBJECT, b"node".to_vec())
+            .await
+            .unwrap();
         let (backend, handle) = wrap(inner);
 
         let version = backend
@@ -397,11 +413,33 @@ mod tests {
             .write_if(COLLECTION_RECORD, b"new".to_vec(), &version)
             .await
             .unwrap();
-        let page = backend
-            .list(COLLECTION_PREFIX, None, NonZeroUsize::new(10).unwrap())
+        let compatibility_page = backend
+            .list(COLLECTION_PREFIX, None, NonZeroUsize::new(1).unwrap())
             .await
             .unwrap();
-        assert_eq!(page.objects, [COLLECTION_RECORD]);
+        let cursor = compatibility_page.next.clone().unwrap();
+        let request_page = backend
+            .list_request(
+                ListRequest::new(
+                    COLLECTION_PREFIX,
+                    Some(&cursor),
+                    NonZeroUsize::new(1).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(compatibility_page.objects, [COLLECTION_RECORD]);
+        assert_eq!(request_page.objects, [SECOND_OBJECT]);
+        assert!(request_page.next.is_none());
+        let error = backend
+            .list("invalid", None, NonZeroUsize::new(10).unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "list prefix must be empty or end in '/': \"invalid\""
+        );
         backend
             .delete_if(COLLECTION_RECORD, &version)
             .await
@@ -422,8 +460,8 @@ mod tests {
                 write_bytes: 7,
             }
         );
-        assert_eq!(got.other.lists, 1);
-        assert_eq!(got.total(), 7);
+        assert_eq!(got.other.lists, 3);
+        assert_eq!(got.total(), 9);
     }
 
     #[test]

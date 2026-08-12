@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
+use crate::{
+    Backend, BackendError, ListCursor, ListLimit, ListPage, ListRequest, ReadReply, Version,
+};
 
 /// A single recorded backend operation: the method tag, the primary path, and a
 /// canonical encoding of the remaining arguments.
@@ -159,11 +161,22 @@ impl Backend for RecordingBackend {
         cursor: Option<&ListCursor>,
         limit: ListLimit,
     ) -> Result<ListPage, BackendError> {
+        if let Ok(request) = ListRequest::new(prefix, cursor, limit) {
+            return self.list_request(request).await;
+        }
         let mut args = Vec::new();
         enc_cursor(&mut args, cursor);
         args.extend_from_slice(&(limit.get() as u64).to_le_bytes());
         self.record("list", prefix, args);
         self.inner.list(prefix, cursor, limit).await
+    }
+
+    async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
+        let mut args = Vec::new();
+        enc_cursor(&mut args, request.cursor());
+        args.extend_from_slice(&(request.limit().get() as u64).to_le_bytes());
+        self.record("list", request.prefix(), args);
+        self.inner.list_request(request).await
     }
 }
 
