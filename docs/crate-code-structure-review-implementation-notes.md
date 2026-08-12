@@ -714,3 +714,28 @@ working document and is intentionally not committed with these changes.
   entropy accounting, and distribution vectors remain long term.
 - No production implementation, harness behavior, scheduling decision, or ADR
   changed, and there is no baseline update mode.
+
+## F25-A — Provide one all-build entropy facade
+
+- Added the public `glassdb_concurr::entropy` facade with byte filling and
+  uniform `[0, 1)` sampling in every build. Native execution still calls the
+  same process-RNG operations; simulation builds use the existing executor
+  entropy only while an executor is active and retain the process-RNG fallback
+  for ordinary Tokio tests.
+- Data ID minting now calls the shared byte filler directly for transaction,
+  database, collection, and B-link node identities. The existing data shuffle
+  helper follows the same facade because it previously shared that local byte
+  source. `glassdb-data` no longer needs its own `rand` dependency or duplicated
+  build-mode selection.
+- Retry jitter now calls the shared unit sampler. Under simulation it still
+  consumes one eight-byte fill and maps the high 53 bits exactly as before, so
+  the entropy draw boundary, value, and trace event remain unchanged; native
+  jitter still uses `rand`'s `f64` sampler.
+- One focused seeded vector covers an uneven byte fill, an interleaved unit
+  sample, and a following fill, pinning shared-stream order and chunk count.
+  Both reviewed tape and PCT trace digests pass without a baseline change.
+- No persistent bytes, identifier layout, retry schedule, operation ordering,
+  task spawn order, or existing public signature changed. The new facade is the
+  intended additive API. No ADR was added because this centralizes an existing
+  runtime policy rather than selecting a new one; there were no deviations from
+  the staged finding.

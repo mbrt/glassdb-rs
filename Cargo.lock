@@ -1528,7 +1528,6 @@ name = "glassdb-data"
 version = "0.1.0"
 dependencies = [
  "glassdb-concurr",
- "rand 0.10.1",
  "tokio",
 ]
 

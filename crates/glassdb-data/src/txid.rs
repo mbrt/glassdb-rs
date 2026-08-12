@@ -2,7 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::entropy::fill_random;
+use glassdb_concurr::entropy::fill_bytes;
 
 /// Offset of the big-endian UnixNano timestamp within the ID.
 const TX_ID_TS_OFF: usize = 8;
@@ -44,7 +44,7 @@ impl TxId {
     /// callers (mostly tests) that only need a unique identifier.
     pub fn new_random() -> Self {
         let mut b = vec![0u8; Self::MAX_GENERATED_ENCODED_LEN];
-        fill_random(&mut b);
+        fill_bytes(&mut b);
         TxId(b.into())
     }
 
@@ -59,7 +59,7 @@ impl TxId {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
         let mut b = vec![0u8; Self::MAX_GENERATED_ENCODED_LEN];
-        fill_random(&mut b[..TX_ID_TS_OFF]);
+        fill_bytes(&mut b[..TX_ID_TS_OFF]);
         b[TX_ID_TS_OFF..].copy_from_slice(&unix_nanos.to_be_bytes());
         TxId(b.into())
     }
@@ -81,7 +81,7 @@ impl TxId {
     /// distinct log object that lands in a different storage partition.
     pub fn renew(&self) -> Self {
         let mut b = vec![0u8; Self::MAX_GENERATED_ENCODED_LEN];
-        fill_random(&mut b[..TX_ID_TS_OFF]);
+        fill_bytes(&mut b[..TX_ID_TS_OFF]);
         b[TX_ID_TS_OFF..].copy_from_slice(&self.priority().to_be_bytes());
         TxId(b.into())
     }
@@ -160,7 +160,7 @@ mod tests {
     use super::*;
 
     // These run on a runtime so prefix minting works under any build; outside
-    // the simulation executor `fill_random` simply draws from the OS RNG.
+    // the simulation executor the shared entropy facade uses the process RNG.
     #[tokio::test]
     async fn random_is_16_bytes_and_hex() {
         let id = TxId::new_random();
