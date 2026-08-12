@@ -1058,18 +1058,24 @@ mod tests {
 
     fn entry(
         key: &[u8],
-        lock_type: LockType,
+        typ: LockType,
         holder: Option<&TxId>,
         writer: Option<&TxId>,
     ) -> ShardEntry {
-        ShardEntry {
-            lock_type,
-            locked_by: holder.into_iter().cloned().collect(),
+        let mut entry = ShardEntry {
             current: writer.map_or(CurrentState::Absent, |writer| CurrentState::External {
                 writer: writer.clone(),
             }),
             ..ShardEntry::new(key)
+        };
+        match (typ, holder) {
+            (LockType::None | LockType::Unknown, None) => {}
+            (LockType::Read, Some(holder)) => entry.acquire_read_lock(holder.clone()),
+            (LockType::Write, Some(holder)) => entry.replace_write_lock(holder.clone()),
+            (LockType::Create, Some(holder)) => entry.replace_create_lock(holder.clone()),
+            _ => panic!("test entry requires a valid lock shape"),
         }
+        entry
     }
 
     // Replaces the leaf's entries with exactly `entries` (a plain CAS, no
@@ -1171,12 +1177,11 @@ mod tests {
                 .get(&self.key)
                 .cloned()
                 .unwrap_or_else(|| entry(&self.key, LockType::None, None, None));
-            e.lock_type = if self.admission == StageAdmission::AddsKey {
-                LockType::Create
+            if self.admission == StageAdmission::AddsKey {
+                e.replace_create_lock(self.tx.clone());
             } else {
-                LockType::Write
-            };
-            e.locked_by = vec![self.tx.clone()];
+                e.replace_write_lock(self.tx.clone());
+            }
             Ok(Step::Stage {
                 entries: vec![(self.key.clone(), e)],
                 locks: staged_locks.clone(),
@@ -1393,8 +1398,8 @@ mod tests {
             }
         ));
         assert_eq!(
-            plan.entries.get(b"k".as_slice()).unwrap().locked_by,
-            vec![staged]
+            plan.entries.get(b"k".as_slice()).unwrap().lock_holders(),
+            std::slice::from_ref(&staged)
         );
         coord.close().await;
     }
@@ -1476,8 +1481,7 @@ mod tests {
         let rejected = TxId::with_priority(2, b"rejected");
         let seed = entry(b"a", LockType::None, None, Some(&writer));
         let mut overwritten = seed.clone();
-        overwritten.lock_type = LockType::Write;
-        overwritten.locked_by = vec![staged.clone()];
+        overwritten.replace_write_lock(staged.clone());
         let created = entry(b"z", LockType::Create, Some(&rejected), None);
         let overwrite_len =
             Node::leaf(Shard::from_entries([overwritten.clone()])).content_encoded_len();
@@ -1587,8 +1591,8 @@ mod tests {
 
         let shard = cold_entries(&cold_store(backend), &leaf()).await;
         let e = shard.lookup(b"k").expect("the staged lock is persisted");
-        assert_eq!(e.lock_type, LockType::Write);
-        assert_eq!(e.locked_by, vec![tx]);
+        assert_eq!(e.lock_type(), LockType::Write);
+        assert_eq!(e.lock_holders(), std::slice::from_ref(&tx));
     }
 
     // A split can move a key to a right sibling after it was routed to this
@@ -2372,8 +2376,7 @@ mod tests {
         let young = TxId::with_priority(2, b"young");
         let seed = entry(b"a", LockType::None, None, Some(&writer));
         let mut overwritten = seed.clone();
-        overwritten.lock_type = LockType::Write;
-        overwritten.locked_by = vec![old.clone()];
+        overwritten.replace_write_lock(old.clone());
         let created = entry(b"z", LockType::Create, Some(&young), None);
 
         let base_len = Node::leaf(Shard::from_entries([seed.clone()])).content_encoded_len();
@@ -2454,7 +2457,10 @@ mod tests {
         coord.close().await;
 
         let shard = cold_entries(&cold_store(backend), &leaf()).await;
-        assert_eq!(shard.lookup(b"a").unwrap().locked_by, vec![old]);
+        assert_eq!(
+            shard.lookup(b"a").unwrap().lock_holders(),
+            std::slice::from_ref(&old)
+        );
         assert!(
             shard.lookup(b"z").is_none(),
             "the full create was not staged"

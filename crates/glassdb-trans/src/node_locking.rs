@@ -66,9 +66,10 @@ impl<'a> NodeLockReconciler<'a> {
             }
             let mut quiesced = entry.clone();
             quiesced.current = resolved.resolved_current(Some(entry));
-            quiesced.locked_by.retain(|holder| holder == self.id);
-            if quiesced.locked_by.is_empty() {
-                quiesced.lock_type = LockType::None;
+            for holder in quiesced.lock_holders().to_vec() {
+                if &holder != self.id {
+                    quiesced.release_lock(&holder);
+                }
             }
             resolved_entries.insert(key.clone(), quiesced);
         }
