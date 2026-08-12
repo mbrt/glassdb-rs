@@ -247,3 +247,101 @@ working document and is intentionally not committed with these changes.
   capacity retry, split hints, persisted bytes, and backend operation ordering
   are unchanged. The compatibility-named public policy fields remain for the
   separately authorized F23-D breaking release.
+## F18-A — Extract queue and compatible-batch mechanics
+
+- Added a private `KeyQueue` backed by `VecDeque` for reorderable and strict FIFO
+  arrivals while retaining the active batch as an ordered `Vec`. Submission,
+  compatible batch formation, stable pruning, abandonment, requeue, completion,
+  and diagnostic counts now share that owner.
+- Merge order remains active batch, compatible reorderable arrivals in stable
+  order, then the compatible strict FIFO prefix. The first incompatible FIFO
+  request remains a barrier, and a fixed-length reorderable scan cannot cycle on
+  incompatible work.
+- Driver phases, notification, spawning, result delivery, token cancellation,
+  and public snapshots are deliberately unchanged for F18-B. Strict active work
+  is requeued before existing FIFO work; reorderable active work is appended
+  after older reorderable arrivals.
+- One redundant single-call test was folded into the stronger uncontended
+  no-spawn test. One compact queue regression covers mixed requeue ordering, so
+  the dedup suite remains at thirteen tests.
+- Adversarial review found no ordering, cancellation, lifecycle, diagnostics, or
+  excessive-test issue. No public API, runtime schedule, or persistent state
+  changed.
+
+## F18-B — Make keyed lifecycle transitions explicit
+
+- Replaced the implicit per-key flags with a private `KeyMachine`. Its stored
+  phases are `Driven` (identified inline/owner driver plus ready/running round),
+  `Completing` (the key reservation held through deferred result delivery), and
+  `Handoff` (identified reserved owner); idle and closed keys are removed
+  atomically from the shard map rather than represented as lingering states.
+- Submitting, starting or refreshing a round, finishing, driver/waiter drop,
+  owner start, and close now enter through named transitions. Every driver-facing
+  transition checks `DriverId`, so a stale inline future or owner cannot alter a
+  successor's queue or round token.
+- Transitions mutate state under the shard mutex and return deferred effects.
+  Cancellation, notification, result delivery, retired sender/request drops,
+  and owner spawning run in a fixed order after unlock. Delivery precedes a
+  successor spawn, preserving the existing externally visible ordering.
+- A handoff reserves the active-owner count before releasing the shard lock and
+  moves an RAII permit into the spawned owner. Close therefore cannot miss the
+  interval between committing a handoff and starting its task, and every exit
+  releases exactly one reservation.
+- The uncontended inline/no-spawn path, batching and FIFO semantics, result fan-
+  out, cancellation, shutdown, snapshots, and statistics remain covered by the
+  existing behavior tests. Two focused tests add the requested transition/action
+  table and prove cancellation, wake, and delivery effects remain deferred; no
+  migration-only compatibility test was added.
+- Adversarial review found that immediately removing a just-completed key exposed
+  a short idle window before deferred delivery. Completion now enters
+  `Completing`; submissions in that window only queue, and a post-delivery
+  transition either removes the still-empty key or commits exactly one handoff.
+  The transition table covers the no-successor finish followed by such an
+  interleaving submission.
+- The same review found two destructor/allocation details: a stale completion's
+  error payload could be dropped under the shard lock, and pruning replaced the
+  active batch allocation. Stale outcomes now join the deferred-drop effects;
+  in-place extraction and ordinary completion draining retain the batch `Vec`'s
+  allocation without changing member order.
+- A follow-up allocation audit removed the remaining one-element effect vectors.
+  Completion moves the existing batch allocation into one deferred delivery,
+  returns it empty after delivery, and reinstalls it only for the same completing
+  driver; stale finalization retires it after unlock. Cancellation, wake, retired
+  state, and stale outcome effects use optional slots, so ordinary uncontended
+  completion adds no effect-staging heap allocations or owner spawn.
+- A final hot-path review found that stale/close safety retained an unconditional
+  clone of the merged request, and owner rounds rebuilt their handle key each
+  time. Starting a round now moves the already-computed merged request into one
+  driver-owned fallback slot after unlock, while normal refresh recomputes the
+  queue value and only a stale, closed, or emptied-batch lookup clones the
+  fallback. Inline and owner drivers each reuse one handle for their lifetime,
+  so ordinary rounds add neither that request clone nor a per-owner-round key
+  allocation.
+
+## F18-C — Add deterministic cancellation model coverage
+
+- Added one synchronous state-machine model over the private `KeyMachine`
+  transitions in a dedicated test module. The crate's shared deterministic
+  `Rng` drives three named regression seeds plus a bounded 64-seed, 120-step
+  sweep without Tokio task scheduling.
+- Independent phase, driver-id, receiver, member, and delivery bookkeeping checks
+  every transition for exact live-work accounting, one driver or one identified
+  reserved owner, no orphan or duplicate member, and strict FIFO order through
+  cancellation and requeue. A non-close `Remove` is valid only with zero live
+  members, and all four inline/owner completion-flow outcomes are checked.
+- Completion effects can remain pending while enqueue, cancellation, or close
+  interleaves. Closing in that window retires only queued work; the already
+  completed batch must still receive its success or error exactly once afterward.
+  Owner and inline driver drops are generated in both ready and running phases;
+  running drops must defer cancellation, preserve batch-before-queue FIFO, and
+  reserve exactly the reported successor id.
+- A required 21-bit coverage mask includes distinct success/error and post-close
+  delivery, pending-delivery close, both phases of both driver kinds, owner-drop
+  requeue, and the full completion-flow matrix. Failures print the replay seed,
+  step, expected and actual phase, member ledger, coverage, and recent event
+  trace.
+- The model deliberately submits only strict FIFO mergeable/barrier requests;
+  the compact queue regression remains the single owner of reorderable merge
+  policy. The F18-B migration-only transition table was pruned because the model
+  now exercises its complete flow matrix; deferred-effects and async interface
+  regressions remain. No production behavior or public API changed.
