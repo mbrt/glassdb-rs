@@ -52,7 +52,8 @@ impl DatabaseBuilder {
 
     /// Sets the delay before the first retry of a transient
     /// transaction-coordination operation (polling a peer transaction's commit
-    /// status, or writing a transaction's final log). The delay grows
+    /// status, writing a transaction's final log, or reacquiring locks under the
+    /// same identity after exhausted shard contention). The delay grows
     /// exponentially up to [`DatabaseBuilder::retry_max_interval`].
     pub fn retry_initial_interval(mut self, interval: Duration) -> Self {
         self.engine_config.set_retry_initial_interval(interval);
@@ -60,7 +61,7 @@ impl DatabaseBuilder {
     }
 
     /// Sets the upper bound on the per-retry delay for transient
-    /// transaction-coordination operations.
+    /// transaction-coordination and same-identity lock-acquisition operations.
     pub fn retry_max_interval(mut self, interval: Duration) -> Self {
         self.engine_config.set_retry_max_interval(interval);
         self

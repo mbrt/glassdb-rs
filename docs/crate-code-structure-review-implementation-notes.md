@@ -488,3 +488,118 @@ working document and is intentionally not committed with these changes.
   construct the same request rather than keeping a test-only raw storage API.
 - Providers and compatibility tests deliberately retain the old method until
   F24-G. That release-gated removal remains outside this finding.
+## F20-A — Replace correlated attempt flags with validated transitions
+
+- Added a private `algo::attempt` state machine with explicit `New`, `Engaged`,
+  and `Committed` phases and `Optimistic` or `Locked` read-validation modes.
+  `Handle` no longer exposes separately mutable status, engagement, retry-mode,
+  and attempt-count fields to the commit algorithm.
+- Named transitions now own engagement, commit, locked-read escalation, wound
+  renewal, abort eligibility, and reset validation. Engagement is idempotent and
+  reports whether monitor/manifest initialization is required; commit and reset
+  after commit are validated terminal boundaries.
+- Renewal keeps the original priority/identity behavior, collection attempt,
+  acquisition backoff, and serial-fallback count. The existing consumed-handle
+  boundary may renew from any phase: wound cleanup can discover a concurrent
+  terminal outcome before `restart_after_wound` re-begins the attempt. Preserving
+  that boundary avoids adding a panic, while every renewal still forces locked
+  validation exactly as the old nonzero attempt count did.
+- Direct and optimistic read-only commits remain unengaged; logged attempts stay
+  engaged until abort or commit. Monitor calls, persistent transaction bytes,
+  backend operations, retry results, random identity draws, and acquisition
+  delays are unchanged. Configured acquisition backoff remains deferred to
+  F20-B.
+- Added two compact long-term state tests: one transition table covers direct
+  commit, optimistic escalation, repeated engagement, abort need, wound renewal,
+  engaged commit, and renewal after a terminal cleanup race; one preserves the
+  exact reset-after-commit panic. Two raw `engaged` assertions were replaced by
+  ending each replayed handle before asserting its transaction object remains
+  absent, preserving the stronger long-term interface behavior without exposing
+  state-machine shape.
+
+## F20-B — Inject configured acquisition backoff
+
+- `Algo` now retains the engine's configured retry policy as a factory for each
+  transaction's same-identity lock-acquisition schedule. A new attempt starts
+  from that policy, while wound renewal continues carrying the already-advanced
+  schedule instead of resetting it.
+- The only consumers remain the existing conflict and leaf-capacity retry
+  branches, after partial-lock release and after the capacity timeout check.
+  First acquisition, successful acquisition, deadlock escalation, genuine
+  wounds, optimistic validation, direct replay, and other independently owned
+  coordination schedules are unchanged.
+- The existing paused-time sustained-CAS regression now opens a real `Engine`
+  with a ten-to-twenty millisecond policy, observes the first and capped
+  acquisition gaps at exhausted coordinator rounds, and retains its same-ID and
+  converged-value assertions. Jitter is checked by documented bands rather than
+  exact timing; no second internal backoff test was added.
+- Builder documentation now includes same-identity lock reacquisition in the
+  existing retry options. Defaults, persistent bytes, backend-operation order,
+  retry classification, and random draws on contention-free paths are unchanged.
+
+## F21-A — Move direct-commit vocabulary mechanically
+
+- Moved the direct-commit resolver, attempt/result vocabulary, shape recognizer,
+  predecessor value, and eligibility policy into the private
+  `algo::direct_commit` module. `Algo` still owns predecessor lookup, execution,
+  counters, GC hinting, coordination, and attempt transitions for the later
+  collaborator extraction.
+- Temporary `pub(super)` visibility is limited to the values and fields the
+  parent algorithm already constructs or consumes. The new module has no
+  dependency on `Algo`, `Handle`, `Gc`, or the coordinator owner, so ownership
+  remains one-way without a compatibility abstraction or public re-export.
+- Resolver bodies, eligibility ordering, requirements, admission policy,
+  split-hint behavior, outcome classification, and one-CAS commit point are
+  unchanged. Production imports moved with their code; test-only coordination
+  imports remain local to the existing test module.
+- No tests were added, removed, or relocated. Existing direct-path and fallback
+  behavior coverage remains in `algo.rs` until F21-C; this finding changes no
+  persistent bytes, backend operations, retries, random draws, task spawning,
+  statistics, or public API.
+
+## F21-B — Introduce the concrete `DirectCommit` collaborator
+
+- Added one private concrete collaborator owning the direct path's shared
+  resolver, shard coordinator, inline policy, split-hint sink, GC hint clone,
+  and counters. `Algo` retains its own resolver and GC clones for general read
+  validation, abort, locked write-back, and cleanup; its public constructor and
+  every caller remain unchanged.
+- Moved predecessor lookup and direct execution behind `DirectCommit::try_commit`.
+  The boundary receives only the transaction id, data, and F20's validated
+  `AttemptState`; collection eligibility and dispatch among committed, replay,
+  and locked fallback remain architectural policy in `Algo`.
+- Candidate and landed counter points, `Requirement::Any` cache behavior,
+  eligibility order, inline admission, split-pressure hints, coordinator outcome
+  mapping, and one-CAS semantics are unchanged. After a landed coordinator
+  result, the collaborator still increments `landed`, commits the attempt state,
+  and enqueues the predecessor GC hint synchronously with no intervening await.
+- `DirectCommitStats` and its arithmetic moved with the counters and are
+  re-exported from `algo` at the existing path. Resolver construction and
+  eligibility visibility remains `pub(super)` only for the unchanged tests that
+  stay in `algo.rs` until F21-C; a test-only split-hint accessor serves the same
+  temporary boundary.
+- No tests were added, removed, renamed, or relocated. Existing normal,
+  uncertain-CAS, replay, same-key loser, fallback, statistics, inline-pressure,
+  and cancellation coverage remains the durable acceptance suite.
+
+## F21-C — Relocate direct-path tests
+
+- Moved the 18 existing direct-commit eligibility, landing, replay,
+  uncertain-CAS, batching, cache-reuse, and locked-fallback tests unchanged into
+  `algo::direct_commit::tests`. Their names and assertions are unchanged; the
+  30 general transaction tests remain in `algo::tests`, including CAS/deadlock
+  retry, locked orchestration, and point/scan read validation.
+- Moved only direct-specific fixtures with that suite: the deterministic fold
+  driver, coordinator seed gate, in-doubt CAS hook, same-leaf sibling and store
+  counter helpers, and the deliberately over-inline-budget value. The common
+  engine/transaction setup and operation-count helpers remain single-sourced in
+  `algo::tests` and expose only the members consumed by the relocated tests as
+  test-only `pub(super)` support.
+- Removed the temporary sibling-test visibility on the direct resolver,
+  eligibility classifier, and their fields, along with the test-only split-hint
+  accessor introduced during F21-B. The colocated child test module can inspect
+  those private implementation details without widening the collaborator's
+  boundary.
+- This is a test ownership change only: no durable tests were added, removed, or
+  renamed, and no production control flow, backend operations, retry behavior,
+  persistent bytes, randomness, or task lifetime changed.
