@@ -488,7 +488,8 @@ fn read_observation_has_exclusive_holder(read: &ReadAccess) -> Result<bool, Tran
         .as_leaf()
         .ok_or_else(|| TransError::other("read observation contains a non-leaf node"))?;
     Ok(leaf.lookup(raw_key).is_some_and(|entry| {
-        matches!(entry.lock_type, LockType::Write | LockType::Create) && !entry.locked_by.is_empty()
+        matches!(entry.lock_type(), LockType::Write | LockType::Create)
+            && !entry.lock_holders().is_empty()
     }))
 }
 
@@ -1825,7 +1826,7 @@ mod tests {
         // The shard entry points at the committed writer and the lock is gone.
         let e = entry(&tctx, b"k").await.unwrap();
         assert_eq!(e.current.writer(), Some(&tid));
-        assert!(e.locked_by.is_empty());
+        assert!(e.lock_holders().is_empty());
     }
 
     // Regression (review 1.1 / ADR-022): the committed transaction object must
@@ -2139,7 +2140,7 @@ mod tests {
         // The moved key is locked by us when the stale read is signalled: the
         // re-run owns the lock and cannot lose it again to the same race.
         let e = entry(&tctx, b"k").await.expect("entry exists");
-        assert_eq!(e.locked_by, vec![h.id().clone()]);
+        assert_eq!(e.lock_holders(), std::slice::from_ref(h.id()));
 
         tm.end(&mut h).await.unwrap();
     }
@@ -2319,11 +2320,8 @@ mod tests {
         };
         assert!(!policy.entry_fits_split_budget(&unsafe_entry));
         let creator = TxId::with_priority(2, b"new");
-        let create_entry = ShardEntry {
-            lock_type: LockType::Create,
-            locked_by: vec![creator],
-            ..ShardEntry::new(second.clone())
-        };
+        let mut create_entry = ShardEntry::new(second.clone());
+        create_entry.replace_create_lock(creator);
         assert!(
             Node::leaf(Shard::from_entries([unsafe_entry.clone(), create_entry]))
                 .content_encoded_len()
@@ -2628,7 +2626,7 @@ mod tests {
             "the direct commit published its value"
         );
         let eb = entry(&tctx, &kb).await.unwrap();
-        assert!(eb.locked_by.contains(&txb), "acquire holds B's lock");
+        assert!(eb.is_locked_by(&txb), "acquire holds B's lock");
     }
 
     // ADR-028 regression (batched in-doubt): a direct commit co-batched with a
@@ -2708,7 +2706,7 @@ mod tests {
                 value: Arc::from(b"v2".as_slice()),
             }
         );
-        assert!(entry(&tctx, &kb).await.unwrap().locked_by.contains(&txb));
+        assert!(entry(&tctx, &kb).await.unwrap().is_locked_by(&txb));
     }
 
     // ADR-020/024: CAS contention is resolved *inside* `Algo`. A transaction that
@@ -2761,10 +2759,10 @@ mod tests {
         // It still committed: the shards point at our writer with no live lock.
         let e = entry(&tctx, b"k").await.unwrap();
         assert_eq!(e.current.writer(), Some(&id_before));
-        assert!(e.locked_by.is_empty());
+        assert!(e.lock_holders().is_empty());
         let e2 = entry(&tctx, b"k2").await.unwrap();
         assert_eq!(e2.current.writer(), Some(&id_before));
-        assert!(e2.locked_by.is_empty());
+        assert!(e2.lock_holders().is_empty());
     }
 
     // A value the inline per-value budget rejects, so its transaction takes the
@@ -2915,7 +2913,7 @@ mod tests {
         // committed `_t/` object exists, and the value reads back as ours.
         let e = entry(&tctx, b"k").await.unwrap();
         assert_eq!(e.current.writer(), Some(&tid));
-        assert!(e.locked_by.is_empty());
+        assert!(e.lock_holders().is_empty());
         let status = tctx
             .tlogger
             .commit_status_at(&tid, Requirement::Any)
@@ -3087,8 +3085,7 @@ mod tests {
             .unwrap();
         let windowed = Shard::from_entries(loaded.entries().entries().cloned().map(|mut e| {
             if e.key == raw {
-                e.lock_type = LockType::Write;
-                e.locked_by = vec![h1.clone()];
+                e.replace_write_lock(h1.clone());
                 e.current = CurrentState::External { writer: h0.clone() };
             }
             e
@@ -3149,7 +3146,7 @@ mod tests {
         );
         let e = entry(&tctx, b"k").await.unwrap();
         assert_eq!(e.current.writer(), Some(&h2));
-        assert!(e.locked_by.is_empty());
+        assert!(e.lock_holders().is_empty());
         assert_eq!(
             do_read(&tctx, &keyp).await.last_writer().cloned().unwrap(),
             h2
@@ -3192,7 +3189,7 @@ mod tests {
                 value: Arc::from(b"v2".as_slice()),
             }
         );
-        assert!(e.locked_by.is_empty(), "no lock was ever installed");
+        assert!(e.lock_holders().is_empty(), "no lock was ever installed");
         assert_eq!(
             read_outcome(&tctx, &keyp)
                 .await
@@ -3233,8 +3230,7 @@ mod tests {
             .unwrap();
         let windowed = Shard::from_entries(loaded.entries().entries().cloned().map(|mut e| {
             if e.key == raw {
-                e.lock_type = LockType::Write;
-                e.locked_by = vec![h1.clone()];
+                e.replace_write_lock(h1.clone());
                 e.current = CurrentState::External { writer: h0.clone() };
             }
             e
@@ -3264,7 +3260,7 @@ mod tests {
             }
         );
         assert!(
-            e.locked_by.is_empty(),
+            e.lock_holders().is_empty(),
             "the superseded holder was replaced, not preserved"
         );
         let outcome = read_outcome(&tctx, &keyp).await;
@@ -3377,11 +3373,8 @@ mod tests {
         // even though this transaction also staged nothing.
         let holder = TxId::with_priority(1, b"holder");
         tctx.tmon.begin_tx(&holder);
-        let held = ShardEntry {
-            lock_type: LockType::Write,
-            locked_by: vec![holder],
-            ..seed.clone()
-        };
+        let mut held = seed.clone();
+        held.replace_write_lock(holder);
         let outcome = fold(
             &direct(Some(current.clone())),
             &tctx,
@@ -3554,7 +3547,7 @@ mod tests {
         let e = entry(&tctx, b"k").await.unwrap();
         assert_eq!(e.current.writer(), Some(&winner));
         assert!(
-            e.locked_by.is_empty(),
+            e.lock_holders().is_empty(),
             "a replayed attempt publishes no holder"
         );
 
@@ -3675,7 +3668,7 @@ mod tests {
             "the round's winner published its value directly"
         );
         assert!(
-            e.locked_by.is_empty(),
+            e.lock_holders().is_empty(),
             "the contended round published no holder"
         );
         assert!(
@@ -4046,7 +4039,7 @@ mod tests {
         for _ in 0..100 {
             if entry(&tctx, b"a")
                 .await
-                .is_some_and(|entry| entry.locked_by.is_empty())
+                .is_some_and(|entry| entry.lock_holders().is_empty())
             {
                 settled = true;
                 break;
@@ -4237,7 +4230,7 @@ mod tests {
         assert!(h.should_lock_reads());
         for key in [b"a".as_slice(), b"b"] {
             assert_eq!(
-                entry(&tctx, key).await.unwrap().lock_type,
+                entry(&tctx, key).await.unwrap().lock_type(),
                 LockType::None,
                 "the failed OCC attempt must not lock"
             );
