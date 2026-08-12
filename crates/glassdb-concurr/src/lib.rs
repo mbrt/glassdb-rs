@@ -13,6 +13,8 @@ mod retry;
 mod rng;
 pub mod rt;
 pub mod shard;
+#[cfg(sim)]
+mod sim;
 mod tape;
 
 pub use background::Background;

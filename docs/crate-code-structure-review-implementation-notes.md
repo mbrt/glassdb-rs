@@ -949,3 +949,27 @@ working document and is intentionally not committed with these changes.
   order, task selection, client/nemesis behavior, cache-media ownership, and
   public APIs are unchanged. No deviation from the finding plan and no ADR were
   needed.
+## F31-A — Extract simulation schedulers
+
+- Added the private `sim::scheduler` module and moved the `Scheduler` trait plus
+  tape/replay, seeded-random, and PCT policies into it without changing their
+  fields or decision algorithms. `exec` re-exports the existing public types so
+  every `glassdb_concurr::rt` path and signature remains unchanged.
+- The checklist's FIFO role corresponds to the existing test-only
+  lowest-task-id scheduler used as the executor's fixed-order baseline. It moved
+  with the policies and remains test-only; this finding does not introduce a
+  new public scheduler or claim readiness-queue FIFO semantics for the
+  executor's sorted ready set.
+- Moved tape replay, PCT seed/divergence, and explicit change-point tests beside
+  their implementations. Executor ready-set, virtual-time, wake, panic-budget,
+  and Tokio select-seeding tests remain with the executor because those assert
+  kernel behavior rather than a policy in isolation.
+- Added one compact fixed selection vector for `RandomScheduler`, the only
+  seeded policy that previously lacked an exact local baseline. Existing tape
+  and PCT tests were moved rather than duplicated; no migration-only test was
+  retained.
+- All three tape and both PCT reviewed harness digests remain byte-identical
+  without baseline edits. Scheduler draw boundaries, task spawn/selection order,
+  replay fallback, public visibility, persistent bytes, backend operations, and
+  runtime error behavior are unchanged. No ADR was needed for this mechanical
+  ownership move.
