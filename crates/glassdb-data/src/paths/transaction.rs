@@ -3,7 +3,7 @@ use std::fmt;
 use crate::base64;
 use crate::txid::TxId;
 
-use super::{DbRoot, ObjectPath, PathError, TRANSACTION_SHARD_COUNT};
+use super::{DbRoot, ObjectPath, PathError};
 
 const TRANSACTION_MARKER: &str = "_t";
 
@@ -25,37 +25,10 @@ pub(super) fn parse_object(path: &str) -> Option<Result<ObjectPath, PathError>> 
     }))
 }
 
-pub(super) fn parse_suffix(suffix: &str) -> Result<TxId, PathError> {
-    let expected = format!("{TRANSACTION_MARKER}/");
-    let Some(rest) = suffix.strip_prefix(&expected) else {
-        return Err(PathError::WrongPrefix {
-            suffix: suffix.to_string(),
-            expected: TRANSACTION_MARKER.to_string(),
-        });
-    };
-    let Some((shard, encoded)) = rest.split_once('/') else {
-        return Err(PathError::Parse(suffix.to_string()));
-    };
-    if encoded.contains('/') {
-        return Err(PathError::Parse(suffix.to_string()));
-    }
-    decode_parts(suffix, shard, encoded)
-}
-
 pub(super) fn write_object(f: &mut fmt::Formatter<'_>, prefix: &str, id: &TxId) -> fmt::Result {
     let encoded = base64::encode(id.as_bytes());
     let shard = shard_for_encoding(&encoded);
     write!(f, "{prefix}/{TRANSACTION_MARKER}/{shard}/{encoded}")
-}
-
-pub(super) fn object(prefix: &str, id: &TxId) -> String {
-    let encoded = base64::encode(id.as_bytes());
-    let shard = shard_for_encoding(&encoded);
-    format!("{prefix}/{TRANSACTION_MARKER}/{shard}/{encoded}")
-}
-
-pub(super) fn prefix(prefix: &str) -> String {
-    format!("{prefix}/{TRANSACTION_MARKER}/")
 }
 
 pub(super) fn shard(id: &TxId) -> usize {
@@ -65,17 +38,9 @@ pub(super) fn shard(id: &TxId) -> usize {
 }
 
 pub(super) fn shard_prefix(prefix: &str, shard: usize) -> String {
-    assert!(
-        shard < TRANSACTION_SHARD_COUNT,
-        "transaction shard out of range"
-    );
     let symbols = base64::encode_u12(shard);
     let symbols = std::str::from_utf8(&symbols).expect("base64 alphabet is ASCII");
     format!("{prefix}/{TRANSACTION_MARKER}/{symbols}/")
-}
-
-pub(super) fn encoded_id(id: &TxId) -> String {
-    base64::encode(id.as_bytes())
 }
 
 fn decode_parts(source: &str, shard: &str, encoded: &str) -> Result<TxId, PathError> {

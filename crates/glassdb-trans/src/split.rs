@@ -2454,41 +2454,6 @@ mod tests {
         }
     }
 
-    mod paths {
-        use super::*;
-
-        pub fn tree_root(prefix: &str) -> String {
-            ObjectPath::TreeRoot {
-                collection: collection_at(prefix),
-            }
-            .to_string()
-        }
-
-        pub fn from_node(prefix: &str, token: &str) -> String {
-            ObjectPath::Node {
-                collection: collection_at(prefix),
-                token: test_token(token),
-            }
-            .to_string()
-        }
-
-        pub fn nodes_prefix(prefix: &str) -> String {
-            ObjectPath::nodes_prefix(&collection_at(prefix))
-        }
-
-        pub fn structural_log_dir(root: &str) -> String {
-            ObjectPath::structural_records_prefix(&db_root(root))
-        }
-
-        pub fn structural_log_participant_dir(root: &str, participant: &TxId) -> String {
-            ObjectPath::participant_structural_records_prefix(&db_root(root), participant)
-        }
-
-        pub fn transactions_prefix(root: &str) -> String {
-            format!("{}/_t/", db_root(root))
-        }
-    }
-
     // A soft cap so tight a two-entry leaf is at the cap and a third overflows it,
     // and any three-child index overflows — so splits are driven by a handful of
     // keys instead of hundreds.
@@ -2888,10 +2853,11 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let transaction_prefix = format!("{}/_t/", db_root("db"));
         assert_eq!(
             s.objects
                 .list(
-                    &paths::transactions_prefix("db"),
+                    &transaction_prefix,
                     None,
                     glassdb_backend::ListLimit::new(2).unwrap(),
                 )
@@ -2933,7 +2899,8 @@ mod tests {
         sp.settle_topology_participant(&collection(), &participant)
             .await
             .unwrap();
-        let expected_listing = paths::structural_log_participant_dir("db", &participant);
+        let expected_listing =
+            ObjectPath::participant_structural_records_prefix(&db_root("db"), &participant);
         let listings: Vec<_> = operations
             .lock()
             .unwrap()
@@ -3010,9 +2977,9 @@ mod tests {
             let bg = Arc::new(Background::new());
             let sp = splitter(&s, &bg, tiny());
 
-            let root_path = paths::tree_root(COLL);
-            let nodes_prefix = paths::nodes_prefix(COLL);
-            let structural_prefix = paths::structural_log_dir("db");
+            let root_path = root_path().to_string();
+            let nodes_prefix = ObjectPath::nodes_prefix(&collection());
+            let structural_prefix = ObjectPath::structural_records_prefix(&db_root("db"));
             let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
             backend.set_before({
                 let fired = fired.clone();
@@ -4424,7 +4391,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
-        let source_path = paths::from_node(COLL, "L");
+        let source_path = node_path("L").to_string();
         let (backend, gate) =
             FirstSourceWriteGate::wrap(Arc::new(MemoryBackend::new()), source_path.clone());
         let backend: Arc<dyn Backend> = backend;

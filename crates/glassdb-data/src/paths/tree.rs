@@ -65,24 +65,12 @@ pub(super) fn write_collection_record(f: &mut fmt::Formatter<'_>, prefix: &str) 
     write!(f, "{prefix}/{COLLECTION_RECORD_MARKER}")
 }
 
-pub(super) fn collection_record(prefix: &str) -> String {
-    format!("{prefix}/{COLLECTION_RECORD_MARKER}")
-}
-
 pub(super) fn write_tree_root(f: &mut fmt::Formatter<'_>, prefix: &str) -> fmt::Result {
     write!(f, "{prefix}/{TREE_ROOT_MARKER}")
 }
 
-pub(super) fn tree_root(prefix: &str) -> String {
-    format!("{prefix}/{TREE_ROOT_MARKER}")
-}
-
 pub(super) fn write_node(f: &mut fmt::Formatter<'_>, prefix: &str, token: &str) -> fmt::Result {
     write!(f, "{prefix}/{NODE_MARKER}/{token}")
-}
-
-pub(super) fn node(prefix: &str, token: &str) -> String {
-    format!("{prefix}/{NODE_MARKER}/{token}")
 }
 
 pub(super) fn nodes_prefix(prefix: &str) -> String {

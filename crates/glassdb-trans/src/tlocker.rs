@@ -1339,7 +1339,7 @@ mod tests {
     };
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::{CollectionAddress, DbRoot, ObjectPath, paths};
+    use glassdb_data::{CollectionAddress, DbRoot, ObjectPath};
     use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, Node, Shard, ShardEntry, ShardStore,
@@ -1436,8 +1436,6 @@ mod tests {
         TxId::with_priority(order * 1_000_000_000, name.as_bytes())
     }
 
-    const COLL: &str = "test/_c/0000000000000000000000";
-
     fn collection() -> CollectionAddress {
         CollectionAddress::root("test")
     }
@@ -1446,10 +1444,6 @@ mod tests {
         ObjectPath::TreeRoot {
             collection: collection(),
         }
-    }
-
-    fn object_path(path: &str) -> ObjectPath {
-        ObjectPath::try_from(path).unwrap()
     }
 
     fn key_ref(key: &[u8]) -> KeyRef {
@@ -1594,7 +1588,11 @@ mod tests {
 
         lock_ok(&locker, &tx, &group_of(b"target", put_intent(b"target"))).await;
 
-        let unrelated_path = paths::from_transaction("test", &unrelated);
+        let unrelated_path = ObjectPath::Transaction {
+            db_root: DbRoot::try_from("test").unwrap(),
+            id: unrelated,
+        }
+        .to_string();
         assert!(
             log.lock()
                 .unwrap()
@@ -2277,13 +2275,10 @@ mod tests {
         ctx.monitor.commit_tx(tl).await.unwrap();
 
         // Install the committed pointer directly in the collection's leaf `_r`.
-        let path = paths::tree_root(COLL);
+        let path = root_path();
         let loaded = ctx
             .shards
-            .load_leaf(
-                &object_path(&path),
-                Requirement::AtLeast(ctx.timeline.now()),
-            )
+            .load_leaf(&path, Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
@@ -2463,7 +2458,7 @@ mod tests {
             ShardsOutcome::Locked(_)
         ));
 
-        let shard_path = paths::tree_root(COLL);
+        let shard_path = root_path().to_string();
         assert_eq!(
             count_stores(&log, &shard_path),
             1,
@@ -2517,7 +2512,7 @@ mod tests {
             ShardsOutcome::Locked(_)
         ));
 
-        let shard_path = paths::tree_root(COLL);
+        let shard_path = root_path().to_string();
         assert_eq!(
             count_stores(&log, &shard_path),
             1,
@@ -2588,7 +2583,7 @@ mod tests {
         let (locker, ctx, log, gate) = gated_locker_with(false).await;
         let ka = b"key-a".to_vec();
         let kb = same_shard_sibling(&ka);
-        let shard_path = paths::tree_root(COLL);
+        let shard_path = root_path().to_string();
 
         let tx1 = mk_tid(1, "w1");
         let tx2 = mk_tid(2, "w2");
@@ -2630,7 +2625,7 @@ mod tests {
         let (locker, ctx, log, gate) = gated_locker_with(false).await;
         let ka = b"key-a".to_vec();
         let kb = same_shard_sibling(&ka);
-        let shard_path = paths::tree_root(COLL);
+        let shard_path = root_path().to_string();
 
         let tx1 = mk_tid(1, "w1");
         let lt1 = lock_commit(&locker, &ctx, &tx1, &ka).await;
@@ -2756,7 +2751,7 @@ mod tests {
         let writer = mk_tid(1, "writer");
         let locked = Arc::new(lock_commit(&locker, &ctx, &writer, key).await);
         let landed = Arc::new(Notify::new());
-        let leaf_path = paths::tree_root(COLL);
+        let leaf_path = root_path().to_string();
         hook.set_after({
             let landed = landed.clone();
             move |operation, outcome| {
@@ -2807,7 +2802,7 @@ mod tests {
         let (locker, ctx, log, gate) = gated_locker_with(false).await;
         let ka = b"key-a".to_vec();
         let kb = same_shard_sibling(&ka);
-        let shard_path = paths::tree_root(COLL);
+        let shard_path = root_path().to_string();
 
         let tx1 = mk_tid(1, "r1");
         let tx2 = mk_tid(2, "r2");
@@ -2887,7 +2882,7 @@ mod tests {
         rt::sleep(Duration::from_millis(50)).await;
         assert!(!hy.is_finished(), "the younger waits for the older holder");
 
-        let shard_path = paths::tree_root(COLL);
+        let shard_path = root_path().to_string();
         assert_eq!(
             count_stores(&log, &shard_path),
             1,
@@ -2953,7 +2948,7 @@ mod tests {
         // A load per poll, but only three CAS stores: the older's acquire, the
         // older's release, then the younger's acquire. The younger's waiting
         // rounds stage nothing, so they add no stores.
-        let shard_path = paths::tree_root(COLL);
+        let shard_path = root_path().to_string();
         assert_eq!(count_stores(&log, &shard_path), 3);
     }
 
@@ -3020,7 +3015,7 @@ mod tests {
 
         // Three CAS stores: the winner's acquire, its release, then the loser's
         // acquire. The loser's waiting rounds stage nothing.
-        let shard_path = paths::tree_root(COLL);
+        let shard_path = root_path().to_string();
         assert_eq!(count_stores(&log, &shard_path), 3);
     }
 
@@ -3034,7 +3029,7 @@ mod tests {
         for (wb_order, acq_order) in [(1u64, 2u64), (2u64, 1u64)] {
             let (locker, ctx, log, gate) = gated_locker_with(false).await;
             let key = b"key";
-            let shard_path = paths::tree_root(COLL);
+            let shard_path = root_path().to_string();
 
             // A committed holder leaves its write lock held pending write-back.
             let committer = mk_tid(wb_order, "wb");

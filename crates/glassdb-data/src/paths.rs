@@ -369,25 +369,7 @@ impl LeafRef {
             },
         }
     }
-
-    /// Renders the exact physical backend object path of this leaf.
-    pub fn physical_path(&self) -> String {
-        self.object_path().to_string()
-    }
-
-    /// Parses a physical collection-root or node path.
-    pub fn from_physical_path(path: &str) -> Result<Self, PathError> {
-        match ObjectPath::try_from(path) {
-            Ok(ObjectPath::TreeRoot { collection }) => Ok(LeafRef::root(collection)),
-            Ok(ObjectPath::Node { collection, token }) => Ok(LeafRef::node(collection, token)),
-            Ok(_) => Err(PathError::Parse(path.to_string())),
-            Err(_) => legacy_leaf_from_physical_path(path),
-        }
-    }
 }
-
-/// Number of deterministic transaction-log shards (two base64 symbols).
-pub const TRANSACTION_SHARD_COUNT: usize = 64 * 64;
 
 /// A classified physical backend object path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -414,6 +396,11 @@ pub enum ObjectPath {
 }
 
 impl ObjectPath {
+    /// Returns the deterministic transaction-log shard containing `id`.
+    pub fn transaction_shard(id: &TxId) -> usize {
+        transaction::shard(id)
+    }
+
     /// Returns the listing prefix for all standalone nodes in `collection`.
     pub fn nodes_prefix(collection: &CollectionAddress) -> String {
         tree::nodes_prefix(&collection.physical_prefix())
@@ -492,31 +479,6 @@ impl std::str::FromStr for ObjectPath {
     }
 }
 
-/// The category of a storage path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Type {
-    Unknown,
-    Transaction,
-    CollectionRecord,
-    /// The fixed B-link tree root object (`_r`, ADR-050).
-    TreeRoot,
-    /// A B-link tree node object (`_n/<token>`, ADR-031).
-    Node,
-}
-
-impl Type {
-    /// Returns the physical object marker (`_t`, `_i`, `_r`, `_n`, or `""`).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Type::Unknown => "",
-            Type::Transaction => "_t",
-            Type::CollectionRecord => "_i",
-            Type::TreeRoot => "_r",
-            Type::Node => "_n",
-        }
-    }
-}
-
 /// Error returned by path parsing/decoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathError {
@@ -527,8 +489,6 @@ pub enum PathError {
         component: &'static str,
         value: String,
     },
-    /// The suffix did not start with the expected type marker.
-    WrongPrefix { suffix: String, expected: String },
     /// The base64 payload could not be decoded.
     Decode(base64::DecodeError),
 }
@@ -539,9 +499,6 @@ impl std::fmt::Display for PathError {
             PathError::Parse(p) => write!(f, "expected path with >=3 parts, got {p:?}"),
             PathError::InvalidComponent { component, value } => {
                 write!(f, "invalid {component} path component {value:?}")
-            }
-            PathError::WrongPrefix { suffix, expected } => {
-                write!(f, "got path {suffix:?}, expected prefix {expected:?}")
             }
             PathError::Decode(e) => write!(f, "decoding path: {e}"),
         }
@@ -554,291 +511,6 @@ impl From<base64::DecodeError> for PathError {
     fn from(e: base64::DecodeError) -> Self {
         PathError::Decode(e)
     }
-}
-
-/// The result of [`parse`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseResult {
-    pub prefix: String,
-    pub suffix: String,
-    pub typ: Type,
-}
-
-/// Returns the storage path for the collection record under `prefix`.
-pub fn collection_record(prefix: &str) -> String {
-    tree::collection_record(prefix)
-}
-
-/// Reports whether `p` refers to a collection record.
-pub fn is_collection_record(p: &str) -> bool {
-    match ObjectPath::try_from(p) {
-        Ok(ObjectPath::CollectionRecord { .. }) => true,
-        Ok(_) => false,
-        Err(_) => p.ends_with("/_i"),
-    }
-}
-
-/// Returns the storage path for the fixed B-link tree root under `prefix`.
-pub fn tree_root(prefix: &str) -> String {
-    tree::tree_root(prefix)
-}
-
-/// Reports whether `p` refers to a fixed B-link tree root object.
-pub fn is_tree_root(p: &str) -> bool {
-    match ObjectPath::try_from(p) {
-        Ok(ObjectPath::TreeRoot { .. }) => true,
-        Ok(_) => false,
-        Err(_) => p.ends_with("/_r"),
-    }
-}
-
-/// Encodes a transaction ID into a storage path under `prefix`.
-pub fn from_transaction(prefix: &str, id: &TxId) -> String {
-    transaction::object(prefix, id)
-}
-
-/// Decodes a transaction ID from a sharded storage path suffix
-/// (`_t/<shard>/<b64>`).
-pub fn to_transaction(suffix: &str) -> Result<TxId, PathError> {
-    transaction::parse_suffix(suffix)
-}
-
-/// Returns the listing prefix for all transaction objects under `prefix`.
-pub fn transactions_prefix(prefix: &str) -> String {
-    transaction::prefix(prefix)
-}
-
-/// Returns the deterministic shard index for `id`.
-pub fn transaction_shard(id: &TxId) -> usize {
-    transaction::shard(id)
-}
-
-/// Returns the listing prefix for one deterministic transaction-log shard.
-pub fn transaction_shard_prefix(prefix: &str, shard: usize) -> String {
-    transaction::shard_prefix(prefix, shard)
-}
-
-/// Decodes the transaction ID from a full transaction object path
-/// (`{prefix}/_t/<shard>/<b64>`), the inverse of [`from_transaction`]. Unlike
-/// [`to_transaction`] (which decodes a type-marked suffix), this takes a whole
-/// path as returned by a transaction listing.
-pub fn transaction_id_of(path: &str) -> Result<TxId, PathError> {
-    match transaction::parse_object(path) {
-        Some(Ok(ObjectPath::Transaction { id, .. })) => Ok(id),
-        Some(Ok(_)) => unreachable!("transaction codec returned a non-transaction path"),
-        Some(Err(error)) => Err(error),
-        None if path_parts_indexes(path).is_none() => Err(PathError::Parse(path.to_string())),
-        None => Err(PathError::WrongPrefix {
-            suffix: path.to_string(),
-            expected: format!("{}/<shard>/<txid>", Type::Transaction.as_str()),
-        }),
-    }
-}
-
-/// Returns the storage path for the B-link node named `token` under `prefix`
-/// (`{prefix}/_n/<token>`, ADR-031).
-///
-/// The token is an opaque identity string (typically from [`random_node_token`]),
-/// not a computed index: the tree is dynamic, so a node is addressed by
-/// descending to it, never by formula.
-pub fn from_node(prefix: &str, token: &str) -> String {
-    tree::node(prefix, token)
-}
-
-/// Returns the listing prefix for all B-link node objects under `prefix`.
-pub fn nodes_prefix(prefix: &str) -> String {
-    tree::nodes_prefix(prefix)
-}
-
-/// Returns the database-wide structural-log directory (`{db}/_s/`).
-pub fn structural_log_dir(db_root: &str) -> String {
-    structural::directory(db_root)
-}
-
-/// Returns one topology participant's structural-log directory
-/// (`{db}/_s/<participant_id>/`).
-pub fn structural_log_participant_dir(db_root: &str, participant: &TxId) -> String {
-    structural::participant_directory(db_root, participant)
-}
-
-/// Returns the path of one participant-owned structural-log record
-/// (`{db}/_s/<participant_id>/<record_id>`).
-pub fn structural_log_record(db_root: &str, participant: &TxId, record_id: &str) -> String {
-    structural::record(db_root, participant, record_id)
-}
-
-/// Decodes the participant and record id from a structural-log record path.
-pub fn structural_log_parts_of(path: &str) -> Result<(TxId, String), PathError> {
-    match ObjectPath::try_from(path) {
-        Ok(ObjectPath::StructuralRecord {
-            participant,
-            record_id,
-            ..
-        }) => Ok((participant, record_id.to_string())),
-        Ok(_) => Err(PathError::Parse(path.to_string())),
-        Err(_) => structural::parse_legacy(path),
-    }
-}
-
-/// Decodes the record id from a structural-log record path.
-pub fn structural_log_id_of(path: &str) -> Result<String, PathError> {
-    structural_log_parts_of(path).map(|(_, record_id)| record_id)
-}
-
-/// Returns the database name at the start of a collection prefix.
-pub fn db_root_of(prefix: &str) -> &str {
-    match prefix.find('/') {
-        Some(i) => &prefix[..i],
-        None => prefix,
-    }
-}
-
-/// Decodes a node token from a full node object path (`{prefix}/_n/<token>`),
-/// the inverse of [`from_node`].
-pub fn node_token_of(path: &str) -> Result<String, PathError> {
-    match ObjectPath::try_from(path) {
-        Ok(ObjectPath::Node { token, .. }) => Ok(token.to_string()),
-        Ok(_) => Err(PathError::WrongPrefix {
-            suffix: path.to_string(),
-            expected: Type::Node.as_str().to_string(),
-        }),
-        Err(_) => {
-            let parsed = legacy_parse(path)?;
-            if parsed.typ == Type::Node {
-                Ok(parsed.suffix)
-            } else {
-                Err(PathError::WrongPrefix {
-                    suffix: path.to_string(),
-                    expected: Type::Node.as_str().to_string(),
-                })
-            }
-        }
-    }
-}
-
-/// Mints a fresh, random B-link node token.
-///
-/// The token is deliberately random rather than monotonic: object stores
-/// partition by key prefix, so monotonically increasing names would pile new
-/// nodes onto one partition and accidentally hot-key the backend (ADR-031). It
-/// draws from the same seeded-under-simulation entropy as [`crate::TxId`], so
-/// DST replays stay byte-identical.
-pub fn random_node_token() -> String {
-    NodeToken::new_random().to_string()
-}
-
-/// Splits a storage path into its prefix, type, and suffix components.
-pub fn parse(p: &str) -> Result<ParseResult, PathError> {
-    let Ok(path) = ObjectPath::try_from(p) else {
-        return legacy_parse(p);
-    };
-    Ok(match path {
-        ObjectPath::DatabaseMetadata { db_root } => ParseResult {
-            prefix: db_root.to_string(),
-            suffix: DATABASE_METADATA_OBJECT.to_string(),
-            typ: Type::Unknown,
-        },
-        ObjectPath::CollectionRecord { collection } => ParseResult {
-            prefix: collection.physical_prefix(),
-            suffix: String::new(),
-            typ: Type::CollectionRecord,
-        },
-        ObjectPath::Transaction { db_root, id } => ParseResult {
-            prefix: db_root.to_string(),
-            suffix: transaction::encoded_id(&id),
-            typ: Type::Transaction,
-        },
-        ObjectPath::TreeRoot { collection } => ParseResult {
-            prefix: collection.physical_prefix(),
-            suffix: String::new(),
-            typ: Type::TreeRoot,
-        },
-        ObjectPath::Node { collection, token } => ParseResult {
-            prefix: collection.physical_prefix(),
-            suffix: token.to_string(),
-            typ: Type::Node,
-        },
-        ObjectPath::StructuralRecord {
-            db_root, record_id, ..
-        } => ParseResult {
-            prefix: format!("{db_root}/_s"),
-            suffix: record_id.to_string(),
-            typ: Type::Unknown,
-        },
-    })
-}
-
-fn legacy_leaf_from_physical_path(path: &str) -> Result<LeafRef, PathError> {
-    if let Some(prefix) = path.strip_suffix("/_r") {
-        return Ok(LeafRef::root(CollectionAddress::from_physical_prefix(
-            prefix,
-        )?));
-    }
-    let Some((prefix, token)) = path.rsplit_once("/_n/") else {
-        return Err(PathError::Parse(path.to_string()));
-    };
-    if token.is_empty() || token.contains('/') {
-        return Err(PathError::Parse(path.to_string()));
-    }
-    Ok(LeafRef::node(
-        CollectionAddress::from_physical_prefix(prefix)?,
-        NodeToken::try_from(token)?,
-    ))
-}
-
-fn legacy_parse(p: &str) -> Result<ParseResult, PathError> {
-    if let Some(prefix) = p.strip_suffix("/_i") {
-        return Ok(ParseResult {
-            prefix: prefix.to_string(),
-            suffix: String::new(),
-            typ: Type::CollectionRecord,
-        });
-    }
-    if let Some(prefix) = p.strip_suffix("/_r") {
-        return Ok(ParseResult {
-            prefix: prefix.to_string(),
-            suffix: String::new(),
-            typ: Type::TreeRoot,
-        });
-    }
-    if let Some((prefix, shard, suffix)) = legacy_transaction_parts(p)
-        && shard == suffix.get(..2).unwrap_or("00")
-    {
-        return Ok(ParseResult {
-            prefix: prefix.to_string(),
-            suffix: suffix.to_string(),
-            typ: Type::Transaction,
-        });
-    }
-    let (prefix_idx, type_idx) =
-        path_parts_indexes(p).ok_or_else(|| PathError::Parse(p.to_string()))?;
-    let marker = &p[prefix_idx + 1..type_idx];
-    Ok(ParseResult {
-        prefix: p[..prefix_idx].to_string(),
-        suffix: p[type_idx + 1..].to_string(),
-        typ: if marker == Type::Node.as_str() {
-            Type::Node
-        } else {
-            Type::Unknown
-        },
-    })
-}
-
-fn legacy_transaction_parts(path: &str) -> Option<(&str, &str, &str)> {
-    let (parent, encoded) = path.rsplit_once('/')?;
-    let (typed, shard) = parent.rsplit_once('/')?;
-    let (prefix, marker) = typed.rsplit_once('/')?;
-    (marker == Type::Transaction.as_str() && shard.len() == 2 && !encoded.is_empty())
-        .then_some((prefix, shard, encoded))
-}
-
-fn path_parts_indexes(p: &str) -> Option<(usize, usize)> {
-    let type_idx = p.rfind('/')?;
-    if type_idx == 0 {
-        return None;
-    }
-    let prefix_idx = p[..type_idx - 1].rfind('/')?;
-    Some((prefix_idx, type_idx))
 }
 
 #[cfg(test)]
@@ -1024,122 +696,19 @@ mod tests {
     }
 
     #[test]
-    fn leaf_paths_round_trip() {
+    fn leaf_refs_map_to_canonical_object_paths() {
         let collection = CollectionAddress::new("db", collection_id(1));
-        for leaf in [
-            LeafRef::root(collection.clone()),
-            LeafRef::node(collection, NodeToken::from_bytes([1; NODE_TOKEN_BYTES])),
-        ] {
-            assert_eq!(
-                LeafRef::from_physical_path(&leaf.physical_path()).unwrap(),
-                leaf
-            );
-        }
-    }
-
-    #[test]
-    fn collection_record_paths() {
-        assert_eq!(collection_record("foo/bar"), "foo/bar/_i");
-        assert!(is_collection_record("foo/bar/_i"));
-        let r = parse("foo/bar/_i").unwrap();
-        assert_eq!(r.prefix, "foo/bar");
-        assert_eq!(r.typ, Type::CollectionRecord);
-    }
-
-    #[test]
-    fn tree_root_paths() {
-        assert_eq!(tree_root("foo/bar"), "foo/bar/_r");
-        assert!(is_tree_root("foo/bar/_r"));
-        let parsed = parse("foo/bar/_r").unwrap();
-        assert_eq!(parsed.prefix, "foo/bar");
-        assert_eq!(parsed.typ, Type::TreeRoot);
-    }
-
-    #[test]
-    fn transaction_round_trip() {
-        let id = TxId::from_bytes(vec![1, 2, 3, 4]);
-        let p = from_transaction("db", &id);
-        assert_eq!(p, "db/_t/0F/0F8310");
-        let r = parse(&p).unwrap();
-        assert_eq!(r.typ, Type::Transaction);
-        assert_eq!(to_transaction(p.strip_prefix("db/").unwrap()).unwrap(), id);
-        assert!(matches!(
-            to_transaction("_t/0F8310"),
-            Err(PathError::Parse(_))
-        ));
-        assert_eq!(parse("db/_t/0F8310").unwrap().typ, Type::Unknown);
-    }
-
-    #[test]
-    fn transaction_prefix_format() {
-        assert_eq!(transactions_prefix("db"), "db/_t/");
-        assert_eq!(transaction_shard(&TxId::from_bytes(vec![1, 2, 3, 4])), 16);
-        assert_eq!(transaction_shard_prefix("db", 16), "db/_t/0F/");
-    }
-
-    #[test]
-    fn transaction_id_of_round_trip_and_errors() {
-        let id = TxId::from_bytes(vec![1, 2, 3, 4]);
-        assert_eq!(transaction_id_of(&from_transaction("db", &id)).unwrap(), id);
-        assert!(matches!(
-            transaction_id_of("db/_t/00/0F8310"),
-            Err(PathError::Parse(_))
-        ));
-        // A non-transaction path is rejected.
-        assert!(matches!(
-            transaction_id_of(&from_node("db/coll", "node")),
-            Err(PathError::WrongPrefix { .. })
-        ));
-        // A malformed path (no type segment) is a parse error.
-        assert!(matches!(transaction_id_of("db"), Err(PathError::Parse(_))));
-    }
-
-    #[test]
-    fn node_round_trip_and_errors() {
-        let p = from_node("db/coll", "AbC123");
-        assert_eq!(p, "db/coll/_n/AbC123");
-        let r = parse(&p).unwrap();
-        assert_eq!(r.prefix, "db/coll");
-        assert_eq!(r.typ, Type::Node);
-        assert_eq!(r.suffix, "AbC123");
-        assert_eq!(node_token_of(&p).unwrap(), "AbC123");
-        assert_eq!(nodes_prefix("db/coll"), "db/coll/_n/");
-        // A non-node path is rejected.
-        assert!(matches!(
-            node_token_of(&from_transaction("db", &TxId::from_bytes(vec![1]))),
-            Err(PathError::WrongPrefix { .. })
-        ));
-        // A malformed path (no type segment) is a parse error.
-        assert!(matches!(node_token_of("db"), Err(PathError::Parse(_))));
-    }
-
-    #[test]
-    fn structural_log_record_round_trip() {
-        let participant = TxId::from_bytes(b"participant".to_vec());
-        let record_id = "record";
-        let path = structural_log_record("db", &participant, record_id);
-        assert!(path.starts_with(&structural_log_dir("db")));
-        assert!(path.starts_with(&structural_log_participant_dir("db", &participant)));
+        let token = NodeToken::from_bytes([1; NODE_TOKEN_BYTES]);
         assert_eq!(
-            structural_log_parts_of(&path).unwrap(),
-            (participant, record_id.to_string())
+            LeafRef::root(collection.clone()).object_path(),
+            ObjectPath::TreeRoot {
+                collection: collection.clone(),
+            }
         );
-        assert_eq!(structural_log_id_of(&path).unwrap(), record_id);
-        assert_eq!(structural_log_dir("db"), "db/_s/");
-        assert_eq!(db_root_of("db/root/child"), "db");
-        assert!(structural_log_parts_of("db/_s/record").is_err());
-        assert!(structural_log_parts_of("db/_s//record").is_err());
-        assert!(structural_log_parts_of("db/_s/participant/").is_err());
-        assert!(structural_log_parts_of("db/_s/participant/record/extra").is_err());
-    }
-
-    #[test]
-    fn random_node_token_is_a_valid_decodable_token() {
-        let t = random_node_token();
-        // The token round-trips through a node path.
-        assert_eq!(node_token_of(&from_node("db/coll", &t)).unwrap(), t);
-        // It is our order-preserving base64 of 16 random bytes.
-        assert_eq!(base64::decode(&t).unwrap().len(), 16);
+        assert_eq!(
+            LeafRef::node(collection.clone(), token.clone()).object_path(),
+            ObjectPath::Node { collection, token }
+        );
     }
 
     // Golden vectors produced by the Go implementation, to guarantee
@@ -1157,12 +726,6 @@ mod tests {
         let record_id = StructuralRecordId::from(token.clone());
 
         assert_eq!(collection.physical_prefix(), collection_prefix);
-        assert_eq!(
-            from_transaction("db", &TxId::from_bytes(vec![1, 2, 3, 4])),
-            "db/_t/0F/0F8310"
-        );
-        assert_eq!(collection_record("db/root"), "db/root/_i");
-        assert_eq!(tree_root("db/root"), "db/root/_r");
         assert_eq!(
             ObjectPath::CollectionRecord {
                 collection: collection.clone(),
@@ -1210,6 +773,7 @@ mod tests {
             ObjectPath::transaction_shard_prefix(&db_root, 16),
             "db/_t/0F/"
         );
+        assert_eq!(ObjectPath::transaction_shard(&participant), 16);
         assert_eq!(ObjectPath::structural_records_prefix(&db_root), "db/_s/");
         assert_eq!(
             ObjectPath::participant_structural_records_prefix(&db_root, &participant),

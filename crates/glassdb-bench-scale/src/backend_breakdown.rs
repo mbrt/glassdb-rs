@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use glassdb_backend::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
+use glassdb_data::ObjectPath;
 
 /// Reads, mutations, and lists attributed to one physical object role.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -91,7 +92,7 @@ impl Sub for BackendBreakdown {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObjectRole {
     DatabaseMetadata,
     CollectionRecord,
@@ -219,29 +220,19 @@ impl ClassifiedBackend {
 }
 
 fn classify(path: &str) -> ObjectRole {
-    let mut parts = path.split('/').filter(|part| !part.is_empty());
-    let Some(_database) = parts.next() else {
-        return ObjectRole::Other;
-    };
-    let Some(mut part) = parts.next() else {
-        return ObjectRole::Other;
-    };
-    while part == "_c" {
-        if parts.next().is_none() {
-            return ObjectRole::Other;
-        }
-        let Some(next) = parts.next() else {
-            return ObjectRole::Other;
-        };
-        part = next;
+    match ObjectPath::try_from(path) {
+        Ok(path) => classify_object(&path),
+        Err(_) => ObjectRole::Other,
     }
-    match part {
-        "glassdb" => ObjectRole::DatabaseMetadata,
-        "_i" => ObjectRole::CollectionRecord,
-        "_r" | "_n" => ObjectRole::Node,
-        "_t" => ObjectRole::TransactionLog,
-        "_s" => ObjectRole::StructuralLog,
-        _ => ObjectRole::Other,
+}
+
+fn classify_object(path: &ObjectPath) -> ObjectRole {
+    match path {
+        ObjectPath::DatabaseMetadata { .. } => ObjectRole::DatabaseMetadata,
+        ObjectPath::CollectionRecord { .. } => ObjectRole::CollectionRecord,
+        ObjectPath::TreeRoot { .. } | ObjectPath::Node { .. } => ObjectRole::Node,
+        ObjectPath::Transaction { .. } => ObjectRole::TransactionLog,
+        ObjectPath::StructuralRecord { .. } => ObjectRole::StructuralLog,
     }
 }
 
@@ -307,72 +298,116 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use glassdb_backend::memory::MemoryBackend;
+    use glassdb_data::{CollectionAddress, DbRoot, NodeToken, StructuralRecordId, TxId};
 
     use super::*;
 
     #[test]
-    fn physical_paths_are_classified_without_parsing_payloads() {
-        assert!(matches!(
-            classify("db/glassdb"),
-            ObjectRole::DatabaseMetadata
-        ));
-        assert!(matches!(
-            classify("db/_c/Y29sbA/_i"),
-            ObjectRole::CollectionRecord
-        ));
-        assert!(matches!(
-            classify("db/_c/_t/_i"),
-            ObjectRole::CollectionRecord
-        ));
-        assert!(matches!(
-            classify("db/_c/Y29sbA/_n/token"),
-            ObjectRole::Node
-        ));
-        assert!(matches!(classify("db/_c/Y29sbA/_r"), ObjectRole::Node));
-        assert!(matches!(
-            classify("db/_t/0F/encoded"),
-            ObjectRole::TransactionLog
-        ));
-        assert!(matches!(classify("db/_t/0F/"), ObjectRole::TransactionLog));
-        assert!(matches!(
-            classify("db/_s/record"),
-            ObjectRole::StructuralLog
-        ));
-        assert!(matches!(classify("db/unknown"), ObjectRole::Other));
+    fn every_object_path_variant_is_classified() {
+        let db_root = DbRoot::try_from("db").unwrap();
+        let collection = CollectionAddress::root("db");
+        let participant = TxId::from_bytes(b"participant".to_vec());
+        let cases = [
+            (
+                ObjectPath::DatabaseMetadata {
+                    db_root: db_root.clone(),
+                },
+                ObjectRole::DatabaseMetadata,
+            ),
+            (
+                ObjectPath::CollectionRecord {
+                    collection: collection.clone(),
+                },
+                ObjectRole::CollectionRecord,
+            ),
+            (
+                ObjectPath::TreeRoot {
+                    collection: collection.clone(),
+                },
+                ObjectRole::Node,
+            ),
+            (
+                ObjectPath::Node {
+                    collection: collection.clone(),
+                    token: NodeToken::from_bytes([1; 16]),
+                },
+                ObjectRole::Node,
+            ),
+            (
+                ObjectPath::Transaction {
+                    db_root: db_root.clone(),
+                    id: participant.clone(),
+                },
+                ObjectRole::TransactionLog,
+            ),
+            (
+                ObjectPath::StructuralRecord {
+                    db_root,
+                    participant,
+                    record_id: StructuralRecordId::from(NodeToken::from_bytes([2; 16])),
+                },
+                ObjectRole::StructuralLog,
+            ),
+        ];
+
+        for (path, expected) in cases {
+            assert_eq!(classify_object(&path), expected);
+            assert_eq!(classify(&path.to_string()), expected);
+        }
+    }
+
+    #[test]
+    fn misleading_embedded_markers_are_not_classified() {
+        for path in [
+            "db/glassdb/_t/00/00",
+            "db/_c/_t/_i",
+            "db/_c/0000000000000000000000/_i/_n/token",
+            "db/_c/0000000000000000000000/_n/_t",
+            "db/_t/_n/not-a-transaction",
+            "db/_s/_t/record",
+            "db/_t/0F/",
+            "db/_s/record",
+            "db/unknown",
+        ] {
+            assert_eq!(classify(path), ObjectRole::Other, "classified {path:?}");
+        }
     }
 
     #[tokio::test]
     async fn every_backend_method_counts_and_preserves_results() {
+        const COLLECTION_RECORD: &str = "db/_c/0000000000000000000000/_i";
+        const COLLECTION_PREFIX: &str = "db/_c/0000000000000000000000/";
+
         let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (backend, handle) = wrap(inner);
 
         let version = backend
-            .write_if_not_exists("db/_c/Y29sbA/_i", b"root".to_vec())
+            .write_if_not_exists(COLLECTION_RECORD, b"root".to_vec())
             .await
             .unwrap();
-        let reply = backend.read("db/_c/Y29sbA/_i").await.unwrap();
+        let reply = backend.read(COLLECTION_RECORD).await.unwrap();
         assert_eq!(reply.contents, b"root");
         assert!(matches!(
             backend
-                .read_if_modified("db/_c/Y29sbA/_i", &reply.version)
+                .read_if_modified(COLLECTION_RECORD, &reply.version)
                 .await,
             Err(BackendError::Precondition)
         ));
         let version = backend
-            .write_if("db/_c/Y29sbA/_i", b"new".to_vec(), &version)
+            .write_if(COLLECTION_RECORD, b"new".to_vec(), &version)
             .await
             .unwrap();
         let page = backend
-            .list("db/_c/Y29sbA/", None, NonZeroUsize::new(10).unwrap())
+            .list(COLLECTION_PREFIX, None, NonZeroUsize::new(10).unwrap())
             .await
             .unwrap();
-        assert_eq!(page.objects, ["db/_c/Y29sbA/_i"]);
+        assert_eq!(page.objects, [COLLECTION_RECORD]);
         backend
-            .delete_if("db/_c/Y29sbA/_i", &version)
+            .delete_if(COLLECTION_RECORD, &version)
             .await
             .unwrap();
         assert!(matches!(
-            backend.read("db/_c/Y29sbA/_i").await,
+            backend.read(COLLECTION_RECORD).await,
             Err(BackendError::NotFound)
         ));
 

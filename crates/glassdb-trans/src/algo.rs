@@ -1529,9 +1529,7 @@ mod tests {
     };
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::{
-        CollectionAddress, CollectionId, DbRoot, LeafRef, NodeToken, ObjectPath, paths,
-    };
+    use glassdb_data::{CollectionAddress, CollectionId, DbRoot, LeafRef, NodeToken, ObjectPath};
     use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, CurrentState, Node, Shard, ShardEntry,
@@ -1539,7 +1537,6 @@ mod tests {
     };
 
     const TEST_DB: &str = "testp";
-    const TEST_COLL: &str = "testp/_c/0000000000000000000000";
 
     fn test_collection() -> CollectionAddress {
         CollectionAddress::root(TEST_DB)
@@ -2561,7 +2558,7 @@ mod tests {
         let txb = TxId::with_priority(2_000_000_000, b"acquire");
         tctx.tmon.begin_tx(&txb);
 
-        let shard_path = paths::tree_root(TEST_COLL);
+        let shard_path = test_root_path().to_string();
         log.lock().unwrap().clear();
         gate.arm();
 
@@ -2809,10 +2806,10 @@ mod tests {
             if o.op != "write_if" && o.op != "write_if_not_exists" {
                 continue;
             }
-            if let Ok(parsed) = paths::parse(&o.path) {
-                match parsed.typ {
-                    paths::Type::TreeRoot | paths::Type::Node => c.leaf += 1,
-                    paths::Type::Transaction => c.tx += 1,
+            if let Ok(path) = ObjectPath::try_from(o.path.as_str()) {
+                match path {
+                    ObjectPath::TreeRoot { .. } | ObjectPath::Node { .. } => c.leaf += 1,
+                    ObjectPath::Transaction { .. } => c.tx += 1,
                     _ => {}
                 }
             }
@@ -2827,7 +2824,11 @@ mod tests {
     #[test]
     fn write_counts_parses_transaction_shard_named_like_node() {
         let id = TxId::from_bytes(vec![0x97, 0x30]);
-        let path = paths::from_transaction(TEST_DB, &id);
+        let path = ObjectPath::Transaction {
+            db_root: test_db_root(),
+            id,
+        }
+        .to_string();
         assert!(path.contains("/_t/_n/"), "test id mapped to {path:?}");
         let log = Arc::new(std::sync::Mutex::new(vec![OpRecord {
             op: "write_if_not_exists",
@@ -2845,7 +2846,10 @@ mod tests {
     fn shard_reads(log: &OpLog) -> (usize, usize) {
         let (mut full, mut revalidate) = (0, 0);
         for o in log.lock().unwrap().iter() {
-            if !(o.path.contains("/_n/") || o.path.ends_with("/_r")) {
+            if !matches!(
+                ObjectPath::try_from(o.path.as_str()),
+                Ok(ObjectPath::TreeRoot { .. } | ObjectPath::Node { .. })
+            ) {
                 continue;
             }
             if o.op == "read" {

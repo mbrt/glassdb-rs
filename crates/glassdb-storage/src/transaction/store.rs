@@ -7,11 +7,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use glassdb_backend as backend;
 use glassdb_concurr::rt;
-use glassdb_data::{DbRoot, ObjectPath, TxId, paths};
+use glassdb_data::{DbRoot, ObjectPath, TxId};
 
 use crate::cached_store::{CachedStore, CasResult, Observation, Requirement};
 use crate::error::StorageError;
 use crate::transaction::{TxCommitStatus, TxLifecycleRelation, TxLog, TxLogCodec, TxRecordState};
+
+const TRANSACTION_SHARD_COUNT: usize = 64 * 64;
 
 /// The commit status of a transaction along with its timestamp and version.
 #[derive(Debug, Clone)]
@@ -144,7 +146,12 @@ impl TLogger {
 
     /// Returns every physical transaction-log shard.
     pub fn transaction_shards(&self) -> impl Iterator<Item = usize> {
-        0..paths::TRANSACTION_SHARD_COUNT
+        0..TRANSACTION_SHARD_COUNT
+    }
+
+    /// Returns the physical shard containing `id`.
+    pub fn transaction_shard(&self, id: &TxId) -> usize {
+        ObjectPath::transaction_shard(id)
     }
 
     /// Lists one page of transaction IDs from `shard`.
@@ -234,7 +241,7 @@ mod tests {
     use glassdb_backend::middleware::{
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
     };
-    use glassdb_data::{CollectionAddress, CollectionId, KeyRef, LeafRef, paths};
+    use glassdb_data::{CollectionAddress, CollectionId, KeyRef, LeafRef};
     use tokio::sync::Notify;
 
     fn db_root() -> DbRoot {
@@ -528,7 +535,11 @@ mod tests {
     #[tokio::test]
     async fn commit_status_waits_for_in_flight_create() {
         let id = TxId::from_bytes(vec![1, 2, 3, 4]);
-        let transaction_path = paths::from_transaction("db", &id);
+        let transaction_path = ObjectPath::Transaction {
+            db_root: db_root(),
+            id: id.clone(),
+        }
+        .to_string();
         let create_started = Arc::new(Notify::new());
         let release_create = Arc::new(Notify::new());
         let reads = Arc::new(AtomicUsize::new(0));
@@ -728,8 +739,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let shard = paths::transaction_shard(&ids[0]);
-        assert!(ids.iter().all(|id| paths::transaction_shard(id) == shard));
+        let shard = t.transaction_shard(&ids[0]);
+        assert!(ids.iter().all(|id| t.transaction_shard(id) == shard));
         let limit = backend::ListLimit::new(2).unwrap();
         let first = t.list_transaction_ids(shard, None, limit).await.unwrap();
         assert_eq!(first.ids.len(), 2);

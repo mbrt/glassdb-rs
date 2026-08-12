@@ -582,7 +582,7 @@ mod tests {
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
-    use glassdb_data::{CollectionAddress, CollectionId, DbRoot, ObjectPath, paths};
+    use glassdb_data::{CollectionAddress, CollectionId, DbRoot, ObjectPath};
     use glassdb_storage::transaction::{TxCollectionChange, TxCollectionOp, TxWrite};
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, CurrentState, LockType, Node, Shard,
@@ -830,7 +830,7 @@ mod tests {
             .unwrap();
         // The key now points at a newer writer, not `old`.
         store_entry(&ctx, b"k", writer_entry(b"k", &new)).await;
-        let mut scan = test_scan(vec![paths::transaction_shard(&old)], None);
+        let mut scan = test_scan(vec![ctx.tl.transaction_shard(&old)], None);
 
         ctx.gc.run_once(&mut scan).await;
 
@@ -861,7 +861,7 @@ mod tests {
             },
         )
         .await;
-        let mut scan = test_scan(vec![paths::transaction_shard(&old)], None);
+        let mut scan = test_scan(vec![ctx.tl.transaction_shard(&old)], None);
 
         ctx.gc.run_once(&mut scan).await;
 
@@ -891,7 +891,7 @@ mod tests {
         let mut log = committed(id.clone(), PAST_HORIZON, &[], &[]);
         log.prepared_collections.push(prepared.clone());
         ctx.tl.set(&log).await.unwrap();
-        let mut scan = test_scan(vec![paths::transaction_shard(&id)], None);
+        let mut scan = test_scan(vec![ctx.tl.transaction_shard(&id)], None);
 
         ctx.gc.run_once(&mut scan).await;
 
@@ -923,7 +923,10 @@ mod tests {
         log.prepared_collections.push(prepared.clone());
         ctx.tl.set(&log).await.unwrap();
 
-        let root_path = paths::collection_record(&prepared.physical_prefix());
+        let root_path = ObjectPath::CollectionRecord {
+            collection: prepared.clone(),
+        }
+        .to_string();
         let fail_once = Arc::new(AtomicBool::new(true));
         backend.set_before({
             let fail_once = fail_once.clone();
@@ -1215,7 +1218,7 @@ mod tests {
         let rec = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
         let log = rec.log();
         let ctx = new_ctx_with(rec).await;
-        let mut scan = test_scan((0..paths::TRANSACTION_SHARD_COUNT).collect(), None);
+        let mut scan = test_scan(ctx.tl.transaction_shards().collect(), None);
 
         assert!(ctx.gc.next_list_page(&mut scan).await.is_empty());
 
@@ -1240,7 +1243,7 @@ mod tests {
             .await
             .unwrap();
         let mut scan = test_scan(
-            vec![paths::transaction_shard(&t)],
+            vec![ctx.tl.transaction_shard(&t)],
             Some(backend::ListCursor::new("stale")),
         );
 

@@ -1486,6 +1486,7 @@ dependencies = [
  "glassdb",
  "glassdb-backend",
  "glassdb-concurr",
+ "glassdb-data",
  "mimalloc",
  "rand 0.10.1",
  "serde",

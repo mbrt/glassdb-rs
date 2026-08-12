@@ -20,13 +20,6 @@ pub(super) fn parse_object(path: &str) -> Option<Result<ObjectPath, PathError>> 
     )
 }
 
-pub(super) fn parse_legacy(path: &str) -> Result<(TxId, String), PathError> {
-    let Some((db_root, suffix)) = path.split_once("/_s/") else {
-        return Err(PathError::Parse(path.to_string()));
-    };
-    parse_parts(path, db_root, suffix)
-}
-
 pub(super) fn write_record(
     f: &mut fmt::Formatter<'_>,
     db_root: &str,
@@ -35,13 +28,6 @@ pub(super) fn write_record(
 ) -> fmt::Result {
     write!(
         f,
-        "{db_root}/{STRUCTURAL_MARKER}/{}/{record_id}",
-        base64::encode(participant.as_bytes())
-    )
-}
-
-pub(super) fn record(db_root: &str, participant: &TxId, record_id: &str) -> String {
-    format!(
         "{db_root}/{STRUCTURAL_MARKER}/{}/{record_id}",
         base64::encode(participant.as_bytes())
     )
