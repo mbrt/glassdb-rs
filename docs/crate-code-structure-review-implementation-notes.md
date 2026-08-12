@@ -715,3 +715,32 @@ working document and is intentionally not committed with these changes.
   operations, error precedence, database naming, random draws, worker tasks,
   metrics, serialized output, and status text are unchanged. Workload selection
   and execution intentionally remain in `mixed.rs` for F32-D.
+
+## F32-D — Extract mixed benchmark workload execution
+
+- Added `mixed/workload.rs` as the single owner of shape order, worker-slot
+  distribution, deterministic worker seeds, collection/key selection, worker
+  loops, transaction bodies, and adaptive stopping. `run_cell` now contains only
+  setup, measurement bracketing, worker orchestration, teardown, and reporting.
+- The extraction preserves shape-major/database-major/worker-major spawn order,
+  the initial seed and increment, both collection-selection draws at every
+  affinity, sorted distinct key selection, and the existing read-only versus
+  read-modify-write transaction bodies. Selection remains outside the measured
+  closure, and one successful logical transaction still records one sample.
+- Setup completion and statistics baselines still precede timer start; timers
+  still end before teardown; the shared drain deadline, worker-error precedence,
+  convergence/cap behavior, counter deltas, and serialized/text results are
+  unchanged.
+- The existing affinity test was folded into one deterministic worker-contract
+  test driven by the production worker-spec sequencer. It freezes the complete
+  shape/database/worker seed order for a multi-database plan, representative
+  collection/key vectors, and one successful sample per shape in reporting
+  order. No old-versus-new migration harness or duplicate end-to-end benchmark
+  was kept.
+- Retired the exact stderr-line snapshot at the documented F32-D endpoint.
+  Configuration, dimension ordering, metrics, and serialized-schema snapshots
+  remain as long-term contracts; the human-readable progress wording is not a
+  public interface and remains covered by its ordinary scenario call sites.
+- No public API, database operation, persistent byte, retry, random draw, task
+  count/order, metric, or CLI behavior changed. No deviation from the plan or
+  architecture decision was required.

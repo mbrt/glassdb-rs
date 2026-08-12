@@ -470,21 +470,4 @@ mod tests {
 }"#
         );
     }
-
-    #[test]
-    fn status_lines_are_stable() {
-        assert_eq!(
-            cell_started(2, "lo", 75),
-            "mixed: run=2 mode=lo affinity=75%"
-        );
-        assert_eq!(
-            cell_capped("hi", 25, 0.1),
-            "  note: mode=hi affinity=25% hit --max-duration before every shape reached \
-             --target-ci=0.1"
-        );
-        assert_eq!(
-            setup_settled(Duration::from_millis(1500), 4, Duration::from_secs(10)),
-            "  setup settled after 1.5s: 4 completed splits, 10s quiet"
-        );
-    }
 }
