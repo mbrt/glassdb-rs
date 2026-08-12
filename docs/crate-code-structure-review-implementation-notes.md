@@ -911,3 +911,23 @@ working document and is intentionally not committed with these changes.
 - No public API, database operation, persistent byte, retry, random draw, task
   count/order, metric, or CLI behavior changed. No deviation from the plan or
   architecture decision was required.
+## F29-H — Extract the API program generator
+
+- Moved only `ApiWorkload`'s `Arbitrary` decoder and action-generation logic
+  into the private `sim::api::generator` module. `ApiAction`, `ApiTransaction`,
+  `ApiWorkload`, and its default remain declared in `api.rs`, preserving their
+  existing public paths and fuzz-target bounds without a re-export shim.
+- The exact model, transaction action handlers, program loop, `SimWorkload`
+  implementation, and final oracle remain in `api.rs` for F29-I through F29-K.
+  The generator reads the parent module's existing key and collection
+  cardinalities; its per-transaction generation limit remains private.
+- Decoder branches, modulo arithmetic, client ownership, allocation order,
+  action order, abort decoding, and byte draws moved mechanically. The existing
+  fixed-input test was extended into two compact vectors covering every action
+  variant, owned-key projection, client assignment, abort outcomes, and the
+  number of bytes left after decoding.
+- The reviewed API tape-trace digest remains byte-identical, and all 1,509
+  committed `api_correctness` corpus inputs still replay successfully. No
+  persistent bytes, backend operations, retry semantics, runtime entropy,
+  spawn order, executor/model/oracle behavior, compatibility shim, or ADR
+  changed.
