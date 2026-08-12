@@ -75,6 +75,8 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 fn is_allowed_runtime_use(path: &Path, pattern: &str) -> bool {
     path.ends_with("crates/glassdb-concurr/src/rt.rs")
+        || (path.ends_with("crates/glassdb-concurr/src/rt/dedicated.rs")
+            && matches!(pattern, "tokio::runtime" | "std::thread"))
         || (path.ends_with("crates/glassdb-concurr/src/sim/executor.rs")
             && matches!(pattern, "tokio::task" | "tokio::runtime"))
         || (path.ends_with("crates/glassdb-storage/src/disk_cache/file_media.rs")
