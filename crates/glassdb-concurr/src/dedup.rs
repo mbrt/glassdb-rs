@@ -23,7 +23,7 @@
 //! caller-future's lifetime. This is the structural reason orphaned keys and
 //! lost handoffs are impossible.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -102,26 +102,190 @@ impl<R, E> Member<R, E> {
     }
 }
 
+/// Queue and compatible-batch policy for one key.
+struct KeyQueue<R, E> {
+    /// Members currently being served by the running worker round.
+    batch: Vec<Member<R, E>>,
+    /// Reorderable submissions waiting to merge with a future batch.
+    reorderable: VecDeque<Member<R, E>>,
+    /// FIFO submissions waiting their turn.
+    fifo: VecDeque<Member<R, E>>,
+    /// The merged request for the current batch (kept valid: seeded on creation,
+    /// recomputed on every reconstruction).
+    merged: R,
+}
+
+impl<R, E> KeyQueue<R, E>
+where
+    R: MergeRequest,
+{
+    /// Creates a queue seeded with the inline driver's own submission.
+    fn new(seed: Member<R, E>) -> Self {
+        let merged = seed.request.clone();
+        KeyQueue {
+            batch: vec![seed],
+            reorderable: VecDeque::new(),
+            fifo: VecDeque::new(),
+            merged,
+        }
+    }
+
+    /// Queues a submission according to its ordering constraint.
+    fn enqueue(&mut self, member: Member<R, E>, can_reorder: bool) {
+        if can_reorder {
+            self.reorderable.push_back(member);
+        } else {
+            self.fifo.push_back(member);
+        }
+    }
+
+    /// Drops members whose callers are no longer interested without disturbing
+    /// the order of the survivors.
+    fn prune(&mut self) {
+        self.batch.retain(|member| member.live());
+        self.reorderable.retain(|member| member.live());
+        self.fifo.retain(|member| member.live());
+    }
+
+    /// Reports whether a future batch has queued work.
+    fn has_incoming_live(&mut self) -> bool {
+        self.prune();
+        !self.reorderable.is_empty() || !self.fifo.is_empty()
+    }
+
+    /// Refreshes the active batch with compatible queued work. An empty active
+    /// batch stays empty so its in-flight operation can be cancelled before a
+    /// queued seed starts a fresh round.
+    fn refresh_batch(&mut self) -> bool {
+        self.prune();
+        self.merge_compatible()
+    }
+
+    /// Forms the batch for a worker round, preferring the FIFO front as its seed.
+    fn form_batch(&mut self) -> bool {
+        self.prune();
+        if self.batch.is_empty() {
+            let seed = self
+                .fifo
+                .pop_front()
+                .or_else(|| self.reorderable.pop_front());
+            if let Some(seed) = seed {
+                self.batch.push(seed);
+            }
+        }
+        // Preserve the second liveness boundary before a round starts: a
+        // promoted caller can disappear while the queue is being rebuilt.
+        self.refresh_batch()
+    }
+
+    /// Recomputes the merged request and absorbs compatible queued work.
+    fn merge_compatible(&mut self) -> bool {
+        if self.batch.is_empty() {
+            return false;
+        }
+
+        let mut merged = self.batch[0].request.clone();
+        for member in &self.batch[1..] {
+            merged = merged
+                .merge(&member.request)
+                .expect("dedup: non-mergeable request inside a batch");
+        }
+
+        // Each reorderable candidate present on entry gets one chance. Failed
+        // candidates retain their relative order for the next refresh.
+        let reorderable = self.reorderable.len();
+        for _ in 0..reorderable {
+            let member = self
+                .reorderable
+                .pop_front()
+                .expect("dedup: reorderable scan exceeded its bound");
+            match merged.merge(&member.request) {
+                Some(next) => {
+                    merged = next;
+                    self.batch.push(member);
+                }
+                None => self.reorderable.push_back(member),
+            }
+        }
+
+        // An incompatible FIFO member is an ordering barrier: work behind it
+        // cannot join this batch even if it would otherwise be compatible.
+        while let Some(member) = self.fifo.front() {
+            let Some(next) = merged.merge(&member.request) else {
+                break;
+            };
+            merged = next;
+            self.batch.push(
+                self.fifo
+                    .pop_front()
+                    .expect("dedup: observed FIFO front disappeared"),
+            );
+        }
+
+        self.merged = merged;
+        true
+    }
+
+    /// Delivers a result to the active batch and returns its member count.
+    fn close_batch(&mut self, res: &Result<(), Arc<E>>) -> usize {
+        let delivered = self.batch.len();
+        for member in self.batch.drain(..) {
+            let _ = member.done.send(res.clone());
+        }
+        delivered
+    }
+
+    /// Abandons an active batch after every member has stopped waiting.
+    fn abandon_batch(&mut self) {
+        self.batch.clear();
+    }
+
+    /// Returns live undelivered members to the queues for a successor driver.
+    fn requeue_batch(&mut self) {
+        let mut strict = VecDeque::new();
+        for member in self.batch.drain(..) {
+            if !member.live() {
+                continue;
+            }
+            if member.request.can_reorder() {
+                self.reorderable.push_back(member);
+            } else {
+                strict.push_back(member);
+            }
+        }
+        strict.append(&mut self.fifo);
+        self.fifo = strict;
+    }
+
+    fn merged(&self) -> &R {
+        &self.merged
+    }
+
+    fn batch_len(&self) -> usize {
+        self.batch.len()
+    }
+
+    fn reorderable_len(&self) -> usize {
+        self.reorderable.len()
+    }
+
+    fn fifo_len(&self) -> usize {
+        self.fifo.len()
+    }
+}
+
 /// Per-key coordination state. Lives in the shard map while the key has a
 /// driver; removed (atomically, under the shard lock) once there is no more
 /// outstanding work.
 struct KeyState<R, E> {
-    /// Members currently being served by the running worker round.
-    batch: Vec<Member<R, E>>,
-    /// Reorderable submissions waiting to merge with a future batch.
-    pending: Vec<Member<R, E>>,
-    /// FIFO submissions waiting their turn.
-    queue: Vec<Member<R, E>>,
-    /// The merged request for the current batch (kept valid: seeded on creation,
-    /// recomputed on every reconstruction).
-    merged: R,
+    queue: KeyQueue<R, E>,
     /// Abort signal for the in-flight worker round, if any. Cancelled when the
     /// batch loses all live members so the [`Inner::drive_one_round`]
     /// `select!` drops the worker future at its next `.await`.
     op_signal: Option<CancellationToken>,
     /// Notified whenever new work arrives (or a waiter cancels), so the worker
     /// can re-evaluate. A single stored permit is enough: the worker re-absorbs
-    /// everything via [`KeyState::reconstruct`] on each wake.
+    /// everything via [`KeyQueue::refresh_batch`] on each wake.
     changed: Arc<Notify>,
 }
 
@@ -131,128 +295,11 @@ where
 {
     /// Creates per-key state seeded with the inline driver's own submission.
     fn new(seed: Member<R, E>) -> Self {
-        let merged = seed.request.clone();
         KeyState {
-            batch: vec![seed],
-            pending: Vec::new(),
-            queue: Vec::new(),
-            merged,
+            queue: KeyQueue::new(seed),
             op_signal: None,
             changed: Arc::new(Notify::new()),
         }
-    }
-
-    /// Drops members whose callers are no longer interested.
-    fn prune(&mut self) {
-        self.batch.retain(|m| m.live());
-        self.pending.retain(|m| m.live());
-        self.queue.retain(|m| m.live());
-    }
-
-    /// Reports whether any queued (not yet batched) submission is still live.
-    fn incoming_live(&self) -> bool {
-        self.pending.iter().any(|m| m.live()) || self.queue.iter().any(|m| m.live())
-    }
-
-    /// If the batch is empty, promotes a new seed: the queue front (FIFO) if any,
-    /// otherwise any pending (reorderable) submission. Assumes dead members were
-    /// already pruned.
-    fn promote_seed(&mut self) {
-        if !self.queue.is_empty() {
-            self.batch.push(self.queue.remove(0));
-        } else if !self.pending.is_empty() {
-            self.batch.push(self.pending.remove(0));
-        }
-    }
-
-    /// Recomputes [`KeyState::merged`] from the live batch, absorbing compatible
-    /// incoming submissions: every mergeable pending request (order-independent),
-    /// then queued requests front-to-back up to the first non-mergeable one (so
-    /// write ordering is preserved and reads cannot starve the queue). Returns
-    /// `false` if no live member remains.
-    fn reconstruct(&mut self) -> bool {
-        self.prune();
-        if self.batch.is_empty() {
-            return false;
-        }
-
-        let mut req = self.batch[0].request.clone();
-        for m in &self.batch[1..] {
-            req = req
-                .merge(&m.request)
-                .expect("dedup: non-mergeable request inside a batch");
-        }
-
-        let pending = std::mem::take(&mut self.pending);
-        let mut remaining = Vec::new();
-        for m in pending {
-            match req.merge(&m.request) {
-                Some(mr) => {
-                    req = mr;
-                    self.batch.push(m);
-                }
-                None => remaining.push(m),
-            }
-        }
-        self.pending = remaining;
-
-        let queue = std::mem::take(&mut self.queue);
-        let mut leftover = Vec::new();
-        let mut it = queue.into_iter();
-        for m in it.by_ref() {
-            match req.merge(&m.request) {
-                Some(mr) => {
-                    req = mr;
-                    self.batch.push(m);
-                }
-                None => {
-                    leftover.push(m);
-                    break;
-                }
-            }
-        }
-        leftover.extend(it);
-        self.queue = leftover;
-
-        self.merged = req;
-        true
-    }
-
-    /// Prepares the next batch at the start of a round: promotes a seed if the
-    /// batch is empty, then reconstructs the merged request. Returns `false` if
-    /// there is no live work to do.
-    fn build_batch(&mut self) -> bool {
-        self.prune();
-        if self.batch.is_empty() {
-            self.promote_seed();
-        }
-        self.reconstruct()
-    }
-
-    /// Delivers `res` to every member of the current batch and clears it.
-    fn deliver(&mut self, res: &Result<(), Arc<E>>) {
-        for m in self.batch.drain(..) {
-            let _ = m.done.send(res.clone());
-        }
-    }
-
-    /// Moves still-live, undelivered batch members back into the incoming queues
-    /// so a successor driver re-serves them. Used on the inline-driver drop path.
-    fn requeue_batch(&mut self) {
-        let batch = std::mem::take(&mut self.batch);
-        let mut front = Vec::new();
-        for m in batch {
-            if !m.live() {
-                continue;
-            }
-            if m.request.can_reorder() {
-                self.pending.push(m);
-            } else {
-                front.push(m);
-            }
-        }
-        front.extend(std::mem::take(&mut self.queue));
-        self.queue = front;
     }
 }
 
@@ -294,12 +341,12 @@ where
         let st = map
             .get_mut(&self.key)
             .expect("dedup: merged() for an unknown key");
-        if !st.reconstruct()
+        if !st.queue.refresh_batch()
             && let Some(s) = &st.op_signal
         {
             s.cancel();
         }
-        st.merged.clone()
+        st.queue.merged().clone()
     }
 
     /// Resolves when new work arrives for the key (or a waiter cancels). Intended
@@ -378,7 +425,7 @@ enum WorkerOutcome<E> {
     Done(Result<(), Arc<E>>),
     /// `BatchHandle::merged` cancelled the per-round abort signal because no
     /// live batch member remained; the worker future was dropped. The owner
-    /// loop continues so a fresh batch (built from `pending`/`queue`, if any)
+    /// loop continues so a fresh batch (built from the incoming queues, if any)
     /// gets its own round.
     Liveness,
     /// [`Dedup::close`] fired global shutdown; the worker future was dropped
@@ -413,7 +460,7 @@ where
                     return Round::Exit;
                 }
             };
-            if self.shutdown.is_cancelled() || !st.build_batch() {
+            if self.shutdown.is_cancelled() || !st.queue.form_batch() {
                 map.remove(key);
                 tracing::trace!(target: "glassdb::dedup", key, "key_removed");
                 return Round::Exit;
@@ -424,9 +471,9 @@ where
             tracing::trace!(
                 target: "glassdb::dedup",
                 key,
-                batch_count = st.batch.len(),
-                pending_count = st.pending.len(),
-                queue_count = st.queue.len(),
+                batch_count = st.queue.batch_len(),
+                pending_count = st.queue.reorderable_len(),
+                queue_count = st.queue.fifo_len(),
                 "round_start",
             );
             signal
@@ -448,8 +495,7 @@ where
             WorkerOutcome::Done(res) => {
                 if let Some(st) = map.get_mut(key) {
                     st.op_signal = None;
-                    let delivered = st.batch.len();
-                    st.deliver(&res);
+                    let delivered = st.queue.close_batch(&res);
                     tracing::trace!(
                         target: "glassdb::dedup",
                         key,
@@ -466,10 +512,10 @@ where
                 // dropped its receiver (that is what fired the signal), so
                 // there is nothing to deliver. The caller of `drive_inline`
                 // / `run_owner` will retry: another round will either build
-                // a fresh batch from `pending`/`queue` or remove the key.
+                // a fresh batch from the incoming queues or remove the key.
                 if let Some(st) = map.get_mut(key) {
                     st.op_signal = None;
-                    st.batch.clear();
+                    st.queue.abandon_batch();
                     tracing::trace!(target: "glassdb::dedup", key, "round_liveness_abort");
                 }
                 Round::Delivered
@@ -494,8 +540,7 @@ where
             Some(s) => s,
             None => return,
         };
-        st.prune();
-        if st.incoming_live() {
+        if st.queue.has_incoming_live() {
             self.spawn_owner(shard, key);
         } else {
             map.remove(key);
@@ -617,15 +662,14 @@ where
             }
         };
         let had_op = st.op_signal.take().is_some();
-        st.requeue_batch();
-        st.prune();
-        if st.incoming_live() {
+        st.queue.requeue_batch();
+        if st.queue.has_incoming_live() {
             tracing::debug!(
                 target: "glassdb::dedup",
                 key = %self.key,
                 had_op,
-                pending_count = st.pending.len(),
-                queue_count = st.queue.len(),
+                pending_count = st.queue.reorderable_len(),
+                queue_count = st.queue.fifo_len(),
                 "inline_driver_dropped_handoff",
             );
             self.inner.spawn_owner(&self.shard, &self.key);
@@ -698,7 +742,7 @@ where
         let shard = self.inner.shards.for_key(key.as_bytes()).clone();
         shard.submissions.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        let reorder = r.can_reorder();
+        let can_reorder = r.can_reorder();
         let member = Member {
             request: r,
             done: tx,
@@ -708,11 +752,7 @@ where
             let mut map = shard.map.lock().unwrap();
             match map.get_mut(key) {
                 Some(st) => {
-                    if reorder {
-                        st.pending.push(member);
-                    } else {
-                        st.queue.push(member);
-                    }
+                    st.queue.enqueue(member, can_reorder);
                     st.changed.notify_one();
                     (false, st.changed.clone())
                 }
@@ -769,9 +809,9 @@ where
             for (key, st) in map.iter() {
                 out.push(DedupKeySnapshot {
                     key: key.clone(),
-                    batch_count: st.batch.len(),
-                    pending_count: st.pending.len(),
-                    queue_count: st.queue.len(),
+                    batch_count: st.queue.batch_len(),
+                    pending_count: st.queue.reorderable_len(),
+                    queue_count: st.queue.fifo_len(),
                     has_active_op: st.op_signal.is_some(),
                 });
             }
@@ -843,6 +883,42 @@ mod tests {
         fn can_reorder(&self) -> bool {
             self.can_reorder
         }
+    }
+
+    #[test]
+    fn requeue_preserves_ordering_classes() {
+        let mut results = Vec::new();
+        let mut member = |request| {
+            let (done, result) = oneshot::channel::<Result<(), Arc<()>>>();
+            results.push(result);
+            Member { request, done }
+        };
+
+        let mut queue = KeyQueue::new(member(mergeable(1)));
+        queue.enqueue(member(reorderable(2)), true);
+        assert!(queue.refresh_batch());
+        queue.enqueue(member(unmergeable(3)), false);
+        queue.enqueue(member(reorderable(4)), true);
+
+        queue.requeue_batch();
+
+        assert!(queue.batch.is_empty());
+        assert_eq!(
+            queue
+                .fifo
+                .iter()
+                .map(|member| member.request.counter)
+                .collect::<Vec<_>>(),
+            vec![1, 3],
+        );
+        assert_eq!(
+            queue
+                .reorderable
+                .iter()
+                .map(|member| member.request.counter)
+                .collect::<Vec<_>>(),
+            vec![4, 2],
+        );
     }
 
     /// Records the merged counter of each batch it serves. Its first invocation
@@ -925,13 +1001,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn single_call() {
-        let d = Dedup::new(CounterWorker::default());
-        assert!(d.run("key", mergeable(0)).await.is_ok());
-        assert_eq!(*d.inner.worker.counter.lock().unwrap(), 1);
-    }
-
     // Uncontended work runs inline: a lone caller per key never spawns an owner.
     #[tokio::test]
     async fn uncontended_runs_inline_without_spawn() {
@@ -939,6 +1008,7 @@ mod tests {
         for i in 0..5 {
             assert!(d.run("key", mergeable(i)).await.is_ok());
         }
+        assert_eq!(*d.inner.worker.counter.lock().unwrap(), 5);
         assert_eq!(d.active_owners(), 0, "uncontended work should not spawn");
     }
 

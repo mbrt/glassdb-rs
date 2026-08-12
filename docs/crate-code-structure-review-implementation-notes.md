@@ -134,3 +134,24 @@ working document and is intentionally not committed with these changes.
 - Adversarial review found no semantic, currentness, cache-hit, or operation-
   ordering issue. Its only finding was an avoidable temporary `String` allocation
   on stale right hops; the cursor now parses the borrowed token directly.
+
+## F18-A — Extract queue and compatible-batch mechanics
+
+- Added a private `KeyQueue` backed by `VecDeque` for reorderable and strict FIFO
+  arrivals while retaining the active batch as an ordered `Vec`. Submission,
+  compatible batch formation, stable pruning, abandonment, requeue, completion,
+  and diagnostic counts now share that owner.
+- Merge order remains active batch, compatible reorderable arrivals in stable
+  order, then the compatible strict FIFO prefix. The first incompatible FIFO
+  request remains a barrier, and a fixed-length reorderable scan cannot cycle on
+  incompatible work.
+- Driver phases, notification, spawning, result delivery, token cancellation,
+  and public snapshots are deliberately unchanged for F18-B. Strict active work
+  is requeued before existing FIFO work; reorderable active work is appended
+  after older reorderable arrivals.
+- One redundant single-call test was folded into the stronger uncontended
+  no-spawn test. One compact queue regression covers mixed requeue ordering, so
+  the dedup suite remains at thirteen tests.
+- Adversarial review found no ordering, cancellation, lifecycle, diagnostics, or
+  excessive-test issue. No public API, runtime schedule, or persistent state
+  changed.
