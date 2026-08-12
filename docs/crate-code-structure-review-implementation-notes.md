@@ -663,3 +663,28 @@ working document and is intentionally not committed with these changes.
   output schema, backend operations, or task scheduling changed. Results,
   scenario phases, and workloads intentionally remain in `mixed.rs` for F32-B
   through F32-D.
+
+## F32-B — Extract mixed benchmark results and reporting
+
+- Moved shape latency and throughput summaries, database-counter aggregation,
+  normalized operation/protocol metrics, serialized result types, and the three
+  mixed progress/status line formatters into `mixed/result.rs`. The scenario
+  passes owned timing snapshots and post-shutdown counter deltas across this
+  boundary; measurement and shutdown ordering are unchanged.
+- The result module retains logical committed samples as every per-transaction
+  metric's denominator while reporting physical `Database::tx` attempts
+  separately. Empty sample sets, zero protocol denominators, confidence-target
+  classification, percentile interpolation, millisecond conversion, and
+  settlement-duration saturation retain their previous behavior. Timing
+  snapshots are reduced lazily, preserving the previous one-shape-at-a-time
+  peak sample-vector memory.
+- Replaced the two narrow counter tests with one fixed-sample snapshot through
+  the same `Serialize`-to-`serde_json::Value` path used by `perfbench`. It pins
+  shape ordering, latency summaries, convergence, every serialized field and
+  aggregate metric, including a wholly empty cell whose zero-denominator metrics
+  must remain finite valid JSON. A second compact snapshot pins the existing
+  progress, capped-cell, and setup-settlement text byte-for-byte.
+- No CLI behavior, cell order, setup, settlement, worker selection, random
+  draws, database naming, backend operations, result values, serialized schema,
+  task scheduling, or stderr text changed. Scenario setup and workload execution
+  intentionally remain in `mixed.rs` for F32-C and F32-D.

@@ -28,6 +28,7 @@
 //! read shapes stop being the reason the cell keeps going once they are precise.
 //!
 mod options;
+mod result;
 
 use std::collections::HashSet;
 use std::error::Error;
@@ -38,7 +39,6 @@ use std::time::{Duration, Instant, SystemTime};
 use futures::future::join_all;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
-use serde::Serialize;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
@@ -51,6 +51,8 @@ use super::backend;
 use super::{Execution, cooldown};
 pub(super) use options::Options;
 use options::{CellDimension, Mode};
+pub(super) use result::RunResult;
+use result::{CellMetadata, CellResult, ShapeMeasurement};
 
 const COLLECTION_PREFIX: &str = "mix";
 
@@ -100,176 +102,6 @@ impl Shape {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Results
-// ---------------------------------------------------------------------------
-
-/// Backend-op counters normalized per transaction.
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OpsPerTx {
-    /// Successfully completed logical operations used as the denominator.
-    txn: u64,
-    /// Physical `Database::tx` calls, including unknown-outcome replays.
-    attempted_txn: u64,
-    obj_reads_per_tx: f64,
-    obj_writes_per_tx: f64,
-    obj_lists_per_tx: f64,
-    total_ops_per_tx: f64,
-    retries_per_tx: f64,
-}
-
-/// Coordinator and direct-path counters for the whole mixed cell.
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ProtocolPerTx {
-    coordinator_submissions_per_tx: f64,
-    coordinator_rounds_per_tx: f64,
-    coordinator_members_per_round: f64,
-    coordinator_cas_retries_per_tx: f64,
-    direct_candidates_per_tx: f64,
-    direct_landed_per_tx: f64,
-    direct_land_rate: f64,
-}
-
-/// Raw backend and transaction deltas summed across a cell's Databases.
-#[derive(Default, Clone, Copy)]
-struct RawOps {
-    reads: u64,
-    writes: u64,
-    lists: u64,
-    txn: u64,
-    retries: u64,
-}
-
-impl RawOps {
-    fn of(delta: Stats) -> Self {
-        RawOps {
-            reads: delta.backend.obj_reads,
-            writes: delta.backend.obj_writes,
-            lists: delta.backend.obj_lists,
-            txn: delta.transactions.completed,
-            retries: delta.transactions.retries,
-        }
-    }
-
-    fn add(self, o: RawOps) -> RawOps {
-        RawOps {
-            reads: self.reads + o.reads,
-            writes: self.writes + o.writes,
-            lists: self.lists + o.lists,
-            txn: self.txn + o.txn,
-            retries: self.retries + o.retries,
-        }
-    }
-
-    fn per_tx(self, logical_txn: u64) -> OpsPerTx {
-        let d = logical_txn.max(1) as f64;
-        OpsPerTx {
-            txn: logical_txn,
-            attempted_txn: self.txn,
-            obj_reads_per_tx: self.reads as f64 / d,
-            obj_writes_per_tx: self.writes as f64 / d,
-            obj_lists_per_tx: self.lists as f64 / d,
-            total_ops_per_tx: (self.reads + self.writes + self.lists) as f64 / d,
-            retries_per_tx: self.retries as f64 / d,
-        }
-    }
-}
-
-/// Raw protocol counter deltas summed across a cell's Databases.
-#[derive(Default, Clone, Copy)]
-struct RawProtocol {
-    coordinator_submissions: u64,
-    coordinator_rounds: u64,
-    coordinator_cas_retries: u64,
-    direct_candidates: u64,
-    direct_landed: u64,
-}
-
-impl RawProtocol {
-    fn of(delta: Stats) -> Self {
-        Self {
-            coordinator_submissions: delta.coordinator.submissions,
-            coordinator_rounds: delta.coordinator.rounds,
-            coordinator_cas_retries: delta.coordinator.cas_retries,
-            direct_candidates: delta.direct_commit.candidates,
-            direct_landed: delta.direct_commit.landed,
-        }
-    }
-
-    fn add(self, other: Self) -> Self {
-        Self {
-            coordinator_submissions: self.coordinator_submissions + other.coordinator_submissions,
-            coordinator_rounds: self.coordinator_rounds + other.coordinator_rounds,
-            coordinator_cas_retries: self.coordinator_cas_retries + other.coordinator_cas_retries,
-            direct_candidates: self.direct_candidates + other.direct_candidates,
-            direct_landed: self.direct_landed + other.direct_landed,
-        }
-    }
-
-    fn per_tx(self, logical_txn: u64) -> ProtocolPerTx {
-        let txn = logical_txn.max(1) as f64;
-        ProtocolPerTx {
-            coordinator_submissions_per_tx: self.coordinator_submissions as f64 / txn,
-            coordinator_rounds_per_tx: self.coordinator_rounds as f64 / txn,
-            coordinator_members_per_round: ratio(
-                self.coordinator_submissions,
-                self.coordinator_rounds,
-            ),
-            coordinator_cas_retries_per_tx: self.coordinator_cas_retries as f64 / txn,
-            direct_candidates_per_tx: self.direct_candidates as f64 / txn,
-            direct_landed_per_tx: self.direct_landed as f64 / txn,
-            direct_land_rate: ratio(self.direct_landed, self.direct_candidates),
-        }
-    }
-}
-
-fn ratio(numerator: u64, denominator: u64) -> f64 {
-    if denominator == 0 {
-        0.0
-    } else {
-        numerator as f64 / denominator as f64
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ShapeResult {
-    shape: String,
-    committed: usize,
-    tx_per_sec: f64,
-    p50_ms: f64,
-    p90_ms: f64,
-    /// Achieved relative half-width of the throughput 95% CI (`z/sqrt(committed)`,
-    /// Poisson approximation); smaller is tighter.
-    rel_ci: f64,
-    /// Whether `rel_ci` met the run's `--target-ci`. `false` means the cell hit
-    /// `--max-duration` first, so read this shape's throughput as indicative.
-    converged: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CellResult {
-    mode: String,
-    affinity_pct: u8,
-    databases: usize,
-    setup_splits: u64,
-    split_settle_wall_ms: u64,
-    failures: u64,
-    shapes: Vec<ShapeResult>,
-    aggregate_ops: OpsPerTx,
-    aggregate_protocol: ProtocolPerTx,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct RunResult {
-    run: usize,
-    cells: Vec<CellResult>,
-}
-
 pub(super) fn run(
     handle: &Handle,
     factory: &backend::Factory,
@@ -283,11 +115,7 @@ pub(super) fn run(
         handle.block_on(cooldown(execution, run));
         let mut cells = Vec::new();
         for &CellDimension { mode, affinity_pct } in &dimensions {
-            eprintln!(
-                "mixed: run={run} mode={} affinity={}%",
-                mode.label(),
-                affinity_pct
-            );
+            eprintln!("{}", result::cell_started(run, mode.label(), affinity_pct));
             let database_name = format!(
                 "perfbenchmixed{invocation}r{run}{}a{affinity_pct}",
                 mode.label()
@@ -302,7 +130,7 @@ pub(super) fn run(
                 affinity_pct,
             )?);
         }
-        runs.push(RunResult { run, cells });
+        runs.push(RunResult::new(run, cells));
     }
     Ok(runs)
 }
@@ -429,65 +257,26 @@ fn run_cell(
     };
     if !cell_converged {
         eprintln!(
-            "  note: mode={} affinity={}% hit --max-duration before every shape reached \
-             --target-ci={}",
-            mode.label(),
-            affinity_pct,
-            options.target_ci,
+            "{}",
+            result::cell_capped(mode.label(), affinity_pct, options.target_ci)
         );
     }
 
-    let mut shapes = Vec::with_capacity(plans.len());
-    for p in &plans {
-        let res = p.bench.results();
-        let count = res.samples.len();
-        let secs = res.tot_duration.as_secs_f64();
-        let (p50, p90) = if count > 0 {
-            (
-                res.percentile(0.5).as_secs_f64() * 1000.0,
-                res.percentile(0.9).as_secs_f64() * 1000.0,
-            )
-        } else {
-            (0.0, 0.0)
-        };
-        shapes.push(ShapeResult {
-            shape: p.shape.name().to_string(),
-            committed: count,
-            tx_per_sec: if secs > 0.0 { count as f64 / secs } else { 0.0 },
-            p50_ms: p50,
-            p90_ms: p90,
-            rel_ci: res.rate_rel_ci(),
-            converged: target == 0 || count as u64 >= target,
-        });
-    }
-
-    let logical_txn = shapes.iter().map(|s| s.committed as u64).sum();
-    let raw_ops = deltas
+    let measurements = plans
         .iter()
-        .copied()
-        .fold(RawOps::default(), |acc, stats| acc.add(RawOps::of(stats)));
-    let aggregate_ops = raw_ops.per_tx(logical_txn);
-    let raw_protocol = deltas
-        .into_iter()
-        .fold(RawProtocol::default(), |acc, stats| {
-            acc.add(RawProtocol::of(stats))
-        });
-    let aggregate_protocol = raw_protocol.per_tx(logical_txn);
-    Ok(CellResult {
-        mode: mode.label().to_string(),
-        affinity_pct,
-        databases: dbs.len(),
-        setup_splits: settlement.completed,
-        split_settle_wall_ms: settlement
-            .elapsed
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX),
-        failures: 0,
-        shapes,
-        aggregate_ops,
-        aggregate_protocol,
-    })
+        .map(|plan| ShapeMeasurement::new(plan.shape.name(), plan.bench.results()));
+    Ok(CellResult::summarize(
+        CellMetadata::new(
+            mode.label(),
+            affinity_pct,
+            dbs.len(),
+            settlement.completed,
+            settlement.elapsed,
+        ),
+        measurements,
+        &deltas,
+        target,
+    ))
 }
 
 /// Cell-wide context shared by every worker.
@@ -808,8 +597,12 @@ fn seed_collections(
         options.split_settle_timeout,
     ))?;
     eprintln!(
-        "  setup settled after {:?}: {} completed splits, {:?} quiet",
-        settlement.elapsed, settlement.completed, options.split_quiet
+        "{}",
+        result::setup_settled(
+            settlement.elapsed,
+            settlement.completed,
+            options.split_quiet
+        )
     );
     handle.block_on(shutdown_databases_until(
         std::slice::from_ref(&db),
@@ -821,47 +614,6 @@ fn seed_collections(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ops_are_normalized_by_logical_transactions() {
-        let ops = RawOps {
-            reads: 8,
-            writes: 4,
-            lists: 0,
-            txn: 3,
-            retries: 2,
-        }
-        .per_tx(2);
-
-        assert_eq!(ops.txn, 2);
-        assert_eq!(ops.attempted_txn, 3);
-        assert_eq!(ops.total_ops_per_tx, 6.0);
-        assert_eq!(ops.retries_per_tx, 1.0);
-    }
-
-    #[test]
-    fn protocol_counters_expose_coalescing_and_direct_coverage() {
-        let protocol = RawProtocol {
-            coordinator_submissions: 12,
-            coordinator_rounds: 4,
-            coordinator_cas_retries: 2,
-            direct_candidates: 5,
-            direct_landed: 3,
-        }
-        .per_tx(6);
-
-        assert_eq!(protocol.coordinator_submissions_per_tx, 2.0);
-        assert_eq!(protocol.coordinator_rounds_per_tx, 2.0 / 3.0);
-        assert_eq!(protocol.coordinator_members_per_round, 3.0);
-        assert_eq!(protocol.coordinator_cas_retries_per_tx, 1.0 / 3.0);
-        assert_eq!(protocol.direct_candidates_per_tx, 5.0 / 6.0);
-        assert_eq!(protocol.direct_landed_per_tx, 0.5);
-        assert_eq!(protocol.direct_land_rate, 0.6);
-
-        let empty = RawProtocol::default().per_tx(0);
-        assert_eq!(empty.coordinator_members_per_round, 0.0);
-        assert_eq!(empty.direct_land_rate, 0.0);
-    }
 
     #[test]
     fn affinity_extremes_are_uniform_or_home_only() {
