@@ -28,7 +28,7 @@ const MAX_LIST_PAGE_SIZE: usize = 1_000;
 #[cfg(any(test, feature = "fake-server"))]
 mod fake_server;
 #[cfg(feature = "fake-server")]
-pub use fake_server::{FakeS3, FakeS3Options};
+pub use fake_server::{DEFAULT_FAKE_S3_ENTROPY_SEED, FakeS3, FakeS3Options};
 
 mod dns;
 #[cfg(test)]

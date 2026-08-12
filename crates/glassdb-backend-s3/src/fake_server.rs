@@ -9,7 +9,7 @@
 //! reproduce *client transport* behavior (connection pooling, head-of-line
 //! blocking under load) locally, with no AWS account.
 //!
-//! Two knobs make it useful beyond unit tests (see [`FakeS3Options`]):
+//! Three knobs make it useful beyond unit tests (see [`FakeS3Options`]):
 //!
 //! * **Simulated latency** — each served operation sleeps for a lognormally
 //!   distributed time derived from a [`ProviderLatencyProfile`] (e.g. the
@@ -19,6 +19,8 @@
 //! * **Connection counting** — every accepted TCP connection bumps an optional
 //!   shared counter, giving the server-side connection-churn signal the Rust
 //!   SDK does not surface on the client side.
+//! * **Seeded entropy** — latency sampling reads from a server-owned deterministic
+//!   stream, so the same request order can be replayed with the same delays.
 //!
 //! Fault injection (`503 SlowDown`, lost acknowledgements) is retained for the
 //! retry tests.
@@ -35,14 +37,13 @@ use aws_sdk_s3::config::{
 };
 use aws_smithy_async::time::TimeSource;
 use bytes::Bytes;
-use glassdb_backend::middleware::{Latency, ProviderLatencyProfile};
-use glassdb_concurr::rt;
+use glassdb_backend::middleware::{Latency, Lognormal, ProviderLatencyProfile};
+use glassdb_concurr::{Rng as DeterministicRng, rt};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use rand_distr::{Distribution, StandardNormal};
 use tokio::net::TcpSocket;
 
 /// Listen backlog for the server socket, well above tokio's default of 1024.
@@ -57,8 +58,10 @@ const LISTEN_BACKLOG: u32 = 8192;
 // Public configuration
 // ---------------------------------------------------------------------------
 
+/// Default seed for the fake server's latency entropy stream.
+pub const DEFAULT_FAKE_S3_ENTROPY_SEED: u64 = 0x4641_4b45_5f53_3300;
+
 /// Options for [`FakeS3::start_with`].
-#[derive(Default)]
 pub struct FakeS3Options {
     /// When set, every served operation sleeps for a simulated duration derived
     /// from this profile (e.g. the latency in
@@ -68,6 +71,19 @@ pub struct FakeS3Options {
     /// When set, every accepted TCP connection increments this counter. Lets a
     /// caller observe server-side connection churn across a measurement window.
     pub conn_counter: Option<Arc<AtomicU64>>,
+    /// Seeds the server-owned entropy stream used to sample operation latency.
+    /// Equal seeds replay the same latency sequence for the same request order.
+    pub entropy_seed: u64,
+}
+
+impl Default for FakeS3Options {
+    fn default() -> Self {
+        Self {
+            latency: None,
+            conn_counter: None,
+            entropy_seed: DEFAULT_FAKE_S3_ENTROPY_SEED,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -131,7 +147,9 @@ impl FakeS3 {
             objects: Mutex::new(HashMap::new()),
             slow: Mutex::new(SlowDown::default()),
             lost_ack: Mutex::new(LostAck::default()),
-            latency: opts.latency.map(LatencyModel::from_profile),
+            latency: opts
+                .latency
+                .map(|profile| LatencyModel::from_profile(profile, opts.entropy_seed)),
         });
         let st = state.clone();
         let conns = opts.conn_counter.clone();
@@ -678,67 +696,87 @@ struct LatencyModel {
     put: Lognormal,
     delete: Lognormal,
     list: Lognormal,
+    entropy: Mutex<DeterministicRng>,
 }
 
 impl LatencyModel {
-    fn from_profile(profile: ProviderLatencyProfile) -> Self {
+    fn from_profile(profile: ProviderLatencyProfile, entropy_seed: u64) -> Self {
         LatencyModel {
-            get: Lognormal::from_latency(profile.obj_read),
-            head: Lognormal::from_latency(profile.meta_read),
-            put: Lognormal::from_latency(profile.obj_write),
-            delete: Lognormal::from_latency(profile.obj_write),
-            list: Lognormal::from_latency(profile.list),
+            get: latency_distribution(profile.obj_read),
+            head: latency_distribution(profile.meta_read),
+            put: latency_distribution(profile.obj_write),
+            delete: latency_distribution(profile.obj_write),
+            list: latency_distribution(profile.list),
+            entropy: Mutex::new(DeterministicRng::new(entropy_seed)),
         }
     }
 
     async fn sleep_for(&self, method: &Method, is_list: bool) {
-        let ln = if is_list {
-            self.list
-        } else {
-            match *method {
-                Method::GET => self.get,
-                Method::HEAD => self.head,
-                Method::PUT => self.put,
-                Method::DELETE => self.delete,
-                _ => return,
-            }
+        let Some(millis) = self.sample_millis(method, is_list) else {
+            return;
         };
-        let secs = ln.sample_ms() / 1_000.0;
+        let secs = millis / 1_000.0;
         if secs.is_finite() && secs > 0.0 {
             rt::sleep(Duration::from_secs_f64(secs)).await;
         }
     }
+
+    fn sample_millis(&self, method: &Method, is_list: bool) -> Option<f64> {
+        let distribution = if is_list {
+            &self.list
+        } else {
+            match *method {
+                Method::GET => &self.get,
+                Method::HEAD => &self.head,
+                Method::PUT => &self.put,
+                Method::DELETE => &self.delete,
+                _ => return None,
+            }
+        };
+        Some({
+            let mut entropy = self.entropy.lock().unwrap();
+            distribution.sample(&mut *entropy)
+        })
+    }
 }
 
-/// A lognormal distribution over operation durations, in milliseconds. Mirrors
-/// the one in `glassdb_backend`'s `DelayBackend` so the served latencies track
-/// the simulated backend.
-#[derive(Clone, Copy)]
-struct Lognormal {
-    mu: f64,
-    sigma: f64,
+fn latency_distribution(latency: Latency) -> Lognormal {
+    let mean_ms = latency.mean.as_secs_f64() * 1_000.0;
+    let standard_deviation_ms = if mean_ms == 0.0 {
+        // The former fake-server distribution treated every zero-mean profile
+        // as zero latency, even if its deviation was non-zero. Retain that
+        // behavior while sharing the validated distribution implementation.
+        0.0
+    } else {
+        latency.std_dev.as_secs_f64() * 1_000.0
+    };
+    Lognormal::new(mean_ms, standard_deviation_ms)
+        .expect("Duration-based fake S3 latency is representable")
 }
 
-impl Lognormal {
-    fn from_latency(l: Latency) -> Self {
-        let mean = l.mean.as_secs_f64() * 1_000.0;
-        let std_dev = l.std_dev.as_secs_f64() * 1_000.0;
-        if mean <= 0.0 {
-            return Lognormal {
-                mu: f64::NEG_INFINITY,
-                sigma: 0.0,
-            };
-        }
-        let s_by_m = std_dev / mean;
-        let v = (s_by_m * s_by_m + 1.0).ln();
-        Lognormal {
-            mu: mean.ln() - 0.5 * v,
-            sigma: v.sqrt(),
-        }
+#[cfg(test)]
+mod latency_tests {
+    use glassdb_backend::middleware::s3_delays;
+
+    use super::*;
+
+    fn delay_sequence(seed: u64) -> [u64; 6] {
+        let model = LatencyModel::from_profile(s3_delays().latency, seed);
+        let samples = [
+            (&Method::GET, false),
+            (&Method::HEAD, false),
+            (&Method::PUT, false),
+            (&Method::DELETE, false),
+            (&Method::GET, true),
+            (&Method::GET, false),
+        ];
+        samples.map(|(method, is_list)| model.sample_millis(method, is_list).unwrap().to_bits())
     }
 
-    fn sample_ms(&self) -> f64 {
-        let n: f64 = StandardNormal.sample(&mut rand::rng());
-        (n * self.sigma + self.mu).exp()
+    #[test]
+    fn latency_entropy_replays_by_seed_and_diverges_across_seeds() {
+        let first = delay_sequence(0xF2_5D);
+        assert_eq!(first, delay_sequence(0xF2_5D));
+        assert_ne!(first, delay_sequence(0xF2_5E));
     }
 }

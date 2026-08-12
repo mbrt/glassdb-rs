@@ -1174,3 +1174,35 @@ working document and is intentionally not committed with these changes.
   admissible errors, crash/restart, slow mutations, and PCT schedules. No
   persistent bytes, entropy draw, spawn order, public API, dependency, or ADR
   changed, and the implementation does not deviate from F29-J.
+## F25-D — Give the S3 fake explicit seeded entropy
+
+- `FakeS3Options` now accepts an `entropy_seed` and provides a named stable
+  default. A latency-enabled fake owns a deterministic `glassdb-concurr` RNG;
+  sampling briefly locks that stream and releases it before the model-time
+  sleep, so concurrent connections are not serialized for their wire delay.
+  Equal seeds replay the same samples for the same request order, while callers
+  can select another seed explicitly for breadth.
+- The fake now constructs the validated shared `middleware::Lognormal`
+  distributions and supplies its seeded source through `rand::TryRng`. Its
+  private lognormal implementation, direct process-RNG call, and direct
+  `rand`/`rand_distr` dependencies are gone. The compatibility conversion
+  retains the former fake behavior in which a zero mean produces zero latency
+  even if a caller supplied a non-zero deviation.
+- The first deliberate stream divergence is at the first latency-enabled GET,
+  HEAD, PUT, DELETE, or list request, immediately before its model-time sleep:
+  the old path sampled the process RNG there, while the new path advances the
+  server's configured stream. Requests rejected by `SlowDown` still return
+  before that boundary; lost acknowledgements are still decided after latency
+  and after applying the mutation. Entropy therefore neither changes nor is
+  consumed by either failure-injection counter.
+- One compact test drives the production method-to-distribution sampler and
+  requires complete sample sequences to match for equal seeds and differ for a
+  selected unequal seed. Existing SlowDown and lost-ack behavior tests now
+  compose their fault with an explicitly seeded latency model, avoiding a
+  parallel test matrix while proving the deterministic stream does not perturb
+  fault injection.
+- There is no committed S3-fake trace, timing golden, or fake-server corpus to
+  refresh. The F29 tape and PCT fixtures instantiate the simulation harness's
+  memory/fault stack rather than `FakeS3`; all five reviewed digests remain
+  unchanged. No persistent bytes, request/response behavior, operation order,
+  or retry boundary changed, and this consolidation did not require an ADR.
