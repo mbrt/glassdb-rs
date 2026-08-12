@@ -643,3 +643,23 @@ working document and is intentionally not committed with these changes.
   compatibility assertions retire with F28-C.
 - This migration changes no listing I/O, ordering, snapshots, transaction
   validation, persistent bytes, retries, random draws, or task scheduling.
+
+## F32-A — Extract mixed benchmark options and dimensions
+
+- Moved the mixed scenario's Clap arguments, defaults, validation, contention
+  mode parsing, and mode-by-affinity cell enumeration into `mixed/options.rs`.
+  The scenario runner now consumes the resulting ordered dimensions and still
+  performs the same setup and execution for each cell.
+- Cell generation remains mode-major and affinity-minor, retaining both the
+  caller-provided order and any repeated values. Validation still runs before
+  mode parsing and before the invocation timestamp is generated, so invalid
+  configurations retain the existing error precedence and cause no scenario-cell
+  or backend-operation effects after factory initialization.
+- Added one table-driven snapshot test for the default sweep and a representative
+  explicitly reordered sweep, plus one table-driven test covering the existing
+  validation rules through parsed CLI arguments. These are durable option and
+  cell-order contracts rather than migration-only parity tests.
+- No setup, settlement, worker selection, random draws, database naming, metrics,
+  output schema, backend operations, or task scheduling changed. Results,
+  scenario phases, and workloads intentionally remain in `mixed.rs` for F32-B
+  through F32-D.

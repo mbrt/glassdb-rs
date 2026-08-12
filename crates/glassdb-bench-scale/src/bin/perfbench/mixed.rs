@@ -27,13 +27,14 @@
 //! significance instead of returning a noisy fixed-window number, while cheap
 //! read shapes stop being the reason the cell keeps going once they are precise.
 //!
+mod options;
+
 use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use clap::Args;
 use futures::future::join_all;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -48,6 +49,8 @@ use glassdb_bench_scale::run::{join_tasks_until, shutdown_databases_until};
 
 use super::backend;
 use super::{Execution, cooldown};
+pub(super) use options::Options;
+use options::{CellDimension, Mode};
 
 const COLLECTION_PREFIX: &str = "mix";
 
@@ -60,64 +63,6 @@ fn value() -> Vec<u8> {
 /// The base key name for pool index `i`.
 fn key_bytes(i: usize) -> Vec<u8> {
     format!("key{i}").into_bytes()
-}
-
-// ---------------------------------------------------------------------------
-// CLI
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Args)]
-pub(super) struct Options {
-    /// Minimum measured window per cell. The cell keeps running all shapes
-    /// concurrently past this until every shape's throughput estimate reaches
-    /// `--target-ci`, or `--max-duration` is hit.
-    #[arg(long, default_value = "2s", value_parser = glassdb_bench_scale::parse_duration)]
-    duration: Duration,
-    /// Upper bound on a cell's measured window: the cell stops here even if a
-    /// shape (typically a heavily-contended write shape) has not yet reached
-    /// `--target-ci`; such a shape's result is flagged not-converged.
-    #[arg(long, default_value = "60s", value_parser = glassdb_bench_scale::parse_duration)]
-    max_duration: Duration,
-    /// Target relative half-width of each shape's throughput 95% confidence
-    /// interval (`0.1` = +/-10%). The cell runs until every shape reaches it or
-    /// `--max-duration`. `0` disables adaptivity: run exactly `--duration`.
-    #[arg(long, default_value_t = 0.1)]
-    target_ci: f64,
-    /// Total concurrent workers per shape, split as evenly as possible across
-    /// the Databases.
-    #[arg(long, default_value_t = 8)]
-    workers_per_shape: usize,
-    /// Client `Database`s in each cell. Every Database runs every shape and has
-    /// a distinct home collection. Must not exceed `--workers-per-shape`.
-    #[arg(long, default_value_t = 4)]
-    databases: usize,
-    /// Keys touched by the multi-key shapes (`rwMany`, `roMulti`); clamped to
-    /// the pool size in the `hi` mode.
-    #[arg(long, default_value_t = 10)]
-    multi_keys: usize,
-    /// Key-pool size per collection for the `lo` (spread) mode. A few thousand
-    /// keys already make same-key overlap rare; larger pools add seeding cost
-    /// without materially lowering contention further.
-    #[arg(long, default_value_t = 5000)]
-    num_keys: usize,
-    /// Key-pool size for the `hi` (hot) mode.
-    #[arg(long, default_value_t = 8)]
-    hot_keys: usize,
-    /// Contention modes to sweep.
-    #[arg(long, value_delimiter = ',', default_value = "lo,hi")]
-    modes: Vec<String>,
-    /// Home-collection affinity percentages to sweep. At 0%, a Database picks
-    /// uniformly from every collection. At 100%, it always uses its own.
-    #[arg(long, value_delimiter = ',', default_value = "0,25,50,75,100")]
-    affinities: Vec<u8>,
-    /// Required time with no change to the setup Database's completed-split
-    /// counter before measurement clients are opened. This is real wall time;
-    /// model-time acceleration also compresses the background split cadence.
-    #[arg(long, default_value = "10s", value_parser = glassdb_bench_scale::parse_duration)]
-    split_quiet: Duration,
-    /// Maximum wall time allowed for setup splits to become quiet.
-    #[arg(long, default_value = "60s", value_parser = glassdb_bench_scale::parse_duration)]
-    split_settle_timeout: Duration,
 }
 
 // ---------------------------------------------------------------------------
@@ -153,39 +98,6 @@ impl Shape {
     fn is_write(self) -> bool {
         matches!(self, Shape::RwSingle | Shape::RwMany)
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Lo,
-    Hi,
-}
-
-impl Mode {
-    fn label(self) -> &'static str {
-        match self {
-            Mode::Lo => "lo",
-            Mode::Hi => "hi",
-        }
-    }
-
-    /// Key-pool size for the mode (small = high contention).
-    fn pool_size(self, options: &Options) -> usize {
-        match self {
-            Mode::Lo => options.num_keys.max(1),
-            Mode::Hi => options.hot_keys.max(1),
-        }
-    }
-}
-
-fn parse_modes(v: &[String]) -> Result<Vec<Mode>, Box<dyn Error>> {
-    v.iter()
-        .map(|s| match s.trim() {
-            "lo" => Ok(Mode::Lo),
-            "hi" => Ok(Mode::Hi),
-            other => Err(format!("unknown mode {other:?} (expected lo|hi)").into()),
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -364,57 +276,35 @@ pub(super) fn run(
     options: &Options,
     execution: Execution,
 ) -> Result<Vec<RunResult>, Box<dyn Error>> {
-    validate(options)?;
-    let modes = parse_modes(&options.modes)?;
+    let dimensions = options.cell_dimensions()?;
     let invocation = SystemTime::UNIX_EPOCH.elapsed()?.as_millis();
     let mut runs = Vec::with_capacity(execution.runs);
     for run in 1..=execution.runs {
         handle.block_on(cooldown(execution, run));
         let mut cells = Vec::new();
-        for &mode in &modes {
-            for &affinity_pct in &options.affinities {
-                eprintln!(
-                    "mixed: run={run} mode={} affinity={}%",
-                    mode.label(),
-                    affinity_pct
-                );
-                let database_name = format!(
-                    "perfbenchmixed{invocation}r{run}{}a{affinity_pct}",
-                    mode.label()
-                );
-                cells.push(run_cell(
-                    handle,
-                    factory.backend(),
-                    &database_name,
-                    options,
-                    execution,
-                    mode,
-                    affinity_pct,
-                )?);
-            }
+        for &CellDimension { mode, affinity_pct } in &dimensions {
+            eprintln!(
+                "mixed: run={run} mode={} affinity={}%",
+                mode.label(),
+                affinity_pct
+            );
+            let database_name = format!(
+                "perfbenchmixed{invocation}r{run}{}a{affinity_pct}",
+                mode.label()
+            );
+            cells.push(run_cell(
+                handle,
+                factory.backend(),
+                &database_name,
+                options,
+                execution,
+                mode,
+                affinity_pct,
+            )?);
         }
         runs.push(RunResult { run, cells });
     }
     Ok(runs)
-}
-
-fn validate(options: &Options) -> Result<(), Box<dyn Error>> {
-    if options.workers_per_shape == 0 {
-        return Err("--workers-per-shape must be >= 1".into());
-    }
-    if options.databases == 0 || options.databases > options.workers_per_shape {
-        return Err("--databases must be between 1 and --workers-per-shape".into());
-    }
-    if options.affinities.is_empty() || options.affinities.iter().any(|&a| a > 100) {
-        return Err("--affinities must contain percentages from 0 through 100".into());
-    }
-    if options.split_quiet.is_zero() {
-        return Err("--split-quiet must be greater than zero".into());
-    }
-    if options.split_settle_timeout < options.split_quiet {
-        return Err("--split-settle-timeout must be at least --split-quiet".into());
-    }
-    Ok(())
 }
 
 fn open_db(handle: &Handle, name: &str, backend: Arc<dyn Backend>) -> Database {
