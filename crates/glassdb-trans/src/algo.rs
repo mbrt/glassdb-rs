@@ -52,6 +52,10 @@ use crate::shard_coord::{
 use crate::split::SplitHintSink;
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
+mod attempt;
+
+use attempt::AttemptState;
+
 /// Number of failed parallel-locking attempts before a transaction escalates to
 /// the serial sorted-locking fallback (ADR-020). The parallel path is fast but
 /// can *livelock* two equal-priority transactions that each grab a different
@@ -109,29 +113,12 @@ impl Sub for DirectCommitStats {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Status {
-    New,
-    Validating,
-    Committed,
-}
-
 /// An opaque handle to an in-progress transaction managed by [`Algo`].
 pub struct Handle {
     data: Data,
     collections: CollectionAttempt,
-    status: Status,
+    state: AttemptState,
     id: TxId,
-    /// Number of restarts so far; drives the serial-locking escalation.
-    attempts: usize,
-    /// Whether the transaction took a logged identity: it registered with the
-    /// monitor and may hold locks, so [`Algo::end`] knows it must abort (a pure
-    /// read-only fast path and the logless commit path never engage, so they
-    /// have nothing to release).
-    engaged: bool,
-    /// An optimistic read-only validation failed, so the next attempt must
-    /// validate through the locked path.
-    lock_reads_on_retry: bool,
     /// Per-transaction backoff for the internal CAS-contention retry in
     /// [`Algo::acquire_locks`] (a lost shard/root CAS race): advanced before each
     /// same-id re-lock so churning contenders spread out instead of busy-looping.
@@ -149,7 +136,31 @@ impl Handle {
     /// Whether this read-only attempt is past its optimistic first try and must
     /// use the locked validation path.
     fn should_lock_reads(&self) -> bool {
-        self.lock_reads_on_retry || self.status == Status::Validating || self.attempts > 0
+        self.state.should_lock_reads()
+    }
+
+    fn engage(&mut self) -> bool {
+        self.state.engage()
+    }
+
+    fn commit(&mut self) {
+        self.state.commit();
+    }
+
+    fn force_locked_reads(&mut self) {
+        self.state.force_locked_reads();
+    }
+
+    fn needs_abort(&self) -> bool {
+        self.state.needs_abort()
+    }
+
+    fn assert_resettable(&self) {
+        self.state.assert_resettable();
+    }
+
+    fn renewals(&self) -> usize {
+        self.state.renewals()
     }
 }
 
@@ -568,29 +579,30 @@ impl Algo {
         Handle {
             data,
             collections: CollectionAttempt::new(collection_data),
-            status: Status::New,
+            state: AttemptState::new(),
             id,
-            attempts: 0,
-            engaged: false,
-            lock_reads_on_retry: false,
             backoff: RetryConfig::default().backoff(),
         }
     }
 
     /// Restarts a wounded transaction, preserving its priority (timestamp) while
     /// minting a fresh log identity ([`TxId::renew`]) so it keeps its wound-wait
-    /// rank and cannot be starved. Carries the backoff forward and bumps the
-    /// attempt counter (which drives the serial-locking escalation).
+    /// rank and cannot be starved. Carries the backoff forward and records the
+    /// renewal (which drives the serial-locking escalation).
     pub fn rebegin(&self, old: Handle) -> Handle {
+        let Handle {
+            data,
+            collections,
+            state,
+            id,
+            backoff,
+        } = old;
         Handle {
-            id: old.id.renew(),
-            data: old.data,
-            collections: old.collections.renewed(),
-            status: Status::New,
-            attempts: old.attempts + 1,
-            engaged: false,
-            lock_reads_on_retry: old.lock_reads_on_retry,
-            backoff: old.backoff,
+            id: id.renew(),
+            data,
+            collections: collections.renewed(),
+            state: state.renew(),
+            backoff,
         }
     }
 
@@ -623,10 +635,7 @@ impl Algo {
     /// Replaces the transaction's data. Allowed before commit (the db retry loop
     /// resets accesses between attempts).
     pub fn reset(&self, tx: &mut Handle, data: Data) {
-        assert!(
-            tx.status != Status::Committed,
-            "cannot reset a committed transaction"
-        );
+        tx.assert_resettable();
         tx.data = data;
     }
 
@@ -645,7 +654,7 @@ impl Algo {
     /// and releasing its locks lazily. An optimistic read-only attempt never
     /// engaged, so there is nothing to abort.
     pub async fn end(&self, tx: &mut Handle) -> Result<(), TransError> {
-        if tx.status == Status::Committed || !tx.engaged {
+        if !tx.needs_abort() {
             return Ok(());
         }
         match self.mon.abort_owned_tx(&tx.id).await? {
@@ -665,20 +674,20 @@ impl Algo {
             // collection objects and delete fences now belong to the committed
             // log and must be left for write-back/recovery.
             OwnerAbortOutcome::Committed => {
-                tx.status = Status::Committed;
+                tx.commit();
                 Ok(())
             }
             // The terminal write was dispatched but its result is no longer
             // abortable. Preserve its resources exactly as for an observed
             // committed winner.
             OwnerAbortOutcome::CommitOutcomePreserved => {
-                tx.status = Status::Committed;
+                tx.commit();
                 Ok(())
             }
             // Another local path already finished this identity. Without its
             // owner record this handle must not attempt collection rollback.
             OwnerAbortOutcome::AlreadyFinished => {
-                tx.status = Status::Committed;
+                tx.commit();
                 Ok(())
             }
         }
@@ -764,7 +773,7 @@ impl Algo {
         {
             return Ok(());
         }
-        tx.lock_reads_on_retry = true;
+        tx.force_locked_reads();
         Err(TransError::Retry)
     }
 
@@ -811,20 +820,16 @@ impl Algo {
                 )
                 .await?
         {
-            tx.status = Status::Committed;
+            tx.commit();
             return Ok(());
         }
-        tx.lock_reads_on_retry = true;
+        tx.force_locked_reads();
         Err(TransError::Retry)
     }
 
     /// Locked path for read-write transactions and escalated read-only retries.
     async fn commit_locked(&self, tx: &mut Handle) -> Result<(), TransError> {
-        let is_new = tx.status == Status::New;
-        if is_new {
-            tx.status = Status::Validating;
-            tx.engaged = true;
-        }
+        let is_new = tx.engage();
 
         self.collection_commit
             .reconcile_retry(&tx.id, &mut tx.collections)
@@ -915,7 +920,7 @@ impl Algo {
             }
             return Err(e.context(format!("committing writes for tx {}", tx.id)));
         }
-        tx.status = Status::Committed;
+        tx.commit();
 
         if let Err(error) = self
             .locker
@@ -937,10 +942,8 @@ impl Algo {
     /// successful validation, so this deliberately does not commit the handle.
     async fn validate_locked_reads(&self, tx: &mut Handle) -> Result<(), TransError> {
         self.validate_coordination_keys(&tx.data)?;
-        if tx.status == Status::New {
+        if tx.engage() {
             self.mon.begin_tx(&tx.id);
-            tx.status = Status::Validating;
-            tx.engaged = true;
         }
         // The escalated read-only path uses lock CASes as validation evidence,
         // so their shared lower bound must precede acquisition.
@@ -1098,7 +1101,7 @@ impl Algo {
                 self.direct_commit_stats
                     .landed
                     .fetch_add(1, Ordering::Relaxed);
-                tx.status = Status::Committed;
+                tx.commit();
                 // The predecessor lost its reference, so it may now be
                 // collectable. Only a hint: it was resolved before the CAS, and
                 // a logless predecessor has no object to collect at all.
@@ -1194,14 +1197,14 @@ impl Algo {
     ///   contended shard guarantees one contender always completes. Serial mode
     ///   cannot deadlock, so it arms no timeout.
     ///
-    /// `tx.attempts` (genuine-wound restarts) starts a heavily-restarted
+    /// `tx.renewals()` (genuine-wound restarts) starts a heavily-restarted
     /// transaction directly in the serial order as a backstop.
     async fn acquire_locks(
         &self,
         tx: &mut Handle,
         validation_start: SequencePoint,
     ) -> Result<Acquired, TransError> {
-        let mut serial = tx.attempts >= SERIAL_FALLBACK_AFTER;
+        let mut serial = tx.renewals() >= SERIAL_FALLBACK_AFTER;
         let mut conflicts: usize = 0;
         let mut leaf_full_since: Option<rt::Instant> = None;
         loop {
@@ -2003,8 +2006,7 @@ mod tests {
             .unwrap();
         let id = handle.id().clone();
         tm.mon.begin_tx(&id);
-        handle.status = Status::Validating;
-        handle.engaged = true;
+        assert!(handle.engage());
         tm.commit_writes(&Data::default(), &handle.collections, Vec::new(), &id)
             .await
             .unwrap();
@@ -2055,8 +2057,7 @@ mod tests {
         );
         let id = handle.id().clone();
         tm.mon.begin_tx(&id);
-        handle.status = Status::Validating;
-        handle.engaged = true;
+        assert!(handle.engage());
         tm.collection_commit
             .fence(&id, &mut handle.collections)
             .await
@@ -3518,10 +3519,7 @@ mod tests {
             matches!(err, TransError::Retry),
             "a superseded read replays its body in place, got {err:?}"
         );
-        assert!(
-            !h.engaged,
-            "a replayed attempt staged nothing, so it publishes no identity"
-        );
+        tm.end(&mut h).await.unwrap();
         let status = tctx
             .tlogger
             .commit_status_at(h.id(), Requirement::Any)
@@ -3530,9 +3528,8 @@ mod tests {
         assert_eq!(
             status.status,
             TxCommitStatus::Unknown,
-            "a replayed attempt wrote no transaction object"
+            "ending a replayed attempt writes no transaction object"
         );
-        tm.end(&mut h).await.unwrap();
 
         // The stale value never committed and the key kept its logless shape.
         let e = entry(&tctx, b"k").await.unwrap();
@@ -3640,7 +3637,7 @@ mod tests {
 
         // Which member wins the round's claim depends on id order; that exactly
         // one does is the property under test.
-        let (winner, replayed) = match (&r1, &r2) {
+        let (winner, mut replayed) = match (&r1, &r2) {
             (Ok(()), Err(TransError::Retry)) => (h1.id().clone(), h2),
             (Err(TransError::Retry), Ok(())) => (h2.id().clone(), h1),
             other => panic!("expected one commit and one replay, got {other:?}"),
@@ -3662,10 +3659,7 @@ mod tests {
             e.lock_holders().is_empty(),
             "the contended round published no holder"
         );
-        assert!(
-            !replayed.engaged,
-            "a replayed attempt publishes no identity"
-        );
+        tm.end(&mut replayed).await.unwrap();
         let status = tctx
             .tlogger
             .commit_status_at(replayed.id(), Requirement::Any)
@@ -3674,7 +3668,7 @@ mod tests {
         assert_eq!(
             status.status,
             TxCommitStatus::Unknown,
-            "the replayed attempt wrote no transaction object"
+            "ending the replayed attempt writes no transaction object"
         );
 
         // Reevaluating the body against the winner converges without locking.

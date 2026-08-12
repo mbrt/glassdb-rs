@@ -190,3 +190,32 @@ working document and is intentionally not committed with these changes.
 - Adversarial review found no receipt-completeness, ordering, cleanup, evidence,
   or test-pruning issue. No persistent bytes, backend operations, retry behavior,
   or public API changed.
+
+## F20-A — Replace correlated attempt flags with validated transitions
+
+- Added a private `algo::attempt` state machine with explicit `New`, `Engaged`,
+  and `Committed` phases and `Optimistic` or `Locked` read-validation modes.
+  `Handle` no longer exposes separately mutable status, engagement, retry-mode,
+  and attempt-count fields to the commit algorithm.
+- Named transitions now own engagement, commit, locked-read escalation, wound
+  renewal, abort eligibility, and reset validation. Engagement is idempotent and
+  reports whether monitor/manifest initialization is required; commit and reset
+  after commit are validated terminal boundaries.
+- Renewal keeps the original priority/identity behavior, collection attempt,
+  acquisition backoff, and serial-fallback count. The existing consumed-handle
+  boundary may renew from any phase: wound cleanup can discover a concurrent
+  terminal outcome before `restart_after_wound` re-begins the attempt. Preserving
+  that boundary avoids adding a panic, while every renewal still forces locked
+  validation exactly as the old nonzero attempt count did.
+- Direct and optimistic read-only commits remain unengaged; logged attempts stay
+  engaged until abort or commit. Monitor calls, persistent transaction bytes,
+  backend operations, retry results, random identity draws, and acquisition
+  delays are unchanged. Configured acquisition backoff remains deferred to
+  F20-B.
+- Added two compact long-term state tests: one transition table covers direct
+  commit, optimistic escalation, repeated engagement, abort need, wound renewal,
+  engaged commit, and renewal after a terminal cleanup race; one preserves the
+  exact reset-after-commit panic. Two raw `engaged` assertions were replaced by
+  ending each replayed handle before asserting its transaction object remains
+  absent, preserving the stronger long-term interface behavior without exposing
+  state-machine shape.
