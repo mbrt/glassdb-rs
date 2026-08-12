@@ -1613,8 +1613,8 @@ mod tests {
             RetryConfig::default(),
         );
         let key_state = KeyStateResolver::new(tmon.clone());
-        let resolver = KeyResolver::new(TreeRouter::new(shards.clone()), key_state.clone());
-        let router = TreeRouter::new(shards.clone());
+        let resolver = KeyResolver::new(TreeRouter::new(shards.nodes().clone()), key_state.clone());
+        let router = TreeRouter::new(shards.nodes().clone());
         let (coord, splitter) = crate::split::Splitter::with_coordinator(
             bg_weak.clone(),
             records.clone(),
@@ -1712,7 +1712,7 @@ mod tests {
     async fn read_outcome(tctx: &Tctx, key: &KeyRef) -> crate::reader::ReadOutcome {
         let reader = Reader::new(
             KeyResolver::new(
-                TreeRouter::new(tctx.shards.clone()),
+                TreeRouter::new(tctx.shards.nodes().clone()),
                 KeyStateResolver::new(tctx.tmon.clone()),
             ),
             tctx.timeline.clone(),
@@ -4348,7 +4348,7 @@ mod tests {
     // assert on the snapshot and later re-validate the same coverage.
     async fn scan_data_for_range(tctx: &Tctx, range: ScanRange) -> (Data, Vec<Vec<u8>>) {
         let resolver = KeyResolver::new(
-            TreeRouter::new(tctx.shards.clone()),
+            TreeRouter::new(tctx.shards.nodes().clone()),
             KeyStateResolver::new(tctx.tmon.clone()),
         );
         let scan = resolver
@@ -4376,7 +4376,7 @@ mod tests {
 
         let range = ScanRange::all();
         let resolver = KeyResolver::new(
-            TreeRouter::new(tctx.shards.clone()),
+            TreeRouter::new(tctx.shards.nodes().clone()),
             KeyStateResolver::new(tctx.tmon.clone()),
         );
         let result = resolver

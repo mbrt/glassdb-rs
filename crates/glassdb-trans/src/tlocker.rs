@@ -1387,7 +1387,7 @@ mod tests {
                 .unwrap()
         );
         let key_state = KeyStateResolver::new(mon.clone());
-        let router = TreeRouter::new(shards.clone());
+        let router = TreeRouter::new(shards.nodes().clone());
         let coord = ShardCoordinator::with_hinter(
             shards.clone(),
             key_state,

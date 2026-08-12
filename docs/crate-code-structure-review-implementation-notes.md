@@ -39,3 +39,18 @@ working document and is intentionally not committed with these changes.
 - Adversarial review found no correctness, safety, API, pagination, or excessive-
   test issue; generic cached-store coverage already owns missing-delete
   convergence, so it was not duplicated here.
+
+## F16-C — Narrow `TreeRouter` to `NodeStore`
+
+- `TreeRouter` now owns only `NodeStore`; its production module has no
+  structural-log-capable handle. All composition sites explicitly pass the node
+  capability through `ShardStore::nodes()`.
+- Routing control flow, read requirements, cache-hit aggregation, stale-parent
+  correction, and terminal freshness checks were not changed. Existing router
+  behavior and backend-operation-count tests remain the long-term acceptance
+  coverage.
+- No compatibility conversion or one-implementation abstraction was added, and
+  no migration-only tests were introduced.
+- Adversarial review found no code issue or capability backdoor. It identified
+  one stale architecture sentence naming `ShardStore`; that documentation now
+  names the narrowed `NodeStore` handle.

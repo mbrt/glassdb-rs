@@ -458,7 +458,7 @@ mod tests {
             .unwrap();
         let state = KeyStateResolver::new(mon.clone());
         (
-            KeyResolver::new(TreeRouter::new(shards), state),
+            KeyResolver::new(TreeRouter::new(shards.nodes().clone()), state),
             mon,
             timeline,
             bg,

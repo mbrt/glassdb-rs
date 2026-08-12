@@ -202,7 +202,7 @@ impl Engine {
             CollectionStateResolver::new(records.clone(), tlogger.clone(), monitor.clone(), retry);
         let collection_catalog = CollectionCatalog::new(collection_state.clone());
         let key_state = KeyStateResolver::new(monitor.clone());
-        let resolver = KeyResolver::new(TreeRouter::new(shards.clone()), key_state.clone());
+        let resolver = KeyResolver::new(TreeRouter::new(shards.nodes().clone()), key_state.clone());
         let reader = Reader::new(resolver.clone(), timeline.clone(), retry);
         let (coord, splitter) = Splitter::with_coordinator(
             background_weak.clone(),
@@ -218,7 +218,7 @@ impl Engine {
         );
         let locker = Locker::new(
             coord.clone(),
-            TreeRouter::new(shards.clone()),
+            TreeRouter::new(shards.nodes().clone()),
             collection_state,
             monitor.clone(),
             retry,

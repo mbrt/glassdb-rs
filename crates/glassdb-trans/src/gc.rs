@@ -124,7 +124,7 @@ impl Gc {
         collection_lifecycle: CollectionLifecycle,
         mon: Monitor,
     ) -> Self {
-        let router = TreeRouter::new(shards.clone());
+        let router = TreeRouter::new(shards.nodes().clone());
         Gc {
             bg,
             tl,
@@ -677,7 +677,7 @@ mod tests {
             glassdb_storage::SplitPolicy::default(),
             Arc::new(NoSplitHints),
         );
-        let router = TreeRouter::new(shards.clone());
+        let router = TreeRouter::new(shards.nodes().clone());
         let locker = Locker::new(
             coord.clone(),
             router,

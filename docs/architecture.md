@@ -237,10 +237,11 @@ point, and write-back ordering remain explicit transaction-wide policy.
 Routing traversal is centralized in `TreeRouter`, but use of that mechanism is
 intentionally distributed. `KeyResolver`, the key-lock view, `Gc`, and
 `Splitter` each own a cheap handle for their distinct read, lock, reclamation,
-or structural workflow. A handle contains a cloned `ShardStore`, so all of them
-share the same decoded object cache rather than maintaining independent topology
-state. The Engine centralizes their assembly; it does not invent a single
-semantic owner for those different routing responsibilities.
+or structural workflow. A handle contains a cloned `NodeStore`, so all of them
+share the same decoded object cache without gaining structural-log capabilities
+or maintaining independent topology state. The Engine centralizes their
+assembly; it does not invent a single semantic owner for those different routing
+responsibilities.
 
 Beneath the locker boundary, every data-node entry mutation flows through a
 single transaction-aware `ShardCoordinator`. It owns the protocol shared by a

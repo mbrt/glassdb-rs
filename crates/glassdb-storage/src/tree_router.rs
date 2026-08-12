@@ -8,7 +8,7 @@
 //! along the right-sibling link (the B-link property) instead of restarting
 //! from the root.
 //!
-//! This layer is pure routing: it reads nodes through the [`ShardStore`] (hence
+//! This layer is pure routing: it reads nodes through the [`NodeStore`] (hence
 //! the decoded object store, so interior nodes stay cached and off the hot
 //! path) and never mutates the tree. Splitting and locking live above it.
 
@@ -19,8 +19,7 @@ use glassdb_data::{CollectionAddress, KeyRef, NodeToken, ObjectPath};
 use crate::cached_store::Requirement;
 use crate::error::StorageError;
 use crate::node::{Node, NodeBody};
-use crate::node_store::LeafObservation;
-use crate::shard_store::ShardStore;
+use crate::node_store::{LeafObservation, NodeStore};
 
 /// The leaf that owns a key (or range endpoint), with everything needed to read
 /// or compare-and-swap it: its object `path` and retained physical observation.
@@ -87,13 +86,13 @@ impl Located {
 /// Descends and scans a collection's B-link tree.
 #[derive(Clone)]
 pub struct TreeRouter {
-    shards: ShardStore,
+    nodes: NodeStore,
 }
 
 impl TreeRouter {
-    /// Creates a router that reads nodes through `shards`.
-    pub fn new(shards: ShardStore) -> Self {
-        TreeRouter { shards }
+    /// Creates a router that reads nodes through `nodes`.
+    pub fn new(nodes: NodeStore) -> Self {
+        TreeRouter { nodes }
     }
 
     /// Resolves the leaf that owns `key`, descending from the root `_r` and
@@ -109,7 +108,7 @@ impl TreeRouter {
         let path = ObjectPath::TreeRoot {
             collection: collection.clone(),
         };
-        let observation = self.shards.load_root_state(collection, requirement).await?;
+        let observation = self.nodes.load_root_state(collection, requirement).await?;
         let cache_hit = observation.cache_hit();
         if observation.is_absent() {
             return Err(StorageError::NotFound);
@@ -136,7 +135,7 @@ impl TreeRouter {
         let path = ObjectPath::TreeRoot {
             collection: collection.clone(),
         };
-        let observation = self.shards.load_root_state(collection, requirement).await?;
+        let observation = self.nodes.load_root_state(collection, requirement).await?;
         if observation.is_absent() {
             return Ok(None);
         }
@@ -241,7 +240,7 @@ impl TreeRouter {
         let path = ObjectPath::TreeRoot {
             collection: collection.clone(),
         };
-        let observation = self.shards.load_root_state(collection, requirement).await?;
+        let observation = self.nodes.load_root_state(collection, requirement).await?;
         if observation.is_absent() {
             return Ok(None);
         }
@@ -369,7 +368,7 @@ impl TreeRouter {
         target: &NodeToken,
         requirement: Requirement,
     ) -> Result<bool, StorageError> {
-        let observation = self.shards.load_root_state(collection, requirement).await?;
+        let observation = self.nodes.load_root_state(collection, requirement).await?;
         if observation.is_absent() {
             return Ok(false);
         }
@@ -424,7 +423,7 @@ impl TreeRouter {
         key: &[u8],
         requirement: Requirement,
     ) -> Result<Option<LeafLocator>, StorageError> {
-        let observation = self.shards.load_root_state(collection, requirement).await?;
+        let observation = self.nodes.load_root_state(collection, requirement).await?;
         if observation.is_absent() {
             return Ok(None);
         }
@@ -523,7 +522,7 @@ impl TreeRouter {
         requirement: Requirement,
     ) -> Result<Located, StorageError> {
         let observation = self
-            .shards
+            .nodes
             .load_node_state(collection, token, requirement)
             .await?;
         Ok(Located {
@@ -544,7 +543,7 @@ impl TreeRouter {
         path: &ObjectPath,
         requirement: Requirement,
     ) -> Result<Located, StorageError> {
-        let observation = self.shards.load_node_at_state(path, requirement).await?;
+        let observation = self.nodes.load_node_at_state(path, requirement).await?;
         if observation.is_absent() {
             return Err(StorageError::other("tree node vanished during descent"));
         }
@@ -667,7 +666,7 @@ mod tests {
         let root = Node::leaf(Shard::from_entries([live(b"only")]));
         s.create_root(&collection(), &root).await.unwrap();
 
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.nodes().clone());
         let loc = router
             .leaf_for(
                 &collection(),
@@ -689,7 +688,7 @@ mod tests {
     #[tokio::test]
     async fn absent_collection_is_not_a_writable_empty_leaf() {
         let s = store();
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.nodes().clone());
         assert!(matches!(
             router
                 .leaf_for(&collection(), b"k", Requirement::AtLeast(s.timeline.now()))
@@ -710,7 +709,7 @@ mod tests {
     async fn descends_index_to_correct_leaf() {
         let s = store();
         seed_two_level(&s).await;
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.nodes().clone());
 
         for (key, want_leaf) in [
             (b"apple".as_slice(), node_path(0)),
@@ -754,7 +753,7 @@ mod tests {
         let root = Node::index(IndexNode::from_children([(b"".to_vec(), left.to_string())]));
         s.create_root(&collection(), &root).await.unwrap();
 
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.nodes().clone());
         let loc = router
             .leaf_for(
                 &collection(),
@@ -770,7 +769,7 @@ mod tests {
     async fn leaves_are_returned_in_key_order() {
         let s = store();
         seed_two_level(&s).await;
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.nodes().clone());
 
         let leaves = router
             .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
@@ -796,7 +795,7 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(recorder);
         let s = store_over(backend);
         seed_two_level(&s).await;
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.nodes().clone());
 
         // Warm the cache with a first descent, then measure only the steady state.
         router
@@ -862,7 +861,7 @@ mod tests {
         s_b.create_root(&collection(), &root).await.unwrap();
 
         // Process A warms its cache with the root-as-leaf (stale requirement).
-        let dir_a = TreeRouter::new(s_a.shards.clone());
+        let dir_a = TreeRouter::new(s_a.shards.nodes().clone());
         let warm = dir_a
             .leaf_for_fresh(&collection(), b"a", Requirement::Any, Requirement::Any)
             .await
@@ -921,7 +920,7 @@ mod tests {
     async fn parent_index_for_finds_leaf_parent_and_none_for_single_leaf() {
         let s = store();
         seed_two_level(&s).await;
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.nodes().clone());
 
         // The parent of any key's leaf is the root index `_r`.
         let parent = router
@@ -945,7 +944,7 @@ mod tests {
         let single = store();
         let root = Node::leaf(Shard::from_entries([live(b"only")]));
         single.create_root(&collection(), &root).await.unwrap();
-        let single_dir = TreeRouter::new(single.shards.clone());
+        let single_dir = TreeRouter::new(single.shards.nodes().clone());
         assert!(
             single_dir
                 .parent_index_for(
@@ -963,7 +962,7 @@ mod tests {
     async fn group_keys_by_leaf_routes_and_preserves_order() {
         let s = store();
         seed_two_level(&s).await;
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.nodes().clone());
         assert_eq!(CollectionAddress::root("db").physical_prefix(), COLL_PREFIX);
 
         let groups = router
@@ -998,7 +997,7 @@ mod tests {
     #[tokio::test]
     async fn grouped_routing_classifies_the_collection_that_failed() {
         let s = store();
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.nodes().clone());
         let root = CollectionAddress::root("db");
         let child = CollectionAddress::new("db", CollectionId::from_slice(&[1; 16]).unwrap());
         let requirement = Requirement::AtLeast(s.timeline.now());
