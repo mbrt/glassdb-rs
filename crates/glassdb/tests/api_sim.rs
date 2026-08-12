@@ -70,15 +70,53 @@ fn contended_api_workload() -> ApiWorkload {
 }
 
 #[test]
-fn arbitrary_programs_generate_collection_lifecycle_actions() {
-    // Two clients; client 0 gets one catalog-shaped transaction containing a
-    // collection write, while client 1 has no operations.
-    let mut input = Unstructured::new(&[0, 1, 0, 1, 3, 42, 0, 0]);
-    let workload = ApiWorkload::arbitrary(&mut input).expect("decode API workload");
-    assert!(matches!(
-        workload.clients[0][0].actions.as_slice(),
-        [ApiAction::WriteCollection(1, 42)]
-    ));
+fn fixed_inputs_generate_stable_action_programs() {
+    let bytes = [0, 1, 3, 0, 0, 1, 1, 91, 2, 2, 3, 0, 1, 0, 99, 100];
+    let mut input = Unstructured::new(&bytes);
+    let workload = ApiWorkload::arbitrary(&mut input).expect("decode key API workload");
+    assert_eq!(
+        workload.clients,
+        vec![
+            vec![program(
+                0,
+                vec![
+                    ApiAction::Read(0),
+                    ApiAction::Write(2, 91),
+                    ApiAction::Delete(4),
+                    ApiAction::Read(6),
+                ],
+                false,
+            )],
+            vec![],
+        ]
+    );
+    assert_eq!(input.len(), 2, "key program draw count changed");
+
+    // One input pins every collection selector together so optional value and
+    // abort draws cannot move independently while still producing valid programs.
+    let bytes = [
+        0, 8, 0, 0, 0, 0, 4, 1, 1, 1, 8, 0, 2, 2, 12, 1, 3, 42, 3, 16, 0, 4, 0, 20, 1, 5, 43, 1,
+        24, 0, 6, 2, 28, 1, 7, 3, 1, 32, 0, 8, 0, 250,
+    ];
+    let mut input = Unstructured::new(&bytes);
+    let workload = ApiWorkload::arbitrary(&mut input).expect("decode collection API workload");
+    assert_eq!(
+        workload.clients,
+        vec![
+            vec![
+                program(0, vec![ApiAction::CreateCollection(0)], true),
+                program(0, vec![ApiAction::CreateCollectionIfAbsent(1)], false),
+                program(0, vec![ApiAction::ReadCollection(0)], false),
+                program(0, vec![ApiAction::WriteCollection(1, 42)], false),
+                program(0, vec![ApiAction::CreateNestedCollection(0)], true),
+                program(0, vec![ApiAction::WriteNestedCollection(1, 43)], false),
+                program(0, vec![ApiAction::DropNestedCollection(0)], false),
+                program(0, vec![ApiAction::DropCollection(1)], false),
+            ],
+            vec![program(1, vec![ApiAction::InspectCollections], true)],
+        ]
+    );
+    assert_eq!(input.len(), 1, "collection program draw count changed");
 }
 
 #[test]
