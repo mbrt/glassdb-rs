@@ -1,9 +1,10 @@
 //! Shared deterministic execution, failure/delay injection, replay, and PCT harness.
 
+mod client;
+
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use arbitrary::{Arbitrary, Unstructured};
@@ -18,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{Database, Error, PersistentCacheConfig, ProtocolTiming};
 
+use self::client::ClientRunner;
 use super::slow_backend;
 use super::trace::*;
 use super::{MAX_CLIENTS, MediaFaultProfile, SimMedia};
@@ -345,8 +347,8 @@ fn spawn_nemeses(
 // invariant, and an optional concurrent observer — so those are the trait
 // methods. Each workload owns its own collection(s) behind those methods, so the
 // harness works purely with `Database` handles. The run context owns the
-// backbone, media, model state, and per-client transports; the harness retains
-// crash/restart and nemesis task lifecycles until their focused extractions.
+// backbone, media, model state, and per-client transports; `ClientRunner` owns
+// client crash/restart lifecycles while the harness retains the nemesis tasks.
 // ===========================================================================
 
 /// A deterministic-simulation workload the shared harness ([`run_generic`]) can
@@ -422,46 +424,6 @@ pub trait SimWorkload: Clone + Default + Send + Sync + 'static {
     ) -> Option<rt::JoinHandle<()>> {
         None
     }
-}
-
-/// Runs a client's op sequence in order. Returns the number of ops *consumed*:
-/// `ops.len()` if all succeeded, or `i + 1` if op `i` failed (that op is left
-/// in-doubt and is *not* replayed on restart, since re-running a non-idempotent
-/// op would double-apply).
-async fn run_generic_client<W: SimWorkload>(
-    db: &Database,
-    ops: &[W::Op],
-    state: &W::State,
-    consumed: &AtomicUsize,
-    faults: FaultConfig,
-    trace: ClientOperationTrace<'_>,
-) -> usize {
-    for (i, op) in ops.iter().enumerate() {
-        // Bump consumed *before* attempting the op. If the outer crash future
-        // drops us mid-op, this op is counted as consumed (left in doubt) and is
-        // not replayed by the restart path. We need this counter on a shared
-        // atomic because the `tokio::select!` cancel arm simply drops this future
-        // and cannot read its return value.
-        consumed.store(i + 1, Ordering::SeqCst);
-        trace.record(i, TraceOperationPhase::Started);
-        match W::run_op(db, op, state).await {
-            Ok(()) => trace.record(i, TraceOperationPhase::Succeeded),
-            Err(error) => {
-                assert_admissible_client_error(faults, "running client operation", error);
-                trace.record(i, TraceOperationPhase::AdmissibleError);
-                return i + 1;
-            }
-        }
-    }
-    consumed.store(ops.len(), Ordering::SeqCst);
-    ops.len()
-}
-
-fn assert_admissible_client_error(faults: FaultConfig, context: &str, error: Error) {
-    if client_error_is_admissible(faults, &error) {
-        return;
-    }
-    panic!("{context} returned unexpected error: {error} ({error:?})");
 }
 
 fn client_error_is_admissible(faults: FaultConfig, error: &Error) -> bool {
@@ -580,6 +542,17 @@ struct RunContext<W: SimWorkload> {
 }
 
 impl<W: SimWorkload> RunContext<W> {
+    fn start_clients(&mut self, trace: &TraceSink) -> ClientRunner {
+        ClientRunner::spawn::<W>(
+            std::mem::take(&mut self.client_ops),
+            std::mem::take(&mut self.client_backends),
+            self.run_media.as_ref(),
+            &self.state,
+            self.faults,
+            trace,
+        )
+    }
+
     async fn teardown(self, trace: &TraceSink) -> OpLog {
         // Heal every transport before verifying so recovery reads cannot themselves
         // fail.
@@ -646,119 +619,7 @@ async fn run_generic_with_trace<W: SimWorkload>(
 ) -> OpLog {
     let plan = RunPlan::new(workload, faults, seed, fault_tape, media_tape);
     let mut context = plan.setup().await;
-    let nclients = context.client_ops.len();
-    let client_ops = std::mem::take(&mut context.client_ops);
-    let client_backends = std::mem::take(&mut context.client_backends);
-
-    // Each client runs as its own task over its own transport so the scheduler
-    // can interleave them. A `CancellationToken` lets the crash nemesis
-    // simulate a hard crash by racing the signal against the client's run
-    // loop; the dropped future is the in-Rust analog of a process death. On
-    // a clean run we `Database::shutdown` to drain in-flight transactions and
-    // dedup owners before the Database clone drops; on a crash we *skip* shutdown
-    // and let `Drop` tear everything down abruptly — that is the whole point
-    // of the crash nemesis. The background loops are torn down in both cases
-    // by `Background::drop` once the last `Database` clone goes out of scope (the
-    // captured-task cycle is broken by subsystems holding `Weak<Background>`).
-    let mut handles = Vec::with_capacity(nclients);
-    let mut signals: Vec<CancellationToken> = Vec::with_capacity(nclients);
-    for (client, (ops, backend)) in client_ops.into_iter().zip(client_backends).enumerate() {
-        let signal = CancellationToken::new();
-        signals.push(signal.clone());
-        let state = context.state.clone();
-        let media = context
-            .run_media
-            .as_ref()
-            .map(|run_media| run_media.clients[client].clone());
-        trace.spawn(TraceSpawnRole::Client(client as u32), true);
-        let task_trace = trace.clone();
-        let faults = context.faults;
-        handles.push(rt::spawn(async move {
-            task_trace.client(client, TraceClientPhase::Started, 0);
-            let consumed = Arc::new(AtomicUsize::new(0));
-            let crashed = {
-                let db = match W::open_db(&backend, media.clone()).await {
-                    Ok(db) => db,
-                    Err(error) => {
-                        assert_admissible_client_error(faults, "opening client database", error);
-                        task_trace.client(client, TraceClientPhase::OpenFailed, 0);
-                        task_trace.client(client, TraceClientPhase::Finished, 0);
-                        return;
-                    }
-                };
-                let crashed = tokio::select! {
-                    biased;
-                    _ = signal.cancelled() => true,
-                    _ = run_generic_client::<W>(
-                        &db,
-                        &ops,
-                        &state,
-                        &consumed,
-                        faults,
-                        ClientOperationTrace::new(
-                            &task_trace,
-                            client,
-                            0,
-                            TraceClientRun::Initial,
-                        ),
-                    ) => false,
-                };
-                if !crashed {
-                    db.shutdown().await;
-                }
-                crashed
-            };
-            if crashed && let Some(media) = &media {
-                // The cancelled database models process loss, so its cache
-                // must cross the same unsynchronized durability boundary.
-                media.crash();
-            }
-            // Crash-and-restart: a cancelled (crashed) client reopens the Database
-            // on the same backend and finishes its remaining ops, recovering its
-            // own orphaned locks via lease expiry. The in-doubt op it died on is
-            // left for recovery rather than replayed (which would double-apply a
-            // non-idempotent op). The restart is uncancellable so it runs to
-            // completion.
-            let n = consumed.load(Ordering::SeqCst);
-            if crashed {
-                task_trace.client(client, TraceClientPhase::Crashed, n);
-            }
-            let mut final_consumed = n;
-            if crashed && n < ops.len() {
-                match W::open_db(&backend, media).await {
-                    Ok(db) => {
-                        task_trace.client(client, TraceClientPhase::Restarted, n);
-                        let dummy = AtomicUsize::new(0);
-                        let restarted = run_generic_client::<W>(
-                            &db,
-                            &ops[n..],
-                            &state,
-                            &dummy,
-                            faults,
-                            ClientOperationTrace::new(
-                                &task_trace,
-                                client,
-                                n,
-                                TraceClientRun::Restart,
-                            ),
-                        )
-                        .await;
-                        final_consumed = n + restarted;
-                        db.shutdown().await;
-                    }
-                    Err(error) => {
-                        assert_admissible_client_error(
-                            faults,
-                            "reopening crashed client database",
-                            error,
-                        );
-                        task_trace.client(client, TraceClientPhase::RestartOpenFailed, n);
-                    }
-                }
-            }
-            task_trace.client(client, TraceClientPhase::Finished, final_consumed);
-        }));
-    }
+    let mut clients = context.start_clients(&trace);
 
     // An optional concurrent observer, then the crash and outage nemeses, each on
     // its own slice of the fault tape (and a distinct fallback seed). The fixed
@@ -777,14 +638,12 @@ async fn run_generic_with_trace<W: SimWorkload>(
         context.faults,
         context.seed,
         &context.fault_streams,
-        &signals,
+        clients.signals(),
         &context.transports,
         &trace,
     );
 
-    for h in handles {
-        h.await.expect("client task failed");
-    }
+    clients.join().await;
     if let Some(h) = observer {
         h.await.expect("observer task failed");
     }
