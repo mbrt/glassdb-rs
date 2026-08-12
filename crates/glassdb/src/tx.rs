@@ -23,7 +23,9 @@ use self::data::{DataOverlay, OverlayRead};
 use crate::collection::{Collection, CollectionPath, validate_collection_name};
 use crate::db::DbInner;
 use crate::error::Error;
-use crate::iter::{CollectionEntry, CollectionIter, CollectionsIter};
+#[allow(deprecated)]
+use crate::iter::CollectionsIter;
+use crate::iter::{CollectionEntry, CollectionIter};
 use crate::scan::{KeyPage, KeyScan};
 
 /// An active database transaction. Reads and writes are buffered and only
@@ -276,7 +278,9 @@ impl Transaction {
         Ok(CollectionIter::new(entries))
     }
 
-    /// Returns the direct child bindings in raw-name order.
+    /// Returns a compatibility iterator over direct child bindings.
+    #[allow(deprecated)]
+    #[deprecated(since = "0.1.0", note = "use `Transaction::iter_collections`")]
     pub async fn collections(&self, parent: &Collection) -> Result<CollectionsIter, Error> {
         Ok(CollectionsIter::from_plain(
             self.iter_collections(parent).await?,

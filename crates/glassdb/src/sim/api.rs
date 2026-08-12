@@ -306,10 +306,11 @@ async fn listed_collection_names(
     tx: &Transaction,
     parent: &Collection,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    tx.collections(parent)
+    Ok(tx
+        .iter_collections(parent)
         .await?
-        .map(|entry| entry.map(|entry| entry.name))
-        .collect()
+        .map(|entry| entry.name)
+        .collect())
 }
 
 async fn read_collection_value(
@@ -794,11 +795,10 @@ impl SimWorkload for ApiWorkload {
             .await
             .expect("open API collection");
         let listed: Vec<Vec<u8>> = collection
-            .keys()
+            .iter_keys()
             .await
             .expect("final API listing")
-            .collect::<Result<_, _>>()
-            .expect("final API listing");
+            .collect();
         assert_valid_listing(&listed, API_KEYS);
 
         let nclients = self.clients.len();

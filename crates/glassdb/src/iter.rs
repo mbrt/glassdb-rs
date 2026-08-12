@@ -85,18 +85,21 @@ impl Iterator for KeyIter {
 impl ExactSizeIterator for KeyIter {}
 impl FusedIterator for KeyIter {}
 
-/// Iterates over the keys in a collection.
+/// Compatibility iterator over materialized collection keys.
 ///
-/// In v2 keys are resolved from the collection's shard objects and decoded by
-/// the caller, so this iterator simply yields the pre-decoded, sorted raw keys.
+/// Per-item errors cannot occur because listing and validation finish before
+/// construction. Use [`KeyIter`] for the honest plain-item contract.
+#[deprecated(since = "0.1.0", note = "use `KeyIter` via `Collection::iter_keys`")]
 pub struct KeysIter(FallibleIter<KeyIter>);
 
+#[allow(deprecated)]
 impl KeysIter {
     pub(crate) fn from_plain(items: KeyIter) -> Self {
         Self(FallibleIter::new(items))
     }
 }
 
+#[allow(deprecated)]
 impl Iterator for KeysIter {
     type Item = Result<Vec<u8>, Error>;
 
@@ -148,15 +151,24 @@ impl Iterator for CollectionIter {
 impl ExactSizeIterator for CollectionIter {}
 impl FusedIterator for CollectionIter {}
 
-/// Iterates over immediate child bindings in name order.
+/// Compatibility iterator over materialized immediate child bindings.
+///
+/// Per-item errors cannot occur because the directory is materialized before
+/// construction. Use [`CollectionIter`] for the honest plain-item contract.
+#[deprecated(
+    since = "0.1.0",
+    note = "use `CollectionIter` via `Collection::iter_collections` or `Transaction::iter_collections`"
+)]
 pub struct CollectionsIter(FallibleIter<CollectionIter>);
 
+#[allow(deprecated)]
 impl CollectionsIter {
     pub(crate) fn from_plain(items: CollectionIter) -> Self {
         Self(FallibleIter::new(items))
     }
 }
 
+#[allow(deprecated)]
 impl Iterator for CollectionsIter {
     type Item = Result<CollectionEntry, Error>;
 

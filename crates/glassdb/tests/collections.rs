@@ -139,6 +139,7 @@ async fn strict_and_idempotent_create_have_distinct_race_contracts() {
 }
 
 #[tokio::test]
+#[allow(deprecated)]
 async fn child_listing_returns_sorted_incarnation_bound_handles() {
     let db = Database::open("example", MemoryBackend::new())
         .await
@@ -201,6 +202,7 @@ async fn child_listing_returns_sorted_incarnation_bound_handles() {
 }
 
 #[tokio::test]
+#[allow(deprecated)]
 async fn child_listing_retries_after_the_directory_changes() {
     let backend = Arc::new(MemoryBackend::new());
     let db = Database::open("example", backend.clone()).await.unwrap();
@@ -443,7 +445,10 @@ async fn missing_bound_tree_root_is_not_empty_or_recreated_by_data_operations() 
         matches!(write, Err(Error::StaleCollection)),
         "unexpected write result: {write:?}"
     );
-    assert!(matches!(child.keys().await, Err(Error::StaleCollection)));
+    assert!(matches!(
+        child.iter_keys().await,
+        Err(Error::StaleCollection)
+    ));
     assert!(matches!(
         backend.read(&child_root).await,
         Err(glassdb::backend::BackendError::NotFound)
@@ -474,10 +479,7 @@ async fn collection_changes_compose_with_data_and_nested_changes() {
             tx.write(&users, b"seed", b"ready")?;
             tx.write(&active, b"alice", b"1")?;
 
-            let listed = tx
-                .collections(&users)
-                .await?
-                .collect::<Result<Vec<_>, _>>()?;
+            let listed = tx.iter_collections(&users).await?.collect::<Vec<_>>();
             glassdb::ensure_tx!(
                 listed.len() == 1,
                 Error::internal(format!(
@@ -767,7 +769,7 @@ async fn a_cached_handle_in_another_client_observes_the_drop_fence() {
         old.collection_exists(b"nested").await,
         Err(Error::StaleCollection)
     ));
-    assert!(matches!(old.keys().await, Err(Error::StaleCollection)));
+    assert!(matches!(old.iter_keys().await, Err(Error::StaleCollection)));
 }
 
 #[tokio::test]

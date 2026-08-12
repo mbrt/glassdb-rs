@@ -215,3 +215,19 @@ working document and is intentionally not committed with these changes.
 - No legacy method/type was deprecated or migrated in this finding. Backend
   operations, transaction retry behavior, persistent bytes, and public failure
   boundaries are unchanged.
+
+## F28-B — Deprecate fallible materialized iterators
+
+- Deprecated `KeysIter`, `CollectionsIter`, and their three producing methods
+  with direct links in the diagnostic text to the plain-item replacements.
+  Their compatibility implementations and public re-exports remain intact for
+  the release-gated removal in F28-C.
+- Production simulation clients and repository behavior tests now use
+  `iter_keys` and `iter_collections`; listing errors continue to occur at the
+  awaited materialization boundary, while iteration itself is infallible.
+- Retained only the existing focused old/new parity rows for collection keys and
+  collection- and transaction-scoped child listings. Their deprecated calls are
+  locally allowed so ordinary production code remains warning-free; these
+  compatibility assertions retire with F28-C.
+- This migration changes no listing I/O, ordering, snapshots, transaction
+  validation, persistent bytes, retries, random draws, or task scheduling.
