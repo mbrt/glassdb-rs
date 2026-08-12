@@ -29,6 +29,7 @@
 //!
 mod options;
 mod result;
+mod setup;
 
 use std::collections::HashSet;
 use std::error::Error;
@@ -42,10 +43,10 @@ use rand::{RngExt, SeedableRng};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
-use glassdb::{Collection, CollectionPath, Database, Error as GError, Stats};
+use glassdb::{Collection, Database, Error as GError};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::bench::{Bench, samples_for_rel_ci};
-use glassdb_bench_scale::run::{join_tasks_until, shutdown_databases_until};
+use glassdb_bench_scale::run::join_tasks_until;
 
 use super::backend;
 use super::{Execution, cooldown};
@@ -53,8 +54,6 @@ pub(super) use options::Options;
 use options::{CellDimension, Mode};
 pub(super) use result::RunResult;
 use result::{CellMetadata, CellResult, ShapeMeasurement};
-
-const COLLECTION_PREFIX: &str = "mix";
 
 /// Fixed opaque value written on every put; only op counts and contention
 /// matter, not the payload.
@@ -135,12 +134,6 @@ pub(super) fn run(
     Ok(runs)
 }
 
-fn open_db(handle: &Handle, name: &str, backend: Arc<dyn Backend>) -> Database {
-    handle
-        .block_on(Database::open(name, backend))
-        .expect("open db")
-}
-
 /// Distributes `w` workers across `k` Databases as evenly as possible, dropping
 /// empty slots (so `k` is effectively clamped to `w`).
 fn split_workers(w: usize, k: usize) -> Vec<usize> {
@@ -171,28 +164,20 @@ fn run_cell(
     affinity_pct: u8,
 ) -> Result<CellResult, Box<dyn Error>> {
     let pool_size = mode.pool_size(options);
-    let collection_paths = (0..options.databases)
-        .map(|i| CollectionPath::new(format!("{COLLECTION_PREFIX}-{i}").as_bytes()))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // A throwaway Database owns setup and split convergence, keeping all of its
-    // cache and operation counters outside the measured clients.
-    let settlement = seed_collections(
+    let prepared = setup::prepare_cell(
         handle,
-        backend.clone(),
+        backend,
         database_name,
-        &collection_paths,
-        pool_size,
-        options,
-        execution,
+        setup::CellConfig {
+            databases: options.databases,
+            pool_size,
+            split_quiet: options.split_quiet,
+            split_settle_timeout: options.split_settle_timeout,
+            drain_timeout: execution.drain_timeout,
+        },
     )?;
-
     let w = options.workers_per_shape;
-    let dbs: Vec<Database> = (0..options.databases)
-        .map(|_| open_db(handle, database_name, backend.clone()))
-        .collect();
-    let collections = handle.block_on(open_collections(&dbs, &collection_paths))?;
-    let slots: Vec<(usize, usize)> = split_workers(w, dbs.len())
+    let slots: Vec<(usize, usize)> = split_workers(w, prepared.databases().len())
         .into_iter()
         .enumerate()
         .collect();
@@ -207,7 +192,7 @@ fn run_cell(
 
     // Collection binding and its record reads are setup, not transaction work.
     // Bracket stats only after every client has opened every possible target.
-    let base: Vec<Stats> = dbs.iter().map(|d| d.stats()).collect();
+    let active = prepared.begin_measurement();
     for p in &plans {
         p.bench.start();
     }
@@ -221,7 +206,7 @@ fn run_cell(
         affinity_pct,
     };
     let (drive, run, deadline) = handle.block_on(async {
-        let handles = spawn_workers(&dbs, &collections, &plans, &ctx);
+        let handles = spawn_workers(active.databases(), active.collections(), &plans, &ctx);
         let drive = drive_to_significance(
             &plans,
             &stop,
@@ -238,16 +223,7 @@ fn run_cell(
     for p in &plans {
         p.bench.end();
     }
-    let shutdown = handle.block_on(shutdown_databases_until(&dbs, deadline));
-    run?;
-    shutdown?;
-    // Collect after shutdown so finite write-back passes and task joining have
-    // settled. Counters exclude cleanup deferred by a live structural holder.
-    let deltas: Vec<Stats> = dbs
-        .iter()
-        .enumerate()
-        .map(|(i, d)| d.stats() - base[i])
-        .collect();
+    let completed = active.teardown(handle, deadline, run)?;
     let cell_converged = match drive {
         DriveOutcome::Converged => true,
         DriveOutcome::Capped => false,
@@ -269,12 +245,12 @@ fn run_cell(
         CellMetadata::new(
             mode.label(),
             affinity_pct,
-            dbs.len(),
-            settlement.completed,
-            settlement.elapsed,
+            completed.databases,
+            completed.setup_splits,
+            completed.split_settle_elapsed,
         ),
         measurements,
-        &deltas,
+        &completed.deltas,
         target,
     ))
 }
@@ -474,143 +450,6 @@ async fn ro_tx(db: &Database, coll: &Collection, keys: &[Vec<u8>]) -> Result<(),
     .await
 }
 
-async fn open_collections(
-    dbs: &[Database],
-    paths: &[CollectionPath],
-) -> Result<Vec<Arc<[Collection]>>, GError> {
-    let mut all = Vec::with_capacity(dbs.len());
-    for db in dbs {
-        let mut collections = Vec::with_capacity(paths.len());
-        for path in paths {
-            collections.push(db.open_collection(path).await?);
-        }
-        all.push(Arc::from(collections));
-    }
-    Ok(all)
-}
-
-#[derive(Clone, Copy)]
-struct SplitSettlement {
-    completed: u64,
-    elapsed: Duration,
-}
-
-struct SplitQuietTracker {
-    completed: u64,
-    unchanged_since: Instant,
-}
-
-impl SplitQuietTracker {
-    fn new(completed: u64, now: Instant) -> Self {
-        Self {
-            completed,
-            unchanged_since: now,
-        }
-    }
-
-    fn observe(&mut self, completed: u64, now: Instant) {
-        if completed != self.completed {
-            self.completed = completed;
-            self.unchanged_since = now;
-        }
-    }
-
-    fn is_quiet(&self, now: Instant, quiet: Duration) -> bool {
-        now.duration_since(self.unchanged_since) >= quiet
-    }
-}
-
-/// Waits for the only setup signal that matters to measurement: completed
-/// splits have stopped moving for a full quiet period.
-async fn wait_for_split_quiet(
-    db: &Database,
-    quiet: Duration,
-    timeout: Duration,
-) -> Result<SplitSettlement, Box<dyn Error>> {
-    let started = Instant::now();
-    let mut tracker = SplitQuietTracker::new(db.stats().splitter.completed, started);
-    let poll = (quiet / 4).clamp(Duration::from_millis(20), Duration::from_millis(250));
-    loop {
-        let now = Instant::now();
-        tracker.observe(db.stats().splitter.completed, now);
-        if tracker.is_quiet(now, quiet) {
-            return Ok(SplitSettlement {
-                completed: tracker.completed,
-                elapsed: started.elapsed(),
-            });
-        }
-        if started.elapsed() >= timeout {
-            return Err(format!(
-                "setup splits did not stay quiet for {quiet:?} within {timeout:?} \
-                 (completed={})",
-                tracker.completed
-            )
-            .into());
-        }
-        tokio::time::sleep(poll).await;
-    }
-}
-
-/// Seeds every collection and lets its complete split cascade finish before the
-/// measured Databases open.
-fn seed_collections(
-    handle: &Handle,
-    backend: Arc<dyn Backend>,
-    database_name: &str,
-    paths: &[CollectionPath],
-    pool_size: usize,
-    options: &Options,
-    execution: Execution,
-) -> Result<SplitSettlement, Box<dyn Error>> {
-    let db = open_db(handle, database_name, backend);
-    handle.block_on(async {
-        for path in paths {
-            let name = path
-                .segments()
-                .next()
-                .expect("mixed benchmark collection paths are non-empty");
-            let coll = db
-                .root_collection()
-                .create_collection_if_absent(name)
-                .await?;
-            let mut i = 0;
-            while i < pool_size {
-                let end = (i + 100).min(pool_size);
-                let batch: Vec<Vec<u8>> = (i..end).map(key_bytes).collect();
-                let coll = &coll;
-                let batch = &batch;
-                db.tx(|tx| async move {
-                    for k in batch {
-                        tx.write(coll, k, &value())?;
-                    }
-                    Ok(())
-                })
-                .await?;
-                i = end;
-            }
-        }
-        Ok::<(), GError>(())
-    })?;
-    let settlement = handle.block_on(wait_for_split_quiet(
-        &db,
-        options.split_quiet,
-        options.split_settle_timeout,
-    ))?;
-    eprintln!(
-        "{}",
-        result::setup_settled(
-            settlement.elapsed,
-            settlement.completed,
-            options.split_quiet
-        )
-    );
-    handle.block_on(shutdown_databases_until(
-        std::slice::from_ref(&db),
-        tokio::time::Instant::now() + execution.drain_timeout,
-    ))?;
-    Ok(settlement)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,18 +470,5 @@ mod tests {
         pick_collection(&mut no_affinity, 2, 4, 0);
         pick_collection(&mut full_affinity, 2, 4, 100);
         assert_eq!(no_affinity.random::<u64>(), full_affinity.random::<u64>());
-    }
-
-    #[test]
-    fn split_quiet_period_restarts_when_the_counter_moves() {
-        let start = Instant::now();
-        let quiet = Duration::from_secs(2);
-        let mut tracker = SplitQuietTracker::new(3, start);
-
-        assert!(!tracker.is_quiet(start + Duration::from_secs(1), quiet));
-        tracker.observe(4, start + Duration::from_millis(1500));
-        assert!(!tracker.is_quiet(start + Duration::from_secs(3), quiet));
-        tracker.observe(4, start + Duration::from_millis(3200));
-        assert!(tracker.is_quiet(start + Duration::from_millis(3500), quiet));
     }
 }

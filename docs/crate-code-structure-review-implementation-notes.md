@@ -688,3 +688,30 @@ working document and is intentionally not committed with these changes.
   draws, database naming, backend operations, result values, serialized schema,
   task scheduling, or stderr text changed. Scenario setup and workload execution
   intentionally remain in `mixed.rs` for F32-C and F32-D.
+
+## F32-C — Extract mixed benchmark setup and settlement
+
+- Added `mixed/setup.rs` with explicit prepare, begin-measurement, and teardown
+  phases. Preparation builds the same collection paths, seeds the same fixed
+  values in batches of 100, waits for the completed-split counter to stay quiet,
+  shuts down the throwaway setup Database, then opens every collection on the
+  ordered measurement clients.
+- `run_cell` still builds its unchanged shape plans after collection opening.
+  Only then does `begin_measurement` capture client statistics, immediately
+  before the existing benchmark timers start. This retains the original counter
+  window and keeps all setup reads and structural convergence outside results.
+- Teardown still ends timers first, uses the worker drain deadline for concurrent
+  Database shutdown, gives a worker failure precedence over a simultaneous
+  shutdown failure, and reads counter deltas only after successful shutdown.
+  Collection handles remain alive through shutdown as before, and setup-error
+  paths retain their drop-based cancellation behavior.
+- Moved the existing deterministic quiet-period reset test alongside the phase
+  and extended it with the inclusive timeout boundary. Added one real
+  `MemoryBackend` lifecycle test that verifies each measurement client opens both
+  seeded collections, every collection contains the configured three keys, and
+  a retained client clone rejects work after teardown. No mock lifecycle or
+  migration-only parity suite was added.
+- CLI behavior, cell order, seeding transaction order, setup and measured backend
+  operations, error precedence, database naming, random draws, worker tasks,
+  metrics, serialized output, and status text are unchanged. Workload selection
+  and execution intentionally remain in `mixed.rs` for F32-D.
