@@ -1153,3 +1153,24 @@ working document and is intentionally not committed with these changes.
 - Backend operations, retry/error boundaries, cancellation and panic propagation,
   persistent bytes, public APIs, and schedule decisions are unchanged. No ADR was
   needed because this only changes private code ownership.
+## F29-J — Extract the API action executor
+
+- Moved the database-backed key and collection action handlers, their action
+  loop, read-your-writes/repeatable-read checks, and invariant-error translation
+  into the private `sim::api::executor` module. The generated program and each
+  transaction's backend calls and await points retain their original order.
+- The executor now returns a typed `StepResult` that distinguishes a confirmed
+  commit from a confirmed explicit abort. The workload bridge still widens the
+  reachable model before a non-aborting attempt and narrows it only after the
+  executor reports a definite commit, so unavailable and in-doubt exits retain
+  both outcomes exactly as before.
+- Final key/catalog reads and reachable-state comparison remain in `api.rs` for
+  F29-K. Their shared collection-observation helpers also remain there for now;
+  the executor calls them for per-action validation without taking ownership of
+  final verification. The F29-H generator and F29-I pure model are unchanged.
+- No migration-only coverage was added. The existing nine API simulation tests,
+  reviewed tape-trace digest, and all 1,509 committed `api_correctness` corpus
+  inputs pass unchanged, covering per-step operation logs, explicit aborts,
+  admissible errors, crash/restart, slow mutations, and PCT schedules. No
+  persistent bytes, entropy draw, spawn order, public API, dependency, or ADR
+  changed, and the implementation does not deviate from F29-J.
