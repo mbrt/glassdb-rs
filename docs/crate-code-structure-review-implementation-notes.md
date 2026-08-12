@@ -1042,3 +1042,21 @@ working document and is intentionally not committed with these changes.
   baseline edits. Task IDs, scheduler draw and selection order, virtual-time
   advancement, panic/deadlock propagation, root completion, and drop-time task
   handoff are unchanged. No ADR was needed for this mechanical ownership move.
+## F29-E — Extract `ClientRunner`
+
+- Added a private `harness::client` module whose concrete `ClientRunner` owns
+  the ordered client task handles and crash signals. `RunContext` transfers the
+  per-client operation streams and backends to it once setup is complete.
+- The runner's private task implementation now contains the initial
+  open/run/shutdown path, cancellation race, cache crash boundary,
+  uncancellable restart, and in-doubt operation accounting; the runner collects
+  results in spawn order. Observer and nemesis behavior remains in the harness
+  for F29-F.
+- The three tape and two PCT canonical baselines stayed byte-identical without
+  digest changes, covering client spawn and operation order, cancellation,
+  crash/restart, and final completion. The existing client-panic test still
+  proves the same `client task failed` propagation, so no duplicate structural
+  or migration-only test was added.
+- Backend operations, persistent bytes, retry/error classification, entropy
+  draws, task spawn/selection order, trace events, public APIs, and cache-media
+  behavior are unchanged. No deviation from F29-E and no ADR were needed.
