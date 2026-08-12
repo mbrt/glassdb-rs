@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use glassdb_backend as backend;
 use glassdb_concurr::rt;
-use glassdb_data::{DbRoot, ObjectPath, TxId};
+use glassdb_data::{DbRoot, ObjectPath, TxId, paths};
 
 use crate::cached_store::{CachedStore, CasResult, Observation, Requirement};
 use crate::error::StorageError;
@@ -140,6 +140,11 @@ impl TLogger {
             CasResult::Committed(observed) => Ok(observed),
             CasResult::Conflict => Err(StorageError::Precondition),
         }
+    }
+
+    /// Returns every physical transaction-log shard.
+    pub fn transaction_shards(&self) -> impl Iterator<Item = usize> {
+        0..paths::TRANSACTION_SHARD_COUNT
     }
 
     /// Lists one page of transaction IDs from `shard`.

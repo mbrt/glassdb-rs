@@ -36,7 +36,7 @@ use std::time::UNIX_EPOCH;
 
 use glassdb_backend as backend;
 use glassdb_concurr::{Background, rt};
-use glassdb_data::{KeyRef, TRANSACTION_SHARD_COUNT, TxId, shuffle};
+use glassdb_data::{KeyRef, TxId, shuffle};
 use glassdb_storage::transaction::{TLogger, TxCollectionOp, TxCommitStatus, TxLock, TxLog};
 use glassdb_storage::{Observation, Requirement, ShardStore, StorageError, Timeline, TreeRouter};
 
@@ -88,8 +88,8 @@ struct TxScan {
 }
 
 impl TxScan {
-    fn shuffled() -> Self {
-        let mut shards = (0..TRANSACTION_SHARD_COUNT).collect::<Vec<_>>();
+    fn shuffled(tl: &TLogger) -> Self {
+        let mut shards = tl.transaction_shards().collect::<Vec<_>>();
         shuffle(&mut shards);
         TxScan {
             shards,
@@ -147,7 +147,7 @@ impl Gc {
             return;
         };
         let gc = self.clone();
-        let mut scan = TxScan::shuffled();
+        let mut scan = TxScan::shuffled(&gc.tl);
         bg.spawn(async move {
             loop {
                 rt::sleep(gc.mon.protocol_timing().pending_timeout()).await;
@@ -813,7 +813,7 @@ mod tests {
     }
 
     async fn run_once(gc: &Gc) {
-        let mut scan = TxScan::shuffled();
+        let mut scan = TxScan::shuffled(&gc.tl);
         gc.run_once(&mut scan).await;
     }
 
