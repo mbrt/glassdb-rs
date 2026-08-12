@@ -20,6 +20,7 @@ mod history;
 mod membership;
 mod rmw;
 mod slow_backend;
+mod trace;
 
 pub use api::{ApiAcct, ApiAction, ApiTransaction, ApiWorkload};
 pub use cycle::CycleWorkload;
@@ -30,12 +31,17 @@ pub use harness::{
 };
 #[cfg(sim)]
 pub use harness::{
-    PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS, pct_assert, pct_record, pct_sweep, record_input,
-    replay_input,
+    PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS, pct_assert, pct_record, pct_sweep, pct_trace,
+    record_input, replay_input, trace_input,
 };
 pub use history::{HistoryInstruction, HistoryTransaction, HistoryWorkload};
 pub use membership::{MembOp, MembershipAcct, MembershipWorkload};
 pub use rmw::{RMW_KEY_COUNT, RmwAcct, RmwOp, RmwWorkload};
+pub use trace::{
+    HARNESS_TRACE_SCHEMA_VERSION, HarnessTrace, HarnessTraceEvent, TraceClientPhase,
+    TraceClientRun, TraceEntropyDraw, TraceEntropySource, TraceNemesis, TraceNemesisAction,
+    TraceOperationPhase, TraceRunPhase, TraceSpawnRole, TraceVerificationPhase,
+};
 
 use glassdb_storage::{PersistentCacheConfig, SplitPolicy};
 

@@ -330,7 +330,9 @@ mod imp {
     };
 
     pub use crate::exec::{
-        PctScheduler, RandomScheduler, Scheduler, TapeScheduler, TaskId, block_on_with, in_sim,
+        PctScheduler, RandomScheduler, RuntimeEntropySource, RuntimeTraceEvent,
+        RuntimeTraceObserver, Scheduler, TapeScheduler, TaskId, block_on_with, block_on_with_trace,
+        in_sim,
     };
 
     /// Fills `buf` with deterministic simulated entropy from the running

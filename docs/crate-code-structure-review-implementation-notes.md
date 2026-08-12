@@ -643,3 +643,74 @@ working document and is intentionally not committed with these changes.
   compatibility assertions retire with F28-C.
 - This migration changes no listing I/O, ordering, snapshots, transaction
   validation, persistent bytes, retries, random draws, or task scheduling.
+## F29-A — Add a stable harness trace schema
+
+- Added a versioned, structured trace behind the simulation-only feature. It
+  records harness role spawn decisions, actual executor spawn IDs and selected
+  tasks, every simulated runtime byte, supplied versus fallback `Tape` bytes,
+  and supplied-tape versus PCT-RNG scheduler draws. Client/restart and operation
+  boundaries, crash/outage/final-heal actions, and final verification are in the
+  same event stream.
+- Tracing is opt-in. The ordinary harness uses a zero-allocation disabled sink;
+  the executor observer reads already-produced entropy bytes and assigned task
+  IDs without making an additional draw or scheduling decision.
+- One compact simulation test exercises every top-level event kind, all entropy
+  sources, every nemesis/heal action, and compares backend operation streams
+  with tracing disabled and enabled for uncached tape, cached tape, and PCT
+  runs. Exhausted scheduling tapes emit selected-task events but no fabricated
+  entropy draw.
+- The schema has a canonical, schema-version-prefixed JSON encoding but no
+  digest or corpus baseline. Those reviewed fixtures remain F29-B/F29-C work.
+  Adding optional `serde`/`serde_json` dependencies to the existing `sim`
+  feature is the only dependency change; the trace does not expand the default
+  feature surface.
+- No ADR was added: this is a temporary migration guard plus long-term replay
+  diagnostic, not a production protocol or architecture decision.
+
+## F29-B — Freeze tape-scheduled harness traces
+
+- Froze three small inputs copied from the committed `concurrent_tx`, `history`,
+  and `api_correctness` corpora. Their source basenames are the SHA-1 of the
+  copied bytes, so reviewers can verify provenance without coupling the guard to
+  later corpus minimization.
+- One table-driven simulation test runs every input twice, compares the complete
+  schema-v1 canonical bytes, and then checks a reviewed SHA-256 digest. It also
+  asserts cache-free/cached run boundaries and final verification semantically.
+- The normal RMW and API fixtures perform successful operations without enabled
+  fault nemeses. The History fixture records an admissible failure, crash and
+  same-client restart work, outage down/heal, final healing, and successful final
+  verification. Every fixture consumes supplied scheduler-tape bytes.
+- These exact digests are migration guards through F25-D, F29-K, and F31-D.
+  F25-A/B and structural/runtime extractions must not refresh them; an F25-C
+  entropy-source migration may update only an affected digest after its first
+  divergent event is reviewed and documented. After all three endpoints land,
+  exact digests may retire while same-input replay and semantic boundaries stay.
+- Hashing is confined to the simulation integration test through a dev-only
+  dependency. No production path, persistent bytes, backend operation, retry,
+  or scheduling decision changed, and no baseline update mode was added.
+
+## F29-C — Freeze PCT-scheduled harness traces
+
+- Froze the complete schema-v1 canonical traces for one small contended RMW
+  workload with fallback-tape faults at seeds `12780` and `12980`. Their two PCT
+  change points are `[1, 15]` and `[9, 29]`: both runs cross both boundaries,
+  while the pair covers immediate and later preemption points without adding a
+  large synthetic workload solely to reach the scheduler's 2048-step estimate.
+- The table reruns every seed and compares the full canonical bytes before
+  checking its reviewed SHA-256 digest; it also requires the selected seeds to
+  produce distinct traces. `pct_trace` performs the existing RMW final-state
+  invariant, and the established PCT seed-breadth suites remain unchanged.
+- Semantic checks distinguish the two initial change-point draws from task
+  priority draws, require eight bytes per PCT RNG draw and exactly one priority
+  draw immediately before every sequential task spawn, and reject selecting an
+  unspawned task. They pin client/nemesis role spawn order, prove selection
+  reaches both change points, and require runtime, fallback-tape, and scheduler
+  entropy without any supplied-tape consumption.
+- These PCT digests follow the F29-B migration-guard lifecycle: F25-A/B and
+  F29/F31 structural moves must preserve them; F25-C may refresh only an
+  affected digest after documenting the first deliberate entropy divergence.
+  Exact digests retire only after F25-D, F29-K, and F31-D have all landed, while
+  same-seed replay, seed divergence, semantic event boundaries, scheduler
+  entropy accounting, and distribution vectors remain long term.
+- No production implementation, harness behavior, scheduling decision, or ADR
+  changed, and there is no baseline update mode.
