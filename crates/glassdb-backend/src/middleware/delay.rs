@@ -2,12 +2,15 @@
 //! rate limiting. Ported from the Go `middleware.DelayBackend`.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use glassdb_concurr::entropy;
 use glassdb_concurr::rt::{self, Instant};
+use rand::TryRng;
 
 use crate::{
     Backend, BackendError, ListCursor, ListLimit, ListPage, ListRequest, ReadReply, Version,
@@ -200,7 +203,7 @@ impl DelayBackend {
     }
 
     async fn delay(&self, distribution: &Lognormal) {
-        let ms = sample_process_rng(distribution);
+        let ms = distribution.sample(&mut ActiveEntropy);
         rt::sleep(secs_f64_or_zero(ms / 1_000.0)).await;
     }
 
@@ -303,9 +306,27 @@ fn latency_distribution(latency: Latency) -> Result<Lognormal, DelayOptionsError
     Lognormal::new(mean_ms, standard_deviation_ms).map_err(DelayOptionsError::from)
 }
 
-/// Samples with the process RNG until F25-C deliberately changes the source.
-fn sample_process_rng(distribution: &Lognormal) -> f64 {
-    distribution.sample(&mut rand::rng())
+struct ActiveEntropy;
+
+impl TryRng for ActiveEntropy {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut bytes = [0; 4];
+        entropy::fill_bytes(&mut bytes);
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let mut bytes = [0; 8];
+        entropy::fill_bytes(&mut bytes);
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn try_fill_bytes(&mut self, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        entropy::fill_bytes(bytes);
+        Ok(())
+    }
 }
 
 /// A per-object token-bucket rate limiter. Mirrors the Go `rateLimiter`,

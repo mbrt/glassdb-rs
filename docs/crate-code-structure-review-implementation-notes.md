@@ -764,3 +764,34 @@ working document and is intentionally not committed with these changes.
 - The reviewed tape and PCT trace digests remain byte-identical without a
   baseline refresh. No dependency or persistent-format change and no ADR were
   needed; there was no deviation from the staged plan.
+
+## F25-C — Move delay middleware to simulation-aware entropy
+
+- `DelayBackend` now adapts the shared `glassdb-concurr` entropy facade to the
+  `rand::Rng` interface required by the existing `Lognormal` sampler. Native
+  draws still come from the process RNG; an active simulation now consumes the
+  executor's seeded stream. The adapter reconstructs `u32`/`u64` words from the
+  facade's little-endian bytes, matching `ThreadRng`'s word/fill relationship.
+- The distribution, Ziggurat algorithm, sampling call site, operation/retry
+  sequence, and task-spawn sequence are unchanged. The only deliberate stream
+  change is that a simulated latency sample is now visible to and consumes the
+  run-scoped entropy source before its sleep is armed.
+- In the focused runtime trace, the first divergence from the former
+  process-RNG path is event index 2: immediately after root task spawn and its
+  first selection, the new path emits one eight-byte `FillRandom` entropy draw.
+  The former path went directly from that selection to waiting on the latency
+  timer because its process-RNG draw was outside the executor trace.
+- A simulation regression runs the variable-latency read twice with seed
+  `0xF25C` and requires both the complete runtime trace and sampled model-time
+  delay to be equal. Seed `0xF25D` must change both, and the test pins the new
+  entropy draw to the sampling boundary.
+- Contrary to the staged expectation that an F29 fixture might need refreshing,
+  none of the three frozen tape inputs or two PCT seeds compose
+  `DelayBackend`; they use the harness's memory/fault/one-shot-delay stack.
+  Capturing all five canonical traces before and after this change produced the
+  same reviewed SHA-256 digests, so updating any F29 baseline or corpus would be
+  unrelated churn. The focused delay trace above covers the previously missing
+  composition directly.
+- No persistent bytes, backend result, public signature, or dependency changed,
+  and no ADR was warranted for routing an existing middleware draw through the
+  already-selected entropy policy.
