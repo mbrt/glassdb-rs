@@ -1,30 +1,26 @@
-//! Golden migration guards for deterministic harness scheduling traces.
+//! Semantic regression coverage for deterministic harness scheduling traces.
 
 #![cfg(all(sim, feature = "sim"))]
 
 use glassdb::sim::{
-    ApiWorkload, FaultConfig, HarnessTrace, HarnessTraceEvent, HistoryWorkload, PCT_DEFAULT_DEPTH,
+    FaultConfig, HarnessTrace, HarnessTraceEvent, HistoryWorkload, PCT_DEFAULT_DEPTH,
     PCT_DEFAULT_STEPS, RmwOp, RmwWorkload, TraceClientPhase, TraceClientRun, TraceEntropyDraw,
     TraceEntropySource, TraceNemesisAction, TraceOperationPhase, TraceRunPhase, TraceSpawnRole,
     TraceVerificationPhase, pct_trace, trace_input,
 };
-use sha2::{Digest, Sha256};
-
 type TraceFn = fn(&[u8]) -> HarnessTrace;
 
-struct TapeBaseline {
+struct TapeFixture {
     name: &'static str,
     input: &'static [u8],
     trace: TraceFn,
-    sha256: &'static str,
     expectation: Expectation,
 }
 
-struct PctBaseline {
+struct PctFixture {
     name: &'static str,
     seed: u64,
     change_points: [u64; 2],
-    sha256: &'static str,
 }
 
 #[derive(Clone, Copy)]
@@ -41,12 +37,8 @@ fn history_trace(input: &[u8]) -> HarnessTrace {
     trace_input::<HistoryWorkload>(input)
 }
 
-fn api_trace(input: &[u8]) -> HarnessTrace {
-    trace_input::<ApiWorkload>(input)
-}
-
-// Copied from the named committed corpus entries so corpus minimization cannot
-// silently replace a migration guard. Each basename is the SHA-1 of its bytes.
+// Copied from named committed corpus entries so minimization cannot silently
+// remove the semantic scenarios. Each basename is the SHA-1 of its bytes.
 // Source: fuzz/corpus/concurrent_tx/5854e97b045d69a9995d95cea2295580a2a3dd20
 const RMW_NORMAL: &[u8] = &[
     0, 255, 1, 255, 0, 255, 0, 255, 0, 255, 1, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 255, 0,
@@ -58,56 +50,36 @@ const HISTORY_FAULT_RECOVERY: &[u8] = &[
     255, 255, 255, 251, 1, 80, 63, 13, 52, 114, 241, 99, 49, 101, 100, 244, 101, 100, 244,
 ];
 
-// Source: fuzz/corpus/api_correctness/c2cf339430f079f0ddd1dca379e626f897fec21f
-const API_NORMAL: &[u8] = &[
-    97, 112, 105, 122, 122, 122, 122, 122, 45, 99, 111, 121, 97, 112, 105, 45, 99, 111, 114, 114,
-    101, 99, 116, 110, 101, 51, 64, 115, 115, 114, 101, 99, 116, 109, 112, 116, 121,
-];
-const TAPE_BASELINES: &[TapeBaseline] = &[
-    TapeBaseline {
+const TAPE_FIXTURES: &[TapeFixture] = &[
+    TapeFixture {
         name: "rmw normal",
         input: RMW_NORMAL,
         trace: rmw_trace,
-        sha256: "bfeb54d5206ef83932657f667a94470a91662315d3d4d3161c2f731920a34b09",
         expectation: Expectation::Normal,
     },
-    TapeBaseline {
+    TapeFixture {
         name: "history fault recovery",
         input: HISTORY_FAULT_RECOVERY,
         trace: history_trace,
-        sha256: "fae678c79134297f70f40a8f4daf9bffacb044ff1d549cc131643d4c6321011a",
         expectation: Expectation::FaultRecovery,
-    },
-    TapeBaseline {
-        name: "API normal",
-        input: API_NORMAL,
-        trace: api_trace,
-        sha256: "680ae361aeddab1d3c334c55f11b04969237092f114c8d5a88302a15eef27b54",
-        expectation: Expectation::Normal,
     },
 ];
 
-const PCT_BASELINES: &[PctBaseline] = &[
-    PctBaseline {
+const PCT_FIXTURES: &[PctFixture] = &[
+    PctFixture {
         name: "early PCT boundary",
         seed: 12_780,
         change_points: [1, 15],
-        sha256: "fc8e2558ae3e5db6ff95905e9925197887232386730961ccf9124102d4a412fb",
     },
-    PctBaseline {
+    PctFixture {
         name: "later PCT boundaries",
         seed: 12_980,
         change_points: [9, 29],
-        sha256: "7a4a21cc10d02d0d4af476056c7f9f10622469ff3a21a5ec3a5741184bdfd7ea",
     },
 ];
 
 const TAPE_RUN_MODES: &[bool] = &[false, true];
 const PCT_RUN_MODES: &[bool] = &[false];
-
-fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
 
 struct RunSegment<'a> {
     cached: bool,
@@ -536,19 +508,19 @@ fn assert_pct_semantics(name: &str, trace: &HarnessTrace, expected_change_points
 }
 
 #[test]
-fn tape_traces_match_reviewed_baselines() {
-    for baseline in TAPE_BASELINES {
-        let first = (baseline.trace)(baseline.input);
+fn tape_fixtures_replay_with_semantic_boundaries() {
+    for fixture in TAPE_FIXTURES {
+        let first = (fixture.trace)(fixture.input);
         let first_bytes = first.canonical_bytes();
-        let second_bytes = (baseline.trace)(baseline.input).canonical_bytes();
+        let second_bytes = (fixture.trace)(fixture.input).canonical_bytes();
         assert!(
             first_bytes == second_bytes,
             "{}: repeated runs produced different canonical traces",
-            baseline.name
+            fixture.name
         );
 
-        assert_run_boundaries(baseline.name, &first, TAPE_RUN_MODES);
-        for segment in run_segments(baseline.name, &first, TAPE_RUN_MODES) {
+        assert_run_boundaries(fixture.name, &first, TAPE_RUN_MODES);
+        for segment in run_segments(fixture.name, &first, TAPE_RUN_MODES) {
             assert!(
                 segment.events.iter().any(|event| matches!(
                     event,
@@ -558,53 +530,33 @@ fn tape_traces_match_reviewed_baselines() {
                     })
                 )),
                 "{}: one cache mode did not exercise the tape scheduler",
-                baseline.name
+                fixture.name
             );
         }
-        match baseline.expectation {
-            Expectation::Normal => assert_normal(baseline.name, &first),
-            Expectation::FaultRecovery => assert_fault_recovery(baseline.name, &first),
+        match fixture.expectation {
+            Expectation::Normal => assert_normal(fixture.name, &first),
+            Expectation::FaultRecovery => assert_fault_recovery(fixture.name, &first),
         }
-
-        let actual_digest = digest(&first_bytes);
-        assert_eq!(
-            actual_digest,
-            baseline.sha256,
-            "{}: reviewed trace changed ({} events, {} canonical bytes)",
-            baseline.name,
-            first.events().len(),
-            first_bytes.len()
-        );
     }
 }
 
 #[test]
-fn pct_traces_match_reviewed_baselines() {
+fn pct_seeded_traces_replay_and_diverge_with_expected_boundaries() {
     let workload = pct_workload();
-    let mut canonical = Vec::with_capacity(PCT_BASELINES.len());
-    for baseline in PCT_BASELINES {
-        let first = pct_trace(&workload, FaultConfig::failures(7), baseline.seed);
+    let mut canonical = Vec::with_capacity(PCT_FIXTURES.len());
+    for fixture in PCT_FIXTURES {
+        let first = pct_trace(&workload, FaultConfig::failures(7), fixture.seed);
         let first_bytes = first.canonical_bytes();
         let second_bytes =
-            pct_trace(&workload, FaultConfig::failures(7), baseline.seed).canonical_bytes();
+            pct_trace(&workload, FaultConfig::failures(7), fixture.seed).canonical_bytes();
         assert!(
             first_bytes == second_bytes,
             "{}: repeated seed {} runs produced different canonical traces",
-            baseline.name,
-            baseline.seed
+            fixture.name,
+            fixture.seed
         );
 
-        assert_pct_semantics(baseline.name, &first, baseline.change_points);
-        let actual_digest = digest(&first_bytes);
-        assert_eq!(
-            actual_digest,
-            baseline.sha256,
-            "{}: reviewed seed {} trace changed ({} events, {} canonical bytes)",
-            baseline.name,
-            baseline.seed,
-            first.events().len(),
-            first_bytes.len()
-        );
+        assert_pct_semantics(fixture.name, &first, fixture.change_points);
         canonical.push(first_bytes);
     }
 

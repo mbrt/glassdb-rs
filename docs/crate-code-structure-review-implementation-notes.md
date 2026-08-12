@@ -1252,3 +1252,37 @@ working document and is intentionally not committed with these changes.
   result, final verdict, persistent byte, entropy draw, spawn order, public API,
   dependency, or ADR changed, and the implementation does not deviate from
   F29-K.
+## F29-G — Extract harness scheduling
+
+- Added the private `harness::scheduling` module as the owner of fuzz-input
+  decoding, schedule/fault/media stream selection, tape and PCT scheduler
+  construction, traced executor setup, replay/record/trace entry points, and PCT
+  seed sweeps. The harness re-exports the same public constants and functions,
+  preserving every downstream path and signature.
+- The generic `deinterleave` primitive remains in the harness because fault and
+  cache-media stream construction also use it. Scheduling owns the three-way
+  invocation and exact assignment of remaining fuzz bytes, so the stream layout
+  and one-byte-to-one-decision property are still defined at the scheduling
+  boundary without making that module own nemesis or media behavior.
+- Generic run setup, client and observer spawning, nemesis enablement and
+  execution, joining, healing, and final verification did not move. Tape bytes,
+  exhaustion fallback, PCT seeds/change points, executor entropy seed, cache-run
+  ordering, and the client/observer/crash/outage spawn sequence retain their
+  original calls and ordering.
+- Before retiring the migration guards, all three tape and both PCT reviewed
+  digests remained byte-identical after the extraction. F25-D, F29-K, and F31-D
+  now satisfy the documented retirement gate, so this finding removes the five
+  exact SHA-256 snapshots, the otherwise-unused `sha2` development dependency,
+  and the redundant API-normal fixture. The API simulation and 1,509-input
+  corpus suites retain that workload's permanent coverage.
+- No test was added or duplicated. The retained normal-tape, fault-recovery, and
+  two seeded-PCT fixtures require same-input/seed replay, selected-seed
+  divergence, exact change points and entropy-source boundaries, role/spawn
+  ordering, healing/restart ordering, and final verification boundaries. The
+  semantic trace test still compares traced and untraced tape/PCT operations and
+  counts exact scheduler-input draws. All 6,604 committed workload corpus inputs
+  replay successfully in both cache modes.
+- No backend operation, persistent byte, retry/error boundary, entropy draw,
+  task selection, public API, production dependency, or ADR changed. The
+  test-only `sha2` removal is the intentional migration-guard retirement noted
+  above; there was no deviation from the staged finding.
