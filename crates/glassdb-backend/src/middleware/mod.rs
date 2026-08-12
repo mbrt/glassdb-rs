@@ -5,6 +5,7 @@
 mod delay;
 mod fault;
 mod hook;
+mod latency;
 mod logger;
 mod recording;
 mod scheduled;
@@ -15,6 +16,7 @@ pub use delay::{
 };
 pub use fault::{FaultBackend, FaultOptions};
 pub use hook::{BackendOp, HookBackend, HookFuture, HookOutcome};
+pub use latency::{Lognormal, LognormalError};
 pub use logger::BackendLogger;
 pub use recording::{OpLog, OpRecord, RecordingBackend, first_divergence};
 pub use scheduled::{ScheduledBackend, Scheduler};
