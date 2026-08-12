@@ -253,6 +253,7 @@ impl Engine {
         let algo = Algo::new(
             shards,
             timeline,
+            retry,
             locker.clone(),
             coord.clone(),
             monitor,

@@ -514,6 +514,9 @@ pub struct Algo {
     mon: Monitor,
     gc: Gc,
     timeline: Timeline,
+    // Factory for each transaction's same-identity acquisition schedule. Other
+    // coordination loops own independent schedules from the same engine policy.
+    acquisition_retry: RetryConfig,
     split_policy: SplitPolicy,
     inline_policy: InlinePolicy,
     collection_commit: CollectionCommit,
@@ -533,6 +536,7 @@ impl Algo {
     pub fn new(
         shards: ShardStore,
         timeline: Timeline,
+        acquisition_retry: RetryConfig,
         locker: Locker,
         coord: ShardCoordinator,
         mon: Monitor,
@@ -552,6 +556,7 @@ impl Algo {
             mon,
             gc,
             timeline,
+            acquisition_retry,
             split_policy,
             inline_policy,
             collection_commit,
@@ -581,7 +586,7 @@ impl Algo {
             collections: CollectionAttempt::new(collection_data),
             state: AttemptState::new(),
             id,
-            backoff: RetryConfig::default().backoff(),
+            backoff: self.acquisition_retry.backoff(),
         }
     }
 
@@ -1522,15 +1527,18 @@ mod tests {
     use crate::collection_catalog::CollectionCatalog;
     use crate::collection_coordination::CollectionStateResolver;
     use crate::collections::{CollectionChange, CollectionLifecycle, CollectionOp};
+    use crate::engine::{Engine, EngineConfig};
     use crate::key_state_resolver::KeyStateResolver;
     use crate::monitor::{ProtocolTiming, TxRecoveryManifest};
     use crate::reader::Reader;
     use glassdb_backend::middleware::{
         BackendOp, HookBackend, HookFuture, OpLog, OpRecord, RecordingBackend,
     };
-    use glassdb_backend::{Backend, memory::MemoryBackend};
+    use glassdb_backend::{Backend, StatsBackend, memory::MemoryBackend};
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::{CollectionAddress, CollectionId, DbRoot, LeafRef, NodeToken, ObjectPath};
+    use glassdb_data::{
+        CollectionAddress, CollectionId, DatabaseId, DbRoot, LeafRef, NodeToken, ObjectPath,
+    };
     use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, CurrentState, Node, Shard, ShardEntry,
@@ -1676,6 +1684,7 @@ mod tests {
         let algo = Algo::new(
             shards.clone(),
             timeline.clone(),
+            RetryConfig::default(),
             locker.clone(),
             coord.clone(),
             tmon.clone(),
@@ -2370,24 +2379,45 @@ mod tests {
 
     /// Controls a hook that makes a bounded number of leaf CASes miss.
     struct FlakyCas {
+        path: String,
         armed: std::sync::atomic::AtomicBool,
         remaining: std::sync::atomic::AtomicUsize,
+        attempts: std::sync::Mutex<Vec<rt::Instant>>,
     }
 
     impl FlakyCas {
-        fn wrap(inner: Arc<dyn Backend>, budget: usize) -> (Arc<HookBackend>, Arc<Self>) {
+        fn wrap(
+            inner: Arc<dyn Backend>,
+            path: String,
+            budget: usize,
+        ) -> (Arc<HookBackend>, Arc<Self>) {
             let flaky = Arc::new(Self {
+                path,
                 armed: std::sync::atomic::AtomicBool::new(false),
                 remaining: std::sync::atomic::AtomicUsize::new(budget),
+                attempts: std::sync::Mutex::new(Vec::new()),
             });
             let backend = HookBackend::new(inner);
             backend.set_before({
                 let flaky = flaky.clone();
                 move |op| {
                     use std::sync::atomic::Ordering::SeqCst;
-                    let fail = matches!(op, BackendOp::WriteIf { path, .. }
-                        if path.contains("/_n/") || path.ends_with("/_r"))
-                        && flaky.armed.load(SeqCst)
+                    let targeted = match op {
+                        BackendOp::WriteIf { path, value, .. } if path == &flaky.path => {
+                            Node::decode(value)
+                                .ok()
+                                .and_then(|node| node.as_leaf().cloned())
+                                .is_some_and(|leaf| {
+                                    leaf.entries().any(|entry| !entry.lock_holders().is_empty())
+                                })
+                        }
+                        _ => false,
+                    };
+                    let armed = targeted && flaky.armed.load(SeqCst);
+                    if armed {
+                        flaky.attempts.lock().unwrap().push(rt::Instant::now());
+                    }
+                    let fail = armed
                         && flaky
                             .remaining
                             .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
@@ -2410,6 +2440,10 @@ mod tests {
 
         fn remaining(&self) -> usize {
             self.remaining.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn attempts(&self) -> Vec<rt::Instant> {
+            self.attempts.lock().unwrap().clone()
         }
     }
 
@@ -2720,27 +2754,57 @@ mod tests {
     // serial-fallback behaviour.
     #[tokio::test(start_paused = true)]
     async fn cas_contention_relocks_keeping_id() {
+        let retry = RetryConfig {
+            initial_interval: Duration::from_millis(10),
+            max_interval: Duration::from_millis(20),
+        };
+        const ACQUISITION_RETRIES: usize = 8;
+        let failures = ACQUISITION_RETRIES * crate::shard_coord::CAS_RETRIES;
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (backend, flaky) = FlakyCas::wrap(mem, 70);
-        let (tm, tctx) = new_algo_from_backend(backend).await;
+        let (backend, flaky) = FlakyCas::wrap(mem, test_root_path().to_string(), failures);
+        Engine::prepare_permanent_collection(backend.as_ref(), TEST_DB)
+            .await
+            .unwrap();
+        let mut config = EngineConfig::default();
+        config.set_cache_size(1024);
+        config.set_retry_initial_interval(retry.initial_interval);
+        config.set_retry_max_interval(retry.max_interval);
+        let engine = Engine::open(
+            TEST_DB,
+            DatabaseId::from_bytes([7; 16]),
+            Arc::new(StatsBackend::new(backend)),
+            config,
+        )
+        .await
+        .unwrap();
         let keyp = key_ref(b"k");
         let keyp2 = key_ref(b"k2");
 
         // Seed the keys over a clean connection so their shards exist (the lock
         // CAS is then a `write_if`, the thing we fault).
-        commit_writes(&tm, vec![wa(&keyp, b"v1"), wa(&keyp2, b"v1")]).await;
+        let mut seed = engine.begin_transaction(
+            Data {
+                reads: Vec::new(),
+                writes: vec![wa(&keyp, b"v1"), wa(&keyp2, b"v1")],
+                scans: Vec::new(),
+            },
+            CollectionData::default(),
+        );
+        engine.commit(&mut seed).await.unwrap();
+        engine.end(&mut seed).await.unwrap();
 
         flaky.arm();
-        let mut h = begin_data(
-            &tm,
+        let mut h = engine.begin_transaction(
             Data {
                 reads: Vec::new(),
                 writes: vec![wa(&keyp, b"v2"), wa(&keyp2, b"v2")],
                 scans: Vec::new(),
             },
+            CollectionData::default(),
         );
         let id_before = h.id().clone();
-        tm.commit(&mut h)
+        engine
+            .commit(&mut h)
             .await
             .expect("commits despite sustained CAS contention");
         assert_eq!(
@@ -2748,19 +2812,38 @@ mod tests {
             id_before,
             "CAS contention retries under the same id (no renew)"
         );
-        tm.end(&mut h).await.unwrap();
+        engine.end(&mut h).await.unwrap();
 
         // The whole budget was consumed, so the transaction did exhaust the
         // serial CAS budget (the `Conflict` path), not merely time out in
         // parallel mode.
         assert_eq!(flaky.remaining(), 0, "expected sustained CAS contention");
+        let attempts = flaky.attempts();
+        assert!(attempts.len() > failures);
+        let acquisition_gaps: Vec<_> = (1..=ACQUISITION_RETRIES)
+            .map(|round| {
+                let next = round * crate::shard_coord::CAS_RETRIES;
+                attempts[next].duration_since(attempts[next - 1])
+            })
+            .collect();
+        assert!(
+            acquisition_gaps[0] >= Duration::from_millis(5)
+                && acquisition_gaps[0] <= Duration::from_millis(16),
+            "configured initial acquisition delay was {:?}",
+            acquisition_gaps[0]
+        );
+        for delay in &acquisition_gaps[ACQUISITION_RETRIES - 2..] {
+            assert!(
+                *delay >= Duration::from_millis(10) && *delay <= Duration::from_millis(31),
+                "configured capped acquisition delay was {delay:?}"
+            );
+        }
         // It still committed: the shards point at our writer with no live lock.
-        let e = entry(&tctx, b"k").await.unwrap();
-        assert_eq!(e.current.writer(), Some(&id_before));
-        assert!(e.lock_holders().is_empty());
-        let e2 = entry(&tctx, b"k2").await.unwrap();
-        assert_eq!(e2.current.writer(), Some(&id_before));
-        assert!(e2.lock_holders().is_empty());
+        for key in [&keyp, &keyp2] {
+            let read = engine.read(key, Duration::ZERO).await.unwrap();
+            assert_eq!(read.value.unwrap().value.as_ref(), b"v2");
+        }
+        engine.shutdown().await;
     }
 
     // A value the inline per-value budget rejects, so its transaction takes the

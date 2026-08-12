@@ -219,3 +219,23 @@ working document and is intentionally not committed with these changes.
   ending each replayed handle before asserting its transaction object remains
   absent, preserving the stronger long-term interface behavior without exposing
   state-machine shape.
+
+## F20-B — Inject configured acquisition backoff
+
+- `Algo` now retains the engine's configured retry policy as a factory for each
+  transaction's same-identity lock-acquisition schedule. A new attempt starts
+  from that policy, while wound renewal continues carrying the already-advanced
+  schedule instead of resetting it.
+- The only consumers remain the existing conflict and leaf-capacity retry
+  branches, after partial-lock release and after the capacity timeout check.
+  First acquisition, successful acquisition, deadlock escalation, genuine
+  wounds, optimistic validation, direct replay, and other independently owned
+  coordination schedules are unchanged.
+- The existing paused-time sustained-CAS regression now opens a real `Engine`
+  with a ten-to-twenty millisecond policy, observes the first and capped
+  acquisition gaps at exhausted coordinator rounds, and retains its same-ID and
+  converged-value assertions. Jitter is checked by documented bands rather than
+  exact timing; no second internal backoff test was added.
+- Builder documentation now includes same-identity lock reacquisition in the
+  existing retry options. Defaults, persistent bytes, backend-operation order,
+  retry classification, and random draws on contention-free paths are unchanged.
