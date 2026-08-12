@@ -778,3 +778,27 @@ working document and is intentionally not committed with these changes.
   admissible errors, crash/restart, slow mutations, and PCT schedules. No
   persistent bytes, entropy draw, spawn order, public API, dependency, or ADR
   changed, and the implementation does not deviate from F29-J.
+
+## F29-K — Extract the API oracle
+
+- Moved final key and collection-catalog reads, reachable-state comparison, and
+  their existing panic diagnostics into the private `sim::api::oracle` module.
+  `ApiWorkload::verify` now delegates only the database, model account, and
+  client count; the verifier has no program-generation or action-execution
+  responsibility.
+- Moved the read-only collection observation helpers shared by per-action
+  validation and final verification into a neutral `sim::api::observation`
+  module. This avoids coupling the F29-J executor to the final oracle while
+  retaining every direct/path existence check, listing check, backend call,
+  await point, and error classification in its original order.
+- Added one durable oracle unit test covering both a reachable state and an
+  intentionally corrupted model. The corrupted fixture pins the complete
+  pre-extraction diagnostic, including client identity, observed state, and
+  reachable state set; no migration-only test or duplicate integration fixture
+  was added.
+- The nine API simulation tests, reviewed tape-trace baseline, and all 1,509
+  committed `api_correctness` corpus inputs pass unchanged. Native and
+  simulation-targeted clippy checks also pass. No generated program, action
+  result, final verdict, persistent byte, entropy draw, spawn order, public API,
+  dependency, or ADR changed, and the implementation does not deviate from
+  F29-K.

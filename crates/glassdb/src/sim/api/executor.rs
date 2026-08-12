@@ -7,12 +7,13 @@ use crate::{Collection, CollectionPath, Database, Error, Transaction};
 use super::model::{
     ApiModel, expected_catalog_states, expected_collection_states, possible_values,
 };
+use super::observation::{api_collection_name, inspect_collection, read_collection_value};
 use super::{
     API_COLLECTION, API_COLLECTION_SLOTS, API_COLLECTION_VALUE_KEY, API_KEYS,
-    API_NESTED_COLLECTION, ApiAction, ApiTransaction, api_collection_name, api_invariant_error,
-    api_invariant_message, check_api_invariant, inspect_collection, key_name,
-    read_collection_value,
+    API_NESTED_COLLECTION, ApiAction, ApiTransaction, api_invariant_error, api_invariant_message,
+    check_api_invariant,
 };
+use crate::sim::key_name;
 
 /// Definite outcome of one API transaction program.
 pub(super) enum StepResult {
