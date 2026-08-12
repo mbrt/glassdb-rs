@@ -152,3 +152,20 @@ working document and is intentionally not committed with these changes.
   long-term coverage for absent roots/targets and dangling links. One compact
   interface test now pins those results, the asymmetric errors, and the absence
   of a direct target read.
+
+## F17-D — Extract `LeafChain`
+
+- Added a private sibling-chain context that owns the router, typed collection
+  address, and requirement. `next_leaf`, bounded leaf enumeration, and full leaf
+  enumeration now share one successor load and one collection loop.
+- Inclusive-bound ownership is checked before loading a successor, so bounded
+  scans still avoid reading beyond their terminal leaf. Cache-hit evidence is
+  ANDed through the bootstrap and every sibling, and invalid or dangling links
+  retain their prior errors.
+- Point-key grouping intentionally remains independent per-key descent: changing
+  it to a sibling scan would alter mixed-collection ordering, observation timing,
+  and backend operations. Existing scan consumers already use the migrated
+  bounded/full interfaces.
+- No new tests were added. The committed F17-A matrix already owns three-leaf
+  order, middle-bound/no-prefetch, warm/cold cumulative evidence, stale-link, and
+  absence behavior.

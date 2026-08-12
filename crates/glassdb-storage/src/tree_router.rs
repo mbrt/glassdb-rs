@@ -243,6 +243,62 @@ impl DescentStop for FindParent {
     }
 }
 
+/// Walks retained leaf locators through their right-sibling links.
+struct LeafChain<'a> {
+    router: &'a TreeRouter,
+    collection: &'a CollectionAddress,
+    requirement: Requirement,
+}
+
+impl<'a> LeafChain<'a> {
+    fn new(
+        router: &'a TreeRouter,
+        collection: &'a CollectionAddress,
+        requirement: Requirement,
+    ) -> Self {
+        LeafChain {
+            router,
+            collection,
+            requirement,
+        }
+    }
+
+    async fn successor(&self, leaf: &LeafLocator) -> Result<Option<LeafLocator>, StorageError> {
+        let Some(token) = leaf.node().and_then(Node::right_sibling) else {
+            return Ok(None);
+        };
+        let token = node_token(token)?;
+        Ok(Some(
+            self.router
+                .load_child(self.collection, &token, self.requirement)
+                .await?
+                .after(leaf.cache_hit)
+                .into_locator(),
+        ))
+    }
+
+    async fn collect_through(
+        &self,
+        mut leaf: LeafLocator,
+        end: Option<&[u8]>,
+    ) -> Result<Vec<LeafLocator>, StorageError> {
+        let mut out = Vec::new();
+        loop {
+            let done = end.is_some_and(|end| leaf.node().is_some_and(|node| node.owns(end)));
+            let next = if done {
+                None
+            } else {
+                self.successor(&leaf).await?
+            };
+            out.push(leaf);
+            match next {
+                Some(right) => leaf = right,
+                None => return Ok(out),
+            }
+        }
+    }
+}
+
 /// Descends and scans a collection's B-link tree.
 #[derive(Clone)]
 pub struct TreeRouter {
@@ -292,16 +348,9 @@ impl TreeRouter {
         leaf: &LeafLocator,
         requirement: Requirement,
     ) -> Result<Option<LeafLocator>, StorageError> {
-        let Some(token) = leaf.node().and_then(Node::right_sibling) else {
-            return Ok(None);
-        };
-        let token = node_token(token)?;
-        Ok(Some(
-            self.load_child(collection, &token, requirement)
-                .await?
-                .after(leaf.cache_hit)
-                .into_locator(),
-        ))
+        LeafChain::new(self, collection, requirement)
+            .successor(leaf)
+            .await
     }
 
     /// Returns the leaves from the one owning `start` through the one owning
@@ -313,23 +362,12 @@ impl TreeRouter {
         end: Option<&[u8]>,
         requirement: Requirement,
     ) -> Result<Vec<LeafLocator>, StorageError> {
-        let Some(mut leaf) = self.first_leaf_at(collection, start, requirement).await? else {
+        let Some(first) = self.first_leaf_at(collection, start, requirement).await? else {
             return Err(StorageError::NotFound);
         };
-        let mut out = Vec::new();
-        loop {
-            let done = end.is_some_and(|end| leaf.node().is_some_and(|node| node.owns(end)));
-            let next = if done {
-                None
-            } else {
-                self.next_leaf(collection, &leaf, requirement).await?
-            };
-            out.push(leaf);
-            match next {
-                Some(right) => leaf = right,
-                None => return Ok(out),
-            }
-        }
+        LeafChain::new(self, collection, requirement)
+            .collect_through(first, end)
+            .await
     }
 
     /// Resolves the owning leaf while keeping interior-node currentness checks
@@ -388,27 +426,9 @@ impl TreeRouter {
         let Some(first) = self.leftmost_leaf(collection, requirement).await? else {
             return Ok(Vec::new());
         };
-        let mut out = Vec::new();
-        let mut cur = first;
-        loop {
-            let next = cur
-                .node()
-                .and_then(Node::right_sibling)
-                .map(node_token)
-                .transpose()?;
-            let cache_hit = cur.cache_hit;
-            out.push(cur);
-            match next {
-                Some(token) => {
-                    cur = self
-                        .load_child(collection, &token, requirement)
-                        .await?
-                        .after(cache_hit)
-                        .into_locator()
-                }
-                None => return Ok(out),
-            }
-        }
+        LeafChain::new(self, collection, requirement)
+            .collect_through(first, None)
+            .await
     }
 
     /// Routes `(key, payload)` items to their owning leaves, returning one
