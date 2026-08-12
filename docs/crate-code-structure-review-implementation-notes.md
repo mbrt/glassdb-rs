@@ -996,3 +996,27 @@ working document and is intentionally not committed with these changes.
 - No production dependency, public API, persistent byte, backend operation,
   retry policy, authentication behavior, or ADR changed. There were no
   deviations from the staged finding.
+## F25-B — Extract a validated lognormal latency distribution
+
+- Added the reusable `Lognormal` distribution and `LognormalError` beside the
+  backend latency middleware. Construction validates finite, non-negative
+  arithmetic mean/deviation pairs and rejects the impossible positive-deviation
+  zero-mean case and parameter combinations that overflow the derived normal
+  representation. Zero latency and positive fixed latency remain supported.
+- Sampling accepts an injected uniform random-bit source through `rand::Rng`.
+  The delay middleware supplies a small process-RNG adapter at the original
+  sampling point; it still uses `rand_distr::StandardNormal` and the same
+  parameter arithmetic, so source choice, Ziggurat draws, and their ordering are
+  unchanged. F25-C remains the sole owner of the deliberate source migration.
+- One compact seeded vector pins zero latency, zero deviation, representative
+  GCS/S3-shaped distributions, and the entropy state after all samples. A second
+  table covers every invalid-parameter class. The existing paused-time
+  integration test continues to prove that a fixed middleware latency advances
+  process model time by the configured duration.
+- Existing rate-limit validation precedence is retained. `DelayBackend::new`
+  now rejects the previously nonsensical `mean = 0, deviation > 0` latency while
+  every meaningful existing profile and operation path is unchanged. No extra
+  backend operation, retry, task, or entropy draw was added.
+- The reviewed tape and PCT trace digests remain byte-identical without a
+  baseline refresh. No dependency or persistent-format change and no ADR were
+  needed; there was no deviation from the staged plan.

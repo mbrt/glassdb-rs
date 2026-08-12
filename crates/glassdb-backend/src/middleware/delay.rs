@@ -8,11 +8,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use glassdb_concurr::rt::{self, Instant};
-use rand_distr::{Distribution, StandardNormal};
 
 use crate::{
     Backend, BackendError, ListCursor, ListLimit, ListPage, ListRequest, ReadReply, Version,
 };
+
+use super::latency::{Lognormal, LognormalError};
 
 /// Typical latency values observed with Google Cloud Storage.
 pub fn gcs_delays() -> DelayOptions {
@@ -134,6 +135,9 @@ pub struct DelayOptions {
 /// An invalid combination of delay and rate-limit options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DelayOptionsError {
+    /// An operation latency cannot form a lognormal distribution.
+    #[error("invalid latency: {0}")]
+    InvalidLatency(#[from] LognormalError),
     /// A prefix limit was enabled without selecting a prefix.
     #[error("prefix depth must be greater than zero when a prefix rate limit is enabled")]
     ZeroPrefixDepth,
@@ -176,26 +180,27 @@ impl DelayBackend {
                 Some(RateLimiter::new(rate, retry_delay))
             }
         };
+        let prefix_reads =
+            PrefixLimiter::from_limit(rate_limits.prefix_read_ps, rate_limits.prefix_depth)?;
+        let prefix_writes =
+            PrefixLimiter::from_limit(rate_limits.prefix_write_ps, rate_limits.prefix_depth)?;
+        let obj_read = latency_distribution(latency.obj_read)?;
+        let obj_write = latency_distribution(latency.obj_write)?;
+        let list = latency_distribution(latency.list)?;
 
         Ok(DelayBackend {
             inner,
-            obj_read: Lognormal::from_latency(latency.obj_read),
-            obj_write: Lognormal::from_latency(latency.obj_write),
-            list: Lognormal::from_latency(latency.list),
+            obj_read,
+            obj_write,
+            list,
             rlimit,
-            prefix_reads: PrefixLimiter::from_limit(
-                rate_limits.prefix_read_ps,
-                rate_limits.prefix_depth,
-            )?,
-            prefix_writes: PrefixLimiter::from_limit(
-                rate_limits.prefix_write_ps,
-                rate_limits.prefix_depth,
-            )?,
+            prefix_reads,
+            prefix_writes,
         })
     }
 
-    async fn delay(&self, ln: &Lognormal) {
-        let ms = ln.rand();
+    async fn delay(&self, distribution: &Lognormal) {
+        let ms = sample_process_rng(distribution);
         rt::sleep(secs_f64_or_zero(ms / 1_000.0)).await;
     }
 
@@ -292,39 +297,15 @@ impl Backend for DelayBackend {
     }
 }
 
-/// A lognormal distribution over operation durations, in milliseconds.
-#[derive(Debug, Clone, Copy)]
-struct Lognormal {
-    mu: f64,
-    sigma: f64,
+fn latency_distribution(latency: Latency) -> Result<Lognormal, DelayOptionsError> {
+    let mean_ms = latency.mean.as_secs_f64() * 1_000.0;
+    let standard_deviation_ms = latency.std_dev.as_secs_f64() * 1_000.0;
+    Lognormal::new(mean_ms, standard_deviation_ms).map_err(DelayOptionsError::from)
 }
 
-impl Lognormal {
-    /// Derives the lognormal parameters from a desired mean and standard
-    /// deviation (https://stats.stackexchange.com/a/95506).
-    fn from_latency(l: Latency) -> Self {
-        let mean = l.mean.as_secs_f64() * 1_000.0;
-        let std_dev = l.std_dev.as_secs_f64() * 1_000.0;
-        if mean <= 0.0 {
-            // A zero mean has no meaningful lognormal; yield a zero delay.
-            return Lognormal {
-                mu: f64::NEG_INFINITY,
-                sigma: 0.0,
-            };
-        }
-        let s_by_m = std_dev / mean;
-        let v = (s_by_m * s_by_m + 1.0).ln();
-        Lognormal {
-            mu: mean.ln() - 0.5 * v,
-            sigma: v.sqrt(),
-        }
-    }
-
-    /// Samples a duration in milliseconds.
-    fn rand(&self) -> f64 {
-        let n: f64 = StandardNormal.sample(&mut rand::rng());
-        (n * self.sigma + self.mu).exp()
-    }
+/// Samples with the process RNG until F25-C deliberately changes the source.
+fn sample_process_rng(distribution: &Lognormal) -> f64 {
+    distribution.sample(&mut rand::rng())
 }
 
 /// A per-object token-bucket rate limiter. Mirrors the Go `rateLimiter`,
