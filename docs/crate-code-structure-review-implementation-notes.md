@@ -694,3 +694,26 @@ working document and is intentionally not committed with these changes.
   and safe to run in parallel.
 - Production behavior, transaction-error handling, backend operations,
   persistent bytes, retries, randomness, and task lifetimes are unchanged.
+
+## F33-C — Move shutdown and cancellation tests and retire the monolith
+
+- Moved the remaining seven shutdown, cancellation, logless-abort, abandoned-
+  holder, and async-wound behaviors verbatim into `integration_shutdown` and
+  deleted the now-empty `tests/integration.rs` monolith. Test names, Tokio
+  attributes, comments, paused-clock choices, hook arm points, assertions, and
+  in-test task scheduling are unchanged.
+- The durable integration suite now consists of four focused targets: 15 basic
+  database/transaction tests, five statistics/diagnostics tests, 12 scan and
+  listing tests, and seven shutdown/cancellation tests. All behavior coverage
+  remains; no test was added, removed, merged, or renamed.
+- Package-wide Cargo discovery finds every one of the original 39 test names
+  exactly once, and attempting to select the retired `integration` target
+  fails. This was a one-time migration audit only; no name/count/location test
+  or auxiliary manifest machinery remains in the repository.
+- Each target passes independently, and all four also pass when launched as
+  concurrent test processes. Shared support is compiled target-locally, while
+  every test constructs its own in-memory backend, hook controls, channels,
+  and synchronization state; there is no cross-process mutable fixture.
+- This completes the behavior-oriented ownership change without modifying
+  production APIs, persistent bytes, backend operations, retry policy,
+  randomness, runtime task lifetimes, or shutdown/cancellation semantics.
