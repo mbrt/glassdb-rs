@@ -117,3 +117,20 @@ working document and is intentionally not committed with these changes.
   operation logs. The revised matrix uses independent rows, asserts every trace,
   and adds mixed-hit, bounded-chain, and observation-kind/membership checks
   identified across the two review rounds.
+
+## F17-B — Introduce `DescentCursor`
+
+- Added a private cursor that carries the typed collection prefix, current
+  requirement, location, observation, and route-wide cache-hit evidence.
+  Leaf lookup, optional bootstrap, leftmost descent, and terminal freshness now
+  share its root/right/child traversal.
+- `leaf_for_fresh` still descends interiors at its original requirement, reloads
+  only the exact terminal path when requirements differ, and resumes descent if
+  that refreshed node became an index. No public API or error classification
+  changed.
+- Topology queries retain only a thin cursor-normalization adapter until F17-C;
+  sibling-chain APIs remain deliberately unchanged for F17-D. The committed
+  F17-A matrix passed without modification.
+- Adversarial review found no semantic, currentness, cache-hit, or operation-
+  ordering issue. Its only finding was an avoidable temporary `String` allocation
+  on stale right hops; the cursor now parses the borrowed token directly.

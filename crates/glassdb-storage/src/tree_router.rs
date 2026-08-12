@@ -83,6 +83,105 @@ impl Located {
     }
 }
 
+/// Stateful keyed descent through one collection tree.
+struct DescentCursor<'a> {
+    router: &'a TreeRouter,
+    collection: &'a CollectionAddress,
+    requirement: Requirement,
+    current: Located,
+}
+
+impl<'a> DescentCursor<'a> {
+    fn new(
+        router: &'a TreeRouter,
+        collection: &'a CollectionAddress,
+        requirement: Requirement,
+        current: Located,
+    ) -> Self {
+        DescentCursor {
+            router,
+            collection,
+            requirement,
+            current,
+        }
+    }
+
+    fn into_current(self) -> Located {
+        self.current
+    }
+
+    fn into_locator(self) -> LeafLocator {
+        self.current.into_locator()
+    }
+
+    /// Moves right until the current node owns `key`.
+    async fn normalize_at(&mut self, key: &[u8]) -> Result<(), StorageError> {
+        while !self.current.node().owns(key) {
+            let Some(token) = self.current.node().right_sibling() else {
+                break;
+            };
+            let token = node_token(token)?;
+            let cache_hit = self.current.cache_hit;
+            self.current = self
+                .router
+                .load_child(self.collection, &token, self.requirement)
+                .await?
+                .after(cache_hit);
+        }
+        Ok(())
+    }
+
+    /// Normalizes at `key` and advances one index level, returning whether it
+    /// moved below an index.
+    async fn advance_for(&mut self, key: &[u8]) -> Result<bool, StorageError> {
+        self.normalize_at(key).await?;
+        let token = match self.current.node().body() {
+            NodeBody::Leaf(_) => return Ok(false),
+            NodeBody::Index(index) => node_token(
+                index
+                    .child_for(key)
+                    .ok_or_else(|| StorageError::other("descent reached an empty index node"))?,
+            )?,
+        };
+        let cache_hit = self.current.cache_hit;
+        self.current = self
+            .router
+            .load_child(self.collection, &token, self.requirement)
+            .await?
+            .after(cache_hit);
+        Ok(true)
+    }
+
+    /// Continues the keyed descent until it reaches a leaf.
+    async fn descend_to_leaf(mut self, key: &[u8]) -> Result<Self, StorageError> {
+        while self.advance_for(key).await? {}
+        Ok(self)
+    }
+
+    /// Reloads the exact current path at a new requirement without losing the
+    /// hit state accumulated along the route.
+    async fn reload_current(&mut self, requirement: Requirement) -> Result<(), StorageError> {
+        let path = self.current.path.clone();
+        let cache_hit = self.current.cache_hit;
+        let observation = self
+            .router
+            .nodes
+            .load_node_at_state(&path, requirement)
+            .await?;
+        if observation.is_absent() {
+            return Err(StorageError::other("tree node vanished during descent"));
+        }
+        self.current = Located {
+            path,
+            cache_hit: observation.cache_hit(),
+            observation,
+        }
+        .after(cache_hit);
+        self.requirement = requirement;
+        Ok(())
+    }
+}
+
 /// Descends and scans a collection's B-link tree.
 #[derive(Clone)]
 pub struct TreeRouter {
@@ -105,23 +204,10 @@ impl TreeRouter {
         key: &[u8],
         requirement: Requirement,
     ) -> Result<LeafLocator, StorageError> {
-        let path = ObjectPath::TreeRoot {
-            collection: collection.clone(),
-        };
-        let observation = self.nodes.load_root_state(collection, requirement).await?;
-        let cache_hit = observation.cache_hit();
-        if observation.is_absent() {
-            return Err(StorageError::NotFound);
-        }
-        let cur = Located {
-            path,
-            cache_hit,
-            observation,
-        };
-        Ok(self
-            .descend_to_leaf(collection, cur, key, requirement)
+        self.leaf_cursor(collection, key, requirement)
             .await?
-            .into_locator())
+            .map(DescentCursor::into_locator)
+            .ok_or(StorageError::NotFound)
     }
 
     /// Returns the existing leaf that owns `key`, or `None` when the collection
@@ -132,23 +218,10 @@ impl TreeRouter {
         key: &[u8],
         requirement: Requirement,
     ) -> Result<Option<LeafLocator>, StorageError> {
-        let path = ObjectPath::TreeRoot {
-            collection: collection.clone(),
-        };
-        let observation = self.nodes.load_root_state(collection, requirement).await?;
-        if observation.is_absent() {
-            return Ok(None);
-        }
-        let cur = Located {
-            path,
-            cache_hit: observation.cache_hit(),
-            observation,
-        };
-        Ok(Some(
-            self.descend_to_leaf(collection, cur, key, requirement)
-                .await?
-                .into_locator(),
-        ))
+        Ok(self
+            .leaf_cursor(collection, key, requirement)
+            .await?
+            .map(DescentCursor::into_locator))
     }
 
     /// Returns the right sibling of `leaf`, or `None` for the rightmost leaf.
@@ -213,21 +286,21 @@ impl TreeRouter {
         interior: Requirement,
         leaf: Requirement,
     ) -> Result<LeafLocator, StorageError> {
-        let loc = self.leaf_for(collection, key, interior).await?;
+        let mut cursor = self
+            .leaf_cursor(collection, key, interior)
+            .await?
+            .ok_or(StorageError::NotFound)?;
         // The same requirement needs no terminal refresh.
         if interior == leaf {
-            return Ok(loc);
+            return Ok(cursor.into_locator());
         }
         // Check the terminal node at the stricter requirement and resume the
         // descent from it: the cached interior read may have routed us to `_r`
         // as a leaf while a concurrent split has since rewritten `_r` into an
         // index (or split the leaf), so we must keep descending — never hand
         // back an index masquerading as a leaf.
-        let located = self.reload(&loc.path, leaf).await?.after(loc.cache_hit);
-        Ok(self
-            .descend_to_leaf(collection, located, key, leaf)
-            .await?
-            .into_locator())
+        cursor.reload_current(leaf).await?;
+        Ok(cursor.descend_to_leaf(key).await?.into_locator())
     }
 
     /// Returns the leftmost leaf of the collection, or `None` if the collection
@@ -237,38 +310,10 @@ impl TreeRouter {
         collection: &CollectionAddress,
         requirement: Requirement,
     ) -> Result<Option<LeafLocator>, StorageError> {
-        let path = ObjectPath::TreeRoot {
-            collection: collection.clone(),
-        };
-        let observation = self.nodes.load_root_state(collection, requirement).await?;
-        if observation.is_absent() {
-            return Ok(None);
-        }
-        let mut cur = Located {
-            path,
-            cache_hit: observation.cache_hit(),
-            observation,
-        };
-        loop {
-            match cur.node().body() {
-                NodeBody::Leaf(_) => return Ok(Some(cur.into_locator())),
-                NodeBody::Index(index) => {
-                    let token = index
-                        .children()
-                        .next()
-                        .map(|(_, token)| node_token(token))
-                        .transpose()?
-                        .ok_or_else(|| {
-                            StorageError::other("descent reached an empty index node")
-                        })?;
-                    let cache_hit = cur.cache_hit;
-                    cur = self
-                        .load_child(collection, &token, requirement)
-                        .await?
-                        .after(cache_hit);
-                }
-            }
-        }
+        Ok(self
+            .leaf_cursor(collection, b"", requirement)
+            .await?
+            .map(DescentCursor::into_locator))
     }
 
     /// Collects every leaf of the collection in key order, following the leaf
@@ -385,7 +430,7 @@ impl TreeRouter {
         };
         loop {
             cur = match self
-                .step_right_until_owns(collection, cur, key, requirement)
+                .normalize_current(collection, cur, key, requirement)
                 .await
             {
                 Ok(cur) => cur,
@@ -437,7 +482,7 @@ impl TreeRouter {
         let mut parent: Option<Located> = None;
         loop {
             cur = self
-                .step_right_until_owns(collection, cur, key, requirement)
+                .normalize_current(collection, cur, key, requirement)
                 .await?;
             let token = match cur.node().body() {
                 NodeBody::Leaf(_) => return Ok(parent.map(Located::into_locator)),
@@ -456,63 +501,54 @@ impl TreeRouter {
         }
     }
 
-    /// Descends from `cur` to the leaf that owns `key`: at each level step right
-    /// to the owning node, then follow the index child pointer, until a leaf is
-    /// reached. Self-correcting through right-links, so a stale interior read
-    /// never traps the descent at the wrong node — and, crucially, a node that
-    /// turns out to be an index (e.g. a freshly checked `_r` that split into one) is
-    /// resolved to its child rather than returned as a leaf.
-    async fn descend_to_leaf(
-        &self,
-        collection: &CollectionAddress,
-        mut cur: Located,
-        key: &[u8],
+    async fn start_descent<'a>(
+        &'a self,
+        collection: &'a CollectionAddress,
         requirement: Requirement,
-    ) -> Result<Located, StorageError> {
-        loop {
-            cur = self
-                .step_right_until_owns(collection, cur, key, requirement)
-                .await?;
-            match cur.node().body() {
-                NodeBody::Leaf(_) => return Ok(cur),
-                NodeBody::Index(index) => {
-                    let token = node_token(index.child_for(key).ok_or_else(|| {
-                        StorageError::other("descent reached an empty index node")
-                    })?)?;
-                    let cache_hit = cur.cache_hit;
-                    cur = self
-                        .load_child(collection, &token, requirement)
-                        .await?
-                        .after(cache_hit);
-                }
-            }
+    ) -> Result<Option<DescentCursor<'a>>, StorageError> {
+        let observation = self.nodes.load_root_state(collection, requirement).await?;
+        if observation.is_absent() {
+            return Ok(None);
         }
+        let current = Located {
+            path: ObjectPath::TreeRoot {
+                collection: collection.clone(),
+            },
+            cache_hit: observation.cache_hit(),
+            observation,
+        };
+        Ok(Some(DescentCursor::new(
+            self,
+            collection,
+            requirement,
+            current,
+        )))
     }
 
-    /// Follows right-sibling links until the current node owns `key` (its
-    /// high-key is above `key`). The rightmost node owns everything up to
-    /// +infinity, so a node with no right sibling always terminates the walk.
-    async fn step_right_until_owns(
+    async fn leaf_cursor<'a>(
+        &'a self,
+        collection: &'a CollectionAddress,
+        key: &[u8],
+        requirement: Requirement,
+    ) -> Result<Option<DescentCursor<'a>>, StorageError> {
+        let Some(cursor) = self.start_descent(collection, requirement).await? else {
+            return Ok(None);
+        };
+        Ok(Some(cursor.descend_to_leaf(key).await?))
+    }
+
+    // Topology queries retain their stopping policies until F17-C; this keeps
+    // their only right-hop operation shared with ordinary keyed descent.
+    async fn normalize_current(
         &self,
         collection: &CollectionAddress,
-        mut cur: Located,
+        current: Located,
         key: &[u8],
         requirement: Requirement,
     ) -> Result<Located, StorageError> {
-        while !cur.node().owns(key) {
-            match cur.node().right_sibling() {
-                Some(token) => {
-                    let token = node_token(token)?;
-                    let cache_hit = cur.cache_hit;
-                    cur = self
-                        .load_child(collection, &token, requirement)
-                        .await?
-                        .after(cache_hit);
-                }
-                None => break,
-            }
-        }
-        Ok(cur)
+        let mut cursor = DescentCursor::new(self, collection, requirement, current);
+        cursor.normalize_at(key).await?;
+        Ok(cursor.into_current())
     }
 
     async fn load_child(
@@ -530,25 +566,6 @@ impl TreeRouter {
                 collection: collection.clone(),
                 token: token.clone(),
             },
-            cache_hit: observation.cache_hit(),
-            observation,
-        })
-    }
-
-    /// Re-reads the node at `path` (the root `_r` or a standalone `_n`) at
-    /// `requirement`, for checking a terminal leaf reached through a cached
-    /// interior descent.
-    async fn reload(
-        &self,
-        path: &ObjectPath,
-        requirement: Requirement,
-    ) -> Result<Located, StorageError> {
-        let observation = self.nodes.load_node_at_state(path, requirement).await?;
-        if observation.is_absent() {
-            return Err(StorageError::other("tree node vanished during descent"));
-        }
-        Ok(Located {
-            path: path.clone(),
             cache_hit: observation.cache_hit(),
             observation,
         })
