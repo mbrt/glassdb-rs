@@ -94,3 +94,26 @@ working document and is intentionally not committed with these changes.
 - The architecture module inventory now identifies the extracted recovery owner.
   No ADR was added because this extraction changes neither protocol nor external
   architectural contract.
+
+## F17-A — Add the traversal matrix
+
+- Added a test-only routing matrix for stale roots, stale leaf parents, interior
+  right hops, and sibling-chain traversal before changing production traversal.
+  All public `TreeRouter` entry points are covered where the topology applies.
+- Independent cache views and exact ordered backend traces pin cold reads, warm
+  zero-read routing, conditional freshness checks, terminal-only fresh routing,
+  and cumulative cache-hit evidence. Complementary warm-prefix/cold-right and
+  cold-prefix/warm-terminal cases prove every visit is ANDed and a later hit
+  cannot erase an earlier miss.
+- A three-leaf chain pins complete sibling order and inclusive middle-bound
+  stopping without reading past the bound. `next_leaf`, which starts from a
+  retained locator rather than a root descent, has direct right-link freshness,
+  cumulative-hit, and malformed-reference coverage.
+- The broader matrix replaced narrower stale-parent, stale-root, leaf-order,
+  interior-freshness, and ordinary parent-lookup tests. The router suite now has
+  nine tests rather than ten; distinct single-root, absence, separator-boundary,
+  grouping-order, classification, and single-leaf-parent contracts remain.
+- The first adversarial review rejected shared warm-cache rows and discarded
+  operation logs. The revised matrix uses independent rows, asserts every trace,
+  and adds mixed-hit, bounded-chain, and observation-kind/membership checks
+  identified across the two review rounds.
