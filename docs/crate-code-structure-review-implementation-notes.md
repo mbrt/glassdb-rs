@@ -811,3 +811,103 @@ working document and is intentionally not committed with these changes.
   intended additive API. No ADR was added because this centralizes an existing
   runtime policy rather than selecting a new one; there were no deviations from
   the staged finding.
+## F32-A — Extract mixed benchmark options and dimensions
+
+- Moved the mixed scenario's Clap arguments, defaults, validation, contention
+  mode parsing, and mode-by-affinity cell enumeration into `mixed/options.rs`.
+  The scenario runner now consumes the resulting ordered dimensions and still
+  performs the same setup and execution for each cell.
+- Cell generation remains mode-major and affinity-minor, retaining both the
+  caller-provided order and any repeated values. Validation still runs before
+  mode parsing and before the invocation timestamp is generated, so invalid
+  configurations retain the existing error precedence and cause no scenario-cell
+  or backend-operation effects after factory initialization.
+- Added one table-driven snapshot test for the default sweep and a representative
+  explicitly reordered sweep, plus one table-driven test covering the existing
+  validation rules through parsed CLI arguments. These are durable option and
+  cell-order contracts rather than migration-only parity tests.
+- No setup, settlement, worker selection, random draws, database naming, metrics,
+  output schema, backend operations, or task scheduling changed. Results,
+  scenario phases, and workloads intentionally remain in `mixed.rs` for F32-B
+  through F32-D.
+
+## F32-B — Extract mixed benchmark results and reporting
+
+- Moved shape latency and throughput summaries, database-counter aggregation,
+  normalized operation/protocol metrics, serialized result types, and the three
+  mixed progress/status line formatters into `mixed/result.rs`. The scenario
+  passes owned timing snapshots and post-shutdown counter deltas across this
+  boundary; measurement and shutdown ordering are unchanged.
+- The result module retains logical committed samples as every per-transaction
+  metric's denominator while reporting physical `Database::tx` attempts
+  separately. Empty sample sets, zero protocol denominators, confidence-target
+  classification, percentile interpolation, millisecond conversion, and
+  settlement-duration saturation retain their previous behavior. Timing
+  snapshots are reduced lazily, preserving the previous one-shape-at-a-time
+  peak sample-vector memory.
+- Replaced the two narrow counter tests with one fixed-sample snapshot through
+  the same `Serialize`-to-`serde_json::Value` path used by `perfbench`. It pins
+  shape ordering, latency summaries, convergence, every serialized field and
+  aggregate metric, including a wholly empty cell whose zero-denominator metrics
+  must remain finite valid JSON. A second compact snapshot pins the existing
+  progress, capped-cell, and setup-settlement text byte-for-byte.
+- No CLI behavior, cell order, setup, settlement, worker selection, random
+  draws, database naming, backend operations, result values, serialized schema,
+  task scheduling, or stderr text changed. Scenario setup and workload execution
+  intentionally remain in `mixed.rs` for F32-C and F32-D.
+
+## F32-C — Extract mixed benchmark setup and settlement
+
+- Added `mixed/setup.rs` with explicit prepare, begin-measurement, and teardown
+  phases. Preparation builds the same collection paths, seeds the same fixed
+  values in batches of 100, waits for the completed-split counter to stay quiet,
+  shuts down the throwaway setup Database, then opens every collection on the
+  ordered measurement clients.
+- `run_cell` still builds its unchanged shape plans after collection opening.
+  Only then does `begin_measurement` capture client statistics, immediately
+  before the existing benchmark timers start. This retains the original counter
+  window and keeps all setup reads and structural convergence outside results.
+- Teardown still ends timers first, uses the worker drain deadline for concurrent
+  Database shutdown, gives a worker failure precedence over a simultaneous
+  shutdown failure, and reads counter deltas only after successful shutdown.
+  Collection handles remain alive through shutdown as before, and setup-error
+  paths retain their drop-based cancellation behavior.
+- Moved the existing deterministic quiet-period reset test alongside the phase
+  and extended it with the inclusive timeout boundary. Added one real
+  `MemoryBackend` lifecycle test that verifies each measurement client opens both
+  seeded collections, every collection contains the configured three keys, and
+  a retained client clone rejects work after teardown. No mock lifecycle or
+  migration-only parity suite was added.
+- CLI behavior, cell order, seeding transaction order, setup and measured backend
+  operations, error precedence, database naming, random draws, worker tasks,
+  metrics, serialized output, and status text are unchanged. Workload selection
+  and execution intentionally remain in `mixed.rs` for F32-D.
+
+## F32-D — Extract mixed benchmark workload execution
+
+- Added `mixed/workload.rs` as the single owner of shape order, worker-slot
+  distribution, deterministic worker seeds, collection/key selection, worker
+  loops, transaction bodies, and adaptive stopping. `run_cell` now contains only
+  setup, measurement bracketing, worker orchestration, teardown, and reporting.
+- The extraction preserves shape-major/database-major/worker-major spawn order,
+  the initial seed and increment, both collection-selection draws at every
+  affinity, sorted distinct key selection, and the existing read-only versus
+  read-modify-write transaction bodies. Selection remains outside the measured
+  closure, and one successful logical transaction still records one sample.
+- Setup completion and statistics baselines still precede timer start; timers
+  still end before teardown; the shared drain deadline, worker-error precedence,
+  convergence/cap behavior, counter deltas, and serialized/text results are
+  unchanged.
+- The existing affinity test was folded into one deterministic worker-contract
+  test driven by the production worker-spec sequencer. It freezes the complete
+  shape/database/worker seed order for a multi-database plan, representative
+  collection/key vectors, and one successful sample per shape in reporting
+  order. No old-versus-new migration harness or duplicate end-to-end benchmark
+  was kept.
+- Retired the exact stderr-line snapshot at the documented F32-D endpoint.
+  Configuration, dimension ordering, metrics, and serialized-schema snapshots
+  remain as long-term contracts; the human-readable progress wording is not a
+  public interface and remains covered by its ordinary scenario call sites.
+- No public API, database operation, persistent byte, retry, random draw, task
+  count/order, metric, or CLI behavior changed. No deviation from the plan or
+  architecture decision was required.
