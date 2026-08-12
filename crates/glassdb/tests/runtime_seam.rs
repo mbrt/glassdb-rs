@@ -93,7 +93,7 @@ fn is_allowed_runtime_use(path: &Path, pattern: &str) -> bool {
 }
 
 fn is_s3_drop_deadline_use(path: &Path, lines: &[&str], index: usize, pattern: &str) -> bool {
-    path.ends_with("crates/glassdb-backend-s3/src/fake_server.rs")
+    path.ends_with("crates/glassdb-backend-s3/src/fake_server/lifecycle.rs")
         && pattern == "std::time::Instant::now("
         && lines.get(index.wrapping_sub(1)).map(|line| line.trim())
             == Some("fn drop_deadline_now() -> std::time::Instant {")
@@ -163,7 +163,7 @@ fn unreviewed_tokio_apis_are_forbidden_by_default() {
         "std::thread"
     ));
 
-    let fake_path = Path::new("crates/glassdb-backend-s3/src/fake_server.rs");
+    let fake_path = Path::new("crates/glassdb-backend-s3/src/fake_server/lifecycle.rs");
     let approved = [
         "fn drop_deadline_now() -> std::time::Instant {",
         "    std::time::Instant::now()",
@@ -262,10 +262,14 @@ fn sim_controlled_code_uses_only_reviewed_runtime_apis() {
 #[test]
 fn synthetic_s3_time_uses_the_model_time_seam() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let files = [
+    let mut files = vec![
         workspace.join("crates/glassdb-backend-s3/src/lib.rs"),
         workspace.join("crates/glassdb-backend-s3/src/fake_server.rs"),
     ];
+    collect_rs_files(
+        &workspace.join("crates/glassdb-backend-s3/src/fake_server"),
+        &mut files,
+    );
     let timing = [
         "tokio::time",
         "SystemTime::now(",

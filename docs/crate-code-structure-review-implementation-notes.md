@@ -1319,3 +1319,37 @@ working document and is intentionally not committed with these changes.
   doctest, S3 all-target/all-feature clippy, and the perfbench build/clippy pass;
   no dependency version, persistent format, or ADR changed. F26-B's internal
   responsibility split remains untouched.
+## F26-B — Split S3 fake responsibilities
+
+- Reduced `fake_server.rs` to the documented facade, public options and default
+  entropy seed, and the existing `FakeS3` re-export. The implementation is now
+  divided into private `lifecycle`, `routing`, `parsing`, `state`, `faults`, and
+  `latency` modules along the finding's responsibility boundaries.
+- Lifecycle retains the dedicated runtime and thread, socket accept loop,
+  connection accounting, shutdown and bounded-drop order, SDK client wiring,
+  and model-time adapters. Routing retains request-body collection, key/list
+  classification, latency placement, object-operation dispatch, lost-ack
+  placement, and byte-for-byte response construction. Parsing owns only header,
+  query, continuation-token, percent-decoding, and XML helpers. The object store
+  owns lookup and conditional-read decisions, conditional put/delete state
+  transitions, content-derived ETags, and list selection/pagination; the fault
+  module owns the same independent injection counters.
+- The first review exposed that merely moving the object structs and mutex left
+  their policy in routing. The corrected boundary uses typed state outcomes and
+  read/list rendering views: response construction remains in routing while the
+  object lock is held for exactly the same interval, without snapshot clones.
+  Successful mutations return only after releasing that lock, before routing
+  consumes the lost-ack counter, preserving the durability/fault boundary.
+- The runtime-seam audit now scans both the facade and every Rust file beneath
+  the fake-server module directory. Its defensive cleanup exception follows
+  `drop_deadline_now` into `lifecycle.rs` and still requires exactly one
+  reviewed host-time deadline; all request latency remains on model time.
+- No parity or migration-only test was added. The durable seeded-latency test
+  moved with its implementation, while the existing 30-test S3 behavior and
+  lifecycle suite and doctest continue to exercise the public facade and real
+  SDK transport. Focused fake-feature compilation, the runtime-seam tests, and
+  S3 all-target/all-feature clippy also pass.
+- Public and crate-visible paths and signatures, wire bytes, status and header
+  choices, state/fault lock boundaries, entropy draw order, await and spawn
+  order, listen/drop constants, dependency versions, and persistent formats are
+  unchanged. There was no deviation from F26-B and no ADR was warranted.
