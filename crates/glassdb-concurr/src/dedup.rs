@@ -110,9 +110,10 @@ struct KeyQueue<R, E> {
     reorderable: VecDeque<Member<R, E>>,
     /// FIFO submissions waiting their turn.
     fifo: VecDeque<Member<R, E>>,
-    /// The merged request for the current batch (kept valid: seeded on creation,
-    /// recomputed on every reconstruction).
-    merged: R,
+    /// The merged request for the current batch. Starting a round moves it into
+    /// that driver's handle as stale/close/liveness fallback; the next refresh
+    /// recomputes it from the still-owned batch.
+    merged: Option<R>,
 }
 
 impl<R, E> KeyQueue<R, E>
@@ -126,7 +127,7 @@ where
             batch: vec![seed],
             reorderable: VecDeque::new(),
             fifo: VecDeque::new(),
-            merged,
+            merged: Some(merged),
         }
     }
 
@@ -141,29 +142,43 @@ where
 
     /// Drops members whose callers are no longer interested without disturbing
     /// the order of the survivors.
-    fn prune(&mut self) {
-        self.batch.retain(|member| member.live());
-        self.reorderable.retain(|member| member.live());
-        self.fifo.retain(|member| member.live());
+    fn prune(&mut self, discarded: &mut Vec<Member<R, E>>) {
+        discarded.extend(self.batch.extract_if(.., |member| !member.live()));
+        Self::prune_queue(&mut self.reorderable, discarded);
+        Self::prune_queue(&mut self.fifo, discarded);
+    }
+
+    fn prune_queue(queue: &mut VecDeque<Member<R, E>>, discarded: &mut Vec<Member<R, E>>) {
+        let count = queue.len();
+        for _ in 0..count {
+            let member = queue
+                .pop_front()
+                .expect("dedup: queue changed while pruning");
+            if member.live() {
+                queue.push_back(member);
+            } else {
+                discarded.push(member);
+            }
+        }
     }
 
     /// Reports whether a future batch has queued work.
-    fn has_incoming_live(&mut self) -> bool {
-        self.prune();
+    fn has_incoming_live(&mut self, discarded: &mut Vec<Member<R, E>>) -> bool {
+        self.prune(discarded);
         !self.reorderable.is_empty() || !self.fifo.is_empty()
     }
 
     /// Refreshes the active batch with compatible queued work. An empty active
     /// batch stays empty so its in-flight operation can be cancelled before a
     /// queued seed starts a fresh round.
-    fn refresh_batch(&mut self) -> bool {
-        self.prune();
+    fn refresh_batch(&mut self, discarded: &mut Vec<Member<R, E>>) -> bool {
+        self.prune(discarded);
         self.merge_compatible()
     }
 
     /// Forms the batch for a worker round, preferring the FIFO front as its seed.
-    fn form_batch(&mut self) -> bool {
-        self.prune();
+    fn form_batch(&mut self, discarded: &mut Vec<Member<R, E>>) -> bool {
+        self.prune(discarded);
         if self.batch.is_empty() {
             let seed = self
                 .fifo
@@ -175,7 +190,7 @@ where
         }
         // Preserve the second liveness boundary before a round starts: a
         // promoted caller can disappear while the queue is being rebuilt.
-        self.refresh_batch()
+        self.refresh_batch(discarded)
     }
 
     /// Recomputes the merged request and absorbs compatible queued work.
@@ -222,29 +237,27 @@ where
             );
         }
 
-        self.merged = merged;
+        self.merged = Some(merged);
         true
     }
 
-    /// Delivers a result to the active batch and returns its member count.
-    fn close_batch(&mut self, res: &Result<(), Arc<E>>) -> usize {
-        let delivered = self.batch.len();
-        for member in self.batch.drain(..) {
-            let _ = member.done.send(res.clone());
-        }
-        delivered
+    /// Moves out the active batch so delivery can drain and return its
+    /// allocation after releasing the shard lock.
+    fn take_batch(&mut self) -> Vec<Member<R, E>> {
+        std::mem::take(&mut self.batch)
     }
 
     /// Abandons an active batch after every member has stopped waiting.
-    fn abandon_batch(&mut self) {
-        self.batch.clear();
+    fn abandon_batch(&mut self, discarded: &mut Vec<Member<R, E>>) {
+        discarded.append(&mut self.batch);
     }
 
     /// Returns live undelivered members to the queues for a successor driver.
-    fn requeue_batch(&mut self) {
+    fn requeue_batch(&mut self, discarded: &mut Vec<Member<R, E>>) {
         let mut strict = VecDeque::new();
         for member in self.batch.drain(..) {
             if !member.live() {
+                discarded.push(member);
                 continue;
             }
             if member.request.can_reorder() {
@@ -257,8 +270,14 @@ where
         self.fifo = strict;
     }
 
-    fn merged(&self) -> &R {
-        &self.merged
+    fn merged(&self) -> Option<&R> {
+        self.merged.as_ref()
+    }
+
+    fn take_merged(&mut self) -> R {
+        self.merged
+            .take()
+            .expect("dedup: formed batch has no merged request")
     }
 
     fn batch_len(&self) -> usize {
@@ -274,38 +293,408 @@ where
     }
 }
 
-/// Per-key coordination state. Lives in the shard map while the key has a
-/// driver; removed (atomically, under the shard lock) once there is no more
-/// outstanding work.
-struct KeyState<R, E> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DriverId(u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DriverKind {
+    Inline,
+    Owner,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Driver {
+    id: DriverId,
+    kind: DriverKind,
+}
+
+enum RoundPhase {
+    Ready,
+    Running(CancellationToken),
+}
+
+enum KeyPhase {
+    Driven {
+        driver: Driver,
+        round: RoundPhase,
+    },
+    /// Reserves the key for `driver` while its result is delivered outside the
+    /// shard lock. New submissions queue behind this phase.
+    Completing {
+        driver: Driver,
+    },
+    Handoff {
+        reserved_owner: DriverId,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MachineAction {
+    Keep,
+    Remove,
+    SpawnOwner(DriverId),
+}
+
+type BatchDelivery<R, E> = (Vec<Member<R, E>>, Result<(), Arc<E>>);
+
+struct MachineEffects<R, E> {
+    cancellation: Option<CancellationToken>,
+    wake: Option<Arc<Notify>>,
+    delivery: Option<BatchDelivery<R, E>>,
+    discarded: Vec<Member<R, E>>,
+    retired: Option<KeyMachine<R, E>>,
+    discarded_outcome: Option<MachineRoundOutcome<E>>,
+    retired_batch: Option<Vec<Member<R, E>>>,
+}
+
+impl<R, E> MachineEffects<R, E> {
+    fn new() -> Self {
+        Self {
+            cancellation: None,
+            wake: None,
+            delivery: None,
+            discarded: Vec::new(),
+            retired: None,
+            discarded_outcome: None,
+            retired_batch: None,
+        }
+    }
+
+    /// Applies observable effects in one fixed order after the shard lock has
+    /// been released.
+    fn apply(self) {
+        drop(self.apply_recycling());
+    }
+
+    /// Applies effects and returns a drained batch allocation for the same
+    /// completing driver to reuse in its successor round.
+    fn apply_recycling(self) -> Option<Vec<Member<R, E>>> {
+        let Self {
+            cancellation,
+            wake,
+            delivery,
+            discarded,
+            retired,
+            discarded_outcome,
+            retired_batch,
+        } = self;
+        if let Some(cancellation) = cancellation {
+            cancellation.cancel();
+        }
+        if let Some(wake) = wake {
+            wake.notify_one();
+        }
+        let (recycled_batch, delivered_outcome) = match delivery {
+            Some((mut batch, result)) => {
+                for member in batch.drain(..) {
+                    let _ = member.done.send(result.clone());
+                }
+                (Some(batch), Some(MachineRoundOutcome::Done(result)))
+            }
+            None => (None, None),
+        };
+        drop(discarded);
+        drop(retired);
+        drop(discarded_outcome);
+        drop(delivered_outcome);
+        drop(retired_batch);
+        recycled_batch
+    }
+
+    fn delivery_len(&self) -> usize {
+        self.delivery
+            .as_ref()
+            .map_or(0, |(batch, _result)| batch.len())
+    }
+}
+
+struct MachineStep<R, E, T> {
+    value: T,
+    action: MachineAction,
+    effects: MachineEffects<R, E>,
+}
+
+impl<R, E, T> MachineStep<R, E, T> {
+    fn keep(value: T) -> Self {
+        Self {
+            value,
+            action: MachineAction::Keep,
+            effects: MachineEffects::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DriverFlow {
+    Continue,
+    Exit,
+}
+
+enum MachineRoundOutcome<E> {
+    Done(Result<(), Arc<E>>),
+    Liveness,
+    Shutdown,
+}
+
+/// The explicit lifecycle machine for one keyed queue. `Idle` and `Closed` are
+/// not stored phases: transitions to either remove the entry from the shard map
+/// while that map is still locked.
+struct KeyMachine<R, E> {
     queue: KeyQueue<R, E>,
-    /// Abort signal for the in-flight worker round, if any. Cancelled when the
-    /// batch loses all live members so the [`Inner::drive_one_round`]
-    /// `select!` drops the worker future at its next `.await`.
-    op_signal: Option<CancellationToken>,
-    /// Notified whenever new work arrives (or a waiter cancels), so the worker
-    /// can re-evaluate. A single stored permit is enough: the worker re-absorbs
-    /// everything via [`KeyQueue::refresh_batch`] on each wake.
+    phase: KeyPhase,
     changed: Arc<Notify>,
 }
 
-impl<R, E> KeyState<R, E>
+impl<R, E> KeyMachine<R, E>
 where
     R: MergeRequest,
 {
-    /// Creates per-key state seeded with the inline driver's own submission.
-    fn new(seed: Member<R, E>) -> Self {
-        KeyState {
+    fn new(seed: Member<R, E>, inline: DriverId) -> Self {
+        Self {
             queue: KeyQueue::new(seed),
-            op_signal: None,
+            phase: KeyPhase::Driven {
+                driver: Driver {
+                    id: inline,
+                    kind: DriverKind::Inline,
+                },
+                round: RoundPhase::Ready,
+            },
             changed: Arc::new(Notify::new()),
         }
+    }
+
+    fn submit(
+        &mut self,
+        member: Member<R, E>,
+        can_reorder: bool,
+    ) -> MachineStep<R, E, Arc<Notify>> {
+        self.queue.enqueue(member, can_reorder);
+        let mut step = MachineStep::keep(self.changed.clone());
+        step.effects.wake = Some(self.changed.clone());
+        step
+    }
+
+    fn start_round(
+        &mut self,
+        driver_id: DriverId,
+        closing: bool,
+    ) -> MachineStep<R, E, Option<(CancellationToken, R)>> {
+        let matches_ready = matches!(
+            &self.phase,
+            KeyPhase::Driven {
+                driver,
+                round: RoundPhase::Ready,
+            } if driver.id == driver_id
+        );
+        if !matches_ready {
+            return MachineStep::keep(None);
+        }
+
+        let mut step = MachineStep::keep(None);
+        if closing || !self.queue.form_batch(&mut step.effects.discarded) {
+            step.action = MachineAction::Remove;
+            return step;
+        }
+
+        let signal = CancellationToken::new();
+        let fallback = self.queue.take_merged();
+        if let KeyPhase::Driven { round, .. } = &mut self.phase {
+            *round = RoundPhase::Running(signal.clone());
+        }
+        step.value = Some((signal, fallback));
+        step
+    }
+
+    fn refresh(&mut self, driver_id: DriverId) -> MachineStep<R, E, Option<R>> {
+        let signal = match &self.phase {
+            KeyPhase::Driven {
+                driver,
+                round: RoundPhase::Running(signal),
+            } if driver.id == driver_id => signal.clone(),
+            _ => return MachineStep::keep(None),
+        };
+
+        let mut step = MachineStep::keep(None);
+        if !self.queue.refresh_batch(&mut step.effects.discarded) {
+            step.effects.cancellation = Some(signal);
+        }
+        step.value = self.queue.merged().cloned();
+        step
+    }
+
+    fn round_finished(
+        &mut self,
+        driver_id: DriverId,
+        outcome: MachineRoundOutcome<E>,
+    ) -> MachineStep<R, E, bool> {
+        let driver = match &self.phase {
+            KeyPhase::Driven {
+                driver,
+                round: RoundPhase::Running(_),
+            } if driver.id == driver_id => *driver,
+            _ => {
+                let mut step = MachineStep::keep(false);
+                step.effects.discarded_outcome = Some(outcome);
+                return step;
+            }
+        };
+
+        let mut step = MachineStep::keep(false);
+        match outcome {
+            MachineRoundOutcome::Done(result) => {
+                step.effects.delivery = Some((self.queue.take_batch(), result));
+            }
+            MachineRoundOutcome::Liveness => {
+                self.queue.abandon_batch(&mut step.effects.discarded);
+            }
+            MachineRoundOutcome::Shutdown => {
+                step.action = MachineAction::Remove;
+                return step;
+            }
+        }
+
+        self.phase = KeyPhase::Completing { driver };
+        step.value = true;
+        step
+    }
+
+    fn finalize_completion(
+        &mut self,
+        driver_id: DriverId,
+        recycled_batch: Option<Vec<Member<R, E>>>,
+        successor: impl FnOnce() -> DriverId,
+    ) -> MachineStep<R, E, DriverFlow> {
+        let driver = match self.phase {
+            KeyPhase::Completing { driver } if driver.id == driver_id => driver,
+            _ => {
+                let mut step = MachineStep::keep(DriverFlow::Exit);
+                step.effects.retired_batch = recycled_batch;
+                return step;
+            }
+        };
+
+        let mut step = MachineStep::keep(DriverFlow::Exit);
+        if let Some(batch) = recycled_batch {
+            debug_assert!(batch.is_empty());
+            debug_assert!(self.queue.batch.is_empty());
+            self.queue.batch = batch;
+        }
+        let has_more = self.queue.has_incoming_live(&mut step.effects.discarded);
+        match (driver.kind, has_more) {
+            (DriverKind::Inline, true) => {
+                let successor = successor();
+                self.phase = KeyPhase::Handoff {
+                    reserved_owner: successor,
+                };
+                step.action = MachineAction::SpawnOwner(successor);
+            }
+            (DriverKind::Owner, true) => {
+                self.phase = KeyPhase::Driven {
+                    driver,
+                    round: RoundPhase::Ready,
+                };
+                step.value = DriverFlow::Continue;
+            }
+            (_, false) => step.action = MachineAction::Remove,
+        }
+        step
+    }
+
+    fn driver_dropped(
+        &mut self,
+        driver_id: DriverId,
+        closing: bool,
+        successor: impl FnOnce() -> DriverId,
+    ) -> MachineStep<R, E, ()> {
+        let round_signal = match &self.phase {
+            KeyPhase::Driven { driver, round } if driver.id == driver_id => match round {
+                RoundPhase::Ready => None,
+                RoundPhase::Running(signal) => Some(signal.clone()),
+            },
+            KeyPhase::Completing { driver } if driver.id == driver_id => None,
+            _ => return MachineStep::keep(()),
+        };
+
+        let mut step = MachineStep::keep(());
+        if let Some(signal) = round_signal {
+            step.effects.cancellation = Some(signal);
+        }
+        self.queue.requeue_batch(&mut step.effects.discarded);
+        if closing {
+            step.action = MachineAction::Remove;
+        } else if self.queue.has_incoming_live(&mut step.effects.discarded) {
+            let successor = successor();
+            self.phase = KeyPhase::Handoff {
+                reserved_owner: successor,
+            };
+            step.action = MachineAction::SpawnOwner(successor);
+        } else {
+            step.action = MachineAction::Remove;
+        }
+        step
+    }
+
+    fn owner_started(&mut self, owner: DriverId) -> MachineStep<R, E, bool> {
+        if !matches!(
+            self.phase,
+            KeyPhase::Handoff { reserved_owner } if reserved_owner == owner
+        ) {
+            return MachineStep::keep(false);
+        }
+        self.phase = KeyPhase::Driven {
+            driver: Driver {
+                id: owner,
+                kind: DriverKind::Owner,
+            },
+            round: RoundPhase::Ready,
+        };
+        MachineStep::keep(true)
+    }
+
+    fn waiter_dropped(&self) -> MachineStep<R, E, ()> {
+        let mut step = MachineStep::keep(());
+        step.effects.wake = Some(self.changed.clone());
+        step
+    }
+
+    fn close(&mut self) -> MachineStep<R, E, ()> {
+        let mut step = MachineStep::keep(());
+        if let KeyPhase::Driven {
+            round: RoundPhase::Running(signal),
+            ..
+        } = &self.phase
+        {
+            step.effects.cancellation = Some(signal.clone());
+        }
+        step.action = MachineAction::Remove;
+        step
+    }
+
+    fn changed_for(&self, driver_id: DriverId) -> Option<Arc<Notify>> {
+        matches!(
+            &self.phase,
+            KeyPhase::Driven {
+                driver,
+                round: RoundPhase::Running(_),
+            } if driver.id == driver_id
+        )
+        .then(|| self.changed.clone())
+    }
+
+    fn has_active_op(&self) -> bool {
+        matches!(
+            self.phase,
+            KeyPhase::Driven {
+                round: RoundPhase::Running(_),
+                ..
+            }
+        )
     }
 }
 
 /// One key-space partition guarded by a single lock.
 struct Shard<R, E> {
-    map: Mutex<HashMap<String, KeyState<R, E>>>,
+    map: Mutex<HashMap<String, KeyMachine<R, E>>>,
     submissions: AtomicU64,
     rounds: AtomicU64,
 }
@@ -324,6 +713,8 @@ impl<R, E> Shard<R, E> {
 pub struct BatchHandle<R, E> {
     shard: Arc<Shard<R, E>>,
     key: String,
+    driver: DriverId,
+    fallback: Option<R>,
 }
 
 impl<R, E> BatchHandle<R, E>
@@ -337,16 +728,23 @@ where
     /// `.await`. The (now-stale) merged request is still returned so the
     /// worker has something to inspect for the rest of its current poll.
     pub fn merged(&self) -> R {
-        let mut map = self.shard.map.lock().unwrap();
-        let st = map
-            .get_mut(&self.key)
-            .expect("dedup: merged() for an unknown key");
-        if !st.queue.refresh_batch()
-            && let Some(s) = &st.op_signal
-        {
-            s.cancel();
-        }
-        st.queue.merged().clone()
+        let (merged, effects) = {
+            let mut map = self.shard.map.lock().unwrap();
+            match map.get_mut(&self.key) {
+                Some(machine) => {
+                    let step = machine.refresh(self.driver);
+                    (step.value, step.effects)
+                }
+                None => (None, MachineEffects::new()),
+            }
+        };
+        effects.apply();
+        merged.unwrap_or_else(|| {
+            self.fallback
+                .as_ref()
+                .expect("dedup: active batch has no round fallback")
+                .clone()
+        })
     }
 
     /// Resolves when new work arrives for the key (or a waiter cancels). Intended
@@ -355,21 +753,22 @@ where
         let notify = {
             let map = self.shard.map.lock().unwrap();
             match map.get(&self.key) {
-                Some(st) => st.changed.clone(),
+                Some(machine) => match machine.changed_for(self.driver) {
+                    Some(changed) => changed,
+                    None => return,
+                },
                 None => return,
             }
         };
         notify.notified().await;
     }
-}
 
-/// Outcome of a single worker round.
-enum Round {
-    /// A batch was served and its result delivered.
-    Delivered,
-    /// There was no live work (or the deduplicator is closing); the key entry
-    /// was removed.
-    Exit,
+    /// Retains the already-computed request when a stale, closed, or emptied
+    /// batch cannot produce a current merge. Replacing the prior round's value
+    /// happens after the shard unlocks.
+    fn install_fallback(&mut self, fallback: R) {
+        drop(self.fallback.replace(fallback));
+    }
 }
 
 /// Diagnostic snapshot of one key's coordination state inside a [`Dedup`].
@@ -416,6 +815,7 @@ struct Inner<R, E, W> {
     active_owners: AtomicUsize,
     /// Notified when the last spawned owner exits.
     owners_idle: Notify,
+    next_driver: AtomicU64,
 }
 
 /// What happened to the worker future inside [`Inner::drive_one_round`]'s
@@ -433,51 +833,181 @@ enum WorkerOutcome<E> {
     Shutdown,
 }
 
+struct OwnerPermit<R, E, W> {
+    inner: Arc<Inner<R, E, W>>,
+}
+
+impl<R, E, W> OwnerPermit<R, E, W> {
+    fn reserve(inner: Arc<Inner<R, E, W>>) -> Self {
+        inner
+            .active_owners
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |owners| {
+                owners.checked_add(1)
+            })
+            .expect("dedup: active owner count overflowed");
+        Self { inner }
+    }
+}
+
+impl<R, E, W> Drop for OwnerPermit<R, E, W> {
+    fn drop(&mut self) {
+        let owners = self
+            .inner
+            .active_owners
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |owners| {
+                owners.checked_sub(1)
+            })
+            .expect("dedup: released an unreserved owner");
+        if owners == 1 {
+            self.inner.owners_idle.notify_waiters();
+        }
+    }
+}
+
+struct OwnerSpawn<R, E, W> {
+    inner: Arc<Inner<R, E, W>>,
+    shard: Arc<Shard<R, E>>,
+    key: String,
+    driver: DriverId,
+    permit: OwnerPermit<R, E, W>,
+}
+
+impl<R, E, W> OwnerSpawn<R, E, W>
+where
+    R: MergeRequest,
+    E: Send + Sync + 'static,
+    W: Worker<R, E> + 'static,
+{
+    fn apply(self) {
+        let Self {
+            inner,
+            shard,
+            key,
+            driver,
+            permit,
+        } = self;
+        tracing::trace!(target: "glassdb::dedup", key = %key, ?driver, "spawn_owner");
+        let owner = rt::spawn(async move {
+            let _permit = permit;
+            inner.run_owner(&shard, key, driver).await;
+        });
+        drop(owner);
+    }
+}
+
+struct DeferredEffects<R, E, W> {
+    machine: MachineEffects<R, E>,
+    spawn: Option<OwnerSpawn<R, E, W>>,
+}
+
+impl<R, E, W> DeferredEffects<R, E, W>
+where
+    R: MergeRequest,
+    E: Send + Sync + 'static,
+    W: Worker<R, E> + 'static,
+{
+    fn apply(self) {
+        drop(self.apply_recycling());
+    }
+
+    fn apply_recycling(self) -> Option<Vec<Member<R, E>>> {
+        let recycled_batch = self.machine.apply_recycling();
+        if let Some(spawn) = self.spawn {
+            spawn.apply();
+        }
+        recycled_batch
+    }
+}
+
 impl<R, E, W> Inner<R, E, W>
 where
     R: MergeRequest,
     E: Send + Sync + 'static,
     W: Worker<R, E> + 'static,
 {
-    /// Runs one worker round for `key`: builds the batch under the lock, races
-    /// the worker future against the per-round and global abort signals
-    /// outside it, then delivers (or abandons) the result. Removes the key
-    /// (returning [`Round::Exit`]) when there is no live work, when the
-    /// deduplicator is shutting down, or when the worker bailed mid-round
-    /// because shutdown raced it.
+    fn next_driver(&self) -> DriverId {
+        let id = self
+            .next_driver
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .expect("dedup: exhausted driver identifiers");
+        DriverId(id)
+    }
+
+    /// Commits removal or handoff while the shard is locked. A handoff reserves
+    /// its owner count here; only the actual task spawn is deferred.
+    fn commit_step<T>(
+        self: &Arc<Self>,
+        map: &mut HashMap<String, KeyMachine<R, E>>,
+        shard: &Arc<Shard<R, E>>,
+        key: &str,
+        mut step: MachineStep<R, E, T>,
+    ) -> (T, DeferredEffects<R, E, W>) {
+        let spawn = match step.action {
+            MachineAction::Keep => None,
+            MachineAction::Remove => {
+                debug_assert!(step.effects.retired.is_none());
+                step.effects.retired = map.remove(key);
+                None
+            }
+            MachineAction::SpawnOwner(driver) => Some(OwnerSpawn {
+                inner: self.clone(),
+                shard: shard.clone(),
+                key: key.to_owned(),
+                driver,
+                permit: OwnerPermit::reserve(self.clone()),
+            }),
+        };
+        (
+            step.value,
+            DeferredEffects {
+                machine: step.effects,
+                spawn,
+            },
+        )
+    }
+
+    /// Runs one worker round for the identified driver, applying every cancel,
+    /// wake, delivery, drop, and spawn only after releasing the shard lock.
     async fn drive_one_round(
         self: &Arc<Self>,
         shard: &Arc<Shard<R, E>>,
         key: &str,
-        handle: &BatchHandle<R, E>,
-    ) -> Round {
-        let op_signal = {
+        driver: DriverId,
+        handle: &mut BatchHandle<R, E>,
+    ) -> DriverFlow {
+        let (started, effects) = {
             let mut map = shard.map.lock().unwrap();
-            let st = match map.get_mut(key) {
-                Some(s) => s,
+            let machine = match map.get_mut(key) {
+                Some(machine) => machine,
                 None => {
                     tracing::trace!(target: "glassdb::dedup", key, "round_exit_no_state");
-                    return Round::Exit;
+                    return DriverFlow::Exit;
                 }
             };
-            if self.shutdown.is_cancelled() || !st.queue.form_batch() {
-                map.remove(key);
+            let step = machine.start_round(driver, self.shutdown.is_cancelled());
+            if step.value.is_some() {
+                shard.rounds.fetch_add(1, Ordering::Relaxed);
+                tracing::trace!(
+                    target: "glassdb::dedup",
+                    key,
+                    ?driver,
+                    batch_count = machine.queue.batch_len(),
+                    pending_count = machine.queue.reorderable_len(),
+                    queue_count = machine.queue.fifo_len(),
+                    "round_start",
+                );
+            } else if matches!(step.action, MachineAction::Remove) {
                 tracing::trace!(target: "glassdb::dedup", key, "key_removed");
-                return Round::Exit;
             }
-            shard.rounds.fetch_add(1, Ordering::Relaxed);
-            let signal = CancellationToken::new();
-            st.op_signal = Some(signal.clone());
-            tracing::trace!(
-                target: "glassdb::dedup",
-                key,
-                batch_count = st.queue.batch_len(),
-                pending_count = st.queue.reorderable_len(),
-                queue_count = st.queue.fifo_len(),
-                "round_start",
-            );
-            signal
+            self.commit_step(&mut map, shard, key, step)
         };
+        effects.apply();
+        let Some((op_signal, fallback)) = started else {
+            return DriverFlow::Exit;
+        };
+        handle.install_fallback(fallback);
 
         // Drop-the-future cancellation. The worker is a plain cancel-safe
         // async fn (see `Worker` trait contract); whichever arm wins, the
@@ -490,95 +1020,66 @@ where
             res = self.worker.run(key, handle) => WorkerOutcome::Done(res.map_err(Arc::new)),
         };
 
-        let mut map = shard.map.lock().unwrap();
-        match outcome {
-            WorkerOutcome::Done(res) => {
-                if let Some(st) = map.get_mut(key) {
-                    st.op_signal = None;
-                    let delivered = st.queue.close_batch(&res);
-                    tracing::trace!(
-                        target: "glassdb::dedup",
-                        key,
-                        delivered,
-                        is_err = res.is_err(),
-                        "round_delivered",
-                    );
-                }
-                Round::Delivered
-            }
-            WorkerOutcome::Liveness => {
-                // Dead batch members go with their senders when we clear the
-                // batch: every waiter the round was serving had already
-                // dropped its receiver (that is what fired the signal), so
-                // there is nothing to deliver. The caller of `drive_inline`
-                // / `run_owner` will retry: another round will either build
-                // a fresh batch from the incoming queues or remove the key.
-                if let Some(st) = map.get_mut(key) {
-                    st.op_signal = None;
-                    st.queue.abandon_batch();
-                    tracing::trace!(target: "glassdb::dedup", key, "round_liveness_abort");
-                }
-                Round::Delivered
-            }
-            WorkerOutcome::Shutdown => {
-                // Tear down: dropping the `KeyState` drops every member's
-                // `oneshot::Sender`, so each caller's `rx.await` resolves to
-                // `RecvError` and `Dedup::run` returns `DedupError::Cancelled`.
-                map.remove(key);
-                tracing::trace!(target: "glassdb::dedup", key, "round_shutdown");
-                Round::Exit
-            }
-        }
-    }
-
-    /// After an inline driver's single round: hand the leftover queue off to a
-    /// spawned owner, or remove the key if nothing live remains. Atomic under the
-    /// shard lock w.r.t. concurrent submitters.
-    fn finish_round(self: &Arc<Self>, shard: &Arc<Shard<R, E>>, key: &str) {
-        let mut map = shard.map.lock().unwrap();
-        let st = match map.get_mut(key) {
-            Some(s) => s,
-            None => return,
+        let (completing, effects, delivered) = {
+            let mut map = shard.map.lock().unwrap();
+            let Some(machine) = map.get_mut(key) else {
+                return DriverFlow::Exit;
+            };
+            let machine_outcome = match outcome {
+                WorkerOutcome::Done(result) => MachineRoundOutcome::Done(result),
+                WorkerOutcome::Liveness => MachineRoundOutcome::Liveness,
+                WorkerOutcome::Shutdown => MachineRoundOutcome::Shutdown,
+            };
+            let step = machine.round_finished(driver, machine_outcome);
+            let delivered = step.effects.delivery_len();
+            let (completing, effects) = self.commit_step(&mut map, shard, key, step);
+            (completing, effects, delivered)
         };
-        if st.queue.has_incoming_live() {
-            self.spawn_owner(shard, key);
-        } else {
-            map.remove(key);
+        if delivered != 0 {
+            tracing::trace!(target: "glassdb::dedup", key, ?driver, delivered, "round_delivered");
         }
-    }
+        let recycled_batch = effects.apply_recycling();
+        if !completing {
+            return DriverFlow::Exit;
+        }
 
-    /// Spawns a dedicated owner task to drain the key's queue. Synchronous (no
-    /// await), so it is safe to call while holding the shard lock; the spawned
-    /// task only runs once the lock is released.
-    fn spawn_owner(self: &Arc<Self>, shard: &Arc<Shard<R, E>>, key: &str) {
-        self.active_owners.fetch_add(1, Ordering::SeqCst);
-        let inner = self.clone();
-        let shard = shard.clone();
-        let key = key.to_string();
-        tracing::trace!(target: "glassdb::dedup", key = %key, "spawn_owner");
-        // Detached: the owner is tracked via `active_owners`/`owners_idle` for
-        // `close`, not by joining a handle (which would accumulate per handoff).
-        let owner = rt::spawn(async move {
-            inner.run_owner(&shard, key).await;
-            if inner.active_owners.fetch_sub(1, Ordering::SeqCst) == 1 {
-                inner.owners_idle.notify_waiters();
-            }
-        });
-        drop(owner);
+        let (flow, effects) = {
+            let mut map = shard.map.lock().unwrap();
+            let Some(machine) = map.get_mut(key) else {
+                return DriverFlow::Exit;
+            };
+            let step = machine.finalize_completion(driver, recycled_batch, || self.next_driver());
+            self.commit_step(&mut map, shard, key, step)
+        };
+        effects.apply();
+        flow
     }
 
     /// Owner task loop: serves rounds until the queue drains, then exits.
-    async fn run_owner(self: &Arc<Self>, shard: &Arc<Shard<R, E>>, key: String) {
-        let handle = BatchHandle {
+    async fn run_owner(self: &Arc<Self>, shard: &Arc<Shard<R, E>>, key: String, driver: DriverId) {
+        let (started, effects) = {
+            let mut map = shard.map.lock().unwrap();
+            let Some(machine) = map.get_mut(&key) else {
+                return;
+            };
+            let step = machine.owner_started(driver);
+            self.commit_step(&mut map, shard, &key, step)
+        };
+        effects.apply();
+        if !started {
+            return;
+        }
+        let mut guard = DriverGuard::new(self.clone(), shard.clone(), key.clone(), driver);
+        let mut handle = BatchHandle {
             shard: shard.clone(),
             key: key.clone(),
+            driver,
+            fallback: None,
         };
-        loop {
-            match self.drive_one_round(shard, &key, &handle).await {
-                Round::Delivered => continue,
-                Round::Exit => return,
-            }
-        }
+        while let DriverFlow::Continue =
+            self.drive_one_round(shard, &key, driver, &mut handle).await
+        {}
+        guard.disarm();
     }
 
     /// Drives the inline fast path for the first caller of an idle key. Runs one
@@ -592,41 +1093,90 @@ where
         self: &Arc<Self>,
         shard: &Arc<Shard<R, E>>,
         key: &str,
+        driver: DriverId,
         mut rx: oneshot::Receiver<Result<(), Arc<E>>>,
     ) -> Result<(), DedupError<E>> {
-        let handle = BatchHandle {
+        let mut guard = DriverGuard::new(self.clone(), shard.clone(), key.to_string(), driver);
+        let mut handle = BatchHandle {
             shard: shard.clone(),
-            key: key.to_string(),
+            key: key.to_owned(),
+            driver,
+            fallback: None,
         };
-        let mut guard = DriverGuard {
-            inner: self.clone(),
-            shard: shard.clone(),
-            key: key.to_string(),
-            armed: true,
-        };
-
-        let round = self.drive_one_round(shard, key, &handle).await;
-        guard.armed = false;
-        if let Round::Delivered = round {
-            self.finish_round(shard, key);
-        }
+        let _ = self.drive_one_round(shard, key, driver, &mut handle).await;
+        guard.disarm();
         match rx.try_recv() {
             Ok(res) => res.map_err(DedupError::Work),
             // Our own member was pruned (e.g. by shutdown) before delivery.
             Err(_) => Err(DedupError::Cancelled),
         }
     }
+
+    fn driver_dropped(self: &Arc<Self>, shard: &Arc<Shard<R, E>>, key: &str, driver: DriverId) {
+        let effects = {
+            let mut map = shard.map.lock().unwrap();
+            let Some(machine) = map.get_mut(key) else {
+                return;
+            };
+            let step =
+                machine.driver_dropped(driver, self.shutdown.is_cancelled(), || self.next_driver());
+            self.commit_step(&mut map, shard, key, step).1
+        };
+        effects.apply();
+    }
+
+    fn waiter_dropped(
+        self: &Arc<Self>,
+        shard: &Arc<Shard<R, E>>,
+        key: &str,
+        changed: &Arc<Notify>,
+    ) {
+        let effects = {
+            let mut map = shard.map.lock().unwrap();
+            let Some(machine) = map.get_mut(key) else {
+                return;
+            };
+            if !Arc::ptr_eq(&machine.changed, changed) {
+                return;
+            }
+            let step = machine.waiter_dropped();
+            self.commit_step(&mut map, shard, key, step).1
+        };
+        effects.apply();
+    }
+
+    fn close_keys(self: &Arc<Self>) {
+        self.shards.each(|shard| {
+            let effects = {
+                let mut map = shard.map.lock().unwrap();
+                let keys = map.keys().cloned().collect::<Vec<_>>();
+                let mut effects = Vec::with_capacity(keys.len());
+                for key in keys {
+                    let step = map
+                        .get_mut(&key)
+                        .expect("dedup: key disappeared during close")
+                        .close();
+                    effects.push(self.commit_step(&mut map, shard, &key, step).1);
+                }
+                effects
+            };
+            for effect in effects {
+                effect.apply();
+            }
+        });
+    }
 }
 
-/// RAII handoff for a dropped inline driver. On drop while still armed (the
-/// driver's future was dropped or cancelled mid-round), it requeues undelivered
-/// live members, and either spawns a fresh owner to finish the work or removes
-/// the key. Because the successor is a spawned task, not a caller future, the
-/// handoff cannot be lost.
+/// RAII handoff for a dropped driver. On drop while still armed (the driver's
+/// future was dropped or cancelled mid-round), it requeues undelivered live
+/// members, and either spawns a fresh owner to finish the work or removes the
+/// key. Because the successor is a spawned task, not a caller future, the
+/// handoff cannot be lost. The driver id makes the drop a no-op if ownership has
+/// already moved on.
 ///
-/// Note: the worker future is part of the inline driver's own future tree, so
-/// it is already being dropped by the time `drop` runs. We just clear the
-/// per-round `op_signal` for bookkeeping; there is no separate cancel to issue.
+/// The worker future is part of the driver's own future tree, so it is already
+/// being dropped by the time `drop` runs. The transition still defers token
+/// cancellation so observers see every effect only after the shard unlocks.
 struct DriverGuard<R, E, W>
 where
     R: MergeRequest,
@@ -636,7 +1186,34 @@ where
     inner: Arc<Inner<R, E, W>>,
     shard: Arc<Shard<R, E>>,
     key: String,
+    driver: DriverId,
     armed: bool,
+}
+
+impl<R, E, W> DriverGuard<R, E, W>
+where
+    R: MergeRequest,
+    E: Send + Sync + 'static,
+    W: Worker<R, E> + 'static,
+{
+    fn new(
+        inner: Arc<Inner<R, E, W>>,
+        shard: Arc<Shard<R, E>>,
+        key: String,
+        driver: DriverId,
+    ) -> Self {
+        Self {
+            inner,
+            shard,
+            key,
+            driver,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 
 impl<R, E, W> Drop for DriverGuard<R, E, W>
@@ -649,39 +1226,8 @@ where
         if !self.armed {
             return;
         }
-        let mut map = self.shard.map.lock().unwrap();
-        let st = match map.get_mut(&self.key) {
-            Some(s) => s,
-            None => {
-                tracing::debug!(
-                    target: "glassdb::dedup",
-                    key = %self.key,
-                    "inline_driver_dropped_no_state",
-                );
-                return;
-            }
-        };
-        let had_op = st.op_signal.take().is_some();
-        st.queue.requeue_batch();
-        if st.queue.has_incoming_live() {
-            tracing::debug!(
-                target: "glassdb::dedup",
-                key = %self.key,
-                had_op,
-                pending_count = st.queue.reorderable_len(),
-                queue_count = st.queue.fifo_len(),
-                "inline_driver_dropped_handoff",
-            );
-            self.inner.spawn_owner(&self.shard, &self.key);
-        } else {
-            tracing::debug!(
-                target: "glassdb::dedup",
-                key = %self.key,
-                had_op,
-                "inline_driver_dropped_key_removed",
-            );
-            map.remove(&self.key);
-        }
+        self.inner
+            .driver_dropped(&self.shard, &self.key, self.driver);
     }
 }
 
@@ -690,15 +1236,29 @@ where
 /// notifier so the driver re-evaluates liveness and can abandon the batch if
 /// no caller remains. Without it, the driver might sit indefinitely in
 /// `BatchHandle::changed`.
-struct WaiterDropGuard {
+struct WaiterDropGuard<R, E, W>
+where
+    R: MergeRequest,
+    E: Send + Sync + 'static,
+    W: Worker<R, E> + 'static,
+{
+    inner: Arc<Inner<R, E, W>>,
+    shard: Arc<Shard<R, E>>,
+    key: String,
     changed: Arc<Notify>,
     armed: bool,
 }
 
-impl Drop for WaiterDropGuard {
+impl<R, E, W> Drop for WaiterDropGuard<R, E, W>
+where
+    R: MergeRequest,
+    E: Send + Sync + 'static,
+    W: Worker<R, E> + 'static,
+{
     fn drop(&mut self) {
         if self.armed {
-            self.changed.notify_one();
+            self.inner
+                .waiter_dropped(&self.shard, &self.key, &self.changed);
         }
     }
 }
@@ -729,6 +1289,7 @@ where
                 shutdown: CancellationToken::new(),
                 active_owners: AtomicUsize::new(0),
                 owners_idle: Notify::new(),
+                next_driver: AtomicU64::new(1),
             }),
         }
     }
@@ -748,31 +1309,43 @@ where
             done: tx,
         };
 
-        let (is_driver, changed) = {
+        let (driver, changed, effects) = {
             let mut map = shard.map.lock().unwrap();
             match map.get_mut(key) {
-                Some(st) => {
-                    st.queue.enqueue(member, can_reorder);
-                    st.changed.notify_one();
-                    (false, st.changed.clone())
+                Some(machine) => {
+                    let step = machine.submit(member, can_reorder);
+                    let (changed, effects) = self.inner.commit_step(&mut map, &shard, key, step);
+                    (None, changed, effects)
                 }
                 None => {
-                    let st = KeyState::new(member);
-                    let changed = st.changed.clone();
-                    map.insert(key.to_string(), st);
-                    (true, changed)
+                    let driver = self.inner.next_driver();
+                    let machine = KeyMachine::new(member, driver);
+                    let changed = machine.changed.clone();
+                    map.insert(key.to_string(), machine);
+                    (
+                        Some(driver),
+                        changed,
+                        DeferredEffects {
+                            machine: MachineEffects::new(),
+                            spawn: None,
+                        },
+                    )
                 }
             }
         };
+        effects.apply();
 
-        if is_driver {
-            return self.inner.drive_inline(&shard, key, rx).await;
+        if let Some(driver) = driver {
+            return self.inner.drive_inline(&shard, key, driver, rx).await;
         }
 
         // If a queued waiter is dropped mid-wait, its `oneshot::Receiver` goes
         // with it; the guard wakes the driver so it can prune the dead member
         // promptly (and abandon the batch if no live caller remains).
         let mut guard = WaiterDropGuard {
+            inner: self.inner.clone(),
+            shard,
+            key: key.to_owned(),
             changed,
             armed: true,
         };
@@ -789,6 +1362,7 @@ where
     /// when the owning component shuts down.
     pub async fn close(&self) {
         self.inner.shutdown.cancel();
+        self.inner.close_keys();
         loop {
             let owners_idle = self.inner.owners_idle.notified();
             if self.inner.active_owners.load(Ordering::SeqCst) == 0 {
@@ -806,13 +1380,13 @@ where
         let mut out = Vec::new();
         self.inner.shards.each(|shard| {
             let map = shard.map.lock().unwrap();
-            for (key, st) in map.iter() {
+            for (key, machine) in map.iter() {
                 out.push(DedupKeySnapshot {
                     key: key.clone(),
-                    batch_count: st.queue.batch_len(),
-                    pending_count: st.queue.reorderable_len(),
-                    queue_count: st.queue.fifo_len(),
-                    has_active_op: st.op_signal.is_some(),
+                    batch_count: machine.queue.batch_len(),
+                    pending_count: machine.queue.reorderable_len(),
+                    queue_count: machine.queue.fifo_len(),
+                    has_active_op: machine.has_active_op(),
                 });
             }
         });
@@ -885,6 +1459,190 @@ mod tests {
         }
     }
 
+    type TestResult = oneshot::Receiver<Result<(), Arc<()>>>;
+
+    fn test_member(request: TestRequest) -> (Member<TestRequest, ()>, TestResult) {
+        let (done, result) = oneshot::channel();
+        (Member { request, done }, result)
+    }
+
+    #[test]
+    fn key_machine_transition_action_table() {
+        fn phase(machine: &KeyMachine<TestRequest, ()>) -> &'static str {
+            match &machine.phase {
+                KeyPhase::Driven {
+                    driver:
+                        Driver {
+                            kind: DriverKind::Inline,
+                            ..
+                        },
+                    round: RoundPhase::Ready,
+                } => "inline-ready",
+                KeyPhase::Driven {
+                    driver:
+                        Driver {
+                            kind: DriverKind::Inline,
+                            ..
+                        },
+                    round: RoundPhase::Running(_),
+                } => "inline-running",
+                KeyPhase::Driven {
+                    driver:
+                        Driver {
+                            kind: DriverKind::Owner,
+                            ..
+                        },
+                    round: RoundPhase::Ready,
+                } => "owner-ready",
+                KeyPhase::Driven {
+                    driver:
+                        Driver {
+                            kind: DriverKind::Owner,
+                            ..
+                        },
+                    round: RoundPhase::Running(_),
+                } => "owner-running",
+                KeyPhase::Completing {
+                    driver:
+                        Driver {
+                            kind: DriverKind::Inline,
+                            ..
+                        },
+                } => "inline-completing",
+                KeyPhase::Completing {
+                    driver:
+                        Driver {
+                            kind: DriverKind::Owner,
+                            ..
+                        },
+                } => "owner-completing",
+                KeyPhase::Handoff { .. } => "handoff",
+            }
+        }
+        fn action(action: &MachineAction) -> &'static str {
+            match action {
+                MachineAction::Keep => "keep",
+                MachineAction::Remove => "remove",
+                MachineAction::SpawnOwner(_) => "spawn-owner",
+            }
+        }
+
+        let inline = DriverId(1);
+        let owner = DriverId(2);
+        let stale = DriverId(3);
+        let (seed, _seed_result) = test_member(mergeable(1));
+        let mut machine = KeyMachine::new(seed, inline);
+        let mut actual = Vec::new();
+
+        let (first_waiter, _first_result) = test_member(reorderable(2));
+        let step = machine.submit(first_waiter, true);
+        actual.push(("Submit", phase(&machine), action(&step.action)));
+        step.effects.apply();
+
+        let step = machine.start_round(inline, false);
+        actual.push(("StartRound", phase(&machine), action(&step.action)));
+        assert!(step.value.is_some());
+        step.effects.apply();
+
+        let step = machine.refresh(inline);
+        actual.push(("Refresh", phase(&machine), action(&step.action)));
+        assert!(step.value.is_some());
+        step.effects.apply();
+
+        let step = machine.waiter_dropped();
+        actual.push(("WaiterDropped", phase(&machine), action(&step.action)));
+        step.effects.apply();
+
+        let step = machine.round_finished(inline, MachineRoundOutcome::Done(Ok(())));
+        actual.push(("RoundFinished", phase(&machine), action(&step.action)));
+        assert!(step.value);
+
+        // No successor existed when the round finished. A submission arriving
+        // before deferred delivery remains queued behind the completing round.
+        let (barrier, _barrier_result) = test_member(unmergeable(4));
+        let submitted = machine.submit(barrier, false);
+        actual.push(("Submit", phase(&machine), action(&submitted.action)));
+        submitted.effects.apply();
+        let recycled_batch = step.effects.apply_recycling();
+
+        let step = machine.finalize_completion(inline, recycled_batch, || owner);
+        actual.push(("FinalizeCompletion", phase(&machine), action(&step.action)));
+        step.effects.apply();
+
+        let step = machine.driver_dropped(inline, false, || stale);
+        actual.push(("DriverDropped", phase(&machine), action(&step.action)));
+        step.effects.apply();
+
+        let step = machine.owner_started(owner);
+        actual.push(("OwnerStarted", phase(&machine), action(&step.action)));
+        assert!(step.value);
+        step.effects.apply();
+
+        let step = machine.close();
+        actual.push(("Close", phase(&machine), action(&step.action)));
+        step.effects.apply();
+
+        assert_eq!(
+            actual,
+            [
+                ("Submit", "inline-ready", "keep"),
+                ("StartRound", "inline-running", "keep"),
+                ("Refresh", "inline-running", "keep"),
+                ("WaiterDropped", "inline-running", "keep"),
+                ("RoundFinished", "inline-completing", "keep"),
+                ("Submit", "inline-completing", "keep"),
+                ("FinalizeCompletion", "handoff", "spawn-owner"),
+                ("DriverDropped", "handoff", "keep"),
+                ("OwnerStarted", "owner-ready", "keep"),
+                ("Close", "owner-ready", "remove"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn machine_effects_are_deferred() {
+        let (seed, mut result) = test_member(mergeable(1));
+        let mut delivery = KeyMachine::new(seed, DriverId(1));
+        let started = delivery.start_round(DriverId(1), false);
+        started.effects.apply();
+        let finished = delivery.round_finished(DriverId(1), MachineRoundOutcome::Done(Ok(())));
+        assert!(matches!(
+            result.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        finished.effects.apply();
+        assert!(matches!(result.try_recv(), Ok(Ok(()))));
+
+        let (seed, result) = test_member(mergeable(1));
+        let mut cancellation = KeyMachine::new(seed, DriverId(3));
+        let started = cancellation.start_round(DriverId(3), false);
+        let signal = started.value.unwrap().0;
+        started.effects.apply();
+        drop(result);
+        let refreshed = cancellation.refresh(DriverId(3));
+        assert!(!signal.is_cancelled());
+        refreshed.effects.apply();
+        assert!(signal.is_cancelled());
+
+        let (seed, _result) = test_member(mergeable(1));
+        let wake = KeyMachine::new(seed, DriverId(4));
+        let mut notified = Box::pin(wake.changed.notified());
+        assert!(futures::poll!(notified.as_mut()).is_pending());
+        let dropped = wake.waiter_dropped();
+        assert!(futures::poll!(notified.as_mut()).is_pending());
+        dropped.effects.apply();
+        assert!(futures::poll!(notified.as_mut()).is_ready());
+
+        let (seed, _result) = test_member(mergeable(1));
+        let mut stale = KeyMachine::new(seed, DriverId(5));
+        let error = Arc::new(());
+        let finished =
+            stale.round_finished(DriverId(99), MachineRoundOutcome::Done(Err(error.clone())));
+        assert_eq!(Arc::strong_count(&error), 2);
+        finished.effects.apply();
+        assert_eq!(Arc::strong_count(&error), 1);
+    }
+
     #[test]
     fn requeue_preserves_ordering_classes() {
         let mut results = Vec::new();
@@ -896,11 +1654,12 @@ mod tests {
 
         let mut queue = KeyQueue::new(member(mergeable(1)));
         queue.enqueue(member(reorderable(2)), true);
-        assert!(queue.refresh_batch());
+        let mut discarded = Vec::new();
+        assert!(queue.refresh_batch(&mut discarded));
         queue.enqueue(member(unmergeable(3)), false);
         queue.enqueue(member(reorderable(4)), true);
 
-        queue.requeue_batch();
+        queue.requeue_batch(&mut discarded);
 
         assert!(queue.batch.is_empty());
         assert_eq!(

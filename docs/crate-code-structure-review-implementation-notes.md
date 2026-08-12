@@ -155,3 +155,53 @@ working document and is intentionally not committed with these changes.
 - Adversarial review found no ordering, cancellation, lifecycle, diagnostics, or
   excessive-test issue. No public API, runtime schedule, or persistent state
   changed.
+
+## F18-B — Make keyed lifecycle transitions explicit
+
+- Replaced the implicit per-key flags with a private `KeyMachine`. Its stored
+  phases are `Driven` (identified inline/owner driver plus ready/running round),
+  `Completing` (the key reservation held through deferred result delivery), and
+  `Handoff` (identified reserved owner); idle and closed keys are removed
+  atomically from the shard map rather than represented as lingering states.
+- Submitting, starting or refreshing a round, finishing, driver/waiter drop,
+  owner start, and close now enter through named transitions. Every driver-facing
+  transition checks `DriverId`, so a stale inline future or owner cannot alter a
+  successor's queue or round token.
+- Transitions mutate state under the shard mutex and return deferred effects.
+  Cancellation, notification, result delivery, retired sender/request drops,
+  and owner spawning run in a fixed order after unlock. Delivery precedes a
+  successor spawn, preserving the existing externally visible ordering.
+- A handoff reserves the active-owner count before releasing the shard lock and
+  moves an RAII permit into the spawned owner. Close therefore cannot miss the
+  interval between committing a handoff and starting its task, and every exit
+  releases exactly one reservation.
+- The uncontended inline/no-spawn path, batching and FIFO semantics, result fan-
+  out, cancellation, shutdown, snapshots, and statistics remain covered by the
+  existing behavior tests. Two focused tests add the requested transition/action
+  table and prove cancellation, wake, and delivery effects remain deferred; no
+  migration-only compatibility test was added.
+- Adversarial review found that immediately removing a just-completed key exposed
+  a short idle window before deferred delivery. Completion now enters
+  `Completing`; submissions in that window only queue, and a post-delivery
+  transition either removes the still-empty key or commits exactly one handoff.
+  The transition table covers the no-successor finish followed by such an
+  interleaving submission.
+- The same review found two destructor/allocation details: a stale completion's
+  error payload could be dropped under the shard lock, and pruning replaced the
+  active batch allocation. Stale outcomes now join the deferred-drop effects;
+  in-place extraction and ordinary completion draining retain the batch `Vec`'s
+  allocation without changing member order.
+- A follow-up allocation audit removed the remaining one-element effect vectors.
+  Completion moves the existing batch allocation into one deferred delivery,
+  returns it empty after delivery, and reinstalls it only for the same completing
+  driver; stale finalization retires it after unlock. Cancellation, wake, retired
+  state, and stale outcome effects use optional slots, so ordinary uncontended
+  completion adds no effect-staging heap allocations or owner spawn.
+- A final hot-path review found that stale/close safety retained an unconditional
+  clone of the merged request, and owner rounds rebuilt their handle key each
+  time. Starting a round now moves the already-computed merged request into one
+  driver-owned fallback slot after unlock, while normal refresh recomputes the
+  queue value and only a stale, closed, or emptied-batch lookup clones the
+  fallback. Inline and owner drivers each reuse one handle for their lifetime,
+  so ordinary rounds add neither that request clone nor a per-owner-round key
+  allocation.
