@@ -190,3 +190,27 @@ working document and is intentionally not committed with these changes.
 - Adversarial review found no receipt-completeness, ordering, cleanup, evidence,
   or test-pruning issue. No persistent bytes, backend operations, retry behavior,
   or public API changed.
+
+## F29-A — Add a stable harness trace schema
+
+- Added a versioned, structured trace behind the simulation-only feature. It
+  records harness role spawn decisions, actual executor spawn IDs and selected
+  tasks, every simulated runtime byte, supplied versus fallback `Tape` bytes,
+  and supplied-tape versus PCT-RNG scheduler draws. Client/restart and operation
+  boundaries, crash/outage/final-heal actions, and final verification are in the
+  same event stream.
+- Tracing is opt-in. The ordinary harness uses a zero-allocation disabled sink;
+  the executor observer reads already-produced entropy bytes and assigned task
+  IDs without making an additional draw or scheduling decision.
+- One compact simulation test exercises every top-level event kind, all entropy
+  sources, every nemesis/heal action, and compares backend operation streams
+  with tracing disabled and enabled for uncached tape, cached tape, and PCT
+  runs. Exhausted scheduling tapes emit selected-task events but no fabricated
+  entropy draw.
+- The schema has a canonical, schema-version-prefixed JSON encoding but no
+  digest or corpus baseline. Those reviewed fixtures remain F29-B/F29-C work.
+  Adding optional `serde`/`serde_json` dependencies to the existing `sim`
+  feature is the only dependency change; the trace does not expand the default
+  feature surface.
+- No ADR was added: this is a temporary migration guard plus long-term replay
+  diagnostic, not a production protocol or architecture decision.

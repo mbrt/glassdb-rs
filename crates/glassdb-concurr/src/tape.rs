@@ -60,9 +60,19 @@ impl Tape {
         match self.bytes.get(self.pos) {
             Some(&b) => {
                 self.pos += 1;
+                #[cfg(sim)]
+                crate::exec::record_tape_draw(crate::exec::RuntimeEntropySource::TapeInput, b);
                 b
             }
-            None => (self.rng.next_u64() & 0xff) as u8,
+            None => {
+                let byte = (self.rng.next_u64() & 0xff) as u8;
+                #[cfg(sim)]
+                crate::exec::record_tape_draw(
+                    crate::exec::RuntimeEntropySource::TapeFallbackRng,
+                    byte,
+                );
+                byte
+            }
         }
     }
 }

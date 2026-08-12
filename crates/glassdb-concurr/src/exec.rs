@@ -45,6 +45,39 @@ const DEFAULT_STEP_BUDGET: u64 = 1_000_000;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct TaskId(pub u64);
 
+/// A stable observation emitted by the deterministic executor when a harness
+/// explicitly enables tracing. Ordinary runs do not allocate or emit events.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeTraceEvent {
+    /// A task was assigned its spawn-order identifier.
+    TaskSpawned { task_id: u64 },
+    /// The executor selected this task at the scheduling boundary.
+    TaskSelected { task_id: u64 },
+    /// One call consumed bytes from the executor's seeded entropy stream.
+    EntropyDraw {
+        source: RuntimeEntropySource,
+        bytes: Vec<u8>,
+    },
+}
+
+/// The deterministic entropy stream that produced an observed draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeEntropySource {
+    /// Bytes produced by `rt::fill_random`.
+    FillRandom,
+    /// A byte consumed from a supplied fault/media tape.
+    TapeInput,
+    /// A byte drawn from a tape's seeded fallback generator.
+    TapeFallbackRng,
+    /// A byte consumed from a supplied scheduling tape.
+    SchedulerInput,
+    /// A value drawn by a seeded randomized scheduling policy.
+    SchedulerRng,
+}
+
+/// Receives deterministic-executor observations for a single traced run.
+pub type RuntimeTraceObserver = Arc<dyn Fn(RuntimeTraceEvent) + Send + Sync>;
+
 /// Decides which ready task to poll next. Implementations must be deterministic
 /// functions of their own state so the entire run replays from a seed/tape.
 pub trait Scheduler: Send {
@@ -65,18 +98,40 @@ pub trait Scheduler: Send {
 pub struct TapeScheduler {
     tape: Vec<u8>,
     pos: usize,
+    trace: Option<RuntimeTraceObserver>,
 }
 
 impl TapeScheduler {
     pub fn new(tape: Vec<u8>) -> Self {
-        TapeScheduler { tape, pos: 0 }
+        TapeScheduler {
+            tape,
+            pos: 0,
+            trace: None,
+        }
+    }
+
+    /// Builds a tape scheduler that observes each consumed schedule byte.
+    pub fn new_traced(tape: Vec<u8>, trace: RuntimeTraceObserver) -> Self {
+        TapeScheduler {
+            tape,
+            pos: 0,
+            trace: Some(trace),
+        }
     }
 }
 
 impl Scheduler for TapeScheduler {
     fn pick(&mut self, ready: &[TaskId]) -> usize {
-        let b = self.tape.get(self.pos).copied().unwrap_or(0);
+        let input = self.tape.get(self.pos).copied();
+        let b = input.unwrap_or(0);
         self.pos = self.pos.wrapping_add(1);
+        if input.is_some() {
+            trace_scheduler_draw(
+                self.trace.as_ref(),
+                RuntimeEntropySource::SchedulerInput,
+                &[b],
+            );
+        }
         (b as usize) % ready.len()
     }
 }
@@ -114,6 +169,7 @@ impl Scheduler for RandomScheduler {
 /// seed-breadth complement to the byte-tape policy that needs no fuzzer feedback.
 pub struct PctScheduler {
     rng: Rng,
+    trace: Option<RuntimeTraceObserver>,
     /// Priority per task; higher wins. Initial priorities sit in a high band so
     /// they always dominate the small priorities assigned at change points.
     priorities: BTreeMap<TaskId, u64>,
@@ -136,15 +192,31 @@ impl PctScheduler {
     /// decisions. Both the priorities and the change points are pure functions of
     /// `seed`, so a run replays exactly.
     pub fn new(seed: u64, depth: usize, steps: u64) -> Self {
+        Self::build(seed, depth, steps, None)
+    }
+
+    /// Builds a PCT scheduler that observes change-point and priority draws.
+    pub fn new_traced(seed: u64, depth: usize, steps: u64, trace: RuntimeTraceObserver) -> Self {
+        Self::build(seed, depth, steps, Some(trace))
+    }
+
+    fn build(seed: u64, depth: usize, steps: u64, trace: Option<RuntimeTraceObserver>) -> Self {
         let mut rng = Rng::new(seed);
         let steps = steps.max(1);
         let n = depth.saturating_sub(1);
         let mut change_points = Vec::with_capacity(n);
         for _ in 0..n {
-            change_points.push(1 + rng.next_u64() % steps);
+            let draw = rng.next_u64();
+            trace_scheduler_draw(
+                trace.as_ref(),
+                RuntimeEntropySource::SchedulerRng,
+                &draw.to_le_bytes(),
+            );
+            change_points.push(1 + draw % steps);
         }
         PctScheduler {
             rng,
+            trace,
             priorities: BTreeMap::new(),
             change_points,
             step: 0,
@@ -177,8 +249,27 @@ impl Scheduler for PctScheduler {
     }
 
     fn on_spawn(&mut self, id: TaskId) {
-        let p = Self::HIGH_BASE + (self.rng.next_u64() >> 1);
+        let draw = self.rng.next_u64();
+        trace_scheduler_draw(
+            self.trace.as_ref(),
+            RuntimeEntropySource::SchedulerRng,
+            &draw.to_le_bytes(),
+        );
+        let p = Self::HIGH_BASE + (draw >> 1);
         self.priorities.insert(id, p);
+    }
+}
+
+fn trace_scheduler_draw(
+    trace: Option<&RuntimeTraceObserver>,
+    source: RuntimeEntropySource,
+    bytes: &[u8],
+) {
+    if let Some(trace) = trace {
+        trace(RuntimeTraceEvent::EntropyDraw {
+            source,
+            bytes: bytes.to_vec(),
+        });
     }
 }
 
@@ -221,6 +312,9 @@ struct Inner {
     /// Simulated entropy source for `fill_random` (e.g. `TxId` prefixes), seeded
     /// so the run is reproducible.
     entropy: Rng,
+    /// Optional migration guard for the simulation harness. Kept out of the
+    /// ordinary path so users that do not request a trace pay no allocation.
+    trace: Option<RuntimeTraceObserver>,
 }
 
 /// Tasks woken via a `Waker`. The only state shared with wakers, so it is the
@@ -288,6 +382,11 @@ impl Handle {
         inner.tasks.insert(id, Task { future: fut });
         inner.ready.insert(id);
         inner.scheduler.on_spawn(id);
+        let trace = inner.trace.clone();
+        drop(inner);
+        if let Some(trace) = trace {
+            trace(RuntimeTraceEvent::TaskSpawned { task_id: id.0 });
+        }
         id
     }
 
@@ -371,7 +470,28 @@ pub(crate) fn now_nanos() -> u64 {
 /// Panics if no executor is running.
 pub(crate) fn fill_random(buf: &mut [u8]) {
     let h = current().expect("rt::fill_random called outside the simulation executor");
-    h.inner.borrow_mut().entropy.fill(buf);
+    let trace = {
+        let mut inner = h.inner.borrow_mut();
+        inner.entropy.fill(buf);
+        inner.trace.clone()
+    };
+    if let Some(trace) = trace {
+        trace(RuntimeTraceEvent::EntropyDraw {
+            source: RuntimeEntropySource::FillRandom,
+            bytes: buf.to_vec(),
+        });
+    }
+}
+
+pub(crate) fn record_tape_draw(source: RuntimeEntropySource, byte: u8) {
+    if let Some(h) = current()
+        && let Some(trace) = h.inner.borrow().trace.clone()
+    {
+        trace(RuntimeTraceEvent::EntropyDraw {
+            source,
+            bytes: vec![byte],
+        });
+    }
 }
 
 /// A future that yields once, then completes. Equivalent to
@@ -412,14 +532,43 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    block_on_with_budget(scheduler, entropy_seed, DEFAULT_STEP_BUDGET, root)
+    block_on_with_budget(scheduler, entropy_seed, DEFAULT_STEP_BUDGET, None, root)
+}
+
+/// Runs `root` like [`block_on_with`] and emits spawn/entropy observations to
+/// `trace`. This is intended for deterministic migration guards; registering an
+/// observer does not consume scheduler or entropy state.
+pub fn block_on_with_trace<S, F, T>(
+    scheduler: S,
+    entropy_seed: u64,
+    trace: RuntimeTraceObserver,
+    root: F,
+) -> T
+where
+    S: Scheduler + 'static,
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    block_on_with_budget(
+        scheduler,
+        entropy_seed,
+        DEFAULT_STEP_BUDGET,
+        Some(trace),
+        root,
+    )
 }
 
 /// As [`block_on_with`], but with an explicit per-run step `budget`. Private so
 /// the public entry point always uses [`DEFAULT_STEP_BUDGET`]; a small budget
 /// lets the tests exercise the non-termination guard without spinning millions
 /// of steps.
-fn block_on_with_budget<S, F, T>(scheduler: S, entropy_seed: u64, budget: u64, root: F) -> T
+fn block_on_with_budget<S, F, T>(
+    scheduler: S,
+    entropy_seed: u64,
+    budget: u64,
+    trace: Option<RuntimeTraceObserver>,
+    root: F,
+) -> T
 where
     S: Scheduler + 'static,
     F: Future<Output = T> + Send + 'static,
@@ -454,6 +603,7 @@ where
         timers: BinaryHeap::new(),
         scheduler: Box::new(scheduler),
         entropy: Rng::new(entropy_seed),
+        trace,
     }));
     let handle = Handle {
         inner: inner.clone(),
@@ -548,11 +698,14 @@ fn run_loop<T>(handle: &Handle, out: &Arc<Mutex<Option<T>>>, budget: u64) {
                 let idx = inner.scheduler.pick(&ready_vec) % ready_vec.len();
                 let tid = ready_vec[idx];
                 inner.ready.remove(&tid);
-                Some(tid)
+                Some((tid, inner.trace.clone()))
             }
         };
 
-        if let Some(tid) = picked {
+        if let Some((tid, trace)) = picked {
+            if let Some(trace) = trace {
+                trace(RuntimeTraceEvent::TaskSelected { task_id: tid.0 });
+            }
             let taken = handle.inner.borrow_mut().tasks.remove(&tid);
             if let Some(mut task) = taken {
                 let waker = Waker::from(Arc::new(TaskWaker {
@@ -642,7 +795,7 @@ mod tests {
         // deterministic non-termination guard and panic, instead of spinning
         // forever and hanging the fuzzer or a corpus replay. A tiny budget keeps
         // the test fast: the workload below would otherwise take ~10k steps.
-        block_on_with_budget(LowestFirst, 0, 100, async {
+        block_on_with_budget(LowestFirst, 0, 100, None, async {
             for _ in 0..10_000 {
                 DetYield::default().await;
             }
@@ -879,6 +1032,7 @@ mod tests {
     fn pct_change_point_demotes_selected_task() {
         let mut scheduler = PctScheduler {
             rng: Rng::new(0),
+            trace: None,
             priorities: BTreeMap::from([(TaskId(1), 100), (TaskId(2), 90)]),
             change_points: vec![1],
             step: 0,
