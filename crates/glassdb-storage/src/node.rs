@@ -24,7 +24,7 @@ use glassdb_proto as pb;
 use prost::Message;
 
 use crate::error::StorageError;
-use crate::lock::LockType;
+use crate::lock::{LockState, LockStateError, LockType};
 use crate::shard::{CurrentState, Shard, ShardEntry};
 use glassdb_data::TxId;
 
@@ -202,94 +202,62 @@ impl Default for SplitPolicy {
 }
 
 /// One node-level lock and its transaction holders.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NodeLock {
-    typ: LockType,
-    locked_by: Vec<TxId>,
-}
-
-impl Default for NodeLock {
-    fn default() -> Self {
-        NodeLock {
-            typ: LockType::None,
-            locked_by: Vec::new(),
-        }
-    }
+    state: LockState,
 }
 
 impl NodeLock {
     /// Returns the held lock type.
     pub fn lock_type(&self) -> LockType {
-        self.typ
+        self.state.lock_type()
     }
 
     /// Returns the transactions holding the lock.
     pub fn holders(&self) -> &[TxId] {
-        &self.locked_by
+        self.state.holders()
     }
 
     /// Reports whether `id` holds this lock.
     pub fn contains(&self, id: &TxId) -> bool {
-        self.locked_by.contains(id)
+        self.state.contains(id)
     }
 
     pub(crate) fn add_reader(&mut self, id: TxId) {
-        if !self.contains(&id) {
-            self.locked_by.push(id);
-            self.locked_by.sort();
-        }
-        self.typ = LockType::Read;
+        self.state.add_reader(id);
     }
 
     pub(crate) fn set_writer(&mut self, id: TxId) {
-        self.typ = LockType::Write;
-        self.locked_by = vec![id];
+        self.state.set_writer(id);
     }
 
     pub(crate) fn remove(&mut self, id: &TxId) -> bool {
-        let old_len = self.locked_by.len();
-        self.locked_by.retain(|holder| holder != id);
-        if self.locked_by.is_empty() {
-            self.typ = LockType::None;
-        }
-        self.locked_by.len() != old_len
-    }
-
-    fn clear(&mut self) {
-        self.typ = LockType::None;
-        self.locked_by.clear();
+        self.state.remove(id)
     }
 
     pub(crate) fn to_pb(&self) -> pb::NodeLock {
-        let mut locked_by: Vec<Vec<u8>> = self
-            .locked_by
-            .iter()
-            .map(|id| id.as_bytes().to_vec())
-            .collect();
-        locked_by.sort();
+        let (lock_type, locked_by) = self.state.to_wire();
         pb::NodeLock {
-            lock_type: lock_type_to_proto(self.typ) as i32,
+            lock_type,
             locked_by,
         }
     }
 
-    pub(crate) fn from_pb(raw: Option<pb::NodeLock>) -> Self {
+    pub(crate) fn from_pb(raw: Option<pb::NodeLock>) -> Result<Self, LockStateError> {
         let Some(raw) = raw else {
-            return NodeLock::default();
+            return Ok(NodeLock::default());
         };
-        let typ = lock_type_from_proto(raw.lock_type);
-        NodeLock {
-            typ: if typ == LockType::Unknown && raw.locked_by.is_empty() {
-                LockType::None
-            } else {
-                typ
-            },
-            locked_by: raw.locked_by.into_iter().map(TxId::from_bytes).collect(),
-        }
+        Ok(NodeLock {
+            state: LockState::from_wire(raw.lock_type, raw.locked_by)?,
+        })
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.locked_by.is_empty() && matches!(self.typ, LockType::None | LockType::Unknown)
+        self.state.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.state.clear();
     }
 }
 
@@ -703,9 +671,12 @@ impl Node {
             Some(pb::node::Body::Leaf(leaf)) => NodeBody::Leaf(Shard::from_pb(leaf)?),
             None => NodeBody::Leaf(Shard::new()),
         };
-        let structure = NodeLock::from_pb(raw.structure_lock);
+        let structure = NodeLock::from_pb(raw.structure_lock).map_err(|_| {
+            StorageError::other("node structural gate must be empty or have one write holder")
+        })?;
         validate_structural_gate(&structure)?;
-        let membership = NodeLock::from_pb(raw.membership_lock);
+        let membership = NodeLock::from_pb(raw.membership_lock)
+            .map_err(|_| StorageError::other("node has invalid membership lock"))?;
         validate_membership_lock(&membership)?;
         let delete_intent = (!raw.collection_delete_intent.is_empty())
             .then(|| TxId::from_bytes(raw.collection_delete_intent));
@@ -738,26 +709,6 @@ fn validate_membership_lock(lock: &NodeLock) -> Result<(), StorageError> {
         | (LockType::Read, [_, ..])
         | (LockType::Write, [_]) => Ok(()),
         _ => Err(StorageError::other("node has invalid membership lock")),
-    }
-}
-
-fn lock_type_to_proto(t: LockType) -> pb::lock::LockType {
-    match t {
-        LockType::None => pb::lock::LockType::None,
-        LockType::Read => pb::lock::LockType::Read,
-        LockType::Write => pb::lock::LockType::Write,
-        LockType::Create => pb::lock::LockType::Create,
-        LockType::Unknown => pb::lock::LockType::Unknown,
-    }
-}
-
-fn lock_type_from_proto(t: i32) -> LockType {
-    match pb::lock::LockType::try_from(t) {
-        Ok(pb::lock::LockType::None) => LockType::None,
-        Ok(pb::lock::LockType::Read) => LockType::Read,
-        Ok(pb::lock::LockType::Write) => LockType::Write,
-        Ok(pb::lock::LockType::Create) => LockType::Create,
-        _ => LockType::Unknown,
     }
 }
 
@@ -835,6 +786,20 @@ mod tests {
             };
             assert!(Node::decode(&raw.encode_to_vec()).is_err());
         }
+    }
+
+    #[test]
+    fn decode_rejects_duplicate_node_lock_holders() {
+        let raw = pb::Node {
+            membership_lock: Some(pb::NodeLock {
+                lock_type: pb::lock::LockType::Read as i32,
+                locked_by: vec![vec![2], vec![1], vec![1]],
+            }),
+            ..pb::Node::default()
+        };
+
+        let error = Node::decode(&raw.encode_to_vec()).unwrap_err();
+        assert_eq!(error.to_string(), "node has invalid membership lock");
     }
 
     #[test]

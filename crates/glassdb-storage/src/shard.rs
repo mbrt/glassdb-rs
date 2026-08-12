@@ -18,7 +18,7 @@ use glassdb_proto as pb;
 use prost::Message;
 
 use crate::error::StorageError;
-use crate::lock::LockType;
+use crate::lock::{LockState, LockType, holders_to_proto, lock_type_to_proto};
 
 /// A key's committed current value (ADR-051): the writer that produced it plus
 /// where the value itself lives.
@@ -238,29 +238,18 @@ impl Shard {
 }
 
 fn entry_to_proto(e: &ShardEntry) -> pb::ShardEntry {
-    // Sort the holder set so logically equal entries encode to identical bytes.
-    let mut locked_by: Vec<Vec<u8>> = e.locked_by.iter().map(|t| t.as_bytes().to_vec()).collect();
-    locked_by.sort();
     pb::ShardEntry {
         key: e.key.clone(),
         lock_type: lock_type_to_proto(e.lock_type) as i32,
-        locked_by,
+        locked_by: holders_to_proto(&e.locked_by),
         current: current_to_proto(&e.current),
     }
 }
 
 fn entry_from_proto(e: pb::ShardEntry) -> Result<ShardEntry, StorageError> {
-    let mut lock_type = lock_type_from_proto(e.lock_type);
-    let locked_by: Vec<TxId> = e.locked_by.into_iter().map(TxId::from_bytes).collect();
-    match (lock_type, locked_by.as_slice()) {
-        (LockType::None | LockType::Unknown, [])
-        | (LockType::Read, [_, ..])
-        | (LockType::Write | LockType::Create, [_]) => {}
-        _ => return Err(StorageError::other("shard entry has an invalid lock")),
-    }
-    if lock_type == LockType::Unknown {
-        lock_type = LockType::None;
-    }
+    let (lock_type, locked_by) = LockState::from_wire(e.lock_type, e.locked_by)
+        .map_err(|_| StorageError::other("shard entry has an invalid lock"))?
+        .into_parts();
     Ok(ShardEntry {
         key: e.key,
         lock_type,
@@ -309,26 +298,6 @@ fn current_from_proto(raw: Option<pb::CurrentState>) -> Result<CurrentState, Sto
         None => Err(StorageError::other(
             "shard entry current value has no state tag",
         )),
-    }
-}
-
-fn lock_type_to_proto(t: LockType) -> pb::lock::LockType {
-    match t {
-        LockType::None => pb::lock::LockType::None,
-        LockType::Read => pb::lock::LockType::Read,
-        LockType::Write => pb::lock::LockType::Write,
-        LockType::Create => pb::lock::LockType::Create,
-        LockType::Unknown => pb::lock::LockType::Unknown,
-    }
-}
-
-fn lock_type_from_proto(t: i32) -> LockType {
-    match pb::lock::LockType::try_from(t) {
-        Ok(pb::lock::LockType::None) => LockType::None,
-        Ok(pb::lock::LockType::Read) => LockType::Read,
-        Ok(pb::lock::LockType::Write) => LockType::Write,
-        Ok(pb::lock::LockType::Create) => LockType::Create,
-        _ => LockType::Unknown,
     }
 }
 
@@ -428,24 +397,91 @@ mod tests {
     }
 
     #[test]
+    fn decoding_accepts_and_canonicalizes_the_lock_wire_matrix() {
+        use pb::lock::LockType as PbLockType;
+
+        let valid_locks = [
+            (
+                PbLockType::Unknown as i32,
+                Vec::new(),
+                LockType::None,
+                Vec::new(),
+            ),
+            (99, Vec::new(), LockType::None, Vec::new()),
+            (
+                PbLockType::None as i32,
+                Vec::new(),
+                LockType::None,
+                Vec::new(),
+            ),
+            (
+                PbLockType::Read as i32,
+                vec![vec![2], vec![1]],
+                LockType::Read,
+                vec![tx(&[1]), tx(&[2])],
+            ),
+            (
+                PbLockType::Write as i32,
+                vec![vec![3]],
+                LockType::Write,
+                vec![tx(&[3])],
+            ),
+            (
+                PbLockType::Create as i32,
+                vec![vec![4]],
+                LockType::Create,
+                vec![tx(&[4])],
+            ),
+        ];
+
+        for (lock_type, locked_by, expected_type, expected_holders) in valid_locks {
+            let raw = pb::Shard {
+                entries: vec![pb::ShardEntry {
+                    key: b"k".to_vec(),
+                    lock_type,
+                    locked_by,
+                    current: None,
+                }],
+            };
+
+            let shard = Shard::decode(&raw.encode_to_vec()).unwrap();
+            let entry = shard.lookup(b"k").unwrap();
+            assert_eq!(entry.lock_type, expected_type);
+            assert_eq!(entry.locked_by, expected_holders);
+
+            let canonical = pb::Shard::decode(shard.encode().as_slice()).unwrap();
+            assert_eq!(
+                canonical.entries[0].lock_type,
+                lock_type_to_proto(expected_type) as i32
+            );
+            assert_eq!(
+                canonical.entries[0].locked_by,
+                holders_to_proto(&expected_holders)
+            );
+        }
+    }
+
+    #[test]
     fn decoding_rejects_inconsistent_entry_locks() {
         use pb::lock::LockType as PbLockType;
 
         let invalid_locks = [
-            (PbLockType::None, vec![vec![1]]),
-            (PbLockType::Unknown, vec![vec![1]]),
-            (PbLockType::Read, Vec::new()),
-            (PbLockType::Write, Vec::new()),
-            (PbLockType::Write, vec![vec![1], vec![2]]),
-            (PbLockType::Create, Vec::new()),
-            (PbLockType::Create, vec![vec![1], vec![2]]),
+            (PbLockType::None as i32, vec![vec![1]]),
+            (PbLockType::Unknown as i32, vec![vec![1]]),
+            (99, vec![vec![1]]),
+            (PbLockType::Read as i32, Vec::new()),
+            (PbLockType::Read as i32, vec![vec![1], vec![1]]),
+            (PbLockType::Write as i32, Vec::new()),
+            (PbLockType::Write as i32, vec![vec![1], vec![2]]),
+            (PbLockType::Create as i32, Vec::new()),
+            (PbLockType::Create as i32, vec![vec![1], vec![2]]),
         ];
 
         for (lock_type, locked_by) in invalid_locks {
             let raw = pb::Shard {
                 entries: vec![pb::ShardEntry {
                     key: b"k".to_vec(),
-                    lock_type: lock_type as i32,
+                    lock_type,
                     locked_by,
                     current: None,
                 }],

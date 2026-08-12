@@ -211,7 +211,9 @@ impl CollectionRecord {
         Ok(CollectionRecord {
             children,
             directory_lock: {
-                let lock = NodeLock::from_pb(raw.directory_lock);
+                let lock = NodeLock::from_pb(raw.directory_lock).map_err(|_| {
+                    StorageError::other("collection record has an invalid directory lock")
+                })?;
                 match (lock.lock_type(), lock.holders()) {
                     (LockType::None | LockType::Unknown, [])
                     | (LockType::Read, [_, ..])
@@ -447,6 +449,23 @@ mod tests {
             unfrozen
                 .topology_participants()
                 .any(|holder| holder == &participant)
+        );
+    }
+
+    #[test]
+    fn decoding_rejects_duplicate_directory_lock_holders() {
+        let raw = pb::CollectionRecord {
+            directory_lock: Some(pb::NodeLock {
+                lock_type: pb::lock::LockType::Read as i32,
+                locked_by: vec![vec![2], vec![1], vec![1]],
+            }),
+            ..pb::CollectionRecord::default()
+        };
+
+        let error = CollectionRecord::decode(&raw.encode_to_vec()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "collection record has an invalid directory lock"
         );
     }
 
