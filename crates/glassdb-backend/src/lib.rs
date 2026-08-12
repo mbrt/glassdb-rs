@@ -163,6 +163,49 @@ impl ListCursor {
 /// A positive upper bound on the objects returned by one listing call.
 pub type ListLimit = NonZeroUsize;
 
+/// Validated arguments for listing one page of object paths.
+///
+/// The request borrows its prefix and cursor, so validation does not add an
+/// allocation to listing. Construct it at the boundary where raw listing
+/// arguments enter the backend contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListRequest<'a> {
+    prefix: &'a str,
+    cursor: Option<&'a ListCursor>,
+    limit: ListLimit,
+}
+
+impl<'a> ListRequest<'a> {
+    /// Validates and groups the arguments for one listing call.
+    pub fn new(
+        prefix: &'a str,
+        cursor: Option<&'a ListCursor>,
+        limit: ListLimit,
+    ) -> Result<Self, BackendError> {
+        validate_list_args(prefix, cursor, limit)?;
+        Ok(Self {
+            prefix,
+            cursor,
+            limit,
+        })
+    }
+
+    /// Returns the recursive object-path prefix.
+    pub fn prefix(&self) -> &str {
+        self.prefix
+    }
+
+    /// Returns the continuation cursor, when listing a subsequent page.
+    pub fn cursor(&self) -> Option<&ListCursor> {
+        self.cursor
+    }
+
+    /// Returns the positive page-size limit.
+    pub fn limit(&self) -> ListLimit {
+        self.limit
+    }
+}
+
 const LIST_CURSOR_PREFIX: &str = "glassdb-list-v1:";
 
 /// Validates the provider-independent arguments to [`Backend::list`].
@@ -306,6 +349,16 @@ pub trait Backend: Send + Sync {
         cursor: Option<&ListCursor>,
         limit: ListLimit,
     ) -> Result<ListPage, BackendError>;
+
+    /// Lists one page using arguments validated at construction.
+    ///
+    /// The default preserves compatibility with existing backend
+    /// implementations. Providers may continue implementing [`Backend::list`]
+    /// until the request-taking method becomes the required contract.
+    async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
+        self.list(request.prefix(), request.cursor(), request.limit())
+            .await
+    }
 }
 
 /// Transparent delegation so any `Arc<B: Backend>` (including
@@ -356,6 +409,10 @@ impl<B: Backend + ?Sized + 'static> Backend for std::sync::Arc<B> {
     ) -> Result<ListPage, BackendError> {
         (**self).list(prefix, cursor, limit).await
     }
+
+    async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
+        (**self).list_request(request).await
+    }
 }
 
 #[cfg(test)]
@@ -363,7 +420,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn list_argument_boundaries() {
+    fn list_request_and_cursor_boundaries() {
         let one = ListLimit::new(1).unwrap();
         let largest = ListLimit::new(usize::MAX).unwrap();
         let root_cursor = bind_list_cursor("", "root-token").unwrap();
@@ -377,6 +434,10 @@ mod tests {
             ("a/", None, largest, None),
             ("a/b/", Some(&nested_cursor), largest, Some("nested-token")),
         ] {
+            let request = ListRequest::new(prefix, cursor, limit).unwrap();
+            assert_eq!(request.prefix(), prefix);
+            assert_eq!(request.cursor(), cursor);
+            assert_eq!(request.limit(), limit);
             assert_eq!(
                 validate_list_args_and_cursor(prefix, cursor, limit).unwrap(),
                 provider_token,
@@ -386,7 +447,7 @@ mod tests {
 
         let malformed_cursor = ListCursor::new("opaque");
         for (prefix, cursor) in [("a", None), ("a/b", Some(&malformed_cursor))] {
-            let error = validate_list_args(prefix, cursor, one).unwrap_err();
+            let error = ListRequest::new(prefix, cursor, one).unwrap_err();
             match error {
                 BackendError::Other { msg, source } => {
                     assert_eq!(
@@ -435,7 +496,7 @@ mod tests {
             ),
             ("wrong prefix", wrong_prefix),
         ] {
-            let error = validate_list_args("a/", Some(&cursor), one).unwrap_err();
+            let error = ListRequest::new("a/", Some(&cursor), one).unwrap_err();
             assert!(
                 matches!(error, BackendError::InvalidCursor),
                 "{case} returned {error:?}"
@@ -447,5 +508,38 @@ mod tests {
             Err(BackendError::Other { .. })
         ));
         assert!(ListLimit::new(0).is_none());
+    }
+
+    #[tokio::test]
+    async fn list_request_default_delegates_through_a_trait_object() {
+        let backend: Arc<dyn Backend> = Arc::new(memory::MemoryBackend::new());
+        backend
+            .write_if_not_exists("a/one", Vec::new())
+            .await
+            .unwrap();
+        backend
+            .write_if_not_exists("a/two", Vec::new())
+            .await
+            .unwrap();
+        backend
+            .write_if_not_exists("b/other", Vec::new())
+            .await
+            .unwrap();
+
+        let limit = ListLimit::new(1).unwrap();
+        let first = backend
+            .list_request(ListRequest::new("a/", None, limit).unwrap())
+            .await
+            .unwrap();
+        let second = backend
+            .list_request(ListRequest::new("a/", first.next.as_ref(), limit).unwrap())
+            .await
+            .unwrap();
+
+        let mut objects = first.objects;
+        objects.extend(second.objects);
+        objects.sort();
+        assert_eq!(objects, ["a/one", "a/two"]);
+        assert!(second.next.is_none());
     }
 }

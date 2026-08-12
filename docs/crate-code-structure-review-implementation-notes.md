@@ -263,3 +263,21 @@ working document and is intentionally not committed with these changes.
   or pre-F24-C memory cursors are rejected and callers restart the prefix. No
   `ListRequest`, backend-instance identity, middleware migration, or caller
   migration from F24-D and later was introduced.
+
+## F24-D — Add `ListRequest` additively
+
+- Added a field-private, borrowed `ListRequest` that validates prefix, cursor,
+  and positive limit together without allocating. Its constructor preserves the
+  existing prefix-first error precedence, and accessors expose only the already
+  validated arguments.
+- Added an object-safe request-taking `Backend` entry point whose default calls
+  the existing required `list` method. The blanket `Arc<B>` implementation
+  forwards it explicitly so type erasure remains transparent to future
+  middleware overrides.
+- Existing providers, middleware, storage, and transaction callers remain on
+  the old signature for F24-E/F. No provider request, cursor bytes, page result,
+  operation count, or public error classification changed.
+- The existing validation table now exercises `ListRequest` construction and
+  accessors at the same boundaries. One compact trait-object test pins default
+  forwarding, prefix isolation, limit/cursor continuation, and termination;
+  this compatibility check may retire with the old signature in F24-G.
