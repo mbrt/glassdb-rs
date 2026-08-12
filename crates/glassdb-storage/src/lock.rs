@@ -185,6 +185,123 @@ impl LockState {
     }
 }
 
+/// A lock scope that permits shared readers or one exclusive writer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SharedExclusiveLock {
+    state: LockState,
+}
+
+impl SharedExclusiveLock {
+    /// Returns the held lock type.
+    pub fn lock_type(&self) -> LockType {
+        self.state.lock_type()
+    }
+
+    /// Returns the transactions holding the lock.
+    pub fn holders(&self) -> &[TxId] {
+        self.state.holders()
+    }
+
+    /// Reports whether `id` holds this lock.
+    pub fn contains(&self, id: &TxId) -> bool {
+        self.state.contains(id)
+    }
+
+    pub(crate) fn add_reader(&mut self, id: TxId) {
+        self.state.add_reader(id);
+    }
+
+    pub(crate) fn set_writer(&mut self, id: TxId) {
+        self.state.set_writer(id);
+    }
+
+    pub(crate) fn remove(&mut self, id: &TxId) -> bool {
+        self.state.remove(id)
+    }
+
+    pub(crate) fn to_pb(&self) -> pb::NodeLock {
+        lock_state_to_pb(&self.state)
+    }
+
+    pub(crate) fn from_pb(raw: Option<pb::NodeLock>) -> Result<Self, LockStateError> {
+        let state = lock_state_from_pb(raw)?;
+        if !matches!(
+            state.lock_type(),
+            LockType::None | LockType::Read | LockType::Write
+        ) {
+            return Err(LockStateError::InvalidShape);
+        }
+        Ok(Self { state })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.state.is_empty()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.state.clear();
+    }
+}
+
+/// A lock scope that is either open or closed by one exclusive writer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExclusiveGate {
+    state: LockState,
+}
+
+impl ExclusiveGate {
+    /// Returns the held lock type.
+    pub fn lock_type(&self) -> LockType {
+        self.state.lock_type()
+    }
+
+    /// Returns the transaction holding the gate, if closed.
+    pub fn holder(&self) -> Option<&TxId> {
+        self.state.holders().first()
+    }
+
+    /// Returns the transactions holding the gate.
+    pub fn holders(&self) -> &[TxId] {
+        self.state.holders()
+    }
+
+    /// Reports whether `id` holds this gate.
+    pub fn contains(&self, id: &TxId) -> bool {
+        self.state.contains(id)
+    }
+
+    pub(crate) fn set_writer(&mut self, id: TxId) {
+        self.state.set_writer(id);
+    }
+
+    pub(crate) fn remove(&mut self, id: &TxId) -> bool {
+        self.state.remove(id)
+    }
+
+    pub(crate) fn to_pb(&self) -> pb::NodeLock {
+        lock_state_to_pb(&self.state)
+    }
+
+    pub(crate) fn from_pb(raw: Option<pb::NodeLock>) -> Result<Self, LockStateError> {
+        let state = lock_state_from_pb(raw)?;
+        if !matches!(state.lock_type(), LockType::None | LockType::Write) {
+            return Err(LockStateError::InvalidShape);
+        }
+        Ok(Self { state })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.state.is_empty()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.state.clear();
+    }
+}
+
+/// Compatibility name for a node's former scope-neutral lock type.
+pub type NodeLock = SharedExclusiveLock;
+
 /// Why persisted lock fields could not form a neutral lock state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LockStateError {
@@ -219,4 +336,19 @@ pub(crate) fn holders_to_proto(holders: &[TxId]) -> Vec<Vec<u8>> {
     let mut locked_by: Vec<Vec<u8>> = holders.iter().map(|id| id.as_bytes().to_vec()).collect();
     locked_by.sort();
     locked_by
+}
+
+fn lock_state_from_pb(raw: Option<pb::NodeLock>) -> Result<LockState, LockStateError> {
+    let Some(raw) = raw else {
+        return Ok(LockState::default());
+    };
+    LockState::from_wire(raw.lock_type, raw.locked_by)
+}
+
+fn lock_state_to_pb(state: &LockState) -> pb::NodeLock {
+    let (lock_type, locked_by) = state.to_wire();
+    pb::NodeLock {
+        lock_type,
+        locked_by,
+    }
 }

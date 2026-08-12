@@ -24,7 +24,7 @@ use glassdb_proto as pb;
 use prost::Message;
 
 use crate::error::StorageError;
-use crate::lock::{LockState, LockStateError, LockType};
+use crate::lock::{ExclusiveGate, LockType, SharedExclusiveLock};
 use crate::shard::{CurrentState, Shard, ShardEntry};
 use glassdb_data::TxId;
 
@@ -201,66 +201,6 @@ impl Default for SplitPolicy {
     }
 }
 
-/// One node-level lock and its transaction holders.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NodeLock {
-    state: LockState,
-}
-
-impl NodeLock {
-    /// Returns the held lock type.
-    pub fn lock_type(&self) -> LockType {
-        self.state.lock_type()
-    }
-
-    /// Returns the transactions holding the lock.
-    pub fn holders(&self) -> &[TxId] {
-        self.state.holders()
-    }
-
-    /// Reports whether `id` holds this lock.
-    pub fn contains(&self, id: &TxId) -> bool {
-        self.state.contains(id)
-    }
-
-    pub(crate) fn add_reader(&mut self, id: TxId) {
-        self.state.add_reader(id);
-    }
-
-    pub(crate) fn set_writer(&mut self, id: TxId) {
-        self.state.set_writer(id);
-    }
-
-    pub(crate) fn remove(&mut self, id: &TxId) -> bool {
-        self.state.remove(id)
-    }
-
-    pub(crate) fn to_pb(&self) -> pb::NodeLock {
-        let (lock_type, locked_by) = self.state.to_wire();
-        pb::NodeLock {
-            lock_type,
-            locked_by,
-        }
-    }
-
-    pub(crate) fn from_pb(raw: Option<pb::NodeLock>) -> Result<Self, LockStateError> {
-        let Some(raw) = raw else {
-            return Ok(NodeLock::default());
-        };
-        Ok(NodeLock {
-            state: LockState::from_wire(raw.lock_type, raw.locked_by)?,
-        })
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.state.is_empty()
-    }
-
-    fn clear(&mut self) {
-        self.state.clear();
-    }
-}
-
 /// The node-level coordination state threaded through a leaf CAS round.
 ///
 /// Keeping this separate from the node's topology prevents transaction-engine
@@ -268,20 +208,20 @@ impl NodeLock {
 /// only intend to change locks.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NodeLocks {
-    structure: NodeLock,
-    membership: NodeLock,
+    structure: ExclusiveGate,
+    membership: SharedExclusiveLock,
     membership_version: u64,
     delete_intent: Option<TxId>,
 }
 
 impl NodeLocks {
     /// Returns the exclusive gate guarding changes to the node's physical shape.
-    pub fn structural_gate(&self) -> &NodeLock {
+    pub fn structural_gate(&self) -> &ExclusiveGate {
         &self.structure
     }
 
     /// Returns the membership lock guarding a leaf's live key set.
-    pub fn membership(&self) -> &NodeLock {
+    pub fn membership(&self) -> &SharedExclusiveLock {
         &self.membership
     }
 
@@ -456,7 +396,7 @@ impl Node {
     }
 
     /// Returns the node's exclusive structural gate.
-    pub fn structural_gate(&self) -> &NodeLock {
+    pub fn structural_gate(&self) -> &ExclusiveGate {
         self.locks.structural_gate()
     }
 
@@ -497,7 +437,7 @@ impl Node {
     }
 
     /// Returns the leaf membership lock.
-    pub fn membership_lock(&self) -> &NodeLock {
+    pub fn membership_lock(&self) -> &SharedExclusiveLock {
         self.locks.membership()
     }
 
@@ -671,13 +611,11 @@ impl Node {
             Some(pb::node::Body::Leaf(leaf)) => NodeBody::Leaf(Shard::from_pb(leaf)?),
             None => NodeBody::Leaf(Shard::new()),
         };
-        let structure = NodeLock::from_pb(raw.structure_lock).map_err(|_| {
+        let structure = ExclusiveGate::from_pb(raw.structure_lock).map_err(|_| {
             StorageError::other("node structural gate must be empty or have one write holder")
         })?;
-        validate_structural_gate(&structure)?;
-        let membership = NodeLock::from_pb(raw.membership_lock)
+        let membership = SharedExclusiveLock::from_pb(raw.membership_lock)
             .map_err(|_| StorageError::other("node has invalid membership lock"))?;
-        validate_membership_lock(&membership)?;
         let delete_intent = (!raw.collection_delete_intent.is_empty())
             .then(|| TxId::from_bytes(raw.collection_delete_intent));
         Ok(Node {
@@ -691,24 +629,6 @@ impl Node {
                 delete_intent,
             },
         })
-    }
-}
-
-fn validate_structural_gate(gate: &NodeLock) -> Result<(), StorageError> {
-    match (gate.lock_type(), gate.holders()) {
-        (LockType::None | LockType::Unknown, []) | (LockType::Write, [_]) => Ok(()),
-        _ => Err(StorageError::other(
-            "node structural gate must be empty or have one write holder",
-        )),
-    }
-}
-
-fn validate_membership_lock(lock: &NodeLock) -> Result<(), StorageError> {
-    match (lock.lock_type(), lock.holders()) {
-        (LockType::None | LockType::Unknown, [])
-        | (LockType::Read, [_, ..])
-        | (LockType::Write, [_]) => Ok(()),
-        _ => Err(StorageError::other("node has invalid membership lock")),
     }
 }
 
@@ -769,10 +689,14 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_shared_or_nonexclusive_structural_gate() {
+    fn decode_rejects_invalid_structural_gate_states() {
         for gate in [
             pb::NodeLock {
                 lock_type: pb::lock::LockType::Read as i32,
+                locked_by: vec![vec![1]],
+            },
+            pb::NodeLock {
+                lock_type: pb::lock::LockType::Create as i32,
                 locked_by: vec![vec![1]],
             },
             pb::NodeLock {
@@ -786,6 +710,20 @@ mod tests {
             };
             assert!(Node::decode(&raw.encode_to_vec()).is_err());
         }
+    }
+
+    #[test]
+    fn decode_rejects_create_membership_lock() {
+        let raw = pb::Node {
+            membership_lock: Some(pb::NodeLock {
+                lock_type: pb::lock::LockType::Create as i32,
+                locked_by: vec![vec![1]],
+            }),
+            ..pb::Node::default()
+        };
+
+        let error = Node::decode(&raw.encode_to_vec()).unwrap_err();
+        assert_eq!(error.to_string(), "node has invalid membership lock");
     }
 
     #[test]
