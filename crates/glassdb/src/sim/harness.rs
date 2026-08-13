@@ -515,7 +515,7 @@ async fn run_generic<W: SimWorkload>(
 
 // ---------------------------------------------------------------------------
 // Public entry points, generic over the workload. These are plain async fns; the
-// deterministic driver (a `TapeScheduler`/seed under `rt::block_on_with`) is
+// deterministic driver (a `TapeScheduler`/seed under `exec::block_on_with`) is
 // supplied by the fuzz target and the `*_sim` self-checks.
 // ---------------------------------------------------------------------------
 

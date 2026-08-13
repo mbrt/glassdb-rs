@@ -7,8 +7,8 @@
 /// Fills `bytes` from the active entropy source.
 pub fn fill_bytes(bytes: &mut [u8]) {
     #[cfg(sim)]
-    if crate::rt::in_sim() {
-        crate::rt::fill_random(bytes);
+    if crate::exec::executor::in_sim() {
+        crate::exec::executor::fill_random(bytes);
         return;
     }
     // Ordinary Tokio tests in a simulation build do not require a deterministic
@@ -20,7 +20,7 @@ pub fn fill_bytes(bytes: &mut [u8]) {
 /// source.
 pub fn uniform_unit() -> f64 {
     #[cfg(sim)]
-    if crate::rt::in_sim() {
+    if crate::exec::executor::in_sim() {
         let mut bytes = [0; 8];
         fill_bytes(&mut bytes);
         return ((u64::from_le_bytes(bytes) >> 11) as f64) / ((1u64 << 53) as f64);
@@ -45,7 +45,7 @@ mod tests {
     #[test]
     fn seeded_fill_and_unit_draws_share_one_stream() {
         let (prefix, unit, suffix) =
-            crate::rt::block_on_with(crate::rt::TapeScheduler::new(Vec::new()), 7, async {
+            crate::exec::block_on_with(crate::exec::TapeScheduler::new(Vec::new()), 7, async {
                 let mut prefix = [0; 10];
                 fill_bytes(&mut prefix);
                 let unit = uniform_unit();

@@ -2,7 +2,7 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::middleware::{OpLog, OpRecord};
-use glassdb_concurr::rt;
+use glassdb_concurr::exec;
 
 use super::{
     FaultConfig, SimWorkload, deinterleave, run_and_assert_with_faults, run_and_record_with_faults,
@@ -58,7 +58,7 @@ pub(super) fn run_fuzz_mode<W: SimWorkload>(
     fault_tape: Vec<u8>,
     media_tape: Option<Vec<u8>>,
 ) -> OpLog {
-    rt::block_on_with(rt::TapeScheduler::new(schedule_tape), seed, async move {
+    exec::block_on_with(exec::TapeScheduler::new(schedule_tape), seed, async move {
         run_generic(workload, faults, seed, fault_tape, media_tape).await
     })
 }
@@ -133,8 +133,8 @@ pub fn record_input<W: SimWorkload + for<'a> Arbitrary<'a>>(data: &[u8]) -> Vec<
 /// invariant. Panics on any violation.
 pub fn pct_assert<W: SimWorkload>(workload: &W, faults: FaultConfig, seed: u64) {
     let w = workload.clone();
-    rt::block_on_with(
-        rt::PctScheduler::new(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS),
+    exec::block_on_with(
+        exec::PctScheduler::new(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS),
         seed,
         // Empty fault tape: PCT explores the seed-breadth fault space.
         async move { run_and_assert_with_faults(w, faults, seed, Vec::new()).await },
@@ -145,8 +145,8 @@ pub fn pct_assert<W: SimWorkload>(workload: &W, faults: FaultConfig, seed: u64) 
 /// stream, for per-seed determinism comparison.
 pub fn pct_record<W: SimWorkload>(workload: &W, faults: FaultConfig, seed: u64) -> OpLog {
     let w = workload.clone();
-    rt::block_on_with(
-        rt::PctScheduler::new(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS),
+    exec::block_on_with(
+        exec::PctScheduler::new(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS),
         seed,
         async move { run_and_record_with_faults(&w, faults, seed, Vec::new()).await },
     )

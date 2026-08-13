@@ -1,14 +1,14 @@
 //! Runtime indirection seam.
 //!
 //! Production builds delegate to real `tokio`. Under `--cfg sim`, task spawning
-//! and time route through the in-repo deterministic executor ([`crate::exec`])
+//! and time route through the in-repo deterministic executor (`crate::exec`)
 //! when one is running on the current thread, and fall back to real `tokio`
 //! otherwise (so ordinary `#[tokio::test]` unit tests still work under a `sim`
 //! build).
 //!
 //! `tokio::sync` and `tokio::select!` are runtime-agnostic and are used directly
 //! elsewhere (non-`biased` selects stay deterministic under sim via the seeded
-//! branch-poll RNG; see `exec::block_on_with`).
+//! branch-poll RNG; see `crate::exec::block_on_with`).
 
 mod dedicated;
 #[cfg(not(sim))]
@@ -49,9 +49,6 @@ mod tests {
             Err(super::TimedOut)
         );
         assert_eq!(timeout_started.elapsed(), Duration::from_millis(7));
-
-        let unit = crate::entropy::uniform_unit();
-        assert!((0.0..1.0).contains(&unit));
 
         let task = spawn_dedicated("glassdb-runtime-contract", async { 42 }).unwrap();
         assert_eq!(task.await.unwrap(), 42);
@@ -146,7 +143,7 @@ mod tests {
         let caller = std::thread::current().id();
         let dropped_at_shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_notice = dropped_at_shutdown.clone();
-        super::block_on_with(super::TapeScheduler::new(Vec::new()), 0, async move {
+        crate::exec::block_on_with(crate::exec::TapeScheduler::new(Vec::new()), 0, async move {
             runtime_facade_contract().await;
 
             let success = spawn_dedicated("not-a-native-thread", async move {

@@ -9,23 +9,18 @@ use std::time::{Duration, SystemTime};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::exec;
+use crate::exec::executor;
 
 use super::TimedOut;
 
-pub use crate::exec::{
-    PctScheduler, RandomScheduler, Scheduler, TapeScheduler, TaskId, block_on_with, in_sim,
-};
-
-/// Fills `buf` with deterministic simulated entropy from the running
-/// executor's seeded RNG. Panics if called outside the executor.
-pub fn fill_random(buf: &mut [u8]) {
-    exec::fill_random(buf)
+/// Reports whether the deterministic executor is active.
+pub fn in_sim() -> bool {
+    executor::in_sim()
 }
 
 fn now_nanos() -> u64 {
-    if exec::in_sim() {
-        exec::now_nanos()
+    if executor::in_sim() {
+        executor::now_nanos()
     } else {
         // Fall-back clock for `#[tokio::test]` runs under a `sim` build (no
         // deterministic executor is active). `tokio::time::Instant::now`
@@ -77,7 +72,7 @@ impl Add<Duration> for Instant {
 /// byte-identical. Outside the executor it is the real clock.
 pub fn system_now() -> SystemTime {
     use std::time::UNIX_EPOCH;
-    if exec::in_sim() {
+    if executor::in_sim() {
         const SIM_WALL_BASE_SECS: u64 = 1_700_000_000;
         return UNIX_EPOCH
             + Duration::from_secs(SIM_WALL_BASE_SECS)
@@ -94,8 +89,8 @@ pub fn available_parallelism() -> usize {
 
 /// Sleeps for `dur` on the active clock.
 pub async fn sleep(dur: Duration) {
-    if exec::in_sim() {
-        exec::det_sleep(dur).await
+    if executor::in_sim() {
+        executor::det_sleep(dur).await
     } else {
         tokio::time::sleep(dur).await
     }
@@ -103,8 +98,8 @@ pub async fn sleep(dur: Duration) {
 
 /// Yields once to the scheduler.
 pub async fn yield_now() {
-    if exec::in_sim() {
-        exec::DetYield::default().await
+    if executor::in_sim() {
+        executor::DetYield::default().await
     } else {
         tokio::task::yield_now().await
     }
@@ -116,12 +111,12 @@ pub async fn timeout<F>(duration: Duration, future: F) -> Result<F::Output, Time
 where
     F: Future,
 {
-    if exec::in_sim() {
+    if executor::in_sim() {
         tokio::pin!(future);
         tokio::select! {
             biased;
             value = &mut future => Ok(value),
-            _ = exec::det_sleep(duration) => Err(TimedOut),
+            _ = executor::det_sleep(duration) => Err(TimedOut),
         }
     } else {
         tokio::time::timeout(duration, future)
@@ -182,10 +177,10 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    if exec::in_sim() {
+    if executor::in_sim() {
         let abort = CancellationToken::new();
         let abort_inner = abort.clone();
-        let rx = exec::det_spawn(async move {
+        let rx = executor::det_spawn(async move {
             tokio::select! {
                 biased;
                 _ = abort_inner.cancelled() => None,

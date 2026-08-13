@@ -62,7 +62,7 @@ const ALLOWED_TOKIO: &[&str] = &[
 const EXEMPT_SEAM_GLOBS: &[&str] = &[
     "crates/glassdb-concurr/src/rt.rs",
     "crates/glassdb-concurr/src/rt/*.rs",
-    "crates/glassdb-concurr/src/sim/executor.rs",
+    "crates/glassdb-concurr/src/exec/executor.rs",
     "crates/glassdb-storage/src/disk_cache/file_media.rs",
 ];
 

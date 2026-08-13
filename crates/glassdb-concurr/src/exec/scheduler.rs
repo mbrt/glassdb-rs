@@ -3,10 +3,17 @@
 use std::collections::BTreeMap;
 
 use crate::rng::Rng;
-use crate::sim::executor::TaskId;
+
+/// Unique id of a task within a single executor run. Assigned in spawn order,
+/// so it is a deterministic function of the schedule.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct TaskId(pub u64);
 
 /// Decides which ready task to poll next. Implementations must be deterministic
 /// functions of their own state so the entire run replays from a seed/tape.
+/// Callbacks may observe or spawn work through [`crate::rt`]; spawn
+/// notifications produced within a callback are delivered afterward in task
+/// creation order.
 pub trait Scheduler: Send {
     /// Picks an index into `ready` (always sorted ascending by [`TaskId`]).
     /// The returned index is taken modulo `ready.len()` by the caller, so any
@@ -159,10 +166,7 @@ impl Scheduler for LowestFirst {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use super::*;
-    use crate::exec::{DetYield, block_on_with, det_spawn};
 
     #[test]
     fn random_scheduler_seeded_selection_matches_reviewed_vector() {
@@ -171,36 +175,6 @@ mod tests {
         let selected: Vec<_> = (0..8).map(|_| scheduler.pick(&ready)).collect();
 
         assert_eq!(selected, [0, 2, 3, 0, 1, 0, 1, 2]);
-    }
-
-    #[test]
-    fn same_tape_is_byte_identical() {
-        fn run(tape: Vec<u8>) -> Vec<u32> {
-            block_on_with(TapeScheduler::new(tape), 0, async {
-                let log = Arc::new(Mutex::new(Vec::new()));
-                let mut handles = Vec::new();
-                for i in 0..4u32 {
-                    let log = log.clone();
-                    handles.push(det_spawn(async move {
-                        for _ in 0..3 {
-                            log.lock().unwrap().push(i);
-                            DetYield::default().await;
-                        }
-                    }));
-                }
-                for handle in handles {
-                    handle.await.unwrap();
-                }
-                Arc::try_unwrap(log).unwrap().into_inner().unwrap()
-            })
-        }
-        let tape = vec![3, 1, 2, 0, 1, 3, 2, 0, 1, 2, 3, 0];
-        let first = run(tape.clone());
-        let second = run(tape);
-        assert_eq!(first, second);
-        // A different tape should generally produce a different interleaving.
-        let different = run(vec![0; 16]);
-        assert_ne!(first, different);
     }
 
     #[test]
@@ -215,44 +189,6 @@ mod tests {
             0,
             "exhausted tapes fall back to the deterministic lowest-ready choice"
         );
-    }
-
-    /// Drives four yielding tasks under a [`PctScheduler`] and returns the order
-    /// in which their steps ran.
-    fn pct_order(seed: u64) -> Vec<u32> {
-        block_on_with(PctScheduler::new(seed, 3, 64), 0, async {
-            let log = Arc::new(Mutex::new(Vec::new()));
-            let mut handles = Vec::new();
-            for i in 0..4u32 {
-                let log = log.clone();
-                handles.push(det_spawn(async move {
-                    for _ in 0..3 {
-                        log.lock().unwrap().push(i);
-                        DetYield::default().await;
-                    }
-                }));
-            }
-            for handle in handles {
-                handle.await.unwrap();
-            }
-            Arc::try_unwrap(log).unwrap().into_inner().unwrap()
-        })
-    }
-
-    #[test]
-    fn pct_is_seed_reproducible() {
-        for seed in [0u64, 1, 42, 9999] {
-            assert_eq!(pct_order(seed), pct_order(seed), "seed {seed} not stable");
-        }
-    }
-
-    #[test]
-    fn pct_explores_interleavings() {
-        // Different seeds should generally yield different interleavings, or PCT
-        // would not be sampling the schedule space.
-        let baseline = pct_order(0);
-        let differs = (1u64..32).any(|seed| pct_order(seed) != baseline);
-        assert!(differs, "no PCT seed in 1..32 changed the interleaving");
     }
 
     #[test]

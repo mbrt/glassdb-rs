@@ -9,7 +9,7 @@ mod sim_support;
 
 use sim_support::{assert_slow_mutation_modes, fault_tape, tape};
 
-use glassdb::rt::{TapeScheduler, block_on_with};
+use glassdb::exec::{TapeScheduler, block_on_with};
 use glassdb::sim::{
     ApiAction, ApiTransaction, ApiWorkload, FaultConfig, pct_sweep, run_and_assert,
     run_and_assert_with_faults,

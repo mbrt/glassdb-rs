@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use glassdb_concurr::rt;
+use glassdb_concurr::{exec, rt};
 use glassdb_data::DatabaseId;
 use sha2::{Digest, Sha256};
 
@@ -300,8 +300,8 @@ pub fn replay_disk_cache_input(data: &[u8]) {
 /// Runs one cache-only fuzz input and returns its deterministic observable trace.
 pub fn record_disk_cache_input(data: &[u8]) -> Vec<DiskCacheEvent> {
     let decoded = decode(data);
-    rt::block_on_with(
-        rt::TapeScheduler::new(decoded.schedule_tape),
+    exec::block_on_with(
+        exec::TapeScheduler::new(decoded.schedule_tape),
         decoded.seed,
         run(decoded.seed, decoded.commands, decoded.media_tape),
     )

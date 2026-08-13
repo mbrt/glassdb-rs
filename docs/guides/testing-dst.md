@@ -35,7 +35,7 @@ This costs ownership of a small executor, media model, and `--cfg sim` seam.
 | Criterion                             | Current (in-repo `DetExecutor`)                                                        | madsim                                                                 | turmoil                                                                    | mad-turmoil                                                                 |
 | ------------------------------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | -------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
 | Maintainable / minimal / tokio-robust | **Good** — small and owned; but bespoke executor/media + `tokio_unstable` coupling     | **Partial** — large dependency that re-implements Tokio's runtime      | **Good** — tokio-org maintained; filesystem surface is new and unstable   | **Partial** — small crate but global `libc` interposition + young 3rd-party |
-| Easy to use                           | **Good** — `rt`/media seams + `--cfg sim`; users unaffected                           | **Partial** — `--cfg madsim` + tokio alias; cloud backends excluded    | **Partial (here)** — useful filesystem shim, mismatched host/runtime model | **Partial** — turmoil structuring + `main()` init incantation               |
+| Easy to use                           | **Good** — distinct `exec`, `rt`, entropy, and media seams + `--cfg sim`; users unaffected | **Partial** — `--cfg madsim` + tokio alias; cloud backends excluded    | **Partial (here)** — useful filesystem shim, mismatched host/runtime model | **Partial** — turmoil structuring + `main()` init incantation               |
 | Fully deterministic & reproducible    | **Strong** — verified by byte-identical op-stream + corpus replay; owned input streams | **Good** — but leaks tokio's `select!`/`watch` RNG until tamed         | **Partial** — seeded model does not close application entropy/time leaks   | **Strong** — closes turmoil's `libc` leaks; trace-diff meta-test            |
 | Fuzz-guided edge-case exploration     | **Strong** — schedule/backend/media tapes + PCT depth bound                            | **Weak** — own seeded scheduler, not byte-guidable                     | **Weak** — own seeded scheduler and event sampling                         | **Weak** — same as turmoil                                                  |
 | Efficient                             | **Strong** — single thread, narrow in-memory models, virtual time                      | **Partial** — full runtime + simulated net + RPC                       | **Partial** — per-host runtimes and general network/filesystem models      | **Partial** — turmoil overhead + cheap overrides                            |
@@ -43,10 +43,13 @@ This costs ownership of a small executor, media model, and `--cfg sim` seam.
 ## The four approaches in one paragraph each
 
 - **Current — in-repo `DetExecutor` (ADR-011).** A single-threaded executor with
-  a pluggable `Scheduler` controls task **poll order at await points**. A `rt`
-  seam redirects task execution and time; `tokio::sync`, `tokio::select!`, and
-  `tokio_util::CancellationToken` are reused as-is. Time is virtual, entropy is
-  a seeded RNG, and tokio's own `select!` branch RNG is seeded via `RngSeed`.
+  a pluggable `Scheduler` controls task **poll order at await points**.
+  `exec::{block_on_with, TapeScheduler, PctScheduler}` configures each run;
+  `rt::{spawn, sleep, Instant, timeout}` provides services inside it, and the
+  entropy facade selects the run's seeded stream. `tokio::sync`,
+  `tokio::select!`, and `tokio_util::CancellationToken` are reused as-is. Time
+  is virtual, entropy is a seeded RNG, and tokio's own `select!` branch RNG is
+  seeded via `RngSeed`.
   Two schedulers provide a **schedule-tape** (libFuzzer bytes choose the next
   task) and **PCT** (randomized priorities + change points). `FaultBackend`
   consumes an independent backend-fault tape. ADR-048 adds a third,
@@ -142,11 +145,14 @@ authority. Those facts drive the comparison:
 
 ### 2. Easy to use
 
-- **Current — Good.** Engine code calls `rt::{spawn, sleep, Instant, system_now}`
-  instead of tokio directly — one seam to remember, enforced by a test. Tests
-  run the _real_ engine suite under `--cfg sim`; library users see nothing.
-  Faults are ordinary `Backend` middleware. _Cons:_ the seam is a standing
-  discipline, and the sim build needs `--cfg sim --cfg tokio_unstable`.
+- **Current — Good.** Simulation harnesses call
+  `exec::{block_on_with, TapeScheduler, PctScheduler}` to configure runs;
+  engine code calls `rt::{spawn, sleep, Instant, system_now}` for in-run
+  services, while entropy callers use the separate entropy facade. The runtime
+  seam is enforced by a test. Tests run the _real_ engine suite under
+  `--cfg sim`; library users see nothing. Faults are ordinary `Backend`
+  middleware. _Cons:_ these seams are a standing discipline, and the sim build
+  needs `--cfg sim --cfg tokio_unstable`.
 
 - **madsim — Partial.** Requires `--cfg madsim`, the workspace-wide tokio alias,
   and excluding anything that can't compile against fake-tokio (the s3/gcs

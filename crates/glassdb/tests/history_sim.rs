@@ -6,7 +6,7 @@
 
 mod sim_support;
 
-use glassdb::rt::{TapeScheduler, block_on_with};
+use glassdb::exec::{TapeScheduler, block_on_with};
 use glassdb::sim::{
     FaultConfig, HistoryInstruction as I, HistoryTransaction, HistoryWorkload, pct_sweep,
     run_and_assert, run_and_assert_with_faults,

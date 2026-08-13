@@ -17,7 +17,7 @@
 
 use std::cell::RefCell;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -26,7 +26,8 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use crate::rng::Rng;
-use crate::sim::scheduler::Scheduler;
+
+use super::scheduler::{Scheduler, TaskId};
 
 /// Maximum number of scheduler steps (task polls plus virtual-time advances) a
 /// single [`block_on_with`] run may take before it is declared non-terminating
@@ -40,11 +41,6 @@ use crate::sim::scheduler::Scheduler;
 /// suite (~1.4k steps), so it cannot false-trip a bounded workload. Note this is
 /// a *complement* to, not a replacement for, libFuzzer's wall-clock `-timeout`.
 const DEFAULT_STEP_BUDGET: u64 = 1_000_000;
-
-/// Unique id of a task within a single executor run. Assigned in spawn order, so
-/// it is a deterministic function of the (deterministic) schedule.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct TaskId(pub u64);
 
 struct TimerEntry {
     deadline: u64,
@@ -81,7 +77,7 @@ struct Inner {
     tasks: BTreeMap<TaskId, Task>,
     ready: BTreeSet<TaskId>,
     timers: BinaryHeap<Reverse<TimerEntry>>,
-    scheduler: Box<dyn Scheduler>,
+    pending_spawns: VecDeque<TaskId>,
     /// Simulated entropy source for `fill_random` (e.g. `TxId` prefixes), seeded
     /// so the run is reproducible.
     entropy: Rng,
@@ -122,7 +118,7 @@ impl Wake for TaskWaker {
 /// call. The futures live behind `Rc<RefCell<..>>` (single-threaded), while the
 /// wake queue is the `Arc` shared with wakers.
 #[derive(Clone)]
-pub(crate) struct Handle {
+struct Handle {
     inner: Rc<RefCell<Inner>>,
     wake: Arc<WakeQueue>,
 }
@@ -131,7 +127,7 @@ thread_local! {
     static CURRENT: RefCell<Option<Handle>> = const { RefCell::new(None) };
 }
 
-pub(crate) fn current() -> Option<Handle> {
+fn current() -> Option<Handle> {
     CURRENT.with(|c| c.borrow().clone())
 }
 
@@ -151,7 +147,7 @@ impl Handle {
         inner.next_task += 1;
         inner.tasks.insert(id, Task { future: fut });
         inner.ready.insert(id);
-        inner.scheduler.on_spawn(id);
+        inner.pending_spawns.push_back(id);
         id
     }
 
@@ -164,6 +160,16 @@ impl Handle {
             id,
             waker,
         }));
+    }
+}
+
+fn drain_spawn_notifications(handle: &Handle, scheduler: &mut dyn Scheduler) {
+    loop {
+        let spawned = handle.inner.borrow_mut().pending_spawns.pop_front();
+        let Some(spawned) = spawned else {
+            return;
+        };
+        scheduler.on_spawn(spawned);
     }
 }
 
@@ -234,7 +240,7 @@ pub(crate) fn now_nanos() -> u64 {
 /// Fills `buf` with deterministic simulated entropy from the run's seeded RNG.
 /// Panics if no executor is running.
 pub(crate) fn fill_random(buf: &mut [u8]) {
-    let h = current().expect("rt::fill_random called outside the simulation executor");
+    let h = current().expect("simulation entropy requested outside the deterministic executor");
     h.inner.borrow_mut().entropy.fill(buf);
 }
 
@@ -265,11 +271,12 @@ impl Future for DetYield {
 /// Panics deterministically if the system deadlocks: no task is runnable and no
 /// timer is pending while `root` has not completed.
 ///
-/// Panics deterministically if the run exceeds [`DEFAULT_STEP_BUDGET`] scheduler
+/// Panics deterministically if the run exceeds the `DEFAULT_STEP_BUDGET` scheduler
 /// steps, treating non-termination (livelock / infinite retry) as a failure
 /// instead of hanging forever.
 ///
-/// `entropy_seed` seeds the simulated entropy source read by [`fill_random`].
+/// `entropy_seed` seeds the simulated entropy source read through
+/// [`crate::entropy::fill_bytes`].
 pub fn block_on_with<S, F, T>(scheduler: S, entropy_seed: u64, root: F) -> T
 where
     S: Scheduler + 'static,
@@ -283,7 +290,7 @@ where
 /// the public entry point always uses [`DEFAULT_STEP_BUDGET`]; a small budget
 /// lets the tests exercise the non-termination guard without spinning millions
 /// of steps.
-fn block_on_with_budget<S, F, T>(scheduler: S, entropy_seed: u64, budget: u64, root: F) -> T
+fn block_on_with_budget<S, F, T>(mut scheduler: S, entropy_seed: u64, budget: u64, root: F) -> T
 where
     S: Scheduler + 'static,
     F: Future<Output = T> + Send + 'static,
@@ -316,7 +323,7 @@ where
         tasks: BTreeMap::new(),
         ready: BTreeSet::new(),
         timers: BinaryHeap::new(),
-        scheduler: Box::new(scheduler),
+        pending_spawns: VecDeque::new(),
         entropy: Rng::new(entropy_seed),
     }));
     let handle = Handle {
@@ -333,6 +340,7 @@ where
         let v = root.await;
         *o2.lock().unwrap() = Some(v);
     }));
+    drain_spawn_notifications(&handle, &mut scheduler);
 
     // Drive the synchronous executor loop inside `block_on` so the seeded select
     // RNG is installed for the duration. `unconstrained` disables tokio's
@@ -341,7 +349,7 @@ where
     // synthetic poll (we never re-enter `block_on`, so a yield would stall).
     tokio_rt.block_on(tokio::task::coop::unconstrained(std::future::poll_fn(
         |_cx| {
-            run_loop(&handle, &out, budget);
+            run_loop(&handle, &out, &mut scheduler, budget);
             std::task::Poll::Ready(())
         },
     )));
@@ -360,6 +368,7 @@ where
     // if we held it across the drop, so we repeatedly snapshot-and-clear the
     // task map until it stays empty.
     loop {
+        drain_spawn_notifications(&handle, &mut scheduler);
         let drained: Vec<_> = std::mem::take(&mut handle.inner.borrow_mut().tasks)
             .into_iter()
             .collect();
@@ -373,7 +382,12 @@ where
     result
 }
 
-fn run_loop<T>(handle: &Handle, out: &Arc<Mutex<Option<T>>>, budget: u64) {
+fn run_loop<T>(
+    handle: &Handle,
+    out: &Arc<Mutex<Option<T>>>,
+    scheduler: &mut dyn Scheduler,
+    budget: u64,
+) {
     let mut steps: u64 = 0;
     loop {
         // Bound a single execution: a run that never terminates (livelock /
@@ -398,23 +412,28 @@ fn run_loop<T>(handle: &Handle, out: &Arc<Mutex<Option<T>>>, budget: u64) {
             }
         }
 
+        drain_spawn_notifications(handle, scheduler);
+
         if out.lock().unwrap().is_some() {
             return;
         }
 
         // 2. If any task is ready, let the scheduler pick one and poll it.
-        let picked = {
-            let mut inner = handle.inner.borrow_mut();
+        let ready = {
+            let inner = handle.inner.borrow();
             if inner.ready.is_empty() {
                 None
             } else {
-                let ready_vec: Vec<TaskId> = inner.ready.iter().copied().collect();
-                let idx = inner.scheduler.pick(&ready_vec) % ready_vec.len();
-                let tid = ready_vec[idx];
-                inner.ready.remove(&tid);
-                Some(tid)
+                Some(inner.ready.iter().copied().collect::<Vec<_>>())
             }
         };
+        let picked = ready.map(|ready| {
+            let idx = scheduler.pick(&ready) % ready.len();
+            drain_spawn_notifications(handle, scheduler);
+            let tid = ready[idx];
+            handle.inner.borrow_mut().ready.remove(&tid);
+            tid
+        });
 
         if let Some(tid) = picked {
             let taken = handle.inner.borrow_mut().tasks.remove(&tid);
@@ -429,7 +448,10 @@ fn run_loop<T>(handle: &Handle, out: &Arc<Mutex<Option<T>>>, budget: u64) {
                 let poll = task.future.as_mut().poll(&mut cx);
                 if poll.is_pending() {
                     handle.inner.borrow_mut().tasks.insert(tid, task);
+                } else {
+                    drop(task);
                 }
+                drain_spawn_notifications(handle, scheduler);
             }
             continue;
         }
@@ -479,8 +501,8 @@ fn run_loop<T>(handle: &Handle, out: &Arc<Mutex<Option<T>>>, budget: u64) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::scheduler::LowestFirst;
     use super::*;
-    use crate::sim::scheduler::LowestFirst;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -509,18 +531,6 @@ mod tests {
         let elapsed = block_on_with(LowestFirst, 0, async {
             let start = now_nanos();
             super::det_sleep(Duration::from_secs(10)).await;
-            now_nanos() - start
-        });
-        assert_eq!(elapsed, Duration::from_secs(10).as_nanos() as u64);
-    }
-
-    #[test]
-    fn runtime_timeout_uses_virtual_time() {
-        let elapsed = block_on_with(LowestFirst, 0, async {
-            let start = now_nanos();
-            let result =
-                crate::rt::timeout(Duration::from_secs(10), std::future::pending::<()>()).await;
-            assert_eq!(result, Err(crate::rt::TimedOut));
             now_nanos() - start
         });
         assert_eq!(elapsed, Duration::from_secs(10).as_nanos() as u64);
@@ -559,19 +569,6 @@ mod tests {
             "select order did not vary with the seed; tokio's branch RNG may not \
              be seeded by our runtime"
         );
-    }
-
-    #[test]
-    fn entropy_is_seed_reproducible() {
-        fn draw(seed: u64) -> [u8; 16] {
-            block_on_with(LowestFirst, seed, async {
-                let mut buf = [0u8; 16];
-                super::fill_random(&mut buf);
-                buf
-            })
-        }
-        assert_eq!(draw(7), draw(7));
-        assert_ne!(draw(7), draw(8));
     }
 
     #[test]

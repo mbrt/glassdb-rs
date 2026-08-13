@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use glassdb_backend::middleware::{DelayBackend, Latency, gcs_delays};
 use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
-use glassdb_concurr::rt::{self, TapeScheduler, block_on_with};
+use glassdb_concurr::exec::{TapeScheduler, block_on_with};
+use glassdb_concurr::{entropy, rt};
 
 fn replay(seed: u64) -> (Duration, [u8; 8]) {
     block_on_with(TapeScheduler::new(Vec::new()), seed, async {
@@ -19,7 +20,7 @@ fn replay(seed: u64) -> (Duration, [u8; 8]) {
         ));
         let elapsed = start.elapsed();
         let mut entropy_sentinel = [0; 8];
-        rt::fill_random(&mut entropy_sentinel);
+        entropy::fill_bytes(&mut entropy_sentinel);
         (elapsed, entropy_sentinel)
     })
 }

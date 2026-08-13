@@ -21,8 +21,8 @@ use sim_support::{
     assert_no_divergence, assert_slow_mutation_modes, fault_tape, record_faults_with_tape, tape,
 };
 
+use glassdb::exec::{TapeScheduler, block_on_with};
 use glassdb::middleware::OpRecord;
-use glassdb::rt::{TapeScheduler, block_on_with};
 use glassdb::sim::{
     FaultConfig, RmwOp, RmwWorkload, pct_record, pct_sweep, run_and_assert,
     run_and_assert_with_faults, run_and_record,

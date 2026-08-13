@@ -136,9 +136,9 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    if crate::exec::in_sim() {
+    if crate::exec::executor::in_sim() {
         let abort = CancellationToken::new();
-        let result = crate::exec::det_spawn(drive(future, abort.clone()));
+        let result = crate::exec::executor::det_spawn(drive(future, abort.clone()));
         Ok(DedicatedJoinHandle { result, abort })
     } else {
         spawn_native(name, future)

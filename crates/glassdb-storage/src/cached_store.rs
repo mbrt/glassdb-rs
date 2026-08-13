@@ -927,7 +927,7 @@ mod tests {
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
     };
     #[cfg(sim)]
-    use glassdb_concurr::rt;
+    use glassdb_concurr::exec;
     use glassdb_data::DatabaseId;
     use tempfile::TempDir;
     use tokio::sync::Notify;
@@ -1155,7 +1155,7 @@ mod tests {
     fn persistent_cache_runs_with_cached_store_in_deterministic_simulation() {
         let directory = TempDir::new().unwrap();
         let media = SimMedia::new(MediaFaultProfile::Healthy, Vec::new(), 0);
-        rt::block_on_with(rt::TapeScheduler::new(Vec::new()), 0, async move {
+        exec::block_on_with(exec::TapeScheduler::new(Vec::new()), 0, async move {
             let backend = Arc::new(MemoryBackend::new());
             backend
                 .write_if_not_exists("p", b"one".to_vec())
@@ -1189,7 +1189,7 @@ mod tests {
     fn simulated_media_failure_remains_a_cached_store_performance_failure() {
         let directory = TempDir::new().unwrap();
         let media = SimMedia::new(MediaFaultProfile::Selected, vec![255], 0);
-        rt::block_on_with(rt::TapeScheduler::new(Vec::new()), 0, async move {
+        exec::block_on_with(exec::TapeScheduler::new(Vec::new()), 0, async move {
             let backend = Arc::new(MemoryBackend::new());
             backend
                 .write_if_not_exists("p", b"one".to_vec())
@@ -1264,7 +1264,7 @@ mod tests {
     fn simulated_invalid_candidate_is_rejected_before_escape() {
         let directory = TempDir::new().unwrap();
         let media = SimMedia::new(MediaFaultProfile::Healthy, Vec::new(), 0);
-        rt::block_on_with(rt::TapeScheduler::new(Vec::new()), 0, async move {
+        exec::block_on_with(exec::TapeScheduler::new(Vec::new()), 0, async move {
             let backend = Arc::new(MemoryBackend::new());
             backend
                 .write_if_not_exists("p", b"backend".to_vec())

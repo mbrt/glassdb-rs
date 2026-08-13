@@ -1,5 +1,5 @@
+use glassdb::exec::{TapeScheduler, block_on_with};
 use glassdb::middleware::{OpRecord, first_divergence};
-use glassdb::rt::{TapeScheduler, block_on_with};
 use glassdb::sim::{FaultConfig, SimWorkload, run_and_record_with_faults};
 
 /// Returns a deterministic schedule tape long enough for a simulation run.
