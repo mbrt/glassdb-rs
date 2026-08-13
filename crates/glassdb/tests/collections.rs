@@ -122,7 +122,10 @@ async fn strict_and_idempotent_create_have_distinct_race_contracts() {
     db2.shutdown().await;
 
     let objects = backend
-        .list("example/_c/", None, ListLimit::new(100).unwrap())
+        .list_request(
+            glassdb::backend::ListRequest::new("example/_c/", None, ListLimit::new(100).unwrap())
+                .unwrap(),
+        )
         .await
         .unwrap()
         .objects;
@@ -432,7 +435,10 @@ async fn missing_bound_tree_root_is_not_empty_or_recreated_by_data_operations() 
 
     let permanent_root = "example/_c/0000000000000000000000/_r";
     let child_root = backend
-        .list("example/_c/", None, ListLimit::new(100).unwrap())
+        .list_request(
+            glassdb::backend::ListRequest::new("example/_c/", None, ListLimit::new(100).unwrap())
+                .unwrap(),
+        )
         .await
         .unwrap()
         .objects

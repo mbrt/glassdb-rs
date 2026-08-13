@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::{Backend, BackendError, ListCursor, ListLimit, bind_list_cursor};
+use crate::{Backend, BackendError, ListCursor, ListLimit, ListRequest, bind_list_cursor};
 
 const PREFIX: &str = "__glassdb_list_conformance__/target/";
 const EMPTY_PREFIX: &str = "__glassdb_list_conformance__/empty/";
@@ -50,7 +50,7 @@ pub async fn assert_list_conformance(backend: &dyn Backend) {
     for _ in 0..MAX_PAGES {
         pages += 1;
         let page = backend
-            .list(PREFIX, cursor.as_ref(), limit)
+            .list_request(ListRequest::new(PREFIX, cursor.as_ref(), limit).unwrap())
             .await
             .unwrap_or_else(|error| panic!("list page {pages} failed: {error:?}"));
         assert!(
@@ -87,16 +87,16 @@ pub async fn assert_list_conformance(backend: &dyn Backend) {
     assert_eq!(objects, expected, "recursive listing membership differed");
 
     let first_cursor = first_cursor.expect("paginated fixture returned no cursor");
-    let error = backend
-        .list(EMPTY_PREFIX, Some(&first_cursor), limit)
-        .await
-        .unwrap_err();
+    let error = ListRequest::new(EMPTY_PREFIX, Some(&first_cursor), limit).unwrap_err();
     assert!(
         matches!(error, BackendError::InvalidCursor),
         "cursor reused under another prefix returned {error:?}"
     );
 
-    let empty_page = backend.list(EMPTY_PREFIX, None, limit).await.unwrap();
+    let empty_page = backend
+        .list_request(ListRequest::new(EMPTY_PREFIX, None, limit).unwrap())
+        .await
+        .unwrap();
     assert!(
         empty_page.objects.is_empty(),
         "empty prefix returned objects"
@@ -107,20 +107,25 @@ pub async fn assert_list_conformance(backend: &dyn Backend) {
     let empty_cursor = ListCursor::new("");
     let invalid_provider_cursor = bind_list_cursor(PREFIX, "invalid").unwrap();
     for cursor in [None, Some(&invalid_cursor), Some(&empty_cursor)] {
-        let error = backend
-            .list(INVALID_PREFIX, cursor, limit)
-            .await
-            .unwrap_err();
+        let error = ListRequest::new(INVALID_PREFIX, cursor, limit).unwrap_err();
         assert!(
             matches!(&error, BackendError::Other { .. }),
             "invalid prefix returned {error:?}"
         );
     }
-    for cursor in [&invalid_cursor, &empty_cursor, &invalid_provider_cursor] {
-        let error = backend.list(PREFIX, Some(cursor), limit).await.unwrap_err();
+    for cursor in [&invalid_cursor, &empty_cursor] {
+        let error = ListRequest::new(PREFIX, Some(cursor), limit).unwrap_err();
         assert!(
             matches!(&error, BackendError::InvalidCursor),
             "invalid cursor returned {error:?}"
         );
     }
+    let error = backend
+        .list_request(ListRequest::new(PREFIX, Some(&invalid_provider_cursor), limit).unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, BackendError::InvalidCursor),
+        "provider-invalid cursor returned {error:?}"
+    );
 }

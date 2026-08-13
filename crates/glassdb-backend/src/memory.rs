@@ -11,8 +11,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::{
-    Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version, bind_list_cursor,
-    validate_list_args_and_cursor,
+    Backend, BackendError, ListCursor, ListPage, ListRequest, ReadReply, Version, bind_list_cursor,
 };
 
 #[derive(Clone, Default)]
@@ -142,13 +141,11 @@ impl Backend for MemoryBackend {
         Ok(())
     }
 
-    async fn list(
-        &self,
-        prefix: &str,
-        cursor: Option<&ListCursor>,
-        limit: ListLimit,
-    ) -> Result<ListPage, BackendError> {
-        let after = validate_list_args_and_cursor(prefix, cursor, limit)?
+    async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
+        let prefix = request.prefix();
+        let limit = request.limit();
+        let after = request
+            .provider_cursor()
             .map(|cursor| decode_memory_list_cursor(prefix, cursor))
             .transpose()?;
         let state = self.state.lock().unwrap();

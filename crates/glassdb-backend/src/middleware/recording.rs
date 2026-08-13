@@ -18,9 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::{
-    Backend, BackendError, ListCursor, ListLimit, ListPage, ListRequest, ReadReply, Version,
-};
+use crate::{Backend, BackendError, ListCursor, ListPage, ListRequest, ReadReply, Version};
 
 /// A single recorded backend operation: the method tag, the primary path, and a
 /// canonical encoding of the remaining arguments.
@@ -155,22 +153,6 @@ impl Backend for RecordingBackend {
         self.inner.delete_if(path, expected).await
     }
 
-    async fn list(
-        &self,
-        prefix: &str,
-        cursor: Option<&ListCursor>,
-        limit: ListLimit,
-    ) -> Result<ListPage, BackendError> {
-        if let Ok(request) = ListRequest::new(prefix, cursor, limit) {
-            return self.list_request(request).await;
-        }
-        let mut args = Vec::new();
-        enc_cursor(&mut args, cursor);
-        args.extend_from_slice(&(limit.get() as u64).to_le_bytes());
-        self.record("list", prefix, args);
-        self.inner.list(prefix, cursor, limit).await
-    }
-
     async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
         let mut args = Vec::new();
         enc_cursor(&mut args, request.cursor());
@@ -213,7 +195,9 @@ mod tests {
         let _ = rec.read("a/b").await;
         let _ = rec.read_if_modified("a/b", &v).await;
         let _ = rec.delete_if("a/b", &v).await;
-        let _ = rec.list("a/", None, ListLimit::new(1).unwrap()).await;
+        let _ = rec
+            .list_request(ListRequest::new("a/", None, crate::ListLimit::new(1).unwrap()).unwrap())
+            .await;
 
         let recorded = log.lock().unwrap();
         let ops: Vec<&str> = recorded.iter().map(|r| r.op).collect();

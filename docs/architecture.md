@@ -337,11 +337,8 @@ pub trait Backend: Send + Sync {
     async fn delete_if(
         &self, path: &str, expected: &Version,
     ) -> Result<(), BackendError>;
-    async fn list(
-        &self,
-        prefix: &str,
-        cursor: Option<&ListCursor>,
-        limit: ListLimit,
+    async fn list_request(
+        &self, request: ListRequest<'_>,
     ) -> Result<ListPage, BackendError>;
 }
 ```
@@ -360,11 +357,14 @@ establishes an ordering edge; an `Unavailable` result does not. Provider retries
 remain inside one logical backend invocation so that attempts do not manufacture
 ordering edges between themselves.
 
-`list` returns one recursive prefix page of actual object paths. Its cursor is
-an opaque provider token valid only for the same backend and prefix, and only a
-page without a next cursor completes the traversal. A rejected token returns
-`InvalidCursor`, allowing the caller to restart that prefix. S3 and GCS map this
-contract directly to their native continuation tokens without a delimiter
+`list_request` returns one recursive prefix page of actual object paths. A
+`ListRequest` validates the prefix, positive limit, and prefix-bound cursor at
+construction and carries the decoded provider continuation token to the backend.
+Its cursor is opaque to callers and valid only for the same backend and prefix;
+only a page without a next cursor completes the traversal. A rejected provider
+token returns `InvalidCursor`, allowing the caller to restart that prefix. S3
+and GCS map this contract directly to their native continuation tokens without
+a delimiter
 ([ADR-035](adr/035-paginated-listing-and-sharded-transaction-logs.md)).
 
 ### Key concepts

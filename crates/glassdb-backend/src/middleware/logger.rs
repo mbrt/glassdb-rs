@@ -5,9 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::{
-    Backend, BackendError, ListCursor, ListLimit, ListPage, ListRequest, ReadReply, Version,
-};
+use crate::{Backend, BackendError, ListPage, ListRequest, ReadReply, Version};
 
 /// A [`Backend`] decorator that emits a `tracing` debug event on the
 /// `glassdb::backend` target for every operation, tagged with the configured
@@ -118,28 +116,6 @@ impl Backend for BackendLogger {
             expv = %format!("{expected:?}"),
             err = ?r.as_ref().err(),
             "DeleteIf"
-        );
-        r
-    }
-
-    async fn list(
-        &self,
-        prefix: &str,
-        cursor: Option<&ListCursor>,
-        limit: ListLimit,
-    ) -> Result<ListPage, BackendError> {
-        if let Ok(request) = ListRequest::new(prefix, cursor, limit) {
-            return self.list_request(request).await;
-        }
-        let r = self.inner.list(prefix, cursor, limit).await;
-        tracing::debug!(
-            target: "glassdb::backend",
-            backend_id = %self.id,
-            path = prefix,
-            cursor = ?cursor,
-            limit = limit.get(),
-            err = ?r.as_ref().err(),
-            "List"
         );
         r
     }
