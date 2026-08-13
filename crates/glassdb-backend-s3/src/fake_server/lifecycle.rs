@@ -1,5 +1,5 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aws_sdk_s3::config::{
@@ -28,24 +28,12 @@ use super::state::FakeState;
 /// `net.core.somaxconn`.
 const LISTEN_BACKLOG: u32 = 8192;
 
-/// Drop must not be able to wedge a test process if the server thread fails to
-/// observe its shutdown signal. Callers that need failure reporting should use
-/// [`FakeS3::shutdown`], which joins without a timeout.
-const DROP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// A defensive destructor deadline must keep advancing even when model time is
-/// paused; request latency continues to use the simulation-aware runtime seam.
-fn drop_deadline_now() -> std::time::Instant {
-    std::time::Instant::now()
-}
-
 /// A minimal in-process S3 server implementing just the REST subset the backend
 /// uses, with optional latency and `503 SlowDown` / lost-ack injection.
 pub struct FakeS3 {
     base_url: String,
     state: Arc<FakeState>,
     shutdown: Option<oneshot::Sender<()>>,
-    stopped: Mutex<std::sync::mpsc::Receiver<()>>,
     server_thread: Option<std::thread::JoinHandle<()>>,
     #[cfg(test)]
     server_thread_lifetime: std::sync::Weak<()>,
@@ -67,7 +55,8 @@ impl FakeS3 {
     /// runtime with hundreds of busy client workers it would be starved when
     /// they all open connections at once, which surfaces on the client as
     /// `dispatch failure` (a connect timeout). The returned fake owns that
-    /// thread; [`FakeS3::shutdown`] or dropping the fake stops it.
+    /// thread; [`FakeS3::shutdown`] waits for it to stop, while dropping the
+    /// fake requests asynchronous shutdown.
     pub async fn start_with(opts: FakeS3Options) -> FakeS3 {
         let state =
             Arc::new(FakeState::new(opts.latency.map(|profile| {
@@ -77,7 +66,6 @@ impl FakeS3 {
         let conns = opts.conn_counter.clone();
         let (addr_tx, addr_rx) = std::sync::mpsc::channel();
         let (shutdown, shutdown_rx) = oneshot::channel();
-        let (stopped_tx, stopped) = std::sync::mpsc::channel();
         #[cfg(test)]
         let thread_lifetime = Arc::new(());
         #[cfg(test)]
@@ -99,7 +87,6 @@ impl FakeS3 {
                 // Runtime drop joins its worker threads. Report completion only
                 // after none of them can outlive the owner.
                 drop(rt);
-                let _ = stopped_tx.send(());
             })
             .expect("spawn fake-s3 thread");
         let addr = match addr_rx.recv() {
@@ -113,7 +100,6 @@ impl FakeS3 {
             base_url: format!("http://{addr}"),
             state,
             shutdown: Some(shutdown),
-            stopped: Mutex::new(stopped),
             server_thread: Some(server_thread),
             #[cfg(test)]
             server_thread_lifetime,
@@ -122,8 +108,9 @@ impl FakeS3 {
 
     /// Stops the server and joins its dedicated thread.
     ///
-    /// Prefer this over relying on [`Drop`] when a server-thread panic must be
-    /// reported to the caller. The drop fallback is deliberately time-bounded.
+    /// Tests that require completed cleanup should call this explicitly. It
+    /// also reports a server-thread panic; [`Drop`] only requests shutdown and
+    /// detaches the thread so destruction can never block.
     pub fn shutdown(mut self) {
         self.signal_shutdown();
         if let Some(server_thread) = self.server_thread.take() {
@@ -200,28 +187,9 @@ impl FakeS3 {
 impl Drop for FakeS3 {
     fn drop(&mut self) {
         self.signal_shutdown();
-        let Some(server_thread) = self.server_thread.take() else {
-            return;
-        };
-        let deadline = drop_deadline_now() + DROP_SHUTDOWN_TIMEOUT;
-        let _ = self
-            .stopped
-            .get_mut()
-            .expect("fake-s3 completion mutex poisoned")
-            .recv_timeout(deadline.saturating_duration_since(drop_deadline_now()));
-        while !server_thread.is_finished() {
-            let remaining = deadline.saturating_duration_since(drop_deadline_now());
-            if remaining.is_zero() {
-                // Dropping a JoinHandle detaches. The shutdown signal remains
-                // set, but Drop itself must stay bounded if the thread wedges.
-                return;
-            }
-            std::thread::sleep(remaining.min(Duration::from_millis(1)));
-        }
-        // Do not panic from defensive cleanup (especially during unwinding);
-        // explicit shutdown reports a thread panic. `is_finished` makes this
-        // join non-blocking even if completion was reported slightly early.
-        let _ = server_thread.join();
+        // Dropping the JoinHandle detaches the dedicated thread. The server
+        // still observes the signal and tears itself down asynchronously; a
+        // caller that needs that teardown to be complete uses `shutdown()`.
     }
 }
 

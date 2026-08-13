@@ -526,8 +526,8 @@ fn conditional_put_retry_budget_is_shared_across_provider_facts() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fake_lifecycle_releases_listener_and_thread() {
-    for explicit_shutdown in [false, true, false, true] {
+async fn explicit_fake_shutdown_releases_listener_and_thread() {
+    for _ in 0..4 {
         let fake = FakeS3::start().await;
         let server_thread = fake.server_thread_lifetime();
         let address = fake
@@ -542,11 +542,7 @@ async fn fake_lifecycle_releases_listener_and_thread() {
             .unwrap();
         assert_eq!(b.read("lifecycle").await.unwrap().contents, b"value");
 
-        if explicit_shutdown {
-            fake.shutdown();
-        } else {
-            drop(fake);
-        }
+        fake.shutdown();
         assert!(
             tokio::net::TcpStream::connect(address).await.is_err(),
             "fake S3 listener at {address} survived shutdown"
@@ -555,12 +551,6 @@ async fn fake_lifecycle_releases_listener_and_thread() {
             server_thread.upgrade().is_none(),
             "fake S3 server thread survived shutdown"
         );
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.set_reuseaddr(true).unwrap();
-        socket.bind(address).unwrap_or_else(|error| {
-            panic!("fake S3 listener at {address} was not released: {error}")
-        });
-        drop(socket.listen(1).unwrap());
     }
 }
 

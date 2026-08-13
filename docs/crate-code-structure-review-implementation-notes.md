@@ -1345,26 +1345,19 @@ working document and is intentionally not committed with these changes.
   above; there was no deviation from the staged finding.
 ## F26-A — Own and stop the S3 fake thread
 
-- `FakeS3` now owns its dedicated server thread, a one-shot shutdown sender,
-  and a completion receiver. Its accept loop gives shutdown priority, tracks
-  connection tasks in a `JoinSet`, reaps completed tasks during service, and
-  cancels the remainder before dropping the four-worker runtime; completion is
-  reported only after the runtime has joined its worker threads.
+- `FakeS3` now owns its dedicated server thread and a one-shot shutdown sender.
+  Its accept loop gives shutdown priority, tracks connection tasks in a
+  `JoinSet`, reaps completed tasks during service, and cancels the remainder
+  before dropping the four-worker runtime.
 - Added consuming `FakeS3::shutdown`, which signals and joins without a timeout
-  so a server-thread panic is reported. Defensive `Drop` sends the same signal,
-  waits at most one second, and joins without panicking only after the thread
-  handle reports completion. The timeout path detaches only to keep a wedged
-  destructor bounded; normal drop is verified to complete and leave no thread.
-- The Drop deadline deliberately uses host monotonic time: model time may be
-  paused while a value is destroyed and therefore cannot bound a destructor.
-  The runtime-seam source audit admits only the fake's named deadline helper;
-  request latency and provider timestamps remain required to use model time.
+  so a server-thread panic is reported. `Drop` sends the same signal and
+  immediately detaches; destructors never block, while callers that require
+  completed cleanup use explicit shutdown.
 - One durable lifecycle test repeatedly starts the public fake, performs a
-  write and read through the real SDK transport, alternates explicit shutdown
-  and drop, verifies the old address refuses connections, observes the
-  individual server thread terminate, and rebinds the exact released port. It
-  covers active pooled connections without duplicating the existing S3
-  behavior matrix.
+  write and read through the real SDK transport, explicitly shuts it down,
+  verifies the ephemeral listener refuses connections, and observes the
+  individual server thread terminate. It covers active pooled connections
+  without duplicating the existing S3 behavior matrix.
 - The private `perfbench` backend factory now retains the fake owner beside its
   SDK client. Before this finding it could discard the handle because the
   detached thread leaked for the process lifetime; retaining it preserves the
@@ -1383,7 +1376,7 @@ working document and is intentionally not committed with these changes.
   divided into private `lifecycle`, `routing`, `parsing`, `state`, `faults`, and
   `latency` modules along the finding's responsibility boundaries.
 - Lifecycle retains the dedicated runtime and thread, socket accept loop,
-  connection accounting, shutdown and bounded-drop order, SDK client wiring,
+  connection accounting, explicit shutdown and detached-drop order, SDK wiring,
   and model-time adapters. Routing retains request-body collection, key/list
   classification, latency placement, object-operation dispatch, lost-ack
   placement, and byte-for-byte response construction. Parsing owns only header,
@@ -1397,10 +1390,9 @@ working document and is intentionally not committed with these changes.
   object lock is held for exactly the same interval, without snapshot clones.
   Successful mutations return only after releasing that lock, before routing
   consumes the lost-ack counter, preserving the durability/fault boundary.
-- The runtime-seam audit now scans both the facade and every Rust file beneath
-  the fake-server module directory. Its defensive cleanup exception follows
-  `drop_deadline_now` into `lifecycle.rs` and still requires exactly one
-  reviewed host-time deadline; all request latency remains on model time.
+- The runtime-seam audit scans both the facade and every Rust file beneath the
+  fake-server module directory. No host-time exception remains; all synthetic
+  request timing continues to use model time.
 - No parity or migration-only test was added. The durable seeded-latency test
   moved with its implementation, while the existing 30-test S3 behavior and
   lifecycle suite and doctest continue to exercise the public facade and real
@@ -1408,8 +1400,23 @@ working document and is intentionally not committed with these changes.
   S3 all-target/all-feature clippy also pass.
 - Public and crate-visible paths and signatures, wire bytes, status and header
   choices, state/fault lock boundaries, entropy draw order, await and spawn
-  order, listen/drop constants, dependency versions, and persistent formats are
+  order, listener configuration, dependency versions, and persistent formats are
   unchanged. There was no deviation from F26-B and no ADR was warranted.
+
+## Post-review simplification — Nonblocking fake-server Drop
+
+- Removed the one-second host-time cleanup deadline and completion channel from
+  `FakeS3`. The server already binds an ephemeral loopback port, so defensive
+  destruction does not need to synchronously prove exact-address reuse.
+- `FakeS3::shutdown()` remains the explicit, consuming operation for complete
+  teardown, thread joining, and panic reporting. `Drop` now only sends the
+  shutdown signal; dropping its thread handle detaches immediately while the
+  server completes the same prioritized asynchronous teardown.
+- Lifecycle coverage now requires explicit shutdown and verifies the listener
+  and server thread are gone, without a fixed-port rebind assertion. The
+  runtime-seam audit no longer admits any host-clock use in the fake server.
+- Request handling, fault injection, seeded latency, wire behavior, backend
+  operations, and retry semantics are unchanged. No ADR is warranted.
 
 ## F23-D — Rename and encapsulate split-policy fields
 
