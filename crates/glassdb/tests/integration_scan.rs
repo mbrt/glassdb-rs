@@ -15,7 +15,6 @@ use integration_support::{
 };
 
 #[tokio::test(start_paused = true)]
-#[allow(deprecated)]
 async fn list_keys() {
     let db = init_db(mem()).await;
     let coll = db
@@ -40,30 +39,13 @@ async fn list_keys() {
     .await
     .unwrap();
 
-    let legacy: Vec<Vec<u8>> = coll
-        .keys()
-        .await
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-
     let mut plain = coll.iter_keys().await.unwrap();
     assert_eq!(plain.len(), keys.len());
     let first = plain.next().unwrap();
     assert_eq!(plain.len(), keys.len() - 1);
     drop(coll);
     let got: Vec<Vec<u8>> = std::iter::once(first).chain(plain).collect();
-    assert_eq!(got, legacy);
-
-    assert_eq!(got.len(), keys.len());
-    let got_set: std::collections::HashSet<Vec<u8>> = got.iter().cloned().collect();
-    for k in &keys {
-        assert!(got_set.contains(k), "missing key {k:?}");
-    }
-    // The listing must be sorted.
-    let mut sorted = got.clone();
-    sorted.sort();
-    assert_eq!(got, sorted);
+    assert_eq!(got, keys);
 
     // Listing descends the B-link tree and scans its leaves via reads (ADR-031),
     // never a directory `list` of an object prefix.

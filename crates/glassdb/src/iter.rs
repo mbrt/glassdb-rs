@@ -4,7 +4,6 @@
 use std::iter::FusedIterator;
 
 use crate::Collection;
-use crate::error::Error;
 
 struct MaterializedIter<T> {
     items: std::vec::IntoIter<T>,
@@ -33,31 +32,6 @@ impl<T> Iterator for MaterializedIter<T> {
 impl<T> ExactSizeIterator for MaterializedIter<T> {}
 impl<T> FusedIterator for MaterializedIter<T> {}
 
-struct FallibleIter<I> {
-    items: I,
-}
-
-impl<I> FallibleIter<I> {
-    fn new(items: I) -> Self {
-        Self { items }
-    }
-}
-
-impl<I: Iterator> Iterator for FallibleIter<I> {
-    type Item = Result<I::Item, Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.items.next().map(Ok)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.items.size_hint()
-    }
-}
-
-impl<I: ExactSizeIterator> ExactSizeIterator for FallibleIter<I> {}
-impl<I: FusedIterator> FusedIterator for FallibleIter<I> {}
-
 /// Iterates over materialized collection keys without per-item failure.
 ///
 /// All I/O, decoding, and serializable validation complete before this owned
@@ -84,29 +58,6 @@ impl Iterator for KeyIter {
 
 impl ExactSizeIterator for KeyIter {}
 impl FusedIterator for KeyIter {}
-
-/// Compatibility iterator over materialized collection keys.
-///
-/// Per-item errors cannot occur because listing and validation finish before
-/// construction. Use [`KeyIter`] for the honest plain-item contract.
-#[deprecated(since = "0.1.0", note = "use `KeyIter` via `Collection::iter_keys`")]
-pub struct KeysIter(FallibleIter<KeyIter>);
-
-#[allow(deprecated)]
-impl KeysIter {
-    pub(crate) fn from_plain(items: KeyIter) -> Self {
-        Self(FallibleIter::new(items))
-    }
-}
-
-#[allow(deprecated)]
-impl Iterator for KeysIter {
-    type Item = Result<Vec<u8>, Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.next()
-    }
-}
 
 /// One immediate child returned by a collection listing.
 #[derive(Clone)]
@@ -150,29 +101,3 @@ impl Iterator for CollectionIter {
 
 impl ExactSizeIterator for CollectionIter {}
 impl FusedIterator for CollectionIter {}
-
-/// Compatibility iterator over materialized immediate child bindings.
-///
-/// Per-item errors cannot occur because the directory is materialized before
-/// construction. Use [`CollectionIter`] for the honest plain-item contract.
-#[deprecated(
-    since = "0.1.0",
-    note = "use `CollectionIter` via `Collection::iter_collections` or `Transaction::iter_collections`"
-)]
-pub struct CollectionsIter(FallibleIter<CollectionIter>);
-
-#[allow(deprecated)]
-impl CollectionsIter {
-    pub(crate) fn from_plain(items: CollectionIter) -> Self {
-        Self(FallibleIter::new(items))
-    }
-}
-
-#[allow(deprecated)]
-impl Iterator for CollectionsIter {
-    type Item = Result<CollectionEntry, Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.next()
-    }
-}

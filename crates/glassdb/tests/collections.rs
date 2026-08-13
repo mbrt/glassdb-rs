@@ -142,7 +142,6 @@ async fn strict_and_idempotent_create_have_distinct_race_contracts() {
 }
 
 #[tokio::test]
-#[allow(deprecated)]
 async fn child_listing_returns_sorted_incarnation_bound_handles() {
     let db = Database::open("example", MemoryBackend::new())
         .await
@@ -167,26 +166,12 @@ async fn child_listing_returns_sorted_incarnation_bound_handles() {
         .await
         .unwrap();
 
-    let legacy_names = parent
-        .collections()
-        .await
-        .unwrap()
-        .map(|entry| entry.map(|entry| entry.name))
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
     let mut plain = parent.iter_collections().await.unwrap();
     assert_eq!(plain.len(), 2);
     let first = plain.next().unwrap();
     assert_eq!(plain.len(), 1);
     drop(parent);
     let entries = std::iter::once(first).chain(plain).collect::<Vec<_>>();
-    assert_eq!(
-        entries
-            .iter()
-            .map(|entry| entry.name.clone())
-            .collect::<Vec<_>>(),
-        legacy_names
-    );
     assert_eq!(
         entries
             .iter()
@@ -205,7 +190,6 @@ async fn child_listing_returns_sorted_incarnation_bound_handles() {
 }
 
 #[tokio::test]
-#[allow(deprecated)]
 async fn child_listing_retries_after_the_directory_changes() {
     let backend = Arc::new(MemoryBackend::new());
     let db = Database::open("example", backend.clone()).await.unwrap();
@@ -220,22 +204,11 @@ async fn child_listing_retries_after_the_directory_changes() {
                 let attempts = attempts.clone();
                 async move {
                     let root = tx.root_collection();
-                    let legacy = tx
-                        .collections(&root)
-                        .await?
-                        .map(|entry| entry.map(|entry| entry.name))
-                        .collect::<Result<Vec<_>, _>>()?;
                     let names = tx
                         .iter_collections(&root)
                         .await?
                         .map(|entry| entry.name)
                         .collect::<Vec<_>>();
-                    glassdb::ensure_tx!(
-                        names == legacy,
-                        Error::internal(format!(
-                            "plain collection iterator differed from legacy: {names:?} vs {legacy:?}"
-                        ))
-                    );
                     if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                         peer.create_collection("appeared").await?;
                     }
