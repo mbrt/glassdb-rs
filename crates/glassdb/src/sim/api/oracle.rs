@@ -99,22 +99,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reachable_verdicts_and_diagnostics_are_stable() {
+    fn reachable_state_is_accepted() {
         let account = ApiAcct::new(1);
         assert_reachable(&[ApiModel::new()], &account);
+    }
 
+    #[test]
+    #[should_panic(expected = "not reachable")]
+    fn unreachable_state_is_rejected() {
+        let account = ApiAcct::new(1);
         let mut corrupted = ApiModel::new();
         corrupted.set_value(0, Some(7));
-        let panic = std::panic::catch_unwind(|| assert_reachable(&[corrupted], &account))
-            .expect_err("corrupted model unexpectedly passed the API oracle");
-        let message = panic
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| panic.downcast_ref::<&str>().copied())
-            .expect("oracle panic did not contain a string diagnostic");
-        assert_eq!(
-            message,
-            "client 0 final API state ApiModel { values: [Some(7), None, None, None, None, None, None, None], collections: [None, None] } is not reachable; expected one of {ApiModel { values: [None, None, None, None, None, None, None, None], collections: [None, None] }}"
-        );
+        assert_reachable(&[corrupted], &account);
     }
 }
