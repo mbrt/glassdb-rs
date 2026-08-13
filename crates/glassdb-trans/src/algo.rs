@@ -1731,12 +1731,12 @@ mod tests {
     // instead of retrying forever.
     #[tokio::test(start_paused = true)]
     async fn leaf_capacity_retry_episode_is_bounded() {
-        let policy = SplitPolicy {
-            leaf_max_bytes: 384,
-            node_max_bytes: 512,
-            split_headroom_bytes: 128,
-            ..SplitPolicy::default()
-        };
+        let policy = SplitPolicy::builder()
+            .node_soft_max_bytes(384)
+            .node_max_bytes(512)
+            .split_headroom_bytes(128)
+            .build()
+            .unwrap();
         let (tm, tctx) = new_algo_with_policy(policy).await;
 
         let mut low = 0;
@@ -1771,7 +1771,7 @@ mod tests {
         );
         assert!(
             Node::leaf(Shard::from_entries([unsafe_entry.clone()])).encoded_len()
-                <= policy.node_max_bytes,
+                <= policy.node_max_bytes(),
             "the grandfathered singleton itself must remain storable"
         );
 

@@ -56,11 +56,11 @@ async fn rw() {
 
 #[tokio::test]
 async fn individually_oversized_key_is_invalid_input() {
-    let policy = SplitPolicy {
-        node_max_bytes: 256,
-        split_headroom_bytes: 64,
-        ..SplitPolicy::default()
-    };
+    let policy = SplitPolicy::builder()
+        .node_max_bytes(256)
+        .split_headroom_bytes(64)
+        .build()
+        .unwrap();
     let db = Database::builder("example", mem())
         .split_policy(policy)
         .open()
@@ -84,12 +84,12 @@ async fn individually_oversized_key_is_invalid_input() {
 
 #[tokio::test(start_paused = true)]
 async fn boundary_inline_falls_back_before_it_can_strand_a_leaf() {
-    let policy = SplitPolicy {
-        leaf_max_bytes: 384,
-        node_max_bytes: 512,
-        split_headroom_bytes: 128,
-        ..SplitPolicy::default()
-    };
+    let policy = SplitPolicy::builder()
+        .node_soft_max_bytes(384)
+        .node_max_bytes(512)
+        .split_headroom_bytes(128)
+        .build()
+        .unwrap();
     let inline_value = vec![b'v'; 128];
     let first = split_unsafe_boundary_key(&policy, &inline_value, b'a');
     let second = vec![b'z'; first.len()];

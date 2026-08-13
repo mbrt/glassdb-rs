@@ -523,7 +523,7 @@ impl SeparatorPublisher {
             updated.set_index(new_index)?;
             let content_limit = self.policy.content_limit();
             if updated.content_encoded_len() > content_limit
-                || updated.encoded_len() > self.policy.node_max_bytes
+                || updated.encoded_len() > self.policy.node_max_bytes()
             {
                 self.nodes
                     .finish_without_split(&separator.collection, parent_token.as_ref(), &lock_id)
@@ -1193,8 +1193,8 @@ impl SplitHinter for SplitCandidates {
     /// when the queue is full.
     fn observe_leaf(&self, path: &ObjectPath, entries: &Shard) {
         let over_cap = entries.len() >= 2
-            && (entries.len() > self.policy.leaf_max_entries
-                || entries.encoded_len() > self.policy.leaf_max_bytes);
+            && (entries.len() > self.policy.leaf_max_entries()
+                || entries.encoded_len() > self.policy.node_soft_max_bytes());
         if !over_cap {
             return;
         }
@@ -1960,7 +1960,7 @@ impl Splitter {
         let sized_root = index.clone();
         let content_limit = self.candidates.policy().content_limit();
         if sized_root.content_encoded_len() > content_limit
-            || sized_root.encoded_len() > self.candidates.policy().node_max_bytes
+            || sized_root.encoded_len() > self.candidates.policy().node_max_bytes()
         {
             let result = match self.release_structural_gate(collection, None, worker).await {
                 Ok(()) => Err(TransError::InvalidInput(
@@ -2326,12 +2326,12 @@ mod tests {
     // and any three-child index overflows — so splits are driven by a handful of
     // keys instead of hundreds.
     fn tiny() -> SplitPolicy {
-        SplitPolicy {
-            leaf_max_entries: 2,
-            leaf_max_bytes: 1 << 20,
-            index_max_children: 2,
-            ..SplitPolicy::default()
-        }
+        SplitPolicy::builder()
+            .leaf_max_entries(2)
+            .node_soft_max_bytes(1 << 20)
+            .index_max_children(2)
+            .build()
+            .unwrap()
     }
 
     #[derive(Clone)]
@@ -3257,12 +3257,12 @@ mod tests {
         let root = Node::leaf(Shard::from_entries(keys.iter().map(|key| live(key))));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
-        let policy = SplitPolicy {
-            leaf_max_entries: 2,
-            leaf_max_bytes: 1 << 20,
-            index_max_children: 100,
-            ..SplitPolicy::default()
-        };
+        let policy = SplitPolicy::builder()
+            .leaf_max_entries(2)
+            .node_soft_max_bytes(1 << 20)
+            .index_max_children(100)
+            .build()
+            .unwrap();
         let candidates = SplitCandidates::with_policy(policy);
         candidates.observe_leaf(&root_path(), root.as_leaf().unwrap());
         let sp = splitter_with_candidates(&s, &bg, candidates);
@@ -3279,7 +3279,7 @@ mod tests {
             .unwrap();
         assert_eq!(leaves.len(), 5);
         assert!(leaves.iter().all(|leaf| {
-            leaf.node().unwrap().as_leaf().unwrap().len() <= policy.leaf_max_entries
+            leaf.node().unwrap().as_leaf().unwrap().len() <= policy.leaf_max_entries()
         }));
         for key in keys {
             let located = router
@@ -3725,12 +3725,12 @@ mod tests {
 
         // A generous entry cap but a tiny byte cap: the four-entry leaf is far
         // under the entry cap yet over the byte cap.
-        let policy = SplitPolicy {
-            leaf_max_entries: 1000,
-            leaf_max_bytes: 8,
-            index_max_children: 1000,
-            ..SplitPolicy::default()
-        };
+        let policy = SplitPolicy::builder()
+            .leaf_max_entries(1000)
+            .node_soft_max_bytes(8)
+            .index_max_children(1000)
+            .build()
+            .unwrap();
         let candidates = SplitCandidates::with_policy(policy);
         candidates.observe_leaf(
             &root_path(),
@@ -3785,12 +3785,12 @@ mod tests {
 
         // Tiny leaf cap so S splits, but a wide fan-out so the parent index does
         // not itself overflow — keeping the assertion on its separators direct.
-        let policy = SplitPolicy {
-            leaf_max_entries: 2,
-            leaf_max_bytes: 1 << 20,
-            index_max_children: 100,
-            ..SplitPolicy::default()
-        };
+        let policy = SplitPolicy::builder()
+            .leaf_max_entries(2)
+            .node_soft_max_bytes(1 << 20)
+            .index_max_children(100)
+            .build()
+            .unwrap();
         splitter(&s, &bg, policy)
             .split_path(&node_path("S"))
             .await

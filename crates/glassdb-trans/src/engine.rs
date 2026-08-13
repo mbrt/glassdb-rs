@@ -8,9 +8,9 @@ use glassdb_concurr::{Background, DedupKeySnapshot, RetryConfig};
 use glassdb_data::{CollectionAddress, CollectionId, DatabaseId, DbRoot, KeyRef, ObjectPath, TxId};
 use glassdb_storage::transaction::TLogger;
 use glassdb_storage::{
-    CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, InvalidSplitPolicy,
-    Node, PersistentCache, PersistentCacheConfig, PersistentCacheMedia, Requirement, Shard,
-    ShardStore, SplitPolicy, StorageError, StructuralLogStore, Timeline, TreeRouter,
+    CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, Node,
+    PersistentCache, PersistentCacheConfig, PersistentCacheMedia, Requirement, Shard, ShardStore,
+    SplitPolicy, StorageError, StructuralLogStore, Timeline, TreeRouter,
 };
 
 use crate::access::{Data, ScanMutation, ScanRange};
@@ -88,11 +88,6 @@ impl EngineConfig {
     pub fn set_protocol_timing(&mut self, timing: ProtocolTiming) {
         self.protocol_timing = timing;
     }
-
-    /// Validates configuration invariants required before runtime assembly.
-    pub fn validate(&self) -> Result<(), InvalidSplitPolicy> {
-        self.split_policy.validate()
-    }
 }
 
 impl Default for EngineConfig {
@@ -166,9 +161,6 @@ impl Engine {
         backend: Arc<StatsBackend>,
         config: EngineConfig,
     ) -> Result<Self, StorageError> {
-        config
-            .validate()
-            .map_err(|error| StorageError::other(error.to_string()))?;
         let EngineConfig {
             cache_size,
             persistent_cache,

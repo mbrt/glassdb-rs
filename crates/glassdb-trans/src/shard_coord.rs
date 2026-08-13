@@ -589,7 +589,7 @@ impl CasWorker {
                 .entries
                 .iter()
                 .any(|(_, entry)| !self.core.policy.entry_fits_split_budget(entry));
-        if candidate_node.encoded_len() <= self.core.policy.node_max_bytes
+        if candidate_node.encoded_len() <= self.core.policy.node_max_bytes()
             && !create_full
             && !inline_entry_full
         {
@@ -1488,11 +1488,11 @@ mod tests {
         let full_node = Node::leaf(Shard::from_entries([overwritten, created]));
         let content_limit = overwrite_len - 1;
         let node_max_bytes = full_node.encoded_len() + 64;
-        let policy = SplitPolicy {
-            node_max_bytes,
-            split_headroom_bytes: node_max_bytes - content_limit,
-            ..SplitPolicy::default()
-        };
+        let policy = SplitPolicy::builder()
+            .node_max_bytes(node_max_bytes)
+            .split_headroom_bytes(node_max_bytes - content_limit)
+            .build()
+            .unwrap();
         let hints = Arc::new(HintCounter::default());
         let (coord, shards, _timeline, _bg) = coord_over_with(backend, policy, hints.clone()).await;
         store_shard_entries(&shards, &leaf(), vec![seed]).await;
@@ -2386,11 +2386,11 @@ mod tests {
         assert!(full_node.content_encoded_len() > content_limit);
 
         let node_max_bytes = full_node.encoded_len() + 64;
-        let policy = SplitPolicy {
-            node_max_bytes,
-            split_headroom_bytes: node_max_bytes - content_limit,
-            ..SplitPolicy::default()
-        };
+        let policy = SplitPolicy::builder()
+            .node_max_bytes(node_max_bytes)
+            .split_headroom_bytes(node_max_bytes - content_limit)
+            .build()
+            .unwrap();
         let hints = Arc::new(HintCounter::default());
         let (coord, shards, _timeline, _bg) =
             coord_over_with(backend.clone(), policy, hints.clone()).await;
@@ -2529,11 +2529,11 @@ mod tests {
             inline_len > external_len,
             "the inline payload must add bytes"
         );
-        SplitPolicy {
-            node_max_bytes: external_len,
-            split_headroom_bytes: 0,
-            ..SplitPolicy::default()
-        }
+        SplitPolicy::builder()
+            .node_max_bytes(external_len)
+            .split_headroom_bytes(0)
+            .build()
+            .unwrap()
     }
 
     // A logless commit's leaf entry is the value's only copy, so an over-cap
@@ -2582,12 +2582,12 @@ mod tests {
             value: Arc::from(value.as_slice()),
         });
         let entry_len = Node::leaf(Shard::from_entries([inline.clone()])).content_encoded_len();
-        let policy = SplitPolicy {
-            node_max_bytes: entry_len * 2 + 64,
-            split_headroom_bytes: 65,
-            ..SplitPolicy::default()
-        };
-        assert!(Node::leaf(Shard::from_entries([inline])).encoded_len() <= policy.node_max_bytes);
+        let policy = SplitPolicy::builder()
+            .node_max_bytes(entry_len * 2 + 64)
+            .split_headroom_bytes(65)
+            .build()
+            .unwrap();
+        assert!(Node::leaf(Shard::from_entries([inline])).encoded_len() <= policy.node_max_bytes());
         assert!(
             !policy.entry_fits_split_budget(&ShardEntry::new(b"k").with_current(
                 CurrentState::Inline {
@@ -2686,11 +2686,11 @@ mod tests {
         let small_len = Node::leaf(Shard::from_entries([small])).encoded_len();
         let large_len = Node::leaf(Shard::from_entries([large])).encoded_len();
         assert!(large_len > small_len);
-        let policy = SplitPolicy {
-            node_max_bytes: small_len,
-            split_headroom_bytes: 0,
-            ..SplitPolicy::default()
-        };
+        let policy = SplitPolicy::builder()
+            .node_max_bytes(small_len)
+            .split_headroom_bytes(0)
+            .build()
+            .unwrap();
 
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (gated, gate) = Gate::wrap(mem);

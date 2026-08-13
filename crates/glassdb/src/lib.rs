@@ -56,6 +56,7 @@ macro_rules! ensure_tx {
 pub use glassdb_data::MAX_COLLECTION_NAME_BYTES;
 pub use glassdb_storage::{
     CacheStats, InlinePolicy, InvalidSplitPolicy, PersistentCacheConfig, SplitPolicy,
+    SplitPolicyBuilder,
 };
 pub use glassdb_trans::{
     DirectCommitStats, InlinePressureStats, LockerStats, ProtocolTiming, ShardCoordinatorStats,
