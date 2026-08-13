@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 
 use crate::rng::Rng;
-use crate::sim::executor::{RuntimeEntropySource, RuntimeTraceEvent, RuntimeTraceObserver, TaskId};
+use crate::sim::executor::{
+    RuntimeEntropySource, RuntimeTraceEvent, RuntimeTraceObserver, TaskId, emit_scheduler_trace,
+};
 
 /// Decides which ready task to poll next. Implementations must be deterministic
 /// functions of their own state so the entire run replays from a seed/tape.
@@ -195,10 +197,13 @@ fn trace_scheduler_draw(
     bytes: &[u8],
 ) {
     if let Some(trace) = trace {
-        trace(RuntimeTraceEvent::EntropyDraw {
-            source,
-            bytes: bytes.to_vec(),
-        });
+        emit_scheduler_trace(
+            trace,
+            RuntimeTraceEvent::EntropyDraw {
+                source,
+                bytes: bytes.to_vec(),
+            },
+        );
     }
 }
 
@@ -218,7 +223,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::exec::{DetYield, block_on_with, det_spawn};
+    use crate::exec::{DetYield, block_on_with, block_on_with_trace, det_spawn};
 
     #[test]
     fn random_scheduler_seeded_selection_matches_reviewed_vector() {
@@ -270,6 +275,63 @@ mod tests {
             scheduler.pick(&ready),
             0,
             "exhausted tapes fall back to the deterministic lowest-ready choice"
+        );
+    }
+
+    #[test]
+    fn scheduler_trace_observers_can_reenter_the_runtime_clock() {
+        fn observer(events: Arc<Mutex<Vec<RuntimeTraceEvent>>>) -> RuntimeTraceObserver {
+            Arc::new(move |event| {
+                let _ = crate::rt::Instant::now();
+                events.lock().unwrap().push(event);
+            })
+        }
+
+        let tape_events = Arc::new(Mutex::new(Vec::new()));
+        let tape_trace = observer(tape_events.clone());
+        block_on_with_trace(
+            TapeScheduler::new_traced(vec![7], tape_trace.clone()),
+            0,
+            tape_trace,
+            async {},
+        );
+        assert_eq!(
+            *tape_events.lock().unwrap(),
+            [
+                RuntimeTraceEvent::TaskSpawned { task_id: 0 },
+                RuntimeTraceEvent::EntropyDraw {
+                    source: RuntimeEntropySource::SchedulerInput,
+                    bytes: vec![7],
+                },
+                RuntimeTraceEvent::TaskSelected { task_id: 0 },
+            ]
+        );
+
+        // Depth one draws no constructor-time change points, so this exercises
+        // the priority draw made by `on_spawn` inside the active executor.
+        let pct_events = Arc::new(Mutex::new(Vec::new()));
+        let pct_trace = observer(pct_events.clone());
+        block_on_with_trace(
+            PctScheduler::new_traced(42, 1, 1, pct_trace.clone()),
+            0,
+            pct_trace,
+            async {},
+        );
+        let pct_events = pct_events.lock().unwrap();
+        assert_eq!(pct_events.len(), 3);
+        assert!(matches!(
+            &pct_events[0],
+            RuntimeTraceEvent::EntropyDraw {
+                source: RuntimeEntropySource::SchedulerRng,
+                bytes,
+            } if bytes.len() == 8
+        ));
+        assert_eq!(
+            pct_events[1..],
+            [
+                RuntimeTraceEvent::TaskSpawned { task_id: 0 },
+                RuntimeTraceEvent::TaskSelected { task_id: 0 },
+            ]
         );
     }
 

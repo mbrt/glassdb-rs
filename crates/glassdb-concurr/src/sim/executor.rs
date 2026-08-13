@@ -165,6 +165,79 @@ pub(crate) struct Handle {
 
 thread_local! {
     static CURRENT: RefCell<Option<Handle>> = const { RefCell::new(None) };
+    static DEFERRED_SCHEDULER_TRACES: RefCell<Option<Vec<DeferredSchedulerTrace>>> =
+        const { RefCell::new(None) };
+}
+
+type DeferredSchedulerTrace = (RuntimeTraceObserver, RuntimeTraceEvent);
+
+/// Defers scheduler-owned callbacks until the executor releases its state.
+///
+/// Schedulers run while [`Inner`] is mutably borrowed. Trace observers are user
+/// callbacks and may re-enter the runtime, so invoking them there would panic on
+/// the `RefCell` borrow. A scope queues those callbacks in order; the executor
+/// finishes and flushes it only after dropping the state borrow.
+struct SchedulerTraceScope {
+    previous: Option<Vec<DeferredSchedulerTrace>>,
+    active: bool,
+}
+
+impl SchedulerTraceScope {
+    fn enter() -> Self {
+        let previous =
+            DEFERRED_SCHEDULER_TRACES.with(|pending| pending.borrow_mut().replace(Vec::new()));
+        Self {
+            previous,
+            active: true,
+        }
+    }
+
+    fn finish(mut self) -> Vec<DeferredSchedulerTrace> {
+        let mut queued = DEFERRED_SCHEDULER_TRACES.with(|pending| {
+            pending
+                .borrow_mut()
+                .take()
+                .expect("scheduler trace scope is active")
+        });
+        let ready = if let Some(mut previous) = self.previous.take() {
+            previous.append(&mut queued);
+            DEFERRED_SCHEDULER_TRACES.with(|pending| *pending.borrow_mut() = Some(previous));
+            Vec::new()
+        } else {
+            queued
+        };
+        self.active = false;
+        ready
+    }
+}
+
+impl Drop for SchedulerTraceScope {
+    fn drop(&mut self) {
+        if self.active {
+            DEFERRED_SCHEDULER_TRACES.with(|pending| *pending.borrow_mut() = self.previous.take());
+        }
+    }
+}
+
+pub(super) fn emit_scheduler_trace(trace: &RuntimeTraceObserver, event: RuntimeTraceEvent) {
+    let immediate = DEFERRED_SCHEDULER_TRACES.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        if let Some(pending) = pending.as_mut() {
+            pending.push((trace.clone(), event));
+            None
+        } else {
+            Some(event)
+        }
+    });
+    if let Some(event) = immediate {
+        trace(event);
+    }
+}
+
+fn flush_scheduler_traces(traces: Vec<DeferredSchedulerTrace>) {
+    for (trace, event) in traces {
+        trace(event);
+    }
 }
 
 pub(crate) fn current() -> Option<Handle> {
@@ -182,6 +255,7 @@ impl Handle {
     }
 
     fn spawn_raw(&self, fut: Pin<Box<dyn Future<Output = ()> + Send>>) -> TaskId {
+        let scheduler_traces = SchedulerTraceScope::enter();
         let mut inner = self.inner.borrow_mut();
         let id = TaskId(inner.next_task);
         inner.next_task += 1;
@@ -190,6 +264,7 @@ impl Handle {
         inner.scheduler.on_spawn(id);
         let trace = inner.trace.clone();
         drop(inner);
+        flush_scheduler_traces(scheduler_traces.finish());
         if let Some(trace) = trace {
             trace(RuntimeTraceEvent::TaskSpawned { task_id: id.0 });
         }
@@ -290,9 +365,8 @@ pub(crate) fn fill_random(buf: &mut [u8]) {
 }
 
 pub(crate) fn record_tape_draw(source: RuntimeEntropySource, byte: u8) {
-    if let Some(h) = current()
-        && let Some(trace) = h.inner.borrow().trace.clone()
-    {
+    let trace = current().and_then(|h| h.inner.borrow().trace.clone());
+    if let Some(trace) = trace {
         trace(RuntimeTraceEvent::EntropyDraw {
             source,
             bytes: vec![byte],
@@ -495,6 +569,7 @@ fn run_loop<T>(handle: &Handle, out: &Arc<Mutex<Option<T>>>, budget: u64) {
         }
 
         // 2. If any task is ready, let the scheduler pick one and poll it.
+        let scheduler_traces = SchedulerTraceScope::enter();
         let picked = {
             let mut inner = handle.inner.borrow_mut();
             if inner.ready.is_empty() {
@@ -507,6 +582,7 @@ fn run_loop<T>(handle: &Handle, out: &Arc<Mutex<Option<T>>>, budget: u64) {
                 Some((tid, inner.trace.clone()))
             }
         };
+        flush_scheduler_traces(scheduler_traces.finish());
 
         if let Some((tid, trace)) = picked {
             if let Some(trace) = trace {

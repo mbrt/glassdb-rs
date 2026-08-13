@@ -1455,3 +1455,23 @@ working document and is intentionally not committed with these changes.
 - This is a documentation-only final-review correction. It changes no API,
   persistent bytes, backend operation, retry, entropy draw, await, or spawn
   behavior, and it adds no test or ADR.
+
+## Post-review fix — Re-entrant scheduler trace observers
+
+- A post-completion review found that traced scheduler entropy callbacks ran
+  while the deterministic executor still held its mutable `Inner` borrow.
+  Observers are user callbacks, so an observer that read the simulation clock
+  re-entered that state and panicked with `already borrowed`.
+- Scheduler callbacks are now queued only across `Scheduler::on_spawn` and
+  `Scheduler::pick`, then flushed after the executor borrow is released. FIFO
+  delivery preserves the existing scheduler-draw-before-task-spawn/selection
+  trace order, and untraced runs allocate no trace queue storage.
+- The deferral scope restores prior state during unwinding and moves its queue
+  out before invoking callbacks, so observer re-entry and observer panics cannot
+  leave the trace machinery borrowed. The adjacent tape-trace path likewise
+  clones its observer before invoking it.
+- One deterministic regression covers both a tape `pick` draw and a PCT
+  `on_spawn` priority draw with an observer that calls `rt::Instant::now()`, and
+  also pins their ordering relative to task-spawn and task-selection events.
+  Scheduler decisions, entropy bytes and draw counts, task order, runtime API,
+  and production behavior are unchanged; no ADR is warranted.
