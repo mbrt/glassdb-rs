@@ -212,9 +212,11 @@ mod tests {
         slow.read_if_modified("p", &Version::new("different"))
             .await
             .unwrap();
-        slow.list("", None, NonZeroUsize::new(10).unwrap())
-            .await
-            .unwrap();
+        slow.list_request(
+            glassdb_backend::ListRequest::new("", None, NonZeroUsize::new(10).unwrap()).unwrap(),
+        )
+        .await
+        .unwrap();
         let updated = slow.write_if("p", b"v2".to_vec(), &initial).await.unwrap();
 
         let delete = tokio::spawn({

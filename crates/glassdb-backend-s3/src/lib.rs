@@ -16,8 +16,7 @@ use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use glassdb_backend::{
-    Backend, BackendError, Cause, ListCursor, ListLimit, ListPage, ReadReply, Version,
-    bind_list_cursor, validate_list_args_and_cursor,
+    Backend, BackendError, Cause, ListPage, ListRequest, ReadReply, Version, bind_list_cursor,
 };
 
 const MAX_LIST_PAGE_SIZE: usize = 1_000;
@@ -412,13 +411,10 @@ impl Backend for S3Backend {
         }
     }
 
-    async fn list(
-        &self,
-        prefix: &str,
-        cursor: Option<&ListCursor>,
-        limit: ListLimit,
-    ) -> Result<ListPage, BackendError> {
-        let provider_cursor = validate_list_args_and_cursor(prefix, cursor, limit)?;
+    async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
+        let prefix = request.prefix();
+        let cursor = request.cursor();
+        let limit = request.limit();
         let max_keys = i32::try_from(limit.get().min(MAX_LIST_PAGE_SIZE)).unwrap();
         let mut op = self
             .client
@@ -426,7 +422,7 @@ impl Backend for S3Backend {
             .bucket(&self.bucket)
             .prefix(prefix)
             .max_keys(max_keys);
-        if let Some(provider_cursor) = provider_cursor {
+        if let Some(provider_cursor) = request.provider_cursor() {
             op = op.continuation_token(provider_cursor);
         }
         let out = op

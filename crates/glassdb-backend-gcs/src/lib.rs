@@ -10,8 +10,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use glassdb_backend::{
-    Backend, BackendError, Cause, ListCursor, ListLimit, ListPage, ReadReply, Version,
-    bind_list_cursor, validate_list_args_and_cursor,
+    Backend, BackendError, Cause, ListPage, ListRequest, ReadReply, Version, bind_list_cursor,
 };
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::header::CONTENT_TYPE;
@@ -346,19 +345,16 @@ impl Backend for GcsBackend {
         Ok(())
     }
 
-    async fn list(
-        &self,
-        prefix: &str,
-        cursor: Option<&ListCursor>,
-        limit: ListLimit,
-    ) -> Result<ListPage, BackendError> {
-        let provider_cursor = validate_list_args_and_cursor(prefix, cursor, limit)?;
+    async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
+        let prefix = request.prefix();
+        let cursor = request.cursor();
+        let limit = request.limit();
         let max_results = u32::try_from(limit.get().min(MAX_LIST_PAGE_SIZE)).unwrap();
         let mut query = vec![
             ("prefix", prefix.to_string()),
             ("maxResults", max_results.to_string()),
         ];
-        if let Some(provider_cursor) = provider_cursor {
+        if let Some(provider_cursor) = request.provider_cursor() {
             query.push(("pageToken", provider_cursor.to_string()));
         }
         let rb = self.http.get(self.objects_url()).query(&query);

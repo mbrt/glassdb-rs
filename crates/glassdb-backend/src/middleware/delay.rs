@@ -12,9 +12,7 @@ use glassdb_concurr::entropy;
 use glassdb_concurr::rt::{self, Instant};
 use rand::TryRng;
 
-use crate::{
-    Backend, BackendError, ListCursor, ListLimit, ListPage, ListRequest, ReadReply, Version,
-};
+use crate::{Backend, BackendError, ListPage, ListRequest, ReadReply, Version};
 
 use super::latency::{Lognormal, LognormalError};
 
@@ -275,22 +273,6 @@ impl Backend for DelayBackend {
         self.object_write_wait(path).await;
         self.delay(&self.obj_write).await;
         self.inner.delete_if(path, expected).await
-    }
-
-    async fn list(
-        &self,
-        prefix: &str,
-        cursor: Option<&ListCursor>,
-        limit: ListLimit,
-    ) -> Result<ListPage, BackendError> {
-        match ListRequest::new(prefix, cursor, limit) {
-            Ok(request) => self.list_request(request).await,
-            Err(_) => {
-                self.prefix_read_wait(prefix).await;
-                self.delay(&self.list).await;
-                self.inner.list(prefix, cursor, limit).await
-            }
-        }
     }
 
     async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {

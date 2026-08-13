@@ -208,28 +208,6 @@ impl Backend for HookBackend {
         .await
     }
 
-    async fn list(
-        &self,
-        prefix: &str,
-        cursor: Option<&ListCursor>,
-        limit: ListLimit,
-    ) -> Result<ListPage, BackendError> {
-        match ListRequest::new(prefix, cursor, limit) {
-            Ok(request) => self.list_request(request).await,
-            Err(_) => {
-                self.hooked(
-                    BackendOp::List {
-                        path: prefix,
-                        cursor,
-                        limit,
-                    },
-                    || self.inner.list(prefix, cursor, limit),
-                )
-                .await
-            }
-        }
-    }
-
     async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
         self.hooked(
             BackendOp::List {
@@ -293,7 +271,7 @@ mod tests {
             .unwrap();
         backend.delete_if("p", &version).await.unwrap();
         backend
-            .list("", None, ListLimit::new(1).unwrap())
+            .list_request(ListRequest::new("", None, ListLimit::new(1).unwrap()).unwrap())
             .await
             .unwrap();
         assert!(!version.is_unset());

@@ -8,9 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use glassdb_concurr::rt;
 
-use crate::{
-    Backend, BackendError, ListCursor, ListLimit, ListPage, ListRequest, ReadReply, Version,
-};
+use crate::{Backend, BackendError, ListPage, ListRequest, ReadReply, Version};
 
 /// Produces deterministic delays from a byte sequence. Each call to the
 /// scheduler consumes one byte and yields `byte * tick`; once the sequence is
@@ -109,21 +107,6 @@ impl Backend for ScheduledBackend {
     async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
         self.wait().await;
         self.inner.delete_if(path, expected).await
-    }
-
-    async fn list(
-        &self,
-        prefix: &str,
-        cursor: Option<&ListCursor>,
-        limit: ListLimit,
-    ) -> Result<ListPage, BackendError> {
-        match ListRequest::new(prefix, cursor, limit) {
-            Ok(request) => self.list_request(request).await,
-            Err(_) => {
-                self.wait().await;
-                self.inner.list(prefix, cursor, limit).await
-            }
-        }
     }
 
     async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {

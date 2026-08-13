@@ -488,6 +488,37 @@ working document and is intentionally not committed with these changes.
   construct the same request rather than keeping a test-only raw storage API.
 - Providers and compatibility tests deliberately retain the old method until
   F24-G. That release-gated removal remains outside this finding.
+
+## F24-G — Make `ListRequest` the provider contract
+
+- Made `Backend::list_request(ListRequest<'_>)` the sole required listing
+  method and removed the raw `Backend::list` compatibility delegate. Memory,
+  S3, GCS, every middleware and statistics wrapper, the benchmark attribution
+  wrapper, test backends, and all callers now implement or invoke only the
+  request-taking contract; `Arc<dyn Backend>` remains transparently forwarded.
+- `ListRequest::new` now validates and unwraps the prefix-bound cursor once and
+  stores the borrowed provider continuation token. Providers consume
+  `provider_cursor()` directly, eliminating their redundant validation pass.
+  Removed the now-unused public `validate_list_args` and doc-hidden
+  `validate_list_args_and_cursor`; `bind_list_cursor` remains the common
+  provider-output boundary.
+- Removed the public raw `CachedStore::list` wrapper. External callers now
+  construct `ListRequest` before entering storage, so invalid requests cannot
+  trigger timeline, middleware, provider, delay, fault, hook, logging,
+  recording, or statistics effects. This is the intended breaking cleanup of
+  the temporary compatibility behavior documented by F24-D through F24-F.
+- Pruned only migration guards: the default-delegation trait-object fixture,
+  old-vs-request duplicate middleware and benchmark calls, and the invalid raw
+  middleware-effects case. The request boundary table, composed middleware
+  forwarding/count test, three-provider conformance suite including a
+  provider-valid-envelope/invalid-token case, and provider transport behavior
+  remain as durable coverage.
+- Updated the live architecture description and added `docs/migrations.md` with
+  the exact external implementer/caller replacements and removed helper list.
+  Valid requests retain prefixes, limits, provider tokens, pages, middleware
+  order, delays/fault decisions, hook/log/record fields, and one operation count
+  per provider call. No provider wire request, persistent format, dependency,
+  or ADR changed.
 ## F20-A — Replace correlated attempt flags with validated transitions
 
 - Added a private `algo::attempt` state machine with explicit `New`, `Engaged`,

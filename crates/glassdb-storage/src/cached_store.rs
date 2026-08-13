@@ -591,23 +591,6 @@ impl CachedStore {
             .ok_or(StorageError::Precondition)
     }
 
-    /// Lists one page of object paths, an uncached pass-through because a
-    /// prefix has no object version.
-    pub async fn list(
-        &self,
-        prefix: &str,
-        cursor: Option<&backend::ListCursor>,
-        limit: backend::ListLimit,
-    ) -> Result<backend::ListPage, StorageError> {
-        match backend::ListRequest::new(prefix, cursor, limit) {
-            Ok(request) => self.list_request(request).await,
-            Err(_) => {
-                let _invoked = self.next_invocation();
-                Ok(self.backend.list(prefix, cursor, limit).await?)
-            }
-        }
-    }
-
     /// Lists one validated page of object paths.
     pub async fn list_request(
         &self,
@@ -1056,11 +1039,9 @@ mod tests {
             Ok(())
         }
 
-        async fn list(
+        async fn list_request(
             &self,
-            _prefix: &str,
-            _cursor: Option<&backend::ListCursor>,
-            _limit: backend::ListLimit,
+            _request: backend::ListRequest<'_>,
         ) -> Result<backend::ListPage, BackendError> {
             Ok(backend::ListPage::default())
         }

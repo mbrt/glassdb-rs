@@ -172,6 +172,7 @@ pub type ListLimit = NonZeroUsize;
 pub struct ListRequest<'a> {
     prefix: &'a str,
     cursor: Option<&'a ListCursor>,
+    provider_cursor: Option<&'a str>,
     limit: ListLimit,
 }
 
@@ -182,10 +183,14 @@ impl<'a> ListRequest<'a> {
         cursor: Option<&'a ListCursor>,
         limit: ListLimit,
     ) -> Result<Self, BackendError> {
-        validate_list_args(prefix, cursor, limit)?;
+        validate_list_prefix(prefix)?;
+        let provider_cursor = cursor
+            .map(|cursor| decode_list_cursor(prefix, cursor))
+            .transpose()?;
         Ok(Self {
             prefix,
             cursor,
+            provider_cursor,
             limit,
         })
     }
@@ -200,6 +205,11 @@ impl<'a> ListRequest<'a> {
         self.cursor
     }
 
+    /// Returns the validated provider continuation token, when present.
+    pub fn provider_cursor(&self) -> Option<&str> {
+        self.provider_cursor
+    }
+
     /// Returns the positive page-size limit.
     pub fn limit(&self) -> ListLimit {
         self.limit
@@ -207,18 +217,6 @@ impl<'a> ListRequest<'a> {
 }
 
 const LIST_CURSOR_PREFIX: &str = "glassdb-list-v1:";
-
-/// Validates the provider-independent arguments to [`Backend::list`].
-///
-/// A [`ListLimit`] is positive by construction. Cursors remain opaque to
-/// callers and are rejected when malformed or bound to another prefix.
-pub fn validate_list_args(
-    prefix: &str,
-    cursor: Option<&ListCursor>,
-    limit: ListLimit,
-) -> Result<(), BackendError> {
-    validate_list_args_and_cursor(prefix, cursor, limit).map(|_| ())
-}
 
 /// Binds a provider continuation token to its listing prefix.
 #[doc(hidden)]
@@ -233,19 +231,6 @@ pub fn bind_list_cursor(prefix: &str, provider_token: &str) -> Result<ListCursor
         "{LIST_CURSOR_PREFIX}{}:{prefix}{provider_token}",
         prefix.len()
     )))
-}
-
-/// Validates listing arguments and unwraps the provider continuation token.
-#[doc(hidden)]
-pub fn validate_list_args_and_cursor<'a>(
-    prefix: &str,
-    cursor: Option<&'a ListCursor>,
-    _limit: ListLimit,
-) -> Result<Option<&'a str>, BackendError> {
-    validate_list_prefix(prefix)?;
-    cursor
-        .map(|cursor| decode_list_cursor(prefix, cursor))
-        .transpose()
 }
 
 fn validate_list_prefix(prefix: &str) -> Result<(), BackendError> {
@@ -278,7 +263,7 @@ fn decode_list_cursor<'a>(prefix: &str, cursor: &'a ListCursor) -> Result<&'a st
     Ok(provider_token)
 }
 
-/// One page of object paths returned by [`Backend::list`].
+/// One page of object paths returned by [`Backend::list_request`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ListPage {
     /// Actual object paths matching the requested prefix.
@@ -338,27 +323,12 @@ pub trait Backend: Send + Sync {
     /// outcome is always [`BackendError::Unavailable`].
     async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError>;
 
-    /// Lists one page of object paths recursively under `prefix`.
+    /// Lists one page of object paths recursively.
     ///
-    /// `prefix` is empty or ends in `/`. `cursor`, when present, must have been
+    /// Its prefix is empty or ends in `/`. Its cursor, when present, must have been
     /// returned by this backend for the same prefix. Result order is unspecified
     /// and only `ListPage::next == None` means traversal is complete.
-    async fn list(
-        &self,
-        prefix: &str,
-        cursor: Option<&ListCursor>,
-        limit: ListLimit,
-    ) -> Result<ListPage, BackendError>;
-
-    /// Lists one page using arguments validated at construction.
-    ///
-    /// The default preserves compatibility with existing backend
-    /// implementations. Providers may continue implementing [`Backend::list`]
-    /// until the request-taking method becomes the required contract.
-    async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
-        self.list(request.prefix(), request.cursor(), request.limit())
-            .await
-    }
+    async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError>;
 }
 
 /// Transparent delegation so any `Arc<B: Backend>` (including
@@ -401,15 +371,6 @@ impl<B: Backend + ?Sized + 'static> Backend for std::sync::Arc<B> {
         (**self).delete_if(path, expected).await
     }
 
-    async fn list(
-        &self,
-        prefix: &str,
-        cursor: Option<&ListCursor>,
-        limit: ListLimit,
-    ) -> Result<ListPage, BackendError> {
-        (**self).list(prefix, cursor, limit).await
-    }
-
     async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
         (**self).list_request(request).await
     }
@@ -437,12 +398,12 @@ mod tests {
             let request = ListRequest::new(prefix, cursor, limit).unwrap();
             assert_eq!(request.prefix(), prefix);
             assert_eq!(request.cursor(), cursor);
-            assert_eq!(request.limit(), limit);
             assert_eq!(
-                validate_list_args_and_cursor(prefix, cursor, limit).unwrap(),
+                request.provider_cursor(),
                 provider_token,
                 "prefix {prefix:?}"
             );
+            assert_eq!(request.limit(), limit);
         }
 
         let malformed_cursor = ListCursor::new("opaque");
@@ -466,7 +427,9 @@ mod tests {
             "glassdb-list-v1:3:é/provider-token"
         );
         assert_eq!(
-            validate_list_args_and_cursor("é/", Some(&unicode_cursor), one).unwrap(),
+            ListRequest::new("é/", Some(&unicode_cursor), one)
+                .unwrap()
+                .provider_cursor(),
             Some("provider-token")
         );
 
@@ -508,38 +471,5 @@ mod tests {
             Err(BackendError::Other { .. })
         ));
         assert!(ListLimit::new(0).is_none());
-    }
-
-    #[tokio::test]
-    async fn list_request_default_delegates_through_a_trait_object() {
-        let backend: Arc<dyn Backend> = Arc::new(memory::MemoryBackend::new());
-        backend
-            .write_if_not_exists("a/one", Vec::new())
-            .await
-            .unwrap();
-        backend
-            .write_if_not_exists("a/two", Vec::new())
-            .await
-            .unwrap();
-        backend
-            .write_if_not_exists("b/other", Vec::new())
-            .await
-            .unwrap();
-
-        let limit = ListLimit::new(1).unwrap();
-        let first = backend
-            .list_request(ListRequest::new("a/", None, limit).unwrap())
-            .await
-            .unwrap();
-        let second = backend
-            .list_request(ListRequest::new("a/", first.next.as_ref(), limit).unwrap())
-            .await
-            .unwrap();
-
-        let mut objects = first.objects;
-        objects.extend(second.objects);
-        objects.sort();
-        assert_eq!(objects, ["a/one", "a/two"]);
-        assert!(second.next.is_none());
     }
 }

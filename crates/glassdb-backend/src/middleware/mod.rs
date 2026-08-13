@@ -29,7 +29,7 @@ mod tests {
 
     use super::*;
     use crate::memory::MemoryBackend;
-    use crate::{Backend, BackendError, ListCursor, ListRequest, StatsBackend};
+    use crate::{Backend, ListCursor, ListRequest, StatsBackend};
 
     fn delay_options() -> DelayOptions {
         let zero = Latency::new(0, 0);
@@ -105,10 +105,13 @@ mod tests {
             .await
             .unwrap();
         let limit = NonZeroUsize::new(1).unwrap();
-        let first = memory.list("a/", None, limit).await.unwrap();
+        let first = memory
+            .list_request(ListRequest::new("a/", None, limit).unwrap())
+            .await
+            .unwrap();
         let cursor = first.next.unwrap();
 
-        let stack = listing_stack(memory, vec![3, 3]);
+        let stack = listing_stack(memory, vec![3]);
         let seen = Arc::new(Mutex::new(Vec::new()));
         stack.hook.set_before({
             let seen = seen.clone();
@@ -130,73 +133,25 @@ mod tests {
         });
 
         let started = tokio::time::Instant::now();
-        let page = stack
-            .backend
-            .list("a/", Some(&cursor), limit)
-            .await
-            .unwrap();
         let erased: Arc<dyn Backend> = stack.backend.clone();
-        let direct = erased
+        let page = erased
             .list_request(ListRequest::new("a/", Some(&cursor), limit).unwrap())
             .await
             .unwrap();
 
         assert_eq!(page.objects, ["a/two"]);
         assert!(page.next.is_none());
-        assert_eq!(direct, page);
-        assert_eq!(started.elapsed(), Duration::from_millis(10));
+        assert_eq!(started.elapsed(), Duration::from_millis(5));
         assert_eq!(
             *seen.lock().unwrap(),
-            vec![
-                ("a/".to_string(), Some(cursor.as_str().to_string()), 1),
-                ("a/".to_string(), Some(cursor.as_str().to_string()), 1),
-            ]
+            vec![("a/".to_string(), Some(cursor.as_str().to_string()), 1)]
         );
-        assert_eq!(stack.backend.stats_and_reset().obj_lists, 2);
-        assert_eq!(stack.provider_stats.stats_and_reset().obj_lists, 2);
-        let recorded = stack.log.lock().unwrap();
-        assert_eq!(recorded.len(), 2);
-        for record in recorded.iter() {
-            assert_eq!(record.op, "list");
-            assert_eq!(record.path, "a/");
-            assert_eq!(record.args, encoded_list_args(Some(&cursor), 1));
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn invalid_compatibility_call_preserves_decorator_effects_and_error_precedence() {
-        let stack = listing_stack(Arc::new(MemoryBackend::new()), vec![3]);
-        let hook_calls = Arc::new(Mutex::new(0));
-        stack.hook.set_after({
-            let hook_calls = hook_calls.clone();
-            move |op, outcome| {
-                if matches!(op, BackendOp::List { .. }) {
-                    *hook_calls.lock().unwrap() += 1;
-                    assert!(!outcome.is_success());
-                    return Box::pin(async {
-                        Err(BackendError::Unavailable("hook override".into()))
-                    });
-                }
-                Box::pin(async { Ok(()) })
-            }
-        });
-
-        let started = tokio::time::Instant::now();
-        let error = stack
-            .backend
-            .list("invalid", None, NonZeroUsize::new(1).unwrap())
-            .await
-            .unwrap_err();
-
-        assert!(matches!(error, BackendError::Unavailable(ref msg) if msg == "hook override"));
-        assert_eq!(started.elapsed(), Duration::from_millis(5));
-        assert_eq!(*hook_calls.lock().unwrap(), 1);
         assert_eq!(stack.backend.stats_and_reset().obj_lists, 1);
         assert_eq!(stack.provider_stats.stats_and_reset().obj_lists, 1);
         let recorded = stack.log.lock().unwrap();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].op, "list");
-        assert_eq!(recorded[0].path, "invalid");
-        assert_eq!(recorded[0].args, encoded_list_args(None, 1));
+        assert_eq!(recorded[0].path, "a/");
+        assert_eq!(recorded[0].args, encoded_list_args(Some(&cursor), 1));
     }
 }
