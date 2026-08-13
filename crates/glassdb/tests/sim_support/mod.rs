@@ -1,6 +1,6 @@
 use glassdb::middleware::{OpRecord, first_divergence};
 use glassdb::rt::{TapeScheduler, block_on_with};
-use glassdb::sim::{FaultConfig, SimWorkload, run_and_record, run_and_record_with_faults};
+use glassdb::sim::{FaultConfig, SimWorkload, run_and_record_with_faults};
 
 /// Returns a deterministic schedule tape long enough for a simulation run.
 pub fn tape(seed: u64) -> Vec<u8> {
@@ -31,33 +31,14 @@ pub fn assert_no_divergence(label: &str, first: &[OpRecord], second: &[OpRecord]
     }
 }
 
-pub fn record_once<W: SimWorkload>(seed: u64, workload: &W) -> Vec<OpRecord> {
-    let workload = workload.clone();
-    let log = block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
-        run_and_record(&workload).await
-    });
-    let recorded = log.lock().unwrap();
-    recorded.clone()
-}
-
 pub fn record_faults_with_tape<W: SimWorkload>(
     seed: u64,
     workload: &W,
     faults: FaultConfig,
     fault_tape: Vec<u8>,
 ) -> Vec<OpRecord> {
-    record_with_tapes(seed, workload, faults, tape(seed), fault_tape)
-}
-
-pub fn record_with_tapes<W: SimWorkload>(
-    seed: u64,
-    workload: &W,
-    faults: FaultConfig,
-    schedule_tape: Vec<u8>,
-    fault_tape: Vec<u8>,
-) -> Vec<OpRecord> {
     let workload = workload.clone();
-    let log = block_on_with(TapeScheduler::new(schedule_tape), seed, async move {
+    let log = block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
         run_and_record_with_faults(&workload, faults, seed, fault_tape).await
     });
     let recorded = log.lock().unwrap();

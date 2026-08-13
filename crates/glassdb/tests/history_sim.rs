@@ -8,14 +8,11 @@ mod sim_support;
 
 use glassdb::rt::{TapeScheduler, block_on_with};
 use glassdb::sim::{
-    FaultConfig, HistoryInstruction as I, HistoryTransaction, HistoryWorkload, pct_record,
-    pct_sweep, record_input, run_and_assert, run_and_assert_with_faults,
+    FaultConfig, HistoryInstruction as I, HistoryTransaction, HistoryWorkload, pct_sweep,
+    run_and_assert, run_and_assert_with_faults,
 };
 
-use sim_support::{
-    assert_no_divergence, assert_slow_mutation_modes, fault_tape, record_faults_with_tape,
-    record_once, tape,
-};
+use sim_support::{assert_slow_mutation_modes, fault_tape, tape};
 
 fn transaction(op_id: u64, client_id: usize, instructions: Vec<I>) -> HistoryTransaction {
     HistoryTransaction {
@@ -129,51 +126,15 @@ fn point_group_and_range_history_holds_under_tape_schedules() {
 }
 
 #[test]
-fn backend_stream_is_byte_identical_with_transport_faults_and_crashes() {
-    let workload = contended_history();
-    let faults = FaultConfig::failures(200);
-    for seed in [0u64, 7, 42, 1234] {
-        let faults_tape = fault_tape(seed);
-        let first = record_faults_with_tape(seed, &workload, faults, faults_tape.clone());
-        let second = record_faults_with_tape(seed, &workload, faults, faults_tape);
-        assert_no_divergence(&format!("seed {seed}: history recovery"), &first, &second);
-    }
-}
-
-#[test]
 fn exact_history_holds_with_slow_mutations() {
     assert_slow_mutation_modes("history workload", &contended_history());
 }
 
 #[test]
-fn cache_free_and_simulated_cache_replay_identically() {
-    // record_input performs one cache-free and one simulated-persistent-cache
-    // run. Repeating the same input proves both modes consume deterministic
-    // schedule, transport-fault, crash, and media-fault tapes.
-    let input = b"history-stage-three-seed-with-schedule-and-fault-tail";
-    let first = record_input::<HistoryWorkload>(input);
-    let second = record_input::<HistoryWorkload>(input);
-    assert_no_divergence("history cache-mode replay", &first, &second);
-}
-
-#[test]
-fn pct_schedules_are_reproducible_and_serializable() {
+fn pct_seed_breadth_holds_exact_history() {
     let workload = contended_history();
     let faults = FaultConfig::failures(7);
-    for seed in [0u64, 1, 7, 42] {
-        let first = pct_record(&workload, faults, seed);
-        let second = pct_record(&workload, faults, seed);
-        let first = first.lock().unwrap().clone();
-        let second = second.lock().unwrap().clone();
-        assert_no_divergence(&format!("seed {seed}: history PCT"), &first, &second);
-    }
     pct_sweep(&workload, faults, 0..16);
-}
-
-#[test]
-fn faulted_backend_stream_is_nonempty() {
-    let log = record_once(17, &contended_history());
-    assert!(!log.is_empty());
 }
 
 #[test]

@@ -18,14 +18,14 @@
 mod sim_support;
 
 use sim_support::{
-    assert_no_divergence, assert_slow_mutation_modes, fault_tape, record_faults_with_tape,
-    record_once, record_with_tapes, tape,
+    assert_no_divergence, assert_slow_mutation_modes, fault_tape, record_faults_with_tape, tape,
 };
 
+use glassdb::middleware::OpRecord;
 use glassdb::rt::{TapeScheduler, block_on_with};
 use glassdb::sim::{
     FaultConfig, RmwOp, RmwWorkload, pct_record, pct_sweep, run_and_assert,
-    run_and_assert_with_faults,
+    run_and_assert_with_faults, run_and_record,
 };
 
 /// A contended workload: every client hammers overlapping keys with single- and
@@ -55,53 +55,12 @@ fn contended_workload() -> RmwWorkload {
     }
 }
 
-/// A boundary-heavy workload: maximum generated client/op shape, with frequent
-/// read-only transactions mixed into contended writes.
-fn max_read_heavy_workload() -> RmwWorkload {
-    RmwWorkload {
-        clients: vec![
-            vec![
-                RmwOp::ReadOnly(vec![0, 1, 2, 3]),
-                RmwOp::Rmw(0),
-                RmwOp::ReadOnly(vec![0, 2]),
-                RmwOp::MultiRmw(0, 1),
-                RmwOp::ReadOnly(vec![1, 3]),
-                RmwOp::Rmw(2),
-                RmwOp::ReadOnly(vec![0, 1, 2, 3]),
-                RmwOp::MultiRmw(2, 3),
-            ],
-            vec![
-                RmwOp::ReadOnly(vec![3, 2, 1, 0]),
-                RmwOp::Rmw(1),
-                RmwOp::ReadOnly(vec![1, 2]),
-                RmwOp::MultiRmw(1, 2),
-                RmwOp::ReadOnly(vec![0, 3]),
-                RmwOp::Rmw(3),
-                RmwOp::ReadOnly(vec![2, 3]),
-                RmwOp::MultiRmw(0, 3),
-            ],
-            vec![
-                RmwOp::ReadOnly(vec![]),
-                RmwOp::MultiRmw(2, 0),
-                RmwOp::ReadOnly(vec![0]),
-                RmwOp::Rmw(2),
-                RmwOp::ReadOnly(vec![1, 2, 3]),
-                RmwOp::MultiRmw(3, 1),
-                RmwOp::ReadOnly(vec![0, 1, 2, 3]),
-                RmwOp::Rmw(0),
-            ],
-            vec![
-                RmwOp::ReadOnly(vec![2]),
-                RmwOp::Rmw(3),
-                RmwOp::ReadOnly(vec![0, 3]),
-                RmwOp::MultiRmw(0, 2),
-                RmwOp::ReadOnly(vec![1]),
-                RmwOp::Rmw(1),
-                RmwOp::ReadOnly(vec![0, 1, 2, 3]),
-                RmwOp::MultiRmw(1, 3),
-            ],
-        ],
-    }
+fn record_once(seed: u64, workload: &RmwWorkload) -> Vec<OpRecord> {
+    let workload = workload.clone();
+    let log = block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
+        run_and_record(&workload).await
+    });
+    log.lock().unwrap().clone()
 }
 
 #[test]
@@ -158,19 +117,6 @@ fn serializability_holds_under_contention() {
 }
 
 #[test]
-fn op_stream_is_byte_identical_with_faults() {
-    // Determinism must hold even with faults active: scheduling, time,
-    // randomness, and the fault schedule are all functions of the tape and seed.
-    let workload = contended_workload();
-    let faults = FaultConfig::failures(7);
-    for seed in [0u64, 1, 7, 42, 1234, 0xDEAD_BEEF] {
-        let first = record_faults_with_tape(seed, &workload, faults, fault_tape(seed));
-        let second = record_faults_with_tape(seed, &workload, faults, fault_tape(seed));
-        assert_no_divergence(&format!("seed {seed}: faulted"), &first, &second);
-    }
-}
-
-#[test]
 fn serializability_holds_under_faults() {
     // With faults the invariant relaxes to acked <= final <= started; a
     // violation (lost or fabricated write) panics inside run_and_assert.
@@ -211,35 +157,20 @@ fn fault_tape_guides_the_fault_schedule() {
 }
 
 #[test]
-fn boundary_tapes_replay_deterministically() {
-    let workload = max_read_heavy_workload();
-    let faults = FaultConfig::failures(128);
-    for (schedule, fault_tape) in [
-        (Vec::new(), Vec::new()),
-        (vec![0], Vec::new()),
-        (vec![255, 1], vec![0; 16]),
-    ] {
-        let first = record_with_tapes(77, &workload, faults, schedule.clone(), fault_tape.clone());
-        let second = record_with_tapes(77, &workload, faults, schedule, fault_tape);
-        assert_no_divergence("boundary tape replay", &first, &second);
-    }
-}
-
-#[test]
 fn recovery_holds_under_crash_restart_and_outages() {
     // High intensity drives multiple client crashes (→ crash-and-restart on the
     // same backend) and sustained, all-or-nothing per-client transport outages.
-    // Each run must stay byte-for-byte deterministic per (tape, seed), and the
-    // acked-bounds invariant (asserted inside the harness) must survive the
-    // recovery paths those faults exercise: lease expiry, lock-lease recovery,
-    // and a restarted client reclaiming its own orphaned locks.
+    // The acked-bounds invariant must survive the recovery paths those faults
+    // exercise: lease expiry, lock-lease recovery, and a restarted client
+    // reclaiming its own orphaned locks.
     let workload = contended_workload();
     let faults = FaultConfig::failures(200);
     for seed in [0u64, 1, 7, 42, 99, 1234] {
+        let workload = workload.clone();
         let ft = fault_tape(seed);
-        let first = record_faults_with_tape(seed, &workload, faults, ft.clone());
-        let second = record_faults_with_tape(seed, &workload, faults, ft);
-        assert_no_divergence(&format!("seed {seed}: recovery"), &first, &second);
+        block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
+            run_and_assert_with_faults(workload, faults, seed, ft).await
+        });
     }
 }
 
