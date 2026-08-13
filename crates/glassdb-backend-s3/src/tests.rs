@@ -11,7 +11,7 @@ use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::SdkBody;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::http::StatusCode;
-use glassdb_backend::middleware::{Latency, ProviderLatencyProfile};
+use glassdb_backend::middleware::ProviderLatencyProfile;
 use glassdb_backend::{Backend, BackendError, Version};
 use hyper::Method;
 
@@ -32,17 +32,6 @@ fn backend(fake: &FakeS3) -> S3Backend {
 
 fn builder(fake: &FakeS3) -> Builder {
     S3Backend::builder(fake.client(), "test")
-}
-
-fn zero_latency_profile() -> ProviderLatencyProfile {
-    let zero = Latency::new(0, 0);
-    ProviderLatencyProfile {
-        meta_read: zero,
-        meta_write: zero,
-        obj_read: zero,
-        obj_write: zero,
-        list: zero,
-    }
 }
 
 /// A standard retryer that retries the same errors as the default (incl. 503
@@ -730,7 +719,7 @@ async fn list_is_recursive_and_paginated() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conditional_write_retries_through_slow_down() {
     let fake = FakeS3::start_with(FakeS3Options {
-        latency: Some(zero_latency_profile()),
+        latency: Some(ProviderLatencyProfile::zero()),
         entropy_seed: 0xF2_5D,
         ..FakeS3Options::default()
     })
@@ -797,7 +786,7 @@ async fn read_transient_failure_surfaces_unavailable() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_if_not_exists_lost_ack_is_in_doubt() {
     let fake = FakeS3::start_with(FakeS3Options {
-        latency: Some(zero_latency_profile()),
+        latency: Some(ProviderLatencyProfile::zero()),
         entropy_seed: 0xF2_5D,
         ..FakeS3Options::default()
     })

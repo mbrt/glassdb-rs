@@ -27,9 +27,9 @@
 
 mod faults;
 mod latency;
-mod lifecycle;
 mod parsing;
 mod routing;
+mod server;
 mod state;
 
 use std::sync::Arc;
@@ -37,7 +37,7 @@ use std::sync::atomic::AtomicU64;
 
 use glassdb_backend::middleware::ProviderLatencyProfile;
 
-pub use lifecycle::FakeS3;
+pub use server::FakeS3;
 
 /// Default seed for the fake server's latency entropy stream.
 pub const DEFAULT_FAKE_S3_ENTROPY_SEED: u64 = 0x4641_4b45_5f53_3300;

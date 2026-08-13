@@ -84,6 +84,20 @@ pub struct ProviderLatencyProfile {
     pub list: Latency,
 }
 
+impl ProviderLatencyProfile {
+    /// Returns a profile with zero latency for every provider operation.
+    pub fn zero() -> Self {
+        let zero = Latency::new(0, 0);
+        Self {
+            meta_read: zero,
+            meta_write: zero,
+            obj_read: zero,
+            obj_write: zero,
+            list: zero,
+        }
+    }
+}
+
 impl Latency {
     /// Builds a [`Latency`] from a mean and standard deviation in milliseconds.
     pub fn new(mean_ms: u64, std_dev_ms: u64) -> Self {
