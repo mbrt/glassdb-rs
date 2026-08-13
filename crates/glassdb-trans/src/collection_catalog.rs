@@ -103,7 +103,7 @@ impl CollectionCatalog {
 
     fn directory_fits(record: &CollectionRecord, policy: &SplitPolicy) -> bool {
         record.content_encoded_len() <= policy.content_limit()
-            && record.encoded_len() <= policy.node_max_bytes
+            && record.encoded_len() <= policy.node_max_bytes()
     }
 }
 

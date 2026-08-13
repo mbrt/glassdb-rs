@@ -78,12 +78,12 @@ pub(super) fn key_name(key: usize) -> Vec<u8> {
 }
 
 pub(super) fn tiny_split_policy() -> SplitPolicy {
-    SplitPolicy {
-        leaf_max_entries: 2,
-        leaf_max_bytes: 1 << 20,
-        index_max_children: 2,
-        ..SplitPolicy::default()
-    }
+    SplitPolicy::builder()
+        .leaf_max_entries(2)
+        .node_soft_max_bytes(1 << 20)
+        .index_max_children(2)
+        .build()
+        .expect("tiny simulation split policy is valid")
 }
 
 pub(super) fn assert_valid_listing(keys: &[Vec<u8>], universe_size: usize) {

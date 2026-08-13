@@ -47,7 +47,10 @@ pub use disk_cache::{
 pub use error::StorageError;
 pub use inline::InlinePolicy;
 pub use lock::{EntryLockState, ExclusiveGate, LockType, SharedExclusiveLock};
-pub use node::{IndexNode, InvalidSplitPolicy, Node, NodeBody, NodeLocks, NodeToken, SplitPolicy};
+pub use node::{
+    IndexNode, InvalidSplitPolicy, Node, NodeBody, NodeLocks, NodeToken, SplitPolicy,
+    SplitPolicyBuilder,
+};
 pub use node_store::{LeafEdit, LeafObservation, LeafObservationCheck, LoadedLeaf, NodeStore};
 pub use shard::{CurrentState, Shard, ShardEntry};
 pub use shard_store::ShardStore;

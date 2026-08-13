@@ -1353,3 +1353,33 @@ working document and is intentionally not committed with these changes.
   choices, state/fault lock boundaries, entropy draw order, await and spawn
   order, listen/drop constants, dependency versions, and persistent formats are
   unchanged. There was no deviation from F26-B and no ADR was warranted.
+
+## F23-D — Rename and encapsulate split-policy fields
+
+- `SplitPolicy` no longer supports public struct-literal construction. The five
+  former public fields are private and have one-to-one read accessors:
+  `leaf_max_entries` became `leaf_max_entries()`, `leaf_max_bytes` was renamed
+  to the node-kind-neutral `node_soft_max_bytes()`, `index_max_children` became
+  `index_max_children()`, `node_max_bytes` became `node_max_bytes()`, and
+  `split_headroom_bytes` became `split_headroom_bytes()`.
+- Configuration now starts at `SplitPolicy::builder()`, whose setters use those
+  same five names and production defaults. `SplitPolicyBuilder::build()` is the
+  only fallible construction boundary and still accepts headroom equal to the
+  hard cap while rejecting headroom above it with `InvalidSplitPolicy`; the
+  default policy is also completed through that checked path. Both the storage
+  crate and `glassdb` re-export the builder alongside the policy and error.
+- Removed `SplitPolicy::validate` and `EngineConfig::validate`, plus their
+  redundant calls from `DatabaseBuilder::open` and `Engine::open`. Validation
+  therefore moves from database-open time to policy construction time: a
+  `DatabaseBuilder` can only receive an already-valid `SplitPolicy`, and no
+  metadata, cache, or runtime path needs to defend against an invalid one.
+- Pruned the migration-only integration assertion that manufactured an invalid
+  public literal and expected `DatabaseBuilder::open` to reject it before I/O.
+  The durable builder unit boundary still pins equal-headroom acceptance and
+  one-byte-over rejection; exact leaf/index soft limits, entry/key admission,
+  hard-cap, varint, collection-directory, and inline-fallback coverage remain.
+- Every in-tree literal and direct read now uses the validated builder or an
+  accessor. The renamed soft cap retains its exact default and remains shared by
+  leaf and index nodes; all comparison strictness, size calculations, request
+  and await order, backend operations, error classifications, persistent bytes,
+  and split/admission behavior are unchanged. No dependency or ADR changed.

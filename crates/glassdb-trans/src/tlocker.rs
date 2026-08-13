@@ -1692,11 +1692,11 @@ mod tests {
         node.set_membership_writer(tx.clone());
         let content_limit = node.content_encoded_len() - 1;
         let node_max_bytes = node.encoded_len() + 64;
-        let policy = SplitPolicy {
-            node_max_bytes,
-            split_headroom_bytes: node_max_bytes - content_limit,
-            ..SplitPolicy::default()
-        };
+        let policy = SplitPolicy::builder()
+            .node_max_bytes(node_max_bytes)
+            .split_headroom_bytes(node_max_bytes - content_limit)
+            .build()
+            .unwrap();
 
         let (locker, ctx) =
             new_test_locker_with_policy(Arc::new(MemoryBackend::new()), policy).await;
@@ -2147,14 +2147,14 @@ mod tests {
         // only way this acquisition could fit.
         let mut demoted = ShardEntry::new(key).with_current(CurrentState::External { writer });
         demoted.acquire_read_lock(reader.clone());
-        let policy = SplitPolicy {
-            node_max_bytes: Node::leaf(Shard::from_entries([demoted])).encoded_len(),
-            split_headroom_bytes: 0,
-            ..SplitPolicy::default()
-        };
+        let policy = SplitPolicy::builder()
+            .node_max_bytes(Node::leaf(Shard::from_entries([demoted])).encoded_len())
+            .split_headroom_bytes(0)
+            .build()
+            .unwrap();
         assert!(
             Node::leaf(Shard::from_entries([seeded.clone()])).encoded_len()
-                <= policy.node_max_bytes,
+                <= policy.node_max_bytes(),
             "the seeded leaf must fit, so only the acquisition can overflow it"
         );
         let (locker, ctx) =
