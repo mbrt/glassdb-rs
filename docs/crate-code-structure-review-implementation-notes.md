@@ -643,6 +643,32 @@ working document and is intentionally not committed with these changes.
   compatibility assertions retire with F28-C.
 - This migration changes no listing I/O, ordering, snapshots, transaction
   validation, persistent bytes, retries, random draws, or task scheduling.
+
+## F28-C — Remove legacy iterator wrappers
+
+- Removed the release-gated compatibility surface with these one-to-one
+  replacements:
+  - `Collection::keys` becomes `Collection::iter_keys`, returning `KeyIter`
+    whose item is `Vec<u8>` rather than `Result<Vec<u8>, Error>`.
+  - `Collection::collections` becomes `Collection::iter_collections`, returning
+    `CollectionIter` whose item is `CollectionEntry` rather than
+    `Result<CollectionEntry, Error>`.
+  - `Transaction::collections` becomes `Transaction::iter_collections` with the
+    same plain `CollectionEntry` item.
+  - The public `KeysIter` and `CollectionsIter` types are removed in favor of
+    `KeyIter` and `CollectionIter`, respectively.
+- Removed the private `FallibleIter` adapter and all compatibility imports,
+  re-exports, deprecation attributes, and deprecation allowances. Listing I/O,
+  decoding, and serializable validation still finish at the awaited method
+  boundary; iteration over the owned materialization has no error channel.
+- Pruned only the temporary old/new parity portions of the key, collection, and
+  transaction listing tests. The retained suite still covers empty listings,
+  raw ordering, exact remaining length, owned iterator lifetime, incarnation-
+  bound handles, multi-page key scans, transaction retry after a directory
+  change, and materialization-time stale/shutdown errors.
+- No listing implementation, backend operation, lock boundary, retry behavior,
+  persistent byte, random draw, or task schedule changed. There was no
+  deviation from the approved breaking-release plan and no ADR was warranted.
 ## F29-A — Add a stable harness trace schema
 
 - Added a versioned, structured trace behind the simulation-only feature. It

@@ -9,8 +9,6 @@ use glassdb_data::{CollectionAddress, DatabaseId, KeyRef, MAX_COLLECTION_NAME_BY
 use crate::db::DbInner;
 use crate::error::Error;
 use crate::iter::{CollectionIter, KeyIter};
-#[allow(deprecated)]
-use crate::iter::{CollectionsIter, KeysIter};
 use crate::scan::{KeyPage, KeyScan};
 
 /// An unresolved sequence of logical collection names.
@@ -193,13 +191,6 @@ impl Collection {
         ))
     }
 
-    /// Returns a compatibility iterator over the keys in the collection.
-    #[allow(deprecated)]
-    #[deprecated(since = "0.1.0", note = "use `Collection::iter_keys`")]
-    pub async fn keys(&self) -> Result<KeysIter, Error> {
-        Ok(KeysIter::from_plain(self.iter_keys().await?))
-    }
-
     /// Materializes one serializable, sorted page of collection keys.
     pub async fn scan_keys(&self, scan: KeyScan<'_>) -> Result<KeyPage, Error> {
         self.db
@@ -215,13 +206,6 @@ impl Collection {
         self.db
             .tx(|tx| async move { tx.iter_collections(self).await })
             .await
-    }
-
-    /// Returns a compatibility iterator over direct child bindings.
-    #[allow(deprecated)]
-    #[deprecated(since = "0.1.0", note = "use `Collection::iter_collections`")]
-    pub async fn collections(&self) -> Result<CollectionsIter, Error> {
-        Ok(CollectionsIter::from_plain(self.iter_collections().await?))
     }
 
     /// Non-recursively drops this exact collection incarnation.
