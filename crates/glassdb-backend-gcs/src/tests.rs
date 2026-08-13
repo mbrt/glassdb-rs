@@ -139,7 +139,7 @@ async fn read_not_found() {
 async fn list_is_recursive_and_paginated() {
     let fake = FakeGcs::start().await;
     let b = fake.backend();
-    glassdb_backend::conformance::assert_list_conformance(&b).await;
+    glassdb_backend::implementation::assert_list_conformance(&b).await;
 }
 
 // In-doubt contract (ADR-009): a conditional write whose outcome is uncertain

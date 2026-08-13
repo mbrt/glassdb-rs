@@ -1240,10 +1240,10 @@ mod tests {
             .set(&committed(t.clone(), PAST_HORIZON, &[], &[]))
             .await
             .unwrap();
-        let mut scan = test_scan(
-            vec![ctx.tl.transaction_shard(&t)],
-            Some(backend::ListCursor::new("stale")),
-        );
+        let shard = ctx.tl.transaction_shard(&t);
+        let prefix = ObjectPath::transaction_shard_prefix(&DbRoot::try_from("db").unwrap(), shard);
+        let stale = backend::implementation::bind_list_cursor(&prefix, "stale").unwrap();
+        let mut scan = test_scan(vec![shard], Some(stale));
 
         ctx.gc.run_once(&mut scan).await;
 

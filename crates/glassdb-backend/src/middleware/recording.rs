@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::{Backend, BackendError, ListCursor, ListPage, ListRequest, ReadReply, Version};
+use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
 
 /// A single recorded backend operation: the method tag, the primary path, and a
 /// canonical encoding of the remaining arguments.
@@ -63,7 +63,9 @@ fn enc_cursor(buf: &mut Vec<u8>, cursor: Option<&ListCursor>) {
     match cursor {
         Some(cursor) => {
             buf.push(1);
-            enc_bytes(buf, cursor.as_str().as_bytes());
+            let (prefix, provider_token) = cursor.recording_parts();
+            enc_bytes(buf, prefix.as_bytes());
+            enc_bytes(buf, provider_token.as_bytes());
         }
         None => buf.push(0),
     }
@@ -153,12 +155,17 @@ impl Backend for RecordingBackend {
         self.inner.delete_if(path, expected).await
     }
 
-    async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
+    async fn list(
+        &self,
+        prefix: &str,
+        cursor: Option<&ListCursor>,
+        limit: ListLimit,
+    ) -> Result<ListPage, BackendError> {
         let mut args = Vec::new();
-        enc_cursor(&mut args, request.cursor());
-        args.extend_from_slice(&(request.limit().get() as u64).to_le_bytes());
-        self.record("list", request.prefix(), args);
-        self.inner.list_request(request).await
+        enc_cursor(&mut args, cursor);
+        args.extend_from_slice(&(limit.get() as u64).to_le_bytes());
+        self.record("list", prefix, args);
+        self.inner.list(prefix, cursor, limit).await
     }
 }
 
@@ -196,7 +203,7 @@ mod tests {
         let _ = rec.read_if_modified("a/b", &v).await;
         let _ = rec.delete_if("a/b", &v).await;
         let _ = rec
-            .list_request(ListRequest::new("a/", None, crate::ListLimit::new(1).unwrap()).unwrap())
+            .list("a/", None, crate::ListLimit::new(1).unwrap())
             .await;
 
         let recorded = log.lock().unwrap();

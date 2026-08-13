@@ -10,9 +10,8 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::{
-    Backend, BackendError, ListCursor, ListPage, ListRequest, ReadReply, Version, bind_list_cursor,
-};
+use crate::implementation::{bind_list_cursor, list_provider_token};
+use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
 
 #[derive(Clone, Default)]
 struct Object {
@@ -141,11 +140,13 @@ impl Backend for MemoryBackend {
         Ok(())
     }
 
-    async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
-        let prefix = request.prefix();
-        let limit = request.limit();
-        let after = request
-            .provider_cursor()
+    async fn list(
+        &self,
+        prefix: &str,
+        cursor: Option<&ListCursor>,
+        limit: ListLimit,
+    ) -> Result<ListPage, BackendError> {
+        let after = list_provider_token(prefix, cursor)?
             .map(|cursor| decode_memory_list_cursor(prefix, cursor))
             .transpose()?;
         let state = self.state.lock().unwrap();
@@ -255,7 +256,7 @@ mod tests {
     #[tokio::test]
     async fn list_is_recursive_and_paginated() {
         let b = MemoryBackend::new();
-        crate::conformance::assert_list_conformance(&b).await;
+        crate::implementation::assert_list_conformance(&b).await;
     }
 
     #[tokio::test]

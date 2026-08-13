@@ -29,7 +29,7 @@ mod tests {
 
     use super::*;
     use crate::memory::MemoryBackend;
-    use crate::{Backend, ListCursor, ListRequest, StatsBackend};
+    use crate::{Backend, ListCursor, StatsBackend};
 
     fn delay_options() -> DelayOptions {
         let zero = Latency::new(0, 0);
@@ -84,8 +84,11 @@ mod tests {
         match cursor {
             Some(cursor) => {
                 encoded.push(1);
-                encoded.extend_from_slice(&(cursor.as_str().len() as u64).to_le_bytes());
-                encoded.extend_from_slice(cursor.as_str().as_bytes());
+                let (prefix, provider_token) = cursor.recording_parts();
+                encoded.extend_from_slice(&(prefix.len() as u64).to_le_bytes());
+                encoded.extend_from_slice(prefix.as_bytes());
+                encoded.extend_from_slice(&(provider_token.len() as u64).to_le_bytes());
+                encoded.extend_from_slice(provider_token.as_bytes());
             }
             None => encoded.push(0),
         }
@@ -94,7 +97,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn listing_request_flows_through_every_decorator() {
+    async fn listing_arguments_flow_through_every_decorator() {
         let memory = Arc::new(MemoryBackend::new());
         memory
             .write_if_not_exists("a/one", Vec::new())
@@ -105,10 +108,7 @@ mod tests {
             .await
             .unwrap();
         let limit = NonZeroUsize::new(1).unwrap();
-        let first = memory
-            .list_request(ListRequest::new("a/", None, limit).unwrap())
-            .await
-            .unwrap();
+        let first = memory.list("a/", None, limit).await.unwrap();
         let cursor = first.next.unwrap();
 
         let stack = listing_stack(memory, vec![3]);
@@ -122,11 +122,9 @@ mod tests {
                     limit,
                 } = op
                 {
-                    seen.lock().unwrap().push((
-                        path.to_string(),
-                        cursor.map(ListCursor::as_str).map(str::to_owned),
-                        limit.get(),
-                    ));
+                    seen.lock()
+                        .unwrap()
+                        .push((path.to_string(), cursor.cloned(), limit.get()));
                 }
                 Box::pin(async { Ok(()) })
             }
@@ -134,17 +132,14 @@ mod tests {
 
         let started = tokio::time::Instant::now();
         let erased: Arc<dyn Backend> = stack.backend.clone();
-        let page = erased
-            .list_request(ListRequest::new("a/", Some(&cursor), limit).unwrap())
-            .await
-            .unwrap();
+        let page = erased.list("a/", Some(&cursor), limit).await.unwrap();
 
         assert_eq!(page.objects, ["a/two"]);
         assert!(page.next.is_none());
         assert_eq!(started.elapsed(), Duration::from_millis(5));
         assert_eq!(
             *seen.lock().unwrap(),
-            vec![("a/".to_string(), Some(cursor.as_str().to_string()), 1)]
+            vec![("a/".to_string(), Some(cursor.clone()), 1)]
         );
         assert_eq!(stack.backend.stats_and_reset().obj_lists, 1);
         assert_eq!(stack.provider_stats.stats_and_reset().obj_lists, 1);

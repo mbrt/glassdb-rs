@@ -6,9 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::{
-    Backend, BackendError, ListCursor, ListLimit, ListPage, ListRequest, ReadReply, Version,
-};
+use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
 
 /// A backend operation presented to a hook before and after it is forwarded.
 #[derive(Debug, Clone, Copy)]
@@ -208,14 +206,19 @@ impl Backend for HookBackend {
         .await
     }
 
-    async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
+    async fn list(
+        &self,
+        prefix: &str,
+        cursor: Option<&ListCursor>,
+        limit: ListLimit,
+    ) -> Result<ListPage, BackendError> {
         self.hooked(
             BackendOp::List {
-                path: request.prefix(),
-                cursor: request.cursor(),
-                limit: request.limit(),
+                path: prefix,
+                cursor,
+                limit,
             },
-            || self.inner.list_request(request),
+            || self.inner.list(prefix, cursor, limit),
         )
         .await
     }
@@ -271,7 +274,7 @@ mod tests {
             .unwrap();
         backend.delete_if("p", &version).await.unwrap();
         backend
-            .list_request(ListRequest::new("", None, ListLimit::new(1).unwrap()).unwrap())
+            .list("", None, ListLimit::new(1).unwrap())
             .await
             .unwrap();
         assert!(!version.is_unset());

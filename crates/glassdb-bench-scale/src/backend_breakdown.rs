@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use glassdb_backend::{Backend, BackendError, ListPage, ListRequest, ReadReply, Version};
+use glassdb_backend::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
 use glassdb_data::ObjectPath;
 
 /// Reads, mutations, and lists attributed to one physical object role.
@@ -282,10 +282,14 @@ impl Backend for ClassifiedBackend {
         self.inner.delete_if(path, expected).await
     }
 
-    async fn list_request(&self, request: ListRequest<'_>) -> Result<ListPage, BackendError> {
-        let prefix = request.prefix();
+    async fn list(
+        &self,
+        prefix: &str,
+        cursor: Option<&ListCursor>,
+        limit: ListLimit,
+    ) -> Result<ListPage, BackendError> {
         self.count_list(prefix);
-        self.inner.list_request(request).await
+        self.inner.list(prefix, cursor, limit).await
     }
 }
 
@@ -399,20 +403,15 @@ mod tests {
             .await
             .unwrap();
         let first_page = backend
-            .list_request(
-                ListRequest::new(COLLECTION_PREFIX, None, NonZeroUsize::new(1).unwrap()).unwrap(),
-            )
+            .list(COLLECTION_PREFIX, None, NonZeroUsize::new(1).unwrap())
             .await
             .unwrap();
         let cursor = first_page.next.clone().unwrap();
         let second_page = backend
-            .list_request(
-                ListRequest::new(
-                    COLLECTION_PREFIX,
-                    Some(&cursor),
-                    NonZeroUsize::new(1).unwrap(),
-                )
-                .unwrap(),
+            .list(
+                COLLECTION_PREFIX,
+                Some(&cursor),
+                NonZeroUsize::new(1).unwrap(),
             )
             .await
             .unwrap();

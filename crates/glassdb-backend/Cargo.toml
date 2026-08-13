@@ -9,10 +9,6 @@ description = "Backend trait, in-memory backend, and middleware for GlassDB."
 [lints]
 workspace = true
 
-[features]
-default = []
-test-support = []
-
 [dependencies]
 async-trait = "0.1.89"
 glassdb-concurr = { version = "0.1.0", path = "../glassdb-concurr" }

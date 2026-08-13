@@ -724,7 +724,7 @@ async fn read_not_found() {
 async fn list_is_recursive_and_paginated() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
-    glassdb_backend::conformance::assert_list_conformance(&b).await;
+    glassdb_backend::implementation::assert_list_conformance(&b).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

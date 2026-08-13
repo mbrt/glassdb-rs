@@ -159,8 +159,7 @@ impl TLogger {
         limit: backend::ListLimit,
     ) -> Result<TxListPage, StorageError> {
         let prefix = ObjectPath::transaction_shard_prefix(&self.db_root, shard);
-        let request = backend::ListRequest::new(&prefix, cursor, limit)?;
-        let page = self.logs.list_request(request).await?;
+        let page = self.logs.list(&prefix, cursor, limit).await?;
         let ids = page
             .objects
             .iter()

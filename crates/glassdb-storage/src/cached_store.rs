@@ -591,13 +591,15 @@ impl CachedStore {
             .ok_or(StorageError::Precondition)
     }
 
-    /// Lists one validated page of object paths.
-    pub async fn list_request(
+    /// Lists one page of object paths.
+    pub async fn list(
         &self,
-        request: backend::ListRequest<'_>,
+        prefix: &str,
+        cursor: Option<&backend::ListCursor>,
+        limit: backend::ListLimit,
     ) -> Result<backend::ListPage, StorageError> {
         let _invoked = self.next_invocation();
-        Ok(self.backend.list_request(request).await?)
+        Ok(self.backend.list(prefix, cursor, limit).await?)
     }
 
     /// Allocates a unique invocation watermark, ordered before the backend
@@ -824,11 +826,13 @@ impl<C: Codec> TypedCachedStore<C> {
     }
 
     /// Lists one page of object paths belonging to this typed store.
-    pub(crate) async fn list_request(
+    pub(crate) async fn list(
         &self,
-        request: backend::ListRequest<'_>,
+        prefix: &str,
+        cursor: Option<&backend::ListCursor>,
+        limit: backend::ListLimit,
     ) -> Result<TypedListPage, StorageError> {
-        let page = self.store.list_request(request).await?;
+        let page = self.store.list(prefix, cursor, limit).await?;
         let mut objects = Vec::with_capacity(page.objects.len());
         for encoded in page.objects {
             let key = ObjectKey::parse(Arc::<str>::from(encoded))
@@ -1039,9 +1043,11 @@ mod tests {
             Ok(())
         }
 
-        async fn list_request(
+        async fn list(
             &self,
-            _request: backend::ListRequest<'_>,
+            _prefix: &str,
+            _cursor: Option<&backend::ListCursor>,
+            _limit: backend::ListLimit,
         ) -> Result<backend::ListPage, BackendError> {
             Ok(backend::ListPage::default())
         }
