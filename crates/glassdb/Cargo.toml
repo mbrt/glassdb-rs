@@ -47,6 +47,7 @@ gcs = ["dep:glassdb-backend-gcs"]
 sim = ["dep:arbitrary", "dep:serde", "dep:serde_json", "glassdb-storage/sim"]
 
 [dev-dependencies]
+glob = "0.3"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "rt-multi-thread", "test-util"] }
 proptest = "1.9.0"
 criterion = "0.8.2"

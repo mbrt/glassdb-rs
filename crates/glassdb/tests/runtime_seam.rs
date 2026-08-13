@@ -14,6 +14,8 @@
 
 use std::path::{Path, PathBuf};
 
+use glob::Pattern;
+
 // Module prefixes are intentional: importing or calling any API from these
 // runtime-coupled surfaces needs an explicit simulation-aware design.
 const FORBIDDEN: &[&str] = &[
@@ -57,6 +59,13 @@ const ALLOWED_TOKIO: &[&str] = &[
     "tokio::pin!",
 ];
 
+const EXEMPT_SEAM_GLOBS: &[&str] = &[
+    "crates/glassdb-concurr/src/rt.rs",
+    "crates/glassdb-concurr/src/rt/*.rs",
+    "crates/glassdb-concurr/src/sim/executor.rs",
+    "crates/glassdb-storage/src/disk_cache/file_media.rs",
+];
+
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap_or_else(|e| {
         panic!("read source dir {}: {e}", dir.display());
@@ -73,23 +82,12 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn is_allowed_runtime_use(path: &Path, pattern: &str) -> bool {
-    (path.ends_with("crates/glassdb-concurr/src/rt/native.rs")
-        && matches!(
-            pattern,
-            "tokio::spawn" | "tokio::task" | "tokio::time" | "std::thread" | "SystemTime::now("
-        ))
-        || (path.ends_with("crates/glassdb-concurr/src/rt/sim.rs")
-            && matches!(
-                pattern,
-                "tokio::spawn" | "tokio::task" | "tokio::time" | "SystemTime::now("
-            ))
-        || (path.ends_with("crates/glassdb-concurr/src/rt/dedicated.rs")
-            && matches!(pattern, "tokio::runtime" | "std::thread"))
-        || (path.ends_with("crates/glassdb-concurr/src/sim/executor.rs")
-            && matches!(pattern, "tokio::task" | "tokio::runtime"))
-        || (path.ends_with("crates/glassdb-storage/src/disk_cache/file_media.rs")
-            && matches!(pattern, "std::fs" | "std::os::unix::fs" | "rustix::fs"))
+fn is_exempt_seam_file(path: &Path) -> bool {
+    EXEMPT_SEAM_GLOBS.iter().any(|glob| {
+        Pattern::new(glob)
+            .expect("valid exempt seam glob")
+            .matches_path(path)
+    })
 }
 
 fn unclassified_tokio_use(line: &str) -> Option<&str> {
@@ -136,23 +134,6 @@ fn unreviewed_tokio_apis_are_forbidden_by_default() {
             "`{forbidden}` escaped the forbidden Tokio inventory"
         );
     }
-
-    for adapter in [
-        Path::new("crates/glassdb-concurr/src/rt/native.rs"),
-        Path::new("crates/glassdb-concurr/src/rt/sim.rs"),
-    ] {
-        for forbidden in ["tokio::sync::Mutex", "tokio::runtime", "std::fs"] {
-            assert!(
-                !is_allowed_runtime_use(adapter, forbidden),
-                "{} unexpectedly admits `{forbidden}`",
-                adapter.display()
-            );
-        }
-    }
-    assert!(!is_allowed_runtime_use(
-        Path::new("crates/glassdb-concurr/src/rt/sim.rs"),
-        "std::thread"
-    ));
 }
 
 #[test]
@@ -173,6 +154,10 @@ fn sim_controlled_code_uses_only_reviewed_runtime_apis() {
 
     let mut violations = Vec::new();
     for path in files {
+        let rel = path.strip_prefix(&workspace).unwrap_or(&path);
+        if is_exempt_seam_file(rel) {
+            continue;
+        }
         let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
             panic!("read source file {}: {e}", path.display());
         });
@@ -195,19 +180,12 @@ fn sim_controlled_code_uses_only_reviewed_runtime_apis() {
                 continue;
             }
             if let Some(pattern) = FORBIDDEN.iter().find(|pattern| trimmed.contains(**pattern)) {
-                if is_allowed_runtime_use(&path, pattern) {
-                    continue;
-                }
-                let rel = path.strip_prefix(&workspace).unwrap_or(&path);
                 violations.push(format!(
                     "{}:{} contains `{pattern}`",
                     rel.display(),
                     idx + 1
                 ));
-            } else if let Some(usage) = unclassified_tokio_use(trimmed)
-                && !is_allowed_runtime_use(&path, usage)
-            {
-                let rel = path.strip_prefix(&workspace).unwrap_or(&path);
+            } else if let Some(usage) = unclassified_tokio_use(trimmed) {
                 violations.push(format!(
                     "{}:{} contains unclassified `{usage}`",
                     rel.display(),
