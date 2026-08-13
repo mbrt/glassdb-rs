@@ -23,13 +23,10 @@ use self::client::ClientRunner;
 use self::nemesis::{FaultTransports, NemesisRunner};
 #[cfg(sim)]
 pub use self::scheduling::{
-    PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS, pct_assert, pct_record, pct_sweep, pct_trace,
-    record_input, replay_input, trace_input,
+    PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS, pct_assert, pct_record, pct_sweep, record_input,
+    replay_input,
 };
-#[cfg(all(test, sim))]
-use self::scheduling::{run_fuzz_mode, run_fuzz_mode_traced, run_pct_mode_traced};
 use super::slow_backend;
-use super::trace::*;
 use super::{MAX_CLIENTS, MediaFaultProfile, SimMedia};
 
 const DB_NAME: &str = "fuzz";
@@ -211,20 +208,15 @@ fn spawn_nemeses(
     streams: &[Vec<u8>; FAULT_STREAMS],
     signals: &[CancellationToken],
     transports: &FaultTransports,
-    trace: &TraceSink,
 ) -> NemesisRunner {
     let mut nemeses = NemesisRunner::new();
     if !faults.failures_enabled() {
-        trace.spawn(TraceSpawnRole::CrashNemesis, false);
-        trace.spawn(TraceSpawnRole::OutageNemesis, false);
         return nemeses;
     }
     let crash_tape = Tape::new(streams[CRASH_STREAM].clone(), seed ^ 0x00C0_FFEE_C0DE_BEEF);
-    trace.spawn(TraceSpawnRole::CrashNemesis, true);
-    nemeses.spawn_crash(signals, faults.intensity, crash_tape, trace);
+    nemeses.spawn_crash(signals, faults.intensity, crash_tape);
     let outage_tape = Tape::new(streams[OUTAGE_STREAM].clone(), seed ^ 0xFEED_FACE_DEAD_5EED);
-    trace.spawn(TraceSpawnRole::OutageNemesis, true);
-    nemeses.spawn_outage(transports, faults.intensity, outage_tape, trace);
+    nemeses.spawn_outage(transports, faults.intensity, outage_tape);
     nemeses
 }
 
@@ -443,25 +435,23 @@ struct RunContext<W: SimWorkload> {
 }
 
 impl<W: SimWorkload> RunContext<W> {
-    fn start_clients(&mut self, trace: &TraceSink) -> ClientRunner {
+    fn start_clients(&mut self) -> ClientRunner {
         ClientRunner::spawn::<W>(
             std::mem::take(&mut self.client_ops),
             self.transports.take_client_backends(),
             self.run_media.as_ref(),
             &self.state,
             self.faults,
-            trace,
         )
     }
 
-    async fn teardown(self, trace: &TraceSink) -> OpLog {
+    async fn teardown(self) -> OpLog {
         // Heal every transport before verifying so recovery reads cannot themselves
         // fail.
-        self.transports.final_heal(trace);
+        self.transports.final_heal();
 
         // The workload reads the final committed state (driving recovery of any
         // crashed client's locks via lease expiry) and asserts its invariant.
-        trace.verification(TraceVerificationPhase::Started);
         let verify_db = W::open_db(
             &self.backbone,
             self.run_media
@@ -474,7 +464,6 @@ impl<W: SimWorkload> RunContext<W> {
             .verify(&verify_db, &self.state, self.faults.failures_enabled())
             .await;
         verify_db.shutdown().await;
-        trace.verification(TraceVerificationPhase::Finished);
         drop(self.client_backbone);
         self.log
     }
@@ -491,28 +480,9 @@ async fn run_generic<W: SimWorkload>(
     fault_tape: Vec<u8>,
     media_tape: Option<Vec<u8>>,
 ) -> OpLog {
-    run_generic_with_trace(
-        workload,
-        faults,
-        seed,
-        fault_tape,
-        media_tape,
-        TraceSink::default(),
-    )
-    .await
-}
-
-async fn run_generic_with_trace<W: SimWorkload>(
-    workload: W,
-    faults: FaultConfig,
-    seed: u64,
-    fault_tape: Vec<u8>,
-    media_tape: Option<Vec<u8>>,
-    trace: TraceSink,
-) -> OpLog {
     let plan = RunPlan::new(workload, faults, seed, fault_tape, media_tape);
     let mut context = plan.setup().await;
-    let mut clients = context.start_clients(&trace);
+    let mut clients = context.start_clients();
 
     // An optional concurrent observer, then the crash and outage nemeses, each on
     // its own slice of the fault tape (and a distinct fallback seed). The fixed
@@ -526,14 +496,12 @@ async fn run_generic_with_trace<W: SimWorkload>(
             .as_ref()
             .map(|media| media.observer.clone()),
     );
-    trace.spawn(TraceSpawnRole::Observer, observer.is_some());
     let nemeses = spawn_nemeses(
         context.faults,
         context.seed,
         &context.fault_streams,
         clients.signals(),
         &context.transports,
-        &trace,
     );
 
     clients.join().await;
@@ -542,7 +510,7 @@ async fn run_generic_with_trace<W: SimWorkload>(
     }
     nemeses.join().await;
 
-    context.teardown(&trace).await
+    context.teardown().await
 }
 
 // ---------------------------------------------------------------------------
@@ -589,172 +557,6 @@ pub async fn run_and_record_with_faults<W: SimWorkload>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(sim)]
-    #[test]
-    fn trace_schema_covers_events_without_perturbing_operations() {
-        use super::super::{RmwOp, RmwWorkload};
-
-        let workload = RmwWorkload {
-            clients: vec![
-                vec![RmwOp::Rmw(0), RmwOp::ReadOnly(vec![0])],
-                vec![RmwOp::Rmw(1)],
-            ],
-        };
-        let schedule = vec![3, 1, 4, 1, 5, 9, 2, 6];
-        let fault_tape = vec![255; 256];
-        let faults = FaultConfig::failures(49);
-        let seed = 0xF29A;
-        let untraced = run_fuzz_mode(
-            workload.clone(),
-            faults,
-            seed,
-            schedule.clone(),
-            fault_tape.clone(),
-            None,
-        );
-        let (traced, trace) = run_fuzz_mode_traced(
-            workload.clone(),
-            faults,
-            seed,
-            schedule.clone(),
-            fault_tape.clone(),
-            None,
-        );
-        assert_eq!(*untraced.lock().unwrap(), *traced.lock().unwrap());
-
-        let media_tape = vec![0; 256];
-        let cached_untraced = run_fuzz_mode(
-            workload.clone(),
-            faults,
-            seed,
-            schedule.clone(),
-            fault_tape.clone(),
-            Some(media_tape.clone()),
-        );
-        let (cached_traced, cached_trace) = run_fuzz_mode_traced(
-            workload.clone(),
-            faults,
-            seed,
-            schedule.clone(),
-            fault_tape,
-            Some(media_tape),
-        );
-        assert_eq!(
-            *cached_untraced.lock().unwrap(),
-            *cached_traced.lock().unwrap()
-        );
-
-        let pct_untraced = pct_record(&workload, faults, seed);
-        let (pct_traced, pct_trace) = run_pct_mode_traced(workload, faults, seed);
-        assert_eq!(*pct_untraced.lock().unwrap(), *pct_traced.lock().unwrap());
-        assert_eq!(trace.schema_version(), HARNESS_TRACE_SCHEMA_VERSION);
-        assert!(trace.canonical_bytes().starts_with(b"[1,["));
-
-        assert!(matches!(
-            trace.events().first(),
-            Some(HarnessTraceEvent::Run {
-                cached: false,
-                phase: TraceRunPhase::Started
-            })
-        ));
-        assert!(matches!(
-            trace.events().last(),
-            Some(HarnessTraceEvent::Run {
-                cached: false,
-                phase: TraceRunPhase::Finished
-            })
-        ));
-        let kinds: std::collections::BTreeSet<u8> = trace
-            .events()
-            .iter()
-            .map(|event| match event {
-                HarnessTraceEvent::Run { .. } => 0,
-                HarnessTraceEvent::SpawnDecision { .. } => 1,
-                HarnessTraceEvent::TaskSpawned { .. } => 2,
-                HarnessTraceEvent::TaskSelected { .. } => 3,
-                HarnessTraceEvent::EntropyDraw(_) => 4,
-                HarnessTraceEvent::Client { .. } => 5,
-                HarnessTraceEvent::Operation { .. } => 6,
-                HarnessTraceEvent::Nemesis { .. } => 7,
-                HarnessTraceEvent::Verification { .. } => 8,
-            })
-            .collect();
-        assert_eq!(kinds, (0..=8).collect());
-        for action in [
-            TraceNemesisAction::Crash,
-            TraceNemesisAction::Down,
-            TraceNemesisAction::Heal,
-            TraceNemesisAction::FinalHeal,
-        ] {
-            assert!(trace.events().iter().any(|event| matches!(
-                event,
-                HarnessTraceEvent::Nemesis { action: actual, .. } if *actual == action
-            )));
-        }
-        assert!(trace.events().iter().any(|event| matches!(
-            event,
-            HarnessTraceEvent::EntropyDraw(TraceEntropyDraw::Bytes {
-                source: TraceEntropySource::Runtime,
-                ..
-            })
-        )));
-        assert!(trace.events().iter().any(|event| matches!(
-            event,
-            HarnessTraceEvent::EntropyDraw(TraceEntropyDraw::Bytes {
-                source: TraceEntropySource::TapeInput,
-                ..
-            })
-        )));
-        assert!(trace.events().iter().any(|event| matches!(
-            event,
-            HarnessTraceEvent::EntropyDraw(TraceEntropyDraw::Bytes {
-                source: TraceEntropySource::SchedulerInput,
-                ..
-            })
-        )));
-        assert!(pct_trace.events().iter().any(|event| matches!(
-            event,
-            HarnessTraceEvent::EntropyDraw(TraceEntropyDraw::Bytes {
-                source: TraceEntropySource::TapeFallbackRng,
-                ..
-            })
-        )));
-        assert!(pct_trace.events().iter().any(|event| matches!(
-            event,
-            HarnessTraceEvent::EntropyDraw(TraceEntropyDraw::Bytes {
-                source: TraceEntropySource::SchedulerRng,
-                ..
-            })
-        )));
-        assert!(cached_trace.events().iter().any(|event| matches!(
-            event,
-            HarnessTraceEvent::EntropyDraw(TraceEntropyDraw::Bytes {
-                source: TraceEntropySource::TapeInput,
-                ..
-            })
-        )));
-        let schedule_draws = trace
-            .events()
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    HarnessTraceEvent::EntropyDraw(TraceEntropyDraw::Bytes {
-                        source: TraceEntropySource::SchedulerInput,
-                        ..
-                    })
-                )
-            })
-            .count();
-        let selections = trace
-            .events()
-            .iter()
-            .filter(|event| matches!(event, HarnessTraceEvent::TaskSelected { .. }))
-            .count();
-        assert_eq!(schedule_draws, schedule.len());
-        assert!(selections > schedule_draws);
-    }
 
     #[test]
     fn fault_config_decodes_four_modes_without_shifting_the_tail() {

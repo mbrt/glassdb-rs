@@ -131,9 +131,9 @@ mod tests {
 
     #[cfg(sim)]
     #[test]
-    fn active_simulation_preserves_runtime_contract_and_dedicated_spawn_order() {
+    fn active_simulation_preserves_runtime_and_dedicated_task_contracts() {
+        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::{Arc, Mutex};
 
         struct DropNotice(Arc<AtomicBool>);
 
@@ -146,54 +146,37 @@ mod tests {
         let caller = std::thread::current().id();
         let dropped_at_shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_notice = dropped_at_shutdown.clone();
-        let trace = Arc::new(Mutex::new(Vec::new()));
-        let trace_sink = trace.clone();
-        super::block_on_with_trace(
-            super::TapeScheduler::new(Vec::new()),
-            0,
-            Arc::new(move |event| trace_sink.lock().unwrap().push(event)),
-            async move {
-                runtime_facade_contract().await;
+        super::block_on_with(super::TapeScheduler::new(Vec::new()), 0, async move {
+            runtime_facade_contract().await;
 
-                let success = spawn_dedicated("not-a-native-thread", async move {
-                    super::yield_now().await;
-                    std::thread::current().id()
-                })
-                .unwrap();
-                let panicked = spawn_dedicated("simulated-panic", async move {
-                    panic!("dedicated test panic");
-                })
-                .unwrap();
-                let cancelled = spawn_dedicated("simulated-cancellation", async move {
-                    std::future::pending::<()>().await;
-                })
-                .unwrap();
-                cancelled.abort();
+            let success = spawn_dedicated("not-a-native-thread", async move {
+                super::yield_now().await;
+                std::thread::current().id()
+            })
+            .unwrap();
+            let panicked = spawn_dedicated("simulated-panic", async move {
+                panic!("dedicated test panic");
+            })
+            .unwrap();
+            let cancelled = spawn_dedicated("simulated-cancellation", async move {
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
+            cancelled.abort();
 
-                let notice = DropNotice(shutdown_notice);
-                let detached = spawn_dedicated("simulated-shutdown", async move {
-                    let _notice = notice;
-                    std::future::pending::<()>().await;
-                })
-                .unwrap();
-                drop(detached);
+            let notice = DropNotice(shutdown_notice);
+            let detached = spawn_dedicated("simulated-shutdown", async move {
+                let _notice = notice;
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
+            drop(detached);
 
-                assert_eq!(success.await.unwrap(), caller);
-                assert!(matches!(panicked.await, Err(DedicatedJoinError::Panicked)));
-                assert_eq!(cancelled.await, Err(DedicatedJoinError::Cancelled));
-            },
-        );
+            assert_eq!(success.await.unwrap(), caller);
+            assert!(matches!(panicked.await, Err(DedicatedJoinError::Panicked)));
+            assert_eq!(cancelled.await, Err(DedicatedJoinError::Cancelled));
+        });
 
         assert!(dropped_at_shutdown.load(Ordering::SeqCst));
-        let spawned: Vec<_> = trace
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|event| match event {
-                super::RuntimeTraceEvent::TaskSpawned { task_id } => Some(*task_id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(spawned, [0, 1, 2, 3, 4, 5, 6]);
     }
 }

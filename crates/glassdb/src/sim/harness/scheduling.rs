@@ -4,11 +4,9 @@ use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::middleware::{OpLog, OpRecord};
 use glassdb_concurr::rt;
 
-use crate::sim::trace::{HarnessTrace, HarnessTraceEvent, TraceRunPhase, TraceSink};
-
 use super::{
     FaultConfig, SimWorkload, deinterleave, run_and_assert_with_faults, run_and_record_with_faults,
-    run_generic, run_generic_with_trace,
+    run_generic,
 };
 
 // PCT seed-breadth run mode (ADR-011) drives the harness with a PctScheduler
@@ -63,55 +61,6 @@ pub(super) fn run_fuzz_mode<W: SimWorkload>(
     rt::block_on_with(rt::TapeScheduler::new(schedule_tape), seed, async move {
         run_generic(workload, faults, seed, fault_tape, media_tape).await
     })
-}
-
-pub(super) fn run_fuzz_mode_traced<W: SimWorkload>(
-    workload: W,
-    faults: FaultConfig,
-    seed: u64,
-    schedule_tape: Vec<u8>,
-    fault_tape: Vec<u8>,
-    media_tape: Option<Vec<u8>>,
-) -> (OpLog, HarnessTrace) {
-    run_scheduled_mode_traced(
-        workload,
-        faults,
-        seed,
-        fault_tape,
-        media_tape,
-        move |trace| rt::TapeScheduler::new_traced(schedule_tape, trace),
-    )
-}
-
-fn run_scheduled_mode_traced<W, S>(
-    workload: W,
-    faults: FaultConfig,
-    seed: u64,
-    fault_tape: Vec<u8>,
-    media_tape: Option<Vec<u8>>,
-    scheduler: impl FnOnce(rt::RuntimeTraceObserver) -> S,
-) -> (OpLog, HarnessTrace)
-where
-    W: SimWorkload,
-    S: rt::Scheduler + 'static,
-{
-    let cached = media_tape.is_some();
-    let trace = TraceSink::enabled();
-    trace.record(HarnessTraceEvent::Run {
-        cached,
-        phase: TraceRunPhase::Started,
-    });
-    let runtime_trace = trace.runtime_observer();
-    let run_trace = trace.clone();
-    let scheduler = scheduler(runtime_trace.clone());
-    let log = rt::block_on_with_trace(scheduler, seed, runtime_trace, async move {
-        run_generic_with_trace(workload, faults, seed, fault_tape, media_tape, run_trace).await
-    });
-    trace.record(HarnessTraceEvent::Run {
-        cached,
-        phase: TraceRunPhase::Finished,
-    });
-    (log, trace.finish())
 }
 
 /// Decodes one libFuzzer input for workload `W` exactly as its target does and
@@ -180,39 +129,6 @@ pub fn record_input<W: SimWorkload + for<'a> Arbitrary<'a>>(data: &[u8]) -> Vec<
     recorded
 }
 
-/// Decodes and runs one fuzzer input like [`record_input`], returning the
-/// structured cache-free and cache-enabled harness observations as one trace.
-/// No digest or corpus baseline is imposed here; callers choose what to retain.
-pub fn trace_input<W: SimWorkload + for<'a> Arbitrary<'a>>(data: &[u8]) -> HarnessTrace {
-    let DecodedFuzzInput {
-        seed,
-        workload,
-        faults,
-        schedule_tape,
-        fault_tape,
-        media_tape,
-    } = decode_fuzz_input::<W>(data);
-    let (_, without_cache) = run_fuzz_mode_traced(
-        workload.clone(),
-        faults,
-        seed,
-        schedule_tape.clone(),
-        fault_tape.clone(),
-        None,
-    );
-    let (_, with_cache) = run_fuzz_mode_traced(
-        workload,
-        faults,
-        seed,
-        schedule_tape,
-        fault_tape,
-        Some(media_tape),
-    );
-    let mut events = without_cache.events;
-    events.extend(with_cache.events);
-    HarnessTrace { events }
-}
-
 /// Runs `workload` once under a PCT schedule seeded by `seed`, asserting its
 /// invariant. Panics on any violation.
 pub fn pct_assert<W: SimWorkload>(workload: &W, faults: FaultConfig, seed: u64) {
@@ -234,22 +150,6 @@ pub fn pct_record<W: SimWorkload>(workload: &W, faults: FaultConfig, seed: u64) 
         seed,
         async move { run_and_record_with_faults(&w, faults, seed, Vec::new()).await },
     )
-}
-
-/// Runs `workload` under a traced PCT schedule without imposing a digest
-/// baseline. The scheduler's change-point and spawn-priority draws are included.
-pub fn pct_trace<W: SimWorkload>(workload: &W, faults: FaultConfig, seed: u64) -> HarnessTrace {
-    run_pct_mode_traced(workload.clone(), faults, seed).1
-}
-
-pub(super) fn run_pct_mode_traced<W: SimWorkload>(
-    workload: W,
-    faults: FaultConfig,
-    seed: u64,
-) -> (OpLog, HarnessTrace) {
-    run_scheduled_mode_traced(workload, faults, seed, Vec::new(), None, move |trace| {
-        rt::PctScheduler::new_traced(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS, trace)
-    })
 }
 
 /// Seed-breadth sweep: runs `workload` under one PCT schedule per seed, asserting

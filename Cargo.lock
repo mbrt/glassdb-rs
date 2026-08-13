@@ -1409,8 +1409,6 @@ dependencies = [
  "proptest",
  "prost",
  "rayon",
- "serde",
- "serde_json",
  "syn",
  "thiserror",
  "tokio",

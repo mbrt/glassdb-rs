@@ -3,9 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::rng::Rng;
-use crate::sim::executor::{
-    RuntimeEntropySource, RuntimeTraceEvent, RuntimeTraceObserver, TaskId, emit_scheduler_trace,
-};
+use crate::sim::executor::TaskId;
 
 /// Decides which ready task to poll next. Implementations must be deterministic
 /// functions of their own state so the entire run replays from a seed/tape.
@@ -27,41 +25,19 @@ pub trait Scheduler: Send {
 pub struct TapeScheduler {
     tape: Vec<u8>,
     pos: usize,
-    trace: Option<RuntimeTraceObserver>,
 }
 
 impl TapeScheduler {
     /// Builds a scheduler that replays `tape`, then selects the lowest ready task.
     pub fn new(tape: Vec<u8>) -> Self {
-        TapeScheduler {
-            tape,
-            pos: 0,
-            trace: None,
-        }
-    }
-
-    /// Builds a tape scheduler that observes each consumed schedule byte.
-    pub fn new_traced(tape: Vec<u8>, trace: RuntimeTraceObserver) -> Self {
-        TapeScheduler {
-            tape,
-            pos: 0,
-            trace: Some(trace),
-        }
+        TapeScheduler { tape, pos: 0 }
     }
 }
 
 impl Scheduler for TapeScheduler {
     fn pick(&mut self, ready: &[TaskId]) -> usize {
-        let input = self.tape.get(self.pos).copied();
-        let b = input.unwrap_or(0);
+        let b = self.tape.get(self.pos).copied().unwrap_or(0);
         self.pos = self.pos.wrapping_add(1);
-        if input.is_some() {
-            trace_scheduler_draw(
-                self.trace.as_ref(),
-                RuntimeEntropySource::SchedulerInput,
-                &[b],
-            );
-        }
         (b as usize) % ready.len()
     }
 }
@@ -100,7 +76,6 @@ impl Scheduler for RandomScheduler {
 /// seed-breadth complement to the byte-tape policy that needs no fuzzer feedback.
 pub struct PctScheduler {
     rng: Rng,
-    trace: Option<RuntimeTraceObserver>,
     /// Priority per task; higher wins. Initial priorities sit in a high band so
     /// they always dominate the small priorities assigned at change points.
     priorities: BTreeMap<TaskId, u64>,
@@ -123,31 +98,16 @@ impl PctScheduler {
     /// decisions. Both the priorities and the change points are pure functions of
     /// `seed`, so a run replays exactly.
     pub fn new(seed: u64, depth: usize, steps: u64) -> Self {
-        Self::build(seed, depth, steps, None)
-    }
-
-    /// Builds a PCT scheduler that observes change-point and priority draws.
-    pub fn new_traced(seed: u64, depth: usize, steps: u64, trace: RuntimeTraceObserver) -> Self {
-        Self::build(seed, depth, steps, Some(trace))
-    }
-
-    fn build(seed: u64, depth: usize, steps: u64, trace: Option<RuntimeTraceObserver>) -> Self {
         let mut rng = Rng::new(seed);
         let steps = steps.max(1);
         let n = depth.saturating_sub(1);
         let mut change_points = Vec::with_capacity(n);
         for _ in 0..n {
             let draw = rng.next_u64();
-            trace_scheduler_draw(
-                trace.as_ref(),
-                RuntimeEntropySource::SchedulerRng,
-                &draw.to_le_bytes(),
-            );
             change_points.push(1 + draw % steps);
         }
         PctScheduler {
             rng,
-            trace,
             priorities: BTreeMap::new(),
             change_points,
             step: 0,
@@ -181,29 +141,8 @@ impl Scheduler for PctScheduler {
 
     fn on_spawn(&mut self, id: TaskId) {
         let draw = self.rng.next_u64();
-        trace_scheduler_draw(
-            self.trace.as_ref(),
-            RuntimeEntropySource::SchedulerRng,
-            &draw.to_le_bytes(),
-        );
         let p = Self::HIGH_BASE + (draw >> 1);
         self.priorities.insert(id, p);
-    }
-}
-
-fn trace_scheduler_draw(
-    trace: Option<&RuntimeTraceObserver>,
-    source: RuntimeEntropySource,
-    bytes: &[u8],
-) {
-    if let Some(trace) = trace {
-        emit_scheduler_trace(
-            trace,
-            RuntimeTraceEvent::EntropyDraw {
-                source,
-                bytes: bytes.to_vec(),
-            },
-        );
     }
 }
 
@@ -223,7 +162,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::exec::{DetYield, block_on_with, block_on_with_trace, det_spawn};
+    use crate::exec::{DetYield, block_on_with, det_spawn};
 
     #[test]
     fn random_scheduler_seeded_selection_matches_reviewed_vector() {
@@ -278,63 +217,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scheduler_trace_observers_can_reenter_the_runtime_clock() {
-        fn observer(events: Arc<Mutex<Vec<RuntimeTraceEvent>>>) -> RuntimeTraceObserver {
-            Arc::new(move |event| {
-                let _ = crate::rt::Instant::now();
-                events.lock().unwrap().push(event);
-            })
-        }
-
-        let tape_events = Arc::new(Mutex::new(Vec::new()));
-        let tape_trace = observer(tape_events.clone());
-        block_on_with_trace(
-            TapeScheduler::new_traced(vec![7], tape_trace.clone()),
-            0,
-            tape_trace,
-            async {},
-        );
-        assert_eq!(
-            *tape_events.lock().unwrap(),
-            [
-                RuntimeTraceEvent::TaskSpawned { task_id: 0 },
-                RuntimeTraceEvent::EntropyDraw {
-                    source: RuntimeEntropySource::SchedulerInput,
-                    bytes: vec![7],
-                },
-                RuntimeTraceEvent::TaskSelected { task_id: 0 },
-            ]
-        );
-
-        // Depth one draws no constructor-time change points, so this exercises
-        // the priority draw made by `on_spawn` inside the active executor.
-        let pct_events = Arc::new(Mutex::new(Vec::new()));
-        let pct_trace = observer(pct_events.clone());
-        block_on_with_trace(
-            PctScheduler::new_traced(42, 1, 1, pct_trace.clone()),
-            0,
-            pct_trace,
-            async {},
-        );
-        let pct_events = pct_events.lock().unwrap();
-        assert_eq!(pct_events.len(), 3);
-        assert!(matches!(
-            &pct_events[0],
-            RuntimeTraceEvent::EntropyDraw {
-                source: RuntimeEntropySource::SchedulerRng,
-                bytes,
-            } if bytes.len() == 8
-        ));
-        assert_eq!(
-            pct_events[1..],
-            [
-                RuntimeTraceEvent::TaskSpawned { task_id: 0 },
-                RuntimeTraceEvent::TaskSelected { task_id: 0 },
-            ]
-        );
-    }
-
     /// Drives four yielding tasks under a [`PctScheduler`] and returns the order
     /// in which their steps ran.
     fn pct_order(seed: u64) -> Vec<u32> {
@@ -377,7 +259,6 @@ mod tests {
     fn pct_change_point_demotes_selected_task() {
         let mut scheduler = PctScheduler {
             rng: Rng::new(0),
-            trace: None,
             priorities: BTreeMap::from([(TaskId(1), 100), (TaskId(2), 90)]),
             change_points: vec![1],
             step: 0,

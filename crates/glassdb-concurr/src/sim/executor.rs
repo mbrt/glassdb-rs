@@ -46,39 +46,6 @@ const DEFAULT_STEP_BUDGET: u64 = 1_000_000;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct TaskId(pub u64);
 
-/// A stable observation emitted by the deterministic executor when a harness
-/// explicitly enables tracing. Ordinary runs do not allocate or emit events.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RuntimeTraceEvent {
-    /// A task was assigned its spawn-order identifier.
-    TaskSpawned { task_id: u64 },
-    /// The executor selected this task at the scheduling boundary.
-    TaskSelected { task_id: u64 },
-    /// One call consumed bytes from the executor's seeded entropy stream.
-    EntropyDraw {
-        source: RuntimeEntropySource,
-        bytes: Vec<u8>,
-    },
-}
-
-/// The deterministic entropy stream that produced an observed draw.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RuntimeEntropySource {
-    /// Bytes produced by `rt::fill_random`.
-    FillRandom,
-    /// A byte consumed from a supplied fault/media tape.
-    TapeInput,
-    /// A byte drawn from a tape's seeded fallback generator.
-    TapeFallbackRng,
-    /// A byte consumed from a supplied scheduling tape.
-    SchedulerInput,
-    /// A value drawn by a seeded randomized scheduling policy.
-    SchedulerRng,
-}
-
-/// Receives deterministic-executor observations for a single traced run.
-pub type RuntimeTraceObserver = Arc<dyn Fn(RuntimeTraceEvent) + Send + Sync>;
-
 struct TimerEntry {
     deadline: u64,
     id: u64,
@@ -118,9 +85,6 @@ struct Inner {
     /// Simulated entropy source for `fill_random` (e.g. `TxId` prefixes), seeded
     /// so the run is reproducible.
     entropy: Rng,
-    /// Optional migration guard for the simulation harness. Kept out of the
-    /// ordinary path so users that do not request a trace pay no allocation.
-    trace: Option<RuntimeTraceObserver>,
 }
 
 /// Tasks woken via a `Waker`. The only state shared with wakers, so it is the
@@ -165,79 +129,6 @@ pub(crate) struct Handle {
 
 thread_local! {
     static CURRENT: RefCell<Option<Handle>> = const { RefCell::new(None) };
-    static DEFERRED_SCHEDULER_TRACES: RefCell<Option<Vec<DeferredSchedulerTrace>>> =
-        const { RefCell::new(None) };
-}
-
-type DeferredSchedulerTrace = (RuntimeTraceObserver, RuntimeTraceEvent);
-
-/// Defers scheduler-owned callbacks until the executor releases its state.
-///
-/// Schedulers run while [`Inner`] is mutably borrowed. Trace observers are user
-/// callbacks and may re-enter the runtime, so invoking them there would panic on
-/// the `RefCell` borrow. A scope queues those callbacks in order; the executor
-/// finishes and flushes it only after dropping the state borrow.
-struct SchedulerTraceScope {
-    previous: Option<Vec<DeferredSchedulerTrace>>,
-    active: bool,
-}
-
-impl SchedulerTraceScope {
-    fn enter() -> Self {
-        let previous =
-            DEFERRED_SCHEDULER_TRACES.with(|pending| pending.borrow_mut().replace(Vec::new()));
-        Self {
-            previous,
-            active: true,
-        }
-    }
-
-    fn finish(mut self) -> Vec<DeferredSchedulerTrace> {
-        let mut queued = DEFERRED_SCHEDULER_TRACES.with(|pending| {
-            pending
-                .borrow_mut()
-                .take()
-                .expect("scheduler trace scope is active")
-        });
-        let ready = if let Some(mut previous) = self.previous.take() {
-            previous.append(&mut queued);
-            DEFERRED_SCHEDULER_TRACES.with(|pending| *pending.borrow_mut() = Some(previous));
-            Vec::new()
-        } else {
-            queued
-        };
-        self.active = false;
-        ready
-    }
-}
-
-impl Drop for SchedulerTraceScope {
-    fn drop(&mut self) {
-        if self.active {
-            DEFERRED_SCHEDULER_TRACES.with(|pending| *pending.borrow_mut() = self.previous.take());
-        }
-    }
-}
-
-pub(super) fn emit_scheduler_trace(trace: &RuntimeTraceObserver, event: RuntimeTraceEvent) {
-    let immediate = DEFERRED_SCHEDULER_TRACES.with(|pending| {
-        let mut pending = pending.borrow_mut();
-        if let Some(pending) = pending.as_mut() {
-            pending.push((trace.clone(), event));
-            None
-        } else {
-            Some(event)
-        }
-    });
-    if let Some(event) = immediate {
-        trace(event);
-    }
-}
-
-fn flush_scheduler_traces(traces: Vec<DeferredSchedulerTrace>) {
-    for (trace, event) in traces {
-        trace(event);
-    }
 }
 
 pub(crate) fn current() -> Option<Handle> {
@@ -255,19 +146,12 @@ impl Handle {
     }
 
     fn spawn_raw(&self, fut: Pin<Box<dyn Future<Output = ()> + Send>>) -> TaskId {
-        let scheduler_traces = SchedulerTraceScope::enter();
         let mut inner = self.inner.borrow_mut();
         let id = TaskId(inner.next_task);
         inner.next_task += 1;
         inner.tasks.insert(id, Task { future: fut });
         inner.ready.insert(id);
         inner.scheduler.on_spawn(id);
-        let trace = inner.trace.clone();
-        drop(inner);
-        flush_scheduler_traces(scheduler_traces.finish());
-        if let Some(trace) = trace {
-            trace(RuntimeTraceEvent::TaskSpawned { task_id: id.0 });
-        }
         id
     }
 
@@ -351,27 +235,7 @@ pub(crate) fn now_nanos() -> u64 {
 /// Panics if no executor is running.
 pub(crate) fn fill_random(buf: &mut [u8]) {
     let h = current().expect("rt::fill_random called outside the simulation executor");
-    let trace = {
-        let mut inner = h.inner.borrow_mut();
-        inner.entropy.fill(buf);
-        inner.trace.clone()
-    };
-    if let Some(trace) = trace {
-        trace(RuntimeTraceEvent::EntropyDraw {
-            source: RuntimeEntropySource::FillRandom,
-            bytes: buf.to_vec(),
-        });
-    }
-}
-
-pub(crate) fn record_tape_draw(source: RuntimeEntropySource, byte: u8) {
-    let trace = current().and_then(|h| h.inner.borrow().trace.clone());
-    if let Some(trace) = trace {
-        trace(RuntimeTraceEvent::EntropyDraw {
-            source,
-            bytes: vec![byte],
-        });
-    }
+    h.inner.borrow_mut().entropy.fill(buf);
 }
 
 /// A future that yields once, then completes. Equivalent to
@@ -412,43 +276,14 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    block_on_with_budget(scheduler, entropy_seed, DEFAULT_STEP_BUDGET, None, root)
-}
-
-/// Runs `root` like [`block_on_with`] and emits spawn/entropy observations to
-/// `trace`. This is intended for deterministic migration guards; registering an
-/// observer does not consume scheduler or entropy state.
-pub fn block_on_with_trace<S, F, T>(
-    scheduler: S,
-    entropy_seed: u64,
-    trace: RuntimeTraceObserver,
-    root: F,
-) -> T
-where
-    S: Scheduler + 'static,
-    F: Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    block_on_with_budget(
-        scheduler,
-        entropy_seed,
-        DEFAULT_STEP_BUDGET,
-        Some(trace),
-        root,
-    )
+    block_on_with_budget(scheduler, entropy_seed, DEFAULT_STEP_BUDGET, root)
 }
 
 /// As [`block_on_with`], but with an explicit per-run step `budget`. Private so
 /// the public entry point always uses [`DEFAULT_STEP_BUDGET`]; a small budget
 /// lets the tests exercise the non-termination guard without spinning millions
 /// of steps.
-fn block_on_with_budget<S, F, T>(
-    scheduler: S,
-    entropy_seed: u64,
-    budget: u64,
-    trace: Option<RuntimeTraceObserver>,
-    root: F,
-) -> T
+fn block_on_with_budget<S, F, T>(scheduler: S, entropy_seed: u64, budget: u64, root: F) -> T
 where
     S: Scheduler + 'static,
     F: Future<Output = T> + Send + 'static,
@@ -483,7 +318,6 @@ where
         timers: BinaryHeap::new(),
         scheduler: Box::new(scheduler),
         entropy: Rng::new(entropy_seed),
-        trace,
     }));
     let handle = Handle {
         inner: inner.clone(),
@@ -569,7 +403,6 @@ fn run_loop<T>(handle: &Handle, out: &Arc<Mutex<Option<T>>>, budget: u64) {
         }
 
         // 2. If any task is ready, let the scheduler pick one and poll it.
-        let scheduler_traces = SchedulerTraceScope::enter();
         let picked = {
             let mut inner = handle.inner.borrow_mut();
             if inner.ready.is_empty() {
@@ -579,15 +412,11 @@ fn run_loop<T>(handle: &Handle, out: &Arc<Mutex<Option<T>>>, budget: u64) {
                 let idx = inner.scheduler.pick(&ready_vec) % ready_vec.len();
                 let tid = ready_vec[idx];
                 inner.ready.remove(&tid);
-                Some((tid, inner.trace.clone()))
+                Some(tid)
             }
         };
-        flush_scheduler_traces(scheduler_traces.finish());
 
-        if let Some((tid, trace)) = picked {
-            if let Some(trace) = trace {
-                trace(RuntimeTraceEvent::TaskSelected { task_id: tid.0 });
-            }
+        if let Some(tid) = picked {
             let taken = handle.inner.borrow_mut().tasks.remove(&tid);
             if let Some(mut task) = taken {
                 let waker = Waker::from(Arc::new(TaskWaker {
@@ -667,7 +496,7 @@ mod tests {
         // deterministic non-termination guard and panic, instead of spinning
         // forever and hanging the fuzzer or a corpus replay. A tiny budget keeps
         // the test fast: the workload below would otherwise take ~10k steps.
-        block_on_with_budget(LowestFirst, 0, 100, None, async {
+        block_on_with_budget(LowestFirst, 0, 100, async {
             for _ in 0..10_000 {
                 DetYield::default().await;
             }

@@ -29,8 +29,6 @@ tokio-util = "0.7.18"
 # Only used by the `sim` feature (deterministic fuzz harness); kept optional so
 # production builds don't pull it in.
 arbitrary = { version = "1", optional = true }
-serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
 tracing = "0.1.44"
 
 [features]
@@ -44,7 +42,7 @@ s3-fake-server = ["s3", "glassdb-backend-s3/fake-server"]
 gcs = ["dep:glassdb-backend-gcs"]
 # Expose the deterministic-simulation workload harness (`glassdb::sim`) used by
 # the `fuzz/` crate and the op-stream self-check. See ADR-008 and ADR-011.
-sim = ["dep:arbitrary", "dep:serde", "dep:serde_json", "glassdb-storage/sim"]
+sim = ["dep:arbitrary", "glassdb-storage/sim"]
 
 [dev-dependencies]
 glob = "0.3"

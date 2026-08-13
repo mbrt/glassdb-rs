@@ -13,8 +13,6 @@ use glassdb_backend::middleware::{FaultBackend, FaultOptions};
 use glassdb_concurr::{Tape, rt};
 use tokio_util::sync::CancellationToken;
 
-use crate::sim::trace::{TraceNemesis, TraceNemesisAction, TraceSink};
-
 /// Owns the fault-injecting transports and ordered client backend views.
 pub(super) struct FaultTransports {
     injected: Vec<Arc<FaultBackend>>,
@@ -56,16 +54,10 @@ impl FaultTransports {
         std::mem::take(&mut self.client_backends)
     }
 
-    /// Disables every injector before final verification and records the order.
-    pub(super) fn final_heal(&self, trace: &TraceSink) {
-        for (client, transport) in self.injected.iter().enumerate() {
+    /// Disables every injector before final verification.
+    pub(super) fn final_heal(&self) {
+        for transport in &self.injected {
             transport.set_active(false);
-            trace.nemesis(
-                TraceNemesis::Harness,
-                TraceNemesisAction::FinalHeal,
-                Some(client),
-                None,
-            );
         }
     }
 }
@@ -86,36 +78,18 @@ impl NemesisRunner {
     }
 
     /// Starts deterministic client-crash injection.
-    pub(super) fn spawn_crash(
-        &mut self,
-        signals: &[CancellationToken],
-        intensity: u8,
-        tape: Tape,
-        trace: &TraceSink,
-    ) {
+    pub(super) fn spawn_crash(&mut self, signals: &[CancellationToken], intensity: u8, tape: Tape) {
         debug_assert!(self.crash.is_none());
-        self.crash = Some(rt::spawn(crash_nemesis(
-            signals.to_vec(),
-            intensity,
-            tape,
-            trace.clone(),
-        )));
+        self.crash = Some(rt::spawn(crash_nemesis(signals.to_vec(), intensity, tape)));
     }
 
     /// Starts deterministic sustained-outage injection.
-    pub(super) fn spawn_outage(
-        &mut self,
-        transports: &FaultTransports,
-        intensity: u8,
-        tape: Tape,
-        trace: &TraceSink,
-    ) {
+    pub(super) fn spawn_outage(&mut self, transports: &FaultTransports, intensity: u8, tape: Tape) {
         debug_assert!(self.outage.is_none());
         self.outage = Some(rt::spawn(outage_nemesis(
             transports.injected.clone(),
             intensity,
             tape,
-            trace.clone(),
         )));
     }
 
@@ -132,34 +106,18 @@ impl NemesisRunner {
 
 /// Cancels selected clients at deterministic virtual times. Their task owner
 /// performs the uncancellable restart without replaying an in-doubt operation.
-async fn crash_nemesis(
-    signals: Vec<CancellationToken>,
-    intensity: u8,
-    mut tape: Tape,
-    trace: TraceSink,
-) {
+async fn crash_nemesis(signals: Vec<CancellationToken>, intensity: u8, mut tape: Tape) {
     let crashes = (intensity as usize % 3).min(signals.len());
     for _ in 0..crashes {
         let gap = tape.below(40) + 1;
         rt::sleep(Duration::from_millis(gap)).await;
         let client = tape.below(signals.len() as u64) as usize;
         signals[client].cancel();
-        trace.nemesis(
-            TraceNemesis::Crash,
-            TraceNemesisAction::Crash,
-            Some(client),
-            Some(gap),
-        );
     }
 }
 
 /// Takes selected client transports down for sustained windows and heals them.
-async fn outage_nemesis(
-    transports: Vec<Arc<FaultBackend>>,
-    intensity: u8,
-    mut tape: Tape,
-    trace: TraceSink,
-) {
+async fn outage_nemesis(transports: Vec<Arc<FaultBackend>>, intensity: u8, mut tape: Tape) {
     if transports.is_empty() {
         return;
     }
@@ -168,22 +126,10 @@ async fn outage_nemesis(
         rt::sleep(Duration::from_millis(gap)).await;
         let client = tape.below(transports.len() as u64) as usize;
         transports[client].down();
-        trace.nemesis(
-            TraceNemesis::Outage,
-            TraceNemesisAction::Down,
-            Some(client),
-            Some(gap),
-        );
         // The span keeps retries failing long enough to reach lease recovery.
         let span = tape.below(80) + 20;
         rt::sleep(Duration::from_millis(span)).await;
         transports[client].heal();
-        trace.nemesis(
-            TraceNemesis::Outage,
-            TraceNemesisAction::Heal,
-            Some(client),
-            Some(span),
-        );
     }
 }
 

@@ -1,21 +1,14 @@
 #![cfg(sim)]
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use glassdb_backend::middleware::{DelayBackend, Latency, gcs_delays};
 use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
-use glassdb_concurr::rt::{
-    self, RuntimeEntropySource, RuntimeTraceEvent, TapeScheduler, block_on_with_trace,
-};
+use glassdb_concurr::rt::{self, TapeScheduler, block_on_with};
 
-fn replay(seed: u64) -> (Duration, Vec<RuntimeTraceEvent>) {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let observer = {
-        let events = events.clone();
-        Arc::new(move |event| events.lock().unwrap().push(event))
-    };
-    let elapsed = block_on_with_trace(TapeScheduler::new(Vec::new()), seed, observer, async {
+fn replay(seed: u64) -> (Duration, [u8; 8]) {
+    block_on_with(TapeScheduler::new(Vec::new()), seed, async {
         let mut options = gcs_delays();
         options.latency.obj_read = Latency::new(57, 7);
         let backend = DelayBackend::new(Arc::new(MemoryBackend::new()), options).unwrap();
@@ -24,10 +17,11 @@ fn replay(seed: u64) -> (Duration, Vec<RuntimeTraceEvent>) {
             backend.read("missing").await,
             Err(BackendError::NotFound)
         ));
-        start.elapsed()
-    });
-    let trace = events.lock().unwrap().clone();
-    (elapsed, trace)
+        let elapsed = start.elapsed();
+        let mut entropy_sentinel = [0; 8];
+        rt::fill_random(&mut entropy_sentinel);
+        (elapsed, entropy_sentinel)
+    })
 }
 
 #[test]
@@ -35,26 +29,9 @@ fn delay_sampling_replays_from_the_executor_entropy_stream() {
     let first = replay(0xF2_5C);
     let repeated = replay(0xF2_5C);
     assert_eq!(first, repeated);
-
-    let first_draw = first
-        .1
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                RuntimeTraceEvent::EntropyDraw {
-                    source: RuntimeEntropySource::FillRandom,
-                    bytes,
-                } if bytes.len() == 8
-            )
-        })
-        .expect("delay sampling did not consume executor entropy");
-    assert_eq!(
-        first_draw, 2,
-        "latency entropy moved past its call boundary"
-    );
+    assert_eq!(first.1, [213, 85, 126, 142, 115, 101, 39, 176]);
 
     let different_seed = replay(0xF2_5D);
-    assert_ne!(first.1, different_seed.1);
     assert_ne!(first.0, different_seed.0);
+    assert_ne!(first.1, different_seed.1);
 }
