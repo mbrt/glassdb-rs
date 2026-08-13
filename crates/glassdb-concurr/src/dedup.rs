@@ -1466,6 +1466,46 @@ mod tests {
         (Member { request, done }, result)
     }
 
+    fn queue_counters(machine: &KeyMachine<TestRequest, ()>) -> Vec<i64> {
+        machine
+            .queue
+            .batch
+            .iter()
+            .chain(&machine.queue.reorderable)
+            .chain(&machine.queue.fifo)
+            .map(|member| member.request.counter)
+            .collect()
+    }
+
+    fn apply_delivery(
+        effects: MachineEffects<TestRequest, ()>,
+        result: &mut TestResult,
+        succeeds: bool,
+    ) -> Option<Vec<Member<TestRequest, ()>>> {
+        assert!(matches!(
+            result.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        let recycled = effects.apply_recycling();
+        assert_eq!(result.try_recv().unwrap().is_ok(), succeeds);
+        assert!(matches!(
+            result.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        recycled
+    }
+
+    fn assert_completing(step: &MachineStep<TestRequest, (), bool>) {
+        assert!(step.value);
+        assert_eq!(step.action, MachineAction::Keep);
+    }
+
+    fn assert_owner_started(step: MachineStep<TestRequest, (), bool>) {
+        assert!(step.value);
+        assert_eq!(step.action, MachineAction::Keep);
+        step.effects.apply();
+    }
+
     #[tokio::test]
     async fn machine_effects_are_deferred() {
         let (seed, mut result) = test_member(mergeable(1));
@@ -1473,6 +1513,7 @@ mod tests {
         let started = delivery.start_round(DriverId(1), false);
         started.effects.apply();
         let finished = delivery.round_finished(DriverId(1), MachineRoundOutcome::Done(Ok(())));
+        assert_completing(&finished);
         assert!(matches!(
             result.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
@@ -1505,9 +1546,207 @@ mod tests {
         let error = Arc::new(());
         let finished =
             stale.round_finished(DriverId(99), MachineRoundOutcome::Done(Err(error.clone())));
+        assert!(!finished.value);
+        assert_eq!(finished.action, MachineAction::Keep);
         assert_eq!(Arc::strong_count(&error), 2);
         finished.effects.apply();
         assert_eq!(Arc::strong_count(&error), 1);
+
+        let (seed, mut result) = test_member(mergeable(1));
+        let mut running = KeyMachine::new(seed, DriverId(6));
+        let started = running.start_round(DriverId(6), false);
+        let signal = started.value.unwrap().0;
+        started.effects.apply();
+        let mut closed = running.close();
+        assert_eq!(closed.action, MachineAction::Remove);
+        closed.effects.retired = Some(running);
+        assert!(!signal.is_cancelled());
+        assert!(matches!(
+            result.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        closed.effects.apply();
+        assert!(signal.is_cancelled());
+        assert!(matches!(
+            result.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+
+        let (seed, mut result) = test_member(mergeable(1));
+        let mut completing = KeyMachine::new(seed, DriverId(7));
+        completing.start_round(DriverId(7), false).effects.apply();
+        let pending = completing.round_finished(DriverId(7), MachineRoundOutcome::Done(Ok(())));
+        assert_completing(&pending);
+        let (queued, mut queued_result) = test_member(unmergeable(2));
+        let submitted = completing.submit(queued, false);
+        assert_eq!(submitted.action, MachineAction::Keep);
+        assert!(submitted.effects.wake.is_some());
+        submitted.effects.apply();
+        let mut closed = completing.close();
+        assert_eq!(closed.action, MachineAction::Remove);
+        closed.effects.retired = Some(completing);
+        closed.effects.apply();
+        assert!(matches!(
+            result.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            queued_result.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        pending.effects.apply();
+        assert!(matches!(result.try_recv(), Ok(Ok(()))));
+        assert!(matches!(
+            result.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[test]
+    fn finalize_paths_and_stale_driver_ids() {
+        let (seed, mut result) = test_member(mergeable(1));
+        let mut drained = KeyMachine::new(seed, DriverId(1));
+        let stale = drained.start_round(DriverId(99), false);
+        assert!(stale.value.is_none());
+        assert_eq!(stale.action, MachineAction::Keep);
+        stale.effects.apply();
+        drained.start_round(DriverId(1), false).effects.apply();
+        let stale = drained.refresh(DriverId(99));
+        assert!(stale.value.is_none());
+        assert_eq!(stale.action, MachineAction::Keep);
+        stale.effects.apply();
+        let stale =
+            drained.round_finished(DriverId(99), MachineRoundOutcome::Done(Err(Arc::new(()))));
+        assert!(!stale.value);
+        assert_eq!(stale.action, MachineAction::Keep);
+        stale.effects.apply();
+        let finished = drained.round_finished(DriverId(1), MachineRoundOutcome::Done(Ok(())));
+        assert_completing(&finished);
+        let recycled = apply_delivery(finished.effects, &mut result, true);
+        let stale = drained.finalize_completion(DriverId(99), None, || {
+            panic!("stale driver reserved a successor")
+        });
+        assert_eq!(stale.value, DriverFlow::Exit);
+        assert_eq!(stale.action, MachineAction::Keep);
+        stale.effects.apply();
+        let finalized = drained.finalize_completion(DriverId(1), recycled, || {
+            panic!("drained inline driver reserved a successor")
+        });
+        assert_eq!(finalized.value, DriverFlow::Exit);
+        assert_eq!(finalized.action, MachineAction::Remove);
+        finalized.effects.apply();
+
+        let (seed, mut first) = test_member(unmergeable(1));
+        let mut handed_off = KeyMachine::new(seed, DriverId(10));
+        handed_off.start_round(DriverId(10), false).effects.apply();
+        let (queued, mut second) = test_member(unmergeable(2));
+        handed_off.submit(queued, false).effects.apply();
+        let finished =
+            handed_off.round_finished(DriverId(10), MachineRoundOutcome::Done(Err(Arc::new(()))));
+        assert_completing(&finished);
+        let recycled = apply_delivery(finished.effects, &mut first, false);
+        let finalized = handed_off.finalize_completion(DriverId(10), recycled, || DriverId(20));
+        assert_eq!(finalized.value, DriverFlow::Exit);
+        assert_eq!(finalized.action, MachineAction::SpawnOwner(DriverId(20)));
+        finalized.effects.apply();
+
+        let stale = handed_off.driver_dropped(DriverId(99), false, || {
+            panic!("stale driver reserved a successor")
+        });
+        assert_eq!(stale.action, MachineAction::Keep);
+        stale.effects.apply();
+        let stale = handed_off.owner_started(DriverId(99));
+        assert!(!stale.value);
+        assert_eq!(stale.action, MachineAction::Keep);
+        stale.effects.apply();
+        assert_owner_started(handed_off.owner_started(DriverId(20)));
+
+        handed_off.start_round(DriverId(20), false).effects.apply();
+        let (queued, mut third) = test_member(unmergeable(3));
+        handed_off.submit(queued, false).effects.apply();
+        let finished = handed_off.round_finished(DriverId(20), MachineRoundOutcome::Done(Ok(())));
+        assert_completing(&finished);
+        let recycled = apply_delivery(finished.effects, &mut second, true);
+        let finalized = handed_off.finalize_completion(DriverId(20), recycled, || {
+            panic!("owner continuation reserved a successor")
+        });
+        assert_eq!(finalized.value, DriverFlow::Continue);
+        assert_eq!(finalized.action, MachineAction::Keep);
+        finalized.effects.apply();
+
+        handed_off.start_round(DriverId(20), false).effects.apply();
+        let finished = handed_off.round_finished(DriverId(20), MachineRoundOutcome::Done(Ok(())));
+        assert_completing(&finished);
+        let recycled = apply_delivery(finished.effects, &mut third, true);
+        let finalized = handed_off.finalize_completion(DriverId(20), recycled, || {
+            panic!("drained owner reserved a successor")
+        });
+        assert_eq!(finalized.value, DriverFlow::Exit);
+        assert_eq!(finalized.action, MachineAction::Remove);
+        finalized.effects.apply();
+    }
+
+    #[test]
+    fn driver_drop_handoffs_preserve_fifo_and_defer_cancellation() {
+        for kind in [DriverKind::Inline, DriverKind::Owner] {
+            for running in [false, true] {
+                let inline = DriverId(1);
+                let owner = DriverId(2);
+                let initial_counter = if kind == DriverKind::Inline { 1 } else { 0 };
+                let (seed, seed_result) = test_member(unmergeable(initial_counter));
+                let mut machine = KeyMachine::new(seed, inline);
+                let (driver, mut active_result) = if kind == DriverKind::Inline {
+                    (inline, Some(seed_result))
+                } else {
+                    let (owner_seed, owner_result) = test_member(unmergeable(1));
+                    machine.submit(owner_seed, false).effects.apply();
+                    drop(seed_result);
+                    let handoff = machine.driver_dropped(inline, false, || owner);
+                    assert_eq!(queue_counters(&machine), vec![1]);
+                    assert_eq!(handoff.action, MachineAction::SpawnOwner(owner));
+                    handoff.effects.apply();
+                    assert_owner_started(machine.owner_started(owner));
+                    (owner, Some(owner_result))
+                };
+                let signal = running.then(|| {
+                    let started = machine.start_round(driver, false);
+                    let signal = started.value.unwrap().0;
+                    started.effects.apply();
+                    signal
+                });
+                let (queued, queued_result) = test_member(unmergeable(2));
+                machine.submit(queued, false).effects.apply();
+                if kind == DriverKind::Inline {
+                    drop(active_result.take());
+                }
+
+                let mut successors = 0;
+                let successor = DriverId(3);
+                let dropped = machine.driver_dropped(driver, false, || {
+                    successors += 1;
+                    successor
+                });
+                assert_eq!(successors, 1);
+                assert_eq!(dropped.action, MachineAction::SpawnOwner(successor));
+                let expected_fifo = if kind == DriverKind::Inline {
+                    vec![2]
+                } else {
+                    vec![1, 2]
+                };
+                assert_eq!(queue_counters(&machine), expected_fifo);
+                assert_eq!(dropped.effects.cancellation.is_some(), running);
+                if let Some(signal) = &signal {
+                    assert!(!signal.is_cancelled());
+                }
+                dropped.effects.apply();
+                if let Some(signal) = signal {
+                    assert!(signal.is_cancelled());
+                }
+                assert_owner_started(machine.owner_started(successor));
+
+                drop((active_result, queued_result));
+            }
+        }
     }
 
     #[test]
@@ -1546,7 +1785,6 @@ mod tests {
             vec![4, 2],
         );
     }
-    mod model;
 
     /// Records the merged counter of each batch it serves. Its first invocation
     /// blocks on `release`, so tests can register waiters before the batch is
@@ -1555,6 +1793,7 @@ mod tests {
         release: Arc<tokio::sync::Semaphore>,
         calls: StdMutex<i64>,
         done: StdMutex<Vec<i64>>,
+        fails: bool,
     }
 
     impl GatedWorker {
@@ -1563,6 +1802,14 @@ mod tests {
                 release: Arc::new(tokio::sync::Semaphore::new(0)),
                 calls: StdMutex::new(0),
                 done: StdMutex::new(Vec::new()),
+                fails: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                fails: true,
+                ..Self::new()
             }
         }
     }
@@ -1586,7 +1833,7 @@ mod tests {
             }
             let r = batch.merged();
             self.done.lock().unwrap().push(r.counter);
-            Ok(())
+            if self.fails { Err(()) } else { Ok(()) }
         }
     }
 
@@ -1789,6 +2036,26 @@ mod tests {
         // One batch served all five mergeable callers: 1 + 4 = 5.
         assert_eq!(*d.inner.worker.done.lock().unwrap(), vec![5]);
         assert_eq!(d.active_owners(), 0);
+    }
+
+    #[tokio::test]
+    async fn work_error_fans_out_to_all_mergeable_callers() {
+        let d = Arc::new(Dedup::new(GatedWorker::failing()));
+        let release = d.inner.worker.release.clone();
+
+        let mut a = Box::pin(d.run("key", mergeable(1)));
+        assert!(futures::poll!(a.as_mut()).is_pending());
+        let mut b = Box::pin(d.run("key", mergeable(1)));
+        assert!(futures::poll!(b.as_mut()).is_pending());
+
+        release.add_permits(1);
+        match (a.await, b.await) {
+            (Err(DedupError::Work(a)), Err(DedupError::Work(b))) => {
+                assert!(Arc::ptr_eq(&a, &b));
+            }
+            results => panic!("batch did not share its work error: {results:?}"),
+        }
+        assert_eq!(*d.inner.worker.done.lock().unwrap(), vec![2]);
     }
 
     // Regression (defect A): dropping the inline driver mid-round must hand the
