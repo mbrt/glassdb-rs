@@ -1440,3 +1440,18 @@ working document and is intentionally not committed with these changes.
   leaf and index nodes; all comparison strictness, size calculations, request
   and await order, backend operations, error classifications, persistent bytes,
   and split/admission behavior are unchanged. No dependency or ADR changed.
+
+## Final integrated review — Complete breaking-API migration guide
+
+- The final adversarial review found that the living downstream migration guide
+  documented only the new backend listing contract, even though five other
+  completed release-gated findings also removed public compatibility surfaces.
+- Consolidated the exact replacements for F12-C opaque validation evidence,
+  F13-D observation-bound leaf edits, F14-G entry-lock state, F23-D split-policy
+  construction, and F28-C materialized iterators into `docs/migrations.md`.
+  The guide now names every removed field, method, type, alias, and construction
+  path required by those acceptance gates, including surfaces with deliberately
+  no public replacement.
+- This is a documentation-only final-review correction. It changes no API,
+  persistent bytes, backend operation, retry, entropy draw, await, or spawn
+  behavior, and it adds no test or ADR.
