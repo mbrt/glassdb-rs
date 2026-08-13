@@ -58,6 +58,7 @@ fn is_user_workload_source(path: &Path) -> bool {
 
     path.starts_with("fuzz")
         || path.starts_with("crates/glassdb/src/sim")
+        || path.file_name().is_some_and(|name| name == "tests.rs")
         || components
             .iter()
             .any(|component| matches!(*component, "tests" | "benches"))
@@ -182,6 +183,10 @@ fn inspect_source(path: &Path, contents: &str) -> (usize, Vec<String>) {
 
 #[test]
 fn policy_recognizes_panicking_transaction_bodies() {
+    assert!(is_user_workload_source(Path::new(
+        "crates/example/src/component/tests.rs"
+    )));
+
     let source = r#"
         async fn workload(db: &Database) {
             db.tx(|tx| async move {

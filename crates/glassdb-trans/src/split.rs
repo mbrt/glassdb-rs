@@ -986,12 +986,7 @@ impl<'a> StructuralSplitAttempt<'a> {
                 StructuralSplitTopology::Joined(_) => result,
             },
             SplitAttemptResult::RetryCleanly => {
-                let cleanup = match self
-                    .splitter
-                    .structural_logs
-                    .delete_structural_log(prepared)
-                    .await
-                {
+                let cleanup = match self.splitter.structural_logs.delete(prepared).await {
                     Ok(()) => match topology {
                         StructuralSplitTopology::Owned => {
                             self.splitter
@@ -1641,7 +1636,7 @@ impl Splitter {
         );
         let observed = self
             .structural_logs
-            .write_structural_log(
+            .write(
                 collection.db_root_component(),
                 &record_id,
                 &StructuralLog {
@@ -1785,7 +1780,7 @@ impl Splitter {
         let mut ready = prepared.into_ready(source_version, split_key.clone());
         let transition = self
             .structural_logs
-            .update_structural_log(ready.expected(), ready.record())
+            .update(ready.expected(), ready.record())
             .await;
         let observed = match transition {
             Ok(Some(observed)) => observed,
@@ -1852,11 +1847,7 @@ impl Splitter {
         {
             return SplitAttemptOutcome::recovery_required(ready, error);
         }
-        if let Err(error) = self
-            .structural_logs
-            .delete_structural_log(ready.observation())
-            .await
-        {
+        if let Err(error) = self.structural_logs.delete(ready.observation()).await {
             return SplitAttemptOutcome::recovery_required(ready, error.into());
         }
         SplitAttemptOutcome::completed()
@@ -1982,7 +1973,7 @@ impl Splitter {
         let mut ready = prepared.into_ready(source_version, split_key);
         let transition = self
             .structural_logs
-            .update_structural_log(ready.expected(), ready.record())
+            .update(ready.expected(), ready.record())
             .await;
         let observed = match transition {
             Ok(Some(observed)) => observed,
@@ -2047,11 +2038,7 @@ impl Splitter {
                 .inline_pressure_completed
                 .fetch_add(1, Ordering::Relaxed);
         }
-        if let Err(error) = self
-            .structural_logs
-            .delete_structural_log(ready.observation())
-            .await
-        {
+        if let Err(error) = self.structural_logs.delete(ready.observation()).await {
             return SplitAttemptOutcome::recovery_required(ready, error.into());
         }
         SplitAttemptOutcome::completed()
@@ -2437,7 +2424,7 @@ mod tests {
             record: &StructuralLog,
         ) -> Result<Observation<StructuralLog>, StorageError> {
             self.structural_logs
-                .write_structural_log(
+                .write(
                     &db_root("db"),
                     &StructuralRecordId::from(test_token(record_id)),
                     &canonical_record(record),
@@ -2450,9 +2437,7 @@ mod tests {
             root: &str,
             requirement: Requirement,
         ) -> Result<Vec<(StructuralRecordId, Observation<StructuralLog>)>, StorageError> {
-            self.structural_logs
-                .list_structural_logs(&db_root(root), requirement)
-                .await
+            self.structural_logs.list(&db_root(root), requirement).await
         }
     }
 

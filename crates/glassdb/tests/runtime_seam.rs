@@ -66,6 +66,11 @@ const EXEMPT_SEAM_GLOBS: &[&str] = &[
     "crates/glassdb-storage/src/disk_cache/file_media.rs",
 ];
 
+// The source scanner recognizes inline `#[cfg(test)] mod tests` blocks, but an
+// out-of-line test module has no distinguishing syntax in its own file. Keep
+// this list exact so a production file named `tests.rs` cannot evade the guard.
+const OUT_OF_LINE_TEST_MODULES: &[&str] = &["crates/glassdb-trans/src/algo/direct_commit/tests.rs"];
+
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap_or_else(|e| {
         panic!("read source dir {}: {e}", dir.display());
@@ -88,6 +93,12 @@ fn is_exempt_seam_file(path: &Path) -> bool {
             .expect("valid exempt seam glob")
             .matches_path(path)
     })
+}
+
+fn is_out_of_line_test_module(path: &Path) -> bool {
+    OUT_OF_LINE_TEST_MODULES
+        .iter()
+        .any(|test_module| path == Path::new(test_module))
 }
 
 fn unclassified_tokio_use(line: &str) -> Option<&str> {
@@ -155,7 +166,7 @@ fn sim_controlled_code_uses_only_reviewed_runtime_apis() {
     let mut violations = Vec::new();
     for path in files {
         let rel = path.strip_prefix(&workspace).unwrap_or(&path);
-        if is_exempt_seam_file(rel) {
+        if is_exempt_seam_file(rel) || is_out_of_line_test_module(rel) {
             continue;
         }
         let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {

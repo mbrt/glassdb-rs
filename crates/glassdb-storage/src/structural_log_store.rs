@@ -53,7 +53,7 @@ impl StructuralLogStore {
     }
 
     /// Creates a split write-ahead record and returns its exact observation.
-    pub async fn write_structural_log(
+    pub async fn write(
         &self,
         db_root: &DbRoot,
         record_id: &StructuralRecordId,
@@ -76,7 +76,7 @@ impl StructuralLogStore {
     }
 
     /// Conditionally advances an exact split intent.
-    pub async fn update_structural_log(
+    pub async fn update(
         &self,
         expected: &Observation<StructuralLog>,
         record: &StructuralLog,
@@ -93,36 +93,33 @@ impl StructuralLogStore {
     }
 
     /// Lists exact observations of every unresolved structural record.
-    pub async fn list_structural_logs(
+    pub async fn list(
         &self,
         db_root: &DbRoot,
         requirement: Requirement,
     ) -> Result<Vec<(StructuralRecordId, Observation<StructuralLog>)>, StorageError> {
         let prefix = ObjectPath::structural_records_prefix(db_root);
-        self.list_structural_logs_under(&prefix, requirement).await
+        self.list_under(&prefix, requirement).await
     }
 
     /// Lists only the unresolved structural records owned by `participant`.
-    pub async fn list_structural_logs_for_participant(
+    pub async fn list_for_participant(
         &self,
         db_root: &DbRoot,
         participant: &TxId,
         requirement: Requirement,
     ) -> Result<Vec<(StructuralRecordId, Observation<StructuralLog>)>, StorageError> {
         let prefix = ObjectPath::participant_structural_records_prefix(db_root, participant);
-        self.list_structural_logs_under(&prefix, requirement).await
+        self.list_under(&prefix, requirement).await
     }
 
     /// Deletes the exact observed structural record, converging if it is missing.
-    pub async fn delete_structural_log(
-        &self,
-        expected: &Observation<StructuralLog>,
-    ) -> Result<(), StorageError> {
+    pub async fn delete(&self, expected: &Observation<StructuralLog>) -> Result<(), StorageError> {
         self.structural_logs.delete(expected).await?;
         Ok(())
     }
 
-    async fn list_structural_logs_under(
+    async fn list_under(
         &self,
         prefix: &str,
         requirement: Requirement,
@@ -250,29 +247,21 @@ mod tests {
         let participant = TxId::from_bytes(b"participant".to_vec());
         let preparing = record(&participant, StructuralLogPhase::Preparing);
         let created = store
-            .write_structural_log(&db_root(), &record_id(1), &preparing)
+            .write(&db_root(), &record_id(1), &preparing)
             .await
             .unwrap();
 
         let ready = record(&participant, StructuralLogPhase::Ready);
-        let updated = store
-            .update_structural_log(&created, &ready)
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = store.update(&created, &ready).await.unwrap().unwrap();
         assert!(
-            store
-                .update_structural_log(&created, &preparing)
-                .await
-                .unwrap()
-                .is_none(),
+            store.update(&created, &preparing).await.unwrap().is_none(),
             "the superseded observation must not overwrite the current record"
         );
 
-        store.delete_structural_log(&updated).await.unwrap();
+        store.delete(&updated).await.unwrap();
         assert!(
             store
-                .list_structural_logs(&db_root(), Requirement::Any)
+                .list(&db_root(), Requirement::Any)
                 .await
                 .unwrap()
                 .is_empty()
@@ -288,13 +277,13 @@ mod tests {
             record.created_tokens = vec![token(i as u8)];
             record.split_key = vec![i as u8];
             store
-                .write_structural_log(&db_root(), &record_id(i as u8), &record)
+                .write(&db_root(), &record_id(i as u8), &record)
                 .await
                 .unwrap();
         }
 
         let records = store
-            .list_structural_logs(&db_root(), Requirement::AtLeast(store.timeline.now()))
+            .list(&db_root(), Requirement::AtLeast(store.timeline.now()))
             .await
             .unwrap();
         assert_eq!(records.len(), STRUCTURAL_LIST_PAGE_SIZE + 1);
@@ -307,7 +296,7 @@ mod tests {
         let second = TxId::from_bytes(b"second".to_vec());
         for participant in [&first, &second] {
             store
-                .write_structural_log(
+                .write(
                     &db_root(),
                     &record_id(1),
                     &record(participant, StructuralLogPhase::Preparing),
@@ -317,7 +306,7 @@ mod tests {
         }
 
         let records = store
-            .list_structural_logs_for_participant(
+            .list_for_participant(
                 &db_root(),
                 &first,
                 Requirement::AtLeast(store.timeline.now()),

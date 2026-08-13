@@ -547,11 +547,7 @@ impl Gc {
         for collection in topology {
             let records = self
                 .structural_logs
-                .list_structural_logs_for_participant(
-                    collection.db_root_component(),
-                    tid,
-                    requirement,
-                )
+                .list_for_participant(collection.db_root_component(), tid, requirement)
                 .await?;
             if !records.is_empty() {
                 return Ok(false);

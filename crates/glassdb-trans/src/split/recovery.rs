@@ -111,7 +111,7 @@ impl StructuralRecovery {
         let recovery_start = Requirement::AtLeast(self.timeline.now());
         let records = self
             .structural_logs
-            .list_structural_logs(&self.db_root, recovery_start)
+            .list(&self.db_root, recovery_start)
             .await?;
         let active = !records.is_empty();
         let participants = records
@@ -166,9 +166,7 @@ impl StructuralRecovery {
                     }
                 },
                 RecordRecoveryPhase::Delete => {
-                    self.structural_logs
-                        .delete_structural_log(&recovery.observed)
-                        .await?;
+                    self.structural_logs.delete(&recovery.observed).await?;
                     return Ok(RecordRecoveryStep::Completed);
                 }
             }
@@ -221,7 +219,7 @@ impl StructuralRecovery {
 
             let records = self
                 .structural_logs
-                .list_structural_logs_for_participant(
+                .list_for_participant(
                     settlement.collection.db_root_component(),
                     &settlement.participant,
                     Requirement::AtLeast(self.timeline.now()),
