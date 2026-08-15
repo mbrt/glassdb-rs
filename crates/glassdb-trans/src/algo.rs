@@ -30,7 +30,7 @@ use glassdb_concurr::{Background, Backoff, RetryConfig, rt};
 use glassdb_data::{KeyRef, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxLog, TxWrite};
 use glassdb_storage::{
-    InlinePolicy, LeafObservationCheck, LockType, Requirement, SequencePoint, ShardStore,
+    InlinePolicy, LeafObservationCheck, LockType, NodeStore, Requirement, SequencePoint,
     SplitPolicy, Timeline,
 };
 
@@ -188,7 +188,7 @@ fn read_observation_has_exclusive_holder(read: &ReadAccess) -> Result<bool, Tran
 /// Coordinates transactions: read validation, locking, commit, and write-back.
 #[derive(Clone)]
 pub struct Algo {
-    shards: ShardStore,
+    shards: NodeStore,
     resolver: KeyResolver,
     locker: Locker,
     direct_commit: DirectCommit,
@@ -212,7 +212,7 @@ impl Algo {
     /// share the process-wide model-time domain.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        shards: ShardStore,
+        shards: NodeStore,
         timeline: Timeline,
         acquisition_retry: RetryConfig,
         locker: Locker,
@@ -1070,8 +1070,8 @@ mod tests {
     };
     use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
-        CachedStore, CollectionRecord, CollectionStore, CurrentState, Node, Shard, ShardEntry,
-        ShardStore, StructuralLogStore, TreeRouter,
+        CachedStore, CollectionRecord, CollectionStore, CurrentState, Node, NodeStore, Shard,
+        ShardEntry, StructuralLogStore, TreeRouter,
     };
 
     const TEST_DB: &str = "testp";
@@ -1099,7 +1099,7 @@ mod tests {
         pub(super) tlogger: TLogger,
         pub(super) tmon: Monitor,
         records: CollectionStore,
-        pub(super) shards: ShardStore,
+        pub(super) shards: NodeStore,
         pub(super) timeline: Timeline,
         pub(super) locker: Locker,
     }
@@ -1145,7 +1145,7 @@ mod tests {
             ProtocolTiming::simulation(),
         );
         let records = CollectionStore::new(objects.clone());
-        let shards = ShardStore::new(objects.clone());
+        let shards = NodeStore::new(objects.clone());
         let structural_logs = StructuralLogStore::new(objects.clone());
         let collection_state = CollectionStateResolver::new(
             records.clone(),
@@ -1154,8 +1154,8 @@ mod tests {
             RetryConfig::default(),
         );
         let key_state = KeyStateResolver::new(tmon.clone());
-        let resolver = KeyResolver::new(TreeRouter::new(shards.nodes().clone()), key_state.clone());
-        let router = TreeRouter::new(shards.nodes().clone());
+        let resolver = KeyResolver::new(TreeRouter::new(shards.clone()), key_state.clone());
+        let router = TreeRouter::new(shards.clone());
         let (coord, splitter) = crate::split::Splitter::with_coordinator(
             bg_weak.clone(),
             records.clone(),
@@ -1256,7 +1256,7 @@ mod tests {
     pub(super) async fn read_outcome(tctx: &Tctx, key: &KeyRef) -> crate::reader::ReadOutcome {
         let reader = Reader::new(
             KeyResolver::new(
-                TreeRouter::new(tctx.shards.nodes().clone()),
+                TreeRouter::new(tctx.shards.clone()),
                 KeyStateResolver::new(tctx.tmon.clone()),
             ),
             tctx.timeline.clone(),
@@ -2365,7 +2365,7 @@ mod tests {
         // independent, so it cannot advance the retained observation of A in
         // this database.
         let external_timeline = Timeline::new();
-        let external = ShardStore::new(CachedStore::new(
+        let external = NodeStore::new(CachedStore::new(
             tctx.backend.clone(),
             1 << 20,
             external_timeline.clone(),
@@ -2598,7 +2598,7 @@ mod tests {
     // assert on the snapshot and later re-validate the same coverage.
     async fn scan_data_for_range(tctx: &Tctx, range: ScanRange) -> (Data, Vec<Vec<u8>>) {
         let resolver = KeyResolver::new(
-            TreeRouter::new(tctx.shards.nodes().clone()),
+            TreeRouter::new(tctx.shards.clone()),
             KeyStateResolver::new(tctx.tmon.clone()),
         );
         let scan = resolver
@@ -2626,7 +2626,7 @@ mod tests {
 
         let range = ScanRange::all();
         let resolver = KeyResolver::new(
-            TreeRouter::new(tctx.shards.nodes().clone()),
+            TreeRouter::new(tctx.shards.clone()),
             KeyStateResolver::new(tctx.tmon.clone()),
         );
         let result = resolver

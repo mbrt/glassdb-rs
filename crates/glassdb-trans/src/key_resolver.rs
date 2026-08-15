@@ -408,7 +408,7 @@ mod tests {
     use glassdb_data::{CollectionId, DbRoot, ObjectPath};
     use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
-        CachedStore, CurrentState, Node, Shard, ShardEntry, ShardStore, Timeline, TreeRouter,
+        CachedStore, CurrentState, Node, NodeStore, Shard, ShardEntry, Timeline, TreeRouter,
     };
 
     use crate::monitor::Monitor;
@@ -451,14 +451,14 @@ mod tests {
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
-        let shards = ShardStore::new(objects);
+        let shards = NodeStore::new(objects);
         shards
             .create_root(&collection(), &Node::leaf(Shard::new()))
             .await
             .unwrap();
         let state = KeyStateResolver::new(mon.clone());
         (
-            KeyResolver::new(TreeRouter::new(shards.nodes().clone()), state),
+            KeyResolver::new(TreeRouter::new(shards.clone()), state),
             mon,
             timeline,
             bg,
@@ -466,12 +466,12 @@ mod tests {
     }
 
     struct TestStore {
-        shards: ShardStore,
+        shards: NodeStore,
         timeline: Timeline,
     }
 
     impl std::ops::Deref for TestStore {
-        type Target = ShardStore;
+        type Target = NodeStore;
 
         fn deref(&self) -> &Self::Target {
             &self.shards
@@ -480,7 +480,7 @@ mod tests {
 
     async fn store_over(backend: Arc<dyn Backend>) -> TestStore {
         let timeline = Timeline::new();
-        let shards = ShardStore::new(CachedStore::new(backend, 1 << 20, timeline.clone(), None));
+        let shards = NodeStore::new(CachedStore::new(backend, 1 << 20, timeline.clone(), None));
         shards
             .create_root(&collection(), &Node::leaf(Shard::new()))
             .await

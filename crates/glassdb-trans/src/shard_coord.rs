@@ -35,7 +35,7 @@ use glassdb_concurr::{
 };
 use glassdb_data::{ObjectPath, TxId};
 use glassdb_storage::{
-    LeafEdit, LeafObservation, LockType, NodeLocks, Requirement, Shard, ShardEntry, ShardStore,
+    LeafEdit, LeafObservation, LockType, NodeLocks, NodeStore, Requirement, Shard, ShardEntry,
     SplitPolicy, StorageError,
 };
 
@@ -349,7 +349,7 @@ pub trait SplitHinter: Send + Sync {
 /// storage handles, retry config, and stats.
 struct CoordCore {
     tmon: Monitor,
-    shards: ShardStore,
+    shards: NodeStore,
     key_state: KeyStateResolver,
     retry: RetryConfig,
     stats: Stats,
@@ -812,7 +812,7 @@ impl ShardCoordinator {
     /// normally the background [`Splitter`](crate::split::Splitter)'s queue.
     /// `policy` governs the coordinator's hard node-size limit.
     pub fn with_hinter(
-        shards: ShardStore,
+        shards: NodeStore,
         key_state: KeyStateResolver,
         tmon: Monitor,
         retry: RetryConfig,
@@ -979,7 +979,7 @@ mod tests {
     // kept alive for the monitor's lifetime.
     async fn coord_over(
         backend: Arc<dyn Backend>,
-    ) -> (ShardCoordinator, ShardStore, Timeline, Arc<Background>) {
+    ) -> (ShardCoordinator, NodeStore, Timeline, Arc<Background>) {
         coord_over_with(backend, SplitPolicy::default(), Arc::new(NoSplitHints)).await
     }
 
@@ -987,7 +987,7 @@ mod tests {
         backend: Arc<dyn Backend>,
         policy: SplitPolicy,
         hinter: Arc<dyn SplitHinter>,
-    ) -> (ShardCoordinator, ShardStore, Timeline, Arc<Background>) {
+    ) -> (ShardCoordinator, NodeStore, Timeline, Arc<Background>) {
         coord_over_retry(backend, policy, hinter, RetryConfig::default()).await
     }
 
@@ -995,7 +995,7 @@ mod tests {
     // does not pay the production retry delay.
     async fn coord_over_fast(
         backend: Arc<dyn Backend>,
-    ) -> (ShardCoordinator, ShardStore, Timeline, Arc<Background>) {
+    ) -> (ShardCoordinator, NodeStore, Timeline, Arc<Background>) {
         coord_over_retry(
             backend,
             SplitPolicy::default(),
@@ -1013,9 +1013,9 @@ mod tests {
         policy: SplitPolicy,
         hinter: Arc<dyn SplitHinter>,
         retry: RetryConfig,
-    ) -> (ShardCoordinator, ShardStore, Timeline, Arc<Background>) {
+    ) -> (ShardCoordinator, NodeStore, Timeline, Arc<Background>) {
         let seed_timeline = Timeline::new();
-        let seed_store = ShardStore::new(CachedStore::new(
+        let seed_store = NodeStore::new(CachedStore::new(
             backend.clone(),
             1 << 20,
             seed_timeline,
@@ -1042,7 +1042,7 @@ mod tests {
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
-        let shards = ShardStore::new(objects);
+        let shards = NodeStore::new(objects);
         let key_state = KeyStateResolver::new(mon.clone());
         let coord =
             ShardCoordinator::with_hinter(shards.clone(), key_state, mon, retry, policy, hinter);
@@ -1051,9 +1051,9 @@ mod tests {
 
     // A cold shard store over `backend` (its own empty cache), for asserting what
     // actually landed in storage without touching the coordinator's cache.
-    fn cold_store(backend: Arc<dyn Backend>) -> ShardStore {
+    fn cold_store(backend: Arc<dyn Backend>) -> NodeStore {
         let timeline = Timeline::new();
-        ShardStore::new(CachedStore::new(backend, 1 << 20, timeline, None))
+        NodeStore::new(CachedStore::new(backend, 1 << 20, timeline, None))
     }
 
     fn entry(
@@ -1080,7 +1080,7 @@ mod tests {
 
     // Replaces the leaf's entries with exactly `entries` (a plain CAS, no
     // coordinator).
-    async fn store_shard_entries(store: &ShardStore, path: &ObjectPath, entries: Vec<ShardEntry>) {
+    async fn store_shard_entries(store: &NodeStore, path: &ObjectPath, entries: Vec<ShardEntry>) {
         let _ = store
             .store_node(
                 &collection(),
@@ -1097,7 +1097,7 @@ mod tests {
         assert!(store.commit_leaf(edit).await.unwrap());
     }
 
-    async fn replace_leaf_node(store: &ShardStore, node: &Node) {
+    async fn replace_leaf_node(store: &NodeStore, node: &Node) {
         let observed = store
             .load_node_state(&collection(), &leaf_token(), Requirement::Any)
             .await
@@ -1129,7 +1129,7 @@ mod tests {
     }
 
     // Loads the leaf's entries from a cold store, for asserting what landed.
-    async fn cold_entries(store: &ShardStore, path: &ObjectPath) -> Shard {
+    async fn cold_entries(store: &NodeStore, path: &ObjectPath) -> Shard {
         store
             .load_leaf(path, Requirement::Any)
             .await

@@ -1369,7 +1369,7 @@ mod tests {
     use glassdb_data::{CollectionAddress, DbRoot, ObjectPath};
     use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
-        CachedStore, CollectionRecord, CollectionStore, Node, Shard, ShardEntry, ShardStore,
+        CachedStore, CollectionRecord, CollectionStore, Node, NodeStore, Shard, ShardEntry,
         SplitPolicy, Timeline, TreeRouter,
     };
     use std::sync::Arc;
@@ -1384,7 +1384,7 @@ mod tests {
     }
 
     struct TlCtx {
-        shards: ShardStore,
+        shards: NodeStore,
         timeline: Timeline,
         monitor: Monitor,
         coord: ShardCoordinator,
@@ -1411,7 +1411,7 @@ mod tests {
             ProtocolTiming::simulation(),
         );
         let records = CollectionStore::new(objects.clone());
-        let shards = ShardStore::new(objects.clone());
+        let shards = NodeStore::new(objects.clone());
         assert!(
             records
                 .create_record(&collection(), &CollectionRecord::new())
@@ -1425,7 +1425,7 @@ mod tests {
                 .unwrap()
         );
         let key_state = KeyStateResolver::new(mon.clone());
-        let router = TreeRouter::new(shards.nodes().clone());
+        let router = TreeRouter::new(shards.clone());
         let coord = ShardCoordinator::with_hinter(
             shards.clone(),
             key_state,

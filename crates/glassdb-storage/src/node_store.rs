@@ -1,4 +1,9 @@
 //! Typed persistence for B-link tree nodes.
+//!
+//! Tree roots (`_r`) and standalone nodes (`_n/<token>`) are the coordination
+//! units. Mutations use create-if-absent, version-conditional compare-and-swap,
+//! or exact-revision deletion (ADR-023/ADR-031/ADR-042), all through the decoded
+//! [`CachedStore`].
 
 use std::sync::Arc;
 

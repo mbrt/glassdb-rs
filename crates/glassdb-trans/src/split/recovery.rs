@@ -6,7 +6,7 @@ use glassdb_concurr::{RetryConfig, rt};
 use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, StructuralRecordId, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
-    CollectionStore, LockType, Observation, Requirement, ShardStore, StorageError, StructuralLog,
+    CollectionStore, LockType, NodeStore, Observation, Requirement, StorageError, StructuralLog,
     StructuralLogPhase, StructuralLogStore, Timeline, TreeRouter,
 };
 
@@ -22,7 +22,7 @@ use super::{
 #[derive(Clone)]
 pub(super) struct StructuralRecovery {
     records: CollectionStore,
-    shards: ShardStore,
+    shards: NodeStore,
     structural_logs: StructuralLogStore,
     router: TreeRouter,
     mon: Monitor,
@@ -79,7 +79,7 @@ impl StructuralRecovery {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         records: CollectionStore,
-        shards: ShardStore,
+        shards: NodeStore,
         structural_logs: StructuralLogStore,
         router: TreeRouter,
         mon: Monitor,

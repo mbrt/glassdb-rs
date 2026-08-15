@@ -390,7 +390,7 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_data::TxId;
 
-    use crate::{Node, Shard, ShardStore, Timeline};
+    use crate::{Node, NodeStore, Shard, Timeline};
 
     fn collection_id(byte: u8) -> CollectionId {
         CollectionId::from_slice(&[byte; 16]).unwrap()
@@ -564,7 +564,7 @@ mod tests {
             None,
         );
         let records = CollectionStore::new(objects.clone());
-        let shards = ShardStore::new(objects);
+        let shards = NodeStore::new(objects);
         let collection = CollectionAddress::new("db", collection_id(9));
 
         assert!(

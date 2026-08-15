@@ -39,7 +39,7 @@ use glassdb_concurr::{Background, rt};
 use glassdb_data::{KeyRef, TxId, shuffle};
 use glassdb_storage::transaction::{TLogger, TxCollectionOp, TxCommitStatus, TxLock, TxLog};
 use glassdb_storage::{
-    Observation, Requirement, ShardStore, StorageError, StructuralLogStore, Timeline, TreeRouter,
+    NodeStore, Observation, Requirement, StorageError, StructuralLogStore, Timeline, TreeRouter,
 };
 
 use crate::collections::CollectionLifecycle;
@@ -121,14 +121,14 @@ impl Gc {
     pub fn new(
         bg: Weak<Background>,
         tl: TLogger,
-        shards: ShardStore,
+        shards: NodeStore,
         structural_logs: StructuralLogStore,
         timeline: Timeline,
         locker: Locker,
         collection_lifecycle: CollectionLifecycle,
         mon: Monitor,
     ) -> Self {
-        let router = TreeRouter::new(shards.nodes().clone());
+        let router = TreeRouter::new(shards.clone());
         Gc {
             bg,
             tl,
@@ -632,7 +632,7 @@ mod tests {
         gc: Gc,
         tl: TLogger,
         records: CollectionStore,
-        shards: ShardStore,
+        shards: NodeStore,
         timeline: Timeline,
         locker: Locker,
         mon: Monitor,
@@ -648,7 +648,7 @@ mod tests {
         let tl = TLogger::new(objects.clone(), DbRoot::try_from("db").unwrap());
         let records = CollectionStore::new(objects.clone());
         let structural_logs = StructuralLogStore::new(objects.clone());
-        let shards = ShardStore::new(objects);
+        let shards = NodeStore::new(objects);
         assert!(
             records
                 .create_record(&collection(), &CollectionRecord::new())
@@ -678,7 +678,7 @@ mod tests {
             glassdb_storage::SplitPolicy::default(),
             Arc::new(NoSplitHints),
         );
-        let router = TreeRouter::new(shards.nodes().clone());
+        let router = TreeRouter::new(shards.clone());
         let locker = Locker::new(
             coord.clone(),
             router,

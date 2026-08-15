@@ -609,18 +609,18 @@ mod tests {
     use crate::Timeline;
     use crate::cached_store::CachedStore;
     use crate::node::{IndexNode, Node};
+    use crate::node_store::NodeStore;
     use crate::shard::Shard;
     use crate::shard::ShardEntry;
-    use crate::shard_store::ShardStore;
 
     #[derive(Clone)]
     struct TestStore {
-        shards: ShardStore,
+        shards: NodeStore,
         timeline: Timeline,
     }
 
     impl std::ops::Deref for TestStore {
-        type Target = ShardStore;
+        type Target = NodeStore;
 
         fn deref(&self) -> &Self::Target {
             &self.shards
@@ -634,7 +634,7 @@ mod tests {
     fn store_over(backend: Arc<dyn Backend>) -> TestStore {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        let shards = ShardStore::new(objects);
+        let shards = NodeStore::new(objects);
         TestStore { shards, timeline }
     }
 
@@ -697,7 +697,7 @@ mod tests {
     }
 
     async fn store_leaf(
-        s: &ShardStore,
+        s: &NodeStore,
         byte: u8,
         entries: &[&[u8]],
         high_key: Option<&[u8]>,
@@ -716,7 +716,7 @@ mod tests {
 
     // Seeds a two-level tree: root index -> {L0 (apple,cat), L1 (mango,pear)},
     // split at "m", with the leaves chained by right-sibling.
-    async fn seed_two_level(s: &ShardStore) {
+    async fn seed_two_level(s: &NodeStore) {
         let left = token(0);
         let right = token(1);
         store_leaf(s, 0, &[b"apple", b"cat"], Some(b"m"), Some(1)).await;
@@ -730,7 +730,7 @@ mod tests {
 
     // Models a leaf split whose parent is stale: R still routes every key to
     // L0, while L0's right-link moves keys at and above "m" to L1.
-    async fn seed_stale_leaf_parent(s: &ShardStore) {
+    async fn seed_stale_leaf_parent(s: &NodeStore) {
         let left = token(0);
         store_leaf(s, 0, &[b"apple", b"cat"], Some(b"m"), Some(1)).await;
         store_leaf(s, 1, &[b"mango", b"pear"], None, None).await;
@@ -744,7 +744,7 @@ mod tests {
 
     // Three leaves behind one stale parent exercise both a bounded scan and
     // the leaf-to-leaf interface without involving another descent shape.
-    async fn seed_three_leaf_chain(s: &ShardStore) {
+    async fn seed_three_leaf_chain(s: &NodeStore) {
         let first = token(0);
         store_leaf(s, 0, &[b"apple"], Some(b"m"), Some(1)).await;
         store_leaf(s, 1, &[b"mango"], Some(b"t"), Some(4)).await;
@@ -759,7 +759,7 @@ mod tests {
 
     // Models an interior split whose parent is stale: R still routes to I0,
     // whose right-link moves the lookup to I1 before descending to L1.
-    async fn seed_stale_interior_parent(s: &ShardStore) {
+    async fn seed_stale_interior_parent(s: &NodeStore) {
         let interior_left = token(2);
         let interior_right = token(3);
         let leaf_left = token(0);
@@ -807,7 +807,7 @@ mod tests {
         let root = Node::leaf(Shard::from_entries([live(b"only")]));
         s.create_root(&collection(), &root).await.unwrap();
 
-        let router = TreeRouter::new(s.shards.nodes().clone());
+        let router = TreeRouter::new(s.shards.clone());
         let requirement = Requirement::AtLeast(s.timeline.now());
         let loc = router
             .leaf_for(&collection(), b"only", requirement)
@@ -828,7 +828,7 @@ mod tests {
     #[tokio::test]
     async fn absent_collection_is_not_a_writable_empty_leaf() {
         let s = store();
-        let router = TreeRouter::new(s.shards.nodes().clone());
+        let router = TreeRouter::new(s.shards.clone());
         assert!(matches!(
             router
                 .leaf_for(&collection(), b"k", Requirement::AtLeast(s.timeline.now()))
@@ -863,7 +863,7 @@ mod tests {
     async fn descends_index_to_correct_leaf() {
         let s = store();
         seed_two_level(&s).await;
-        let router = TreeRouter::new(s.shards.nodes().clone());
+        let router = TreeRouter::new(s.shards.clone());
 
         for (key, want_leaf) in [
             (b"apple".as_slice(), node_path(0)),
@@ -887,7 +887,7 @@ mod tests {
         take_reads(&log);
 
         let cold = store_over(backend.clone());
-        let router = TreeRouter::new(cold.shards.nodes().clone());
+        let router = TreeRouter::new(cold.shards.clone());
         let loc = router
             .leaf_for(&collection(), b"pear", Requirement::Any)
             .await
@@ -919,7 +919,7 @@ mod tests {
             .await
             .unwrap();
         take_reads(&log);
-        let loc = TreeRouter::new(terminal_warm.shards.nodes().clone())
+        let loc = TreeRouter::new(terminal_warm.shards.clone())
             .leaf_for(&collection(), b"pear", Requirement::Any)
             .await
             .unwrap();
@@ -937,7 +937,7 @@ mod tests {
         take_reads(&log);
 
         let s = store_over(backend.clone());
-        let router = TreeRouter::new(s.shards.nodes().clone());
+        let router = TreeRouter::new(s.shards.clone());
         router
             .leaf_for(&collection(), b"pear", Requirement::Any)
             .await
@@ -968,7 +968,7 @@ mod tests {
         }
         take_reads(&log);
         let bound = mixed.timeline.now();
-        let loc = TreeRouter::new(mixed.shards.nodes().clone())
+        let loc = TreeRouter::new(mixed.shards.clone())
             .leaf_for_fresh(
                 &collection(),
                 b"pear",
@@ -1000,7 +1000,7 @@ mod tests {
             .unwrap();
         take_reads(&log);
 
-        let router = TreeRouter::new(s.shards.nodes().clone());
+        let router = TreeRouter::new(s.shards.clone());
         let first = router
             .first_leaf_at(&collection(), b"apple", Requirement::Any)
             .await
@@ -1028,7 +1028,7 @@ mod tests {
         take_reads(&log);
 
         let bounded = store_over(backend.clone());
-        let leaves = TreeRouter::new(bounded.shards.nodes().clone())
+        let leaves = TreeRouter::new(bounded.shards.clone())
             .leaves_through(&collection(), b"apple", Some(b"mango"), Requirement::Any)
             .await
             .unwrap();
@@ -1053,7 +1053,7 @@ mod tests {
             .await
             .unwrap();
         take_reads(&log);
-        let leaves = TreeRouter::new(terminal_warm.shards.nodes().clone())
+        let leaves = TreeRouter::new(terminal_warm.shards.clone())
             .leaves(&collection(), Requirement::Any)
             .await
             .unwrap();
@@ -1082,7 +1082,7 @@ mod tests {
         take_reads(&log);
 
         let s = store_over(backend);
-        let router = TreeRouter::new(s.shards.nodes().clone());
+        let router = TreeRouter::new(s.shards.clone());
         let loc = router
             .leaf_for(&collection(), b"pear", Requirement::Any)
             .await
@@ -1130,7 +1130,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let router = TreeRouter::new(reader.shards.nodes().clone());
+        let router = TreeRouter::new(reader.shards.clone());
         router
             .leaf_for(&collection(), b"pear", Requirement::Any)
             .await
@@ -1203,7 +1203,7 @@ mod tests {
         take_reads(&log);
         let s = store_over(backend);
         assert!(
-            !TreeRouter::new(s.shards.nodes().clone())
+            !TreeRouter::new(s.shards.clone())
                 .token_reachable_at_key(&collection(), b"pear", &token(0), Requirement::Any)
                 .await
                 .unwrap()
@@ -1225,7 +1225,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let router = TreeRouter::new(dangling.shards.nodes().clone());
+        let router = TreeRouter::new(dangling.shards.clone());
         assert!(
             !router
                 .token_reachable_at_key(&collection(), b"pear", &token(8), Requirement::Any)
@@ -1244,7 +1244,7 @@ mod tests {
     async fn group_keys_by_leaf_routes_and_preserves_order() {
         let s = store();
         seed_two_level(&s).await;
-        let router = TreeRouter::new(s.shards.nodes().clone());
+        let router = TreeRouter::new(s.shards.clone());
 
         let groups = router
             .group_keys_by_leaf(
@@ -1278,7 +1278,7 @@ mod tests {
     #[tokio::test]
     async fn grouped_routing_classifies_the_collection_that_failed() {
         let s = store();
-        let router = TreeRouter::new(s.shards.nodes().clone());
+        let router = TreeRouter::new(s.shards.clone());
         let root = CollectionAddress::root("db");
         let child = CollectionAddress::new("db", CollectionId::from_slice(&[1; 16]).unwrap());
         let requirement = Requirement::AtLeast(s.timeline.now());

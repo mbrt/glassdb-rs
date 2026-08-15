@@ -12,7 +12,6 @@ mod lock;
 mod node;
 mod node_store;
 mod shard;
-mod shard_store;
 mod structlog;
 mod structural_log_store;
 mod timeline;
@@ -53,7 +52,6 @@ pub use node::{
 };
 pub use node_store::{LeafEdit, LeafObservation, LeafObservationCheck, LoadedLeaf, NodeStore};
 pub use shard::{CurrentState, Shard, ShardEntry};
-pub use shard_store::ShardStore;
 pub use structlog::{StructuralLog, StructuralLogPhase};
 pub use structural_log_store::StructuralLogStore;
 pub use timeline::{SequencePoint, Timeline};

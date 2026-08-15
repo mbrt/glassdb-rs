@@ -8,9 +8,9 @@ use glassdb_concurr::{Background, DedupKeySnapshot, RetryConfig};
 use glassdb_data::{CollectionAddress, CollectionId, DatabaseId, DbRoot, KeyRef, ObjectPath, TxId};
 use glassdb_storage::transaction::TLogger;
 use glassdb_storage::{
-    CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, Node,
-    PersistentCache, PersistentCacheConfig, PersistentCacheMedia, Requirement, Shard, ShardStore,
-    SplitPolicy, StorageError, StructuralLogStore, Timeline, TreeRouter,
+    CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, Node, NodeStore,
+    PersistentCache, PersistentCacheConfig, PersistentCacheMedia, Requirement, Shard, SplitPolicy,
+    StorageError, StructuralLogStore, Timeline, TreeRouter,
 };
 
 use crate::access::{Data, ScanMutation, ScanRange};
@@ -185,7 +185,7 @@ impl Engine {
         };
         let objects = CachedStore::new(dyn_backend, cache_size, timeline.clone(), persistent);
         let records = CollectionStore::new(objects.clone());
-        let shards = ShardStore::new(objects.clone());
+        let shards = NodeStore::new(objects.clone());
         let structural_logs = StructuralLogStore::new(objects.clone());
         Self::verify_permanent_collection(&db_root, &records, &shards, &timeline).await?;
 
@@ -203,7 +203,7 @@ impl Engine {
             CollectionStateResolver::new(records.clone(), tlogger.clone(), monitor.clone(), retry);
         let collection_catalog = CollectionCatalog::new(collection_state.clone());
         let key_state = KeyStateResolver::new(monitor.clone());
-        let resolver = KeyResolver::new(TreeRouter::new(shards.nodes().clone()), key_state.clone());
+        let resolver = KeyResolver::new(TreeRouter::new(shards.clone()), key_state.clone());
         let reader = Reader::new(resolver.clone(), timeline.clone(), retry);
         let (coord, splitter) = Splitter::with_coordinator(
             background_weak.clone(),
@@ -220,7 +220,7 @@ impl Engine {
         );
         let locker = Locker::new(
             coord.clone(),
-            TreeRouter::new(shards.nodes().clone()),
+            TreeRouter::new(shards.clone()),
             collection_state,
             monitor.clone(),
             retry,
@@ -402,7 +402,7 @@ impl Engine {
     async fn verify_permanent_collection(
         db_root: &DbRoot,
         records: &CollectionStore,
-        shards: &ShardStore,
+        shards: &NodeStore,
         timeline: &Timeline,
     ) -> Result<(), StorageError> {
         let collection = CollectionAddress::from_db_root(db_root.clone(), CollectionId::root());
