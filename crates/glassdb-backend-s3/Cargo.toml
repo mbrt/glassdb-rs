@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
 description = "Amazon S3 object-storage backend for GlassDB."
+keywords = ["glassdb", "s3", "object-storage", "backend", "database"]
+categories = ["database-implementations", "asynchronous"]
 
 [dependencies]
 async-trait = "0.1.89"

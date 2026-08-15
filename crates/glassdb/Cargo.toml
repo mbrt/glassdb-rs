@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "../../README.md"
 description = "A stateless, ACID, serializable key/value store on top of object storage."
 keywords = ["database", "acid", "key-value", "object-storage", "transactions"]
 categories = ["database", "asynchronous"]
@@ -43,6 +44,12 @@ gcs = ["dep:glassdb-backend-gcs"]
 # Expose the deterministic-simulation workload harness (`glassdb::sim`) used by
 # the `fuzz/` crate and the op-stream self-check. See ADR-008 and ADR-011.
 sim = ["dep:arbitrary", "glassdb-storage/sim"]
+
+# The cloud backends are feature-gated, so docs.rs would otherwise not show
+# `glassdb::s3` and `glassdb::gcs`. `sim` is left out on purpose: it is an
+# internal test harness, not part of the public surface.
+[package.metadata.docs.rs]
+features = ["s3", "gcs"]
 
 [dev-dependencies]
 glob = "0.3"

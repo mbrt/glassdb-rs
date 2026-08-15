@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
 description = "Backend trait, in-memory backend, and middleware for GlassDB."
+keywords = ["glassdb", "object-storage", "backend", "database"]
+categories = ["database-implementations", "asynchronous"]
 
 [lints]
 workspace = true
