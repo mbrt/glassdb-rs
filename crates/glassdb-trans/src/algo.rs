@@ -43,8 +43,7 @@ use crate::key_resolver::KeyResolver;
 use crate::monitor::{Monitor, OwnerAbortOutcome};
 use crate::shard_coord::ShardCoordinator;
 use crate::split::SplitHintSink;
-use crate::tlocker::{LockOutcome, LockedTx, Locker, WriteBackRetrySink};
-use crate::write_back::WriteBackScheduler;
+use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
 mod attempt;
 mod direct_commit;
@@ -201,7 +200,6 @@ pub struct Algo {
     acquisition_retry: RetryConfig,
     split_policy: SplitPolicy,
     collection_commit: CollectionCommit,
-    write_back_scheduler: WriteBackScheduler,
     // Weak so a captured `Algo` clone inside a spawned async-abort task does not
     // keep [`Background`] alive past DB shutdown.
     background: Option<Weak<Background>>,
@@ -235,12 +233,6 @@ impl Algo {
             split_hints,
             gc.clone(),
         );
-        let write_back_scheduler = WriteBackScheduler::new(
-            background.clone(),
-            locker.keys().clone(),
-            gc.clone(),
-            mon.protocol_timing(),
-        );
         Algo {
             shards,
             resolver,
@@ -252,7 +244,6 @@ impl Algo {
             acquisition_retry,
             split_policy,
             collection_commit,
-            write_back_scheduler,
             background,
         }
     }
@@ -407,11 +398,6 @@ impl Algo {
                 gc.schedule_tx_cleanup(tx_id);
             }
         });
-    }
-
-    /// Closes delayed write-back admission and dispatches every accepted retry.
-    pub(crate) async fn shutdown(&self) {
-        self.write_back_scheduler.close().await;
     }
 
     async fn commit_inner(&self, tx: &mut Handle) -> Result<(), TransError> {
@@ -698,20 +684,16 @@ impl Algo {
             Some(bg) => {
                 let locker = self.locker.clone();
                 let gc = self.gc.clone();
-                let scheduler = self.write_back_scheduler.clone();
                 let id = id.clone();
                 // Cancelling a dedup driver may need to spawn a successor for
                 // merged callers, so shutdown drains this finite pass.
                 bg.spawn_waited(async move {
-                    let retry_sink = scheduler
-                        .enabled()
-                        .then_some(&scheduler as &dyn WriteBackRetrySink);
-                    let superseded = locker.keys().write_back(&id, &locked, retry_sink).await;
+                    let superseded = locker.keys().write_back(&id, &locked).await;
                     feed_gc_hints(&gc, superseded);
                 });
             }
             None => {
-                let superseded = self.locker.keys().write_back(id, &locked, None).await;
+                let superseded = self.locker.keys().write_back(id, &locked).await;
                 feed_gc_hints(&self.gc, superseded);
             }
         }

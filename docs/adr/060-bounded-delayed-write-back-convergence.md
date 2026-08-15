@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Superseded: durable benchmarks did not justify the scheduler, so ordinary convergent write-back retry is restored; see the [removal assessment](../../hack/perf/investigations.md#2026-08-15-adr-060-implementation-removed).
 
 This refines [ADR-020](020-commit-write-back-protocol.md)'s asynchronous,
 idempotent write-back and [ADR-028](028-shard-mutation-coordinator.md)'s retry

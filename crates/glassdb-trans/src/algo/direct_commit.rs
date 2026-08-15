@@ -369,7 +369,7 @@ impl DirectCommitResolver {
     /// superseded, so the ambiguity is irreducible and is never downgraded to a
     /// replay (ADR-051, ADR-053).
     fn unlanded(&self, ctx: &ResolveCtx<'_>, why: Ineligible) -> FoldOutcome {
-        if ctx.cause == ReloadCause::InDoubt {
+        if matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true }) {
             return FoldOutcome::InDoubt(format!(
                 "direct commit for {} in-doubt: marker absent after an uncertain CAS",
                 self.id

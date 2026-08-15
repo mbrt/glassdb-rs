@@ -84,7 +84,7 @@ impl EngineConfig {
         self.inline_policy = policy;
     }
 
-    /// Sets transaction-liveness and delayed write-back timing.
+    /// Sets transaction-liveness timing.
     pub fn set_protocol_timing(&mut self, timing: ProtocolTiming) {
         self.protocol_timing = timing;
     }
@@ -374,7 +374,6 @@ impl Engine {
 
     /// Gracefully drains background work and closes engine storage.
     pub async fn shutdown(&self) {
-        self.algo.shutdown().await;
         self.background.shutdown().await;
         self.coord.close().await;
         self.objects.shutdown().await;

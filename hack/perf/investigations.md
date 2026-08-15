@@ -12,6 +12,40 @@ This file is evidence, not a record of accepted behavior:
   performance work.
 - ADRs record significant decisions once accepted.
 
+## 2026-08-15: ADR-060 implementation removed
+
+Status: closed; the delayed write-back scheduler was removed and definitive
+write-back losses again use the ordinary convergent coordinator retry.
+
+ADR-060's mechanism worked as designed: it moved a losing committed write-back
+out of the contention burst, coalesced later retries, converged before graceful
+shutdown completed, and avoided the permanent cold-read debt of abandoning
+write-back. The durable implementation nevertheless did not reproduce the
+prototype's stable aggregate-throughput improvement. Across three interleaved
+pairs, aggregate throughput ratios were `0.982`, `0.867`, and `1.401` (median
+`0.982`). Write-shape throughput had a positive `1.073` median but ranged from
+`0.712` to `1.345`, while `rwMany` had a `0.765` median. Median backend
+operations and coordinator retries fell to `0.901` and `0.669`, respectively,
+but their individual pairs were also inconsistent. The implementation therefore
+demonstrated mechanical coalescing, not a reliable product-level performance
+gain.
+
+Retaining that narrow optimization required a database-local scheduler, a
+one-time retry ownership transfer, capacity and shutdown protocols, public
+quiet/max-age timing controls, and per-member definitive-loss attribution in
+the shard coordinator. Those boundaries were necessary to make delayed work
+safe; removing only pieces of them would reintroduce dropped-work, repeated
+deferral, ambiguous-failure, or shutdown races. The ordinary retry path already
+provides correctness, physical convergence, and no unbounded fresh-read debt,
+so the measured benefit did not justify maintaining the additional protocol.
+
+The implementation and its architecture documentation were cleanly restored to
+their pre-ADR-060 state. The earlier rejection of permanently abandoning a
+cleanly losing write-back still stands: it caused repeated transaction-object
+reads for fresh clients and prevented reclamation. Pre-existing per-member
+in-doubt attribution and the safety improvements from the review-blind-spots
+work remain unchanged.
+
 ## 2026-08-12: fixed-topology coordinator retry attribution
 
 Status: investigation complete; no engine change retained. The coordinator's

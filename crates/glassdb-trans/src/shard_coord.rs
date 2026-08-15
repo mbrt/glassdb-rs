@@ -108,10 +108,6 @@ pub(crate) enum FoldOutcome {
     /// `superseded` carries the `current_writer` transaction ids a write-back
     /// overwrote — GC reverse-check candidates (ADR-022); empty for a release.
     Released { superseded: Vec<TxId> },
-    /// A committed write-back still needs publication after its own staged CAS
-    /// definitively lost. The locker may transfer this work to the bounded
-    /// delayed-convergence scheduler (ADR-060).
-    RetryWriteBack,
     /// The submitted leaf no longer owns one of this operation's keys. The
     /// caller must descend again and regroup before retrying.
     Reroute,
@@ -143,14 +139,18 @@ pub(crate) struct CoordinatedOutcome {
     pub(crate) cas_precondition: Option<LeafObservation>,
 }
 
-/// Why the fold engine is running one resolver this attempt. Retry causes are
-/// attributed only to members whose own stage rode the prior CAS; ambiguity is
-/// sticky and dominates a later definitive loss.
+/// Why the fold engine is (re-)running one resolver this attempt: a `Fresh`
+/// first pass, or a re-fold after a CAS that failed precondition
+/// (`Reloaded { in_doubt: false }`) or came back in-doubt
+/// (`Reloaded { in_doubt: true }`). The in-doubt bit is the member's own: it is
+/// set only for the members whose stage rode the uncertain CAS. Only the direct
+/// commit resolver consults it — to distinguish a definitive loss from an
+/// irreducible `InDoubt` — so every other resolver ignores it and stays
+/// idempotent across re-folds.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReloadCause {
     Fresh,
-    DefinitiveLoss,
-    InDoubt,
+    Reloaded { in_doubt: bool },
 }
 
 /// Per-submission mailbox carrying one transaction's [`CoordinatedOutcome`]
@@ -434,7 +434,7 @@ impl CasWorker {
         edit: &LeafEdit,
         members: &BTreeMap<TxId, ShardMember>,
         requirement: Requirement,
-        definitive_losses: &BTreeSet<TxId>,
+        reloaded: bool,
         in_doubt: &BTreeSet<TxId>,
     ) -> Result<FoldPlan, TransError> {
         let mut plan = FoldPlan {
@@ -461,10 +461,10 @@ impl CasWorker {
                 key_state: &self.core.key_state,
                 tmon: &self.core.tmon,
                 requirement,
-                cause: if member_in_doubt {
-                    ReloadCause::InDoubt
-                } else if definitive_losses.contains(tx) {
-                    ReloadCause::DefinitiveLoss
+                cause: if reloaded {
+                    ReloadCause::Reloaded {
+                        in_doubt: member_in_doubt,
+                    }
                 } else {
                     ReloadCause::Fresh
                 },
@@ -670,10 +670,9 @@ impl CasWorker {
             rt::yield_now().await;
         }
         let mut backoff = self.core.retry.backoff();
-        // Members whose own stage rode a CAS that definitively lost. Keeping
-        // this per member prevents a skipped or newly merged operation from
-        // inheriting another member's retry history.
-        let mut definitive_losses: BTreeSet<TxId> = BTreeSet::new();
+        // Whether the current fold is a re-fold, so a resolver can tell its first
+        // pass from a retry after a CAS that did not land.
+        let mut reloaded = false;
         // The members whose changes rode a CAS that came back in-doubt. For them
         // in-doubt is *sticky* across re-folds: that write may have landed
         // durably (and been help-forwarded to a peer), so a later
@@ -733,7 +732,7 @@ impl CasWorker {
                     &edit,
                     &members,
                     first_requirement,
-                    &definitive_losses,
+                    reloaded,
                     &in_doubt,
                 )
                 .await?;
@@ -745,13 +744,14 @@ impl CasWorker {
                 // This CAS definitely did not land, but an earlier in-doubt CAS
                 // might have, so leave the members it carried marked.
                 PersistResult::PreconditionMiss => {
-                    definitive_losses.extend(plan.staged_ids().cloned());
+                    reloaded = true;
                     continue;
                 }
                 // Re-folding over a freshly-read shard is idempotent. Only the
                 // members this uncertain CAS actually carried inherit its doubt.
                 PersistResult::InDoubt(staged_ids) => {
                     in_doubt.extend(staged_ids);
+                    reloaded = true;
                     continue;
                 }
             }
@@ -1835,7 +1835,7 @@ mod tests {
             _staged: &BTreeMap<Vec<u8>, ShardEntry>,
             _staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
-            let in_doubt = ctx.cause == ReloadCause::InDoubt;
+            let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true });
             let outcome = if in_doubt {
                 FoldOutcome::InDoubt("uncertain CAS attributed to skipped member".into())
             } else {
@@ -1920,161 +1920,6 @@ mod tests {
             ),
             "the skipped member never staged, so its loss stays definitive"
         );
-        coord.close().await;
-    }
-
-    struct CleanLossProbe {
-        key: Vec<u8>,
-        tx: TxId,
-    }
-
-    #[async_trait::async_trait]
-    impl ShardResolver for CleanLossProbe {
-        async fn resolve(
-            &self,
-            ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
-            staged_locks: &NodeLocks,
-        ) -> Result<Step, TransError> {
-            if ctx.cause == ReloadCause::DefinitiveLoss {
-                return Ok(Step::Skip {
-                    outcome: FoldOutcome::RetryWriteBack,
-                });
-            }
-            Ok(Step::Stage {
-                entries: vec![(
-                    self.key.clone(),
-                    entry(&self.key, LockType::Write, Some(&self.tx), None),
-                )],
-                locks: staged_locks.clone(),
-                admission: StageAdmission::ExistingKeys,
-                outcome: FoldOutcome::Landed,
-            })
-        }
-
-        fn reorderable(&self) -> bool {
-            false
-        }
-
-        fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
-            FoldOutcome::Moved
-        }
-
-        fn owned_keys(&self) -> Vec<&[u8]> {
-            vec![self.key.as_slice()]
-        }
-    }
-
-    struct SkippedCleanLossProbe;
-
-    #[async_trait::async_trait]
-    impl ShardResolver for SkippedCleanLossProbe {
-        async fn resolve(
-            &self,
-            ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
-            _staged_locks: &NodeLocks,
-        ) -> Result<Step, TransError> {
-            Ok(Step::Skip {
-                outcome: if ctx.cause == ReloadCause::DefinitiveLoss {
-                    FoldOutcome::RetryWriteBack
-                } else {
-                    FoldOutcome::Moved
-                },
-            })
-        }
-
-        fn reorderable(&self) -> bool {
-            false
-        }
-
-        fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
-            FoldOutcome::Moved
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_skipped_member_does_not_inherit_a_clean_loss() {
-        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let seed = TxId::with_priority(1, b"seed");
-        store_shard_entries(
-            &cold_store(memory.clone()),
-            &leaf(),
-            vec![entry(b"seed", LockType::None, None, Some(&seed))],
-        )
-        .await;
-        let faulted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let hook = HookBackend::new(memory);
-        hook.set_before({
-            let faulted = faulted.clone();
-            move |operation| {
-                let fail = matches!(operation, BackendOp::WriteIf { path, .. }
-                    if path.contains("/_n/") || path.ends_with("/_r"))
-                    && !faulted.swap(true, Ordering::SeqCst);
-                Box::pin(async move {
-                    if fail {
-                        Err(glassdb_backend::BackendError::Precondition)
-                    } else {
-                        Ok(())
-                    }
-                })
-            }
-        });
-        let (backend, gate) = Gate::wrap(hook as Arc<dyn Backend>);
-        let (coord, _shards, _timeline, _bg) = coord_over(backend as Arc<dyn Backend>).await;
-        let staged = TxId::with_priority(2, b"staged");
-        let skipped = TxId::with_priority(3, b"skipped");
-
-        gate.arm();
-        let driver = tokio::spawn({
-            let coord = coord.clone();
-            let staged = staged.clone();
-            async move {
-                coord
-                    .submit_shard(
-                        &leaf(),
-                        &staged,
-                        Arc::new(CleanLossProbe {
-                            key: b"key".to_vec(),
-                            tx: staged.clone(),
-                        }),
-                        Requirement::Any,
-                    )
-                    .await
-            }
-        });
-        rt::sleep(Duration::from_secs(1)).await;
-        let joiner = tokio::spawn({
-            let coord = coord.clone();
-            let skipped = skipped.clone();
-            async move {
-                coord
-                    .submit_shard(
-                        &leaf(),
-                        &skipped,
-                        Arc::new(SkippedCleanLossProbe),
-                        Requirement::Any,
-                    )
-                    .await
-            }
-        });
-        rt::sleep(Duration::from_secs(1)).await;
-        gate.release();
-
-        assert!(matches!(
-            driver.await.unwrap().unwrap(),
-            Some(CoordinatedOutcome {
-                outcome: FoldOutcome::RetryWriteBack,
-                ..
-            })
-        ));
-        assert!(matches!(
-            joiner.await.unwrap().unwrap(),
-            Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Moved,
-                cas_precondition: None,
-            })
-        ));
         coord.close().await;
     }
 
@@ -2755,7 +2600,7 @@ mod tests {
                     outcome: FoldOutcome::Landed,
                 });
             }
-            let in_doubt = ctx.cause == ReloadCause::InDoubt;
+            let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true });
             *self.seen_in_doubt.lock().unwrap() = Some(in_doubt);
             let outcome = if in_doubt {
                 FoldOutcome::InDoubt("lost race after in-doubt CAS".into())
