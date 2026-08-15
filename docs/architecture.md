@@ -87,18 +87,20 @@ is absent from normal library builds.
 | `glassdb-backend`     | `lib.rs`, `memory.rs`, `stats.rs`, `middleware/`                             | The `Backend` trait, in-memory backend, stats decorator, and middleware (delay, scheduler, logger, fault, recording)                          |
 | `glassdb-backend-s3`  | —                                                                            | Amazon S3 backend (`aws-sdk-s3`), enabled via the `s3` feature                                                                                |
 | `glassdb-backend-gcs` | —                                                                            | Google Cloud Storage backend (GCS JSON API), enabled via the `gcs` feature                                                                    |
-| `glassdb-trans`       | `engine.rs`, `access.rs`, `algo.rs`, `collection_*`, `collections/`, `tlocker.rs`, `shard_coord.rs`, `key_*`, `monitor.rs`, `reader.rs`, `gc.rs` | Transaction engine: the runtime façade and assembly, shared access vocabulary, commit algorithm, collection lifecycle, locking, shard mutation, resolution, monitoring, reads, and GC |
-| `glassdb-storage`     | `cached_store.rs`, `collection_store.rs`, `shard_store.rs`, `tree_router.rs`, `node.rs`, `shard.rs`, `transaction/`, `txobject.rs`, `cache.rs` | Shared decoded object store with bounded-freshness evidence, separate collection-record and B-link-node CAS stores/codecs, B-link traversal, transaction-log persistence, and generic LRU |
+| `glassdb-trans`       | `engine.rs`, `access.rs`, `algo.rs`, `collection_*`, `collections/`, `tlocker.rs`, `shard_coord.rs`, `key_*`, `monitor.rs`, `reader.rs`, `split.rs`, `split/recovery.rs`, `gc.rs` | Transaction engine: the runtime façade and assembly, shared access vocabulary, commit algorithm, collection lifecycle, locking, shard mutation, resolution, monitoring, reads, structural splitting and recovery, and GC |
+| `glassdb-storage`     | `cached_store.rs`, `collection_store.rs`, `node_store.rs`, `structural_log_store.rs`, `tree_router.rs`, `node.rs`, `shard.rs`, `transaction/`, `txobject.rs`, `cache.rs` | Shared decoded object store with bounded-freshness evidence, separate collection-record, B-link-node, and structural-recovery CAS stores/codecs, B-link traversal, transaction-log persistence, and generic LRU |
 | `glassdb-data`        | `txid.rs`, `paths.rs`, `base64.rs`                                           | Core types: `TxId` and order-preserving path encoding                                                                                          |
 | `glassdb-proto`       | —                                                                            | `prost`-generated transaction-log protobuf messages                                                                                           |
-| `glassdb-concurr`     | `background.rs`, `retry.rs`, `dedup.rs`, `rt.rs`                             | Concurrency utilities: `Background` tasks, retry/backoff, request deduplication, and the process-wide model-time/runtime seam                 |
+| `glassdb-concurr`     | `background.rs`, `retry.rs`, `dedup.rs`, `entropy.rs`, `exec.rs`, `exec/`, `rt.rs`, `rt/` | Concurrency utilities: background tasks, retry/backoff, request deduplication, entropy selection, deterministic execution control, and in-run task/time services |
 
 Only the top-level `glassdb` crate is intended for direct use; the rest are
 implementation detail. Its public API surface is small: `Database`,
 `Transaction`, and `Collection`, plus the re-exported `Backend` trait and the
-in-memory backend and middleware. The deterministic-simulation runtime (the
-`rt`/`exec` seam in `glassdb-concurr`) is compiled only under `--cfg sim`; see
-[testing-dst.md](guides/testing-dst.md).
+in-memory backend and middleware. The deterministic-simulation runtime is
+compiled only under `--cfg sim`. `glassdb::exec` configures and starts
+deterministic runs, while `glassdb::rt` provides task, time, timeout, and
+dedicated-task services inside a run. Entropy selection remains in
+`glassdb-concurr::entropy`; see [testing-dst.md](guides/testing-dst.md).
 
 The cross-crate transaction boundary is deliberately narrower than the engine's
 internal module graph. `glassdb` talks to `glassdb-trans` through `Engine` and
@@ -119,7 +121,7 @@ transaction orchestration from shared shard mutation, with one structural invari
 (paths), the version tokens observed at read time, and staged writes — while the
 `Locker` decides *how* to acquire those locks efficiently, owning the mapping
 from keys to shard objects and the parallel/serial CAS. (`Reader` is likewise
-shard-aware internally but exposes a path-based API. `Algo` holds a `ShardStore`
+shard-aware internally but exposes a path-based API. `Algo` holds a `NodeStore`
 for one narrow purpose: re-checking during optimistic validation whether a leaf
 observation already carried in its own `Data` is still current. It routes no key
 and CASes no object.)
@@ -177,8 +179,8 @@ supply each operation's mutation decision as an installed resolver. For the full
       │       └───────────────┬───────────────┘                │
       ▼                       ▼            ▼ (tx logs)          ▼
 ══════════════════════════ glassdb-storage ══════════════════════════
-  CollectionStore (_i records) · ShardStore (_r/_n B-link nodes)
-  TLogger (_t logs)
+  CollectionStore (_i records) · NodeStore (_r/_n B-link nodes)
+  StructuralLogStore (_s recovery records) · TLogger (_t logs)
   CachedStore (decoded, path-keyed, bounded-freshness LRU)
                                 │
                                 ▼
@@ -223,7 +225,7 @@ same resolver to `CollectionCatalog` and `Locker`; the catalog therefore depends
 on collection-state resolution directly instead of reaching through the whole
 locker. It constructs logical snapshots and validates collection preconditions,
 but cannot acquire or release locks. This keeps collection-record coordination
-out of both the B-link `ShardStore` and the semantic catalog without introducing
+out of both the B-link `NodeStore` and the semantic catalog without introducing
 a one-implementation capability trait.
 
 `CollectionCommit` is the collection side of transaction commit, not another
@@ -237,10 +239,11 @@ point, and write-back ordering remain explicit transaction-wide policy.
 Routing traversal is centralized in `TreeRouter`, but use of that mechanism is
 intentionally distributed. `KeyResolver`, the key-lock view, `Gc`, and
 `Splitter` each own a cheap handle for their distinct read, lock, reclamation,
-or structural workflow. A handle contains a cloned `ShardStore`, so all of them
-share the same decoded object cache rather than maintaining independent topology
-state. The Engine centralizes their assembly; it does not invent a single
-semantic owner for those different routing responsibilities.
+or structural workflow. A handle contains a cloned `NodeStore`, so all of them
+share the same decoded object cache without gaining structural-log capabilities
+or maintaining independent topology state. The Engine centralizes their
+assembly; it does not invent a single semantic owner for those different routing
+responsibilities.
 
 Beneath the locker boundary, every data-node entry mutation flows through a
 single transaction-aware `ShardCoordinator`. It owns the protocol shared by a
@@ -359,11 +362,15 @@ establishes an ordering edge; an `Unavailable` result does not. Provider retries
 remain inside one logical backend invocation so that attempts do not manufacture
 ordering edges between themselves.
 
-`list` returns one recursive prefix page of actual object paths. Its cursor is
-an opaque provider token valid only for the same backend and prefix, and only a
-page without a next cursor completes the traversal. A rejected token returns
-`InvalidCursor`, allowing the caller to restart that prefix. S3 and GCS map this
-contract directly to their native continuation tokens without a delimiter
+`list` returns one recursive prefix page of actual object paths. `ListLimit` is
+positive by construction. `ListCursor` structurally binds an opaque provider
+continuation token to its prefix; callers can only retain and return it, while
+backend implementations use the documented `backend::implementation` support
+module to validate the common prefix binding before provider I/O.
+Only a page without a next cursor completes the traversal. A rejected provider
+token returns `InvalidCursor`, allowing the caller to restart that prefix. S3
+and GCS map this contract directly to their native continuation tokens without
+a delimiter
 ([ADR-035](adr/035-paginated-listing-and-sharded-transaction-logs.md)).
 
 ### Key concepts

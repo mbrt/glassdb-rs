@@ -29,7 +29,7 @@ pub use collection::{Collection, CollectionPath};
 pub use db::{Database, DatabaseBuilder};
 pub use diagnostics::Diagnostics;
 pub use error::Error;
-pub use iter::{CollectionEntry, CollectionsIter, KeysIter};
+pub use iter::{CollectionEntry, CollectionIter, KeyIter};
 pub use scan::{KeyPage, KeyScan};
 pub use stats::{Stats, TransactionStats};
 pub use tx::Transaction;
@@ -52,7 +52,10 @@ macro_rules! ensure_tx {
 // tree splits (see [`DatabaseBuilder::split_policy`]), and the inline-value
 // budgets (see [`DatabaseBuilder::inline_policy`]).
 pub use glassdb_data::MAX_COLLECTION_NAME_BYTES;
-pub use glassdb_storage::{CacheStats, InlinePolicy, PersistentCacheConfig, SplitPolicy};
+pub use glassdb_storage::{
+    CacheStats, InlinePolicy, InvalidSplitPolicy, PersistentCacheConfig, SplitPolicy,
+    SplitPolicyBuilder,
+};
 pub use glassdb_trans::{
     DirectCommitStats, InlinePressureStats, LockerStats, ProtocolTiming, ShardCoordinatorStats,
     SplitterStats,
@@ -69,8 +72,8 @@ pub use glassdb_backend_gcs as gcs;
 #[cfg(feature = "s3")]
 pub use glassdb_backend_s3 as s3;
 
-// The deterministic simulation runtime (only under `--cfg sim`). Used by the
-// concurrency fuzzer and the `concurrent_sim` self-check to drive the harness on
-// the in-repo executor with a `TapeScheduler`/seed.
+// Deterministic execution control and runtime services (only under `--cfg sim`).
+// The concurrency fuzzers and simulation self-checks use `exec` to drive the
+// harness while application code uses `rt` for task and time services.
 #[cfg(sim)]
-pub use glassdb_concurr::rt;
+pub use glassdb_concurr::{exec, rt};

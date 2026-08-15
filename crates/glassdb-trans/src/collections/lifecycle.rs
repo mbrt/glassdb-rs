@@ -8,7 +8,7 @@ use glassdb_concurr::{RetryConfig, rt};
 use glassdb_data::{CollectionAddress, NodeToken, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
-    CollectionRecord, CollectionStore, Node, Requirement, Shard, ShardStore, StorageError,
+    CollectionRecord, CollectionStore, Node, NodeStore, Requirement, Shard, StorageError,
 };
 
 use super::{CollectionChange, CollectionOp};
@@ -34,7 +34,7 @@ pub trait TopologySettler: Send + Sync {
 #[derive(Clone)]
 pub struct CollectionLifecycle {
     records: CollectionStore,
-    shards: ShardStore,
+    shards: NodeStore,
     monitor: Monitor,
     retry: RetryConfig,
     // A drop must outlive every pre-existing topology participant before its
@@ -46,7 +46,7 @@ impl CollectionLifecycle {
     /// Creates collection lifecycle access over the shared stores.
     pub fn new(
         records: CollectionStore,
-        shards: ShardStore,
+        shards: NodeStore,
         monitor: Monitor,
         retry: RetryConfig,
         topology: Arc<dyn TopologySettler>,
@@ -478,7 +478,7 @@ mod tests {
 
     struct TestStore {
         records: CollectionStore,
-        shards: ShardStore,
+        shards: NodeStore,
         objects: CachedStore,
         timeline: Timeline,
     }
@@ -488,7 +488,7 @@ mod tests {
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         TestStore {
             records: CollectionStore::new(objects.clone()),
-            shards: ShardStore::new(objects.clone()),
+            shards: NodeStore::new(objects.clone()),
             objects,
             timeline,
         }

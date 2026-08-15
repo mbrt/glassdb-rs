@@ -10,14 +10,16 @@ mod error;
 mod inline;
 mod lock;
 mod node;
+mod node_store;
 mod shard;
-mod shard_store;
 mod structlog;
+mod structural_log_store;
 mod timeline;
 pub mod transaction;
 mod tree_router;
 pub mod txobject;
 mod version;
+mod wire_size;
 
 /// Persistent-cache media and harnesses for deterministic simulation.
 #[cfg(feature = "sim")]
@@ -44,10 +46,14 @@ pub use disk_cache::{
 pub use error::StorageError;
 pub use inline::InlinePolicy;
 pub use lock::{EntryLockState, ExclusiveGate, LockType, SharedExclusiveLock};
-pub use node::{IndexNode, Node, NodeBody, NodeLocks, NodeToken, SplitPolicy};
+pub use node::{
+    IndexNode, InvalidSplitPolicy, Node, NodeBody, NodeLocks, NodeToken, SplitPolicy,
+    SplitPolicyBuilder,
+};
+pub use node_store::{LeafEdit, LeafObservation, LeafObservationCheck, LoadedLeaf, NodeStore};
 pub use shard::{CurrentState, Shard, ShardEntry};
-pub use shard_store::{LeafEdit, LeafObservation, LeafObservationCheck, LoadedLeaf, ShardStore};
 pub use structlog::{StructuralLog, StructuralLogPhase};
+pub use structural_log_store::StructuralLogStore;
 pub use timeline::{SequencePoint, Timeline};
 pub use tree_router::{LeafGroup, LeafLocator, TreeRouter};
 pub use version::Version;

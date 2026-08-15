@@ -23,7 +23,7 @@ use self::data::{DataOverlay, OverlayRead};
 use crate::collection::{Collection, CollectionPath, validate_collection_name};
 use crate::db::DbInner;
 use crate::error::Error;
-use crate::iter::{CollectionEntry, CollectionsIter};
+use crate::iter::{CollectionEntry, CollectionIter};
 use crate::scan::{KeyPage, KeyScan};
 
 /// An active database transaction. Reads and writes are buffered and only
@@ -246,8 +246,13 @@ impl Transaction {
         Ok(true)
     }
 
-    /// Returns the direct child bindings in raw-name order.
-    pub async fn collections(&self, parent: &Collection) -> Result<CollectionsIter, Error> {
+    /// Returns an owned iterator over direct child bindings in raw-name order.
+    ///
+    /// The directory observation and materialization complete before the
+    /// iterator is returned; the enclosing transaction validates that
+    /// observation when its attempt completes. Each yielded handle remains
+    /// bound to the listed incarnation.
+    pub async fn iter_collections(&self, parent: &Collection) -> Result<CollectionIter, Error> {
         self.validate_handle(parent)?;
         self.ensure_directory(parent.address()).await?;
         let current = {
@@ -268,7 +273,7 @@ impl Transaction {
                 )
             })
             .collect();
-        Ok(CollectionsIter::new(entries))
+        Ok(CollectionIter::new(entries))
     }
 
     /// Non-recursively drops the exact collection incarnation bound by `collection`.

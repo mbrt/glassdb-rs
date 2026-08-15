@@ -11,10 +11,11 @@ use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::SdkBody;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::http::StatusCode;
-use glassdb_backend::{Backend, BackendError, ListCursor, ListLimit, Version};
+use glassdb_backend::middleware::ProviderLatencyProfile;
+use glassdb_backend::{Backend, BackendError, Version};
 use hyper::Method;
 
-use crate::fake_server::FakeS3;
+use crate::fake_server::{FakeS3, FakeS3Options};
 use crate::{
     Builder, ConditionalPutAction, ConditionalPutEvent, ConditionalPutState, DEFAULT_MAX_ATTEMPTS,
     MAX_CONFLICT_RETRIES, ProviderFact, ProviderFailure, S3Backend, annotate, annotate_list,
@@ -514,6 +515,35 @@ fn conditional_put_retry_budget_is_shared_across_provider_facts() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_fake_shutdown_releases_listener_and_thread() {
+    for _ in 0..4 {
+        let fake = FakeS3::start().await;
+        let server_thread = fake.server_thread_lifetime();
+        let address = fake
+            .url()
+            .strip_prefix("http://")
+            .unwrap()
+            .parse::<std::net::SocketAddr>()
+            .unwrap();
+        let b = backend(&fake);
+        b.write_if_not_exists("lifecycle", b"value".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(b.read("lifecycle").await.unwrap().contents, b"value");
+
+        fake.shutdown();
+        assert!(
+            tokio::net::TcpStream::connect(address).await.is_err(),
+            "fake S3 listener at {address} survived shutdown"
+        );
+        assert!(
+            server_thread.upgrade().is_none(),
+            "fake S3 server thread survived shutdown"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_returns_value_and_version() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
@@ -683,30 +713,17 @@ async fn read_not_found() {
 async fn list_is_recursive_and_paginated() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
-    for name in ["d/a/1", "d/a/2", "d/a/b/1", "d/c/1", "d/root"] {
-        b.write_if_not_exists(name, name.as_bytes().to_vec())
-            .await
-            .unwrap();
-    }
-    let limit = ListLimit::new(2).unwrap();
-    let first = b.list("d/", None, limit).await.unwrap();
-    assert_eq!(first.objects, vec!["d/a/1", "d/a/2"]);
-    let second = b.list("d/", first.next.as_ref(), limit).await.unwrap();
-    assert_eq!(second.objects, vec!["d/a/b/1", "d/c/1"]);
-    let third = b.list("d/", second.next.as_ref(), limit).await.unwrap();
-    assert_eq!(third.objects, vec!["d/root"]);
-    assert!(third.next.is_none());
-
-    let err = b
-        .list("d/", Some(&ListCursor::new("invalid")), limit)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, BackendError::InvalidCursor));
+    glassdb_backend::implementation::assert_list_conformance(&b).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conditional_write_retries_through_slow_down() {
-    let fake = FakeS3::start().await;
+    let fake = FakeS3::start_with(FakeS3Options {
+        latency: Some(ProviderLatencyProfile::zero()),
+        entropy_seed: 0xF2_5D,
+        ..FakeS3Options::default()
+    })
+    .await;
     let b = builder(&fake).retry_config(fast_retry()).build();
     fake.set_slowdown(2, Some(Method::PUT));
 
@@ -768,7 +785,12 @@ async fn read_transient_failure_surfaces_unavailable() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_if_not_exists_lost_ack_is_in_doubt() {
-    let fake = FakeS3::start().await;
+    let fake = FakeS3::start_with(FakeS3Options {
+        latency: Some(ProviderLatencyProfile::zero()),
+        entropy_seed: 0xF2_5D,
+        ..FakeS3Options::default()
+    })
+    .await;
     let b = backend(&fake);
 
     // The create lands, but its ack is lost; the re-send sees the object exists

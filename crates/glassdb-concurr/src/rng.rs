@@ -7,6 +7,10 @@
 //! zero-dependency generator lives here so those callers share one source of
 //! truth instead of each re-implementing it.
 
+use std::convert::Infallible;
+
+use rand::TryRng;
+
 /// A seedable [SplitMix64](https://prng.di.unimi.it/splitmix64.c) generator.
 /// Zero-dependency and fully deterministic: the same seed yields the same
 /// sequence, so simulation runs replay identically.
@@ -41,5 +45,22 @@ impl Rng {
                 *b = vb;
             }
         }
+    }
+}
+
+impl TryRng for Rng {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(self.next_u64() as u32)
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.next_u64())
+    }
+
+    fn try_fill_bytes(&mut self, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        self.fill(bytes);
+        Ok(())
     }
 }

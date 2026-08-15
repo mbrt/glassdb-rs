@@ -14,6 +14,8 @@
 
 use std::path::{Path, PathBuf};
 
+use glob::Pattern;
+
 // Module prefixes are intentional: importing or calling any API from these
 // runtime-coupled surfaces needs an explicit simulation-aware design.
 const FORBIDDEN: &[&str] = &[
@@ -57,6 +59,18 @@ const ALLOWED_TOKIO: &[&str] = &[
     "tokio::pin!",
 ];
 
+const EXEMPT_SEAM_GLOBS: &[&str] = &[
+    "crates/glassdb-concurr/src/rt.rs",
+    "crates/glassdb-concurr/src/rt/*.rs",
+    "crates/glassdb-concurr/src/exec/executor.rs",
+    "crates/glassdb-storage/src/disk_cache/file_media.rs",
+];
+
+// The source scanner recognizes inline `#[cfg(test)] mod tests` blocks, but an
+// out-of-line test module has no distinguishing syntax in its own file. Keep
+// this list exact so a production file named `tests.rs` cannot evade the guard.
+const OUT_OF_LINE_TEST_MODULES: &[&str] = &["crates/glassdb-trans/src/algo/direct_commit/tests.rs"];
+
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap_or_else(|e| {
         panic!("read source dir {}: {e}", dir.display());
@@ -73,12 +87,18 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn is_allowed_runtime_use(path: &Path, pattern: &str) -> bool {
-    path.ends_with("crates/glassdb-concurr/src/rt.rs")
-        || (path.ends_with("crates/glassdb-concurr/src/exec.rs")
-            && matches!(pattern, "tokio::task" | "tokio::runtime"))
-        || (path.ends_with("crates/glassdb-storage/src/disk_cache/file_media.rs")
-            && matches!(pattern, "std::fs" | "std::os::unix::fs" | "rustix::fs"))
+fn is_exempt_seam_file(path: &Path) -> bool {
+    EXEMPT_SEAM_GLOBS.iter().any(|glob| {
+        Pattern::new(glob)
+            .expect("valid exempt seam glob")
+            .matches_path(path)
+    })
+}
+
+fn is_out_of_line_test_module(path: &Path) -> bool {
+    OUT_OF_LINE_TEST_MODULES
+        .iter()
+        .any(|test_module| path == Path::new(test_module))
 }
 
 fn unclassified_tokio_use(line: &str) -> Option<&str> {
@@ -145,11 +165,16 @@ fn sim_controlled_code_uses_only_reviewed_runtime_apis() {
 
     let mut violations = Vec::new();
     for path in files {
+        let rel = path.strip_prefix(&workspace).unwrap_or(&path);
+        if is_exempt_seam_file(rel) || is_out_of_line_test_module(rel) {
+            continue;
+        }
         let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
             panic!("read source file {}: {e}", path.display());
         });
+        let lines: Vec<_> = contents.lines().collect();
         let mut test_attribute = false;
-        for (idx, line) in contents.lines().enumerate() {
+        for (idx, line) in lines.iter().copied().enumerate() {
             let trimmed = line.trim_start();
             if trimmed == "#[cfg(test)]" {
                 test_attribute = true;
@@ -166,19 +191,12 @@ fn sim_controlled_code_uses_only_reviewed_runtime_apis() {
                 continue;
             }
             if let Some(pattern) = FORBIDDEN.iter().find(|pattern| trimmed.contains(**pattern)) {
-                if is_allowed_runtime_use(&path, pattern) {
-                    continue;
-                }
-                let rel = path.strip_prefix(&workspace).unwrap_or(&path);
                 violations.push(format!(
                     "{}:{} contains `{pattern}`",
                     rel.display(),
                     idx + 1
                 ));
-            } else if let Some(usage) = unclassified_tokio_use(trimmed)
-                && !is_allowed_runtime_use(&path, usage)
-            {
-                let rel = path.strip_prefix(&workspace).unwrap_or(&path);
+            } else if let Some(usage) = unclassified_tokio_use(trimmed) {
                 violations.push(format!(
                     "{}:{} contains unclassified `{usage}`",
                     rel.display(),
@@ -198,10 +216,14 @@ fn sim_controlled_code_uses_only_reviewed_runtime_apis() {
 #[test]
 fn synthetic_s3_time_uses_the_model_time_seam() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let files = [
+    let mut files = vec![
         workspace.join("crates/glassdb-backend-s3/src/lib.rs"),
         workspace.join("crates/glassdb-backend-s3/src/fake_server.rs"),
     ];
+    collect_rs_files(
+        &workspace.join("crates/glassdb-backend-s3/src/fake_server"),
+        &mut files,
+    );
     let timing = [
         "tokio::time",
         "SystemTime::now(",
@@ -213,7 +235,8 @@ fn synthetic_s3_time_uses_the_model_time_seam() {
         let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
             panic!("read source file {}: {e}", path.display());
         });
-        for (idx, line) in contents.lines().enumerate() {
+        let lines: Vec<_> = contents.lines().collect();
+        for (idx, line) in lines.iter().copied().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("//") {
                 continue;

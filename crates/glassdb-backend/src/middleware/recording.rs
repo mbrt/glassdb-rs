@@ -63,7 +63,9 @@ fn enc_cursor(buf: &mut Vec<u8>, cursor: Option<&ListCursor>) {
     match cursor {
         Some(cursor) => {
             buf.push(1);
-            enc_bytes(buf, cursor.as_str().as_bytes());
+            let (prefix, provider_token) = cursor.recording_parts();
+            enc_bytes(buf, prefix.as_bytes());
+            enc_bytes(buf, provider_token.as_bytes());
         }
         None => buf.push(0),
     }
@@ -200,7 +202,9 @@ mod tests {
         let _ = rec.read("a/b").await;
         let _ = rec.read_if_modified("a/b", &v).await;
         let _ = rec.delete_if("a/b", &v).await;
-        let _ = rec.list("a/", None, ListLimit::new(1).unwrap()).await;
+        let _ = rec
+            .list("a/", None, crate::ListLimit::new(1).unwrap())
+            .await;
 
         let recorded = log.lock().unwrap();
         let ops: Vec<&str> = recorded.iter().map(|r| r.op).collect();

@@ -7,7 +7,7 @@
 //! uses only basic media delays and pre-effect failures. Every client runs as
 //! its own task over
 //! a shared in-process backend on the in-repo deterministic executor
-//! ([`glassdb::rt`], `--cfg sim`); a [`TapeScheduler`] consumes the schedule
+//! ([`glassdb::exec`], `--cfg sim`); a [`TapeScheduler`] consumes the schedule
 //! tape to choose task interleavings, while the other tapes independently guide
 //! transport and media faults. All three dimensions are therefore part of the
 //! libFuzzer input and become coverage-guidable.

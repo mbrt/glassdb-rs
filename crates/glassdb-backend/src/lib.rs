@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+pub mod implementation;
 pub mod memory;
 pub mod middleware;
 mod stats;
@@ -138,22 +139,19 @@ pub struct ReadReply {
     pub version: Version,
 }
 
-/// A provider-issued continuation token for a paginated listing.
+/// An opaque continuation token for a paginated listing.
 ///
 /// The token has no engine-level meaning. Callers may only retain it and pass it
 /// back to the same backend with the same prefix.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ListCursor(Arc<str>);
+pub struct ListCursor {
+    prefix: Arc<str>,
+    provider_token: Arc<str>,
+}
 
 impl ListCursor {
-    /// Wraps the provider token returned by a backend implementation.
-    pub fn new(token: impl Into<Arc<str>>) -> Self {
-        ListCursor(token.into())
-    }
-
-    /// Returns the provider token for forwarding to the underlying store.
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub(crate) fn recording_parts(&self) -> (&str, &str) {
+        (&self.prefix, &self.provider_token)
     }
 }
 
@@ -220,9 +218,9 @@ pub trait Backend: Send + Sync {
     /// outcome is always [`BackendError::Unavailable`].
     async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError>;
 
-    /// Lists one page of object paths recursively under `prefix`.
+    /// Lists one page of object paths recursively.
     ///
-    /// `prefix` is empty or ends in `/`. `cursor`, when present, must have been
+    /// Its prefix is empty or ends in `/`. Its cursor, when present, must have been
     /// returned by this backend for the same prefix. Result order is unspecified
     /// and only `ListPage::next == None` means traversal is complete.
     async fn list(
@@ -280,5 +278,64 @@ impl<B: Backend + ?Sized + 'static> Backend for std::sync::Arc<B> {
         limit: ListLimit,
     ) -> Result<ListPage, BackendError> {
         (**self).list(prefix, cursor, limit).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::implementation::{bind_list_cursor, list_provider_token};
+
+    #[test]
+    fn list_cursor_boundaries() {
+        let root_cursor = bind_list_cursor("", "root-token").unwrap();
+        let slash_cursor = bind_list_cursor("/", "slash-token").unwrap();
+        let nested_cursor = bind_list_cursor("a/b/", "nested-token").unwrap();
+
+        for (prefix, cursor, provider_token) in [
+            ("", None, None),
+            ("", Some(&root_cursor), Some("root-token")),
+            ("/", Some(&slash_cursor), Some("slash-token")),
+            ("a/", None, None),
+            ("a/b/", Some(&nested_cursor), Some("nested-token")),
+        ] {
+            assert_eq!(
+                list_provider_token(prefix, cursor).unwrap(),
+                provider_token,
+                "prefix {prefix:?}"
+            );
+        }
+
+        for (prefix, cursor) in [("a", None), ("a/b", Some(&nested_cursor))] {
+            let error = list_provider_token(prefix, cursor).unwrap_err();
+            match error {
+                BackendError::Other { msg, source } => {
+                    assert_eq!(
+                        msg,
+                        format!("list prefix must be empty or end in '/': {prefix:?}")
+                    );
+                    assert!(source.is_none());
+                }
+                error => panic!("prefix {prefix:?} returned {error:?}"),
+            }
+        }
+
+        let unicode_cursor = bind_list_cursor("é/", "provider-token").unwrap();
+        assert_eq!(
+            list_provider_token("é/", Some(&unicode_cursor)).unwrap(),
+            Some("provider-token")
+        );
+
+        let wrong_prefix = bind_list_cursor("other/", "provider-token").unwrap();
+        assert!(matches!(
+            list_provider_token("a/", Some(&wrong_prefix)),
+            Err(BackendError::InvalidCursor)
+        ));
+
+        assert!(matches!(
+            bind_list_cursor("a/", ""),
+            Err(BackendError::Other { .. })
+        ));
+        assert!(ListLimit::new(0).is_none());
     }
 }

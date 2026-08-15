@@ -2,10 +2,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::entropy::fill_random;
+use glassdb_concurr::entropy::fill_bytes;
 
-/// Total length, in bytes, of a freshly generated transaction ID.
-const TX_ID_LEN: usize = 16;
 /// Offset of the big-endian UnixNano timestamp within the ID.
 const TX_ID_TS_OFF: usize = 8;
 
@@ -31,6 +29,13 @@ const TX_ID_TS_OFF: usize = 8;
 pub struct TxId(Arc<[u8]>);
 
 impl TxId {
+    /// Maximum number of protobuf bytes used by an ID minted by GlassDB.
+    ///
+    /// [`TxId::from_bytes`] deliberately preserves arbitrary persisted IDs, so
+    /// this is a bound on generated and renewed IDs rather than every value the
+    /// compatibility wrapper can hold.
+    pub const MAX_GENERATED_ENCODED_LEN: usize = 16;
+
     /// Generates a new random 128-bit transaction ID.
     ///
     /// The timestamp suffix is random rather than clock-derived: this keeps the
@@ -38,8 +43,8 @@ impl TxId {
     /// [`TxId::new_at`] with a clock-sourced timestamp; this constructor is for
     /// callers (mostly tests) that only need a unique identifier.
     pub fn new_random() -> Self {
-        let mut b = vec![0u8; TX_ID_LEN];
-        fill_random(&mut b);
+        let mut b = vec![0u8; Self::MAX_GENERATED_ENCODED_LEN];
+        fill_bytes(&mut b);
         TxId(b.into())
     }
 
@@ -53,8 +58,8 @@ impl TxId {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        let mut b = vec![0u8; TX_ID_LEN];
-        fill_random(&mut b[..TX_ID_TS_OFF]);
+        let mut b = vec![0u8; Self::MAX_GENERATED_ENCODED_LEN];
+        fill_bytes(&mut b[..TX_ID_TS_OFF]);
         b[TX_ID_TS_OFF..].copy_from_slice(&unix_nanos.to_be_bytes());
         TxId(b.into())
     }
@@ -63,7 +68,7 @@ impl TxId {
     /// Meant for tests that need deterministic priorities. At most the first 8
     /// bytes of `prefix` are used.
     pub fn with_priority(unix_nanos: u64, prefix: &[u8]) -> Self {
-        let mut b = vec![0u8; TX_ID_LEN];
+        let mut b = vec![0u8; Self::MAX_GENERATED_ENCODED_LEN];
         let n = prefix.len().min(TX_ID_TS_OFF);
         b[..n].copy_from_slice(&prefix[..n]);
         b[TX_ID_TS_OFF..].copy_from_slice(&unix_nanos.to_be_bytes());
@@ -75,8 +80,8 @@ impl TxId {
     /// priority on restart to avoid starvation, while the new prefix gives it a
     /// distinct log object that lands in a different storage partition.
     pub fn renew(&self) -> Self {
-        let mut b = vec![0u8; TX_ID_LEN];
-        fill_random(&mut b[..TX_ID_TS_OFF]);
+        let mut b = vec![0u8; Self::MAX_GENERATED_ENCODED_LEN];
+        fill_bytes(&mut b[..TX_ID_TS_OFF]);
         b[TX_ID_TS_OFF..].copy_from_slice(&self.priority().to_be_bytes());
         TxId(b.into())
     }
@@ -120,11 +125,11 @@ impl TxId {
     /// suffix). Defensive on short IDs, which have no timestamp and thus the
     /// highest priority (zero).
     fn priority(&self) -> u64 {
-        if self.0.len() < TX_ID_LEN {
+        if self.0.len() < Self::MAX_GENERATED_ENCODED_LEN {
             return 0;
         }
         let mut ts = [0u8; 8];
-        ts.copy_from_slice(&self.0[TX_ID_TS_OFF..TX_ID_LEN]);
+        ts.copy_from_slice(&self.0[TX_ID_TS_OFF..Self::MAX_GENERATED_ENCODED_LEN]);
         u64::from_be_bytes(ts)
     }
 }
@@ -155,11 +160,11 @@ mod tests {
     use super::*;
 
     // These run on a runtime so prefix minting works under any build; outside
-    // the simulation executor `fill_random` simply draws from the OS RNG.
+    // the simulation executor the shared entropy facade uses the process RNG.
     #[tokio::test]
     async fn random_is_16_bytes_and_hex() {
         let id = TxId::new_random();
-        assert_eq!(id.as_bytes().len(), 16);
+        assert_eq!(id.as_bytes().len(), TxId::MAX_GENERATED_ENCODED_LEN);
         assert_eq!(id.to_string().len(), 32);
     }
 

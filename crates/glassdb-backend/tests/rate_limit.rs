@@ -7,8 +7,8 @@ use std::time::Duration;
 use glassdb_backend::Backend;
 use glassdb_backend::memory::MemoryBackend;
 use glassdb_backend::middleware::{
-    DelayBackend, DelayOptions, DelayOptionsError, Latency, ProviderLatencyProfile, RateLimit,
-    WriteRateLimits,
+    DelayBackend, DelayOptions, DelayOptionsError, Latency, LognormalError, ProviderLatencyProfile,
+    RateLimit, WriteRateLimits,
 };
 
 /// Creates a positive per-second rate for test configurations.
@@ -39,6 +39,18 @@ fn unlimited_options() -> DelayOptions {
 #[test]
 fn unlimited_limits_allow_zero_depth_and_retry_timing() {
     assert!(DelayBackend::new(Arc::new(MemoryBackend::new()), unlimited_options()).is_ok());
+}
+
+#[test]
+fn positive_deviation_requires_positive_latency() {
+    let mut options = unlimited_options();
+    options.latency.obj_read = Latency::new(0, 1);
+    assert_eq!(
+        DelayBackend::new(Arc::new(MemoryBackend::new()), options).err(),
+        Some(DelayOptionsError::InvalidLatency(
+            LognormalError::PositiveDeviationWithZeroMean,
+        ))
+    );
 }
 
 #[test]

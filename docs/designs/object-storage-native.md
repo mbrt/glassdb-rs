@@ -477,7 +477,7 @@ Group E — backends:
       with an opaque provider cursor, positive limit, and distinct invalid-cursor
       error.
 - [x] Cache tagless coordination objects via version/ETag-conditional reads.
-      Today `ShardStore` full-fetches every shard/root read (the writer-tag
+      Today `NodeStore` full-fetches every shard/root read (the writer-tag
       `read_if_modified` is unusable on these tagless objects).
 - [x] S3 mapping — `S3Backend` on the slimmed trait: `If-Match` /
       `If-None-Match` conditional writes, ETag versions, no nonce/tags and

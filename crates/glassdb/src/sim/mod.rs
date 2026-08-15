@@ -24,6 +24,7 @@ mod slow_backend;
 pub use api::{ApiAcct, ApiAction, ApiTransaction, ApiWorkload};
 pub use cycle::CycleWorkload;
 pub use glassdb_storage::sim::{MediaFaultProfile, MediaPause, SimMedia};
+use glassdb_storage::{PersistentCacheConfig, SplitPolicy};
 pub use harness::{
     FaultConfig, SimWorkload, run_and_assert, run_and_assert_with_faults, run_and_record,
     run_and_record_with_faults,
@@ -36,8 +37,6 @@ pub use harness::{
 pub use history::{HistoryInstruction, HistoryTransaction, HistoryWorkload};
 pub use membership::{MembOp, MembershipAcct, MembershipWorkload};
 pub use rmw::{RMW_KEY_COUNT, RmwAcct, RmwOp, RmwWorkload};
-
-use glassdb_storage::{PersistentCacheConfig, SplitPolicy};
 
 use crate::db::DatabaseBuilder;
 
@@ -72,12 +71,12 @@ pub(super) fn key_name(key: usize) -> Vec<u8> {
 }
 
 pub(super) fn tiny_split_policy() -> SplitPolicy {
-    SplitPolicy {
-        leaf_max_entries: 2,
-        leaf_max_bytes: 1 << 20,
-        index_max_children: 2,
-        ..SplitPolicy::default()
-    }
+    SplitPolicy::builder()
+        .leaf_max_entries(2)
+        .node_soft_max_bytes(1 << 20)
+        .index_max_children(2)
+        .build()
+        .expect("tiny simulation split policy is valid")
 }
 
 pub(super) fn assert_valid_listing(keys: &[Vec<u8>], universe_size: usize) {

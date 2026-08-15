@@ -377,8 +377,13 @@ mod tests {
     async fn every_backend_method_counts_and_preserves_results() {
         const COLLECTION_RECORD: &str = "db/_c/0000000000000000000000/_i";
         const COLLECTION_PREFIX: &str = "db/_c/0000000000000000000000/";
+        const SECOND_OBJECT: &str = "db/_c/0000000000000000000000/_n/0000000000000000000000";
 
         let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        inner
+            .write_if_not_exists(SECOND_OBJECT, b"node".to_vec())
+            .await
+            .unwrap();
         let (backend, handle) = wrap(inner);
 
         let version = backend
@@ -397,11 +402,22 @@ mod tests {
             .write_if(COLLECTION_RECORD, b"new".to_vec(), &version)
             .await
             .unwrap();
-        let page = backend
-            .list(COLLECTION_PREFIX, None, NonZeroUsize::new(10).unwrap())
+        let first_page = backend
+            .list(COLLECTION_PREFIX, None, NonZeroUsize::new(1).unwrap())
             .await
             .unwrap();
-        assert_eq!(page.objects, [COLLECTION_RECORD]);
+        let cursor = first_page.next.clone().unwrap();
+        let second_page = backend
+            .list(
+                COLLECTION_PREFIX,
+                Some(&cursor),
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_page.objects, [COLLECTION_RECORD]);
+        assert_eq!(second_page.objects, [SECOND_OBJECT]);
+        assert!(second_page.next.is_none());
         backend
             .delete_if(COLLECTION_RECORD, &version)
             .await
@@ -422,8 +438,8 @@ mod tests {
                 write_bytes: 7,
             }
         );
-        assert_eq!(got.other.lists, 1);
-        assert_eq!(got.total(), 7);
+        assert_eq!(got.other.lists, 2);
+        assert_eq!(got.total(), 8);
     }
 
     #[test]

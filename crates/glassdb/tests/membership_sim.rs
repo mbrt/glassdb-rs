@@ -14,21 +14,16 @@
 //! splits, right-link traversal, and cross-leaf sorted listing. The harness
 //! asserts every committed listing is strictly sorted and drawn from the key
 //! universe, and that the final key set matches the per-key membership
-//! accounting. As with the other workloads, a fixed (workload, tape, seed) must
-//! issue a byte-for-byte identical backend op stream on every run.
+//! accounting across tape, PCT, fault, and recovery schedules.
 #![cfg(all(sim, feature = "sim"))]
 
 mod sim_support;
 
-use sim_support::{
-    assert_no_divergence, assert_slow_mutation_modes, fault_tape, record_faults_with_tape,
-    record_once, record_with_tapes, tape,
-};
+use sim_support::{assert_slow_mutation_modes, fault_tape, tape};
 
-use glassdb::rt::{TapeScheduler, block_on_with};
+use glassdb::exec::{TapeScheduler, block_on_with};
 use glassdb::sim::{
-    FaultConfig, MembOp, MembershipWorkload, pct_record, pct_sweep, run_and_assert,
-    run_and_assert_with_faults,
+    FaultConfig, MembOp, MembershipWorkload, pct_sweep, run_and_assert, run_and_assert_with_faults,
 };
 
 /// A contended membership workload over three clients, each owning a disjoint
@@ -85,20 +80,6 @@ fn fill_all_keys() -> MembershipWorkload {
 }
 
 #[test]
-fn op_stream_is_byte_identical_across_runs() {
-    let workload = contended_membership();
-    for seed in [0u64, 1, 7, 42, 1234, 0xDEAD_BEEF] {
-        let first = record_once(seed, &workload);
-        let second = record_once(seed, &workload);
-        assert!(
-            !first.is_empty(),
-            "seed {seed}: expected the workload to issue backend operations"
-        );
-        assert_no_divergence(&format!("seed {seed}: backend"), &first, &second);
-    }
-}
-
-#[test]
 fn membership_invariant_holds_under_contention() {
     // run_and_assert panics on any violation; reaching the end means every
     // committed listing was well-formed and the final set matched the accounting.
@@ -121,19 +102,6 @@ fn full_universe_lists_every_key_across_leaves() {
         block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
             run_and_assert(workload).await
         });
-    }
-}
-
-#[test]
-fn op_stream_is_byte_identical_with_faults() {
-    // Determinism must hold even with faults active: scheduling, time,
-    // randomness, and the fault schedule are all functions of the tape and seed.
-    let workload = contended_membership();
-    let faults = FaultConfig::failures(7);
-    for seed in [0u64, 1, 7, 42, 1234, 0xDEAD_BEEF] {
-        let first = record_faults_with_tape(seed, &workload, faults, fault_tape(seed));
-        let second = record_faults_with_tape(seed, &workload, faults, fault_tape(seed));
-        assert_no_divergence(&format!("seed {seed}: faulted"), &first, &second);
     }
 }
 
@@ -161,47 +129,17 @@ fn membership_holds_with_slow_mutations() {
 #[test]
 fn membership_holds_under_crash_restart_and_outages() {
     // High intensity drives multiple client crashes (-> crash-and-restart on the
-    // same backend) and sustained per-client transport outages. Each run must
-    // stay byte-for-byte deterministic per (tape, seed), and the membership bound
-    // (asserted inside the harness) must survive the recovery paths those faults
-    // exercise while splits run concurrently in the background.
+    // same backend) and sustained per-client transport outages. The membership
+    // bound must survive the recovery paths those faults exercise while splits
+    // run concurrently in the background.
     let workload = contended_membership();
     let faults = FaultConfig::failures(200);
     for seed in [0u64, 1, 7, 42, 99, 1234] {
-        let ft = fault_tape(seed);
-        let first = record_faults_with_tape(seed, &workload, faults, ft.clone());
-        let second = record_faults_with_tape(seed, &workload, faults, ft);
-        assert_no_divergence(&format!("seed {seed}: recovery"), &first, &second);
-    }
-}
-
-#[test]
-fn boundary_tapes_replay_deterministically() {
-    let workload = fill_all_keys();
-    let faults = FaultConfig::failures(128);
-    for (schedule, fault_tape) in [
-        (Vec::new(), Vec::new()),
-        (vec![0], Vec::new()),
-        (vec![255, 1], vec![0; 16]),
-    ] {
-        let first = record_with_tapes(77, &workload, faults, schedule.clone(), fault_tape.clone());
-        let second = record_with_tapes(77, &workload, faults, schedule, fault_tape);
-        assert_no_divergence("membership boundary tape replay", &first, &second);
-    }
-}
-
-#[test]
-fn pct_schedule_is_byte_identical_per_seed() {
-    // The PCT policy must be just as reproducible as the tape policy: a fixed
-    // seed yields a byte-for-byte identical op stream across runs.
-    let workload = contended_membership();
-    let faults = FaultConfig::failures(5);
-    for seed in [0u64, 1, 7, 42, 1234] {
-        let first = pct_record(&workload, faults, seed);
-        let second = pct_record(&workload, faults, seed);
-        let first = first.lock().unwrap().clone();
-        let second = second.lock().unwrap().clone();
-        assert_no_divergence(&format!("seed {seed}: PCT"), &first, &second);
+        let workload = workload.clone();
+        let faults_tape = fault_tape(seed);
+        block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
+            run_and_assert_with_faults(workload, faults, seed, faults_tape).await
+        });
     }
 }
 

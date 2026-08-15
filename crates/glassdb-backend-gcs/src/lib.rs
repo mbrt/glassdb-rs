@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use glassdb_backend::implementation::{bind_list_cursor, list_provider_token};
 use glassdb_backend::{
     Backend, BackendError, Cause, ListCursor, ListLimit, ListPage, ReadReply, Version,
 };
@@ -351,14 +352,14 @@ impl Backend for GcsBackend {
         cursor: Option<&ListCursor>,
         limit: ListLimit,
     ) -> Result<ListPage, BackendError> {
-        validate_list_prefix(prefix)?;
+        let provider_cursor = list_provider_token(prefix, cursor)?;
         let max_results = u32::try_from(limit.get().min(MAX_LIST_PAGE_SIZE)).unwrap();
         let mut query = vec![
             ("prefix", prefix.to_string()),
             ("maxResults", max_results.to_string()),
         ];
-        if let Some(cursor) = cursor {
-            query.push(("pageToken", cursor.as_str().to_string()));
+        if let Some(provider_cursor) = provider_cursor {
+            query.push(("pageToken", provider_cursor.to_string()));
         }
         let rb = self.http.get(self.objects_url()).query(&query);
         let resp = self.send(rb).await?;
@@ -371,7 +372,8 @@ impl Backend for GcsBackend {
         let next = page
             .next_page_token
             .filter(|token| !token.is_empty())
-            .map(ListCursor::new);
+            .map(|token| bind_list_cursor(prefix, &token))
+            .transpose()?;
         Ok(ListPage { objects, next })
     }
 }
@@ -530,14 +532,4 @@ fn multipart_body(json: &str, value: &[u8]) -> Vec<u8> {
     body.extend_from_slice(value);
     body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
     body
-}
-
-fn validate_list_prefix(prefix: &str) -> Result<(), BackendError> {
-    if prefix.is_empty() || prefix.ends_with('/') {
-        Ok(())
-    } else {
-        Err(BackendError::other(format!(
-            "list prefix must be empty or end in '/': {prefix:?}"
-        )))
-    }
 }

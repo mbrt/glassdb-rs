@@ -1,23 +1,31 @@
 //! Shared deterministic execution, failure/delay injection, replay, and PCT harness.
 
+mod client;
+mod nemesis;
+#[cfg(sim)]
+mod scheduling;
+
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
 use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
 use glassdb_backend::memory::MemoryBackend;
-#[cfg(sim)]
-use glassdb_backend::middleware::OpRecord;
-use glassdb_backend::middleware::{FaultBackend, FaultOptions, OpLog, RecordingBackend};
+use glassdb_backend::middleware::{OpLog, RecordingBackend};
 use glassdb_concurr::{Tape, rt};
 use glassdb_storage::{InlinePolicy, SplitPolicy};
 use tokio_util::sync::CancellationToken;
 
 use crate::{Database, Error, PersistentCacheConfig, ProtocolTiming};
 
+use self::client::ClientRunner;
+use self::nemesis::{FaultTransports, NemesisRunner};
+#[cfg(sim)]
+pub use self::scheduling::{
+    PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS, pct_assert, pct_record, pct_sweep, record_input,
+    replay_input,
+};
 use super::slow_backend;
 use super::{MAX_CLIENTS, MediaFaultProfile, SimMedia};
 
@@ -114,54 +122,6 @@ pub(crate) async fn open_det_db(
     };
     builder.open().await
 }
-/// The crash nemesis: cancels a few clients' abort signals at deterministic
-/// virtual times, modelling an abrupt client stop mid-transaction. Each cancelled
-/// client drops its `Database` (without calling `shutdown`), so its in-flight locks
-/// are recovered later via lease expiry during the final reads. Crash timing and
-/// targets are drawn from `tape` (the fuzzer-guided fault schedule), falling back
-/// to the tape's seeded PRNG once its bytes run out.
-async fn crash_nemesis(signals: Vec<CancellationToken>, intensity: u8, mut tape: Tape) {
-    let crashes = (intensity as usize % 3).min(signals.len());
-    for _ in 0..crashes {
-        let gap = tape.below(40) + 1;
-        rt::sleep(Duration::from_millis(gap)).await;
-        let idx = tape.below(signals.len() as u64) as usize;
-        signals[idx].cancel();
-    }
-}
-
-/// Number of sustained outage windows the outage nemesis opens at `intensity`.
-fn outage_count(intensity: u8) -> usize {
-    match intensity {
-        0..=47 => 0,
-        48..=127 => 1,
-        _ => 2,
-    }
-}
-
-/// The outage nemesis: takes a whole client's transport down for a sustained
-/// span and then heals it, modelling a node that disconnects/clogs and later
-/// recovers. While one client is down its peers keep reaching storage and can
-/// recover its orphaned locks via lease expiry — the path coincident i.i.d.
-/// rolls reach only by luck. The target client, start gap, and duration are
-/// drawn from `tape` (the fuzzer-guided fault schedule).
-async fn outage_nemesis(transports: Vec<Arc<FaultBackend>>, intensity: u8, mut tape: Tape) {
-    if transports.is_empty() {
-        return;
-    }
-    for _ in 0..outage_count(intensity) {
-        let gap = tape.below(30) + 1;
-        rt::sleep(Duration::from_millis(gap)).await;
-        let idx = tape.below(transports.len() as u64) as usize;
-        transports[idx].down();
-        // Sustained: long enough that retries during the window keep failing,
-        // so recovery happens via lease expiry rather than a lucky retry.
-        let span = tape.below(80) + 20;
-        rt::sleep(Duration::from_millis(span)).await;
-        transports[idx].heal();
-    }
-}
-
 /// Deinterleaves a fault tape into `N` independent byte streams (byte `i` goes to
 /// stream `i % N`). Keeping the streams disjoint means a single mutated byte maps
 /// to exactly one fault decision, which is what makes the fault schedule
@@ -237,65 +197,27 @@ fn make_backbone() -> (Arc<dyn Backend>, OpLog) {
     (backbone, log)
 }
 
-/// One transport per client over `backbone`. With transport failures enabled,
-/// each is an active, tape-guided [`FaultBackend`]; otherwise each client shares
-/// the backbone directly. Returns the transports (for the outage nemesis and
-/// final healing) and the per-client backends, in client order.
-fn build_transports(
-    backbone: &Arc<dyn Backend>,
-    faults: FaultConfig,
-    seed: u64,
-    streams: &[Vec<u8>; FAULT_STREAMS],
-    nclients: usize,
-) -> (Vec<Arc<FaultBackend>>, Vec<Arc<dyn Backend>>) {
-    let mut transports: Vec<Arc<FaultBackend>> = Vec::new();
-    let mut client_backends: Vec<Arc<dyn Backend>> = Vec::with_capacity(nclients);
-    if faults.failures_enabled() {
-        let fopts = FaultOptions::from_intensity(faults.intensity);
-        for i in 0..nclients {
-            let tape = streams[CLIENT_STREAM_BASE + i % MAX_CLIENTS].clone();
-            let t = FaultBackend::with_tape(backbone.clone(), tape, client_seed(seed, i), fopts);
-            t.set_active(true);
-            transports.push(t.clone());
-            client_backends.push(t);
-        }
-    } else {
-        for _ in 0..nclients {
-            client_backends.push(backbone.clone());
-        }
-    }
-    (transports, client_backends)
-}
-
 /// Spawns the crash and outage nemeses when transport failures are enabled,
 /// each on its own fault-tape stream and a distinct fallback seed. The caller
-/// spawns the client tasks first, so the fixed spawn order (clients, then crash,
-/// then outage) keeps task ids — and thus the schedule — deterministic. Returns
-/// their join handles (both `None` without transport failures).
-#[allow(clippy::type_complexity)]
+/// spawns the client tasks and optional observer first, so the fixed spawn order
+/// (clients, observer when enabled, crash, then outage) keeps task ids — and
+/// thus the schedule — deterministic.
 fn spawn_nemeses(
     faults: FaultConfig,
     seed: u64,
     streams: &[Vec<u8>; FAULT_STREAMS],
     signals: &[CancellationToken],
-    transports: &[Arc<FaultBackend>],
-) -> (Option<rt::JoinHandle<()>>, Option<rt::JoinHandle<()>>) {
+    transports: &FaultTransports,
+) -> NemesisRunner {
+    let mut nemeses = NemesisRunner::new();
     if !faults.failures_enabled() {
-        return (None, None);
+        return nemeses;
     }
     let crash_tape = Tape::new(streams[CRASH_STREAM].clone(), seed ^ 0x00C0_FFEE_C0DE_BEEF);
-    let crash = rt::spawn(crash_nemesis(
-        signals.to_vec(),
-        faults.intensity,
-        crash_tape,
-    ));
+    nemeses.spawn_crash(signals, faults.intensity, crash_tape);
     let outage_tape = Tape::new(streams[OUTAGE_STREAM].clone(), seed ^ 0xFEED_FACE_DEAD_5EED);
-    let outage = rt::spawn(outage_nemesis(
-        transports.to_vec(),
-        faults.intensity,
-        outage_tape,
-    ));
-    (Some(crash), Some(outage))
+    nemeses.spawn_outage(transports, faults.intensity, outage_tape);
+    nemeses
 }
 
 // ===========================================================================
@@ -308,8 +230,9 @@ fn spawn_nemeses(
 // differ per workload — opening the database, the seed step, how one op runs, the
 // invariant, and an optional concurrent observer — so those are the trait
 // methods. Each workload owns its own collection(s) behind those methods, so the
-// harness works purely with `Database` handles and `run_generic` owns everything
-// else (the backbone, per-client transports, crash/restart, and nemeses).
+// harness works purely with `Database` handles. The run context owns the
+// backbone, media, model state, and per-client transports; `ClientRunner` owns
+// client crash/restart lifecycles, and `NemesisRunner` owns the nemesis tasks.
 // ===========================================================================
 
 /// A deterministic-simulation workload the shared harness ([`run_generic`]) can
@@ -387,42 +310,163 @@ pub trait SimWorkload: Clone + Default + Send + Sync + 'static {
     }
 }
 
-/// Runs a client's op sequence in order. Returns the number of ops *consumed*:
-/// `ops.len()` if all succeeded, or `i + 1` if op `i` failed (that op is left
-/// in-doubt and is *not* replayed on restart, since re-running a non-idempotent
-/// op would double-apply).
-async fn run_generic_client<W: SimWorkload>(
-    db: &Database,
-    ops: &[W::Op],
-    state: &W::State,
-    consumed: &AtomicUsize,
-    faults: FaultConfig,
-) -> usize {
-    for (i, op) in ops.iter().enumerate() {
-        // Bump consumed *before* attempting the op. If the outer crash future
-        // drops us mid-op, this op is counted as consumed (left in doubt) and is
-        // not replayed by the restart path. We need this counter on a shared
-        // atomic because the `tokio::select!` cancel arm simply drops this future
-        // and cannot read its return value.
-        consumed.store(i + 1, Ordering::SeqCst);
-        if let Err(error) = W::run_op(db, op, state).await {
-            assert_admissible_client_error(faults, "running client operation", error);
-            return i + 1;
-        }
-    }
-    consumed.store(ops.len(), Ordering::SeqCst);
-    ops.len()
-}
-
-fn assert_admissible_client_error(faults: FaultConfig, context: &str, error: Error) {
-    if client_error_is_admissible(faults, &error) {
-        return;
-    }
-    panic!("{context} returned unexpected error: {error} ({error:?})");
-}
-
 fn client_error_is_admissible(faults: FaultConfig, error: &Error) -> bool {
     faults.failures_enabled() && matches!(error, Error::InDoubt(_) | Error::Unavailable(_))
+}
+
+/// Immutable inputs for one harness run.
+struct RunPlan<W: SimWorkload> {
+    workload: W,
+    faults: FaultConfig,
+    seed: u64,
+    fault_tape: Vec<u8>,
+    media_tape: Option<Vec<u8>>,
+}
+
+impl<W: SimWorkload> RunPlan<W> {
+    fn new(
+        workload: W,
+        faults: FaultConfig,
+        seed: u64,
+        fault_tape: Vec<u8>,
+        media_tape: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            workload,
+            faults,
+            seed,
+            fault_tape,
+            media_tape,
+        }
+    }
+
+    async fn setup(self) -> RunContext<W> {
+        let Self {
+            workload,
+            faults,
+            seed,
+            fault_tape,
+            media_tape,
+        } = self;
+
+        // The fault tape guides each client's transport failures, crash timing,
+        // outage windows, and the independent one-shot slow mutation. With an empty
+        // tape all decisions fall back to the seed (PCT/seed-breadth runs).
+        let fault_streams = deinterleave::<FAULT_STREAMS>(&fault_tape);
+
+        // The store and a shared recorder form a faultless backbone; each client gets
+        // its own transport (`FaultBackend`) over it.
+        let (backbone, log) = make_backbone();
+        let client_ops: Vec<Vec<W::Op>> = workload.clients().to_vec();
+        let nclients = client_ops.len();
+        let run_media = media_tape.map(|tape| RunMedia::new(tape, seed, nclients));
+
+        // Let the workload open and seed its collection(s), over the faultless
+        // backbone so setup cannot fail spuriously.
+        let init_db = W::open_db(
+            &backbone,
+            run_media
+                .as_ref()
+                .map(|media| media.init_and_verify.clone()),
+        )
+        .await
+        .expect("open init db");
+        workload.seed(&init_db).await;
+        init_db.shutdown().await;
+        drop(init_db);
+
+        let state = Arc::new(workload.new_state());
+
+        // One transport per client over the shared backbone. Injectors are live
+        // only while the clients run.
+        let client_backbone: Arc<dyn Backend> = if faults.slow_mutations_enabled() {
+            slow_backend::with_tape(
+                backbone.clone(),
+                fault_tape,
+                seed ^ SLOW_MUTATION_SEED,
+                ProtocolTiming::simulation(),
+            )
+        } else {
+            backbone.clone()
+        };
+        let transports = if faults.failures_enabled() {
+            let schedules = (0..nclients)
+                .map(|client| {
+                    (
+                        fault_streams[CLIENT_STREAM_BASE + client % MAX_CLIENTS].clone(),
+                        client_seed(seed, client),
+                    )
+                })
+                .collect();
+            FaultTransports::faulting(&client_backbone, faults.intensity, schedules)
+        } else {
+            FaultTransports::faultless(&client_backbone, nclients)
+        };
+
+        RunContext {
+            workload,
+            faults,
+            seed,
+            fault_streams,
+            backbone,
+            log,
+            client_ops,
+            run_media,
+            state,
+            client_backbone,
+            transports,
+        }
+    }
+}
+
+/// Resources whose lifetime spans one harness run.
+struct RunContext<W: SimWorkload> {
+    workload: W,
+    faults: FaultConfig,
+    seed: u64,
+    fault_streams: [Vec<u8>; FAULT_STREAMS],
+    backbone: Arc<dyn Backend>,
+    log: OpLog,
+    client_ops: Vec<Vec<W::Op>>,
+    run_media: Option<RunMedia>,
+    state: Arc<W::State>,
+    client_backbone: Arc<dyn Backend>,
+    transports: FaultTransports,
+}
+
+impl<W: SimWorkload> RunContext<W> {
+    fn start_clients(&mut self) -> ClientRunner {
+        ClientRunner::spawn::<W>(
+            std::mem::take(&mut self.client_ops),
+            self.transports.take_client_backends(),
+            self.run_media.as_ref(),
+            &self.state,
+            self.faults,
+        )
+    }
+
+    async fn teardown(self) -> OpLog {
+        // Heal every transport before verifying so recovery reads cannot themselves
+        // fail.
+        self.transports.final_heal();
+
+        // The workload reads the final committed state (driving recovery of any
+        // crashed client's locks via lease expiry) and asserts its invariant.
+        let verify_db = W::open_db(
+            &self.backbone,
+            self.run_media
+                .as_ref()
+                .map(|media| media.init_and_verify.clone()),
+        )
+        .await
+        .expect("open fresh verification db");
+        self.workload
+            .verify(&verify_db, &self.state, self.faults.failures_enabled())
+            .await;
+        verify_db.shutdown().await;
+        drop(self.client_backbone);
+        self.log
+    }
 }
 
 /// Core harness, generic over the workload: seed the store, run the clients as
@@ -436,167 +480,42 @@ async fn run_generic<W: SimWorkload>(
     fault_tape: Vec<u8>,
     media_tape: Option<Vec<u8>>,
 ) -> OpLog {
-    // The fault tape guides each client's transport failures, crash timing,
-    // outage windows, and the independent one-shot slow mutation. With an empty
-    // tape all decisions fall back to the seed (PCT/seed-breadth runs).
-    let streams = deinterleave::<FAULT_STREAMS>(&fault_tape);
-
-    // The store and a shared recorder form a faultless backbone; each client gets
-    // its own transport (`FaultBackend`) over it.
-    let (backbone, log) = make_backbone();
-    let client_ops: Vec<Vec<W::Op>> = workload.clients().to_vec();
-    let nclients = client_ops.len();
-    let run_media = media_tape.map(|tape| RunMedia::new(tape, seed, nclients));
-
-    // Let the workload open and seed its collection(s), over the faultless
-    // backbone so setup cannot fail spuriously.
-    let init_db = W::open_db(
-        &backbone,
-        run_media
-            .as_ref()
-            .map(|media| media.init_and_verify.clone()),
-    )
-    .await
-    .expect("open init db");
-    workload.seed(&init_db).await;
-    init_db.shutdown().await;
-    drop(init_db);
-
-    let state = Arc::new(workload.new_state());
-
-    // One transport per client over the shared backbone. Injectors are live
-    // only while the clients run.
-    let client_backbone: Arc<dyn Backend> = if faults.slow_mutations_enabled() {
-        slow_backend::with_tape(
-            backbone.clone(),
-            fault_tape,
-            seed ^ SLOW_MUTATION_SEED,
-            ProtocolTiming::simulation(),
-        )
-    } else {
-        backbone.clone()
-    };
-    let (transports, client_backends) =
-        build_transports(&client_backbone, faults, seed, &streams, nclients);
-
-    // Each client runs as its own task over its own transport so the scheduler
-    // can interleave them. A `CancellationToken` lets the crash nemesis
-    // simulate a hard crash by racing the signal against the client's run
-    // loop; the dropped future is the in-Rust analog of a process death. On
-    // a clean run we `Database::shutdown` to drain in-flight transactions and
-    // dedup owners before the Database clone drops; on a crash we *skip* shutdown
-    // and let `Drop` tear everything down abruptly — that is the whole point
-    // of the crash nemesis. The background loops are torn down in both cases
-    // by `Background::drop` once the last `Database` clone goes out of scope (the
-    // captured-task cycle is broken by subsystems holding `Weak<Background>`).
-    let mut handles = Vec::with_capacity(nclients);
-    let mut signals: Vec<CancellationToken> = Vec::with_capacity(nclients);
-    for (client, (ops, backend)) in client_ops.into_iter().zip(client_backends).enumerate() {
-        let signal = CancellationToken::new();
-        signals.push(signal.clone());
-        let state = state.clone();
-        let media = run_media
-            .as_ref()
-            .map(|run_media| run_media.clients[client].clone());
-        handles.push(rt::spawn(async move {
-            let consumed = Arc::new(AtomicUsize::new(0));
-            let crashed = {
-                let db = match W::open_db(&backend, media.clone()).await {
-                    Ok(db) => db,
-                    Err(error) => {
-                        assert_admissible_client_error(faults, "opening client database", error);
-                        return;
-                    }
-                };
-                let crashed = tokio::select! {
-                    biased;
-                    _ = signal.cancelled() => true,
-                    _ = run_generic_client::<W>(&db, &ops, &state, &consumed, faults) => false,
-                };
-                if !crashed {
-                    db.shutdown().await;
-                }
-                crashed
-            };
-            if crashed && let Some(media) = &media {
-                // The cancelled database models process loss, so its cache
-                // must cross the same unsynchronized durability boundary.
-                media.crash();
-            }
-            // Crash-and-restart: a cancelled (crashed) client reopens the Database
-            // on the same backend and finishes its remaining ops, recovering its
-            // own orphaned locks via lease expiry. The in-doubt op it died on is
-            // left for recovery rather than replayed (which would double-apply a
-            // non-idempotent op). The restart is uncancellable so it runs to
-            // completion.
-            let n = consumed.load(Ordering::SeqCst);
-            if crashed && n < ops.len() {
-                match W::open_db(&backend, media).await {
-                    Ok(db) => {
-                        let dummy = AtomicUsize::new(0);
-                        run_generic_client::<W>(&db, &ops[n..], &state, &dummy, faults).await;
-                        db.shutdown().await;
-                    }
-                    Err(error) => assert_admissible_client_error(
-                        faults,
-                        "reopening crashed client database",
-                        error,
-                    ),
-                }
-            }
-        }));
-    }
+    let plan = RunPlan::new(workload, faults, seed, fault_tape, media_tape);
+    let mut context = plan.setup().await;
+    let mut clients = context.start_clients();
 
     // An optional concurrent observer, then the crash and outage nemeses, each on
     // its own slice of the fault tape (and a distinct fallback seed). The fixed
     // spawn order (clients, observer, crash, outage) keeps task ids — and thus
     // the schedule — deterministic.
-    let observer = workload.spawn_observer(
-        &backbone,
-        &state,
-        run_media.as_ref().map(|media| media.observer.clone()),
+    let observer = context.workload.spawn_observer(
+        &context.backbone,
+        &context.state,
+        context
+            .run_media
+            .as_ref()
+            .map(|media| media.observer.clone()),
     );
-    let (crash, outage) = spawn_nemeses(faults, seed, &streams, &signals, &transports);
+    let nemeses = spawn_nemeses(
+        context.faults,
+        context.seed,
+        &context.fault_streams,
+        clients.signals(),
+        &context.transports,
+    );
 
-    for h in handles {
-        h.await.expect("client task failed");
-    }
+    clients.join().await;
     if let Some(h) = observer {
         h.await.expect("observer task failed");
     }
-    if let Some(h) = crash {
-        h.await.expect("crash nemesis task failed");
-    }
-    if let Some(h) = outage {
-        h.await.expect("outage nemesis task failed");
-    }
+    nemeses.join().await;
 
-    // Heal every transport before verifying so recovery reads cannot themselves
-    // fail.
-    for t in &transports {
-        t.set_active(false);
-    }
-
-    // The workload reads the final committed state (driving recovery of any
-    // crashed client's locks via lease expiry) and asserts its invariant.
-    let verify_db = W::open_db(
-        &backbone,
-        run_media
-            .as_ref()
-            .map(|media| media.init_and_verify.clone()),
-    )
-    .await
-    .expect("open fresh verification db");
-    workload
-        .verify(&verify_db, &state, faults.failures_enabled())
-        .await;
-    verify_db.shutdown().await;
-    log
+    context.teardown().await
 }
 
 // ---------------------------------------------------------------------------
 // Public entry points, generic over the workload. These are plain async fns; the
-// deterministic driver (a `TapeScheduler`/seed under `rt::block_on_with`) is
+// deterministic driver (a `TapeScheduler`/seed under `exec::block_on_with`) is
 // supplied by the fuzz target and the `*_sim` self-checks.
 // ---------------------------------------------------------------------------
 
@@ -633,176 +552,6 @@ pub async fn run_and_record_with_faults<W: SimWorkload>(
     fault_tape: Vec<u8>,
 ) -> OpLog {
     run_generic(workload.clone(), faults, seed, fault_tape, None).await
-}
-
-// ---------------------------------------------------------------------------
-// PCT seed-breadth run mode (ADR-011). Only under `--cfg sim`: these drive the
-// harness on the deterministic executor with a `PctScheduler` instead of a
-// fuzzer tape, so they complement (rather than replace) the coverage-guided
-// `fuzz/` target. Each run is a pure function of `seed`, so a failure reproduces
-// exactly by re-running that seed.
-// ---------------------------------------------------------------------------
-
-/// Default bug depth the PCT scheduler targets (preemption points + 1).
-#[cfg(sim)]
-pub const PCT_DEFAULT_DEPTH: usize = 3;
-
-/// Rough estimate of the scheduling steps a workload run makes; affects only the
-/// distribution of PCT change points, not correctness.
-#[cfg(sim)]
-pub const PCT_DEFAULT_STEPS: u64 = 2048;
-
-#[cfg(sim)]
-struct DecodedFuzzInput<W> {
-    seed: u64,
-    workload: W,
-    faults: FaultConfig,
-    schedule_tape: Vec<u8>,
-    fault_tape: Vec<u8>,
-    media_tape: Vec<u8>,
-}
-
-#[cfg(sim)]
-fn decode_fuzz_input<W>(data: &[u8]) -> DecodedFuzzInput<W>
-where
-    W: for<'a> Arbitrary<'a> + Default,
-{
-    let mut u = Unstructured::new(data);
-    let seed: u64 = u.arbitrary().unwrap_or(0);
-    let workload = W::arbitrary(&mut u).unwrap_or_default();
-    let faults = FaultConfig::arbitrary(&mut u).unwrap_or_default();
-    // Each remaining byte guides exactly one of scheduling, backend faults, or
-    // cache-media faults, keeping mutations local to one decision stream.
-    let [schedule_tape, fault_tape, media_tape] = deinterleave::<3>(u.take_rest());
-    DecodedFuzzInput {
-        seed,
-        workload,
-        faults,
-        schedule_tape,
-        fault_tape,
-        media_tape,
-    }
-}
-
-#[cfg(sim)]
-fn run_fuzz_mode<W: SimWorkload>(
-    workload: W,
-    faults: FaultConfig,
-    seed: u64,
-    schedule_tape: Vec<u8>,
-    fault_tape: Vec<u8>,
-    media_tape: Option<Vec<u8>>,
-) -> OpLog {
-    rt::block_on_with(rt::TapeScheduler::new(schedule_tape), seed, async move {
-        run_generic(workload, faults, seed, fault_tape, media_tape).await
-    })
-}
-
-/// Decodes one libFuzzer input for workload `W` exactly as its target does and
-/// runs it on fresh deterministic executors without and with the persistent
-/// cache, asserting the invariant in both modes. The cached run injects only
-/// basic media delays and pre-effect failures. Panics on any violation. Shared
-/// by the fuzz target and the corpus-replay test so the two can never diverge.
-#[cfg(sim)]
-pub fn replay_input<W: SimWorkload + for<'a> Arbitrary<'a>>(data: &[u8]) {
-    let DecodedFuzzInput {
-        seed,
-        workload,
-        faults,
-        schedule_tape,
-        fault_tape,
-        media_tape,
-    } = decode_fuzz_input::<W>(data);
-    run_fuzz_mode(
-        workload.clone(),
-        faults,
-        seed,
-        schedule_tape.clone(),
-        fault_tape.clone(),
-        None,
-    );
-    run_fuzz_mode(
-        workload,
-        faults,
-        seed,
-        schedule_tape,
-        fault_tape,
-        Some(media_tape),
-    );
-}
-
-/// Decodes one libFuzzer input exactly as [`replay_input`] does, runs it, and
-/// returns the cache-free and cache-enabled backend op streams concatenated.
-/// Used by corpus replay tests to prove committed inputs replay byte-for-byte,
-/// not just invariant-cleanly.
-#[cfg(sim)]
-pub fn record_input<W: SimWorkload + for<'a> Arbitrary<'a>>(data: &[u8]) -> Vec<OpRecord> {
-    let DecodedFuzzInput {
-        seed,
-        workload,
-        faults,
-        schedule_tape,
-        fault_tape,
-        media_tape,
-    } = decode_fuzz_input::<W>(data);
-    let without_cache = run_fuzz_mode(
-        workload.clone(),
-        faults,
-        seed,
-        schedule_tape.clone(),
-        fault_tape.clone(),
-        None,
-    );
-    let with_cache = run_fuzz_mode(
-        workload,
-        faults,
-        seed,
-        schedule_tape,
-        fault_tape,
-        Some(media_tape),
-    );
-    let mut recorded = without_cache.lock().unwrap().clone();
-    recorded.extend(with_cache.lock().unwrap().iter().cloned());
-    recorded
-}
-
-/// Runs `workload` once under a PCT schedule seeded by `seed`, asserting its
-/// invariant. Panics on any violation.
-#[cfg(sim)]
-pub fn pct_assert<W: SimWorkload>(workload: &W, faults: FaultConfig, seed: u64) {
-    let w = workload.clone();
-    rt::block_on_with(
-        rt::PctScheduler::new(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS),
-        seed,
-        // Empty fault tape: PCT explores the seed-breadth fault space.
-        async move { run_and_assert_with_faults(w, faults, seed, Vec::new()).await },
-    );
-}
-
-/// Runs `workload` under a PCT schedule and returns the recorded backend op
-/// stream, for per-seed determinism comparison.
-#[cfg(sim)]
-pub fn pct_record<W: SimWorkload>(workload: &W, faults: FaultConfig, seed: u64) -> OpLog {
-    let w = workload.clone();
-    rt::block_on_with(
-        rt::PctScheduler::new(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS),
-        seed,
-        async move { run_and_record_with_faults(&w, faults, seed, Vec::new()).await },
-    )
-}
-
-/// Seed-breadth sweep: runs `workload` under one PCT schedule per seed, asserting
-/// the invariant on each. This is the seed-loop entry that complements the
-/// coverage-guided tape fuzzer.
-#[cfg(sim)]
-pub fn pct_sweep<W: SimWorkload>(
-    workload: &W,
-    faults: FaultConfig,
-    seeds: impl IntoIterator<Item = u64>,
-) {
-    for seed in seeds {
-        pct_assert(workload, faults, seed);
-    }
 }
 
 #[cfg(test)]

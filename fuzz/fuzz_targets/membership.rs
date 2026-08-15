@@ -8,7 +8,7 @@
 //! media delays and pre-effect failures. Each client owns a disjoint slice of a
 //! small key universe and concurrently creates, deletes, and lists keys over a
 //! shared in-process backend on the in-repo deterministic executor
-//! ([`glassdb::rt`], `--cfg sim`). The databases open with a tiny split soft
+//! ([`glassdb::exec`], `--cfg sim`). The databases open with a tiny split soft
 //! cap, so a couple of live keys overflow a leaf and drive B-link leaf/root
 //! splits, right-link traversal, and cross-leaf sorted listing.
 //!

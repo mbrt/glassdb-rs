@@ -8,7 +8,7 @@
 //! along the right-sibling link (the B-link property) instead of restarting
 //! from the root.
 //!
-//! This layer is pure routing: it reads nodes through the [`ShardStore`] (hence
+//! This layer is pure routing: it reads nodes through the [`NodeStore`] (hence
 //! the decoded object store, so interior nodes stay cached and off the hot
 //! path) and never mutates the tree. Splitting and locking live above it.
 
@@ -19,7 +19,7 @@ use glassdb_data::{CollectionAddress, KeyRef, NodeToken, ObjectPath};
 use crate::cached_store::Requirement;
 use crate::error::StorageError;
 use crate::node::{Node, NodeBody};
-use crate::shard_store::{LeafObservation, ShardStore};
+use crate::node_store::{LeafObservation, NodeStore};
 
 /// The leaf that owns a key (or range endpoint), with everything needed to read
 /// or compare-and-swap it: its object `path` and retained physical observation.
@@ -83,16 +83,232 @@ impl Located {
     }
 }
 
+/// Stateful keyed descent through one collection tree.
+struct DescentCursor<'a> {
+    router: &'a TreeRouter,
+    collection: &'a CollectionAddress,
+    requirement: Requirement,
+    current: Located,
+}
+
+impl<'a> DescentCursor<'a> {
+    fn new(
+        router: &'a TreeRouter,
+        collection: &'a CollectionAddress,
+        requirement: Requirement,
+        current: Located,
+    ) -> Self {
+        DescentCursor {
+            router,
+            collection,
+            requirement,
+            current,
+        }
+    }
+
+    fn into_locator(self) -> LeafLocator {
+        self.current.into_locator()
+    }
+
+    /// Moves right until the current node owns `key`.
+    async fn normalize_at(&mut self, key: &[u8]) -> Result<(), StorageError> {
+        while !self.current.node().owns(key) {
+            let Some(token) = self.current.node().right_sibling() else {
+                break;
+            };
+            let token = node_token(token)?;
+            let cache_hit = self.current.cache_hit;
+            self.current = self
+                .router
+                .load_child(self.collection, &token, self.requirement)
+                .await?
+                .after(cache_hit);
+        }
+        Ok(())
+    }
+
+    /// Advances one index level and returns the normalized index it left.
+    async fn advance_for(&mut self, key: &[u8]) -> Result<Option<Located>, StorageError> {
+        let token = match self.current.node().body() {
+            NodeBody::Leaf(_) => return Ok(None),
+            NodeBody::Index(index) => node_token(
+                index
+                    .child_for(key)
+                    .ok_or_else(|| StorageError::other("descent reached an empty index node"))?,
+            )?,
+        };
+        let cache_hit = self.current.cache_hit;
+        let child = self
+            .router
+            .load_child(self.collection, &token, self.requirement)
+            .await?
+            .after(cache_hit);
+        Ok(Some(std::mem::replace(&mut self.current, child)))
+    }
+
+    /// Continues the keyed descent until it reaches a leaf.
+    async fn descend_to_leaf(mut self, key: &[u8]) -> Result<Self, StorageError> {
+        loop {
+            self.normalize_at(key).await?;
+            if self.advance_for(key).await?.is_none() {
+                return Ok(self);
+            }
+        }
+    }
+
+    async fn run_until<S: DescentStop>(
+        mut self,
+        key: &[u8],
+        mut stop: S,
+    ) -> Result<S::Output, StorageError> {
+        loop {
+            self.normalize_at(key).await?;
+            if let Some(output) = stop.stop_at(&self.current) {
+                return Ok(output);
+            }
+            let Some(index) = self.advance_for(key).await? else {
+                return Ok(stop.finish_at_leaf());
+            };
+            stop.descended_from(index);
+        }
+    }
+
+    /// Reloads the exact current path at a new requirement without losing the
+    /// hit state accumulated along the route.
+    async fn reload_current(&mut self, requirement: Requirement) -> Result<(), StorageError> {
+        let path = self.current.path.clone();
+        let cache_hit = self.current.cache_hit;
+        let observation = self
+            .router
+            .nodes
+            .load_node_at_state(&path, requirement)
+            .await?;
+        if observation.is_absent() {
+            return Err(StorageError::other("tree node vanished during descent"));
+        }
+        self.current = Located {
+            path,
+            cache_hit: observation.cache_hit(),
+            observation,
+        }
+        .after(cache_hit);
+        self.requirement = requirement;
+        Ok(())
+    }
+}
+
+trait DescentStop {
+    type Output;
+
+    fn stop_at(&mut self, current: &Located) -> Option<Self::Output>;
+
+    fn finish_at_leaf(self) -> Self::Output;
+
+    fn descended_from(&mut self, _index: Located) {}
+}
+
+struct ReachTarget {
+    target: ObjectPath,
+}
+
+impl DescentStop for ReachTarget {
+    type Output = bool;
+
+    fn stop_at(&mut self, current: &Located) -> Option<Self::Output> {
+        (current.path == self.target).then_some(true)
+    }
+
+    fn finish_at_leaf(self) -> Self::Output {
+        false
+    }
+}
+
+struct FindParent {
+    parent: Option<Located>,
+}
+
+impl DescentStop for FindParent {
+    type Output = Option<LeafLocator>;
+
+    fn stop_at(&mut self, _current: &Located) -> Option<Self::Output> {
+        None
+    }
+
+    fn finish_at_leaf(self) -> Self::Output {
+        self.parent.map(Located::into_locator)
+    }
+
+    fn descended_from(&mut self, index: Located) {
+        self.parent = Some(index);
+    }
+}
+
+/// Walks retained leaf locators through their right-sibling links.
+struct LeafChain<'a> {
+    router: &'a TreeRouter,
+    collection: &'a CollectionAddress,
+    requirement: Requirement,
+}
+
+impl<'a> LeafChain<'a> {
+    fn new(
+        router: &'a TreeRouter,
+        collection: &'a CollectionAddress,
+        requirement: Requirement,
+    ) -> Self {
+        LeafChain {
+            router,
+            collection,
+            requirement,
+        }
+    }
+
+    async fn successor(&self, leaf: &LeafLocator) -> Result<Option<LeafLocator>, StorageError> {
+        let Some(token) = leaf.node().and_then(Node::right_sibling) else {
+            return Ok(None);
+        };
+        let token = node_token(token)?;
+        Ok(Some(
+            self.router
+                .load_child(self.collection, &token, self.requirement)
+                .await?
+                .after(leaf.cache_hit)
+                .into_locator(),
+        ))
+    }
+
+    async fn collect_through(
+        &self,
+        mut leaf: LeafLocator,
+        end: Option<&[u8]>,
+    ) -> Result<Vec<LeafLocator>, StorageError> {
+        let mut out = Vec::new();
+        loop {
+            let done = end.is_some_and(|end| leaf.node().is_some_and(|node| node.owns(end)));
+            let next = if done {
+                None
+            } else {
+                self.successor(&leaf).await?
+            };
+            out.push(leaf);
+            match next {
+                Some(right) => leaf = right,
+                None => return Ok(out),
+            }
+        }
+    }
+}
+
 /// Descends and scans a collection's B-link tree.
 #[derive(Clone)]
 pub struct TreeRouter {
-    shards: ShardStore,
+    nodes: NodeStore,
 }
 
 impl TreeRouter {
-    /// Creates a router that reads nodes through `shards`.
-    pub fn new(shards: ShardStore) -> Self {
-        TreeRouter { shards }
+    /// Creates a router that reads nodes through `nodes`.
+    pub fn new(nodes: NodeStore) -> Self {
+        TreeRouter { nodes }
     }
 
     /// Resolves the leaf that owns `key`, descending from the root `_r` and
@@ -105,23 +321,10 @@ impl TreeRouter {
         key: &[u8],
         requirement: Requirement,
     ) -> Result<LeafLocator, StorageError> {
-        let path = ObjectPath::TreeRoot {
-            collection: collection.clone(),
-        };
-        let observation = self.shards.load_root_state(collection, requirement).await?;
-        let cache_hit = observation.cache_hit();
-        if observation.is_absent() {
-            return Err(StorageError::NotFound);
-        }
-        let cur = Located {
-            path,
-            cache_hit,
-            observation,
-        };
-        Ok(self
-            .descend_to_leaf(collection, cur, key, requirement)
+        self.leaf_cursor(collection, key, requirement)
             .await?
-            .into_locator())
+            .map(DescentCursor::into_locator)
+            .ok_or(StorageError::NotFound)
     }
 
     /// Returns the existing leaf that owns `key`, or `None` when the collection
@@ -132,23 +335,10 @@ impl TreeRouter {
         key: &[u8],
         requirement: Requirement,
     ) -> Result<Option<LeafLocator>, StorageError> {
-        let path = ObjectPath::TreeRoot {
-            collection: collection.clone(),
-        };
-        let observation = self.shards.load_root_state(collection, requirement).await?;
-        if observation.is_absent() {
-            return Ok(None);
-        }
-        let cur = Located {
-            path,
-            cache_hit: observation.cache_hit(),
-            observation,
-        };
-        Ok(Some(
-            self.descend_to_leaf(collection, cur, key, requirement)
-                .await?
-                .into_locator(),
-        ))
+        Ok(self
+            .leaf_cursor(collection, key, requirement)
+            .await?
+            .map(DescentCursor::into_locator))
     }
 
     /// Returns the right sibling of `leaf`, or `None` for the rightmost leaf.
@@ -158,16 +348,9 @@ impl TreeRouter {
         leaf: &LeafLocator,
         requirement: Requirement,
     ) -> Result<Option<LeafLocator>, StorageError> {
-        let Some(token) = leaf.node().and_then(Node::right_sibling) else {
-            return Ok(None);
-        };
-        let token = node_token(token)?;
-        Ok(Some(
-            self.load_child(collection, &token, requirement)
-                .await?
-                .after(leaf.cache_hit)
-                .into_locator(),
-        ))
+        LeafChain::new(self, collection, requirement)
+            .successor(leaf)
+            .await
     }
 
     /// Returns the leaves from the one owning `start` through the one owning
@@ -179,23 +362,12 @@ impl TreeRouter {
         end: Option<&[u8]>,
         requirement: Requirement,
     ) -> Result<Vec<LeafLocator>, StorageError> {
-        let Some(mut leaf) = self.first_leaf_at(collection, start, requirement).await? else {
+        let Some(first) = self.first_leaf_at(collection, start, requirement).await? else {
             return Err(StorageError::NotFound);
         };
-        let mut out = Vec::new();
-        loop {
-            let done = end.is_some_and(|end| leaf.node().is_some_and(|node| node.owns(end)));
-            let next = if done {
-                None
-            } else {
-                self.next_leaf(collection, &leaf, requirement).await?
-            };
-            out.push(leaf);
-            match next {
-                Some(right) => leaf = right,
-                None => return Ok(out),
-            }
-        }
+        LeafChain::new(self, collection, requirement)
+            .collect_through(first, end)
+            .await
     }
 
     /// Resolves the owning leaf while keeping interior-node currentness checks
@@ -213,21 +385,21 @@ impl TreeRouter {
         interior: Requirement,
         leaf: Requirement,
     ) -> Result<LeafLocator, StorageError> {
-        let loc = self.leaf_for(collection, key, interior).await?;
+        let mut cursor = self
+            .leaf_cursor(collection, key, interior)
+            .await?
+            .ok_or(StorageError::NotFound)?;
         // The same requirement needs no terminal refresh.
         if interior == leaf {
-            return Ok(loc);
+            return Ok(cursor.into_locator());
         }
         // Check the terminal node at the stricter requirement and resume the
         // descent from it: the cached interior read may have routed us to `_r`
         // as a leaf while a concurrent split has since rewritten `_r` into an
         // index (or split the leaf), so we must keep descending — never hand
         // back an index masquerading as a leaf.
-        let located = self.reload(&loc.path, leaf).await?.after(loc.cache_hit);
-        Ok(self
-            .descend_to_leaf(collection, located, key, leaf)
-            .await?
-            .into_locator())
+        cursor.reload_current(leaf).await?;
+        Ok(cursor.descend_to_leaf(key).await?.into_locator())
     }
 
     /// Returns the leftmost leaf of the collection, or `None` if the collection
@@ -237,38 +409,10 @@ impl TreeRouter {
         collection: &CollectionAddress,
         requirement: Requirement,
     ) -> Result<Option<LeafLocator>, StorageError> {
-        let path = ObjectPath::TreeRoot {
-            collection: collection.clone(),
-        };
-        let observation = self.shards.load_root_state(collection, requirement).await?;
-        if observation.is_absent() {
-            return Ok(None);
-        }
-        let mut cur = Located {
-            path,
-            cache_hit: observation.cache_hit(),
-            observation,
-        };
-        loop {
-            match cur.node().body() {
-                NodeBody::Leaf(_) => return Ok(Some(cur.into_locator())),
-                NodeBody::Index(index) => {
-                    let token = index
-                        .children()
-                        .next()
-                        .map(|(_, token)| node_token(token))
-                        .transpose()?
-                        .ok_or_else(|| {
-                            StorageError::other("descent reached an empty index node")
-                        })?;
-                    let cache_hit = cur.cache_hit;
-                    cur = self
-                        .load_child(collection, &token, requirement)
-                        .await?
-                        .after(cache_hit);
-                }
-            }
-        }
+        Ok(self
+            .leaf_cursor(collection, b"", requirement)
+            .await?
+            .map(DescentCursor::into_locator))
     }
 
     /// Collects every leaf of the collection in key order, following the leaf
@@ -282,27 +426,9 @@ impl TreeRouter {
         let Some(first) = self.leftmost_leaf(collection, requirement).await? else {
             return Ok(Vec::new());
         };
-        let mut out = Vec::new();
-        let mut cur = first;
-        loop {
-            let next = cur
-                .node()
-                .and_then(Node::right_sibling)
-                .map(node_token)
-                .transpose()?;
-            let cache_hit = cur.cache_hit;
-            out.push(cur);
-            match next {
-                Some(token) => {
-                    cur = self
-                        .load_child(collection, &token, requirement)
-                        .await?
-                        .after(cache_hit)
-                        .into_locator()
-                }
-                None => return Ok(out),
-            }
-        }
+        LeafChain::new(self, collection, requirement)
+            .collect_through(first, None)
+            .await
     }
 
     /// Routes `(key, payload)` items to their owning leaves, returning one
@@ -368,46 +494,24 @@ impl TreeRouter {
         target: &NodeToken,
         requirement: Requirement,
     ) -> Result<bool, StorageError> {
-        let observation = self.shards.load_root_state(collection, requirement).await?;
-        if observation.is_absent() {
+        let Some(cursor) = self.start_descent(collection, requirement).await? else {
             return Ok(false);
-        }
-        let target_path = ObjectPath::Node {
-            collection: collection.clone(),
-            token: target.clone(),
         };
-        let mut cur = Located {
-            path: ObjectPath::TreeRoot {
-                collection: collection.clone(),
-            },
-            cache_hit: observation.cache_hit(),
-            observation,
-        };
-        loop {
-            cur = match self
-                .step_right_until_owns(collection, cur, key, requirement)
-                .await
-            {
-                Ok(cur) => cur,
-                Err(StorageError::NotFound) => return Ok(false),
-                Err(error) => return Err(error),
-            };
-            if cur.path == target_path {
-                return Ok(true);
-            }
-            let token = match cur.node().body() {
-                NodeBody::Leaf(_) => return Ok(false),
-                NodeBody::Index(index) => {
-                    node_token(index.child_for(key).ok_or_else(|| {
-                        StorageError::other("descent reached an empty index node")
-                    })?)?
-                }
-            };
-            cur = match self.load_child(collection, &token, requirement).await {
-                Ok(child) => child.after(cur.cache_hit),
-                Err(StorageError::NotFound) => return Ok(false),
-                Err(error) => return Err(error),
-            };
+        match cursor
+            .run_until(
+                key,
+                ReachTarget {
+                    target: ObjectPath::Node {
+                        collection: collection.clone(),
+                        token: target.clone(),
+                    },
+                },
+            )
+            .await
+        {
+            Ok(reachable) => Ok(reachable),
+            Err(StorageError::NotFound) => Ok(false),
+            Err(error) => Err(error),
         }
     }
 
@@ -423,96 +527,46 @@ impl TreeRouter {
         key: &[u8],
         requirement: Requirement,
     ) -> Result<Option<LeafLocator>, StorageError> {
-        let observation = self.shards.load_root_state(collection, requirement).await?;
+        let Some(cursor) = self.start_descent(collection, requirement).await? else {
+            return Ok(None);
+        };
+        cursor.run_until(key, FindParent { parent: None }).await
+    }
+
+    async fn start_descent<'a>(
+        &'a self,
+        collection: &'a CollectionAddress,
+        requirement: Requirement,
+    ) -> Result<Option<DescentCursor<'a>>, StorageError> {
+        let observation = self.nodes.load_root_state(collection, requirement).await?;
         if observation.is_absent() {
             return Ok(None);
         }
-        let mut cur = Located {
+        let current = Located {
             path: ObjectPath::TreeRoot {
                 collection: collection.clone(),
             },
             cache_hit: observation.cache_hit(),
             observation,
         };
-        let mut parent: Option<Located> = None;
-        loop {
-            cur = self
-                .step_right_until_owns(collection, cur, key, requirement)
-                .await?;
-            let token = match cur.node().body() {
-                NodeBody::Leaf(_) => return Ok(parent.map(Located::into_locator)),
-                NodeBody::Index(index) => {
-                    node_token(index.child_for(key).ok_or_else(|| {
-                        StorageError::other("descent reached an empty index node")
-                    })?)?
-                }
-            };
-            let child = self
-                .load_child(collection, &token, requirement)
-                .await?
-                .after(cur.cache_hit);
-            parent = Some(cur);
-            cur = child;
-        }
+        Ok(Some(DescentCursor::new(
+            self,
+            collection,
+            requirement,
+            current,
+        )))
     }
 
-    /// Descends from `cur` to the leaf that owns `key`: at each level step right
-    /// to the owning node, then follow the index child pointer, until a leaf is
-    /// reached. Self-correcting through right-links, so a stale interior read
-    /// never traps the descent at the wrong node — and, crucially, a node that
-    /// turns out to be an index (e.g. a freshly checked `_r` that split into one) is
-    /// resolved to its child rather than returned as a leaf.
-    async fn descend_to_leaf(
-        &self,
-        collection: &CollectionAddress,
-        mut cur: Located,
+    async fn leaf_cursor<'a>(
+        &'a self,
+        collection: &'a CollectionAddress,
         key: &[u8],
         requirement: Requirement,
-    ) -> Result<Located, StorageError> {
-        loop {
-            cur = self
-                .step_right_until_owns(collection, cur, key, requirement)
-                .await?;
-            match cur.node().body() {
-                NodeBody::Leaf(_) => return Ok(cur),
-                NodeBody::Index(index) => {
-                    let token = node_token(index.child_for(key).ok_or_else(|| {
-                        StorageError::other("descent reached an empty index node")
-                    })?)?;
-                    let cache_hit = cur.cache_hit;
-                    cur = self
-                        .load_child(collection, &token, requirement)
-                        .await?
-                        .after(cache_hit);
-                }
-            }
-        }
-    }
-
-    /// Follows right-sibling links until the current node owns `key` (its
-    /// high-key is above `key`). The rightmost node owns everything up to
-    /// +infinity, so a node with no right sibling always terminates the walk.
-    async fn step_right_until_owns(
-        &self,
-        collection: &CollectionAddress,
-        mut cur: Located,
-        key: &[u8],
-        requirement: Requirement,
-    ) -> Result<Located, StorageError> {
-        while !cur.node().owns(key) {
-            match cur.node().right_sibling() {
-                Some(token) => {
-                    let token = node_token(token)?;
-                    let cache_hit = cur.cache_hit;
-                    cur = self
-                        .load_child(collection, &token, requirement)
-                        .await?
-                        .after(cache_hit);
-                }
-                None => break,
-            }
-        }
-        Ok(cur)
+    ) -> Result<Option<DescentCursor<'a>>, StorageError> {
+        let Some(cursor) = self.start_descent(collection, requirement).await? else {
+            return Ok(None);
+        };
+        Ok(Some(cursor.descend_to_leaf(key).await?))
     }
 
     async fn load_child(
@@ -522,7 +576,7 @@ impl TreeRouter {
         requirement: Requirement,
     ) -> Result<Located, StorageError> {
         let observation = self
-            .shards
+            .nodes
             .load_node_state(collection, token, requirement)
             .await?;
         Ok(Located {
@@ -530,25 +584,6 @@ impl TreeRouter {
                 collection: collection.clone(),
                 token: token.clone(),
             },
-            cache_hit: observation.cache_hit(),
-            observation,
-        })
-    }
-
-    /// Re-reads the node at `path` (the root `_r` or a standalone `_n`) at
-    /// `requirement`, for checking a terminal leaf reached through a cached
-    /// interior descent.
-    async fn reload(
-        &self,
-        path: &ObjectPath,
-        requirement: Requirement,
-    ) -> Result<Located, StorageError> {
-        let observation = self.shards.load_node_at_state(path, requirement).await?;
-        if observation.is_absent() {
-            return Err(StorageError::other("tree node vanished during descent"));
-        }
-        Ok(Located {
-            path: path.clone(),
             cache_hit: observation.cache_hit(),
             observation,
         })
@@ -574,20 +609,18 @@ mod tests {
     use crate::Timeline;
     use crate::cached_store::CachedStore;
     use crate::node::{IndexNode, Node};
+    use crate::node_store::NodeStore;
     use crate::shard::Shard;
     use crate::shard::ShardEntry;
-    use crate::shard_store::ShardStore;
-
-    const COLL_PREFIX: &str = "db/_c/0000000000000000000000";
 
     #[derive(Clone)]
     struct TestStore {
-        shards: ShardStore,
+        shards: NodeStore,
         timeline: Timeline,
     }
 
     impl std::ops::Deref for TestStore {
-        type Target = ShardStore;
+        type Target = NodeStore;
 
         fn deref(&self) -> &Self::Target {
             &self.shards
@@ -601,8 +634,39 @@ mod tests {
     fn store_over(backend: Arc<dyn Backend>) -> TestStore {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        let shards = ShardStore::new(objects);
+        let shards = NodeStore::new(objects);
         TestStore { shards, timeline }
+    }
+
+    fn recording_backend() -> (Arc<dyn Backend>, OpLog) {
+        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let log = recorder.log();
+        (Arc::new(recorder), log)
+    }
+
+    fn take_reads(log: &OpLog) -> Vec<(String, String)> {
+        let mut log = log.lock().unwrap();
+        let reads = log
+            .iter()
+            .filter(|record| matches!(record.op, "read" | "read_if_modified"))
+            .map(|record| (record.op.to_string(), record.path.clone()))
+            .collect();
+        log.clear();
+        reads
+    }
+
+    fn read(op: &str, path: ObjectPath) -> (String, String) {
+        (op.to_string(), path.to_string())
+    }
+
+    fn root_path() -> ObjectPath {
+        ObjectPath::TreeRoot {
+            collection: collection(),
+        }
+    }
+
+    fn assert_fresh(locator: &LeafLocator, bound: crate::SequencePoint) {
+        assert!(locator.observation.current_after() >= bound);
     }
 
     fn live(key: &[u8]) -> ShardEntry {
@@ -632,27 +696,31 @@ mod tests {
             .with_right_sibling(right.map(ToString::to_string))
     }
 
+    async fn store_leaf(
+        s: &NodeStore,
+        byte: u8,
+        entries: &[&[u8]],
+        high_key: Option<&[u8]>,
+        right: Option<u8>,
+    ) {
+        let right = right.map(token);
+        s.store_node(
+            &collection(),
+            &token(byte),
+            &leaf(entries, high_key, right.as_ref()),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
     // Seeds a two-level tree: root index -> {L0 (apple,cat), L1 (mango,pear)},
     // split at "m", with the leaves chained by right-sibling.
-    async fn seed_two_level(s: &ShardStore) {
+    async fn seed_two_level(s: &NodeStore) {
         let left = token(0);
         let right = token(1);
-        s.store_node(
-            &collection(),
-            &left,
-            &leaf(&[b"apple", b"cat"], Some(b"m"), Some(&right)),
-            None,
-        )
-        .await
-        .unwrap();
-        s.store_node(
-            &collection(),
-            &right,
-            &leaf(&[b"mango", b"pear"], None, None),
-            None,
-        )
-        .await
-        .unwrap();
+        store_leaf(s, 0, &[b"apple", b"cat"], Some(b"m"), Some(1)).await;
+        store_leaf(s, 1, &[b"mango", b"pear"], None, None).await;
         let root = Node::index(IndexNode::from_children([
             (b"".to_vec(), left.to_string()),
             (b"m".to_vec(), right.to_string()),
@@ -660,29 +728,101 @@ mod tests {
         s.create_root(&collection(), &root).await.unwrap();
     }
 
+    // Models a leaf split whose parent is stale: R still routes every key to
+    // L0, while L0's right-link moves keys at and above "m" to L1.
+    async fn seed_stale_leaf_parent(s: &NodeStore) {
+        let left = token(0);
+        store_leaf(s, 0, &[b"apple", b"cat"], Some(b"m"), Some(1)).await;
+        store_leaf(s, 1, &[b"mango", b"pear"], None, None).await;
+        s.create_root(
+            &collection(),
+            &Node::index(IndexNode::from_children([(Vec::new(), left.to_string())])),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Three leaves behind one stale parent exercise both a bounded scan and
+    // the leaf-to-leaf interface without involving another descent shape.
+    async fn seed_three_leaf_chain(s: &NodeStore) {
+        let first = token(0);
+        store_leaf(s, 0, &[b"apple"], Some(b"m"), Some(1)).await;
+        store_leaf(s, 1, &[b"mango"], Some(b"t"), Some(4)).await;
+        store_leaf(s, 4, &[b"zebra"], None, None).await;
+        s.create_root(
+            &collection(),
+            &Node::index(IndexNode::from_children([(Vec::new(), first.to_string())])),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Models an interior split whose parent is stale: R still routes to I0,
+    // whose right-link moves the lookup to I1 before descending to L1.
+    async fn seed_stale_interior_parent(s: &NodeStore) {
+        let interior_left = token(2);
+        let interior_right = token(3);
+        let leaf_left = token(0);
+        let leaf_right = token(1);
+        store_leaf(s, 0, &[b"apple"], Some(b"m"), Some(1)).await;
+        store_leaf(s, 1, &[b"pear"], None, None).await;
+        s.store_node(
+            &collection(),
+            &interior_left,
+            &Node::index(IndexNode::from_children([(
+                Vec::new(),
+                leaf_left.to_string(),
+            )]))
+            .with_high_key(Some(b"m".to_vec()))
+            .with_right_sibling(Some(interior_right.to_string())),
+            None,
+        )
+        .await
+        .unwrap();
+        s.store_node(
+            &collection(),
+            &interior_right,
+            &Node::index(IndexNode::from_children([(
+                b"m".to_vec(),
+                leaf_right.to_string(),
+            )])),
+            None,
+        )
+        .await
+        .unwrap();
+        s.create_root(
+            &collection(),
+            &Node::index(IndexNode::from_children([(
+                Vec::new(),
+                interior_left.to_string(),
+            )])),
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
-    async fn single_leaf_collection_resolves_to_root() {
+    async fn single_leaf_collection_resolves_to_root_without_parent() {
         let s = store();
         let root = Node::leaf(Shard::from_entries([live(b"only")]));
         s.create_root(&collection(), &root).await.unwrap();
 
         let router = TreeRouter::new(s.shards.clone());
+        let requirement = Requirement::AtLeast(s.timeline.now());
         let loc = router
-            .leaf_for(
-                &collection(),
-                b"only",
-                Requirement::AtLeast(s.timeline.now()),
-            )
+            .leaf_for(&collection(), b"only", requirement)
             .await
             .unwrap();
-        assert_eq!(
-            loc.path,
-            ObjectPath::TreeRoot {
-                collection: collection()
-            }
-        );
+        assert_eq!(loc.path, root_path());
         assert!(!loc.observation.is_absent());
         assert!(loc.node().unwrap().as_leaf().unwrap().exists(b"only"));
+        assert!(
+            router
+                .parent_index_for(&collection(), b"only", requirement)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -702,6 +842,20 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+        let requirement = Requirement::AtLeast(s.timeline.now());
+        assert!(
+            !router
+                .token_reachable_at_key(&collection(), b"k", &token(9), requirement)
+                .await
+                .unwrap()
+        );
+        assert!(
+            router
+                .parent_index_for(&collection(), b"k", requirement)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -727,235 +881,363 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn follows_right_link_when_parent_is_stale() {
-        // Model a split the parent has not yet learned about: the index still
-        // points every key to L0, but L0's high-key ("m") shows keys >= "m" have
-        // moved to its right sibling L1. Descent must step right, not fail.
-        let s = store();
-        let left = token(0);
-        let right = token(1);
-        s.store_node(
-            &collection(),
-            &left,
-            &leaf(&[b"apple", b"cat"], Some(b"m"), Some(&right)),
-            None,
-        )
-        .await
-        .unwrap();
-        s.store_node(
-            &collection(),
-            &right,
-            &leaf(&[b"mango", b"pear"], None, None),
-            None,
-        )
-        .await
-        .unwrap();
-        let root = Node::index(IndexNode::from_children([(b"".to_vec(), left.to_string())]));
-        s.create_root(&collection(), &root).await.unwrap();
+    async fn stale_leaf_right_hop_preserves_trace_and_cumulative_hits() {
+        let (backend, log) = recording_backend();
+        seed_stale_leaf_parent(&store_over(backend.clone())).await;
+        take_reads(&log);
 
-        let router = TreeRouter::new(s.shards.clone());
+        let cold = store_over(backend.clone());
+        let router = TreeRouter::new(cold.shards.clone());
         let loc = router
-            .leaf_for(
+            .leaf_for(&collection(), b"pear", Requirement::Any)
+            .await
+            .unwrap();
+        assert_eq!(loc.path, node_path(1));
+        assert!(!loc.cache_hit);
+        assert!(loc.node().unwrap().as_leaf().unwrap().exists(b"pear"));
+        assert_eq!(
+            take_reads(&log),
+            [
+                read("read", root_path()),
+                read("read", node_path(0)),
+                read("read", node_path(1)),
+            ]
+        );
+
+        assert!(
+            router
+                .leaf_for(&collection(), b"pear", Requirement::Any)
+                .await
+                .unwrap()
+                .cache_hit
+        );
+        assert!(take_reads(&log).is_empty());
+
+        let terminal_warm = store_over(backend);
+        terminal_warm
+            .load_node_state(&collection(), &token(1), Requirement::Any)
+            .await
+            .unwrap();
+        take_reads(&log);
+        let loc = TreeRouter::new(terminal_warm.shards.clone())
+            .leaf_for(&collection(), b"pear", Requirement::Any)
+            .await
+            .unwrap();
+        assert!(!loc.cache_hit, "a warm leaf cannot hide cold prefix reads");
+        assert_eq!(
+            take_reads(&log),
+            [read("read", root_path()), read("read", node_path(0))]
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_freshness_checks_only_the_leaf() {
+        let (backend, log) = recording_backend();
+        seed_stale_leaf_parent(&store_over(backend.clone())).await;
+        take_reads(&log);
+
+        let s = store_over(backend.clone());
+        let router = TreeRouter::new(s.shards.clone());
+        router
+            .leaf_for(&collection(), b"pear", Requirement::Any)
+            .await
+            .unwrap();
+        take_reads(&log);
+
+        let bound = s.timeline.now();
+        let loc = router
+            .leaf_for_fresh(
                 &collection(),
                 b"pear",
-                Requirement::AtLeast(s.timeline.now()),
+                Requirement::Any,
+                Requirement::AtLeast(bound),
             )
             .await
             .unwrap();
         assert_eq!(loc.path, node_path(1));
-    }
+        assert!(loc.cache_hit);
+        assert_fresh(&loc, bound);
+        assert_eq!(take_reads(&log), [read("read_if_modified", node_path(1))]);
 
-    #[tokio::test]
-    async fn leaves_are_returned_in_key_order() {
-        let s = store();
-        seed_two_level(&s).await;
-        let router = TreeRouter::new(s.shards.clone());
-
-        let leaves = router
-            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
-            .await
-            .unwrap();
-        let paths: Vec<ObjectPath> = leaves.iter().map(|leaf| leaf.path.clone()).collect();
-        assert_eq!(paths, vec![node_path(0), node_path(1)]);
-
-        let leftmost = router
-            .leftmost_leaf(&collection(), Requirement::AtLeast(s.timeline.now()))
-            .await
-            .unwrap();
-        assert_eq!(leftmost.unwrap().path, node_path(0));
-    }
-
-    // ADR-031 hot-path invariant: with interior-vs-leaf requirement split, repeated
-    // coordination on a non-root leaf serves the root index `_r` from cache
-    // (never checking it) while still checking the terminal leaf.
-    #[tokio::test]
-    async fn interior_descent_does_not_check_root() {
-        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
-        let log: OpLog = recorder.log();
-        let backend: Arc<dyn Backend> = Arc::new(recorder);
-        let s = store_over(backend);
-        seed_two_level(&s).await;
-        let router = TreeRouter::new(s.shards.clone());
-
-        // Warm the cache with a first descent, then measure only the steady state.
-        router
-            .leaf_for_fresh(
-                &collection(),
-                b"apple",
-                Requirement::Any,
-                Requirement::AtLeast(s.timeline.now()),
-            )
-            .await
-            .unwrap();
-        log.lock().unwrap().clear();
-
-        for _ in 0..3 {
-            let loc = router
-                .leaf_for_fresh(
-                    &collection(),
-                    b"apple",
-                    Requirement::Any,
-                    Requirement::AtLeast(s.timeline.now()),
-                )
+        let mixed = store_over(backend);
+        for byte in [0, 1] {
+            mixed
+                .load_node_state(&collection(), &token(byte), Requirement::Any)
                 .await
                 .unwrap();
-            assert_eq!(loc.path, node_path(0));
         }
-
-        let reads = |suffix: &str| {
-            log.lock()
-                .unwrap()
-                .iter()
-                .filter(|r| {
-                    r.path.ends_with(suffix) && (r.op == "read" || r.op == "read_if_modified")
-                })
-                .count()
-        };
-        assert_eq!(
-            reads("/_r"),
-            0,
-            "root index is served from cache, never checked"
-        );
-        let terminal = node_path(0).to_string();
-        assert!(
-            reads(&terminal) >= 3,
-            "the terminal leaf is checked each time"
-        );
-    }
-
-    // ADR-031 P0 regression: a process that cached the root `_r` as a *leaf*
-    // must still resolve to a real leaf after another process splits `_r` into
-    // an index. Two independent cache views over one backend model the two
-    // processes: the first warms its cache with the root-as-leaf at stale
-    // requirement; the second splits the root in place; the first then resolves a
-    // key at a current leaf bound and must descend into the fresh index
-    // rather than return the index as if it were a leaf.
-    #[tokio::test]
-    async fn stale_root_leaf_cache_still_descends_after_root_split() {
-        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let s_a = store_over(backend.clone());
-        let s_b = store_over(backend);
-
-        // A single-leaf collection: the root `_r` holds the leaf directly.
-        let root = Node::leaf(Shard::from_entries([live(b"a"), live(b"b")]));
-        s_b.create_root(&collection(), &root).await.unwrap();
-
-        // Process A warms its cache with the root-as-leaf (stale requirement).
-        let dir_a = TreeRouter::new(s_a.shards.clone());
-        let warm = dir_a
-            .leaf_for_fresh(&collection(), b"a", Requirement::Any, Requirement::Any)
-            .await
-            .unwrap();
-        assert!(
-            warm.node().unwrap().as_leaf().is_some(),
-            "warm read sees a leaf"
-        );
-
-        // Process B splits the root in place: `_r` becomes a two-child index
-        // over fresh leaves L (<"b") and R (>="b").
-        let left = token(0);
-        let right = token(1);
-        s_b.store_node(
-            &collection(),
-            &left,
-            &leaf(&[b"a"], Some(b"b"), Some(&right)),
-            None,
-        )
-        .await
-        .unwrap();
-        s_b.store_node(&collection(), &right, &leaf(&[b"b"], None, None), None)
-            .await
-            .unwrap();
-        let (_, ver) = s_b
-            .load_root(&collection(), Requirement::AtLeast(s_b.timeline.now()))
-            .await
-            .unwrap();
-        let root2 = Node::index(IndexNode::from_children([
-            (b"".to_vec(), left.to_string()),
-            (b"b".to_vec(), right.to_string()),
-        ]));
-        assert!(s_b.store_root(&collection(), &root2, &ver).await.unwrap());
-
-        // Process A, still holding the stale root-as-leaf, resolves `a` with a
-        // current leaf bound: it must descend into the fresh index and return leaf L.
-        let loc = dir_a
+        take_reads(&log);
+        let bound = mixed.timeline.now();
+        let loc = TreeRouter::new(mixed.shards.clone())
             .leaf_for_fresh(
                 &collection(),
-                b"a",
+                b"pear",
                 Requirement::Any,
-                Requirement::AtLeast(s_a.timeline.now()),
+                Requirement::AtLeast(bound),
             )
             .await
             .unwrap();
-        let shard = loc
-            .node()
-            .unwrap()
-            .as_leaf()
-            .expect("descent must yield a leaf, not the freshly-split root index");
-        assert!(shard.exists(b"a"));
-        assert_eq!(loc.path, node_path(0), "resolved to the owning child leaf");
+        assert!(!loc.cache_hit, "a terminal hit cannot erase a root miss");
+        assert_fresh(&loc, bound);
+        assert_eq!(
+            take_reads(&log),
+            [
+                read("read", root_path()),
+                read("read_if_modified", node_path(1)),
+            ]
+        );
     }
 
     #[tokio::test]
-    async fn parent_index_for_finds_leaf_parent_and_none_for_single_leaf() {
-        let s = store();
-        seed_two_level(&s).await;
-        let router = TreeRouter::new(s.shards.clone());
+    async fn next_leaf_retains_a_prior_miss_when_the_sibling_is_warm() {
+        let (backend, log) = recording_backend();
+        seed_stale_leaf_parent(&store_over(backend.clone())).await;
+        take_reads(&log);
 
-        // The parent of any key's leaf is the root index `_r`.
-        let parent = router
-            .parent_index_for(
-                &collection(),
-                b"mango",
-                Requirement::AtLeast(s.timeline.now()),
-            )
+        let s = store_over(backend);
+        s.load_node_state(&collection(), &token(1), Requirement::Any)
+            .await
+            .unwrap();
+        take_reads(&log);
+
+        let router = TreeRouter::new(s.shards.clone());
+        let first = router
+            .first_leaf_at(&collection(), b"apple", Requirement::Any)
             .await
             .unwrap()
-            .expect("a two-level tree has an index parent");
-        assert_eq!(
-            parent.path,
-            ObjectPath::TreeRoot {
-                collection: collection()
-            }
-        );
-        assert!(parent.node().unwrap().as_index().is_some());
-
-        // A single-leaf collection has no index level, hence no parent.
-        let single = store();
-        let root = Node::leaf(Shard::from_entries([live(b"only")]));
-        single.create_root(&collection(), &root).await.unwrap();
-        let single_dir = TreeRouter::new(single.shards.clone());
+            .unwrap();
+        assert!(!first.cache_hit);
+        take_reads(&log);
+        let middle = router
+            .next_leaf(&collection(), &first, Requirement::Any)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(middle.path, node_path(1));
         assert!(
-            single_dir
-                .parent_index_for(
+            !middle.cache_hit,
+            "the retained prefix miss must survive the warm sibling read"
+        );
+        assert!(take_reads(&log).is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounded_scan_is_inclusive_without_prefetching() {
+        let (backend, log) = recording_backend();
+        seed_three_leaf_chain(&store_over(backend.clone())).await;
+        take_reads(&log);
+
+        let bounded = store_over(backend.clone());
+        let leaves = TreeRouter::new(bounded.shards.clone())
+            .leaves_through(&collection(), b"apple", Some(b"mango"), Requirement::Any)
+            .await
+            .unwrap();
+        assert_eq!(
+            leaves.iter().map(|leaf| &leaf.path).collect::<Vec<_>>(),
+            [&node_path(0), &node_path(1)]
+        );
+        assert!(leaves.iter().all(|leaf| !leaf.cache_hit));
+        assert_eq!(
+            take_reads(&log),
+            [
+                read("read", root_path()),
+                read("read", node_path(0)),
+                read("read", node_path(1)),
+            ],
+            "the inclusive middle bound must not prefetch its successor"
+        );
+
+        let terminal_warm = store_over(backend);
+        terminal_warm
+            .load_node_state(&collection(), &token(4), Requirement::Any)
+            .await
+            .unwrap();
+        take_reads(&log);
+        let leaves = TreeRouter::new(terminal_warm.shards.clone())
+            .leaves(&collection(), Requirement::Any)
+            .await
+            .unwrap();
+        assert_eq!(
+            leaves.iter().map(|leaf| &leaf.path).collect::<Vec<_>>(),
+            [&node_path(0), &node_path(1), &node_path(4)]
+        );
+        assert!(
+            leaves.iter().all(|leaf| !leaf.cache_hit),
+            "a warm terminal leaf cannot erase an earlier miss"
+        );
+        assert_eq!(
+            take_reads(&log),
+            [
+                read("read", root_path()),
+                read("read", node_path(0)),
+                read("read", node_path(1)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn interior_right_hop_preserves_visit_order_and_topology() {
+        let (backend, log) = recording_backend();
+        seed_stale_interior_parent(&store_over(backend.clone())).await;
+        take_reads(&log);
+
+        let s = store_over(backend);
+        let router = TreeRouter::new(s.shards.clone());
+        let loc = router
+            .leaf_for(&collection(), b"pear", Requirement::Any)
+            .await
+            .unwrap();
+        assert_eq!(loc.path, node_path(1));
+        assert!(!loc.cache_hit);
+        assert_eq!(
+            take_reads(&log),
+            [
+                read("read", root_path()),
+                read("read", node_path(2)),
+                read("read", node_path(3)),
+                read("read", node_path(1)),
+            ]
+        );
+
+        assert!(
+            router
+                .token_reachable_at_key(&collection(), b"pear", &token(3), Requirement::Any)
+                .await
+                .unwrap()
+        );
+        let parent = router
+            .parent_index_for(&collection(), b"pear", Requirement::Any)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.path, node_path(3));
+        assert!(matches!(parent.node().unwrap().body(), NodeBody::Index(_)));
+        assert!(take_reads(&log).is_empty());
+    }
+
+    // ADR-031 P0 regression: a reader that cached the root as a leaf must
+    // refresh it before routing after another reader rewrites it as an index.
+    #[tokio::test]
+    async fn fresh_leaf_lookup_refreshes_a_stale_root_before_routing() {
+        let (backend, log) = recording_backend();
+        let reader = store_over(backend.clone());
+        let writer = store_over(backend);
+
+        writer
+            .create_root(
+                &collection(),
+                &Node::leaf(Shard::from_entries([live(b"apple"), live(b"pear")])),
+            )
+            .await
+            .unwrap();
+        let router = TreeRouter::new(reader.shards.clone());
+        router
+            .leaf_for(&collection(), b"pear", Requirement::Any)
+            .await
+            .unwrap();
+
+        writer
+            .store_node(
+                &collection(),
+                &token(0),
+                &leaf(&[b"apple"], Some(b"m"), Some(&token(1))),
+                None,
+            )
+            .await
+            .unwrap();
+        writer
+            .store_node(
+                &collection(),
+                &token(1),
+                &leaf(&[b"pear"], None, None),
+                None,
+            )
+            .await
+            .unwrap();
+        let (_, version) = writer
+            .load_root(&collection(), Requirement::AtLeast(writer.timeline.now()))
+            .await
+            .unwrap();
+        assert!(
+            writer
+                .store_root(
                     &collection(),
-                    b"only",
-                    Requirement::AtLeast(single.timeline.now()),
+                    &Node::index(IndexNode::from_children([
+                        (Vec::new(), token(0).to_string()),
+                        (b"m".to_vec(), token(1).to_string()),
+                    ])),
+                    &version,
                 )
                 .await
                 .unwrap()
-                .is_none()
         );
+        take_reads(&log);
+
+        let bound = reader.timeline.now();
+        let loc = router
+            .leaf_for_fresh(
+                &collection(),
+                b"pear",
+                Requirement::Any,
+                Requirement::AtLeast(bound),
+            )
+            .await
+            .unwrap();
+        assert_eq!(loc.path, node_path(1));
+        assert!(!loc.cache_hit);
+        assert_fresh(&loc, bound);
+        assert!(loc.node().unwrap().as_leaf().unwrap().exists(b"pear"));
+        assert_eq!(
+            take_reads(&log),
+            [
+                read("read_if_modified", root_path()),
+                read("read", node_path(1)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn topology_queries_ignore_off_path_nodes_and_classify_dangling_links() {
+        let (backend, log) = recording_backend();
+        seed_two_level(&store_over(backend.clone())).await;
+        take_reads(&log);
+        let s = store_over(backend);
+        assert!(
+            !TreeRouter::new(s.shards.clone())
+                .token_reachable_at_key(&collection(), b"pear", &token(0), Requirement::Any)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            take_reads(&log),
+            [read("read", root_path()), read("read", node_path(1))],
+            "reachability follows the key path and never reads the target directly"
+        );
+
+        let dangling = store();
+        dangling
+            .create_root(
+                &collection(),
+                &Node::index(IndexNode::from_children([(
+                    Vec::new(),
+                    token(9).to_string(),
+                )])),
+            )
+            .await
+            .unwrap();
+        let router = TreeRouter::new(dangling.shards.clone());
+        assert!(
+            !router
+                .token_reachable_at_key(&collection(), b"pear", &token(8), Requirement::Any)
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            router
+                .parent_index_for(&collection(), b"pear", Requirement::Any)
+                .await,
+            Err(StorageError::NotFound)
+        ));
     }
 
     #[tokio::test]
@@ -963,7 +1245,6 @@ mod tests {
         let s = store();
         seed_two_level(&s).await;
         let router = TreeRouter::new(s.shards.clone());
-        assert_eq!(CollectionAddress::root("db").physical_prefix(), COLL_PREFIX);
 
         let groups = router
             .group_keys_by_leaf(

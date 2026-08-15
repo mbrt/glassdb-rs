@@ -7,7 +7,7 @@
 //! and with the persistent cache; the cached run uses only basic media delays
 //! and pre-effect failures. It lays down a ring (`key(i) -> (i + 1) % N`) and
 //! runs every client as its own task over a shared in-process backend on the
-//! in-repo deterministic executor ([`glassdb::rt`], `--cfg sim`); each client
+//! in-repo deterministic executor ([`glassdb::exec`], `--cfg sim`); each client
 //! repeatedly rotates three consecutive ring edges. Because that rotation does
 //! not commute, any isolation or atomicity break splits, shrinks, or grows the
 //! ring.

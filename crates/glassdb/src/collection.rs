@@ -8,7 +8,7 @@ use glassdb_data::{CollectionAddress, DatabaseId, KeyRef, MAX_COLLECTION_NAME_BY
 
 use crate::db::DbInner;
 use crate::error::Error;
-use crate::iter::{CollectionsIter, KeysIter};
+use crate::iter::{CollectionIter, KeyIter};
 use crate::scan::{KeyPage, KeyScan};
 
 /// An unresolved sequence of logical collection names.
@@ -180,12 +180,13 @@ impl Collection {
             .await
     }
 
-    /// Returns an iterator over the keys in the collection.
+    /// Returns an owned iterator over the collection's materialized keys.
     ///
-    /// The listing scans the keys in order. The scan runs inside a read-only
-    /// serializable transaction and returns the keys in order.
-    pub async fn keys(&self) -> Result<KeysIter, Error> {
-        Ok(KeysIter::new(
+    /// The listing runs inside a read-only serializable transaction. All I/O
+    /// and validation complete before the iterator is returned, so iteration
+    /// itself cannot fail and yields sorted raw keys.
+    pub async fn iter_keys(&self) -> Result<KeyIter, Error> {
+        Ok(KeyIter::new(
             self.scan_keys(KeyScan::all()).await?.into_keys(),
         ))
     }
@@ -197,13 +198,13 @@ impl Collection {
             .await
     }
 
-    /// Returns the direct child bindings in raw-name order.
+    /// Returns an owned iterator over direct child bindings in raw-name order.
     ///
-    /// The returned handles remain bound to the listed incarnations even if a
-    /// later lifecycle operation changes the logical names.
-    pub async fn collections(&self) -> Result<CollectionsIter, Error> {
+    /// All I/O and serializable validation complete before the iterator is
+    /// returned. Each yielded handle remains bound to the listed incarnation.
+    pub async fn iter_collections(&self) -> Result<CollectionIter, Error> {
         self.db
-            .tx(|tx| async move { tx.collections(self).await })
+            .tx(|tx| async move { tx.iter_collections(self).await })
             .await
     }
 

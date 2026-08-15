@@ -10,6 +10,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use crate::implementation::{bind_list_cursor, list_provider_token};
 use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
 
 #[derive(Clone, Default)]
@@ -145,9 +146,8 @@ impl Backend for MemoryBackend {
         cursor: Option<&ListCursor>,
         limit: ListLimit,
     ) -> Result<ListPage, BackendError> {
-        validate_list_prefix(prefix)?;
-        let after = cursor
-            .map(|cursor| decode_list_cursor(prefix, cursor))
+        let after = list_provider_token(prefix, cursor)?
+            .map(|cursor| decode_memory_list_cursor(prefix, cursor))
             .transpose()?;
         let state = self.state.lock().unwrap();
         let mut matches: Vec<&str> = state
@@ -166,7 +166,10 @@ impl Backend for MemoryBackend {
             .map(str::to_string)
             .collect();
         let next = if has_more {
-            objects.last().map(|last| encode_list_cursor(prefix, last))
+            objects
+                .last()
+                .map(|last| encode_memory_list_cursor(prefix, last))
+                .transpose()?
         } else {
             None
         };
@@ -174,31 +177,18 @@ impl Backend for MemoryBackend {
     }
 }
 
-fn validate_list_prefix(prefix: &str) -> Result<(), BackendError> {
-    if prefix.is_empty() || prefix.ends_with('/') {
-        Ok(())
-    } else {
-        Err(BackendError::other(format!(
-            "list prefix must be empty or end in '/': {prefix:?}"
-        )))
-    }
+fn encode_memory_list_cursor(prefix: &str, last: &str) -> Result<ListCursor, BackendError> {
+    bind_list_cursor(prefix, &format!("m:{last}"))
 }
 
-fn encode_list_cursor(prefix: &str, last: &str) -> ListCursor {
-    ListCursor::new(format!("{}:{prefix}{last}", prefix.len()))
-}
-
-fn decode_list_cursor<'a>(prefix: &str, cursor: &'a ListCursor) -> Result<&'a str, BackendError> {
-    let (prefix_len, body) = cursor
-        .as_str()
-        .split_once(':')
+fn decode_memory_list_cursor<'a>(
+    prefix: &str,
+    provider_token: &'a str,
+) -> Result<&'a str, BackendError> {
+    let last = provider_token
+        .strip_prefix("m:")
         .ok_or(BackendError::InvalidCursor)?;
-    let prefix_len = prefix_len
-        .parse::<usize>()
-        .map_err(|_| BackendError::InvalidCursor)?;
-    let stored_prefix = body.get(..prefix_len).ok_or(BackendError::InvalidCursor)?;
-    let last = body.get(prefix_len..).ok_or(BackendError::InvalidCursor)?;
-    if stored_prefix != prefix || !last.starts_with(prefix) {
+    if !last.starts_with(prefix) {
         return Err(BackendError::InvalidCursor);
     }
     Ok(last)
@@ -266,21 +256,7 @@ mod tests {
     #[tokio::test]
     async fn list_is_recursive_and_paginated() {
         let b = MemoryBackend::new();
-        for p in ["d/b", "d/a", "d/sub/x", "d/sub/y", "other/z"] {
-            b.write_if_not_exists(p, b"v".to_vec()).await.unwrap();
-        }
-        let limit = ListLimit::new(2).unwrap();
-        let first = b.list("d/", None, limit).await.unwrap();
-        assert_eq!(first.objects, vec!["d/a", "d/b"]);
-        let second = b.list("d/", first.next.as_ref(), limit).await.unwrap();
-        assert_eq!(second.objects, vec!["d/sub/x", "d/sub/y"]);
-        assert!(second.next.is_none());
-
-        let err = b
-            .list("other/", first.next.as_ref(), limit)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, BackendError::InvalidCursor));
+        crate::implementation::assert_list_conformance(&b).await;
     }
 
     #[tokio::test]

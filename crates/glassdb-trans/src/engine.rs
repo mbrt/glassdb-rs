@@ -8,9 +8,9 @@ use glassdb_concurr::{Background, DedupKeySnapshot, RetryConfig};
 use glassdb_data::{CollectionAddress, CollectionId, DatabaseId, DbRoot, KeyRef, ObjectPath, TxId};
 use glassdb_storage::transaction::TLogger;
 use glassdb_storage::{
-    CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, Node,
-    PersistentCache, PersistentCacheConfig, PersistentCacheMedia, Requirement, Shard, ShardStore,
-    SplitPolicy, StorageError, Timeline, TreeRouter,
+    CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, Node, NodeStore,
+    PersistentCache, PersistentCacheConfig, PersistentCacheMedia, Requirement, Shard, SplitPolicy,
+    StorageError, StructuralLogStore, Timeline, TreeRouter,
 };
 
 use crate::access::{Data, ScanMutation, ScanRange};
@@ -185,7 +185,8 @@ impl Engine {
         };
         let objects = CachedStore::new(dyn_backend, cache_size, timeline.clone(), persistent);
         let records = CollectionStore::new(objects.clone());
-        let shards = ShardStore::new(objects.clone());
+        let shards = NodeStore::new(objects.clone());
+        let structural_logs = StructuralLogStore::new(objects.clone());
         Self::verify_permanent_collection(&db_root, &records, &shards, &timeline).await?;
 
         let tlogger = TLogger::new(objects.clone(), db_root.clone());
@@ -208,6 +209,7 @@ impl Engine {
             background_weak.clone(),
             records.clone(),
             shards.clone(),
+            structural_logs.clone(),
             timeline.clone(),
             monitor.clone(),
             key_state,
@@ -234,6 +236,7 @@ impl Engine {
             background_weak.clone(),
             tlogger,
             shards.clone(),
+            structural_logs,
             timeline.clone(),
             locker.clone(),
             collection_lifecycle.clone(),
@@ -250,6 +253,7 @@ impl Engine {
         let algo = Algo::new(
             shards,
             timeline,
+            retry,
             locker.clone(),
             coord.clone(),
             monitor,
@@ -398,7 +402,7 @@ impl Engine {
     async fn verify_permanent_collection(
         db_root: &DbRoot,
         records: &CollectionStore,
-        shards: &ShardStore,
+        shards: &NodeStore,
         timeline: &Timeline,
     ) -> Result<(), StorageError> {
         let collection = CollectionAddress::from_db_root(db_root.clone(), CollectionId::root());

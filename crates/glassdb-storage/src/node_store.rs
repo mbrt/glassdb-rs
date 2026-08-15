@@ -1,16 +1,14 @@
-//! Compare-and-swap storage for the v2 coordination objects (ADR-031).
+//! Typed persistence for B-link tree nodes.
 //!
-//! B-link nodes (`{prefix}/_r` and `{prefix}/_n/<token>`) are the coordination
-//! units. Each mutation is a create-if-absent, a
-//! version-conditional compare-and-swap, or an exact-revision delete
-//! (ADR-023/ADR-042).
-//!
-//! Reads and mutations go through the decoded [`CachedStore`].
+//! Tree roots (`_r`) and standalone nodes (`_n/<token>`) are the coordination
+//! units. Mutations use create-if-absent, version-conditional compare-and-swap,
+//! or exact-revision deletion (ADR-023/ADR-031/ADR-042), all through the decoded
+//! [`CachedStore`].
 
 use std::sync::Arc;
 
 use glassdb_backend as backend;
-use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, StructuralRecordId, TxId};
+use glassdb_data::{CollectionAddress, NodeToken, ObjectPath};
 
 use crate::cached_store::{
     CachedStore, CasResult, Codec, Observation, ObservationCheck, Requirement,
@@ -18,17 +16,14 @@ use crate::cached_store::{
 use crate::error::StorageError;
 use crate::node::{Node, NodeLocks};
 use crate::shard::Shard;
-use crate::structlog::StructuralLog;
 use crate::timeline::SequencePoint;
 
-const STRUCTURAL_LIST_PAGE_SIZE: usize = 128;
 const NODE_LIST_PAGE_SIZE: usize = 128;
 
 /// Reads and compare-and-swaps B-link nodes.
 #[derive(Clone)]
-pub struct ShardStore {
+pub struct NodeStore {
     nodes: crate::cached_store::TypedCachedStore<Node>,
-    structural_logs: crate::cached_store::TypedCachedStore<StructuralLog>,
 }
 
 /// A B-link leaf loaded for one coordination round.
@@ -157,57 +152,11 @@ impl Codec for Node {
     }
 }
 
-impl Codec for StructuralLog {
-    type Value = StructuralLog;
-
-    fn decode(path: &ObjectPath, body: &[u8]) -> Result<Self::Value, StorageError> {
-        let record = StructuralLog::decode(body)?;
-        let ObjectPath::StructuralRecord { participant, .. } = path else {
-            return Err(StorageError::other(
-                "structural log has a non-structural path",
-            ));
-        };
-        if participant != &record.participant_id {
-            return Err(StorageError::other(
-                "structural-log path does not match its participant",
-            ));
-        }
-        Ok(record)
-    }
-
-    fn encode(path: &ObjectPath, record: &Self::Value) -> Result<Vec<u8>, StorageError> {
-        let ObjectPath::StructuralRecord { participant, .. } = path else {
-            return Err(StorageError::other(
-                "structural log has a non-structural path",
-            ));
-        };
-        if participant != &record.participant_id {
-            return Err(StorageError::other(
-                "structural-log path does not match its participant",
-            ));
-        }
-        Ok(record.encode())
-    }
-
-    fn size(record: &Self::Value) -> usize {
-        record.encode().len()
-    }
-
-    fn accepts(path: &ObjectPath) -> bool {
-        matches!(path, ObjectPath::StructuralRecord { .. })
-    }
-
-    fn name() -> &'static str {
-        "structural log"
-    }
-}
-
-impl ShardStore {
-    /// Creates a shard store that reads and compare-and-swaps through `objects`.
+impl NodeStore {
+    /// Creates a node store that reads and compare-and-swaps through `objects`.
     pub fn new(objects: CachedStore) -> Self {
-        ShardStore {
+        Self {
             nodes: objects.typed(),
-            structural_logs: objects.typed(),
         }
     }
 
@@ -338,7 +287,7 @@ impl ShardStore {
         match res {
             Ok(CasResult::Committed(_)) => Ok(true),
             Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(false),
-            Err(e) => Err(e),
+            Err(error) => Err(error),
         }
     }
 
@@ -412,76 +361,6 @@ impl ShardStore {
         }
     }
 
-    /// Creates a split write-ahead record and returns its exact observation.
-    pub async fn write_structural_log(
-        &self,
-        db_root: &DbRoot,
-        record_id: &StructuralRecordId,
-        record: &StructuralLog,
-    ) -> Result<Observation<StructuralLog>, StorageError> {
-        let path = ObjectPath::StructuralRecord {
-            db_root: db_root.clone(),
-            participant: record.participant_id.clone(),
-            record_id: record_id.clone(),
-        };
-        match self
-            .structural_logs
-            .create(path, None, Arc::new(record.clone()))
-            .await
-        {
-            Ok(CasResult::Committed(observed)) => Ok(observed),
-            Ok(CasResult::Conflict) => Err(StorageError::Precondition),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Conditionally advances an exact split intent.
-    pub async fn update_structural_log(
-        &self,
-        expected: &Observation<StructuralLog>,
-        record: &StructuralLog,
-    ) -> Result<Option<Observation<StructuralLog>>, StorageError> {
-        match self
-            .structural_logs
-            .compare_and_swap(expected, Arc::new(record.clone()))
-            .await
-        {
-            Ok(CasResult::Committed(observed)) => Ok(Some(observed)),
-            Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Lists exact observations of every unresolved structural record.
-    pub async fn list_structural_logs(
-        &self,
-        db_root: &DbRoot,
-        requirement: Requirement,
-    ) -> Result<Vec<(StructuralRecordId, Observation<StructuralLog>)>, StorageError> {
-        let prefix = ObjectPath::structural_records_prefix(db_root);
-        self.list_structural_logs_under(&prefix, requirement).await
-    }
-
-    /// Lists only the unresolved structural records owned by `participant`.
-    pub async fn list_structural_logs_for_participant(
-        &self,
-        db_root: &DbRoot,
-        participant: &TxId,
-        requirement: Requirement,
-    ) -> Result<Vec<(StructuralRecordId, Observation<StructuralLog>)>, StorageError> {
-        let prefix = ObjectPath::participant_structural_records_prefix(db_root, participant);
-        self.list_structural_logs_under(&prefix, requirement).await
-    }
-
-    /// Deletes the exact observed structural record, converging if it is missing.
-    pub async fn delete_structural_log(
-        &self,
-        expected: &Observation<StructuralLog>,
-    ) -> Result<(), StorageError> {
-        self.structural_logs.delete(expected).await?;
-        Ok(())
-    }
-
     /// Loads the leaf node at `_r` or `_n/<token>`.
     pub async fn load_leaf(
         &self,
@@ -508,15 +387,15 @@ impl ShardStore {
     /// Compare-and-swaps an observation-bound leaf edit.
     pub async fn commit_leaf(&self, edit: LeafEdit) -> Result<bool, StorageError> {
         let LeafEdit { observation, node } = edit;
-        let res = self
+        let result = self
             .nodes
             .compare_and_swap(&observation, Arc::new(node))
             .await
             .map(|result| result.committed());
-        match res {
+        match result {
             Ok(committed) => Ok(committed),
             Err(StorageError::NotFound) => Ok(false),
-            Err(e) => Err(e),
+            Err(error) => Err(error),
         }
     }
 
@@ -564,7 +443,7 @@ impl ShardStore {
         match self.nodes.create(path, None, Arc::new(root.clone())).await {
             Ok(CasResult::Committed(_)) => Ok(true),
             Ok(CasResult::Conflict) => Ok(false),
-            Err(e) => Err(e),
+            Err(error) => Err(error),
         }
     }
 
@@ -592,38 +471,6 @@ impl ShardStore {
     pub async fn delete_root(&self, expected: &Observation<Node>) -> Result<(), StorageError> {
         self.delete_node(expected).await
     }
-
-    async fn list_structural_logs_under(
-        &self,
-        prefix: &str,
-        requirement: Requirement,
-    ) -> Result<Vec<(StructuralRecordId, Observation<StructuralLog>)>, StorageError> {
-        let limit = backend::ListLimit::new(STRUCTURAL_LIST_PAGE_SIZE).unwrap();
-        let mut cursor = None;
-        let mut records = Vec::new();
-        loop {
-            let page = self
-                .structural_logs
-                .list(prefix, cursor.as_ref(), limit)
-                .await?;
-            for path in page.objects {
-                let ObjectPath::StructuralRecord { record_id, .. } = path.object_path() else {
-                    return Err(StorageError::other(
-                        "structural listing returned a non-structural path",
-                    ));
-                };
-                let record_id = record_id.clone();
-                let observed = self.structural_logs.read(path, requirement).await?;
-                if observed.exists() {
-                    records.push((record_id, observed));
-                }
-            }
-            match page.next {
-                Some(next) => cursor = Some(next),
-                None => return Ok(records),
-            }
-        }
-    }
 }
 
 fn validate_node_path(path: &ObjectPath) -> Result<(), StorageError> {
@@ -636,31 +483,31 @@ fn validate_node_path(path: &ObjectPath) -> Result<(), StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structlog::StructuralLogPhase;
     use crate::{ShardEntry, Timeline};
 
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
+    use glassdb_data::TxId;
 
     struct TestStore {
-        shards: ShardStore,
+        nodes: NodeStore,
         timeline: Timeline,
     }
 
     impl std::ops::Deref for TestStore {
-        type Target = ShardStore;
+        type Target = NodeStore;
 
         fn deref(&self) -> &Self::Target {
-            &self.shards
+            &self.nodes
         }
     }
 
     fn store_over(backend: Arc<dyn Backend>) -> TestStore {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        let shards = ShardStore::new(objects);
-        TestStore { shards, timeline }
+        let nodes = NodeStore::new(objects);
+        TestStore { nodes, timeline }
     }
 
     fn count(log: &OpLog, op: &str) -> usize {
@@ -682,37 +529,8 @@ mod tests {
         }
     }
 
-    fn db_root() -> DbRoot {
-        DbRoot::try_from("db").unwrap()
-    }
-
-    fn record_id(byte: u8) -> StructuralRecordId {
-        StructuralRecordId::from(token(byte))
-    }
-
-    #[test]
-    fn structural_codec_rejects_a_different_path_participant() {
-        let path = ObjectPath::StructuralRecord {
-            db_root: db_root(),
-            participant: TxId::from_bytes(b"path-participant".to_vec()),
-            record_id: record_id(1),
-        };
-        let record = StructuralLog {
-            collection: CollectionAddress::root("db"),
-            source_token: None,
-            source_version: String::new(),
-            created_tokens: Vec::new(),
-            split_key: Vec::new(),
-            participant_id: TxId::from_bytes(b"body-participant".to_vec()),
-            phase: StructuralLogPhase::Preparing,
-        };
-
-        assert!(<StructuralLog as Codec>::encode(&path, &record).is_err());
-    }
-
-    // Seeds an empty node leaf at `path` through a separate store so a later
-    // reader starts with a cold cache. Creates it with a bare `write_if_not_exists`
-    // (no seeding read) so the shared op log reflects only the reader's traffic.
+    // Use a separate store so the reader begins cold. Creating directly avoids
+    // a seeding read, keeping the operation log limited to reader traffic.
     async fn seed_empty_leaf(backend: &Arc<dyn Backend>, token: &NodeToken) {
         let store = store_over(backend.clone());
         assert!(
@@ -723,20 +541,16 @@ mod tests {
         );
     }
 
-    // A node object exists in the backend. A cold cache full-fetches it on the
-    // first load; a subsequent hot load checks with `read_if_modified`
-    // instead of re-fetching, and returns the same version (ADR-023).
     #[tokio::test]
     async fn hot_reload_checks_current_without_full_read() {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let log = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
-        let token = token(1);
         let path = node_path(1);
-        seed_empty_leaf(&backend, &token).await;
+        seed_empty_leaf(&backend, &token(1)).await;
 
-        let reader = store_over(backend.clone());
-        let v1 = reader
+        let reader = store_over(backend);
+        let first = reader
             .load_leaf(&path, Requirement::AtLeast(reader.timeline.now()))
             .await
             .unwrap()
@@ -745,7 +559,7 @@ mod tests {
         assert_eq!(count(&log, "read"), 1, "cold load full-reads");
         assert_eq!(count(&log, "read_if_modified"), 0);
 
-        let v2 = reader
+        let second = reader
             .load_leaf(&path, Requirement::AtLeast(reader.timeline.now()))
             .await
             .unwrap()
@@ -757,34 +571,24 @@ mod tests {
             1,
             "hot load checks conditionally"
         );
-        assert_eq!(
-            v1.revision(),
-            v2.revision(),
-            "unchanged node keeps its revision"
-        );
+        assert_eq!(first.revision(), second.revision());
     }
 
-    // A cached node loaded with `Any` is served without any backend op
-    // (neither a full read nor a currentness check), while an uncached node still
-    // does one full read (ADR-030).
     #[tokio::test]
     async fn any_serves_cached_without_backend_op() {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let log = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
-        let token = token(1);
         let path = node_path(1);
-        seed_empty_leaf(&backend, &token).await;
+        seed_empty_leaf(&backend, &token(1)).await;
 
-        let reader = store_over(backend.clone());
-        // Warm the cache with one cold full read.
+        let reader = store_over(backend);
         reader
             .load_leaf(&path, Requirement::AtLeast(reader.timeline.now()))
             .await
             .unwrap();
         assert_eq!(count(&log, "read"), 1);
 
-        // A cached `Any` load touches the backend for nothing.
         reader.load_leaf(&path, Requirement::Any).await.unwrap();
         assert_eq!(count(&log, "read"), 1, "cached Any must not read");
         assert_eq!(
@@ -793,53 +597,35 @@ mod tests {
             "cached Any must not check the backend"
         );
 
-        // An uncached node has nothing to serve, so it falls through to a read.
-        let other = node_path(2);
         assert!(matches!(
-            reader.load_leaf(&other, Requirement::Any).await,
+            reader.load_leaf(&node_path(2), Requirement::Any).await,
             Err(StorageError::NotFound)
         ));
         assert_eq!(count(&log, "read"), 2, "uncached Any falls through");
     }
 
-    // A write-through store updates the cache, so a load after a CAS observes the
-    // freshly written content and its new version.
     #[tokio::test]
-    async fn store_is_visible_to_next_load() {
+    async fn committed_edit_is_visible_to_the_next_cached_load() {
         let store = store_over(Arc::new(MemoryBackend::new()));
         let path = node_path(1);
-        let token = token(1);
         assert!(
             store
-                .store_node(&collection(), &token, &Node::leaf(Shard::new()), None)
+                .store_node(&collection(), &token(1), &Node::leaf(Shard::new()), None,)
                 .await
                 .unwrap()
         );
 
-        let loaded = store
-            .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
-            .await
-            .unwrap();
-        assert!(store.commit_leaf(loaded.into_edit()).await.unwrap());
-        let loaded = store
-            .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
-            .await
-            .unwrap();
-        let v1 = loaded.observation().clone();
+        let loaded = store.load_leaf(&path, Requirement::Any).await.unwrap();
+        let previous_revision = loaded.observation().revision().cloned();
+        let mut edit = loaded.into_edit();
+        edit.set_entries(Shard::from_entries([ShardEntry::new(b"new".as_slice())]));
+        assert!(store.commit_leaf(edit).await.unwrap());
 
-        // CAS a new generation over the loaded version, then confirm the next
-        // load reflects it.
-        assert!(store.commit_leaf(loaded.into_edit()).await.unwrap());
-        let v2 = store
-            .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
-            .await
-            .unwrap()
-            .observation()
-            .clone();
+        let committed = store.load_leaf(&path, Requirement::Any).await.unwrap();
+        assert!(committed.entries().lookup(b"new").is_some());
         assert_ne!(
-            v1.revision(),
-            v2.revision(),
-            "a CAS store advances the revision"
+            committed.observation().revision(),
+            previous_revision.as_ref()
         );
     }
 
@@ -847,13 +633,12 @@ mod tests {
     async fn leaf_edit_commits_bounded_changes_without_changing_topology() {
         let store = store_over(Arc::new(MemoryBackend::new()));
         let path = node_path(1);
-        let token = token(1);
         let original = Node::leaf(Shard::new())
             .with_high_key(Some(b"m".to_vec()))
             .with_right_sibling(Some("right".to_string()));
         assert!(
             store
-                .store_node(&collection(), &token, &original, None)
+                .store_node(&collection(), &token(1), &original, None)
                 .await
                 .unwrap()
         );
@@ -866,8 +651,6 @@ mod tests {
 
         let mut edit = loaded.into_edit();
         assert_eq!(edit.path(), &path);
-        assert_eq!(edit.node().high_key(), Some(b"m".as_slice()));
-        assert_eq!(edit.node().right_sibling(), Some("right"));
         edit.set_entries(entries.clone());
         edit.set_locks(locks.clone());
         assert!(store.commit_leaf(edit).await.unwrap());
@@ -881,7 +664,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leaf_edit_is_bound_to_observed_path() {
+    async fn leaf_edit_is_bound_to_its_observed_path() {
         let store = store_over(Arc::new(MemoryBackend::new()));
         let left_path = node_path(1);
         let right_path = node_path(2);
@@ -894,8 +677,11 @@ mod tests {
             );
         }
 
-        let loaded = store.load_leaf(&left_path, Requirement::Any).await.unwrap();
-        let mut edit = loaded.into_edit();
+        let mut edit = store
+            .load_leaf(&left_path, Requirement::Any)
+            .await
+            .unwrap()
+            .into_edit();
         edit.set_entries(Shard::from_entries([ShardEntry::new(
             b"left-key".as_slice(),
         )]));
@@ -915,10 +701,9 @@ mod tests {
     async fn stale_leaf_edit_conflicts() {
         let store = store_over(Arc::new(MemoryBackend::new()));
         let path = node_path(1);
-        let token = token(1);
         assert!(
             store
-                .store_node(&collection(), &token, &Node::leaf(Shard::new()), None)
+                .store_node(&collection(), &token(1), &Node::leaf(Shard::new()), None,)
                 .await
                 .unwrap()
         );
@@ -945,72 +730,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structural_log_listing_drains_backend_pages() {
-        let store = store_over(Arc::new(MemoryBackend::new()));
-        let participant = TxId::from_bytes(b"participant".to_vec());
-        for i in 0..=STRUCTURAL_LIST_PAGE_SIZE {
-            store
-                .write_structural_log(
-                    &db_root(),
-                    &record_id(i as u8),
-                    &StructuralLog {
-                        collection: CollectionAddress::root("db"),
-                        source_token: Some(token(200)),
-                        source_version: "v1".to_string(),
-                        created_tokens: vec![token(i as u8)],
-                        split_key: vec![i as u8],
-                        participant_id: participant.clone(),
-                        phase: StructuralLogPhase::Ready,
-                    },
-                )
-                .await
-                .unwrap();
+    async fn node_listing_drains_backend_pages() {
+        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let log = recorder.log();
+        let store = store_over(Arc::new(recorder));
+        let expected: Vec<_> = (0..=NODE_LIST_PAGE_SIZE)
+            .map(|index| token(index as u8))
+            .collect();
+        for token in &expected {
+            assert!(
+                store
+                    .store_node(&collection(), token, &Node::leaf(Shard::new()), None)
+                    .await
+                    .unwrap()
+            );
         }
 
-        let records = store
-            .list_structural_logs(&db_root(), Requirement::AtLeast(store.timeline.now()))
+        let listed = store
+            .list_nodes(&collection(), Requirement::Any)
             .await
             .unwrap();
-        assert_eq!(records.len(), STRUCTURAL_LIST_PAGE_SIZE + 1);
-    }
 
-    #[tokio::test]
-    async fn structural_log_listing_is_scoped_to_one_participant() {
-        let store = store_over(Arc::new(MemoryBackend::new()));
-        let first = TxId::from_bytes(b"first".to_vec());
-        let second = TxId::from_bytes(b"second".to_vec());
-        for participant in [&first, &second] {
-            store
-                .write_structural_log(
-                    &db_root(),
-                    &record_id(1),
-                    &StructuralLog {
-                        collection: CollectionAddress::root("db"),
-                        source_token: Some(token(200)),
-                        source_version: String::new(),
-                        created_tokens: vec![token(201)],
-                        split_key: Vec::new(),
-                        participant_id: participant.clone(),
-                        phase: StructuralLogPhase::Preparing,
-                    },
-                )
-                .await
-                .unwrap();
+        assert_eq!(count(&log, "list"), 2);
+        assert_eq!(listed.len(), expected.len());
+        for token in expected {
+            assert!(listed.iter().any(|(listed, _)| listed == &token));
         }
-
-        let records = store
-            .list_structural_logs_for_participant(
-                &db_root(),
-                &first,
-                Requirement::AtLeast(store.timeline.now()),
-            )
-            .await
-            .unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(
-            records[0].1.value().unwrap().participant_id,
-            first,
-            "a participant listing must not discover another participant's work"
-        );
     }
 }

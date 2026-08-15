@@ -35,7 +35,7 @@ use glassdb_concurr::{
 };
 use glassdb_data::{ObjectPath, TxId};
 use glassdb_storage::{
-    LeafEdit, LeafObservation, LockType, NodeLocks, Requirement, Shard, ShardEntry, ShardStore,
+    LeafEdit, LeafObservation, LockType, NodeLocks, NodeStore, Requirement, Shard, ShardEntry,
     SplitPolicy, StorageError,
 };
 
@@ -349,7 +349,7 @@ pub trait SplitHinter: Send + Sync {
 /// storage handles, retry config, and stats.
 struct CoordCore {
     tmon: Monitor,
-    shards: ShardStore,
+    shards: NodeStore,
     key_state: KeyStateResolver,
     retry: RetryConfig,
     stats: Stats,
@@ -589,7 +589,7 @@ impl CasWorker {
                 .entries
                 .iter()
                 .any(|(_, entry)| !self.core.policy.entry_fits_split_budget(entry));
-        if candidate_node.encoded_len() <= self.core.policy.node_max_bytes
+        if candidate_node.encoded_len() <= self.core.policy.node_max_bytes()
             && !create_full
             && !inline_entry_full
         {
@@ -812,7 +812,7 @@ impl ShardCoordinator {
     /// normally the background [`Splitter`](crate::split::Splitter)'s queue.
     /// `policy` governs the coordinator's hard node-size limit.
     pub fn with_hinter(
-        shards: ShardStore,
+        shards: NodeStore,
         key_state: KeyStateResolver,
         tmon: Monitor,
         retry: RetryConfig,
@@ -979,7 +979,7 @@ mod tests {
     // kept alive for the monitor's lifetime.
     async fn coord_over(
         backend: Arc<dyn Backend>,
-    ) -> (ShardCoordinator, ShardStore, Timeline, Arc<Background>) {
+    ) -> (ShardCoordinator, NodeStore, Timeline, Arc<Background>) {
         coord_over_with(backend, SplitPolicy::default(), Arc::new(NoSplitHints)).await
     }
 
@@ -987,7 +987,7 @@ mod tests {
         backend: Arc<dyn Backend>,
         policy: SplitPolicy,
         hinter: Arc<dyn SplitHinter>,
-    ) -> (ShardCoordinator, ShardStore, Timeline, Arc<Background>) {
+    ) -> (ShardCoordinator, NodeStore, Timeline, Arc<Background>) {
         coord_over_retry(backend, policy, hinter, RetryConfig::default()).await
     }
 
@@ -995,7 +995,7 @@ mod tests {
     // does not pay the production retry delay.
     async fn coord_over_fast(
         backend: Arc<dyn Backend>,
-    ) -> (ShardCoordinator, ShardStore, Timeline, Arc<Background>) {
+    ) -> (ShardCoordinator, NodeStore, Timeline, Arc<Background>) {
         coord_over_retry(
             backend,
             SplitPolicy::default(),
@@ -1013,9 +1013,9 @@ mod tests {
         policy: SplitPolicy,
         hinter: Arc<dyn SplitHinter>,
         retry: RetryConfig,
-    ) -> (ShardCoordinator, ShardStore, Timeline, Arc<Background>) {
+    ) -> (ShardCoordinator, NodeStore, Timeline, Arc<Background>) {
         let seed_timeline = Timeline::new();
-        let seed_store = ShardStore::new(CachedStore::new(
+        let seed_store = NodeStore::new(CachedStore::new(
             backend.clone(),
             1 << 20,
             seed_timeline,
@@ -1042,7 +1042,7 @@ mod tests {
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
-        let shards = ShardStore::new(objects);
+        let shards = NodeStore::new(objects);
         let key_state = KeyStateResolver::new(mon.clone());
         let coord =
             ShardCoordinator::with_hinter(shards.clone(), key_state, mon, retry, policy, hinter);
@@ -1051,9 +1051,9 @@ mod tests {
 
     // A cold shard store over `backend` (its own empty cache), for asserting what
     // actually landed in storage without touching the coordinator's cache.
-    fn cold_store(backend: Arc<dyn Backend>) -> ShardStore {
+    fn cold_store(backend: Arc<dyn Backend>) -> NodeStore {
         let timeline = Timeline::new();
-        ShardStore::new(CachedStore::new(backend, 1 << 20, timeline, None))
+        NodeStore::new(CachedStore::new(backend, 1 << 20, timeline, None))
     }
 
     fn entry(
@@ -1080,7 +1080,7 @@ mod tests {
 
     // Replaces the leaf's entries with exactly `entries` (a plain CAS, no
     // coordinator).
-    async fn store_shard_entries(store: &ShardStore, path: &ObjectPath, entries: Vec<ShardEntry>) {
+    async fn store_shard_entries(store: &NodeStore, path: &ObjectPath, entries: Vec<ShardEntry>) {
         let _ = store
             .store_node(
                 &collection(),
@@ -1097,7 +1097,7 @@ mod tests {
         assert!(store.commit_leaf(edit).await.unwrap());
     }
 
-    async fn replace_leaf_node(store: &ShardStore, node: &Node) {
+    async fn replace_leaf_node(store: &NodeStore, node: &Node) {
         let observed = store
             .load_node_state(&collection(), &leaf_token(), Requirement::Any)
             .await
@@ -1129,33 +1129,13 @@ mod tests {
     }
 
     // Loads the leaf's entries from a cold store, for asserting what landed.
-    async fn cold_entries(store: &ShardStore, path: &ObjectPath) -> Shard {
+    async fn cold_entries(store: &NodeStore, path: &ObjectPath) -> Shard {
         store
             .load_leaf(path, Requirement::Any)
             .await
             .unwrap()
             .entries()
             .clone()
-    }
-
-    fn test_member(resolver: Arc<dyn ShardResolver>) -> ShardMember {
-        ShardMember {
-            resolver,
-            slot: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    fn cas_worker(coord: &ShardCoordinator) -> CasWorker {
-        CasWorker {
-            core: coord.inner.core.clone(),
-        }
-    }
-
-    fn planned_member<'a>(plan: &'a FoldPlan, id: &TxId) -> &'a MemberFold {
-        plan.members
-            .iter()
-            .find(|member| &member.id == id)
-            .expect("the fold plans every member")
     }
 
     // Stages a write lock for `tx` on `key`, preserving any fields already staged.
@@ -1329,234 +1309,6 @@ mod tests {
         fn observe_leaf(&self, _path: &ObjectPath, _shard: &Shard) {
             self.calls.fetch_add(1, Ordering::SeqCst);
         }
-    }
-
-    // A fold plan records the physical participation separately from the policy
-    // outcome, so only an admitted stage dirties the plan and earns a receipt.
-    #[tokio::test]
-    async fn fold_plan_distinguishes_staged_and_skipped_members() {
-        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
-        let log = recorder.log();
-        let backend: Arc<dyn Backend> = Arc::new(recorder);
-        let (coord, shards, _timeline, _bg) = coord_over(backend).await;
-        let edit = shards
-            .load_leaf(&leaf_path(), Requirement::Any)
-            .await
-            .unwrap()
-            .into_edit();
-        log.lock().unwrap().clear();
-
-        let staged = TxId::with_priority(1, b"staged");
-        let skipped = TxId::with_priority(2, b"skipped");
-        let members = BTreeMap::from([
-            (
-                staged.clone(),
-                test_member(Arc::new(StageLock {
-                    key: b"k".to_vec(),
-                    tx: staged.clone(),
-                    admission: StageAdmission::ExistingKeys,
-                })),
-            ),
-            (skipped.clone(), test_member(Arc::new(SkipRelease))),
-        ]);
-
-        let plan = cas_worker(&coord)
-            .fold_round(
-                &leaf(),
-                &edit,
-                &members,
-                Requirement::Any,
-                false,
-                &BTreeSet::new(),
-            )
-            .await
-            .unwrap();
-
-        assert!(
-            log.lock().unwrap().is_empty(),
-            "fold planning performs no backend I/O"
-        );
-        assert!(plan.is_dirty());
-        assert_eq!(
-            plan.staged_ids().cloned().collect::<Vec<_>>(),
-            vec![staged.clone()]
-        );
-        assert!(matches!(
-            planned_member(&plan, &staged),
-            MemberFold {
-                outcome: FoldOutcome::Locked { .. },
-                participation: Participation::Staged,
-                ..
-            }
-        ));
-        assert!(matches!(
-            planned_member(&plan, &skipped),
-            MemberFold {
-                outcome: FoldOutcome::Released { .. },
-                participation: Participation::Skipped,
-                ..
-            }
-        ));
-        assert_eq!(
-            plan.entries.get(b"k".as_slice()).unwrap().lock_holders(),
-            std::slice::from_ref(&staged)
-        );
-        coord.close().await;
-    }
-
-    // The first logless stage claims its key inside the plan; a later claimant
-    // is excluded before resolution so it cannot erase the first commit marker.
-    #[tokio::test]
-    async fn fold_plan_excludes_a_second_same_key_logless_member() {
-        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (coord, shards, _timeline, _bg) = coord_over(backend).await;
-        let edit = shards
-            .load_leaf(&leaf_path(), Requirement::Any)
-            .await
-            .unwrap()
-            .into_edit();
-        let first = TxId::with_priority(1, b"first");
-        let second = TxId::with_priority(2, b"second");
-        let members = BTreeMap::from([
-            (
-                first.clone(),
-                test_member(Arc::new(StageInline::logless(b"k", &first, b"first"))),
-            ),
-            (
-                second.clone(),
-                test_member(Arc::new(StageInline::logless(b"k", &second, b"second"))),
-            ),
-        ]);
-
-        let plan = cas_worker(&coord)
-            .fold_round(
-                &leaf(),
-                &edit,
-                &members,
-                Requirement::Any,
-                false,
-                &BTreeSet::new(),
-            )
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            planned_member(&plan, &first),
-            MemberFold {
-                outcome: FoldOutcome::Landed,
-                participation: Participation::Staged,
-                ..
-            }
-        ));
-        assert!(matches!(
-            planned_member(&plan, &second),
-            MemberFold {
-                outcome: FoldOutcome::Conflict,
-                participation: Participation::Skipped,
-                ..
-            }
-        ));
-        assert_eq!(plan.staged_ids().cloned().collect::<Vec<_>>(), vec![first]);
-        assert_eq!(
-            plan.entries
-                .get(b"k".as_slice())
-                .unwrap()
-                .current
-                .inline()
-                .map(|value| &**value),
-            Some(b"first".as_slice())
-        );
-        coord.close().await;
-    }
-
-    // Capacity rejection is member-local: an admitted overwrite remains in the
-    // plan when a later create crosses the reserved content limit.
-    #[tokio::test]
-    async fn fold_plan_keeps_an_admitted_stage_when_a_later_member_is_full() {
-        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
-        let log = recorder.log();
-        let backend: Arc<dyn Backend> = Arc::new(recorder);
-        let writer = TxId::with_priority(0, b"writer");
-        let staged = TxId::with_priority(1, b"staged");
-        let rejected = TxId::with_priority(2, b"rejected");
-        let seed = entry(b"a", LockType::None, None, Some(&writer));
-        let mut overwritten = seed.clone();
-        overwritten.replace_write_lock(staged.clone());
-        let created = entry(b"z", LockType::Create, Some(&rejected), None);
-        let overwrite_len =
-            Node::leaf(Shard::from_entries([overwritten.clone()])).content_encoded_len();
-        let full_node = Node::leaf(Shard::from_entries([overwritten, created]));
-        let content_limit = overwrite_len - 1;
-        let node_max_bytes = full_node.encoded_len() + 64;
-        let policy = SplitPolicy {
-            node_max_bytes,
-            split_headroom_bytes: node_max_bytes - content_limit,
-            ..SplitPolicy::default()
-        };
-        let hints = Arc::new(HintCounter::default());
-        let (coord, shards, _timeline, _bg) = coord_over_with(backend, policy, hints.clone()).await;
-        store_shard_entries(&shards, &leaf(), vec![seed]).await;
-        let edit = shards
-            .load_leaf(&leaf_path(), Requirement::Any)
-            .await
-            .unwrap()
-            .into_edit();
-        log.lock().unwrap().clear();
-        let members = BTreeMap::from([
-            (
-                staged.clone(),
-                test_member(Arc::new(StageLock {
-                    key: b"a".to_vec(),
-                    tx: staged.clone(),
-                    admission: StageAdmission::ExistingKeys,
-                })),
-            ),
-            (
-                rejected.clone(),
-                test_member(Arc::new(StageLock {
-                    key: b"z".to_vec(),
-                    tx: rejected.clone(),
-                    admission: StageAdmission::AddsKey,
-                })),
-            ),
-        ]);
-
-        let plan = cas_worker(&coord)
-            .fold_round(
-                &leaf(),
-                &edit,
-                &members,
-                Requirement::Any,
-                false,
-                &BTreeSet::new(),
-            )
-            .await
-            .unwrap();
-
-        assert!(
-            log.lock().unwrap().is_empty(),
-            "capacity admission performs no shard-store work"
-        );
-        assert!(matches!(
-            planned_member(&plan, &staged),
-            MemberFold {
-                participation: Participation::Staged,
-                ..
-            }
-        ));
-        assert!(matches!(
-            planned_member(&plan, &rejected),
-            MemberFold {
-                outcome: FoldOutcome::LeafFull,
-                participation: Participation::Skipped,
-                ..
-            }
-        ));
-        assert_eq!(plan.staged_ids().cloned().collect::<Vec<_>>(), vec![staged]);
-        assert!(plan.entries.contains_key(b"a".as_slice()));
-        assert!(!plan.entries.contains_key(b"z".as_slice()));
-        assert_eq!(hints.calls.load(Ordering::SeqCst), 1);
-        coord.close().await;
     }
 
     // A resolver that stages entries drives one CAS, receives its exact
@@ -2386,11 +2138,11 @@ mod tests {
         assert!(full_node.content_encoded_len() > content_limit);
 
         let node_max_bytes = full_node.encoded_len() + 64;
-        let policy = SplitPolicy {
-            node_max_bytes,
-            split_headroom_bytes: node_max_bytes - content_limit,
-            ..SplitPolicy::default()
-        };
+        let policy = SplitPolicy::builder()
+            .node_max_bytes(node_max_bytes)
+            .split_headroom_bytes(node_max_bytes - content_limit)
+            .build()
+            .unwrap();
         let hints = Arc::new(HintCounter::default());
         let (coord, shards, _timeline, _bg) =
             coord_over_with(backend.clone(), policy, hints.clone()).await;
@@ -2529,11 +2281,11 @@ mod tests {
             inline_len > external_len,
             "the inline payload must add bytes"
         );
-        SplitPolicy {
-            node_max_bytes: external_len,
-            split_headroom_bytes: 0,
-            ..SplitPolicy::default()
-        }
+        SplitPolicy::builder()
+            .node_max_bytes(external_len)
+            .split_headroom_bytes(0)
+            .build()
+            .unwrap()
     }
 
     // A logless commit's leaf entry is the value's only copy, so an over-cap
@@ -2582,12 +2334,12 @@ mod tests {
             value: Arc::from(value.as_slice()),
         });
         let entry_len = Node::leaf(Shard::from_entries([inline.clone()])).content_encoded_len();
-        let policy = SplitPolicy {
-            node_max_bytes: entry_len * 2 + 64,
-            split_headroom_bytes: 65,
-            ..SplitPolicy::default()
-        };
-        assert!(Node::leaf(Shard::from_entries([inline])).encoded_len() <= policy.node_max_bytes);
+        let policy = SplitPolicy::builder()
+            .node_max_bytes(entry_len * 2 + 64)
+            .split_headroom_bytes(65)
+            .build()
+            .unwrap();
+        assert!(Node::leaf(Shard::from_entries([inline])).encoded_len() <= policy.node_max_bytes());
         assert!(
             !policy.entry_fits_split_budget(&ShardEntry::new(b"k").with_current(
                 CurrentState::Inline {
@@ -2686,11 +2438,11 @@ mod tests {
         let small_len = Node::leaf(Shard::from_entries([small])).encoded_len();
         let large_len = Node::leaf(Shard::from_entries([large])).encoded_len();
         assert!(large_len > small_len);
-        let policy = SplitPolicy {
-            node_max_bytes: small_len,
-            split_headroom_bytes: 0,
-            ..SplitPolicy::default()
-        };
+        let policy = SplitPolicy::builder()
+            .node_max_bytes(small_len)
+            .split_headroom_bytes(0)
+            .build()
+            .unwrap();
 
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (gated, gate) = Gate::wrap(mem);

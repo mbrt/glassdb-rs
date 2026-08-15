@@ -1404,6 +1404,7 @@ dependencies = [
  "glassdb-proto",
  "glassdb-storage",
  "glassdb-trans",
+ "glob",
  "proc-macro2",
  "proptest",
  "prost",
@@ -1465,8 +1466,6 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "rand 0.10.1",
- "rand_distr",
  "thiserror",
  "tokio",
  "tracing",
@@ -1525,7 +1524,6 @@ name = "glassdb-data"
 version = "0.1.0"
 dependencies = [
  "glassdb-concurr",
- "rand 0.10.1",
  "tokio",
 ]
 
@@ -1576,6 +1574,12 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "glob"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "group"

@@ -31,7 +31,6 @@ pub(super) struct Options {
     http_pool: String,
 }
 
-#[derive(Clone)]
 pub(super) enum Factory {
     Memory(DelayOptions),
     Gcs {
@@ -40,6 +39,7 @@ pub(super) enum Factory {
     S3 {
         client: aws_sdk_s3::Client,
         bucket: String,
+        _fake: Option<FakeS3>,
     },
 }
 
@@ -62,6 +62,7 @@ impl Options {
                 Ok(Factory::S3 {
                     client,
                     bucket: required_env("BUCKET")?,
+                    _fake: None,
                 })
             }
             "fakes3" => self.initialize_fakes3().await,
@@ -119,7 +120,7 @@ impl Options {
         let delays = self.delay_profile()?;
         let fake = FakeS3::start_with(FakeS3Options {
             latency: Some(delays.latency),
-            conn_counter: None,
+            ..FakeS3Options::default()
         })
         .await;
         let mut config = fake.client_config();
@@ -129,6 +130,7 @@ impl Options {
         Ok(Factory::S3 {
             client: aws_sdk_s3::Client::from_conf(config.build()),
             bucket: "bench".to_string(),
+            _fake: Some(fake),
         })
     }
 }
@@ -142,7 +144,7 @@ impl Factory {
                     .expect("generated delay profile is valid"),
             ),
             Factory::Gcs { bucket } => Arc::new(glassdb::gcs::GcsBackend::new(bucket.clone())),
-            Factory::S3 { client, bucket } => {
+            Factory::S3 { client, bucket, .. } => {
                 Arc::new(glassdb::s3::S3Backend::new(client.clone(), bucket.clone()))
             }
         }

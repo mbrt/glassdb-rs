@@ -163,12 +163,12 @@ async fn child_listing_returns_sorted_incarnation_bound_handles() {
         .await
         .unwrap();
 
-    let entries = parent
-        .collections()
-        .await
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let mut plain = parent.iter_collections().await.unwrap();
+    assert_eq!(plain.len(), 2);
+    let first = plain.next().unwrap();
+    assert_eq!(plain.len(), 1);
+    drop(parent);
+    let entries = std::iter::once(first).chain(plain).collect::<Vec<_>>();
     assert_eq!(
         entries
             .iter()
@@ -202,10 +202,10 @@ async fn child_listing_retries_after_the_directory_changes() {
                 async move {
                     let root = tx.root_collection();
                     let names = tx
-                        .collections(&root)
+                        .iter_collections(&root)
                         .await?
-                        .map(|entry| entry.map(|entry| entry.name))
-                        .collect::<Result<Vec<_>, _>>()?;
+                        .map(|entry| entry.name)
+                        .collect::<Vec<_>>();
                     if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                         peer.create_collection("appeared").await?;
                     }
@@ -257,7 +257,7 @@ async fn bound_handle_data_access_does_not_revalidate_its_logical_path() {
 }
 
 #[tokio::test]
-async fn collection_names_are_validated_before_io() {
+async fn names_are_validated_before_io() {
     assert!(matches!(
         CollectionPath::new([] as [u8; 0]),
         Err(Error::InvalidInput(_))
@@ -280,11 +280,13 @@ async fn collection_names_are_validated_before_io() {
 #[tokio::test]
 async fn collection_directories_respect_the_record_size_limit() {
     let db = Database::builder("example", MemoryBackend::new())
-        .split_policy(SplitPolicy {
-            node_max_bytes: 256,
-            split_headroom_bytes: 64,
-            ..SplitPolicy::default()
-        })
+        .split_policy(
+            SplitPolicy::builder()
+                .node_max_bytes(256)
+                .split_headroom_bytes(64)
+                .build()
+                .unwrap(),
+        )
         .open()
         .await
         .unwrap();
@@ -418,7 +420,10 @@ async fn missing_bound_tree_root_is_not_empty_or_recreated_by_data_operations() 
         matches!(write, Err(Error::StaleCollection)),
         "unexpected write result: {write:?}"
     );
-    assert!(matches!(child.keys().await, Err(Error::StaleCollection)));
+    assert!(matches!(
+        child.iter_keys().await,
+        Err(Error::StaleCollection)
+    ));
     assert!(matches!(
         backend.read(&child_root).await,
         Err(glassdb::backend::BackendError::NotFound)
@@ -449,10 +454,7 @@ async fn collection_changes_compose_with_data_and_nested_changes() {
             tx.write(&users, b"seed", b"ready")?;
             tx.write(&active, b"alice", b"1")?;
 
-            let listed = tx
-                .collections(&users)
-                .await?
-                .collect::<Result<Vec<_>, _>>()?;
+            let listed = tx.iter_collections(&users).await?.collect::<Vec<_>>();
             glassdb::ensure_tx!(
                 listed.len() == 1,
                 Error::internal(format!(
@@ -742,7 +744,7 @@ async fn a_cached_handle_in_another_client_observes_the_drop_fence() {
         old.collection_exists(b"nested").await,
         Err(Error::StaleCollection)
     ));
-    assert!(matches!(old.keys().await, Err(Error::StaleCollection)));
+    assert!(matches!(old.iter_keys().await, Err(Error::StaleCollection)));
 }
 
 #[tokio::test]

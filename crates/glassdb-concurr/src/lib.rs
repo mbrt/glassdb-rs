@@ -6,8 +6,9 @@
 //! `JoinHandle::abort`, `Dedup::close`, simulation-harness crash nemesis).
 mod background;
 mod dedup;
+pub mod entropy;
 #[cfg(sim)]
-mod exec;
+pub mod exec;
 mod retry;
 mod rng;
 pub mod rt;
