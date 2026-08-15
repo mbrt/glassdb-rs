@@ -847,14 +847,7 @@ async fn direct_commit_blocked_after_uncertain_cas_stays_in_doubt() {
             "{what} on a fresh fold proves nothing was written, got {outcome:?}"
         );
 
-        let outcome = fold(
-            &resolver,
-            &tctx,
-            ReloadCause::Reloaded { in_doubt: true },
-            &staged,
-            locks,
-        )
-        .await;
+        let outcome = fold(&resolver, &tctx, ReloadCause::InDoubt, &staged, locks).await;
         assert!(
             matches!(outcome, FoldOutcome::InDoubt(_)),
             "{what} cannot disprove a landed uncertain CAS, got {outcome:?}"
@@ -897,14 +890,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
         matches!(outcome, FoldOutcome::Replay),
         "a superseded read staged nothing and can be reevaluated, got {outcome:?}"
     );
-    let outcome = fold(
-        &stale,
-        &tctx,
-        ReloadCause::Reloaded { in_doubt: true },
-        &staged,
-        &locks,
-    )
-    .await;
+    let outcome = fold(&stale, &tctx, ReloadCause::InDoubt, &staged, &locks).await;
     assert!(
         matches!(outcome, FoldOutcome::InDoubt(_)),
         "an uncertain CAS is never downgraded to a replay, got {outcome:?}"
@@ -978,14 +964,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     ));
     assert_eq!(split_hints.pending_inline_pressure(), 1);
     assert!(matches!(
-        fold_step(
-            &budgeted,
-            &tctx,
-            ReloadCause::Reloaded { in_doubt: true },
-            &crowded,
-            &locks,
-        )
-        .await,
+        fold_step(&budgeted, &tctx, ReloadCause::InDoubt, &crowded, &locks,).await,
         Step::Skip {
             outcome: FoldOutcome::InDoubt(_)
         }

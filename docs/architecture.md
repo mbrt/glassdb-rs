@@ -131,7 +131,7 @@ write-back, release, and GC reclamation — flows through **one shard-mutation
 coordinator** that loads the object once, folds the round's operations in
 wound-wait order, and CASes once (ADR-028/029). The coordinator is a
 transaction-aware shared mutation engine: it owns identity, ordering, admission,
-and recovery across the heterogeneous round, while `Algo` and the `Locker`
+and per-member failed-CAS recovery across the heterogeneous round, while `Algo` and the `Locker`
 supply each operation's mutation decision as an installed resolver. For the full design see
 [designs/object-storage-native.md](designs/object-storage-native.md).
 
@@ -156,6 +156,7 @@ supply each operation's mutation decision as an installed resolver. For the full
     · conflict policy:  wound · deadlock-timeout · serial · backoff
     · read validation:  effective-writer token vs. observed (post-lock)
     · speaks:           Data · TxId · LockOutcome{Locked|Conflict}
+    · schedules:        bounded delayed write-back convergence
 
       │ validate           │ lock(Data, serial)  │ status        │ reclaim hint
       │                    │  ▲ LockedTx (opaque) │               │
@@ -257,11 +258,20 @@ supplies direct commit, and `Gc` reclaims through the `Locker`'s unlock methods
 commit orchestration, GC selection, and held-lock bookkeeping remain outside
 the coordinator.
 
+`Algo` owns one database-local `WriteBackScheduler`. A write-back resolver may
+identify that its own staged leaf CAS definitively lost, but the coordinator and
+locker do not own the resulting timer or capacity policy. The locker transfers
+an opaque retry synchronously; the scheduler groups it by leaf hint, bounds its
+quiet delay and maximum age, and later sends it through the ordinary locker and
+coordinator path without permitting another delayed handoff. `Engine` closes
+this admission and forces pending groups before it drains background work.
+
 | Component             | Layer            | Speaks                       | Owns                                                                                                                  | Must not know                       |
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
 | `glassdb` (`tx_impl`) | API / retry      | `Engine`, closures, `Error`  | metadata bootstrap, operation admission, user body, retry loop, public handles/errors, cancel-safety                  | stores, locks, shards, tx logs, runtime wiring |
 | `Engine`              | runtime façade   | logical keys, `Data`, configuration | component assembly/lifetime, read/scan/catalog entry points, transaction-attempt delegation, shutdown, component stats/diagnostics | user closures, public handles/errors, body retry policy |
 | `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome` | transaction lifecycle, cross-domain lock→validate→commit→write-back orchestration, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), single read-write `CommitInstall`, GC candidate hints | shard routing, CAS details, caching, collection lifecycle implementation, the split mechanism beyond its `SplitHintSink` producer handle |
+| `WriteBackScheduler`  | convergence scheduling | opaque committed write-back retries | database-local quiet/max-age timing, bounded coalescing, background dispatch, close admission | shard mutation decisions, durable authority, read resolution, retry semantics |
 | `CollectionCommit`    | collection-commit **policy** | `CollectionAttempt`, catalog, lifecycle | same-ID collection retry state, recovery and committed-log fields, incarnation preparation, validation, drop fencing, post-commit/abort cleanup | key locking, key validation, the atomic commit decision |
 | `Locker::keys`        | key-lock **policy** | `Data`, `TxId`, B-link nodes | key→leaf grouping, parallel & serial acquisition, hold-and-wait, acquire / write-back / release resolvers | collection-directory semantics |
 | `Locker::collections` | collection-lock **policy** | collection addresses, `TxId`, records | directory/topology lock acquisition, recovery write-back and release | key routing, B-link topology, catalog semantics |
@@ -654,8 +664,12 @@ The validate-and-commit sequence:
    ([ADR-054](adr/054-reserve-inline-publication-for-logless-commits.md)). This
    can happen asynchronously because the transaction log is the source of truth.
    If the client crashes, another transaction can read the log and complete the
-   write-back (or just observe the committed values from the log). A live
-   structural holder defers to lazy recovery.
+   write-back (or just observe the committed values from the log). After a
+   definitive leaf-CAS loss, one retry may move to the database-local bounded
+   quiet scheduler before re-entering the same convergent protocol. Ambiguous
+   failures continue reconciling immediately. Graceful shutdown forces queued
+   retries and waits for them; a live structural holder still defers to lazy
+   recovery.
 
 ### Optimizations
 

@@ -7,6 +7,52 @@ version.
 Keep this document sorted by the most recent changes first. Each entry should
 include a reference to the commit or ADR that introduced the change.
 
+## ADR-060: bounded delayed write-back convergence
+
+[ADR-060](../adr/060-bounded-delayed-write-back-convergence.md) moves one
+committed write-back retry after a definitive leaf-CAS loss into a bounded,
+database-local quiet-period queue.
+
+### Setup
+
+- base: `a4b7c419` (ADR-only control, before implementation); target: uncommitted
+  ADR-060 implementation on the same tree
+- ratio = target / base (throughput >1 good; latency/ops <1 good)
+- three interleaved release pairs, in-memory backend with the S3 delay profile,
+  `delay-scale=0.2`, four Databases, 0% affinity, 2,000 keys per collection,
+  eight workers per shape, a two-second minimum window, 12% throughput-CI
+  target, 40-second maximum window, three-second split quiet period, and
+  90-second drain bound
+- per-side command: `perfbench --backend memory --delays s3 --delay-scale 0.2
+  --runs 1 --drain-timeout 90s mixed --modes lo --affinities 0 --databases 4
+  --workers-per-shape 8 --num-keys 2000 --duration 2s --max-duration 40s
+  --target-ci 0.12 --split-quiet 3s --split-settle-timeout 45s`
+- all six cells report zero failures, every shape converges, setup reaches its
+  quiet period after `28–40` completed splits, and shutdown drains successfully;
+  backend and coordinator counters include the forced shutdown cleanup
+
+### Results
+
+| Metric | Pair ratios | Median |
+| --- | --- | ---: |
+| Aggregate throughput | `0.982`, `0.867`, `1.401` | `0.982` |
+| Aggregate write-shape throughput | `1.073`, `0.712`, `1.345` | `1.073` |
+| `rwSingle` throughput | `1.031`, `0.693`, `1.555` | `1.031` |
+| `rwMany` throughput | `1.202`, `0.765`, `0.648` | `0.765` |
+| `roSingle` throughput | `0.953`, `0.903`, `1.418` | `0.953` |
+| `roMulti` throughput | `1.061`, `0.828`, `1.363` | `1.061` |
+| `rwSingle` p50 | `1.354`, `0.730`, `0.748` | `0.748` |
+| `rwMany` p50 | `1.107`, `0.761`, `0.772` | `0.772` |
+| Backend operations / transaction | `1.084`, `0.901`, `0.769` | `0.901` |
+| Coordinator CAS retries / transaction | `1.450`, `0.669`, `0.491` | `0.669` |
+
+The durable implementation retains the prototype's median write-throughput
+gain, while aggregate throughput is effectively flat and individual shapes are
+mixed. Because counters are sampled after shutdown, the lower median backend
+work and coordinator retry rate represent coalescing rather than omitted
+cleanup. The earlier temporary prototype's `1.079` aggregate ratio did not
+reproduce reliably enough to claim as the implementation result.
+
 ## Current tree: baseline reassessment after inline-policy tuning
 
 ### Setup

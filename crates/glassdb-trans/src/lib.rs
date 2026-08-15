@@ -19,6 +19,7 @@ mod shard_coord;
 mod split;
 mod tlocker;
 mod wound_wait;
+mod write_back;
 
 pub use access::{
     Data, ReadAccess, ReadEvidence, ScanAccess, ScanMutation, ScanRange, WriteAccess,

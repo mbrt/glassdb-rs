@@ -47,8 +47,8 @@ use crate::error::TransError;
 use crate::monitor::Monitor;
 use crate::node_locking::NodeLockReconciler;
 use crate::shard_coord::{
-    CoordinatedOutcome, FoldOutcome, ResolveCtx, ShardCoordinator, ShardResolver, StageAdmission,
-    Step,
+    CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver,
+    StageAdmission, Step,
 };
 use crate::wound_wait::{Reclaim, try_reclaim};
 
@@ -116,11 +116,11 @@ enum Desired {
 #[derive(Clone)]
 struct KeyIntent {
     /// Raw user key bytes (the shard-entry key).
-    pub raw_key: Vec<u8>,
+    raw_key: Vec<u8>,
     /// Logical key used to fetch a help-forwarded writer's value.
-    pub key: KeyRef,
+    key: KeyRef,
     /// The lock to install.
-    pub desired: Desired,
+    desired: Desired,
 }
 
 /// The keys a transaction touches in one leaf, plus the leaf's location
@@ -448,6 +448,7 @@ fn shard_lock_type(intents: &[KeyIntent]) -> LockType {
 struct WriteBackResolver {
     id: TxId,
     intents: Arc<Vec<KeyIntent>>,
+    allow_defer: bool,
 }
 
 #[async_trait]
@@ -488,6 +489,10 @@ impl ShardResolver for WriteBackResolver {
         let locks_changed = locks.release_membership(&self.id);
         if changes.is_empty() && !locks_changed {
             Ok(Step::Skip { outcome })
+        } else if self.allow_defer && ctx.cause == ReloadCause::DefinitiveLoss {
+            Ok(Step::Skip {
+                outcome: FoldOutcome::RetryWriteBack,
+            })
         } else {
             Ok(Step::Stage {
                 entries: changes,
@@ -600,7 +605,58 @@ struct WritebackStaged {
 enum WriteBackOutcome {
     Released(Vec<TxId>),
     Reroute,
-    Deferred,
+    Retry(WriteBackRetry),
+    StructuralDeferred,
+}
+
+/// Opaque ownership of one committed leaf write-back that may be retried later.
+pub(crate) struct WriteBackRetry {
+    id: TxId,
+    leaf_hint: ObjectPath,
+    intents: Arc<Vec<KeyIntent>>,
+}
+
+impl WriteBackRetry {
+    fn new(id: TxId, leaf_hint: ObjectPath, intents: Arc<Vec<KeyIntent>>) -> Self {
+        Self {
+            id,
+            leaf_hint,
+            intents,
+        }
+    }
+
+    pub(crate) fn tx_id(&self) -> &TxId {
+        &self.id
+    }
+
+    pub(crate) fn leaf_hint(&self) -> &ObjectPath {
+        &self.leaf_hint
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        debug_assert_eq!(self.id, other.id);
+        debug_assert_eq!(self.leaf_hint, other.leaf_hint);
+        let intents = Arc::make_mut(&mut self.intents);
+        for intent in other.intents.iter() {
+            if !intents
+                .iter()
+                .any(|existing| existing.raw_key == intent.raw_key)
+            {
+                intents.push(intent.clone());
+            }
+        }
+        intents.sort_by(|left, right| left.raw_key.cmp(&right.raw_key));
+    }
+
+    #[cfg(test)]
+    pub(super) fn empty(id: TxId, leaf_hint: ObjectPath) -> Self {
+        Self::new(id, leaf_hint, Arc::new(Vec::new()))
+    }
+}
+
+/// Immediate, non-blocking ownership transfer for delayed write-back work.
+pub(crate) trait WriteBackRetrySink: Send + Sync {
+    fn try_schedule(&self, retry: WriteBackRetry) -> Result<(), WriteBackRetry>;
 }
 
 /// Resolves the holders of an entry (help-forward committed, drop aborted,
@@ -929,7 +985,12 @@ impl KeyLocker {
     /// Returns the transaction ids each published pointer *superseded* (the
     /// former `current_writer` an overwrite replaced): these just lost a
     /// reference and are GC write-back hint candidates (ADR-022).
-    pub(crate) async fn write_back(&self, id: &TxId, locked: &LockedTx) -> Vec<TxId> {
+    pub(crate) async fn write_back(
+        &self,
+        id: &TxId,
+        locked: &LockedTx,
+        retry_sink: Option<&dyn WriteBackRetrySink>,
+    ) -> Vec<TxId> {
         // Publication is already recoverable from the committed log. Keep the
         // process-local diagnostic state equally safe if this future is dropped.
         let _cleanup = TxLocksCleanup { locker: self, id };
@@ -947,6 +1008,8 @@ impl KeyLocker {
                     &group.path,
                     Arc::new(group.intents.clone()),
                     requirement,
+                    retry_sink,
+                    retry_sink.is_some(),
                 )
                 .await
             {
@@ -972,9 +1035,26 @@ impl KeyLocker {
             key: key.clone(),
             desired: Desired::Put,
         }]);
-        self.write_back_routed(id, leaf_path, intents, Requirement::Any)
+        self.write_back_routed(id, leaf_path, intents, Requirement::Any, None, false)
             .await
             .unwrap_or_default()
+    }
+
+    /// Runs delayed work through the ordinary convergent protocol without
+    /// allowing another delayed handoff.
+    pub(crate) async fn retry_write_back(
+        &self,
+        retry: WriteBackRetry,
+    ) -> Result<Vec<TxId>, TransError> {
+        self.write_back_routed(
+            &retry.id,
+            &retry.leaf_hint,
+            retry.intents.clone(),
+            Requirement::Any,
+            None,
+            false,
+        )
+        .await
     }
 
     /// Releases `id` from one exact leaf path.
@@ -1130,12 +1210,14 @@ impl KeyLocker {
         path: &ObjectPath,
         intents: Arc<Vec<KeyIntent>>,
         requirement: Requirement,
+        retry_sink: Option<&dyn WriteBackRetrySink>,
+        allow_defer: bool,
     ) -> Result<Vec<TxId>, TransError> {
-        let mut pending = vec![(path.clone(), intents)];
+        let mut pending = vec![(path.clone(), intents, requirement, allow_defer)];
         let mut superseded = Vec::new();
-        while let Some((path, intents)) = pending.pop() {
+        while let Some((path, intents, requirement, allow_defer)) = pending.pop() {
             match self
-                .write_back_shard(id, &path, intents.clone(), requirement)
+                .write_back_shard(id, &path, intents.clone(), requirement, allow_defer)
                 .await?
             {
                 WriteBackOutcome::Released(mut ids) => superseded.append(&mut ids),
@@ -1152,12 +1234,22 @@ impl KeyLocker {
                         .map_err(|e| TransError::from(e).context("rerouting delayed write-back"))?;
                     pending.extend(groups.into_iter().map(|group| {
                         let intents = group.keys.into_iter().map(|(_, intent)| intent).collect();
-                        (group.path, Arc::new(intents))
+                        (group.path, Arc::new(intents), requirement, allow_defer)
                     }));
+                }
+                WriteBackOutcome::Retry(retry) => {
+                    let retry = match retry_sink {
+                        Some(sink) => match sink.try_schedule(retry) {
+                            Ok(()) => continue,
+                            Err(retry) => retry,
+                        },
+                        None => retry,
+                    };
+                    pending.push((retry.leaf_hint, retry.intents, Requirement::Any, false));
                 }
                 // A gate on one routed leaf does not prevent independent leaves
                 // from completing their best-effort cleanup in this pass.
-                WriteBackOutcome::Deferred => {}
+                WriteBackOutcome::StructuralDeferred => {}
             }
         }
         Ok(superseded)
@@ -1170,10 +1262,12 @@ impl KeyLocker {
         path: &ObjectPath,
         intents: Arc<Vec<KeyIntent>>,
         requirement: Requirement,
+        allow_defer: bool,
     ) -> Result<WriteBackOutcome, TransError> {
         let resolver = Arc::new(WriteBackResolver {
             id: id.clone(),
-            intents,
+            intents: intents.clone(),
+            allow_defer,
         });
         match self
             .coord
@@ -1188,12 +1282,20 @@ impl KeyLocker {
                 outcome: FoldOutcome::Reroute,
                 ..
             }) => Ok(WriteBackOutcome::Reroute),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::RetryWriteBack,
+                ..
+            }) => Ok(WriteBackOutcome::Retry(WriteBackRetry::new(
+                id.clone(),
+                path.clone(),
+                intents,
+            ))),
             // The log is already committed, so a structural gate delays only
             // publication and lock cleanup. Later access or GC can help it.
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::Wait(_),
                 ..
-            }) => Ok(WriteBackOutcome::Deferred),
+            }) => Ok(WriteBackOutcome::StructuralDeferred),
             Some(_) => Err(TransError::other(
                 "write-back produced a non-cleanup outcome",
             )),
@@ -1297,6 +1399,7 @@ impl KeyLocker {
                 // takes the safe release-and-relock path.
                 FoldOutcome::Conflict
                 | FoldOutcome::Released { .. }
+                | FoldOutcome::RetryWriteBack
                 | FoldOutcome::Reroute
                 | FoldOutcome::Landed
                 | FoldOutcome::Moved
@@ -1493,11 +1596,34 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct CapturingRetrySink {
+        retry: Mutex<Option<WriteBackRetry>>,
+    }
+
+    impl WriteBackRetrySink for CapturingRetrySink {
+        fn try_schedule(&self, retry: WriteBackRetry) -> Result<(), WriteBackRetry> {
+            let mut captured = self.retry.lock().unwrap();
+            assert!(captured.is_none(), "write-back handed off more than once");
+            *captured = Some(retry);
+            Ok(())
+        }
+    }
+
+    struct RejectingRetrySink;
+
+    impl WriteBackRetrySink for RejectingRetrySink {
+        fn try_schedule(&self, retry: WriteBackRetry) -> Result<(), WriteBackRetry> {
+            Err(retry)
+        }
+    }
+
     #[test]
     fn exhausted_write_back_requires_rerouting() {
         let resolver = WriteBackResolver {
             id: mk_tid(1, "writer"),
             intents: Arc::new(vec![put_intent(b"key")]),
+            allow_defer: false,
         };
 
         assert!(matches!(
@@ -1508,6 +1634,134 @@ mod tests {
             resolver.exhausted_outcome(true),
             FoldOutcome::Reroute
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clean_write_back_loss_can_transfer_one_retry() {
+        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let hook = HookBackend::new(memory);
+        let (locker, ctx) = new_test_locker(hook.clone()).await;
+        let key = b"key";
+        seed_committed(&ctx, key, b"old").await;
+        let writer = mk_tid(1, "writer");
+        let locked = lock_commit(&locker, &ctx, &writer, key).await;
+
+        let faulted = Arc::new(AtomicBool::new(false));
+        hook.set_before({
+            let faulted = faulted.clone();
+            move |operation| {
+                let fail = matches!(operation, BackendOp::WriteIf { path, .. }
+                    if path.ends_with("/_r"))
+                    && !faulted.swap(true, Ordering::SeqCst);
+                Box::pin(async move {
+                    if fail {
+                        Err(glassdb_backend::BackendError::Precondition)
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+
+        let sink = CapturingRetrySink::default();
+        assert!(
+            locker
+                .keys()
+                .write_back(&writer, &locked, Some(&sink))
+                .await
+                .is_empty()
+        );
+        hook.clear_before();
+
+        let entry = entry_of(&ctx, key).await.unwrap();
+        assert_eq!(entry.lock_holders(), std::slice::from_ref(&writer));
+        assert_ne!(entry.current.writer(), Some(&writer));
+
+        let retry = sink.retry.lock().unwrap().take().unwrap();
+        locker.keys().retry_write_back(retry).await.unwrap();
+        let entry = entry_of(&ctx, key).await.unwrap();
+        assert!(entry.lock_holders().is_empty());
+        assert_eq!(entry.current.writer(), Some(&writer));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejected_retry_handoff_converges_inline() {
+        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let hook = HookBackend::new(memory);
+        let (locker, ctx) = new_test_locker(hook.clone()).await;
+        let key = b"key";
+        seed_committed(&ctx, key, b"old").await;
+        let writer = mk_tid(1, "writer");
+        let locked = lock_commit(&locker, &ctx, &writer, key).await;
+
+        let faulted = Arc::new(AtomicBool::new(false));
+        hook.set_before({
+            let faulted = faulted.clone();
+            move |operation| {
+                let fail = matches!(operation, BackendOp::WriteIf { path, .. }
+                    if path.ends_with("/_r"))
+                    && !faulted.swap(true, Ordering::SeqCst);
+                Box::pin(async move {
+                    if fail {
+                        Err(glassdb_backend::BackendError::Precondition)
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+
+        locker
+            .keys()
+            .write_back(&writer, &locked, Some(&RejectingRetrySink))
+            .await;
+        hook.clear_before();
+
+        let entry = entry_of(&ctx, key).await.unwrap();
+        assert!(entry.lock_holders().is_empty());
+        assert_eq!(entry.current.writer(), Some(&writer));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn in_doubt_write_back_does_not_enter_the_retry_sink() {
+        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let hook = HookBackend::new(memory);
+        let (locker, ctx) = new_test_locker(hook.clone()).await;
+        let key = b"key";
+        seed_committed(&ctx, key, b"old").await;
+        let writer = mk_tid(1, "writer");
+        let locked = lock_commit(&locker, &ctx, &writer, key).await;
+
+        let faulted = Arc::new(AtomicBool::new(false));
+        hook.set_before({
+            let faulted = faulted.clone();
+            move |operation| {
+                let fail = matches!(operation, BackendOp::WriteIf { path, .. }
+                    if path.ends_with("/_r"))
+                    && !faulted.swap(true, Ordering::SeqCst);
+                Box::pin(async move {
+                    if fail {
+                        Err(glassdb_backend::BackendError::Unavailable(
+                            "simulated lost acknowledgement".into(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+
+        let sink = CapturingRetrySink::default();
+        locker
+            .keys()
+            .write_back(&writer, &locked, Some(&sink))
+            .await;
+        hook.clear_before();
+
+        assert!(sink.retry.lock().unwrap().is_none());
+        let entry = entry_of(&ctx, key).await.unwrap();
+        assert!(entry.lock_holders().is_empty());
+        assert_eq!(entry.current.writer(), Some(&writer));
     }
 
     // Routes an intent to the collection's single leaf `_r` (ADR-031: with split
@@ -1911,7 +2165,7 @@ mod tests {
             prev_writer: TxId::default(),
         }];
         ctx.monitor.commit_tx(tl).await.unwrap();
-        locker.keys().write_back(&old, &old_locked).await;
+        locker.keys().write_back(&old, &old_locked, None).await;
 
         let outcome = waiting.await.unwrap().unwrap();
         assert!(
@@ -1936,7 +2190,7 @@ mod tests {
         let receipts = lock_ok(&locker, &tx, &groups).await;
         let locked = LockedTx::from_receipts(groups, receipts).unwrap();
         // First writer of a fresh key overwrites no pointer: no GC hint.
-        let superseded = locker.keys().write_back(&tx, &locked).await;
+        let superseded = locker.keys().write_back(&tx, &locked, None).await;
         assert!(superseded.is_empty());
 
         let e = entry_of(&ctx, key).await.unwrap();
@@ -1975,7 +2229,7 @@ mod tests {
 
         let superseded = tokio::time::timeout(
             Duration::from_secs(1),
-            locker.keys().write_back(&writer, &locked),
+            locker.keys().write_back(&writer, &locked, None),
         )
         .await
         .expect("post-commit write-back waited on a structural gate");
@@ -2002,7 +2256,13 @@ mod tests {
         // First committer publishes the pointer for `key`; it supersedes nothing.
         let old = mk_tid(1, "old");
         let lt_old = lock_commit(&locker, &ctx, &old, key).await;
-        assert!(locker.keys().write_back(&old, &lt_old).await.is_empty());
+        assert!(
+            locker
+                .keys()
+                .write_back(&old, &lt_old, None)
+                .await
+                .is_empty()
+        );
         assert_eq!(
             entry_of(&ctx, key).await.unwrap().current.writer(),
             Some(&old)
@@ -2012,7 +2272,10 @@ mod tests {
         // pointer it replaced.
         let new = mk_tid(2, "new");
         let lt_new = lock_commit(&locker, &ctx, &new, key).await;
-        assert_eq!(locker.keys().write_back(&new, &lt_new).await, vec![old]);
+        assert_eq!(
+            locker.keys().write_back(&new, &lt_new, None).await,
+            vec![old]
+        );
         assert_eq!(
             entry_of(&ctx, key).await.unwrap().current.writer(),
             Some(&new)
@@ -2119,7 +2382,14 @@ mod tests {
         let group = group_of(key, put_intent(key)).remove(&root_path()).unwrap();
         locker
             .keys()
-            .write_back_routed(&tx, &group.path, Arc::new(group.intents), Requirement::Any)
+            .write_back_routed(
+                &tx,
+                &group.path,
+                Arc::new(group.intents),
+                Requirement::Any,
+                None,
+                false,
+            )
             .await
             .unwrap();
 
@@ -2581,6 +2851,8 @@ mod tests {
                     &group.path,
                     Arc::new(group.intents.clone()),
                     Requirement::Any,
+                    None,
+                    false,
                 )
                 .await
                 .unwrap();
@@ -2706,7 +2978,7 @@ mod tests {
         let write_back = tokio::spawn(async move {
             write_locker
                 .keys()
-                .write_back(&write_id, &write_locked)
+                .write_back(&write_id, &write_locked, None)
                 .await
         });
         rt::sleep(Duration::from_millis(50)).await;
@@ -2748,7 +3020,7 @@ mod tests {
             std::slice::from_ref(&acquirer)
         );
 
-        locker.keys().write_back(&writer, &locked).await;
+        locker.keys().write_back(&writer, &locked, None).await;
         let written = entry_of(&ctx, &written_key).await.unwrap();
         assert!(written.lock_holders().is_empty());
         assert_eq!(written.current.writer(), Some(&writer));
@@ -2792,7 +3064,7 @@ mod tests {
         let write_back = tokio::spawn(async move {
             task_locker
                 .keys()
-                .write_back(&task_writer, &task_locked)
+                .write_back(&task_writer, &task_locked, None)
                 .await
         });
         landed.notified().await;
@@ -2805,7 +3077,7 @@ mod tests {
         assert!(entry.lock_holders().is_empty());
         assert_eq!(entry.current.writer(), Some(&writer));
 
-        locker.keys().write_back(&writer, &locked).await;
+        locker.keys().write_back(&writer, &locked, None).await;
         assert!(locker.tx_locks_snapshot().is_empty());
         let entry = entry_of(&ctx, key).await.unwrap();
         assert!(entry.lock_holders().is_empty());

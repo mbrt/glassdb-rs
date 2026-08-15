@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted
 
 This refines [ADR-020](020-commit-write-back-protocol.md)'s asynchronous,
 idempotent write-back and [ADR-028](028-shard-mutation-coordinator.md)'s retry

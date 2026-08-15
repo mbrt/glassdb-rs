@@ -85,9 +85,10 @@ impl DatabaseBuilder {
         self
     }
 
-    /// Overrides transaction-liveness timing, including the pending lease and
-    /// cross-client clock-skew allowance. The configured skew must bound every
-    /// client using this database so a live transaction is never reclaimed.
+    /// Overrides transaction-liveness and delayed write-back timing. The
+    /// configured skew must bound every client using this database so a live
+    /// transaction is never reclaimed. Write-back timing affects only local
+    /// physical convergence and may differ safely between clients.
     pub fn protocol_timing(mut self, timing: ProtocolTiming) -> Self {
         self.engine_config.set_protocol_timing(timing);
         self

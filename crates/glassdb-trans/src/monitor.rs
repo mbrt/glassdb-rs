@@ -31,19 +31,28 @@ const FINAL_STATUS_CACHE_SIZE: usize = 16384;
 pub struct ProtocolTiming {
     pending_timeout: Duration,
     max_clock_skew: Duration,
+    write_back_quiet_period: Duration,
+    write_back_max_age: Duration,
 }
 
 impl ProtocolTiming {
-    /// Creates a timing profile with an explicit pending-transaction timeout
-    /// and maximum expected clock skew between database clients.
+    /// Creates a timing profile for transaction liveness and delayed
+    /// write-back convergence.
     ///
     /// `max_clock_skew` must conservatively bound the clocks of every client
     /// using the database; underestimating it can reclaim a live transaction.
+    /// Setting either write-back duration to zero disables delayed handoff and
+    /// leaves clean losses on the ordinary convergent retry path.
     ///
     /// # Panics
     ///
     /// Panics when `pending_timeout` is zero.
-    pub const fn new(pending_timeout: Duration, max_clock_skew: Duration) -> Self {
+    pub const fn new(
+        pending_timeout: Duration,
+        max_clock_skew: Duration,
+        write_back_quiet_period: Duration,
+        write_back_max_age: Duration,
+    ) -> Self {
         assert!(
             !pending_timeout.is_zero(),
             "pending timeout must be non-zero"
@@ -51,12 +60,19 @@ impl ProtocolTiming {
         Self {
             pending_timeout,
             max_clock_skew,
+            write_back_quiet_period,
+            write_back_max_age,
         }
     }
 
     /// Returns the shortened timing profile used by deterministic simulation.
     pub const fn simulation() -> Self {
-        Self::new(Duration::from_millis(250), Duration::from_millis(500))
+        Self::new(
+            Duration::from_millis(250),
+            Duration::from_millis(500),
+            Duration::from_millis(10),
+            Duration::from_millis(50),
+        )
     }
 
     /// Returns the interval after which an unrefreshed transaction is stale.
@@ -67,6 +83,16 @@ impl ProtocolTiming {
     /// Returns the allowance for timestamps written by another machine.
     pub const fn max_clock_skew(self) -> Duration {
         self.max_clock_skew
+    }
+
+    /// Returns how long a losing write-back waits for its leaf to become quiet.
+    pub const fn write_back_quiet_period(self) -> Duration {
+        self.write_back_quiet_period
+    }
+
+    /// Returns the maximum delay before a queued write-back becomes eligible.
+    pub const fn write_back_max_age(self) -> Duration {
+        self.write_back_max_age
     }
 
     /// Applies the skew-padded absolute lease check used for foreign timestamps
@@ -96,7 +122,12 @@ impl ProtocolTiming {
 
 impl Default for ProtocolTiming {
     fn default() -> Self {
-        Self::new(Duration::from_secs(15), Duration::from_secs(30))
+        Self::new(
+            Duration::from_secs(15),
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
     }
 }
 
@@ -2185,11 +2216,18 @@ mod tests {
         let production = ProtocolTiming::default();
         assert_eq!(production.pending_timeout(), Duration::from_secs(15));
         assert_eq!(production.max_clock_skew(), Duration::from_secs(30));
+        assert_eq!(production.write_back_quiet_period(), Duration::from_secs(1));
+        assert_eq!(production.write_back_max_age(), Duration::from_secs(5));
         assert_eq!(production.refresh_interval(), Duration::from_millis(7_500));
 
         let simulation = ProtocolTiming::simulation();
         assert_eq!(simulation.pending_timeout(), Duration::from_millis(250));
         assert_eq!(simulation.max_clock_skew(), Duration::from_millis(500));
+        assert_eq!(
+            simulation.write_back_quiet_period(),
+            Duration::from_millis(10)
+        );
+        assert_eq!(simulation.write_back_max_age(), Duration::from_millis(50));
         assert_eq!(simulation.refresh_interval(), Duration::from_millis(125));
 
         let refreshed = SystemTime::UNIX_EPOCH;
@@ -3303,7 +3341,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn dead_holder_reclaimed_by_relative_progress() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let timing = ProtocolTiming::new(Duration::from_nanos(1), Duration::from_secs(30));
+        let timing = ProtocolTiming::new(
+            Duration::from_nanos(1),
+            Duration::from_secs(30),
+            Duration::ZERO,
+            Duration::ZERO,
+        );
         let (mon, t) = new_test_monitor_with_timing(b.clone(), timing);
         let tx = TxId::from_bytes(b"dead".to_vec());
 
@@ -3328,7 +3371,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn unknown_recheck_preserves_a_concurrent_commit() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let timing = ProtocolTiming::new(Duration::from_nanos(1), Duration::ZERO);
+        let timing = ProtocolTiming::new(
+            Duration::from_nanos(1),
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
         let (observer, _o) = new_test_monitor_with_timing(b.clone(), timing);
         let (_owner, owner) = new_test_monitor(b.clone());
         let tx = TxId::from_bytes(b"committed-during-unknown-grace".to_vec());

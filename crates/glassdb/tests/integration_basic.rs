@@ -491,6 +491,8 @@ async fn builder_custom_options() {
         .protocol_timing(ProtocolTiming::new(
             Duration::from_secs(1),
             Duration::from_secs(2),
+            Duration::from_millis(10),
+            Duration::from_millis(50),
         ))
         .open()
         .await
