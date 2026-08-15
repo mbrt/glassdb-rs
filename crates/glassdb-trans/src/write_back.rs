@@ -55,6 +55,7 @@ struct PendingGroup {
 enum EnqueueResult {
     Accepted {
         forced: Option<(ObjectPath, PendingGroup)>,
+        wake_driver: bool,
     },
     Rejected(WriteBackRetry),
 }
@@ -64,6 +65,9 @@ enum DriverAction {
         path: ObjectPath,
         group: PendingGroup,
         reason: DrainReason,
+    },
+    DrainAll {
+        groups: BTreeMap<ObjectPath, PendingGroup>,
     },
     Wait(Option<rt::Instant>),
     Finished,
@@ -98,16 +102,21 @@ impl Queue {
 
         let path = retry.leaf_hint().clone();
         let tx_id = retry.tx_id().clone();
-        if let Some(existing) = self
-            .groups
-            .get_mut(&path)
-            .and_then(|group| group.retries.get_mut(&tx_id))
+        if let Some(group) = self.groups.get_mut(&path)
+            && let Some(existing) = group.retries.get_mut(&tx_id)
         {
             existing.merge(retry);
-            self.groups.get_mut(&path).unwrap().last_activity = now;
-            return EnqueueResult::Accepted { forced: None };
+            group.last_activity = now;
+            return EnqueueResult::Accepted {
+                forced: None,
+                wake_driver: false,
+            };
         }
 
+        // All groups use the same timing profile. A new group cannot precede
+        // an already armed deadline, while activity only moves a deadline
+        // later, so only the first group needs to wake an idle driver.
+        let wake_driver = self.groups.is_empty();
         let forced = (self.queued >= self.capacity)
             .then(|| self.take_oldest())
             .flatten();
@@ -123,7 +132,10 @@ impl Queue {
         group.last_activity = now;
         group.retries.insert(tx_id, retry);
         self.queued += 1;
-        EnqueueResult::Accepted { forced }
+        EnqueueResult::Accepted {
+            forced,
+            wake_driver,
+        }
     }
 
     fn close(&mut self) {
@@ -139,11 +151,10 @@ impl Queue {
         max_age: Duration,
     ) -> DriverAction {
         if self.lifecycle == Lifecycle::Closing {
-            if let Some((path, group)) = self.take_oldest() {
-                return DriverAction::Drain {
-                    path,
-                    group,
-                    reason: DrainReason::Shutdown,
+            if !self.groups.is_empty() {
+                self.queued = 0;
+                return DriverAction::DrainAll {
+                    groups: std::mem::take(&mut self.groups),
                 };
             }
             self.lifecycle = Lifecycle::Closed;
@@ -274,6 +285,11 @@ impl WriteBackScheduler {
                     group,
                     reason,
                 } => self.dispatch(path, group, reason),
+                DriverAction::DrainAll { groups } => {
+                    for (path, group) in groups {
+                        self.dispatch(path, group, DrainReason::Shutdown);
+                    }
+                }
                 DriverAction::Wait(Some(deadline)) => {
                     let delay = deadline.saturating_duration_since(rt::Instant::now());
                     tokio::select! {
@@ -338,14 +354,20 @@ impl WriteBackRetrySink for WriteBackScheduler {
         let mut queue = self.inner.queue.lock().unwrap();
         let result = queue.enqueue(rt::Instant::now(), retry);
         match result {
-            EnqueueResult::Accepted { forced } => {
+            EnqueueResult::Accepted {
+                forced,
+                wake_driver,
+            } => {
                 if let Some((path, group)) = forced {
-                    // Capacity pressure hands the oldest group to background
-                    // ownership before accepting more delayed work.
+                    // Keep registration atomic with close: once the group is
+                    // absent from the queue, shutdown must be able to observe
+                    // its new background owner.
                     self.dispatch(path, group, DrainReason::Capacity);
                 }
                 drop(queue);
-                self.inner.wake.notify_one();
+                if wake_driver {
+                    self.inner.wake.notify_one();
+                }
                 Ok(())
             }
             EnqueueResult::Rejected(retry) => {
@@ -384,13 +406,19 @@ mod tests {
         let start = rt::Instant::now();
         assert!(matches!(
             queue.enqueue(start, retry(1, &leaf)),
-            EnqueueResult::Accepted { forced: None }
+            EnqueueResult::Accepted {
+                forced: None,
+                wake_driver: true
+            }
         ));
 
         rt::sleep(Duration::from_secs(8)).await;
         assert!(matches!(
             queue.enqueue(rt::Instant::now(), retry(1, &leaf)),
-            EnqueueResult::Accepted { forced: None }
+            EnqueueResult::Accepted {
+                forced: None,
+                wake_driver: false
+            }
         ));
         assert!(matches!(
             queue.next_action(
@@ -435,16 +463,32 @@ mod tests {
         let second = path("second");
         let third = path("third");
 
-        queue.enqueue(now, retry(1, &first));
         assert!(matches!(
             queue.enqueue(now, retry(1, &first)),
-            EnqueueResult::Accepted { forced: None }
+            EnqueueResult::Accepted {
+                forced: None,
+                wake_driver: true
+            }
+        ));
+        assert!(matches!(
+            queue.enqueue(now, retry(1, &first)),
+            EnqueueResult::Accepted {
+                forced: None,
+                wake_driver: false
+            }
         ));
         assert_eq!(queue.queued, 1);
-        queue.enqueue(now, retry(2, &second));
+        assert!(matches!(
+            queue.enqueue(now, retry(2, &second)),
+            EnqueueResult::Accepted {
+                forced: None,
+                wake_driver: false
+            }
+        ));
         let forced = match queue.enqueue(now, retry(3, &third)) {
             EnqueueResult::Accepted {
                 forced: Some((_, group)),
+                wake_driver: false,
             } => group,
             _ => panic!("capacity did not force the oldest group"),
         };
@@ -462,24 +506,27 @@ mod tests {
 
     #[test]
     fn close_rejects_new_work_and_forces_pending_groups() {
-        let mut queue = Queue::new(2, true);
+        let mut queue = Queue::new(3, true);
         let now = rt::Instant::now();
         let first = path("first");
         let second = path("second");
+        let third = path("third");
         queue.enqueue(now, retry(1, &first));
+        queue.enqueue(now, retry(2, &second));
         queue.close();
 
         assert!(matches!(
-            queue.enqueue(now, retry(2, &second)),
+            queue.enqueue(now, retry(3, &third)),
             EnqueueResult::Rejected(_)
         ));
-        assert!(matches!(
-            queue.next_action(now, Duration::MAX, Duration::MAX),
-            DriverAction::Drain {
-                reason: DrainReason::Shutdown,
-                ..
-            }
-        ));
+        let groups = match queue.next_action(now, Duration::MAX, Duration::MAX) {
+            DriverAction::DrainAll { groups } => groups,
+            _ => panic!("shutdown did not drain every pending group"),
+        };
+        assert_eq!(groups.len(), 2);
+        assert!(groups.contains_key(&first));
+        assert!(groups.contains_key(&second));
+        assert_eq!(queue.queued, 0);
         assert!(matches!(
             queue.next_action(now, Duration::MAX, Duration::MAX),
             DriverAction::Finished
