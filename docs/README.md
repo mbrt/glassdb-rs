@@ -6,7 +6,6 @@ the **living narrative** that indexes and explains them (architecture + designs)
 | Area                | What it holds                                                        | Lifecycle |
 | ------------------- | -------------------------------------------------------------------- | --------- |
 | [`architecture.md`](architecture.md) | The high-level architecture and design of GlassDB. | Living — kept current. |
-| [`migrations.md`](migrations.md) | Breaking API replacements for downstream users and implementers. | Living — updated with releases. |
 | [`adr/`](adr/)      | Architecture Decision Records: one significant decision each, in sequence. | Frozen — only status/links change after acceptance. |
 | [`designs/`](designs/) | Design explorations and overviews for significant work. A design may precede ADR extraction or serve as an umbrella narrative and decision index. | Living — edited as the effort progresses. |
 | [`guides/`](guides/) | Process and how-to: releasing, reviewing, performance tracking, testing. | Living. |
