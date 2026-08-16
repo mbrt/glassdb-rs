@@ -367,6 +367,22 @@ async fn ro_tx(db: &Database, collection: &Collection, keys: &[Vec<u8>]) -> Resu
 mod tests {
     use super::*;
 
+    #[test]
+    fn worker_distribution_keeps_every_open_database_active() {
+        let cases = [
+            (1, 5, vec![1]),
+            (5, 5, vec![1, 1, 1, 1, 1]),
+            (8, 5, vec![2, 2, 2, 1, 1]),
+            (10, 5, vec![2, 2, 2, 2, 2]),
+        ];
+        for (workers, databases, expected) in cases {
+            let distribution = split_workers(workers, databases);
+            assert_eq!(distribution, expected);
+            assert_eq!(distribution.iter().sum::<usize>(), workers);
+            assert!(distribution.iter().all(|&count| count > 0));
+        }
+    }
+
     #[tokio::test]
     async fn seeded_selection_and_logical_counts_are_stable() {
         let worker_plans = plans(3, 2, Duration::from_secs(1));

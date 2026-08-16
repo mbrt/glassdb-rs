@@ -227,42 +227,16 @@ clients and transactions:
 
 ![](docs/img/tx-throughput.png)
 
-The graph shows separately the three different types of transactions, where the
-bold line is the median number of transactions per second and the error band
-includes the 10th and 90th percentiles.
+The graph shows separately four different types of transactions, running
+concurrently: single and multi-key reads and read-writes.
 
 As you can see the median throughput increases linearly (better for reads than
-for writes), touching 2.5k transactions per second with 500 concurrent clients.
+for writes), touching 2.5k transactions per second with 200 concurrent workers.
 
-To note also the slight performance degradation at the 10th percentile with more
-than 30 concurrent DBs. This is due to the increased probability of conflicts
-between transactions (e.g. when writers race each other).
-
-See the transaction retries below, hurting performance at the higher
-percentiles:
-
-![](docs/img/retries.png)
-
-Since each transaction operates on multiple keys, here is for completeness the
-graph of those. Each operation is a key being read or written:
-
-![](docs/img/ops-latency.png)
-
-It's interesting to see that weak reads are losing against strong reads in this
-benchmark, for several reasons:
-
-- Given the uniform distribution of reads, it's unlikely that a weak read will
-  hit the same key twice within the 10 seconds allowed staleness time frame.
-- Weak reads are currently translated into strong reads when the value is not
-  present in cache.
-- Strong reads operate on two keys in the same transactions, weak reads are a
-  "single shot".
-
-Taken all together this means that weak reads in this case translate mostly into
-strong reads on a single key. These tend to perform worse (in terms of
-throughput) than reading two keys per transactions, because they can be done in
-parallel. The advantage of weak reads in this case comes with less sensitivity
-to retries, as you can see from the lower variability at higher percentiles.
+Note the plateau for multi-key read-writes, which is due to AWS throttling.
+Nothing in principle prevents us from scaling further, by spreading the load
+into more collections (which are independent of each other when S3 assigns them
+to different partitions).
 
 ### Latency
 

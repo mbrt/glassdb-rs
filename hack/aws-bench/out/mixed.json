@@ -1,0 +1,653 @@
+{
+  "backend": "s3",
+  "modelTimeSpeedup": 1.0,
+  "runs": [
+    {
+      "cells": [
+        {
+          "affinityPct": 0,
+          "aggregateOps": {
+            "attemptedTxn": 8901,
+            "objListsPerTx": 0.003932142455903831,
+            "objReadsPerTx": 3.0917874396135265,
+            "objWritesPerTx": 1.2514324233232221,
+            "retriesPerTx": 0.010560611167284574,
+            "totalOpsPerTx": 4.347152005392653,
+            "txn": 8901
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.2651387484552297,
+            "coordinatorMembersPerRound": 1.050823192555476,
+            "coordinatorRoundsPerTx": 0.9416919447253118,
+            "coordinatorSubmissionsPerTx": 0.989551735760027,
+            "directCandidatesPerTx": 0.09302325581395349,
+            "directLandRate": 0.9963768115942029,
+            "directLandedPerTx": 0.09268621503201888
+          },
+          "databases": 4,
+          "failures": 0,
+          "mode": "lo",
+          "setupSplits": 124,
+          "shapes": [
+            {
+              "committed": 826,
+              "converged": true,
+              "p50Ms": 163.336562,
+              "p90Ms": 372.31174500000003,
+              "relCi": 0.06819712206264365,
+              "shape": "rwSingle",
+              "txPerSec": 33.72595960968559
+            },
+            {
+              "committed": 393,
+              "converged": true,
+              "p50Ms": 277.58326500000004,
+              "p90Ms": 940.179305,
+              "relCi": 0.09886892137184239,
+              "shape": "rwMany",
+              "txPerSec": 16.04637041677078
+            },
+            {
+              "committed": 6793,
+              "converged": true,
+              "p50Ms": 28.484987,
+              "p90Ms": 38.710287,
+              "relCi": 0.02378073448913284,
+              "shape": "roSingle",
+              "txPerSec": 277.3613060214587
+            },
+            {
+              "committed": 889,
+              "converged": true,
+              "p50Ms": 171.704481,
+              "p90Ms": 239.244387,
+              "relCi": 0.06573629014874269,
+              "shape": "roMulti",
+              "txPerSec": 36.29827765297243
+            }
+          ],
+          "splitSettleWallMs": 67840
+        },
+        {
+          "affinityPct": 25,
+          "aggregateOps": {
+            "attemptedTxn": 9840,
+            "objListsPerTx": 0.0019308943089430895,
+            "objReadsPerTx": 2.9723577235772356,
+            "objWritesPerTx": 1.1086382113821138,
+            "retriesPerTx": 0.00894308943089431,
+            "totalOpsPerTx": 4.082926829268293,
+            "txn": 9840
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.2138211382113821,
+            "coordinatorMembersPerRound": 1.0531977775150727,
+            "coordinatorRoundsPerTx": 0.8596544715447154,
+            "coordinatorSubmissionsPerTx": 0.9053861788617886,
+            "directCandidatesPerTx": 0.09359756097560976,
+            "directLandRate": 0.9869706840390879,
+            "directLandedPerTx": 0.0923780487804878
+          },
+          "databases": 4,
+          "failures": 0,
+          "mode": "lo",
+          "setupSplits": 124,
+          "shapes": [
+            {
+              "committed": 914,
+              "converged": true,
+              "p50Ms": 56.853139,
+              "p90Ms": 370.245544,
+              "relCi": 0.064831037762251,
+              "shape": "rwSingle",
+              "txPerSec": 30.440149509689128
+            },
+            {
+              "committed": 395,
+              "converged": true,
+              "p50Ms": 234.88673,
+              "p90Ms": 925.407197,
+              "relCi": 0.09861830266361901,
+              "shape": "rwMany",
+              "txPerSec": 13.15520668727186
+            },
+            {
+              "committed": 7498,
+              "converged": true,
+              "p50Ms": 22.248337,
+              "p90Ms": 36.456109,
+              "relCi": 0.022635148773297923,
+              "shape": "roSingle",
+              "txPerSec": 249.71579300406486
+            },
+            {
+              "committed": 1033,
+              "converged": true,
+              "p50Ms": 150.770857,
+              "p90Ms": 219.05718800000002,
+              "relCi": 0.0609825963461314,
+              "shape": "roMulti",
+              "txPerSec": 34.40336268109112
+            }
+          ],
+          "splitSettleWallMs": 64311
+        },
+        {
+          "affinityPct": 50,
+          "aggregateOps": {
+            "attemptedTxn": 9661,
+            "objListsPerTx": 0.0017596522099161578,
+            "objReadsPerTx": 2.7852189214367042,
+            "objWritesPerTx": 1.1330090052789565,
+            "retriesPerTx": 0.010971949073594866,
+            "totalOpsPerTx": 3.919987578925577,
+            "txn": 9661
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.2139530069350999,
+            "coordinatorMembersPerRound": 1.0589063600093875,
+            "coordinatorRoundsPerTx": 0.8821033019356175,
+            "coordinatorSubmissionsPerTx": 0.9340647966049064,
+            "directCandidatesPerTx": 0.1069247489907877,
+            "directLandRate": 0.9845111326234269,
+            "directLandedPerTx": 0.10526860573439603
+          },
+          "databases": 4,
+          "failures": 0,
+          "mode": "lo",
+          "setupSplits": 124,
+          "shapes": [
+            {
+              "committed": 1024,
+              "converged": true,
+              "p50Ms": 42.2637,
+              "p90Ms": 343.50822800000003,
+              "relCi": 0.06125,
+              "shape": "rwSingle",
+              "txPerSec": 45.29444222373255
+            },
+            {
+              "committed": 393,
+              "converged": true,
+              "p50Ms": 269.47781,
+              "p90Ms": 989.128227,
+              "relCi": 0.09886892137184239,
+              "shape": "rwMany",
+              "txPerSec": 17.38351118379445
+            },
+            {
+              "committed": 7272,
+              "converged": true,
+              "p50Ms": 14.557192,
+              "p90Ms": 38.081809,
+              "relCi": 0.022984186461189535,
+              "shape": "roSingle",
+              "txPerSec": 321.661305098197
+            },
+            {
+              "committed": 972,
+              "converged": true,
+              "p50Ms": 146.07317799999998,
+              "p90Ms": 232.663411,
+              "relCi": 0.06286702931175925,
+              "shape": "roMulti",
+              "txPerSec": 42.99433255727983
+            }
+          ],
+          "splitSettleWallMs": 65309
+        },
+        {
+          "affinityPct": 75,
+          "aggregateOps": {
+            "attemptedTxn": 8474,
+            "objListsPerTx": 0.0018881283927307056,
+            "objReadsPerTx": 2.54850129808827,
+            "objWritesPerTx": 1.2033278262921878,
+            "retriesPerTx": 0.010974746282747227,
+            "totalOpsPerTx": 3.7537172527731886,
+            "txn": 8474
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.17748406891668633,
+            "coordinatorMembersPerRound": 1.0763037731314589,
+            "coordinatorRoundsPerTx": 0.9820627802690582,
+            "coordinatorSubmissionsPerTx": 1.0569978758555583,
+            "directCandidatesPerTx": 0.1321689874911494,
+            "directLandRate": 0.9901785714285715,
+            "directLandedPerTx": 0.13087089922114703
+          },
+          "databases": 4,
+          "failures": 0,
+          "mode": "lo",
+          "setupSplits": 116,
+          "shapes": [
+            {
+              "committed": 1113,
+              "converged": true,
+              "p50Ms": 36.746112999999994,
+              "p90Ms": 311.573372,
+              "relCi": 0.05875008363435771,
+              "shape": "rwSingle",
+              "txPerSec": 56.703801120264174
+            },
+            {
+              "committed": 398,
+              "converged": true,
+              "p50Ms": 159.11257600000002,
+              "p90Ms": 675.126749,
+              "relCi": 0.09824592259494876,
+              "shape": "rwMany",
+              "txPerSec": 20.276830602597542
+            },
+            {
+              "committed": 6071,
+              "converged": true,
+              "p50Ms": 12.896268000000001,
+              "p90Ms": 38.039067,
+              "relCi": 0.025155094600990472,
+              "shape": "roSingle",
+              "txPerSec": 309.29808703151343
+            },
+            {
+              "committed": 892,
+              "converged": true,
+              "p50Ms": 108.489895,
+              "p90Ms": 225.52214600000002,
+              "relCi": 0.06562565395787766,
+              "shape": "roMulti",
+              "txPerSec": 45.44455459982577
+            }
+          ],
+          "splitSettleWallMs": 63562
+        },
+        {
+          "affinityPct": 100,
+          "aggregateOps": {
+            "attemptedTxn": 3731,
+            "objListsPerTx": 0.0,
+            "objReadsPerTx": 2.0595014741356206,
+            "objWritesPerTx": 2.072098633074243,
+            "retriesPerTx": 0.009648887697668185,
+            "totalOpsPerTx": 4.131600107209863,
+            "txn": 3731
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.0,
+            "coordinatorMembersPerRound": 1.135304537402916,
+            "coordinatorRoundsPerTx": 1.967032967032967,
+            "coordinatorSubmissionsPerTx": 2.233181452693648,
+            "directCandidatesPerTx": 0.26239614044492093,
+            "directLandRate": 0.9969356486210419,
+            "directLandedPerTx": 0.26159206647011524
+          },
+          "databases": 4,
+          "failures": 0,
+          "mode": "lo",
+          "setupSplits": 116,
+          "shapes": [
+            {
+              "committed": 977,
+              "converged": true,
+              "p50Ms": 39.793632,
+              "p90Ms": 72.909849,
+              "relCi": 0.06270595543879642,
+              "shape": "rwSingle",
+              "txPerSec": 163.14171078295857
+            },
+            {
+              "committed": 400,
+              "converged": true,
+              "p50Ms": 106.525441,
+              "p90Ms": 166.22853500000002,
+              "relCi": 0.098,
+              "shape": "rwMany",
+              "txPerSec": 66.79291752615933
+            },
+            {
+              "committed": 1856,
+              "converged": true,
+              "p50Ms": 18.172425,
+              "p90Ms": 46.944843999999996,
+              "relCi": 0.04549535785337771,
+              "shape": "roSingle",
+              "txPerSec": 309.9191335435557
+            },
+            {
+              "committed": 498,
+              "converged": true,
+              "p50Ms": 83.993454,
+              "p90Ms": 136.305016,
+              "relCi": 0.08782970012985128,
+              "shape": "roMulti",
+              "txPerSec": 83.15717453014815
+            }
+          ],
+          "splitSettleWallMs": 65807
+        },
+        {
+          "affinityPct": 0,
+          "aggregateOps": {
+            "attemptedTxn": 5311,
+            "objListsPerTx": 0.016757672754660138,
+            "objReadsPerTx": 1.3357183204669554,
+            "objWritesPerTx": 0.8019205422707588,
+            "retriesPerTx": 0.2781020523441913,
+            "totalOpsPerTx": 2.154396535492374,
+            "txn": 5311
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.09659197891169272,
+            "coordinatorMembersPerRound": 1.7746268656716417,
+            "coordinatorRoundsPerTx": 0.5046130672189795,
+            "coordinatorSubmissionsPerTx": 0.895499905855771,
+            "directCandidatesPerTx": 0.14234607418565243,
+            "directLandRate": 0.30158730158730157,
+            "directLandedPerTx": 0.04292976840519676
+          },
+          "databases": 4,
+          "failures": 0,
+          "mode": "hi",
+          "setupSplits": 0,
+          "shapes": [
+            {
+              "committed": 475,
+              "converged": true,
+              "p50Ms": 185.93010900000002,
+              "p90Ms": 1971.5175230000002,
+              "relCi": 0.0899309676772602,
+              "shape": "rwSingle",
+              "txPerSec": 9.760302754264831
+            },
+            {
+              "committed": 393,
+              "converged": true,
+              "p50Ms": 264.379814,
+              "p90Ms": 2243.3144770000004,
+              "relCi": 0.09886892137184239,
+              "shape": "rwMany",
+              "txPerSec": 8.075366225029558
+            },
+            {
+              "committed": 2707,
+              "converged": true,
+              "p50Ms": 19.651728,
+              "p90Ms": 93.442424,
+              "relCi": 0.03767141588043441,
+              "shape": "roSingle",
+              "txPerSec": 55.623451146650886
+            },
+            {
+              "committed": 1736,
+              "converged": true,
+              "p50Ms": 22.37067,
+              "p90Ms": 219.219399,
+              "relCi": 0.04704150535225729,
+              "shape": "roMulti",
+              "txPerSec": 35.671337637322864
+            }
+          ],
+          "splitSettleWallMs": 10048
+        },
+        {
+          "affinityPct": 25,
+          "aggregateOps": {
+            "attemptedTxn": 7012,
+            "objListsPerTx": 0.011694238448374215,
+            "objReadsPerTx": 0.988876212207644,
+            "objWritesPerTx": 0.5372219053051911,
+            "retriesPerTx": 0.18625213918996006,
+            "totalOpsPerTx": 1.5377923559612094,
+            "txn": 7012
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.037079292641186534,
+            "coordinatorMembersPerRound": 1.986864406779661,
+            "coordinatorRoundsPerTx": 0.3365658870507701,
+            "coordinatorSubmissionsPerTx": 0.6687107815173987,
+            "directCandidatesPerTx": 0.10139760410724473,
+            "directLandRate": 0.3656821378340366,
+            "directLandedPerTx": 0.037079292641186534
+          },
+          "databases": 4,
+          "failures": 0,
+          "mode": "hi",
+          "setupSplits": 0,
+          "shapes": [
+            {
+              "committed": 468,
+              "converged": true,
+              "p50Ms": 126.192527,
+              "p90Ms": 827.6498220000001,
+              "relCi": 0.09060103205012075,
+              "shape": "rwSingle",
+              "txPerSec": 7.5304069698430505
+            },
+            {
+              "committed": 394,
+              "converged": true,
+              "p50Ms": 239.073855,
+              "p90Ms": 905.198635,
+              "relCi": 0.09874337348453616,
+              "shape": "rwMany",
+              "txPerSec": 6.339701523780884
+            },
+            {
+              "committed": 3732,
+              "converged": true,
+              "p50Ms": 13.766502,
+              "p90Ms": 45.913278000000005,
+              "relCi": 0.032083759619110905,
+              "shape": "roSingle",
+              "txPerSec": 60.05016754928232
+            },
+            {
+              "committed": 2418,
+              "converged": true,
+              "p50Ms": 13.751601,
+              "p90Ms": 81.29478599999999,
+              "relCi": 0.03985913990432212,
+              "shape": "roMulti",
+              "txPerSec": 38.90710206650824
+            }
+          ],
+          "splitSettleWallMs": 10052
+        },
+        {
+          "affinityPct": 50,
+          "aggregateOps": {
+            "attemptedTxn": 4671,
+            "objListsPerTx": 0.012202954399486191,
+            "objReadsPerTx": 1.2185827445943054,
+            "objWritesPerTx": 0.8413615928066795,
+            "retriesPerTx": 0.3127809890815671,
+            "totalOpsPerTx": 2.072147291800471,
+            "txn": 4671
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.08798972382787412,
+            "coordinatorMembersPerRound": 2.0628381190178944,
+            "coordinatorRoundsPerTx": 0.5144508670520231,
+            "coordinatorSubmissionsPerTx": 1.0612288589167203,
+            "directCandidatesPerTx": 0.1661314493684436,
+            "directLandRate": 0.31056701030927836,
+            "directLandedPerTx": 0.05159494754870477
+          },
+          "databases": 4,
+          "failures": 0,
+          "mode": "hi",
+          "setupSplits": 0,
+          "shapes": [
+            {
+              "committed": 476,
+              "converged": true,
+              "p50Ms": 209.481044,
+              "p90Ms": 1440.4717229999999,
+              "relCi": 0.08983645270876471,
+              "shape": "rwSingle",
+              "txPerSec": 9.946221003896545
+            },
+            {
+              "committed": 394,
+              "converged": true,
+              "p50Ms": 353.964294,
+              "p90Ms": 1717.439176,
+              "relCi": 0.09874337348453616,
+              "shape": "rwMany",
+              "txPerSec": 8.232796311976353
+            },
+            {
+              "committed": 2447,
+              "converged": true,
+              "p50Ms": 21.689743,
+              "p90Ms": 79.252696,
+              "relCi": 0.039622245694845945,
+              "shape": "roSingle",
+              "txPerSec": 51.131097680620115
+            },
+            {
+              "committed": 1354,
+              "converged": true,
+              "p50Ms": 23.737509,
+              "p90Ms": 308.589017,
+              "relCi": 0.053265589669467116,
+              "shape": "roMulti",
+              "txPerSec": 28.29240140965807
+            }
+          ],
+          "splitSettleWallMs": 10050
+        },
+        {
+          "affinityPct": 75,
+          "aggregateOps": {
+            "attemptedTxn": 6713,
+            "objListsPerTx": 0.022940563086548488,
+            "objReadsPerTx": 0.8797854908386712,
+            "objWritesPerTx": 0.6521674363175928,
+            "retriesPerTx": 0.28243706241620736,
+            "totalOpsPerTx": 1.5548934902428124,
+            "txn": 6713
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.04751973782213616,
+            "coordinatorMembersPerRound": 2.5895316804407713,
+            "coordinatorRoundsPerTx": 0.37851929092805003,
+            "coordinatorSubmissionsPerTx": 0.9801876955161627,
+            "directCandidatesPerTx": 0.13838820199612692,
+            "directLandRate": 0.26264800861141013,
+            "directLandedPerTx": 0.036347385669596305
+          },
+          "databases": 4,
+          "failures": 0,
+          "mode": "hi",
+          "setupSplits": 0,
+          "shapes": [
+            {
+              "committed": 548,
+              "converged": true,
+              "p50Ms": 274.311736,
+              "p90Ms": 969.105265,
+              "relCi": 0.08372705045624257,
+              "shape": "rwSingle",
+              "txPerSec": 7.607416329314531
+            },
+            {
+              "committed": 393,
+              "converged": true,
+              "p50Ms": 504.43403499999994,
+              "p90Ms": 1275.738308,
+              "relCi": 0.09886892137184239,
+              "shape": "rwMany",
+              "txPerSec": 5.455683576698136
+            },
+            {
+              "committed": 3720,
+              "converged": true,
+              "p50Ms": 17.727581,
+              "p90Ms": 57.580459,
+              "relCi": 0.0321354659534137,
+              "shape": "roSingle",
+              "txPerSec": 51.64158483018553
+            },
+            {
+              "committed": 2052,
+              "converged": true,
+              "p50Ms": 25.739352,
+              "p90Ms": 300.000587,
+              "relCi": 0.043268056997458094,
+              "shape": "roMulti",
+              "txPerSec": 28.486164490674657
+            }
+          ],
+          "splitSettleWallMs": 10051
+        },
+        {
+          "affinityPct": 100,
+          "aggregateOps": {
+            "attemptedTxn": 9725,
+            "objListsPerTx": 0.003290488431876607,
+            "objReadsPerTx": 0.37038560411311056,
+            "objWritesPerTx": 0.4334190231362468,
+            "retriesPerTx": 0.2728020565552699,
+            "totalOpsPerTx": 0.8070951156812339,
+            "txn": 9725
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.0,
+            "coordinatorMembersPerRound": 3.958677685950413,
+            "coordinatorRoundsPerTx": 0.24884318766066837,
+            "coordinatorSubmissionsPerTx": 0.9850899742930591,
+            "directCandidatesPerTx": 0.10107969151670951,
+            "directLandRate": 0.1525940996948118,
+            "directLandedPerTx": 0.015424164524421594
+          },
+          "databases": 4,
+          "failures": 0,
+          "mode": "hi",
+          "setupSplits": 0,
+          "shapes": [
+            {
+              "committed": 546,
+              "converged": true,
+              "p50Ms": 530.615691,
+              "p90Ms": 702.23477,
+              "relCi": 0.08388025653213893,
+              "shape": "rwSingle",
+              "txPerSec": 17.695839398616318
+            },
+            {
+              "committed": 395,
+              "converged": true,
+              "p50Ms": 592.693179,
+              "p90Ms": 734.6683790000001,
+              "relCi": 0.09861830266361901,
+              "shape": "rwMany",
+              "txPerSec": 12.801934920976464
+            },
+            {
+              "committed": 5824,
+              "converged": true,
+              "p50Ms": 26.666718,
+              "p90Ms": 53.762342,
+              "relCi": 0.025682978499687,
+              "shape": "roSingle",
+              "txPerSec": 188.7556157126761
+            },
+            {
+              "committed": 2960,
+              "converged": true,
+              "p50Ms": 29.630689,
+              "p90Ms": 386.64075799999995,
+              "relCi": 0.036025516482596574,
+              "shape": "roMulti",
+              "txPerSec": 95.93348569689608
+            }
+          ],
+          "splitSettleWallMs": 10050
+        }
+      ],
+      "run": 1
+    }
+  ],
+  "scenario": "mixed",
+  "schemaVersion": 1
+}

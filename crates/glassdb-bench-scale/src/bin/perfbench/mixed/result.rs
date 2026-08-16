@@ -5,6 +5,8 @@ use serde::Serialize;
 use glassdb::Stats;
 use glassdb_bench_scale::bench::Results;
 
+use super::options::CellDimension;
+
 /// One shape's fixed timing observations for a cell report.
 pub(super) struct ShapeMeasurement {
     shape: &'static str,
@@ -22,7 +24,9 @@ impl ShapeMeasurement {
 pub(super) struct CellMetadata {
     mode: &'static str,
     affinity_pct: u8,
+    database_limit: usize,
     databases: usize,
+    workers_per_shape: usize,
     setup_splits: u64,
     split_settle_elapsed: Duration,
 }
@@ -32,14 +36,18 @@ impl CellMetadata {
     pub(super) fn new(
         mode: &'static str,
         affinity_pct: u8,
+        database_limit: usize,
         databases: usize,
+        workers_per_shape: usize,
         setup_splits: u64,
         split_settle_elapsed: Duration,
     ) -> Self {
         Self {
             mode,
             affinity_pct,
+            database_limit,
             databases,
+            workers_per_shape,
             setup_splits,
             split_settle_elapsed,
         }
@@ -65,7 +73,9 @@ impl RunResult {
 pub(super) struct CellResult {
     mode: String,
     affinity_pct: u8,
+    database_limit: usize,
     databases: usize,
+    workers_per_shape: usize,
     setup_splits: u64,
     split_settle_wall_ms: u64,
     failures: u64,
@@ -103,7 +113,9 @@ impl CellResult {
         Self {
             mode: metadata.mode.to_string(),
             affinity_pct: metadata.affinity_pct,
+            database_limit: metadata.database_limit,
             databases: metadata.databases,
+            workers_per_shape: metadata.workers_per_shape,
             setup_splits: metadata.setup_splits,
             split_settle_wall_ms: metadata
                 .split_settle_elapsed
@@ -119,15 +131,27 @@ impl CellResult {
 }
 
 /// Formats the progress line emitted before a cell starts.
-pub(super) fn cell_started(run: usize, mode: &str, affinity_pct: u8) -> String {
-    format!("mixed: run={run} mode={mode} affinity={affinity_pct}%")
+pub(super) fn cell_started(run: usize, dimension: CellDimension) -> String {
+    format!(
+        "mixed: run={run} mode={} affinity={}% databases={}/{} workers/shape={}",
+        dimension.mode.label(),
+        dimension.affinity_pct,
+        dimension.databases,
+        dimension.database_limit,
+        dimension.workers_per_shape,
+    )
 }
 
 /// Formats the warning emitted when a cell misses its confidence target.
-pub(super) fn cell_capped(mode: &str, affinity_pct: u8, target_ci: f64) -> String {
+pub(super) fn cell_capped(dimension: CellDimension, target_ci: f64) -> String {
     format!(
-        "  note: mode={mode} affinity={affinity_pct}% hit --max-duration before every shape reached \
-         --target-ci={target_ci}"
+        "  note: mode={} affinity={}% databases={}/{} workers/shape={} hit --max-duration before \
+         every shape reached --target-ci={target_ci}",
+        dimension.mode.label(),
+        dimension.affinity_pct,
+        dimension.databases,
+        dimension.database_limit,
+        dimension.workers_per_shape,
     )
 }
 
@@ -375,13 +399,13 @@ mod tests {
             },
         ];
         let cell = CellResult::summarize(
-            CellMetadata::new("hi", 25, 2, 4, Duration::from_millis(1500)),
+            CellMetadata::new("hi", 25, 2, 2, 8, 4, Duration::from_millis(1500)),
             measurements,
             &deltas,
             3,
         );
         let empty_cell = CellResult::summarize(
-            CellMetadata::new("lo", 0, 0, 0, Duration::ZERO),
+            CellMetadata::new("lo", 0, 0, 0, 0, 0, Duration::ZERO),
             std::iter::empty(),
             &[],
             3,
@@ -412,6 +436,7 @@ mod tests {
         "directLandRate": 0.6666666666666666,
         "directLandedPerTx": 1.3333333333333333
       },
+      "databaseLimit": 2,
       "databases": 2,
       "failures": 0,
       "mode": "hi",
@@ -436,7 +461,8 @@ mod tests {
           "txPerSec": 0.0
         }
       ],
-      "splitSettleWallMs": 1500
+      "splitSettleWallMs": 1500,
+      "workersPerShape": 8
     },
     {
       "affinityPct": 0,
@@ -458,12 +484,14 @@ mod tests {
         "directLandRate": 0.0,
         "directLandedPerTx": 0.0
       },
+      "databaseLimit": 0,
       "databases": 0,
       "failures": 0,
       "mode": "lo",
       "setupSplits": 0,
       "shapes": [],
-      "splitSettleWallMs": 0
+      "splitSettleWallMs": 0,
+      "workersPerShape": 0
     }
   ],
   "run": 7
