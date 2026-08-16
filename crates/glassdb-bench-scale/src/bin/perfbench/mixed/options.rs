@@ -21,13 +21,15 @@ pub(crate) struct Options {
     #[arg(long, default_value_t = 0.1)]
     pub(super) target_ci: f64,
     /// Total concurrent workers per shape, split as evenly as possible across
-    /// the Databases.
-    #[arg(long, default_value_t = 8)]
-    pub(super) workers_per_shape: usize,
-    /// Client `Database`s in each cell. Every Database runs every shape and has
-    /// a distinct home collection. Must not exceed `--workers-per-shape`.
-    #[arg(long, default_value_t = 4)]
-    pub(super) databases: usize,
+    /// the Databases. A comma-separated list sweeps several worker counts.
+    #[arg(long, value_delimiter = ',', default_value = "8")]
+    workers_per_shape: Vec<usize>,
+    /// Maximum client `Database`s in each cell. The active count is the smaller
+    /// of this limit and the worker count, so every open Database runs every
+    /// shape and has a distinct home collection. A comma-separated list sweeps
+    /// several limits.
+    #[arg(long, value_delimiter = ',', default_value = "4")]
+    databases: Vec<usize>,
     /// Keys touched by the multi-key shapes (`rwMany`, `roMulti`); clamped to
     /// the pool size in the `hi` mode.
     #[arg(long, default_value_t = 10)]
@@ -62,23 +64,31 @@ impl Options {
     pub(super) fn cell_dimensions(&self) -> Result<Vec<CellDimension>, Box<dyn Error>> {
         self.validate()?;
         let modes = parse_modes(&self.modes)?;
-        Ok(modes
-            .into_iter()
-            .flat_map(|mode| {
-                self.affinities
-                    .iter()
-                    .copied()
-                    .map(move |affinity_pct| CellDimension { mode, affinity_pct })
-            })
-            .collect())
+        let mut dimensions = Vec::new();
+        for mode in modes {
+            for &affinity_pct in &self.affinities {
+                for &database_limit in &self.databases {
+                    for &workers_per_shape in &self.workers_per_shape {
+                        dimensions.push(CellDimension {
+                            mode,
+                            affinity_pct,
+                            database_limit,
+                            databases: database_limit.min(workers_per_shape),
+                            workers_per_shape,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(dimensions)
     }
 
     fn validate(&self) -> Result<(), Box<dyn Error>> {
-        if self.workers_per_shape == 0 {
-            return Err("--workers-per-shape must be >= 1".into());
+        if self.workers_per_shape.is_empty() || self.workers_per_shape.contains(&0) {
+            return Err("--workers-per-shape must contain values >= 1".into());
         }
-        if self.databases == 0 || self.databases > self.workers_per_shape {
-            return Err("--databases must be between 1 and --workers-per-shape".into());
+        if self.databases.is_empty() || self.databases.contains(&0) {
+            return Err("--databases must contain values >= 1".into());
         }
         if self.affinities.is_empty() || self.affinities.iter().any(|&a| a > 100) {
             return Err("--affinities must contain percentages from 0 through 100".into());
@@ -97,6 +107,9 @@ impl Options {
 pub(super) struct CellDimension {
     pub(super) mode: Mode,
     pub(super) affinity_pct: u8,
+    pub(super) database_limit: usize,
+    pub(super) databases: usize,
+    pub(super) workers_per_shape: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -151,7 +164,16 @@ mod tests {
             .options
             .cell_dimensions()?
             .into_iter()
-            .map(|cell| format!("{}:{}", cell.mode.label(), cell.affinity_pct))
+            .map(|cell| {
+                format!(
+                    "{}:{}:limit{}:db{}:w{}",
+                    cell.mode.label(),
+                    cell.affinity_pct,
+                    cell.database_limit,
+                    cell.databases,
+                    cell.workers_per_shape
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n"))
     }
@@ -161,11 +183,37 @@ mod tests {
         let cases: &[(&[&str], &str)] = &[
             (
                 &["perfbench"],
-                "lo:0\nlo:25\nlo:50\nlo:75\nlo:100\nhi:0\nhi:25\nhi:50\nhi:75\nhi:100",
+                "lo:0:limit4:db4:w8\n\
+                 lo:25:limit4:db4:w8\n\
+                 lo:50:limit4:db4:w8\n\
+                 lo:75:limit4:db4:w8\n\
+                 lo:100:limit4:db4:w8\n\
+                 hi:0:limit4:db4:w8\n\
+                 hi:25:limit4:db4:w8\n\
+                 hi:50:limit4:db4:w8\n\
+                 hi:75:limit4:db4:w8\n\
+                 hi:100:limit4:db4:w8",
             ),
             (
-                &["perfbench", "--modes", "hi,lo", "--affinities", "100,25"],
-                "hi:100\nhi:25\nlo:100\nlo:25",
+                &[
+                    "perfbench",
+                    "--modes",
+                    "hi,lo",
+                    "--affinities",
+                    "100",
+                    "--databases",
+                    "1,3",
+                    "--workers-per-shape",
+                    "1,5",
+                ],
+                "hi:100:limit1:db1:w1\n\
+                 hi:100:limit1:db1:w5\n\
+                 hi:100:limit3:db1:w1\n\
+                 hi:100:limit3:db3:w5\n\
+                 lo:100:limit1:db1:w1\n\
+                 lo:100:limit1:db1:w5\n\
+                 lo:100:limit3:db1:w1\n\
+                 lo:100:limit3:db3:w5",
             ),
         ];
 
@@ -180,15 +228,11 @@ mod tests {
         let cases: &[(&[&str], &str)] = &[
             (
                 &["perfbench", "--workers-per-shape", "0"],
-                "--workers-per-shape must be >= 1",
+                "--workers-per-shape must contain values >= 1",
             ),
             (
                 &["perfbench", "--databases", "0"],
-                "--databases must be between 1 and --workers-per-shape",
-            ),
-            (
-                &["perfbench", "--workers-per-shape", "2", "--databases", "3"],
-                "--databases must be between 1 and --workers-per-shape",
+                "--databases must contain values >= 1",
             ),
             (
                 &["perfbench", "--affinities", "101"],
@@ -214,7 +258,7 @@ mod tests {
             ),
             (
                 &["perfbench", "--workers-per-shape", "0", "--modes", "medium"],
-                "--workers-per-shape must be >= 1",
+                "--workers-per-shape must contain values >= 1",
             ),
         ];
 

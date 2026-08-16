@@ -232,6 +232,22 @@ class CompareTest(unittest.TestCase):
         self.assertEqual(table.loc[0, "run"], 2)
         self.assertEqual(table.loc[0, "layout"], "100%")
 
+    def test_multidimensional_mixed_report_is_not_silently_collapsed(self) -> None:
+        cells = [
+            {
+                "mode": "lo",
+                "affinityPct": 100,
+                "databaseLimit": database_limit,
+                "databases": database_limit,
+                "workersPerShape": 20,
+                "shapes": [],
+            }
+            for database_limit in (1, 3)
+        ]
+
+        with self.assertRaisesRegex(ValueError, "mixed-sweep plotter"):
+            compare.mixed_shape_table(cells, cells)
+
     def test_perfbench_contention_envelope_converts_to_legacy_frames(self) -> None:
         report = {
             "schemaVersion": 1,

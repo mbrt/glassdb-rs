@@ -8,6 +8,8 @@
 //!   leaves), and
 //! - home-collection **affinity** (`0` = each `Database` chooses uniformly
 //!   among every collection; `100` = each uses only its own collection).
+//! - client-`Database` limits and workers per shape. Each cell opens no more
+//!   Databases than it has workers per shape, so every open client is active.
 //!
 //! Every `Database` runs every shape and has one distinct home collection. An
 //! intermediate affinity mixes home traffic with uniformly selected
@@ -45,8 +47,8 @@ use glassdb_bench_scale::run::join_tasks_until;
 
 use super::backend;
 use super::{Execution, cooldown};
+use options::CellDimension;
 pub(super) use options::Options;
-use options::{CellDimension, Mode};
 pub(super) use result::RunResult;
 use result::{CellMetadata, CellResult};
 use workload::DriveOutcome;
@@ -73,11 +75,15 @@ pub(super) fn run(
     for run in 1..=execution.runs {
         handle.block_on(cooldown(execution, run));
         let mut cells = Vec::new();
-        for &CellDimension { mode, affinity_pct } in &dimensions {
-            eprintln!("{}", result::cell_started(run, mode.label(), affinity_pct));
+        for &dimension in &dimensions {
+            eprintln!("{}", result::cell_started(run, dimension));
             let database_name = format!(
-                "perfbenchmixed{invocation}r{run}{}a{affinity_pct}",
-                mode.label()
+                "perfbenchmixed{invocation}r{run}{}a{}d{}l{}w{}",
+                dimension.mode.label(),
+                dimension.affinity_pct,
+                dimension.databases,
+                dimension.database_limit,
+                dimension.workers_per_shape,
             );
             cells.push(run_cell(
                 handle,
@@ -85,8 +91,7 @@ pub(super) fn run(
                 &database_name,
                 options,
                 execution,
-                mode,
-                affinity_pct,
+                dimension,
             )?);
         }
         runs.push(RunResult::new(run, cells));
@@ -100,16 +105,15 @@ fn run_cell(
     database_name: &str,
     options: &Options,
     execution: Execution,
-    mode: Mode,
-    affinity_pct: u8,
+    dimension: CellDimension,
 ) -> Result<CellResult, Box<dyn Error>> {
-    let pool_size = mode.pool_size(options);
+    let pool_size = dimension.mode.pool_size(options);
     let prepared = setup::prepare_cell(
         handle,
         backend,
         database_name,
         setup::CellConfig {
-            databases: options.databases,
+            databases: dimension.databases,
             pool_size,
             split_quiet: options.split_quiet,
             split_settle_timeout: options.split_settle_timeout,
@@ -117,7 +121,7 @@ fn run_cell(
         },
     )?;
     let plans = workload::plans(
-        options.workers_per_shape,
+        dimension.workers_per_shape,
         prepared.databases().len(),
         options.max_duration,
     );
@@ -129,7 +133,12 @@ fn run_cell(
 
     let stop = Arc::new(AtomicBool::new(false));
     let target = samples_for_rel_ci(options.target_ci);
-    let ctx = workload::WorkerCtx::new(stop.clone(), pool_size, options.multi_keys, affinity_pct);
+    let ctx = workload::WorkerCtx::new(
+        stop.clone(),
+        pool_size,
+        options.multi_keys,
+        dimension.affinity_pct,
+    );
     let (drive, run, deadline) = handle.block_on(async {
         let handles =
             workload::spawn_workers(active.databases(), active.collections(), &plans, &ctx);
@@ -156,17 +165,16 @@ fn run_cell(
         }
     };
     if !cell_converged {
-        eprintln!(
-            "{}",
-            result::cell_capped(mode.label(), affinity_pct, options.target_ci)
-        );
+        eprintln!("{}", result::cell_capped(dimension, options.target_ci));
     }
 
     Ok(CellResult::summarize(
         CellMetadata::new(
-            mode.label(),
-            affinity_pct,
+            dimension.mode.label(),
+            dimension.affinity_pct,
+            dimension.database_limit,
             completed.databases,
+            dimension.workers_per_shape,
             completed.setup_splits,
             completed.split_settle_elapsed,
         ),

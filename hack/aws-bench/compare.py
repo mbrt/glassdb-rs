@@ -751,14 +751,24 @@ def _mixed_cells(report: Any) -> list[dict]:
 
 
 def _indexed_mixed_cells(report: Any) -> dict:
-    """Index current affinity cells, retaining legacy topology JSON support."""
+    """Index one-dimensional mixed cells, retaining legacy topology support."""
 
     def identity(cell: dict) -> tuple:
         if "affinityPct" in cell:
             return (cell["run"], cell["mode"], "affinity", cell["affinityPct"])
         return (cell["run"], cell["mode"], "topology", cell["topology"])
 
-    return {identity(cell): cell for cell in _mixed_cells(report)}
+    indexed = {}
+    for cell in _mixed_cells(report):
+        key = identity(cell)
+        if key in indexed:
+            raise ValueError(
+                "mixed-workload report contains multiple cells for one "
+                "mode/affinity; use the mixed-sweep plotter for worker or "
+                "Database dimensions"
+            )
+        indexed[key] = cell
+    return indexed
 
 
 def mixed_shape_table(a: Any, b: Any) -> pd.DataFrame:

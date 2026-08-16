@@ -28,6 +28,10 @@ otherwise it chooses uniformly among all collections. The default
 `0,25,50,75,100%` sweep ranges from no client-specific preference to complete
 client isolation. The separate `lo` and `hi` modes vary the key pool within a
 collection, keeping key contention independent from collection affinity.
+`--workers-per-shape` and `--databases` also accept comma-separated sweeps.
+The Database value is a limit: each cell opens the smaller of that limit and
+its worker count, ensuring that every open client runs every shape. Results
+record the limit, active client count, and worker count separately.
 
 Each cell gets an isolated database namespace. A throwaway client seeds every
 collection and observes its completed-split counter. Any change resets the
@@ -50,6 +54,41 @@ interval, or the cell reaches `--max-duration`. Capped shapes are marked
 unconverged. Whole-cell results include backend operations and transaction
 retries plus coordinator submissions, rounds, CAS retries, fold width, and
 direct-path coverage, all derived from the public `Database::stats()` counters.
+
+### Worker and affinity sweep plots
+
+The canonical scale plots use the low-contention mixed workload and the local
+S3 model. `--prefix-depth=3` gives each physical collection subtree
+(`db/_c/<collection-id>`) an independent simulated S3 request-rate bucket;
+database-wide transaction-log shards remain separate prefixes. Build once and
+run the two grids:
+
+```bash
+cargo build --release -p glassdb-bench-scale --bin perfbench
+
+target/release/perfbench \
+  --backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3 \
+  --runs=3 --drain-timeout=90s \
+  --output=hack/aws-bench/out-sweeps/workers.json \
+  mixed --modes=lo --affinities=100 --databases=5 \
+  --workers-per-shape=1,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100 \
+  --duration=2s --max-duration=60s --target-ci=0.1
+
+target/release/perfbench \
+  --backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3 \
+  --runs=3 --drain-timeout=90s \
+  --output=hack/aws-bench/out-sweeps/affinity.json \
+  mixed --modes=lo --affinities=0,25,50,75,100 \
+  --databases=1,3,5,7 --workers-per-shape=20 \
+  --duration=2s --max-duration=60s --target-ci=0.1
+
+uv run hack/aws-bench/plot-mixed-sweeps.py
+```
+
+The plotter requires three clean, converged runs and writes throughput plus
+p50/p90 latency figures for each transaction shape under
+`hack/aws-bench/out-sweeps/`. Faint points are individual runs and lines are
+their cross-run medians.
 
 ## Focused scenarios
 
