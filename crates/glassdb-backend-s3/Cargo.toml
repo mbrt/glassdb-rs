@@ -26,8 +26,8 @@ aws-sdk-s3 = { version = "1.137.0", default-features = false, features = [
 aws-smithy-async = "1.2.14"
 aws-smithy-http-client = { version = "1.1.13", default-features = false, features = ["default-client", "rustls-aws-lc"] }
 aws-smithy-runtime-api = { version = "1.12.3", default-features = false, features = ["client"] }
-glassdb-backend = { version = "0.1.0", path = "../glassdb-backend" }
-glassdb-concurr = { version = "0.1.0", path = "../glassdb-concurr" }
+glassdb-backend = { version = "0.2.0", path = "../glassdb-backend" }
+glassdb-concurr = { version = "0.2.0", path = "../glassdb-concurr" }
 # Pure-Rust async DNS resolver. The tuned HTTP client resolves through this
 # instead of hyper's default `getaddrinfo`-on-the-blocking-pool resolver, so a
 # burst of new connections cannot saturate tokio's blocking pool. hickory also

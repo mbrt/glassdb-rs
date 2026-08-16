@@ -14,10 +14,10 @@ workspace = true
 [dependencies]
 async-trait = "0.1.89"
 base64 = "0.22.1"
-glassdb-backend = { version = "0.1.0", path = "../glassdb-backend" }
-glassdb-concurr = { version = "0.1.0", path = "../glassdb-concurr" }
-glassdb-data = { version = "0.1.0", path = "../glassdb-data" }
-glassdb-proto = { version = "0.1.0", path = "../glassdb-proto" }
+glassdb-backend = { version = "0.2.0", path = "../glassdb-backend" }
+glassdb-concurr = { version = "0.2.0", path = "../glassdb-concurr" }
+glassdb-data = { version = "0.2.0", path = "../glassdb-data" }
+glassdb-proto = { version = "0.2.0", path = "../glassdb-proto" }
 hashlink = "0.12.0"
 prost = "0.14.3"
 prost-types = "0.14.3"

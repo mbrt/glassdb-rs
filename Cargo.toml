@@ -18,7 +18,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/mbrt/glassdb-rs"
@@ -31,14 +31,14 @@ homepage = "https://github.com/mbrt/glassdb-rs"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(sim)'] }
 
 [workspace.dependencies]
-glassdb-data = { path = "crates/glassdb-data", version = "0.1.0" }
-glassdb-proto = { path = "crates/glassdb-proto", version = "0.1.0" }
-glassdb-concurr = { path = "crates/glassdb-concurr", version = "0.1.0" }
-glassdb-backend = { path = "crates/glassdb-backend", version = "0.1.0" }
-glassdb-backend-s3 = { path = "crates/glassdb-backend-s3", version = "0.1.0" }
-glassdb-backend-gcs = { path = "crates/glassdb-backend-gcs", version = "0.1.0" }
-glassdb-storage = { path = "crates/glassdb-storage", version = "0.1.0" }
-glassdb-trans = { path = "crates/glassdb-trans", version = "0.1.0" }
+glassdb-data = { path = "crates/glassdb-data", version = "0.2.0" }
+glassdb-proto = { path = "crates/glassdb-proto", version = "0.2.0" }
+glassdb-concurr = { path = "crates/glassdb-concurr", version = "0.2.0" }
+glassdb-backend = { path = "crates/glassdb-backend", version = "0.2.0" }
+glassdb-backend-s3 = { path = "crates/glassdb-backend-s3", version = "0.2.0" }
+glassdb-backend-gcs = { path = "crates/glassdb-backend-gcs", version = "0.2.0" }
+glassdb-storage = { path = "crates/glassdb-storage", version = "0.2.0" }
+glassdb-trans = { path = "crates/glassdb-trans", version = "0.2.0" }
 
 [profile.release]
 opt-level = 3

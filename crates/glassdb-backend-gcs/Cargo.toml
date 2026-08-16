@@ -13,8 +13,8 @@ categories = ["database-implementations", "asynchronous"]
 [dependencies]
 async-trait = "0.1.89"
 gcp_auth = "0.12.6"
-glassdb-backend = { version = "0.1.0", path = "../glassdb-backend" }
-glassdb-concurr = { version = "0.1.0", path = "../glassdb-concurr" }
+glassdb-backend = { version = "0.2.0", path = "../glassdb-backend" }
+glassdb-concurr = { version = "0.2.0", path = "../glassdb-concurr" }
 percent-encoding = "2.3.2"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "rustls"] }
 serde = { version = "1.0.228", features = ["derive"] }
