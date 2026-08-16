@@ -1,12 +1,14 @@
 # release-plz configuration for the GlassDB workspace.
 #
-# release-plz is used only for the version bump: `hack/release.sh` runs
-# `release-plz update` (or `set-version`) to bump every published crate in
-# lockstep from the conventional-commit history and to keep the inter-crate
-# `version = "x.y.z"` path-dependency requirements in sync. The actual publish,
+# release-plz is used only for the auto-computed version bump: `hack/release.sh`
+# runs `release-plz update` to bump every published crate in lockstep from the
+# conventional-commit history and to keep the inter-crate `version = "x.y.z"`
+# path-dependency requirements in sync. The actual publish,
 # git tag, and GitHub release are done by the script with `cargo publish
 # --workspace`, `git tag`, and `gh` -- `release-plz release` is not used because
 # it is hard-coupled to a forge token / API even when git releases are disabled.
+# `hack/release.sh --version X.Y.Z` bypasses release-plz altogether and edits the
+# manifests itself (see the note on `set-version` in the script).
 #
 # The library crates are versioned in lockstep (one shared version, via
 # `version_group`), matching `version.workspace = true` in the root Cargo.toml.

@@ -11,7 +11,7 @@
 #   1. sanity checks (clean tree, on main, tooling + credentials present)
 #   2. `make test-all` gate
 #   3. `release-plz update` bumps every published crate in lockstep
-#      (or `--version X.Y.Z` to force an exact version)
+#      (or `--version X.Y.Z` rewrites the manifests to an exact version)
 #   4. review the diff and confirm
 #   5. commit + push the version bump
 #   6. `cargo publish --workspace` publishes the crates to crates.io
@@ -37,7 +37,8 @@
 #                         optional if you've already run `cargo login`. If absent
 #                         and not logged in, `cargo publish` just fails.
 #   gh                    GitHub CLI, authenticated (for the GitHub release)
-#   release-plz           auto-installed via `cargo install` if missing
+#   release-plz           auto-installed via `cargo install` if missing; only
+#                         needed for the auto-computed bump (not with --version)
 
 set -euo pipefail
 
@@ -58,6 +59,32 @@ die() {
 # source of truth for the published package set (see its [[package]] entries).
 published_pkgs() {
 	grep -E '^name = ' release-plz.toml | sed -E 's/^name = "([^"]+)".*/\1/'
+}
+
+# The lockstep version, read from [workspace.package] of the root Cargo.toml.
+workspace_version() {
+	grep -m1 -E '^version = "' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/'
+}
+
+# Set the lockstep version everywhere it is spelled out: the [workspace.package]
+# version and the `version` requirement of each inter-crate path dependency.
+#
+# `release-plz set-version` cannot do this: it replaces the crates'
+# `version.workspace = true` with a literal version, leaving [workspace.package]
+# behind, and it insists on a per-crate CHANGELOG.md even with
+# `changelog_update = false` (this project keeps release notes on GitHub only).
+set_lockstep_version() {
+	local new="$1" old old_re
+	old="$(workspace_version)"
+	[ -n "$old" ] || die "could not determine the current version from Cargo.toml"
+	old_re="${old//./\\.}"
+
+	sed -i -E "/^\[workspace\.package\]/,/^\[/ s/^version = \"$old_re\"\$/version = \"$new\"/" Cargo.toml
+	sed -i -E "/^glassdb[a-z0-9-]* = \{.*path = / s/version = \"$old_re\"/version = \"$new\"/" \
+		Cargo.toml crates/*/Cargo.toml
+
+	[ "$(workspace_version)" = "$new" ] || die "failed to set the version to $new in Cargo.toml"
+	cargo update --workspace --quiet
 }
 
 DRY_RUN=true
@@ -84,6 +111,14 @@ while [ $# -gt 0 ]; do
 	shift
 done
 
+if [ -n "$FORCE_VERSION" ]; then
+	case "$FORCE_VERSION" in
+	v*) die "--version takes a bare version, without the 'v' prefix (e.g. 0.2.0)" ;;
+	[0-9]*.[0-9]*.[0-9]*) ;;
+	*) die "--version must look like X.Y.Z (got '$FORCE_VERSION')" ;;
+	esac
+fi
+
 # --- Preconditions ----------------------------------------------------------
 
 branch="$(git rev-parse --abbrev-ref HEAD)"
@@ -93,7 +128,7 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 	die "working tree is dirty; commit or stash changes first"
 fi
 
-if ! command -v release-plz >/dev/null 2>&1; then
+if [ -z "$FORCE_VERSION" ] && ! command -v release-plz >/dev/null 2>&1; then
 	echo "==> release-plz not found; installing (cargo install --locked release-plz)"
 	cargo install --locked release-plz
 fi
@@ -126,20 +161,12 @@ fi
 
 echo "==> bumping versions"
 if [ -n "$FORCE_VERSION" ]; then
-	# Force an exact version on every published crate (lockstep).
-	mapfile -t pkgs < <(published_pkgs)
-	[ "${#pkgs[@]}" -gt 0 ] || die "no published packages found in release-plz.toml"
-	specs=()
-	for p in "${pkgs[@]}"; do
-		specs+=("$p@$FORCE_VERSION")
-	done
-	release-plz set-version "${specs[@]}"
+	set_lockstep_version "$FORCE_VERSION"
 else
 	release-plz update
 fi
 
-# The lockstep version lives in [workspace.package] of the root Cargo.toml.
-new_version="$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')"
+new_version="$(workspace_version)"
 [ -n "$new_version" ] || die "could not determine the new version from Cargo.toml"
 tag="v$new_version"
 

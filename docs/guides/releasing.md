@@ -30,15 +30,17 @@ The script:
 1. checks the working tree is clean and on `main`, with the tooling and
    credentials above present;
 2. runs the `make test-all` gate;
-3. bumps every published crate in lockstep with `release-plz update`;
+3. bumps every published crate in lockstep with `release-plz update`, or to the
+   `--version` given;
 4. shows the diff and asks for confirmation;
 5. commits and pushes the version bump;
 6. publishes to crates.io with `cargo publish --workspace`;
 7. creates and pushes the single `vX.Y.Z` git tag;
 8. opens the GitHub release with `gh release create --generate-notes`.
 
-The version bump is computed from the conventional-commit history. To force an
-exact version, call the script directly:
+The version bump is computed from the conventional-commit history, so commits
+that do not follow that convention only ever yield a patch bump. To force an
+exact version (which skips release-plz and rewrites the manifests directly):
 
 ```bash
 hack/release.sh --no-dry-run --version 0.2.0
