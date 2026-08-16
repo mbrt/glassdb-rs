@@ -71,7 +71,7 @@ target/release/perfbench \
   --runs=3 --drain-timeout=90s \
   --output=hack/aws-bench/out-sweeps/workers.json \
   mixed --modes=lo --affinities=100 --databases=5 \
-  --workers-per-shape=1,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100 \
+  --workers-per-shape="1,$(seq -s, 10 10 200)" \
   --duration=2s --max-duration=60s --target-ci=0.1
 
 target/release/perfbench \
@@ -85,10 +85,11 @@ target/release/perfbench \
 uv run hack/aws-bench/plot-mixed-sweeps.py
 ```
 
-The plotter requires three clean, converged runs and writes throughput plus
-p50/p90 latency figures for each transaction shape under
-`hack/aws-bench/out-sweeps/`. Faint points are individual runs and lines are
-their cross-run medians.
+The plotter requires three clean, converged runs. Throughput is shown as the
+cross-run median line. Latency uses the cross-run median p50 as a line and the
+area from p50 through p90 as a band. Affinity figures put all transaction shapes
+on one panel per Database-client count. The four figures are written under
+`hack/aws-bench/out-sweeps/`.
 
 ## Focused scenarios
 

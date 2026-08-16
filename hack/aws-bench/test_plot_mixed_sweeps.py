@@ -18,6 +18,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 def load_plotter():
@@ -141,6 +142,8 @@ class MixedSweepPlotterTest(unittest.TestCase):
         self.assertEqual(row["throughput"], 122.0)
         self.assertEqual(row["p50_ms"], 244.0)
         self.assertEqual(row["p90_ms"], 488.0)
+        self.assertEqual(plotter.WORKER_POINTS, (1, *range(10, 201, 10)))
+        self.assertEqual(plotter.WORKER_TICKS, plotter.WORKER_POINTS)
 
     def test_database_count_must_match_limit_and_workers(self) -> None:
         invalid = worker_report()
@@ -157,6 +160,86 @@ class MixedSweepPlotterTest(unittest.TestCase):
             path = self.write_report(Path(directory_name), "invalid.json", invalid)
             with self.assertRaisesRegex(plotter.ReportError, "did not converge"):
                 plotter.read_report(path)
+
+    def test_p90_latency_must_not_be_below_p50(self) -> None:
+        invalid = worker_report()
+        shape = invalid["runs"][0]["cells"][0]["shapes"][0]
+        shape["p90Ms"] = shape["p50Ms"] - 1
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write_report(Path(directory_name), "invalid.json", invalid)
+            with self.assertRaisesRegex(plotter.ReportError, "below p50Ms"):
+                plotter.read_report(path)
+
+    def test_series_use_plain_lines_and_latency_bands(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write_report(
+                Path(directory_name), "workers.json", worker_report()
+            )
+            _, workers = plotter.read_report(path)
+        medians = plotter.median_rows(workers, ["workers"])
+        colors = plotter._shape_colors()
+
+        line_figure, line_axis = plotter.plt.subplots()
+        plotter._plot_shape_lines(
+            line_axis, medians, "workers", "throughput", colors
+        )
+        self.assertEqual(len(line_axis.lines), len(plotter.SHAPES))
+        self.assertEqual(len(line_axis.collections), 0)
+        self.assertTrue(all(line.get_marker() == "None" for line in line_axis.lines))
+        plotter.plt.close(line_figure)
+
+        band_figure, band_axis = plotter.plt.subplots()
+        plotter._plot_shape_latency_bands(
+            band_axis, medians, "workers", colors
+        )
+        self.assertEqual(len(band_axis.lines), len(plotter.SHAPES))
+        self.assertEqual(len(band_axis.collections), len(plotter.SHAPES))
+        self.assertTrue(all(line.get_marker() == "None" for line in band_axis.lines))
+        plotter.plt.close(band_figure)
+
+    def test_affinity_figures_are_faceted_by_database_count(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write_report(
+                Path(directory_name), "affinity.json", affinity_report()
+            )
+            _, affinities = plotter.read_report(path)
+
+        figures = {}
+
+        def capture(figure, out_dir, name):
+            figures[name] = figure
+            return out_dir / name
+
+        with mock.patch.object(plotter, "_save", side_effect=capture):
+            plotter.plot_affinity_throughput(affinities, Path("plots"))
+            plotter.plot_affinity_latency(affinities, Path("plots"))
+
+        expected_titles = [
+            "1 DB client",
+            "3 DB clients",
+            "5 DB clients",
+            "7 DB clients",
+        ]
+        throughput = figures["affinity-throughput.png"]
+        latency = figures["affinity-latency.png"]
+        self.assertEqual([axis.get_title() for axis in throughput.axes], expected_titles)
+        self.assertEqual([axis.get_title() for axis in latency.axes], expected_titles)
+        self.assertTrue(
+            all(len(axis.lines) == len(plotter.SHAPES) for axis in throughput.axes)
+        )
+        self.assertTrue(
+            all(len(axis.lines) == len(plotter.SHAPES) for axis in latency.axes)
+        )
+        self.assertTrue(
+            all(len(axis.collections) == len(plotter.SHAPES) for axis in latency.axes)
+        )
+        self.assertEqual(len(latency.legends), 1)
+        self.assertEqual(
+            [text.get_text() for text in latency.legends[0].get_texts()],
+            [plotter.SHAPE_LABELS[shape] for shape in plotter.SHAPES],
+        )
+        plotter.plt.close(throughput)
+        plotter.plt.close(latency)
 
     def test_render_writes_all_four_figures(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:

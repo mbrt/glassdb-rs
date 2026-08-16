@@ -34,7 +34,8 @@ SHAPE_LABELS = {
     "roSingle": "RO single-key",
     "roMulti": "RO multi-key",
 }
-WORKER_POINTS = (1, *range(5, 101, 5))
+WORKER_POINTS = (1, *range(10, 201, 10))
+WORKER_TICKS = WORKER_POINTS
 AFFINITY_POINTS = (0, 25, 50, 75, 100)
 AFFINITY_DATABASES = (1, 3, 5, 7)
 EXPECTED_RUNS = (1, 2, 3)
@@ -162,6 +163,12 @@ def read_report(path: Path) -> tuple[ReportMetadata, pd.DataFrame]:
 
             for name in SHAPES:
                 shape = shapes[name]
+                p50_ms = _number(shape.get("p50Ms"), f"{label}.{name}.p50Ms")
+                p90_ms = _number(shape.get("p90Ms"), f"{label}.{name}.p90Ms")
+                if p90_ms < p50_ms:
+                    raise ReportError(
+                        f"{label}.{name}: p90Ms={p90_ms} is below p50Ms={p50_ms}"
+                    )
                 rows.append(
                     {
                         "run": run_id,
@@ -174,12 +181,8 @@ def read_report(path: Path) -> tuple[ReportMetadata, pd.DataFrame]:
                         "throughput": _number(
                             shape.get("txPerSec"), f"{label}.{name}.txPerSec"
                         ),
-                        "p50_ms": _number(
-                            shape.get("p50Ms"), f"{label}.{name}.p50Ms"
-                        ),
-                        "p90_ms": _number(
-                            shape.get("p90Ms"), f"{label}.{name}.p90Ms"
-                        ),
+                        "p50_ms": p50_ms,
+                        "p90_ms": p90_ms,
                     }
                 )
 
@@ -261,111 +264,115 @@ def _save(fig: plt.Figure, out_dir: Path, name: str) -> Path:
     return path
 
 
-def _plot_shape_series(
+def _shape_colors() -> dict[str, Any]:
+    return dict(
+        zip(SHAPES, sns.color_palette("colorblind", len(SHAPES)), strict=True)
+    )
+
+
+def _plot_shape_lines(
     ax: plt.Axes,
-    raw: pd.DataFrame,
     medians: pd.DataFrame,
     x: str,
     metric: str,
     colors: dict[str, Any],
+    *,
+    labels: bool = True,
 ) -> None:
     for shape in SHAPES:
-        points = raw[raw["shape"] == shape]
-        line = medians[medians["shape"] == shape]
-        ax.scatter(points[x], points[metric], color=colors[shape], alpha=0.2, s=18)
+        line = medians[medians["shape"] == shape].sort_values(x)
         ax.plot(
             line[x],
             line[metric],
             color=colors[shape],
-            marker="o",
-            label=SHAPE_LABELS[shape],
+            label=SHAPE_LABELS[shape] if labels else None,
+        )
+
+
+def _plot_shape_latency_bands(
+    ax: plt.Axes,
+    medians: pd.DataFrame,
+    x: str,
+    colors: dict[str, Any],
+    *,
+    labels: bool = True,
+) -> None:
+    for shape in SHAPES:
+        line = medians[medians["shape"] == shape].sort_values(x)
+        x_values = line[x].to_numpy()
+        p50_values = line["p50_ms"].to_numpy()
+        p90_values = line["p90_ms"].to_numpy()
+        ax.fill_between(
+            x_values,
+            p50_values,
+            p90_values,
+            color=colors[shape],
+            alpha=0.15,
+            linewidth=0,
+        )
+        ax.plot(
+            x_values,
+            p50_values,
+            color=colors[shape],
+            label=SHAPE_LABELS[shape] if labels else None,
         )
 
 
 def plot_worker_throughput(data: pd.DataFrame, out_dir: Path) -> Path:
     medians = median_rows(data, ["workers"])
-    colors = dict(zip(SHAPES, sns.color_palette("colorblind", len(SHAPES)), strict=True))
-    fig, ax = plt.subplots(figsize=(10, 6))
-    _plot_shape_series(ax, data, medians, "workers", "throughput", colors)
+    colors = _shape_colors()
+    fig, ax = plt.subplots(figsize=(14, 6))
+    _plot_shape_lines(ax, medians, "workers", "throughput", colors)
     ax.set_title("Mixed-workload throughput with isolated collections")
     ax.set_xlabel("Concurrent workers per shape")
     ax.set_ylabel("Transactions / sec")
-    ax.set_xticks((1, 20, 40, 60, 80, 100))
+    ax.set_xticks(WORKER_TICKS)
+    ax.set_xlim(1, 200)
+    ax.tick_params(axis="x", labelrotation=45)
     ax.legend(title="Transaction shape")
     return _save(fig, out_dir, "worker-throughput.png")
 
 
 def plot_worker_latency(data: pd.DataFrame, out_dir: Path) -> Path:
     medians = median_rows(data, ["workers"])
-    colors = dict(zip(SHAPES, sns.color_palette("colorblind", len(SHAPES)), strict=True))
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6), sharex=True)
-    for ax, metric, title in zip(
-        axes, ("p50_ms", "p90_ms"), ("p50 latency", "p90 latency"), strict=True
-    ):
-        _plot_shape_series(ax, data, medians, "workers", metric, colors)
-        ax.set_title(title)
-        ax.set_xlabel("Concurrent workers per shape")
-        ax.set_ylabel("Latency (ms)")
-        ax.set_xticks((1, 20, 40, 60, 80, 100))
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.suptitle("Mixed-workload latency with isolated collections", y=0.99)
-    fig.legend(
-        handles,
-        labels,
-        title="Transaction shape",
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.91),
-        ncol=4,
+    colors = _shape_colors()
+    fig, ax = plt.subplots(figsize=(14, 6))
+    _plot_shape_latency_bands(ax, medians, "workers", colors)
+    ax.set_title(
+        "Mixed-workload latency with isolated collections\n"
+        "p50 line; p50–p90 band"
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.72))
+    ax.set_xlabel("Concurrent workers per shape")
+    ax.set_ylabel("Latency (ms)")
+    ax.set_xticks(WORKER_TICKS)
+    ax.set_xlim(1, 200)
+    ax.tick_params(axis="x", labelrotation=45)
+    ax.legend(title="Transaction shape")
     return _save(fig, out_dir, "worker-latency.png")
 
 
-def _plot_database_series(
-    ax: plt.Axes,
-    raw: pd.DataFrame,
-    medians: pd.DataFrame,
-    shape: str,
-    metric: str,
-    colors: dict[int, Any],
-    *,
-    labels: bool,
-) -> None:
-    for databases in AFFINITY_DATABASES:
-        points = raw[
-            (raw["shape"] == shape) & (raw["database_limit"] == databases)
-        ]
-        line = medians[
-            (medians["shape"] == shape)
-            & (medians["database_limit"] == databases)
-        ]
-        ax.scatter(
-            points["affinity"], points[metric], color=colors[databases], alpha=0.2, s=18
-        )
-        ax.plot(
-            line["affinity"],
-            line[metric],
-            color=colors[databases],
-            marker="o",
-            label=f"{databases} DB" if labels else None,
-        )
+def _database_title(databases: int) -> str:
+    suffix = "client" if databases == 1 else "clients"
+    return f"{databases} DB {suffix}"
 
 
 def plot_affinity_throughput(data: pd.DataFrame, out_dir: Path) -> Path:
     medians = median_rows(data, ["database_limit", "affinity"])
-    colors = dict(
-        zip(
-            AFFINITY_DATABASES,
-            sns.color_palette("colorblind", len(AFFINITY_DATABASES)),
-            strict=True,
-        )
-    )
+    colors = _shape_colors()
     fig, axes = plt.subplots(2, 2, figsize=(14, 10), sharex=True)
-    for index, (ax, shape) in enumerate(zip(axes.flat, SHAPES, strict=True)):
-        _plot_database_series(
-            ax, data, medians, shape, "throughput", colors, labels=index == 0
+    for index, (ax, databases) in enumerate(
+        zip(axes.flat, AFFINITY_DATABASES, strict=True)
+    ):
+        database_medians = medians[medians["database_limit"] == databases]
+        _plot_shape_lines(
+            ax,
+            database_medians,
+            "affinity",
+            "throughput",
+            colors,
+            labels=index == 0,
         )
-        ax.set_title(SHAPE_LABELS[shape])
+        ax.set_title(_database_title(databases))
         ax.set_xlabel("Home-collection affinity (%)")
         ax.set_ylabel("Transactions / sec")
         ax.set_xticks(AFFINITY_POINTS)
@@ -374,7 +381,7 @@ def plot_affinity_throughput(data: pd.DataFrame, out_dir: Path) -> Path:
     fig.legend(
         handles,
         labels,
-        title="Database clients",
+        title="Transaction shape",
         loc="upper center",
         bbox_to_anchor=(0.5, 0.94),
         ncol=4,
@@ -385,36 +392,31 @@ def plot_affinity_throughput(data: pd.DataFrame, out_dir: Path) -> Path:
 
 def plot_affinity_latency(data: pd.DataFrame, out_dir: Path) -> Path:
     medians = median_rows(data, ["database_limit", "affinity"])
-    colors = dict(
-        zip(
-            AFFINITY_DATABASES,
-            sns.color_palette("colorblind", len(AFFINITY_DATABASES)),
-            strict=True,
+    colors = _shape_colors()
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10), sharex=True)
+    for index, (ax, databases) in enumerate(
+        zip(axes.flat, AFFINITY_DATABASES, strict=True)
+    ):
+        database_medians = medians[medians["database_limit"] == databases]
+        _plot_shape_latency_bands(
+            ax,
+            database_medians,
+            "affinity",
+            colors,
+            labels=index == 0,
         )
+        ax.set_title(_database_title(databases))
+        ax.set_xlabel("Home-collection affinity (%)")
+        ax.set_ylabel("Latency (ms)")
+        ax.set_xticks(AFFINITY_POINTS)
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    fig.suptitle(
+        "Latency by home-collection affinity — p50 line; p50–p90 band", y=0.99
     )
-    fig, axes = plt.subplots(2, 4, figsize=(22, 10), sharex=True)
-    for row, (metric, percentile) in enumerate((("p50_ms", "p50"), ("p90_ms", "p90"))):
-        for column, shape in enumerate(SHAPES):
-            ax = axes[row, column]
-            _plot_database_series(
-                ax,
-                data,
-                medians,
-                shape,
-                metric,
-                colors,
-                labels=row == 0 and column == 0,
-            )
-            ax.set_title(f"{SHAPE_LABELS[shape]} — {percentile}")
-            ax.set_xlabel("Home-collection affinity (%)")
-            ax.set_ylabel("Latency (ms)")
-            ax.set_xticks(AFFINITY_POINTS)
-    handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.suptitle("Latency by home-collection affinity", y=0.99)
     fig.legend(
         handles,
         labels,
-        title="Database clients",
+        title="Transaction shape",
         loc="upper center",
         bbox_to_anchor=(0.5, 0.94),
         ncol=4,
