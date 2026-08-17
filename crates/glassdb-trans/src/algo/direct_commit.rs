@@ -246,6 +246,16 @@ struct DirectCommitResolver {
     staged_over: Mutex<Option<TxId>>,
 }
 
+/// The direct path's policy decision before uncertain-CAS recovery is applied.
+enum DirectResolution {
+    AlreadyCommitted,
+    Publish {
+        predecessor: TxId,
+        entry: ShardEntry,
+    },
+    Declined(Ineligible),
+}
+
 #[async_trait]
 impl ShardResolver for DirectCommitResolver {
     async fn resolve(
@@ -254,82 +264,8 @@ impl ShardResolver for DirectCommitResolver {
         staged: &std::collections::BTreeMap<Vec<u8>, ShardEntry>,
         staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
-        let cur = staged.get(&self.raw_key);
-
-        // Our exact commit marker is already published: an in-doubt CAS landed
-        // (possibly under a later holder's lock), so this is an idempotent
-        // success rather than a second application (ADR-051).
-        if cur.is_some_and(|e| self.committed(&e.current)) {
-            return Ok(Step::Skip {
-                outcome: FoldOutcome::Landed,
-            });
-        }
-
-        // A structural gate or a collection-deletion fence needs the logged
-        // protocol's coordination, and neither is a race the direct path can
-        // arbitrate.
-        if staged_locks.structural_gate().lock_type() == LockType::Write
-            || staged_locks.delete_intent().is_some()
-        {
-            return Ok(Step::Skip {
-                outcome: self.unlanded(ctx, Ineligible::Locked),
-            });
-        }
-
-        let res = ctx
-            .key_state
-            .resolve_holders(&self.key, cur, None, ctx.requirement)
-            .await?;
-        let writer = match eligible_writer(&res, self.read_version.as_ref()) {
-            Ok(writer) => writer,
-            Err(why) => {
-                return Ok(Step::Skip {
-                    outcome: self.unlanded(ctx, why),
-                });
-            }
-        };
-        // A budget the folded leaf closes is a stable property of that leaf, not
-        // a race a re-run of the body can win (ADR-053).
-        let other_inline_bytes = staged
-            .iter()
-            .filter(|(key, _)| key.as_slice() != self.raw_key.as_slice())
-            .map(|(_, entry)| entry.current.inline_len())
-            .sum();
-        if !self.inline.admits(other_inline_bytes, self.value.len()) {
-            let outcome = self.unlanded(ctx, Ineligible::Locked);
-            if self.inline.admits_value(self.value.len()) {
-                // Resolution runs in the coordinator worker, so this
-                // best-effort observation is detached from the submitter even
-                // though the coordinator has no inline-pressure policy.
-                self.split_hints.observe_inline_pressure(
-                    &self.leaf_path,
-                    &self.raw_key,
-                    self.value.len(),
-                );
-            }
-            return Ok(Step::Skip { outcome });
-        }
-        if let Some(outcome) = self.superseded_after_uncertain_cas(ctx, &writer) {
-            return Ok(Step::Skip { outcome });
-        }
-
-        // Publish the value itself as the new current state, dropping the
-        // entry's holders: eligibility proved every one of them is final, so an
-        // already-committed writer awaiting write-back is help-forwarded and
-        // replaced here (its own write-back becomes a no-op). Leaving it in
-        // place would resolve the entry *backwards* to it, behind the value
-        // this CAS publishes.
-        let e = ShardEntry::new(self.raw_key.clone()).with_current(CurrentState::Inline {
-            writer: self.id.clone(),
-            value: self.value.clone(),
-        });
-        *self.staged_over.lock().unwrap() = Some(writer);
-        Ok(Step::Stage {
-            entries: vec![(self.raw_key.clone(), e)],
-            locks: staged_locks.clone(),
-            admission: StageAdmission::InlinePublication,
-            outcome: FoldOutcome::Landed,
-        })
+        let resolution = self.resolve_candidate(ctx, staged, staged_locks).await?;
+        Ok(self.finalize(ctx, staged_locks, resolution))
     }
 
     fn reorderable(&self) -> bool {
@@ -337,26 +273,17 @@ impl ShardResolver for DirectCommitResolver {
     }
 
     fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
-        if in_doubt {
-            return FoldOutcome::InDoubt("round abandoned after in-doubt CAS".into());
-        }
         // An exhausted CAS budget does not certify that this attempt staged
         // nothing durable in an earlier attempt of the round, so it is not a
         // body-replay case (ADR-053).
-        FoldOutcome::Moved
+        self.uncertain_or(in_doubt, FoldOutcome::Moved)
     }
 
     fn excluded_outcome(&self, in_doubt: bool) -> FoldOutcome {
-        if in_doubt {
-            return FoldOutcome::InDoubt(format!(
-                "direct commit for {} in-doubt: excluded after an uncertain CAS",
-                self.id
-            ));
-        }
         // A peer claimed the key before this member folded, so it staged nothing
         // at all this round: a read-modify-write may reevaluate its body against
         // the winner rather than publish a holder (ADR-053).
-        self.definitive_loss()
+        self.uncertain_or(in_doubt, self.definitive_loss())
     }
 
     fn owned_keys(&self) -> Vec<&[u8]> {
@@ -369,51 +296,133 @@ impl ShardResolver for DirectCommitResolver {
 }
 
 impl DirectCommitResolver {
+    /// Resolves whether the current fold can publish this direct commit.
+    async fn resolve_candidate(
+        &self,
+        ctx: &ResolveCtx<'_>,
+        staged: &std::collections::BTreeMap<Vec<u8>, ShardEntry>,
+        staged_locks: &NodeLocks,
+    ) -> Result<DirectResolution, TransError> {
+        let cur = staged.get(&self.raw_key);
+
+        // Our exact commit marker is already published: an in-doubt CAS landed
+        // (possibly under a later holder's lock), so this is an idempotent
+        // success rather than a second application (ADR-051).
+        if cur.is_some_and(|e| self.committed(&e.current)) {
+            return Ok(DirectResolution::AlreadyCommitted);
+        }
+
+        // A structural gate or a collection-deletion fence needs the logged
+        // protocol's coordination, and neither is a race the direct path can
+        // arbitrate.
+        if staged_locks.structural_gate().lock_type() == LockType::Write
+            || staged_locks.delete_intent().is_some()
+        {
+            return Ok(DirectResolution::Declined(Ineligible::Locked));
+        }
+
+        let res = ctx
+            .key_state
+            .resolve_holders(&self.key, cur, None, ctx.requirement)
+            .await?;
+        let writer = match eligible_writer(&res, self.read_version.as_ref()) {
+            Ok(writer) => writer,
+            Err(why) => return Ok(DirectResolution::Declined(why)),
+        };
+        // A budget the folded leaf closes is a stable property of that leaf, not
+        // a race a re-run of the body can win (ADR-053).
+        let other_inline_bytes = staged
+            .iter()
+            .filter(|(key, _)| key.as_slice() != self.raw_key.as_slice())
+            .map(|(_, entry)| entry.current.inline_len())
+            .sum();
+        if !self.inline.admits(other_inline_bytes, self.value.len()) {
+            if self.inline.admits_value(self.value.len()) {
+                // Resolution runs in the coordinator worker, so this
+                // best-effort observation is detached from the submitter even
+                // though the coordinator has no inline-pressure policy.
+                self.split_hints.observe_inline_pressure(
+                    &self.leaf_path,
+                    &self.raw_key,
+                    self.value.len(),
+                );
+            }
+            return Ok(DirectResolution::Declined(Ineligible::Locked));
+        }
+
+        // Publish the value itself as the new current state, dropping the
+        // entry's holders: eligibility proved every one of them is final, so an
+        // already-committed writer awaiting write-back is help-forwarded and
+        // replaced here (its own write-back becomes a no-op). Leaving it in
+        // place would resolve the entry *backwards* to it, behind the value
+        // this CAS publishes.
+        let e = ShardEntry::new(self.raw_key.clone()).with_current(CurrentState::Inline {
+            writer: self.id.clone(),
+            value: self.value.clone(),
+        });
+        Ok(DirectResolution::Publish {
+            predecessor: writer,
+            entry: e,
+        })
+    }
+
+    /// Applies uncertain-CAS recovery to one direct-path policy decision.
+    fn finalize(
+        &self,
+        ctx: &ResolveCtx<'_>,
+        staged_locks: &NodeLocks,
+        resolution: DirectResolution,
+    ) -> Step {
+        let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true });
+        match resolution {
+            DirectResolution::AlreadyCommitted => Step::Skip {
+                outcome: FoldOutcome::Landed,
+            },
+            DirectResolution::Declined(why) => Step::Skip {
+                outcome: self.uncertain_or(in_doubt, self.declined_outcome(why)),
+            },
+            DirectResolution::Publish { predecessor, entry } => {
+                let mut staged_over = self.staged_over.lock().unwrap();
+                if in_doubt && staged_over.as_ref() != Some(&predecessor) {
+                    return Step::Skip {
+                        outcome: self.ambiguous_outcome(),
+                    };
+                }
+                *staged_over = Some(predecessor);
+                Step::Stage {
+                    entries: vec![(self.raw_key.clone(), entry)],
+                    locks: staged_locks.clone(),
+                    admission: StageAdmission::InlinePublication,
+                    outcome: FoldOutcome::Landed,
+                }
+            }
+        }
+    }
+
     /// Whether `current` is this transaction's own published commit marker.
     fn committed(&self, current: &CurrentState) -> bool {
         current.writer() == Some(&self.id) && current.inline() == Some(&self.value)
     }
 
-    /// Whether republishing over `writer` after this member's own uncertain CAS
-    /// would be unsafe, and how to report it.
-    ///
-    /// A key whose committed writer moved on since that CAS staged is
-    /// indistinguishable from one the CAS itself published and a later commit
-    /// then superseded — a commit that may already have been read. Republishing
-    /// would roll the key back behind it, so the ambiguity stands (ADR-051,
-    /// ADR-053). Only an entry still naming the writer that CAS built on proves
-    /// it never landed, and that alone may be republished.
-    fn superseded_after_uncertain_cas(
-        &self,
-        ctx: &ResolveCtx<'_>,
-        writer: &TxId,
-    ) -> Option<FoldOutcome> {
-        if !matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true }) {
-            return None;
+    /// Preserves an uncertain CAS outcome over a less conservative result.
+    fn uncertain_or(&self, in_doubt: bool, otherwise: FoldOutcome) -> FoldOutcome {
+        if in_doubt {
+            self.ambiguous_outcome()
+        } else {
+            otherwise
         }
-        let staged_over = self.staged_over.lock().unwrap().clone();
-        if staged_over.as_ref() == Some(writer) {
-            return None;
-        }
-        Some(FoldOutcome::InDoubt(format!(
-            "direct commit for {} in-doubt: {writer} superseded the key after an uncertain CAS",
-            self.id
-        )))
     }
 
-    /// How to report a fold that is not publishing the commit marker. Every such
-    /// reason is only evidence that the marker is *not there now*. Without an
-    /// in-doubt CAS that also proves nothing was ever written; after one it
-    /// cannot be told from our own commit having landed and then been
-    /// superseded, so the ambiguity is irreducible and is never downgraded to a
-    /// replay (ADR-051, ADR-053).
-    fn unlanded(&self, ctx: &ResolveCtx<'_>, why: Ineligible) -> FoldOutcome {
-        if matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true }) {
-            return FoldOutcome::InDoubt(format!(
-                "direct commit for {} in-doubt: marker absent after an uncertain CAS",
-                self.id
-            ));
-        }
+    /// Reports an uncertain direct commit that current state cannot resolve.
+    fn ambiguous_outcome(&self) -> FoldOutcome {
+        FoldOutcome::InDoubt(format!(
+            "direct commit for {} could not be resolved after an uncertain CAS",
+            self.id
+        ))
+    }
+
+    /// Classifies a direct attempt that staged no publication on this fold.
+    fn declined_outcome(&self, why: Ineligible) -> FoldOutcome {
         match why {
             Ineligible::Replay => self.definitive_loss(),
             Ineligible::Locked => FoldOutcome::Moved,
