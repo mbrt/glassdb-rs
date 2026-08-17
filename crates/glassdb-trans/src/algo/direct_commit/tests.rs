@@ -831,6 +831,7 @@ async fn direct_commit_blocked_after_uncertain_cas_stays_in_doubt() {
         read_version: seed.current.writer().cloned(),
         inline: InlinePolicy::default(),
         split_hints: tm.direct_commit.split_hints.clone(),
+        staged_over: Mutex::new(None),
     };
     let staged = BTreeMap::from([(b"k".to_vec(), seed)]);
 
@@ -862,6 +863,81 @@ async fn direct_commit_blocked_after_uncertain_cas_stays_in_doubt() {
     }
 }
 
+// ADR-051 regression (fuzz `history` crash-3ddc66ba): a blind put is
+// last-writer-wins on a fresh fold, but after its own uncertain CAS the entry
+// may already hold a commit that read the very value that CAS published.
+// Republishing then rolls the key back behind a commit whose writer was told it
+// succeeded, losing that update. Only an entry still naming the writer the
+// uncertain CAS built on proves nothing landed.
+#[tokio::test]
+async fn a_blind_put_after_an_uncertain_cas_never_republishes_over_a_newer_writer() {
+    let (tm, tctx) = new_algo().await;
+    let keyp = key_ref(b"k");
+    commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
+    let seed = entry(&tctx, b"k").await.unwrap();
+    let locks = NodeLocks::default();
+
+    let blind = DirectCommitResolver {
+        id: TxId::with_priority(9, b"blind"),
+        raw_key: b"k".to_vec(),
+        leaf_path: test_root_path(),
+        key: keyp.clone(),
+        value: Arc::from(b"v2".as_slice()),
+        read_version: None,
+        inline: InlinePolicy::default(),
+        split_hints: tm.direct_commit.split_hints.clone(),
+        staged_over: Mutex::new(None),
+    };
+    let staged = BTreeMap::from([(b"k".to_vec(), seed)]);
+
+    // The fresh fold publishes over the seeded writer; its CAS is the one that
+    // comes back uncertain.
+    assert!(matches!(
+        fold_step(&blind, &tctx, ReloadCause::Fresh, &staged, &locks).await,
+        Step::Stage {
+            outcome: FoldOutcome::Landed,
+            ..
+        }
+    ));
+
+    // The entry still names that writer, so the uncertain CAS provably did not
+    // land and the publication is retried rather than surfaced as in-doubt.
+    assert!(matches!(
+        fold_step(
+            &blind,
+            &tctx,
+            ReloadCause::Reloaded { in_doubt: true },
+            &staged,
+            &locks,
+        )
+        .await,
+        Step::Stage {
+            outcome: FoldOutcome::Landed,
+            ..
+        }
+    ));
+
+    let superseded = BTreeMap::from([(
+        b"k".to_vec(),
+        ShardEntry::new(b"k".to_vec()).with_current(CurrentState::Inline {
+            writer: TxId::with_priority(10, b"newer"),
+            value: Arc::from(b"v3".as_slice()),
+        }),
+    )]);
+    let outcome = fold(
+        &blind,
+        &tctx,
+        ReloadCause::Reloaded { in_doubt: true },
+        &superseded,
+        &locks,
+    )
+    .await;
+    assert!(
+        matches!(outcome, FoldOutcome::InDoubt(_)),
+        "a newer writer cannot disprove a landed uncertain CAS, got {outcome:?}"
+    );
+}
+
 // ADR-053: only a *superseded read* certifies the body-replay case, and an
 // uncertain CAS still outranks it. Every other way a fold declines is either
 // state the direct path cannot arbitrate or evidence that proves nothing, so
@@ -886,6 +962,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
         read_version,
         inline: InlinePolicy::default(),
         split_hints: split_hints.clone(),
+        staged_over: Mutex::new(None),
     };
 
     // A read the entry has moved past: nothing is staged and the loss is

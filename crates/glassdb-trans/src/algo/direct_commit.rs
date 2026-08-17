@@ -1,6 +1,6 @@
 use std::ops::{AddAssign, Sub};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use glassdb_data::{KeyRef, ObjectPath, TxId};
@@ -139,6 +139,7 @@ impl DirectCommit {
             read_version,
             inline,
             split_hints: self.split_hints.clone(),
+            staged_over: Mutex::new(None),
         });
         let outcome = self
             .coord
@@ -239,6 +240,10 @@ struct DirectCommitResolver {
     read_version: Option<TxId>,
     inline: InlinePolicy,
     split_hints: SplitHintSink,
+    /// The committed writer the last staged publication built on, so a re-fold
+    /// after an uncertain CAS can tell an entry that CAS never touched from one
+    /// it may have produced.
+    staged_over: Mutex<Option<TxId>>,
 }
 
 #[async_trait]
@@ -275,11 +280,14 @@ impl ShardResolver for DirectCommitResolver {
             .key_state
             .resolve_holders(&self.key, cur, None, ctx.requirement)
             .await?;
-        if let Err(why) = eligible_writer(&res, self.read_version.as_ref()) {
-            return Ok(Step::Skip {
-                outcome: self.unlanded(ctx, why),
-            });
-        }
+        let writer = match eligible_writer(&res, self.read_version.as_ref()) {
+            Ok(writer) => writer,
+            Err(why) => {
+                return Ok(Step::Skip {
+                    outcome: self.unlanded(ctx, why),
+                });
+            }
+        };
         // A budget the folded leaf closes is a stable property of that leaf, not
         // a race a re-run of the body can win (ADR-053).
         let other_inline_bytes = staged
@@ -301,6 +309,9 @@ impl ShardResolver for DirectCommitResolver {
             }
             return Ok(Step::Skip { outcome });
         }
+        if let Some(outcome) = self.superseded_after_uncertain_cas(ctx, &writer) {
+            return Ok(Step::Skip { outcome });
+        }
 
         // Publish the value itself as the new current state, dropping the
         // entry's holders: eligibility proved every one of them is final, so an
@@ -312,6 +323,7 @@ impl ShardResolver for DirectCommitResolver {
             writer: self.id.clone(),
             value: self.value.clone(),
         });
+        *self.staged_over.lock().unwrap() = Some(writer);
         Ok(Step::Stage {
             entries: vec![(self.raw_key.clone(), e)],
             locks: staged_locks.clone(),
@@ -360,6 +372,33 @@ impl DirectCommitResolver {
     /// Whether `current` is this transaction's own published commit marker.
     fn committed(&self, current: &CurrentState) -> bool {
         current.writer() == Some(&self.id) && current.inline() == Some(&self.value)
+    }
+
+    /// Whether republishing over `writer` after this member's own uncertain CAS
+    /// would be unsafe, and how to report it.
+    ///
+    /// A key whose committed writer moved on since that CAS staged is
+    /// indistinguishable from one the CAS itself published and a later commit
+    /// then superseded — a commit that may already have been read. Republishing
+    /// would roll the key back behind it, so the ambiguity stands (ADR-051,
+    /// ADR-053). Only an entry still naming the writer that CAS built on proves
+    /// it never landed, and that alone may be republished.
+    fn superseded_after_uncertain_cas(
+        &self,
+        ctx: &ResolveCtx<'_>,
+        writer: &TxId,
+    ) -> Option<FoldOutcome> {
+        if !matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true }) {
+            return None;
+        }
+        let staged_over = self.staged_over.lock().unwrap().clone();
+        if staged_over.as_ref() == Some(writer) {
+            return None;
+        }
+        Some(FoldOutcome::InDoubt(format!(
+            "direct commit for {} in-doubt: {writer} superseded the key after an uncertain CAS",
+            self.id
+        )))
     }
 
     /// How to report a fold that is not publishing the commit marker. Every such
