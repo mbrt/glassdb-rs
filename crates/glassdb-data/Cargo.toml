@@ -12,7 +12,7 @@ description = "Low level data types for GlassDB (internal crate)."
 workspace = true
 
 [dependencies]
-glassdb-concurr = { version = "0.2.0", path = "../glassdb-concurr" }
+glassdb-concurr = { version = "0.2.1", path = "../glassdb-concurr" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
