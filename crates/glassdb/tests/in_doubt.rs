@@ -11,10 +11,11 @@
 //! state disambiguates the outcome, so the engine recovers most in-doubt
 //! outcomes by reading that object back:
 //!
-//! - The logless direct commit path (ADR-051) commits an eligible small
-//!   overwrite with one leaf CAS that publishes the value itself. A lost ack is
-//!   resolved by reloading the leaf: our exact inline state proves the commit, an
-//!   unchanged entry proves it did not land (retry the idempotent CAS).
+//! - The logless direct commit path (ADR-061) commits an eligible complete
+//!   same-leaf point transaction with one leaf CAS that publishes every inline
+//!   value or tombstone. A lost ack is resolved by reloading the leaf: any exact
+//!   own output proves the whole member committed, while unchanged predecessors
+//!   prove it did not land (retry the idempotent CAS).
 //!
 //!   An uncertain CAS is irreducibly in-doubt exactly when the read-back cannot
 //!   prove that state either way — surfaced as [`Error::InDoubt`] rather than
@@ -55,7 +56,7 @@ use std::sync::{Arc, Mutex};
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture, HookOutcome};
 use glassdb::backend::{Backend, BackendError};
-use glassdb::{Collection, CollectionPath, Database, Error, Transaction};
+use glassdb::{Collection, CollectionPath, Database, Error, InlinePolicy, Transaction};
 use glassdb_storage::transaction::TxCommitStatus;
 
 type Before = Box<dyn for<'a> Fn(&BackendOp<'a>) -> Result<(), BackendError> + Send + Sync>;
@@ -395,7 +396,7 @@ async fn single_rw_in_doubt_not_landed_retries_and_commits() {
     assert_eq!(got, 11, "the increment must be applied exactly once");
 }
 
-/// The logged (multi-write) path: when the *committed* transaction-log write —
+/// The logged path: when the *committed* transaction-log write —
 /// the commit point — lands but loses its ack, the engine must recover the
 /// outcome transparently instead of surfacing the uncertainty.
 ///
@@ -409,7 +410,11 @@ async fn single_rw_in_doubt_not_landed_retries_and_commits() {
 async fn logged_commit_lost_ack_recovers_transparently() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = HookBackend::new(mem);
-    let db = Database::open("example", backend.clone()).await.unwrap();
+    let db = Database::builder("example", backend.clone())
+        .inline_policy(InlinePolicy::none())
+        .open()
+        .await
+        .unwrap();
     let coll = db
         .root_collection()
         .create_collection_if_absent(b"c")
@@ -425,8 +430,9 @@ async fn logged_commit_lost_ack_recovers_transparently() {
     // the ack.
     let committed_log_writes = arm_after(&backend, lost_ack_after(committed_log));
 
-    // Two distinct writes force the locked, log-based commit path. Capture `coll`
-    // by reference so the body stays `FnMut` (re-runnable on a retry).
+    // The disabled inline policy makes this fixture explicitly exercise the
+    // locked, log-based path. Capture `coll` by reference so the body stays
+    // `FnMut` (re-runnable on a retry).
     let coll = &coll;
     db.tx(|tx| async move {
         let a = read_existing_int(&tx, coll, b"a").await?;
@@ -461,7 +467,11 @@ async fn logged_commit_lost_ack_recovers_transparently() {
 async fn lock_acquisition_lost_ack_retries_in_place() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = HookBackend::new(mem);
-    let db = Database::open("example", backend.clone()).await.unwrap();
+    let db = Database::builder("example", backend.clone())
+        .inline_policy(InlinePolicy::none())
+        .open()
+        .await
+        .unwrap();
     let coll = db
         .root_collection()
         .create_collection_if_absent(b"c")
@@ -475,9 +485,10 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
     // actually applied but the locker observes `Unavailable`.
     let _ = arm_after(&backend, lost_ack_after(shard_cas));
 
-    // Two writes force the locked, log-based commit path. Capture `coll` by
-    // reference so the body stays `FnMut` (re-runnable, though we expect no
-    // closure re-run here — the lock retry is invisible to `Database::tx`).
+    // Inline publication is disabled so this fixture takes the locked,
+    // log-based path. Capture `coll` by reference so the body stays `FnMut`
+    // (re-runnable, though we expect no closure re-run here — the lock retry is
+    // invisible to `Database::tx`).
     let coll = &coll;
     db.tx(|tx| async move {
         let a = read_existing_int(&tx, coll, b"a").await?;

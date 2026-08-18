@@ -12,6 +12,26 @@ This file is evidence, not a record of accepted behavior:
   performance work.
 - ADRs record significant decisions once accepted.
 
+## 2026-08-18: ADR-061 acceptance matrix
+
+Status: complete; the direct path meets its uncontended one-CAS cost gate and
+retains bounded fallback under same-leaf contention.
+
+The 2/8/32-key blind-put, mixed put/delete, and cross-key RMW matrix landed all
+30 low-contention operations directly on memory and the modeled GCS/S3
+profiles. Every cell used exactly one object write per transaction and no lock.
+Near both inline boundaries, all six memory cells had the same result. The
+paired 10-key RMW median fell from `116.77 µs` to `44.19 µs`, while the
+single-key guardrail moved from `9.34 µs` to `9.48 µs` with overlapping
+intervals.
+
+Disjoint transactions from separate databases still contend on the shared leaf
+CAS. Every measured operation entered the direct path; short provider-profile
+windows landed `29–30/30` directly and used at most `0.07` lock calls per
+transaction after bounded clean-CAS retry exhaustion. This is expected fallback,
+not an eligibility failure, so the durable benchmark asserts exact one-CAS
+behavior only in uncontended cells and records contention coverage separately.
+
 ## 2026-08-15: ADR-060 implementation removed
 
 Status: closed; the delayed write-back scheduler was removed and definitive

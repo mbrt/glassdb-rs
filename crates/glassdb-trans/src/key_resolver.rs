@@ -11,7 +11,7 @@ use glassdb_storage::{LeafLocator, Requirement, ShardEntry, StorageError, TreeRo
 
 use crate::access::{LeafCoverage, ScanAccess, ScanEvidence, ScanMutation, ScanRange};
 use crate::error::{TransError, trans_to_storage};
-use crate::key_state_resolver::{HolderResolution, KeyStateResolver, WriterResolution};
+use crate::key_state_resolver::{KeyStateResolver, WriterResolution};
 use crate::monitor::KeyCommitStatus;
 
 /// The result of a phantom-safe scan: the live keys in key order, the covered
@@ -53,6 +53,26 @@ impl KeyResolver {
     /// Creates key resolution over a tree router and loaded-state resolver.
     pub(crate) fn new(router: TreeRouter, state: KeyStateResolver) -> Self {
         Self { router, state }
+    }
+
+    /// Routes a complete point dependency set and returns its one owning leaf.
+    /// A result of `None` means the keys currently span more than one leaf.
+    pub(crate) async fn route_one_leaf(
+        &self,
+        keys: impl IntoIterator<Item = KeyRef>,
+    ) -> Result<Option<glassdb_data::ObjectPath>, StorageError> {
+        let groups = self
+            .router
+            .group_keys_by_leaf_fresh(
+                keys.into_iter().map(|key| (key, ())),
+                Requirement::Any,
+                Requirement::Any,
+            )
+            .await?;
+        Ok(match groups.as_slice() {
+            [group] => Some(group.path.clone()),
+            _ => None,
+        })
     }
 
     /// Resolves one bounded, forward page and its membership dependencies.
@@ -309,10 +329,10 @@ impl KeyResolver {
     /// Resolves `key` to its owning leaf and effective writer, returning
     /// the located leaf alongside. An absent key resolves to no writer.
     ///
-    /// `requirement` is forwarded to the descent: the single read-write commit
-    /// passes [`Requirement::Any`] so its eligibility check reuses the leaf
-    /// the read already cached, without a revalidation round-trip; a stale copy is
-    /// caught by the commit-install's version-conditional CAS (ADR-030).
+    /// `requirement` is forwarded to the descent: same-leaf direct commit passes
+    /// [`Requirement::Any`] so its eligibility check reuses a leaf already
+    /// cached by the transaction, without a revalidation round-trip; a stale
+    /// copy is caught by the publication's version-conditional CAS (ADR-030).
     pub(crate) async fn resolve_key(
         &self,
         key: &KeyRef,
@@ -324,31 +344,6 @@ impl KeyResolver {
             .resolve_writer(key, Self::entry_at(&loc, key.key())?, requirement)
             .await?;
         Ok((writer, loc))
-    }
-
-    /// Resolves `key` to its owning leaf and a coherent view of its effective
-    /// writer and foreign holders.
-    ///
-    /// Mutation paths use this form when the located entry will be changed:
-    /// routing and holder classification remain one logical observation, with
-    /// no discarded writer-only status lookup.
-    pub(crate) async fn resolve_key_holders(
-        &self,
-        key: &KeyRef,
-        own_lock_holder: Option<&TxId>,
-        requirement: Requirement,
-    ) -> Result<(HolderResolution, LeafLocator), TransError> {
-        let loc = self.locate_key(key, requirement).await?;
-        let holders = self
-            .state
-            .resolve_holders(
-                key,
-                Self::entry_at(&loc, key.key())?,
-                own_lock_holder,
-                requirement,
-            )
-            .await?;
-        Ok((holders, loc))
     }
 
     async fn locate_key(
@@ -707,9 +702,8 @@ mod tests {
 
     // `resolve_key` with `Any` reuses a shard already in the resolver's
     // cache without any backend read, while a current bound revalidates it with one
-    // conditional read (ADR-030). This is what lets the single read-write
-    // commit's eligibility check reuse the shard the transaction body's read
-    // cached, adding no shard load at commit.
+    // conditional read (ADR-030). This lets a same-leaf direct candidate reuse
+    // the shard the transaction body cached, adding no shard load at commit.
     #[tokio::test]
     async fn resolve_key_any_reuses_cached_shard() {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));

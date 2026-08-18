@@ -168,7 +168,15 @@ pub(crate) enum StageAdmission {
     /// The stage publishes an inline value. In addition to the absolute object
     /// limit, each published entry must retain the per-entry split budget so it
     /// cannot leave behind an intrinsically unsplittable singleton.
-    InlinePublication,
+    InlinePublication {
+        /// Whether the publication creates at least one live user key and must
+        /// therefore preserve the content headroom used by structural work.
+        adds_key: bool,
+        /// Whether a rejected publication should notify the splitter. ADR-061
+        /// suppresses this for multi-key direct members because splitting can
+        /// destroy their eligibility.
+        pressure_hint: bool,
+    },
     /// The stage adds at least one user key and must fit below the content limit
     /// that reserves headroom for locks and the split's shrink CAS.
     AddsKey,
@@ -188,6 +196,14 @@ pub(crate) enum Step {
     },
     /// Stage nothing; deliver `outcome` to the member regardless of the CAS.
     Skip { outcome: FoldOutcome },
+    /// Stage nothing, but reserve this logless member's markers against later
+    /// publishers in the same fold. Used after an existing marker proves the
+    /// member already committed.
+    Claim { outcome: FoldOutcome },
+    /// The enclosed decision follows proof that an earlier uncertain CAS did
+    /// not land. The coordinator clears the member's inherited uncertainty
+    /// before applying the decision or attributing a replacement CAS.
+    Recovered { step: Box<Step> },
 }
 
 /// The shared handles a resolver may consult mid-fold: loaded key-state
@@ -206,6 +222,11 @@ pub(crate) struct ResolveCtx<'a> {
 /// owns the ordering, admission, and recovery contract they share (ADR-028).
 #[async_trait]
 pub(crate) trait ShardResolver: Send + Sync {
+    /// Lets a resolver retain evidence from the leaf exactly as loaded, before
+    /// any earlier-ordered member stages over it. Direct commit uses this to
+    /// remember an exact own marker; other resolvers need no pre-fold state.
+    fn observe_loaded(&self, _entries: &BTreeMap<Vec<u8>, ShardEntry>) {}
+
     /// Resolves this member against entries and node locks as currently staged
     /// this round. Resolvers cannot mutate node topology.
     async fn resolve(
@@ -262,6 +283,14 @@ pub(crate) trait ShardResolver: Send + Sync {
     /// records its commit outside the leaf and needs no exclusivity.
     fn logless_keys(&self) -> Vec<&[u8]> {
         Vec::new()
+    }
+
+    /// The raw keys whose current committed state this member may replace.
+    /// Once a logless member claims a key, any later publisher intersecting it
+    /// is excluded as a whole. Lock-only and release-only mutations leave this
+    /// empty because they preserve current-state markers.
+    fn publication_keys(&self) -> Vec<&[u8]> {
+        self.logless_keys()
     }
 }
 
@@ -435,7 +464,7 @@ impl CasWorker {
         members: &BTreeMap<TxId, ShardMember>,
         requirement: Requirement,
         reloaded: bool,
-        in_doubt: &BTreeSet<TxId>,
+        in_doubt: &mut BTreeSet<TxId>,
     ) -> Result<FoldPlan, TransError> {
         let mut plan = FoldPlan {
             entries: edit
@@ -452,6 +481,12 @@ impl CasWorker {
         // wound a member whose stage it has already observed (ADR-028).
         let mut ordered: Vec<(&TxId, &ShardMember)> = members.iter().collect();
         ordered.sort_by(|(a, _), (b, _)| fold_order(a, b));
+        // Marker evidence belongs to the loaded leaf version, not to the
+        // running fold order. Give every member a chance to retain it before a
+        // preceding publisher can replace the corresponding entry in memory.
+        for member in members.values() {
+            member.resolver.observe_loaded(&plan.entries);
+        }
         // A logless stage is its commit's only evidence, so another member may
         // not overwrite it before the shared CAS (ADR-051).
         let mut logless: BTreeSet<Vec<u8>> = BTreeSet::new();
@@ -485,7 +520,7 @@ impl CasWorker {
             }
             let logless_conflict = member
                 .resolver
-                .logless_keys()
+                .publication_keys()
                 .iter()
                 .any(|&key| logless.contains(key));
             if logless_conflict {
@@ -501,6 +536,16 @@ impl CasWorker {
                 .resolver
                 .resolve(&ctx, &plan.entries, &plan.locks)
                 .await?;
+            let (step, recovered) = match step {
+                Step::Recovered { step } => (*step, true),
+                step => (step, false),
+            };
+            let member_in_doubt = if recovered {
+                in_doubt.remove(tx);
+                false
+            } else {
+                member_in_doubt
+            };
             match step {
                 Step::Stage {
                     entries: changes,
@@ -554,6 +599,24 @@ impl CasWorker {
                     outcome,
                     participation: Participation::Skipped,
                 }),
+                Step::Claim { outcome } => {
+                    in_doubt.remove(tx);
+                    logless.extend(
+                        member
+                            .resolver
+                            .logless_keys()
+                            .into_iter()
+                            .map(<[u8]>::to_vec),
+                    );
+                    plan.members.push(MemberFold {
+                        id: tx.clone(),
+                        outcome,
+                        participation: Participation::Skipped,
+                    });
+                }
+                Step::Recovered { .. } => {
+                    unreachable!("recovery wrappers are unwrapped before applying a fold step")
+                }
             }
         }
         Ok(plan)
@@ -582,9 +645,16 @@ impl CasWorker {
         let mut candidate_node = edit.node().clone();
         candidate_node.set_leaf(candidate_shard.clone())?;
         candidate_node.set_locks(proposed.locks.clone());
-        let create_full = proposed.admission == StageAdmission::AddsKey
+        let (inline_publication, direct_adds_key, pressure_hint) = match proposed.admission {
+            StageAdmission::InlinePublication {
+                adds_key,
+                pressure_hint,
+            } => (true, adds_key, pressure_hint),
+            _ => (false, false, true),
+        };
+        let create_full = (proposed.admission == StageAdmission::AddsKey || direct_adds_key)
             && candidate_node.content_encoded_len() > self.core.policy.content_limit();
-        let inline_entry_full = proposed.admission == StageAdmission::InlinePublication
+        let inline_entry_full = inline_publication
             && proposed
                 .entries
                 .iter()
@@ -598,7 +668,7 @@ impl CasWorker {
 
         // Splitting cannot make an intrinsically oversized entry fit. The
         // direct publisher falls back to an external value instead.
-        if !inline_entry_full {
+        if pressure_hint && !inline_entry_full {
             self.core.hinter.observe_leaf(path, &candidate_shard);
         }
         let outcome = if proposed.admission == StageAdmission::AddsKey {
@@ -687,8 +757,8 @@ impl CasWorker {
         // batch's ambiguity would strand it in-doubt over a write it never made.
         let mut in_doubt: BTreeSet<TxId> = BTreeSet::new();
         // The first fold attempt may reuse a cached shard the submitter just
-        // loaded (a lone single read-write round; `Any` serves it without
-        // a revalidation round-trip, ADR-030). A failed or in-doubt CAS
+        // loaded (a direct same-leaf member; `Any` serves it without a
+        // revalidation round-trip, ADR-030). A failed or in-doubt CAS
         // invalidates the exact seed observation, so later attempts can also use
         // `Any`: they either read the winner or reuse newer knowledge another
         // operation already published. A stale cached shard only costs a CAS
@@ -733,7 +803,7 @@ impl CasWorker {
                     &members,
                     first_requirement,
                     reloaded,
-                    &in_doubt,
+                    &mut in_doubt,
                 )
                 .await?;
 
@@ -866,9 +936,9 @@ impl ShardCoordinator {
     /// operation-specific best-effort behavior.
     ///
     /// `first_requirement` chooses the cache requirement for the round's first fold
-    /// attempt: a submitter that just read this leaf (the single read-write fast
-    /// path, for its eligibility check) passes `Any` so the round reuses
-    /// the cached copy instead of revalidating it (ADR-030); skip-capable
+    /// attempt: a direct submitter that just read this leaf while evaluating its
+    /// complete point member passes `Any` so the round reuses the cached copy
+    /// instead of revalidating it (ADR-030); skip-capable
     /// resolvers pass their phase's captured lower bound because their outcome
     /// may not be followed by a CAS.
     ///
@@ -1799,6 +1869,300 @@ mod tests {
         }
     }
 
+    struct MultiPublisherProbe {
+        keys: Vec<Vec<u8>>,
+        tx: TxId,
+        logless: bool,
+        claim: bool,
+    }
+
+    impl MultiPublisherProbe {
+        fn direct(keys: &[&[u8]], tx: &TxId) -> Self {
+            Self {
+                keys: keys.iter().map(|key| key.to_vec()).collect(),
+                tx: tx.clone(),
+                logless: true,
+                claim: false,
+            }
+        }
+
+        fn publisher(keys: &[&[u8]], tx: &TxId) -> Self {
+            Self {
+                keys: keys.iter().map(|key| key.to_vec()).collect(),
+                tx: tx.clone(),
+                logless: false,
+                claim: false,
+            }
+        }
+
+        fn claim(keys: &[&[u8]], tx: &TxId) -> Self {
+            Self {
+                claim: true,
+                ..Self::direct(keys, tx)
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ShardResolver for MultiPublisherProbe {
+        async fn resolve(
+            &self,
+            _ctx: &ResolveCtx<'_>,
+            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            staged_locks: &NodeLocks,
+        ) -> Result<Step, TransError> {
+            if self.claim {
+                return Ok(Step::Claim {
+                    outcome: FoldOutcome::Landed,
+                });
+            }
+            let entries = self
+                .keys
+                .iter()
+                .map(|key| {
+                    let entry = ShardEntry::new(key.clone()).with_current(CurrentState::Inline {
+                        writer: self.tx.clone(),
+                        value: Arc::from(self.tx.as_bytes()),
+                    });
+                    (key.clone(), entry)
+                })
+                .collect();
+            Ok(Step::Stage {
+                entries,
+                locks: staged_locks.clone(),
+                admission: StageAdmission::ExistingKeys,
+                outcome: FoldOutcome::Landed,
+            })
+        }
+
+        fn reorderable(&self) -> bool {
+            false
+        }
+
+        fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
+            if in_doubt && self.logless {
+                FoldOutcome::InDoubt("multi-key logless probe is uncertain".into())
+            } else if self.logless {
+                FoldOutcome::Moved
+            } else {
+                FoldOutcome::Reroute
+            }
+        }
+
+        fn owned_keys(&self) -> Vec<&[u8]> {
+            self.keys.iter().map(Vec::as_slice).collect()
+        }
+
+        fn logless_keys(&self) -> Vec<&[u8]> {
+            if self.logless {
+                self.keys.iter().map(Vec::as_slice).collect()
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn publication_keys(&self) -> Vec<&[u8]> {
+            self.keys.iter().map(Vec::as_slice).collect()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_multi_key_publisher_is_excluded_as_a_whole() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (backend, gate) = Gate::wrap(mem);
+        let backend = backend as Arc<dyn Backend>;
+        let recording = Arc::new(RecordingBackend::new(backend.clone()));
+        let log = recording.log();
+        let (coord, _shards, _timeline, _bg) = coord_over(recording.clone()).await;
+        let first = TxId::with_priority(1, b"first");
+        let second = TxId::with_priority(2, b"second");
+        log.lock().unwrap().clear();
+
+        gate.arm();
+        let (c1, t1) = (coord.clone(), first.clone());
+        let driver = tokio::spawn(async move {
+            c1.submit_shard(
+                &leaf(),
+                &t1,
+                Arc::new(MultiPublisherProbe::direct(&[b"a", b"b"], &t1)),
+                Requirement::Any,
+            )
+            .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        let (c2, t2) = (coord.clone(), second.clone());
+        let joiner = tokio::spawn(async move {
+            c2.submit_shard(
+                &leaf(),
+                &t2,
+                Arc::new(MultiPublisherProbe::publisher(&[b"b", b"c"], &t2)),
+                Requirement::Any,
+            )
+            .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        gate.release();
+
+        assert!(matches!(
+            driver.await.unwrap().unwrap(),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Landed,
+                ..
+            })
+        ));
+        let joined = joiner.await.unwrap().unwrap();
+        let expected = matches!(
+            &joined,
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Reroute,
+                cas_precondition: None,
+            })
+        );
+        if !expected {
+            match joined {
+                Some(outcome) => panic!("unexpected publisher outcome: {:?}", outcome.outcome),
+                None => panic!("publisher received no outcome"),
+            }
+        }
+        assert_eq!(shard_stores(&log), 1);
+        coord.close().await;
+
+        let shard = cold_entries(&cold_store(backend), &leaf()).await;
+        assert_eq!(shard.lookup(b"a").unwrap().current.writer(), Some(&first));
+        assert_eq!(shard.lookup(b"b").unwrap().current.writer(), Some(&first));
+        assert!(shard.lookup(b"c").is_none(), "the loser staged no subset");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disjoint_multi_key_logless_members_share_one_cas() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (backend, gate) = Gate::wrap(mem);
+        let backend = backend as Arc<dyn Backend>;
+        let recording = Arc::new(RecordingBackend::new(backend));
+        let log = recording.log();
+        let (coord, _shards, _timeline, _bg) = coord_over(recording).await;
+        let first = TxId::with_priority(1, b"first");
+        let second = TxId::with_priority(2, b"second");
+        log.lock().unwrap().clear();
+
+        gate.arm();
+        let (c1, t1) = (coord.clone(), first.clone());
+        let driver = tokio::spawn(async move {
+            c1.submit_shard(
+                &leaf(),
+                &t1,
+                Arc::new(MultiPublisherProbe::direct(&[b"a", b"b"], &t1)),
+                Requirement::Any,
+            )
+            .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        let (c2, t2) = (coord.clone(), second.clone());
+        let joiner = tokio::spawn(async move {
+            c2.submit_shard(
+                &leaf(),
+                &t2,
+                Arc::new(MultiPublisherProbe::direct(&[b"c", b"d"], &t2)),
+                Requirement::Any,
+            )
+            .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        gate.release();
+
+        for outcome in [
+            driver.await.unwrap().unwrap(),
+            joiner.await.unwrap().unwrap(),
+        ] {
+            assert!(matches!(
+                outcome,
+                Some(CoordinatedOutcome {
+                    outcome: FoldOutcome::Landed,
+                    ..
+                })
+            ));
+        }
+        assert_eq!(shard_stores(&log), 1);
+        coord.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovered_marker_claim_protects_later_publishers() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (backend, gate) = Gate::wrap(mem);
+        let backend = backend as Arc<dyn Backend>;
+        let (coord, _shards, _timeline, _bg) = coord_over(backend.clone()).await;
+        let first = TxId::with_priority(1, b"first");
+        let second = TxId::with_priority(2, b"second");
+        let seed_store = cold_store(backend.clone());
+        store_shard_entries(
+            &seed_store,
+            &leaf(),
+            [b"a".as_slice(), b"b".as_slice()]
+                .into_iter()
+                .map(|key| {
+                    ShardEntry::new(key).with_current(CurrentState::Inline {
+                        writer: first.clone(),
+                        value: Arc::from(b"landed".as_slice()),
+                    })
+                })
+                .collect(),
+        )
+        .await;
+
+        gate.arm();
+        let (c1, t1) = (coord.clone(), first.clone());
+        let driver = tokio::spawn(async move {
+            c1.submit_shard(
+                &leaf(),
+                &t1,
+                Arc::new(MultiPublisherProbe::claim(&[b"a", b"b"], &t1)),
+                Requirement::Any,
+            )
+            .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        let (c2, t2) = (coord.clone(), second.clone());
+        let joiner = tokio::spawn(async move {
+            c2.submit_shard(
+                &leaf(),
+                &t2,
+                Arc::new(MultiPublisherProbe::publisher(&[b"b", b"c"], &t2)),
+                Requirement::Any,
+            )
+            .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        gate.release();
+
+        assert!(matches!(
+            driver.await.unwrap().unwrap(),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Landed,
+                cas_precondition: None,
+            })
+        ));
+        let joined = joiner.await.unwrap().unwrap();
+        let expected = matches!(
+            &joined,
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Reroute,
+                cas_precondition: None,
+            })
+        );
+        if !expected {
+            match joined {
+                Some(outcome) => panic!("unexpected publisher outcome: {:?}", outcome.outcome),
+                None => panic!("publisher received no outcome"),
+            }
+        }
+        coord.close().await;
+
+        let shard = cold_entries(&cold_store(backend), &leaf()).await;
+        assert_eq!(shard.lookup(b"b").unwrap().current.writer(), Some(&first));
+        assert!(shard.lookup(b"c").is_none());
+    }
+
     // Faults the first leaf CAS as in-doubt and lets every later one through.
     fn in_doubt_then_ok(inner: Arc<dyn Backend>) -> Arc<HookBackend> {
         let backend = HookBackend::new(inner);
@@ -2248,7 +2612,10 @@ mod tests {
             Ok(Step::Stage {
                 entries: vec![(self.key.clone(), e)],
                 locks: staged_locks.clone(),
-                admission: StageAdmission::InlinePublication,
+                admission: StageAdmission::InlinePublication {
+                    adds_key: false,
+                    pressure_hint: true,
+                },
                 outcome: FoldOutcome::Landed,
             })
         }
@@ -2380,13 +2747,14 @@ mod tests {
         key: Vec<u8>,
         tx: TxId,
         folds: std::sync::atomic::AtomicUsize,
+        recovers_non_landing: bool,
     }
 
     #[async_trait]
     impl ShardResolver for CapacityAfterInDoubt {
         async fn resolve(
             &self,
-            _ctx: &ResolveCtx<'_>,
+            ctx: &ResolveCtx<'_>,
             _staged: &BTreeMap<Vec<u8>, ShardEntry>,
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
@@ -2399,12 +2767,21 @@ mod tests {
                 writer: self.tx.clone(),
                 value,
             });
-            Ok(Step::Stage {
+            let step = Step::Stage {
                 entries: vec![(self.key.clone(), entry)],
                 locks: staged_locks.clone(),
                 admission: StageAdmission::ExistingKeys,
                 outcome: FoldOutcome::Landed,
-            })
+            };
+            if self.recovers_non_landing
+                && matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true })
+            {
+                Ok(Step::Recovered {
+                    step: Box::new(step),
+                })
+            } else {
+                Ok(step)
+            }
         }
 
         fn reorderable(&self) -> bool {
@@ -2481,6 +2858,7 @@ mod tests {
                         key: b"k".to_vec(),
                         tx: driver_tx.clone(),
                         folds: std::sync::atomic::AtomicUsize::new(0),
+                        recovers_non_landing: false,
                     }),
                     Requirement::Any,
                 )
@@ -2522,6 +2900,74 @@ mod tests {
             1,
             "the oversized retry did not CAS"
         );
+        coord.close().await;
+    }
+
+    #[tokio::test]
+    async fn proven_non_landing_clears_uncertainty_before_capacity_rejection() {
+        let tx = TxId::with_priority(1, b"t");
+        let small = ShardEntry::new(b"k").with_current(CurrentState::Inline {
+            writer: tx.clone(),
+            value: Arc::from(b"x".as_slice()),
+        });
+        let large = ShardEntry::new(b"k").with_current(CurrentState::Inline {
+            writer: tx.clone(),
+            value: Arc::from(vec![b'x'; 128]),
+        });
+        let small_len = Node::leaf(Shard::from_entries([small])).encoded_len();
+        assert!(Node::leaf(Shard::from_entries([large])).encoded_len() > small_len);
+        let policy = SplitPolicy::builder()
+            .node_max_bytes(small_len)
+            .split_headroom_bytes(0)
+            .build()
+            .unwrap();
+
+        let hooked = Arc::new(HookBackend::new(Arc::new(MemoryBackend::new())));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        hooked.set_before({
+            let calls = calls.clone();
+            move |op| {
+                let result = match op {
+                    BackendOp::WriteIf { path, .. }
+                        if (path.contains("/_n/") || path.ends_with("/_r"))
+                            && calls.fetch_add(1, Ordering::SeqCst) == 0 =>
+                    {
+                        Err(glassdb_backend::BackendError::Unavailable(
+                            "simulated non-landing unavailable CAS".into(),
+                        ))
+                    }
+                    _ => Ok(()),
+                };
+                let future: HookFuture = Box::pin(async move { result });
+                future
+            }
+        });
+        let backend: Arc<dyn Backend> = hooked;
+        let (coord, _shards, _timeline, _bg) =
+            coord_over_with(backend, policy, Arc::new(NoSplitHints)).await;
+
+        let outcome = coord
+            .submit_shard(
+                &leaf(),
+                &tx,
+                Arc::new(CapacityAfterInDoubt {
+                    key: b"k".to_vec(),
+                    tx: tx.clone(),
+                    folds: std::sync::atomic::AtomicUsize::new(0),
+                    recovers_non_landing: true,
+                }),
+                Requirement::Any,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Conflict,
+                cas_precondition: None,
+            })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         coord.close().await;
     }
 

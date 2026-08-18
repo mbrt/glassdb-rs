@@ -7,6 +7,66 @@ version.
 Keep this document sorted by the most recent changes first. Each entry should
 include a reference to the commit or ADR that introduced the change.
 
+## ADR-061: atomic logless commits within one leaf
+
+[ADR-061](../adr/061-atomic-logless-single-leaf-commits.md) generalizes direct
+commit from one existing-key overwrite to complete point-access transactions
+whose reads and writes share one leaf. Creates, overwrites, and tombstone
+deletes publish atomically in one CAS when the complete output fits inline.
+
+### Setup
+
+- base: `2b54060f` (ADR-only control, before implementation); target: this
+  worktree
+- release Criterion benchmark on the in-memory backend and the existing
+  model-time GCS/S3 delay profiles; 10 samples per timed cell
+- low-contention and disjoint-key same-leaf-contention matrices cover blind
+  puts, mixed put/delete, and cross-key RMW at 2, 8, and 32 keys
+- separate memory cells approach the per-value and aggregate inline limits at
+  each key count
+- each operation-cost sample contains 30 completed transactions; the
+  uncontended gate requires 30 candidates, 30 direct landings, one object write
+  per transaction, and no lock call
+
+### Protocol outcomes
+
+- all 27 low-contention shape/count/backend cells pass the gate: every
+  transaction lands directly with exactly one object write and no lock call
+- all six near-boundary cells also land `30/30` with one write and no lock call
+- every same-leaf-contention transaction remains a direct candidate. The short
+  simulated-provider windows land `29–30/30` directly, with at most `0.07` lock
+  calls per transaction when clean CAS contention exhausts the bounded direct
+  retry and selects the regular fallback; memory cells land `30/30`
+- direct counters count transactions rather than keys or physical CAS attempts,
+  as required by the ADR
+
+### Latency
+
+Low-contention memory medians are:
+
+| Workload | 2 keys | 8 keys | 32 keys |
+| --- | ---: | ---: | ---: |
+| Blind put | `11.21 µs` | `26.55 µs` | `101.57 µs` |
+| Mixed put/delete | `12.32 µs` | `29.11 µs` | `101.52 µs` |
+| Cross-key RMW | `13.44 µs` | `35.69 µs` | `143.44 µs` |
+
+GCS/S3 low-contention medians are `1.10–1.23 ms`, dominated by the one modeled
+provider write. At the inline boundaries, memory medians are `11.23`, `27.10`,
+and `97.69 µs` near the per-value limit and `12.93`, `30.81`, and `103.33 µs`
+near the aggregate limit for 2, 8, and 32 keys respectively.
+
+The pre-existing benchmarks provide the paired regression check:
+
+| Workload | Base median | Target median | Target/base |
+| --- | ---: | ---: | ---: |
+| Single-key RMW | `9.34 µs` | `9.48 µs` | `1.015` |
+| 10-key RMW | `116.77 µs` | `44.19 µs` | `0.378` |
+
+The single-key intervals overlap (`9.19–9.60 µs` base and `9.43–9.52 µs`
+target), so the implementation does not establish a regression in the original
+fast path. For 10-key RMW, backend work falls from `3.20` writes and `0.63`
+reads per transaction to exactly one write and no reads.
+
 ## ADR-060: bounded delayed write-back convergence
 
 [ADR-060](../adr/060-bounded-delayed-write-back-convergence.md) moves one

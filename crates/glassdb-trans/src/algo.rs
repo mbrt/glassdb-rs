@@ -1,13 +1,14 @@
 //! The transaction commit protocol with serializable isolation for the v2
 //! object-native engine (ADR-016 … ADR-021).
 //!
-//! A read-write transaction validates its reads and installs its locks with one
-//! read-modify-write CAS per touched shard (create/delete is coordinated by the
-//! per-key entry lock in the owning leaf, ADR-031), flips its transaction object
-//! to committed (the commit point), then publishes `current_writer` pointers and
-//! releases its locks (write-back). A read-only transaction starts on a pure
-//! optimistic fast path. If validation fails, retries lock their point reads
-//! and scan predicates so sustained churn cannot make them retry forever.
+//! A complete point transaction whose dependencies and inline-admissible outputs
+//! share one leaf first attempts ADR-061's logless one-CAS commit. Other
+//! read-write transactions validate their reads and install locks with one
+//! read-modify-write CAS per touched shard, flip their transaction object to
+//! committed, then publish `current_writer` pointers and release their locks.
+//! A read-only transaction starts on a pure optimistic fast path. If validation
+//! fails, retries lock their point reads and scan predicates so sustained churn
+//! cannot make them retry forever.
 //!
 //! Concurrency control (ADR-002 / ADR-020 / ADR-021 / ADR-024): strict two-phase
 //! locking with wound-wait and leases for crash recovery. On a conflict it cannot
@@ -248,7 +249,7 @@ impl Algo {
         }
     }
 
-    /// Returns and resets direct single-key commit coverage counters.
+    /// Returns and resets direct same-leaf commit coverage counters.
     pub fn direct_commit_stats_and_reset(&self) -> DirectCommitStats {
         self.direct_commit.stats_and_reset()
     }
@@ -380,7 +381,7 @@ impl Algo {
     ///
     /// A no-op unless the transaction still holds a live logged identity. An
     /// attempt that never took one — an optimistic read-only validation, or a
-    /// logless one-CAS commit (ADR-051) — is invisible to peers, so an aborted
+    /// logless one-CAS commit (ADR-061) — is invisible to peers, so an aborted
     /// object for its id would invent a transaction that never existed (and,
     /// after a dispatched logless CAS, would not even be true).
     pub fn async_abort(&self, tx_id: &TxId) {
@@ -409,10 +410,11 @@ impl Algo {
             return self.commit_readonly(tx).await;
         }
         self.validate_coordination_keys(&tx.data)?;
-        // Try the logless direct path first: a lone overwrite whose value fits
-        // the inline budgets commits in one leaf CAS with no transaction object
-        // at all (ADR-051). It writes nothing unless it commits, so a
-        // non-landing attempt is classified rather than failed (ADR-053).
+        // Try the logless direct path first: a complete point transaction whose
+        // dependencies share one leaf and whose outputs fit inline commits in
+        // one leaf CAS with no transaction object (ADR-061). It writes nothing
+        // unless it commits, so a non-landing attempt is classified rather than
+        // failed (ADR-053).
         if tx.collections.data().reads.is_empty() && tx.collections.data().changes.is_empty() {
             match self
                 .direct_commit
@@ -1071,7 +1073,7 @@ mod tests {
     use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, CurrentState, Node, NodeStore, Shard,
-        ShardEntry, StructuralLogStore, TreeRouter,
+        ShardEntry, StorageError, StructuralLogStore, TreeRouter,
     };
 
     const TEST_DB: &str = "testp";
@@ -1098,7 +1100,7 @@ mod tests {
         pub(super) backend: Arc<dyn Backend>,
         pub(super) tlogger: TLogger,
         pub(super) tmon: Monitor,
-        records: CollectionStore,
+        pub(super) records: CollectionStore,
         pub(super) shards: NodeStore,
         pub(super) timeline: Timeline,
         pub(super) locker: Locker,
@@ -1301,7 +1303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_new() {
+    async fn direct_write_new() {
         let (tm, tctx) = new_algo().await;
         let keyp = key_ref(b"k");
         let val = b"v";
@@ -1323,12 +1325,14 @@ mod tests {
             .commit_status_at(&tid, Requirement::Any)
             .await
             .unwrap();
-        assert_eq!(status.status, TxCommitStatus::Ok);
-        let txlog = tctx.tlogger.get_at(&tid, Requirement::Any).await.unwrap();
-        let txlog = txlog.value().unwrap();
-        assert_eq!(txlog.writes.len(), 1);
-        assert_eq!(txlog.writes[0].key, keyp);
-        assert_eq!(&*txlog.writes[0].value, val);
+        assert_eq!(status.status, TxCommitStatus::Unknown);
+        assert!(
+            matches!(
+                tctx.tlogger.get_at(&tid, Requirement::Any).await,
+                Err(StorageError::NotFound)
+            ),
+            "a direct create has no transaction object"
+        );
 
         // The shard entry points at the committed writer and the lock is gone.
         let e = entry(&tctx, b"k").await.unwrap();
@@ -1351,11 +1355,12 @@ mod tests {
         commit_writes(&tm, vec![wa(&readp, b"seed")]).await;
 
         let r = do_read(&tctx, &readp).await;
+        let logged = vec![b'v'; InlinePolicy::default().max_value_bytes + 1];
         let mut h = begin_data(
             &tm,
             Data {
                 reads: vec![r],
-                writes: vec![wa(&writep, b"v")],
+                writes: vec![wa(&writep, &logged)],
                 scans: Vec::new(),
             },
         );
@@ -1613,8 +1618,8 @@ mod tests {
     // abort-and-renew; it re-runs the body in place (`Retry`) while holding its
     // locks. The engine validates *after* locking, so unlike a pre-lock check the
     // moved key is itself locked during the re-run window — the v1 guarantee that
-    // the retry holds all its locks. Two writes force the full locked path (the
-    // direct commit path handles a lone write; see the test below).
+    // the retry holds all its locks. An over-inline-budget output explicitly
+    // forces the full locked path.
     #[tokio::test]
     async fn stale_read_write_retries_holding_locks() {
         let (tm, tctx) = new_algo().await;
@@ -1631,11 +1636,12 @@ mod tests {
         // Another client overwrites `k`, making `ra` stale.
         commit_writes(&tm2, vec![wa(&ka, b"v2")]).await;
 
+        let logged = vec![b'x'; InlinePolicy::default().max_value_bytes + 1];
         let mut h = begin_data(
             &tm,
             Data {
                 reads: vec![ra],
-                writes: vec![wa(&ka, b"v3"), wa(&kb, b"x2")],
+                writes: vec![wa(&ka, b"v3"), wa(&kb, &logged)],
                 scans: Vec::new(),
             },
         );
@@ -1889,9 +1895,8 @@ mod tests {
     // ~handful of parallel attempts that fit before the deadlock timeout forces
     // the serial CAS budget to be exhausted, i.e. the `Conflict` path.
     //
-    // Uses a two-key write so the transaction is ineligible for the direct commit
-    // path (ADR-051) and genuinely exercises the full locked path's same-id
-    // serial-fallback behaviour.
+    // Direct publication is disabled explicitly so this test genuinely
+    // exercises the full locked path's same-id serial-fallback behaviour.
     #[tokio::test(start_paused = true)]
     async fn cas_contention_relocks_keeping_id() {
         let retry = RetryConfig {
@@ -1909,6 +1914,7 @@ mod tests {
         config.set_cache_size(1024);
         config.set_retry_initial_interval(retry.initial_interval);
         config.set_retry_max_interval(retry.max_interval);
+        config.set_inline_policy(InlinePolicy::none());
         let engine = Engine::open(
             TEST_DB,
             DatabaseId::from_bytes([7; 16]),

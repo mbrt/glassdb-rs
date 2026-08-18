@@ -1,5 +1,5 @@
 //! Budgets bounding how much committed value data leaf entries carry inline
-//! (ADR-051).
+//! (ADR-051, ADR-061).
 
 /// Default largest value eligible for a logless direct commit.
 const DEFAULT_MAX_VALUE_BYTES: usize = 1024;
@@ -10,7 +10,7 @@ const DEFAULT_MAX_LEAF_BYTES: usize = 16 * 1024;
 /// How much committed value data a leaf may carry inline.
 ///
 /// The budgets govern new authoritative inline values published by logless
-/// direct commits (ADR-051, ADR-054). A value that misses either takes the
+/// direct commits (ADR-051, ADR-054, ADR-061). A value that misses either takes the
 /// regular logged protocol and is eventually published as an external pointer.
 /// The budgets are a runtime tuning knob, never persisted, and values already
 /// inline are grandfathered — lowering a budget leaves them alone, because an

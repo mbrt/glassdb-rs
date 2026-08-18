@@ -14,7 +14,11 @@ use integration_support::{create_top, init_db, mem, open_top, read_int, rmw, wri
 // must bump `locker.calls` while a pure read leaves the counter unchanged.
 #[tokio::test(start_paused = true)]
 async fn stats_report_locker_activity() {
-    let db = init_db(mem()).await;
+    let db = Database::builder("example", mem())
+        .inline_policy(InlinePolicy::none())
+        .open()
+        .await
+        .unwrap();
     let coll = db
         .root_collection()
         .create_collection_if_absent(b"demo-coll")

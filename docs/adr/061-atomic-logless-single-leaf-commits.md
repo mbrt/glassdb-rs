@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed.
+Accepted — implemented.
 
 Supersedes [ADR-051](051-inline-latest-values.md)'s initial direct-commit
 eligibility, which was limited to one `Put` of an existing key and reads of that

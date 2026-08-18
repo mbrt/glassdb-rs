@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use glassdb::{Backend, CollectionPath, Database, Error};
+use glassdb::{Backend, CollectionPath, Database, Error, InlinePolicy};
 use glassdb_storage::Node;
 use tokio::sync::Barrier;
 
@@ -39,6 +39,7 @@ async fn list_keys() {
     .await
     .unwrap();
 
+    let before_list = db.stats();
     let mut plain = coll.iter_keys().await.unwrap();
     assert_eq!(plain.len(), keys.len());
     let first = plain.next().unwrap();
@@ -49,7 +50,7 @@ async fn list_keys() {
 
     // Listing descends the B-link tree and scans its leaves via reads (ADR-031),
     // never a directory `list` of an object prefix.
-    let stats = db.stats();
+    let stats = db.stats() - before_list;
     assert_eq!(stats.backend.obj_lists, 0);
 }
 
@@ -276,7 +277,11 @@ async fn keys_listing_is_phantom_safe() {
 #[tokio::test]
 async fn listing_hides_keys_from_aborted_transactions() {
     let (backend, pause) = PauseControl::wrap(mem());
-    let db = Database::open("example", backend.clone()).await.unwrap();
+    let db = Database::builder("example", backend.clone())
+        .inline_policy(InlinePolicy::none())
+        .open()
+        .await
+        .unwrap();
     let coll = db
         .root_collection()
         .create_collection_if_absent(b"aborted-vis")
@@ -287,10 +292,11 @@ async fn listing_hides_keys_from_aborted_transactions() {
     coll.write(b"real-a", b"v").await.unwrap();
     coll.write(b"real-b", b"v").await.unwrap();
 
-    // A transaction creates two brand-new keys and reaches the commit-log write
-    // (so its create locks are already installed in the leaf), then is cancelled
-    // mid-commit. The attempt cancellation guard asynchronously marks it
-    // aborted: the ghost keys were "added" by a transaction that never committed.
+    // With inline publication disabled, a transaction creates two brand-new
+    // keys and reaches the commit-log write (so its create locks are already
+    // installed in the leaf), then is cancelled mid-commit. The attempt
+    // cancellation guard asynchronously marks it aborted: the ghost keys were
+    // "added" by a transaction that never committed.
     let arrived = pause.arm("/_t/");
     let stalled = tokio::spawn({
         let db = db.clone();
