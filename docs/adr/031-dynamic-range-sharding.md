@@ -25,6 +25,10 @@ hot-path decisions here are unchanged.
 ADR's combined `_i` collection-record/tree-root representation. The tree now
 starts at fixed `_r`; its topology and split protocol are unchanged.
 
+[ADR-062](062-splitter-driven-tombstone-reclamation.md) refines split-candidate
+processing by compacting quiescent tombstones before deciding whether the leaf
+must divide. The B-link split protocol and lack of merging remain unchanged.
+
 [ADR-047]: 047-transactional-collection-management.md
 
 ## Context

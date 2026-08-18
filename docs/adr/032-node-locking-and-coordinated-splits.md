@@ -13,6 +13,14 @@ This ADR's shared structure-R protocol is superseded by
 [ADR-044](044-cas-fenced-structural-gate.md). Its split linearization,
 right-link, membership-lock, structural recovery, and hard-cap decisions remain.
 
+[ADR-061](061-atomic-logless-single-leaf-commits.md) adds a logless exception to
+the requirement that creates and deletes install membership-W: a direct member
+instead observes the membership domain clear and advances its generation in
+the commit CAS. The regular locked protocol is unchanged.
+
+[ADR-062](062-splitter-driven-tombstone-reclamation.md) additionally makes the
+membership version the validation generation for unmarked point absence.
+
 Supersedes the **"escalate to per-leaf read locks"** membership clause of
 [ADR-031](031-dynamic-range-sharding.md). It **refines** — does not replace —
 ADR-031's split: the source-shrink CAS stays the split's linearization point and

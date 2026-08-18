@@ -25,6 +25,14 @@ including its in-doubt contract, are unchanged.
 ADR's ordinary write-back and help-forward inlining while retaining
 authoritative inline values and logless direct commit.
 
+[ADR-061](061-atomic-logless-single-leaf-commits.md) supersedes this ADR's
+initial one-existing-key direct-commit eligibility and recovery scope. The
+inline representation and bounded admission decisions remain.
+
+[ADR-062](062-splitter-driven-tombstone-reclamation.md) refines tombstone
+lifetime: a quiescent tombstone may be compacted during split processing once
+unmarked absence is protected by a leaf generation.
+
 This also refines
 [ADR-022](022-garbage-collection-mark-sweep.md)'s transaction-object liveness
 model and extends [ADR-028](028-shard-mutation-coordinator.md)'s shard-mutation

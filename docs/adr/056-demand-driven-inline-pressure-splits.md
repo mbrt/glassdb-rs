@@ -10,6 +10,15 @@ and resolves the capacity follow-up left by
 change [ADR-051](051-inline-latest-values.md)'s inline representation,
 admission budgets, or direct-commit correctness contract.
 
+[ADR-061](061-atomic-logless-single-leaf-commits.md) retains this pressure
+policy for the existing single-key case but specifies that multi-key direct
+admission failure does not request a split, because splitting may divide the
+candidate's dependency set.
+
+[ADR-062](062-splitter-driven-tombstone-reclamation.md) refines execution of an
+actionable request by compacting quiescent tombstones before the final split
+decision. The pressure signal and one-split-per-request policy remain.
+
 ## Context
 
 ADR-051's aggregate inline budget bounds the value bytes rewritten with every
