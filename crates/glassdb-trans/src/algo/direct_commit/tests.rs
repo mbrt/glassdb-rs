@@ -13,8 +13,10 @@ use crate::key_state_resolver::KeyStateResolver;
 use crate::shard_coord::{FoldOutcome, ReloadCause, ResolveCtx, ShardResolver, Step};
 use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend};
 use glassdb_backend::{Backend, memory::MemoryBackend};
-use glassdb_data::{CollectionAddress, CollectionId};
-use glassdb_storage::{CollectionRecord, CurrentState, Node, NodeLocks, Shard, ShardEntry};
+use glassdb_data::{CollectionAddress, CollectionId, NodeToken};
+use glassdb_storage::{
+    CollectionRecord, CurrentState, IndexNode, Node, NodeLocks, Shard, ShardEntry,
+};
 
 /// Runs one resolver fold and retains its complete classification.
 async fn fold_step(
@@ -31,11 +33,7 @@ async fn fold_step(
         requirement: Requirement::Any,
         cause,
     };
-    let mut step = resolver.resolve(&ctx, staged, locks).await.unwrap();
-    while let Step::Recovered { step: recovered } = step {
-        step = *recovered;
-    }
-    step
+    resolver.resolve(&ctx, staged, locks).await.unwrap()
 }
 
 /// Runs one fold of `resolver` over the leaf state a coordinator round would
@@ -50,8 +48,7 @@ async fn fold(
     locks: &NodeLocks,
 ) -> FoldOutcome {
     match fold_step(resolver, tctx, cause, staged, locks).await {
-        Step::Skip { outcome } | Step::Stage { outcome, .. } | Step::Claim { outcome } => outcome,
-        Step::Recovered { .. } => unreachable!("fold_step removes recovery wrappers"),
+        Step::Skip { outcome } | Step::Stage { outcome, .. } => outcome,
     }
 }
 
@@ -1036,7 +1033,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
             &NodeLocks::default(),
         )
         .await,
-        Step::Claim {
+        Step::Skip {
             outcome: FoldOutcome::Landed
         }
     ));
@@ -1787,6 +1784,188 @@ async fn direct_mixed_member_is_atomic_and_advances_membership_once() {
         membership_version(&tctx).await,
         stable,
         "overwrite and already-absent deletes preserve membership"
+    );
+}
+
+// One concurrent split is worth a fresh regroup because the complete member
+// may still share a leaf. A second split means topology is churning; the direct
+// path must stop there instead of inheriting the coordinator's CAS retry budget.
+#[tokio::test(start_paused = true)]
+async fn direct_commit_reroutes_once_then_falls_back() {
+    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let (backend, gate) = Gate::wrap(mem.clone());
+    let (tm, tctx) = new_algo_from_backend(backend.clone()).await;
+
+    let l0 = NodeToken::from_bytes([0; 16]);
+    let l1 = NodeToken::from_bytes([1; 16]);
+    let l2 = NodeToken::from_bytes([2; 16]);
+    let seed = TxId::with_priority(1, b"seed");
+    let seeded_l0 = || {
+        Node::leaf(Shard::from_entries([ShardEntry::new(b"a").with_current(
+            CurrentState::Inline {
+                writer: seed.clone(),
+                value: Arc::from(b"a0".as_slice()),
+            },
+        )]))
+    };
+    assert!(
+        tctx.shards
+            .store_node(&test_collection(), &l0, &seeded_l0(), None)
+            .await
+            .unwrap()
+    );
+    let root = tctx
+        .shards
+        .load_leaf(&test_root_path(), Requirement::AtLeast(tctx.timeline.now()))
+        .await
+        .unwrap();
+    assert!(
+        tctx.shards
+            .store_root(
+                &test_collection(),
+                &Node::index(IndexNode::from_children([(Vec::new(), l0.to_string(),)])),
+                root.observation(),
+            )
+            .await
+            .unwrap()
+    );
+
+    // This independent cache mutates topology while the main coordinator is
+    // paused, as a splitter on another process could.
+    let (_peer, peer) = new_algo_from_backend(mem.clone()).await;
+    let second_split = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let l1_path = ObjectPath::Node {
+        collection: test_collection(),
+        token: l1.clone(),
+    }
+    .to_string();
+    backend.set_after({
+        let second_split = second_split.clone();
+        let shards = peer.shards.clone();
+        let collection = test_collection();
+        let l1 = l1.clone();
+        let l2 = l2.clone();
+        move |op, outcome| {
+            use std::sync::atomic::Ordering::SeqCst;
+            let split = outcome.is_success()
+                && matches!(
+                    op,
+                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                )
+                && op.path() == l1_path
+                && second_split
+                    .compare_exchange(false, true, SeqCst, SeqCst)
+                    .is_ok();
+            let shards = shards.clone();
+            let collection = collection.clone();
+            let l1 = l1.clone();
+            let l2 = l2.clone();
+            let future: HookFuture = Box::pin(async move {
+                if split {
+                    assert!(
+                        shards
+                            .store_node(&collection, &l2, &Node::leaf(Shard::new()), None)
+                            .await
+                            .unwrap()
+                    );
+                    let (_, observed) = shards
+                        .load_node(&collection, &l1, Requirement::Any)
+                        .await
+                        .unwrap();
+                    let bounded = Node::leaf(Shard::new())
+                        .with_high_key(Some(b"y".to_vec()))
+                        .with_right_sibling(Some(l2.to_string()));
+                    assert!(
+                        shards
+                            .store_node(&collection, &l1, &bounded, Some(&observed))
+                            .await
+                            .unwrap()
+                    );
+                }
+                Ok(())
+            });
+            future
+        }
+    });
+
+    // Hold a coordinator round open on L0 so the candidate groups there before
+    // the first split moves its key to L1.
+    gate.arm();
+    let driver = TxId::with_priority(2, b"driver");
+    tctx.tmon.begin_tx(&driver);
+    let locker = tctx.locker.clone();
+    let driver_data = Data {
+        reads: Vec::new(),
+        writes: vec![wa(&key_ref(b"a"), b"a1")],
+        scans: Vec::new(),
+    };
+    let requirement = Requirement::AtLeast(tctx.timeline.now());
+    let acquire = tokio::spawn(async move {
+        locker
+            .keys()
+            .lock_at(&driver, &driver_data, false, requirement)
+            .await
+    });
+    rt::sleep(Duration::from_secs(1)).await;
+
+    let direct = tm.direct_commit.clone();
+    let direct_id = TxId::with_priority(3, b"direct");
+    let candidate = tokio::spawn(async move {
+        let mut state = AttemptState::new();
+        direct
+            .try_commit(
+                &direct_id,
+                &Data {
+                    reads: Vec::new(),
+                    writes: vec![wa(&key_ref(b"z"), b"z1")],
+                    scans: Vec::new(),
+                },
+                &mut state,
+            )
+            .await
+    });
+    rt::sleep(Duration::from_secs(1)).await;
+
+    assert!(
+        peer.shards
+            .store_node(&test_collection(), &l1, &Node::leaf(Shard::new()), None)
+            .await
+            .unwrap()
+    );
+    let (_, observed_l0) = peer
+        .shards
+        .load_node(&test_collection(), &l0, Requirement::Any)
+        .await
+        .unwrap();
+    let bounded_l0 = seeded_l0()
+        .with_high_key(Some(b"m".to_vec()))
+        .with_right_sibling(Some(l1.to_string()));
+    assert!(
+        peer.shards
+            .store_node(&test_collection(), &l0, &bounded_l0, Some(&observed_l0),)
+            .await
+            .unwrap()
+    );
+    gate.release();
+
+    assert!(matches!(
+        acquire.await.unwrap().unwrap(),
+        LockOutcome::Locked(_)
+    ));
+    assert!(matches!(
+        candidate.await.unwrap().unwrap(),
+        DirectAttempt::Locked
+    ));
+    assert!(
+        second_split.load(std::sync::atomic::Ordering::SeqCst),
+        "the one allowed regroup reached L1 before its second split"
+    );
+    assert_eq!(
+        tm.direct_commit_stats_and_reset(),
+        DirectCommitStats {
+            candidates: 1,
+            landed: 0,
+        }
     );
 }
 

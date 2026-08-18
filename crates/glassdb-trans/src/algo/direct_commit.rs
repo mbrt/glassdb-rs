@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use glassdb_data::{KeyRef, ObjectPath, TxId};
+use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
     CurrentState, InlinePolicy, NodeLocks, Requirement, ShardEntry, StorageError,
 };
@@ -15,10 +16,9 @@ use crate::error::TransError;
 use crate::gc::Gc;
 use crate::key_resolver::KeyResolver;
 use crate::key_state_resolver::HolderResolution;
-use crate::node_locking::NodeLockReconciler;
 use crate::shard_coord::{
-    CAS_RETRIES, CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator,
-    ShardResolver, StageAdmission, Step,
+    CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver,
+    StageAdmission, Step,
 };
 use crate::split::SplitHintSink;
 
@@ -127,7 +127,11 @@ impl DirectCommit {
             return Ok(DirectAttempt::Locked);
         }
 
-        for reroute in 0..CAS_RETRIES {
+        // A split can stale the path between grouping and submission. One fresh
+        // regroup preserves the direct path for that race; repeated topology
+        // churn falls back instead of borrowing the coordinator's CAS budget.
+        let mut rerouted = false;
+        loop {
             let resolver = Arc::new(DirectCommitResolver::new(
                 id.clone(),
                 leaf_path.clone(),
@@ -162,11 +166,12 @@ impl DirectCommit {
                 Some(CoordinatedOutcome {
                     outcome: FoldOutcome::Reroute,
                     ..
-                }) if reroute + 1 < CAS_RETRIES => {
+                }) if !rerouted => {
                     let Some(path) = self.route_member(&member).await? else {
                         return Ok(DirectAttempt::Locked);
                     };
                     leaf_path = path;
+                    rerouted = true;
                 }
                 Some(CoordinatedOutcome {
                     outcome:
@@ -184,7 +189,6 @@ impl DirectCommit {
                 }
             }
         }
-        Ok(DirectAttempt::Locked)
     }
 
     /// Returns the one leaf currently owning every dependency in `member`.
@@ -292,6 +296,47 @@ impl DirectCommitResolver {
         Ok(resolutions)
     }
 
+    /// Validates node-level coordination for a direct publication.
+    async fn reconcile_node_blockers(
+        &self,
+        ctx: &ResolveCtx<'_>,
+        locks: &mut NodeLocks,
+        changes_membership: bool,
+    ) -> Result<bool, TransError> {
+        // Pruning only the staged copy keeps this outside the lock lifecycle:
+        // finalized metadata becomes durable iff the publication CAS lands.
+        if let Some(holder) = locks.delete_intent().cloned() {
+            match ctx.tmon.tx_status(&holder).await? {
+                TxCommitStatus::Ok => return Err(TransError::StaleCollection),
+                TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
+                    locks.remove_delete_intent(&holder);
+                }
+                TxCommitStatus::Pending | TxCommitStatus::Unknown => return Ok(true),
+            }
+        }
+
+        for holder in locks.structural_gate().holders().to_vec() {
+            match ctx.tmon.tx_status(&holder).await? {
+                TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
+                    locks.remove_structural_gate(&holder);
+                }
+                TxCommitStatus::Pending | TxCommitStatus::Unknown => return Ok(true),
+            }
+        }
+
+        if changes_membership {
+            for holder in locks.membership().holders().to_vec() {
+                match ctx.tmon.tx_status(&holder).await? {
+                    TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
+                        locks.remove_membership_holder(&holder);
+                    }
+                    TxCommitStatus::Pending | TxCommitStatus::Unknown => return Ok(true),
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Produces the ordinary policy decision after uncertainty, if any, has
     /// been resolved as a definite non-landing.
     async fn resolve_fresh(
@@ -313,10 +358,9 @@ impl DirectCommitResolver {
             });
 
         let mut locks = staged_locks.clone();
-        if NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id)
-            .admit_direct(&mut locks, changes_membership)
+        if self
+            .reconcile_node_blockers(ctx, &mut locks, changes_membership)
             .await?
-            .is_some()
         {
             return Ok(Step::Skip {
                 outcome: FoldOutcome::Moved,
@@ -520,7 +564,7 @@ impl ShardResolver for DirectCommitResolver {
     ) -> Result<Step, TransError> {
         if self.proven_landed() || self.has_marker(staged) {
             self.remember_landed();
-            return Ok(Step::Claim {
+            return Ok(Step::Skip {
                 outcome: FoldOutcome::Landed,
             });
         }
@@ -532,16 +576,8 @@ impl ShardResolver for DirectCommitResolver {
                 outcome: self.ambiguous_outcome(),
             });
         }
-        let step = self
-            .resolve_fresh(ctx, staged, staged_locks, &resolutions)
-            .await?;
-        if in_doubt {
-            Ok(Step::Recovered {
-                step: Box::new(step),
-            })
-        } else {
-            Ok(step)
-        }
+        self.resolve_fresh(ctx, staged, staged_locks, &resolutions)
+            .await
     }
 
     fn reorderable(&self) -> bool {

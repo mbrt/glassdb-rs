@@ -194,16 +194,18 @@ pub(crate) enum Step {
         admission: StageAdmission,
         outcome: FoldOutcome,
     },
-    /// Stage nothing; deliver `outcome` to the member regardless of the CAS.
+    /// Stage nothing; deliver `outcome` to the member regardless of the CAS. A
+    /// logless member that reports `Landed` also protects its existing markers
+    /// from later publishers in this fold.
     Skip { outcome: FoldOutcome },
-    /// Stage nothing, but reserve this logless member's markers against later
-    /// publishers in the same fold. Used after an existing marker proves the
-    /// member already committed.
-    Claim { outcome: FoldOutcome },
-    /// The enclosed decision follows proof that an earlier uncertain CAS did
-    /// not land. The coordinator clears the member's inherited uncertainty
-    /// before applying the decision or attributing a replacement CAS.
-    Recovered { step: Box<Step> },
+}
+
+impl Step {
+    fn outcome(&self) -> &FoldOutcome {
+        match self {
+            Step::Stage { outcome, .. } | Step::Skip { outcome } => outcome,
+        }
+    }
 }
 
 /// The shared handles a resolver may consult mid-fold: loaded key-state
@@ -229,6 +231,11 @@ pub(crate) trait ShardResolver: Send + Sync {
 
     /// Resolves this member against entries and node locks as currently staged
     /// this round. Resolvers cannot mutate node topology.
+    ///
+    /// When `ctx.cause` carries unresolved uncertainty, returning `InDoubt`
+    /// preserves it. Any other decision certifies that the resolver reconciled
+    /// the earlier CAS; in particular, a new stage must already be safe to
+    /// apply zero or one additional time.
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
@@ -276,8 +283,8 @@ pub(crate) trait ShardResolver: Send + Sync {
     }
 
     /// The raw keys this member commits loglessly (ADR-051): its staged entry is
-    /// the commit's only record, so no second logless member may stage over it in
-    /// the same CAS. The coordinator lets at most one of them stage per key per
+    /// the commit's only record, so no later publisher may stage over it in the
+    /// same CAS. The coordinator lets at most one of them stage per key per
     /// round and tells the rest they did not land. Disjoint keys still share a
     /// round. The default is empty: a member backed by a transaction object
     /// records its commit outside the leaf and needs no exclusivity.
@@ -489,7 +496,7 @@ impl CasWorker {
         }
         // A logless stage is its commit's only evidence, so another member may
         // not overwrite it before the shared CAS (ADR-051).
-        let mut logless: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let mut protected_markers: BTreeSet<Vec<u8>> = BTreeSet::new();
         for (tx, member) in ordered {
             let member_in_doubt = in_doubt.contains(tx);
             let ctx = ResolveCtx {
@@ -518,12 +525,12 @@ impl CasWorker {
                 });
                 continue;
             }
-            let logless_conflict = member
+            let protected_marker_conflict = member
                 .resolver
                 .publication_keys()
                 .iter()
-                .any(|&key| logless.contains(key));
-            if logless_conflict {
+                .any(|&key| protected_markers.contains(key));
+            if protected_marker_conflict {
                 plan.members.push(MemberFold {
                     id: tx.clone(),
                     outcome: member.resolver.excluded_outcome(member_in_doubt),
@@ -536,16 +543,10 @@ impl CasWorker {
                 .resolver
                 .resolve(&ctx, &plan.entries, &plan.locks)
                 .await?;
-            let (step, recovered) = match step {
-                Step::Recovered { step } => (*step, true),
-                step => (step, false),
-            };
-            let member_in_doubt = if recovered {
+            if member_in_doubt && !matches!(step.outcome(), FoldOutcome::InDoubt(_)) {
                 in_doubt.remove(tx);
-                false
-            } else {
-                member_in_doubt
-            };
+            }
+            let member_in_doubt = in_doubt.contains(tx);
             match step {
                 Step::Stage {
                     entries: changes,
@@ -571,7 +572,7 @@ impl CasWorker {
                             for (key, entry) in proposed.entries {
                                 plan.entries.insert(key, entry);
                             }
-                            logless.extend(
+                            protected_markers.extend(
                                 member
                                     .resolver
                                     .logless_keys()
@@ -594,28 +595,21 @@ impl CasWorker {
                         }
                     }
                 }
-                Step::Skip { outcome } => plan.members.push(MemberFold {
-                    id: tx.clone(),
-                    outcome,
-                    participation: Participation::Skipped,
-                }),
-                Step::Claim { outcome } => {
-                    in_doubt.remove(tx);
-                    logless.extend(
-                        member
-                            .resolver
-                            .logless_keys()
-                            .into_iter()
-                            .map(<[u8]>::to_vec),
-                    );
+                Step::Skip { outcome } => {
+                    if matches!(&outcome, FoldOutcome::Landed) {
+                        protected_markers.extend(
+                            member
+                                .resolver
+                                .logless_keys()
+                                .into_iter()
+                                .map(<[u8]>::to_vec),
+                        );
+                    }
                     plan.members.push(MemberFold {
                         id: tx.clone(),
                         outcome,
                         participation: Participation::Skipped,
-                    });
-                }
-                Step::Recovered { .. } => {
-                    unreachable!("recovery wrappers are unwrapped before applying a fold step")
+                    })
                 }
             }
         }
@@ -744,12 +738,12 @@ impl CasWorker {
         // pass from a retry after a CAS that did not land.
         let mut reloaded = false;
         // The members whose changes rode a CAS that came back in-doubt. For them
-        // in-doubt is *sticky* across re-folds: that write may have landed
-        // durably (and been help-forwarded to a peer), so a later
-        // precondition-miss must not downgrade the ambiguity to a definitive
-        // loss. Commit-install would otherwise misclassify a landed-but-unacked
-        // lock as `Moved` and unsafely abandon-and-rerun a committed object a
-        // peer already observed.
+        // in-doubt is *sticky* across re-folds until their resolver returns a
+        // reconciled, non-InDoubt decision: that write may have landed durably
+        // (and been help-forwarded to a peer), so a later precondition-miss must
+        // not downgrade the ambiguity to a definitive loss. Commit-install
+        // would otherwise misclassify a landed-but-unacked lock as `Moved` and
+        // unsafely abandon-and-rerun a committed object a peer already observed.
         //
         // It is per member rather than per round: a member the uncertain CAS did
         // not carry — one skipped for a same-key logless claim, or merged into
@@ -1873,7 +1867,7 @@ mod tests {
         keys: Vec<Vec<u8>>,
         tx: TxId,
         logless: bool,
-        claim: bool,
+        already_landed: bool,
     }
 
     impl MultiPublisherProbe {
@@ -1882,7 +1876,7 @@ mod tests {
                 keys: keys.iter().map(|key| key.to_vec()).collect(),
                 tx: tx.clone(),
                 logless: true,
-                claim: false,
+                already_landed: false,
             }
         }
 
@@ -1891,13 +1885,13 @@ mod tests {
                 keys: keys.iter().map(|key| key.to_vec()).collect(),
                 tx: tx.clone(),
                 logless: false,
-                claim: false,
+                already_landed: false,
             }
         }
 
-        fn claim(keys: &[&[u8]], tx: &TxId) -> Self {
+        fn landed(keys: &[&[u8]], tx: &TxId) -> Self {
             Self {
-                claim: true,
+                already_landed: true,
                 ..Self::direct(keys, tx)
             }
         }
@@ -1911,8 +1905,8 @@ mod tests {
             _staged: &BTreeMap<Vec<u8>, ShardEntry>,
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
-            if self.claim {
-                return Ok(Step::Claim {
+            if self.already_landed {
+                return Ok(Step::Skip {
                     outcome: FoldOutcome::Landed,
                 });
             }
@@ -2087,7 +2081,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn recovered_marker_claim_protects_later_publishers() {
+    async fn observed_logless_marker_protects_later_publishers() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (backend, gate) = Gate::wrap(mem);
         let backend = backend as Arc<dyn Backend>;
@@ -2116,7 +2110,7 @@ mod tests {
             c1.submit_shard(
                 &leaf(),
                 &t1,
-                Arc::new(MultiPublisherProbe::claim(&[b"a", b"b"], &t1)),
+                Arc::new(MultiPublisherProbe::landed(&[b"a", b"b"], &t1)),
                 Requirement::Any,
             )
             .await
@@ -2758,7 +2752,16 @@ mod tests {
             _staged: &BTreeMap<Vec<u8>, ShardEntry>,
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
-            let value: Arc<[u8]> = if self.folds.fetch_add(1, Ordering::SeqCst) == 0 {
+            let fold = self.folds.fetch_add(1, Ordering::SeqCst);
+            let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true });
+            if in_doubt && !self.recovers_non_landing {
+                return Ok(Step::Skip {
+                    outcome: FoldOutcome::InDoubt(
+                        "capacity changed after an unreconciled CAS".into(),
+                    ),
+                });
+            }
+            let value: Arc<[u8]> = if fold == 0 {
                 Arc::from(b"x".as_slice())
             } else {
                 Arc::from(vec![b'x'; 128])
@@ -2767,21 +2770,12 @@ mod tests {
                 writer: self.tx.clone(),
                 value,
             });
-            let step = Step::Stage {
+            Ok(Step::Stage {
                 entries: vec![(self.key.clone(), entry)],
                 locks: staged_locks.clone(),
                 admission: StageAdmission::ExistingKeys,
                 outcome: FoldOutcome::Landed,
-            };
-            if self.recovers_non_landing
-                && matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true })
-            {
-                Ok(Step::Recovered {
-                    step: Box::new(step),
-                })
-            } else {
-                Ok(step)
-            }
+            })
         }
 
         fn reorderable(&self) -> bool {
@@ -2797,11 +2791,12 @@ mod tests {
         }
     }
 
-    // Capacity rejection must preserve uncertainty only for the member carried
-    // by the failed CAS; clouding a co-batched member that never staged would
-    // manufacture ambiguity for a write it never issued.
+    // An unresolved member must decline to propose a replacement stage. Its
+    // uncertainty belongs only to the member carried by the failed CAS;
+    // clouding a co-batched member that never staged would manufacture
+    // ambiguity for a write it never issued.
     #[tokio::test(start_paused = true)]
-    async fn capacity_rejection_after_in_doubt_preserves_uncertainty() {
+    async fn unreconciled_member_does_not_restage_after_in_doubt() {
         let tx = TxId::with_priority(1, b"t");
         let skipped = TxId::with_priority(2, b"skipped");
         let small = ShardEntry::new(b"k").with_current(CurrentState::Inline {
@@ -2898,7 +2893,7 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
-            "the oversized retry did not CAS"
+            "the unreconciled member issued no replacement CAS"
         );
         coord.close().await;
     }
@@ -3015,11 +3010,9 @@ mod tests {
         backend
     }
 
-    // A commit-shaped resolver: it stages a mutation (issuing a CAS) on its first
-    // two folds, then on the third fold classifies its lost race the same way
-    // `DirectCommitResolver` does — `InDoubt` if any earlier CAS this round was
-    // in-doubt, else a definitive `Moved`. Records the deciding fold's
-    // `in_doubt` cause so the test can pin the coordinator's state machine.
+    // A commit-shaped resolver that stages once, then refuses to restage until
+    // its uncertain CAS can be reconciled. Records the later fold's cause so
+    // tests can pin the coordinator's sticky attribution.
     struct StickyCommitProbe {
         key: Vec<u8>,
         tx: TxId,
@@ -3035,7 +3028,7 @@ mod tests {
             _staged: &BTreeMap<Vec<u8>, ShardEntry>,
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
-            if self.folds.fetch_add(1, Ordering::SeqCst) < 2 {
+            if self.folds.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Ok(Step::Stage {
                     entries: vec![(
                         self.key.clone(),
@@ -3081,9 +3074,9 @@ mod tests {
     // non-idempotent write a peer already observed — breaking the
     // `final <= started` serializability bound.
     //
-    // This pins the coordinator half of the fix in isolation, including exact
-    // attribution alongside a co-batched member that never staged. The
-    // *end-to-end* manifestation (a real commit being abandoned and
+    // This pins the coordinator half of the fix in isolation: the uncertain
+    // member declines to restage while an idempotent peer drives the later CAS.
+    // The *end-to-end* manifestation (a real commit being abandoned and
     // double-applying under the true 3-way co-batched interleaving) is covered
     // deterministically by the committed fuzz reproducer
     // `fuzz/corpus/concurrent_tx/crash-95084997…`, which the corpus-replay test
@@ -3108,7 +3101,7 @@ mod tests {
         let (coord, _shards, _timeline, _bg) = coord_over(backend).await;
 
         let tx = TxId::with_priority(2, b"install");
-        let skipped = TxId::with_priority(3, b"skipped");
+        let retrying = TxId::with_priority(3, b"retrying");
         let seen_in_doubt = Arc::new(Mutex::new(None));
         gate.arm();
         let (driver_coord, driver_tx, driver_seen) =
@@ -3129,13 +3122,16 @@ mod tests {
                 .await
         });
         rt::sleep(Duration::from_secs(1)).await;
-        let (joiner_coord, joiner_tx) = (coord.clone(), skipped.clone());
+        let (joiner_coord, joiner_tx) = (coord.clone(), retrying.clone());
         let joiner = tokio::spawn(async move {
             joiner_coord
                 .submit_shard(
                     &leaf(),
                     &joiner_tx,
-                    Arc::new(SkipCauseProbe),
+                    Arc::new(AlwaysStageProbe {
+                        key: b"peer".to_vec(),
+                        tx: joiner_tx.clone(),
+                    }),
                     Requirement::Any,
                 )
                 .await
@@ -3144,7 +3140,7 @@ mod tests {
         gate.release();
 
         let out = driver.await.unwrap().unwrap();
-        let skipped_outcome = joiner.await.unwrap().unwrap();
+        let retrying_outcome = joiner.await.unwrap().unwrap();
 
         assert_eq!(
             *seen_in_doubt.lock().unwrap(),
@@ -3162,21 +3158,18 @@ mod tests {
             "a landed-but-unacked CAS that is then superseded must classify InDoubt, \
              not Moved (else the caller abandons and double-applies)"
         );
-        assert!(
-            matches!(
-                skipped_outcome,
-                Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::Moved,
-                    cas_precondition: None,
-                })
-            ),
-            "the member that never staged must not inherit either failed CAS"
-        );
+        assert!(matches!(
+            retrying_outcome,
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Landed,
+                ..
+            })
+        ));
         coord.close().await;
     }
 
-    // A commit-shaped resolver that keeps staging until the round's retry budget
-    // is exhausted.
+    // An idempotent resolver that can safely acknowledge uncertainty by
+    // proposing the same state again.
     struct AlwaysStageProbe {
         key: Vec<u8>,
         tx: TxId,
@@ -3245,7 +3238,7 @@ mod tests {
 
     // Regression: exhausting the retry budget must not turn a possibly-landed
     // commit CAS into `Moved`, which would permit a non-idempotent retry.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn exhausted_budget_after_in_doubt_cas_stays_in_doubt() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let seed = TxId::with_priority(1, b"seed");
@@ -3255,24 +3248,54 @@ mod tests {
             vec![entry(b"seed", LockType::None, None, Some(&seed))],
         )
         .await;
-        let backend: Arc<dyn Backend> = in_doubt_then_miss_forever(mem);
+        let (gated, gate) = Gate::wrap(mem);
+        let backend: Arc<dyn Backend> = in_doubt_then_miss_forever(gated as Arc<dyn Backend>);
         let (coord, _shards, _timeline, _bg) = coord_over_fast(backend).await;
 
-        let tx = TxId::with_priority(2, b"install");
-        let out = coord
-            .submit_shard(
-                &leaf(),
-                &tx,
-                Arc::new(AlwaysStageProbe {
-                    key: b"k".to_vec(),
-                    tx: tx.clone(),
-                }),
-                Requirement::Any,
-            )
-            .await
-            .unwrap();
+        let uncertain = TxId::with_priority(2, b"uncertain");
+        let retrying = TxId::with_priority(3, b"retrying");
+        let seen_in_doubt = Arc::new(Mutex::new(None));
+        gate.arm();
+        let (driver_coord, driver_tx, driver_seen) =
+            (coord.clone(), uncertain.clone(), seen_in_doubt.clone());
+        let driver = tokio::spawn(async move {
+            driver_coord
+                .submit_shard(
+                    &leaf(),
+                    &driver_tx,
+                    Arc::new(StickyCommitProbe {
+                        key: b"uncertain".to_vec(),
+                        tx: driver_tx.clone(),
+                        folds: std::sync::atomic::AtomicUsize::new(0),
+                        seen_in_doubt: driver_seen,
+                    }),
+                    Requirement::Any,
+                )
+                .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        let (joiner_coord, joiner_tx) = (coord.clone(), retrying.clone());
+        let joiner = tokio::spawn(async move {
+            joiner_coord
+                .submit_shard(
+                    &leaf(),
+                    &joiner_tx,
+                    Arc::new(AlwaysStageProbe {
+                        key: b"retrying".to_vec(),
+                        tx: joiner_tx.clone(),
+                    }),
+                    Requirement::Any,
+                )
+                .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        gate.release();
+
+        let out = driver.await.unwrap().unwrap();
+        let retrying_outcome = joiner.await.unwrap().unwrap();
         coord.close().await;
 
+        assert_eq!(*seen_in_doubt.lock().unwrap(), Some(true));
         assert!(
             matches!(
                 out,
@@ -3283,5 +3306,12 @@ mod tests {
             ),
             "exhaustion after an in-doubt CAS must preserve uncertainty"
         );
+        assert!(matches!(
+            retrying_outcome,
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Moved,
+                cas_precondition: None,
+            })
+        ));
     }
 }

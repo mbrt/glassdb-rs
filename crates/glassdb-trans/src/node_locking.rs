@@ -102,55 +102,6 @@ impl<'a> NodeLockReconciler<'a> {
         Ok(Some(holder))
     }
 
-    /// Admits a logless leaf rewrite without waiting for or wounding a live
-    /// node-lock holder.
-    ///
-    /// Terminal holders can be removed by the commit CAS. Pending and unknown
-    /// holders force the caller onto the regular locked protocol, whose
-    /// lifecycle owns waiting and wound-wait (ADR-061).
-    pub(crate) async fn admit_direct(
-        &self,
-        locks: &mut NodeLocks,
-        changes_membership: bool,
-    ) -> Result<Option<TxId>, TransError> {
-        if let Some(holder) = locks.delete_intent().cloned() {
-            match self.monitor.tx_status(&holder).await? {
-                TxCommitStatus::Ok => return Err(TransError::StaleCollection),
-                TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
-                    locks.remove_delete_intent(&holder);
-                }
-                TxCommitStatus::Pending | TxCommitStatus::Unknown => {
-                    return Ok(Some(holder));
-                }
-            }
-        }
-
-        for holder in locks.structural_gate().holders().to_vec() {
-            match self.monitor.tx_status(&holder).await? {
-                TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
-                    locks.remove_structural_gate(&holder);
-                }
-                TxCommitStatus::Pending | TxCommitStatus::Unknown => {
-                    return Ok(Some(holder));
-                }
-            }
-        }
-
-        if changes_membership {
-            for holder in locks.membership().holders().to_vec() {
-                match self.monitor.tx_status(&holder).await? {
-                    TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
-                        locks.remove_membership_holder(&holder);
-                    }
-                    TxCommitStatus::Pending | TxCommitStatus::Unknown => {
-                        return Ok(Some(holder));
-                    }
-                }
-            }
-        }
-        Ok(None)
-    }
-
     /// Closes the structural gate after quiescing membership holders.
     ///
     /// Returns the live holder to wait for, or leaves both node-lock scopes free
