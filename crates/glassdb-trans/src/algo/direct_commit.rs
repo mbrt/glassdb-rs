@@ -613,6 +613,7 @@ impl ShardResolver for DirectCommitResolver {
 }
 
 /// What an attempted direct commit established about its transaction.
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum DirectAttempt {
     /// The one-CAS commit landed.
     Committed,

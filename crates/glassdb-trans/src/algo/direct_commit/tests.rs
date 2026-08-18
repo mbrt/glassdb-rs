@@ -149,40 +149,55 @@ async fn single_rw_stale_read_renews_and_converges() {
     );
 }
 
-/// Controls a hook that gates the coordinator's bounded seed read.
+#[derive(Clone, Copy)]
+enum GateKind {
+    Read,
+    Write,
+}
+
+/// Controls a hook that gates the coordinator's next configured operation.
 struct Gate {
-    notify: Arc<tokio::sync::Notify>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
     armed: std::sync::atomic::AtomicBool,
-    skip: std::sync::atomic::AtomicUsize,
+    kind: GateKind,
 }
 
 impl Gate {
     fn wrap(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
+        Self::wrap_kind(inner, GateKind::Read)
+    }
+
+    fn wrap_writes(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
+        Self::wrap_kind(inner, GateKind::Write)
+    }
+
+    fn wrap_kind(inner: Arc<dyn Backend>, kind: GateKind) -> (Arc<HookBackend>, Arc<Self>) {
         let gate = Arc::new(Self {
-            notify: Arc::new(tokio::sync::Notify::new()),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
             armed: std::sync::atomic::AtomicBool::new(false),
-            skip: std::sync::atomic::AtomicUsize::new(0),
+            kind,
         });
         let backend = HookBackend::new(inner);
         backend.set_before({
             let gate = gate.clone();
             move |op| {
                 use std::sync::atomic::Ordering::SeqCst;
-                let wait = matches!(
-                    op,
-                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
-                ) && gate.armed.load(SeqCst)
-                    && gate
-                        .skip
-                        .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
-                        .is_err();
-                if wait {
-                    gate.armed.store(false, SeqCst);
-                }
-                let notify = gate.notify.clone();
+                let matches = match gate.kind {
+                    GateKind::Read => matches!(
+                        op,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    ),
+                    GateKind::Write => matches!(op, BackendOp::WriteIf { .. }),
+                };
+                let wait = matches && gate.armed.swap(false, SeqCst);
+                let entered = gate.entered.clone();
+                let release = gate.release.clone();
                 let future: HookFuture = Box::pin(async move {
                     if wait {
-                        notify.notified().await;
+                        entered.notify_one();
+                        release.notified().await;
                     }
                     Ok(())
                 });
@@ -193,14 +208,15 @@ impl Gate {
     }
 
     fn arm(&self) {
-        // Point routing is cache-local; the coordinator seed is now the
-        // first backend read in the lock phase.
-        self.skip.store(0, std::sync::atomic::Ordering::SeqCst);
         self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    async fn wait_until_blocked(&self) {
+        self.entered.notified().await;
+    }
+
     fn release(&self) {
-        self.notify.notify_one();
+        self.release.notify_one();
     }
 }
 
@@ -1793,7 +1809,7 @@ async fn direct_mixed_member_is_atomic_and_advances_membership_once() {
 #[tokio::test(start_paused = true)]
 async fn direct_commit_reroutes_once_then_falls_back() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let (backend, gate) = Gate::wrap(mem.clone());
+    let (backend, gate) = Gate::wrap_writes(mem.clone());
     let (tm, tctx) = new_algo_from_backend(backend.clone()).await;
 
     let l0 = NodeToken::from_bytes([0; 16]);
@@ -1830,84 +1846,13 @@ async fn direct_commit_reroutes_once_then_falls_back() {
             .unwrap()
     );
 
-    // This independent cache mutates topology while the main coordinator is
-    // paused, as a splitter on another process could.
+    // This independent cache mutates topology while the main coordinator's
+    // CAS is paused, as a splitter on another process could.
     let (_peer, peer) = new_algo_from_backend(mem.clone()).await;
-    let second_split = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let l1_path = ObjectPath::Node {
-        collection: test_collection(),
-        token: l1.clone(),
-    }
-    .to_string();
-    backend.set_after({
-        let second_split = second_split.clone();
-        let shards = peer.shards.clone();
-        let collection = test_collection();
-        let l1 = l1.clone();
-        let l2 = l2.clone();
-        move |op, outcome| {
-            use std::sync::atomic::Ordering::SeqCst;
-            let split = outcome.is_success()
-                && matches!(
-                    op,
-                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
-                )
-                && op.path() == l1_path
-                && second_split
-                    .compare_exchange(false, true, SeqCst, SeqCst)
-                    .is_ok();
-            let shards = shards.clone();
-            let collection = collection.clone();
-            let l1 = l1.clone();
-            let l2 = l2.clone();
-            let future: HookFuture = Box::pin(async move {
-                if split {
-                    assert!(
-                        shards
-                            .store_node(&collection, &l2, &Node::leaf(Shard::new()), None)
-                            .await
-                            .unwrap()
-                    );
-                    let (_, observed) = shards
-                        .load_node(&collection, &l1, Requirement::Any)
-                        .await
-                        .unwrap();
-                    let bounded = Node::leaf(Shard::new())
-                        .with_high_key(Some(b"y".to_vec()))
-                        .with_right_sibling(Some(l2.to_string()));
-                    assert!(
-                        shards
-                            .store_node(&collection, &l1, &bounded, Some(&observed))
-                            .await
-                            .unwrap()
-                    );
-                }
-                Ok(())
-            });
-            future
-        }
-    });
 
-    // Hold a coordinator round open on L0 so the candidate groups there before
-    // the first split moves its key to L1.
+    // Park the candidate's L0 CAS after it has grouped and folded there. Moving
+    // z to L1 now deterministically makes that first CAS stale.
     gate.arm();
-    let driver = TxId::with_priority(2, b"driver");
-    tctx.tmon.begin_tx(&driver);
-    let locker = tctx.locker.clone();
-    let driver_data = Data {
-        reads: Vec::new(),
-        writes: vec![wa(&key_ref(b"a"), b"a1")],
-        scans: Vec::new(),
-    };
-    let requirement = Requirement::AtLeast(tctx.timeline.now());
-    let acquire = tokio::spawn(async move {
-        locker
-            .keys()
-            .lock_at(&driver, &driver_data, false, requirement)
-            .await
-    });
-    rt::sleep(Duration::from_secs(1)).await;
-
     let direct = tm.direct_commit.clone();
     let direct_id = TxId::with_priority(3, b"direct");
     let candidate = tokio::spawn(async move {
@@ -1924,7 +1869,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
             )
             .await
     });
-    rt::sleep(Duration::from_secs(1)).await;
+    gate.wait_until_blocked().await;
 
     assert!(
         peer.shards
@@ -1946,20 +1891,37 @@ async fn direct_commit_reroutes_once_then_falls_back() {
             .await
             .unwrap()
     );
+
+    // Arm the next write before releasing L0. The coordinator reloads the
+    // moved key, reports one reroute, and the direct path stages its next CAS
+    // on L1, where the second barrier catches it.
+    gate.arm();
+    gate.release();
+    gate.wait_until_blocked().await;
+
+    assert!(
+        peer.shards
+            .store_node(&test_collection(), &l2, &Node::leaf(Shard::new()), None)
+            .await
+            .unwrap()
+    );
+    let (_, observed_l1) = peer
+        .shards
+        .load_node(&test_collection(), &l1, Requirement::Any)
+        .await
+        .unwrap();
+    let bounded_l1 = Node::leaf(Shard::new())
+        .with_high_key(Some(b"y".to_vec()))
+        .with_right_sibling(Some(l2.to_string()));
+    assert!(
+        peer.shards
+            .store_node(&test_collection(), &l1, &bounded_l1, Some(&observed_l1))
+            .await
+            .unwrap()
+    );
     gate.release();
 
-    assert!(matches!(
-        acquire.await.unwrap().unwrap(),
-        LockOutcome::Locked(_)
-    ));
-    assert!(matches!(
-        candidate.await.unwrap().unwrap(),
-        DirectAttempt::Locked
-    ));
-    assert!(
-        second_split.load(std::sync::atomic::Ordering::SeqCst),
-        "the one allowed regroup reached L1 before its second split"
-    );
+    assert_eq!(candidate.await.unwrap().unwrap(), DirectAttempt::Locked);
     assert_eq!(
         tm.direct_commit_stats_and_reset(),
         DirectCommitStats {
