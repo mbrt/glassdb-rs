@@ -26,6 +26,10 @@ commit-critical direct inline publish. The coordinator invariant remains;
 a same-key round reservation prevents one batched direct commit from erasing
 another's in-doubt recovery evidence.
 
+[ADR-061](061-atomic-logless-single-leaf-commits.md) broadens that installed
+policy to member-atomic, multi-entry direct publication. Whole-member exclusion
+and transaction-local recovery preserve the coordinator contracts.
+
 The `Clock`-based time-source detail is superseded by
 [ADR-058](058-process-wide-model-time.md); coordinator behavior is unchanged.
 

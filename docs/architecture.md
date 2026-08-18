@@ -115,18 +115,17 @@ boundary.
 ## Component Responsibilities
 
 Inside the transaction engine (`glassdb-trans`) the division of labour separates
-transaction orchestration from shared shard mutation, with one structural invariant:
-**shard routing and shard CAS never leak above the locker**. `Algo` decides
-*what* must happen to commit a transaction — purely in terms of logical keys
-(paths), the version tokens observed at read time, and staged writes — while the
-`Locker` decides *how* to acquire those locks efficiently, owning the mapping
-from keys to shard objects and the parallel/serial CAS. (`Reader` is likewise
-shard-aware internally but exposes a path-based API. `Algo` holds a `NodeStore`
-for one narrow purpose: re-checking during optimistic validation whether a leaf
-observation already carried in its own `Data` is still current. It routes no key
-and CASes no object.)
+transaction orchestration from shared shard mutation. `Algo` decides *what*
+must happen to commit a transaction in terms of logical keys, observed writer
+tokens, and staged writes. The `Locker` owns physical routing and acquisition for
+the logged protocol. `DirectCommit` owns the narrower logless mechanism: it asks
+`KeyResolver` whether a complete point-access member shares one leaf, then
+installs that member in the shared coordinator. `Algo` itself routes no key and
+CASes no object. (`Reader` is likewise shard-aware internally but exposes a
+path-based API. `Algo` holds a `NodeStore` only to re-check whether a leaf
+observation already carried in its own `Data` is still current.)
 
-Every shard/root entry mutation — lock acquire, single read-write commit-install,
+Every shard/root entry mutation — lock acquire, direct same-leaf publication,
 write-back, release, and GC reclamation — flows through **one shard-mutation
 coordinator** that loads the object once, folds the round's operations in
 wound-wait order, and CASes once (ADR-028/029). The coordinator is a
@@ -169,7 +168,7 @@ supply each operation's mutation decision as an installed resolver. For the full
  │ validate│   │ · installs resolvers  │   │ refresh  │   │ →Locker │
  └────┬────┘   └───────────┬───────────┘   └────┬─────┘   └────┬────┘
       │                    │ acquire / write-back / release    │
-      │                    │ + Algo CommitInstall + Gc release │
+      │                    │ + DirectCommit / Gc publication   │
       │                    ▼                                   │
       │       ┌───────────────────────────────┐                │
       │       │ ShardCoordinator — FOLD ENGINE│                │
@@ -245,12 +244,12 @@ or maintaining independent topology state. The Engine centralizes their
 assembly; it does not invent a single semantic owner for those different routing
 responsibilities.
 
-Beneath the locker boundary, every data-node entry mutation flows through a
+Behind the physical-mutation boundary, every data-node entry mutation flows through a
 single transaction-aware `ShardCoordinator`. It owns the protocol shared by a
 heterogeneous round: single-flight batching, transaction identity,
-oldest-first wound-wait order, ownership and capacity admission, same-key
-logless exclusion, one CAS, per-member uncertainty attribution, and
-reload-and-re-fold recovery. Installed resolvers own the operation-specific
+oldest-first wound-wait order, ownership and capacity admission, whole-member
+exclusion for overlapping logless output claims, one CAS, per-member
+uncertainty attribution, and reload-and-re-fold recovery. Installed resolvers own the operation-specific
 mutation decisions — `Locker` supplies acquire / write-back / release, `Algo`
 supplies direct commit, and `Gc` reclaims through the `Locker`'s unlock methods
 (ADR-028/029). Cross-shard acquisition strategy, transaction lifecycle,
@@ -261,13 +260,14 @@ the coordinator.
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
 | `glassdb` (`tx_impl`) | API / retry      | `Engine`, closures, `Error`  | metadata bootstrap, operation admission, user body, retry loop, public handles/errors, cancel-safety                  | stores, locks, shards, tx logs, runtime wiring |
 | `Engine`              | runtime façade   | logical keys, `Data`, configuration | component assembly/lifetime, read/scan/catalog entry points, transaction-attempt delegation, shutdown, component stats/diagnostics | user closures, public handles/errors, body retry policy |
-| `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome` | transaction lifecycle, cross-domain lock→validate→commit→write-back orchestration, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), single read-write `CommitInstall`, GC candidate hints | shard routing, CAS details, caching, collection lifecycle implementation, the split mechanism beyond its `SplitHintSink` producer handle |
+| `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome` | transaction lifecycle, direct-vs-logged selection, cross-domain lock→validate→commit→write-back orchestration, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), GC candidate hints | shard routing, CAS details, caching, collection lifecycle implementation, the split mechanism beyond its `SplitHintSink` producer handle |
+| `DirectCommit`        | logless commit mechanism | `Data`, `TxId`, `KeyResolver`, resolvers | complete point-member normalization, one-leaf eligibility, atomic inline/tombstone publication, transaction-local recovery classification | transaction logs, range/catalog validation, waiting or wounding holders |
 | `CollectionCommit`    | collection-commit **policy** | `CollectionAttempt`, catalog, lifecycle | same-ID collection retry state, recovery and committed-log fields, incarnation preparation, validation, drop fencing, post-commit/abort cleanup | key locking, key validation, the atomic commit decision |
 | `Locker::keys`        | key-lock **policy** | `Data`, `TxId`, B-link nodes | key→leaf grouping, parallel & serial acquisition, hold-and-wait, acquire / write-back / release resolvers | collection-directory semantics |
 | `Locker::collections` | collection-lock **policy** | collection addresses, `TxId`, records | directory/topology lock acquisition, recovery write-back and release | key routing, B-link topology, catalog semantics |
 | `CollectionStateResolver` | collection-state mechanism | collection addresses, records, `TxId` | resolved record loads, foreign-holder reconciliation, committed directory write-back assistance | key routing, B-link topology, catalog semantics |
 | `CollectionCatalog`   | collection semantics | directory reads, binding changes, resolved records | logical snapshots, read-your-writes validation, capacity/precondition checks | locking policy, CAS, wound-wait |
-| `ShardCoordinator`    | shared mutation engine | object paths, `TxId`, resolvers | one round per object: single-flight, oldest-first fold, ownership/capacity admission, logless exclusion, single CAS, per-member uncertainty, reload-recover, vestigial-entry pruning | cross-shard strategy, transaction lifecycle, commit orchestration, GC selection, held-lock bookkeeping |
+| `ShardCoordinator`    | shared mutation engine | object paths, `TxId`, resolvers | one round per object: single-flight, oldest-first fold, ownership/capacity admission, overlapping logless-member exclusion, single CAS, per-member uncertainty, reload-recover, vestigial-entry pruning | cross-shard strategy, transaction lifecycle, commit orchestration, GC selection, held-lock bookkeeping |
 | `KeyResolver`         | key/range resolution | logical keys, ranges, `TreeRouter` | routing and scan composition | commit / lock policy, collection-record coordination |
 | `KeyStateResolver`    | loaded key-state mechanism | nodes, entries, `TxId` | transaction-dependent interpretation of already-loaded key and node state | routing, scan composition, commit policy |
 | `Reader`              | read mechanism   | logical keys, resolved writers | value materialization | commit / lock policy                |
@@ -682,38 +682,46 @@ This makes read-heavy workloads very efficient — the happy path requires only
 one metadata read per key, with zero writes, plus one value read for keys whose
 current value is not inline.
 
-#### Single read-modify-write
+#### Same-leaf direct commits
 
-A transaction that overwrites exactly one existing key with an inline-eligible
-value commits in **one** conditional leaf CAS — no lock, no transaction object,
-no write-back ([ADR-051](adr/051-inline-latest-values.md)). The CAS installs
-`Inline { writer: txid, value }` with no lock holder, which is simultaneously the
-commit point and the published value: a reader that sees it needs nothing else,
-and a reader that does not see it observes the predecessor. Eligibility is
-decided before anything is written, so an attempt that does not commit has staged
-nothing at all.
+A transaction whose complete point-read and point-write dependency set shares
+one leaf can commit in **one** conditional leaf CAS — no lock, transaction
+object, or write-back
+([ADR-061](adr/061-atomic-logless-single-leaf-commits.md)). The transaction may
+read keys other than those it writes and may mix creates, overwrites, and
+deletes. Every put becomes `Inline { writer: txid, value }`; every delete becomes
+`Tombstone { writer: txid }`. The leaf CAS validates every observed writer and
+publishes every output atomically, so it is both the commit point and the
+complete durable result. An actual create or delete also advances the leaf's
+membership generation once for the whole member.
 
-That makes a non-landing attempt something to *classify* rather than fail
-([ADR-053](adr/053-replay-definitive-logless-rmw-losses.md)). A
-read-modify-write whose loss is certified — excluded from a coordinator round, or
-superseded before publication — replays its body under the same, still
-unengaged, id, so a local scheduling loss does not publish a holder that would
-push the key's next writer onto the locked protocol. Genuine ineligibility — a
-live pending or unknown holder, an exclusive structural gate, a collection-delete
-intent, a missing key, a value over either inline budget, or an inline entry
-larger than its half of the leaf's reserved content budget — takes the regular
-[commit protocol](#commit-protocol) above under the same id. The last check
-preserves room for another independently accepted key, so direct publication
-cannot create an intrinsically unsplittable singleton. There is no third,
-single-key-only commit protocol between the two.
+Direct admission requires all output values to fit the per-value inline limit
+and the complete post-state to fit the aggregate and encoded leaf limits. There
+is no direct-specific key-count cap. Range scans, collection-catalog operations,
+cross-leaf point dependencies, structural or deletion fencing, and live or
+unknown holders use the regular [commit protocol](#commit-protocol). Direct
+commit never waits for or wounds a holder. A failed multi-key admission does not
+request a pressure split because a split could destroy the member's one-leaf
+eligibility; the original single-key pressure signal remains available.
 
-Because the commit is invisible until the CAS lands, a retry is proved
-idempotent by the entry already naming this transaction as its inline writer, and
-a cancelled attempt writes no abort-side object (the recovery guard fires only
-for a transaction that took a logged identity). The coordinator reserves the key for at
-most one logless member per round, so a batched blind writer cannot erase another
-direct commit's recovery evidence. An uncertain CAS followed by a moved entry
-surfaces `Error::InDoubt` as usual, and is never downgraded to a replay.
+A non-landing direct attempt is classified as a whole
+([ADR-053](adr/053-replay-definitive-logless-rmw-losses.md)). A read-dependent
+member whose loss is certified replays its body under the same, still-unengaged
+id; a blind member and a member requiring coordination take the regular locked
+path. Within one coordinator round, an earlier direct member claims all of its
+output keys. Any later publisher that overlaps those claims is excluded as a
+whole, while disjoint direct members may share the same physical leaf CAS.
+
+Recovery remains transaction-local. Seeing any exact inline or tombstone output
+marker for this txid proves the entire member landed. With no marker, every
+output still naming its recorded predecessor proves non-landing; valid reads may
+retry direct, while a stale read replays the body. Without either landing or
+non-landing proof, an unavailable CAS reports `Error::InDoubt`. A topology move
+after an uncertain CAS is likewise in doubt unless landing was already proved
+on the original leaf. Cancellation before dispatch leaves no state, while
+cancellation after dispatch is crash-equivalent. Tombstones remain until the
+splitter-driven reclamation protocol in
+[ADR-062](adr/062-splitter-driven-tombstone-reclamation.md) is implemented.
 
 #### Retry with locks held
 
@@ -1060,9 +1068,11 @@ token for the conditional write that takes the lock.
 A transaction object is **live** exactly while some data node or collection
 record still references its txid (entry, membership, directory, or topology
 coordination), so garbage collection is a reachability problem rather than a
-timer. A logless direct commit ([ADR-051](adr/051-inline-latest-values.md)) names
-a writer that never had an object, which is not a dangling reference: only
-existing objects are candidates, and one is dead once nothing names it. The `Gc` component (`glassdb-trans/src/gc.rs`) implements a
+timer. A logless direct commit
+([ADR-061](adr/061-atomic-logless-single-leaf-commits.md)) names one or more
+inline or tombstone writers that never had an object, which is not a dangling
+reference: only existing objects are candidates, and one is dead once nothing
+names it. The `Gc` component (`glassdb-trans/src/gc.rs`) implements a
 candidate-driven **reverse mark-sweep** ([ADR-022](adr/022-garbage-collection-mark-sweep.md)):
 
 - **Reverse liveness check.** A forward mark (list every shard, union the

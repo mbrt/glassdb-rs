@@ -170,12 +170,10 @@ async fn delete() {
 }
 
 /// Regression: reading a found key and deleting that same key in one
-/// transaction must commit. Such a transaction is shaped like a single
-/// read-write, but the logless fast path cannot perform a delete (it would
-/// issue a conditional delete while holding no lock, which the storage locker
-/// rejects). Deletes must therefore route through the locked commit path. This
-/// failed with an internal error before deletes were excluded from the fast
-/// path.
+/// transaction must commit. ADR-061 publishes the deletion as an authoritative
+/// tombstone in the direct leaf CAS; before direct deletes were supported this
+/// shape had to route cleanly through the locked protocol rather than reaching
+/// a conditional-delete path without a lock.
 #[tokio::test(start_paused = true)]
 async fn read_then_delete_single_tx() {
     let db = init_db(mem()).await;

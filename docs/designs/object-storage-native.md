@@ -33,19 +33,24 @@ tags. No object tags anywhere.
     existing key touches only its shard.
   - _Transaction_ (`_t/<ss>/<txid>`): unified; `Pending` (small: lease + lock
     intentions), `Committed` (fat: value map), `Wounded` (terminal but pinned),
-    or `Aborted` (owner-retired and GC-eligible). The first two encoded txid
-    symbols select one of 4,096 deterministic listing shards.
+    or `Aborted` (owner-retired and GC-eligible). It stores values for logged
+    commits; directly committed values and tombstones are authoritative in the
+    leaf. The first two encoded txid symbols select one of 4,096 deterministic
+    listing shards.
 - **Protocol** — execute → lock (one shard GET + one CAS per shard) → validate
   reads (re-resolve effective writers in `Algo`, post-lock) → commit (CAS the
   transaction object to committed, attaching values) → async per-shard write-back
-  (publish current-writer pointers + release locks).
+  (publish current-writer pointers + release locks). An eligible complete
+  same-leaf point transaction instead validates and publishes directly in one
+  leaf CAS.
 - **Membership** — key create/delete write-lock the collection root (phantom
   prevention) and CAS the key's shard; listing OCC-validates the root version and
   enumerates, falling back to a root read lock under contention. Subcollections
   are listed from the root.
-- **Reads** — shard (conditional GET) → current-writer txid → value from the
-  immutable transaction object (cacheable indefinitely). Read/write of an
-  existing key needs no root lock; read-only stays lock-free.
+- **Reads** — shard (conditional GET) → authoritative inline value/tombstone, or
+  current-writer txid → value from the immutable transaction object (cacheable
+  indefinitely). Read/write of an existing key needs no root lock; read-only
+  stays lock-free.
 - **GC** — mark-sweep; live set = `current-writer ∪ locked-by` across shards.
 - **Backend trait** — `read / read_if_modified / write / write_if /
 write_if_not_exists / delete / list` (seven methods; tags, nonce, `set_tags_if`,
@@ -58,7 +63,8 @@ per-decision ADRs.
 
 - Full redesign; format **replaced wholesale** (S3 + GCS); Go on-disk
   compatibility dropped.
-- Values live **only in unified transaction objects**.
+- Logged values live in unified transaction objects; logless direct values and
+  tombstones live authoritatively in leaf entries.
 - **Fixed compile-time `C`** shards per collection (`C = 1024`, not
   configurable); split-resharding is a [future improvement](#future-improvements).
 - **Mark-sweep GC**; the explicit liveness counter and compaction are
@@ -150,14 +156,17 @@ Caching and batching are in place: the `ObjectCache` / `ValueCache` (ADR-023),
 asynchronous background write-back, and dedup-batched CAS on acquisition,
 release, and write-back (ADR-025/026).
 
-The **logless direct commit** ([ADR-051](../adr/051-inline-latest-values.md))
-commits a lone overwrite of an existing key with one leaf CAS that publishes the
-value itself — no lock and no transaction object. A non-landing attempt is
-classified rather than failed ([ADR-053](../adr/053-replay-definitive-logless-rmw-losses.md)):
-a certified read-modify-write loss replays its body under the same id, and
-genuine ineligibility (create/delete, multi-key, cross-key reads, locked entries,
-values over the inline budgets) takes the regular locked protocol. There is no
-separate single-key logged protocol.
+The **logless direct commit**
+([ADR-061](../adr/061-atomic-logless-single-leaf-commits.md), extending
+[ADR-051](../adr/051-inline-latest-values.md)) commits a complete point-access
+transaction with one leaf CAS when all dependencies share that leaf and every
+output fits inline. It may publish creates, overwrites, and deletes across many
+keys, with inline values and tombstones as its durable result — no lock,
+transaction object, or write-back. A non-landing member is classified as a
+whole ([ADR-053](../adr/053-replay-definitive-logless-rmw-losses.md)): a certified
+read-dependent loss replays its body, while blind loss or genuine ineligibility
+takes the regular locked protocol. Range scans, catalog changes, and cross-leaf
+dependencies are never direct.
 
 All shard/root entry mutations flow through **one shard-mutation coordinator**
 ([ADR-028](../adr/028-shard-mutation-coordinator.md)): a single per-object mechanism
@@ -349,9 +358,9 @@ Every design decision is captured in its own ADR.
   coordinator.** ✅ Implemented. Generalizes ADR-025/026's deduplication into a
   single per-object **mechanism** over which callers install **resolvers** that
   encode policy: load once, fold the round's resolvers in wound-wait order, CAS
-  once, recover by reload. Every shard/root mutation — acquire, single read-write
-  commit, write-back, release — flows through one coordinator, so the last racing
-  CAS (the single read-write commit) stops racing. ADR-025's merge predicate and
+  once, recover by reload. Every shard/root mutation — acquire, direct same-leaf
+  publication, write-back, release — flows through one coordinator, so direct
+  commits do not race a separate CAS site. ADR-025's merge predicate and
   ADR-027's bespoke reclassify loop dissolve into the fold; the concurrency
   semantics of ADR-002/021/024 are unchanged.
 - **[ADR-029](../adr/029-gc-through-shard-coordinator.md) — GC through the
@@ -363,12 +372,21 @@ Every design decision is captured in its own ADR.
   CAS that clears the last holder. ADR-022's GC policy is unchanged.
 - **[ADR-030](../adr/030-seed-shard-loads.md) — Reusing cached shard loads across a
   transaction's coordinator rounds.** ✅ Implemented. Adds an `AllowStale`
-  freshness flag to the object-cache read path so a single read-write commit
-  reuses a shard the transaction already cached (its body read, or the eligibility
+  freshness flag to the object-cache read path so a same-leaf direct commit
+  reuses a shard the transaction already cached (a body read, or the eligibility
   pre-check) for its first fold attempt with **no backend op**, restoring the
   single-load commit ADR-028 had split in two. A stale snapshot self-corrects: the
   version-conditional CAS misses, the round reloads `Latest` and re-folds — a pure
   optimization with no new CAS site or in-doubt case.
+- **[ADR-061](../adr/061-atomic-logless-single-leaf-commits.md) — Atomic logless
+  commits within one leaf.** ✅ Implemented. Generalizes direct commit to every
+  complete point-access transaction whose dependencies route to one leaf and
+  whose full output is inline-admissible. One member may mix creates,
+  overwrites, and tombstone deletes; one leaf CAS validates all reads, publishes
+  all outputs, and advances membership generation once when needed. Overlapping
+  later publishers are excluded as whole members, recovery uses only the
+  member's own output markers and predecessor proof, and ambiguous topology or
+  marker loss expands `InDoubt`. Multi-key rejection does not request a split.
 
 ## Design questions resolved
 
@@ -420,17 +438,17 @@ Group B — protocol details:
       check with an observer-relative (no-skew) no-progress check.
 - [x] In-doubt (`Unavailable`) handling parity at the new CAS sites (pending
       create, shard lock CAS, commit CAS, write-back CAS) — ADR-009 carries over
-      (ADR-020). The single-RW commit CAS is a further in-doubt site (see below):
-      a lost ack resolves by reading the shard back, leaving one irreducible
-      in-doubt (a fast follow-on writer moved the entry, ADR-051).
+      (ADR-020). The direct-member CAS is a further in-doubt site: any exact own
+      output marker proves the member landed, while unchanged predecessors prove
+      non-landing. A moved dependency or erased evidence remains irreducibly in
+      doubt (ADR-061).
 - [x] Read-only fast-path shape in the new layout (ADR-020).
-- [x] Single-RW commit path (ADR-020, revised by ADR-027, now ADR-051/053). A
-      read-write transaction that overwrites a single existing key publishes its
-      value in **one** leaf CAS with no lock and no transaction object. A
-      non-landing attempt either replays its body (a certified read-modify-write
-      loss) or takes the regular locked + logged path; ineligible shapes
-      (create/delete, multi-key, cross-key reads, locked entries, values over the
-      inline budgets) go straight to it.
+- [x] Direct commit path (ADR-020, revised by ADR-027/051/053 and generalized by
+      ADR-061). A complete point-access transaction whose dependencies share one
+      leaf publishes all inline values and tombstones in **one** leaf CAS with no
+      lock or transaction object. A certified read-dependent loss replays its
+      body; a blind loss or member requiring coordination takes the regular
+      locked + logged path.
 
 Group C — listing, snapshots, phantoms (the collection root is the coordination
 point; see ADR-018):

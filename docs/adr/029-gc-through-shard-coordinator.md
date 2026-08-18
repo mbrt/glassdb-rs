@@ -20,6 +20,11 @@ not _what_ it decides.
 The `Clock`-based time-source detail is superseded by
 [ADR-058](058-process-wide-model-time.md); reclamation behavior is unchanged.
 
+[ADR-062](062-splitter-driven-tombstone-reclamation.md) adds
+structural-gate-owned compaction of quiescent tombstones. Ordinary fold
+finalization still prunes only holder-free entries in `Absent` state, and
+transaction-object GC does not become a leaf scanner.
+
 ## Context
 
 [ADR-028](028-shard-mutation-coordinator.md) established a single invariant:

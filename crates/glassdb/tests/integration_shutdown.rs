@@ -1,6 +1,6 @@
 //! Shutdown and cancellation integration behavior.
 
-use glassdb::{Database, Error};
+use glassdb::{Database, Error, InlinePolicy};
 
 #[path = "integration_support/mod.rs"]
 pub mod integration_support;
@@ -170,7 +170,11 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
     use std::time::Duration;
 
     let (backend, pause) = PauseControl::wrap(mem());
-    let db = Database::open("example", backend.clone()).await.unwrap();
+    let db = Database::builder("example", backend.clone())
+        .inline_policy(InlinePolicy::none())
+        .open()
+        .await
+        .unwrap();
     let coll = db
         .root_collection()
         .create_collection_if_absent(b"c")
@@ -182,9 +186,8 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
 
     let (lock_landed, release_lock) = pause.arm_leaf_write_gate();
 
-    // Spawn a tx that writes two distinct keys, so it goes through the
-    // standard locked commit path (the single-RW fast path requires 1
-    // read + 1 write on the same key and would skip the tx-log write).
+    // Inline publication is disabled so the transaction reaches the standard
+    // locked commit path and its transaction-log write.
     let stalled = tokio::spawn({
         let db = db.clone();
         let coll = coll.clone();
@@ -307,7 +310,11 @@ async fn shutdown_waits_for_cancelled_tx_async_abort() {
     use std::time::Duration;
 
     let (backend, pause) = PauseControl::wrap(mem());
-    let db = Database::open("example", backend.clone()).await.unwrap();
+    let db = Database::builder("example", backend.clone())
+        .inline_policy(InlinePolicy::none())
+        .open()
+        .await
+        .unwrap();
     let coll = db
         .root_collection()
         .create_collection_if_absent(b"c")

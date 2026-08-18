@@ -10,6 +10,11 @@ This refines
 [ADR-051](051-inline-latest-values.md)'s direct-commit fallback policy.
 ADR-051 remains otherwise unchanged.
 
+[ADR-061](061-atomic-logless-single-leaf-commits.md) generalizes these outcome
+categories to member-atomic single-leaf transactions. A read-dependent excluded
+member still replays as a whole, while a blind excluded member still takes the
+bounded locked fallback.
+
 This supersedes
 [ADR-027](027-single-rw-parallel-lock-publish.md)'s parallel logged
 single-read-write path. Transactions that genuinely require logging use the

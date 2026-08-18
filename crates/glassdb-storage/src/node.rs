@@ -336,6 +336,14 @@ impl NodeLocks {
         self.membership_version
     }
 
+    /// Records one logical membership change without installing a holder.
+    ///
+    /// Logless commits have no prepare/release lock lifecycle, so their commit
+    /// CAS advances the scan-validation generation directly (ADR-061).
+    pub fn advance_membership_version(&mut self) {
+        self.membership_version = self.membership_version.wrapping_add(1);
+    }
+
     /// Returns the transaction preparing deletion of the containing collection.
     pub fn delete_intent(&self) -> Option<&TxId> {
         self.delete_intent.as_ref()
@@ -892,6 +900,9 @@ mod tests {
         assert_eq!(node.membership_version(), 2);
         assert!(!node.remove_membership_holder(&id));
         assert_eq!(node.membership_version(), 2);
+
+        node.locks.advance_membership_version();
+        assert_eq!(node.membership_version(), 3);
 
         node.locks.membership_version = u64::MAX;
         node.set_membership_writer(id);

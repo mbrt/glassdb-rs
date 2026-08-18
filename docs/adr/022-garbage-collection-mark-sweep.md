@@ -20,6 +20,11 @@ an inline writer ID may have no transaction object, while an existing ordinary
 transaction object remains live whenever current or locked state names it.
 Candidate-driven listing and reverse reference checks remain unchanged.
 
+[ADR-062](062-splitter-driven-tombstone-reclamation.md) supersedes the rule
+that `current_writer` is never cleared, only for tombstones compacted by the
+splitter. Inline and external writers remain live value references, and
+transaction-object GC remains candidate-driven.
+
 Deferred to a follow-up: subcollection teardown (reclaiming orphaned child roots
 and shards). A `Wounded` object created for a missing lazy transaction cannot
 name unknown holders; those are removed when encountered by resolvers.

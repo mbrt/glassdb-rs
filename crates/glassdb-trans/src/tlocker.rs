@@ -16,8 +16,8 @@
 //! collection locks and their committed effects. The data mutation *mechanism* — deduplicated
 //! load + resolve + CAS with retry — lives in the
 //! [`ShardCoordinator`](crate::shard_coord::ShardCoordinator) below it, which
-//! the locker shares with the commit algorithm so every shard/root mutation
-//! flows through one place (ADR-028).
+//! the locker shares with the direct commit mechanism so every shard/root
+//! mutation flows through one place (ADR-028, ADR-061).
 //!
 //! Lock acquisition has two modes (ADR-020): the default **parallel** path locks
 //! every touched shard concurrently; the **serial** fallback locks them one at a
@@ -516,6 +516,14 @@ impl ShardResolver for WriteBackResolver {
     fn owned_keys(&self) -> Vec<&[u8]> {
         self.intents
             .iter()
+            .map(|intent| intent.raw_key.as_slice())
+            .collect()
+    }
+
+    fn publication_keys(&self) -> Vec<&[u8]> {
+        self.intents
+            .iter()
+            .filter(|intent| matches!(intent.desired, Desired::Put | Desired::Delete))
             .map(|intent| intent.raw_key.as_slice())
             .collect()
     }
