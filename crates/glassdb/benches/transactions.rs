@@ -273,7 +273,7 @@ async fn run_direct_workload(
         Ok(())
     })
     .await
-    .expect("ADR-061 direct workload");
+    .expect("direct-commit workload");
 }
 
 async fn seed_direct_workload(
@@ -296,11 +296,6 @@ async fn seed_direct_workload(
 }
 
 fn verify_direct_gate(label: &str, stats: &Stats, uncontended: bool) {
-    // This escape hatch supports temporarily applying the harness to a pre-ADR
-    // worktree for paired measurements; its old protocol cannot meet the gate.
-    if std::env::var_os("GLASSDB_ADR061_BASELINE").is_some() {
-        return;
-    }
     let completed = STATS_ITERS as u64;
     assert_eq!(stats.transactions.completed, completed, "{label}: failures");
     assert_eq!(
@@ -501,8 +496,8 @@ fn bench_shared_read(c: &mut Criterion, rt: &Runtime) {
     group.finish();
 }
 
-fn bench_adr061_low_contention(c: &mut Criterion, rt: &Runtime) {
-    let mut group = c.benchmark_group("adr061_direct_low");
+fn bench_direct_commit_uncontended(c: &mut Criterion, rt: &Runtime) {
+    let mut group = c.benchmark_group("direct_commit_uncontended");
     group.sample_size(10);
     group.warm_up_time(Duration::from_millis(100));
     group.measurement_time(Duration::from_millis(250));
@@ -514,16 +509,23 @@ fn bench_adr061_low_contention(c: &mut Criterion, rt: &Runtime) {
     ] {
         for count in [2usize, 8, 32] {
             for (backend_name, backend) in backends() {
-                let collection_name = format!("a61-l-{}-{count}-{backend_name}", workload.label());
+                let collection_name = format!(
+                    "direct-uncontended-{}-{count}-{backend_name}",
+                    workload.label()
+                );
                 let (db, coll) = rt.block_on(open_coll(backend, collection_name.as_bytes()));
                 let keys = make_prefixed_keys("measured", count);
                 let initial = rt.block_on(seed_direct_workload(workload, &db, &coll, &keys, 8));
                 let sequence = AtomicUsize::new(initial);
                 let label = format!("{}/{count}/{backend_name}", workload.label());
-                let stats = rt.block_on(report_stats(&format!("adr061_low/{label}"), &db, || {
-                    let next = sequence.fetch_add(1, Ordering::Relaxed);
-                    run_direct_workload(workload, &db, &coll, &keys, next, 8)
-                }));
+                let stats = rt.block_on(report_stats(
+                    &format!("direct_commit_uncontended/{label}"),
+                    &db,
+                    || {
+                        let next = sequence.fetch_add(1, Ordering::Relaxed);
+                        run_direct_workload(workload, &db, &coll, &keys, next, 8)
+                    },
+                ));
                 verify_direct_gate(&label, &stats, true);
 
                 group.bench_function(&label, |bch| {
@@ -539,8 +541,8 @@ fn bench_adr061_low_contention(c: &mut Criterion, rt: &Runtime) {
     group.finish();
 }
 
-fn bench_adr061_same_leaf_contention(c: &mut Criterion, rt: &Runtime) {
-    let mut group = c.benchmark_group("adr061_direct_same_leaf_contention");
+fn bench_direct_commit_leaf_contention(c: &mut Criterion, rt: &Runtime) {
+    let mut group = c.benchmark_group("direct_commit_leaf_contention");
     group.sample_size(10);
     group.warm_up_time(Duration::from_millis(100));
     group.measurement_time(Duration::from_millis(250));
@@ -552,7 +554,10 @@ fn bench_adr061_same_leaf_contention(c: &mut Criterion, rt: &Runtime) {
     ] {
         for count in [2usize, 8, 32] {
             for (backend_name, backend) in backends() {
-                let collection_name = format!("a61-c-{}-{count}-{backend_name}", workload.label());
+                let collection_name = format!(
+                    "direct-contended-{}-{count}-{backend_name}",
+                    workload.label()
+                );
                 let (background_db, background_coll) =
                     rt.block_on(open_coll(backend.clone(), collection_name.as_bytes()));
                 let measured_db = rt.block_on(open_db(backend));
@@ -594,7 +599,7 @@ fn bench_adr061_same_leaf_contention(c: &mut Criterion, rt: &Runtime) {
                 let measured_sequence = AtomicUsize::new(measured_initial);
                 let label = format!("{}/{count}/{backend_name}", workload.label());
                 let stats = rt.block_on(report_stats(
-                    &format!("adr061_same_leaf/{label}"),
+                    &format!("direct_commit_leaf_contention/{label}"),
                     &measured_db,
                     || {
                         let next = measured_sequence.fetch_add(1, Ordering::Relaxed);
@@ -634,10 +639,10 @@ fn bench_adr061_same_leaf_contention(c: &mut Criterion, rt: &Runtime) {
     group.finish();
 }
 
-fn bench_adr061_inline_boundaries(c: &mut Criterion, rt: &Runtime) {
+fn bench_direct_commit_inline_boundaries(c: &mut Criterion, rt: &Runtime) {
     const PER_VALUE_MAX: usize = 1024;
     const AGGREGATE_MAX: usize = 16 * 1024;
-    let mut group = c.benchmark_group("adr061_direct_inline_boundaries");
+    let mut group = c.benchmark_group("direct_commit_inline_boundaries");
     group.sample_size(10);
     group.warm_up_time(Duration::from_millis(100));
     group.measurement_time(Duration::from_millis(250));
@@ -662,7 +667,7 @@ fn bench_adr061_inline_boundaries(c: &mut Criterion, rt: &Runtime) {
             ),
         ] {
             let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-            let collection_name = format!("a61-boundary-{boundary}-{count}");
+            let collection_name = format!("direct-boundary-{boundary}-{count}");
             let (db, coll) = rt.block_on(open_coll_with_inline(
                 backend,
                 collection_name.as_bytes(),
@@ -679,7 +684,7 @@ fn bench_adr061_inline_boundaries(c: &mut Criterion, rt: &Runtime) {
             let sequence = AtomicUsize::new(initial);
             let label = format!("{boundary}/{count}/memory");
             let stats = rt.block_on(report_stats(
-                &format!("adr061_boundary/{label}"),
+                &format!("direct_commit_inline_boundaries/{label}"),
                 &db,
                 || {
                     let next = sequence.fetch_add(1, Ordering::Relaxed);
@@ -722,9 +727,9 @@ fn benches(c: &mut Criterion) {
     bench_hundred_writes(c, &rt);
     bench_concurr_multi_rmw(c, &rt);
     bench_shared_read(c, &rt);
-    bench_adr061_low_contention(c, &rt);
-    bench_adr061_same_leaf_contention(c, &rt);
-    bench_adr061_inline_boundaries(c, &rt);
+    bench_direct_commit_uncontended(c, &rt);
+    bench_direct_commit_leaf_contention(c, &rt);
+    bench_direct_commit_inline_boundaries(c, &rt);
 }
 
 criterion_group!(transactions, benches);
