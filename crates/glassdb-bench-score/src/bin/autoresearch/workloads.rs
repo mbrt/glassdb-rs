@@ -21,6 +21,7 @@ use crate::metrics::{Measure, Sample};
 const SINGLE_RMW_TX: usize = 200;
 const MULTI_RMW_TX: usize = 100;
 const MULTI_RMW_KEYS: usize = 10;
+const MULTI_RMW_COLLECTIONS: usize = 5;
 const BATCH_READ_TX: usize = 200;
 const BATCH_READ_KEYS: usize = 10;
 const BATCH_WRITE_TX: usize = 50;
@@ -106,25 +107,35 @@ async fn single_rmw(db: &Database) -> Result<Sample, Error> {
     Ok(m.into_sample())
 }
 
-/// 100 transactions that read 10 keys in parallel and write each one back.
+/// 100 transactions that read 10 keys across 5 leaves in parallel and write
+/// each one back through the regular logged protocol.
 async fn multi_rmw(db: &Database) -> Result<Sample, Error> {
-    let coll = create_coll(db, "multi").await?;
-    let keys = make_keys(MULTI_RMW_KEYS);
-    let coll = &coll;
-    let keys = &keys;
+    // A fresh collection root is one physical leaf. Five roots guarantee the
+    // multi-leaf path without splitter timing, while two keys per root also
+    // exercise grouping multiple dependencies into each leaf operation.
+    let mut collections = Vec::with_capacity(MULTI_RMW_COLLECTIONS);
+    for i in 0..MULTI_RMW_COLLECTIONS {
+        collections.push(create_coll(db, &format!("multi{i}")).await?);
+    }
+    let members: Vec<_> = make_keys(MULTI_RMW_KEYS)
+        .into_iter()
+        .enumerate()
+        .map(|(i, key)| (collections[i % MULTI_RMW_COLLECTIONS].clone(), key))
+        .collect();
+    let members = &members;
 
     let mut m = Measure::new("multiRMW10");
     m.begin(db);
     for _ in 0..MULTI_RMW_TX {
         db.tx(|tx| async move {
-            let vals = join_all(keys.iter().map(|k| tx.read(coll, k))).await;
-            for (k, rv) in keys.iter().zip(vals) {
+            let vals = join_all(members.iter().map(|(coll, key)| tx.read(coll, key))).await;
+            for ((coll, key), rv) in members.iter().zip(vals) {
                 let current = match rv {
-                    Ok(Some(value)) => read_int(k, &value)?,
+                    Ok(Some(value)) => read_int(key, &value)?,
                     Ok(None) => 0,
                     Err(e) => return Err(e),
                 };
-                tx.write(coll, k, &incremented_value(k, current)?)?;
+                tx.write(coll, key, &incremented_value(key, current)?)?;
             }
             Ok(())
         })
@@ -212,4 +223,26 @@ async fn read_repeat(db: &Database) -> Result<Sample, Error> {
     }
     m.end(db);
     Ok(m.into_sample())
+}
+
+#[cfg(test)]
+mod tests {
+    use glassdb::backend::memory::MemoryBackend;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn multi_rmw_exercises_the_regular_commit_path() {
+        let db = Database::open("multirmw", MemoryBackend::new())
+            .await
+            .unwrap();
+
+        let sample = multi_rmw(&db).await.unwrap();
+        db.shutdown().await;
+
+        assert_eq!(sample.stats.transactions.completed, MULTI_RMW_TX as u64);
+        assert_eq!(sample.stats.direct_commit.candidates, 0);
+        assert_eq!(sample.stats.direct_commit.landed, 0);
+        assert!(sample.stats.locker.calls >= MULTI_RMW_TX as u64);
+    }
 }
