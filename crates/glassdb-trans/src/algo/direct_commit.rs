@@ -596,7 +596,7 @@ impl ShardResolver for DirectCommitResolver {
         self.known_or(in_doubt, self.definitive_loss())
     }
 
-    fn owned_keys(&self) -> Vec<&[u8]> {
+    fn leaf_scope_keys(&self) -> Vec<&[u8]> {
         self.member
             .keys
             .iter()
@@ -604,7 +604,7 @@ impl ShardResolver for DirectCommitResolver {
             .collect()
     }
 
-    fn logless_keys(&self) -> Vec<&[u8]> {
+    fn logless_publication_keys(&self) -> Vec<&[u8]> {
         self.member
             .output_keys()
             .map(|key| key.raw_key.as_slice())

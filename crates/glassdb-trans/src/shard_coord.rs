@@ -261,34 +261,23 @@ pub(crate) trait ShardResolver: Send + Sync {
     }
 
     /// The outcome delivered when a peer already claimed one of this member's
-    /// [`logless_keys`](ShardResolver::logless_keys) this round, so nothing was
-    /// folded for it at all. Distinct from exhaustion: the peer's claim proves
-    /// this member staged nothing, which a spent CAS budget does not, so a
-    /// resolver may treat it as a certified loss rather than an unknown one
-    /// (ADR-053). `in_doubt` still reports whether an *earlier* attempt of this
-    /// round carried this member's own stage.
+    /// [`publication_keys`](ShardResolver::publication_keys) as a logless
+    /// publication this round, so nothing was folded for it at all. Distinct
+    /// from exhaustion: the peer's claim proves this member staged nothing,
+    /// which a spent CAS budget does not, so a resolver may treat it as a
+    /// certified loss rather than an unknown one (ADR-053). `in_doubt` still
+    /// reports whether an *earlier* attempt of this round carried this member's
+    /// own stage.
     fn excluded_outcome(&self, in_doubt: bool) -> FoldOutcome {
         self.exhausted_outcome(in_doubt)
     }
 
-    /// The raw keys this member may **create or update**, so the coordinator can
-    /// verify the loaded leaf still owns them before folding (ADR-031). A split
-    /// can move a key to a right sibling after it was routed to this leaf;
-    /// mutating the stale leaf would strand the key. The default is empty: a
-    /// resolver that only touches entries already present (release, write-back)
-    /// can never create a misplaced entry — a present entry is always owned,
-    /// because a split removes the keys it moves — so it needs no check.
-    fn owned_keys(&self) -> Vec<&[u8]> {
-        Vec::new()
-    }
-
-    /// The raw keys this member commits loglessly (ADR-051): its staged entry is
-    /// the commit's only record, so no later publisher may stage over it in the
-    /// same CAS. The coordinator lets at most one of them stage per key per
-    /// round and tells the rest they did not land. Disjoint keys still share a
-    /// round. The default is empty: a member backed by a transaction object
-    /// records its commit outside the leaf and needs no exclusivity.
-    fn logless_keys(&self) -> Vec<&[u8]> {
+    /// The raw keys defining this member's leaf-local scope. The coordinator
+    /// verifies that the loaded leaf still owns every key before folding
+    /// (ADR-031). This includes read-only dependencies when their placement
+    /// matters. A resolver whose decision is valid for the leaf as a whole may
+    /// leave the scope empty.
+    fn leaf_scope_keys(&self) -> Vec<&[u8]> {
         Vec::new()
     }
 
@@ -297,7 +286,18 @@ pub(crate) trait ShardResolver: Send + Sync {
     /// is excluded as a whole. Lock-only and release-only mutations leave this
     /// empty because they preserve current-state markers.
     fn publication_keys(&self) -> Vec<&[u8]> {
-        self.logless_keys()
+        self.logless_publication_keys()
+    }
+
+    /// The [`publication_keys`](ShardResolver::publication_keys) this member
+    /// commits loglessly (ADR-051): their leaf state is the commit's only durable
+    /// record, so no later publisher may stage over them in the same CAS. The
+    /// coordinator lets at most one member stage per key per round and tells the
+    /// rest they did not land. Disjoint keys still share a round. The default is
+    /// empty: a member backed by a transaction object records its commit outside
+    /// the leaf and needs no exclusivity.
+    fn logless_publication_keys(&self) -> Vec<&[u8]> {
+        Vec::new()
     }
 }
 
@@ -514,7 +514,7 @@ impl CasWorker {
 
             let needs_reroute = member
                 .resolver
-                .owned_keys()
+                .leaf_scope_keys()
                 .iter()
                 .any(|&key| !edit.owns(key));
             if needs_reroute {
@@ -575,7 +575,7 @@ impl CasWorker {
                             protected_markers.extend(
                                 member
                                     .resolver
-                                    .logless_keys()
+                                    .logless_publication_keys()
                                     .into_iter()
                                     .map(<[u8]>::to_vec),
                             );
@@ -600,7 +600,7 @@ impl CasWorker {
                         protected_markers.extend(
                             member
                                 .resolver
-                                .logless_keys()
+                                .logless_publication_keys()
                                 .into_iter()
                                 .map(<[u8]>::to_vec),
                         );
@@ -1245,7 +1245,7 @@ mod tests {
             FoldOutcome::Conflict
         }
 
-        fn owned_keys(&self) -> Vec<&[u8]> {
+        fn leaf_scope_keys(&self) -> Vec<&[u8]> {
             vec![self.key.as_slice()]
         }
     }
@@ -1854,11 +1854,11 @@ mod tests {
             FoldOutcome::Moved
         }
 
-        fn owned_keys(&self) -> Vec<&[u8]> {
+        fn leaf_scope_keys(&self) -> Vec<&[u8]> {
             vec![self.key.as_slice()]
         }
 
-        fn logless_keys(&self) -> Vec<&[u8]> {
+        fn logless_publication_keys(&self) -> Vec<&[u8]> {
             vec![self.key.as_slice()]
         }
     }
@@ -1943,11 +1943,11 @@ mod tests {
             }
         }
 
-        fn owned_keys(&self) -> Vec<&[u8]> {
+        fn leaf_scope_keys(&self) -> Vec<&[u8]> {
             self.keys.iter().map(Vec::as_slice).collect()
         }
 
-        fn logless_keys(&self) -> Vec<&[u8]> {
+        fn logless_publication_keys(&self) -> Vec<&[u8]> {
             if self.logless {
                 self.keys.iter().map(Vec::as_slice).collect()
             } else {
@@ -2622,7 +2622,7 @@ mod tests {
             FoldOutcome::Conflict
         }
 
-        fn logless_keys(&self) -> Vec<&[u8]> {
+        fn logless_publication_keys(&self) -> Vec<&[u8]> {
             vec![self.key.as_slice()]
         }
     }
@@ -3061,7 +3061,7 @@ mod tests {
             }
         }
 
-        fn owned_keys(&self) -> Vec<&[u8]> {
+        fn leaf_scope_keys(&self) -> Vec<&[u8]> {
             vec![self.key.as_slice()]
         }
     }
@@ -3206,7 +3206,7 @@ mod tests {
             }
         }
 
-        fn owned_keys(&self) -> Vec<&[u8]> {
+        fn leaf_scope_keys(&self) -> Vec<&[u8]> {
             vec![self.key.as_slice()]
         }
     }

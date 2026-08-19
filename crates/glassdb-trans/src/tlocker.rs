@@ -422,7 +422,7 @@ impl ShardResolver for AcquireResolver {
         FoldOutcome::Conflict
     }
 
-    fn owned_keys(&self) -> Vec<&[u8]> {
+    fn leaf_scope_keys(&self) -> Vec<&[u8]> {
         // Acquiring a lock may create the key's entry, so it must land on the
         // owning leaf; re-route (release and re-lock) if a split moved a key
         // after routing (ADR-031).
@@ -513,7 +513,7 @@ impl ShardResolver for WriteBackResolver {
         FoldOutcome::Reroute
     }
 
-    fn owned_keys(&self) -> Vec<&[u8]> {
+    fn leaf_scope_keys(&self) -> Vec<&[u8]> {
         self.intents
             .iter()
             .map(|intent| intent.raw_key.as_slice())
