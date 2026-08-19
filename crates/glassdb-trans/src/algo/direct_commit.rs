@@ -213,6 +213,16 @@ struct DirectKey {
 #[derive(Clone)]
 struct ReadPredicate {
     writer: Option<TxId>,
+    absence_generation: Option<u64>,
+}
+
+impl ReadPredicate {
+    fn validates(&self, writer: Option<&TxId>, membership_version: u64) -> bool {
+        self.writer.as_ref() == writer
+            && self
+                .absence_generation
+                .is_none_or(|observed| observed == membership_version)
+    }
 }
 
 /// A directly publishable final mutation.
@@ -380,9 +390,9 @@ impl DirectCommitResolver {
             .iter()
             .zip(resolutions)
             .any(|(key, state)| {
-                key.read
-                    .as_ref()
-                    .is_some_and(|read| read.writer != state.writer)
+                key.read.as_ref().is_some_and(|read| {
+                    !read.validates(state.writer.as_ref(), locks.membership_version())
+                })
             })
         {
             return Ok(Step::Skip {
@@ -506,12 +516,26 @@ impl DirectCommitResolver {
         let Some(staged) = staged.as_ref() else {
             return false;
         };
-        self.member
+        let mut durable_witness = false;
+        for (key, state) in self
+            .member
             .keys
             .iter()
             .zip(resolutions)
             .filter(|(key, _)| key.write.is_some())
-            .all(|(key, state)| staged.get(&key.raw_key) == Some(&state.writer))
+        {
+            let predecessor = staged
+                .get(&key.raw_key)
+                .expect("every direct output records its predecessor");
+            if predecessor != &state.writer {
+                return false;
+            }
+            durable_witness |= match key.write.as_ref().expect("output key has a write") {
+                DirectWrite::Put(_) => true,
+                DirectWrite::Delete => predecessor.is_some(),
+            };
+        }
+        durable_witness
     }
 
     fn proven_landed(&self) -> bool {
@@ -638,6 +662,7 @@ fn direct_shape(data: &Data) -> Option<DirectMember> {
         });
         key.read = Some(ReadPredicate {
             writer: read.last_writer().cloned(),
+            absence_generation: read.absence_generation(),
         });
     }
     for write in &data.writes {

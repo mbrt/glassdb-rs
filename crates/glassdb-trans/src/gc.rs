@@ -12,10 +12,10 @@
 //! database per cycle. Instead each candidate `_t/` object records its own
 //! back-references (its `locks ∪ writes`), so GC works **backward**: it reads a
 //! batch of candidates and confirms each one dead by GET-ing only the handful of
-//! shards it names — never a database-wide scan. Candidates come from the
-//! write-back hint ([`Gc::schedule_tx_cleanup`], the `current_writer` a fresh
-//! commit just superseded) and paged walks of the sharded `{db}/_t/{ss}/`
-//! namespace (which makes the candidate set complete regardless of lost hints).
+//! shards it names — never a database-wide scan. Candidates come from cleanup
+//! hints ([`Gc::schedule_tx_cleanup`] for a superseded writer and ADR-062
+//! tombstone reclamation) and paged walks of the sharded `{db}/_t/{ss}/`
+//! namespace, which makes the candidate set complete regardless of lost hints.
 //!
 //! Safety rests on the ADR-021 lease as a horizon (`is_expired`): a candidate
 //! within the horizon is always kept, because the non-atomic reverse check can
@@ -58,10 +58,38 @@ const GC_LIST_PAGE: usize = 128;
 /// is.
 const GC_LIST_REQUEST_BUDGET: usize = 64;
 
-/// Upper bound on the buffered write-back hint queue. The paged list guarantees
+/// Upper bound on the buffered cleanup-hint queue. The paged list guarantees
 /// completeness, so dropping the oldest hint when the queue is full only delays
 /// a delete, never causes an unsafe one (ADR-022).
 const HINT_QUEUE_CAP: usize = 4096;
+
+/// Producer/consumer queue for transaction-object cleanup candidates.
+///
+/// Keeping this handle separate from [`Gc`] lets maintenance code report a
+/// lost writer reference without depending on the collector's lifecycle.
+#[derive(Clone, Default)]
+pub(crate) struct TxCleanupHints {
+    queue: Arc<Mutex<VecDeque<TxId>>>,
+}
+
+impl TxCleanupHints {
+    pub(crate) fn schedule(&self, tid: TxId) {
+        let mut queue = self.queue.lock().unwrap();
+        if queue.len() >= HINT_QUEUE_CAP {
+            queue.pop_front();
+        }
+        queue.push_back(tid);
+    }
+
+    fn drain(&self) -> Vec<TxId> {
+        self.queue.lock().unwrap().drain(..).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> Vec<TxId> {
+        self.queue.lock().unwrap().iter().cloned().collect()
+    }
+}
 
 /// Garbage collector for finalized transaction objects (ADR-022).
 #[derive(Clone)]
@@ -77,9 +105,8 @@ pub struct Gc {
     locker: Locker,
     mon: Monitor,
     timeline: Timeline,
-    // Write-back hint feed: txids a fresh commit just superseded (primary
-    // candidate source). Deduplicated when drained.
-    hints: Arc<Mutex<VecDeque<TxId>>>,
+    // Txids whose latest known leaf reference disappeared. Deduplicated when drained.
+    hints: TxCleanupHints,
 }
 
 /// Task-local traversal state for the transaction-log shards.
@@ -118,7 +145,7 @@ impl Gc {
     /// horizons use model time so they remain deterministic under the DST
     /// executor.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         bg: Weak<Background>,
         tl: TLogger,
         shards: NodeStore,
@@ -127,6 +154,7 @@ impl Gc {
         locker: Locker,
         collection_lifecycle: CollectionLifecycle,
         mon: Monitor,
+        hints: TxCleanupHints,
     ) -> Self {
         let router = TreeRouter::new(shards.clone());
         Gc {
@@ -138,7 +166,7 @@ impl Gc {
             locker,
             mon,
             timeline,
-            hints: Arc::new(Mutex::new(VecDeque::new())),
+            hints,
         }
     }
 
@@ -160,16 +188,11 @@ impl Gc {
         });
     }
 
-    /// Enqueues a superseded transaction id as a reverse-check candidate: the
-    /// former `current_writer` a fresh commit's write-back just overwrote, which
-    /// therefore just lost a reference (ADR-022). The oldest hint is dropped when
-    /// the queue is full; the paged list still visits it eventually.
+    /// Enqueues a transaction id that lost a leaf reference as a reverse-check
+    /// candidate. The oldest hint is dropped when the queue is full; the paged
+    /// list still visits it eventually.
     pub(crate) fn schedule_tx_cleanup(&self, tid: TxId) {
-        let mut q = self.hints.lock().unwrap();
-        if q.len() >= HINT_QUEUE_CAP {
-            q.pop_front();
-        }
-        q.push_back(tid);
+        self.hints.schedule(tid);
     }
 
     /// Runs a single sweep cycle: the buffered hints plus at most one non-empty
@@ -179,12 +202,9 @@ impl Gc {
     async fn run_once(&self, scan: &mut TxScan) {
         let mut seen: BTreeSet<TxId> = BTreeSet::new();
         let mut candidates: Vec<TxId> = Vec::new();
-        {
-            let mut q = self.hints.lock().unwrap();
-            while let Some(tid) = q.pop_front() {
-                if seen.insert(tid.clone()) {
-                    candidates.push(tid);
-                }
+        for tid in self.hints.drain() {
+            if seen.insert(tid.clone()) {
+                candidates.push(tid);
             }
         }
         for tid in self.next_list_page(scan).await {
@@ -706,6 +726,7 @@ mod tests {
                 Arc::new(UnexpectedTopologySettler),
             ),
             mon.clone(),
+            TxCleanupHints::default(),
         );
         Ctx {
             gc,
@@ -1195,12 +1216,12 @@ mod tests {
         assert!(lookup_entry(&ctx, b"k").await.is_none());
     }
 
-    // A candidate with no object at all is a harmless no-op.
+    // A shared hint for a logless writer has no object and is a harmless no-op.
     #[tokio::test(start_paused = true)]
-    async fn missing_candidate_is_noop() {
+    async fn logless_cleanup_hint_is_a_noop() {
         let ctx = new_ctx().await;
         let t = tx(9);
-        ctx.gc.schedule_tx_cleanup(t.clone());
+        ctx.gc.hints.clone().schedule(t.clone());
         run_once(&ctx.gc).await;
         assert!(is_gone(&ctx.tl, &t).await);
     }

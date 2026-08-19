@@ -16,12 +16,20 @@ use glassdb_storage::LeafObservation;
 #[derive(Debug, Clone)]
 pub struct ReadEvidence {
     last_writer: Option<TxId>,
+    absence_generation: Option<u64>,
     leaf: LeafObservation,
 }
 
 impl ReadEvidence {
     pub(crate) fn new(last_writer: Option<TxId>, leaf: LeafObservation) -> Self {
-        Self { last_writer, leaf }
+        let absence_generation = last_writer
+            .is_none()
+            .then(|| leaf.value().map_or(0, |node| node.membership_version()));
+        Self {
+            last_writer,
+            absence_generation,
+            leaf,
+        }
     }
 
     pub(crate) fn last_writer(&self) -> Option<&TxId> {
@@ -30,6 +38,17 @@ impl ReadEvidence {
 
     pub(crate) fn observation(&self) -> &LeafObservation {
         &self.leaf
+    }
+
+    pub(crate) fn absence_generation(&self) -> Option<u64> {
+        self.absence_generation
+    }
+
+    pub(crate) fn validates(&self, writer: Option<&TxId>, membership_version: u64) -> bool {
+        self.last_writer.as_ref() == writer
+            && self
+                .absence_generation
+                .is_none_or(|observed| observed == membership_version)
     }
 }
 
@@ -52,6 +71,14 @@ impl ReadAccess {
 
     pub(crate) fn observation(&self) -> &LeafObservation {
         self.evidence.observation()
+    }
+
+    pub(crate) fn absence_generation(&self) -> Option<u64> {
+        self.evidence.absence_generation()
+    }
+
+    pub(crate) fn validates(&self, writer: Option<&TxId>, membership_version: u64) -> bool {
+        self.evidence.validates(writer, membership_version)
     }
 }
 

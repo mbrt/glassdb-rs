@@ -331,7 +331,7 @@ impl NodeLocks {
         &self.membership
     }
 
-    /// Returns the membership activity version used by optimistic scans.
+    /// Returns the membership generation used by scans and unmarked point absence.
     pub fn membership_version(&self) -> u64 {
         self.membership_version
     }
@@ -570,7 +570,7 @@ impl Node {
         self.locks.remove_membership_holder(id)
     }
 
-    /// Returns the leaf membership activity version.
+    /// Returns the leaf membership generation.
     pub fn membership_version(&self) -> u64 {
         self.locks.membership_version()
     }
@@ -968,6 +968,24 @@ mod tests {
         assert_eq!(right_keys, vec![b"mango".as_slice(), b"pear"]);
         assert_eq!(right.high_key(), Some(b"tiger".as_slice()));
         assert_eq!(right.right_sibling(), Some("oldRight"));
+    }
+
+    #[test]
+    fn leaf_split_preserves_membership_generation_in_both_outputs() {
+        let mut src = Node::leaf(Shard::from_entries([
+            entry(b"a", 1),
+            entry(b"b", 2),
+            entry(b"c", 3),
+            entry(b"d", 4),
+        ]));
+        let mut locks = src.locks().clone();
+        locks.advance_membership_version();
+        locks.advance_membership_version();
+        src.set_locks(locks);
+
+        let (right, _) = src.split("newRight").expect("splittable");
+        assert_eq!(src.membership_version(), 2);
+        assert_eq!(right.membership_version(), 2);
     }
 
     #[test]

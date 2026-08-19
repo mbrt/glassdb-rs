@@ -562,6 +562,16 @@ logless direct commits, where the leaf is the value's only durable authority
 write-back and help-forwarding publish `External`; an existing inline value is
 never demoted because it may have no transaction object.
 
+An unmarked point absence records the owning leaf's membership generation. If
+the physical leaf changes, validation requires both continued absence and the
+same generation; a tombstone read instead records its exact writer. The
+splitter preserves this generation across topology changes and, under its
+structural gate, removes holder-free tombstones before its final split decision
+([ADR-062](adr/062-splitter-driven-tombstone-reclamation.md)). If compaction
+removes the pressure, it persists the smaller leaf and cancels the split;
+otherwise the recoverable split partitions the compacted state. Removed writer
+IDs become ordinary transaction-GC hints.
+
 Lock acquisition is a compare-and-swap on the shard *object*: read the current
 shard and its version, compute the new lock state for every requested key that
 maps to it, and conditionally rewrite the shard with `write_if` (the
@@ -713,15 +723,14 @@ output keys. Any later publisher that overlaps those claims is excluded as a
 whole, while disjoint direct members may share the same physical leaf CAS.
 
 Recovery remains transaction-local. Seeing any exact inline or tombstone output
-marker for this txid proves the entire member landed. With no marker, every
-output still naming its recorded predecessor proves non-landing; valid reads may
-retry direct, while a stale read replays the body. Without either landing or
-non-landing proof, an unavailable CAS reports `Error::InDoubt`. A topology move
-after an uncertain CAS is likewise in doubt unless landing was already proved
-on the original leaf. Cancellation before dispatch leaves no state, while
-cancellation after dispatch is crash-equivalent. Tombstones remain until the
-splitter-driven reclamation protocol in
-[ADR-062](adr/062-splitter-driven-tombstone-reclamation.md) is implemented.
+marker for this txid proves the entire member landed. With no marker, unchanged
+predecessors prove non-landing only when at least one output could not have
+collapsed back to that predecessor through tombstone reclamation; an uncertain
+all-unmarked-absence delete can therefore become `Error::InDoubt`. Valid reads
+may retry direct, while a stale read replays the body. A topology move after an
+uncertain CAS is likewise in doubt unless landing was already proved on the
+original leaf. Cancellation before dispatch leaves no state, while cancellation
+after dispatch is crash-equivalent.
 
 #### Retry with locks held
 

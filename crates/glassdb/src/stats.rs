@@ -144,6 +144,8 @@ mod tests {
                 candidates: 3,
                 completed: 2,
                 deferred: 1,
+                tombstones_reclaimed: 4,
+                splits_avoided: 1,
                 inline_pressure: InlinePressureStats {
                     candidates: 2,
                     completed: 1,
@@ -185,6 +187,8 @@ mod tests {
                 candidates: 5,
                 completed: 3,
                 deferred: 1,
+                tombstones_reclaimed: 9,
+                splits_avoided: 3,
                 inline_pressure: InlinePressureStats {
                     candidates: 5,
                     completed: 2,
@@ -228,6 +232,8 @@ mod tests {
                     candidates: 2,
                     completed: 1,
                     deferred: 0,
+                    tombstones_reclaimed: 5,
+                    splits_avoided: 2,
                     inline_pressure: InlinePressureStats {
                         candidates: 3,
                         completed: 1,
