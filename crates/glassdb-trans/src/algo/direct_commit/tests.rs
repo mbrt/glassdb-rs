@@ -67,7 +67,10 @@ fn put_resolver(
             keys: vec![DirectKey {
                 raw_key: key.key().to_vec(),
                 key,
-                read: read_writer.map(|writer| ReadPredicate { writer }),
+                read: read_writer.map(|writer| ReadPredicate {
+                    absence_generation: writer.is_none().then_some(0),
+                    writer,
+                }),
                 write: Some(DirectWrite::Put(Arc::from(value))),
             }]
             .into(),
@@ -913,6 +916,27 @@ async fn direct_membership_change_neither_waits_for_nor_wounds_a_live_holder() {
     );
 }
 
+#[tokio::test]
+async fn direct_commit_replays_an_absence_read_from_an_older_generation() {
+    let (tm, tctx) = new_algo().await;
+    let direct = put_resolver(
+        &tm,
+        TxId::with_priority(1, b"direct"),
+        key_ref(b"missing"),
+        Some(None),
+        b"value",
+    );
+    let mut locks = NodeLocks::default();
+    locks.advance_membership_version();
+
+    assert!(matches!(
+        fold_step(&direct, &tctx, ReloadCause::Fresh, &BTreeMap::new(), &locks,).await,
+        Step::Skip {
+            outcome: FoldOutcome::Replay
+        }
+    ));
+}
+
 // ADR-051 regression (fuzz `history` crash-3ddc66ba): a blind put is
 // last-writer-wins on a fresh fold, but after its own uncertain CAS the entry
 // may already hold a commit that read the very value that CAS published.
@@ -1057,7 +1081,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
 }
 
 #[tokio::test]
-async fn permanent_tombstones_let_an_all_delete_member_prove_non_landing() {
+async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
     let (tm, tctx) = new_algo().await;
     let id = TxId::with_priority(9, b"deletes");
     let member = direct_shape(&Data {
@@ -1091,6 +1115,56 @@ async fn permanent_tombstones_let_an_all_delete_member_prove_non_landing() {
             &tctx,
             ReloadCause::Reloaded { in_doubt: true },
             &empty,
+            &NodeLocks::default(),
+        )
+        .await,
+        Step::Skip {
+            outcome: FoldOutcome::InDoubt(_)
+        }
+    ));
+}
+
+#[tokio::test]
+async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
+    let (tm, tctx) = new_algo().await;
+    let id = TxId::with_priority(9, b"deletes");
+    let member = direct_shape(&Data {
+        reads: Vec::new(),
+        writes: vec![wdel(&key_ref(b"a")), wdel(&key_ref(b"b"))],
+        scans: Vec::new(),
+    })
+    .unwrap();
+    let resolver = DirectCommitResolver::new(
+        id,
+        test_root_path(),
+        member,
+        InlinePolicy::default(),
+        tm.direct_commit.split_hints.clone(),
+    );
+    let predecessor = TxId::with_priority(1, b"predecessor");
+    let unchanged = BTreeMap::from([(
+        b"a".to_vec(),
+        ShardEntry::new(b"a").with_current(CurrentState::Tombstone {
+            writer: predecessor,
+        }),
+    )]);
+    assert!(matches!(
+        fold_step(
+            &resolver,
+            &tctx,
+            ReloadCause::Fresh,
+            &unchanged,
+            &NodeLocks::default(),
+        )
+        .await,
+        Step::Stage { .. }
+    ));
+    assert!(matches!(
+        fold_step(
+            &resolver,
+            &tctx,
+            ReloadCause::Reloaded { in_doubt: true },
+            &unchanged,
             &NodeLocks::default(),
         )
         .await,
@@ -1675,6 +1749,7 @@ async fn cross_key_aggregate_rejection_does_not_hint() {
                 key: source.clone(),
                 read: Some(ReadPredicate {
                     writer: Some(predecessor.clone()),
+                    absence_generation: None,
                 }),
                 write: None,
             },

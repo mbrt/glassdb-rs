@@ -182,10 +182,9 @@ impl ShardEntry {
             + current_state_field_len(&self.current)
     }
 
-    /// Reports whether the entry records nothing worth keeping: no lock holder
-    /// and no committed value (not even a tombstone, which always names a
-    /// writer). Such an entry names no transaction and is indistinguishable
-    /// from an absent one, so a mutation that leaves it this way may drop it.
+    /// Reports whether an ordinary mutation left no coordination or committed
+    /// state to retain. Tombstones are excluded here because only the splitter's
+    /// generation-aware compaction may reclaim them (ADR-062).
     pub fn is_vestigial(&self) -> bool {
         self.lock_holders().is_empty() && matches!(self.current, CurrentState::Absent)
     }

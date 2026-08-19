@@ -387,6 +387,12 @@ Every design decision is captured in its own ADR.
   later publishers are excluded as whole members, recovery uses only the
   member's own output markers and predecessor proof, and ambiguous topology or
   marker loss expands `InDoubt`. Multi-key rejection does not request a split.
+- **[ADR-062](../adr/062-splitter-driven-tombstone-reclamation.md) —
+  Splitter-driven tombstone reclamation.** ✅ Implemented. Actionable leaf
+  candidates compact holder-free tombstones under the structural gate before
+  their final split decision. Unmarked point absence validates with the leaf
+  membership generation, removed writers feed ordinary GC hints, and reclaimed
+  direct-delete markers deliberately expand `InDoubt`.
 
 ## Design questions resolved
 

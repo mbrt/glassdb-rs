@@ -8,10 +8,9 @@ use prost::Message;
 
 use crate::error::Error;
 
-// Bumped to "v2" with the v2 engine redesign, which broke on-disk
-// compatibility: a database written by an older format must be rejected rather
-// than silently misread.
-const DB_VERSION: &str = "v2";
+// ADR-062 makes point-absence validation incompatible with v2 clients, which
+// do not retain the leaf membership generation.
+const DB_VERSION: &str = "v3";
 const DB_META_PATH: &str = "glassdb";
 
 /// Verifies the database metadata exists with the expected version, creating it
@@ -107,11 +106,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrong_version_is_rejected() {
+    async fn previous_version_is_rejected() {
         let b = MemoryBackend::new();
         let p = format!("mydb/{DB_META_PATH}");
         let body = pb::DatabaseMetadata {
-            version: "v1".to_string(),
+            version: "v2".to_string(),
             database_id: DatabaseId::new_random().as_bytes().to_vec(),
         }
         .encode_to_vec();
@@ -119,7 +118,7 @@ mod tests {
 
         let err = check_or_create_db_meta(&b, "mydb").await.unwrap_err();
         assert!(
-            matches!(&err, Error::Internal { msg, .. } if msg.contains("v1") && msg.contains("v2")),
+            matches!(&err, Error::Internal { msg, .. } if msg.contains("v2") && msg.contains("v3")),
             "unexpected error: {err:?}"
         );
     }
@@ -166,8 +165,8 @@ mod tests {
             database_id: id.to_vec(),
         }
         .encode_to_vec();
-        // field 1 (string), len 2, "v2"; field 2 (bytes), len 16, ID.
-        let mut expected = vec![0x0a, 0x02, 0x76, 0x32, 0x12, 0x10];
+        // field 1 (string), len 2, "v3"; field 2 (bytes), len 16, ID.
+        let mut expected = vec![0x0a, 0x02, 0x76, 0x33, 0x12, 0x10];
         expected.extend(id);
         assert_eq!(got, expected, "db-metadata encoding drifted");
     }

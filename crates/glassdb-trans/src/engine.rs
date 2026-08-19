@@ -20,7 +20,7 @@ use crate::collection_commit::CollectionCommit;
 use crate::collection_coordination::CollectionStateResolver;
 use crate::collections::{CollectionData, CollectionLifecycle, DirectorySnapshot};
 use crate::error::TransError;
-use crate::gc::Gc;
+use crate::gc::{Gc, TxCleanupHints};
 use crate::key_resolver::{KeyResolver, ScanResult};
 use crate::key_state_resolver::KeyStateResolver;
 use crate::monitor::{Monitor, ProtocolTiming};
@@ -205,6 +205,7 @@ impl Engine {
         let key_state = KeyStateResolver::new(monitor.clone());
         let resolver = KeyResolver::new(TreeRouter::new(shards.clone()), key_state.clone());
         let reader = Reader::new(resolver.clone(), timeline.clone(), retry);
+        let cleanup_hints = TxCleanupHints::default();
         let (coord, splitter) = Splitter::with_coordinator(
             background_weak.clone(),
             records.clone(),
@@ -217,6 +218,7 @@ impl Engine {
             db_root,
             split_policy,
             inline_policy,
+            cleanup_hints.clone(),
         );
         let locker = Locker::new(
             coord.clone(),
@@ -241,6 +243,7 @@ impl Engine {
             locker.clone(),
             collection_lifecycle.clone(),
             monitor.clone(),
+            cleanup_hints,
         );
         gc.start();
         splitter.start();

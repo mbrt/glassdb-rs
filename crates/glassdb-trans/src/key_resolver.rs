@@ -21,6 +21,13 @@ pub struct ScanResult {
     evidence: ScanEvidence,
 }
 
+/// Current point state used by logical validation after physical leaf churn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PointValidationState {
+    pub(crate) writer: Option<TxId>,
+    pub(crate) membership_version: u64,
+}
+
 impl ScanResult {
     /// Returns the live keys surfaced by the scan.
     pub fn keys(&self) -> &[Vec<u8>] {
@@ -286,12 +293,13 @@ impl KeyResolver {
         })
     }
 
-    /// Resolves effective writers against one shared freshness requirement.
-    pub(crate) async fn effective_writers(
+    /// Resolves effective writers and owning-leaf generations against one
+    /// shared freshness requirement.
+    pub(crate) async fn effective_point_states(
         &self,
         keys: &[KeyRef],
         requirement: Requirement,
-    ) -> Result<HashMap<KeyRef, Option<TxId>>, StorageError> {
+    ) -> Result<HashMap<KeyRef, PointValidationState>, StorageError> {
         // Route the keys to their leaves and load each once; the key→leaf
         // grouping (and its deterministic order) lives in `group_keys_by_leaf`.
         // Each key rides along as its own payload so it can key the output map.
@@ -303,6 +311,7 @@ impl KeyResolver {
 
         let mut out = HashMap::with_capacity(keys.len());
         for group in &groups {
+            let membership_version = group.node().map_or(0, |node| node.membership_version());
             if let Some(node) = group.node() {
                 self.state.ensure_collection_live(node).await?;
             }
@@ -320,7 +329,13 @@ impl KeyResolver {
                     .resolve_writer(key, leaf.and_then(|leaf| leaf.lookup(raw_key)), requirement)
                     .await
                     .map_err(trans_to_storage)?;
-                out.insert(key.clone(), resolved.writer);
+                out.insert(
+                    key.clone(),
+                    PointValidationState {
+                        writer: resolved.writer,
+                        membership_version,
+                    },
+                );
             }
         }
         Ok(out)
@@ -653,7 +668,9 @@ mod tests {
             Err(StorageError::StaleCollection)
         ));
         assert!(matches!(
-            resolver.effective_writers(&[key], Requirement::Any).await,
+            resolver
+                .effective_point_states(&[key], Requirement::Any)
+                .await,
             Err(StorageError::StaleCollection)
         ));
     }
@@ -662,7 +679,7 @@ mod tests {
     // (ADR-031), so a batch of keys resolves against that one leaf: a live
     // pointer, a tombstone, and an absent key each resolve to the right writer.
     #[tokio::test]
-    async fn effective_writers_resolve_against_the_single_leaf() {
+    async fn effective_point_states_resolve_against_the_single_leaf() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
 
         // Seed through a separate cache so the resolver-under-test starts cold.
@@ -683,21 +700,25 @@ mod tests {
         let pb = key_ref(&b);
         let pc = key_ref(&c);
         let out = resolver
-            .effective_writers(&[pa.clone(), pb.clone(), pc.clone()], Requirement::Any)
+            .effective_point_states(&[pa.clone(), pb.clone(), pc.clone()], Requirement::Any)
             .await
             .unwrap();
 
-        assert_eq!(out.get(&pa).cloned(), Some(Some(live)));
         assert_eq!(
-            out.get(&pb).cloned(),
+            out.get(&pa).map(|state| state.writer.clone()),
+            Some(Some(live))
+        );
+        assert_eq!(
+            out.get(&pb).map(|state| state.writer.clone()),
             Some(Some(tomb)),
             "a tombstone still has a writer"
         );
         assert_eq!(
-            out.get(&pc).cloned(),
+            out.get(&pc).map(|state| state.writer.clone()),
             Some(None),
             "an absent key resolves to no writer"
         );
+        assert!(out.values().all(|state| state.membership_version == 0));
     }
 
     // `resolve_key` with `Any` reuses a shard already in the resolver's

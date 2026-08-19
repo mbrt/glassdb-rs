@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed.
+Accepted — implemented.
 
 Refines [ADR-051](051-inline-latest-values.md)'s tombstone lifetime and
 [ADR-061](061-atomic-logless-single-leaf-commits.md)'s logless deletes.

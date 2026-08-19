@@ -935,9 +935,15 @@ impl Algo {
             return Ok(true);
         }
         let keys: Vec<KeyRef> = data.reads.iter().map(|read| read.key.clone()).collect();
-        let current = self.resolver.effective_writers(&keys, requirement).await?;
+        let current = self
+            .resolver
+            .effective_point_states(&keys, requirement)
+            .await?;
         for r in &data.reads {
-            if current.get(&r.key).and_then(Option::as_ref) != r.last_writer() {
+            let Some(state) = current.get(&r.key) else {
+                return Ok(false);
+            };
+            if !r.validates(state.writer.as_ref(), state.membership_version) {
                 return Ok(false);
             }
         }
@@ -1059,6 +1065,7 @@ mod tests {
     use crate::collection_coordination::CollectionStateResolver;
     use crate::collections::{CollectionChange, CollectionLifecycle, CollectionOp};
     use crate::engine::{Engine, EngineConfig};
+    use crate::gc::TxCleanupHints;
     use crate::key_state_resolver::KeyStateResolver;
     use crate::monitor::{ProtocolTiming, TxRecoveryManifest};
     use crate::reader::Reader;
@@ -1158,6 +1165,7 @@ mod tests {
         let key_state = KeyStateResolver::new(tmon.clone());
         let resolver = KeyResolver::new(TreeRouter::new(shards.clone()), key_state.clone());
         let router = TreeRouter::new(shards.clone());
+        let cleanup_hints = TxCleanupHints::default();
         let (coord, splitter) = crate::split::Splitter::with_coordinator(
             bg_weak.clone(),
             records.clone(),
@@ -1170,6 +1178,7 @@ mod tests {
             test_db_root(),
             split_policy,
             glassdb_storage::InlinePolicy::default(),
+            cleanup_hints.clone(),
         );
         let locker = Locker::new(
             coord.clone(),
@@ -1194,6 +1203,7 @@ mod tests {
             locker.clone(),
             collection_lifecycle.clone(),
             tmon.clone(),
+            cleanup_hints,
         );
         let collection_commit = CollectionCommit::new(
             CollectionCatalog::new(collection_state),
@@ -2140,6 +2150,111 @@ mod tests {
                 .await
                 .unwrap(),
             "opaque evidence rejects a superseded value"
+        );
+    }
+
+    #[tokio::test]
+    async fn unmarked_absence_validates_representation_churn_but_not_membership_aba() {
+        let (tm, tctx) = new_algo().await;
+        let key = key_ref(b"missing");
+        let read = do_read(&tctx, &key).await;
+        assert_eq!(read.last_writer(), None);
+        assert_eq!(read.absence_generation(), Some(0));
+        let data = Data {
+            reads: vec![read],
+            writes: Vec::new(),
+            scans: Vec::new(),
+        };
+
+        let validation_start = tctx.timeline.now();
+        let loaded = tctx
+            .shards
+            .load_leaf(&test_root_path(), Requirement::Any)
+            .await
+            .unwrap();
+        let mut edit = loaded.into_edit();
+        edit.set_entries(Shard::from_entries([ShardEntry::new(b"other")
+            .with_current(CurrentState::Tombstone {
+                writer: TxId::with_priority(1, b"representation"),
+            })]));
+        assert!(tctx.shards.commit_leaf(edit).await.unwrap());
+        assert!(
+            tm.validate(&data, ValidationContext::Optimistic, validation_start)
+                .await
+                .unwrap(),
+            "representing an unrelated absence does not change membership"
+        );
+
+        let validation_start = tctx.timeline.now();
+        let loaded = tctx
+            .shards
+            .load_leaf(&test_root_path(), Requirement::Any)
+            .await
+            .unwrap();
+        let mut edit = loaded.into_edit();
+        edit.set_entries(Shard::new());
+        let mut locks = edit.locks().clone();
+        locks.advance_membership_version();
+        locks.advance_membership_version();
+        edit.set_locks(locks);
+        assert!(tctx.shards.commit_leaf(edit).await.unwrap());
+        assert!(
+            !tm.validate(&data, ValidationContext::Optimistic, validation_start)
+                .await
+                .unwrap(),
+            "create-delete-reclaim returning to unmarked absence changes its generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn tombstone_read_is_invalidated_when_its_exact_marker_is_reclaimed() {
+        let (tm, tctx) = new_algo().await;
+        let key = key_ref(b"deleted");
+        let writer = TxId::with_priority(1, b"deleter");
+        let loaded = tctx
+            .shards
+            .load_leaf(&test_root_path(), Requirement::Any)
+            .await
+            .unwrap();
+        let mut edit = loaded.into_edit();
+        edit.set_entries(Shard::from_entries([ShardEntry::new(b"deleted")
+            .with_current(CurrentState::Tombstone {
+                writer: writer.clone(),
+            })]));
+        assert!(tctx.shards.commit_leaf(edit).await.unwrap());
+
+        let read = do_read(&tctx, &key).await;
+        assert_eq!(read.last_writer(), Some(&writer));
+        assert_eq!(read.absence_generation(), None);
+        let data = Data {
+            reads: vec![read],
+            writes: Vec::new(),
+            scans: Vec::new(),
+        };
+        let validation_start = tctx.timeline.now();
+
+        let external_timeline = Timeline::new();
+        let external = NodeStore::new(CachedStore::new(
+            tctx.backend.clone(),
+            1 << 20,
+            external_timeline.clone(),
+            None,
+        ));
+        let loaded = external
+            .load_leaf(
+                &test_root_path(),
+                Requirement::AtLeast(external_timeline.now()),
+            )
+            .await
+            .unwrap();
+        let mut edit = loaded.into_edit();
+        edit.set_entries(Shard::new());
+        assert!(external.commit_leaf(edit).await.unwrap());
+
+        assert!(
+            !tm.validate(&data, ValidationContext::Optimistic, validation_start)
+                .await
+                .unwrap()
         );
     }
 

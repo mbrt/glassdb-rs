@@ -34,6 +34,10 @@
 //! that leaf. Interior indexes and roots still use direct structural CASes.
 //! The source shrink (or root rewrite) releases structure-write inline, so no
 //! unlocked post-split state is exposed before a separate release CAS.
+//! Once a leaf is quiescent behind that gate, holder-free tombstones are
+//! removed before the final reason check. The compacted leaf either cancels the
+//! split in one CAS or supplies the ordinary recoverable split outputs
+//! (ADR-062).
 //!
 //! The collection root `_r` cannot move (its address is fixed), so when it
 //! overflows it splits **in place**: two children are created and the root is
@@ -61,6 +65,7 @@ use tokio::sync::Notify;
 
 use crate::collections::TopologySettler;
 use crate::error::TransError;
+use crate::gc::TxCleanupHints;
 use crate::key_state_resolver::KeyStateResolver;
 use crate::monitor::{Monitor, TxRecoveryManifest};
 use crate::node_locking::{NodeLockReconciler, QuiescedEntries, StructuralGateResolver};
@@ -720,6 +725,52 @@ enum SplitNeed {
     Reroute,
 }
 
+/// Removes durable absence entries that no transaction still holds.
+fn reclaim_holder_free_tombstones(node: &mut Node) -> Vec<TxId> {
+    let Some(leaf) = node.as_leaf() else {
+        return Vec::new();
+    };
+    let mut reclaimed = Vec::new();
+    let retained = leaf.entries().filter_map(|entry| {
+        if entry.lock_holders().is_empty() && entry.current.is_tombstone() {
+            reclaimed.push(
+                entry
+                    .current
+                    .writer()
+                    .expect("a tombstone always names its writer")
+                    .clone(),
+            );
+            None
+        } else {
+            Some(entry.clone())
+        }
+    });
+    let compacted = Shard::from_entries(retained);
+    if !reclaimed.is_empty() {
+        node.set_leaf(compacted)
+            .expect("tombstone reclamation only rewrites leaves");
+    }
+    reclaimed
+}
+
+/// A source node that is quiescent behind its structural gate and still needs
+/// the requested split after tombstone reclamation.
+struct QuiescedSplitSource {
+    node: Node,
+    observation: LeafObservation,
+    reclaimed: Vec<TxId>,
+}
+
+/// The objects planned for an in-place root split.
+struct RootSplitPlan {
+    left_token: NodeToken,
+    right_token: NodeToken,
+    left: Node,
+    right: Node,
+    index: Node,
+    split_key: Vec<u8>,
+}
+
 /// An exact structural intent that is still safe to cancel.
 struct PreparedSplit {
     observed: Observation<StructuralLog>,
@@ -1012,6 +1063,8 @@ struct Stats {
     candidates: AtomicU64,
     completed: AtomicU64,
     deferred: AtomicU64,
+    tombstones_reclaimed: AtomicU64,
+    splits_avoided: AtomicU64,
     inline_pressure_candidates: AtomicU64,
     inline_pressure_completed: AtomicU64,
     inline_pressure_deferred: AtomicU64,
@@ -1031,6 +1084,10 @@ pub struct SplitterStats {
     pub completed: u64,
     /// Retryable candidate attempts requeued for any cause.
     pub deferred: u64,
+    /// Holder-free tombstone entries removed by acknowledged leaf rewrites.
+    pub tombstones_reclaimed: u64,
+    /// Actionable splits cancelled after tombstone reclamation removed the need.
+    pub splits_avoided: u64,
     /// Activity attributable specifically to aggregate inline pressure.
     pub inline_pressure: InlinePressureStats,
 }
@@ -1075,6 +1132,8 @@ impl AddAssign for SplitterStats {
         self.candidates += rhs.candidates;
         self.completed += rhs.completed;
         self.deferred += rhs.deferred;
+        self.tombstones_reclaimed += rhs.tombstones_reclaimed;
+        self.splits_avoided += rhs.splits_avoided;
         self.inline_pressure += rhs.inline_pressure;
     }
 }
@@ -1087,6 +1146,10 @@ impl Sub for SplitterStats {
             candidates: self.candidates.saturating_sub(rhs.candidates),
             completed: self.completed.saturating_sub(rhs.completed),
             deferred: self.deferred.saturating_sub(rhs.deferred),
+            tombstones_reclaimed: self
+                .tombstones_reclaimed
+                .saturating_sub(rhs.tombstones_reclaimed),
+            splits_avoided: self.splits_avoided.saturating_sub(rhs.splits_avoided),
             inline_pressure: self.inline_pressure - rhs.inline_pressure,
         }
     }
@@ -1228,6 +1291,7 @@ pub struct Splitter {
     // Paces collection-record and node CAS retries. Transaction-status polling remains
     // entirely owned by Monitor.
     retry: RetryConfig,
+    cleanup_hints: TxCleanupHints,
     stats: Arc<Stats>,
 }
 
@@ -1247,6 +1311,7 @@ impl Splitter {
         db_root: DbRoot,
         policy: SplitPolicy,
         inline: InlinePolicy,
+        cleanup_hints: TxCleanupHints,
     ) -> (ShardCoordinator, Self) {
         let candidates = SplitCandidates::with_policies(policy, inline);
         let coord = ShardCoordinator::with_hinter(
@@ -1269,6 +1334,7 @@ impl Splitter {
             coord.clone(),
             candidates,
             retry,
+            cleanup_hints,
         );
         (coord, splitter)
     }
@@ -1285,6 +1351,8 @@ impl Splitter {
             candidates: self.stats.candidates.swap(0, Ordering::Relaxed),
             completed: self.stats.completed.swap(0, Ordering::Relaxed),
             deferred: self.stats.deferred.swap(0, Ordering::Relaxed),
+            tombstones_reclaimed: self.stats.tombstones_reclaimed.swap(0, Ordering::Relaxed),
+            splits_avoided: self.stats.splits_avoided.swap(0, Ordering::Relaxed),
             inline_pressure: InlinePressureStats {
                 candidates: self
                     .stats
@@ -1320,6 +1388,7 @@ impl Splitter {
         coord: ShardCoordinator,
         candidates: SplitCandidates,
         retry: RetryConfig,
+        cleanup_hints: TxCleanupHints,
     ) -> Self {
         let router = TreeRouter::new(shards.clone());
         let structural_nodes =
@@ -1356,6 +1425,7 @@ impl Splitter {
             recovery,
             recovery_wake: Arc::new(Notify::new()),
             retry,
+            cleanup_hints,
             stats: Arc::new(Stats::default()),
         }
     }
@@ -1715,6 +1785,302 @@ impl Splitter {
             .await
     }
 
+    /// Releases the structural gate while the intent is still safe to discard.
+    async fn cancel_preparing_split(
+        &self,
+        collection: &CollectionAddress,
+        target: StructuralSplitTarget<'_>,
+        worker: &TxId,
+        result: Result<(), TransError>,
+    ) -> SplitAttemptOutcome {
+        let release = self
+            .release_structural_gate(collection, target.source_token(), worker)
+            .await;
+        SplitAttemptOutcome::retry_cleanly(release.and(result))
+    }
+
+    /// Finishes an authoritative reason check that no longer calls for this
+    /// source to split.
+    async fn finish_without_split(
+        &self,
+        collection: &CollectionAddress,
+        target: StructuralSplitTarget<'_>,
+        worker: &TxId,
+        reason: &SplitReason,
+        need: SplitNeed,
+    ) -> SplitAttemptOutcome {
+        let result = match need {
+            SplitNeed::NotActionable => {
+                if reason.is_inline_pressure() {
+                    self.stats
+                        .inline_pressure_discarded
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            SplitNeed::Reroute => Err(TransError::Retry),
+            SplitNeed::Split => unreachable!("a required split must remain in coordination"),
+        };
+        self.cancel_preparing_split(collection, target, worker, result)
+            .await
+    }
+
+    fn record_reclamation(&self, writers: &[TxId], split_avoided: bool) {
+        if writers.is_empty() {
+            return;
+        }
+        let count = u64::try_from(writers.len()).unwrap_or(u64::MAX);
+        self.stats
+            .tombstones_reclaimed
+            .fetch_add(count, Ordering::Relaxed);
+        if split_avoided {
+            self.stats.splits_avoided.fetch_add(1, Ordering::Relaxed);
+        }
+        for writer in writers {
+            self.cleanup_hints.schedule(writer.clone());
+        }
+    }
+
+    /// Persists compaction and opens the gate in the same CAS when it made the
+    /// candidate non-actionable. The split intent is still Preparing and can be
+    /// discarded through the ordinary clean-cancellation path.
+    async fn finish_reclamation_without_split(
+        &self,
+        collection: &CollectionAddress,
+        target: StructuralSplitTarget<'_>,
+        worker: &TxId,
+        mut node: Node,
+        version: &LeafObservation,
+        writers: &[TxId],
+    ) -> SplitAttemptOutcome {
+        node.remove_structural_gate(worker);
+        match self
+            .store_structural_node(collection, target.source_token(), &node, version)
+            .await
+        {
+            Ok(true) => {
+                self.record_reclamation(writers, true);
+                SplitAttemptOutcome::retry_cleanly(Ok(()))
+            }
+            Ok(false) => {
+                self.cancel_preparing_split(collection, target, worker, Err(TransError::Retry))
+                    .await
+            }
+            Err(error) => {
+                let _ = self
+                    .release_structural_gate(collection, target.source_token(), worker)
+                    .await;
+                SplitAttemptOutcome::retry_cleanly(Err(error))
+            }
+        }
+    }
+
+    /// Acquires, revalidates, and compacts one source before any split intent
+    /// becomes recoverable.
+    async fn prepare_split_source(
+        &self,
+        collection: &CollectionAddress,
+        target: StructuralSplitTarget<'_>,
+        worker: &TxId,
+        reason: &SplitReason,
+    ) -> Result<QuiescedSplitSource, SplitAttemptOutcome> {
+        let (mut node, observation) = match self
+            .acquire_structural_gate(collection, target.source_token(), worker)
+            .await
+        {
+            Ok(Some(acquired)) => acquired,
+            Ok(None) => {
+                return Err(SplitAttemptOutcome::retry_cleanly(Err(TransError::Retry)));
+            }
+            Err(error) => return Err(SplitAttemptOutcome::retry_cleanly(Err(error))),
+        };
+        match self.split_need(&node, reason) {
+            SplitNeed::Split => {}
+            need => {
+                return Err(self
+                    .finish_without_split(collection, target, worker, reason, need)
+                    .await);
+            }
+        }
+
+        let reclaimed = reclaim_holder_free_tombstones(&mut node);
+        match self.split_need(&node, reason) {
+            SplitNeed::Split => Ok(QuiescedSplitSource {
+                node,
+                observation,
+                reclaimed,
+            }),
+            SplitNeed::NotActionable if !reclaimed.is_empty() => Err(self
+                .finish_reclamation_without_split(
+                    collection,
+                    target,
+                    worker,
+                    node,
+                    &observation,
+                    &reclaimed,
+                )
+                .await),
+            need => Err(self
+                .finish_without_split(collection, target, worker, reason, need)
+                .await),
+        }
+    }
+
+    /// Transitions the structural intent to Ready while its source gate is
+    /// still held.
+    async fn mark_split_ready(
+        &self,
+        collection: &CollectionAddress,
+        target: StructuralSplitTarget<'_>,
+        worker: &TxId,
+        prepared: PreparedSplit,
+        observation: &LeafObservation,
+        split_key: Vec<u8>,
+    ) -> Result<ReadySplit, SplitAttemptOutcome> {
+        let source_version = match observation.revision() {
+            Some(revision) => revision.serialize().to_string(),
+            None => {
+                return Err(SplitAttemptOutcome::retry_cleanly(Err(TransError::other(
+                    "split source is absent",
+                ))));
+            }
+        };
+        let mut ready = prepared.into_ready(source_version, split_key);
+        match self
+            .structural_logs
+            .update(ready.expected(), ready.record())
+            .await
+        {
+            Ok(Some(observed)) => {
+                if let Err(error) = ready.confirm(observed) {
+                    return Err(SplitAttemptOutcome::recovery_required(ready, error));
+                }
+                Ok(ready)
+            }
+            Ok(None) => Err(self
+                .cancel_preparing_split(collection, target, worker, Err(TransError::Retry))
+                .await),
+            Err(error) => Err(SplitAttemptOutcome::recovery_required(ready, error.into())),
+        }
+    }
+
+    /// Creates one immutable child reserved by a structural split.
+    async fn create_split_node(
+        &self,
+        collection: &CollectionAddress,
+        token: &NodeToken,
+        node: &Node,
+    ) -> Result<(), TransError> {
+        if self
+            .shards
+            .store_node(collection, token, node, None)
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(TransError::Retry)
+        }
+    }
+
+    /// Shrinks a non-root source at the version recorded in its Ready intent.
+    async fn store_nonroot_split_source(
+        &self,
+        collection: &CollectionAddress,
+        token: &NodeToken,
+        node: &Node,
+        observation: &LeafObservation,
+    ) -> Result<(), TransError> {
+        if self
+            .shards
+            .store_node(collection, token, node, Some(observation))
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(TransError::Retry)
+        }
+    }
+
+    /// Rewrites the fixed collection root at the version recorded in its Ready
+    /// intent.
+    async fn store_split_root(
+        &self,
+        collection: &CollectionAddress,
+        index: &Node,
+        observation: &LeafObservation,
+    ) -> Result<(), TransError> {
+        if self
+            .store_structural_node(collection, None, index, observation)
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(TransError::Retry)
+        }
+    }
+
+    /// Builds both root children and the replacement root index before the
+    /// structural intent becomes recoverable.
+    fn plan_root_split(
+        &self,
+        prepared: &PreparedSplit,
+        node: &Node,
+        worker: &TxId,
+    ) -> Result<RootSplitPlan, TransError> {
+        let left_token = prepared.record.created_tokens[0].clone();
+        let right_token = prepared.record.created_tokens[1].clone();
+        let (left, right, split_key) = split_into_children(node, right_token.as_str(), worker);
+        let index = Node::index(IndexNode::from_children([
+            (Vec::new(), left_token.to_string()),
+            (split_key.clone(), right_token.to_string()),
+        ]));
+        let policy = self.candidates.policy();
+        if index.content_encoded_len() > policy.content_limit()
+            || index.encoded_len() > policy.node_max_bytes()
+        {
+            return Err(TransError::InvalidInput(
+                "root index exceeds the coordination node size limit".into(),
+            ));
+        }
+        Ok(RootSplitPlan {
+            left_token,
+            right_token,
+            left,
+            right,
+            index,
+            split_key,
+        })
+    }
+
+    /// Publishes statistics, follow-up candidates, and cleanup hints after the
+    /// source/root linearization is acknowledged.
+    fn record_completed_split(
+        &self,
+        collection: &CollectionAddress,
+        reason: &SplitReason,
+        reclaimed: &[TxId],
+        outputs: [(&NodeToken, &Node); 2],
+    ) {
+        self.record_reclamation(reclaimed, false);
+        self.stats.completed.fetch_add(1, Ordering::Relaxed);
+        for (token, node) in outputs {
+            self.enqueue_if_over_soft_cap(collection, token, node);
+        }
+        if reason.is_inline_pressure() {
+            self.stats
+                .inline_pressure_completed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Deletes an acknowledged Ready intent or leaves it for recovery.
+    async fn finish_ready_split(&self, ready: ReadySplit) -> SplitAttemptOutcome {
+        match self.structural_logs.delete(ready.observation()).await {
+            Ok(()) => SplitAttemptOutcome::completed(),
+            Err(error) => SplitAttemptOutcome::recovery_required(ready, error.into()),
+        }
+    }
+
     /// Performs the write-ahead, sibling creation, shrink, and publication.
     async fn coordinate_nonroot_split(
         &self,
@@ -1727,115 +2093,58 @@ impl Splitter {
         debug_assert!(!prepared.record.is_root());
         debug_assert_eq!(&prepared.record.collection, collection);
         debug_assert_eq!(prepared.record.source_token.as_ref(), Some(token));
+        let target = StructuralSplitTarget::NonRoot(token);
         let right_token = prepared.record.created_tokens[0].clone();
-        let (mut node, version) = match self
-            .acquire_structural_gate(collection, Some(token), worker)
+        let QuiescedSplitSource {
+            mut node,
+            observation,
+            reclaimed,
+        } = match self
+            .prepare_split_source(collection, target, worker, reason)
             .await
         {
-            Ok(Some(acquired)) => acquired,
-            Ok(None) => return SplitAttemptOutcome::retry_cleanly(Err(TransError::Retry)),
-            Err(error) => return SplitAttemptOutcome::retry_cleanly(Err(error)),
+            Ok(source) => source,
+            Err(outcome) => return outcome,
         };
-        match self.split_need(&node, reason) {
-            SplitNeed::Split => {}
-            SplitNeed::NotActionable => {
-                if reason.is_inline_pressure() {
-                    self.stats
-                        .inline_pressure_discarded
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                let result = self
-                    .release_structural_gate(collection, Some(token), worker)
-                    .await;
-                return SplitAttemptOutcome::retry_cleanly(result);
-            }
-            SplitNeed::Reroute => {
-                let result = match self
-                    .release_structural_gate(collection, Some(token), worker)
-                    .await
-                {
-                    Ok(()) => Err(TransError::Retry),
-                    Err(error) => Err(error),
-                };
-                return SplitAttemptOutcome::retry_cleanly(result);
-            }
-        }
 
         let Some((right, split_key)) = node.split(right_token.as_str()) else {
-            let result = self
-                .release_structural_gate(collection, Some(token), worker)
+            return self
+                .cancel_preparing_split(collection, target, worker, Ok(()))
                 .await;
-            return SplitAttemptOutcome::retry_cleanly(result);
         };
         node.remove_structural_gate(worker);
-
-        let source_version = match version.revision() {
-            Some(revision) => revision.serialize().to_string(),
-            None => {
-                return SplitAttemptOutcome::retry_cleanly(Err(TransError::other(
-                    "split source is absent",
-                )));
-            }
+        let ready = match self
+            .mark_split_ready(
+                collection,
+                target,
+                worker,
+                prepared,
+                &observation,
+                split_key.clone(),
+            )
+            .await
+        {
+            Ok(ready) => ready,
+            Err(outcome) => return outcome,
         };
-        let mut ready = prepared.into_ready(source_version, split_key.clone());
-        let transition = self
-            .structural_logs
-            .update(ready.expected(), ready.record())
-            .await;
-        let observed = match transition {
-            Ok(Some(observed)) => observed,
-            Ok(None) => {
-                let result = match self
-                    .release_structural_gate(collection, Some(token), worker)
-                    .await
-                {
-                    Ok(()) => Err(TransError::Retry),
-                    Err(error) => Err(error),
-                };
-                return SplitAttemptOutcome::retry_cleanly(result);
-            }
-            Err(error) => {
-                return SplitAttemptOutcome::recovery_required(ready, error.into());
-            }
-        };
-        if let Err(error) = ready.confirm(observed) {
+        if let Err(error) = self
+            .create_split_node(collection, &right_token, &right)
+            .await
+        {
             return SplitAttemptOutcome::recovery_required(ready, error);
         }
-
-        match self
-            .shards
-            .store_node(collection, &right_token, &right, None)
+        if let Err(error) = self
+            .store_nonroot_split_source(collection, token, &node, &observation)
             .await
         {
-            Ok(true) => {}
-            Ok(false) => {
-                return SplitAttemptOutcome::recovery_required(ready, TransError::Retry);
-            }
-            Err(error) => {
-                return SplitAttemptOutcome::recovery_required(ready, error.into());
-            }
+            return SplitAttemptOutcome::recovery_required(ready, error);
         }
-        match self
-            .shards
-            .store_node(collection, token, &node, Some(&version))
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                return SplitAttemptOutcome::recovery_required(ready, TransError::Retry);
-            }
-            Err(error) => {
-                return SplitAttemptOutcome::recovery_required(ready, error.into());
-            }
-        }
-        self.stats.completed.fetch_add(1, Ordering::Relaxed);
-        self.enqueue_if_over_soft_cap(collection, token, &node);
-        self.enqueue_if_over_soft_cap(collection, &right_token, &right);
-        if reason.is_inline_pressure() {
-            self.stats
-                .inline_pressure_completed
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        self.record_completed_split(
+            collection,
+            reason,
+            &reclaimed,
+            [(token, &node), (&right_token, &right)],
+        );
         if let Err(error) = self
             .publish_separators(
                 collection,
@@ -1847,10 +2156,7 @@ impl Splitter {
         {
             return SplitAttemptOutcome::recovery_required(ready, error);
         }
-        if let Err(error) = self.structural_logs.delete(ready.observation()).await {
-            return SplitAttemptOutcome::recovery_required(ready, error.into());
-        }
-        SplitAttemptOutcome::completed()
+        self.finish_ready_split(ready).await
     }
 
     async fn join_topology(
@@ -1915,133 +2221,69 @@ impl Splitter {
     ) -> SplitAttemptOutcome {
         debug_assert!(prepared.record.is_root());
         debug_assert_eq!(&prepared.record.collection, collection);
-        let (node, version) = match self.acquire_structural_gate(collection, None, worker).await {
-            Ok(Some(acquired)) => acquired,
-            Ok(None) => return SplitAttemptOutcome::retry_cleanly(Err(TransError::Retry)),
-            Err(error) => return SplitAttemptOutcome::retry_cleanly(Err(error)),
-        };
-        match self.split_need(&node, reason) {
-            SplitNeed::Split => {}
-            SplitNeed::NotActionable => {
-                if reason.is_inline_pressure() {
-                    self.stats
-                        .inline_pressure_discarded
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                let result = self.release_structural_gate(collection, None, worker).await;
-                return SplitAttemptOutcome::retry_cleanly(result);
-            }
-            SplitNeed::Reroute => {
-                let result = match self.release_structural_gate(collection, None, worker).await {
-                    Ok(()) => Err(TransError::Retry),
-                    Err(error) => Err(error),
-                };
-                return SplitAttemptOutcome::retry_cleanly(result);
-            }
-        }
-
-        let l_token = prepared.record.created_tokens[0].clone();
-        let r_token = prepared.record.created_tokens[1].clone();
-        let (left, right, split_key) = split_into_children(&node, r_token.as_str(), worker);
-        let root_index = IndexNode::from_children([
-            (Vec::new(), l_token.to_string()),
-            (split_key.clone(), r_token.to_string()),
-        ]);
-        let index = Node::index(root_index);
-        let sized_root = index.clone();
-        let content_limit = self.candidates.policy().content_limit();
-        if sized_root.content_encoded_len() > content_limit
-            || sized_root.encoded_len() > self.candidates.policy().node_max_bytes()
+        let target = StructuralSplitTarget::Root;
+        let QuiescedSplitSource {
+            node,
+            observation,
+            reclaimed,
+        } = match self
+            .prepare_split_source(collection, target, worker, reason)
+            .await
         {
-            let result = match self.release_structural_gate(collection, None, worker).await {
-                Ok(()) => Err(TransError::InvalidInput(
-                    "root index exceeds the coordination node size limit".into(),
-                )),
-                Err(error) => Err(error),
-            };
-            return SplitAttemptOutcome::retry_cleanly(result);
-        }
-
-        let source_version = match version.revision() {
-            Some(revision) => revision.serialize().to_string(),
-            None => {
-                return SplitAttemptOutcome::retry_cleanly(Err(TransError::other(
-                    "split source is absent",
-                )));
-            }
+            Ok(source) => source,
+            Err(outcome) => return outcome,
         };
-        let mut ready = prepared.into_ready(source_version, split_key);
-        let transition = self
-            .structural_logs
-            .update(ready.expected(), ready.record())
-            .await;
-        let observed = match transition {
-            Ok(Some(observed)) => observed,
-            Ok(None) => {
-                let result = match self.release_structural_gate(collection, None, worker).await {
-                    Ok(()) => Err(TransError::Retry),
-                    Err(error) => Err(error),
-                };
-                return SplitAttemptOutcome::retry_cleanly(result);
-            }
+        let RootSplitPlan {
+            left_token,
+            right_token,
+            left,
+            right,
+            index,
+            split_key,
+        } = match self.plan_root_split(&prepared, &node, worker) {
+            Ok(plan) => plan,
             Err(error) => {
-                return SplitAttemptOutcome::recovery_required(ready, error.into());
+                return self
+                    .cancel_preparing_split(collection, target, worker, Err(error))
+                    .await;
             }
         };
-        if let Err(error) = ready.confirm(observed) {
+        let ready = match self
+            .mark_split_ready(
+                collection,
+                target,
+                worker,
+                prepared,
+                &observation,
+                split_key,
+            )
+            .await
+        {
+            Ok(ready) => ready,
+            Err(outcome) => return outcome,
+        };
+        if let Err(error) = self.create_split_node(collection, &left_token, &left).await {
             return SplitAttemptOutcome::recovery_required(ready, error);
         }
-
-        match self
-            .shards
-            .store_node(collection, &l_token, &left, None)
+        if let Err(error) = self
+            .create_split_node(collection, &right_token, &right)
             .await
         {
-            Ok(true) => {}
-            Ok(false) => {
-                return SplitAttemptOutcome::recovery_required(ready, TransError::Retry);
-            }
-            Err(error) => {
-                return SplitAttemptOutcome::recovery_required(ready, error.into());
-            }
+            return SplitAttemptOutcome::recovery_required(ready, error);
         }
-        match self
-            .shards
-            .store_node(collection, &r_token, &right, None)
+        if let Err(error) = self
+            .store_split_root(collection, &index, &observation)
             .await
         {
-            Ok(true) => {}
-            Ok(false) => {
-                return SplitAttemptOutcome::recovery_required(ready, TransError::Retry);
-            }
-            Err(error) => {
-                return SplitAttemptOutcome::recovery_required(ready, error.into());
-            }
+            return SplitAttemptOutcome::recovery_required(ready, error);
         }
-        match self
-            .store_structural_node(collection, None, &index, &version)
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                return SplitAttemptOutcome::recovery_required(ready, TransError::Retry);
-            }
-            Err(error) => {
-                return SplitAttemptOutcome::recovery_required(ready, error);
-            }
-        }
-        self.stats.completed.fetch_add(1, Ordering::Relaxed);
-        self.enqueue_if_over_soft_cap(collection, &l_token, &left);
-        self.enqueue_if_over_soft_cap(collection, &r_token, &right);
-        if reason.is_inline_pressure() {
-            self.stats
-                .inline_pressure_completed
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        if let Err(error) = self.structural_logs.delete(ready.observation()).await {
-            return SplitAttemptOutcome::recovery_required(ready, error.into());
-        }
-        SplitAttemptOutcome::completed()
+        self.record_completed_split(
+            collection,
+            reason,
+            &reclaimed,
+            [(&left_token, &left), (&right_token, &right)],
+        );
+        self.finish_ready_split(ready).await
     }
 
     /// Finalizes the split's ephemeral wound-wait identity without creating a
@@ -2471,6 +2713,10 @@ mod tests {
         })
     }
 
+    fn tombstone(key: &[u8], writer: TxId) -> ShardEntry {
+        ShardEntry::new(key).with_current(CurrentState::Tombstone { writer })
+    }
+
     fn pressure_inline() -> InlinePolicy {
         InlinePolicy {
             max_value_bytes: 8,
@@ -2493,6 +2739,15 @@ mod tests {
         bg: &Arc<Background>,
         candidates: SplitCandidates,
     ) -> Splitter {
+        splitter_with_candidates_and_hints(shards, bg, candidates, TxCleanupHints::default())
+    }
+
+    fn splitter_with_candidates_and_hints(
+        shards: &TestStore,
+        bg: &Arc<Background>,
+        candidates: SplitCandidates,
+        cleanup_hints: TxCleanupHints,
+    ) -> Splitter {
         let tl = TLogger::new(shards.objects.clone(), db_root("db"));
         let mon = Monitor::with_config(
             tl.clone(),
@@ -2501,7 +2756,7 @@ mod tests {
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
-        splitter_with_monitor(shards, bg, mon, candidates)
+        splitter_with_monitor_and_hints(shards, bg, mon, candidates, cleanup_hints)
     }
 
     fn splitter_with_monitor(
@@ -2509,6 +2764,16 @@ mod tests {
         bg: &Arc<Background>,
         mon: Monitor,
         candidates: SplitCandidates,
+    ) -> Splitter {
+        splitter_with_monitor_and_hints(shards, bg, mon, candidates, TxCleanupHints::default())
+    }
+
+    fn splitter_with_monitor_and_hints(
+        shards: &TestStore,
+        bg: &Arc<Background>,
+        mon: Monitor,
+        candidates: SplitCandidates,
+        cleanup_hints: TxCleanupHints,
     ) -> Splitter {
         let key_state = KeyStateResolver::new(mon.clone());
         let coord = ShardCoordinator::with_hinter(
@@ -2531,6 +2796,7 @@ mod tests {
             coord,
             candidates,
             RetryConfig::default(),
+            cleanup_hints,
         )
     }
 
@@ -2592,6 +2858,197 @@ mod tests {
         let pending = publisher.drain_pending();
         assert_eq!(pending.len(), CANDIDATE_QUEUE_CAP);
         assert_eq!(pending[0].split_key, 1usize.to_be_bytes());
+    }
+
+    #[test]
+    fn reclamation_removes_only_holder_free_tombstones() {
+        let reclaimed_writer = TxId::with_priority(1, b"reclaimed");
+        let retained_writer = TxId::with_priority(2, b"retained");
+        let holder = TxId::with_priority(3, b"holder");
+        let mut retained = tombstone(b"locked", retained_writer.clone());
+        retained.acquire_read_lock(holder);
+        let mut node = Node::leaf(Shard::from_entries([
+            live(b"live"),
+            tombstone(b"reclaimed", reclaimed_writer.clone()),
+            retained,
+        ]));
+        let mut locks = node.locks().clone();
+        locks.advance_membership_version();
+        node.set_locks(locks);
+
+        assert_eq!(
+            reclaim_holder_free_tombstones(&mut node),
+            vec![reclaimed_writer]
+        );
+        let leaf = node.as_leaf().unwrap();
+        assert!(leaf.lookup(b"reclaimed").is_none());
+        assert!(leaf.lookup(b"live").unwrap().exists());
+        assert_eq!(
+            leaf.lookup(b"locked").unwrap().current.writer(),
+            Some(&retained_writer)
+        );
+        assert_eq!(node.membership_version(), 1);
+    }
+
+    #[tokio::test]
+    async fn root_reclamation_can_avoid_an_actionable_split() {
+        let s = store();
+        let first = TxId::with_priority(2, b"first");
+        let second = TxId::with_priority(3, b"second");
+        let mut root = Node::leaf(Shard::from_entries([
+            live(b"a"),
+            tombstone(b"b", first.clone()),
+            tombstone(b"c", second.clone()),
+        ]));
+        let mut locks = root.locks().clone();
+        locks.advance_membership_version();
+        locks.advance_membership_version();
+        root.set_locks(locks);
+        s.create_root(COLL, &root).await.unwrap();
+        let bg = Arc::new(Background::new());
+        let candidates = SplitCandidates::with_policy(tiny());
+        candidates.observe_leaf(&root_path(), root.as_leaf().unwrap());
+        let cleanup_hints = TxCleanupHints::default();
+        let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, cleanup_hints.clone());
+
+        sp.run_once().await;
+
+        let (root, _) = s
+            .load_root(COLL, Requirement::AtLeast(s.timeline.now()))
+            .await
+            .unwrap();
+        let leaf = root.as_leaf().expect("compaction avoided height growth");
+        assert_eq!(leaf.len(), 1);
+        assert!(leaf.lookup(b"a").unwrap().exists());
+        assert_eq!(root.membership_version(), 2);
+        assert!(
+            s.list_nodes(COLL, Requirement::AtLeast(s.timeline.now()))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            sp.stats_and_reset(),
+            SplitterStats {
+                candidates: 1,
+                tombstones_reclaimed: 2,
+                splits_avoided: 1,
+                ..SplitterStats::default()
+            }
+        );
+        assert_eq!(cleanup_hints.pending(), vec![first, second]);
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_does_not_publish_reclamation_outcomes() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let s = store_with_backend(backend.clone());
+        let root = Node::leaf(Shard::from_entries([
+            live(b"a"),
+            tombstone(b"b", TxId::with_priority(2, b"deleted")),
+            tombstone(b"c", TxId::with_priority(3, b"other")),
+        ]));
+        s.create_root(COLL, &root).await.unwrap();
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        backend.set_before({
+            let failed = failed.clone();
+            move |operation| {
+                let reject = matches!(
+                    operation,
+                    BackendOp::WriteIf { path, value, .. }
+                        if path.ends_with("/_r")
+                            && Node::decode(value).is_ok_and(|node| {
+                                node.as_leaf().is_some_and(|leaf| leaf.len() == 1)
+                                    && node.structural_gate().holders().is_empty()
+                            })
+                ) && !failed.swap(true, std::sync::atomic::Ordering::SeqCst);
+                let result = if reject {
+                    Err(glassdb_backend::BackendError::Precondition)
+                } else {
+                    Ok(())
+                };
+                let future: HookFuture = Box::pin(async move { result });
+                future
+            }
+        });
+        let bg = Arc::new(Background::new());
+        let candidates = SplitCandidates::with_policy(tiny());
+        candidates.observe_leaf(&root_path(), root.as_leaf().unwrap());
+        let cleanup_hints = TxCleanupHints::default();
+        let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, cleanup_hints.clone());
+
+        sp.run_once().await;
+
+        assert!(failed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            sp.stats_and_reset(),
+            SplitterStats {
+                candidates: 1,
+                deferred: 1,
+                ..SplitterStats::default()
+            }
+        );
+        assert!(cleanup_hints.pending().is_empty());
+        let (root, _) = s
+            .load_root(COLL, Requirement::AtLeast(s.timeline.now()))
+            .await
+            .unwrap();
+        assert_eq!(root.as_leaf().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn nonroot_split_partitions_the_compacted_leaf() {
+        let s = store();
+        let writer = TxId::with_priority(2, b"deleted");
+        let mut source = Node::leaf(Shard::from_entries([
+            live(b"a"),
+            live(b"b"),
+            live(b"c"),
+            tombstone(b"d", writer.clone()),
+        ]));
+        let mut locks = source.locks().clone();
+        locks.advance_membership_version();
+        locks.advance_membership_version();
+        source.set_locks(locks);
+        s.store_node(COLL, "L", &source, None).await.unwrap();
+        s.create_root(
+            COLL,
+            &Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())])),
+        )
+        .await
+        .unwrap();
+        let bg = Arc::new(Background::new());
+        let candidates = SplitCandidates::with_policy(tiny());
+        candidates.observe_leaf(&node_path("L"), source.as_leaf().unwrap());
+        let cleanup_hints = TxCleanupHints::default();
+        let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, cleanup_hints.clone());
+
+        sp.run_once().await;
+
+        let leaves = TreeRouter::new(s.shards.clone())
+            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+            .await
+            .unwrap();
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().all(|leaf| {
+            let node = leaf.node().unwrap();
+            node.membership_version() == 2
+                && node
+                    .as_leaf()
+                    .unwrap()
+                    .entries()
+                    .all(|entry| !entry.current.is_tombstone())
+        }));
+        assert_eq!(
+            sp.stats_and_reset(),
+            SplitterStats {
+                candidates: 1,
+                completed: 1,
+                tombstones_reclaimed: 1,
+                ..SplitterStats::default()
+            }
+        );
+        assert_eq!(cleanup_hints.pending(), vec![writer]);
     }
 
     // ADR-051: an inline value may be a key's only copy, so a split has to move
