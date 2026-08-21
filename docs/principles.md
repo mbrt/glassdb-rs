@@ -10,7 +10,8 @@ These are the principles from which GlassDB is founded:
 - Single value transactions with warm caches should take a single backend
   operation.
 - Conflicts and inconsistencies cannot be exposed to user code. If they are, the
-  user code must be transparently retried.
+  user code must be transparently retried. The only exception is when user code
+  panics.
 - Correctness over speed. We prefer to be correct and slow than fast and wrong.
 - The user doesn't pay for what they don't use. Expensive background work should
   happen only if the user's workload justifies it.

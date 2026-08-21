@@ -1355,6 +1355,12 @@ impl KeyLocker {
         paths
     }
 
+    /// Forgets process-local ownership after recovery takes responsibility for
+    /// an abandoned transaction's durable locks.
+    pub(crate) fn forget_tx_locks(&self, id: &TxId) {
+        self.clear_tx_locks(id);
+    }
+
     /// Drops `id`'s held-lock bookkeeping once its locks are released.
     fn clear_tx_locks(&self, id: &TxId) {
         let mut tlocks = self.tlocks.for_key(id.as_bytes()).lock().unwrap();

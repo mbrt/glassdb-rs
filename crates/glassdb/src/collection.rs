@@ -118,6 +118,10 @@ impl Collection {
     }
 
     /// Atomically reads `key`, applies `f`, and writes the result back.
+    ///
+    /// The callback may run more than once when its read is invalidated. If it
+    /// panics, the payload propagates without read validation or replay and no
+    /// staged write from that execution is published.
     pub async fn update<F>(&self, key: &[u8], f: F) -> Result<Vec<u8>, Error>
     where
         F: FnMut(Vec<u8>) -> Result<Vec<u8>, Error> + Send,

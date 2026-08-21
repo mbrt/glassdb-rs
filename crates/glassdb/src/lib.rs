@@ -10,8 +10,15 @@
 //! future mid-flight is equivalent to a crash and is recovered by the commit
 //! protocol, so it never corrupts data. Cancel by wrapping the future with
 //! `tokio::time::timeout`, `tokio::select!`, or aborting a `JoinHandle`. Locks
-//! held by an abandoned attempt are reclaimed after wait/lease timeouts. See
-//! [`Database::tx`] for details.
+//! held by an abandoned local attempt are synchronously handed to managed
+//! retirement; helpers and garbage collection may reclaim their physical
+//! resources later. See [`Database::tx`] for details.
+//!
+//! # Transaction-body panics
+//!
+//! Panics propagate without read validation or transparent retry, including on
+//! stale snapshots. The unwind path uses the same managed retirement as
+//! cancellation, so framework-owned transaction resources remain recoverable.
 
 mod collection;
 mod db;
@@ -38,7 +45,8 @@ pub use tx::Transaction;
 ///
 /// This is the transaction-body analogue of `assert!`: returning the error lets
 /// [`Database::tx`] validate the attempt's reads and retry if they were
-/// inconsistent. Assertions and other panics bypass that validation.
+/// inconsistent. Assertions and other panics bypass that validation; their
+/// cleanup safety does not make them snapshot-transparent.
 #[macro_export]
 macro_rules! ensure_tx {
     ($condition:expr, $error:expr $(,)?) => {

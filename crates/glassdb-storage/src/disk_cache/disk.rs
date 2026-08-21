@@ -101,7 +101,7 @@ impl Disk {
         let mut bytes = vec![0; self.format.block_bytes() as usize];
         self.read_exact_at(&mut bytes, offset).await?;
         let mut slots = Vec::new();
-        for raw in bytes.chunks_exact(CacheFormat::SLOT_BYTES as usize) {
+        for raw in bytes.as_chunks::<{ CacheFormat::SLOT_BYTES as usize }>().0 {
             let slot = self.format.decode_slot(raw);
             if slot.fingerprint == fingerprint
                 && slot.generation != 0
@@ -128,7 +128,7 @@ impl Disk {
             let read_bytes = remaining.min(bytes.len());
             self.read_exact_at(&mut bytes[..read_bytes], offset).await?;
             for bucket in bytes[..read_bytes].chunks_exact(block_bytes) {
-                for raw in bucket.chunks_exact(CacheFormat::SLOT_BYTES as usize) {
+                for raw in bucket.as_chunks::<{ CacheFormat::SLOT_BYTES as usize }>().0 {
                     let slot = self.format.decode_slot(raw);
                     if slot.generation != 0 && self.slot_range(slot).is_some() {
                         maximum = Some(
@@ -249,7 +249,9 @@ impl WriterState {
         self.disk.read_exact_at(&mut bytes, bucket_offset).await?;
         let zero = [0u8; CacheFormat::SLOT_BYTES as usize];
         for (index, raw) in bytes
-            .chunks_exact(CacheFormat::SLOT_BYTES as usize)
+            .as_chunks::<{ CacheFormat::SLOT_BYTES as usize }>()
+            .0
+            .iter()
             .enumerate()
         {
             let slot = self.disk.format.decode_slot(raw);
@@ -348,7 +350,9 @@ impl WriterState {
         self.disk.read_exact_at(&mut bytes, bucket_offset).await?;
         let zero = [0u8; CacheFormat::SLOT_BYTES as usize];
         for (index, raw) in bytes
-            .chunks_exact_mut(CacheFormat::SLOT_BYTES as usize)
+            .as_chunks_mut::<{ CacheFormat::SLOT_BYTES as usize }>()
+            .0
+            .iter_mut()
             .enumerate()
         {
             let previous = self.disk.format.decode_slot(raw);
@@ -367,7 +371,9 @@ impl WriterState {
         let mut stale = None;
         let mut oldest = None;
         for (index, raw) in bytes
-            .chunks_exact(CacheFormat::SLOT_BYTES as usize)
+            .as_chunks::<{ CacheFormat::SLOT_BYTES as usize }>()
+            .0
+            .iter()
             .enumerate()
         {
             let candidate = self.disk.format.decode_slot(raw);

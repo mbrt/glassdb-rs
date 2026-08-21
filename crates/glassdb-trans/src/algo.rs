@@ -201,7 +201,7 @@ pub struct Algo {
     acquisition_retry: RetryConfig,
     split_policy: SplitPolicy,
     collection_commit: CollectionCommit,
-    // Weak so a captured `Algo` clone inside a spawned async-abort task does not
+    // Weak so a captured `Algo` clone inside a spawned retirement task does not
     // keep [`Background`] alive past DB shutdown.
     background: Option<Weak<Background>>,
 }
@@ -375,16 +375,18 @@ impl Algo {
         }
     }
 
-    /// Schedules cancellation recovery for `tx_id` when a transaction future is
-    /// dropped before [`Algo::end`] runs. The waited background task pins a safe
-    /// pre-dispatch attempt as wounded and returns immediately; idempotent.
+    /// Hands `tx_id` to managed recovery when its owner exits before
+    /// [`Algo::end`] succeeds. Process-local lock ownership is forgotten before
+    /// returning; the waited background task then pins a safe pre-dispatch
+    /// attempt as wounded. Total and idempotent.
     ///
     /// A no-op unless the transaction still holds a live logged identity. An
     /// attempt that never took one — an optimistic read-only validation, or a
     /// logless one-CAS commit (ADR-061) — is invisible to peers, so an aborted
     /// object for its id would invent a transaction that never existed (and,
     /// after a dispatched logless CAS, would not even be true).
-    pub fn async_abort(&self, tx_id: &TxId) {
+    pub fn retire_abandoned(&self, tx_id: &TxId) {
+        self.locker.keys().forget_tx_locks(tx_id);
         if !self.mon.is_tracked_local(tx_id) {
             return;
         }
@@ -1058,6 +1060,7 @@ fn feed_gc_hints(gc: &Gc, superseded: Vec<TxId>) {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
     use crate::access::{ScanRange, WriteAccess};
@@ -1082,6 +1085,7 @@ mod tests {
         CachedStore, CollectionRecord, CollectionStore, CurrentState, Node, NodeStore, Shard,
         ShardEntry, StorageError, StructuralLogStore, TreeRouter,
     };
+    use tokio::sync::Notify;
 
     const TEST_DB: &str = "testp";
 
@@ -1138,12 +1142,22 @@ mod tests {
         cache_bytes: usize,
         split_policy: SplitPolicy,
     ) -> (Algo, Tctx) {
+        new_algo_from_backend_with_cache_policy_and_retirement(b, cache_bytes, split_policy, false)
+            .await
+    }
+
+    async fn new_algo_from_backend_with_cache_policy_and_retirement(
+        b: Arc<dyn Backend>,
+        cache_bytes: usize,
+        split_policy: SplitPolicy,
+        managed_retirement: bool,
+    ) -> (Algo, Tctx) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(b.clone(), cache_bytes, timeline.clone(), None);
         let tlogger = TLogger::new(objects.clone(), test_db_root());
         let bg = Arc::new(Background::new());
         let bg_weak = Arc::downgrade(&bg);
-        // Leak the background so spawned async aborts can run for the test's
+        // Leak the background so spawned retirement can run for the test's
         // lifetime without us threading the owner through every helper.
         std::mem::forget(bg);
         let tmon = Monitor::with_config(
@@ -1231,7 +1245,7 @@ mod tests {
             tmon.clone(),
             collection_commit,
             gc,
-            None,
+            managed_retirement.then_some(bg_weak),
             resolver,
             split_policy,
             glassdb_storage::InlinePolicy::default(),
@@ -1310,6 +1324,77 @@ mod tests {
             .await
             .unwrap();
         loaded.entries().lookup(key).cloned()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_retirement_hands_off_local_locks_when_its_status_read_fails() {
+        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(HookBackend::new(inner));
+        let fail_status_read = Arc::new(AtomicBool::new(false));
+        let failure_reached = Arc::new(Notify::new());
+        backend.set_before({
+            let fail_status_read = fail_status_read.clone();
+            let failure_reached = failure_reached.clone();
+            move |op| {
+                let fail = matches!(
+                    op,
+                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                ) && fail_status_read.swap(false, Ordering::SeqCst);
+                let failure_reached = failure_reached.clone();
+                let future: HookFuture = Box::pin(async move {
+                    if fail {
+                        failure_reached.notify_one();
+                        return Err(glassdb_backend::BackendError::other(
+                            "injected retirement status-read failure",
+                        ));
+                    }
+                    Ok(())
+                });
+                future
+            }
+        });
+        let (algo, tctx) = new_algo_from_backend_with_cache_policy_and_retirement(
+            backend.clone(),
+            1024,
+            SplitPolicy::default(),
+            true,
+        )
+        .await;
+        let key = key_ref(b"abandoned");
+        let data = Data {
+            reads: Vec::new(),
+            writes: vec![wa(&key, b"uncommitted")],
+            scans: Vec::new(),
+        };
+        let abandoned = begin_data(&algo, data.clone()).id;
+        tctx.tmon.begin_tx(&abandoned);
+        let outcome = tctx
+            .locker
+            .keys()
+            .lock_at(&abandoned, &data, false, Requirement::Any)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, LockOutcome::Locked(_)));
+        assert!(!tctx.locker.tx_locks_snapshot().is_empty());
+
+        fail_status_read.store(true, Ordering::SeqCst);
+        algo.retire_abandoned(&abandoned);
+        assert!(
+            tctx.locker.tx_locks_snapshot().is_empty(),
+            "local ownership must be bounded by the synchronous handoff"
+        );
+        tokio::time::timeout(Duration::from_secs(1), failure_reached.notified())
+            .await
+            .expect("retirement never attempted its status read");
+
+        let (peer, peer_ctx) = new_algo_from_backend(backend).await;
+        peer_ctx.tmon.preempt_tx(&abandoned).await.unwrap();
+        let mut peer_handle = begin_data(&peer, data);
+        tokio::time::timeout(Duration::from_secs(1), peer.commit(&mut peer_handle))
+            .await
+            .expect("protocol helping did not make progress")
+            .unwrap();
+        peer.end(&mut peer_handle).await.unwrap();
     }
 
     #[tokio::test]

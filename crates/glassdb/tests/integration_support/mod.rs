@@ -1,9 +1,11 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use glassdb::backend::BackendError;
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
 use glassdb::{Backend, Collection, CollectionPath, Database, Error, Transaction};
+use glassdb_data::ObjectPath;
 use glassdb_storage::transaction::TxCommitStatus;
 use tokio::sync::{Notify, oneshot};
 
@@ -408,6 +410,183 @@ impl LoglessCommitControl {
     }
 }
 
+/// Acknowledges preparation and durable recovery registration for one newly
+/// created collection without imposing scheduler timing on the test.
+pub struct PreparedCollectionRecoveryControl {
+    backend: Arc<HookBackend>,
+    armed: AtomicBool,
+    prepared: Mutex<Option<oneshot::Sender<()>>>,
+    retired: Mutex<Option<oneshot::Sender<usize>>>,
+}
+
+impl PreparedCollectionRecoveryControl {
+    pub fn wrap(inner: Arc<dyn Backend>) -> Arc<Self> {
+        let backend = HookBackend::new(inner);
+        let control = Arc::new(Self {
+            backend: backend.clone(),
+            armed: AtomicBool::new(false),
+            prepared: Mutex::new(None),
+            retired: Mutex::new(None),
+        });
+        backend.set_after({
+            let control = control.clone();
+            move |operation, outcome| {
+                let mut prepared = None;
+                let mut retired = None;
+                if control.armed.load(Ordering::SeqCst) && outcome.is_success() {
+                    match operation {
+                        BackendOp::WriteIfNotExists { path, .. }
+                            if matches!(
+                                ObjectPath::try_from(*path),
+                                Ok(ObjectPath::CollectionRecord { .. })
+                            ) =>
+                        {
+                            prepared = control.prepared.lock().unwrap().take();
+                        }
+                        BackendOp::WriteIf { path, value, .. }
+                        | BackendOp::WriteIfNotExists { path, value }
+                            if path.contains("/_t/")
+                                && glassdb_storage::txobject::status(value)
+                                    .is_ok_and(|status| status == TxCommitStatus::Aborted) =>
+                        {
+                            if let Ok(ObjectPath::Transaction { db_root, id }) =
+                                ObjectPath::try_from(*path)
+                                && let Ok(log) =
+                                    glassdb_storage::txobject::decode(db_root.as_str(), &id, value)
+                            {
+                                control.armed.store(false, Ordering::SeqCst);
+                                retired = control
+                                    .retired
+                                    .lock()
+                                    .unwrap()
+                                    .take()
+                                    .map(|retired| (retired, log.prepared_collections.len()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let future: HookFuture = Box::pin(async move {
+                    if let Some(prepared) = prepared {
+                        let _ = prepared.send(());
+                    }
+                    if let Some((retired, prepared_collections)) = retired {
+                        let _ = retired.send(prepared_collections);
+                    }
+                    Ok(())
+                });
+                future
+            }
+        });
+        control
+    }
+
+    pub fn backend(&self) -> Arc<HookBackend> {
+        self.backend.clone()
+    }
+
+    pub fn arm(&self) -> (oneshot::Receiver<()>, oneshot::Receiver<usize>) {
+        let (prepared, prepared_rx) = oneshot::channel();
+        let (retired, retired_rx) = oneshot::channel();
+        *self.prepared.lock().unwrap() = Some(prepared);
+        *self.retired.lock().unwrap() = Some(retired);
+        self.armed.store(true, Ordering::SeqCst);
+        (prepared_rx, retired_rx)
+    }
+}
+
+/// Fails one owner-side `Aborted` write and acknowledges the managed retry that
+/// follows the failed synchronous transaction finalization.
+pub struct RetirementFailureControl {
+    backend: Arc<HookBackend>,
+    armed: AtomicBool,
+    failure_observed: AtomicBool,
+    failed: Mutex<Option<oneshot::Sender<()>>>,
+    recovered: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl RetirementFailureControl {
+    pub fn wrap(inner: Arc<dyn Backend>) -> Arc<Self> {
+        let backend = HookBackend::new(inner);
+        let control = Arc::new(Self {
+            backend: backend.clone(),
+            armed: AtomicBool::new(false),
+            failure_observed: AtomicBool::new(false),
+            failed: Mutex::new(None),
+            recovered: Mutex::new(None),
+        });
+        backend.set_before({
+            let control = control.clone();
+            move |operation| {
+                let fail = match operation {
+                    BackendOp::WriteIf { value, .. }
+                    | BackendOp::WriteIfNotExists { value, .. } => {
+                        is_aborted_tx_log(value) && control.armed.swap(false, Ordering::SeqCst)
+                    }
+                    _ => false,
+                };
+                let failed = fail
+                    .then(|| {
+                        control.failure_observed.store(true, Ordering::SeqCst);
+                        control.failed.lock().unwrap().take()
+                    })
+                    .flatten();
+                let future: HookFuture = Box::pin(async move {
+                    if let Some(failed) = failed {
+                        let _ = failed.send(());
+                    }
+                    if fail {
+                        return Err(BackendError::other(
+                            "injected owner-retirement write failure",
+                        ));
+                    }
+                    Ok(())
+                });
+                future
+            }
+        });
+        backend.set_after({
+            let control = control.clone();
+            move |operation, outcome| {
+                let recovered = (outcome.is_success()
+                    && control.failure_observed.load(Ordering::SeqCst)
+                    && match operation {
+                        BackendOp::WriteIf { value, .. }
+                        | BackendOp::WriteIfNotExists { value, .. } => is_aborted_tx_log(value),
+                        _ => false,
+                    })
+                .then(|| control.recovered.lock().unwrap().take())
+                .flatten();
+                let future: HookFuture = Box::pin(async move {
+                    if let Some(recovered) = recovered {
+                        let _ = recovered.send(());
+                    }
+                    Ok(())
+                });
+                future
+            }
+        });
+        control
+    }
+
+    pub fn backend(&self) -> Arc<HookBackend> {
+        self.backend.clone()
+    }
+
+    pub fn observe(&self) -> (oneshot::Receiver<()>, oneshot::Receiver<()>) {
+        let (failed, failed_rx) = oneshot::channel();
+        let (recovered, recovered_rx) = oneshot::channel();
+        self.failure_observed.store(false, Ordering::SeqCst);
+        *self.failed.lock().unwrap() = Some(failed);
+        *self.recovered.lock().unwrap() = Some(recovered);
+        (failed_rx, recovered_rx)
+    }
+
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Reports whether `path` addresses a coordination leaf: a small collection's
 /// root (`_r`) or a standalone node (`_n`).
 fn is_leaf_path(path: &str) -> bool {
@@ -419,6 +598,10 @@ fn is_abort_side_tx_log(body: &[u8]) -> bool {
     glassdb_storage::txobject::status(body)
         .map(|status| matches!(status, TxCommitStatus::Aborted | TxCommitStatus::Wounded))
         .unwrap_or(false)
+}
+
+fn is_aborted_tx_log(body: &[u8]) -> bool {
+    glassdb_storage::txobject::status(body).is_ok_and(|status| status == TxCommitStatus::Aborted)
 }
 
 /// Reports whether `body` is a pinned transaction wound.
