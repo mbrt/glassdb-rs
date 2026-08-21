@@ -32,9 +32,10 @@ use crate::scan::{KeyPage, KeyScan};
 /// Awaiting [`Transaction::read`] (and the enclosing [`crate::Database::tx`] future) is
 /// durability-safe to cancel by being dropped (`tokio::time::timeout`,
 /// `select!`, or `JoinHandle::abort`). When the future is dropped mid-flight
-/// the surrounding `Database::tx` arranges (via an internal RAII guard) for the
-/// engine-side transaction to be asynchronously aborted, so locks are
-/// released promptly instead of waiting for lease expiry.
+/// the surrounding `Database::tx` uses an internal RAII guard to hand any
+/// engine-side attempt to managed retirement. Panics use the same handoff.
+/// Durable helpers and garbage collection may reclaim physical resources
+/// asynchronously.
 pub struct Transaction {
     db: Arc<DbInner>,
     inner: Arc<Mutex<TransactionInner>>,

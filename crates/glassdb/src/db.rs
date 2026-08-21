@@ -187,6 +187,9 @@ impl Database {
     /// drained as a finite pass; a leaf blocked by a live structural holder is
     /// deferred to lazy recovery rather than waited on.
     /// Idempotent; safe to call from multiple [`Database`] clones concurrently.
+    /// Managed abandonment retirement is part of the drain and can wait
+    /// indefinitely on storage or protocol recovery. Cancelling this future is
+    /// safe; a later call resumes the shutdown.
     ///
     /// Dropping the last [`Database`] still aborts background work, but
     /// `shutdown` additionally waits for those tasks to stop. It cannot wait for
@@ -276,16 +279,25 @@ impl Database {
     /// reads are validated. If those reads were inconsistent, `f` is invoked
     /// again; otherwise the original error is returned. Conditions derived from
     /// transaction reads must therefore return an error, for example with
-    /// [`crate::ensure_tx!`], rather than assert or panic. Panics bypass read
-    /// validation.
+    /// [`crate::ensure_tx!`], rather than assert or panic.
+    ///
+    /// # Panics
+    ///
+    /// A panic from `f` propagates with its original payload. It is neither
+    /// read-validated nor retried, even when the execution observed an
+    /// inconsistent snapshot. Uncommitted database changes stay unpublished.
+    /// If an earlier execution left an engine attempt active for a retained
+    /// retry, unwinding synchronously hands that attempt to managed recovery;
+    /// physical lock and prepared-object reclamation may finish later.
     ///
     /// # Cancellation
     ///
     /// This future is durability-safe to cancel: dropping it cannot produce a
-    /// partial logical commit. It dispatches, but does not guarantee rollback,
-    /// because a transaction-log commit or logless value CAS already dispatched
-    /// when the future is dropped may still commit even though the caller
-    /// receives no result.
+    /// partial logical commit. Active attempt resources are handed to managed
+    /// recovery before the future is destroyed. Cancellation does not guarantee
+    /// rollback, because a transaction-log commit or logless value CAS already
+    /// dispatched when the future is dropped may still commit even though the
+    /// caller receives no result.
     pub async fn tx<T, F, Fut>(&self, f: F) -> Result<T, Error>
     where
         F: FnMut(Transaction) -> Fut + Send,
@@ -575,12 +587,20 @@ impl<'a> AttemptDriver<'a> {
             .resources
             .as_mut()
             .expect("a wound is reported only for an active attempt");
-        let _ = self.engine.end(&mut resources.handle).await;
+        let retired_id = resources.handle.id().clone();
+        let end_result = self.engine.end(&mut resources.handle).await;
+        if let Err(error) = &end_result {
+            tracing::debug!(
+                transaction = %retired_id,
+                error = ?error,
+                "wounded transaction retirement deferred to the abandonment guard"
+            );
+        }
         let resources = self
             .resources
             .take()
             .expect("the ended attempt remains active until it is renewed");
-        self.resources = Some(resources.rebegin());
+        self.resources = Some(resources.rebegin(end_result.is_ok()));
     }
 
     /// Commits the accesses installed for the latest closure execution.
@@ -598,18 +618,20 @@ impl<'a> AttemptDriver<'a> {
             return Ok(());
         };
         let result = self.engine.end(&mut resources.handle).await;
-        resources.abort_guard.disarm();
+        if result.is_ok() {
+            resources.retirement_guard.disarm();
+        }
         result
     }
 }
 
-/// Engine state for one active attempt and its cancellation safety net.
+/// Engine state for one active attempt and its abnormal-exit safety net.
 ///
 /// Storing this as one optional value ensures the handle and armed guard exist
 /// together or not at all.
 struct AttemptResources<'a> {
     handle: EngineTransaction,
-    abort_guard: TransactionAbortGuard<'a>,
+    retirement_guard: AttemptRetirementGuard<'a>,
 }
 
 impl<'a> AttemptResources<'a> {
@@ -617,33 +639,34 @@ impl<'a> AttemptResources<'a> {
         let tx_id = handle.id().clone();
         Self {
             handle,
-            abort_guard: TransactionAbortGuard::new(engine, tx_id),
+            retirement_guard: AttemptRetirementGuard::new(engine, tx_id),
         }
     }
 
-    fn rebegin(mut self) -> Self {
-        let engine = self.abort_guard.engine;
-        self.abort_guard.disarm();
+    fn rebegin(mut self, ended: bool) -> Self {
+        let engine = self.retirement_guard.engine;
+        if ended {
+            self.retirement_guard.disarm();
+        }
         let handle = engine.rebegin_transaction(self.handle);
         Self::new(engine, handle)
     }
 }
 
-/// RAII safety net for [`DbInner::tx_impl`]: if the surrounding future is
-/// dropped between attempt begin and end, the guard schedules recovery for the
-/// currently armed transaction id. Before terminal dispatch this publishes a
-/// pinned wound so peers need not wait for the lock lease; after dispatch it
-/// preserves the possibly committed outcome.
+/// RAII safety net for [`DbInner::tx_impl`]: cancellation, unwinding, or failed
+/// finalization hands the currently armed transaction id to recovery. Before
+/// terminal dispatch this publishes a pinned wound so peers need not wait for
+/// the lock lease; after dispatch it preserves the possibly committed outcome.
 ///
 /// Whether the armed id actually needs an abort is the engine's decision, not
 /// the guard's: an attempt that never took a logged identity is
 /// invisible to peers and must not be given an abort-side object it never had.
-struct TransactionAbortGuard<'a> {
+struct AttemptRetirementGuard<'a> {
     engine: &'a Engine,
     armed: Option<TxId>,
 }
 
-impl<'a> TransactionAbortGuard<'a> {
+impl<'a> AttemptRetirementGuard<'a> {
     fn new(engine: &'a Engine, tx_id: TxId) -> Self {
         Self {
             engine,
@@ -657,10 +680,10 @@ impl<'a> TransactionAbortGuard<'a> {
     }
 }
 
-impl Drop for TransactionAbortGuard<'_> {
+impl Drop for AttemptRetirementGuard<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.armed.take() {
-            self.engine.async_abort(&id);
+            self.engine.retire_abandoned(&id);
         }
     }
 }

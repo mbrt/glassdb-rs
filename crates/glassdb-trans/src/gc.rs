@@ -918,6 +918,41 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn aborted_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
+        let ctx = new_ctx().await;
+        let id = tx(1);
+        let prepared = CollectionAddress::new(
+            "db",
+            CollectionId::from_slice(&[7; 16]).expect("fixed ID has the required width"),
+        );
+        ctx.records
+            .create_record(&prepared, &CollectionRecord::new())
+            .await
+            .unwrap();
+        ctx.shards
+            .create_root(&prepared, &Node::leaf(Shard::new()))
+            .await
+            .unwrap();
+        let mut log = committed(id.clone(), PAST_HORIZON, &[], &[]);
+        log.status = TxCommitStatus::Aborted;
+        log.prepared_collections.push(prepared.clone());
+        ctx.tl.set(&log).await.unwrap();
+        ctx.gc.schedule_tx_cleanup(id.clone());
+
+        run_once(&ctx.gc).await;
+
+        assert!(is_gone(&ctx.tl, &id).await);
+        assert!(matches!(
+            ctx.shards.load_root(&prepared, Requirement::Any).await,
+            Err(StorageError::NotFound)
+        ));
+        assert!(matches!(
+            ctx.records.load_record(&prepared, Requirement::Any).await,
+            Err(StorageError::NotFound)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn collection_cleanup_conflict_keeps_the_recovery_manifest() {
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
         let ctx = new_ctx_with(backend.clone()).await;

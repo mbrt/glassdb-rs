@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Accepted. Transaction-attempt guard semantics are refined by
+[ADR-063](063-protocol-safe-transaction-body-panics.md).
 
 Follow-up to [ADR-008](008-deterministic-simulation-fuzzer.md) and
 [ADR-011](011-guided-interleaving-executor.md).

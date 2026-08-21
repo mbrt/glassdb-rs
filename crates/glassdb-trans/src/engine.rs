@@ -370,9 +370,9 @@ impl Engine {
         self.algo.end(&mut tx.0).await
     }
 
-    /// Schedules cancellation cleanup for an abandoned transaction identity.
-    pub fn async_abort(&self, tx_id: &TxId) {
-        self.algo.async_abort(tx_id);
+    /// Hands an abandoned transaction identity to managed recovery.
+    pub fn retire_abandoned(&self, tx_id: &TxId) {
+        self.algo.retire_abandoned(tx_id);
     }
 
     /// Gracefully drains background work and closes engine storage.

@@ -259,8 +259,8 @@ the coordinator.
 | Component             | Layer            | Speaks                       | Owns                                                                                                                  | Must not know                       |
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
 | `glassdb` (`tx_impl`) | API / retry      | `Engine`, closures, `Error`  | metadata bootstrap, operation admission, user body, retry loop, public handles/errors, cancel-safety                  | stores, locks, shards, tx logs, runtime wiring |
-| `Engine`              | runtime façade   | logical keys, `Data`, configuration | component assembly/lifetime, read/scan/catalog entry points, transaction-attempt delegation, shutdown, component stats/diagnostics | user closures, public handles/errors, body retry policy |
-| `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome` | transaction lifecycle, direct-vs-logged selection, cross-domain lock→validate→commit→write-back orchestration, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), GC candidate hints | shard routing, CAS details, caching, collection lifecycle implementation, the split mechanism beyond its `SplitHintSink` producer handle |
+| `Engine`              | runtime façade   | logical keys, `Data`, configuration | component assembly/lifetime, read/scan/catalog entry points, transaction-attempt delegation and abandonment retirement, shutdown, component stats/diagnostics | user closures, public handles/errors, body retry policy |
+| `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome` | transaction lifecycle, direct-vs-logged selection, cross-domain lock→validate→commit→write-back orchestration, abandoned-owner retirement, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), GC candidate hints | shard routing, CAS details, caching, collection lifecycle implementation, the split mechanism beyond its `SplitHintSink` producer handle |
 | `DirectCommit`        | logless commit mechanism | `Data`, `TxId`, `KeyResolver`, resolvers | complete point-member normalization, one-leaf eligibility, atomic inline/tombstone publication, transaction-local recovery classification | transaction logs, range/catalog validation, waiting or wounding holders |
 | `CollectionCommit`    | collection-commit **policy** | `CollectionAttempt`, catalog, lifecycle | same-ID collection retry state, recovery and committed-log fields, incarnation preparation, validation, drop fencing, post-commit/abort cleanup | key locking, key validation, the atomic commit decision |
 | `Locker::keys`        | key-lock **policy** | `Data`, `TxId`, B-link nodes | key→leaf grouping, parallel & serial acquisition, hold-and-wait, acquire / write-back / release resolvers | collection-directory semantics |
@@ -739,6 +739,22 @@ still held. This means the second attempt runs under pessimistic locking and is
 guaranteed to succeed — no further conflicts are possible. This bounds the
 maximum number of retries to one per conflict.
 
+#### Abnormal body exits
+
+Snapshot transparency applies to values and errors returned by the transaction
+body. A panic is not converted into a returned error: its payload propagates
+without read validation or replay, even when that execution observed a stale
+snapshot.
+
+An active engine attempt and its retirement guard are one owned resource. The
+guard is disarmed only after finalization succeeds. Cancellation or unwinding
+synchronously transfers an armed identity to engine-managed retirement, which
+forgets process-local lock ownership before control escapes and then settles or
+pins the durable identity in waited background work. Physical locks and
+prepared collection objects remain recoverable from the transaction manifest
+and are released lazily by helpers or garbage collection. Process abort skips
+local unwinding and uses the ordinary crash-recovery path.
+
 ### Deadlock Handling
 
 GlassDB prevents deadlocks proactively with the **wound-wait** rule. Each
@@ -791,6 +807,12 @@ drives this:
    still publish conditionally changes `Wounded` to `Aborted`; only then does
    finite GC retention apply. If a commit races the wound, CAS semantics ensure
    exactly one wins. A quiescent local victim can write `Aborted` directly.
+
+4. **Local retirement handoff.** Cancellation, unwinding, and failed owner-side
+   finalization keep the attempt guard armed. Its synchronous handoff removes
+   process-local ownership from diagnostics and admits waited recovery before
+   control leaves the owner. A cleanup failure is diagnostic only; durable
+   wounds, leases, helping, and GC retain recovery ownership.
 
 ## Storage, Caching & Consistency
 
