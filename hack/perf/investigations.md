@@ -14,138 +14,74 @@ This file is evidence, not a record of accepted behavior:
 
 ## 2026-08-21: root-leaf structural-gate coordinator rationale
 
-Status: investigation complete; no engine change made. There is no recorded
-measurement showing that structural-gate acquisition on the tree root is faster
-outside the shard coordinator when that root is a leaf. The current exception
-appears to classify the fixed root address as if it were always an index. Direct
-structural CAS remains appropriate for actual index nodes and for the topology
-rewrite performed after a gate is held; only root-leaf gate acquisition is in
-question.
+Status: investigation complete; no engine change made. No retained benchmark
+compares direct and coordinated structural-gate acquisition on a root leaf.
 
-### Current behavior
+### Finding
 
-Every collection's fixed `_r` object is a leaf while the collection is small and
-an index after its first split
+A collection root `_r` starts as a leaf and becomes an index after its first
+split
 ([ADR-050](../../docs/adr/050-separate-collection-record-and-tree-root.md)). As a
-leaf, `_r` is the CAS unit for ordinary key mutations and has the same
-coordination semantics as a non-root leaf. The `ShardCoordinator` therefore
-supports both `TreeRoot` and `Node` leaf paths, and `StructuralGateResolver`
-already accepts either path.
+leaf, it is the CAS unit for its keys and has the same coordination semantics as
+a non-root leaf.
 
-`StructuralNodeAccess::acquire_structural_gate` nevertheless dispatches by
-address before fully dispatching by shape:
+[`ShardCoordinator::submit_shard`](../../crates/glassdb-trans/src/shard_coord.rs)
+and
+[`StructuralGateResolver`](../../crates/glassdb-trans/src/node_locking.rs)
+support root and non-root leaf paths. However,
+[`StructuralNodeAccess::acquire_structural_gate`](../../crates/glassdb-trans/src/split.rs)
+selects the path from `Option<&NodeToken>`:
 
-- a non-root token is loaded and, if it names a leaf, gate acquisition joins the
-  coordinator's single-flight CAS stream;
-- a non-root index takes the direct structural path; and
-- the root has no token, so it always takes the direct path even when `_r` is a
-  data-bearing leaf.
+- a non-root leaf uses the coordinator;
+- a non-root index uses the direct path; and
+- the root always uses the direct path, even when it is a leaf.
 
-Both leaf paths quiesce entry and membership holders, install the gate with a
-conditional write, and reload the landed version. Once the gate is held, the
-split's source shrink or in-place root rewrite remains a direct conditional
-structural write and releases the gate inline. Routing root-leaf *gate
-acquisition* through the coordinator would not route topology changes through a
-resolver or change the split linearization point.
+Thus, the root-leaf exception is based on the address, not the node shape. Its
+direct CAS can race data mutations that use the same `Database` coordinator.
 
-### Origin of the exception
+The candidate changes only root-leaf gate acquisition. Index acquisition and
+writes after the gate is held stay outside it. This includes a root rewrite and
+[ADR-062](../../docs/adr/062-splitter-driven-tombstone-reclamation.md)
+compaction, which can finish without a split.
 
-Commit `c4216276` (2026-07-14, `Separate _t and _s logs`) introduced the
-leaf-only coordinator branch while refactoring structural-log and node-locking
-code. Its stated rationale, still present in `split.rs`, is that "roots and
-interior indexes use the direct structural CAS path because they carry no
-data-mutation traffic." The commit added no performance comparison or benchmark
-artifact for this choice.
+### Rationale and evidence
 
-That rationale applies to index nodes but not to a root leaf. ADR-031 already
-defined the root at height one as a key-bearing leaf and the CAS unit for its
-keys. Commit `9b4e5e49` (2026-07-28, `Refactor: Separate out collection record`)
-made the distinction explicit by moving the tree root to `_r`: ADR-050 says that
-`_r` initially has the same representation and coordination semantics as every
-other B-link node, and that every key-bearing leaf has one mutation path. The
-branch was retained through that change and later refactors. Commit `c13aab70`
-(2026-08-12, `Migrate transaction path ownership`) even made
-`StructuralGateResolver` accept `TreeRoot`, but its structural-gate caller still
-constructs only a non-root `Node` path.
+Commit `c4216276` introduced the exception with the claim that roots and indexes
+carry no data-mutation traffic. This claim did not apply to a root leaf, which
+was already key-bearing. The commit has no benchmark for the exception.
+ADR-050 later made the mismatch explicit by giving `_r` the same node semantics
+as other B-link nodes. Root support also already exists in the resolver; commit
+`c13aab70` only made it typed.
 
-The exception is therefore historical classification logic, not a demonstrated
-root-leaf fast path. Its address-based condition became more visibly inconsistent
-after ADR-050 separated the collection record from the shape-changing root node.
+The retained performance evidence does not justify the bypass:
 
-### Relevant performance evidence
+- [ADR-044](../../docs/adr/044-cas-fenced-structural-gate.md) reduced structural
+  work on ordinary mutations. It did not compare gate-acquisition paths.
+- [ADR-056](../../docs/adr/056-demand-driven-inline-pressure-splits.md) ran one
+  direct root split and one coordinated non-root split. It did not compare their
+  acquisition cost.
+- [ADR-061](../../docs/adr/061-atomic-logless-single-leaf-commits.md) sends
+  logless direct commits through the coordinator. Thus, “direct commit” does
+  not mean coordinator bypass.
+- The 2026-08-12 coordinator measurements show that competing CAS owners can be
+  costly. They did not measure gate acquisition on `_r`.
 
-ADR-044's structural-gate redesign was performance-motivated, but it optimized
-ordinary stable-leaf traffic rather than direct gate acquisition. The preceding
-shared-lock protocol made each mutation create, retain, reconcile, and remove a
-structure holder. Measurements attributed most of the dynamic-sharding
-regression to that holder reconciliation. ADR-044 removed shared structure
-holders from ordinary mutations: they now prove the exclusive gate absent in
-the same CAS that installs or publishes data, while rare structural operations
-pay full-node reconciliation when acquiring the gate.
+A coordinated variant must reuse the root load that classifies the node. It
+must not add a second physical root read.
 
-The landed comparison in [`docs/guides/perf.md`](../../docs/guides/perf.md)
-supports the work reduction but not a general throughput claim. Relative backend
-operations per transaction fell to `0.64`, `0.80`, and `0.51` in the balanced,
-read-heavy, and write-heavy rw9010 mixes, while throughput ratios were mixed at
-`0.79`, `0.94`, and `1.30`. The deterministic efficiency score was effectively
-unchanged at `0.985`. Those results justify moving structural bookkeeping off
-the stable path; they do not distinguish direct from coordinated gate
-acquisition on a root leaf.
+### Required guardrail
 
-Coordinator overhead has mattered on hot transaction paths. ADR-028 initially
-made the single-RW path load a leaf twice when it entered the coordinator, and
-ADR-030 restored the one-load path by seeding the first fold from the cached
-observation. The ADR-030 deterministic comparison reduced `singleRMW` cost to
-`0.67` and the overall efficiency score to `0.902` of its base. Any root-leaf
-change must therefore preserve cached first-fold seeding and avoid adding a
-physical root read merely to classify the node.
+Compare only the two root-leaf acquisition paths under one shared `Database`
+and under independent `Database` instances. Race each path with ordinary
+root-leaf mutations. Cover a real root split and ADR-062 compaction that avoids
+a split.
 
-The more recent coordinator attribution points away from resolver execution as
-the relevant cost. In the 2026-08-12 fixed-topology S3-model experiment
-(`d7635058`), spread traffic spent `616–676 s` of aggregate coordinator worker
-time in retry sleep versus `9.5–9.8 s` in resolver folding; hot traffic spent
-`384–424 s` retrying versus `31–41 s` folding. The same investigation found
-local queueing and provider-rate-limit waits secondary to CAS losses. A separate
-four-Database phase probe found nearly-zero direct-commit fold work while
-submission time changed by `6.5x`; independent coordinator owners were racing
-the same leaf CAS, reloading, and backing off.
+Measure root reads, writes, bytes, precondition misses, coordinator retries,
+and latency. Verify values, deleted-key absence, final topology, holder cleanup,
+and bounded shutdown.
 
-A coordinator can remove only competition within its own `Database`. In the
-corrected hot affinity sweep, moving all collection traffic through one
-`Database` increased members per coordinator round from `1.74` to `3.27`,
-reduced rounds per transaction from `0.497` to `0.274`, eliminated the measured
-`0.111` CAS retries per transaction, and increased aggregate throughput from
-`62.0` to `161.6` transactions/s. Independent `Database` instances still have
-independent coordinators and must arbitrate through the backend CAS.
-
-These results make it plausible that a direct root-leaf gate CAS is an extra
-local CAS owner rather than a useful shortcut, but they do not measure a root
-split. No retained benchmark isolates structural-gate acquisition on `_r`, so
-that conclusion remains an inference.
-
-The phrases "direct root CASes" and "direct-path CASes" elsewhere in this log do
-not supply the missing comparison. They describe logless data transactions on a
-small collection's root leaf. The per-leaf miss probe that attributed excess
-misses to the direct path recorded zero measured splits; the inline-policy sweep
-measured uninterrupted direct RMWs before pressure splitting. Neither exercised
-the structural-gate branch discussed here.
-
-### Required guardrail before changing the path
-
-A focused comparison should start from the same small, data-bearing `_r` leaf
-and vary only root-leaf gate acquisition: current direct acquisition versus a
-`TreeRoot` submission using `StructuralGateResolver`. It should cover both one
-shared `Database` and independent `Database` instances while ordinary root-leaf
-mutations race the first split. The comparison should report physical root
-reads and writes, precondition misses, coordinator retries, gate-acquisition
-latency, and bounded split completion. It must also verify that every committed
-value remains readable, the root becomes an index over the expected children,
-no holder is stranded, and shutdown drains.
-
-Until that guardrail exists, the supported design conclusion is narrow: retain
-direct structural CAS for true index nodes and for the gated structural rewrite;
-classify `_r` by node shape, and treat coordinated root-leaf gate acquisition as
-an unmeasured candidate rather than a performance claim.
+Until this comparison exists, coordinated root-leaf acquisition is an
+architecture candidate, not a performance claim.
 
 ## 2026-08-18: ADR-061 acceptance matrix
 

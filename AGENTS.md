@@ -3,7 +3,7 @@
 ## Language
 
 - Talk in ASD-STE100 Simplified Technical English
-- In your language, comments, and documentation, use the terms defined in `docs/CONTEXT.md`
+- In your language, comments, and documentation, use the terms defined in `CONTEXT.md`
 
 ## Design
 
