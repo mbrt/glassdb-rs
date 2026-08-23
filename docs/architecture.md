@@ -123,7 +123,15 @@ the logged protocol. `DirectCommit` owns the narrower logless mechanism: it asks
 installs that member in the shared coordinator. `Algo` itself routes no key and
 CASes no object. (`Reader` is likewise shard-aware internally but exposes a
 path-based API. `Algo` holds a `NodeStore` only to re-check whether a leaf
-observation already carried in its own `Data` is still current.)
+observation already carried in its own `AccessSet` is still current.)
+
+`AccessSet` is the immutable access-fact module between the transaction body and
+the commit engine. It normalizes point reads and final key writes, keeps their
+deterministic order, and exposes one merged point view without a map allocation.
+It also owns read and write counts, the read-only projection, point-read
+predicates, scan order, and the structural direct-commit shape. `DataOverlay`
+creates it. Routing, locking, validation orchestration, and commit policy stay
+outside it.
 
 Every shard/root entry mutation — lock acquire, direct same-leaf publication,
 write-back, release, and GC reclamation — and every leaf structural-gate
@@ -144,6 +152,7 @@ flowchart TD
   subgraph TRANS["glassdb-trans"]
     direction TB
     Engine["Engine — runtime façade<br/>assembly · lifetime · shutdown<br/>reads · scans · snapshots · diagnostics"]
+    Accesses["AccessSet — access facts<br/>normalize · order · merge<br/>read predicates · direct shape"]
     Algo["Algo — commit policy<br/>attempt lifecycle · orchestration · conflict policy<br/>post-lock read validation"]
     Reader["Reader / KeyResolver<br/>effective-writer reads and validation"]
     Locker["Locker — lock policy<br/>key grouping · parallel or serial acquisition<br/>hold-and-wait · operation construction"]
@@ -155,11 +164,15 @@ flowchart TD
     Gc["Gc<br/>reverse liveness checks<br/>transaction-object reclamation"]
 
     Engine -->|"transaction-attempt lifecycle"| Algo
+    Engine -->|"immutable access set"| Accesses
     Engine -->|"reads · scans · snapshots"| Reader
     Algo -->|"validate"| Reader
-    Algo -->|"lock Data"| Locker
+    Algo -->|"lock access set"| Locker
     Locker -->|"LockedTx"| Algo
     Algo -->|"status"| Monitor
+    Accesses -->|"merged point facts · scans"| Algo
+    Accesses -->|"merged point facts · scans"| Locker
+    Accesses -->|"direct point shape"| Direct
     Algo -->|"direct candidate"| Direct
     Algo -->|"cleanup hints"| Hints
     Direct -->|"cleanup hints"| Hints
@@ -177,7 +190,7 @@ flowchart TD
 
   Backend["glassdb-backend<br/>content-CAS object store · GCS / S3"]
 
-  API -->|"logical reads · scans · snapshots · Data"| Engine
+  API -->|"logical reads · scans · snapshots · AccessSet"| Engine
   Reader -->|"typed reads"| Stores
   Monitor -->|"transaction logs"| Stores
   Coord -->|"data-node CAS"| Stores
@@ -264,12 +277,13 @@ bookkeeping remain outside the coordinator.
 | Component             | Layer            | Speaks                       | Owns                                                                                                                  | Must not know                       |
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
 | `glassdb` (`tx_impl`) | API / retry      | `Engine`, closures, `Error`  | metadata bootstrap, operation admission, user body, retry loop, public handles/errors, cancel-safety                  | stores, locks, shards, tx logs, runtime wiring |
-| `Engine`              | runtime façade   | logical keys, `Data`, configuration | component assembly/lifetime, read/scan/catalog entry points, transaction-attempt delegation and abandonment retirement, shutdown, component stats/diagnostics | user closures, public handles/errors, body retry policy |
-| `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome`, `TxCleanupHints` | transaction lifecycle, direct-vs-logged selection, cross-domain lock→validate→commit→write-back orchestration, abandoned-owner retirement, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), GC candidate hints | shard routing, CAS details, caching, collection lifecycle implementation, GC execution, the split mechanism beyond its `SplitHintSink` producer handle |
-| `DirectCommit`        | logless commit mechanism | `Data`, `TxId`, `KeyResolver`, shard operations, `TxCleanupHints` | complete point-member normalization, one-leaf eligibility, atomic inline/tombstone publication, transaction-local recovery classification, predecessor cleanup hints | transaction logs, range/catalog validation, waiting or wounding holders, GC execution |
+| `Engine`              | runtime façade   | logical keys, `AccessSet`, configuration | component assembly/lifetime, read/scan/catalog entry points, transaction-attempt delegation and abandonment retirement, shutdown, component stats/diagnostics | user closures, public handles/errors, body retry policy |
+| `AccessSet`           | access facts     | point reads, final key writes, range scans | normalization, deterministic order, merged point facts, counts, read-only projection, read predicates, structural direct-commit shape | routing, locking, I/O, commit policy |
+| `Algo`                | commit **policy** | `AccessSet`, `TxId`, `LockOutcome`, `TxCleanupHints` | transaction lifecycle, direct-vs-logged selection, cross-domain lock→validate→commit→write-back orchestration, abandoned-owner retirement, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), GC candidate hints | shard routing, CAS details, caching, collection lifecycle implementation, GC execution, the split mechanism beyond its `SplitHintSink` producer handle |
+| `DirectCommit`        | logless commit mechanism | direct point shape, `TxId`, `KeyResolver`, shard operations, `TxCleanupHints` | one-leaf and physical eligibility, atomic inline/tombstone publication, transaction-local recovery classification, predecessor cleanup hints | access normalization, transaction logs, range/catalog validation, waiting or wounding holders, GC execution |
 | `TxCleanupHints`      | maintenance seam | `TxId`                       | bounded ordered cleanup-candidate queue, drop-oldest loss policy, drain-time de-duplication | GC execution, transaction policy, backend storage |
 | `CollectionCommit`    | collection-commit **policy** | `CollectionAttempt`, catalog, lifecycle | same-ID collection retry state, recovery and committed-log fields, incarnation preparation, validation, drop fencing, post-commit/abort cleanup | key locking, key validation, the atomic commit decision |
-| `Locker::keys`        | key-lock **policy** | `Data`, `TxId`, B-link nodes | key→leaf grouping, parallel & serial acquisition, hold-and-wait, acquire / write-back / release operations | collection-directory semantics |
+| `Locker::keys`        | key-lock **policy** | merged point facts, scans, `TxId`, B-link nodes | key→leaf grouping, parallel & serial acquisition, hold-and-wait, acquire / write-back / release operations | access normalization, collection-directory semantics |
 | `Locker::collections` | collection-lock **policy** | collection addresses, `TxId`, records | directory/topology lock acquisition, recovery write-back and release | key routing, B-link topology, catalog semantics |
 | `CollectionStateResolver` | collection-state mechanism | collection addresses, records, `TxId` | resolved record loads, foreign-holder reconciliation, committed directory write-back assistance | key routing, B-link topology, catalog semantics |
 | `CollectionCatalog`   | collection semantics | directory reads, binding changes, resolved records | logical snapshots, read-your-writes validation, capacity/precondition checks | locking policy, CAS, wound-wait |
@@ -287,7 +301,7 @@ representation:
 
 ```rust
 // Algo → Locker key view.
-async fn lock_at(&self, id: &TxId, data: &Data, serial: bool, at: Requirement)
+async fn lock_at(&self, id: &TxId, accesses: &AccessSet, serial: bool, at: Requirement)
     -> Result<LockOutcome, TransError>;
 
 // Algo → Locker collection view.
@@ -299,7 +313,7 @@ async fn lock(
 ) -> Result<LockedDirectories, TransError>;
 ```
 
-- **Down**: the key view receives `Data`, `serial`, and the validation bound; it
+- **Down**: the key view receives `AccessSet`, `serial`, and the validation bound; it
   groups keys by current leaf and locks leaves in parallel or sorted order. The
   collection view receives logical directory reads and binding changes; it
   derives a stable collection-address lock order. Neither interface exposes

@@ -63,11 +63,6 @@ impl ReadOutcome {
     pub fn into_parts(self) -> (Option<ReadValue>, bool, ReadEvidence) {
         (self.value, self.cache_hit, self.evidence)
     }
-
-    #[cfg(test)]
-    pub(crate) fn last_writer(&self) -> Option<&glassdb_data::TxId> {
-        self.evidence.last_writer()
-    }
 }
 
 /// Reads values by resolving a key's shard entry to its effective committed

@@ -1,12 +1,11 @@
-//! The vocabulary a transaction body accumulates: the point reads, key writes,
-//! and range scans it performed, each carrying the physical dependencies commit
-//! validates it against.
+//! The access-set module owns the point reads, final key writes, and range scans
+//! from one transaction-body execution. It normalizes point facts and retains
+//! the physical dependencies used for validation.
 //!
-//! These are the argument and result shapes shared by the commit algorithm, the
-//! locker, and the resolver. They carry no commit policy, so the modules below
-//! [`Algo`](crate::algo::Algo) do not have to reach up into it for their own
-//! signatures.
+//! Its interface supplies shared access facts to the commit algorithm, locker,
+//! and resolver. It carries no routing, locking, or commit policy.
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use glassdb_data::{CollectionAddress, KeyRef, TxId};
@@ -15,8 +14,7 @@ use glassdb_storage::LeafObservation;
 /// Opaque validation evidence retained by a transactional point read.
 #[derive(Debug, Clone)]
 pub struct ReadEvidence {
-    last_writer: Option<TxId>,
-    absence_generation: Option<u64>,
+    predicate: ReadPredicate,
     leaf: LeafObservation,
 }
 
@@ -26,22 +24,37 @@ impl ReadEvidence {
             .is_none()
             .then(|| leaf.value().map_or(0, |node| node.membership_version()));
         Self {
-            last_writer,
-            absence_generation,
+            predicate: ReadPredicate::new(last_writer, absence_generation),
             leaf,
         }
-    }
-
-    pub(crate) fn last_writer(&self) -> Option<&TxId> {
-        self.last_writer.as_ref()
     }
 
     pub(crate) fn observation(&self) -> &LeafObservation {
         &self.leaf
     }
 
-    pub(crate) fn absence_generation(&self) -> Option<u64> {
-        self.absence_generation
+    pub(crate) fn predicate(&self) -> &ReadPredicate {
+        &self.predicate
+    }
+
+    pub(crate) fn validates(&self, writer: Option<&TxId>, membership_version: u64) -> bool {
+        self.predicate.validates(writer, membership_version)
+    }
+}
+
+/// The logical point-read fact used to validate an effective key state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadPredicate {
+    last_writer: Option<TxId>,
+    absence_generation: Option<u64>,
+}
+
+impl ReadPredicate {
+    pub(crate) fn new(last_writer: Option<TxId>, absence_generation: Option<u64>) -> Self {
+        Self {
+            last_writer,
+            absence_generation,
+        }
     }
 
     pub(crate) fn validates(&self, writer: Option<&TxId>, membership_version: u64) -> bool {
@@ -55,7 +68,7 @@ impl ReadEvidence {
 /// A single key read within a transaction.
 #[derive(Debug, Clone)]
 pub struct ReadAccess {
-    pub key: KeyRef,
+    key: KeyRef,
     evidence: ReadEvidence,
 }
 
@@ -65,16 +78,16 @@ impl ReadAccess {
         Self { key, evidence }
     }
 
-    pub(crate) fn last_writer(&self) -> Option<&TxId> {
-        self.evidence.last_writer()
+    pub(crate) fn key(&self) -> &KeyRef {
+        &self.key
     }
 
     pub(crate) fn observation(&self) -> &LeafObservation {
         self.evidence.observation()
     }
 
-    pub(crate) fn absence_generation(&self) -> Option<u64> {
-        self.evidence.absence_generation()
+    pub(crate) fn predicate(&self) -> &ReadPredicate {
+        self.evidence.predicate()
     }
 
     pub(crate) fn validates(&self, writer: Option<&TxId>, membership_version: u64) -> bool {
@@ -85,8 +98,8 @@ impl ReadAccess {
 /// A single key write within a transaction.
 #[derive(Debug, Clone)]
 pub struct WriteAccess {
-    pub key: KeyRef,
-    pub(crate) op: WriteOp,
+    key: KeyRef,
+    op: WriteOp,
 }
 
 /// The write operation staged for a key.
@@ -109,6 +122,14 @@ impl WriteAccess {
             key,
             op: WriteOp::Delete,
         }
+    }
+
+    pub(crate) fn key(&self) -> &KeyRef {
+        &self.key
+    }
+
+    pub(crate) fn operation(&self) -> &WriteOp {
+        &self.op
     }
 }
 
@@ -153,11 +174,11 @@ impl ScanEvidence {
 #[derive(Debug, Clone)]
 pub struct ScanAccess {
     /// Collection the scan ranged over.
-    pub collection: CollectionAddress,
+    collection: CollectionAddress,
     /// Normalized logical range and page limit.
-    pub range: ScanRange,
+    range: ScanRange,
     /// Staged membership mutations visible when the scan ran.
-    pub overlay: Vec<ScanMutation>,
+    overlay: Vec<ScanMutation>,
     evidence: ScanEvidence,
 }
 
@@ -178,6 +199,18 @@ impl ScanAccess {
 
     pub(crate) fn keys(&self) -> &[Vec<u8>] {
         self.evidence.keys()
+    }
+
+    pub(crate) fn collection(&self) -> &CollectionAddress {
+        &self.collection
+    }
+
+    pub(crate) fn range(&self) -> &ScanRange {
+        &self.range
+    }
+
+    pub(crate) fn overlay(&self) -> &[ScanMutation] {
+        &self.overlay
     }
 
     pub(crate) fn frontier(&self) -> Option<&[u8]> {
@@ -260,10 +293,350 @@ impl PartialEq for LeafCoverage {
 
 impl Eq for LeafCoverage {}
 
-/// The reads, writes, and range scans that make up a transaction.
+/// The point reads, final key writes, and range scans from one transaction-body
+/// execution.
 #[derive(Debug, Clone, Default)]
-pub struct Data {
-    pub reads: Vec<ReadAccess>,
-    pub writes: Vec<WriteAccess>,
-    pub scans: Vec<ScanAccess>,
+pub struct AccessSet {
+    reads: Vec<ReadAccess>,
+    writes: Vec<WriteAccess>,
+    scans: Vec<ScanAccess>,
+}
+
+impl AccessSet {
+    /// Creates an immutable access set in deterministic key order.
+    pub fn new(
+        mut reads: Vec<ReadAccess>,
+        mut writes: Vec<WriteAccess>,
+        scans: Vec<ScanAccess>,
+    ) -> Self {
+        normalize(&mut reads);
+        normalize(&mut writes);
+        Self {
+            reads,
+            writes,
+            scans,
+        }
+    }
+
+    /// Returns the number of distinct point reads.
+    pub fn read_count(&self) -> usize {
+        self.reads.len()
+    }
+
+    /// Returns the number of distinct final key writes.
+    pub fn write_count(&self) -> usize {
+        self.writes.len()
+    }
+
+    /// Returns the validation dependencies without final key writes.
+    pub fn into_read_only(mut self) -> Self {
+        self.writes.clear();
+        self
+    }
+
+    pub(crate) fn has_writes(&self) -> bool {
+        !self.writes.is_empty()
+    }
+
+    pub(crate) fn point_reads(&self) -> &[ReadAccess] {
+        &self.reads
+    }
+
+    pub(crate) fn final_writes(&self) -> &[WriteAccess] {
+        &self.writes
+    }
+
+    pub(crate) fn range_scans(&self) -> &[ScanAccess] {
+        &self.scans
+    }
+
+    /// Returns each point key once, with its read and final-write facts paired.
+    pub(crate) fn points(&self) -> PointAccesses<'_> {
+        PointAccesses {
+            reads: &self.reads,
+            writes: &self.writes,
+            read_index: 0,
+            write_index: 0,
+        }
+    }
+
+    /// Returns the complete point-mutation shape used by logless commit.
+    pub(crate) fn direct_shape(&self) -> Option<DirectShape<'_>> {
+        (self.has_writes() && self.scans.is_empty()).then_some(DirectShape { accesses: self })
+    }
+}
+
+/// A complete point-mutation access set with no range scans.
+pub(crate) struct DirectShape<'a> {
+    accesses: &'a AccessSet,
+}
+
+impl DirectShape<'_> {
+    pub(crate) fn points(&self) -> PointAccesses<'_> {
+        self.accesses.points()
+    }
+
+    pub(crate) fn read_count(&self) -> usize {
+        self.accesses.read_count()
+    }
+
+    pub(crate) fn write_count(&self) -> usize {
+        self.accesses.write_count()
+    }
+}
+
+/// One key's optional point-read fact and optional final key write.
+#[derive(Clone, Copy)]
+pub(crate) struct PointAccess<'a> {
+    pub(crate) key: &'a KeyRef,
+    pub(crate) read: Option<&'a ReadAccess>,
+    pub(crate) write: Option<&'a WriteAccess>,
+}
+
+/// A zero-allocation merge of the access set's sorted read and write runs.
+pub(crate) struct PointAccesses<'a> {
+    reads: &'a [ReadAccess],
+    writes: &'a [WriteAccess],
+    read_index: usize,
+    write_index: usize,
+}
+
+impl<'a> Iterator for PointAccesses<'a> {
+    type Item = PointAccess<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let read = self.reads.get(self.read_index);
+        let write = self.writes.get(self.write_index);
+        match (read, write) {
+            (Some(read), Some(write)) => match read.key().cmp(write.key()) {
+                Ordering::Less => {
+                    self.read_index += 1;
+                    Some(PointAccess {
+                        key: read.key(),
+                        read: Some(read),
+                        write: None,
+                    })
+                }
+                Ordering::Equal => {
+                    self.read_index += 1;
+                    self.write_index += 1;
+                    Some(PointAccess {
+                        key: read.key(),
+                        read: Some(read),
+                        write: Some(write),
+                    })
+                }
+                Ordering::Greater => {
+                    self.write_index += 1;
+                    Some(PointAccess {
+                        key: write.key(),
+                        read: None,
+                        write: Some(write),
+                    })
+                }
+            },
+            (Some(read), None) => {
+                self.read_index += 1;
+                Some(PointAccess {
+                    key: read.key(),
+                    read: Some(read),
+                    write: None,
+                })
+            }
+            (None, Some(write)) => {
+                self.write_index += 1;
+                Some(PointAccess {
+                    key: write.key(),
+                    read: None,
+                    write: Some(write),
+                })
+            }
+            (None, None) => None,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let reads = self.reads.len() - self.read_index;
+        let writes = self.writes.len() - self.write_index;
+        (reads.max(writes), Some(reads + writes))
+    }
+}
+
+trait KeyedAccess {
+    fn key(&self) -> &KeyRef;
+}
+
+impl KeyedAccess for ReadAccess {
+    fn key(&self) -> &KeyRef {
+        self.key()
+    }
+}
+
+impl KeyedAccess for WriteAccess {
+    fn key(&self) -> &KeyRef {
+        self.key()
+    }
+}
+
+fn normalize<T: KeyedAccess>(accesses: &mut Vec<T>) {
+    accesses.sort_by(|left, right| left.key().cmp(right.key()));
+    if !accesses
+        .windows(2)
+        .any(|pair| pair[0].key() == pair[1].key())
+    {
+        return;
+    }
+    // Reversing the stable order makes `dedup_by` retain the final record for
+    // each duplicate key, which matches transaction staging without a map.
+    accesses.reverse();
+    accesses.dedup_by(|left, right| left.key() == right.key());
+    accesses.reverse();
+}
+
+#[cfg(test)]
+mod tests {
+    use glassdb_backend::memory::MemoryBackend;
+    use glassdb_storage::{CachedStore, NodeStore, Requirement, Timeline};
+
+    use super::*;
+
+    fn key(raw: &[u8]) -> KeyRef {
+        KeyRef::new(CollectionAddress::root("accesstest"), raw)
+    }
+
+    async fn point_read(key: KeyRef, last_writer: Option<TxId>) -> ReadAccess {
+        let store = CachedStore::new(
+            Arc::new(MemoryBackend::new()),
+            1024 * 1024,
+            Timeline::new(),
+            None,
+        );
+        let observation = NodeStore::new(store)
+            .load_root_state(key.collection(), Requirement::Any)
+            .await
+            .unwrap();
+        ReadAccess::new(key, ReadEvidence::new(last_writer, observation))
+    }
+
+    #[tokio::test]
+    async fn normalizes_and_merges_point_facts() {
+        let a = key(b"a");
+        let b = key(b"b");
+        let old_writer = TxId::with_priority(1, b"old");
+        let reads = vec![
+            point_read(b.clone(), Some(old_writer.clone())).await,
+            point_read(a.clone(), Some(old_writer.clone())).await,
+            point_read(a.clone(), None).await,
+        ];
+        let writes = vec![
+            WriteAccess::put(b.clone(), Arc::from(b"b".as_slice())),
+            WriteAccess::put(a.clone(), Arc::from(b"old".as_slice())),
+            WriteAccess::delete(a.clone()),
+        ];
+
+        let accesses = AccessSet::new(reads, writes, Vec::new());
+
+        assert_eq!(accesses.read_count(), 2);
+        assert_eq!(accesses.write_count(), 2);
+        let points = accesses.points().collect::<Vec<_>>();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].key, &a);
+        assert_eq!(points[1].key, &b);
+        let final_read = points[0].read.unwrap();
+        assert!(final_read.validates(None, 0));
+        assert!(!final_read.validates(Some(&old_writer), 0));
+        assert!(matches!(
+            points[0].write.unwrap().operation(),
+            WriteOp::Delete
+        ));
+        assert!(points[1].read.is_some());
+        assert!(matches!(
+            points[1].write.unwrap().operation(),
+            WriteOp::Put(value) if value.as_ref() == b"b"
+        ));
+    }
+
+    #[test]
+    fn read_predicate_distinguishes_blind_writes_from_observed_absence() {
+        let writer = TxId::with_priority(1, b"writer");
+        let present = ReadPredicate::new(Some(writer.clone()), None);
+        let absent = ReadPredicate::new(None, Some(7));
+
+        assert!(present.validates(Some(&writer), 99));
+        assert!(!present.validates(None, 99));
+        assert!(absent.validates(None, 7));
+        assert!(!absent.validates(None, 8));
+
+        let blind = AccessSet::new(
+            Vec::new(),
+            vec![WriteAccess::delete(key(b"blind"))],
+            Vec::new(),
+        );
+        assert!(blind.points().next().unwrap().read.is_none());
+    }
+
+    #[test]
+    fn read_only_projection_keeps_scan_order_and_overlay() {
+        let collection = CollectionAddress::root("accesstest");
+        let first = ScanAccess::new(
+            collection.clone(),
+            ScanRange {
+                start: b"b".to_vec(),
+                start_exclusive: false,
+                end: None,
+                limit: None,
+            },
+            vec![ScanMutation {
+                key: b"staged".to_vec(),
+                present: true,
+            }],
+            ScanEvidence::new(Vec::new(), Vec::new(), None),
+        );
+        let second = ScanAccess::new(
+            collection,
+            ScanRange::all(),
+            Vec::new(),
+            ScanEvidence::new(Vec::new(), Vec::new(), None),
+        );
+        let accesses = AccessSet::new(
+            Vec::new(),
+            vec![WriteAccess::delete(key(b"staged"))],
+            vec![first, second],
+        )
+        .into_read_only();
+
+        assert_eq!(accesses.write_count(), 0);
+        assert_eq!(accesses.range_scans()[0].range().start, b"b");
+        assert_eq!(
+            accesses.range_scans()[0].overlay(),
+            &[ScanMutation {
+                key: b"staged".to_vec(),
+                present: true,
+            }]
+        );
+        assert!(accesses.range_scans()[1].range().start.is_empty());
+    }
+
+    #[test]
+    fn direct_shape_accepts_only_point_mutations() {
+        let write = || WriteAccess::delete(key(b"key"));
+        assert!(
+            AccessSet::new(Vec::new(), vec![write()], Vec::new())
+                .direct_shape()
+                .is_some()
+        );
+        assert!(AccessSet::default().direct_shape().is_none());
+
+        let scan = ScanAccess::new(
+            CollectionAddress::root("accesstest"),
+            ScanRange::all(),
+            Vec::new(),
+            ScanEvidence::new(Vec::new(), Vec::new(), None),
+        );
+        assert!(
+            AccessSet::new(Vec::new(), vec![write()], vec![scan])
+                .direct_shape()
+                .is_none()
+        );
+    }
 }

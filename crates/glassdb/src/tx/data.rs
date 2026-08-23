@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use glassdb_data::{CollectionAddress, KeyRef};
-use glassdb_trans::{Data, ReadAccess, ReadEvidence, ScanAccess, ScanMutation, WriteAccess};
+use glassdb_trans::{AccessSet, ReadAccess, ReadEvidence, ScanAccess, ScanMutation, WriteAccess};
 
 /// The result of consulting the transaction-local point-read state.
 pub(super) enum OverlayRead {
@@ -105,7 +105,7 @@ impl DataOverlay {
         self.staged.insert(key, StagedValue::Delete);
     }
 
-    /// Reports whether a collection has a staged data mutation.
+    /// Reports whether a collection has a staged key mutation.
     pub(super) fn has_writes_for(&self, collection: &CollectionAddress) -> bool {
         self.staged.iter().any(|(key, value)| {
             key.collection() == collection
@@ -113,15 +113,15 @@ impl DataOverlay {
         })
     }
 
-    /// Discards data accesses from the completed body attempt.
+    /// Discards key accesses from the completed body attempt.
     pub(super) fn reset(&mut self) {
         self.staged.clear();
         self.reads.clear();
         self.scans.clear();
     }
 
-    /// Serializes the accumulated logical accesses for the commit engine.
-    pub(super) fn accesses(&self) -> Data {
+    /// Builds the immutable access set for the commit engine.
+    pub(super) fn accesses(&self) -> AccessSet {
         let mut writes = Vec::new();
         for (key, value) in &self.staged {
             match value {
@@ -136,16 +136,7 @@ impl DataOverlay {
         for (key, state) in &self.reads {
             reads.push(ReadAccess::new(key.clone(), state.evidence().clone()));
         }
-        // Stable key order keeps transaction logs, locking, validation, and
-        // deterministic simulation independent of HashMap iteration order.
-        writes.sort_by(|a, b| a.key.cmp(&b.key));
-        reads.sort_by(|a, b| a.key.cmp(&b.key));
-        Data {
-            reads,
-            writes,
-            // Scan order already follows deterministic left-to-right listing.
-            scans: self.scans.clone(),
-        }
+        AccessSet::new(reads, writes, self.scans.clone())
     }
 
     /// Returns the number of distinct point reads served from decoded cache state.

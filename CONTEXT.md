@@ -8,6 +8,10 @@ Domain language for GlassDB's optimistic transactions and recovery guarantees.
 The caller-supplied computation that produces a transaction's staged changes and normal outcome. GlassDB may execute it more than once.
 _Avoid_: Callback, user closure
 
+**Access set**:
+The point reads, final key writes, and range scans from one execution of a transaction body.
+_Avoid_: Data, transaction data
+
 **Normal outcome**:
 A value or error returned by a transaction body and therefore eligible for snapshot validation and transparent retry.
 _Avoid_: Success

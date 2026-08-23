@@ -13,7 +13,7 @@ use glassdb_storage::{
     StorageError, StructuralLogStore, Timeline, TreeRouter,
 };
 
-use crate::access::{Data, ScanMutation, ScanRange};
+use crate::access::{AccessSet, ScanMutation, ScanRange};
 use crate::algo::{Algo, DirectCommitStats, Handle};
 use crate::collection_catalog::CollectionCatalog;
 use crate::collection_commit::CollectionCommit;
@@ -333,21 +333,21 @@ impl Engine {
     /// Starts a transaction attempt from its collected logical accesses.
     pub fn begin_transaction(
         &self,
-        data: Data,
+        accesses: AccessSet,
         collection_data: CollectionData,
     ) -> EngineTransaction {
-        EngineTransaction(self.algo.begin(data, collection_data))
+        EngineTransaction(self.algo.begin(accesses, collection_data))
     }
 
     /// Replaces the logical accesses of an uncommitted transaction attempt.
     pub fn reset_transaction(
         &self,
         tx: &mut EngineTransaction,
-        data: Data,
+        accesses: AccessSet,
         collection_data: CollectionData,
     ) {
         self.algo
-            .reset_with_collections(&mut tx.0, data, collection_data);
+            .reset_with_collections(&mut tx.0, accesses, collection_data);
     }
 
     /// Restarts a wounded attempt with a fresh identity and preserved priority.

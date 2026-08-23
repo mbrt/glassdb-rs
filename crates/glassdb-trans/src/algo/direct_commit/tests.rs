@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use super::super::tests::{
-    Tctx, begin_data, commit_access, commit_writes, do_read, entry, key_ref, new_algo,
+    Tctx, begin_accesses, commit_access, commit_writes, do_read, entry, key_ref, new_algo,
     new_algo_from_backend, new_recording_algo, new_recording_algo_big_cache, read_outcome,
     shard_reads, test_collection, test_root_path, wa, wdel, write_counts,
 };
@@ -67,9 +67,9 @@ fn put_resolver(
             keys: vec![DirectKey {
                 raw_key: key.key().to_vec(),
                 key,
-                read: read_writer.map(|writer| ReadPredicate {
-                    absence_generation: writer.is_none().then_some(0),
-                    writer,
+                read: read_writer.map(|writer| {
+                    let absence_generation = writer.is_none().then_some(0);
+                    ReadPredicate::new(writer, absence_generation)
                 }),
                 write: Some(DirectWrite::Put(Arc::from(value))),
             }]
@@ -111,13 +111,9 @@ async fn single_rw_stale_read_renews_and_converges() {
     // Another client overwrites the key, making `ra` stale.
     let h2 = commit_writes(&tm2, vec![wa(&keyp, b"v2")]).await;
 
-    let mut h = begin_data(
+    let mut h = begin_accesses(
         &tm,
-        Data {
-            reads: vec![ra],
-            writes: vec![wa(&keyp, b"v3")],
-            scans: Vec::new(),
-        },
+        AccessSet::new(vec![ra], vec![wa(&keyp, b"v3")], Vec::new()),
     );
     let err = tm.commit(&mut h).await.unwrap_err();
     assert!(
@@ -128,9 +124,8 @@ async fn single_rw_stale_read_renews_and_converges() {
 
     // The stale write never committed: v2 is still current (the abandoned
     // attempt's object is unreferenced, so help-forward cannot promote it).
-    assert_eq!(
-        do_read(&tctx, &keyp).await.last_writer().cloned().unwrap(),
-        *h2.id(),
+    assert!(
+        do_read(&tctx, &keyp).await.validates(Some(h2.id()), 0),
         "the stale write did not commit; v2 is still current"
     );
 
@@ -138,16 +133,11 @@ async fn single_rw_stale_read_renews_and_converges() {
     let ra2 = do_read(&tctx, &keyp).await;
     let h3 = commit_access(
         &tm,
-        Data {
-            reads: vec![ra2],
-            writes: vec![wa(&keyp, b"v3")],
-            scans: Vec::new(),
-        },
+        AccessSet::new(vec![ra2], vec![wa(&keyp, b"v3")], Vec::new()),
     )
     .await;
-    assert_eq!(
-        do_read(&tctx, &keyp).await.last_writer().cloned().unwrap(),
-        *h3.id(),
+    assert!(
+        do_read(&tctx, &keyp).await.validates(Some(h3.id()), 0),
         "the renewed attempt commits"
     );
 }
@@ -320,11 +310,7 @@ async fn direct_commit_merges_with_disjoint_acquire() {
     // the driver's already-loading round rather than racing a solo, cache-
     // served CAS — which is exactly the ADR-028 single-round behavior.)
     let (ca, cb) = (tm.clone(), tctx.locker.clone());
-    let data_b = Data {
-        reads: Vec::new(),
-        writes: vec![wa(&kbp, b"vb2")],
-        scans: Vec::new(),
-    };
+    let data_b = AccessSet::new(Vec::new(), vec![wa(&kbp, b"vb2")], Vec::new());
     let tb = txb.clone();
     let lock_requirement = Requirement::AtLeast(tctx.timeline.now());
     let acquire = tokio::spawn(async move {
@@ -336,13 +322,9 @@ async fn direct_commit_merges_with_disjoint_acquire() {
     // Let the driver park in the gated load before the commit joins.
     rt::sleep(Duration::from_secs(1)).await;
 
-    let mut ha = begin_data(
+    let mut ha = begin_accesses(
         &tm,
-        Data {
-            reads: Vec::new(),
-            writes: vec![wa(&kap, b"v2")],
-            scans: Vec::new(),
-        },
+        AccessSet::new(Vec::new(), vec![wa(&kap, b"v2")], Vec::new()),
     );
     let txa = ha.id().clone();
     let commit = tokio::spawn(async move {
@@ -413,24 +395,16 @@ async fn direct_commit_batched_in_doubt_recovers() {
     gate.arm();
 
     let (ca, cb) = (tm.clone(), tctx.locker.clone());
-    let mut ha = begin_data(
+    let mut ha = begin_accesses(
         &tm,
-        Data {
-            reads: Vec::new(),
-            writes: vec![wa(&kap, b"v2")],
-            scans: Vec::new(),
-        },
+        AccessSet::new(Vec::new(), vec![wa(&kap, b"v2")], Vec::new()),
     );
     let txa = ha.id().clone();
     let commit = tokio::spawn(async move {
         let result = ca.commit(&mut ha).await;
         (ha, result)
     });
-    let data_b = Data {
-        reads: Vec::new(),
-        writes: vec![wa(&kbp, b"vb2")],
-        scans: Vec::new(),
-    };
+    let data_b = AccessSet::new(Vec::new(), vec![wa(&kbp, b"vb2")], Vec::new());
     let tb = txb.clone();
     let lock_requirement = Requirement::AtLeast(tctx.timeline.now());
     let acquire = tokio::spawn(async move {
@@ -485,13 +459,9 @@ async fn an_overwrite_over_the_inline_budget_takes_the_locked_path() {
 
     log.lock().unwrap().clear();
     tctx.locker.stats_and_reset();
-    let mut h = begin_data(
+    let mut h = begin_accesses(
         &tm,
-        Data {
-            reads: vec![r],
-            writes: vec![wa(&keyp, &logged_value())],
-            scans: Vec::new(),
-        },
+        AccessSet::new(vec![r], vec![wa(&keyp, &logged_value())], Vec::new()),
     );
     let tid = h.id().clone();
     tm.commit(&mut h).await.unwrap();
@@ -520,7 +490,7 @@ async fn an_overwrite_over_the_inline_budget_takes_the_locked_path() {
         .unwrap();
     assert_eq!(status.status, TxCommitStatus::Ok);
     let r = do_read(&tctx, &keyp).await;
-    assert_eq!(r.last_writer().cloned().unwrap(), tid);
+    assert!(r.validates(Some(&tid), 0));
 }
 
 #[tokio::test(start_paused = true)]
@@ -546,13 +516,9 @@ async fn single_rw_observing_a_gate_uses_the_full_locked_path() {
     );
 
     tctx.locker.stats_and_reset();
-    let mut handle = begin_data(
+    let mut handle = begin_accesses(
         &tm,
-        Data {
-            reads: vec![read],
-            writes: vec![wa(&keyp, b"v2")],
-            scans: Vec::new(),
-        },
+        AccessSet::new(vec![read], vec![wa(&keyp, b"v2")], Vec::new()),
     );
     let committing_tm = tm.clone();
     let committing = tokio::spawn(async move {
@@ -573,10 +539,7 @@ async fn single_rw_observing_a_gate_uses_the_full_locked_path() {
         tctx.locker.stats_and_reset().calls >= 1,
         "an observed gate bypasses the direct commit"
     );
-    assert_eq!(
-        do_read(&tctx, &keyp).await.last_writer().cloned(),
-        Some(handle.id().clone())
-    );
+    assert!(do_read(&tctx, &keyp).await.validates(Some(handle.id()), 0));
 }
 
 // ADR-030: a warm single read-write commit reuses the shard the read cached
@@ -597,13 +560,9 @@ async fn single_rw_commit_reuses_cached_shard() {
     let r = do_read(&tctx, &keyp).await;
 
     log.lock().unwrap().clear();
-    let mut h = begin_data(
+    let mut h = begin_accesses(
         &tm,
-        Data {
-            reads: vec![r],
-            writes: vec![wa(&keyp, b"v2")],
-            scans: Vec::new(),
-        },
+        AccessSet::new(vec![r], vec![wa(&keyp, b"v2")], Vec::new()),
     );
     tm.commit(&mut h).await.unwrap();
     tm.end(&mut h).await.unwrap();
@@ -626,13 +585,9 @@ async fn a_blind_put_over_the_inline_budget_takes_the_locked_path() {
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
 
     log.lock().unwrap().clear();
-    let mut h = begin_data(
+    let mut h = begin_accesses(
         &tm,
-        Data {
-            reads: Vec::new(),
-            writes: vec![wa(&keyp, &logged_value())],
-            scans: Vec::new(),
-        },
+        AccessSet::new(Vec::new(), vec![wa(&keyp, &logged_value())], Vec::new()),
     );
     let tid = h.id().clone();
     tm.commit(&mut h).await.unwrap();
@@ -696,18 +651,14 @@ async fn a_committed_holder_keeps_the_next_writer_on_the_direct_path() {
     // The window is observably at the committed holder H1 (v2), not the
     // lagging pointer H0: the shared resolver already help-forwards it.
     let r = do_read(&tctx, &keyp).await;
-    assert_eq!(r.last_writer().cloned().unwrap(), h1);
+    assert!(r.validates(Some(&h1), 0));
 
     // End to end: the writer commits directly over H1 (help-forwarding it
     // into the chain, not orphaning it), taking no lock of its own.
     tctx.locker.stats_and_reset();
-    let mut h = begin_data(
+    let mut h = begin_accesses(
         &tm,
-        Data {
-            reads: vec![r],
-            writes: vec![wa(&keyp, b"v3")],
-            scans: Vec::new(),
-        },
+        AccessSet::new(vec![r], vec![wa(&keyp, b"v3")], Vec::new()),
     );
     let h2 = h.id().clone();
     tm.commit(&mut h).await.unwrap();
@@ -721,10 +672,7 @@ async fn a_committed_holder_keeps_the_next_writer_on_the_direct_path() {
     let e = entry(&tctx, b"k").await.unwrap();
     assert_eq!(e.current.writer(), Some(&h2));
     assert!(e.lock_holders().is_empty());
-    assert_eq!(
-        do_read(&tctx, &keyp).await.last_writer().cloned().unwrap(),
-        h2
-    );
+    assert!(do_read(&tctx, &keyp).await.validates(Some(&h2), 0));
 }
 
 // ADR-051: an eligible small overwrite commits in a single conditional leaf
@@ -739,13 +687,9 @@ async fn direct_commit_overwrites_in_one_leaf_cas() {
     let r = do_read(&tctx, &keyp).await;
 
     log.lock().unwrap().clear();
-    let mut h = begin_data(
+    let mut h = begin_accesses(
         &tm,
-        Data {
-            reads: vec![r],
-            writes: vec![wa(&keyp, b"v2")],
-            scans: Vec::new(),
-        },
+        AccessSet::new(vec![r], vec![wa(&keyp, b"v2")], Vec::new()),
     );
     let tid = h.id().clone();
     tm.commit(&mut h).await.unwrap();
@@ -764,14 +708,8 @@ async fn direct_commit_overwrites_in_one_leaf_cas() {
         }
     );
     assert!(e.lock_holders().is_empty(), "no lock was ever installed");
-    assert_eq!(
-        read_outcome(&tctx, &keyp)
-            .await
-            .last_writer()
-            .cloned()
-            .unwrap(),
-        tid
-    );
+    let value = read_outcome(&tctx, &keyp).await.value.unwrap();
+    assert_eq!(value.version.writer, tid);
 }
 
 // ADR-051 regression: a direct commit lands on an entry whose write lock is
@@ -813,13 +751,9 @@ async fn direct_commit_replaces_a_committed_holder() {
     edit.set_entries(windowed);
     assert!(tctx.shards.commit_leaf(edit).await.unwrap());
 
-    let mut h = begin_data(
+    let mut h = begin_accesses(
         &tm,
-        Data {
-            reads: Vec::new(),
-            writes: vec![wa(&keyp, b"v3")],
-            scans: Vec::new(),
-        },
+        AccessSet::new(Vec::new(), vec![wa(&keyp, b"v3")], Vec::new()),
     );
     let h2 = h.id().clone();
     tm.commit(&mut h).await.unwrap();
@@ -838,8 +772,9 @@ async fn direct_commit_replaces_a_committed_holder() {
         "the superseded holder was replaced, not preserved"
     );
     let outcome = read_outcome(&tctx, &keyp).await;
-    assert_eq!(outcome.last_writer().cloned().unwrap(), h2);
-    assert_eq!(&*outcome.value.unwrap().value, b"v3");
+    let value = outcome.value.unwrap();
+    assert_eq!(value.version.writer, h2);
+    assert_eq!(&*value.value, b"v3");
 }
 
 // ADR-051 regression: every reason a fold declines to publish the commit
@@ -1014,11 +949,11 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
     let ka = key_ref(b"a");
     let kb = key_ref(b"b");
     let id = TxId::with_priority(9, b"mixed");
-    let member = direct_shape(&Data {
-        reads: Vec::new(),
-        writes: vec![wa(&ka, b"a2"), wdel(&kb)],
-        scans: Vec::new(),
-    })
+    let member = direct_member(&AccessSet::new(
+        Vec::new(),
+        vec![wa(&ka, b"a2"), wdel(&kb)],
+        Vec::new(),
+    ))
     .unwrap();
     let resolver = DirectCommitOperation::new(
         id.clone(),
@@ -1084,11 +1019,11 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
 async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
     let (tm, tctx) = new_algo().await;
     let id = TxId::with_priority(9, b"deletes");
-    let member = direct_shape(&Data {
-        reads: Vec::new(),
-        writes: vec![wdel(&key_ref(b"a")), wdel(&key_ref(b"b"))],
-        scans: Vec::new(),
-    })
+    let member = direct_member(&AccessSet::new(
+        Vec::new(),
+        vec![wdel(&key_ref(b"a")), wdel(&key_ref(b"b"))],
+        Vec::new(),
+    ))
     .unwrap();
     let resolver = DirectCommitOperation::new(
         id,
@@ -1128,11 +1063,11 @@ async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
 async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
     let (tm, tctx) = new_algo().await;
     let id = TxId::with_priority(9, b"deletes");
-    let member = direct_shape(&Data {
-        reads: Vec::new(),
-        writes: vec![wdel(&key_ref(b"a")), wdel(&key_ref(b"b"))],
-        scans: Vec::new(),
-    })
+    let member = direct_member(&AccessSet::new(
+        Vec::new(),
+        vec![wdel(&key_ref(b"a")), wdel(&key_ref(b"b"))],
+        Vec::new(),
+    ))
     .unwrap();
     let resolver = DirectCommitOperation::new(
         id,
@@ -1360,13 +1295,9 @@ async fn direct_commit_superseded_read_replays_in_place() {
         .id()
         .clone();
 
-    let mut h = begin_data(
+    let mut h = begin_accesses(
         &tm,
-        Data {
-            reads: vec![stale],
-            writes: vec![wa(&keyp, b"v3")],
-            scans: Vec::new(),
-        },
+        AccessSet::new(vec![stale], vec![wa(&keyp, b"v3")], Vec::new()),
     );
     let err = tm.commit(&mut h).await.unwrap_err();
     assert!(
@@ -1397,11 +1328,7 @@ async fn direct_commit_superseded_read_replays_in_place() {
     let fresh = do_read(&tctx, &keyp).await;
     let replayed = commit_access(
         &tm,
-        Data {
-            reads: vec![fresh],
-            writes: vec![wa(&keyp, b"v3")],
-            scans: Vec::new(),
-        },
+        AccessSet::new(vec![fresh], vec![wa(&keyp, b"v3")], Vec::new()),
     )
     .await;
     assert_eq!(
@@ -1436,13 +1363,9 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
     let ra1 = do_read(&tctx, &kap).await;
     let ra2 = do_read(&tctx, &kap).await;
     let rmw = |read| {
-        begin_data(
+        begin_accesses(
             &tm,
-            Data {
-                reads: vec![read],
-                writes: vec![wa(&kap, b"v2")],
-                scans: Vec::new(),
-            },
+            AccessSet::new(vec![read], vec![wa(&kap, b"v2")], Vec::new()),
         )
     };
     let (mut h1, mut h2) = (rmw(ra1), rmw(ra2));
@@ -1455,11 +1378,7 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
     let driver = TxId::with_priority(1, b"driver");
     tctx.tmon.begin_tx(&driver);
     let locker = tctx.locker.clone();
-    let data_b = Data {
-        reads: Vec::new(),
-        writes: vec![wa(&kbp, b"vb2")],
-        scans: Vec::new(),
-    };
+    let data_b = AccessSet::new(Vec::new(), vec![wa(&kbp, b"vb2")], Vec::new());
     let requirement = Requirement::AtLeast(tctx.timeline.now());
     let acquire = tokio::spawn(async move {
         locker
@@ -1547,13 +1466,9 @@ async fn direct_create_uses_one_leaf_cas() {
 
     log.lock().unwrap().clear();
     tctx.locker.stats_and_reset();
-    let mut h = begin_data(
+    let mut h = begin_accesses(
         &tm,
-        Data {
-            reads: vec![absent],
-            writes: vec![wa(&keyp, b"v")],
-            scans: Vec::new(),
-        },
+        AccessSet::new(vec![absent], vec![wa(&keyp, b"v")], Vec::new()),
     );
     let tid = h.id().clone();
     tm.commit(&mut h).await.unwrap();
@@ -1583,14 +1498,7 @@ async fn direct_delete_uses_one_leaf_cas() {
 
     log.lock().unwrap().clear();
     tctx.locker.stats_and_reset();
-    let mut h = begin_data(
-        &tm,
-        Data {
-            reads: vec![r],
-            writes: vec![wdel(&keyp)],
-            scans: Vec::new(),
-        },
-    );
+    let mut h = begin_accesses(&tm, AccessSet::new(vec![r], vec![wdel(&keyp)], Vec::new()));
     let tid = h.id().clone();
     tm.commit(&mut h).await.unwrap();
     tm.end(&mut h).await.unwrap();
@@ -1615,13 +1523,9 @@ async fn direct_multi_key_put_uses_one_leaf_cas() {
     commit_writes(&tm, vec![wa(&ka, b"v1"), wa(&kb, b"v1")]).await;
 
     log.lock().unwrap().clear();
-    let mut h = begin_data(
+    let mut h = begin_accesses(
         &tm,
-        Data {
-            reads: Vec::new(),
-            writes: vec![wa(&ka, b"v2"), wa(&kb, b"v2")],
-            scans: Vec::new(),
-        },
+        AccessSet::new(Vec::new(), vec![wa(&ka, b"v2"), wa(&kb, b"v2")], Vec::new()),
     );
     tm.commit(&mut h).await.unwrap();
     tm.end(&mut h).await.unwrap();
@@ -1660,13 +1564,13 @@ async fn direct_blind_puts_cover_two_eight_and_thirty_two_keys() {
             .map(|index| key_ref(format!("n{count}-{index:02}").as_bytes()))
             .collect();
         log.lock().unwrap().clear();
-        let mut h = begin_data(
+        let mut h = begin_accesses(
             &tm,
-            Data {
-                reads: Vec::new(),
-                writes: keys.iter().map(|key| wa(key, b"v")).collect(),
-                scans: Vec::new(),
-            },
+            AccessSet::new(
+                Vec::new(),
+                keys.iter().map(|key| wa(key, b"v")).collect(),
+                Vec::new(),
+            ),
         );
         let tid = h.id().clone();
         tm.commit(&mut h).await.unwrap();
@@ -1702,13 +1606,13 @@ async fn multi_key_aggregate_rejection_is_atomic_and_does_not_hint() {
 
     log.lock().unwrap().clear();
     tm.direct_commit_stats_and_reset();
-    let mut h = begin_data(
+    let mut h = begin_accesses(
         &tm,
-        Data {
-            reads: Vec::new(),
-            writes: keys.iter().map(|key| wa(key, &value)).collect(),
-            scans: Vec::new(),
-        },
+        AccessSet::new(
+            Vec::new(),
+            keys.iter().map(|key| wa(key, &value)).collect(),
+            Vec::new(),
+        ),
     );
     let tid = h.id().clone();
     tm.commit(&mut h).await.unwrap();
@@ -1747,10 +1651,7 @@ async fn cross_key_aggregate_rejection_does_not_hint() {
             DirectKey {
                 raw_key: source.key().to_vec(),
                 key: source.clone(),
-                read: Some(ReadPredicate {
-                    writer: Some(predecessor.clone()),
-                    absence_generation: None,
-                }),
+                read: Some(ReadPredicate::new(Some(predecessor.clone()), None)),
                 write: None,
             },
             DirectKey {
@@ -1815,13 +1716,13 @@ async fn direct_mixed_member_is_atomic_and_advances_membership_once() {
     tctx.locker.stats_and_reset();
     tm.direct_commit_stats_and_reset();
 
-    let mut h = begin_data(
+    let mut h = begin_accesses(
         &tm,
-        Data {
-            reads: Vec::new(),
-            writes: vec![wa(&ka, b"a2"), wa(&kb, b"b1"), wdel(&kc), wdel(&kd)],
-            scans: Vec::new(),
-        },
+        AccessSet::new(
+            Vec::new(),
+            vec![wa(&ka, b"a2"), wa(&kb, b"b1"), wdel(&kc), wdel(&kd)],
+            Vec::new(),
+        ),
     );
     let tid = h.id().clone();
     tm.commit(&mut h).await.unwrap();
@@ -1935,11 +1836,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
         direct
             .try_commit(
                 &direct_id,
-                &Data {
-                    reads: Vec::new(),
-                    writes: vec![wa(&key_ref(b"z"), b"z1")],
-                    scans: Vec::new(),
-                },
+                &AccessSet::new(Vec::new(), vec![wa(&key_ref(b"z"), b"z1")], Vec::new()),
                 &mut state,
             )
             .await
@@ -2029,13 +1926,9 @@ async fn cross_leaf_member_uses_the_logged_protocol() {
     log.lock().unwrap().clear();
     tctx.locker.stats_and_reset();
     tm.direct_commit_stats_and_reset();
-    let mut h = begin_data(
+    let mut h = begin_accesses(
         &tm,
-        Data {
-            reads: Vec::new(),
-            writes: vec![wa(&ka, b"a"), wa(&kb, b"b")],
-            scans: Vec::new(),
-        },
+        AccessSet::new(Vec::new(), vec![wa(&ka, b"a"), wa(&kb, b"b")], Vec::new()),
     );
     tm.commit(&mut h).await.unwrap();
     tm.end(&mut h).await.unwrap();
@@ -2061,13 +1954,9 @@ async fn direct_cross_key_read_modify_write_uses_one_leaf_cas() {
     let ra = do_read(&tctx, &ka).await;
 
     log.lock().unwrap().clear();
-    let mut h = begin_data(
+    let mut h = begin_accesses(
         &tm,
-        Data {
-            reads: vec![ra],
-            writes: vec![wa(&kb, b"v2")],
-            scans: Vec::new(),
-        },
+        AccessSet::new(vec![ra], vec![wa(&kb, b"v2")], Vec::new()),
     );
     tm.commit(&mut h).await.unwrap();
     tm.end(&mut h).await.unwrap();

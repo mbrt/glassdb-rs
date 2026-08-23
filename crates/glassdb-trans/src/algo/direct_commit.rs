@@ -11,7 +11,7 @@ use glassdb_storage::{
 };
 
 use super::attempt::AttemptState;
-use crate::access::{Data, WriteOp};
+use crate::access::{AccessSet, ReadPredicate, WriteOp};
 use crate::error::TransError;
 use crate::gc::TxCleanupHints;
 use crate::key_resolver::KeyResolver;
@@ -102,10 +102,10 @@ impl DirectCommit {
     pub(super) async fn try_commit(
         &self,
         id: &TxId,
-        data: &Data,
+        accesses: &AccessSet,
         state: &mut AttemptState,
     ) -> Result<DirectAttempt, TransError> {
-        let Some(member) = direct_shape(data) else {
+        let Some(member) = direct_member(accesses) else {
             return Ok(DirectAttempt::Locked);
         };
         let Some(mut leaf_path) = self.route_member(&member).await? else {
@@ -179,24 +179,6 @@ struct DirectKey {
     raw_key: Vec<u8>,
     read: Option<ReadPredicate>,
     write: Option<DirectWrite>,
-}
-
-/// The exact writer observed by a point read. The outer option on
-/// [`DirectKey::read`] distinguishes a blind write from a read of unmarked
-/// absence, whose expected writer is `None`.
-#[derive(Clone)]
-struct ReadPredicate {
-    writer: Option<TxId>,
-    absence_generation: Option<u64>,
-}
-
-impl ReadPredicate {
-    fn validates(&self, writer: Option<&TxId>, membership_version: u64) -> bool {
-        self.writer.as_ref() == writer
-            && self
-                .absence_generation
-                .is_none_or(|observed| observed == membership_version)
-    }
 }
 
 /// A directly publishable final mutation.
@@ -675,40 +657,26 @@ pub(super) enum DirectAttempt {
     Locked,
 }
 
-/// Recognizes and normalizes a complete point mutation transaction.
-fn direct_shape(data: &Data) -> Option<DirectMember> {
-    if data.writes.is_empty() || !data.scans.is_empty() {
-        return None;
-    }
-    let mut keys: BTreeMap<KeyRef, DirectKey> = BTreeMap::new();
-    for read in &data.reads {
-        let key = keys.entry(read.key.clone()).or_insert_with(|| DirectKey {
-            key: read.key.clone(),
-            raw_key: read.key.key().to_vec(),
-            read: None,
-            write: None,
-        });
-        key.read = Some(ReadPredicate {
-            writer: read.last_writer().cloned(),
-            absence_generation: read.absence_generation(),
-        });
-    }
-    for write in &data.writes {
-        let key = keys.entry(write.key.clone()).or_insert_with(|| DirectKey {
-            key: write.key.clone(),
-            raw_key: write.key.key().to_vec(),
-            read: None,
-            write: None,
-        });
-        key.write = Some(match &write.op {
-            WriteOp::Put(value) => DirectWrite::Put(value.clone()),
-            WriteOp::Delete => DirectWrite::Delete,
-        });
-    }
+/// Converts the access set's complete point-mutation shape into direct-commit
+/// state.
+fn direct_member(accesses: &AccessSet) -> Option<DirectMember> {
+    let shape = accesses.direct_shape()?;
+    let keys = shape
+        .points()
+        .map(|point| DirectKey {
+            key: point.key.clone(),
+            raw_key: point.key.key().to_vec(),
+            read: point.read.map(|read| read.predicate().clone()),
+            write: point.write.map(|write| match write.operation() {
+                WriteOp::Put(value) => DirectWrite::Put(value.clone()),
+                WriteOp::Delete => DirectWrite::Delete,
+            }),
+        })
+        .collect::<Vec<_>>();
     Some(DirectMember {
-        keys: keys.into_values().collect(),
-        writes: data.writes.len(),
-        has_reads: !data.reads.is_empty(),
+        keys: keys.into(),
+        writes: shape.write_count(),
+        has_reads: shape.read_count() != 0,
     })
 }
 

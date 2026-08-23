@@ -35,7 +35,7 @@ use glassdb_storage::{
     SplitPolicy, Timeline,
 };
 
-use crate::access::{Data, ReadAccess, WriteOp};
+use crate::access::{AccessSet, ReadAccess, WriteOp};
 use crate::collection_commit::{CollectionAttempt, CollectionCommit};
 use crate::collections::CollectionData;
 use crate::error::TransError;
@@ -79,7 +79,7 @@ const MAX_LEAF_FULL_WAIT: Duration = Duration::from_secs(30);
 
 /// An opaque handle to an in-progress transaction managed by [`Algo`].
 pub struct Handle {
-    data: Data,
+    accesses: AccessSet,
     collections: CollectionAttempt,
     state: AttemptState,
     id: TxId,
@@ -173,7 +173,7 @@ impl<'a> ValidationContext<'a> {
 /// Reports whether the observed leaf contains an exclusive holder whose final
 /// state can change the effective writer without rewriting the leaf.
 fn read_observation_has_exclusive_holder(read: &ReadAccess) -> Result<bool, TransError> {
-    let raw_key = read.key.key();
+    let raw_key = read.key().key();
     let Some(node) = read.observation().value().map(AsRef::as_ref) else {
         return Ok(false);
     };
@@ -254,12 +254,12 @@ impl Algo {
         self.direct_commit.stats_and_reset()
     }
 
-    /// Starts a new transaction with its key and collection-management data.
+    /// Starts a new transaction with its key and collection-management accesses.
     /// The id's random prefix and timestamp are deterministic under `--cfg sim`.
-    pub fn begin(&self, data: Data, collection_data: CollectionData) -> Handle {
+    pub fn begin(&self, accesses: AccessSet, collection_data: CollectionData) -> Handle {
         let id = TxId::new_at(rt::system_now());
         Handle {
-            data,
+            accesses,
             collections: CollectionAttempt::new(collection_data),
             state: AttemptState::new(),
             id,
@@ -273,7 +273,7 @@ impl Algo {
     /// renewal (which drives the serial-locking escalation).
     pub fn rebegin(&self, old: Handle) -> Handle {
         let Handle {
-            data,
+            accesses,
             collections,
             state,
             id,
@@ -281,7 +281,7 @@ impl Algo {
         } = old;
         Handle {
             id: id.renew(),
-            data,
+            accesses,
             collections: collections.renewed(),
             state: state.renew(),
             backoff,
@@ -314,21 +314,20 @@ impl Algo {
         result
     }
 
-    /// Replaces the transaction's data. Allowed before commit (the db retry loop
-    /// resets accesses between attempts).
-    pub fn reset(&self, tx: &mut Handle, data: Data) {
+    /// Replaces the transaction's access set before commit.
+    pub fn reset(&self, tx: &mut Handle, accesses: AccessSet) {
         tx.assert_resettable();
-        tx.data = data;
+        tx.accesses = accesses;
     }
 
     /// Replaces both key and collection-management accesses before commit.
     pub fn reset_with_collections(
         &self,
         tx: &mut Handle,
-        data: Data,
+        accesses: AccessSet,
         collection_data: CollectionData,
     ) {
-        self.reset(tx, data);
+        self.reset(tx, accesses);
         tx.collections.replace_data(collection_data);
     }
 
@@ -404,14 +403,14 @@ impl Algo {
     }
 
     async fn commit_inner(&self, tx: &mut Handle) -> Result<(), TransError> {
-        if tx.data.writes.is_empty() && !tx.collections.has_writes() {
+        if !tx.accesses.has_writes() && !tx.collections.has_writes() {
             if tx.should_lock_reads() {
-                self.validate_coordination_keys(&tx.data)?;
+                self.validate_coordination_keys(&tx.accesses)?;
                 return self.commit_locked(tx).await;
             }
             return self.commit_readonly(tx).await;
         }
-        self.validate_coordination_keys(&tx.data)?;
+        self.validate_coordination_keys(&tx.accesses)?;
         // Try the logless direct path first: a complete point transaction whose
         // dependencies share one leaf and whose outputs fit inline commits in
         // one leaf CAS with no transaction object (ADR-061). It writes nothing
@@ -420,7 +419,7 @@ impl Algo {
         if tx.collections.data().reads.is_empty() && tx.collections.data().changes.is_empty() {
             match self
                 .direct_commit
-                .try_commit(&tx.id, &tx.data, &mut tx.state)
+                .try_commit(&tx.id, &tx.accesses, &mut tx.state)
                 .await?
             {
                 DirectAttempt::Committed => return Ok(()),
@@ -437,7 +436,7 @@ impl Algo {
     }
 
     async fn validate_attempt_reads(&self, tx: &mut Handle) -> Result<(), TransError> {
-        if !tx.data.writes.is_empty() || tx.collections.has_writes() {
+        if tx.accesses.has_writes() || tx.collections.has_writes() {
             return Err(TransError::other(
                 "cannot validate only reads when writes are present",
             ));
@@ -449,7 +448,11 @@ impl Algo {
         // reads, so optimistic validation must establish its own lower bound.
         let validation_start = self.timeline.now();
         if self
-            .validate(&tx.data, ValidationContext::Optimistic, validation_start)
+            .validate(
+                &tx.accesses,
+                ValidationContext::Optimistic,
+                validation_start,
+            )
             .await?
             && self
                 .collection_commit
@@ -467,13 +470,8 @@ impl Algo {
     }
 
     /// Rejects keys that can never fit before the transaction has side effects.
-    fn validate_coordination_keys(&self, data: &Data) -> Result<(), TransError> {
-        for key in data
-            .reads
-            .iter()
-            .map(|read| &read.key)
-            .chain(data.writes.iter().map(|write| &write.key))
-        {
+    fn validate_coordination_keys(&self, accesses: &AccessSet) -> Result<(), TransError> {
+        for key in accesses.points().map(|point| point.key) {
             if !self.split_policy.key_fits(key.key()) {
                 return Err(TransError::InvalidInput(
                     "key exceeds the coordination node size limit".into(),
@@ -498,7 +496,11 @@ impl Algo {
         // completed body from the physical observations that certify it.
         let validation_start = self.timeline.now();
         if self
-            .validate(&tx.data, ValidationContext::Optimistic, validation_start)
+            .validate(
+                &tx.accesses,
+                ValidationContext::Optimistic,
+                validation_start,
+            )
             .await?
             && self
                 .collection_commit
@@ -573,7 +575,7 @@ impl Algo {
         // acquired locks prevent another change in the validation-to-commit gap.
         if !self
             .validate(
-                &tx.data,
+                &tx.accesses,
                 ValidationContext::LocksHeldBy {
                     tx_id: &tx.id,
                     locked: &locked,
@@ -600,7 +602,7 @@ impl Algo {
 
         // Commit point: create-or-flip the transaction object to committed.
         if let Err(e) = self
-            .commit_writes(&tx.data, &tx.collections, locks.clone(), &tx.id)
+            .commit_writes(&tx.accesses, &tx.collections, locks.clone(), &tx.id)
             .await
         {
             if matches!(e, TransError::AlreadyFinalized) {
@@ -630,7 +632,7 @@ impl Algo {
     /// returned an error. The caller will abort through [`Algo::end`] after a
     /// successful validation, so this deliberately does not commit the handle.
     async fn validate_locked_reads(&self, tx: &mut Handle) -> Result<(), TransError> {
-        self.validate_coordination_keys(&tx.data)?;
+        self.validate_coordination_keys(&tx.accesses)?;
         if tx.engage() {
             self.mon.begin_tx(&tx.id);
         }
@@ -651,7 +653,7 @@ impl Algo {
         self.mon.record_tx_locks(&tx.id, locks.clone());
         if self
             .validate(
-                &tx.data,
+                &tx.accesses,
                 ValidationContext::LocksHeldBy {
                     tx_id: &tx.id,
                     locked: &locked,
@@ -756,12 +758,12 @@ impl Algo {
             let outcome = if serial {
                 self.locker
                     .keys()
-                    .lock_at(&tx.id, &tx.data, true, scan_requirement)
+                    .lock_at(&tx.id, &tx.accesses, true, scan_requirement)
                     .await
             } else {
                 let key_locker = self.locker.keys();
                 tokio::select! {
-                    res = key_locker.lock_at(&tx.id, &tx.data, false, scan_requirement) => res,
+                    res = key_locker.lock_at(&tx.id, &tx.accesses, false, scan_requirement) => res,
                     _ = rt::sleep(MAX_DEADLOCK_TIMEOUT) => Err(TransError::LockTimeout),
                 }
             };
@@ -849,34 +851,34 @@ impl Algo {
     /// operation can therefore avoid I/O without deciding logical validity.
     async fn validate(
         &self,
-        data: &Data,
+        accesses: &AccessSet,
         context: ValidationContext<'_>,
         validation_start: SequencePoint,
     ) -> Result<bool, TransError> {
         let lock_validation = context.lock_validation();
         let physical_reads_valid = self
-            .validate_read_observations(data, validation_start, lock_validation)
+            .validate_read_observations(accesses, validation_start, lock_validation)
             .await?;
         let physical_scans_valid = self
-            .validate_scan_observations(data, validation_start, lock_validation)
+            .validate_scan_observations(accesses, validation_start, lock_validation)
             .await?;
         let requirement = Requirement::AtLeast(validation_start);
         Ok(
-            (physical_reads_valid || self.validate_reads_inner(data, requirement).await?)
+            (physical_reads_valid || self.validate_reads_inner(accesses, requirement).await?)
                 && (physical_scans_valid
                     || self
-                        .validate_scans_inner(data, context.own_lock_holder(), validation_start)
+                        .validate_scans_inner(accesses, context.own_lock_holder(), validation_start)
                         .await?),
         )
     }
 
     async fn validate_read_observations(
         &self,
-        data: &Data,
+        accesses: &AccessSet,
         validation_start: SequencePoint,
         lock_validation: Option<&LockedTx>,
     ) -> Result<bool, TransError> {
-        for read in &data.reads {
+        for read in accesses.point_reads() {
             let leaf_unchanged = match lock_validation {
                 Some(locked) => locked.validated(read.observation()),
                 None => matches!(
@@ -898,11 +900,15 @@ impl Algo {
 
     async fn validate_scan_observations(
         &self,
-        data: &Data,
+        accesses: &AccessSet,
         validation_start: SequencePoint,
         lock_validation: Option<&LockedTx>,
     ) -> Result<bool, TransError> {
-        for coverage in data.scans.iter().flat_map(|scan| scan.covered()) {
+        for coverage in accesses
+            .range_scans()
+            .iter()
+            .flat_map(|scan| scan.covered())
+        {
             let leaf_unchanged = match lock_validation {
                 Some(locked) => locked.validated(&coverage.observation),
                 None => matches!(
@@ -930,19 +936,23 @@ impl Algo {
     /// loaded once) rather than one shard load per key.
     async fn validate_reads_inner(
         &self,
-        data: &Data,
+        accesses: &AccessSet,
         requirement: Requirement,
     ) -> Result<bool, TransError> {
-        if data.reads.is_empty() {
+        if accesses.point_reads().is_empty() {
             return Ok(true);
         }
-        let keys: Vec<KeyRef> = data.reads.iter().map(|read| read.key.clone()).collect();
+        let keys: Vec<KeyRef> = accesses
+            .point_reads()
+            .iter()
+            .map(|read| read.key().clone())
+            .collect();
         let current = self
             .resolver
             .effective_point_states(&keys, requirement)
             .await?;
-        for r in &data.reads {
-            let Some(state) = current.get(&r.key) else {
+        for r in accesses.point_reads() {
+            let Some(state) = current.get(r.key()) else {
                 return Ok(false);
             };
             if !r.validates(state.writer.as_ref(), state.membership_version) {
@@ -960,17 +970,17 @@ impl Algo {
     /// harmless split from a logical page change.
     async fn validate_scans_inner(
         &self,
-        data: &Data,
+        accesses: &AccessSet,
         own_lock_holder: Option<&TxId>,
         validation_start: SequencePoint,
     ) -> Result<bool, TransError> {
         let requirement = Requirement::AtLeast(validation_start);
-        for scan in &data.scans {
+        for scan in accesses.range_scans() {
             let current = self
                 .resolver
                 .scan_coverage(
-                    &scan.collection,
-                    &scan.range,
+                    scan.collection(),
+                    scan.range(),
                     scan.frontier(),
                     own_lock_holder,
                     requirement,
@@ -1000,9 +1010,9 @@ impl Algo {
             let resolved = self
                 .resolver
                 .scan_keys_at(
-                    &scan.collection,
-                    &scan.range,
-                    &scan.overlay,
+                    scan.collection(),
+                    scan.range(),
+                    scan.overlay(),
                     own_lock_holder,
                     scan.frontier(),
                     requirement,
@@ -1020,19 +1030,19 @@ impl Algo {
     /// carries its full back-reference set for GC's reverse check (ADR-022).
     async fn commit_writes(
         &self,
-        data: &Data,
+        accesses: &AccessSet,
         collections: &CollectionAttempt,
         locks: Vec<TxLock>,
         id: &TxId,
     ) -> Result<(), TransError> {
         let mut tl = TxLog::new(id.clone(), TxCommitStatus::Ok);
-        for w in &data.writes {
-            let (value, deleted): (Arc<[u8]>, bool) = match &w.op {
+        for w in accesses.final_writes() {
+            let (value, deleted): (Arc<[u8]>, bool) = match w.operation() {
                 WriteOp::Put(value) => (value.clone(), false),
                 WriteOp::Delete => (Arc::from(&[] as &[u8]), true),
             };
             tl.writes.push(TxWrite {
-                key: w.key.clone(),
+                key: w.key().clone(),
                 value,
                 deleted,
                 prev_writer: TxId::default(),
@@ -1274,27 +1284,19 @@ mod tests {
         }
     }
 
-    pub(super) fn begin_data(tm: &Algo, data: Data) -> Handle {
-        tm.begin(data, CollectionData::default())
+    pub(super) fn begin_accesses(tm: &Algo, accesses: AccessSet) -> Handle {
+        tm.begin(accesses, CollectionData::default())
     }
 
-    pub(super) async fn commit_access(tm: &Algo, d: Data) -> Handle {
-        let mut h = begin_data(tm, d);
+    pub(super) async fn commit_access(tm: &Algo, accesses: AccessSet) -> Handle {
+        let mut h = begin_accesses(tm, accesses);
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
         h
     }
 
     pub(super) async fn commit_writes(tm: &Algo, ws: Vec<WriteAccess>) -> Handle {
-        commit_access(
-            tm,
-            Data {
-                reads: Vec::new(),
-                writes: ws,
-                scans: Vec::new(),
-            },
-        )
-        .await
+        commit_access(tm, AccessSet::new(Vec::new(), ws, Vec::new())).await
     }
 
     pub(super) async fn entry(tctx: &Tctx, key: &[u8]) -> Option<ShardEntry> {
@@ -1341,12 +1343,8 @@ mod tests {
         )
         .await;
         let key = key_ref(b"abandoned");
-        let data = Data {
-            reads: Vec::new(),
-            writes: vec![wa(&key, b"uncommitted")],
-            scans: Vec::new(),
-        };
-        let abandoned = begin_data(&algo, data.clone()).id;
+        let data = AccessSet::new(Vec::new(), vec![wa(&key, b"uncommitted")], Vec::new());
+        let abandoned = begin_accesses(&algo, data.clone()).id;
         tctx.tmon.begin_tx(&abandoned);
         let outcome = tctx
             .locker
@@ -1369,7 +1367,7 @@ mod tests {
 
         let (peer, peer_ctx) = new_algo_from_backend(backend).await;
         peer_ctx.tmon.preempt_tx(&abandoned).await.unwrap();
-        let mut peer_handle = begin_data(&peer, data);
+        let mut peer_handle = begin_accesses(&peer, data);
         tokio::time::timeout(Duration::from_secs(1), peer.commit(&mut peer_handle))
             .await
             .expect("protocol helping did not make progress")
@@ -1383,13 +1381,9 @@ mod tests {
         let keyp = key_ref(b"k");
         let val = b"v";
 
-        let mut h = begin_data(
+        let mut h = begin_accesses(
             &tm,
-            Data {
-                reads: Vec::new(),
-                writes: vec![wa(&keyp, val)],
-                scans: Vec::new(),
-            },
+            AccessSet::new(Vec::new(), vec![wa(&keyp, val)], Vec::new()),
         );
         tm.commit(&mut h).await.unwrap();
         let tid = h.id().clone();
@@ -1431,13 +1425,9 @@ mod tests {
 
         let r = do_read(&tctx, &readp).await;
         let logged = vec![b'v'; InlinePolicy::default().max_value_bytes + 1];
-        let mut h = begin_data(
+        let mut h = begin_accesses(
             &tm,
-            Data {
-                reads: vec![r],
-                writes: vec![wa(&writep, &logged)],
-                scans: Vec::new(),
-            },
+            AccessSet::new(vec![r], vec![wa(&writep, &logged)], Vec::new()),
         );
         tm.commit(&mut h).await.unwrap();
         let tid = h.id().clone();
@@ -1491,7 +1481,7 @@ mod tests {
                 op: CollectionOp::Create,
             }],
         };
-        let mut handle = tm.begin(Data::default(), earlier_data);
+        let mut handle = tm.begin(AccessSet::default(), earlier_data);
         tm.collection_commit
             .prepare(&mut handle.collections)
             .await
@@ -1504,7 +1494,7 @@ mod tests {
         let id = handle.id().clone();
         tm.mon.begin_tx(&id);
 
-        tm.commit_writes(&Data::default(), &handle.collections, Vec::new(), &id)
+        tm.commit_writes(&AccessSet::default(), &handle.collections, Vec::new(), &id)
             .await
             .unwrap();
 
@@ -1523,7 +1513,7 @@ mod tests {
             CollectionId::from_slice(&[3; 16]).expect("fixed ID has the required width"),
         );
         let handle = tm.begin(
-            Data::default(),
+            AccessSet::default(),
             CollectionData {
                 reads: Vec::new(),
                 changes: vec![CollectionChange {
@@ -1572,7 +1562,7 @@ mod tests {
             CollectionId::from_slice(&[3; 16]).expect("fixed ID has the required width"),
         );
         let mut handle = tm.begin(
-            Data::default(),
+            AccessSet::default(),
             CollectionData {
                 reads: Vec::new(),
                 changes: vec![CollectionChange {
@@ -1591,7 +1581,7 @@ mod tests {
         let id = handle.id().clone();
         tm.mon.begin_tx(&id);
         assert!(handle.engage());
-        tm.commit_writes(&Data::default(), &handle.collections, Vec::new(), &id)
+        tm.commit_writes(&AccessSet::default(), &handle.collections, Vec::new(), &id)
             .await
             .unwrap();
 
@@ -1627,7 +1617,7 @@ mod tests {
                 .unwrap()
         );
         let mut handle = tm.begin(
-            Data::default(),
+            AccessSet::default(),
             CollectionData {
                 reads: Vec::new(),
                 changes: vec![CollectionChange {
@@ -1674,19 +1664,15 @@ mod tests {
         let _ = h;
 
         let r = do_read(&tctx, &keyp).await;
-        let mut h = begin_data(
+        let mut h = begin_accesses(
             &tm,
-            Data {
-                reads: vec![r],
-                writes: vec![wa(&keyp, b"v2")],
-                scans: Vec::new(),
-            },
+            AccessSet::new(vec![r], vec![wa(&keyp, b"v2")], Vec::new()),
         );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
         let r = do_read(&tctx, &keyp).await;
-        assert_eq!(r.last_writer().unwrap(), h.id());
+        assert!(r.validates(Some(h.id()), 0));
     }
 
     // Full path (ADR-024): a read whose value moved before it was locked does not
@@ -1712,13 +1698,9 @@ mod tests {
         commit_writes(&tm2, vec![wa(&ka, b"v2")]).await;
 
         let logged = vec![b'x'; InlinePolicy::default().max_value_bytes + 1];
-        let mut h = begin_data(
+        let mut h = begin_accesses(
             &tm,
-            Data {
-                reads: vec![ra],
-                writes: vec![wa(&ka, b"v3"), wa(&kb, &logged)],
-                scans: Vec::new(),
-            },
+            AccessSet::new(vec![ra], vec![wa(&ka, b"v3"), wa(&kb, &logged)], Vec::new()),
         );
         let err = tm.commit(&mut h).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
@@ -1752,11 +1734,7 @@ mod tests {
             .keys()
             .lock_at(
                 &holder,
-                &Data {
-                    reads: Vec::new(),
-                    writes: vec![wa(&keyp, b"h")],
-                    scans: Vec::new(),
-                },
+                &AccessSet::new(Vec::new(), vec![wa(&keyp, b"h")], Vec::new()),
                 false,
                 Requirement::AtLeast(tctx.timeline.now()),
             )
@@ -1769,13 +1747,9 @@ mod tests {
 
         // A younger transaction wants the same key; it cannot wound the holder.
         // Drive its commit concurrently so we can observe it parked waiting.
-        let mut h = begin_data(
+        let mut h = begin_accesses(
             &tm,
-            Data {
-                reads: Vec::new(),
-                writes: vec![wa(&keyp, b"a")],
-                scans: Vec::new(),
-            },
+            AccessSet::new(Vec::new(), vec![wa(&keyp, b"a")], Vec::new()),
         );
         let id_before = h.id().clone();
         let tm2 = tm.clone();
@@ -1867,13 +1841,9 @@ mod tests {
         assert!(tctx.shards.commit_leaf(edit).await.unwrap());
 
         let key = key_ref(&second);
-        let mut handle = begin_data(
+        let mut handle = begin_accesses(
             &tm,
-            Data {
-                reads: Vec::new(),
-                writes: vec![wa(&key, b"value")],
-                scans: Vec::new(),
-            },
+            AccessSet::new(Vec::new(), vec![wa(&key, b"value")], Vec::new()),
         );
         let error = tokio::time::timeout(
             MAX_LEAF_FULL_WAIT + Duration::from_secs(10),
@@ -2004,11 +1974,11 @@ mod tests {
         // Seed the keys over a clean connection so their shards exist (the lock
         // CAS is then a `write_if`, the thing we fault).
         let mut seed = engine.begin_transaction(
-            Data {
-                reads: Vec::new(),
-                writes: vec![wa(&keyp, b"v1"), wa(&keyp2, b"v1")],
-                scans: Vec::new(),
-            },
+            AccessSet::new(
+                Vec::new(),
+                vec![wa(&keyp, b"v1"), wa(&keyp2, b"v1")],
+                Vec::new(),
+            ),
             CollectionData::default(),
         );
         engine.commit(&mut seed).await.unwrap();
@@ -2016,11 +1986,11 @@ mod tests {
 
         flaky.arm();
         let mut h = engine.begin_transaction(
-            Data {
-                reads: Vec::new(),
-                writes: vec![wa(&keyp, b"v2"), wa(&keyp2, b"v2")],
-                scans: Vec::new(),
-            },
+            AccessSet::new(
+                Vec::new(),
+                vec![wa(&keyp, b"v2"), wa(&keyp2, b"v2")],
+                Vec::new(),
+            ),
             CollectionData::default(),
         );
         let id_before = h.id().clone();
@@ -2173,14 +2143,7 @@ mod tests {
         commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
         let r = do_read(&tctx, &keyp).await;
 
-        let mut h = begin_data(
-            &tm,
-            Data {
-                reads: vec![r],
-                writes: Vec::new(),
-                scans: Vec::new(),
-            },
-        );
+        let mut h = begin_accesses(&tm, AccessSet::new(vec![r], Vec::new(), Vec::new()));
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
     }
@@ -2193,11 +2156,11 @@ mod tests {
 
         let outcome = read_outcome(&tctx, &keyp).await;
         let (_, _, evidence) = outcome.into_parts();
-        let data = Data {
-            reads: vec![ReadAccess::new(keyp.clone(), evidence)],
-            writes: Vec::new(),
-            scans: Vec::new(),
-        };
+        let data = AccessSet::new(
+            vec![ReadAccess::new(keyp.clone(), evidence)],
+            Vec::new(),
+            Vec::new(),
+        );
 
         let validation_start = tctx.timeline.now();
         assert!(
@@ -2223,13 +2186,9 @@ mod tests {
         let (tm, tctx) = new_algo().await;
         let key = key_ref(b"missing");
         let read = do_read(&tctx, &key).await;
-        assert_eq!(read.last_writer(), None);
-        assert_eq!(read.absence_generation(), Some(0));
-        let data = Data {
-            reads: vec![read],
-            writes: Vec::new(),
-            scans: Vec::new(),
-        };
+        assert!(read.validates(None, 0));
+        assert!(!read.validates(None, 1));
+        let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
 
         let validation_start = tctx.timeline.now();
         let loaded = tctx
@@ -2289,13 +2248,9 @@ mod tests {
         assert!(tctx.shards.commit_leaf(edit).await.unwrap());
 
         let read = do_read(&tctx, &key).await;
-        assert_eq!(read.last_writer(), Some(&writer));
-        assert_eq!(read.absence_generation(), None);
-        let data = Data {
-            reads: vec![read],
-            writes: Vec::new(),
-            scans: Vec::new(),
-        };
+        assert!(read.validates(Some(&writer), 0));
+        assert!(read.validates(Some(&writer), 1));
+        let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
         let validation_start = tctx.timeline.now();
 
         let external_timeline = Timeline::new();
@@ -2334,11 +2289,7 @@ mod tests {
 
         let holder = TxId::with_priority(1, b"holder");
         tctx.tmon.begin_tx(&holder);
-        let holder_data = Data {
-            reads: Vec::new(),
-            writes: vec![wa(&keyp, b"v2")],
-            scans: Vec::new(),
-        };
+        let holder_data = AccessSet::new(Vec::new(), vec![wa(&keyp, b"v2")], Vec::new());
         let locked = match tctx
             .locker
             .keys()
@@ -2356,12 +2307,8 @@ mod tests {
         };
 
         let read = do_read(&tctx, &keyp).await;
-        assert_eq!(read.last_writer(), Some(&previous));
-        let data = Data {
-            reads: vec![read],
-            writes: Vec::new(),
-            scans: Vec::new(),
-        };
+        assert!(read.validates(Some(&previous), 0));
+        let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
         let validation_start = tctx.timeline.now();
 
         // Finalize only the transaction object. The leaf still contains the
@@ -2402,11 +2349,7 @@ mod tests {
 
         let holder = TxId::with_priority(1, b"holder");
         tctx.tmon.begin_tx(&holder);
-        let holder_data = Data {
-            reads: Vec::new(),
-            writes: vec![wa(&keyp, b"v2")],
-            scans: Vec::new(),
-        };
+        let holder_data = AccessSet::new(Vec::new(), vec![wa(&keyp, b"v2")], Vec::new());
         match tctx
             .locker
             .keys()
@@ -2424,12 +2367,8 @@ mod tests {
         }
 
         let read = do_read(&tctx, &keyp).await;
-        assert_eq!(read.last_writer(), Some(&previous));
-        let data = Data {
-            reads: vec![read],
-            writes: Vec::new(),
-            scans: Vec::new(),
-        };
+        assert!(read.validates(Some(&previous), 0));
+        let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
         let validation_start = tctx.timeline.now();
 
         // Aborting the holder leaves the previously observed writer effective.
@@ -2480,11 +2419,7 @@ mod tests {
         // leaf after our barrier and therefore advances its shared evidence.
         let other = TxId::with_priority(1, b"other");
         tctx.tmon.begin_tx(&other);
-        let other_data = Data {
-            reads: Vec::new(),
-            writes: vec![wa(&kb, b"b1")],
-            scans: Vec::new(),
-        };
+        let other_data = AccessSet::new(Vec::new(), vec![wa(&kb, b"b1")], Vec::new());
         let other_locked = match tctx
             .locker
             .keys()
@@ -2506,11 +2441,7 @@ mod tests {
         // cannot use `other`'s earlier receipt to certify our original read.
         let current = TxId::with_priority(2, b"current");
         tctx.tmon.begin_tx(&current);
-        let current_data = Data {
-            reads: vec![read],
-            writes: Vec::new(),
-            scans: Vec::new(),
-        };
+        let current_data = AccessSet::new(vec![read], Vec::new(), Vec::new());
         let current_locked = match tctx
             .locker
             .keys()
@@ -2580,11 +2511,7 @@ mod tests {
         // no longer matches, but A's effective writer remains unchanged.
         let other = TxId::with_priority(4, b"other");
         tctx.tmon.begin_tx(&other);
-        let other_data = Data {
-            reads: Vec::new(),
-            writes: vec![wa(&kb, b"b1")],
-            scans: Vec::new(),
-        };
+        let other_data = AccessSet::new(Vec::new(), vec![wa(&kb, b"b1")], Vec::new());
         let other_locked = match tctx
             .locker
             .keys()
@@ -2601,11 +2528,7 @@ mod tests {
             _ => panic!("disjoint lock acquisition must succeed"),
         };
 
-        let data = Data {
-            reads: vec![read],
-            writes: Vec::new(),
-            scans: Vec::new(),
-        };
+        let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
         log.lock().unwrap().clear();
         assert!(
             !tm.validate_read_observations(&data, validation_start, None)
@@ -2641,14 +2564,7 @@ mod tests {
         let rb = do_read(&tctx, &kb).await;
         commit_writes(&tm2, vec![wa(&ka, b"a2")]).await;
 
-        let mut h = begin_data(
-            &tm,
-            Data {
-                reads: vec![ra, rb],
-                writes: Vec::new(),
-                scans: Vec::new(),
-            },
-        );
+        let mut h = begin_accesses(&tm, AccessSet::new(vec![ra, rb], Vec::new(), Vec::new()));
         let err = tm.commit(&mut h).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
         assert!(h.should_lock_reads());
@@ -2664,14 +2580,7 @@ mod tests {
         // complete fresh read set before deciding whether it can commit.
         let ra = do_read(&tctx, &ka).await;
         let rb = do_read(&tctx, &kb).await;
-        tm.reset(
-            &mut h,
-            Data {
-                reads: vec![ra, rb],
-                writes: Vec::new(),
-                scans: Vec::new(),
-            },
-        );
+        tm.reset(&mut h, AccessSet::new(vec![ra, rb], Vec::new(), Vec::new()));
         tm.commit(&mut h).await.unwrap();
         let log = tctx.tlogger.get_at(h.id(), Requirement::Any).await.unwrap();
         let log = log.value().unwrap();
@@ -2693,15 +2602,8 @@ mod tests {
 
         // A read now resolves to not-found.
         let r = do_read(&tctx, &keyp).await;
-        assert_eq!(r.last_writer(), Some(&deleted_by));
-        let mut h = begin_data(
-            &tm,
-            Data {
-                reads: vec![r],
-                writes: Vec::new(),
-                scans: Vec::new(),
-            },
-        );
+        assert!(r.validates(Some(&deleted_by), 0));
+        let mut h = begin_accesses(&tm, AccessSet::new(vec![r], Vec::new(), Vec::new()));
         tm.commit(&mut h).await.unwrap();
     }
 
@@ -2712,21 +2614,14 @@ mod tests {
 
         commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
         let r = do_read(&tctx, &keyp).await;
-        let mut h = begin_data(
-            &tm,
-            Data {
-                reads: vec![r],
-                writes: vec![wdel(&keyp)],
-                scans: Vec::new(),
-            },
-        );
+        let mut h = begin_accesses(&tm, AccessSet::new(vec![r], vec![wdel(&keyp)], Vec::new()));
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
         let e = entry(&tctx, b"k").await.unwrap();
         assert!(e.current.is_tombstone());
         let r = do_read(&tctx, &keyp).await;
-        assert_eq!(r.last_writer(), Some(h.id()));
+        assert!(r.validates(Some(h.id()), 0));
     }
 
     #[tokio::test]
@@ -2735,13 +2630,9 @@ mod tests {
         let k1 = key_ref(b"k1");
         let k2 = key_ref(b"k2");
 
-        let mut h = begin_data(
+        let mut h = begin_accesses(
             &tm,
-            Data {
-                reads: Vec::new(),
-                writes: vec![wa(&k1, b"v1"), wa(&k2, b"v2")],
-                scans: Vec::new(),
-            },
+            AccessSet::new(Vec::new(), vec![wa(&k1, b"v1"), wa(&k2, b"v2")], Vec::new()),
         );
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
@@ -2779,10 +2670,14 @@ mod tests {
         assert!(tctx.shards.commit_leaf(edit).await.unwrap());
     }
 
-    // Builds a read-only listing transaction's [`Data`] from a fresh scan of the
+    // Builds a read-only listing transaction's [`AccessSet`] from a fresh scan of the
     // test collection, returning the scan's live keys alongside so a test can
     // assert on the snapshot and later re-validate the same coverage.
-    async fn scan_data_for_range(tctx: &Tctx, range: ScanRange) -> (Data, Vec<Vec<u8>>) {
+    async fn scan_accesses_for_range(
+        tctx: &Tctx,
+        range: ScanRange,
+        writes: Vec<WriteAccess>,
+    ) -> (AccessSet, Vec<Vec<u8>>) {
         let resolver = KeyResolver::new(
             TreeRouter::new(tctx.shards.clone()),
             KeyStateResolver::new(tctx.tmon.clone()),
@@ -2793,16 +2688,12 @@ mod tests {
             .unwrap();
         let keys = scan.keys().to_vec();
         let access = scan.into_access(test_collection(), range, Vec::new());
-        let data = Data {
-            reads: Vec::new(),
-            writes: Vec::new(),
-            scans: vec![access],
-        };
+        let data = AccessSet::new(Vec::new(), writes, vec![access]);
         (data, keys)
     }
 
-    async fn scan_data(tctx: &Tctx) -> (Data, Vec<Vec<u8>>) {
-        scan_data_for_range(tctx, ScanRange::all()).await
+    async fn scan_accesses(tctx: &Tctx) -> (AccessSet, Vec<Vec<u8>>) {
+        scan_accesses_for_range(tctx, ScanRange::all(), Vec::new()).await
     }
 
     #[tokio::test]
@@ -2819,11 +2710,11 @@ mod tests {
             .scan_keys(&test_collection(), &range, &[], None, None)
             .await
             .unwrap();
-        let data = Data {
-            reads: Vec::new(),
-            writes: Vec::new(),
-            scans: vec![result.into_access(test_collection(), range, Vec::new())],
-        };
+        let data = AccessSet::new(
+            Vec::new(),
+            Vec::new(),
+            vec![result.into_access(test_collection(), range, Vec::new())],
+        );
 
         let validation_start = tctx.timeline.now();
         assert!(
@@ -2852,12 +2743,12 @@ mod tests {
         let (tm, tctx) = new_algo().await;
         seed_live_keys(&tctx, &[b"a", b"c"]).await;
 
-        let (data, keys) = scan_data(&tctx).await;
+        let (data, keys) = scan_accesses(&tctx).await;
         assert_eq!(keys, vec![b"a".to_vec(), b"c".to_vec()]);
 
         // No concurrent change: the listing validates and commits.
         tctx.locker.stats_and_reset();
-        let mut h = begin_data(&tm, data.clone());
+        let mut h = begin_accesses(&tm, data.clone());
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
         assert_eq!(tctx.locker.stats_and_reset().calls, 0);
@@ -2865,7 +2756,7 @@ mod tests {
         // A create between the scan and (re-)validation bumps the covered leaf.
         commit_writes(&tm, vec![wa(&key_ref(b"b"), b"1")]).await;
 
-        let mut stale = begin_data(&tm, data);
+        let mut stale = begin_accesses(&tm, data);
         let err = tm.commit(&mut stale).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
         assert!(
@@ -2874,7 +2765,7 @@ mod tests {
         );
 
         // The retry computes a fresh page, then commits through the locked path.
-        let (fresh, keys) = scan_data(&tctx).await;
+        let (fresh, keys) = scan_accesses(&tctx).await;
         assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
         tm.reset(&mut stale, fresh);
         tctx.locker.stats_and_reset();
@@ -2902,11 +2793,7 @@ mod tests {
         let key_path = key_ref(b"new");
         let holder = TxId::with_priority(1, b"holder");
         tctx.tmon.begin_tx(&holder);
-        let holder_data = Data {
-            reads: Vec::new(),
-            writes: vec![wa(&key_path, b"value")],
-            scans: Vec::new(),
-        };
+        let holder_data = AccessSet::new(Vec::new(), vec![wa(&key_path, b"value")], Vec::new());
         let locked = match tctx
             .locker
             .keys()
@@ -2926,7 +2813,7 @@ mod tests {
 
         // The scan observes the pending create as absent and records its
         // membership holder as a status dependency.
-        let (scan, keys) = scan_data(&tctx).await;
+        let (scan, keys) = scan_accesses(&tctx).await;
         assert!(keys.is_empty());
 
         // Commit only the transaction object: membership_version is unchanged
@@ -2941,7 +2828,7 @@ mod tests {
         });
         tctx.tmon.commit_tx(log).await.unwrap();
 
-        let mut stale = begin_data(&tm, scan);
+        let mut stale = begin_accesses(&tm, scan);
         let err = tm.commit(&mut stale).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
     }
@@ -2951,10 +2838,10 @@ mod tests {
         let (tm, tctx) = new_algo().await;
         let key_path = key_ref(b"a");
         seed_live_keys(&tctx, &[b"a"]).await;
-        let (mut data, _) = scan_data(&tctx).await;
-        data.writes.push(wa(&key_path, b"updated"));
+        let (data, _) =
+            scan_accesses_for_range(&tctx, ScanRange::all(), vec![wa(&key_path, b"updated")]).await;
 
-        let mut handle = begin_data(&tm, data);
+        let mut handle = begin_accesses(&tm, data);
         tm.commit(&mut handle).await.unwrap();
         let log = tctx
             .tlogger
@@ -2985,24 +2872,25 @@ mod tests {
             end: None,
             limit: Some(2),
         };
-        let (mut stale, keys) = scan_data_for_range(&tctx, range.clone()).await;
+        let (stale, keys) =
+            scan_accesses_for_range(&tctx, range.clone(), vec![wa(&key_ref(b"a"), b"updated")])
+                .await;
         assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
-        assert_eq!(stale.scans[0].frontier(), Some(b"b".as_slice()));
-        stale.writes.push(wa(&key_ref(b"a"), b"updated"));
+        assert_eq!(stale.range_scans()[0].frontier(), Some(b"b".as_slice()));
 
         // Removing the old frontier means the refreshed two-key page reaches
         // into S1. The first locked validation only owns S0 and must retry.
         commit_writes(&tm, vec![wdel(&key_ref(b"b"))]).await;
-        let mut handle = begin_data(&tm, stale);
+        let mut handle = begin_accesses(&tm, stale);
         let err = tm.commit(&mut handle).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
 
         // The body re-runs while S0 stays locked. Its new frontier is `m`, so
         // the next validation adds S1 before committing.
-        let (mut fresh, keys) = scan_data_for_range(&tctx, range).await;
+        let (fresh, keys) =
+            scan_accesses_for_range(&tctx, range, vec![wa(&key_ref(b"a"), b"updated")]).await;
         assert_eq!(keys, vec![b"a".to_vec(), b"m".to_vec()]);
-        assert_eq!(fresh.scans[0].frontier(), Some(b"m".as_slice()));
-        fresh.writes.push(wa(&key_ref(b"a"), b"updated"));
+        assert_eq!(fresh.range_scans()[0].frontier(), Some(b"m".as_slice()));
         tm.reset(&mut handle, fresh);
         tm.commit(&mut handle).await.unwrap();
 
@@ -3032,12 +2920,12 @@ mod tests {
         let bp = key_ref(b"b");
         seed_live_keys(&tctx, &[b"a", b"b"]).await;
 
-        let (data, keys) = scan_data(&tctx).await;
+        let (data, keys) = scan_accesses(&tctx).await;
         assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
 
         commit_writes(&tm, vec![wdel(&bp)]).await;
 
-        let mut stale = begin_data(&tm, data);
+        let mut stale = begin_accesses(&tm, data);
         let err = tm.commit(&mut stale).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
     }
@@ -3049,14 +2937,14 @@ mod tests {
         let (tm, tctx) = new_algo().await;
         seed_live_keys(&tctx, &[b"a", b"m"]).await;
 
-        let (data, _keys) = scan_data(&tctx).await;
+        let (data, _keys) = scan_accesses(&tctx).await;
 
         // Grow the tree in place: rewrite `_r` from its single leaf into an index
         // root pointing at two fresh leaves (the shape the background splitter
         // produces), so the covered leaf set is no longer just `_r`.
         split_root_in_place(&tctx).await;
 
-        let mut stable = begin_data(&tm, data);
+        let mut stable = begin_accesses(&tm, data);
         tm.commit(&mut stable).await.unwrap();
         tm.end(&mut stable).await.unwrap();
     }
@@ -3113,7 +3001,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (data, keys) = scan_data(&tctx).await;
+        let (data, keys) = scan_accesses(&tctx).await;
         assert_eq!(
             keys,
             vec![b"a".to_vec(), b"c".to_vec(), b"m".to_vec(), b"p".to_vec()]
@@ -3143,7 +3031,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut stale = begin_data(&tm, data);
+        let mut stale = begin_accesses(&tm, data);
         let err = tm.commit(&mut stale).await.unwrap_err();
         assert!(matches!(err, TransError::Retry), "got {err:?}");
     }

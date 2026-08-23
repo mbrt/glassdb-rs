@@ -41,7 +41,7 @@ use glassdb_storage::{
     TreeRouter,
 };
 
-use crate::access::{Data, WriteOp};
+use crate::access::{AccessSet, WriteOp};
 use crate::collection_coordination::{CollectionLocker, CollectionStateResolver};
 use crate::error::TransError;
 use crate::monitor::Monitor;
@@ -239,29 +239,23 @@ fn lock_type(desired: Desired) -> LockType {
 /// locking, ADR-024), so no read token is carried here.
 async fn build_groups(
     router: &TreeRouter,
-    data: &Data,
+    accesses: &AccessSet,
     scan_requirement: Requirement,
 ) -> Result<BTreeMap<ObjectPath, ShardGroup>, TransError> {
-    let mut by_key: BTreeMap<KeyRef, Desired> = BTreeMap::new();
-    for w in &data.writes {
-        let desired = match &w.op {
-            WriteOp::Delete => Desired::Delete,
-            WriteOp::Put(_) => Desired::Put,
-        };
-        // A later write to the same key wins (e.g. put-then-delete).
-        by_key.insert(w.key.clone(), desired);
-    }
-    for r in &data.reads {
-        // A key that is also written keeps its exclusive intent.
-        by_key.entry(r.key.clone()).or_insert(Desired::Read);
-    }
-
     // Collect before descending so the returned future does not close over a
     // borrowing iterator (which would not be higher-ranked / `Send` when a
     // caller spawns the lock).
-    let items: Vec<(KeyRef, (KeyRef, Desired))> = by_key
-        .into_iter()
-        .map(|(key, desired)| (key.clone(), (key, desired)))
+    let items: Vec<(KeyRef, (KeyRef, Desired))> = accesses
+        .points()
+        .map(|point| {
+            let desired = match point.write.map(|write| write.operation()) {
+                Some(WriteOp::Delete) => Desired::Delete,
+                Some(WriteOp::Put(_)) => Desired::Put,
+                None => Desired::Read,
+            };
+            let key = point.key.clone();
+            (key.clone(), (key, desired))
+        })
         .collect();
     // Route with interior nodes served from cache (ADR-031 hot-path invariant):
     // a stale index misroute self-corrects via right-links, and the leaf's own
@@ -299,19 +293,19 @@ async fn build_groups(
     // Lock the current cover, not the body's earlier cover. If a split moved
     // the range before locking, validation reconciles the logical page while
     // the new leaves are protected.
-    for scan in &data.scans {
-        if scan.range.is_empty() {
+    for scan in accesses.range_scans() {
+        if scan.range().is_empty() {
             continue;
         }
         for leaf in router
             .leaves_through(
-                &scan.collection,
-                &scan.range.start,
+                scan.collection(),
+                &scan.range().start,
                 scan.frontier(),
                 scan_requirement,
             )
             .await
-            .map_err(|error| error.classify_collection_absence(&scan.collection))?
+            .map_err(|error| error.classify_collection_absence(scan.collection()))?
         {
             let group = groups
                 .entry(leaf.path.clone())
@@ -1021,11 +1015,11 @@ impl KeyLocker {
     pub(crate) async fn lock_at(
         &self,
         id: &TxId,
-        data: &Data,
+        accesses: &AccessSet,
         serial: bool,
         scan_requirement: Requirement,
     ) -> Result<LockOutcome, TransError> {
-        let groups = build_groups(&self.router, data, scan_requirement).await?;
+        let groups = build_groups(&self.router, accesses, scan_requirement).await?;
         let receipts = match self
             .lock_shards_at(id, &groups, serial, scan_requirement)
             .await?
@@ -2264,14 +2258,14 @@ mod tests {
 
         // A blind put installs both the key Create lock and the leaf
         // membership-write lock.
-        let data = Data {
-            reads: Vec::new(),
-            writes: vec![crate::access::WriteAccess::put(
+        let data = AccessSet::new(
+            Vec::new(),
+            vec![crate::access::WriteAccess::put(
                 key_ref(key),
                 Arc::from(&b"v"[..]),
             )],
-            scans: Vec::new(),
-        };
+            Vec::new(),
+        );
         let out = locker
             .keys()
             .lock_at(&tx, &data, false, Requirement::Any)
