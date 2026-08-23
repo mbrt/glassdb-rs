@@ -126,12 +126,13 @@ path-based API. `Algo` holds a `NodeStore` only to re-check whether a leaf
 observation already carried in its own `Data` is still current.)
 
 Every shard/root entry mutation — lock acquire, direct same-leaf publication,
-write-back, release, and GC reclamation — flows through **one shard-mutation
-coordinator** that loads the object once, folds the round's operations in
-wound-wait order, and CASes once (ADR-028/029). The coordinator is a
-transaction-aware shared mutation engine: it owns identity, ordering, admission,
-and recovery across the heterogeneous round, while `Algo` and the `Locker`
-supply each operation's mutation decision as an installed resolver. For the full design see
+write-back, release, and GC reclamation — and every leaf structural-gate
+acquisition flows through **one shard-mutation coordinator**. It loads the
+object once, folds the round's operations in wound-wait order, and CASes once
+(ADR-028/029). The coordinator is a transaction-aware shared mutation engine:
+it owns identity, ordering, admission, and recovery across the heterogeneous
+round, while `Algo`, the `Locker`, and the `Splitter` supply each operation's
+mutation decision as an installed resolver. For the full design see
 [designs/object-storage-native.md](designs/object-storage-native.md).
 
 ```
@@ -244,17 +245,19 @@ or maintaining independent topology state. The Engine centralizes their
 assembly; it does not invent a single semantic owner for those different routing
 responsibilities.
 
-Behind the physical-mutation boundary, every data-node entry mutation flows through a
-single transaction-aware `ShardCoordinator`. It owns the protocol shared by a
-heterogeneous round: single-flight batching, transaction identity,
-oldest-first wound-wait order, ownership and capacity admission, whole-member
-exclusion for overlapping logless output claims, one CAS, per-member
-uncertainty attribution, and reload-and-re-fold recovery. Installed resolvers own the operation-specific
+Behind the physical-mutation boundary, every data-node entry mutation and each
+leaf structural-gate acquisition flows through a single transaction-aware
+`ShardCoordinator`. It owns the protocol shared by a heterogeneous round:
+single-flight batching, transaction identity, oldest-first wound-wait order,
+ownership and capacity admission, whole-member exclusion for overlapping
+logless output claims, one CAS, per-member uncertainty attribution, and
+reload-and-re-fold recovery. Installed resolvers own the operation-specific
 mutation decisions — `Locker` supplies acquire / write-back / release, `Algo`
-supplies direct commit, and `Gc` reclaims through the `Locker`'s unlock methods
-(ADR-028/029). Cross-shard acquisition strategy, transaction lifecycle,
-commit orchestration, GC selection, and held-lock bookkeeping remain outside
-the coordinator.
+supplies direct commit, `Splitter` supplies leaf structural-gate acquisition,
+and `Gc` reclaims through the `Locker`'s unlock methods (ADR-028/029).
+Cross-shard acquisition strategy, transaction lifecycle, commit orchestration,
+GC selection, structural writes after gate acquisition, and held-lock
+bookkeeping remain outside the coordinator.
 
 | Component             | Layer            | Speaks                       | Owns                                                                                                                  | Must not know                       |
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |

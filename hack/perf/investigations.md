@@ -14,8 +14,9 @@ This file is evidence, not a record of accepted behavior:
 
 ## 2026-08-21: root-leaf structural-gate coordinator rationale
 
-Status: investigation complete; no engine change made. No retained benchmark
-compares direct and coordinated structural-gate acquisition on a root leaf.
+Status: implemented through the existing coordinator interface. A deterministic
+regression proves one root read and one conditional write. No retained benchmark
+compares contention or latency between the two acquisition paths.
 
 ### Finding
 
@@ -28,18 +29,18 @@ a non-root leaf.
 [`ShardCoordinator::submit_shard`](../../crates/glassdb-trans/src/shard_coord.rs)
 and
 [`StructuralGateResolver`](../../crates/glassdb-trans/src/node_locking.rs)
-support root and non-root leaf paths. However,
+support root and non-root leaf paths. Before this change,
 [`StructuralNodeAccess::acquire_structural_gate`](../../crates/glassdb-trans/src/split.rs)
-selects the path from `Option<&NodeToken>`:
+selected the path from `Option<&NodeToken>`:
 
 - a non-root leaf uses the coordinator;
 - a non-root index uses the direct path; and
 - the root always uses the direct path, even when it is a leaf.
 
-Thus, the root-leaf exception is based on the address, not the node shape. Its
-direct CAS can race data mutations that use the same `Database` coordinator.
+Thus, the root-leaf exception was based on the address, not the node shape. Its
+direct CAS could race data mutations that used the same `Database` coordinator.
 
-The candidate changes only root-leaf gate acquisition. Index acquisition and
+The change affects only root-leaf gate acquisition. Index acquisition and
 writes after the gate is held stay outside it. This includes a root rewrite and
 [ADR-062](../../docs/adr/062-splitter-driven-tombstone-reclamation.md)
 compaction, which can finish without a split.
@@ -66,10 +67,11 @@ The retained performance evidence does not justify the bypass:
 - The 2026-08-12 coordinator measurements show that competing CAS owners can be
   costly. They did not measure gate acquisition on `_r`.
 
-A coordinated variant must reuse the root load that classifies the node. It
-must not add a second physical root read.
+A coordinated root leaf reuses the root load that classifies the node. The
+regression records one coordinator submission and round, one physical root
+read, and one conditional write.
 
-### Required guardrail
+### Remaining performance guardrail
 
 Compare only the two root-leaf acquisition paths under one shared `Database`
 and under independent `Database` instances. Race each path with ordinary
@@ -81,7 +83,7 @@ and latency. Verify values, deleted-key absence, final topology, holder cleanup,
 and bounded shutdown.
 
 Until this comparison exists, coordinated root-leaf acquisition is an
-architecture candidate, not a performance claim.
+architecture correction, not a performance improvement claim.
 
 ## 2026-08-18: ADR-061 acceptance matrix
 

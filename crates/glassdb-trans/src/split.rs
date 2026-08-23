@@ -29,9 +29,9 @@
 //!    right-link hop; recurse when the parent itself overflows. Purely an
 //!    optimization — correctness never depends on it landing.
 //!
-//! A leaf split acquires structure-write through the shared
-//! [`ShardCoordinator`], in the same folded CAS stream as data mutations on
-//! that leaf. Interior indexes and roots still use direct structural CASes.
+//! A leaf split, including a root-leaf split, acquires structure-write through
+//! the shared [`ShardCoordinator`], in the same folded CAS stream as data
+//! mutations on that leaf. Interior indexes use direct structural CASes.
 //! The source shrink (or root rewrite) releases structure-write inline, so no
 //! unlocked post-split state is exposed before a separate release CAS.
 //! Once a leaf is quiescent behind that gate, holder-free tombstones are
@@ -138,16 +138,22 @@ impl StructuralNodeAccess {
         token: Option<&NodeToken>,
         id: &TxId,
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
-        if let Some(token) = token {
-            let (node, _) = self
-                .shards
-                .load_node(collection, token, Requirement::Any)
-                .await?;
-            if node.as_leaf().is_some() {
-                return self
-                    .acquire_leaf_structural_gate(collection, token, id)
-                    .await;
-            }
+        let path = match token {
+            Some(token) => ObjectPath::Node {
+                collection: collection.clone(),
+                token: token.clone(),
+            },
+            None => ObjectPath::TreeRoot {
+                collection: collection.clone(),
+            },
+        };
+        let (node, _) = match self.shards.load_node_at(&path, Requirement::Any).await {
+            Ok(loaded) => loaded,
+            Err(StorageError::NotFound) if token.is_none() => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if node.as_leaf().is_some() {
+            return self.acquire_leaf_structural_gate(&path, id).await;
         }
         self.acquire_structural_gate_direct(collection, token, id)
             .await
@@ -155,18 +161,13 @@ impl StructuralNodeAccess {
 
     async fn acquire_leaf_structural_gate(
         &self,
-        collection: &CollectionAddress,
-        token: &NodeToken,
+        path: &ObjectPath,
         id: &TxId,
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
-        let path = ObjectPath::Node {
-            collection: collection.clone(),
-            token: token.clone(),
-        };
         let outcome = self
             .coord
             .submit_shard(
-                &path,
+                path,
                 id,
                 Arc::new(StructuralGateResolver::new(id.clone(), path.clone())),
                 Requirement::Any,
@@ -186,10 +187,7 @@ impl StructuralNodeAccess {
             .and_then(|coordinated| coordinated.cas_precondition)
             .map(|observation| Requirement::AtLeast(observation.current_after()))
             .unwrap_or(Requirement::Any);
-        let (node, version) = self
-            .shards
-            .load_node(collection, token, requirement)
-            .await?;
+        let (node, version) = self.shards.load_node_at(path, requirement).await?;
         if node.structural_gate().lock_type() == LockType::Write
             && node.structural_gate().contains(id)
         {
@@ -1746,9 +1744,9 @@ impl Splitter {
             .await
     }
 
-    /// Acquires a source node's structure-write lock under wound-wait. A leaf
-    /// joins the shared coordinator round; roots and interior indexes use the
-    /// direct structural CAS path because they carry no data-mutation traffic.
+    /// Acquires a source node's structure-write lock under wound-wait. A leaf,
+    /// including the fixed root while it is a leaf, joins the shared coordinator
+    /// round. An index uses the direct structural CAS path.
     async fn acquire_structural_gate(
         &self,
         collection: &CollectionAddress,
@@ -2937,6 +2935,61 @@ mod tests {
             }
         );
         assert_eq!(cleanup_hints.pending(), vec![first, second]);
+    }
+
+    #[tokio::test]
+    async fn root_leaf_gate_acquisition_uses_one_coordinator_round() {
+        let recorder = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
+        let operations = recorder.log();
+        let seed = store_with_backend(recorder.clone());
+        seed.create_root(COLL, &leaf_node(&[b"a"], None, None))
+            .await
+            .unwrap();
+
+        // Use a new cache so the operation count includes the root load that
+        // classifies the node before structural-gate acquisition.
+        let s = store_with_backend(recorder);
+        let bg = Arc::new(Background::new());
+        let sp = splitter(&s, &bg, tiny());
+        operations.lock().unwrap().clear();
+
+        let worker = TxId::with_priority(1, b"root-gate");
+        let (node, observation) = sp
+            .structural_nodes
+            .acquire_structural_gate(&collection(), None, &worker)
+            .await
+            .unwrap()
+            .expect("the root leaf can acquire its structural gate");
+
+        assert!(node.structural_gate().contains(&worker));
+        assert_eq!(observation.path(), &root_path());
+        assert_eq!(
+            sp.structural_nodes.coord.stats_and_reset(),
+            crate::shard_coord::ShardCoordinatorStats {
+                submissions: 1,
+                rounds: 1,
+                cas_retries: 0,
+            }
+        );
+        let root_path = root_path().to_string();
+        let root_operations: Vec<_> = operations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|operation| operation.path == root_path)
+            .map(|operation| operation.op)
+            .collect();
+        assert_eq!(root_operations, ["read", "write_if"]);
+
+        sp.structural_nodes
+            .release_structural_gate(&collection(), None, &worker)
+            .await
+            .unwrap();
+        let (root, _) = s
+            .load_root(COLL, Requirement::AtLeast(s.timeline.now()))
+            .await
+            .unwrap();
+        assert!(root.structural_gate().holders().is_empty());
     }
 
     #[tokio::test]
