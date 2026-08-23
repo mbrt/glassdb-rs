@@ -1395,14 +1395,14 @@ mod tests {
                 .await
         });
         let locker = ctx.locker.clone();
-        let data = crate::access::Data {
-            reads: Vec::new(),
-            writes: vec![crate::access::WriteAccess::put(
+        let data = crate::access::AccessSet::new(
+            Vec::new(),
+            vec![crate::access::WriteAccess::put(
                 key_path(&kb),
                 Arc::from(&b"v2"[..]),
             )],
-            scans: Vec::new(),
-        };
+            Vec::new(),
+        );
         let live2 = live.clone();
         let lock_requirement = Requirement::AtLeast(ctx.timeline.now());
         let acquire = tokio::spawn(async move {

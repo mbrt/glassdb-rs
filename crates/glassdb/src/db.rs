@@ -10,7 +10,7 @@ use glassdb_concurr::rt;
 use glassdb_data::{DatabaseId, TxId};
 use glassdb_storage::{InlinePolicy, PersistentCacheConfig, PersistentCacheMedia, SplitPolicy};
 use glassdb_trans::{
-    CollectionData, Data, Engine, EngineConfig, EngineTransaction, ProtocolTiming, TransError,
+    AccessSet, CollectionData, Engine, EngineConfig, EngineTransaction, ProtocolTiming, TransError,
 };
 use tokio::sync::Notify;
 
@@ -494,14 +494,14 @@ impl DbInner {
             }
 
             // Collect the accesses produced by the user function.
-            let (access, collection_access) = tx.collect_accesses();
+            let (accesses, collection_access) = tx.collect_accesses();
             let metrics = tx.metrics();
-            stats.reads += access.reads.len() as u64;
+            stats.reads += accesses.read_count() as u64;
             stats.cache_hits += metrics.cache_hits;
-            stats.writes += access.writes.len() as u64;
+            stats.writes += accesses.write_count() as u64;
 
             let restart_after_wound = if fn_res.is_ok() {
-                driver.install_accesses(access, collection_access);
+                driver.install_accesses(accesses, collection_access);
                 match driver.commit().await {
                     Ok(()) => break fn_res,
                     Err(TransError::Wounded) => true,
@@ -511,7 +511,10 @@ impl DbInner {
             } else {
                 // The user function returned an error. It might be the result
                 // of a spurious read, so validate only the reads.
-                match driver.validate_body_error(access, collection_access).await {
+                match driver
+                    .validate_body_error(accesses, collection_access)
+                    .await
+                {
                     Err(TransError::Retry) => false,
                     Err(TransError::Wounded) => true,
                     _ => break fn_res,
@@ -553,14 +556,14 @@ impl<'a> AttemptDriver<'a> {
     }
 
     /// Installs the accesses collected from the latest closure execution.
-    fn install_accesses(&mut self, access: Data, collection_access: CollectionData) {
+    fn install_accesses(&mut self, accesses: AccessSet, collection_access: CollectionData) {
         match self.resources.as_mut() {
             Some(resources) => {
                 self.engine
-                    .reset_transaction(&mut resources.handle, access, collection_access)
+                    .reset_transaction(&mut resources.handle, accesses, collection_access)
             }
             None => {
-                let handle = self.engine.begin_transaction(access, collection_access);
+                let handle = self.engine.begin_transaction(accesses, collection_access);
                 self.resources = Some(AttemptResources::new(self.engine, handle));
             }
         }
@@ -569,11 +572,13 @@ impl<'a> AttemptDriver<'a> {
     /// Validates the reads that led the transaction body to return an error.
     async fn validate_body_error(
         &mut self,
-        mut access: Data,
+        accesses: AccessSet,
         collection_access: CollectionData,
     ) -> Result<(), TransError> {
-        access.writes.clear();
-        self.install_accesses(access, collection_access.into_read_only());
+        self.install_accesses(
+            accesses.into_read_only(),
+            collection_access.into_read_only(),
+        );
         let resources = self
             .resources
             .as_mut()
@@ -700,7 +705,7 @@ mod tests {
             .await
             .unwrap();
         let mut driver = AttemptDriver::new(&db.inner.engine);
-        driver.install_accesses(Data::default(), CollectionData::default());
+        driver.install_accesses(AccessSet::default(), CollectionData::default());
 
         let original_id = driver
             .resources

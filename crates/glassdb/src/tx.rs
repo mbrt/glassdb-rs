@@ -16,7 +16,7 @@ mod data;
 use std::sync::{Arc, Mutex};
 
 use glassdb_data::{CollectionAddress, KeyRef};
-use glassdb_trans::{CollectionData, Data};
+use glassdb_trans::{AccessSet, CollectionData};
 
 use self::catalog::{CatalogOverlay, CreateMode};
 use self::data::{DataOverlay, OverlayRead};
@@ -336,7 +336,7 @@ impl Transaction {
         inner.catalog.reset();
     }
 
-    pub(crate) fn collect_accesses(&self) -> (Data, CollectionData) {
+    pub(crate) fn collect_accesses(&self) -> (AccessSet, CollectionData) {
         let inner = self.inner.lock().unwrap();
         (inner.data.accesses(), inner.catalog.accesses())
     }

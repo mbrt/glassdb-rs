@@ -21,7 +21,7 @@ mod tlocker;
 mod wound_wait;
 
 pub use access::{
-    Data, ReadAccess, ReadEvidence, ScanAccess, ScanMutation, ScanRange, WriteAccess,
+    AccessSet, ReadAccess, ReadEvidence, ScanAccess, ScanMutation, ScanRange, WriteAccess,
 };
 pub use algo::DirectCommitStats;
 pub use collections::{
