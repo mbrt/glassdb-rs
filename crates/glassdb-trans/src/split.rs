@@ -1820,9 +1820,7 @@ impl Splitter {
         if split_avoided {
             self.stats.splits_avoided.fetch_add(1, Ordering::Relaxed);
         }
-        for writer in writers {
-            self.cleanup_hints.schedule(writer.clone());
-        }
+        self.cleanup_hints.schedule_all(writers.iter().cloned());
     }
 
     /// Persists compaction and opens the gate in the same CAS when it made the

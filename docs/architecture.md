@@ -159,27 +159,27 @@ types stay with their policy owners; the coordinator exposes one typed
     · read validation:  effective-writer token vs. observed (post-lock)
     · speaks:           Data · TxId · LockOutcome{Locked|Conflict}
 
-      │ validate           │ lock(Data, serial)  │ status        │ reclaim hint
+      │ validate           │ lock(Data, serial)  │ status        │ cleanup hint
       │                    │  ▲ LockedTx (opaque) │               │
       ▼                    ▼  │                    ▼               ▼
- ┌─────────┐   ┌───────────────────────┐   ┌──────────┐   ┌─────────┐
- │ Reader  │   │ Locker — lock POLICY  │   │ Monitor  │   │   Gc    │
- │ effctv. │   │ owns the SHARD model: │   │ tx-log   │   │ tx-log  │
- │ writer/ │   │ · path → shard groups │   │ lifecycle│   │ reverse │
- │ validate│   │ · parallel/serial     │   │ wound /  │   │ liveness│
- │ reads + │   │ · hold-and-wait loop  │   │ wait /   │   │ release │
- │ validate│   │ · builds operations   │   │ refresh  │   │ →Locker │
- └────┬────┘   └───────────┬───────────┘   └────┬─────┘   └────┬────┘
-      │                    │ acquire / write-back / release    │
-      │                    │ + DirectCommit / Gc publication   │
-      │                    ▼                                   │
-      │       ┌───────────────────────────────┐                │
-      │       │ ShardCoordinator — FOLD ENGINE│                │
-      │       │ identity · order · admission  │                │
-      │       │ load once · fold · CAS once · │                │
-      │       │ per-member in-doubt recovery  │                │
-      │       └───────────────┬───────────────┘                │
-      ▼                       ▼            ▼ (tx logs)          ▼
+ ┌─────────┐   ┌───────────────────────┐   ┌──────────┐   ┌────────────────┐
+ │ Reader  │   │ Locker — lock POLICY  │   │ Monitor  │   │ TxCleanupHints │
+ │ effctv. │   │ owns the SHARD model: │   │ tx-log   │   │ bounded queue  │
+ │ writer/ │   │ · path → shard groups │   │ lifecycle│   │ ordered input  │
+ │ validate│   │ · parallel/serial     │   │ wound /  │   │ drop oldest   │
+ │ reads + │   │ · hold-and-wait loop  │   │ wait /   │   │ drain dedupes │
+ │ validate│   │ · builds operations   │   │ refresh  │   └───────┬────────┘
+ └────┬────┘   └───────────┬───────────┘   └────┬─────┘           │ candidates
+      │                    │ acquire / write-back / release       ▼
+      │                    │ + DirectCommit / Gc publication  ┌─────────┐
+      │                    ▼                                  │   Gc    │
+      │       ┌───────────────────────────────┐           │ tx-log  │
+      │       │ ShardCoordinator — FOLD ENGINE│           │ reverse │
+      │       │ identity · order · admission  │           │ liveness│
+      │       │ load once · fold · CAS once · │           │ unlock  │
+      │       │ per-member in-doubt recovery  │           │ →Locker │
+      │       └───────────────┬───────────────┘           └────┬────┘
+      ▼                       ▼            ▼ (tx logs)     ▼
 ══════════════════════════ glassdb-storage ══════════════════════════
   CollectionStore (_i records) · NodeStore (_r/_n B-link nodes)
   StructuralLogStore (_s recovery records) · TLogger (_t logs)
@@ -268,8 +268,9 @@ bookkeeping remain outside the coordinator.
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
 | `glassdb` (`tx_impl`) | API / retry      | `Engine`, closures, `Error`  | metadata bootstrap, operation admission, user body, retry loop, public handles/errors, cancel-safety                  | stores, locks, shards, tx logs, runtime wiring |
 | `Engine`              | runtime façade   | logical keys, `Data`, configuration | component assembly/lifetime, read/scan/catalog entry points, transaction-attempt delegation and abandonment retirement, shutdown, component stats/diagnostics | user closures, public handles/errors, body retry policy |
-| `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome` | transaction lifecycle, direct-vs-logged selection, cross-domain lock→validate→commit→write-back orchestration, abandoned-owner retirement, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), GC candidate hints | shard routing, CAS details, caching, collection lifecycle implementation, the split mechanism beyond its `SplitHintSink` producer handle |
-| `DirectCommit`        | logless commit mechanism | `Data`, `TxId`, `KeyResolver`, shard operations | complete point-member normalization, one-leaf eligibility, atomic inline/tombstone publication, transaction-local recovery classification | transaction logs, range/catalog validation, waiting or wounding holders |
+| `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome`, `TxCleanupHints` | transaction lifecycle, direct-vs-logged selection, cross-domain lock→validate→commit→write-back orchestration, abandoned-owner retirement, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), GC candidate hints | shard routing, CAS details, caching, collection lifecycle implementation, GC execution, the split mechanism beyond its `SplitHintSink` producer handle |
+| `DirectCommit`        | logless commit mechanism | `Data`, `TxId`, `KeyResolver`, shard operations, `TxCleanupHints` | complete point-member normalization, one-leaf eligibility, atomic inline/tombstone publication, transaction-local recovery classification, predecessor cleanup hints | transaction logs, range/catalog validation, waiting or wounding holders, GC execution |
+| `TxCleanupHints`      | maintenance seam | `TxId`                       | bounded ordered cleanup-candidate queue, drop-oldest loss policy, drain-time de-duplication | GC execution, transaction policy, backend storage |
 | `CollectionCommit`    | collection-commit **policy** | `CollectionAttempt`, catalog, lifecycle | same-ID collection retry state, recovery and committed-log fields, incarnation preparation, validation, drop fencing, post-commit/abort cleanup | key locking, key validation, the atomic commit decision |
 | `Locker::keys`        | key-lock **policy** | `Data`, `TxId`, B-link nodes | key→leaf grouping, parallel & serial acquisition, hold-and-wait, acquire / write-back / release operations | collection-directory semantics |
 | `Locker::collections` | collection-lock **policy** | collection addresses, `TxId`, records | directory/topology lock acquisition, recovery write-back and release | key routing, B-link topology, catalog semantics |
@@ -280,7 +281,7 @@ bookkeeping remain outside the coordinator.
 | `KeyStateResolver`    | loaded key-state mechanism | nodes, entries, `TxId` | transaction-dependent interpretation of already-loaded key and node state | routing, scan composition, commit policy |
 | `Reader`              | read mechanism   | logical keys, resolved writers | value materialization | commit / lock policy                |
 | `Monitor`             | tx lifecycle     | `TxId`, tx logs              | status, wound/abort, lease refresh, waits                                                                             | shards                              |
-| `Gc`                  | maintenance      | `TxId`, shard objects        | mark-sweep GC: reverse liveness check, pin dead tx as wounded, paged shuffled `_t/<ss>/` walks, reclaims via the `Locker`'s coordinator-backed unlock | commit policy                       |
+| `Gc`                  | maintenance      | `TxCleanupHints`, `TxId`, shard objects | consumes cleanup hints, mark-sweep GC: reverse liveness check, pin dead tx as wounded, paged shuffled `_t/<ss>/` walks, reclaims via the `Locker`'s coordinator-backed unlock | commit policy                       |
 
 ### The lock boundary
 
@@ -1119,12 +1120,15 @@ candidate-driven **reverse mark-sweep** ([ADR-022](adr/022-garbage-collection-ma
   candidate `_t/` object records its own back-references (its `locks ∪ writes`),
   so GC reads a batch of candidates and confirms each one dead by GET-ing only
   the handful of nodes/records it names — never a database-wide scan.
-- **Candidate feed.** Candidates come from the write-back hint queue (the writer
-  a fresh commit just superseded, capped at `HINT_QUEUE_CAP`)
-  and shuffled passes over the 4,096 `{db}/_t/<ss>/` prefixes, which make the
-  candidate set complete regardless of lost hints. Each cycle stops after one
-  non-empty page or a bounded number of listing requests; an invalid provider
-  cursor restarts only its current shard.
+- **Candidate feed.** `Algo`, `DirectCommit`, and `Splitter` report useful
+  reverse-check candidates through one shared `TxCleanupHints` interface. It
+  preserves report order, bounds the queue at `HINT_QUEUE_CAP`, drops the oldest
+  hint at capacity, and de-duplicates each drained batch. `Gc` consumes the hints
+  without exposing its lifecycle or sweep mechanism to producers. Shuffled
+  passes over the 4,096 `{db}/_t/<ss>/` prefixes make the candidate set complete
+  regardless of lost hints. Each cycle stops after one non-empty page or a
+  bounded number of listing requests; an invalid provider cursor restarts only
+  its current shard.
 - **Safety horizon and pinned wounds.** The ADR-021 lease acts as the sweep horizon: a candidate
   within the horizon is always kept, because the non-atomic reverse check can
   race a lock a live transaction has taken but not yet published (ADR-024's lazy

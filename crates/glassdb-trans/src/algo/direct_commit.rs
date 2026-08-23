@@ -13,7 +13,7 @@ use glassdb_storage::{
 use super::attempt::AttemptState;
 use crate::access::{Data, WriteOp};
 use crate::error::TransError;
-use crate::gc::Gc;
+use crate::gc::TxCleanupHints;
 use crate::key_resolver::KeyResolver;
 use crate::key_state_resolver::HolderResolution;
 use crate::shard_coord::{
@@ -62,7 +62,7 @@ pub(super) struct DirectCommit {
     coord: ShardCoordinator,
     inline_policy: InlinePolicy,
     split_hints: SplitHintSink,
-    gc: Gc,
+    cleanup_hints: TxCleanupHints,
     counters: Arc<DirectCommitCounters>,
 }
 
@@ -73,14 +73,14 @@ impl DirectCommit {
         coord: ShardCoordinator,
         inline_policy: InlinePolicy,
         split_hints: SplitHintSink,
-        gc: Gc,
+        cleanup_hints: TxCleanupHints,
     ) -> Self {
         DirectCommit {
             resolver,
             coord,
             inline_policy,
             split_hints,
-            gc,
+            cleanup_hints,
             counters: Arc::new(DirectCommitCounters::default()),
         }
     }
@@ -144,9 +144,7 @@ impl DirectCommit {
                 DirectMutationOutcome::Landed(predecessors) => {
                     self.counters.landed.fetch_add(1, Ordering::Relaxed);
                     state.commit();
-                    for predecessor in predecessors {
-                        self.gc.schedule_tx_cleanup(predecessor);
-                    }
+                    self.cleanup_hints.schedule_all(predecessors);
                     return Ok(DirectAttempt::Committed);
                 }
                 DirectMutationOutcome::InDoubt(msg) => {

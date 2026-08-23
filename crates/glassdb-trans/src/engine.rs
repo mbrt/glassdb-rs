@@ -243,7 +243,7 @@ impl Engine {
             locker.clone(),
             collection_lifecycle.clone(),
             monitor.clone(),
-            cleanup_hints,
+            cleanup_hints.clone(),
         );
         gc.start();
         splitter.start();
@@ -261,7 +261,7 @@ impl Engine {
             coord.clone(),
             monitor,
             collection_commit,
-            gc,
+            cleanup_hints,
             Some(background_weak),
             resolver.clone(),
             split_policy,

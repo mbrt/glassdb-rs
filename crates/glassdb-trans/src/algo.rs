@@ -39,7 +39,7 @@ use crate::access::{Data, ReadAccess, WriteOp};
 use crate::collection_commit::{CollectionAttempt, CollectionCommit};
 use crate::collections::CollectionData;
 use crate::error::TransError;
-use crate::gc::Gc;
+use crate::gc::TxCleanupHints;
 use crate::key_resolver::KeyResolver;
 use crate::monitor::{Monitor, OwnerAbortOutcome};
 use crate::shard_coord::ShardCoordinator;
@@ -194,7 +194,7 @@ pub struct Algo {
     locker: Locker,
     direct_commit: DirectCommit,
     mon: Monitor,
-    gc: Gc,
+    cleanup_hints: TxCleanupHints,
     timeline: Timeline,
     // Factory for each transaction's same-identity acquisition schedule. Other
     // coordination loops own independent schedules from the same engine policy.
@@ -220,7 +220,7 @@ impl Algo {
         coord: ShardCoordinator,
         mon: Monitor,
         collection_commit: CollectionCommit,
-        gc: Gc,
+        cleanup_hints: TxCleanupHints,
         background: Option<Weak<Background>>,
         resolver: KeyResolver,
         split_policy: SplitPolicy,
@@ -232,7 +232,7 @@ impl Algo {
             coord,
             inline_policy,
             split_hints,
-            gc.clone(),
+            cleanup_hints.clone(),
         );
         Algo {
             shards,
@@ -240,7 +240,7 @@ impl Algo {
             locker,
             direct_commit,
             mon,
-            gc,
+            cleanup_hints,
             timeline,
             acquisition_retry,
             split_policy,
@@ -341,7 +341,7 @@ impl Algo {
         }
         match self.mon.abort_owned_tx(&tx.id).await? {
             OwnerAbortOutcome::Acknowledged => {
-                self.gc.schedule_tx_cleanup(tx.id.clone());
+                self.cleanup_hints.schedule(tx.id.clone());
                 self.collection_commit.abort(&tx.id, &tx.collections).await
             }
             // A dropped or otherwise unresolved owner operation was pinned as
@@ -349,7 +349,7 @@ impl Algo {
             // cleanup; local rollback must not race an effect that may land
             // after this future returns.
             OwnerAbortOutcome::Pinned => {
-                self.gc.schedule_tx_cleanup(tx.id.clone());
+                self.cleanup_hints.schedule(tx.id.clone());
                 Ok(())
             }
             // The commit point won before cleanup observed its result. Its
@@ -394,11 +394,11 @@ impl Algo {
             return;
         };
         let mon = self.mon.clone();
-        let gc = self.gc.clone();
+        let cleanup_hints = self.cleanup_hints.clone();
         let tx_id = tx_id.clone();
         bg.spawn_waited(async move {
             if mon.abort_owned_tx(&tx_id).await.is_ok() {
-                gc.schedule_tx_cleanup(tx_id);
+                cleanup_hints.schedule(tx_id);
             }
         });
     }
@@ -687,18 +687,18 @@ impl Algo {
         match self.background.as_ref().and_then(|w| w.upgrade()) {
             Some(bg) => {
                 let locker = self.locker.clone();
-                let gc = self.gc.clone();
+                let cleanup_hints = self.cleanup_hints.clone();
                 let id = id.clone();
                 // Cancelling a dedup driver may need to spawn a successor for
                 // merged callers, so shutdown drains this finite pass.
                 bg.spawn_waited(async move {
                     let superseded = locker.keys().write_back(&id, &locked).await;
-                    feed_gc_hints(&gc, superseded);
+                    cleanup_hints.schedule_all(superseded);
                 });
             }
             None => {
                 let superseded = self.locker.keys().write_back(id, &locked).await;
-                feed_gc_hints(&self.gc, superseded);
+                self.cleanup_hints.schedule_all(superseded);
             }
         }
     }
@@ -1048,15 +1048,6 @@ impl Algo {
     }
 }
 
-/// Feeds the transaction ids a write-back superseded to GC as reverse-check
-/// candidates (ADR-022): each is a former `current_writer` a fresh commit's
-/// pointer overwrote, so it just lost a reference and may now be collectable.
-fn feed_gc_hints(gc: &Gc, superseded: Vec<TxId>) {
-    for prev in superseded {
-        gc.schedule_tx_cleanup(prev);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1208,17 +1199,6 @@ mod tests {
             RetryConfig::default(),
             Arc::new(splitter.clone()),
         );
-        let gc = Gc::new(
-            bg_weak.clone(),
-            tlogger.clone(),
-            shards.clone(),
-            structural_logs,
-            timeline.clone(),
-            locker.clone(),
-            collection_lifecycle.clone(),
-            tmon.clone(),
-            cleanup_hints,
-        );
         let collection_commit = CollectionCommit::new(
             CollectionCatalog::new(collection_state),
             collection_lifecycle,
@@ -1244,7 +1224,7 @@ mod tests {
             coord.clone(),
             tmon.clone(),
             collection_commit,
-            gc,
+            cleanup_hints,
             managed_retirement.then_some(bg_weak),
             resolver,
             split_policy,
