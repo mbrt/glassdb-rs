@@ -137,56 +137,53 @@ types stay with their policy owners; the coordinator exposes one typed
 `coordinate` interface and keeps raw resolver submission private. For the full design see
 [designs/object-storage-native.md](designs/object-storage-native.md).
 
-```
-                         glassdb  (public API)
-        Database · Transaction · Collection · tx_impl retry loop
-      metadata bootstrap · user body · public errors/cancellation
-                                │  logical reads/scans/snapshots + Data
-                                ▼
-═══════════════════════════ glassdb-trans ═══════════════════════════
+```mermaid
+flowchart TD
+  API["glassdb public API<br/>Database · Transaction · Collection<br/>metadata bootstrap · user body · retry loop · public errors"]
 
-  Engine — runtime FAÇADE
-    · owns:             assembly · lifetime · shutdown
-    · dispatches:       reads · scans · collection snapshots
-    · delegates:        transaction-attempt lifecycle
-    · reports:          component stats · live diagnostics
-                                │
-                                ▼
-  Algo — commit POLICY  (no shard routing, no shard CAS)
-    · lifecycle:        begin / rebegin / end
-    · orchestrates:     lock → validate reads → commit point → write-back
-    · conflict policy:  wound · deadlock-timeout · serial · backoff
-    · read validation:  effective-writer token vs. observed (post-lock)
-    · speaks:           Data · TxId · LockOutcome{Locked|Conflict}
+  subgraph TRANS["glassdb-trans"]
+    direction TB
+    Engine["Engine — runtime façade<br/>assembly · lifetime · shutdown<br/>reads · scans · snapshots · diagnostics"]
+    Algo["Algo — commit policy<br/>attempt lifecycle · orchestration · conflict policy<br/>post-lock read validation"]
+    Reader["Reader / KeyResolver<br/>effective-writer reads and validation"]
+    Locker["Locker — lock policy<br/>key grouping · parallel or serial acquisition<br/>hold-and-wait · operation construction"]
+    Direct["DirectCommit<br/>logless same-leaf publication"]
+    Monitor["Monitor<br/>transaction-log lifecycle<br/>wound · wait · refresh"]
+    Hints["TxCleanupHints<br/>bounded ordered queue<br/>drop-oldest loss · drain de-duplication"]
+    Splitter["Splitter<br/>structural coordination and recovery"]
+    Coord["ShardCoordinator — fold engine<br/>identity · order · admission<br/>one load · one fold · one CAS<br/>per-member in-doubt recovery"]
+    Gc["Gc<br/>reverse liveness checks<br/>transaction-object reclamation"]
 
-      │ validate           │ lock(Data, serial)  │ status        │ cleanup hint
-      │                    │  ▲ LockedTx (opaque) │               │
-      ▼                    ▼  │                    ▼               ▼
- ┌─────────┐   ┌───────────────────────┐   ┌──────────┐   ┌────────────────┐
- │ Reader  │   │ Locker — lock POLICY  │   │ Monitor  │   │ TxCleanupHints │
- │ effctv. │   │ owns the SHARD model: │   │ tx-log   │   │ bounded queue  │
- │ writer/ │   │ · path → shard groups │   │ lifecycle│   │ ordered input  │
- │ validate│   │ · parallel/serial     │   │ wound /  │   │ drop oldest   │
- │ reads + │   │ · hold-and-wait loop  │   │ wait /   │   │ drain dedupes │
- │ validate│   │ · builds operations   │   │ refresh  │   └───────┬────────┘
- └────┬────┘   └───────────┬───────────┘   └────┬─────┘           │ candidates
-      │                    │ acquire / write-back / release       ▼
-      │                    │ + DirectCommit / Gc publication  ┌─────────┐
-      │                    ▼                                  │   Gc    │
-      │       ┌───────────────────────────────┐           │ tx-log  │
-      │       │ ShardCoordinator — FOLD ENGINE│           │ reverse │
-      │       │ identity · order · admission  │           │ liveness│
-      │       │ load once · fold · CAS once · │           │ unlock  │
-      │       │ per-member in-doubt recovery  │           │ →Locker │
-      │       └───────────────┬───────────────┘           └────┬────┘
-      ▼                       ▼            ▼ (tx logs)     ▼
-══════════════════════════ glassdb-storage ══════════════════════════
-  CollectionStore (_i records) · NodeStore (_r/_n B-link nodes)
-  StructuralLogStore (_s recovery records) · TLogger (_t logs)
-  CachedStore (decoded, path-keyed, bounded-freshness LRU)
-                                │
-                                ▼
-            glassdb-backend  (content-CAS object store: GCS / S3)
+    Engine -->|"transaction-attempt lifecycle"| Algo
+    Engine -->|"reads · scans · snapshots"| Reader
+    Algo -->|"validate"| Reader
+    Algo -->|"lock Data"| Locker
+    Locker -->|"LockedTx"| Algo
+    Algo -->|"status"| Monitor
+    Algo -->|"direct candidate"| Direct
+    Algo -->|"cleanup hints"| Hints
+    Direct -->|"cleanup hints"| Hints
+    Splitter -->|"cleanup hints"| Hints
+    Hints -->|"candidates"| Gc
+    Locker -->|"acquire · write-back · release"| Coord
+    Direct -->|"direct ShardOperation"| Coord
+    Splitter -->|"leaf structural-gate operation"| Coord
+    Gc -->|"reclaim through unlock"| Locker
+  end
+
+  subgraph STORAGE["glassdb-storage"]
+    Stores["CollectionStore · NodeStore · StructuralLogStore · TLogger<br/>CachedStore — decoded, path-keyed, bounded-freshness LRU"]
+  end
+
+  Backend["glassdb-backend<br/>content-CAS object store · GCS / S3"]
+
+  API -->|"logical reads · scans · snapshots · Data"| Engine
+  Reader -->|"typed reads"| Stores
+  Monitor -->|"transaction logs"| Stores
+  Coord -->|"data-node CAS"| Stores
+  Splitter -->|"structural logs and post-gate writes"| Stores
+  Gc -->|"reverse checks"| Stores
+  Stores --> Backend
 ```
 
 Collection management travels beside key access as `CollectionData`: logical
@@ -832,35 +829,18 @@ unified typed cache from
 ordering protocol from
 [ADR-043](adr/043-causally-coordinated-backend-operations.md):
 
-```
-┌───────────────────────────────────────┐
-│           Transaction Code            │
-└─────────────────┬─────────────────────┘
-                  │ tx.read / tx.write
-                  ▼
-┌───────────────────────────────────────┐
-│  Reader / KeyResolver / Monitor       │
-│ KeyStateResolver interprets nodes and │
-│ entries use transaction-object state  │
-└─────────────────┬─────────────────────┘
-                  │ Any read / AtLeast currentness
-                  ▼
-┌───────────────────────────────────────┐
-│       CachedStore (per database)      │
-│ Decoded L1, retained observations,    │
-│ evidence, and per-path coordination   │
-└─────────────────┬─────────────────────┘
-                  │ miss or insufficient evidence
-                  ▼
-┌───────────────────────────────────────┐
-│ Optional persistent encoded-body L2   │
-│ Fixed-capacity bodies and evidence    │
-└─────────────────┬─────────────────────┘
-                  │ miss or validation
-                  ▼
-┌───────────────────────────────────────┐
-│         Backend (Object Storage)      │
-└───────────────────────────────────────┘
+```mermaid
+flowchart TD
+  Tx["Transaction code"]
+  Access["Reader · KeyResolver · Monitor<br/>KeyStateResolver interprets nodes and entries<br/>with transaction-object state"]
+  L1["CachedStore — per database<br/>decoded L1 · retained observations · evidence<br/>per-path coordination"]
+  L2["Optional persistent encoded-body L2<br/>fixed-capacity bodies and evidence"]
+  Backend["Backend — object storage"]
+
+  Tx -->|"tx.read / tx.write"| Access
+  Access -->|"Any read / AtLeast currentness"| L1
+  L1 -->|"miss or insufficient evidence"| L2
+  L2 -->|"miss or validation"| Backend
 ```
 
 All typed physical objects share one byte-weighted, path-keyed LRU under a
