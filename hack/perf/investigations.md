@@ -12,6 +12,80 @@ This file is evidence, not a record of accepted behavior:
   performance work.
 - ADRs record significant decisions once accepted.
 
+## 2026-08-21: root-leaf structural-gate coordinator rationale
+
+Status: implemented through the typed coordinator interface. A deterministic
+regression proves one root read and one conditional write. No retained benchmark
+compares contention or latency between the two acquisition paths.
+
+### Finding
+
+A collection root `_r` starts as a leaf and becomes an index after its first
+split
+([ADR-050](../../docs/adr/050-separate-collection-record-and-tree-root.md)). As a
+leaf, it is the CAS unit for its keys and has the same coordination semantics as
+a non-root leaf.
+
+[`ShardCoordinator::coordinate`](../../crates/glassdb-trans/src/shard_coord.rs)
+accepts a typed
+[`ShardOperation`](../../crates/glassdb-trans/src/shard_coord.rs).
+[`StructuralGateOperation`](../../crates/glassdb-trans/src/node_locking.rs) uses
+this interface for root and non-root leaf paths. Before this change,
+[`StructuralNodeAccess::acquire_structural_gate`](../../crates/glassdb-trans/src/split.rs)
+selected the path from `Option<&NodeToken>`:
+
+- a non-root leaf uses the coordinator;
+- a non-root index uses the direct path; and
+- the root always uses the direct path, even when it is a leaf.
+
+Thus, the root-leaf exception was based on the address, not the node shape. Its
+direct CAS could race data mutations that used the same `Database` coordinator.
+
+The change affects only root-leaf gate acquisition. Index acquisition and
+writes after the gate is held stay outside it. This includes a root rewrite and
+[ADR-062](../../docs/adr/062-splitter-driven-tombstone-reclamation.md)
+compaction, which can finish without a split.
+
+### Rationale and evidence
+
+Commit `c4216276` introduced the exception with the claim that roots and indexes
+carry no data-mutation traffic. This claim did not apply to a root leaf, which
+was already key-bearing. The commit has no benchmark for the exception.
+ADR-050 later made the mismatch explicit by giving `_r` the same node semantics
+as other B-link nodes. The structural-gate operation already supported root
+paths; commit `c13aab70` only gave its coordinator call a typed result.
+
+The retained performance evidence does not justify the bypass:
+
+- [ADR-044](../../docs/adr/044-cas-fenced-structural-gate.md) reduced structural
+  work on ordinary mutations. It did not compare gate-acquisition paths.
+- [ADR-056](../../docs/adr/056-demand-driven-inline-pressure-splits.md) ran one
+  direct root split and one coordinated non-root split. It did not compare their
+  acquisition cost.
+- [ADR-061](../../docs/adr/061-atomic-logless-single-leaf-commits.md) sends
+  logless direct commits through the coordinator. Thus, “direct commit” does
+  not mean coordinator bypass.
+- The 2026-08-12 coordinator measurements show that competing CAS owners can be
+  costly. They did not measure gate acquisition on `_r`.
+
+A coordinated root leaf reuses the root load that classifies the node. The
+regression records one coordinator submission and round, one physical root
+read, and one conditional write.
+
+### Remaining performance guardrail
+
+Compare only the two root-leaf acquisition paths under one shared `Database`
+and under independent `Database` instances. Race each path with ordinary
+root-leaf mutations. Cover a real root split and ADR-062 compaction that avoids
+a split.
+
+Measure root reads, writes, bytes, precondition misses, coordinator retries,
+and latency. Verify values, deleted-key absence, final topology, holder cleanup,
+and bounded shutdown.
+
+Until this comparison exists, coordinated root-leaf acquisition is an
+architecture correction, not a performance improvement claim.
+
 ## 2026-08-18: ADR-061 acceptance matrix
 
 Status: complete; the direct path meets its uncontended one-CAS cost gate and
@@ -343,8 +417,8 @@ leaf. Remote status rates use all four shapes as the transaction denominator.
 The ordinary data path has no collection changes, so collection-directory
 write-back and `finish_committed` perform only local empty-work bookkeeping.
 Their combined measured cost is under `0.015 ms`. Key write-back is already a
-shutdown-drained `Background::spawn_waited` task; “move write-back off the
-foreground path” is therefore not an available optimization.
+shutdown-drained `Background::spawn_waited` task; "move write-back off the
+foreground path" is therefore not an available optimization.
 
 Resolver work also does not explain submission time. At the hot endpoints the
 `rwMany` fold remains roughly `8 ms` while submission changes by `3.1x`;

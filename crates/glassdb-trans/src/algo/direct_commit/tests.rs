@@ -58,9 +58,9 @@ fn put_resolver(
     key: KeyRef,
     read_writer: Option<Option<TxId>>,
     value: &[u8],
-) -> DirectCommitResolver {
+) -> DirectCommitOperation {
     let has_reads = read_writer.is_some();
-    DirectCommitResolver::new(
+    DirectCommitOperation::new(
         id,
         test_root_path(),
         DirectMember {
@@ -1020,7 +1020,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
         scans: Vec::new(),
     })
     .unwrap();
-    let resolver = DirectCommitResolver::new(
+    let resolver = DirectCommitOperation::new(
         id.clone(),
         test_root_path(),
         member,
@@ -1090,7 +1090,7 @@ async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
         scans: Vec::new(),
     })
     .unwrap();
-    let resolver = DirectCommitResolver::new(
+    let resolver = DirectCommitOperation::new(
         id,
         test_root_path(),
         member,
@@ -1134,7 +1134,7 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
         scans: Vec::new(),
     })
     .unwrap();
-    let resolver = DirectCommitResolver::new(
+    let resolver = DirectCommitOperation::new(
         id,
         test_root_path(),
         member,
@@ -1764,7 +1764,7 @@ async fn cross_key_aggregate_rejection_does_not_hint() {
         writes: 1,
         has_reads: true,
     };
-    let resolver = DirectCommitResolver::new(
+    let resolver = DirectCommitOperation::new(
         TxId::with_priority(1, b"direct"),
         test_root_path(),
         member,

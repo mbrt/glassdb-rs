@@ -12,10 +12,10 @@
 //! database per cycle. Instead each candidate `_t/` object records its own
 //! back-references (its `locks ∪ writes`), so GC works **backward**: it reads a
 //! batch of candidates and confirms each one dead by GET-ing only the handful of
-//! shards it names — never a database-wide scan. Candidates come from cleanup
-//! hints ([`Gc::schedule_tx_cleanup`] for a superseded writer and ADR-062
-//! tombstone reclamation) and paged walks of the sharded `{db}/_t/{ss}/`
-//! namespace, which makes the candidate set complete regardless of lost hints.
+//! shards it names — never a database-wide scan. Useful reverse-check candidates
+//! come through [`TxCleanupHints`]; paged walks of the sharded
+//! `{db}/_t/{ss}/` namespace make the candidate set complete regardless of lost
+//! hints.
 //!
 //! Safety rests on the ADR-021 lease as a horizon (`is_expired`): a candidate
 //! within the horizon is always kept, because the non-atomic reverse check can
@@ -63,31 +63,45 @@ const GC_LIST_REQUEST_BUDGET: usize = 64;
 /// a delete, never causes an unsafe one (ADR-022).
 const HINT_QUEUE_CAP: usize = 4096;
 
-/// Producer/consumer queue for transaction-object cleanup candidates.
+/// Shared cleanup-hint interface for transaction-object candidates.
 ///
-/// Keeping this handle separate from [`Gc`] lets maintenance code report a
-/// lost writer reference without depending on the collector's lifecycle.
+/// Producers report candidates without depending on [`Gc`]. The interface
+/// keeps the queue bounded, preserves report order, drops the oldest hint at
+/// capacity, and de-duplicates each batch when `Gc` drains it.
 #[derive(Clone, Default)]
 pub(crate) struct TxCleanupHints {
     queue: Arc<Mutex<VecDeque<TxId>>>,
 }
 
 impl TxCleanupHints {
+    /// Reports one transaction object for a reverse liveness check.
     pub(crate) fn schedule(&self, tid: TxId) {
-        let mut queue = self.queue.lock().unwrap();
-        if queue.len() >= HINT_QUEUE_CAP {
-            queue.pop_front();
-        }
-        queue.push_back(tid);
+        self.schedule_all([tid]);
     }
 
-    fn drain(&self) -> Vec<TxId> {
-        self.queue.lock().unwrap().drain(..).collect()
+    /// Reports transaction objects for reverse liveness checks.
+    pub(crate) fn schedule_all(&self, tids: impl IntoIterator<Item = TxId>) {
+        let mut queue = self.queue.lock().unwrap();
+        for tid in tids {
+            if queue.len() >= HINT_QUEUE_CAP {
+                queue.pop_front();
+            }
+            queue.push_back(tid);
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn pending(&self) -> Vec<TxId> {
         self.queue.lock().unwrap().iter().cloned().collect()
+    }
+
+    fn drain(&self) -> Vec<TxId> {
+        let queued: Vec<_> = self.queue.lock().unwrap().drain(..).collect();
+        let mut seen = BTreeSet::new();
+        queued
+            .into_iter()
+            .filter(|tid| seen.insert(tid.clone()))
+            .collect()
     }
 }
 
@@ -105,7 +119,7 @@ pub struct Gc {
     locker: Locker,
     mon: Monitor,
     timeline: Timeline,
-    // Txids whose latest known leaf reference disappeared. Deduplicated when drained.
+    // Txids whose latest known leaf reference disappeared.
     hints: TxCleanupHints,
 }
 
@@ -188,25 +202,13 @@ impl Gc {
         });
     }
 
-    /// Enqueues a transaction id that lost a leaf reference as a reverse-check
-    /// candidate. The oldest hint is dropped when the queue is full; the paged
-    /// list still visits it eventually.
-    pub(crate) fn schedule_tx_cleanup(&self, tid: TxId) {
-        self.hints.schedule(tid);
-    }
-
     /// Runs a single sweep cycle: the buffered hints plus at most one non-empty
     /// transaction-log page, each checked by the reverse liveness check.
     /// Best-effort — a transient error on one candidate only delays its delete
     /// to a later cycle, so it is logged and the cycle continues.
     async fn run_once(&self, scan: &mut TxScan) {
-        let mut seen: BTreeSet<TxId> = BTreeSet::new();
-        let mut candidates: Vec<TxId> = Vec::new();
-        for tid in self.hints.drain() {
-            if seen.insert(tid.clone()) {
-                candidates.push(tid);
-            }
-        }
+        let mut candidates = self.hints.drain();
+        let mut seen: BTreeSet<TxId> = candidates.iter().cloned().collect();
         for tid in self.next_list_page(scan).await {
             if seen.insert(tid.clone()) {
                 candidates.push(tid);
@@ -650,6 +652,7 @@ mod tests {
 
     struct Ctx {
         gc: Gc,
+        hints: TxCleanupHints,
         tl: TLogger,
         records: CollectionStore,
         shards: NodeStore,
@@ -711,6 +714,7 @@ mod tests {
             mon.clone(),
             RetryConfig::default(),
         );
+        let hints = TxCleanupHints::default();
         let gc = Gc::new(
             Arc::downgrade(&bg),
             tl.clone(),
@@ -726,10 +730,11 @@ mod tests {
                 Arc::new(UnexpectedTopologySettler),
             ),
             mon.clone(),
-            TxCleanupHints::default(),
+            hints.clone(),
         );
         Ctx {
             gc,
+            hints,
             tl,
             records,
             shards,
@@ -741,6 +746,42 @@ mod tests {
 
     fn tx(n: u8) -> TxId {
         TxId::from_bytes(vec![n])
+    }
+
+    #[test]
+    fn cleanup_hints_preserve_order_and_deduplicate_when_drained() {
+        let hints = TxCleanupHints::default();
+        let first = tx(1);
+        let second = tx(2);
+        let third = tx(3);
+
+        hints.schedule(first.clone());
+        hints.schedule_all([second.clone(), first.clone(), third.clone(), second.clone()]);
+
+        assert_eq!(
+            hints.pending(),
+            vec![
+                first.clone(),
+                second.clone(),
+                first.clone(),
+                third.clone(),
+                second.clone(),
+            ]
+        );
+        assert_eq!(hints.drain(), vec![first, second, third]);
+        assert!(hints.pending().is_empty());
+    }
+
+    #[test]
+    fn cleanup_hint_batch_is_bounded_and_drops_the_oldest() {
+        let hints = TxCleanupHints::default();
+        let scheduled: Vec<_> = (0..HINT_QUEUE_CAP + 2)
+            .map(|ordinal| TxId::from_bytes(ordinal.to_be_bytes().to_vec()))
+            .collect();
+
+        hints.schedule_all(scheduled.clone());
+
+        assert_eq!(hints.pending(), scheduled[2..]);
     }
 
     fn key_path(k: &[u8]) -> KeyRef {
@@ -937,7 +978,7 @@ mod tests {
         log.status = TxCommitStatus::Aborted;
         log.prepared_collections.push(prepared.clone());
         ctx.tl.set(&log).await.unwrap();
-        ctx.gc.schedule_tx_cleanup(id.clone());
+        ctx.hints.schedule(id.clone());
 
         run_once(&ctx.gc).await;
 
@@ -996,7 +1037,7 @@ mod tests {
                 future
             }
         });
-        ctx.gc.schedule_tx_cleanup(id.clone());
+        ctx.hints.schedule(id.clone());
 
         run_once(&ctx.gc).await;
 
@@ -1012,7 +1053,7 @@ mod tests {
         );
 
         backend.clear_before();
-        ctx.gc.schedule_tx_cleanup(id.clone());
+        ctx.hints.schedule(id.clone());
         run_once(&ctx.gc).await;
         assert!(is_gone(&ctx.tl, &id).await);
         assert!(matches!(
@@ -1080,7 +1121,7 @@ mod tests {
             op: TxCollectionOp::Drop,
         });
         ctx.tl.set(&log).await.unwrap();
-        ctx.gc.schedule_tx_cleanup(id.clone());
+        ctx.hints.schedule(id.clone());
 
         run_once(&ctx.gc).await;
 
@@ -1123,7 +1164,7 @@ mod tests {
             typ: LockType::Write,
         });
         ctx.tl.set(&log).await.unwrap();
-        ctx.gc.schedule_tx_cleanup(id.clone());
+        ctx.hints.schedule(id.clone());
 
         run_once(&ctx.gc).await;
 
@@ -1141,7 +1182,7 @@ mod tests {
             .await
             .unwrap();
         store_entry(&ctx, b"k", writer_entry(b"k", &t)).await;
-        ctx.gc.schedule_tx_cleanup(t.clone());
+        ctx.hints.schedule(t.clone());
 
         run_once(&ctx.gc).await;
 
@@ -1161,7 +1202,7 @@ mod tests {
         log.locks = vec![write_lock(b"k")];
         ctx.tl.set(&log).await.unwrap();
         store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
-        ctx.gc.schedule_tx_cleanup(t.clone());
+        ctx.hints.schedule(t.clone());
 
         run_once(&ctx.gc).await;
 
@@ -1185,7 +1226,7 @@ mod tests {
         ctx.tl.set(&log).await.unwrap();
         store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
 
-        ctx.gc.schedule_tx_cleanup(t.clone());
+        ctx.hints.schedule(t.clone());
         run_once(&ctx.gc).await;
 
         // Death is durable...
@@ -1201,12 +1242,12 @@ mod tests {
         // the first cleanup pass. The pinned record makes another pass clean it
         // without relying on a finite tombstone window.
         store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
-        ctx.gc.schedule_tx_cleanup(t.clone());
+        ctx.hints.schedule(t.clone());
         run_once(&ctx.gc).await;
         assert!(lookup_entry(&ctx, b"k").await.is_none());
 
         tokio::time::sleep(PAST_HORIZON * 2).await;
-        ctx.gc.schedule_tx_cleanup(t.clone());
+        ctx.hints.schedule(t.clone());
         run_once(&ctx.gc).await;
         let got = ctx.tl.get_at(&t, Requirement::Any).await.unwrap();
         assert_eq!(got.value().unwrap().status, TxCommitStatus::Wounded);
@@ -1223,7 +1264,7 @@ mod tests {
         log.locks = vec![write_lock(b"k")];
         ctx.tl.set(&log).await.unwrap();
         store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
-        ctx.gc.schedule_tx_cleanup(t.clone());
+        ctx.hints.schedule(t.clone());
 
         run_once(&ctx.gc).await;
 
@@ -1243,7 +1284,7 @@ mod tests {
         log.locks = vec![write_lock(b"k")];
         ctx.tl.set(&log).await.unwrap();
         store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
-        ctx.gc.schedule_tx_cleanup(t.clone());
+        ctx.hints.schedule(t.clone());
 
         run_once(&ctx.gc).await;
 
@@ -1256,7 +1297,7 @@ mod tests {
     async fn logless_cleanup_hint_is_a_noop() {
         let ctx = new_ctx().await;
         let t = tx(9);
-        ctx.gc.hints.clone().schedule(t.clone());
+        ctx.hints.schedule(t.clone());
         run_once(&ctx.gc).await;
         assert!(is_gone(&ctx.tl, &t).await);
     }
