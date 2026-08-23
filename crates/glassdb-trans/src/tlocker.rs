@@ -47,8 +47,8 @@ use crate::error::TransError;
 use crate::monitor::Monitor;
 use crate::node_locking::NodeLockReconciler;
 use crate::shard_coord::{
-    CoordinatedOutcome, FoldOutcome, ResolveCtx, ShardCoordinator, ShardResolver, StageAdmission,
-    Step,
+    CoordinatedOutcome, FoldOutcome, ResolveCtx, ShardCoordinator, ShardOperation, ShardResolver,
+    StageAdmission, Step,
 };
 use crate::wound_wait::{Reclaim, try_reclaim};
 
@@ -339,19 +339,21 @@ fn leaf_ref(path: &ObjectPath) -> Result<LeafRef, TransError> {
     }
 }
 
-// --- Shard resolvers (the locking policy the Locker installs, ADR-028) ------
+// --- Shard operations (the locking policy the Locker supplies, ADR-028) -----
 
 /// Acquires locks on its keys: resolve every key's holders (help-forward
 /// committed, drop abort-side terminal, wound-wait the live pending ones) and install this
 /// transaction's lock (ADR-024).
-struct AcquireResolver {
+struct AcquireOperation {
     id: TxId,
+    path: ObjectPath,
     intents: Arc<Vec<KeyIntent>>,
     membership: LockType,
+    requirement: Requirement,
 }
 
 #[async_trait]
-impl ShardResolver for AcquireResolver {
+impl ShardResolver for AcquireOperation {
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
@@ -430,6 +432,55 @@ impl ShardResolver for AcquireResolver {
     }
 }
 
+impl ShardOperation for AcquireOperation {
+    type Output = AcquireOutcome;
+
+    fn path(&self) -> &ObjectPath {
+        &self.path
+    }
+
+    fn id(&self) -> &TxId {
+        &self.id
+    }
+
+    fn first_requirement(&self) -> Requirement {
+        self.requirement
+    }
+
+    fn complete(&self, outcome: Option<CoordinatedOutcome>) -> Result<Self::Output, TransError> {
+        let Some(coordinated) = outcome else {
+            return Err(TransError::other(
+                "coordinator shut down while locking leaf",
+            ));
+        };
+        match coordinated.outcome {
+            FoldOutcome::Locked { typ, membership } => coordinated
+                .cas_precondition
+                .map(|observation| {
+                    AcquireOutcome::Locked(ShardLockReceipt {
+                        observation,
+                        held: HeldLeaf {
+                            entry_lock: typ,
+                            membership,
+                        },
+                    })
+                })
+                .ok_or_else(|| TransError::other("lock CAS returned no precondition receipt")),
+            FoldOutcome::Wait(holder) => Ok(AcquireOutcome::Wait(holder)),
+            FoldOutcome::LeafFull => Ok(AcquireOutcome::LeafFull),
+            // A result from another operation kind is not proof that this lock
+            // landed. The safe response is the ordinary release-and-relock path.
+            FoldOutcome::Conflict
+            | FoldOutcome::Released { .. }
+            | FoldOutcome::Reroute
+            | FoldOutcome::Landed
+            | FoldOutcome::Moved
+            | FoldOutcome::Replay
+            | FoldOutcome::InDoubt(_) => Ok(AcquireOutcome::Conflict),
+        }
+    }
+}
+
 /// The lock type recorded for a shard hold: its strongest intention, so the
 /// diagnostic snapshot distinguishes read-only from write holders.
 fn shard_lock_type(intents: &[KeyIntent]) -> LockType {
@@ -445,13 +496,15 @@ fn shard_lock_type(intents: &[KeyIntent]) -> LockType {
 /// Publishes its committed writes on its keys and drops its holds (ADR-020).
 /// A gated leaf is mutated only after the current routed state proves this
 /// transaction still has a holder that needs publishing.
-struct WriteBackResolver {
+struct WriteBackOperation {
     id: TxId,
+    path: ObjectPath,
     intents: Arc<Vec<KeyIntent>>,
+    requirement: Requirement,
 }
 
 #[async_trait]
-impl ShardResolver for WriteBackResolver {
+impl ShardResolver for WriteBackOperation {
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
@@ -529,14 +582,58 @@ impl ShardResolver for WriteBackResolver {
     }
 }
 
+impl ShardOperation for WriteBackOperation {
+    type Output = WriteBackOutcome;
+
+    fn path(&self) -> &ObjectPath {
+        &self.path
+    }
+
+    fn id(&self) -> &TxId {
+        &self.id
+    }
+
+    fn first_requirement(&self) -> Requirement {
+        self.requirement
+    }
+
+    fn complete(&self, outcome: Option<CoordinatedOutcome>) -> Result<Self::Output, TransError> {
+        match outcome {
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Released { superseded },
+                ..
+            }) => Ok(WriteBackOutcome::Released(superseded)),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Reroute,
+                ..
+            }) => Ok(WriteBackOutcome::Reroute),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Wait(_),
+                ..
+            }) => {
+                // The committed log makes later publication and cleanup
+                // recoverable, so a live structural gate need not delay commit.
+                Ok(WriteBackOutcome::Deferred)
+            }
+            Some(_) => Err(TransError::other(
+                "write-back produced a non-cleanup outcome",
+            )),
+            None => Err(TransError::other("coordinator shut down during write-back")),
+        }
+    }
+}
+
 /// Drops every hold this transaction has in the shard, publishing nothing
 /// (ADR-024 serial-fallback release).
-struct ReleaseResolver {
+#[derive(Clone)]
+struct ReleaseOperation {
     id: TxId,
+    path: ObjectPath,
+    requirement: Requirement,
 }
 
 #[async_trait]
-impl ShardResolver for ReleaseResolver {
+impl ShardResolver for ReleaseOperation {
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
@@ -589,6 +686,37 @@ impl ShardResolver for ReleaseResolver {
     }
 }
 
+impl ShardOperation for ReleaseOperation {
+    type Output = ReleaseOutcome;
+
+    fn path(&self) -> &ObjectPath {
+        &self.path
+    }
+
+    fn id(&self) -> &TxId {
+        &self.id
+    }
+
+    fn first_requirement(&self) -> Requirement {
+        self.requirement
+    }
+
+    fn complete(&self, outcome: Option<CoordinatedOutcome>) -> Result<Self::Output, TransError> {
+        match outcome {
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Released { .. },
+                ..
+            }) => Ok(ReleaseOutcome::Released),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Wait(holder),
+                ..
+            }) => Ok(ReleaseOutcome::Wait(holder)),
+            Some(_) => Err(TransError::other("release produced a non-cleanup outcome")),
+            None => Err(TransError::other("coordinator shut down during release")),
+        }
+    }
+}
+
 /// Per-key resolution within a shard CAS attempt.
 enum EntryResolution {
     /// The lock is installed in `entry`. The boolean is true when the intent
@@ -609,6 +737,18 @@ enum WriteBackOutcome {
     Released(Vec<TxId>),
     Reroute,
     Deferred,
+}
+
+enum AcquireOutcome {
+    Locked(ShardLockReceipt),
+    Wait(TxId),
+    Conflict,
+    LeafFull,
+}
+
+enum ReleaseOutcome {
+    Released,
+    Wait(TxId),
 }
 
 /// Resolves the holders of an entry (help-forward committed, drop aborted,
@@ -1092,45 +1232,6 @@ impl KeyLocker {
         Ok(ShardsOutcome::Locked(receipts))
     }
 
-    /// Installs this transaction's [`AcquireResolver`] on a shard through the
-    /// shared [`ShardCoordinator`] and returns its single-round coordinated
-    /// outcome. The hold-and-wait loop (on [`FoldOutcome::Wait`]) lives in
-    /// [`lock_shard`](Self::lock_shard) above. A shutdown mid-flight surfaces as
-    /// an error so the caller aborts the lock rather than silently proceeding.
-    async fn acquire(
-        &self,
-        id: &TxId,
-        path: &ObjectPath,
-        intents: Arc<Vec<KeyIntent>>,
-        membership: LockType,
-        requirement: Requirement,
-    ) -> Result<CoordinatedOutcome, TransError> {
-        let resolver = Arc::new(AcquireResolver {
-            id: id.clone(),
-            intents: intents.clone(),
-            membership,
-        });
-        match self
-            .coord
-            .submit_shard(path, id, resolver, requirement)
-            .await?
-        {
-            // The lock landed: record the leaf hold so the serial-fallback
-            // release and diagnostics can find it (the engine no longer tracks
-            // this, ADR-028). The outcome carries the acquired strength, so the
-            // caller records it without re-deriving from the intents.
-            Some(coordinated) => {
-                if let FoldOutcome::Locked { typ, membership } = &coordinated.outcome {
-                    self.record_leaf_lock(id, path, *typ, *membership);
-                }
-                Ok(coordinated)
-            }
-            None => Err(TransError::other(
-                "coordinator shut down while locking leaf",
-            )),
-        }
-    }
-
     /// Publishes a group and re-descends when a split moved any of its keys.
     async fn write_back_routed(
         &self,
@@ -1171,7 +1272,7 @@ impl KeyLocker {
         Ok(superseded)
     }
 
-    /// Installs this transaction's [`WriteBackResolver`] on one routed shard.
+    /// Coordinates this transaction's write-back on one routed shard.
     async fn write_back_shard(
         &self,
         id: &TxId,
@@ -1179,34 +1280,13 @@ impl KeyLocker {
         intents: Arc<Vec<KeyIntent>>,
         requirement: Requirement,
     ) -> Result<WriteBackOutcome, TransError> {
-        let resolver = Arc::new(WriteBackResolver {
+        let operation = WriteBackOperation {
             id: id.clone(),
+            path: path.clone(),
             intents,
-        });
-        match self
-            .coord
-            .submit_shard(path, id, resolver, requirement)
-            .await?
-        {
-            Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Released { superseded },
-                ..
-            }) => Ok(WriteBackOutcome::Released(superseded)),
-            Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Reroute,
-                ..
-            }) => Ok(WriteBackOutcome::Reroute),
-            // The log is already committed, so a structural gate delays only
-            // publication and lock cleanup. Later access or GC can help it.
-            Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Wait(_),
-                ..
-            }) => Ok(WriteBackOutcome::Deferred),
-            Some(_) => Err(TransError::other(
-                "write-back produced a non-cleanup outcome",
-            )),
-            None => Err(TransError::other("coordinator shut down during write-back")),
-        }
+            requirement,
+        };
+        self.coord.coordinate(operation).await
     }
 
     async fn release_leaf_at(
@@ -1215,29 +1295,21 @@ impl KeyLocker {
         path: &ObjectPath,
         requirement: Requirement,
     ) -> Result<(), TransError> {
-        let resolver = Arc::new(ReleaseResolver { id: id.clone() });
+        let operation = ReleaseOperation {
+            id: id.clone(),
+            path: path.clone(),
+            requirement,
+        };
         let mut backoff = self.retry.backoff();
         loop {
-            match self
-                .coord
-                .submit_shard(path, id, resolver.clone(), requirement)
-                .await?
-            {
-                Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::Released { .. },
-                    ..
-                }) => return Ok(()),
-                Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::Wait(holder),
-                    ..
-                }) => {
+            match self.coord.coordinate(operation.clone()).await? {
+                ReleaseOutcome::Released => return Ok(()),
+                ReleaseOutcome::Wait(holder) => {
                     let delay = backoff.next_delay();
                     if let Woke::Finalized = self.wait_for_holder(&holder, delay).await? {
                         backoff = self.retry.backoff();
                     }
                 }
-                Some(_) => return Err(TransError::other("release produced a non-cleanup outcome")),
-                None => return Err(TransError::other("coordinator shut down during release")),
             }
         }
     }
@@ -1259,59 +1331,39 @@ impl KeyLocker {
         // finalizes — real progress.
         let mut backoff = self.retry.backoff();
         loop {
-            let coordinated = self
-                .acquire(
-                    id,
-                    &group.path,
-                    intents.clone(),
-                    group.membership,
-                    requirement,
-                )
-                .await?;
-            match coordinated.outcome {
-                FoldOutcome::Locked { typ, membership } => {
-                    return coordinated
-                        .cas_precondition
-                        .map(|observation| {
-                            ShardOutcome::Locked(ShardLockReceipt {
-                                observation,
-                                held: HeldLeaf {
-                                    entry_lock: typ,
-                                    membership,
-                                },
-                            })
-                        })
-                        .ok_or_else(|| {
-                            TransError::other("lock CAS returned no precondition receipt")
-                        });
+            let operation = AcquireOperation {
+                id: id.clone(),
+                path: group.path.clone(),
+                intents: intents.clone(),
+                membership: group.membership,
+                requirement,
+            };
+            match self.coord.coordinate(operation).await? {
+                AcquireOutcome::Locked(receipt) => {
+                    self.record_leaf_lock(
+                        id,
+                        &group.path,
+                        receipt.held.entry_lock,
+                        receipt.held.membership,
+                    );
+                    return Ok(ShardOutcome::Locked(receipt));
                 }
-                // Hold-and-wait (ADR-024): if the coordinator reports
-                // [`FoldOutcome::Wait`] — a key is held by a live holder this
+                // Hold-and-wait (ADR-024): if the coordinated acquire reports
+                // [`AcquireOutcome::Wait`] — a key is held by a live holder this
                 // transaction cannot wound — it **waits** for that holder to
                 // finalize (keeping every lock already acquired on other
                 // shards) then re-submits. The wait is *not* charged to the
                 // bounded CAS-contention budget; the algo-level deadlock
                 // timeout bounds the total wait and escalates to the
                 // cannot-deadlock serial order.
-                FoldOutcome::Wait(holder) => {
+                AcquireOutcome::Wait(holder) => {
                     let delay = backoff.next_delay();
                     if let Woke::Finalized = self.wait_for_holder(&holder, delay).await? {
                         backoff = self.retry.backoff();
                     }
                 }
-                FoldOutcome::LeafFull => return Ok(ShardOutcome::LeafFull),
-                // Release, write-back, and direct-commit outcomes cannot reach an
-                // acquire. Treat one defensively as a conflict so the caller
-                // takes the safe release-and-relock path.
-                FoldOutcome::Conflict
-                | FoldOutcome::Released { .. }
-                | FoldOutcome::Reroute
-                | FoldOutcome::Landed
-                | FoldOutcome::Moved
-                | FoldOutcome::Replay
-                | FoldOutcome::InDoubt(_) => {
-                    return Ok(ShardOutcome::Conflict);
-                }
+                AcquireOutcome::LeafFull => return Ok(ShardOutcome::LeafFull),
+                AcquireOutcome::Conflict => return Ok(ShardOutcome::Conflict),
             }
         }
     }
@@ -1509,9 +1561,11 @@ mod tests {
 
     #[test]
     fn exhausted_write_back_requires_rerouting() {
-        let resolver = WriteBackResolver {
+        let resolver = WriteBackOperation {
             id: mk_tid(1, "writer"),
+            path: root_path(),
             intents: Arc::new(vec![put_intent(b"key")]),
+            requirement: Requirement::Any,
         };
 
         assert!(matches!(

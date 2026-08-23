@@ -15,7 +15,10 @@ use glassdb_storage::{LockType, NodeLocks, Requirement, ShardEntry};
 use crate::error::TransError;
 use crate::key_state_resolver::KeyStateResolver;
 use crate::monitor::Monitor;
-use crate::shard_coord::{FoldOutcome, ResolveCtx, ShardResolver, StageAdmission, Step};
+use crate::shard_coord::{
+    CoordinatedOutcome, FoldOutcome, ResolveCtx, ShardOperation, ShardResolver, StageAdmission,
+    Step,
+};
 use crate::wound_wait::{Reclaim, try_reclaim};
 
 /// Wound-wait policy over one node's structural gate and membership lock.
@@ -248,20 +251,28 @@ impl<'a> NodeLockReconciler<'a> {
     }
 }
 
-/// The leaf-coordinator resolver for structural-gate acquisition.
-pub(crate) struct StructuralGateResolver {
+/// Acquires a leaf structural gate through the shared shard-mutation engine.
+pub(crate) struct StructuralGateOperation {
     id: TxId,
     path: ObjectPath,
 }
 
-impl StructuralGateResolver {
+/// Result of one coordinated structural-gate acquisition attempt.
+pub(crate) enum StructuralGateOutcome {
+    /// The gate landed; the requirement observes that CAS or a later state.
+    Acquired(Requirement),
+    /// The gate did not land in this attempt.
+    Deferred,
+}
+
+impl StructuralGateOperation {
     pub(crate) fn new(id: TxId, path: ObjectPath) -> Self {
         Self { id, path }
     }
 }
 
 #[async_trait]
-impl ShardResolver for StructuralGateResolver {
+impl ShardResolver for StructuralGateOperation {
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
@@ -313,6 +324,40 @@ impl ShardResolver for StructuralGateResolver {
 
     fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
         FoldOutcome::Conflict
+    }
+}
+
+impl ShardOperation for StructuralGateOperation {
+    type Output = StructuralGateOutcome;
+
+    fn path(&self) -> &ObjectPath {
+        &self.path
+    }
+
+    fn id(&self) -> &TxId {
+        &self.id
+    }
+
+    fn first_requirement(&self) -> Requirement {
+        Requirement::Any
+    }
+
+    fn complete(&self, outcome: Option<CoordinatedOutcome>) -> Result<Self::Output, TransError> {
+        let Some(CoordinatedOutcome {
+            outcome:
+                FoldOutcome::Locked {
+                    typ: LockType::Write,
+                    ..
+                },
+            cas_precondition,
+        }) = outcome
+        else {
+            return Ok(StructuralGateOutcome::Deferred);
+        };
+        let requirement = cas_precondition
+            .map(|observation| Requirement::AtLeast(observation.current_after()))
+            .unwrap_or(Requirement::Any);
+        Ok(StructuralGateOutcome::Acquired(requirement))
     }
 }
 

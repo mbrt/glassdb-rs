@@ -132,7 +132,9 @@ object once, folds the round's operations in wound-wait order, and CASes once
 (ADR-028/029). The coordinator is a transaction-aware shared mutation engine:
 it owns identity, ordering, admission, and recovery across the heterogeneous
 round, while `Algo`, the `Locker`, and the `Splitter` supply each operation's
-mutation decision as an installed resolver. For the full design see
+target, resolver policy, and typed result as a `ShardOperation`. The operation
+types stay with their policy owners; the coordinator exposes one typed
+`coordinate` interface and keeps raw resolver submission private. For the full design see
 [designs/object-storage-native.md](designs/object-storage-native.md).
 
 ```
@@ -166,7 +168,7 @@ mutation decision as an installed resolver. For the full design see
  │ writer/ │   │ · path → shard groups │   │ lifecycle│   │ reverse │
  │ validate│   │ · parallel/serial     │   │ wound /  │   │ liveness│
  │ reads + │   │ · hold-and-wait loop  │   │ wait /   │   │ release │
- │ validate│   │ · installs resolvers  │   │ refresh  │   │ →Locker │
+ │ validate│   │ · builds operations   │   │ refresh  │   │ →Locker │
  └────┬────┘   └───────────┬───────────┘   └────┬─────┘   └────┬────┘
       │                    │ acquire / write-back / release    │
       │                    │ + DirectCommit / Gc publication   │
@@ -252,9 +254,12 @@ single-flight batching, transaction identity, oldest-first wound-wait order,
 ownership and capacity admission, whole-member exclusion for overlapping
 logless output claims, one CAS, per-member uncertainty attribution, and
 reload-and-re-fold recovery. Installed resolvers own the operation-specific
-mutation decisions — `Locker` supplies acquire / write-back / release, `Algo`
-supplies direct commit, `Splitter` supplies leaf structural-gate acquisition,
-and `Gc` reclaims through the `Locker`'s unlock methods (ADR-028/029).
+mutation decisions. Each policy owner packages its resolver, target, first-load
+requirement, and typed result in a `ShardOperation`: `Locker` supplies acquire /
+write-back / release, `DirectCommit` supplies direct commit, `Splitter` supplies
+leaf structural-gate acquisition, and `Gc` reclaims through the `Locker`'s
+unlock methods (ADR-028/029). The shared coordinator does not interpret these
+operation-specific results.
 Cross-shard acquisition strategy, transaction lifecycle, commit orchestration,
 GC selection, structural writes after gate acquisition, and held-lock
 bookkeeping remain outside the coordinator.
@@ -264,13 +269,13 @@ bookkeeping remain outside the coordinator.
 | `glassdb` (`tx_impl`) | API / retry      | `Engine`, closures, `Error`  | metadata bootstrap, operation admission, user body, retry loop, public handles/errors, cancel-safety                  | stores, locks, shards, tx logs, runtime wiring |
 | `Engine`              | runtime façade   | logical keys, `Data`, configuration | component assembly/lifetime, read/scan/catalog entry points, transaction-attempt delegation and abandonment retirement, shutdown, component stats/diagnostics | user closures, public handles/errors, body retry policy |
 | `Algo`                | commit **policy** | `Data`, `TxId`, `LockOutcome` | transaction lifecycle, direct-vs-logged selection, cross-domain lock→validate→commit→write-back orchestration, abandoned-owner retirement, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), GC candidate hints | shard routing, CAS details, caching, collection lifecycle implementation, the split mechanism beyond its `SplitHintSink` producer handle |
-| `DirectCommit`        | logless commit mechanism | `Data`, `TxId`, `KeyResolver`, resolvers | complete point-member normalization, one-leaf eligibility, atomic inline/tombstone publication, transaction-local recovery classification | transaction logs, range/catalog validation, waiting or wounding holders |
+| `DirectCommit`        | logless commit mechanism | `Data`, `TxId`, `KeyResolver`, shard operations | complete point-member normalization, one-leaf eligibility, atomic inline/tombstone publication, transaction-local recovery classification | transaction logs, range/catalog validation, waiting or wounding holders |
 | `CollectionCommit`    | collection-commit **policy** | `CollectionAttempt`, catalog, lifecycle | same-ID collection retry state, recovery and committed-log fields, incarnation preparation, validation, drop fencing, post-commit/abort cleanup | key locking, key validation, the atomic commit decision |
-| `Locker::keys`        | key-lock **policy** | `Data`, `TxId`, B-link nodes | key→leaf grouping, parallel & serial acquisition, hold-and-wait, acquire / write-back / release resolvers | collection-directory semantics |
+| `Locker::keys`        | key-lock **policy** | `Data`, `TxId`, B-link nodes | key→leaf grouping, parallel & serial acquisition, hold-and-wait, acquire / write-back / release operations | collection-directory semantics |
 | `Locker::collections` | collection-lock **policy** | collection addresses, `TxId`, records | directory/topology lock acquisition, recovery write-back and release | key routing, B-link topology, catalog semantics |
 | `CollectionStateResolver` | collection-state mechanism | collection addresses, records, `TxId` | resolved record loads, foreign-holder reconciliation, committed directory write-back assistance | key routing, B-link topology, catalog semantics |
 | `CollectionCatalog`   | collection semantics | directory reads, binding changes, resolved records | logical snapshots, read-your-writes validation, capacity/precondition checks | locking policy, CAS, wound-wait |
-| `ShardCoordinator`    | shared mutation engine | object paths, `TxId`, resolvers | one round per object: single-flight, oldest-first fold, ownership/capacity admission, overlapping logless-member exclusion, single CAS, per-member uncertainty, reload-recover, vestigial-entry pruning | cross-shard strategy, transaction lifecycle, commit orchestration, GC selection, held-lock bookkeeping |
+| `ShardCoordinator`    | shared mutation engine | typed `ShardOperation`s | one round per object: single-flight, oldest-first fold, ownership/capacity admission, overlapping logless-member exclusion, single CAS, per-member uncertainty, reload-recover, vestigial-entry pruning | operation-specific results, cross-shard strategy, transaction lifecycle, commit orchestration, GC selection, held-lock bookkeeping |
 | `KeyResolver`         | key/range resolution | logical keys, ranges, `TreeRouter` | routing and scan composition | commit / lock policy, collection-record coordination |
 | `KeyStateResolver`    | loaded key-state mechanism | nodes, entries, `TxId` | transaction-dependent interpretation of already-loaded key and node state | routing, scan composition, commit policy |
 | `Reader`              | read mechanism   | logical keys, resolved writers | value materialization | commit / lock policy                |

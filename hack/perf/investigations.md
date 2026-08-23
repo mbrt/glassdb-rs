@@ -14,7 +14,7 @@ This file is evidence, not a record of accepted behavior:
 
 ## 2026-08-21: root-leaf structural-gate coordinator rationale
 
-Status: implemented through the existing coordinator interface. A deterministic
+Status: implemented through the typed coordinator interface. A deterministic
 regression proves one root read and one conditional write. No retained benchmark
 compares contention or latency between the two acquisition paths.
 
@@ -26,10 +26,11 @@ split
 leaf, it is the CAS unit for its keys and has the same coordination semantics as
 a non-root leaf.
 
-[`ShardCoordinator::submit_shard`](../../crates/glassdb-trans/src/shard_coord.rs)
-and
-[`StructuralGateResolver`](../../crates/glassdb-trans/src/node_locking.rs)
-support root and non-root leaf paths. Before this change,
+[`ShardCoordinator::coordinate`](../../crates/glassdb-trans/src/shard_coord.rs)
+accepts a typed
+[`ShardOperation`](../../crates/glassdb-trans/src/shard_coord.rs).
+[`StructuralGateOperation`](../../crates/glassdb-trans/src/node_locking.rs) uses
+this interface for root and non-root leaf paths. Before this change,
 [`StructuralNodeAccess::acquire_structural_gate`](../../crates/glassdb-trans/src/split.rs)
 selected the path from `Option<&NodeToken>`:
 
@@ -51,8 +52,8 @@ Commit `c4216276` introduced the exception with the claim that roots and indexes
 carry no data-mutation traffic. This claim did not apply to a root leaf, which
 was already key-bearing. The commit has no benchmark for the exception.
 ADR-050 later made the mismatch explicit by giving `_r` the same node semantics
-as other B-link nodes. Root support also already exists in the resolver; commit
-`c13aab70` only made it typed.
+as other B-link nodes. The structural-gate operation already supported root
+paths; commit `c13aab70` only gave its coordinator call a typed result.
 
 The retained performance evidence does not justify the bypass:
 

@@ -17,8 +17,8 @@ use crate::gc::Gc;
 use crate::key_resolver::KeyResolver;
 use crate::key_state_resolver::HolderResolution;
 use crate::shard_coord::{
-    CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardResolver,
-    StageAdmission, Step,
+    CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardOperation,
+    ShardResolver, StageAdmission, Step,
 };
 use crate::split::SplitHintSink;
 
@@ -132,60 +132,36 @@ impl DirectCommit {
         // churn falls back instead of borrowing the coordinator's CAS budget.
         let mut rerouted = false;
         loop {
-            let resolver = Arc::new(DirectCommitResolver::new(
+            let operation = DirectCommitOperation::new(
                 id.clone(),
                 leaf_path.clone(),
                 member.clone(),
                 self.inline_policy,
                 self.split_hints.clone(),
-            ));
-            let outcome = self
-                .coord
-                .submit_shard(&leaf_path, id, resolver.clone(), Requirement::Any)
-                .await?;
+            );
+            let outcome = self.coord.coordinate(operation).await?;
             match outcome {
-                Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::Landed,
-                    ..
-                }) => {
+                DirectMutationOutcome::Landed(predecessors) => {
                     self.counters.landed.fetch_add(1, Ordering::Relaxed);
                     state.commit();
-                    for predecessor in resolver.predecessors() {
+                    for predecessor in predecessors {
                         self.gc.schedule_tx_cleanup(predecessor);
                     }
                     return Ok(DirectAttempt::Committed);
                 }
-                Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::InDoubt(msg),
-                    ..
-                }) => return Err(TransError::Storage(StorageError::Unavailable(msg))),
-                Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::Replay,
-                    ..
-                }) => return Ok(DirectAttempt::Replay),
-                Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::Reroute,
-                    ..
-                }) if !rerouted => {
+                DirectMutationOutcome::InDoubt(msg) => {
+                    return Err(TransError::Storage(StorageError::Unavailable(msg)));
+                }
+                DirectMutationOutcome::Replay => return Ok(DirectAttempt::Replay),
+                DirectMutationOutcome::Reroute if !rerouted => {
                     let Some(path) = self.route_member(&member).await? else {
                         return Ok(DirectAttempt::Locked);
                     };
                     leaf_path = path;
                     rerouted = true;
                 }
-                Some(CoordinatedOutcome {
-                    outcome:
-                        FoldOutcome::Moved
-                        | FoldOutcome::Conflict
-                        | FoldOutcome::LeafFull
-                        | FoldOutcome::Reroute,
-                    ..
-                })
-                | None => return Ok(DirectAttempt::Locked),
-                Some(_) => {
-                    return Err(TransError::other(
-                        "direct commit produced a non-commit outcome",
-                    ));
+                DirectMutationOutcome::Locked | DirectMutationOutcome::Reroute => {
+                    return Ok(DirectAttempt::Locked);
                 }
             }
         }
@@ -247,7 +223,7 @@ impl DirectMember {
 }
 
 /// Commits one complete same-leaf point transaction in a single leaf CAS.
-struct DirectCommitResolver {
+struct DirectCommitOperation {
     id: TxId,
     leaf_path: ObjectPath,
     member: DirectMember,
@@ -261,7 +237,7 @@ struct DirectCommitResolver {
     landed_proven: AtomicBool,
 }
 
-impl DirectCommitResolver {
+impl DirectCommitOperation {
     fn new(
         id: TxId,
         leaf_path: ObjectPath,
@@ -573,7 +549,7 @@ impl DirectCommitResolver {
 }
 
 #[async_trait]
-impl ShardResolver for DirectCommitResolver {
+impl ShardResolver for DirectCommitOperation {
     fn observe_loaded(&self, entries: &BTreeMap<Vec<u8>, ShardEntry>) {
         if self.has_marker(entries) {
             self.remember_landed();
@@ -634,6 +610,60 @@ impl ShardResolver for DirectCommitResolver {
             .map(|key| key.raw_key.as_slice())
             .collect()
     }
+}
+
+impl ShardOperation for DirectCommitOperation {
+    type Output = DirectMutationOutcome;
+
+    fn path(&self) -> &ObjectPath {
+        &self.leaf_path
+    }
+
+    fn id(&self) -> &TxId {
+        &self.id
+    }
+
+    fn first_requirement(&self) -> Requirement {
+        Requirement::Any
+    }
+
+    fn complete(&self, outcome: Option<CoordinatedOutcome>) -> Result<Self::Output, TransError> {
+        match outcome {
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Landed,
+                ..
+            }) => Ok(DirectMutationOutcome::Landed(self.predecessors())),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::InDoubt(message),
+                ..
+            }) => Ok(DirectMutationOutcome::InDoubt(message)),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Replay,
+                ..
+            }) => Ok(DirectMutationOutcome::Replay),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Reroute,
+                ..
+            }) => Ok(DirectMutationOutcome::Reroute),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Moved | FoldOutcome::Conflict | FoldOutcome::LeafFull,
+                ..
+            })
+            | None => Ok(DirectMutationOutcome::Locked),
+            Some(_) => Err(TransError::other(
+                "direct commit produced a non-commit outcome",
+            )),
+        }
+    }
+}
+
+/// Result of one direct-commit operation at the shard-mutation seam.
+enum DirectMutationOutcome {
+    Landed(Vec<TxId>),
+    InDoubt(String),
+    Replay,
+    Reroute,
+    Locked,
 }
 
 /// What an attempted direct commit established about its transaction.

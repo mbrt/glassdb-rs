@@ -15,13 +15,14 @@
 //! heterogeneous mutations safely: transaction identity, oldest-first fold
 //! order, per-member in-doubt attribution, routing and capacity admission, and
 //! same-key exclusion for logless publication. It loads the leaf object once,
-//! **folds** the round's installed [`ShardResolver`]s over a running staged entry
-//! map, drops vestigial entries, CASes once, recovers by reload-and-re-fold, and
-//! deposits each member's outcome (ADR-029). The resolvers own each
-//! operation's mutation decision: [`Locker`](crate::tlocker::Locker) installs Acquire /
-//! WriteBack / Release, and [`Algo`](crate::algo::Algo) installs direct commit. The
-//! per-transaction held-lock bookkeeping and cross-shard strategy stay with the
-//! [`Locker`](crate::tlocker::Locker), not in the engine.
+//! **folds** the round's installed [`ShardOperation`] resolvers over a running
+//! staged entry map, drops vestigial entries, CASes once, recovers by
+//! reload-and-re-fold, and deposits each member's outcome (ADR-029). Each policy
+//! owner packages its mutation decision and typed result in a `ShardOperation`:
+//! [`Locker`](crate::tlocker::Locker) supplies acquire / write-back / release,
+//! direct commit supplies atomic logless publication, and the splitter supplies
+//! leaf structural-gate acquisition. Per-transaction held-lock bookkeeping and
+//! cross-shard strategy stay with the `Locker`, not in the engine.
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,8 +48,7 @@ use crate::monitor::Monitor;
 /// operation as conflicted and restarting the transaction.
 pub(crate) const CAS_RETRIES: usize = 50;
 
-/// Counters for CAS activity across every submitter (the
-/// [`Locker`](crate::tlocker::Locker) and [`Algo`](crate::algo::Algo)).
+/// Counters for CAS activity across all coordinated shard operations.
 #[derive(Default)]
 struct Stats {
     n_retries: AtomicU64,
@@ -299,6 +299,28 @@ pub(crate) trait ShardResolver: Send + Sync {
     fn logless_publication_keys(&self) -> Vec<&[u8]> {
         Vec::new()
     }
+}
+
+/// One complete operation submitted to the shared shard-mutation engine.
+///
+/// The operation owns its target, transaction identity, first-load requirement,
+/// resolver policy, and typed result. The coordinator only runs the shared fold
+/// mechanism and returns the raw round result to the operation for translation.
+pub(crate) trait ShardOperation: ShardResolver {
+    /// The result vocabulary exposed to this operation's caller.
+    type Output;
+
+    /// Returns the leaf object this operation mutates.
+    fn path(&self) -> &ObjectPath;
+
+    /// Returns the transaction identity used to order this operation.
+    fn id(&self) -> &TxId;
+
+    /// Returns the cache requirement for the first fold attempt.
+    fn first_requirement(&self) -> Requirement;
+
+    /// Translates the shared round result into this operation's result.
+    fn complete(&self, outcome: Option<CoordinatedOutcome>) -> Result<Self::Output, TransError>;
 }
 
 /// One transaction's participation in a shard CAS batch: its installed resolver
@@ -919,15 +941,33 @@ impl ShardCoordinator {
         self.inner.dedup.snapshot()
     }
 
-    /// Submits one shard member (any resolver installed by a caller — the
-    /// [`Locker`](crate::tlocker::Locker)'s acquire / write-back / release or the
-    /// [`Algo`](crate::algo::Algo)'s direct commit) through the [`Dedup`] and awaits
-    /// its single-round [`CoordinatedOutcome`]. The worker merges it into any
+    /// Coordinates one complete operation and returns its operation-specific
+    /// result.
+    pub(crate) async fn coordinate<O>(&self, operation: O) -> Result<O::Output, TransError>
+    where
+        O: ShardOperation + 'static,
+    {
+        let operation = Arc::new(operation);
+        let first_requirement = operation.first_requirement();
+        let resolver: Arc<dyn ShardResolver> = operation.clone();
+        let outcome = self
+            .submit_shard(
+                operation.path(),
+                operation.id(),
+                resolver,
+                first_requirement,
+            )
+            .await?;
+        operation.complete(outcome)
+    }
+
+    /// Submits one operation's resolver through the [`Dedup`] and awaits its
+    /// single-round [`CoordinatedOutcome`]. The worker merges it into any
     /// in-flight round for the shard, folds it, retries CAS contention / in-doubt
     /// internally, and deposits the policy outcome plus any successful-CAS
     /// precondition receipt into the slot. Returns `Ok(None)` if the coordinator
-    /// was shut down before the round ran, so callers can preserve their
-    /// operation-specific best-effort behavior.
+    /// was shut down before the round ran, so the operation can preserve its
+    /// best-effort behavior.
     ///
     /// `first_requirement` chooses the cache requirement for the round's first fold
     /// attempt: a direct submitter that just read this leaf while evaluating its
@@ -939,7 +979,7 @@ impl ShardCoordinator {
     /// `path` is the leaf's object path — the collection root `_r` for a small
     /// collection's single leaf, else a standalone node `_n` resolved by descent
     /// ([`TreeRouter`](glassdb_storage::TreeRouter)).
-    pub(crate) async fn submit_shard(
+    async fn submit_shard(
         &self,
         path: &ObjectPath,
         id: &TxId,
@@ -1250,6 +1290,36 @@ mod tests {
         }
     }
 
+    impl ShardOperation for StageLock {
+        type Output = bool;
+
+        fn path(&self) -> &ObjectPath {
+            static PATH: std::sync::OnceLock<ObjectPath> = std::sync::OnceLock::new();
+            PATH.get_or_init(leaf)
+        }
+
+        fn id(&self) -> &TxId {
+            &self.tx
+        }
+
+        fn first_requirement(&self) -> Requirement {
+            Requirement::Any
+        }
+
+        fn complete(
+            &self,
+            outcome: Option<CoordinatedOutcome>,
+        ) -> Result<Self::Output, TransError> {
+            Ok(matches!(
+                outcome,
+                Some(CoordinatedOutcome {
+                    outcome: FoldOutcome::Locked { .. },
+                    cas_precondition: Some(_),
+                })
+            ))
+        }
+    }
+
     // Stages nothing; always delivers a best-effort `Released`.
     struct SkipRelease;
 
@@ -1375,34 +1445,23 @@ mod tests {
         }
     }
 
-    // A resolver that stages entries drives one CAS, receives its exact
-    // precondition observation, and persists the staged entry.
+    // A typed operation drives one CAS and translates its exact precondition
+    // receipt without exposing the shared outcome vocabulary to its caller.
     #[tokio::test]
     async fn shard_stage_is_cas_persisted() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (coord, _shards, _timeline, _bg) = coord_over(backend.clone()).await;
         let tx = TxId::with_priority(1, b"t");
 
-        let out = coord
-            .submit_shard(
-                &leaf(),
-                &tx,
-                Arc::new(StageLock {
-                    key: b"k".to_vec(),
-                    tx: tx.clone(),
-                    admission: StageAdmission::ExistingKeys,
-                }),
-                Requirement::Any,
-            )
+        let landed = coord
+            .coordinate(StageLock {
+                key: b"k".to_vec(),
+                tx: tx.clone(),
+                admission: StageAdmission::ExistingKeys,
+            })
             .await
             .unwrap();
-        assert!(matches!(
-            out,
-            Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Locked { .. },
-                cas_precondition: Some(_),
-            })
-        ));
+        assert!(landed);
         coord.close().await;
 
         let shard = cold_entries(&cold_store(backend), &leaf()).await;
@@ -1783,7 +1842,7 @@ mod tests {
 
     // A logless direct-commit-shaped resolver (ADR-051): the entry it stages is
     // the only record of its commit, so it claims its key for the round and
-    // classifies an abandoned round the way `DirectCommitResolver` does — the
+    // classifies an abandoned round the way `DirectCommitOperation` does — the
     // ambiguity is irreducible only if its own stage rode a CAS that may have
     // landed. `replayable` models a read-modify-write, whose certified losses are
     // `Replay` rather than `Moved` (ADR-053), and makes exclusion observably

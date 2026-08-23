@@ -68,8 +68,10 @@ use crate::error::TransError;
 use crate::gc::TxCleanupHints;
 use crate::key_state_resolver::KeyStateResolver;
 use crate::monitor::{Monitor, TxRecoveryManifest};
-use crate::node_locking::{NodeLockReconciler, QuiescedEntries, StructuralGateResolver};
-use crate::shard_coord::{FoldOutcome, ShardCoordinator, SplitHinter};
+use crate::node_locking::{
+    NodeLockReconciler, QuiescedEntries, StructuralGateOperation, StructuralGateOutcome,
+};
+use crate::shard_coord::{ShardCoordinator, SplitHinter};
 
 use recovery::{ParticipantSettlementStep, RecordRecoveryStep, StructuralRecovery};
 
@@ -166,27 +168,11 @@ impl StructuralNodeAccess {
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
         let outcome = self
             .coord
-            .submit_shard(
-                path,
-                id,
-                Arc::new(StructuralGateResolver::new(id.clone(), path.clone())),
-                Requirement::Any,
-            )
+            .coordinate(StructuralGateOperation::new(id.clone(), path.clone()))
             .await?;
-        if !matches!(
-            outcome.as_ref().map(|coordinated| &coordinated.outcome),
-            Some(FoldOutcome::Locked {
-                typ: LockType::Write,
-                ..
-            })
-        ) {
+        let StructuralGateOutcome::Acquired(requirement) = outcome else {
             return Ok(None);
-        }
-
-        let requirement = outcome
-            .and_then(|coordinated| coordinated.cas_precondition)
-            .map(|observation| Requirement::AtLeast(observation.current_after()))
-            .unwrap_or(Requirement::Any);
+        };
         let (node, version) = self.shards.load_node_at(path, requirement).await?;
         if node.structural_gate().lock_type() == LockType::Write
             && node.structural_gate().contains(id)
