@@ -1173,7 +1173,7 @@ impl SplitHinter for SplitCandidates {
 #[derive(Clone)]
 pub struct Splitter {
     // Weak so a clone captured in the spawned loop does not keep the executor
-    // alive across shutdown; the single strong owner is `DbInner::background`.
+    // alive across shutdown; `Engine` is the single strong owner.
     bg: Weak<Background>,
     records: CollectionStore,
     shards: NodeStore,
@@ -2257,12 +2257,13 @@ fn split_collection(path: &ObjectPath) -> Result<&CollectionAddress, TransError>
 mod tests {
     use super::*;
 
+    use crate::engine::{AssemblyFixture, EngineConfig};
     use crate::monitor::TxFinalStatus;
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_data::{KeyRef, StructuralRecordId, TxId};
-    use glassdb_storage::transaction::{TLogger, TxWrite};
+    use glassdb_storage::transaction::TxWrite;
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, CurrentState, LockType, Observation,
         ShardEntry, StructuralLog, StructuralLogPhase,
@@ -2356,6 +2357,7 @@ mod tests {
         intent_store: StructuralLogStore,
         objects: CachedStore,
         timeline: Timeline,
+        foundation: AssemblyFixture,
     }
 
     impl std::ops::Deref for TestStore {
@@ -2474,14 +2476,16 @@ mod tests {
     }
 
     fn store_with_backend(backend: Arc<dyn Backend>) -> TestStore {
-        let timeline = Timeline::new();
-        let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
+        let mut config = EngineConfig::default();
+        config.set_cache_size(1 << 20);
+        let foundation = AssemblyFixture::new(backend, db_root("db"), &config);
         TestStore {
-            records: CollectionStore::new(objects.clone()),
-            shards: NodeStore::new(objects.clone()),
-            intent_store: StructuralLogStore::new(objects.clone()),
-            objects,
-            timeline,
+            records: foundation.records.clone(),
+            shards: foundation.shards.clone(),
+            intent_store: foundation.structural_logs.clone(),
+            objects: foundation.objects.clone(),
+            timeline: foundation.timeline.clone(),
+            foundation,
         }
     }
 
@@ -2534,11 +2538,8 @@ mod tests {
         candidates: SplitCandidates,
         cleanup_hints: TxCleanupHints,
     ) -> Splitter {
-        let tl = TLogger::new(shards.objects.clone(), db_root("db"));
-        let mon = Monitor::with_config(
-            tl.clone(),
-            shards.timeline.clone(),
-            Arc::downgrade(bg),
+        let mon = shards.foundation.monitor_for(
+            bg,
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
@@ -2591,11 +2592,8 @@ mod tests {
         bg: &Arc<Background>,
         policy: SplitPolicy,
     ) -> (Splitter, Monitor) {
-        let tl = TLogger::new(shards.objects.clone(), db_root("db"));
-        let mon = Monitor::with_config(
-            tl.clone(),
-            shards.timeline.clone(),
-            Arc::downgrade(bg),
+        let mon = shards.foundation.monitor_for(
+            bg,
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
@@ -3672,11 +3670,9 @@ mod tests {
         // A different instance still targeting the pre-split source must
         // re-descend and converge without recreating the removed holder.
         let other_bg = Arc::new(Background::new());
-        let other_transactions = TLogger::new(other.objects.clone(), db_root("db"));
-        let other_mon = Monitor::with_config(
-            other_transactions.clone(),
-            other.timeline.clone(),
-            Arc::downgrade(&other_bg),
+        let other_transactions = other.foundation.tlogger.clone();
+        let other_mon = other.foundation.monitor_for(
+            &other_bg,
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );

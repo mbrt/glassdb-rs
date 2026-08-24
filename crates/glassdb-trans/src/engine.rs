@@ -1,4 +1,4 @@
-//! The transaction-engine façade and its runtime assembly.
+//! The transaction engine and its runtime graph.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -148,8 +148,8 @@ pub struct Engine {
     coord: ShardCoordinator,
     locker: Locker,
     splitter: Splitter,
-    // Subsystems hold weak references so dropping this sole strong owner breaks
-    // spawned-task capture cycles.
+    // Subsystems hold weak references so this sole strong owner breaks task
+    // capture cycles when the engine is dropped.
     background: Arc<Background>,
 }
 
@@ -161,126 +161,8 @@ impl Engine {
         backend: Arc<StatsBackend>,
         config: EngineConfig,
     ) -> Result<Self, StorageError> {
-        let EngineConfig {
-            cache_size,
-            persistent_cache,
-            retry,
-            split_policy,
-            inline_policy,
-            protocol_timing,
-        } = config;
-        let db_root = DbRoot::try_from(name)
-            .map_err(|error| StorageError::with_source("validating database root", error))?;
-        let dyn_backend: Arc<dyn Backend> = backend.clone();
-        let (persistent, timeline) = match persistent_cache {
-            Some(setup) => {
-                let opened =
-                    PersistentCache::open(setup.config, name, database_id, setup.media).await;
-                // The persistent cache carries sequence points across restarts,
-                // preventing stale cached objects from appearing fresh.
-                let timeline = Timeline::starting_after(opened.last_sequence_point);
-                (Some(opened.cache), timeline)
-            }
-            None => (None, Timeline::new()),
-        };
-        let objects = CachedStore::new(dyn_backend, cache_size, timeline.clone(), persistent);
-        let records = CollectionStore::new(objects.clone());
-        let shards = NodeStore::new(objects.clone());
-        let structural_logs = StructuralLogStore::new(objects.clone());
-        Self::verify_permanent_collection(&db_root, &records, &shards, &timeline).await?;
-
-        let tlogger = TLogger::new(objects.clone(), db_root.clone());
-        let background = Arc::new(Background::new());
-        let background_weak = Arc::downgrade(&background);
-        let monitor = Monitor::with_config(
-            tlogger.clone(),
-            timeline.clone(),
-            background_weak.clone(),
-            retry,
-            protocol_timing,
-        );
-        let collection_state =
-            CollectionStateResolver::new(records.clone(), tlogger.clone(), monitor.clone(), retry);
-        let collection_catalog = CollectionCatalog::new(collection_state.clone());
-        let key_state = KeyStateResolver::new(monitor.clone());
-        let resolver = KeyResolver::new(TreeRouter::new(shards.clone()), key_state.clone());
-        let reader = Reader::new(resolver.clone(), timeline.clone(), retry);
-        let cleanup_hints = TxCleanupHints::default();
-        let (coord, splitter) = Splitter::with_coordinator(
-            background_weak.clone(),
-            records.clone(),
-            shards.clone(),
-            structural_logs.clone(),
-            timeline.clone(),
-            monitor.clone(),
-            key_state,
-            retry,
-            db_root,
-            split_policy,
-            inline_policy,
-            cleanup_hints.clone(),
-        );
-        let locker = Locker::new(
-            coord.clone(),
-            TreeRouter::new(shards.clone()),
-            collection_state,
-            monitor.clone(),
-            retry,
-        );
-        let collection_lifecycle = CollectionLifecycle::new(
-            records,
-            shards.clone(),
-            monitor.clone(),
-            retry,
-            Arc::new(splitter.clone()),
-        );
-        let gc = Gc::new(
-            background_weak.clone(),
-            tlogger,
-            shards.clone(),
-            structural_logs,
-            timeline.clone(),
-            locker.clone(),
-            collection_lifecycle.clone(),
-            monitor.clone(),
-            cleanup_hints.clone(),
-        );
-        gc.start();
-        splitter.start();
-        let collection_commit = CollectionCommit::new(
-            collection_catalog.clone(),
-            collection_lifecycle,
-            monitor.clone(),
-            split_policy,
-        );
-        let algo = Algo::new(
-            shards,
-            timeline,
-            retry,
-            locker.clone(),
-            coord.clone(),
-            monitor,
-            collection_commit,
-            cleanup_hints,
-            Some(background_weak),
-            resolver.clone(),
-            split_policy,
-            inline_policy,
-            splitter.hint_sink(),
-        );
-
-        Ok(Self {
-            backend,
-            objects,
-            reader,
-            resolver,
-            collection_catalog,
-            algo,
-            coord,
-            locker,
-            splitter,
-            background,
-        })
+        let dormant = DormantEngine::open(name, database_id, backend, config).await?;
+        Ok(dormant.start())
     }
 
     /// Creates or verifies the permanent collection objects before metadata is published.
@@ -402,32 +284,6 @@ impl Engine {
         }
     }
 
-    async fn verify_permanent_collection(
-        db_root: &DbRoot,
-        records: &CollectionStore,
-        shards: &NodeStore,
-        timeline: &Timeline,
-    ) -> Result<(), StorageError> {
-        let collection = CollectionAddress::from_db_root(db_root.clone(), CollectionId::root());
-        let requirement = Requirement::AtLeast(timeline.now());
-        match records.load_record(&collection, requirement).await {
-            Ok(_) => {}
-            Err(StorageError::NotFound) => {
-                return Err(StorageError::other(
-                    "initialized database is missing its permanent collection record",
-                ));
-            }
-            Err(error) => return Err(error),
-        }
-        match shards.load_root(&collection, requirement).await {
-            Ok(_) => Ok(()),
-            Err(StorageError::NotFound) => Err(StorageError::other(
-                "initialized database is missing its permanent tree root",
-            )),
-            Err(error) => Err(error),
-        }
-    }
-
     async fn ensure_collection_record<B>(backend: &B, path: &str) -> Result<(), StorageError>
     where
         B: Backend + ?Sized,
@@ -462,5 +318,329 @@ impl Engine {
             }
             Err(error) => Err(error.into()),
         }
+    }
+}
+
+/// Shared storage, time, monitoring, and task ownership for an engine graph.
+///
+/// Focused unit fixtures use this foundation and add only the collaborator that
+/// they exercise. Production construction extends it into the complete graph.
+#[derive(Clone)]
+struct AssemblyFoundation {
+    backend: Arc<StatsBackend>,
+    objects: CachedStore,
+    records: CollectionStore,
+    shards: NodeStore,
+    structural_logs: StructuralLogStore,
+    timeline: Timeline,
+    tlogger: TLogger,
+    background: Arc<Background>,
+    monitor: Monitor,
+}
+
+impl AssemblyFoundation {
+    fn new(
+        backend: Arc<StatsBackend>,
+        cache_size: usize,
+        persistent: Option<PersistentCache>,
+        timeline: Timeline,
+        db_root: DbRoot,
+        retry: RetryConfig,
+        protocol_timing: ProtocolTiming,
+    ) -> Self {
+        let dyn_backend: Arc<dyn Backend> = backend.clone();
+        let objects = CachedStore::new(dyn_backend, cache_size, timeline.clone(), persistent);
+        let records = CollectionStore::new(objects.clone());
+        let shards = NodeStore::new(objects.clone());
+        let structural_logs = StructuralLogStore::new(objects.clone());
+        let tlogger = TLogger::new(objects.clone(), db_root);
+        let background = Arc::new(Background::new());
+        let monitor = Monitor::with_config(
+            tlogger.clone(),
+            timeline.clone(),
+            Arc::downgrade(&background),
+            retry,
+            protocol_timing,
+        );
+        Self {
+            backend,
+            objects,
+            records,
+            shards,
+            structural_logs,
+            timeline,
+            tlogger,
+            background,
+            monitor,
+        }
+    }
+}
+
+/// Direct runtime access for focused unit fixtures.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct AssemblyFixture {
+    foundation: AssemblyFoundation,
+    pub(crate) objects: CachedStore,
+    pub(crate) records: CollectionStore,
+    pub(crate) shards: NodeStore,
+    pub(crate) structural_logs: StructuralLogStore,
+    pub(crate) timeline: Timeline,
+    pub(crate) tlogger: TLogger,
+    pub(crate) background: Arc<Background>,
+    pub(crate) monitor: Monitor,
+}
+
+#[cfg(test)]
+impl AssemblyFixture {
+    /// Creates a dormant test foundation over the supplied backend.
+    pub(crate) fn new(backend: Arc<dyn Backend>, db_root: DbRoot, config: &EngineConfig) -> Self {
+        let foundation = AssemblyFoundation::new(
+            Arc::new(StatsBackend::new(backend)),
+            config.cache_size,
+            None,
+            Timeline::new(),
+            db_root,
+            config.retry,
+            config.protocol_timing,
+        );
+        Self {
+            objects: foundation.objects.clone(),
+            records: foundation.records.clone(),
+            shards: foundation.shards.clone(),
+            structural_logs: foundation.structural_logs.clone(),
+            timeline: foundation.timeline.clone(),
+            tlogger: foundation.tlogger.clone(),
+            background: foundation.background.clone(),
+            monitor: foundation.monitor.clone(),
+            foundation,
+        }
+    }
+
+    /// Creates a monitor that follows a focused fixture's task owner.
+    pub(crate) fn monitor_for(
+        &self,
+        background: &Arc<Background>,
+        retry: RetryConfig,
+        protocol_timing: ProtocolTiming,
+    ) -> Monitor {
+        Monitor::with_config(
+            self.tlogger.clone(),
+            self.timeline.clone(),
+            Arc::downgrade(background),
+            retry,
+            protocol_timing,
+        )
+    }
+}
+
+/// A complete engine whose maintenance tasks have not started.
+struct DormantEngine {
+    engine: Engine,
+    gc: Gc,
+}
+
+impl DormantEngine {
+    /// Opens storage and constructs the transaction runtime without starting work.
+    async fn open(
+        name: &str,
+        database_id: DatabaseId,
+        backend: Arc<StatsBackend>,
+        config: EngineConfig,
+    ) -> Result<Self, StorageError> {
+        let db_root = DbRoot::try_from(name)
+            .map_err(|error| StorageError::with_source("validating database root", error))?;
+        let (persistent, timeline) = match config.persistent_cache.clone() {
+            Some(setup) => {
+                let opened =
+                    PersistentCache::open(setup.config, name, database_id, setup.media).await;
+                // Persistent evidence must establish the next timeline before
+                // any database object can be observed.
+                let timeline = Timeline::starting_after(opened.last_sequence_point);
+                (Some(opened.cache), timeline)
+            }
+            None => (None, Timeline::new()),
+        };
+        let foundation = AssemblyFoundation::new(
+            backend,
+            config.cache_size,
+            persistent,
+            timeline,
+            db_root.clone(),
+            config.retry,
+            config.protocol_timing,
+        );
+        verify_permanent_collection(&db_root, &foundation).await?;
+        Ok(Self::from_foundation(foundation, db_root, config, true))
+    }
+
+    /// Starts maintenance work and returns the live engine.
+    fn start(self) -> Engine {
+        self.gc.start();
+        self.engine.splitter.start();
+        self.engine
+    }
+
+    fn from_foundation(
+        foundation: AssemblyFoundation,
+        db_root: DbRoot,
+        config: EngineConfig,
+        managed_retirement: bool,
+    ) -> Self {
+        let EngineConfig {
+            retry,
+            split_policy,
+            inline_policy,
+            ..
+        } = config;
+        let AssemblyFoundation {
+            backend,
+            objects,
+            records,
+            shards,
+            structural_logs,
+            timeline,
+            tlogger,
+            background,
+            monitor,
+        } = foundation;
+        let background_weak = Arc::downgrade(&background);
+        let collection_state =
+            CollectionStateResolver::new(records.clone(), tlogger.clone(), monitor.clone(), retry);
+        let collection_catalog = CollectionCatalog::new(collection_state.clone());
+        let key_state = KeyStateResolver::new(monitor.clone());
+        let resolver = KeyResolver::new(TreeRouter::new(shards.clone()), key_state.clone());
+        let reader = Reader::new(resolver.clone(), timeline.clone(), retry);
+        let cleanup_hints = TxCleanupHints::default();
+        let (coord, splitter) = Splitter::with_coordinator(
+            background_weak.clone(),
+            records.clone(),
+            shards.clone(),
+            structural_logs.clone(),
+            timeline.clone(),
+            monitor.clone(),
+            key_state,
+            retry,
+            db_root,
+            split_policy,
+            inline_policy,
+            cleanup_hints.clone(),
+        );
+        let locker = Locker::new(
+            coord.clone(),
+            TreeRouter::new(shards.clone()),
+            collection_state,
+            monitor.clone(),
+            retry,
+        );
+        let collection_lifecycle = CollectionLifecycle::new(
+            records,
+            shards.clone(),
+            monitor.clone(),
+            retry,
+            Arc::new(splitter.clone()),
+        );
+        let gc = Gc::new(
+            background_weak.clone(),
+            tlogger,
+            shards.clone(),
+            structural_logs,
+            timeline.clone(),
+            locker.clone(),
+            collection_lifecycle.clone(),
+            monitor.clone(),
+            cleanup_hints.clone(),
+        );
+        let collection_commit = CollectionCommit::new(
+            collection_catalog.clone(),
+            collection_lifecycle,
+            monitor.clone(),
+            split_policy,
+        );
+        let algo = Algo::new(
+            shards,
+            timeline,
+            retry,
+            locker.clone(),
+            coord.clone(),
+            monitor,
+            collection_commit,
+            cleanup_hints,
+            managed_retirement.then_some(background_weak),
+            resolver.clone(),
+            split_policy,
+            inline_policy,
+            splitter.hint_sink(),
+        );
+        let engine = Engine {
+            backend,
+            objects,
+            reader,
+            resolver,
+            collection_catalog,
+            algo,
+            coord,
+            locker,
+            splitter,
+            background,
+        };
+        Self { engine, gc }
+    }
+}
+
+/// Direct handles from a dormant complete engine for Algo tests.
+#[cfg(test)]
+pub(crate) struct EngineFixture {
+    pub(crate) algo: Algo,
+    pub(crate) locker: Locker,
+    _engine: DormantEngine,
+}
+
+/// Extends a focused foundation into the complete dormant engine.
+#[cfg(test)]
+pub(crate) fn engine_fixture(
+    fixture: &AssemblyFixture,
+    db_root: DbRoot,
+    config: EngineConfig,
+    managed_retirement: bool,
+) -> EngineFixture {
+    let dormant = DormantEngine::from_foundation(
+        fixture.foundation.clone(),
+        db_root,
+        config,
+        managed_retirement,
+    );
+    EngineFixture {
+        algo: dormant.engine.algo.clone(),
+        locker: dormant.engine.locker.clone(),
+        _engine: dormant,
+    }
+}
+
+async fn verify_permanent_collection(
+    db_root: &DbRoot,
+    foundation: &AssemblyFoundation,
+) -> Result<(), StorageError> {
+    let collection = CollectionAddress::from_db_root(db_root.clone(), CollectionId::root());
+    let requirement = Requirement::AtLeast(foundation.timeline.now());
+    match foundation
+        .records
+        .load_record(&collection, requirement)
+        .await
+    {
+        Ok(_) => {}
+        Err(StorageError::NotFound) => {
+            return Err(StorageError::other(
+                "initialized database is missing its permanent collection record",
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    match foundation.shards.load_root(&collection, requirement).await {
+        Ok(_) => Ok(()),
+        Err(StorageError::NotFound) => Err(StorageError::other(
+            "initialized database is missing its permanent tree root",
+        )),
+        Err(error) => Err(error),
     }
 }

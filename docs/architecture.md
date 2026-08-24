@@ -87,7 +87,7 @@ is absent from normal library builds.
 | `glassdb-backend`     | `lib.rs`, `memory.rs`, `stats.rs`, `middleware/`                             | The `Backend` trait, in-memory backend, stats decorator, and middleware (delay, scheduler, logger, fault, recording)                          |
 | `glassdb-backend-s3`  | —                                                                            | Amazon S3 backend (`aws-sdk-s3`), enabled via the `s3` feature                                                                                |
 | `glassdb-backend-gcs` | —                                                                            | Google Cloud Storage backend (GCS JSON API), enabled via the `gcs` feature                                                                    |
-| `glassdb-trans`       | `engine.rs`, `access.rs`, `algo.rs`, `collection_*`, `collections/`, `tlocker.rs`, `shard_coord.rs`, `key_*`, `monitor.rs`, `reader.rs`, `split.rs`, `split/recovery.rs`, `gc.rs` | Transaction engine: the runtime façade and assembly, shared access vocabulary, commit algorithm, collection lifecycle, locking, shard mutation, resolution, monitoring, reads, structural splitting and recovery, and GC |
+| `glassdb-trans`       | `engine.rs`, `access.rs`, `algo.rs`, `collection_*`, `collections/`, `tlocker.rs`, `shard_coord.rs`, `key_*`, `monitor.rs`, `reader.rs`, `split.rs`, `split/recovery.rs`, `gc.rs` | Transaction engine: runtime ownership and assembly, shared access vocabulary, commit algorithm, collection lifecycle, locking, shard mutation, resolution, monitoring, reads, structural splitting and recovery, and GC |
 | `glassdb-storage`     | `cached_store.rs`, `collection_store.rs`, `node_store.rs`, `structural_log_store.rs`, `tree_router.rs`, `node.rs`, `shard.rs`, `transaction/`, `txobject.rs`, `cache.rs` | Shared decoded object store with bounded-freshness evidence, separate collection-record, B-link-node, and structural-recovery CAS stores/codecs, B-link traversal, transaction-log persistence, and generic LRU |
 | `glassdb-data`        | `txid.rs`, `paths.rs`, `base64.rs`                                           | Core types: `TxId` and order-preserving path encoding                                                                                          |
 | `glassdb-proto`       | —                                                                            | `prost`-generated transaction-log protobuf messages                                                                                           |
@@ -104,13 +104,22 @@ dedicated-task services inside a run. Entropy selection remains in
 
 The cross-crate transaction boundary is deliberately narrower than the engine's
 internal module graph. `glassdb` talks to `glassdb-trans` through `Engine` and
-logical access/result types. `Engine` owns runtime assembly and lifetime,
-dispatches reads, scans, and collection snapshots, delegates transaction-attempt
-lifecycle to `Algo`, and collects engine statistics and diagnostics. The public
-crate retains metadata/version bootstrap, operation admission, the user-closure
-retry loop, public errors, and public handles. Concrete stores, routing,
-locking, monitoring, splitting, and GC components are not exported across this
+logical access/result types. `Engine` directly owns the runtime graph and its
+lifetime. During `Engine::open`, private dormant state opens caches and stores,
+verifies the permanent collection, constructs the complete graph, and starts it
+only after construction is complete. `Engine` dispatches reads, scans, and
+collection snapshots, delegates transaction-attempt lifecycle to `Algo`, and
+collects runtime statistics and diagnostics. The public crate retains
+metadata/version bootstrap, operation admission, the user-closure retry loop,
+public errors, and public handles. Concrete stores and the routing, locking,
+monitoring, splitting, and GC implementations are not exported across this
 boundary.
+
+The same engine module supplies the storage, time, monitoring, and task
+foundation for focused transaction-engine tests. Production and the Algo tests
+extend it into the complete graph. GC, locking, splitting, and shard-coordination
+tests add only the special collaborator that they exercise, so their manual
+maintenance steps and backend-operation assertions remain deterministic.
 
 ## Component Responsibilities
 
@@ -151,7 +160,7 @@ flowchart TD
 
   subgraph TRANS["glassdb-trans"]
     direction TB
-    Engine["Engine — runtime façade<br/>assembly · lifetime · shutdown<br/>reads · scans · snapshots · diagnostics"]
+    Engine["Engine — runtime owner<br/>storage · wiring · lifetime · shutdown<br/>reads · scans · snapshots · diagnostics"]
     Accesses["AccessSet — access facts<br/>normalize · order · merge<br/>read predicates · direct shape"]
     Algo["Algo — commit policy<br/>attempt lifecycle · orchestration · conflict policy<br/>post-lock read validation"]
     Reader["Reader / KeyResolver<br/>effective-writer reads and validation"]
@@ -164,9 +173,14 @@ flowchart TD
     Coord["ShardCoordinator — fold engine<br/>identity · order · admission<br/>one load · one fold · one CAS<br/>per-member in-doubt recovery"]
     Gc["Gc<br/>reverse liveness checks<br/>transaction-object reclamation"]
 
-    Engine -->|"transaction-attempt lifecycle"| Algo
+    Engine -->|"owns · transaction-attempt lifecycle"| Algo
     Engine -->|"immutable access set"| Accesses
-    Engine -->|"reads · scans · snapshots"| Reader
+    Engine -->|"owns · reads · scans · snapshots"| Reader
+    Engine -.->|"owns and wires"| Locker
+    Engine -.->|"owns and wires"| Monitor
+    Engine -.->|"owns and wires"| Splitter
+    Engine -.->|"owns and wires"| Coord
+    Engine -.->|"starts"| Gc
     Algo -->|"validate"| Reader
     Algo -->|"lock access set"| Locker
     Locker -->|"LockedTx"| Algo
@@ -258,9 +272,10 @@ intentionally distributed. `KeyResolver`, the key-lock view, `Gc`, and
 `Splitter` each own a cheap handle for their distinct read, lock, reclamation,
 or structural workflow. A handle contains a cloned `NodeStore`, so all of them
 share the same decoded object cache without gaining structural-intent store
-capabilities or maintaining independent topology state. The Engine centralizes
-their assembly; it does not invent a single semantic owner for those different
-routing responsibilities.
+capabilities or maintaining independent topology state. The engine module
+centralizes their construction, and `Engine` owns the
+resulting handles. This does not invent a single semantic owner for those
+different routing responsibilities.
 
 `StructuralRecovery` owns each structural intent from its prepared write to
 clean deletion or durable recovery. It exposes opaque prepared and Ready
@@ -290,7 +305,7 @@ bookkeeping remain outside the coordinator.
 | Component             | Layer            | Speaks                       | Owns                                                                                                                  | Must not know                       |
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
 | `glassdb` (`tx_impl`) | API / retry      | `Engine`, closures, `Error`  | metadata bootstrap, operation admission, user body, retry loop, public handles/errors, cancel-safety                  | stores, locks, shards, tx logs, runtime wiring |
-| `Engine`              | runtime façade   | logical keys, `AccessSet`, configuration | component assembly/lifetime, read/scan/catalog entry points, transaction-attempt delegation and abandonment retirement, shutdown, component stats/diagnostics | user closures, public handles/errors, body retry policy |
+| `Engine`              | runtime owner    | backend, database identity, engine configuration, logical keys, `AccessSet` | cache and store opening, permanent-collection verification, runtime construction and lifetime, dormant-to-live startup, read/scan/catalog entry points, transaction-attempt delegation and abandonment retirement, shutdown order, runtime stats/diagnostics | user closures, public handles/errors, body retry policy |
 | `AccessSet`           | access facts     | point reads, final key writes, range scans | normalization, deterministic order, merged point facts, counts, read-only projection, read predicates, structural direct-commit shape | routing, locking, I/O, commit policy |
 | `Algo`                | commit **policy** | `AccessSet`, `TxId`, `LockOutcome`, `TxCleanupHints` | transaction lifecycle, direct-vs-logged selection, cross-domain lock→validate→commit→write-back orchestration, abandoned-owner retirement, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), GC candidate hints | shard routing, CAS details, caching, collection lifecycle implementation, GC execution, the split mechanism beyond its `SplitHintSink` producer handle |
 | `DirectCommit`        | logless commit mechanism | direct point shape, `TxId`, `KeyResolver`, shard operations, `TxCleanupHints` | one-leaf and physical eligibility, atomic inline/tombstone publication, transaction-local recovery classification, predecessor cleanup hints | access normalization, transaction logs, range/catalog validation, waiting or wounding holders, GC execution |

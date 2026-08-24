@@ -416,8 +416,8 @@ struct Inner {
     timeline: Timeline,
     final_status: Mutex<FinalStatusCache>,
     // Weak so a `Monitor` clone captured inside a spawned task does not keep
-    // the [`Background`] alive across DB shutdown. The single strong owner
-    // is `DbInner::background`.
+    // the [`Background`] alive across DB shutdown. `Engine` is the single
+    // strong owner.
     background: Weak<Background>,
     retry: RetryConfig,
     timing: ProtocolTiming,

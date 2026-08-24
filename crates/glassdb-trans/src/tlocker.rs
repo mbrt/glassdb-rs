@@ -1418,6 +1418,7 @@ impl KeyLocker {
 mod tests {
     use super::*;
     use crate::collection_coordination::CollectionStateResolver;
+    use crate::engine::{AssemblyFixture, EngineConfig};
     use crate::key_state_resolver::KeyStateResolver;
     use crate::monitor::ProtocolTiming;
     use crate::shard_coord::SplitHinter;
@@ -1425,12 +1426,11 @@ mod tests {
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
     };
     use glassdb_backend::{Backend, memory::MemoryBackend};
-    use glassdb_concurr::{Background, RetryConfig};
+    use glassdb_concurr::RetryConfig;
     use glassdb_data::{CollectionAddress, DbRoot, ObjectPath};
-    use glassdb_storage::transaction::{TLogger, TxCommitStatus};
+    use glassdb_storage::transaction::TxCommitStatus;
     use glassdb_storage::{
-        CachedStore, CollectionRecord, CollectionStore, Node, NodeStore, Shard, ShardEntry,
-        SplitPolicy, Timeline, TreeRouter,
+        CollectionRecord, Node, NodeStore, Shard, ShardEntry, SplitPolicy, Timeline, TreeRouter,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1448,7 +1448,7 @@ mod tests {
         timeline: Timeline,
         monitor: Monitor,
         coord: ShardCoordinator,
-        _bg: Arc<Background>,
+        _foundation: AssemblyFixture,
     }
 
     async fn new_test_locker(b: Arc<dyn Backend>) -> (Locker, TlCtx) {
@@ -1459,19 +1459,15 @@ mod tests {
         b: Arc<dyn Backend>,
         policy: SplitPolicy,
     ) -> (Locker, TlCtx) {
-        let timeline = Timeline::new();
-        let objects = CachedStore::new(b.clone(), 1024, timeline.clone(), None);
-        let tl = TLogger::new(objects.clone(), DbRoot::try_from("test").unwrap());
-        let bg = Arc::new(Background::new());
-        let mon = Monitor::with_config(
-            tl.clone(),
-            timeline.clone(),
-            Arc::downgrade(&bg),
-            RetryConfig::default(),
-            ProtocolTiming::simulation(),
-        );
-        let records = CollectionStore::new(objects.clone());
-        let shards = NodeStore::new(objects.clone());
+        let mut config = EngineConfig::default();
+        config.set_cache_size(1024);
+        config.set_protocol_timing(ProtocolTiming::simulation());
+        let foundation = AssemblyFixture::new(b, DbRoot::try_from("test").unwrap(), &config);
+        let timeline = foundation.timeline.clone();
+        let tl = foundation.tlogger.clone();
+        let mon = foundation.monitor.clone();
+        let records = foundation.records.clone();
+        let shards = foundation.shards.clone();
         assert!(
             records
                 .create_record(&collection(), &CollectionRecord::new())
@@ -1508,7 +1504,7 @@ mod tests {
                 timeline,
                 monitor: mon,
                 coord,
-                _bg: bg,
+                _foundation: foundation,
             },
         )
     }
