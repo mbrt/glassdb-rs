@@ -1,4 +1,4 @@
-# Define domain leaf-group reuse across commit paths
+# Define routed leaf-group lifetime across commit paths
 
 Type: grilling
 Status: resolved
@@ -6,7 +6,7 @@ Blocked by: 02, 03
 
 ## Question
 
-Which domain-owned leaf groups and observations can be reused across direct-commit eligibility, fallback to the logged path, lock grouping, validation, and write-back without a shared point-leaf plan or trust in stale ownership after a split? Decide which interface owns each value, which later phase may reuse it, and where fresh routing is required.
+Where can a routed leaf group and later protocol-specific leaf state be reused across direct-commit eligibility, fallback to the logged path, lock grouping, validation, and write-back without treating routing evidence as a shared point-leaf plan or current ownership after a split? Decide which interface owns each value, which later phase may reuse it, and where new routing is required.
 
 ## Answer
 
@@ -17,10 +17,15 @@ it, and do not retain routing across a body replay that replaces the access set.
 
 Use `TreeRouter` over the shared `NodeStore` cache as the common physical-routing
 module. `DirectCommit` and `KeyLocker` depend on `TreeRouter` independently and
-call `group_keys_by_leaf` with their own domain payload. A `LeafGroup<T>` is a
-temporary result of one descent, not a shared point-leaf plan or proof of current
-ownership. Repeated `Requirement::Any` descent reuses cached decoded nodes and
-normally adds no backend read. Remove the shallow
+call `group_keys_by_leaf` with their own domain payload. Its canonical output is
+`RoutedLeafGroup<T>`: one leaf observation and the ordered logical keys, with
+their domain payloads, routed to that leaf. It has no separate freshness field
+because the observation already carries currentness evidence and the routing
+requirements decide whether that evidence is sufficient. A routed leaf group
+is a temporary result of one descent, not a shared point-leaf plan or proof of
+current ownership. Repeated
+`Requirement::Any` descent reuses cached decoded nodes and normally adds no
+backend read. Remove the shallow
 `KeyResolver::route_one_leaf`; direct commit performs its physical grouping
 through `TreeRouter` directly.
 
@@ -33,14 +38,14 @@ causes a new complete direct grouping. A later reroute or another locked outcome
 discards the direct grouping; `KeyLocker` then groups the same logical
 `AccessSet` independently.
 
-`KeyLocker` owns its point intentions and routed lock groups. One group can be
-reused while that leaf waits for a foreign holder because each coordinator
-submission reloads the target and checks all keys. A conflict, leaf-capacity
-failure, ownership failure, or serial escalation ends that acquisition attempt.
-Release the exact paths that actually acquired locks, clear their process-local
-bookkeeping, and build new groups from the current `AccessSet`. Do not reuse the
-failed attempt's prospective groups. Retry release uses exact held paths and
-sweeps for the transaction ID; it does not route keys.
+`KeyLocker` converts each routed leaf group into its domain-owned lock group.
+One lock group can be reused while that leaf waits for a foreign holder because
+each coordinator submission reloads the target and checks all keys. A conflict,
+leaf-capacity failure, ownership failure, or serial escalation ends that
+acquisition attempt. Release the exact paths that actually acquired locks,
+clear their process-local bookkeeping, and build new groups from the current
+`AccessSet`. Do not reuse the failed attempt's prospective groups. Retry release
+uses exact held paths and sweeps for the transaction ID; it does not route keys.
 
 Only a fully successful acquisition creates cross-phase physical state.
 `LockedTx`, owned by `KeyLocker`, retains each acquired path, `LeafRef`, point

@@ -26,7 +26,7 @@ This shared seam earns its place because deleting it would repeat bounded admiss
 
 Put combination behavior in the domain interface that understands why inputs belong together:
 
-- `TreeRouter::group_keys_by_leaf` owns path-batched descent, B-link correction, convergence on one path, and stable `LeafGroup` output.
+- `TreeRouter::group_keys_by_leaf` owns path-batched descent, B-link correction, convergence on one path, and stable `RoutedLeafGroup<T>` output. This output includes a leaf observation but does not become a shared point-leaf plan.
 - `KeyResolver::effective_point_states` accepts the complete point-key set and owns logical resolution against grouped leaves.
 - `NodeStore` should accept a set of retained leaf observations when physical validation can share or remove duplicate checks.
 - `KeyLocker` accepts the access set or held leaf set. It owns per-leaf intent grouping, bounded multi-leaf execution, hold-and-wait, retry release, write-back rerouting, held-lock bookkeeping, and the sorted serial fallback.

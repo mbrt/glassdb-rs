@@ -86,7 +86,7 @@ Use cached `Requirement::Any` descent for interior nodes and
 refreshed terminal path if it became an index, so B-link routing remains
 self-correcting.
 
-After routing, run one bounded future per stable `LeafGroup`. A leaf future
+After routing, run one bounded future per stable `RoutedLeafGroup<T>`. A leaf future
 checks collection liveness once, reads the membership version once, and resolves
 its keys serially in their input order. Waiting for collection state or a
 transaction status keeps that leaf future incomplete and therefore consumes one

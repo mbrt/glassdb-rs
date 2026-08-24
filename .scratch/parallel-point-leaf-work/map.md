@@ -12,6 +12,7 @@ Produce an implementation-ready design for bounded parallel execution of indepen
 - Apply one internal concurrency limit to each phase. Do not add public concurrency configuration unless measurements make it necessary.
 - Use bounded `join_all` semantics: waiting futures count against the limit, every supplied input runs, and outputs return in stable input order. Do not add parking, replacement, or terminal-cutoff concepts to the generic interface. Committed write-back remains best-effort across leaves.
 - Put input combination in the domain interface that owns physical routing, logical resolution, or atomic leaf mutation. Do not add a shared routed point-leaf plan.
+- A **routed leaf group** (`RoutedLeafGroup<T>`) is the temporary `TreeRouter` output: one leaf observation and the ordered logical keys, with their domain payloads, routed to it. It records a routing result, not a durable ownership claim. The observation carries currentness evidence; there is no separate freshness field.
 - For `L` independent cold leaves and limit `N`, backend wait time should use approximately `ceil(L/N)` waves instead of `L` waves. A one-leaf transaction must add no backend operation, one phase must not exceed `N` incomplete leaf futures, and a repeatable throughput regression greater than 5% rejects the design.
 - Preserve the principles in `docs/principles.md`, deterministic simulation, self-correcting routing across splits, one ordered mutation stream per leaf, one transaction-object commit point for cross-leaf transactions, and all existing snapshot-transparent outcomes.
 - This Wayfinder effort makes decisions and produces the implementation-ready design. It does not implement the design.
@@ -19,9 +20,9 @@ Produce an implementation-ready design for bounded parallel execution of indepen
 ## Decisions so far
 
 - [Define the bounded distinct-leaf execution contract](issues/01-define-bounded-distinct-leaf-execution-contract.md): Use a foreground bounded join that counts incomplete futures, runs every input, returns stable ordered outputs, and relies on existing cancellation guards.
-- [Choose the point-key batch routing design](issues/02-choose-point-key-batch-routing-design.md): Use path-batched descent for multiple point keys, spend the limit on distinct node paths, and keep direct one-key descent without an extra backend operation.
+- [Choose the point-key batch routing design](issues/02-choose-point-key-batch-routing-design.md): Use path-batched descent for multiple point keys, return stable `RoutedLeafGroup<T>` values, spend the limit on distinct node paths, and keep direct one-key descent without an extra backend operation.
 - [Place the point-leaf planning and execution seams](issues/03-place-point-leaf-planning-and-execution-seams.md): Put `join_all_bounded` in `glassdb-concurr`, keep batching in its domain owners, and add no shared point-leaf plan or domain-aware executor.
-- [Define domain leaf-group reuse across commit paths](issues/04-reuse-one-point-leaf-plan-across-commit-paths.md): Share only logical access facts, reuse cached `Any` descent through `TreeRouter`, retain successful `LockedTx` groups and receipts, and regroup only after stale evidence.
+- [Define routed leaf-group lifetime across commit paths](issues/04-reuse-one-point-leaf-plan-across-commit-paths.md): Share only logical access facts, treat routed leaf groups as temporary evidence, reuse cached `Any` descent through `TreeRouter`, retain successful `LockedTx` groups and receipts, and regroup only after stale evidence.
 - [Define parallel point validation](issues/05-define-parallel-point-validation.md): Use input-aligned physical and logical batches over distinct paths and leaves, share one lower bound and limit, and use keyed receipts with an exact own-holder shortcut.
 
 ## Not yet specified

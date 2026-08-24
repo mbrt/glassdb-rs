@@ -5,17 +5,23 @@ Status: resolved
 
 ## Question
 
-Which concrete batch-routing design gives bounded parallel descent for point keys while reading each required tree node as few times as possible, preserving stable leaf groups, correcting stale routes through B-link right links, and adding no backend operation to the one-key path? Compare concurrent per-key descent, tree-aware breadth-by-node descent, and any materially different design with a small prototype and operation-count evidence.
+Which concrete batch-routing design gives bounded parallel descent for point keys while reading each required tree node as few times as possible, preserving stable routed leaf groups, correcting stale routes through B-link right links, and adding no backend operation to the one-key path? Compare concurrent per-key descent, tree-aware breadth-by-node descent, and any materially different design with a small prototype and operation-count evidence.
 
 ## Prototype
 
-[Point-key routing logic demo](../assets/point-key-routing-prototype.html) compares serial independent descent, bounded independent descent, path-batched wave descent, and a sorted leaf-chain sweep. It shows backend reads, backend waves, stable leaf groups, cache state, and B-link right-link correction.
+[Point-key routing logic demo](../assets/point-key-routing-prototype.html) compares serial independent descent, bounded independent descent, path-batched wave descent, and a sorted leaf-chain sweep. It shows backend reads, backend waves, stable routed leaf groups, cache state, and B-link right-link correction.
 
 The validated primary source is on local throwaway branch `prototype/point-key-routing-wave-descent`, commit `ccfac476`, at `.scratch/parallel-point-leaf-work/assets/point-key-routing-prototype.html`.
 
 ## Answer
 
 Choose path-batched descent for two or more point-key items. Keep the existing direct descent for zero or one item. The batch design is internal to the `TreeRouter` interface and does not add a shared point-leaf plan or a public batch point-read interface. It does not change the sorted serial lock fallback.
+
+Use `RoutedLeafGroup<T>` as the canonical completed-routing output. Each value
+contains one `LeafObservation` and the ordered raw keys with their domain
+payloads. The observation carries currentness evidence; do not add a separate
+freshness field. A routed leaf group is temporary routing evidence, not proof
+that the observed leaf still owns those keys.
 
 A pending routing batch contains one current node path and its ordered point-key items. At most `N` distinct node-path loads are incomplete. A path is loaded once at its required currentness, then all items for that path use the same node and observation:
 
@@ -26,7 +32,7 @@ A pending routing batch contains one current node path and its ordered point-key
 
 Combine pending batches that reach the same path before admission. When one load completes, its child and right-sibling batches can enter the same bounded ready set. The implementation does not need a global level barrier; the prototype uses backend waves only to make causal depth and operation counts visible. `TreeRouter` owns this dynamic ready set because it understands path convergence and B-link correction. Poll all routing work in the caller's task, keep at most `N` path loads incomplete, and return stable grouped output without exposing the ready set through its interface.
 
-Retain each item's original ordinal. Return `LeafGroup` values in stable object-path order and keys in original input order inside each group. Retain one leaf observation for each final path. If several started path loads fail, select the error for the smallest affected input ordinal, with object path as the tie-break. Preserve collection-absence classification for that item.
+Retain each item's original ordinal. Return `RoutedLeafGroup<T>` values in stable object-path order and keys in original input order inside each group. Retain one leaf observation for each final path. If several started path loads fail, select the error for the smallest affected input ordinal, with object path as the tie-break. Preserve collection-absence classification for that item.
 
 This design keeps self-correcting routing. A stale index can send an item too far left; the loaded node high key moves that item to the right sibling. Batches that converge on that sibling combine. A stale cached root that looked like a leaf is reprocessed after its terminal refresh, so an index is never returned as a leaf.
 
