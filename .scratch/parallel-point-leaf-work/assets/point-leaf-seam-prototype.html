@@ -1,0 +1,857 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Point-leaf seam prototype</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17222d;
+      --muted: #5d6975;
+      --line: #d9e0e6;
+      --panel: #f7f9fb;
+      --accent: #176b87;
+      --accent-soft: #e2f2f6;
+      --warn: #8a5b16;
+      --warn-soft: #fff5df;
+      --ok: #25734a;
+      --ok-soft: #eef9f3;
+      --bad: #a63b32;
+      --bad-soft: #fff0ed;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: white;
+      color: var(--ink);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.48;
+    }
+    main { width: min(1180px, calc(100% - 32px)); margin: 38px auto 72px; }
+    h1, h2, h3 { line-height: 1.16; }
+    h1 { margin-bottom: 8px; font-size: clamp(2rem, 4vw, 3rem); }
+    h2 { margin: 0 0 14px; font-size: 1.28rem; }
+    h3 { margin: 0 0 8px; font-size: 1.03rem; }
+    p { max-width: 88ch; }
+    code { background: #edf1f4; border-radius: 4px; padding: 1px 4px; }
+    pre {
+      margin: 12px 0 0;
+      padding: 14px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f1f4f6;
+      font-size: .86rem;
+      line-height: 1.4;
+    }
+    pre code { padding: 0; background: transparent; }
+    button {
+      border: 1px solid #b8c5ce;
+      border-radius: 8px;
+      background: white;
+      color: var(--ink);
+      cursor: pointer;
+      font: inherit;
+      padding: 7px 11px;
+    }
+    button:hover { border-color: var(--accent); }
+    button[aria-pressed="true"], button.primary {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: white;
+    }
+    button:disabled { cursor: default; opacity: .45; }
+    .intro { margin-top: 0; color: var(--muted); font-size: 1.05rem; }
+    .question {
+      margin: 24px 0 28px;
+      padding: 14px 18px;
+      border-left: 4px solid var(--accent);
+      background: var(--accent-soft);
+    }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .panel {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel);
+    }
+    .wide { margin-top: 18px; }
+    .controls { display: grid; gap: 14px; }
+    .control-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .label { min-width: 92px; color: var(--muted); font-weight: 650; }
+    .small { color: var(--muted); font-size: .9rem; }
+    .state-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .state-field {
+      min-width: 0;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: white;
+    }
+    .state-field span {
+      display: block;
+      color: var(--muted);
+      font-size: .76rem;
+      letter-spacing: .05em;
+      text-transform: uppercase;
+    }
+    .state-field strong { display: block; margin-top: 3px; overflow-wrap: anywhere; }
+    .notice { margin-top: 12px; padding: 10px 12px; border-radius: 8px; }
+    .notice.ok { border: 1px solid #aad2bf; background: var(--ok-soft); }
+    .notice.warn { border: 1px solid #e3c98d; background: var(--warn-soft); }
+    .notice.bad { border: 1px solid #e6b3ac; background: var(--bad-soft); }
+    .log { display: grid; gap: 7px; max-height: 240px; margin-top: 12px; overflow: auto; }
+    .log-entry { padding: 8px 10px; border-left: 3px solid var(--line); background: white; }
+    .log-entry.current { border-color: var(--accent); }
+    .cards { display: grid; gap: 14px; }
+    .design-card {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: white;
+    }
+    .design-card.selected { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+    .tag {
+      display: inline-block;
+      margin: 0 6px 6px 0;
+      padding: 3px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: .8rem;
+    }
+    .tag.good { border-color: #aad2bf; color: var(--ok); background: var(--ok-soft); }
+    .tag.risk { border-color: #e3c98d; color: var(--warn); background: var(--warn-soft); }
+    .tradeoffs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; margin-top: 12px; }
+    .tradeoff { padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+    .tradeoff span { display: block; color: var(--muted); font-size: .76rem; text-transform: uppercase; }
+    .tradeoff strong { display: block; margin-top: 3px; }
+    table { width: 100%; border-collapse: collapse; background: white; font-size: .92rem; }
+    th, td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: .76rem; letter-spacing: .04em; text-transform: uppercase; }
+    tr.selected td { background: var(--accent-soft); }
+    .yes { color: var(--ok); font-weight: 700; }
+    .mixed { color: var(--warn); font-weight: 700; }
+    .no { color: var(--bad); font-weight: 700; }
+    .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+    .walkthrough { padding: 14px; border: 1px solid var(--line); border-radius: 9px; background: white; }
+    .steps { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .step-done { text-decoration: line-through; opacity: .55; }
+    .recommendation { border-color: #aad2bf; background: var(--ok-soft); }
+    .module-flow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .module {
+      padding: 7px 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: white;
+      font-weight: 650;
+    }
+    .arrow { color: var(--muted); }
+    @media (max-width: 860px) {
+      .grid, .tradeoffs { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Point-leaf seam prototype</h1>
+  <p class="intro">A throwaway model of four interface shapes for grouped point-leaf work and bounded foreground joins.</p>
+
+  <div class="question">
+    <strong>Question:</strong> Can domain interfaces combine the inputs they understand, then run independent futures through one bounded <code>join_all</code> variant, or does the transaction engine need a routed point-leaf plan?
+  </div>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>Free play</h2>
+      <div id="controls" class="controls"></div>
+    </section>
+    <section class="panel">
+      <h2>Current state</h2>
+      <div id="state"></div>
+    </section>
+  </div>
+
+  <section class="panel wide">
+    <h2>Event log</h2>
+    <div id="event-log" class="log"></div>
+  </section>
+
+  <section class="panel wide">
+    <h2>Designs, in sequence</h2>
+    <p class="small">Select a design to use it in free play. The sketches show the interface, not implementation code.</p>
+    <div id="designs" class="cards"></div>
+  </section>
+
+  <section class="panel wide">
+    <h2>Comparison</h2>
+    <div id="comparison"></div>
+  </section>
+
+  <section class="panel wide">
+    <h2>Guided walkthroughs</h2>
+    <div id="walkthroughs"></div>
+  </section>
+
+  <section class="panel wide recommendation">
+    <h2>Validated decision</h2>
+    <p><strong>Prefer a bounded join with domain batch interfaces. Do not add a persistent point-leaf plan or a domain-aware executor.</strong> Each module combines inputs when it understands a physical or atomic reason to do so. Its existing loop then calls <code>join_all_bounded</code> over the resulting independent futures.</p>
+    <div class="module-flow" aria-label="Recommended module flow">
+      <span class="module">domain batch interface</span><span class="arrow">→ independent futures →</span>
+      <span class="module">join_all_bounded</span><span class="arrow">→ stable outputs →</span>
+      <span class="module">current policy owner</span><span class="arrow">→ complete leaf operation →</span>
+      <span class="module">ShardCoordinator</span>
+    </div>
+    <p><code>join_all_bounded</code> polls in the caller's task, keeps at most <code>N</code> futures incomplete, admits and returns them in input order, and runs every supplied input. A waiting future keeps its position. The helper has no parking, replacement, terminal-outcome, or cleanup concepts.</p>
+    <p><code>TreeRouter</code> owns path-batched descent. <code>KeyResolver</code> owns grouped logical resolution. <code>NodeStore</code> owns batch physical checks. <code>KeyLocker</code> owns per-leaf mutation groups, waits, rerouting, bookkeeping, and the sorted serial fallback. <code>ShardCoordinator</code> accepts one complete same-transaction operation for one exact path and combines compatible operations from different transactions.</p>
+    <p>Keep the existing scheduler yield and backend-I/O collection window in <code>ShardCoordinator</code>. Do not add a timed batching delay.</p>
+  </section>
+</main>
+
+<script>
+const PointLeafSeamPrototype = (() => {
+  const LIMIT = 2;
+
+  const DESIGNS = {
+    executable: {
+      name: "Executable routed plan",
+      short: "Small external seam",
+      planOwner: "TreeRouter",
+      executionOwner: "point_leaf module",
+      policyOwner: "Current phase modules",
+      callerFacts: "Plan + one phase adapter",
+      interfaceCount: "2 main calls",
+      depth: "High",
+      locality: "High",
+      extension: "Focused",
+      tags: ["domain-specific", "explicit parking", "small seam"],
+      summary: "TreeRouter returns a stable physical plan. One crate-private runner drives a domain phase through Complete, Park, or Replace steps.",
+      sketch: `// glassdb-storage/tree_router.rs
+async fn plan_point_leaves<T>(
+    items: impl IntoIterator<Item = (KeyRef, T)>,
+    interior: Requirement,
+    leaf: Requirement,
+) -> Result<RoutedPointLeafPlan<T>, StorageError>;
+
+// glassdb-trans/point_leaf.rs
+async fn run_point_leaves<P: PointLeafPhase>(
+    work: PointLeafWork<P::Item>,
+    phase: &P,
+) -> P::Output;
+
+enum LeafStep<T, O> {
+    Complete(LeafCompletion<O>),
+    Park { work: T, until: LeafWake },
+    Replace(PointLeafReplacement<T>),
+}`,
+      risk: "Each policy owner must convert a long loop into bounded leaf steps.",
+      behavior: {
+        route: "TreeRouter builds one stable RoutedPointLeafPlan.",
+        phase: "point_leaf owns admission, parking, cutoff, draining, and stable selection.",
+        direct: "The plan exposes its only leaf; no phase queue is built.",
+        serial: "KeyLocker bypasses the bounded runner and uses sorted leaf order.",
+      },
+    },
+    flexible: {
+      name: "Flexible phase program",
+      short: "Wide extension seam",
+      planOwner: "TreeRouter",
+      executionOwner: "PointLeafExecutor",
+      policyOwner: "PointLeafPhase adapters",
+      callerFacts: "Initial, attempt, wait, reroute, disposition, finish",
+      interfaceCount: "6 phase hooks",
+      depth: "Medium",
+      locality: "High",
+      extension: "Very high",
+      tags: ["maximum extension", "explicit state", "wide interface"],
+      summary: "A reusable executor lets each phase define work creation, parking, rerouting, terminal policy, and result reduction.",
+      sketch: `trait PointLeafPhase {
+    type Work;
+    type LeafOutcome;
+    type Park;
+    type Reroute;
+    type Output;
+
+    fn initial(&self) -> Vec<Self::Work>;
+    fn attempt(&self, work: Self::Work) -> LeafStep<...>;
+    fn wait(&self, parked: Self::Park) -> Self::Work;
+    fn reroute(&self, request: Self::Reroute) -> Vec<Self::Work>;
+    fn disposition(&self, outcome: &Result<...>) -> Disposition;
+    fn finish(self, results: PhaseResults<...>) -> Self::Output;
+}`,
+      risk: "The interface exposes much scheduler vocabulary. Phase adapters can become large and inconsistent.",
+      behavior: {
+        route: "TreeRouter builds a stable PointLeafPlan.",
+        phase: "Each adapter configures the full PointLeafExecutor program.",
+        direct: "The plan has an only-leaf fast path outside the executor.",
+        serial: "The serial path bypasses the executor by convention.",
+      },
+    },
+    workflow: {
+      name: "Stateful point-leaf workflow",
+      short: "Small Algo caller",
+      planOwner: "PointLeaves facade",
+      executionOwner: "PointLeaves facade",
+      policyOwner: "Facade delegates to four owners",
+      callerFacts: "Plan, try_direct, lock, validate, write_back",
+      interfaceCount: "1 workflow object",
+      depth: "High for Algo",
+      locality: "Low",
+      extension: "Low",
+      tags: ["easy common caller", "opaque state", "high seam"],
+      summary: "One opaque workflow object moves through direct commit, locking, validation, and write-back.",
+      sketch: `let points = point_leaves.plan(&accesses).await?;
+let points = points.try_direct(id, state).await?;
+let locked = points.lock(id, validation_start).await?;
+if !locked.validate(validation_start).await? { /* retry */ }
+point_leaves.write_back_committed(id, locked).await;
+
+struct PointLeaves {
+    router: TreeRouter,
+    resolver: KeyResolver,
+    locker: KeyLocker,
+    direct: DirectCommit,
+}`,
+      risk: "The facade sits above existing policy owners. It can pull commit policy and validation out of Algo and weaken locality.",
+      behavior: {
+        route: "PointLeaves hides the TreeRouter plan behind workflow state.",
+        phase: "The facade selects and runs each phase for Algo.",
+        direct: "try_direct consumes or returns the workflow state.",
+        serial: "lock hides both bounded and sorted modes.",
+      },
+    },
+    foreground: {
+      name: "Bounded join + domain batch interfaces",
+      short: "Bounded join",
+      planOwner: "No persistent plan",
+      executionOwner: "glassdb-concurr::join_all_bounded",
+      policyOwner: "Existing domain module",
+      callerFacts: "Combined futures + stable result interpretation",
+      interfaceCount: "1 join + domain batch interfaces",
+      depth: "High",
+      locality: "High",
+      extension: "Focused",
+      tags: ["small generic mechanism", "deep domain interfaces", "no plan type"],
+      summary: "Each domain module accepts all inputs it can combine efficiently. Its current loop uses one stable bounded join over the independent futures that remain.",
+      sketch: `let groups = router
+    .group_keys_by_leaf(items, requirement)
+    .await?;
+
+let outcomes = join_all_bounded(
+    limit,
+    groups.iter().map(|group| {
+        self.lock_shard(id, group, requirement)
+    }),
+).await;
+
+for (group, outcome) in groups.iter().zip(outcomes) {
+    interpret_in_stable_order(group, outcome)?;
+}
+
+// The helper creates no task per leaf and runs every input.`,
+      risk: "A waiting future keeps one bounded position, and work continues after a terminal domain result. Domain interfaces must combine same-path inputs before this call.",
+      behavior: {
+        route: "TreeRouter's batch interface returns grouped leaves directly; no cross-phase plan is created.",
+        phase: "The current loop calls join_all_bounded after its domain interface has combined inputs.",
+        direct: "The bounded join awaits one input directly without building a multi-future queue.",
+        serial: "KeyLocker bypasses the bounded join and keeps the existing sorted serial fallback.",
+      },
+    },
+  };
+
+  const SCENARIOS = {
+    normal: {
+      name: "Four-leaf logged commit",
+      leaves: 4,
+      description: "Follow normal phase order. Watch which module owns each grouped value and which facts the caller must know.",
+      steps: ["route", "direct", "acquire", "validate", "commit", "writeback", "drain"],
+    },
+    direct: {
+      name: "One-leaf direct commit",
+      leaves: 1,
+      description: "Confirm that one leaf uses direct descent and direct execution, with no queue and no extra backend operation.",
+      steps: ["route", "direct"],
+    },
+    parked: {
+      name: "Foreign-holder wait",
+      leaves: 4,
+      description: "Wait on one foreign holder. In the bounded-join design, the waiting future keeps its incomplete position and no parking protocol is exposed.",
+      steps: ["route", "acquire", "park", "resume", "drain"],
+    },
+    terminal: {
+      name: "Stable terminal result",
+      leaves: 6,
+      description: "Produce one terminal leaf result. The bounded join still runs every supplied input, then the domain owner selects the first result in stable input order.",
+      steps: ["route", "acquire", "terminal", "drain"],
+    },
+    reroute: {
+      name: "Split during write-back",
+      leaves: 3,
+      description: "Reroute one stale write-back leaf. In the bounded-join design, KeyLocker handles the new leaves inside its domain interface instead of returning replacement work to the join.",
+      steps: ["route", "acquire", "validate", "commit", "writeback", "reroute", "drain"],
+    },
+    serial: {
+      name: "Sorted serial fallback",
+      leaves: 4,
+      description: "Release retry holds, then use the existing sorted serial lock path. The bounded join does not own this fallback.",
+      steps: ["route", "acquire", "release", "drain", "serial", "drain"],
+    },
+  };
+
+  const ACTIONS = {
+    route: "Route point access set",
+    direct: "Check direct eligibility",
+    acquire: "Start lock acquisition",
+    park: "Wait on foreign holder",
+    resume: "Foreign holder finalizes",
+    terminal: "Record terminal outcome",
+    validate: "Run point validation",
+    commit: "Write commit point",
+    writeback: "Start committed write-back",
+    reroute: "Reroute stale leaf",
+    release: "Start retry release",
+    serial: "Start sorted serial lock",
+    drain: "Drain started work",
+  };
+
+  function emptyRuntime(scenarioKey) {
+    const scenario = SCENARIOS[scenarioKey];
+    return {
+      phase: "Not routed",
+      planned: false,
+      groups: 0,
+      active: 0,
+      parked: 0,
+      readyStarted: 0,
+      started: 0,
+      complete: 0,
+      unstarted: scenario.leaves,
+      stopped: 0,
+      mode: "None",
+      cutoff: "None",
+      queueBuilt: false,
+      primaryOrders: "None",
+      terminalRecorded: false,
+      normalOutcome: "Pending",
+    };
+  }
+
+  function initialState(design = "foreground", scenario = "normal") {
+    return {
+      design,
+      scenario,
+      runtime: emptyRuntime(scenario),
+      lastChange: "Select an action or start a guided walkthrough.",
+      lastTone: "ok",
+      walkthroughStep: 0,
+      log: ["Prototype reset."],
+    };
+  }
+
+  function note(state, message, tone = "ok") {
+    state.lastChange = message;
+    state.lastTone = tone;
+    state.log.push(message);
+  }
+
+  function invalid(state, message) {
+    note(state, `No state change: ${message}`, "warn");
+  }
+
+  function runAction(input, action) {
+    const state = structuredClone(input);
+    const design = DESIGNS[state.design];
+    const scenario = SCENARIOS[state.scenario];
+    const r = state.runtime;
+
+    switch (action) {
+      case "route": {
+        if (r.planned) return invalid(state, "the point access set is already routed"), state;
+        r.planned = true;
+        r.groups = scenario.leaves;
+        r.unstarted = scenario.leaves;
+        r.phase = state.design === "foreground" ? "Domain leaf groups ready" : "Routed plan ready";
+        r.primaryOrders = scenario.leaves === 1 ? "0" : `0…${scenario.leaves - 1}`;
+        note(state, `${design.behavior.route} ${scenario.leaves} leaf group${scenario.leaves === 1 ? "" : "s"} are ready.`);
+        break;
+      }
+      case "direct": {
+        if (!r.planned) return invalid(state, "route the point access set first"), state;
+        if (r.groups === 1) {
+          r.phase = "Direct commit complete";
+          r.started = 1;
+          r.complete = 1;
+          r.unstarted = 0;
+          r.mode = "Direct one-leaf path";
+          r.queueBuilt = false;
+          r.normalOutcome = "Committed";
+          note(state, `${design.behavior.direct} One ShardCoordinator operation is the commit point.`);
+        } else {
+          r.phase = "Logged fallback selected";
+          note(state, `The complete dependency set spans ${r.groups} leaves. Direct commit does not start.`, "warn");
+        }
+        break;
+      }
+      case "acquire": {
+        if (!r.planned) return invalid(state, "route the point access set first"), state;
+        if (r.normalOutcome === "Committed") return invalid(state, "direct commit is already complete"), state;
+        r.phase = "Normal lock acquisition";
+        r.mode = r.groups === 1 ? "Direct one-leaf drive" : `Bounded, N=${LIMIT}`;
+        r.queueBuilt = r.groups > 1;
+        r.active = Math.min(LIMIT, r.unstarted);
+        r.started += r.active;
+        r.unstarted -= r.active;
+        note(state, `${design.behavior.phase} ${r.active} leaf attempts are active.`);
+        break;
+      }
+      case "park": {
+        if (r.active < 1) return invalid(state, "no active leaf can wait"), state;
+        r.active -= 1;
+        r.parked += 1;
+        if (state.design !== "foreground" && r.unstarted > 0) {
+          r.active += 1;
+          r.started += 1;
+          r.unstarted -= 1;
+        }
+        r.phase = state.design === "foreground" ? "Acquisition with waiting future" : "Acquisition with parked work";
+        note(state, state.design === "foreground"
+          ? "One hold-and-wait future is waiting and keeps its bounded position. No later leaf starts yet."
+          : "One hold-and-wait item is parked and uses no active slot. Another leaf can start.");
+        break;
+      }
+      case "resume": {
+        if (r.parked < 1) return invalid(state, "no parked leaf is ready"), state;
+        r.parked -= 1;
+        if (r.active < LIMIT) {
+          r.active += 1;
+        } else {
+          r.readyStarted += 1;
+        }
+        r.phase = "Started work ready for readmission";
+        note(state, r.readyStarted ? "The woken leaf is ready and waits for readmission before unstarted work." : "The woken leaf is readmitted as active work.");
+        break;
+      }
+      case "terminal": {
+        if (r.started < 1) return invalid(state, "start a leaf phase first"), state;
+        r.terminalRecorded = true;
+        if (state.design === "foreground") {
+          r.cutoff = "None; terminal result recorded while all inputs continue";
+          r.phase = "Terminal result recorded; bounded join continues";
+          note(state, "The bounded join does not interpret the outcome. Remaining inputs run as positions become free.", "warn");
+        } else {
+          r.cutoff = "Terminal result observed; stable selection pending";
+          r.stopped += r.unstarted;
+          r.unstarted = 0;
+          r.phase = "Terminal cutoff; draining";
+          note(state, "Admission stops. All started work stays owned by the phase until it completes or retires.", "warn");
+        }
+        break;
+      }
+      case "validate": {
+        if (!r.planned) return invalid(state, "route the point access set first"), state;
+        if (r.normalOutcome === "Committed") return invalid(state, "direct commit needs no later validation"), state;
+        r.phase = "Point validation";
+        r.mode = r.groups === 1 ? "Direct one-leaf drive" : `Bounded, N=${LIMIT}`;
+        r.queueBuilt ||= r.groups > 1;
+        r.started = Math.max(r.started, r.groups);
+        r.complete = r.groups;
+        r.active = 0;
+        r.parked = 0;
+        r.readyStarted = 0;
+        r.unstarted = 0;
+        note(state, "Point validation uses the same stable leaf order and one shared lower bound.");
+        break;
+      }
+      case "commit": {
+        if (!r.planned) return invalid(state, "route and validate first"), state;
+        if (!r.phase.includes("validation") && r.phase !== "Point validation") return invalid(state, "point validation must finish first"), state;
+        r.phase = "Transaction-object commit point";
+        r.mode = "Single transaction-object operation";
+        r.normalOutcome = "Durably committed; write-back pending";
+        note(state, "Algo keeps the transaction-object commit point after lock and validation phases.");
+        break;
+      }
+      case "writeback": {
+        if (!r.normalOutcome.includes("committed")) return invalid(state, "the transaction-object commit point must win first"), state;
+        r.phase = "Committed write-back";
+        r.mode = r.groups === 1 ? "Direct one-leaf drive" : `Bounded best-effort, N=${LIMIT}`;
+        r.active = Math.min(LIMIT, r.groups);
+        r.started = r.active;
+        r.complete = 0;
+        r.unstarted = r.groups - r.active;
+        r.stopped = 0;
+        r.cutoff = "None; all outcomes continue";
+        r.queueBuilt = r.groups > 1;
+        note(state, "Committed write-back starts independent leaves. All leaf outcomes are continuing.");
+        break;
+      }
+      case "reroute": {
+        if (r.phase !== "Committed write-back") return invalid(state, "reroute replacement is shown during write-back"), state;
+        if (state.design === "foreground") {
+          r.primaryOrders = `${r.primaryOrders}; one admitted operation owns its rerouted descendants`;
+          note(state, "KeyLocker reroutes the stale group inside the admitted write-back future. The bounded join sees no replacement work.");
+        } else {
+          r.groups += 1;
+          r.unstarted += 2;
+          r.primaryOrders = `${r.primaryOrders}; one parent order now has two path tie-breaks`;
+          note(state, "One stale leaf becomes two replacement leaves. Both inherit the parent primary order.");
+        }
+        break;
+      }
+      case "release": {
+        if (!r.planned) return invalid(state, "route and acquire before retry release"), state;
+        r.phase = "Retry release";
+        r.mode = r.groups === 1 ? "Direct one-leaf drive" : `Bounded continuing, N=${LIMIT}`;
+        r.active = Math.min(LIMIT, r.groups);
+        r.started = r.active;
+        r.complete = 0;
+        r.unstarted = r.groups - r.active;
+        r.stopped = 0;
+        r.cutoff = "None; attempt every held leaf";
+        r.queueBuilt = r.groups > 1;
+        note(state, "Retry release uses bounded continuing work before any normal retry or serial reacquisition.");
+        break;
+      }
+      case "serial": {
+        if (!r.planned) return invalid(state, "route the point access set first"), state;
+        if (r.active || r.parked) return invalid(state, "finish retry release before serial reacquisition"), state;
+        r.phase = "Sorted serial lock acquisition";
+        r.mode = "Existing sorted serial fallback";
+        r.active = r.groups ? 1 : 0;
+        r.started = r.groups ? 1 : 0;
+        r.complete = 0;
+        r.unstarted = Math.max(0, r.groups - r.active);
+        r.queueBuilt = false;
+        r.cutoff = "Serial path controls progress";
+        note(state, design.behavior.serial);
+        break;
+      }
+      case "drain": {
+        if (!r.started && !r.active && !r.parked) return invalid(state, "no started work needs draining"), state;
+        const attempted = r.started + r.unstarted;
+        const boundedJoinRunsAll = state.design === "foreground" && r.terminalRecorded;
+        if (boundedJoinRunsAll || (!r.cutoff.startsWith("Terminal") && !r.cutoff.startsWith("First terminal"))) {
+          r.started = Math.max(r.groups, attempted);
+          r.complete = r.started;
+          r.unstarted = 0;
+        } else {
+          r.complete = r.started;
+        }
+        r.active = 0;
+        r.parked = 0;
+        r.readyStarted = 0;
+        if (r.terminalRecorded) {
+          r.cutoff = state.design === "foreground"
+            ? "First terminal result in stable input order selected"
+            : "First terminal result in stable started order selected";
+          r.phase = "Terminal phase complete";
+          r.normalOutcome = "Terminal leaf outcome";
+        } else if (r.phase === "Retry release") {
+          r.phase = "Retry release complete";
+        } else if (r.phase === "Committed write-back") {
+          r.phase = "Committed write-back complete";
+          r.normalOutcome = "Committed";
+        } else if (r.phase === "Sorted serial lock acquisition") {
+          r.phase = "Sorted serial locks held";
+        } else {
+          r.phase = `${r.phase} complete`;
+        }
+        note(state, "Every required input is complete. Stable result selection does not depend on backend completion order.");
+        break;
+      }
+      default:
+        invalid(state, "unknown action");
+    }
+
+    const expected = scenario.steps[state.walkthroughStep];
+    if (action === expected) state.walkthroughStep += 1;
+    return state;
+  }
+
+  function escapeHtml(value) {
+    return String(value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  return { DESIGNS, SCENARIOS, ACTIONS, initialState, runAction, escapeHtml };
+})();
+
+let state = PointLeafSeamPrototype.initialState();
+
+function dispatch(action) {
+  state = PointLeafSeamPrototype.runAction(state, action);
+  render();
+}
+
+function selectDesign(key) {
+  state = PointLeafSeamPrototype.initialState(key, state.scenario);
+  state.log.push(`Selected design: ${PointLeafSeamPrototype.DESIGNS[key].name}.`);
+  render();
+}
+
+function selectScenario(key) {
+  state = PointLeafSeamPrototype.initialState(state.design, key);
+  state.log.push(`Selected walkthrough: ${PointLeafSeamPrototype.SCENARIOS[key].name}.`);
+  render();
+}
+
+function resetState() {
+  state = PointLeafSeamPrototype.initialState(state.design, state.scenario);
+  render();
+}
+
+function renderControls() {
+  const { DESIGNS, SCENARIOS, ACTIONS } = PointLeafSeamPrototype;
+  document.getElementById("controls").innerHTML = `
+    <div>
+      <div class="label">Design</div>
+      <div class="control-row">
+        ${Object.entries(DESIGNS).map(([key, design]) => `
+          <button type="button" aria-pressed="${state.design === key}" onclick="selectDesign('${key}')">${design.short}</button>
+        `).join("")}
+      </div>
+    </div>
+    <div>
+      <div class="label">Scenario</div>
+      <div class="control-row">
+        ${Object.entries(SCENARIOS).map(([key, scenario]) => `
+          <button type="button" aria-pressed="${state.scenario === key}" onclick="selectScenario('${key}')">${scenario.name}</button>
+        `).join("")}
+      </div>
+    </div>
+    <div>
+      <div class="label">Actions</div>
+      <div class="control-row">
+        ${Object.entries(ACTIONS).map(([key, label]) => `<button type="button" onclick="dispatch('${key}')">${label}</button>`).join("")}
+      </div>
+    </div>
+    <div class="control-row">
+      <button type="button" class="primary" onclick="resetState()">Reset current scenario</button>
+    </div>
+  `;
+}
+
+function renderState() {
+  const design = PointLeafSeamPrototype.DESIGNS[state.design];
+  const scenario = PointLeafSeamPrototype.SCENARIOS[state.scenario];
+  const r = state.runtime;
+  document.getElementById("state").innerHTML = `
+    <div class="state-grid">
+      <div class="state-field"><span>Design</span><strong>${design.name}</strong></div>
+      <div class="state-field"><span>Scenario</span><strong>${scenario.name}</strong></div>
+      <div class="state-field"><span>Current phase</span><strong>${r.phase}</strong></div>
+      <div class="state-field"><span>Execution mode</span><strong>${r.mode}</strong></div>
+      <div class="state-field"><span>Routed state owner</span><strong>${design.planOwner}</strong></div>
+      <div class="state-field"><span>Execution owner</span><strong>${design.executionOwner}</strong></div>
+      <div class="state-field"><span>Leaf groups</span><strong>${r.groups}</strong></div>
+      <div class="state-field"><span>Primary order</span><strong>${r.primaryOrders}</strong></div>
+      <div class="state-field"><span>Running / waiting</span><strong>${r.active} / ${r.parked}</strong></div>
+      <div class="state-field"><span>Ready started</span><strong>${r.readyStarted}</strong></div>
+      <div class="state-field"><span>Started / complete</span><strong>${r.started} / ${r.complete}</strong></div>
+      <div class="state-field"><span>Not admitted / stopped</span><strong>${r.unstarted} / ${r.stopped}</strong></div>
+      <div class="state-field"><span>Multi-item queue</span><strong>${r.queueBuilt ? "Yes" : "No"}</strong></div>
+      <div class="state-field"><span>Cutoff</span><strong>${r.cutoff}</strong></div>
+      <div class="state-field"><span>Caller learns</span><strong>${design.callerFacts}</strong></div>
+      <div class="state-field"><span>Normal outcome</span><strong>${r.normalOutcome}</strong></div>
+    </div>
+    <div class="notice ${state.lastTone}">${state.lastChange}</div>
+  `;
+}
+
+function renderLog() {
+  document.getElementById("event-log").innerHTML = state.log
+    .map((entry, index) => `<div class="log-entry ${index === state.log.length - 1 ? "current" : ""}">${index + 1}. ${entry}</div>`)
+    .join("");
+}
+
+function renderDesigns() {
+  const { DESIGNS } = PointLeafSeamPrototype;
+  document.getElementById("designs").innerHTML = Object.entries(DESIGNS).map(([key, design], index) => `
+    <article class="design-card ${state.design === key ? "selected" : ""}">
+      <h3>${index + 1}. ${design.name}</h3>
+      <p>${design.summary}</p>
+      <div>${design.tags.map((tag, tagIndex) => `<span class="tag ${tagIndex === 0 ? "good" : tagIndex === design.tags.length - 1 ? "risk" : ""}">${tag}</span>`).join("")}</div>
+      <pre><code>${PointLeafSeamPrototype.escapeHtml(design.sketch)}</code></pre>
+      <div class="tradeoffs">
+        <div class="tradeoff"><span>Depth</span><strong>${design.depth}</strong></div>
+        <div class="tradeoff"><span>Locality</span><strong>${design.locality}</strong></div>
+        <div class="tradeoff"><span>Extension</span><strong>${design.extension}</strong></div>
+      </div>
+      <p class="small"><strong>Risk:</strong> ${design.risk}</p>
+      <button type="button" onclick="selectDesign('${key}')">Drive this design</button>
+    </article>
+  `).join("");
+}
+
+function renderComparison() {
+  const { DESIGNS } = PointLeafSeamPrototype;
+  const rows = [
+    ["Physical B-link routing stays in TreeRouter", "yes", "yes", "mixed", "yes"],
+    ["Phase policy stays with its current owner", "yes", "yes", "mixed", "yes"],
+    ["Generic mechanism has no domain wait or reroute states", "no", "no", "mixed", "yes"],
+    ["Every supplied input runs and returns in stable order", "mixed", "mixed", "mixed", "yes"],
+    ["One-leaf path avoids a scheduler", "yes", "yes", "yes", "yes"],
+    ["Sorted serial fallback stays separate", "yes", "mixed", "mixed", "yes"],
+    ["Caller interface stays small", "yes", "no", "yes", "yes"],
+    ["Input combination stays with its domain owner", "mixed", "mixed", "no", "yes"],
+    ["Module does not combine existing policy owners", "yes", "yes", "no", "yes"],
+  ];
+  const label = { yes: "Yes", mixed: "Risk", no: "No" };
+  document.getElementById("comparison").innerHTML = `
+    <table>
+      <thead><tr><th>Test</th>${Object.values(DESIGNS).map(design => `<th>${design.name}</th>`).join("")}</tr></thead>
+      <tbody>
+        ${rows.map(row => `
+          <tr>
+            <td>${row[0]}</td>
+            ${row.slice(1).map(value => `<td class="${value}">${label[value]}</td>`).join("")}
+          </tr>
+        `).join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+function renderWalkthroughs() {
+  const { SCENARIOS, ACTIONS } = PointLeafSeamPrototype;
+  const scenario = SCENARIOS[state.scenario];
+  document.getElementById("walkthroughs").innerHTML = `
+    <div class="tabs">
+      ${Object.entries(SCENARIOS).map(([key, item]) => `
+        <button type="button" aria-pressed="${state.scenario === key}" onclick="selectScenario('${key}')">${item.name}</button>
+      `).join("")}
+    </div>
+    <div class="walkthrough">
+      <h3>${scenario.name}</h3>
+      <p>${scenario.description}</p>
+      <div class="steps">
+        ${scenario.steps.map((action, index) => `
+          <button
+            type="button"
+            class="${index < state.walkthroughStep ? "step-done" : index === state.walkthroughStep ? "primary" : ""}"
+            onclick="dispatch('${action}')"
+          >${index + 1}. ${ACTIONS[action]}</button>
+        `).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function render() {
+  renderControls();
+  renderState();
+  renderLog();
+  renderDesigns();
+  renderComparison();
+  renderWalkthroughs();
+}
+
+render();
+</script>
+</body>
+</html>
