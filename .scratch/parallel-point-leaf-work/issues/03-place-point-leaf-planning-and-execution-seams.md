@@ -29,7 +29,13 @@ Put combination behavior in the domain interface that understands why inputs bel
 - `TreeRouter::group_keys_by_leaf` owns path-batched descent, B-link correction, convergence on one path, and stable `RoutedLeafGroup<T>` output. This output includes a leaf observation but does not become a shared point-leaf plan.
 - `KeyResolver::effective_point_states` accepts the complete point-key set and owns logical resolution against grouped leaves.
 - `NodeStore` should accept a set of retained leaf observations when physical validation can share or remove duplicate checks.
-- `KeyLocker` accepts the access set or held leaf set. It owns per-leaf intent grouping, bounded multi-leaf execution, hold-and-wait, retry release, write-back rerouting, held-lock bookkeeping, and the sorted serial fallback.
+- `KeyLocker` accepts the complete access set or a committed `LockedTx`. It owns
+  per-leaf intent grouping, bounded multi-leaf execution, hold-and-wait,
+  recognition of locks retained by the same transaction identity, write-back
+  rerouting, complete `LockedTx` construction, and the sorted serial acquisition
+  mechanism. It does not keep acquisition-phase held-path state. `AttemptDriver`
+  owns transaction-identity replacement when a parallel acquisition episode
+  must enter that serial mechanism.
 - `ShardCoordinator::coordinate` accepts one complete operation for one transaction on one exact leaf path. It keeps compatible cross-transaction merging and one ordered mutation stream per path. Do not add a shallow `coordinate_all` method that only calls the generic bounded join. Do not send raw keys or separate same-transaction operations for one leaf across this seam.
 
 The current modules call `join_all_bounded` only after their domain interface has selected the correct work units. Exceptional conflict waits and split rerouting can remain slower inside their owning module. This keeps the normal independent-leaf path small and follows the optimistic-concurrency principle.

@@ -41,29 +41,47 @@ discards the direct grouping; `KeyLocker` then groups the same logical
 `KeyLocker` converts each routed leaf group into its domain-owned lock group.
 One lock group can be reused while that leaf waits for a foreign holder because
 each coordinator submission reloads the target and checks all keys. A conflict,
-leaf-capacity failure, ownership failure, or serial escalation ends that
-acquisition attempt. Release the exact paths that actually acquired locks,
-clear their process-local bookkeeping, and build new groups from the current
-`AccessSet`. Do not reuse the failed attempt's prospective groups. Retry release
-uses exact held paths and sweeps for the transaction ID; it does not route keys.
+leaf-capacity failure, or ownership failure ends the current bounded pass, but
+not the normal acquisition episode. Keep every lock held by the same pending
+transaction identity. Discard the pass's prospective groups and proof values,
+build current groups from the complete `AccessSet`, and submit the complete set
+again.
 
-Only a fully successful acquisition creates cross-phase physical state.
+For each submitted group, `AcquireOperation` examines the leaf already loaded
+by `ShardCoordinator`. After the coordinator verifies the leaf scope and the
+operation admits ordinary leaf work, return `Locked` without a CAS when that
+transaction identity already holds every required entry and membership lock at
+a sufficient strength. Otherwise, run the normal idempotent complete-leaf CAS.
+This check keeps normal retry state inside the leaf operation. Do not expose or
+retain a partial routed plan or a partial proof set.
+
+A transition from parallel to sorted serial acquisition ends the old identity's
+acquisition episode. `AttemptDriver` first gives that identity a retirement
+handoff and makes its `Wounded` status durable, then renews the identity and
+builds all physical lock state again. Do not run a foreground release sweep.
+
+Only a fully successful acquisition pass creates cross-phase physical state.
 `LockedTx`, owned by `KeyLocker`, retains each acquired path, `LeafRef`, point
-intent group, and successful lock-CAS receipt. It is the source for the durable
-lock manifest, this transaction's physical validation evidence, and committed
-write-back. Do not reconstruct these facts from diagnostic held-path
+intent group, and private lock proof. An `Installed` proof carries the
+successful lock-CAS precondition observation. An `Observed` proof carries the
+loaded leaf observation that showed every required lock already held by this
+transaction identity. `LockedTx` is the source for the durable lock manifest,
+physical validation evidence, and committed write-back. Do not reconstruct
+these facts from acquisition-phase held-path bookkeeping; do not add that
 bookkeeping.
 
 Keep original point-read observations in `ReadEvidence`. Physical validation is
 optimistic: combine or remove work only for observations of the same exact path
-and revision, and accept this transaction's lock receipt only when its CAS
-precondition is that same exact state. Physical equality is not sufficient when
-the observed entry has an exclusive holder, because the holder's transaction
-status can change the effective writer without changing the leaf. When an exact
-observation changed or such a holder exists, `KeyResolver` owns a new logical
-grouping and resolves the complete point-read set at
-`Requirement::AtLeast(validation_start)`. Do not use direct or lock paths as
-current-ownership evidence for that resolution.
+and revision. Accept only an `Installed` proof whose CAS precondition is that
+same exact state. An `Observed` proof establishes the lock hold but cannot
+reconstruct the state that the earlier CAS replaced, so it uses the normal
+logical validation path. Physical equality is not sufficient when the observed
+entry has an exclusive foreign holder, because the holder's transaction status
+can change the effective writer without changing the leaf. When an exact
+observation changed, the proof is `Observed`, or such a foreign holder exists,
+`KeyResolver` owns a new logical grouping and resolves the complete point-read
+set at `Requirement::AtLeast(validation_start)`. Do not use direct or lock paths
+as current-ownership evidence for that resolution.
 
 Do not add separate leaf-load and dependency-resolution requirements to
 `ShardCoordinator`. Direct commit and normal point-lock acquisition seed their
@@ -77,8 +95,9 @@ following CAS keeps `Requirement::AtLeast(validation_start)`. Existing range-sca
 requirements are unchanged.
 
 Committed write-back reuses each `LockedTx` group as its first target. It also
-uses the lock receipt's currentness bound because write-back can prove the holder
-already absent and finish without another CAS. The coordinator still checks the
-complete key scope. On `Reroute`, `KeyLocker` performs a new `TreeRouter` grouping
-of only that affected group's intentions; one old group can become several
-current groups. No old path is trusted after that signal.
+uses that group's `Installed` or `Observed` proof currentness bound because
+write-back can prove the holder already absent and finish without another CAS.
+The coordinator still checks the complete key scope. On `Reroute`, `KeyLocker`
+performs a new `TreeRouter` grouping of only that affected group's intentions;
+one old group can become several current groups. No old path is trusted after
+that signal.

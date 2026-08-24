@@ -2,7 +2,7 @@
 
 ## Destination
 
-Produce an implementation-ready design for bounded parallel execution of independent point-access work on distinct data leaves. The design covers point-key routing, direct-commit eligibility, validation, normal lock acquisition, retry release, and committed write-back. It retains same-leaf ordering, transaction phase ordering, and the sorted serial lock fallback.
+Produce an implementation-ready design for bounded parallel execution of independent point-access work on distinct data leaves. The design covers point-key routing, direct-commit eligibility, validation, normal lock acquisition and retry, and committed write-back. It retains same-leaf ordering, transaction phase ordering, and the sorted serial lock fallback.
 
 ## Notes
 
@@ -21,10 +21,11 @@ Produce an implementation-ready design for bounded parallel execution of indepen
 
 - [Define the bounded distinct-leaf execution contract](issues/01-define-bounded-distinct-leaf-execution-contract.md): Use a foreground bounded join that counts incomplete futures, runs every input, returns stable ordered outputs, and relies on existing cancellation guards.
 - [Choose the point-key batch routing design](issues/02-choose-point-key-batch-routing-design.md): Use path-batched descent for multiple point keys, return stable `RoutedLeafGroup<T>` values, spend the limit on distinct node paths, and keep direct one-key descent without an extra backend operation.
-- [Place the point-leaf planning and execution seams](issues/03-place-point-leaf-planning-and-execution-seams.md): Put `join_all_bounded` in `glassdb-concurr`, keep batching in its domain owners, and add no shared point-leaf plan or domain-aware executor.
-- [Define routed leaf-group lifetime across commit paths](issues/04-reuse-one-point-leaf-plan-across-commit-paths.md): Share only logical access facts, treat routed leaf groups as temporary evidence, reuse cached `Any` descent through `TreeRouter`, retain successful `LockedTx` groups and receipts, and regroup only after stale evidence.
-- [Define parallel point validation](issues/05-define-parallel-point-validation.md): Use input-aligned physical and logical batches over distinct paths and leaves, share one lower bound and limit, and use keyed receipts with an exact own-holder shortcut.
-- [Bound normal leaf lock acquisition](issues/06-bound-normal-leaf-lock-acquisition.md): Bound the complete combined leaf set with stable outcome selection, and retire and renew the transaction identity before hard-timeout serial acquisition.
+- [Place the point-leaf planning and execution seams](issues/03-place-point-leaf-planning-and-execution-seams.md): Put `join_all_bounded` in `glassdb-concurr`, keep batching and retained-lock recognition in their domain owners, and add no shared point-leaf plan or domain-aware executor.
+- [Define routed leaf-group lifetime across commit paths](issues/04-reuse-one-point-leaf-plan-across-commit-paths.md): Share only logical access facts, rebuild temporary routed groups while normal retries retain physical locks, and let `LockedTx` carry installed or observed lock proof.
+- [Define parallel point validation](issues/05-define-parallel-point-validation.md): Use input-aligned physical and logical batches with one lower bound and limit; only an exact installed-lock proof takes the physical own-holder shortcut.
+- [Bound normal leaf lock acquisition](issues/06-bound-normal-leaf-lock-acquisition.md): Bound the complete combined leaf set, retain locks across normal retries, and renew the transaction identity for every transition from parallel to sorted serial acquisition.
+- [Recognize retained leaf locks across normal retries](issues/07-parallelize-retry-release-before-serial-reacquisition.md): Inspect the coordinator-loaded leaf for a complete same-identity hold, skip its CAS without partial retry state, and use a renewed identity instead of foreground release for serial fallback.
 
 ## Not yet specified
 
