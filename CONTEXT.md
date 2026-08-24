@@ -27,6 +27,10 @@ _Avoid_: Point, point item
 The point reads, final key writes, and range scans from one execution of a transaction body.
 _Avoid_: Data, transaction data
 
+**Transaction identity**:
+A durable protocol identity that correlates one transaction's locks, status, and recovery resources. Replacing it does not by itself repeat the transaction body or discard that body's access set and normal outcome.
+_Avoid_: Lock owner ID
+
 **Normal outcome**:
 A value or error returned by a transaction body and therefore eligible for snapshot validation and transparent retry.
 _Avoid_: Success
