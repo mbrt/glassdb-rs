@@ -12,6 +12,10 @@ _Avoid_: Callback, user closure
 The point reads, final key writes, and range scans from one execution of a transaction body.
 _Avoid_: Data, transaction data
 
+**Structural intent**:
+A durable claim for one planned topology change, owned by a topology participant until the change is completed or recovered.
+_Avoid_: Structural log, structural record
+
 **Normal outcome**:
 A value or error returned by a transaction body and therefore eligible for snapshot validation and transparent retry.
 _Avoid_: Success
