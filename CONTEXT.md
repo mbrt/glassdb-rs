@@ -1,8 +1,9 @@
-# GlassDB
+# GlassDB Language
 
-Domain language for GlassDB's optimistic transactions and recovery guarantees.
+This glossary defines domain language for all parts of GlassDB. It groups terms
+by project area.
 
-## Language
+## Transaction execution
 
 **Transaction body**:
 The caller-supplied computation that produces a transaction's staged changes and normal outcome. GlassDB may execute it more than once.
@@ -11,10 +12,6 @@ _Avoid_: Callback, user closure
 **Access set**:
 The point reads, final key writes, and range scans from one execution of a transaction body.
 _Avoid_: Data, transaction data
-
-**Structural intent**:
-A durable claim for one planned topology change, owned by a topology participant until the change is completed or recovered.
-_Avoid_: Structural log, structural record
 
 **Normal outcome**:
 A value or error returned by a transaction body and therefore eligible for snapshot validation and transparent retry.
@@ -34,3 +31,9 @@ _Avoid_: Immediate cleanup, complete deletion
 **Retirement handoff**:
 The synchronous transfer of responsibility for an abandoned transaction to managed recovery work before control leaves its owner. Protocol-clean retirement may follow asynchronously.
 _Avoid_: Synchronous cleanup
+
+## Topology changes
+
+**Structural intent**:
+A durable claim for one planned topology change, owned by a topology participant until the change is completed or recovered.
+_Avoid_: Structural log, structural record
