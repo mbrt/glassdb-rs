@@ -1065,11 +1065,8 @@ mod tests {
 
     use super::*;
     use crate::access::{ScanRange, WriteAccess};
-    use crate::collection_catalog::CollectionCatalog;
-    use crate::collection_coordination::CollectionStateResolver;
-    use crate::collections::{CollectionChange, CollectionLifecycle, CollectionOp};
-    use crate::engine::{Engine, EngineConfig};
-    use crate::gc::TxCleanupHints;
+    use crate::collections::{CollectionChange, CollectionOp};
+    use crate::engine::{AssemblyFixture, Engine, EngineConfig, EngineFixture, engine_fixture};
     use crate::key_state_resolver::KeyStateResolver;
     use crate::monitor::{ProtocolTiming, TxRecoveryManifest};
     use crate::reader::Reader;
@@ -1077,14 +1074,14 @@ mod tests {
         BackendOp, HookBackend, HookFuture, OpLog, OpRecord, RecordingBackend,
     };
     use glassdb_backend::{Backend, StatsBackend, memory::MemoryBackend};
-    use glassdb_concurr::{Background, RetryConfig};
+    use glassdb_concurr::RetryConfig;
     use glassdb_data::{
         CollectionAddress, CollectionId, DatabaseId, DbRoot, LeafRef, NodeToken, ObjectPath,
     };
     use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, CurrentState, Node, NodeStore, Shard,
-        ShardEntry, StorageError, StructuralLogStore, TreeRouter,
+        ShardEntry, StorageError, TreeRouter,
     };
     use tokio::sync::Notify;
 
@@ -1116,6 +1113,7 @@ mod tests {
         pub(super) shards: NodeStore,
         pub(super) timeline: Timeline,
         pub(super) locker: Locker,
+        _engine: EngineFixture,
     }
 
     pub(super) async fn new_algo() -> (Algo, Tctx) {
@@ -1153,104 +1151,37 @@ mod tests {
         split_policy: SplitPolicy,
         managed_retirement: bool,
     ) -> (Algo, Tctx) {
-        let timeline = Timeline::new();
-        let objects = CachedStore::new(b.clone(), cache_bytes, timeline.clone(), None);
-        let tlogger = TLogger::new(objects.clone(), test_db_root());
-        let bg = Arc::new(Background::new());
-        let bg_weak = Arc::downgrade(&bg);
-        // Leak the background so spawned retirement can run for the test's
-        // lifetime without us threading the owner through every helper.
-        std::mem::forget(bg);
-        let tmon = Monitor::with_config(
-            tlogger.clone(),
-            timeline.clone(),
-            bg_weak.clone(),
-            RetryConfig::default(),
-            ProtocolTiming::simulation(),
-        );
-        let records = CollectionStore::new(objects.clone());
-        let shards = NodeStore::new(objects.clone());
-        let structural_logs = StructuralLogStore::new(objects.clone());
-        let collection_state = CollectionStateResolver::new(
-            records.clone(),
-            tlogger.clone(),
-            tmon.clone(),
-            RetryConfig::default(),
-        );
-        let key_state = KeyStateResolver::new(tmon.clone());
-        let resolver = KeyResolver::new(TreeRouter::new(shards.clone()), key_state.clone());
-        let router = TreeRouter::new(shards.clone());
-        let cleanup_hints = TxCleanupHints::default();
-        let (coord, splitter) = crate::split::Splitter::with_coordinator(
-            bg_weak.clone(),
-            records.clone(),
-            shards.clone(),
-            structural_logs.clone(),
-            timeline.clone(),
-            tmon.clone(),
-            key_state,
-            RetryConfig::default(),
-            test_db_root(),
-            split_policy,
-            glassdb_storage::InlinePolicy::default(),
-            cleanup_hints.clone(),
-        );
-        let locker = Locker::new(
-            coord.clone(),
-            router,
-            collection_state.clone(),
-            tmon.clone(),
-            RetryConfig::default(),
-        );
-        let collection_lifecycle = CollectionLifecycle::new(
-            records.clone(),
-            shards.clone(),
-            tmon.clone(),
-            RetryConfig::default(),
-            Arc::new(splitter.clone()),
-        );
-        let collection_commit = CollectionCommit::new(
-            CollectionCatalog::new(collection_state),
-            collection_lifecycle,
-            tmon.clone(),
-            split_policy,
-        );
+        let mut config = EngineConfig::default();
+        config.set_cache_size(cache_bytes);
+        config.set_split_policy(split_policy);
+        config.set_protocol_timing(ProtocolTiming::simulation());
+        let foundation = AssemblyFixture::new(b.clone(), test_db_root(), &config);
 
         // Create the collection root so the test collection exists up front.
-        records
+        foundation
+            .records
             .create_record(&test_collection(), &CollectionRecord::new())
             .await
             .unwrap();
-        shards
+        foundation
+            .shards
             .create_root(&test_collection(), &Node::leaf(Shard::new()))
             .await
             .unwrap();
 
-        let algo = Algo::new(
-            shards.clone(),
-            timeline.clone(),
-            RetryConfig::default(),
-            locker.clone(),
-            coord.clone(),
-            tmon.clone(),
-            collection_commit,
-            cleanup_hints,
-            managed_retirement.then_some(bg_weak),
-            resolver,
-            split_policy,
-            glassdb_storage::InlinePolicy::default(),
-            splitter.hint_sink(),
-        );
+        let engine = engine_fixture(&foundation, test_db_root(), config, managed_retirement);
+        let algo = engine.algo.clone();
         (
             algo,
             Tctx {
                 backend: b,
-                tlogger,
-                tmon,
-                records,
-                shards,
-                timeline,
-                locker,
+                tlogger: foundation.tlogger.clone(),
+                tmon: foundation.monitor.clone(),
+                records: foundation.records.clone(),
+                shards: foundation.shards.clone(),
+                timeline: foundation.timeline.clone(),
+                locker: engine.locker.clone(),
+                _engine: engine,
             },
         )
     }

@@ -109,8 +109,8 @@ impl TxCleanupHints {
 #[derive(Clone)]
 pub struct Gc {
     // Weak so a `Gc` clone captured inside the spawned sweep loop does not keep
-    // the [`Background`] alive across DB shutdown; the single strong owner is
-    // `DbInner::background`.
+    // the [`Background`] alive across DB shutdown; `Engine` is the single
+    // strong owner.
     bg: Weak<Background>,
     tl: TLogger,
     structural_logs: StructuralLogStore,
@@ -597,6 +597,7 @@ mod tests {
     use super::*;
     use crate::collection_coordination::CollectionStateResolver;
     use crate::collections::TopologySettler;
+    use crate::engine::{AssemblyFixture, EngineConfig};
     use crate::key_state_resolver::KeyStateResolver;
     use crate::shard_coord::{ShardCoordinator, SplitHinter};
     use crate::tlocker::LockOutcome;
@@ -607,8 +608,8 @@ mod tests {
     use glassdb_data::{CollectionAddress, CollectionId, DbRoot, ObjectPath};
     use glassdb_storage::transaction::{TxCollectionChange, TxCollectionOp, TxWrite};
     use glassdb_storage::{
-        CachedStore, CollectionRecord, CollectionStore, CurrentState, LockType, Node, Shard,
-        ShardEntry, Timeline, TreeRouter,
+        CollectionRecord, CollectionStore, CurrentState, LockType, Node, Shard, ShardEntry,
+        Timeline, TreeRouter,
     };
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -666,12 +667,14 @@ mod tests {
     }
 
     async fn new_ctx_with(backend: Arc<dyn Backend>) -> Ctx {
-        let timeline = Timeline::new();
-        let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        let tl = TLogger::new(objects.clone(), DbRoot::try_from("db").unwrap());
-        let records = CollectionStore::new(objects.clone());
-        let structural_logs = StructuralLogStore::new(objects.clone());
-        let shards = NodeStore::new(objects);
+        let mut config = EngineConfig::default();
+        config.set_cache_size(1 << 20);
+        let foundation = AssemblyFixture::new(backend, DbRoot::try_from("db").unwrap(), &config);
+        let tl = foundation.tlogger.clone();
+        let records = foundation.records.clone();
+        let structural_logs = foundation.structural_logs.clone();
+        let shards = foundation.shards.clone();
+        let timeline = foundation.timeline.clone();
         assert!(
             records
                 .create_record(&collection(), &CollectionRecord::new())
@@ -684,14 +687,8 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let bg = Arc::new(Background::new());
-        let mon = Monitor::with_config(
-            tl.clone(),
-            timeline.clone(),
-            Arc::downgrade(&bg),
-            RetryConfig::default(),
-            crate::monitor::ProtocolTiming::default(),
-        );
+        let bg = foundation.background.clone();
+        let mon = foundation.monitor.clone();
         let key_state = KeyStateResolver::new(mon.clone());
         let coord = ShardCoordinator::with_hinter(
             shards.clone(),

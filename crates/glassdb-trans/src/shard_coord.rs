@@ -1035,6 +1035,8 @@ fn fold_order(a: &TxId, b: &TxId) -> CmpOrdering {
 mod tests {
     use super::*;
 
+    use crate::engine::{AssemblyFixture, EngineConfig};
+
     use std::time::Duration;
 
     use glassdb_backend::Backend;
@@ -1044,7 +1046,6 @@ mod tests {
     };
     use glassdb_concurr::Background;
     use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath};
-    use glassdb_storage::transaction::TLogger;
     use glassdb_storage::{CachedStore, CurrentState, LockType, Node, Shard, Timeline};
 
     const COLL: &str = "coordp";
@@ -1135,18 +1136,13 @@ mod tests {
             .await
             .unwrap();
 
-        let timeline = Timeline::new();
-        let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        let tl = TLogger::new(objects.clone(), DbRoot::try_from(COLL).unwrap());
-        let bg = Arc::new(Background::new());
-        let mon = Monitor::with_config(
-            tl,
-            timeline.clone(),
-            Arc::downgrade(&bg),
-            RetryConfig::default(),
-            crate::monitor::ProtocolTiming::default(),
-        );
-        let shards = NodeStore::new(objects);
+        let mut config = EngineConfig::default();
+        config.set_cache_size(1 << 20);
+        let foundation = AssemblyFixture::new(backend, DbRoot::try_from(COLL).unwrap(), &config);
+        let timeline = foundation.timeline.clone();
+        let bg = foundation.background.clone();
+        let mon = foundation.monitor.clone();
+        let shards = foundation.shards.clone();
         let key_state = KeyStateResolver::new(mon.clone());
         let coord =
             ShardCoordinator::with_hinter(shards.clone(), key_state, mon, retry, policy, hinter);
