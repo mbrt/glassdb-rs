@@ -21,6 +21,7 @@ Produce an implementation-ready design for bounded parallel execution of indepen
 - [Define the bounded distinct-leaf execution contract](issues/01-define-bounded-distinct-leaf-execution-contract.md): Use a foreground bounded join that counts incomplete futures, runs every input, returns stable ordered outputs, and relies on existing cancellation guards.
 - [Choose the point-key batch routing design](issues/02-choose-point-key-batch-routing-design.md): Use path-batched descent for multiple point keys, spend the limit on distinct node paths, and keep direct one-key descent without an extra backend operation.
 - [Place the point-leaf planning and execution seams](issues/03-place-point-leaf-planning-and-execution-seams.md): Put `join_all_bounded` in `glassdb-concurr`, keep batching in its domain owners, and add no shared point-leaf plan or domain-aware executor.
+- [Define domain leaf-group reuse across commit paths](issues/04-reuse-one-point-leaf-plan-across-commit-paths.md): Share only logical access facts, reuse cached `Any` descent through `TreeRouter`, retain successful `LockedTx` groups and receipts, and regroup only after stale evidence.
 
 ## Not yet specified
 
