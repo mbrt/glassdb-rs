@@ -6,4 +6,4 @@ Blocked by: 01, 03, 04
 
 ## Question
 
-How should the normal lock-acquisition path apply the per-phase concurrency limit, stable leaf order, and finish-started rule to `Locked`, `Conflict`, `LeafFull`, waits, cancellation, and partial receipts while leaving the existing sorted serial fallback unchanged?
+How should `KeyLocker` apply `join_all_bounded` to complete per-leaf lock operations, interpret `Locked`, `Conflict`, and `LeafFull` in stable leaf order after every input runs, account for foreign-holder waits that occupy bounded positions, preserve partial receipts and cancellation safety, and leave the existing sorted serial fallback unchanged?

@@ -9,18 +9,21 @@ What exact contract must every bounded point-leaf phase obey for admission, maxi
 
 ## Answer
 
-Use a nonzero internal limit `N` for each phase invocation of one transaction. The limit is not shared across the `Database`, so concurrent transactions can each have up to `N` active attempts.
+The seam decision in [Place the point-leaf planning and execution seams](03-place-point-leaf-planning-and-execution-seams.md) replaces the earlier active-versus-parked executor contract with bounded `join_all` semantics.
 
-Initial work is grouped by current physical leaf path and admitted in stable ascending order. One invocation has at most one ready or active item for a leaf path. A work item becomes **started** when it is first polled. It is **active** while an admitted attempt runs and counts against `N`; it is **parked** while it waits only for time or foreign progress and does not count against `N`; it is **complete** after it produces its leaf outcome. Any physical poll by parked work requires readmission as active work.
+Use a nonzero internal limit `N` for each phase invocation of one transaction. The limit is not shared across the `Database`, so concurrent transactions can each have up to `N` incomplete leaf futures.
 
-An active attempt must complete or park after bounded internal work. It may follow sequential dependencies, but it must not sleep indefinitely, run an unbounded retry loop, or start parallel child work outside the phase limit. Ready started items are admitted before work that has not started, with stable leaf-path order inside each class. A parked item that is not ready cannot block new admission.
+The bounded join has this contract:
 
-Each phase classifies its own outcomes as terminal or continuing. A terminal outcome stops admission of unrelated work that has not started. Every started item must still finish, including parked items after they become ready. The phase receives every started outcome in stable order, and the first terminal outcome in that order controls its result. Retry release can classify all outcomes as continuing so it attempts every held leaf; committed write-back always continues best-effort.
+- Poll futures in the caller's task. Do not spawn one task per leaf.
+- Admit futures in stable input order until `N` futures are incomplete. A future counts from its first poll until it completes, including while it waits for time, storage, or foreign transaction progress.
+- Admit the next input when an incomplete future completes. Do not expose parking, readmission, replacement, or domain outcome concepts.
+- Run every supplied input unless the bounded join itself is dropped. An error or domain terminal outcome does not stop later admission.
+- Return every output in input order, independent of completion order. The caller interprets domain outcomes and selects errors from this stable vector.
+- Return zero outputs directly. Await one future directly. These paths do not construct the multi-future queue.
 
-Dynamically discovered replacement work uses the same phase limit and remains part of its parent's started work. It inherits the parent's immutable primary order, with its current leaf path as a stable tie-break. Replacement work that converges on an existing leaf path is combined or queued so the invocation never has two ready or active items for that path.
+Dropping or unwinding the bounded join drops both admitted and stored futures. Each operation keeps its existing cancellation guard and retirement handoff. The bounded join does not add a cleanup system. Panics remain uncaught and propagate.
 
-Normal terminal handling drains started work while the caller still awaits the phase. Cancellation or unwinding is different: it stops admission and drops sibling futures. Each started operation must then finish or perform a retirement handoff through its existing cancellation guard. The bounded execution mechanism does not create a second cleanup system. Panics remain uncaught and propagate.
+Domain modules define the input unit before the join. They must combine inputs when physical path sharing, atomic leaf mutation, or routing convergence requires it. Dynamic rerouting stays inside the domain interface that understands it; it is not replacement work in the generic join.
 
-Leaf futures are polled inside the caller's task. The mechanism does not spawn a task per leaf. Zero work returns directly. One work item is awaited directly without constructing the bounded scheduler or a result queue.
-
-Admission, cutoff, outcome ordering, and result selection are deterministic. Real backend completion order can vary; deterministic simulation must reproduce the operation stream for the same schedule and seed.
+Admission and output order are deterministic. Real backend completion order can vary. Deterministic simulation must reproduce the operation stream for the same schedule and seed.

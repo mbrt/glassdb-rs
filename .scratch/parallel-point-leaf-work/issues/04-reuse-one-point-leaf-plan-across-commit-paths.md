@@ -1,4 +1,4 @@
-# Reuse one point-leaf plan across commit paths
+# Define domain leaf-group reuse across commit paths
 
 Type: grilling
 Status: open
@@ -6,4 +6,4 @@ Blocked by: 02, 03
 
 ## Question
 
-How long can one routed point-leaf plan and its observations be reused across direct-commit eligibility, fallback to the logged path, lock grouping, validation, and write-back without trusting stale ownership after a split? Decide which evidence the plan owns, which phases may reuse it, and where fresh rerouting is required.
+Which domain-owned leaf groups and observations can be reused across direct-commit eligibility, fallback to the logged path, lock grouping, validation, and write-back without a shared point-leaf plan or trust in stale ownership after a split? Decide which interface owns each value, which later phase may reuse it, and where fresh routing is required.

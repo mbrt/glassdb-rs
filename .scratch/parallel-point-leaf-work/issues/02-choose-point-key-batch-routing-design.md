@@ -15,16 +15,16 @@ The validated primary source is on local throwaway branch `prototype/point-key-r
 
 ## Answer
 
-Choose path-batched descent for two or more point-key items. Keep the existing direct descent for zero or one item. The batch design is internal to point-leaf planning and does not add a public batch point-read interface. It does not change the sorted serial lock fallback.
+Choose path-batched descent for two or more point-key items. Keep the existing direct descent for zero or one item. The batch design is internal to the `TreeRouter` interface and does not add a shared point-leaf plan or a public batch point-read interface. It does not change the sorted serial lock fallback.
 
-A pending routing batch contains one current node path and its ordered point-key items. At most `N` distinct node-path loads are active. A path is loaded once at its required currentness, then all items for that path use the same node and observation:
+A pending routing batch contains one current node path and its ordered point-key items. At most `N` distinct node-path loads are incomplete. A path is loaded once at its required currentness, then all items for that path use the same node and observation:
 
 1. Items that the node does not own move to its B-link right-sibling path.
 2. Items that an index node owns are partitioned by child path.
 3. Items that a leaf owns are complete when the leaf has the required currentness.
 4. If the interior and leaf requirements differ, reload the terminal path at the leaf requirement. Process the result again because a refreshed former leaf can be an index.
 
-Combine pending batches that reach the same path before admission. When one load completes, its child and right-sibling batches can enter the same bounded ready set. The implementation does not need a global level barrier; the prototype uses backend waves only to make causal depth and operation counts visible. Poll all routing work in the caller's task and apply the accepted bounded execution contract to admission, cutoff, and draining.
+Combine pending batches that reach the same path before admission. When one load completes, its child and right-sibling batches can enter the same bounded ready set. The implementation does not need a global level barrier; the prototype uses backend waves only to make causal depth and operation counts visible. `TreeRouter` owns this dynamic ready set because it understands path convergence and B-link correction. Poll all routing work in the caller's task, keep at most `N` path loads incomplete, and return stable grouped output without exposing the ready set through its interface.
 
 Retain each item's original ordinal. Return `LeafGroup` values in stable object-path order and keys in original input order inside each group. Retain one leaf observation for each final path. If several started path loads fail, select the error for the smallest affected input ordinal, with object path as the tie-break. Preserve collection-absence classification for that item.
 

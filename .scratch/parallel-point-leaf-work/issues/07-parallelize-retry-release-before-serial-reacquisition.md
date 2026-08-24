@@ -6,4 +6,4 @@ Blocked by: 01, 03, 04, 06
 
 ## Question
 
-How should retry cleanup release held leaves with bounded parallel work, wait until every started release has retired or reported an error, update held-lock bookkeeping, and preserve deterministic simulation before any normal retry or sorted serial reacquisition begins?
+How should `KeyLocker` release every held leaf through `join_all_bounded`, interpret all stable ordered results, update held-lock bookkeeping safely on errors or cancellation, and preserve deterministic simulation before any normal retry or sorted serial reacquisition begins?
