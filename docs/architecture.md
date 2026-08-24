@@ -159,7 +159,8 @@ flowchart TD
     Direct["DirectCommit<br/>logless same-leaf publication"]
     Monitor["Monitor<br/>transaction-log lifecycle<br/>wound · wait · refresh"]
     Hints["TxCleanupHints<br/>bounded ordered queue<br/>drop-oldest loss · drain de-duplication"]
-    Splitter["Splitter<br/>structural coordination and recovery"]
+    Splitter["Splitter<br/>split scheduling · planning · node writes<br/>recursive parent split execution"]
+    Recovery["StructuralRecovery<br/>structural-intent lifecycle<br/>classification · fencing · resumption · settlement"]
     Coord["ShardCoordinator — fold engine<br/>identity · order · admission<br/>one load · one fold · one CAS<br/>per-member in-doubt recovery"]
     Gc["Gc<br/>reverse liveness checks<br/>transaction-object reclamation"]
 
@@ -177,10 +178,13 @@ flowchart TD
     Algo -->|"cleanup hints"| Hints
     Direct -->|"cleanup hints"| Hints
     Splitter -->|"cleanup hints"| Hints
+    Splitter -->|"start · resume"| Recovery
+    Recovery -->|"parent split request"| Splitter
     Hints -->|"candidates"| Gc
     Locker -->|"acquire · write-back · release"| Coord
     Direct -->|"direct ShardOperation"| Coord
     Splitter -->|"leaf structural-gate operation"| Coord
+    Recovery -->|"source fencing · clean gate release"| Coord
     Gc -->|"reclaim through unlock"| Locker
   end
 
@@ -194,7 +198,8 @@ flowchart TD
   Reader -->|"typed reads"| Stores
   Monitor -->|"transaction logs"| Stores
   Coord -->|"data-node CAS"| Stores
-  Splitter -->|"structural logs and post-gate writes"| Stores
+  Splitter -->|"post-gate node writes"| Stores
+  Recovery -->|"structural intents · recovery reads and cleanup"| Stores
   Gc -->|"reverse checks"| Stores
   Stores --> Backend
 ```
@@ -212,9 +217,9 @@ materializes committed `name → CollectionId` changes.
 Drop additionally freezes the target collection's split topology and installs
 the transaction ID as a delete intent on every root, index, and leaf object.
 Each structural split records a transaction-log topology backreference and
-remains registered in the collection record until its structural log is
-published or recovered, so a freeze can finish every pre-existing participant
-before node enumeration.
+remains registered in the collection record until its structural intent is
+completed or recovered. A freeze can therefore settle every pre-existing
+participant before node enumeration.
 
 Normal point operations inspect only the terminal node they already access:
 an aborted intent is removable, a pending intent participates in wound-wait,
@@ -252,10 +257,18 @@ Routing traversal is centralized in `TreeRouter`, but use of that mechanism is
 intentionally distributed. `KeyResolver`, the key-lock view, `Gc`, and
 `Splitter` each own a cheap handle for their distinct read, lock, reclamation,
 or structural workflow. A handle contains a cloned `NodeStore`, so all of them
-share the same decoded object cache without gaining structural-log capabilities
-or maintaining independent topology state. The Engine centralizes their
-assembly; it does not invent a single semantic owner for those different routing
-responsibilities.
+share the same decoded object cache without gaining structural-intent store
+capabilities or maintaining independent topology state. The Engine centralizes
+their assembly; it does not invent a single semantic owner for those different
+routing responsibilities.
+
+`StructuralRecovery` owns each structural intent from its prepared write to
+clean deletion or durable recovery. It exposes opaque prepared and Ready
+witnesses to split coordination. For recovery, it exposes one resumable action
+that classifies phases, fences source writers, checks reachability, cleans
+unreachable nodes, and settles finalized topology participants. `Splitter`
+only executes a requested recursive parent split and supplies its result back to
+the action. It does not inspect durable phases or call `StructuralLogStore`.
 
 Behind the physical-mutation boundary, every data-node entry mutation and each
 leaf structural-gate acquisition flows through a single transaction-aware
@@ -288,6 +301,8 @@ bookkeeping remain outside the coordinator.
 | `CollectionStateResolver` | collection-state mechanism | collection addresses, records, `TxId` | resolved record loads, foreign-holder reconciliation, committed directory write-back assistance | key routing, B-link topology, catalog semantics |
 | `CollectionCatalog`   | collection semantics | directory reads, binding changes, resolved records | logical snapshots, read-your-writes validation, capacity/precondition checks | locking policy, CAS, wound-wait |
 | `ShardCoordinator`    | shared mutation engine | typed `ShardOperation`s | one round per object: single-flight, oldest-first fold, ownership/capacity admission, overlapping logless-member exclusion, single CAS, per-member uncertainty, reload-recover, vestigial-entry pruning | operation-specific results, cross-shard strategy, transaction lifecycle, commit orchestration, GC selection, held-lock bookkeeping |
+| `Splitter`            | structural mechanism | split candidates, opaque structural-intent witnesses and recovery actions | scheduling, topology registration/finalization, source preparation and compaction, split planning, node writes, foreground separator publication, recursive parent split execution | durable intent phases, recovery classification, participant settlement |
+| `StructuralRecovery`  | durable recovery mechanism | opaque intent witnesses and resumable parent-split requests | structural-intent creation and phase change, clean deletion, discovery, fencing, reachability classification, orphan cleanup, recovery resumption, participant settlement | split candidates and reasons, tombstone compaction, node split planning, recursive split execution |
 | `KeyResolver`         | key/range resolution | logical keys, ranges, `TreeRouter` | routing and scan composition | commit / lock policy, collection-record coordination |
 | `KeyStateResolver`    | loaded key-state mechanism | nodes, entries, `TxId` | transaction-dependent interpretation of already-loaded key and node state | routing, scan composition, commit policy |
 | `Reader`              | read mechanism   | logical keys, resolved writers | value materialization | commit / lock policy                |
