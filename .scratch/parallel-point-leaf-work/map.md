@@ -24,6 +24,7 @@ Produce an implementation-ready design for bounded parallel execution of indepen
 - [Place the point-leaf planning and execution seams](issues/03-place-point-leaf-planning-and-execution-seams.md): Put `join_all_bounded` in `glassdb-concurr`, keep batching in its domain owners, and add no shared point-leaf plan or domain-aware executor.
 - [Define routed leaf-group lifetime across commit paths](issues/04-reuse-one-point-leaf-plan-across-commit-paths.md): Share only logical access facts, treat routed leaf groups as temporary evidence, reuse cached `Any` descent through `TreeRouter`, retain successful `LockedTx` groups and receipts, and regroup only after stale evidence.
 - [Define parallel point validation](issues/05-define-parallel-point-validation.md): Use input-aligned physical and logical batches over distinct paths and leaves, share one lower bound and limit, and use keyed receipts with an exact own-holder shortcut.
+- [Bound normal leaf lock acquisition](issues/06-bound-normal-leaf-lock-acquisition.md): Bound the complete combined leaf set with stable outcome selection, and retire and renew the transaction identity before hard-timeout serial acquisition.
 
 ## Not yet specified
 
