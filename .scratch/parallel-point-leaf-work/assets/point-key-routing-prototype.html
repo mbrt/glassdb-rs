@@ -1,0 +1,679 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Point-key routing prototype</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17222d;
+      --muted: #5d6975;
+      --line: #d9e0e6;
+      --panel: #f7f9fb;
+      --accent: #176b87;
+      --accent-soft: #e2f2f6;
+      --warn: #8a5b16;
+      --ok: #25734a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #fff;
+      color: var(--ink);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.48;
+    }
+    main { width: min(1180px, calc(100% - 32px)); margin: 38px auto 72px; }
+    h1, h2, h3 { line-height: 1.15; }
+    h1 { margin-bottom: 8px; font-size: clamp(2rem, 4vw, 3rem); }
+    h2 { margin: 0 0 14px; font-size: 1.25rem; }
+    h3 { margin: 0 0 8px; font-size: 1rem; }
+    p { max-width: 82ch; }
+    .intro { color: var(--muted); font-size: 1.05rem; margin-top: 0; }
+    .question {
+      border-left: 4px solid var(--accent);
+      background: var(--accent-soft);
+      padding: 14px 18px;
+      margin: 24px 0 28px;
+    }
+    .grid { display: grid; grid-template-columns: 1.05fr .95fr; gap: 18px; }
+    .panel { border: 1px solid var(--line); border-radius: 12px; padding: 18px; background: var(--panel); }
+    .controls { display: grid; gap: 14px; }
+    .control-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .label { min-width: 106px; color: var(--muted); font-weight: 650; }
+    button {
+      border: 1px solid #b8c5ce;
+      border-radius: 8px;
+      background: white;
+      color: var(--ink);
+      cursor: pointer;
+      font: inherit;
+      padding: 7px 11px;
+    }
+    button:hover { border-color: var(--accent); }
+    button[aria-pressed="true"], button.primary { background: var(--accent); border-color: var(--accent); color: white; }
+    button:disabled { cursor: default; opacity: .45; }
+    .state-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .state-field { background: white; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+    .state-field span { display: block; color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .05em; }
+    .state-field strong { display: block; margin-top: 3px; overflow-wrap: anywhere; }
+    table { width: 100%; border-collapse: collapse; background: white; font-size: .93rem; }
+    th, td { text-align: left; border-bottom: 1px solid var(--line); padding: 9px 10px; vertical-align: top; }
+    th { color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; }
+    tr.selected td { background: var(--accent-soft); }
+    .good { color: var(--ok); font-weight: 700; }
+    .warning { color: var(--warn); font-weight: 700; }
+    .wide { margin-top: 18px; }
+    .wave-list { display: grid; gap: 8px; margin-top: 12px; }
+    .wave { border: 1px solid var(--line); border-radius: 8px; background: white; padding: 10px 12px; }
+    .wave.current { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+    .wave.future { opacity: .48; }
+    code { background: #edf1f4; border-radius: 4px; padding: 1px 4px; }
+    .groups { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .group { border-radius: 999px; background: white; border: 1px solid var(--line); padding: 5px 9px; font-size: .9rem; }
+    .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+    .walkthrough { background: white; border: 1px solid var(--line); border-radius: 9px; padding: 14px; }
+    .steps { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .step-done { text-decoration: line-through; opacity: .55; }
+    .verdict { border: 1px solid #aad2bf; background: #eef9f3; }
+    .small { color: var(--muted); font-size: .9rem; }
+    @media (max-width: 840px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Point-key routing prototype</h1>
+  <p class="intro">A throwaway model of four ways to route a transaction's point keys through one cached B-link tree.</p>
+
+  <div class="question">
+    <strong>Question:</strong> Which bounded routing design keeps backend reads parallel across distinct paths, avoids repeated reads of the same node, preserves stable leaf groups, follows stale right links, and adds no backend work for one key?
+  </div>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>Free play</h2>
+      <div id="controls" class="controls"></div>
+    </section>
+    <section class="panel">
+      <h2>Current state</h2>
+      <div id="state"></div>
+    </section>
+  </div>
+
+  <section class="panel wide">
+    <h2>Design comparison</h2>
+    <div id="comparison"></div>
+  </section>
+
+  <section class="panel wide">
+    <h2>Selected design, one wave at a time</h2>
+    <div id="waves"></div>
+  </section>
+
+  <section class="panel wide">
+    <h2>Guided walkthroughs</h2>
+    <div id="walkthroughs"></div>
+  </section>
+
+  <section class="panel wide verdict">
+    <h2>Working verdict</h2>
+    <p><strong>Prefer path-batched wave descent.</strong> It spends the bound on distinct node paths, so clustered keys cannot occupy every slot while other branches wait. It reads the same physical nodes as concurrent independent descent in the normal cold-cache cases, but it completes them in fewer backend waves. It also preserves one load and one observation per routed path.</p>
+    <p>Keep the current independent descent for the direct one-key path, and keep the existing serial fallback serial. Reject a leaf-chain sweep for sparse point keys: it makes each right link depend on the prior leaf and can read leaves that own no requested key.</p>
+  </section>
+</main>
+
+<script>
+const RoutingPrototype = (() => {
+  const INF = Number.POSITIVE_INFINITY;
+  const NODE_ORDER = ["R", "I0", "I1", "I2", "I3", "L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7"];
+
+  const NODES = {
+    R:  { kind: "index", edges: [[200, "I0"], [400, "I1"], [600, "I2"], [INF, "I3"]] },
+    I0: { kind: "index", edges: [[100, "L0"], [200, "L1"]] },
+    I1: { kind: "index", edges: [[300, "L2"], [400, "L3"]] },
+    I2: { kind: "index", edges: [[500, "L4"], [600, "L5"]] },
+    I3: { kind: "index", edges: [[700, "L6"], [INF, "L7"]] },
+    L0: { kind: "leaf", high: 100, right: "L1" },
+    L1: { kind: "leaf", high: 200, right: "L2" },
+    L2: { kind: "leaf", high: 300, right: "L3" },
+    L3: { kind: "leaf", high: 400, right: "L4" },
+    L4: { kind: "leaf", high: 500, right: "L5" },
+    L5: { kind: "leaf", high: 600, right: "L6" },
+    L6: { kind: "leaf", high: 700, right: "L7" },
+    L7: { kind: "leaf", high: INF, right: null },
+  };
+
+  const SCENARIOS = {
+    one: {
+      name: "One key",
+      keys: [42],
+      note: "All designs must keep the direct path: one root, one index node, and one leaf on a cold tree.",
+    },
+    same: {
+      name: "Many keys, one leaf",
+      keys: [11, 22, 33, 44, 55, 66, 77, 88],
+      note: "Same-path read coalescing means independent descents do not multiply physical backend reads.",
+    },
+    clustered: {
+      name: "Clustered input, four leaves",
+      keys: [11, 22, 33, 44, 211, 222, 233, 244, 411, 422, 433, 444, 611, 622, 633, 644],
+      note: "Input order places four same-leaf keys together. A key-count bound can spend every slot on one branch.",
+    },
+    sparse: {
+      name: "Sparse point keys",
+      keys: [11, 311, 511, 711],
+      note: "The requested leaves are far apart. A leaf-chain sweep reads intervening leaves that own no requested key.",
+    },
+    stale: {
+      name: "Stale separator",
+      keys: [42, 142, 242],
+      note: "The cached I0 separator still sends key 142 to L0. L0's high key redirects it to right sibling L1.",
+      staleI0: true,
+      forceInteriorCache: true,
+    },
+  };
+
+  const ALGORITHMS = {
+    serial: { name: "Serial independent descent" },
+    perKey: { name: "Bounded independent descent" },
+    batched: { name: "Path-batched wave descent" },
+    chain: { name: "Sorted leaf-chain sweep" },
+  };
+
+  function stablePathCompare(a, b) {
+    return NODE_ORDER.indexOf(a) - NODE_ORDER.indexOf(b);
+  }
+
+  function initialCache(mode, scenario) {
+    const cache = new Set();
+    if (mode === "interior" || mode === "all") {
+      ["R", "I0", "I1", "I2", "I3"].forEach(path => cache.add(path));
+    }
+    if (mode === "all") {
+      Object.keys(NODES).forEach(path => cache.add(path));
+    }
+    if (scenario.forceInteriorCache) {
+      ["R", "I0", "I1", "I2", "I3"].forEach(path => cache.add(path));
+    }
+    return cache;
+  }
+
+  function nodeView(path, scenario) {
+    if (path === "I0" && scenario.staleI0) {
+      return { kind: "index", edges: [[200, "L0"]], stale: true };
+    }
+    return NODES[path];
+  }
+
+  function childFor(node, key) {
+    return node.edges.find(([high]) => key < high)[1];
+  }
+
+  function advanceTask(task, cache, scenario) {
+    let moved = false;
+    while (!task.done && cache.has(task.path)) {
+      moved = true;
+      const node = nodeView(task.path, scenario);
+      if (node.kind === "index") {
+        task.path = childFor(node, task.key);
+      } else if (task.key < node.high) {
+        task.done = true;
+        task.leaf = task.path;
+      } else if (node.right) {
+        task.path = node.right;
+      } else {
+        throw new Error(`No leaf owns key ${task.key}`);
+      }
+    }
+    return moved;
+  }
+
+  function groupRoutes(routes) {
+    const groups = new Map();
+    routes
+      .slice()
+      .sort((a, b) => a.index - b.index)
+      .forEach(route => {
+        if (!groups.has(route.leaf)) groups.set(route.leaf, []);
+        groups.get(route.leaf).push(route.key);
+      });
+    return [...groups.entries()].sort((a, b) => stablePathCompare(a[0], b[0]));
+  }
+
+  function snapshot(cache, routes) {
+    return {
+      cache: [...cache].sort(stablePathCompare),
+      groups: groupRoutes(routes),
+    };
+  }
+
+  function planIndependent(keys, requestedWidth, mode, scenario) {
+    const width = Math.max(1, requestedWidth);
+    const cache = initialCache(mode, scenario);
+    const startingCache = [...cache].sort(stablePathCompare);
+    const tasks = [];
+    const routes = [];
+    const waves = [];
+    let next = 0;
+
+    function settle(newRoutes) {
+      let changed = true;
+      while (changed) {
+        changed = false;
+        while (tasks.length < width && next < keys.length) {
+          tasks.push({ index: next, key: keys[next], path: "R", done: false, leaf: null });
+          next += 1;
+          changed = true;
+        }
+        for (const task of tasks) advanceTask(task, cache, scenario);
+        for (let i = tasks.length - 1; i >= 0; i -= 1) {
+          if (!tasks[i].done) continue;
+          const route = { index: tasks[i].index, key: tasks[i].key, leaf: tasks[i].leaf };
+          routes.push(route);
+          newRoutes.push(route);
+          tasks.splice(i, 1);
+          changed = true;
+        }
+      }
+    }
+
+    const warmRoutes = [];
+    settle(warmRoutes);
+    while (tasks.length || next < keys.length) {
+      const requests = new Map();
+      for (const task of tasks) {
+        if (!requests.has(task.path)) requests.set(task.path, []);
+        requests.get(task.path).push(task.key);
+      }
+      const reads = [...requests.keys()].sort(stablePathCompare);
+      if (!reads.length) throw new Error("Independent descent made no progress");
+      reads.forEach(path => cache.add(path));
+      const completed = [];
+      settle(completed);
+      waves.push({
+        reads,
+        demand: reads.map(path => [path, requests.get(path).length]),
+        completed,
+        ...snapshot(cache, routes),
+      });
+    }
+    return finishPlan(waves, warmRoutes, cache, routes, startingCache);
+  }
+
+  function combineBatches(batches) {
+    const combined = new Map();
+    for (const batch of batches) {
+      if (!combined.has(batch.path)) combined.set(batch.path, []);
+      combined.get(batch.path).push(...batch.items);
+    }
+    return [...combined.entries()]
+      .sort((a, b) => stablePathCompare(a[0], b[0]))
+      .map(([path, items]) => ({ path, items: items.sort((a, b) => a.index - b.index) }));
+  }
+
+  function settleBatches(pending, cache, scenario, routes, newRoutes) {
+    let current = combineBatches(pending);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      const next = [];
+      for (const batch of current) {
+        if (!cache.has(batch.path)) {
+          next.push(batch);
+          continue;
+        }
+        changed = true;
+        const node = nodeView(batch.path, scenario);
+        if (node.kind === "index") {
+          const byChild = new Map();
+          for (const item of batch.items) {
+            const child = childFor(node, item.key);
+            if (!byChild.has(child)) byChild.set(child, []);
+            byChild.get(child).push(item);
+          }
+          for (const [path, items] of byChild) next.push({ path, items });
+          continue;
+        }
+        const right = [];
+        for (const item of batch.items) {
+          if (item.key < node.high) {
+            const route = { index: item.index, key: item.key, leaf: batch.path };
+            routes.push(route);
+            newRoutes.push(route);
+          } else {
+            if (!node.right) throw new Error(`No leaf owns key ${item.key}`);
+            right.push(item);
+          }
+        }
+        if (right.length) next.push({ path: node.right, items: right });
+      }
+      current = combineBatches(next);
+    }
+    return current;
+  }
+
+  function planBatched(keys, width, mode, scenario) {
+    const cache = initialCache(mode, scenario);
+    const startingCache = [...cache].sort(stablePathCompare);
+    const routes = [];
+    const waves = [];
+    const items = keys.map((key, index) => ({ key, index }));
+    const warmRoutes = [];
+    let pending = settleBatches([{ path: "R", items }], cache, scenario, routes, warmRoutes);
+
+    while (pending.length) {
+      const selected = pending.slice(0, Math.max(1, width));
+      const selectedPaths = new Set(selected.map(batch => batch.path));
+      const deferred = pending.filter(batch => !selectedPaths.has(batch.path));
+      const reads = selected.map(batch => batch.path);
+      reads.forEach(path => cache.add(path));
+      const completed = [];
+      pending = settleBatches([...selected, ...deferred], cache, scenario, routes, completed);
+      waves.push({
+        reads,
+        demand: selected.map(batch => [batch.path, batch.items.length]),
+        completed,
+        ...snapshot(cache, routes),
+      });
+    }
+    return finishPlan(waves, warmRoutes, cache, routes, startingCache);
+  }
+
+  function planLeafChain(keys, mode, scenario) {
+    const ordered = keys.map((key, index) => ({ key, index })).sort((a, b) => a.key - b.key);
+    if (!ordered.length) return finishPlan([], [], new Set(), []);
+    const cache = initialCache(mode, scenario);
+    const startingCache = [...cache].sort(stablePathCompare);
+    const first = planIndependent([ordered[0].key], 1, mode, scenario);
+    first.finalCache.forEach(path => cache.add(path));
+    const waves = first.waves.map(wave => ({ ...wave, completed: [] }));
+    const routes = [];
+    const warmRoutes = [];
+    let leaf = first.groups[0][0];
+    let cursor = 0;
+
+    function assignCurrent(target) {
+      const node = NODES[leaf];
+      while (cursor < ordered.length && ordered[cursor].key < node.high) {
+        const item = ordered[cursor++];
+        const route = { index: item.index, key: item.key, leaf };
+        routes.push(route);
+        target.push(route);
+      }
+    }
+
+    assignCurrent(warmRoutes);
+    while (cursor < ordered.length) {
+      const right = NODES[leaf].right;
+      if (!right) throw new Error(`No leaf owns key ${ordered[cursor].key}`);
+      leaf = right;
+      const completed = [];
+      if (!cache.has(leaf)) {
+        cache.add(leaf);
+        assignCurrent(completed);
+        waves.push({
+          reads: [leaf],
+          demand: [[leaf, 1]],
+          completed,
+          ...snapshot(cache, routes),
+        });
+      } else {
+        assignCurrent(completed);
+        warmRoutes.push(...completed);
+      }
+    }
+    // Attribute the first routed key to the last initial-descent wave when possible.
+    if (waves.length && warmRoutes.length) {
+      waves[Math.min(first.waves.length, waves.length) - 1].completed.push(warmRoutes.shift());
+    }
+    const final = finishPlan(waves, warmRoutes, cache, routes, startingCache);
+    final.note = "The leaf width is always one because each right sibling is learned from the prior leaf.";
+    return final;
+  }
+
+  function finishPlan(waves, warmRoutes, cache, routes, startingCache = []) {
+    return {
+      waves,
+      warmRoutes,
+      reads: waves.reduce((sum, wave) => sum + wave.reads.length, 0),
+      groups: groupRoutes(routes),
+      startingCache,
+      finalCache: [...cache].sort(stablePathCompare),
+    };
+  }
+
+  function buildPlans(state) {
+    const scenario = SCENARIOS[state.scenario];
+    return {
+      serial: planIndependent(scenario.keys, 1, state.cache, scenario),
+      perKey: planIndependent(scenario.keys, state.width, state.cache, scenario),
+      batched: planBatched(scenario.keys, state.width, state.cache, scenario),
+      chain: planLeafChain(scenario.keys, state.cache, scenario),
+    };
+  }
+
+  function initialState() {
+    return {
+      scenario: "one",
+      width: 4,
+      cache: "cold",
+      algorithm: "batched",
+      step: 0,
+      walkthrough: "single",
+      walkthroughStep: 0,
+      lastChange: "Prototype ready.",
+    };
+  }
+
+  function reduce(state, action) {
+    const next = { ...state };
+    switch (action.type) {
+      case "SCENARIO": next.scenario = action.value; next.step = 0; break;
+      case "WIDTH": next.width = action.value; next.step = 0; break;
+      case "CACHE": next.cache = action.value; next.step = 0; break;
+      case "ALGORITHM": next.algorithm = action.value; next.step = 0; break;
+      case "NEXT": {
+        const count = buildPlans(next)[next.algorithm].waves.length;
+        next.step = Math.min(count, next.step + 1);
+        break;
+      }
+      case "BACK": next.step = Math.max(0, next.step - 1); break;
+      case "RUN": next.step = buildPlans(next)[next.algorithm].waves.length; break;
+      case "RESET_WAVES": next.step = 0; break;
+      case "WALKTHROUGH": next.walkthrough = action.value; next.walkthroughStep = 0; break;
+      case "WALK_ACTION": {
+        Object.assign(next, action.patch);
+        next.step = action.patch.step ?? 0;
+        next.walkthroughStep += 1;
+        break;
+      }
+      default: throw new Error(`Unknown action ${action.type}`);
+    }
+    next.lastChange = action.label || action.type;
+    return next;
+  }
+
+  return { ALGORITHMS, SCENARIOS, buildPlans, initialState, reduce };
+})();
+
+const WALKTHROUGHS = {
+  single: {
+    name: "One-key guardrail",
+    description: "Confirm that the recommended design does not add a backend read or a routing wave for one key.",
+    steps: [
+      { label: "Load one cold key", patch: { scenario: "one", cache: "cold", width: 4, algorithm: "batched", step: 0 } },
+      { label: "Run all waves", patch: { scenario: "one", cache: "cold", width: 4, algorithm: "batched", step: 3 } },
+    ],
+  },
+  clustered: {
+    name: "Clustered input",
+    description: "See why a bound on key futures can still serialize distinct branches when input keys are clustered by leaf.",
+    steps: [
+      { label: "Select clustered keys", patch: { scenario: "clustered", cache: "cold", width: 4, algorithm: "perKey", step: 0 } },
+      { label: "Run independent descent", patch: { scenario: "clustered", cache: "cold", width: 4, algorithm: "perKey", step: 99 } },
+      { label: "Run path-batched descent", patch: { scenario: "clustered", cache: "cold", width: 4, algorithm: "batched", step: 99 } },
+    ],
+  },
+  sparse: {
+    name: "Sparse keys",
+    description: "Compare direct tree routing with a sorted leaf-chain sweep that must cross unrequested leaves.",
+    steps: [
+      { label: "Select sparse keys", patch: { scenario: "sparse", cache: "cold", width: 4, algorithm: "chain", step: 0 } },
+      { label: "Run the leaf chain", patch: { scenario: "sparse", cache: "cold", width: 4, algorithm: "chain", step: 99 } },
+      { label: "Run path-batched descent", patch: { scenario: "sparse", cache: "cold", width: 4, algorithm: "batched", step: 99 } },
+    ],
+  },
+  stale: {
+    name: "Stale separator",
+    description: "Verify that the recommended design partitions a stale batch at the leaf high key and follows the right link.",
+    steps: [
+      { label: "Load stale cached routing", patch: { scenario: "stale", cache: "interior", width: 2, algorithm: "batched", step: 0 } },
+      { label: "Read candidate leaves", patch: { scenario: "stale", cache: "interior", width: 2, algorithm: "batched", step: 1 } },
+      { label: "Follow the right link", patch: { scenario: "stale", cache: "interior", width: 2, algorithm: "batched", step: 2 } },
+    ],
+  },
+};
+
+let state = RoutingPrototype.initialState();
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
+}
+
+function button(label, action, pressed = false, disabled = false, className = "") {
+  const encoded = encodeURIComponent(JSON.stringify(action));
+  return `<button class="${className}" data-action="${encoded}" aria-pressed="${pressed}" ${disabled ? "disabled" : ""}>${escapeHtml(label)}</button>`;
+}
+
+function dispatch(action) {
+  state = RoutingPrototype.reduce(state, action);
+  const plan = RoutingPrototype.buildPlans(state)[state.algorithm];
+  state.step = Math.min(state.step, plan.waves.length);
+  render();
+}
+
+function groupsHtml(groups) {
+  if (!groups.length) return `<span class="small">No keys routed at this step.</span>`;
+  return `<div class="groups">${groups.map(([leaf, keys]) => `<span class="group"><strong>${leaf}</strong>: ${keys.join(", ")}</span>`).join("")}</div>`;
+}
+
+function renderControls() {
+  const scenarios = Object.entries(RoutingPrototype.SCENARIOS)
+    .map(([id, item]) => button(item.name, { type: "SCENARIO", value: id, label: `Scenario: ${item.name}` }, state.scenario === id)).join("");
+  const widths = [1, 2, 4, 8].map(value => button(String(value), { type: "WIDTH", value, label: `Width: ${value}` }, state.width === value)).join("");
+  const caches = [["cold", "Cold"], ["interior", "Warm index"], ["all", "Fully warm"]]
+    .map(([id, label]) => button(label, { type: "CACHE", value: id, label: `Cache: ${label}` }, state.cache === id)).join("");
+  const algorithms = Object.entries(RoutingPrototype.ALGORITHMS)
+    .map(([id, item]) => button(item.name, { type: "ALGORITHM", value: id, label: `Design: ${item.name}` }, state.algorithm === id)).join("");
+  document.querySelector("#controls").innerHTML = `
+    <div class="control-row"><span class="label">Scenario</span>${scenarios}</div>
+    <div class="control-row"><span class="label">Active limit</span>${widths}</div>
+    <div class="control-row"><span class="label">Cache</span>${caches}</div>
+    <div class="control-row"><span class="label">Design</span>${algorithms}</div>
+    <div class="control-row"><span class="label">Waves</span>
+      ${button("Back", { type: "BACK", label: "Previous wave" }, false, state.step === 0)}
+      ${button("Next", { type: "NEXT", label: "Next wave" })}
+      ${button("Run to end", { type: "RUN", label: "All waves complete" }, false, false, "primary")}
+      ${button("Reset", { type: "RESET_WAVES", label: "Wave view reset" })}
+    </div>`;
+}
+
+function renderState() {
+  const scenario = RoutingPrototype.SCENARIOS[state.scenario];
+  const plan = RoutingPrototype.buildPlans(state)[state.algorithm];
+  const completedWaves = plan.waves.slice(0, state.step);
+  const cache = new Set(plan.startingCache);
+  completedWaves.forEach(wave => wave.cache.forEach(path => cache.add(path)));
+  const routes = [...plan.warmRoutes, ...completedWaves.flatMap(wave => wave.completed)];
+  document.querySelector("#state").innerHTML = `
+    <div class="state-grid">
+      <div class="state-field"><span>Scenario</span><strong>${escapeHtml(scenario.name)}</strong></div>
+      <div class="state-field"><span>Selected design</span><strong>${escapeHtml(RoutingPrototype.ALGORITHMS[state.algorithm].name)}</strong></div>
+      <div class="state-field"><span>Input keys</span><strong>${scenario.keys.join(", ")}</strong></div>
+      <div class="state-field"><span>Progress</span><strong>${state.step} / ${plan.waves.length} backend waves</strong></div>
+      <div class="state-field"><span>Reads through this step</span><strong>${completedWaves.reduce((sum, wave) => sum + wave.reads.length, 0)}</strong></div>
+      <div class="state-field"><span>Loaded paths</span><strong>${[...cache].sort().join(", ") || "Cache-only state"}</strong></div>
+    </div>
+    <p class="small"><strong>What to watch:</strong> ${escapeHtml(scenario.note)}</p>
+    <h3>Routed groups through this step</h3>
+    ${groupsHtml(groupRoutesForUi(routes))}
+    <p class="small">Last change: ${escapeHtml(state.lastChange)}</p>`;
+}
+
+function groupRoutesForUi(routes) {
+  const groups = new Map();
+  routes.slice().sort((a, b) => a.index - b.index).forEach(route => {
+    if (!groups.has(route.leaf)) groups.set(route.leaf, []);
+    groups.get(route.leaf).push(route.key);
+  });
+  return [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true }));
+}
+
+function renderComparison() {
+  const plans = RoutingPrototype.buildPlans(state);
+  const minWaves = Math.min(...Object.values(plans).map(plan => plan.waves.length));
+  document.querySelector("#comparison").innerHTML = `
+    <table>
+      <thead><tr><th>Design</th><th>Backend reads</th><th>Backend waves</th><th>Leaf groups</th><th>Observation</th></tr></thead>
+      <tbody>${Object.entries(plans).map(([id, plan]) => {
+        const observation = id === "perKey"
+          ? "Same-path reads coalesce, but same-branch keys can occupy the active limit."
+          : id === "batched"
+            ? "The active limit is spent on distinct node paths."
+            : id === "chain"
+              ? "Right-link discovery is serial and can visit unrequested leaves."
+              : "Baseline: each cold path waits for the prior path.";
+        return `<tr class="${id === state.algorithm ? "selected" : ""}">
+          <td>${escapeHtml(RoutingPrototype.ALGORITHMS[id].name)}</td>
+          <td>${plan.reads}</td>
+          <td class="${plan.waves.length === minWaves ? "good" : ""}">${plan.waves.length}</td>
+          <td>${plan.groups.length}</td>
+          <td>${escapeHtml(observation)}</td>
+        </tr>`;
+      }).join("")}</tbody>
+    </table>`;
+}
+
+function renderWaves() {
+  const plan = RoutingPrototype.buildPlans(state)[state.algorithm];
+  const header = `<p><strong>${escapeHtml(RoutingPrototype.ALGORITHMS[state.algorithm].name)}</strong> performs ${plan.reads} backend reads in ${plan.waves.length} waves. Same-path demand in one wave is one backend read.</p>`;
+  const list = plan.waves.length ? plan.waves.map((wave, index) => {
+    const number = index + 1;
+    const status = number < state.step ? "" : number === state.step ? "current" : "future";
+    const demand = wave.demand.map(([path, count]) => count > 1 ? `${path} (${count} keys share it)` : path).join(", ");
+    return `<div class="wave ${status}"><strong>Wave ${number}</strong>: read <code>${escapeHtml(wave.reads.join(", "))}</code><br><span class="small">Demand: ${escapeHtml(demand)}. Completed keys: ${wave.completed.map(item => item.key).join(", ") || "none yet"}.</span></div>`;
+  }).join("") : `<p class="small">Every required node is already cached. No backend wave is needed.</p>`;
+  document.querySelector("#waves").innerHTML = header + `<div class="wave-list">${list}</div>` + `<h3 style="margin-top:16px">Final stable leaf groups</h3>` + groupsHtml(plan.groups);
+}
+
+function renderWalkthroughs() {
+  const tabs = Object.entries(WALKTHROUGHS).map(([id, walk]) => button(walk.name, { type: "WALKTHROUGH", value: id, label: `Walkthrough: ${walk.name}` }, state.walkthrough === id)).join("");
+  const walk = WALKTHROUGHS[state.walkthrough];
+  const steps = walk.steps.map((step, index) => {
+    const done = index < state.walkthroughStep;
+    const active = index === state.walkthroughStep;
+    return button(`${index + 1}. ${step.label}`, { type: "WALK_ACTION", patch: step.patch, label: `Walkthrough step: ${step.label}` }, false, !active, done ? "step-done" : "");
+  }).join("");
+  document.querySelector("#walkthroughs").innerHTML = `<div class="tabs">${tabs}</div><div class="walkthrough"><h3>${escapeHtml(walk.name)}</h3><p>${escapeHtml(walk.description)}</p><div class="steps">${steps}</div></div>`;
+}
+
+function bindActions() {
+  document.querySelectorAll("button[data-action]").forEach(element => {
+    element.addEventListener("click", () => dispatch(JSON.parse(decodeURIComponent(element.dataset.action))));
+  });
+}
+
+function render() {
+  renderControls();
+  renderState();
+  renderComparison();
+  renderWaves();
+  renderWalkthroughs();
+  bindActions();
+}
+
+render();
+</script>
+</body>
+</html>
