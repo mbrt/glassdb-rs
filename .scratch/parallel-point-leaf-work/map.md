@@ -27,11 +27,11 @@ Produce an implementation-ready design for bounded parallel execution of indepen
 - [Bound normal leaf lock acquisition](issues/06-bound-normal-leaf-lock-acquisition.md): Bound the complete combined leaf set, retain locks across normal retries, and renew the transaction identity for every transition from parallel to sorted serial acquisition.
 - [Recognize retained leaf locks across normal retries](issues/07-parallelize-retry-release-before-serial-reacquisition.md): Inspect the coordinator-loaded leaf for a complete same-identity hold, skip its CAS without partial retry state, and use a renewed identity instead of foreground release for serial fallback.
 - [Bound committed leaf write-back](issues/08-bound-committed-leaf-write-back.md): Bound original `LockedTx` groups, keep stable split descendants inside one position, isolate leaf deferrals and failures, and aggregate hints after all inputs run.
+- [Choose concurrency limits and verification](issues/09-choose-concurrency-limits-and-verification.md): Start every bounded phase at 16, keep the smallest value at the measured throughput plateau, and accept at most one added backend-wait wave through 32 leaves.
 
 ## Not yet specified
 
-- Final file changes, change order, and ADR shape depend on the remaining phase decisions.
-- The exact initial limit for each phase, and whether measurements support one common value, depend on the prototypes and benchmark plan.
+- None.
 
 ## Out of scope
 
