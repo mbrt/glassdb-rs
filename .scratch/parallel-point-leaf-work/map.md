@@ -26,6 +26,7 @@ Produce an implementation-ready design for bounded parallel execution of indepen
 - [Define parallel point validation](issues/05-define-parallel-point-validation.md): Use input-aligned physical and logical batches with one lower bound and limit; only an exact installed-lock proof takes the physical own-holder shortcut.
 - [Bound normal leaf lock acquisition](issues/06-bound-normal-leaf-lock-acquisition.md): Bound the complete combined leaf set, retain locks across normal retries, and renew the transaction identity for every transition from parallel to sorted serial acquisition.
 - [Recognize retained leaf locks across normal retries](issues/07-parallelize-retry-release-before-serial-reacquisition.md): Inspect the coordinator-loaded leaf for a complete same-identity hold, skip its CAS without partial retry state, and use a renewed identity instead of foreground release for serial fallback.
+- [Bound committed leaf write-back](issues/08-bound-committed-leaf-write-back.md): Bound original `LockedTx` groups, keep stable split descendants inside one position, isolate leaf deferrals and failures, and aggregate hints after all inputs run.
 
 ## Not yet specified
 
