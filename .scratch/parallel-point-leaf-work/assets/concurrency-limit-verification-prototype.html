@@ -1,0 +1,904 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Point-leaf concurrency limit and verification prototype</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17211b;
+      --muted: #5e6a63;
+      --paper: #f5f3ec;
+      --panel: #fffefa;
+      --line: #d9d8cd;
+      --accent: #176b55;
+      --accent-soft: #dcefe8;
+      --warn: #855a12;
+      --warn-soft: #fff0cb;
+      --danger: #8f3434;
+      --danger-soft: #fbe4e1;
+      --shadow: 0 12px 35px rgb(31 43 35 / 8%);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 42px 0 80px;
+    }
+
+    h1, h2, h3 { line-height: 1.16; letter-spacing: -0.025em; }
+    h1 { max-width: 850px; margin: 12px 0 14px; font-size: clamp(2rem, 5vw, 3.4rem); }
+    h2 { margin: 0 0 18px; font-size: 1.55rem; }
+    h3 { margin: 0 0 10px; font-size: 1.05rem; }
+    p { margin: 0 0 14px; }
+
+    .eyebrow, .badge {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 0.76rem;
+      font-weight: 750;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow { background: var(--accent); color: white; }
+    .badge { background: var(--accent-soft); color: var(--accent); }
+    .badge.warn { background: var(--warn-soft); color: var(--warn); }
+
+    .lede { max-width: 900px; color: var(--muted); font-size: 1.06rem; }
+
+    .notice {
+      margin-top: 22px;
+      border-left: 4px solid var(--warn);
+      border-radius: 8px;
+      background: var(--warn-soft);
+      padding: 14px 16px;
+    }
+
+    .section {
+      margin-top: 28px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      padding: clamp(20px, 3vw, 30px);
+    }
+
+    .recommendation {
+      display: grid;
+      grid-template-columns: minmax(180px, 0.65fr) minmax(280px, 1.35fr);
+      gap: 24px;
+      align-items: center;
+    }
+
+    .limit-mark {
+      min-height: 190px;
+      display: grid;
+      place-content: center;
+      border-radius: 15px;
+      background: var(--accent);
+      color: white;
+      text-align: center;
+    }
+
+    .limit-mark strong { font-size: 5.5rem; line-height: 0.9; }
+    .limit-mark span { margin-top: 10px; font-weight: 700; }
+
+    ul, ol { margin: 10px 0 0; padding-left: 22px; }
+    li + li { margin-top: 7px; }
+
+    .toolbar, .button-row, .tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .toolbar { margin-bottom: 20px; gap: 18px; }
+    .control { min-width: 170px; }
+    .control > span { display: block; margin-bottom: 7px; color: var(--muted); font-size: 0.8rem; font-weight: 700; }
+
+    button, select {
+      border: 1px solid #bfc5be;
+      border-radius: 9px;
+      background: white;
+      color: var(--ink);
+      font: inherit;
+    }
+
+    select { width: 100%; padding: 9px 10px; }
+    button { cursor: pointer; padding: 8px 11px; font-weight: 650; }
+    button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+    button.active, button.primary { border-color: var(--accent); background: var(--accent); color: white; }
+    button.secondary { border-color: var(--accent); color: var(--accent); }
+    button:disabled { cursor: not-allowed; opacity: 0.42; }
+
+    .state-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(110px, 1fr));
+      gap: 10px;
+      margin: 18px 0;
+    }
+
+    .stat {
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: #faf9f4;
+      padding: 12px;
+    }
+
+    .stat span { display: block; color: var(--muted); font-size: 0.73rem; font-weight: 700; text-transform: uppercase; }
+    .stat strong { display: block; margin-top: 3px; font-size: 1.2rem; }
+
+    .leaf-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(105px, 1fr));
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .leaf {
+      min-height: 72px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 9px;
+      background: #f6f5ef;
+    }
+
+    .leaf strong, .leaf span { display: block; }
+    .leaf span { color: var(--muted); font-size: 0.78rem; }
+    .leaf.active { border-color: var(--accent); background: var(--accent-soft); }
+    .leaf.waiting { border-color: var(--warn); background: var(--warn-soft); }
+    .leaf.done { border-color: #9fb1a7; background: #eef4f0; }
+
+    .split {
+      display: grid;
+      grid-template-columns: 1.25fr 0.75fr;
+      gap: 18px;
+      margin-top: 18px;
+    }
+
+    .subpanel {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 15px;
+      background: #faf9f5;
+      overflow: auto;
+    }
+
+    .event-log { margin: 0; padding-left: 20px; color: var(--muted); }
+    .event-log li:first-child { color: var(--ink); font-weight: 650; }
+    .empty { color: var(--muted); font-style: italic; }
+
+    .tabs { border-bottom: 1px solid var(--line); margin-bottom: 18px; }
+    .tabs button { border: 0; border-radius: 8px 8px 0 0; background: transparent; }
+    .tabs button.active { background: var(--accent-soft); color: var(--accent); }
+    .guide-copy { max-width: 860px; color: var(--muted); }
+    .steps { display: grid; gap: 9px; margin-top: 16px; }
+    .step {
+      display: grid;
+      grid-template-columns: 30px minmax(200px, 1fr) auto;
+      align-items: center;
+      gap: 10px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      padding: 10px;
+      background: #faf9f5;
+    }
+
+    .step-number {
+      display: grid;
+      place-content: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: #e8e8df;
+      font-weight: 800;
+    }
+
+    .step.done .step-number { background: var(--accent); color: white; }
+
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid var(--line); padding: 10px 9px; text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: 0.75rem; letter-spacing: 0.04em; text-transform: uppercase; }
+    td code { white-space: nowrap; }
+    tr.recommended td { background: var(--accent-soft); }
+    .table-wrap { overflow-x: auto; }
+
+    .verdict {
+      display: inline-block;
+      border-radius: 7px;
+      padding: 3px 7px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 0.78rem;
+      font-weight: 800;
+    }
+
+    .verdict.reject { background: var(--danger-soft); color: var(--danger); }
+    code { font: 0.9em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+    @media (max-width: 850px) {
+      .recommendation, .split { grid-template-columns: 1fr; }
+      .state-grid { grid-template-columns: repeat(3, 1fr); }
+    }
+
+    @media (max-width: 520px) {
+      main { width: min(100% - 18px, 1180px); padding-top: 22px; }
+      .state-grid { grid-template-columns: repeat(2, 1fr); }
+      .step { grid-template-columns: 30px 1fr; }
+      .step button { grid-column: 1 / -1; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <span class="eyebrow">Throwaway planning prototype</span>
+  <h1>Choose one point-leaf limit, then prove its contracts</h1>
+  <p class="lede">
+    This demo tests the proposal to give point-key routing, point validation, normal lock
+    acquisition, and committed write-back the same initial internal limit. It also maps the
+    deterministic tests and measurements that must reject a bad implementation.
+  </p>
+  <div class="notice">
+    <strong>This is a model, not benchmark evidence.</strong> Its wave counts follow the bounded
+    execution contract. The implementation must supply the measured latency and throughput data.
+  </div>
+
+  <section class="section recommendation">
+    <div class="limit-mark"><strong>16</strong><span>incomplete futures per phase</span></div>
+    <div>
+      <span class="badge">Proposed decision</span>
+      <h2>Use one common initial value</h2>
+      <ul>
+        <li>Sixteen is the smallest candidate that adds at most one backend-wait wave for transactions of up to 32 independent leaves.</li>
+        <li>A transaction does not pay for unused positions. With eight leaves, limits 8 and 16 poll the same eight futures and issue the same backend operations.</li>
+        <li>Thirty-two leaves use two waves. Limit 32 removes the last added wave, but it doubles the maximum per-transaction burst.</li>
+        <li>Keep 16 only if its measured throughput is within 5% of the best candidate. No result yet justifies separate read and write limits.</li>
+      </ul>
+      <p style="margin-top:14px">
+        The sorted serial lock fallback does not use this limit. A future that waits for a foreign
+        holder stays incomplete and consumes one of the sixteen positions. Each transaction gets
+        its own phase bound; there is no database-wide semaphore.
+      </p>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="model-title">
+    <h2 id="model-title">Free-play bounded episode</h2>
+    <div class="toolbar">
+      <label class="control">
+        <span>Phase</span>
+        <select id="phase-select"></select>
+      </label>
+      <div class="control">
+        <span>Internal limit</span>
+        <div class="button-row" id="limit-buttons"></div>
+      </div>
+      <div class="control">
+        <span>Distinct leaves</span>
+        <div class="button-row" id="leaf-buttons"></div>
+      </div>
+      <div class="control">
+        <span>Cache state</span>
+        <div class="button-row" id="cache-buttons"></div>
+      </div>
+    </div>
+
+    <div class="button-row">
+      <button class="primary" data-action="start-uniform">Start uniform episode</button>
+      <button class="secondary" data-action="complete-wave">Complete active work</button>
+      <button data-action="start-wait">Start with foreign-holder wait</button>
+      <button data-action="release-wait">Finalize foreign holder</button>
+      <button data-action="start-mixed">Start mixed outcomes</button>
+      <button data-action="reset">Reset</button>
+    </div>
+
+    <div class="state-grid" id="state-grid"></div>
+    <div class="leaf-grid" id="leaf-grid"></div>
+    <div class="split">
+      <div class="subpanel">
+        <h3>Full relevant state</h3>
+        <div id="detail-state"></div>
+      </div>
+      <div class="subpanel">
+        <h3>Latest state changes</h3>
+        <ol class="event-log" id="event-log"></ol>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="walkthrough-title">
+    <h2 id="walkthrough-title">Guided awkward cases</h2>
+    <div class="tabs" id="guide-tabs"></div>
+    <h3 id="guide-title"></h3>
+    <p class="guide-copy" id="guide-copy"></p>
+    <div class="steps" id="guide-steps"></div>
+  </section>
+
+  <section class="section">
+    <h2>Limit comparison</h2>
+    <p>
+      For <code>L</code> equal independent backend waits of duration <code>W</code>, a limit
+      <code>N</code> uses about <code>ceil(L/N)</code> waves. Its potential added phase latency
+      relative to one all-at-once wave is about <code>(ceil(L/N) - 1) × W</code>.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Limit</th><th>1 leaf</th><th>2 leaves</th><th>8 leaves</th><th>32 leaves</th><th>Decision signal</th></tr></thead>
+        <tbody>
+          <tr><td>4</td><td>1 wave</td><td>1</td><td>2</td><td>8</td><td>Seven potential added waits at 32 leaves.</td></tr>
+          <tr><td>8</td><td>1 wave</td><td>1</td><td>1</td><td>4</td><td>Three potential added waits at 32 leaves.</td></tr>
+          <tr class="recommended"><td><strong>16</strong></td><td>1 wave</td><td>1</td><td>1</td><td>2</td><td><span class="verdict">Initial choice</span> At most one added wait through 32 leaves, with half the burst of limit 32.</td></tr>
+          <tr><td>32</td><td>1 wave</td><td>1</td><td>1</td><td>1</td><td>No added wait through 32 leaves. Select it if its throughput or required latency is materially better.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>Phase policy</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Phase</th><th>Bounded input</th><th>Limit</th><th>Special rule</th></tr></thead>
+        <tbody>
+          <tr><td>Point-key routing</td><td>Distinct node-path loads</td><td>16</td><td>Combine paths before admission. Keep the direct one-key descent.</td></tr>
+          <tr><td>Physical point validation</td><td>Distinct observed leaf paths</td><td>16</td><td>Different observations of one path run serially inside one position.</td></tr>
+          <tr><td>Logical point revalidation</td><td>Routed leaf groups</td><td>16</td><td>Status waits stay inside their leaf position.</td></tr>
+          <tr><td>Normal lock acquisition</td><td>Complete combined leaf groups</td><td>16</td><td>A foreign-holder wait consumes a position. Serial fallback bypasses the bound.</td></tr>
+          <tr><td>Committed write-back</td><td>Original <code>LockedTx</code> groups</td><td>16</td><td>Split descendants stay serial inside the original position.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>Deterministic verification map</h2>
+    <p class="lede">Use gates and counters. Do not assert real elapsed time in correctness tests.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Boundary</th><th>Deterministic fixture</th><th>Contract proved</th></tr></thead>
+        <tbody>
+          <tr><td><code>join_all_bounded</code></td><td>Gated futures for 0, 1, 2, 8, 16, and 32 inputs; reverse completion; value errors.</td><td>Direct zero/one paths, at most the configured number of incomplete futures, stable admission and output, all inputs run, and drop cancels admitted and stored futures.</td></tr>
+          <tr><td>Point-key routing</td><td>Manually seeded distinct node paths, one shared path, and a stale B-link separator.</td><td><code>ceil(L/16)</code> cold load waves at the production value, one load per required path, path convergence, stable routed leaf groups, and no added one-key operation.</td></tr>
+          <tr><td>Physical validation</td><td>Gated path checks with shared exact state, different revisions, and independent absence observations.</td><td>Input-aligned results, evidence propagation only for exact shared state, all paths run, stable outcome choice, and the incomplete-future bound.</td></tr>
+          <tr><td>Locked validation</td><td>Direct keyed proof lookup with installed, observed, mismatched, and foreign-holder proofs.</td><td>Only an exact installed proof takes the physical own-holder shortcut; every other case takes logical validation.</td></tr>
+          <tr><td>Logical validation</td><td>Distinct leaves whose holders are committed, not-written, deleted, pending, unknown, aborted, or wounded.</td><td>Stable per-key states and errors, one shared lower bound, all leaf groups run, and holder waits consume bounded positions.</td></tr>
+          <tr><td>Normal lock admission</td><td>Sixteen or more distinct leaf CAS gates plus one live foreign holder.</td><td>Maximum sixteen incomplete leaf futures, waiting consumes one position, later positions enter only after capacity opens, and one leaf uses the direct path.</td></tr>
+          <tr><td>Normal lock outcomes</td><td>Mixed locked, conflict, leaf-full, and storage-error results completed out of order.</td><td>Every leaf runs. The first non-locked result in stable leaf-path order wins.</td></tr>
+          <tr><td>Retained-lock retry</td><td>Completed conflict and leaf-full passes, a cached complete same-identity hold, a partial hold, and an uncertain landed CAS.</td><td>No foreground release; complete cached hold adds no CAS; partial hold runs one complete-leaf CAS; an uncertain landed CAS is recognized without a second CAS.</td></tr>
+          <tr><td>Complete lock proof</td><td>Point intentions and range membership work combined on one leaf.</td><td>A successful pass builds one proof for every current group and never carries a partial proof set into retry.</td></tr>
+          <tr><td>Serial transition</td><td>Gate after an old-identity conditional write dispatch and before result delivery; also drive a completed conflict threshold.</td><td>The old identity is durably wounded before renewal; the renewed identity starts sorted serial acquisition; a late old write is abort-side; point/range transaction body count stays one.</td></tr>
+          <tr><td>Collection exception</td><td>The same serial transition with collection create or drop state.</td><td>The existing wound-style transaction-body replay remains in force.</td></tr>
+          <tr><td>Committed write-back</td><td>Gated original groups with one split reroute, one structural deferral, one failure, and superseded hints.</td><td>Sixteen outer positions at most, descendants stay inside one position, every original group runs, failures stay local, and hints flatten in stable order.</td></tr>
+          <tr><td>Simulation</td><td>Repeat the same seed and schedule for each focused episode.</td><td>The backend operation stream and selected result are byte-identical across runs.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>Measurement plan</h2>
+    <p>
+      Build each exact leaf count with one pre-created key in each of 1, 2, 8, or 32
+      collections. Each collection root is one distinct physical leaf. This avoids split timing
+      and gives stable paths. Disable inline publication so the write workloads use the regular
+      logged protocol.
+    </p>
+    <h3>Selection rule</h3>
+    <ol>
+      <li>Sweep limits 8, 16, and 32 through a benchmark-only internal setting. Do not add a public <code>Database</code> option.</li>
+      <li>For cold single-transaction latency, require at most two waves through 32 leaves. Limit 16 is the smallest candidate that meets this modeled latency budget.</li>
+      <li>Use the existing worker sweep to find the throughput plateau. Include one and multiple <code>Database</code> clients because the limit is per transaction, not global.</li>
+      <li>Choose the smallest candidate whose median throughput is within 5% of the best candidate in every converged primary cell. This avoids a larger burst after throughput has stopped improving.</li>
+      <li>If limit 32 gives more than 5% additional throughput, or the accepted workload requires its one-wave 32-leaf latency, use 32. If one phase saturates earlier, give that phase a measured lower limit instead of adding public configuration.</li>
+    </ol>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Workload</th><th>Leaf counts</th><th>Cache states</th><th>Evidence</th></tr></thead>
+        <tbody>
+          <tr><td>Point-read transaction</td><td>1, 2, 8, 32</td><td>Warm and disabled decoded cache</td><td>Routing and point-validation latency, reads per transaction, and one-leaf operation count.</td></tr>
+          <tr><td>Logged blind overwrites</td><td>1, 2, 8, 32</td><td>Warm and disabled decoded cache</td><td>Normal lock and committed write-back waves without point-read work.</td></tr>
+          <tr><td>Logged point read-modify-write</td><td>1, 2, 8, 32</td><td>Warm and disabled decoded cache</td><td>Complete phase-order latency, throughput, retries, reads, writes, and locks per transaction.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <ul>
+      <li>Run memory, simulated GCS, and simulated S3 backends. Include provider request-rate limits. Prime warm cells before measurement. Set decoded-cache capacity to zero for cold cells.</li>
+      <li>Measure foreground latency and a fixed transaction batch followed by graceful shutdown, so committed write-back debt stays in the throughput result.</li>
+      <li>Compare the common-sixteen implementation with the fixed parent revision in alternating paired order. Use at least three pairs per cell.</li>
+      <li>Record p50 and p95 latency, transactions per second, backend reads and writes per transaction, retries, and lock calls.</li>
+      <li>Record maximum active backend operations. A per-transaction limit cannot by itself enforce a process-wide or provider-wide throughput limit.</li>
+      <li>Keep the existing direct-commit benchmark groups as one-leaf regression gates. The new regular-protocol fixture must not hide a direct-commit regression.</li>
+    </ul>
+  </section>
+
+  <section class="section">
+    <h2>Acceptance gates</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Gate</th><th>Accept</th><th>Reject</th></tr></thead>
+        <tbody>
+          <tr><td>Bound</td><td>No phase test observes more than sixteen incomplete leaf futures.</td><td><span class="verdict reject">Reject</span> Any seventeenth incomplete future.</td></tr>
+          <tr><td>Cold waves</td><td>Equal-delay distinct-path tests admit about <code>ceil(L/16)</code> operation waves.</td><td><span class="verdict reject">Reject</span> Serial <code>L</code>-wave behavior or hidden unbounded admission.</td></tr>
+          <tr><td>Added latency</td><td>Transactions through 16 leaves add no wait wave; 32 leaves add one relative to limit 32.</td><td><span class="verdict reject">Reject</span> More waves than the model, or an unacceptable measured p95 cost.</td></tr>
+          <tr><td>One leaf</td><td>The backend operation sequence and count match the parent revision.</td><td><span class="verdict reject">Reject</span> Any new backend operation.</td></tr>
+          <tr><td>Semantics</td><td>All deterministic cases pass under normal and simulation builds.</td><td><span class="verdict reject">Reject</span> Unstable output, skipped input, identity reuse, or retry-state leak.</td></tr>
+          <tr><td>Throughput plateau</td><td>Limit 16 reaches at least 95% of the best 8, 16, or 32 result in every converged primary cell.</td><td><span class="verdict reject">Reject</span> Use 32, or a measured phase-specific value, when 16 stays below the plateau.</td></tr>
+          <tr><td>Regression</td><td>No relevant cell has a repeatable throughput regression greater than 5% against the parent revision.</td><td><span class="verdict reject">Reject</span> Median candidate/base throughput is below 0.95 and all three paired runs are below 0.95.</td></tr>
+          <tr><td>Common value</td><td>The common limit passes all gates.</td><td>Split a phase limit only when its focused measurements identify that phase as the cause; do not add public configuration.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:18px"><strong>Final gate:</strong> run <code>make test-all</code> after the implementation and its deterministic regressions are complete.</p>
+  </section>
+</main>
+
+<script>
+  const ConcurrencyModel = (() => {
+    const phases = {
+      routing: "Point-key routing",
+      physical: "Physical point validation",
+      logical: "Logical point revalidation",
+      locking: "Normal lock acquisition",
+      writeback: "Committed write-back"
+    };
+
+    const resultFor = (index) => {
+      const cycle = ["Locked", "Conflict", "Locked", "Storage error", "LeafFull", "Locked"];
+      return cycle[index % cycle.length];
+    };
+
+    const newItems = (count) => Array.from({ length: count }, (_, index) => ({
+      path: `L${String(index + 1).padStart(2, "0")}`,
+      status: "queued",
+      result: null
+    }));
+
+    const initial = (overrides = {}) => ({
+      phase: "locking",
+      limit: 16,
+      leaves: 8,
+      cache: "cold",
+      mode: "idle",
+      items: newItems(8),
+      completionOrder: [],
+      stableOutputs: [],
+      maxIncomplete: 0,
+      completionRounds: 0,
+      casCount: 0,
+      identity: {
+        current: "T-old",
+        oldStatus: "Pending",
+        acquisition: "parallel",
+        bodyRuns: 1,
+        oldCas: "not dispatched"
+      },
+      events: ["Ready. Start an episode or a guided case."],
+      guide: { name: null, next: 0 },
+      ...overrides
+    });
+
+    const clone = (state) => JSON.parse(JSON.stringify(state));
+    const incompleteCount = (state) => state.items.filter((item) => item.status === "active" || item.status === "waiting").length;
+    const queuedCount = (state) => state.items.filter((item) => item.status === "queued").length;
+
+    const addEvent = (state, message) => {
+      state.events.unshift(message);
+      state.events = state.events.slice(0, 9);
+    };
+
+    const admit = (state) => {
+      let incomplete = incompleteCount(state);
+      for (const item of state.items) {
+        if (incomplete >= state.limit) break;
+        if (item.status === "queued") {
+          item.status = "active";
+          incomplete += 1;
+        }
+      }
+      state.maxIncomplete = Math.max(state.maxIncomplete, incomplete);
+    };
+
+    const start = (state, mode) => {
+      const next = clone(state);
+      next.mode = mode;
+      next.items = newItems(next.leaves);
+      next.completionOrder = [];
+      next.stableOutputs = [];
+      next.maxIncomplete = 0;
+      next.completionRounds = 0;
+      next.events = [];
+      admit(next);
+      if (mode === "wait") {
+        const first = next.items.find((item) => item.status === "active");
+        if (first) first.status = "waiting";
+        addEvent(next, `${first?.path ?? "First leaf"} waits for a foreign transaction identity and keeps its position.`);
+      } else if (mode === "mixed") {
+        addEvent(next, "Mixed outcomes started. Completion order will differ from leaf-path order.");
+      } else {
+        addEvent(next, `Admitted ${incompleteCount(next)} incomplete inputs in stable order.`);
+      }
+      return next;
+    };
+
+    const completeActive = (state) => {
+      const next = clone(state);
+      const active = next.items.filter((item) => item.status === "active").reverse();
+      if (active.length === 0) {
+        addEvent(next, "No active leaf can complete. A foreign-holder wait can still occupy a position.");
+        return next;
+      }
+      next.completionRounds += 1;
+      for (const item of active) {
+        item.status = "done";
+        item.result = next.mode === "mixed" ? resultFor(next.items.indexOf(item)) : "Complete";
+        next.completionOrder.push(item.path);
+      }
+      addEvent(next, `Completed ${active.map((item) => item.path).join(", ")} in reverse order.`);
+      admit(next);
+      if (queuedCount(next) === 0 && incompleteCount(next) === 0) {
+        next.stableOutputs = next.items.map((item) => `${item.path}: ${item.result}`);
+        const firstNonLocked = next.items.find((item) => item.result !== "Locked" && item.result !== "Complete");
+        addEvent(next, firstNonLocked
+          ? `All inputs ran. Stable interpretation selects ${firstNonLocked.path}: ${firstNonLocked.result}.`
+          : "All inputs ran. Outputs are now in stable input order.");
+      } else {
+        addEvent(next, `${incompleteCount(next)} inputs are incomplete after stable admission refilled capacity.`);
+      }
+      return next;
+    };
+
+    const releaseWait = (state) => {
+      const next = clone(state);
+      const waiting = next.items.find((item) => item.status === "waiting");
+      if (!waiting) {
+        addEvent(next, "No leaf is waiting for a foreign transaction identity.");
+        return next;
+      }
+      waiting.status = "done";
+      waiting.result = next.mode === "mixed" ? resultFor(next.items.indexOf(waiting)) : "Complete";
+      next.completionOrder.push(waiting.path);
+      addEvent(next, `${waiting.path} observed the foreign holder as finalized and completed.`);
+      admit(next);
+      if (queuedCount(next) === 0 && incompleteCount(next) === 0) {
+        next.stableOutputs = next.items.map((item) => `${item.path}: ${item.result}`);
+        addEvent(next, "All inputs ran. Outputs are now in stable input order.");
+      }
+      return next;
+    };
+
+    const configure = (state, patch) => {
+      const configured = initial({
+        phase: patch.phase ?? state.phase,
+        limit: patch.limit ?? state.limit,
+        leaves: patch.leaves ?? state.leaves,
+        cache: patch.cache ?? state.cache,
+        guide: clone(state.guide)
+      });
+      configured.items = newItems(configured.leaves);
+      configured.events = ["Configuration changed. Start a new episode."];
+      return configured;
+    };
+
+    const retained = (state, kind) => {
+      const next = clone(state);
+      next.mode = "retained";
+      if (kind === "complete") {
+        addEvent(next, "The cached leaf has every required same-identity hold. Return Observed with no CAS.");
+      } else if (kind === "partial") {
+        next.casCount += 1;
+        addEvent(next, "The same-identity hold is partial. Run one idempotent complete-leaf CAS.");
+      } else if (kind === "uncertain") {
+        next.casCount += 1;
+        next.identity.oldCas = "landed; result unavailable";
+        addEvent(next, "The complete-leaf CAS landed, but its result was unavailable.");
+      } else if (kind === "retry") {
+        addEvent(next, "Retry rebuilt the full group set and observed the complete hold. No second CAS was added.");
+      }
+      return next;
+    };
+
+    const identityStep = (state, step) => {
+      const next = clone(state);
+      next.mode = "identity";
+      const identity = next.identity;
+      if (step === "dispatch") {
+        identity.oldCas = "dispatched; result gated";
+        addEvent(next, "The old identity dispatched a conditional leaf write. Its result is gated.");
+      } else if (step === "timeout") {
+        addEvent(next, "The parallel episode timed out. The old owner operation is still unresolved.");
+      } else if (step === "wound") {
+        identity.oldStatus = "Wounded (durable)";
+        addEvent(next, "The old identity is durably Wounded before a replacement can publish.");
+      } else if (step === "renew") {
+        if (identity.oldStatus !== "Wounded (durable)") {
+          addEvent(next, "Illegal transition: first make the old Wounded status durable.");
+        } else {
+          identity.current = "T-renewed";
+          addEvent(next, "A renewed transaction identity keeps the old wound-wait priority.");
+        }
+      } else if (step === "serial") {
+        if (identity.current !== "T-renewed") {
+          addEvent(next, "Illegal transition: sorted serial acquisition needs the renewed identity.");
+        } else {
+          identity.acquisition = "sorted serial";
+          addEvent(next, "The renewed identity starts sorted serial acquisition. The bounded join is bypassed.");
+        }
+      } else if (step === "late") {
+        identity.oldCas = "landed late for T-old; abort-side";
+        addEvent(next, "The late leaf lock still names T-old. It cannot become a lock of T-renewed.");
+      }
+      return next;
+    };
+
+    const reduce = (state, action) => {
+      switch (action.type) {
+        case "CONFIGURE": return configure(state, action.patch);
+        case "START": return start(state, action.mode);
+        case "COMPLETE": return completeActive(state);
+        case "RELEASE_WAIT": return releaseWait(state);
+        case "RETAINED": return retained(state, action.kind);
+        case "IDENTITY": return identityStep(state, action.step);
+        case "RESET": return initial({ guide: clone(state.guide) });
+        default: return clone(state);
+      }
+    };
+
+    return { phases, initial, reduce, incompleteCount, queuedCount };
+  })();
+
+  const guides = [
+    {
+      name: "why-sixteen",
+      tab: "Why sixteen",
+      title: "Balance added latency with the throughput plateau",
+      copy: "A larger limit costs nothing when the transaction supplies fewer inputs. At 32 leaves, limit eight adds three waits, limit sixteen adds one, and limit 32 adds none. The worker sweep must show whether more than sixteen improves throughput enough to justify the larger burst.",
+      initial: { phase: "routing", limit: 16, leaves: 32, cache: "cold" },
+      steps: [
+        ["Start 32 leaves with limit eight", { type: "SET_START", patch: { limit: 8, leaves: 32 } }],
+        ["Complete one of four waves", { type: "COMPLETE" }],
+        ["Use limit sixteen and restart", { type: "SET_START", patch: { limit: 16, leaves: 32 } }],
+        ["Complete one of two waves", { type: "COMPLETE" }],
+        ["Use limit 32 and compare its doubled burst", { type: "SET_START", patch: { limit: 32, leaves: 32 } }]
+      ]
+    },
+    {
+      name: "bounded-wait",
+      tab: "Foreign wait",
+      title: "A wait keeps one bounded position",
+      copy: "This case checks the selected contract. The waiting leaf is not parked or replaced. Other positions can finish and admit later inputs, but the wait always counts as incomplete.",
+      initial: { phase: "locking", limit: 2, leaves: 4, cache: "cold" },
+      steps: [
+        ["Start with L01 waiting", { type: "START", mode: "wait" }],
+        ["Complete L02 and admit L03", { type: "COMPLETE" }],
+        ["Complete L03 and admit L04", { type: "COMPLETE" }],
+        ["Finalize the foreign holder", { type: "RELEASE_WAIT" }],
+        ["Complete the last leaf", { type: "COMPLETE" }]
+      ]
+    },
+    {
+      name: "stable-results",
+      tab: "Stable results",
+      title: "All inputs run before stable interpretation",
+      copy: "Mixed domain outcomes complete in reverse order. The bounded join still runs every input and returns stable input order. The caller then selects the first non-locked leaf-path result.",
+      initial: { phase: "locking", limit: 3, leaves: 6, cache: "warm" },
+      steps: [
+        ["Start mixed outcomes", { type: "START", mode: "mixed" }],
+        ["Complete the first admitted set", { type: "COMPLETE" }],
+        ["Complete the remaining set", { type: "COMPLETE" }]
+      ]
+    },
+    {
+      name: "retained-retry",
+      tab: "Retained retry",
+      title: "Use physical leaf state as retry memory",
+      copy: "The retry always rebuilds the complete group set. A complete same-identity hold returns Observed without a CAS. A partial hold uses the normal complete-leaf CAS. An uncertain landed CAS is recognized on retry.",
+      initial: { phase: "locking", limit: 16, leaves: 2, cache: "warm" },
+      steps: [
+        ["Observe a complete cached hold", { type: "RETAINED", kind: "complete" }],
+        ["Observe a partial hold", { type: "RETAINED", kind: "partial" }],
+        ["Land a CAS with an unavailable result", { type: "RETAINED", kind: "uncertain" }],
+        ["Retry and recognize the complete hold", { type: "RETAINED", kind: "retry" }]
+      ]
+    },
+    {
+      name: "renewed-identity",
+      tab: "Serial fallback",
+      title: "Renew identity before sorted serial acquisition",
+      copy: "A timed-out conditional write can land after its future is dropped. Durable wounding and identity renewal prevent that late old lock from entering the renewed identity's sorted prefix.",
+      initial: { phase: "locking", limit: 16, leaves: 8, cache: "cold" },
+      steps: [
+        ["Dispatch and gate an old-identity CAS", { type: "IDENTITY", step: "dispatch" }],
+        ["Expire the parallel episode", { type: "IDENTITY", step: "timeout" }],
+        ["Make the old Wounded status durable", { type: "IDENTITY", step: "wound" }],
+        ["Renew the transaction identity", { type: "IDENTITY", step: "renew" }],
+        ["Enter sorted serial acquisition", { type: "IDENTITY", step: "serial" }],
+        ["Let the old CAS land late", { type: "IDENTITY", step: "late" }]
+      ]
+    },
+    {
+      name: "measurement-cells",
+      tab: "Measurements",
+      title: "Visit the required leaf-count cells",
+      copy: "The exact benchmark fixture uses one collection root per leaf. Warm and cache-disabled cells separate scheduler overhead from backend wait improvement.",
+      initial: { phase: "logical", limit: 16, leaves: 1, cache: "warm" },
+      steps: [
+        ["Run the one-leaf warm cell", { type: "START", mode: "uniform" }],
+        ["Run two cold leaves", { type: "SET_START", patch: { leaves: 2, cache: "cold" } }],
+        ["Run eight cold leaves", { type: "SET_START", patch: { leaves: 8, cache: "cold" } }],
+        ["Run 32 cold leaves", { type: "SET_START", patch: { leaves: 32, cache: "cold" } }]
+      ]
+    }
+  ];
+
+  let state = ConcurrencyModel.initial();
+  let activeGuide = 0;
+
+  const phaseSelect = document.querySelector("#phase-select");
+  const limitButtons = document.querySelector("#limit-buttons");
+  const leafButtons = document.querySelector("#leaf-buttons");
+  const cacheButtons = document.querySelector("#cache-buttons");
+
+  const buttonSet = (root, values, current, label, onClick) => {
+    root.replaceChildren(...values.map((value) => {
+      const button = document.createElement("button");
+      button.textContent = label(value);
+      button.className = value === current ? "active" : "";
+      button.addEventListener("click", () => onClick(value));
+      return button;
+    }));
+  };
+
+  const setState = (next) => {
+    state = next;
+    render();
+  };
+
+  const dispatch = (action) => {
+    if (action.type === "SET_START") {
+      const configured = ConcurrencyModel.reduce(state, { type: "CONFIGURE", patch: action.patch });
+      setState(ConcurrencyModel.reduce(configured, { type: "START", mode: "uniform" }));
+      return;
+    }
+    setState(ConcurrencyModel.reduce(state, action));
+  };
+
+  const renderState = () => {
+    const incomplete = ConcurrencyModel.incompleteCount(state);
+    const expectedWaves = Math.ceil(state.leaves / state.limit);
+    const direct = state.leaves <= 1 ? "Direct await" : "Bounded join";
+    const stats = [
+      ["Phase", ConcurrencyModel.phases[state.phase]],
+      ["Expected cold waves", expectedWaves],
+      ["Incomplete now", incomplete],
+      ["Maximum observed", state.maxIncomplete],
+      ["Completion rounds", state.completionRounds],
+      ["One-input path", direct]
+    ];
+    document.querySelector("#state-grid").innerHTML = stats.map(([name, value]) =>
+      `<div class="stat"><span>${name}</span><strong>${value}</strong></div>`
+    ).join("");
+
+    document.querySelector("#leaf-grid").innerHTML = state.items.map((item) =>
+      `<div class="leaf ${item.status}"><strong>${item.path}</strong><span>${item.status}</span><span>${item.result ?? "No output"}</span></div>`
+    ).join("");
+
+    const firstStable = state.stableOutputs.length ? state.stableOutputs.join(" · ") : "Not available until all inputs complete.";
+    const completion = state.completionOrder.length ? state.completionOrder.join(" → ") : "None yet";
+    document.querySelector("#detail-state").innerHTML = `
+      <table>
+        <tr><th>Mode</th><td>${state.mode}</td></tr>
+        <tr><th>Configuration</th><td>limit ${state.limit}; ${state.leaves} distinct leaves; ${state.cache} cache</td></tr>
+        <tr><th>Queued</th><td>${ConcurrencyModel.queuedCount(state)}</td></tr>
+        <tr><th>Completion order</th><td>${completion}</td></tr>
+        <tr><th>Stable outputs</th><td>${firstStable}</td></tr>
+        <tr><th>CAS count in retry case</th><td>${state.casCount}</td></tr>
+        <tr><th>Transaction identity</th><td>${state.identity.current}; old status ${state.identity.oldStatus}; ${state.identity.acquisition}</td></tr>
+        <tr><th>Old conditional write</th><td>${state.identity.oldCas}</td></tr>
+        <tr><th>Transaction body runs</th><td>${state.identity.bodyRuns}</td></tr>
+      </table>`;
+
+    document.querySelector("#event-log").innerHTML = state.events.length
+      ? state.events.map((event) => `<li>${event}</li>`).join("")
+      : '<li class="empty">No state change yet.</li>';
+  };
+
+  const renderControls = () => {
+    if (phaseSelect.options.length === 0) {
+      for (const [value, label] of Object.entries(ConcurrencyModel.phases)) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = label;
+        phaseSelect.append(option);
+      }
+      phaseSelect.addEventListener("change", () => dispatch({ type: "CONFIGURE", patch: { phase: phaseSelect.value } }));
+    }
+    phaseSelect.value = state.phase;
+    buttonSet(limitButtons, [4, 8, 16, 32], state.limit, String,
+      (limit) => dispatch({ type: "CONFIGURE", patch: { limit } }));
+    buttonSet(leafButtons, [1, 2, 8, 32], state.leaves, String,
+      (leaves) => dispatch({ type: "CONFIGURE", patch: { leaves } }));
+    buttonSet(cacheButtons, ["warm", "cold"], state.cache, (value) => value,
+      (cache) => dispatch({ type: "CONFIGURE", patch: { cache } }));
+  };
+
+  const beginGuide = (index) => {
+    activeGuide = index;
+    const guide = guides[index];
+    state = ConcurrencyModel.initial({ ...guide.initial, guide: { name: guide.name, next: 0 } });
+    state.items = Array.from({ length: state.leaves }, (_, itemIndex) => ({
+      path: `L${String(itemIndex + 1).padStart(2, "0")}`,
+      status: "queued",
+      result: null
+    }));
+    state.events = [`Walkthrough “${guide.tab}” reset to its known initial state.`];
+    render();
+  };
+
+  const runGuideStep = (stepIndex) => {
+    const guide = guides[activeGuide];
+    if (stepIndex !== state.guide.next) return;
+    dispatch(guide.steps[stepIndex][1]);
+    state.guide = { name: guide.name, next: stepIndex + 1 };
+    render();
+  };
+
+  const renderGuide = () => {
+    const guide = guides[activeGuide];
+    const tabs = document.querySelector("#guide-tabs");
+    tabs.replaceChildren(...guides.map((candidate, index) => {
+      const button = document.createElement("button");
+      button.textContent = candidate.tab;
+      button.className = index === activeGuide ? "active" : "";
+      button.addEventListener("click", () => beginGuide(index));
+      return button;
+    }));
+    document.querySelector("#guide-title").textContent = guide.title;
+    document.querySelector("#guide-copy").textContent = guide.copy;
+    document.querySelector("#guide-steps").innerHTML = guide.steps.map(([label], index) => `
+      <div class="step ${index < state.guide.next ? "done" : ""}">
+        <span class="step-number">${index + 1}</span>
+        <span>${label}</span>
+        <button data-guide-step="${index}" ${index !== state.guide.next ? "disabled" : ""}>Apply step</button>
+      </div>`).join("");
+    document.querySelectorAll("[data-guide-step]").forEach((button) => {
+      button.addEventListener("click", () => runGuideStep(Number(button.dataset.guideStep)));
+    });
+  };
+
+  const render = () => {
+    renderControls();
+    renderState();
+    renderGuide();
+  };
+
+  document.querySelectorAll("[data-action]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const actions = {
+        "start-uniform": { type: "START", mode: "uniform" },
+        "complete-wave": { type: "COMPLETE" },
+        "start-wait": { type: "START", mode: "wait" },
+        "release-wait": { type: "RELEASE_WAIT" },
+        "start-mixed": { type: "START", mode: "mixed" },
+        reset: { type: "RESET" }
+      };
+      dispatch(actions[button.dataset.action]);
+    });
+  });
+
+  beginGuide(0);
+</script>
+</body>
+</html>
