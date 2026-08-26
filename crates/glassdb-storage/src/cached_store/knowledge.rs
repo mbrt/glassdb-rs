@@ -7,7 +7,7 @@ use crate::cache::{Cache, Weighable};
 use crate::error::StorageError;
 use crate::timeline::SequencePoint;
 
-use super::{Codec, Evidence, ObjectKey, Observation, Requirement, Revision, satisfies};
+use super::{Codec, Evidence, ObjectKey, Observation, Requirement, Revision};
 
 type ErasedValue = Arc<dyn Any + Send + Sync>;
 
@@ -201,7 +201,7 @@ impl Knowledge {
                 evidence,
                 ..
             } => {
-                if !satisfies(evidence.get(), req) {
+                if !req.is_satisfied_by(evidence.get()) {
                     return Ok(None);
                 }
                 let value = downcast::<C>(key.as_str(), value)?;
@@ -214,7 +214,7 @@ impl Knowledge {
                 }))
             }
             EntryState::Absent { evidence } => {
-                if !satisfies(evidence.get(), req) {
+                if !req.is_satisfied_by(evidence.get()) {
                     return Ok(None);
                 }
                 Ok(Some(Observation {

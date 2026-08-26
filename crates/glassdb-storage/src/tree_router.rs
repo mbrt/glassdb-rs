@@ -12,8 +12,12 @@
 //! the decoded object store, so interior nodes stay cached and off the hot
 //! path) and never mutates the tree. Splitting and locking live above it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
+use futures::FutureExt;
+use futures::future::BoxFuture;
+use futures::stream::{FuturesUnordered, StreamExt};
 use glassdb_data::{CollectionAddress, KeyRef, NodeToken, ObjectPath};
 
 use crate::cached_store::Requirement;
@@ -40,18 +44,51 @@ impl LeafLocator {
 
 /// A group of keys routed to one leaf by [`TreeRouter::group_keys_by_leaf`]: the
 /// owning leaf and the raw keys (with their payloads) that landed in it.
-pub struct LeafGroup<T> {
-    pub path: ObjectPath,
+pub struct RoutedLeafGroup<T> {
     pub observation: LeafObservation,
     pub keys: Vec<(Vec<u8>, T)>,
 }
 
-impl<T> LeafGroup<T> {
+impl<T> RoutedLeafGroup<T> {
+    /// Returns the observed leaf's physical object path.
+    pub fn path(&self) -> &ObjectPath {
+        self.observation.path()
+    }
+
     /// Returns the observed node.
     pub fn node(&self) -> Option<&Node> {
         self.observation.value().map(AsRef::as_ref)
     }
 }
+
+struct RoutedItem<T> {
+    ordinal: usize,
+    key: KeyRef,
+    raw_key: Vec<u8>,
+    payload: T,
+    stage: RouteStage,
+}
+
+#[derive(Clone, Copy)]
+enum RouteStage {
+    Interior,
+    Leaf,
+}
+
+struct PendingPath<T> {
+    items: Vec<RoutedItem<T>>,
+}
+
+struct CompletedPath<T> {
+    observation: LeafObservation,
+    items: Vec<RoutedItem<T>>,
+}
+
+type PathLoad = (
+    ObjectPath,
+    Requirement,
+    Result<LeafObservation, StorageError>,
+);
 
 /// One node reached during a descent: its decoded body, object path, and
 /// retained physical observation.
@@ -303,12 +340,13 @@ impl<'a> LeafChain<'a> {
 #[derive(Clone)]
 pub struct TreeRouter {
     nodes: NodeStore,
+    parallelism: NonZeroUsize,
 }
 
 impl TreeRouter {
     /// Creates a router that reads nodes through `nodes`.
-    pub fn new(nodes: NodeStore) -> Self {
-        TreeRouter { nodes }
+    pub fn new(nodes: NodeStore, parallelism: NonZeroUsize) -> Self {
+        TreeRouter { nodes, parallelism }
     }
 
     /// Resolves the leaf that owns `key`, descending from the root `_r` and
@@ -445,7 +483,7 @@ impl TreeRouter {
         &self,
         items: impl IntoIterator<Item = (KeyRef, T)>,
         requirement: Requirement,
-    ) -> Result<Vec<LeafGroup<T>>, StorageError> {
+    ) -> Result<Vec<RoutedLeafGroup<T>>, StorageError> {
         self.group_keys_by_leaf_fresh(items, requirement, requirement)
             .await
     }
@@ -461,25 +499,254 @@ impl TreeRouter {
         items: impl IntoIterator<Item = (KeyRef, T)>,
         interior: Requirement,
         leaf: Requirement,
-    ) -> Result<Vec<LeafGroup<T>>, StorageError> {
-        let mut groups: BTreeMap<ObjectPath, LeafGroup<T>> = BTreeMap::new();
-        for (key, payload) in items {
+    ) -> Result<Vec<RoutedLeafGroup<T>>, StorageError> {
+        let mut items = items.into_iter();
+        let Some(first) = items.next() else {
+            return Ok(Vec::new());
+        };
+        let Some(second) = items.next() else {
+            let (key, payload) = first;
             let raw_key = key.key().to_vec();
-            let loc = self
+            let locator = self
                 .leaf_for_fresh(key.collection(), &raw_key, interior, leaf)
                 .await
                 .map_err(|error| error.classify_collection_absence(key.collection()))?;
-            groups
-                .entry(loc.path.clone())
-                .or_insert_with(|| LeafGroup {
-                    path: loc.path,
-                    observation: loc.observation,
-                    keys: Vec::new(),
-                })
-                .keys
-                .push((raw_key, payload));
+            return Ok(vec![RoutedLeafGroup {
+                observation: locator.observation,
+                keys: vec![(raw_key, payload)],
+            }]);
+        };
+
+        self.group_keys_by_leaf_batched(
+            std::iter::once(first)
+                .chain(std::iter::once(second))
+                .chain(items),
+            interior,
+            leaf,
+        )
+        .await
+    }
+
+    async fn group_keys_by_leaf_batched<T>(
+        &self,
+        items: impl IntoIterator<Item = (KeyRef, T)>,
+        interior: Requirement,
+        leaf: Requirement,
+    ) -> Result<Vec<RoutedLeafGroup<T>>, StorageError> {
+        let mut pending = BTreeMap::<ObjectPath, PendingPath<T>>::new();
+        let mut ready = BTreeSet::<ObjectPath>::new();
+        let mut in_flight_paths = BTreeSet::<ObjectPath>::new();
+        let mut in_flight = FuturesUnordered::<BoxFuture<'static, PathLoad>>::new();
+        let mut completed = BTreeMap::<ObjectPath, CompletedPath<T>>::new();
+        let mut errors = Vec::<(usize, ObjectPath, StorageError)>::new();
+
+        for (ordinal, (key, payload)) in items.into_iter().enumerate() {
+            let path = ObjectPath::TreeRoot {
+                collection: key.collection().clone(),
+            };
+            enqueue_routed_item(
+                &mut pending,
+                &mut ready,
+                &in_flight_paths,
+                path,
+                RoutedItem {
+                    ordinal,
+                    raw_key: key.key().to_vec(),
+                    key,
+                    payload,
+                    stage: RouteStage::Interior,
+                },
+            );
         }
-        Ok(groups.into_values().collect())
+
+        loop {
+            while in_flight.len() < self.parallelism.get() {
+                let Some(path) = next_ready_path(&ready, &pending) else {
+                    break;
+                };
+                ready.remove(&path);
+                let requirement = pending[&path]
+                    .items
+                    .iter()
+                    .map(|item| route_requirement(item.stage, interior, leaf))
+                    .fold(Requirement::Any, Requirement::stricter);
+                in_flight_paths.insert(path.clone());
+                let nodes = self.nodes.clone();
+                in_flight.push(
+                    async move {
+                        let result = nodes.load_node_at_state(&path, requirement).await;
+                        (path, requirement, result)
+                    }
+                    .boxed(),
+                );
+            }
+
+            let Some((path, loaded_at, result)) = in_flight.next().await else {
+                break;
+            };
+            in_flight_paths.remove(&path);
+            let batch = pending
+                .remove(&path)
+                .expect("every admitted path keeps its routed items");
+
+            let observation = match result {
+                Ok(observation) if observation.exists() => observation,
+                Ok(_) => {
+                    let first = batch
+                        .items
+                        .iter()
+                        .min_by_key(|item| item.ordinal)
+                        .expect("a routed path has at least one item");
+                    errors.push((
+                        first.ordinal,
+                        path,
+                        StorageError::NotFound.classify_collection_absence(first.key.collection()),
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    let first = batch
+                        .items
+                        .iter()
+                        .min_by_key(|item| item.ordinal)
+                        .expect("a routed path has at least one item");
+                    errors.push((
+                        first.ordinal,
+                        path,
+                        error.classify_collection_absence(first.key.collection()),
+                    ));
+                    continue;
+                }
+            };
+
+            let mut routed_items = batch.items;
+            if let Some(previous) = completed.remove(&path) {
+                routed_items.extend(previous.items);
+            }
+            routed_items.sort_by_key(|item| item.ordinal);
+
+            let node = observation
+                .value()
+                .cloned()
+                .expect("present node observations have a decoded node");
+            let mut finished = Vec::new();
+            for mut item in routed_items {
+                let required = route_requirement(item.stage, interior, leaf);
+                if !loaded_at.covers(required)
+                    || !required.is_satisfied_by(observation.current_after())
+                {
+                    enqueue_routed_item(
+                        &mut pending,
+                        &mut ready,
+                        &in_flight_paths,
+                        path.clone(),
+                        item,
+                    );
+                    continue;
+                }
+
+                if !node.owns(&item.raw_key) {
+                    let Some(token) = node.right_sibling() else {
+                        finished.push(item);
+                        continue;
+                    };
+                    let token = match node_token(token) {
+                        Ok(token) => token,
+                        Err(error) => {
+                            errors.push((item.ordinal, path.clone(), error));
+                            continue;
+                        }
+                    };
+                    let target = ObjectPath::Node {
+                        collection: item.key.collection().clone(),
+                        token,
+                    };
+                    item.stage = match node.body() {
+                        NodeBody::Leaf(_) => RouteStage::Leaf,
+                        NodeBody::Index(_) => RouteStage::Interior,
+                    };
+                    enqueue_routed_item(&mut pending, &mut ready, &in_flight_paths, target, item);
+                    continue;
+                }
+
+                match node.body() {
+                    NodeBody::Index(index) => {
+                        let Some(token) = index.child_for(&item.raw_key) else {
+                            errors.push((
+                                item.ordinal,
+                                path.clone(),
+                                StorageError::other("descent reached an empty index node"),
+                            ));
+                            continue;
+                        };
+                        let token = match node_token(token) {
+                            Ok(token) => token,
+                            Err(error) => {
+                                errors.push((item.ordinal, path.clone(), error));
+                                continue;
+                            }
+                        };
+                        let target = ObjectPath::Node {
+                            collection: item.key.collection().clone(),
+                            token,
+                        };
+                        item.stage = RouteStage::Interior;
+                        enqueue_routed_item(
+                            &mut pending,
+                            &mut ready,
+                            &in_flight_paths,
+                            target,
+                            item,
+                        );
+                    }
+                    NodeBody::Leaf(_) if leaf.is_satisfied_by(observation.current_after()) => {
+                        finished.push(item);
+                    }
+                    NodeBody::Leaf(_) => {
+                        item.stage = RouteStage::Leaf;
+                        enqueue_routed_item(
+                            &mut pending,
+                            &mut ready,
+                            &in_flight_paths,
+                            path.clone(),
+                            item,
+                        );
+                    }
+                }
+            }
+
+            if !finished.is_empty() {
+                completed.insert(
+                    path,
+                    CompletedPath {
+                        observation,
+                        items: finished,
+                    },
+                );
+            }
+        }
+
+        if let Some((_, _, error)) = errors
+            .into_iter()
+            .min_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)))
+        {
+            return Err(error);
+        }
+
+        Ok(completed
+            .into_values()
+            .map(|mut group| {
+                group.items.sort_by_key(|item| item.ordinal);
+                RoutedLeafGroup {
+                    observation: group.observation,
+                    keys: group
+                        .items
+                        .into_iter()
+                        .map(|item| (item.raw_key, item.payload))
+                        .collect(),
+                }
+            })
+            .collect())
     }
 
     /// Reports whether descent for `key` reaches the node named `target`.
@@ -595,6 +862,54 @@ fn node_token(token: &str) -> Result<NodeToken, StorageError> {
         .map_err(|error| StorageError::with_source("invalid node reference", error))
 }
 
+fn route_requirement(stage: RouteStage, interior: Requirement, leaf: Requirement) -> Requirement {
+    match stage {
+        RouteStage::Interior => interior,
+        RouteStage::Leaf => leaf,
+    }
+}
+
+fn enqueue_routed_item<T>(
+    pending: &mut BTreeMap<ObjectPath, PendingPath<T>>,
+    ready: &mut BTreeSet<ObjectPath>,
+    in_flight: &BTreeSet<ObjectPath>,
+    path: ObjectPath,
+    item: RoutedItem<T>,
+) {
+    pending
+        .entry(path.clone())
+        .or_insert_with(|| PendingPath { items: Vec::new() })
+        .items
+        .push(item);
+    if !in_flight.contains(&path) {
+        ready.insert(path);
+    }
+}
+
+fn next_ready_path<T>(
+    ready: &BTreeSet<ObjectPath>,
+    pending: &BTreeMap<ObjectPath, PendingPath<T>>,
+) -> Option<ObjectPath> {
+    ready
+        .iter()
+        .min_by(|left, right| {
+            let left_ordinal = pending[*left]
+                .items
+                .iter()
+                .map(|item| item.ordinal)
+                .min()
+                .expect("a ready path has at least one routed item");
+            let right_ordinal = pending[*right]
+                .items
+                .iter()
+                .map(|item| item.ordinal)
+                .min()
+                .expect("a ready path has at least one routed item");
+            (left_ordinal, *left).cmp(&(right_ordinal, *right))
+        })
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,7 +949,7 @@ mod tests {
     fn store_over(backend: Arc<dyn Backend>) -> TestStore {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        let shards = NodeStore::new(objects);
+        let shards = NodeStore::new(objects, std::num::NonZeroUsize::MIN);
         TestStore { shards, timeline }
     }
 
@@ -807,7 +1122,7 @@ mod tests {
         let root = Node::leaf(Shard::from_entries([live(b"only")]));
         s.create_root(&collection(), &root).await.unwrap();
 
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN);
         let requirement = Requirement::AtLeast(s.timeline.now());
         let loc = router
             .leaf_for(&collection(), b"only", requirement)
@@ -828,7 +1143,7 @@ mod tests {
     #[tokio::test]
     async fn absent_collection_is_not_a_writable_empty_leaf() {
         let s = store();
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN);
         assert!(matches!(
             router
                 .leaf_for(&collection(), b"k", Requirement::AtLeast(s.timeline.now()))
@@ -863,7 +1178,7 @@ mod tests {
     async fn descends_index_to_correct_leaf() {
         let s = store();
         seed_two_level(&s).await;
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN);
 
         for (key, want_leaf) in [
             (b"apple".as_slice(), node_path(0)),
@@ -887,7 +1202,7 @@ mod tests {
         take_reads(&log);
 
         let cold = store_over(backend.clone());
-        let router = TreeRouter::new(cold.shards.clone());
+        let router = TreeRouter::new(cold.shards.clone(), std::num::NonZeroUsize::MIN);
         let loc = router
             .leaf_for(&collection(), b"pear", Requirement::Any)
             .await
@@ -919,7 +1234,7 @@ mod tests {
             .await
             .unwrap();
         take_reads(&log);
-        let loc = TreeRouter::new(terminal_warm.shards.clone())
+        let loc = TreeRouter::new(terminal_warm.shards.clone(), std::num::NonZeroUsize::MIN)
             .leaf_for(&collection(), b"pear", Requirement::Any)
             .await
             .unwrap();
@@ -937,7 +1252,7 @@ mod tests {
         take_reads(&log);
 
         let s = store_over(backend.clone());
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN);
         router
             .leaf_for(&collection(), b"pear", Requirement::Any)
             .await
@@ -968,7 +1283,7 @@ mod tests {
         }
         take_reads(&log);
         let bound = mixed.timeline.now();
-        let loc = TreeRouter::new(mixed.shards.clone())
+        let loc = TreeRouter::new(mixed.shards.clone(), std::num::NonZeroUsize::MIN)
             .leaf_for_fresh(
                 &collection(),
                 b"pear",
@@ -1000,7 +1315,7 @@ mod tests {
             .unwrap();
         take_reads(&log);
 
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN);
         let first = router
             .first_leaf_at(&collection(), b"apple", Requirement::Any)
             .await
@@ -1028,7 +1343,7 @@ mod tests {
         take_reads(&log);
 
         let bounded = store_over(backend.clone());
-        let leaves = TreeRouter::new(bounded.shards.clone())
+        let leaves = TreeRouter::new(bounded.shards.clone(), std::num::NonZeroUsize::MIN)
             .leaves_through(&collection(), b"apple", Some(b"mango"), Requirement::Any)
             .await
             .unwrap();
@@ -1053,7 +1368,7 @@ mod tests {
             .await
             .unwrap();
         take_reads(&log);
-        let leaves = TreeRouter::new(terminal_warm.shards.clone())
+        let leaves = TreeRouter::new(terminal_warm.shards.clone(), std::num::NonZeroUsize::MIN)
             .leaves(&collection(), Requirement::Any)
             .await
             .unwrap();
@@ -1082,7 +1397,7 @@ mod tests {
         take_reads(&log);
 
         let s = store_over(backend);
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN);
         let loc = router
             .leaf_for(&collection(), b"pear", Requirement::Any)
             .await
@@ -1130,7 +1445,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let router = TreeRouter::new(reader.shards.clone());
+        let router = TreeRouter::new(reader.shards.clone(), std::num::NonZeroUsize::MIN);
         router
             .leaf_for(&collection(), b"pear", Requirement::Any)
             .await
@@ -1203,7 +1518,7 @@ mod tests {
         take_reads(&log);
         let s = store_over(backend);
         assert!(
-            !TreeRouter::new(s.shards.clone())
+            !TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN)
                 .token_reachable_at_key(&collection(), b"pear", &token(0), Requirement::Any)
                 .await
                 .unwrap()
@@ -1225,7 +1540,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let router = TreeRouter::new(dangling.shards.clone());
+        let router = TreeRouter::new(dangling.shards.clone(), std::num::NonZeroUsize::MIN);
         assert!(
             !router
                 .token_reachable_at_key(&collection(), b"pear", &token(8), Requirement::Any)
@@ -1244,7 +1559,7 @@ mod tests {
     async fn group_keys_by_leaf_routes_and_preserves_order() {
         let s = store();
         seed_two_level(&s).await;
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN);
 
         let groups = router
             .group_keys_by_leaf(
@@ -1261,7 +1576,7 @@ mod tests {
         assert_eq!(groups.len(), 2, "keys split across two leaves");
         let l0 = groups
             .iter()
-            .find(|group| group.path == node_path(0))
+            .find(|group| group.path() == &node_path(0))
             .unwrap();
         assert_eq!(
             l0.keys,
@@ -1270,15 +1585,81 @@ mod tests {
         );
         let l1 = groups
             .iter()
-            .find(|group| group.path == node_path(1))
+            .find(|group| group.path() == &node_path(1))
             .unwrap();
         assert_eq!(l1.keys, vec![(b"mango".to_vec(), 'm')]);
     }
 
     #[tokio::test]
+    async fn path_batched_grouping_loads_each_shared_path_once() {
+        let (backend, log) = recording_backend();
+        seed_two_level(&store_over(backend.clone())).await;
+        take_reads(&log);
+        let cold = store_over(backend);
+        let router = TreeRouter::new(cold.shards.clone(), NonZeroUsize::new(16).unwrap());
+
+        let groups = router
+            .group_keys_by_leaf(
+                [
+                    (KeyRef::new(collection(), b"pear"), 0),
+                    (KeyRef::new(collection(), b"apple"), 1),
+                    (KeyRef::new(collection(), b"mango"), 2),
+                    (KeyRef::new(collection(), b"cat"), 3),
+                ],
+                Requirement::Any,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(groups.len(), 2);
+        let reads = take_reads(&log);
+        assert_eq!(reads.len(), 3);
+        assert_eq!(
+            reads
+                .iter()
+                .filter(|read| read.1 == root_path().to_string())
+                .count(),
+            1
+        );
+        assert_eq!(
+            reads
+                .iter()
+                .filter(|read| read.1 == node_path(0).to_string())
+                .count(),
+            1
+        );
+        assert_eq!(
+            reads
+                .iter()
+                .filter(|read| read.1 == node_path(1).to_string())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn one_grouped_key_uses_the_direct_descent_sequence() {
+        let (backend, log) = recording_backend();
+        seed_two_level(&store_over(backend.clone())).await;
+        take_reads(&log);
+        let cold = store_over(backend);
+
+        let groups = TreeRouter::new(cold.shards.clone(), NonZeroUsize::new(16).unwrap())
+            .group_keys_by_leaf([(KeyRef::new(collection(), b"pear"), ())], Requirement::Any)
+            .await
+            .unwrap();
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            take_reads(&log),
+            [read("read", root_path()), read("read", node_path(1))]
+        );
+    }
+
+    #[tokio::test]
     async fn grouped_routing_classifies_the_collection_that_failed() {
         let s = store();
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN);
         let root = CollectionAddress::root("db");
         let child = CollectionAddress::new("db", CollectionId::from_slice(&[1; 16]).unwrap());
         let requirement = Requirement::AtLeast(s.timeline.now());

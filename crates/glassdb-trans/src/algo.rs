@@ -32,7 +32,7 @@ use glassdb_data::{KeyRef, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxLog, TxWrite};
 use glassdb_storage::{
     InlinePolicy, LeafObservationCheck, LockType, NodeStore, Requirement, SequencePoint,
-    SplitPolicy, Timeline,
+    SplitPolicy, Timeline, TreeRouter,
 };
 
 use crate::access::{AccessSet, ReadAccess, WriteOp};
@@ -222,13 +222,14 @@ impl Algo {
         collection_commit: CollectionCommit,
         cleanup_hints: TxCleanupHints,
         background: Option<Weak<Background>>,
+        router: TreeRouter,
         resolver: KeyResolver,
         split_policy: SplitPolicy,
         inline_policy: InlinePolicy,
         split_hints: SplitHintSink,
     ) -> Self {
         let direct_commit = DirectCommit::new(
-            resolver.clone(),
+            router,
             coord,
             inline_policy,
             split_hints,
@@ -862,14 +863,14 @@ impl Algo {
         let physical_scans_valid = self
             .validate_scan_observations(accesses, validation_start, lock_validation)
             .await?;
-        let requirement = Requirement::AtLeast(validation_start);
-        Ok(
-            (physical_reads_valid || self.validate_reads_inner(accesses, requirement).await?)
-                && (physical_scans_valid
-                    || self
-                        .validate_scans_inner(accesses, context.own_lock_holder(), validation_start)
-                        .await?),
-        )
+        Ok((physical_reads_valid
+            || self
+                .validate_reads_inner(accesses, context.own_lock_holder(), validation_start)
+                .await?)
+            && (physical_scans_valid
+                || self
+                    .validate_scans_inner(accesses, context.own_lock_holder(), validation_start)
+                    .await?))
     }
 
     async fn validate_read_observations(
@@ -878,17 +879,20 @@ impl Algo {
         validation_start: SequencePoint,
         lock_validation: Option<&LockedTx>,
     ) -> Result<bool, TransError> {
-        for read in accesses.point_reads() {
-            let leaf_unchanged = match lock_validation {
-                Some(locked) => locked.validated(read.observation()),
-                None => matches!(
-                    self.shards
-                        .check_leaf_current(read.observation(), validation_start)
-                        .await?,
-                    LeafObservationCheck::Current
-                ),
-            };
-            if !leaf_unchanged {
+        if lock_validation.is_some() {
+            return Ok(false);
+        }
+        let observations = accesses
+            .point_reads()
+            .iter()
+            .map(|read| read.observation().clone())
+            .collect::<Vec<_>>();
+        let checks = self
+            .shards
+            .check_leaves_current(&observations, validation_start)
+            .await;
+        for (read, check) in accesses.point_reads().iter().zip(checks) {
+            if !matches!(check?, LeafObservationCheck::Current) {
                 return Ok(false);
             }
             if read_observation_has_exclusive_holder(read)? {
@@ -937,7 +941,8 @@ impl Algo {
     async fn validate_reads_inner(
         &self,
         accesses: &AccessSet,
-        requirement: Requirement,
+        own_lock_holder: Option<&TxId>,
+        validation_start: SequencePoint,
     ) -> Result<bool, TransError> {
         if accesses.point_reads().is_empty() {
             return Ok(true);
@@ -949,12 +954,9 @@ impl Algo {
             .collect();
         let current = self
             .resolver
-            .effective_point_states(&keys, requirement)
+            .effective_point_states(&keys, own_lock_holder, validation_start)
             .await?;
-        for r in accesses.point_reads() {
-            let Some(state) = current.get(r.key()) else {
-                return Ok(false);
-            };
+        for (r, state) in accesses.point_reads().iter().zip(current) {
             if !r.validates(state.writer.as_ref(), state.membership_version) {
                 return Ok(false);
             }
@@ -1203,8 +1205,9 @@ mod tests {
     pub(super) async fn read_outcome(tctx: &Tctx, key: &KeyRef) -> crate::reader::ReadOutcome {
         let reader = Reader::new(
             KeyResolver::new(
-                TreeRouter::new(tctx.shards.clone()),
+                TreeRouter::new(tctx.shards.clone(), std::num::NonZeroUsize::MIN),
                 KeyStateResolver::new(tctx.tmon.clone()),
+                std::num::NonZeroUsize::MIN,
             ),
             tctx.timeline.clone(),
             RetryConfig::default(),
@@ -2185,12 +2188,15 @@ mod tests {
         let validation_start = tctx.timeline.now();
 
         let external_timeline = Timeline::new();
-        let external = NodeStore::new(CachedStore::new(
-            tctx.backend.clone(),
-            1 << 20,
-            external_timeline.clone(),
-            None,
-        ));
+        let external = NodeStore::new(
+            CachedStore::new(
+                tctx.backend.clone(),
+                1 << 20,
+                external_timeline.clone(),
+                None,
+            ),
+            std::num::NonZeroUsize::MIN,
+        );
         let loaded = external
             .load_leaf(
                 &test_root_path(),
@@ -2413,12 +2419,15 @@ mod tests {
         // independent, so it cannot advance the retained observation of A in
         // this database.
         let external_timeline = Timeline::new();
-        let external = NodeStore::new(CachedStore::new(
-            tctx.backend.clone(),
-            1 << 20,
-            external_timeline.clone(),
-            None,
-        ));
+        let external = NodeStore::new(
+            CachedStore::new(
+                tctx.backend.clone(),
+                1 << 20,
+                external_timeline.clone(),
+                None,
+            ),
+            std::num::NonZeroUsize::MIN,
+        );
         let leaf_path = test_root_path();
         let loaded = external
             .load_leaf(&leaf_path, Requirement::AtLeast(external_timeline.now()))
@@ -2610,8 +2619,9 @@ mod tests {
         writes: Vec<WriteAccess>,
     ) -> (AccessSet, Vec<Vec<u8>>) {
         let resolver = KeyResolver::new(
-            TreeRouter::new(tctx.shards.clone()),
+            TreeRouter::new(tctx.shards.clone(), std::num::NonZeroUsize::MIN),
             KeyStateResolver::new(tctx.tmon.clone()),
+            std::num::NonZeroUsize::MIN,
         );
         let scan = resolver
             .scan_keys(&test_collection(), &range, &[], None, None)
@@ -2634,8 +2644,9 @@ mod tests {
 
         let range = ScanRange::all();
         let resolver = KeyResolver::new(
-            TreeRouter::new(tctx.shards.clone()),
+            TreeRouter::new(tctx.shards.clone(), std::num::NonZeroUsize::MIN),
             KeyStateResolver::new(tctx.tmon.clone()),
+            std::num::NonZeroUsize::MIN,
         );
         let result = resolver
             .scan_keys(&test_collection(), &range, &[], None, None)

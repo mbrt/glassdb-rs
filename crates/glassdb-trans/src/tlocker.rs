@@ -25,15 +25,15 @@
 //! lowest contended shard and exactly one wins it (first-CAS-wins), guaranteeing
 //! progress where the parallel path could livelock.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::ops::{AddAssign, Sub};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::future::join_all;
-use glassdb_concurr::{RetryConfig, rt, shard::Sharded};
+use glassdb_concurr::{RetryConfig, join_all_bounded, rt, shard::Sharded};
 use glassdb_data::{KeyRef, LeafRef, ObjectPath, TxId};
 use glassdb_storage::transaction::TxLock;
 use glassdb_storage::{
@@ -268,7 +268,8 @@ async fn build_groups(
 
     let mut groups: BTreeMap<ObjectPath, ShardGroup> = BTreeMap::new();
     for group in grouped {
-        let leaf = leaf_ref(&group.path)?;
+        let path = group.path().clone();
+        let leaf = leaf_ref(&path)?;
         let mut intents: Vec<KeyIntent> = group
             .keys
             .into_iter()
@@ -279,7 +280,6 @@ async fn build_groups(
             })
             .collect();
         intents.sort_by(|a, b| a.raw_key.cmp(&b.raw_key));
-        let path = group.path;
         groups.insert(
             path.clone(),
             ShardGroup {
@@ -948,6 +948,8 @@ pub(crate) struct KeyLocker {
     tmon: Monitor,
     /// Backoff config for the hold-and-wait re-poll cadence.
     retry: RetryConfig,
+    /// Maximum incomplete leaf operations in one transaction phase.
+    parallelism: NonZeroUsize,
     /// Per-transaction held-lock bookkeeping (which leaves a transaction
     /// holds): recorded when an acquire lands, read to drive the serial-fallback
     /// release, and surfaced for diagnostics. Shared across clones so the locker
@@ -979,9 +981,10 @@ impl Locker {
         collection_state: CollectionStateResolver,
         tmon: Monitor,
         retry: RetryConfig,
+        parallelism: NonZeroUsize,
     ) -> Self {
         Locker {
-            keys: KeyLocker::new(coord, router, tmon.clone(), retry),
+            keys: KeyLocker::new(coord, router, tmon.clone(), retry, parallelism),
             collections: CollectionLocker::new(collection_state),
         }
     }
@@ -1077,24 +1080,24 @@ impl KeyLocker {
         let _cleanup = TxLocksCleanup { locker: self, id };
         // A cancelled partial pass may lose these hints; GC's paged scan is
         // complete without them.
-        let mut superseded = Vec::new();
+        let mut operations = Vec::with_capacity(locked.groups.len());
         for group in locked.groups.values() {
-            // The lock-install CAS is the write-back's freshness barrier. Its
-            // retained precondition evidence was advanced by that successful
-            // CAS, so no new clock sample or validation read is needed.
-            let requirement = Requirement::AtLeast(group.receipt.observation.current_after());
-            if let Ok(mut s) = self
-                .write_back_routed(
+            operations.push(async move {
+                // The lock-install CAS is the write-back's freshness barrier.
+                let requirement = Requirement::AtLeast(group.receipt.observation.current_after());
+                self.write_back_routed(
                     id,
                     &group.path,
                     Arc::new(group.intents.clone()),
                     requirement,
                 )
                 .await
-            {
-                superseded.append(&mut s);
-            }
+            });
         }
+        let results = join_all_bounded(operations, self.parallelism).await;
+        let mut superseded = results.into_iter().flatten().collect::<Vec<_>>();
+        superseded.sort();
+        superseded.dedup();
         superseded
     }
 
@@ -1116,7 +1119,6 @@ impl KeyLocker {
         }]);
         self.write_back_routed(id, leaf_path, intents, Requirement::Any)
             .await
-            .unwrap_or_default()
     }
 
     /// Releases `id` from one exact leaf path.
@@ -1130,12 +1132,19 @@ impl KeyLocker {
         self.release_leaf_at(id, path, Requirement::Any).await
     }
 
-    fn new(coord: ShardCoordinator, router: TreeRouter, tmon: Monitor, retry: RetryConfig) -> Self {
+    fn new(
+        coord: ShardCoordinator,
+        router: TreeRouter,
+        tmon: Monitor,
+        retry: RetryConfig,
+        parallelism: NonZeroUsize,
+    ) -> Self {
         Self {
             coord,
             router,
             tmon,
             retry,
+            parallelism,
             tlocks: Arc::new(Sharded::new(|_| Mutex::new(HashMap::new()))),
             calls: Arc::new(AtomicU64::new(0)),
         }
@@ -1207,12 +1216,11 @@ impl KeyLocker {
                 }
             }
         } else {
-            let outcomes = join_all(
-                groups
-                    .values()
-                    .map(|group| self.lock_shard(id, group, requirement)),
-            )
-            .await;
+            let mut operations = Vec::with_capacity(groups.len());
+            for group in groups.values() {
+                operations.push(self.lock_shard(id, group, requirement));
+            }
+            let outcomes = join_all_bounded(operations, self.parallelism).await;
             for (group, outcome) in groups.values().zip(outcomes) {
                 match outcome? {
                     ShardOutcome::Locked(receipt) => {
@@ -1233,14 +1241,27 @@ impl KeyLocker {
         path: &ObjectPath,
         intents: Arc<Vec<KeyIntent>>,
         requirement: Requirement,
-    ) -> Result<Vec<TxId>, TransError> {
-        let mut pending = vec![(path.clone(), intents)];
+    ) -> Vec<TxId> {
+        let mut pending = VecDeque::from([(path.clone(), intents)]);
         let mut superseded = Vec::new();
-        while let Some((path, intents)) = pending.pop() {
-            match self
+        while let Some((path, intents)) = pending.pop_front() {
+            let outcome = match self
                 .write_back_shard(id, &path, intents.clone(), requirement)
-                .await?
+                .await
             {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "glassdb::write_back",
+                        tx_id = %id,
+                        path = %path,
+                        error = %error,
+                        "committed leaf write-back failed"
+                    );
+                    continue;
+                }
+            };
+            match outcome {
                 WriteBackOutcome::Released(mut ids) => superseded.append(&mut ids),
                 WriteBackOutcome::Reroute => {
                     let items: Vec<(KeyRef, KeyIntent)> = intents
@@ -1248,22 +1269,40 @@ impl KeyLocker {
                         .cloned()
                         .map(|intent| (intent.key.clone(), intent))
                         .collect();
-                    let groups = self
+                    let groups = match self
                         .router
                         .group_keys_by_leaf_fresh(items, Requirement::Any, requirement)
                         .await
-                        .map_err(|e| TransError::from(e).context("rerouting delayed write-back"))?;
+                    {
+                        Ok(groups) => groups,
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "glassdb::write_back",
+                                tx_id = %id,
+                                path = %path,
+                                error = %error,
+                                "committed leaf write-back rerouting failed"
+                            );
+                            continue;
+                        }
+                    };
                     pending.extend(groups.into_iter().map(|group| {
+                        let path = group.path().clone();
                         let intents = group.keys.into_iter().map(|(_, intent)| intent).collect();
-                        (group.path, Arc::new(intents))
+                        (path, Arc::new(intents))
                     }));
                 }
                 // A gate on one routed leaf does not prevent independent leaves
                 // from completing their best-effort cleanup in this pass.
-                WriteBackOutcome::Deferred => {}
+                WriteBackOutcome::Deferred => tracing::warn!(
+                    target: "glassdb::write_back",
+                    tx_id = %id,
+                    path = %path,
+                    "committed leaf write-back was deferred"
+                ),
             }
         }
-        Ok(superseded)
+        superseded
     }
 
     /// Coordinates this transaction's write-back on one routed shard.
@@ -1481,7 +1520,7 @@ mod tests {
                 .unwrap()
         );
         let key_state = KeyStateResolver::new(mon.clone());
-        let router = TreeRouter::new(shards.clone());
+        let router = TreeRouter::new(shards.clone(), std::num::NonZeroUsize::MIN);
         let coord = ShardCoordinator::with_hinter(
             shards.clone(),
             key_state,
@@ -1496,6 +1535,7 @@ mod tests {
             CollectionStateResolver::new(records, tl, mon.clone(), RetryConfig::default()),
             mon.clone(),
             RetryConfig::default(),
+            std::num::NonZeroUsize::MIN,
         );
         (
             locker,
@@ -2178,8 +2218,7 @@ mod tests {
         locker
             .keys()
             .write_back_routed(&tx, &group.path, Arc::new(group.intents), Requirement::Any)
-            .await
-            .unwrap();
+            .await;
 
         let entry = entry_of(&ctx, key).await.unwrap();
         assert_eq!(entry.current, inlined);
@@ -2640,8 +2679,7 @@ mod tests {
                     Arc::new(group.intents.clone()),
                     Requirement::Any,
                 )
-                .await
-                .unwrap();
+                .await;
         }
         locker.keys().clear_tx_locks(id);
     }

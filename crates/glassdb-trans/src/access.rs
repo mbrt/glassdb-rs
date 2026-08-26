@@ -511,7 +511,7 @@ mod tests {
             Timeline::new(),
             None,
         );
-        let observation = NodeStore::new(store)
+        let observation = NodeStore::new(store, std::num::NonZeroUsize::MIN)
             .load_root_state(key.collection(), Requirement::Any)
             .await
             .unwrap();

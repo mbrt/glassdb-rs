@@ -170,7 +170,7 @@ impl Gc {
         mon: Monitor,
         hints: TxCleanupHints,
     ) -> Self {
-        let router = TreeRouter::new(shards.clone());
+        let router = TreeRouter::new(shards.clone(), std::num::NonZeroUsize::MIN);
         Gc {
             bg,
             tl,
@@ -556,7 +556,7 @@ impl Gc {
         for items in by_collection.into_values() {
             match self.router.group_keys_by_leaf(items, requirement).await {
                 Ok(groups) => {
-                    leaf_paths.extend(groups.into_iter().map(|group| group.path));
+                    leaf_paths.extend(groups.into_iter().map(|group| group.path().clone()));
                 }
                 Err(StorageError::NotFound | StorageError::StaleCollection) => {}
                 Err(error) => return Err(error.into()),
@@ -698,7 +698,7 @@ mod tests {
             glassdb_storage::SplitPolicy::default(),
             Arc::new(NoSplitHints),
         );
-        let router = TreeRouter::new(shards.clone());
+        let router = TreeRouter::new(shards.clone(), std::num::NonZeroUsize::MIN);
         let locker = Locker::new(
             coord.clone(),
             router,
@@ -710,6 +710,7 @@ mod tests {
             ),
             mon.clone(),
             RetryConfig::default(),
+            std::num::NonZeroUsize::MIN,
         );
         let hints = TxCleanupHints::default();
         let gc = Gc::new(

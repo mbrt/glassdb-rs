@@ -12,7 +12,8 @@
 //! For event-style deduplication breadcrumbs such as
 //! `inline_driver_dropped_handoff`, register a [`tracing`] subscriber on the
 //! `glassdb::dedup` target. Splitter and explicit backend-logging middleware
-//! events use the stable `glassdb::splitter` and `glassdb::backend` targets.
+//! events use the stable `glassdb::splitter`, `glassdb::write_back`, and
+//! `glassdb::backend` targets.
 //!
 //! [`Database::diagnostics`]: crate::Database::diagnostics
 //! [`tracing`]: https://docs.rs/tracing

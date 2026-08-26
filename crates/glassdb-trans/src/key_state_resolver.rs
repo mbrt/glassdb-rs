@@ -211,6 +211,20 @@ impl KeyStateResolver {
             .into_writer())
     }
 
+    /// Resolves an entry's effective writer for point validation.
+    pub(crate) async fn resolve_writer_for_validation(
+        &self,
+        key: &KeyRef,
+        entry: Option<&ShardEntry>,
+        own_lock_holder: Option<&TxId>,
+        requirement: Requirement,
+    ) -> Result<WriterResolution, TransError> {
+        Ok(self
+            .resolve_effective(key, entry, own_lock_holder, requirement)
+            .await?
+            .into_writer())
+    }
+
     /// Resolves an entry's effective writer and live foreign holders from one
     /// status observation per holder.
     pub(crate) async fn resolve_holders(

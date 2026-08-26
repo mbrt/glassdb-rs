@@ -564,7 +564,7 @@ mod tests {
             None,
         );
         let records = CollectionStore::new(objects.clone());
-        let shards = NodeStore::new(objects);
+        let shards = NodeStore::new(objects, std::num::NonZeroUsize::MIN);
         let collection = CollectionAddress::new("db", collection_id(9));
 
         assert!(

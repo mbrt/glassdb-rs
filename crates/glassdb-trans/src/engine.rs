@@ -1,5 +1,6 @@
 //! The transaction engine and its runtime graph.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +32,7 @@ use crate::tlocker::{Locker, LockerStats, TxLockSnapshot};
 
 /// Balances backend traffic and memory use for a default production client.
 const DEFAULT_CACHE_SIZE: usize = 512 * 1024 * 1024;
+const DEFAULT_TRANSACTION_LEAF_PARALLELISM: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 
 #[derive(Clone)]
 struct PersistentCacheSetup {
@@ -47,6 +49,7 @@ pub struct EngineConfig {
     split_policy: SplitPolicy,
     inline_policy: InlinePolicy,
     protocol_timing: ProtocolTiming,
+    transaction_leaf_parallelism: NonZeroUsize,
 }
 
 impl EngineConfig {
@@ -88,6 +91,11 @@ impl EngineConfig {
     pub fn set_protocol_timing(&mut self, timing: ProtocolTiming) {
         self.protocol_timing = timing;
     }
+
+    /// Sets how many leaf operations one transaction can run in parallel in each bounded phase.
+    pub fn set_transaction_leaf_parallelism(&mut self, parallelism: NonZeroUsize) {
+        self.transaction_leaf_parallelism = parallelism;
+    }
 }
 
 impl Default for EngineConfig {
@@ -99,6 +107,7 @@ impl Default for EngineConfig {
             split_policy: SplitPolicy::default(),
             inline_policy: InlinePolicy::default(),
             protocol_timing: ProtocolTiming::default(),
+            transaction_leaf_parallelism: DEFAULT_TRANSACTION_LEAF_PARALLELISM,
         }
     }
 }
@@ -341,17 +350,16 @@ struct AssemblyFoundation {
 impl AssemblyFoundation {
     fn new(
         backend: Arc<StatsBackend>,
-        cache_size: usize,
         persistent: Option<PersistentCache>,
         timeline: Timeline,
         db_root: DbRoot,
-        retry: RetryConfig,
-        protocol_timing: ProtocolTiming,
+        config: &EngineConfig,
     ) -> Self {
         let dyn_backend: Arc<dyn Backend> = backend.clone();
-        let objects = CachedStore::new(dyn_backend, cache_size, timeline.clone(), persistent);
+        let objects =
+            CachedStore::new(dyn_backend, config.cache_size, timeline.clone(), persistent);
         let records = CollectionStore::new(objects.clone());
-        let shards = NodeStore::new(objects.clone());
+        let shards = NodeStore::new(objects.clone(), config.transaction_leaf_parallelism);
         let structural_logs = StructuralLogStore::new(objects.clone());
         let tlogger = TLogger::new(objects.clone(), db_root);
         let background = Arc::new(Background::new());
@@ -359,8 +367,8 @@ impl AssemblyFoundation {
             tlogger.clone(),
             timeline.clone(),
             Arc::downgrade(&background),
-            retry,
-            protocol_timing,
+            config.retry,
+            config.protocol_timing,
         );
         Self {
             backend,
@@ -397,12 +405,10 @@ impl AssemblyFixture {
     pub(crate) fn new(backend: Arc<dyn Backend>, db_root: DbRoot, config: &EngineConfig) -> Self {
         let foundation = AssemblyFoundation::new(
             Arc::new(StatsBackend::new(backend)),
-            config.cache_size,
             None,
             Timeline::new(),
             db_root,
-            config.retry,
-            config.protocol_timing,
+            config,
         );
         Self {
             objects: foundation.objects.clone(),
@@ -461,15 +467,8 @@ impl DormantEngine {
             }
             None => (None, Timeline::new()),
         };
-        let foundation = AssemblyFoundation::new(
-            backend,
-            config.cache_size,
-            persistent,
-            timeline,
-            db_root.clone(),
-            config.retry,
-            config.protocol_timing,
-        );
+        let foundation =
+            AssemblyFoundation::new(backend, persistent, timeline, db_root.clone(), &config);
         verify_permanent_collection(&db_root, &foundation).await?;
         Ok(Self::from_foundation(foundation, db_root, config, true))
     }
@@ -491,6 +490,7 @@ impl DormantEngine {
             retry,
             split_policy,
             inline_policy,
+            transaction_leaf_parallelism,
             ..
         } = config;
         let AssemblyFoundation {
@@ -509,7 +509,12 @@ impl DormantEngine {
             CollectionStateResolver::new(records.clone(), tlogger.clone(), monitor.clone(), retry);
         let collection_catalog = CollectionCatalog::new(collection_state.clone());
         let key_state = KeyStateResolver::new(monitor.clone());
-        let resolver = KeyResolver::new(TreeRouter::new(shards.clone()), key_state.clone());
+        let router = TreeRouter::new(shards.clone(), transaction_leaf_parallelism);
+        let resolver = KeyResolver::new(
+            router.clone(),
+            key_state.clone(),
+            transaction_leaf_parallelism,
+        );
         let reader = Reader::new(resolver.clone(), timeline.clone(), retry);
         let cleanup_hints = TxCleanupHints::default();
         let (coord, splitter) = Splitter::with_coordinator(
@@ -528,10 +533,11 @@ impl DormantEngine {
         );
         let locker = Locker::new(
             coord.clone(),
-            TreeRouter::new(shards.clone()),
+            TreeRouter::new(shards.clone(), transaction_leaf_parallelism),
             collection_state,
             monitor.clone(),
             retry,
+            transaction_leaf_parallelism,
         );
         let collection_lifecycle = CollectionLifecycle::new(
             records,
@@ -567,6 +573,7 @@ impl DormantEngine {
             collection_commit,
             cleanup_hints,
             managed_retirement.then_some(background_weak),
+            router,
             resolver.clone(),
             split_policy,
             inline_policy,

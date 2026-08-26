@@ -35,8 +35,7 @@ locks. Point and range transactions keep the transaction body's access set and
 normal outcome, so this transition alone does not repeat the transaction body.
 Collection create and drop keep their existing transaction-body replay rule.
 
-Do not add special serial-retirement or serial-rebegin interfaces. Normal
-parallel retries continue to keep their identity and physical locks. The
+Normal parallel retries continue to keep their identity and physical locks. The
 renewal rule applies only when parallel acquisition changes to sorted serial
 acquisition.
 

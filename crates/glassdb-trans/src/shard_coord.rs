@@ -1120,12 +1120,10 @@ mod tests {
         retry: RetryConfig,
     ) -> (ShardCoordinator, NodeStore, Timeline, Arc<Background>) {
         let seed_timeline = Timeline::new();
-        let seed_store = NodeStore::new(CachedStore::new(
-            backend.clone(),
-            1 << 20,
-            seed_timeline,
-            None,
-        ));
+        let seed_store = NodeStore::new(
+            CachedStore::new(backend.clone(), 1 << 20, seed_timeline, None),
+            std::num::NonZeroUsize::MIN,
+        );
         let _ = seed_store
             .store_node(
                 &collection(),
@@ -1153,7 +1151,10 @@ mod tests {
     // actually landed in storage without touching the coordinator's cache.
     fn cold_store(backend: Arc<dyn Backend>) -> NodeStore {
         let timeline = Timeline::new();
-        NodeStore::new(CachedStore::new(backend, 1 << 20, timeline, None))
+        NodeStore::new(
+            CachedStore::new(backend, 1 << 20, timeline, None),
+            std::num::NonZeroUsize::MIN,
+        )
     }
 
     fn entry(

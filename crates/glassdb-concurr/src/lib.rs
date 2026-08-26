@@ -9,6 +9,7 @@ mod dedup;
 pub mod entropy;
 #[cfg(sim)]
 pub mod exec;
+mod join;
 mod retry;
 mod rng;
 pub mod rt;
@@ -19,6 +20,7 @@ pub use background::Background;
 pub use dedup::{
     BatchHandle, Dedup, DedupError, DedupKeySnapshot, DedupStats, MergeRequest, Worker,
 };
+pub use join::{join_all_bounded, map_all_bounded};
 pub use retry::{Backoff, RetryConfig};
 pub use rng::Rng;
 pub use tape::Tape;

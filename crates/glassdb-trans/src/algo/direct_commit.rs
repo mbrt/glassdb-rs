@@ -7,14 +7,13 @@ use async_trait::async_trait;
 use glassdb_data::{KeyRef, ObjectPath, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
-    CurrentState, InlinePolicy, NodeLocks, Requirement, ShardEntry, StorageError,
+    CurrentState, InlinePolicy, NodeLocks, Requirement, ShardEntry, StorageError, TreeRouter,
 };
 
 use super::attempt::AttemptState;
 use crate::access::{AccessSet, ReadPredicate, WriteOp};
 use crate::error::TransError;
 use crate::gc::TxCleanupHints;
-use crate::key_resolver::KeyResolver;
 use crate::key_state_resolver::HolderResolution;
 use crate::shard_coord::{
     CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardOperation,
@@ -58,7 +57,7 @@ struct DirectCommitCounters {
 /// Owns the logless same-leaf commit subprotocol.
 #[derive(Clone)]
 pub(super) struct DirectCommit {
-    resolver: KeyResolver,
+    router: TreeRouter,
     coord: ShardCoordinator,
     inline_policy: InlinePolicy,
     split_hints: SplitHintSink,
@@ -69,14 +68,14 @@ pub(super) struct DirectCommit {
 impl DirectCommit {
     /// Creates the direct-commit path over the engine's shared collaborators.
     pub(super) fn new(
-        resolver: KeyResolver,
+        router: TreeRouter,
         coord: ShardCoordinator,
         inline_policy: InlinePolicy,
         split_hints: SplitHintSink,
         cleanup_hints: TxCleanupHints,
     ) -> Self {
         DirectCommit {
-            resolver,
+            router,
             coord,
             inline_policy,
             split_hints,
@@ -108,11 +107,6 @@ impl DirectCommit {
         let Some(member) = direct_member(accesses) else {
             return Ok(DirectAttempt::Locked);
         };
-        let Some(mut leaf_path) = self.route_member(&member).await? else {
-            return Ok(DirectAttempt::Locked);
-        };
-        self.counters.candidates.fetch_add(1, Ordering::Relaxed);
-
         // A zero policy disables the protocol even for all-delete members. All
         // put bytes must be durable in the commit leaf itself.
         if !self.inline_policy.admits_value(0)
@@ -126,6 +120,10 @@ impl DirectCommit {
         {
             return Ok(DirectAttempt::Locked);
         }
+        let Some(mut leaf_path) = self.route_member(&member).await? else {
+            return Ok(DirectAttempt::Locked);
+        };
+        self.counters.candidates.fetch_add(1, Ordering::Relaxed);
 
         // A split can stale the path between grouping and submission. One fresh
         // regroup preserves the direct path for that race; repeated topology
@@ -167,8 +165,19 @@ impl DirectCommit {
 
     /// Returns the one leaf currently owning every dependency in `member`.
     async fn route_member(&self, member: &DirectMember) -> Result<Option<ObjectPath>, TransError> {
-        let keys: Vec<KeyRef> = member.keys.iter().map(|key| key.key.clone()).collect();
-        self.resolver.route_one_leaf(keys).await.map_err(Into::into)
+        let keys = member
+            .keys
+            .iter()
+            .map(|key| (key.key.clone(), ()))
+            .collect::<Vec<_>>();
+        let groups = self
+            .router
+            .group_keys_by_leaf_fresh(keys, Requirement::Any, Requirement::Any)
+            .await?;
+        Ok(match groups.as_slice() {
+            [group] => Some(group.path().clone()),
+            _ => None,
+        })
     }
 }
 

@@ -128,11 +128,11 @@ transaction orchestration from shared shard mutation. `Algo` decides *what*
 must happen to commit a transaction in terms of logical keys, observed writer
 tokens, and staged writes. The `Locker` owns physical routing and acquisition for
 the logged protocol. `DirectCommit` owns the narrower logless mechanism: it asks
-`KeyResolver` whether a complete point-access member shares one leaf, then
+`TreeRouter` whether a complete point-access member shares one leaf, then
 installs that member in the shared coordinator. `Algo` itself routes no key and
 CASes no object. (`Reader` is likewise shard-aware internally but exposes a
-path-based API. `Algo` holds a `NodeStore` only to re-check whether a leaf
-observation already carried in its own `AccessSet` is still current.)
+path-based API. `Algo` uses `NodeStore` to batch physical point checks and
+`KeyResolver` to batch logical point validation.)
 
 `AccessSet` is the immutable access-fact module between the transaction body and
 the commit engine. It normalizes point reads and final key writes, keeps their
@@ -153,6 +153,13 @@ target, resolver policy, and typed result as a `ShardOperation`. The operation
 types stay with their policy owners; the coordinator exposes one typed
 `coordinate` interface and keeps raw resolver submission private. For the full design see
 [designs/object-storage-native.md](designs/object-storage-native.md).
+
+Independent point-leaf phases use one transaction-local parallelism value. Each
+provider combines work that targets one physical path, then uses bounded
+foreground futures with stable input and output order. Waiting work consumes the
+bound. GlassDB does not add an aggregate backend scheduler; backend adapters
+keep responsibility for queues, connections, retries, and provider throttling
+([ADR-064](adr/064-bounded-parallel-point-leaf-work.md)).
 
 ```mermaid
 flowchart TD
@@ -308,7 +315,7 @@ bookkeeping remain outside the coordinator.
 | `Engine`              | runtime owner    | backend, database identity, engine configuration, logical keys, `AccessSet` | cache and store opening, permanent-collection verification, runtime construction and lifetime, dormant-to-live startup, read/scan/catalog entry points, transaction-attempt delegation and abandonment retirement, shutdown order, runtime stats/diagnostics | user closures, public handles/errors, body retry policy |
 | `AccessSet`           | access facts     | point reads, final key writes, range scans | normalization, deterministic order, merged point facts, counts, read-only projection, read predicates, structural direct-commit shape | routing, locking, I/O, commit policy |
 | `Algo`                | commit **policy** | `AccessSet`, `TxId`, `LockOutcome`, `TxCleanupHints` | transaction lifecycle, direct-vs-logged selection, cross-domain lock→validate→commit→write-back orchestration, abandoned-owner retirement, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), GC candidate hints | shard routing, CAS details, caching, collection lifecycle implementation, GC execution, the split mechanism beyond its `SplitHintSink` producer handle |
-| `DirectCommit`        | logless commit mechanism | direct point shape, `TxId`, `KeyResolver`, shard operations, `TxCleanupHints` | one-leaf and physical eligibility, atomic inline/tombstone publication, transaction-local recovery classification, predecessor cleanup hints | access normalization, transaction logs, range/catalog validation, waiting or wounding holders, GC execution |
+| `DirectCommit`        | logless commit mechanism | direct point shape, `TxId`, `TreeRouter`, shard operations, `TxCleanupHints` | one-leaf and physical eligibility, atomic inline/tombstone publication, transaction-local recovery classification, predecessor cleanup hints | access normalization, transaction logs, range/catalog validation, waiting or wounding holders, GC execution |
 | `TxCleanupHints`      | maintenance seam | `TxId`                       | bounded ordered cleanup-candidate queue, drop-oldest loss policy, drain-time de-duplication | GC execution, transaction policy, backend storage |
 | `CollectionCommit`    | collection-commit **policy** | `CollectionAttempt`, catalog, lifecycle | same-ID collection retry state, recovery and committed-log fields, incarnation preparation, validation, drop fencing, post-commit/abort cleanup | key locking, key validation, the atomic commit decision |
 | `Locker::keys`        | key-lock **policy** | merged point facts, scans, `TxId`, B-link nodes | key→leaf grouping, parallel & serial acquisition, hold-and-wait, acquire / write-back / release operations | access normalization, collection-directory semantics |
@@ -318,7 +325,7 @@ bookkeeping remain outside the coordinator.
 | `ShardCoordinator`    | shared mutation engine | typed `ShardOperation`s | one round per object: single-flight, oldest-first fold, ownership/capacity admission, overlapping logless-member exclusion, single CAS, per-member uncertainty, reload-recover, vestigial-entry pruning | operation-specific results, cross-shard strategy, transaction lifecycle, commit orchestration, GC selection, held-lock bookkeeping |
 | `Splitter`            | structural mechanism | split candidates, opaque structural-intent witnesses and recovery actions | scheduling, topology registration/finalization, source preparation and compaction, split planning, node writes, foreground separator publication, recursive parent split execution | durable intent phases, recovery classification, participant settlement |
 | `StructuralRecovery`  | durable recovery mechanism | opaque intent witnesses and resumable parent-split requests | structural-intent creation and phase change, clean deletion, discovery, fencing, reachability classification, orphan cleanup, recovery resumption, participant settlement | split candidates and reasons, tombstone compaction, node split planning, recursive split execution |
-| `KeyResolver`         | key/range resolution | logical keys, ranges, `TreeRouter` | routing and scan composition | commit / lock policy, collection-record coordination |
+| `KeyResolver`         | key/range resolution | logical keys, ranges, `TreeRouter` | routing, scan composition, and input-aligned logical point validation | commit / lock policy, collection-record coordination |
 | `KeyStateResolver`    | loaded key-state mechanism | nodes, entries, `TxId` | transaction-dependent interpretation of already-loaded key and node state | routing, scan composition, commit policy |
 | `Reader`              | read mechanism   | logical keys, resolved writers | value materialization | commit / lock policy                |
 | `Monitor`             | tx lifecycle     | `TxId`, tx logs              | status, wound/abort, lease refresh, waits                                                                             | shards                              |
@@ -344,7 +351,8 @@ async fn lock(
 ```
 
 - **Down**: the key view receives `AccessSet`, `serial`, and the validation bound; it
-  groups keys by current leaf and locks leaves in parallel or sorted order. The
+  groups keys by current leaf and locks leaves with bounded parallel work or in
+  sorted order. The
   collection view receives logical directory reads and binding changes; it
   derives a stable collection-address lock order. Neither interface exposes
   encoded record or node state.
@@ -699,23 +707,32 @@ The validate-and-commit sequence:
    Conflicts are resolved by the wound-wait rule (see [Deadlock
    Handling](#deadlock-handling)): an older transaction aborts younger holders,
    a younger one waits. A 5-second timeout (`MAX_DEADLOCK_TIMEOUT`) falls back
-   to serial locking only if contention prevents progress.
+   to serial locking only if contention prevents progress. At most the
+   configured number of complete leaf operations are incomplete at one time;
+   a foreign-holder wait keeps its position.
 
-2. **Version verification.** For each read key, check that the version hasn't
-   changed since the transaction read it. If it has, the transaction retries
-   with locks held.
+2. **Version verification.** Optimistic point validation first checks retained
+   leaf observations with bounded work on distinct paths. If a physical state
+   changed, it resolves the complete logical point-read set. Validation with
+   locks held always uses the logical path and treats the transaction's own
+   exclusive holder as protection around the predecessor state. If a read
+   predicate changed, the transaction retries with locks held.
 
 3. **Write transaction log.** Write the log object atomically. After this point,
    the transaction is considered committed.
 
 4. **Async write-back.** Publish the new current state for each modified key and
-   release locks. A committed value is published as an `External` pointer to the
+   release locks. Original `LockedTx` leaf groups run with the same bounded
+   parallelism. Split descendants stay serial inside their original position,
+   and a local failure does not stop other original groups. A committed value is
+   published as an `External` pointer to the
    transaction object, and a delete as a `Tombstone`
    ([ADR-054](adr/054-reserve-inline-publication-for-logless-commits.md)). This
    can happen asynchronously because the transaction log is the source of truth.
    If the client crashes, another transaction can read the log and complete the
    write-back (or just observe the committed values from the log). A live
-   structural holder defers to lazy recovery.
+   structural holder defers to lazy recovery. Failures and deferrals use the
+   stable `glassdb::write_back` diagnostic target.
 
 ### Optimizations
 

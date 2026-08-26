@@ -55,5 +55,5 @@ pub use shard::{CurrentState, Shard, ShardEntry};
 pub use structlog::{StructuralLog, StructuralLogPhase};
 pub use structural_log_store::StructuralLogStore;
 pub use timeline::{SequencePoint, Timeline};
-pub use tree_router::{LeafGroup, LeafLocator, TreeRouter};
+pub use tree_router::{LeafLocator, RoutedLeafGroup, TreeRouter};
 pub use version::Version;

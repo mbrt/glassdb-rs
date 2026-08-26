@@ -176,6 +176,24 @@ pub enum Requirement {
 }
 
 impl Requirement {
+    /// Reports whether evidence confirmed current at `current_after` satisfies
+    /// this requirement.
+    pub fn is_satisfied_by(self, current_after: SequencePoint) -> bool {
+        match self {
+            Requirement::Any => true,
+            Requirement::AtLeast(bound) => current_after >= bound,
+        }
+    }
+
+    /// Reports whether this requirement is at least as strong as `required`.
+    pub fn covers(self, required: Self) -> bool {
+        match (self, required) {
+            (_, Requirement::Any) => true,
+            (Requirement::Any, Requirement::AtLeast(_)) => false,
+            (Requirement::AtLeast(loaded), Requirement::AtLeast(required)) => loaded >= required,
+        }
+    }
+
     /// Returns the stronger of two requirements.
     pub fn stricter(self, other: Self) -> Self {
         match (self, other) {
@@ -226,7 +244,7 @@ impl<V> CasResult<V> {
 }
 
 /// The outcome of checking whether a retained observation is still current.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ObservationCheck<V> {
     /// The observed state is still current after the required bound; its
     /// watermark has been advanced if a backend round-trip confirmed it.
@@ -299,6 +317,11 @@ impl<V> Observation<V> {
     /// The watermark after which the state was known to be current.
     pub fn current_after(&self) -> SequencePoint {
         self.evidence.get()
+    }
+
+    /// Advances this observation's currentness evidence without changing its state.
+    pub(crate) fn advance_current_after(&self, bound: SequencePoint) {
+        self.evidence.advance(bound);
     }
 
     /// The parsed physical object path this observation refers to.
@@ -440,7 +463,7 @@ impl CachedStore {
         obs: &Observation<C::Value>,
         req: Requirement,
     ) -> Result<ObservationCheck<C::Value>, StorageError> {
-        if satisfies(obs.evidence.get(), req) {
+        if req.is_satisfied_by(obs.evidence.get()) {
             return Ok(ObservationCheck::Current);
         }
         let key = obs.key.clone();
@@ -640,7 +663,7 @@ impl CachedStore {
                 },
                 ReadAdmission::Lead(permit) => {
                     if let Some(observed) = fallback
-                        && satisfies(observed.current_after(), req)
+                        && req.is_satisfied_by(observed.current_after())
                     {
                         return Ok(self.knowledge.result_from_observation(observed, true));
                     }
@@ -900,14 +923,6 @@ impl<C: Codec> TypedCachedStore<C> {
             return Err(StorageError::other("delete requires a present observation"));
         }
         self.store.delete::<C>(expected).await
-    }
-}
-
-/// Reports whether an entry confirmed current at `evidence` satisfies `req`.
-fn satisfies(evidence: SequencePoint, req: Requirement) -> bool {
-    match req {
-        Requirement::Any => true,
-        Requirement::AtLeast(t) => evidence >= t,
     }
 }
 
@@ -3680,6 +3695,30 @@ mod tests {
         fn elapsed(&self) -> Duration {
             *self.elapsed.lock().unwrap()
         }
+    }
+
+    #[test]
+    fn requirement_coverage_follows_freshness_order() {
+        let earlier = Requirement::AtLeast(SequencePoint::from_raw(1));
+        let later = Requirement::AtLeast(SequencePoint::from_raw(2));
+
+        assert!(Requirement::Any.covers(Requirement::Any));
+        assert!(later.covers(Requirement::Any));
+        assert!(!Requirement::Any.covers(earlier));
+        assert!(earlier.covers(earlier));
+        assert!(later.covers(earlier));
+        assert!(!earlier.covers(later));
+    }
+
+    #[test]
+    fn requirement_satisfaction_follows_currentness_evidence() {
+        let earlier = SequencePoint::from_raw(1);
+        let later = SequencePoint::from_raw(2);
+
+        assert!(Requirement::Any.is_satisfied_by(earlier));
+        assert!(Requirement::AtLeast(earlier).is_satisfied_by(earlier));
+        assert!(Requirement::AtLeast(earlier).is_satisfied_by(later));
+        assert!(!Requirement::AtLeast(later).is_satisfied_by(earlier));
     }
 
     #[test]

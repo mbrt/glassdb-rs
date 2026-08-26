@@ -488,7 +488,7 @@ mod tests {
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         TestStore {
             records: CollectionStore::new(objects.clone()),
-            shards: NodeStore::new(objects.clone()),
+            shards: NodeStore::new(objects.clone(), std::num::NonZeroUsize::MIN),
             objects,
             timeline,
         }

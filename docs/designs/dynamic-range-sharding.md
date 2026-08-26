@@ -2,18 +2,7 @@
 
 ## Status
 
-**Proposed.** This is the design overview and decision index for replacing the
-fixed compile-time hash sharding of collection metadata with a **dynamic,
-order-preserving, range-partitioned** coordination directory. The umbrella
-decision is [ADR-031](../adr/031-dynamic-range-sharding.md). This document is the
-living companion to that (frozen) ADR; it captures the shape, the rationale, the
-invariants, and the open questions.
-
-It builds on the object-storage-native layout of
-[`object-storage-native.md`](object-storage-native.md): the shard *entry* model, transaction
-objects, commit/write-back, wound-wait/leases, GC, and the shard-mutation
-coordinator all carry over. Only the **key→shard mapping** and the **directory
-structure** change.
+Accepted — implemented.
 
 ## Why
 
