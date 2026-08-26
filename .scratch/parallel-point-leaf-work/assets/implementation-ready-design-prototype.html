@@ -316,9 +316,17 @@
     tests, measurements, and documentation work concrete. It does not implement the design.
   </p>
   <div class="notice">
-    <strong>Limit 16 is a candidate, not measured evidence.</strong>
-    The implementation starts at 16 only so the benchmark can compare 8, 16, and 32. The
-    acceptance gate, not this prototype, selects the retained value.
+    <strong>Limit 16 is the reviewed initial value, not measured evidence.</strong>
+    The implementation starts at 16 and the benchmark compares 8, 16, and 32. Retain 16 only
+    if it reaches at least 95% of the best stable throughput in every primary cell, meets the
+    accepted latency objectives, and passes the parent-regression gates.
+  </div>
+  <div class="notice">
+    <strong>The limit bounds one transaction phase, not aggregate backend capacity.</strong>
+    Five hundred 32-leaf transactions can admit as many as 8,000 incomplete leaf futures at
+    limit 16. This count is not a request or connection count. GlassDB adds no shared limit,
+    shared backend handle, or global fairness rule. Backend behavior and the provider own
+    aggregate queueing, connection use, retries, and throttling.
   </div>
 
   <section class="section" aria-labelledby="shape-title">
@@ -344,12 +352,17 @@
         <strong>The transaction object</strong>
         <p>Cross-leaf work stays ordered around the existing logged commit point.</p>
       </article>
+      <article class="summary-card">
+        <span class="badge">Backend ownership</span>
+        <strong>Aggregate capacity stays behind the backend seam</strong>
+        <p>The point-leaf design bounds submissions from one transaction. It does not schedule all transactions.</p>
+      </article>
     </div>
 
     <div class="phase-flow" id="phase-flow">
       <div class="phase" data-phase="Routing"><strong>Routing</strong><span>Distinct node paths</span></div>
       <div class="phase" data-phase="Acquisition"><strong>Acquisition</strong><span>Complete leaf groups</span></div>
-      <div class="phase" data-phase="Validation"><strong>Validation</strong><span>Physical, then logical</span></div>
+      <div class="phase" data-phase="Validation"><strong>Validation</strong><span>Optimistic physical; locked logical</span></div>
       <div class="phase" data-phase="Committed"><strong>Commit</strong><span>One transaction object</span></div>
       <div class="phase" data-phase="Write-back"><strong>Write-back</strong><span>Original locked groups</span></div>
     </div>
@@ -360,7 +373,7 @@
     <p class="lede">These recommendations fill gaps that the behavior tickets did not express as exact Rust seams.</p>
     <div class="decision-grid">
       <article class="decision-card recommend">
-        <span class="badge">Recommended</span>
+        <span class="badge">Accepted</span>
         <h3>Use one private limit bundle</h3>
         <p>
           Add a crate-private <code>PointLeafLimits</code> in <code>glassdb-trans</code>. It has one
@@ -368,14 +381,17 @@
           accept a <code>NonZeroUsize</code>; they do not own product policy.
         </p>
         <ul>
-          <li>No <code>DatabaseBuilder</code> setting and no database-wide semaphore.</li>
+          <li>No <code>DatabaseBuilder</code> setting, database-wide semaphore, process-wide semaphore, or shared backend handle.</li>
           <li>A non-default <code>bench-internals</code> feature exposes one hidden benchmark opening function, not a builder setter.</li>
           <li><code>PointLeafLimits::all(n)</code> supports the first sweep; separate fields permit a measured lower value for one phase.</li>
+          <li>The value is an absolute submission bound. It is not a guaranteed percentage of backend capacity.</li>
+          <li>An eight-leaf phase creates eight futures. The unused positions reserve no work or backend capacity.</li>
+          <li>The five fields share a common numeric default, not runtime admission state.</li>
         </ul>
       </article>
 
       <article class="decision-card recommend">
-        <span class="badge">Recommended</span>
+        <span class="badge">Accepted</span>
         <h3>Make the routed group contain no duplicate path</h3>
         <p>
           <code>RoutedLeafGroup&lt;T&gt;</code> contains one <code>LeafObservation</code> and ordered
@@ -390,7 +406,57 @@
       </article>
 
       <article class="decision-card recommend">
-        <span class="badge">Recommended</span>
+        <span class="badge">Accepted</span>
+        <h3>Close the performance acceptance rule</h3>
+        <p>
+          Treat 8-leaf and 32-leaf workload combinations as the primary limit-selection cells.
+          Keep 1-leaf and 2-leaf cells as operation and shape regressions. No repository-wide
+          absolute transaction-latency objective exists today.
+        </p>
+        <ul>
+          <li>Use the reviewed one-wave-through-16-leaves and two-waves-through-32-leaves objective for limit 16.</li>
+          <li>Run the real 500-by-32 stress case at limit 16 and against the parent first. Use 8 and 32 as diagnostic cells if 16 fails.</li>
+          <li>Reject crashes, resource exhaustion, sustained provider-error instability, or unbounded benchmark memory. Report absolute stress p95 and p99 until a deployment objective exists.</li>
+        </ul>
+      </article>
+
+      <article class="decision-card recommend">
+        <span class="badge">Accepted</span>
+        <h3>Temporarily instrument a missing stress metric when safe</h3>
+        <p>
+          If a required metric is not exposed, a throwaway benchmark branch can add an accurate
+          measurement hook. Use the result only after at least three converged, alternating paired
+          runs show no measurable change in throughput, p95, or p99, and a deterministic check shows
+          that the hook adds no backend operation. Remove the hook from the implementation branch
+          after the measurement and retain its source commit with the raw results.
+        </p>
+        <ul>
+          <li>Prefer existing transport or provider observations when they measure the same quantity.</li>
+          <li>Use the existing two-percent benchmark comparison band as the proposed maximum measurable instrumentation effect.</li>
+          <li>If an accurate, non-perturbing hook is not possible, record the field as <code>notExposed</code>. Never derive it from a different counter.</li>
+        </ul>
+      </article>
+
+      <article class="decision-card recommend">
+        <span class="badge">Accepted</span>
+        <h3>Always use logical validation for locked point reads</h3>
+        <p>
+          A completed acquisition already proves that every required point hold exists. Its leaf
+          load or successful CAS also supplies cache evidence at the shared validation lower bound.
+          Locked point validation can therefore route and read with that bound, then compare the
+          logical point state without branching on how the hold was acquired. The normal read is a
+          local cache hit; eviction or topology churn can require a backend check.
+        </p>
+        <ul>
+          <li>Keep batched physical observation checks for optimistic validation before locks are held.</li>
+          <li>Do not use <code>Installed</code> versus <code>Observed</code> to select the locked point-validation path.</li>
+          <li>Keep the existing exact-state shortcut for range coverage, where the alternative is a complete range re-scan.</li>
+          <li>Retain the one-leaf gate that proves this change adds no backend operation with a warm cache.</li>
+        </ul>
+      </article>
+
+      <article class="decision-card recommend">
+        <span class="badge">Accepted</span>
         <h3>Return a typed serial-renewal action to <code>AttemptDriver</code></h3>
         <p>
           <code>Algo</code> reports that the parallel acquisition episode must end.
@@ -404,18 +470,21 @@
         </ul>
       </article>
 
-      <article class="decision-card open">
-        <span class="badge warn">Human choice</span>
-        <h3>Keep only a non-authoritative diagnostic hold ledger</h3>
+      <article class="decision-card recommend">
+        <span class="badge">Accepted</span>
+        <h3>Keep best-effort local hold observations</h3>
         <p>
-          The current <code>KeyLocker::tlocks</code> is both retry state and operator diagnostics.
-          Remove every correctness and release use. Keep a renamed ledger only if operators still
-          need confirmed local hold observations.
+          The current <code>KeyLocker::tlocks</code> map records a leaf only after this process
+          receives <code>AcquireOutcome::Locked</code>. <code>Database::diagnostics()</code> exposes
+          those paths and aggregate lock strengths to operators investigating hangs. It is not a
+          durable transaction record.
         </p>
         <ul>
-          <li>It can omit a CAS that landed without a result.</li>
-          <li>It never skips work, selects a proof, drives release, or enters serial mode.</li>
-          <li>The public diagnostic text must say that it is best-effort and non-authoritative.</li>
+          <li>Absence does not prove that no physical lock exists: a CAS can land after cancellation or result loss.</li>
+          <li>Presence is the last confirmed local observation and can become stale after recovery or another process acts.</li>
+          <li>Remove <code>held_paths</code> and aggregate <code>release_locks</code>. Never use the map to skip work, build a hold receipt, drive release, retry, or enter serial mode.</li>
+          <li>If retained, rename the private field, keep the public diagnostics shape plus snapshot and lifecycle-clear operations, and document its per-acquire maintenance cost.</li>
+          <li>The durable recovery manifest written by <code>Monitor::record_tx_locks</code> is separate protocol state and remains unchanged.</li>
         </ul>
       </article>
     </div>
@@ -476,10 +545,11 @@ pub async fn group_keys_by_leaf_fresh&lt;T&gt;(
         <pre>pub(crate) async fn effective_point_states(
     &amp;self,
     keys: &amp;[KeyRef],
+    own_lock_holder: Option&lt;&amp;TxId&gt;,
     validation_start: SequencePoint,
     limit: NonZeroUsize,
 ) -&gt; Result&lt;Vec&lt;PointValidationState&gt;, StorageError&gt;;</pre>
-        <p>The vector aligns with normalized point reads. One leaf resolves its keys serially; different leaves can wait in parallel.</p>
+        <p>The vector aligns with normalized point reads. Optimistic validation passes no holder. Locked validation passes its transaction identity after <code>LockedTx</code> has proved complete receipts, so an own exclusive hold is not resolved as a foreign writer. One leaf resolves its keys serially; different leaves can wait in parallel.</p>
       </article>
 
       <article class="interface-card">
@@ -506,17 +576,18 @@ async fn write_back(
       </article>
 
       <article class="interface-card">
-        <h3>Lock proof</h3>
-        <pre>enum LockProof {
-    Installed(LeafLockEvidence),
-    Observed(LeafLockEvidence),
-}
-
-struct LeafLockEvidence {
-    observation: LeafObservation,
-    held: HeldLeaf,
+        <h3>Leaf hold receipt</h3>
+        <pre>enum LeafHoldReceipt {
+    Installed {
+        cas_precondition: LeafObservation,
+        held: HeldLeaf,
+    },
+    Observed {
+        loaded_observation: LeafObservation,
+        held: HeldLeaf,
+    },
 }</pre>
-        <p>The proof supplies path, held strengths, and the write-back lower bound. Only <code>Installed</code> can take the exact physical validation shortcut.</p>
+        <p>Both variants prove a complete hold and provide a freshness anchor for write-back. The skip-capable acquire loads with <code>Requirement::AtLeast(validation_start)</code>; a successful CAS advances its precondition evidence past the same bound. Locked point validation therefore treats both variants alike and checks logical point state at that bound. Only an <code>Installed</code> CAS precondition can retain the existing exact-state shortcut for unchanged range coverage; <code>Observed</code> range coverage uses logical scan validation.</p>
       </article>
 
       <article class="interface-card">
@@ -571,9 +642,79 @@ pub mod benchmark {
         limits: PointLeafLimits,
     ) -&gt; Result&lt;Database, Error&gt;;
 }</pre>
-        <p>The free function consumes a configured builder through a crate-private hook. Production builds have no limit setting, and several benchmark clients can use the same explicit value without global state.</p>
+        <p>The free function consumes a configured builder through a crate-private hook. Production builds have no limit setting. Several benchmark <code>Database</code> instances can use the same explicit transaction-local value without global state. This interface does not set backend capacity.</p>
+      </article>
+
+      <article class="interface-card">
+        <h3>Source-qualified stress telemetry</h3>
+        <pre>enum TelemetryAvailability {
+    Measured,
+    External,
+    NotExposed,
+}
+
+struct TelemetryField&lt;T&gt; {
+    value: Option&lt;T&gt;,
+    source: String,
+    availability: TelemetryAvailability,
+}</pre>
+        <p>This result shape also describes temporary measurements. The source points to the captured instrumentation commit. A hook that passes its overhead gate is removed after measurement and does not change the final production <code>Backend</code> interface.</p>
       </article>
     </div>
+  </section>
+
+  <section class="section" aria-labelledby="capacity-title">
+    <h2 id="capacity-title">Capacity ownership stays at existing seams</h2>
+    <p class="lede">
+      The final limit review rejects a new GlassDB aggregate scheduler. The implementation adds
+      no production interface between transaction phases and backend capacity.
+    </p>
+    <p>
+      GlassDB does not learn the backend's active capacity <code>C</code> or schedule aggregate
+      work. Current backend adapters are not guaranteed to have a hard local active-call limit.
+      An isolated 32-leaf phase with equal waits has four transaction-local waves at limit 8,
+      two at 16, and one at 32.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Concern</th><th>Owner</th><th>Design rule</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Incomplete leaf futures in one bounded phase</td>
+            <td><code>glassdb-trans</code></td>
+            <td>Use the private phase limit. A wait remains incomplete and consumes one position.</td>
+          </tr>
+          <tr>
+            <td>Active calls and queues across transactions and <code>Database</code> instances</td>
+            <td>Backend implementation</td>
+            <td>Backend behavior determines which calls are active or queued. This decision adds no hard local cap, common handle, or fairness rule.</td>
+          </tr>
+          <tr>
+            <td>Provider requests, streams, connections, retries, and throttling</td>
+            <td>Backend transport and provider</td>
+            <td>Do not derive these values from the leaf-future count. Observe them in stress runs.</td>
+          </tr>
+          <tr>
+            <td>Cross-process provider load, file descriptors, memory, CPU, network, and deployment limits</td>
+            <td>Deployment</td>
+            <td>The 500-by-32 long-duration case verifies resource behavior; it does not select a GlassDB aggregate limit.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Use the validated
+      <a href="per-transaction-phase-capacity-prototype.html">per-transaction phase capacity prototype</a>
+      to explore the 8, 16, 32, and 500-transaction capacity cases.
+    </p>
+    <p>
+      The
+      <a href="backend-concurrency-capacity-research.md">backend concurrency capacity research</a>
+      remains factual input. Its recommendation to add a shared GlassDB limit was rejected by the
+      final issue-09 review. Do not implement that recommendation.
+    </p>
   </section>
 
   <section class="section" aria-labelledby="files-title">
@@ -610,8 +751,8 @@ pub mod benchmark {
             <td>One complete direct member, one leaf, stable counter meaning, no added one-key backend operation.</td>
           </tr>
           <tr>
-            <td class="path">crates/glassdb-trans/src/key_resolver.rs</td>
-            <td>Return input-aligned point states; route the complete set; bound leaf futures; select stable errors.</td>
+            <td class="path">crates/glassdb-trans/src/key_resolver.rs<br>crates/glassdb-trans/src/key_state_resolver.rs</td>
+            <td>Return input-aligned point states; route the complete set; pass the optional own holder into entry interpretation; bound leaf futures; select stable errors.</td>
             <td>One validation lower bound and complete snapshot-transparent interpretation.</td>
           </tr>
           <tr>
@@ -621,27 +762,27 @@ pub mod benchmark {
           </tr>
           <tr>
             <td class="path">crates/glassdb-trans/src/shard_coord.rs<br>crates/glassdb-trans/src/node_locking.rs<br>crates/glassdb-trans/src/tlocker.rs</td>
-            <td>Return the loaded observation for skipped members; carry installed versus observed proofs; recognize complete retained holds; bound acquisition and write-back; remove foreground release control.</td>
-            <td>One ordered mutation stream per leaf; full-set retry; proof completeness; local write-back failure.</td>
+            <td>Return the loaded observation for skipped members; carry installed versus observed hold receipts; recognize complete retained holds; bound acquisition and write-back; remove foreground release control.</td>
+            <td>One ordered mutation stream per leaf; full-set retry; receipt completeness; local write-back failure.</td>
           </tr>
           <tr>
             <td class="path">crates/glassdb-trans/src/algo.rs<br>crates/glassdb-trans/src/algo/attempt.rs<br>crates/glassdb-trans/src/engine.rs<br>crates/glassdb/src/db.rs</td>
-            <td>Batch point validation; return serial-renewal control; retire and renew in an <code>AttemptDriver</code> inner loop; resample the validation lower bound.</td>
+            <td>Batch point validation; always use logical point validation after lock acquisition; return serial-renewal control; retire and renew in an <code>AttemptDriver</code> inner loop; resample the validation lower bound.</td>
             <td>Old identity is durably <code>Wounded</code> first; no point/range body replay; one transaction-object commit point.</td>
           </tr>
           <tr>
             <td class="path">crates/glassdb/src/diagnostics.rs</td>
-            <td>If retained, describe the confirmed-hold ledger as best-effort and non-authoritative. Document stable <code>glassdb::write_back</code> failure events.</td>
+            <td>If retained, describe transaction lock snapshots as best-effort local observations that can be incomplete or stale. Correct the current zero-cost claim. Document stable <code>glassdb::write_back</code> failure events.</td>
             <td>Operator visibility cannot become protocol state; local write-back failures remain diagnosable.</td>
           </tr>
           <tr>
-            <td class="path">crates/glassdb/Cargo.toml<br>crates/glassdb-trans/Cargo.toml<br>crates/glassdb-bench-scale/Cargo.toml<br>crates/glassdb-bench-scale/src/bin/perfbench/main.rs<br>crates/glassdb-bench-scale/src/bin/perfbench/point_leaves/<br>hack/aws-bench/run-perfbench.sh<br>hack/aws-bench/README.md<br>hack/aws-bench/compare.py</td>
-            <td>Add the non-default benchmark feature, the calibration scenario, its result shape, and paired comparison support.</td>
-            <td>Measured limit selection without a production setting or global state.</td>
+            <td class="path">crates/glassdb/Cargo.toml<br>crates/glassdb/src/db.rs<br>crates/glassdb/src/lib.rs<br>crates/glassdb-trans/Cargo.toml<br>crates/glassdb-bench-scale/Cargo.toml<br>crates/glassdb-bench-scale/src/bin/perfbench/main.rs<br>crates/glassdb-bench-scale/src/bin/perfbench/point_leaves.rs<br>crates/glassdb-bench-scale/src/bin/perfbench/telemetry.rs<br>crates/glassdb-bench-scale/src/bin/perfbench/backend.rs<br>hack/aws-bench/run-perfbench.sh<br>hack/aws-bench/deploy.sh<br>hack/aws-bench/cloudformation.yaml<br>hack/aws-bench/README.md<br>hack/aws-bench/compare.py<br>hack/aws-bench/test_compare.py</td>
+            <td>Add the non-default benchmark feature, transaction-local calibration, the 500-by-32 stress mode, active-call telemetry, source-qualified optional transport data, drain-inclusive timing, and paired comparison support.</td>
+            <td>Measured phase-limit selection without a production setting, shared limiter, or global state.</td>
           </tr>
           <tr>
             <td class="path">docs/adr/064-bounded-point-leaf-work-and-renewed-serial-fallback.md<br>docs/architecture.md<br>docs/designs/object-storage-native.md<br>docs/guides/caching.md<br>docs/guides/perf.md (after measurements)</td>
-            <td>Add one decision record and update living descriptions of acquisition, validation proof, serial renewal, and write-back.</td>
+            <td>Add one decision record and update living descriptions of acquisition receipts, locked validation, serial renewal, and write-back.</td>
             <td>Frozen older ADR bodies remain unchanged; living documents match the implemented protocol.</td>
           </tr>
         </tbody>
@@ -668,8 +809,8 @@ pub mod benchmark {
     </div>
     <div class="order">
       <span class="order-number">4</span>
-      <h3>Add retained-lock proofs</h3>
-      <p>Teach the coordinator and <code>AcquireOperation</code> to produce <code>Installed</code> or <code>Observed</code>. Change <code>LockedTx::validated</code> to direct path lookup.</p>
+      <h3>Add retained-lock receipts</h3>
+      <p>Teach the coordinator and <code>AcquireOperation</code> to produce <code>Installed</code> or <code>Observed</code> receipts. Locked point validation treats both alike; exact range-coverage lookup uses the receipt by path.</p>
     </div>
     <div class="order">
       <span class="order-number">5</span>
@@ -684,7 +825,7 @@ pub mod benchmark {
     <div class="order">
       <span class="order-number">7</span>
       <h3>Verify, calibrate, and record</h3>
-      <p>Add deterministic regressions, run the 8/16/32 benchmark sweep against the parent revision, write the new ADR, update only status/link lines in older ADRs, and run <code>make test-all</code>.</p>
+      <p>Add deterministic regressions, run the 8/16/32 benchmark sweep and the 500-by-32 backend stress case against the parent revision, write the new ADR, update only status/link lines in older ADRs, and run <code>make test-all</code>.</p>
     </div>
   </section>
 
@@ -698,13 +839,13 @@ pub mod benchmark {
         <tbody>
           <tr>
             <td><code>join_all_bounded</code></td>
-            <td>Zero, one, reverse completion, value errors, 17 gated futures at limit 16, all-input execution, and drop of active plus stored futures.</td>
-            <td>Stable input outputs; maximum incomplete count is 16.</td>
+            <td>Zero, one, limits smaller and larger than the input count, stable admission, reverse completion, value errors, 17 gated futures at limit 16, all-input execution, and drop of active plus stored futures.</td>
+            <td>Stable input outputs; stable admission; maximum incomplete count is 16.</td>
           </tr>
           <tr>
             <td>Routing</td>
             <td>Shared paths, cold 1/2/8/32 leaves, stale separator, converging right links, former leaf becoming index, stable error ordinal.</td>
-            <td>About <code>ceil(L/16)</code> cold waves; one key has the parent operation count.</td>
+            <td>About <code>ceil(L/16)</code> isolated transaction-local waves; one key has the parent operation count.</td>
           </tr>
           <tr>
             <td>Direct commit</td>
@@ -719,12 +860,12 @@ pub mod benchmark {
           <tr>
             <td>Logical validation</td>
             <td>Committed, not-written, deleted, pending, unknown, aborted, and wounded holders; stable result and error ordinals.</td>
-            <td>Only exact <code>Installed</code> own-holder evidence avoids logical work.</td>
+            <td>Locked point reads always use logical validation. A warm post-acquisition pass adds no backend operation and treats <code>Installed</code> and <code>Observed</code> alike.</td>
           </tr>
           <tr>
             <td>Normal acquisition</td>
             <td>Foreign wait occupies one position; conflict and leaf-full retain locks; full and partial same-identity holds; uncertain landed CAS; stable mixed outcome.</td>
-            <td>No foreground release between normal passes and no partial proof enters retry.</td>
+            <td>No foreground release between normal passes and no partial receipt enters retry.</td>
           </tr>
           <tr>
             <td>Serial renewal</td>
@@ -741,6 +882,16 @@ pub mod benchmark {
             <td>Replay each new difficult case under normal and simulation builds with the same seed and schedule.</td>
             <td>The selected outcomes and backend operation stream reproduce.</td>
           </tr>
+          <tr>
+            <td>Every bounded phase</td>
+            <td>Exercise zero inputs and one input through the routing, physical validation, logical validation, normal acquisition, and write-back interfaces.</td>
+            <td>Zero returns directly. One does not build the multi-future queue or add a backend operation.</td>
+          </tr>
+          <tr>
+            <td>Backend stress</td>
+            <td>Run 500 concurrent 32-leaf transactions through cold-burst and long-duration cases on the selected real transports.</td>
+            <td>Measure request, retry, error, resource, throughput, p95, and p99 behavior. Record source-qualified unavailability for queues or connections that the transport does not expose.</td>
+          </tr>
         </tbody>
       </table>
     </div>
@@ -751,10 +902,21 @@ pub mod benchmark {
       <li>Warm decoded cache and cache capacity zero; memory, simulated GCS, and simulated S3 backends.</li>
       <li>Add explicit <code>none</code>, <code>gcs</code>, and <code>s3</code> delay profiles so bare memory is a real cell and reports do not hide the selected profile. Keep provider throttling for GCS and S3.</li>
       <li>Point reads, logged blind overwrites with <code>InlinePolicy::none()</code>, and logged point read-modify-write transactions.</li>
-      <li>One and multiple <code>Database</code> clients, the existing worker sweep, at least three converged paired runs, and cross-run medians.</li>
-      <li>Record p50, p95, transactions per second, reads and writes per transaction, retries, lock calls, maximum active backend operations, and shutdown debt.</li>
+      <li>One and multiple <code>Database</code> instances, the existing worker sweep, at least three converged paired runs, and cross-run medians.</li>
+      <li>The primary selection cells are the 8-leaf and 32-leaf combinations of all three workloads, both cache states, all three delay profiles, and the converged one- and multiple-<code>Database</code> plateaus.</li>
+      <li>Record p50, p95, p99, transactions per second, reads and writes per transaction, retries, lock calls, maximum active backend operations, and shutdown debt.</li>
       <li>Treat peak backend work as a whole-workload measure. Caller-joined public reads can make it larger than 16; deterministic unit gates prove each internal phase limit.</li>
-      <li>Keep a candidate only if every one-leaf operation sequence matches the parent, every primary cell is at least 95% of the best candidate, and no repeatable parent regression exceeds 5%.</li>
+      <li>Run 500 concurrent 32-leaf transactions as separate cold-burst and long-duration cases on real S3 and GCS. Start with limit 16 and a paired parent run. At limit 16, the first admission can contain 8,000 incomplete leaf futures.</li>
+      <li>For the stress case, also record p99 latency, the backend queue, provider requests, connections, retries, provider errors, CPU, memory, file descriptors, network use, and any deployment limit that is on the path.</li>
+      <li>Use a bounded percentile accumulator for the long-duration case. Do not keep every transaction latency sample in memory.</li>
+      <li>Construct an explicit fresh transport client for a cold-pool cell. Reuse one cell client for its warm steady-state run and all of that cell's <code>Database</code> instances.</li>
+      <li>Every optional stress field records its source and availability. For an unavailable metric, first try an accurate temporary hook and prove its effect stays inside the accepted benchmark-noise band. Otherwise record <code>notExposed</code>. Do not calculate queue depth from active-call or leaf-future counts.</li>
+      <li>Use S3 transport interception and fake-S3 connection counters where available. Use CloudWatch, Cloud Monitoring, and process or deployment sampling for provider and host data, with the measurement interval stored in the result.</li>
+      <li>Use the stress results to validate the backend and deployment. Do not derive a shared GlassDB limit or a capacity percentage from them.</li>
+      <li>Keep the existing direct-commit benchmark groups as one-leaf regression gates.</li>
+      <li>Retain 16 only if every one-leaf operation sequence matches the parent, 16 reaches at least 95% of the best stable 8/16/32 throughput in every primary cell, it meets the accepted latency objectives, and no repeatable parent regression exceeds 5%.</li>
+      <li>Use 32 if it gives more than 5% additional stable throughput or an accepted workload requires one transaction-local wave through 32 leaves.</li>
+      <li>If one phase reaches backend saturation earlier, give only that phase a measured lower internal limit.</li>
     </ul>
   </section>
 
@@ -778,9 +940,9 @@ pub mod benchmark {
       <div class="stat"><span>Selected outcome</span><strong id="state-outcome"></strong></div>
       <div class="stat"><span>Routed groups</span><strong id="state-groups"></strong></div>
       <div class="stat"><span>Incomplete positions</span><strong id="state-incomplete"></strong></div>
-      <div class="stat"><span>Backend waves</span><strong id="state-waves"></strong></div>
+      <div class="stat"><span>Transaction-local waves</span><strong id="state-waves"></strong></div>
       <div class="stat"><span>Current locks</span><strong id="state-locks"></strong></div>
-      <div class="stat"><span>Lock proofs</span><strong id="state-proofs"></strong></div>
+      <div class="stat"><span>Hold receipts</span><strong id="state-proofs"></strong></div>
       <div class="stat"><span>Write-back hints</span><strong id="state-hints"></strong></div>
     </div>
 
@@ -810,8 +972,9 @@ pub mod benchmark {
         <h3>Add one ADR when implementation starts</h3>
         <p>
           <code>ADR-064: Bounded point-leaf work and renewed serial fallback</code> records the bounded
-          per-transaction phase policy, retained normal retries, and renewed-identity serial
-          transition. It supersedes only the conflicting release/same-identity statements in
+          per-transaction phase policy, backend-owned aggregate capacity, retained normal retries,
+          and renewed-identity serial transition. It records that this effort adds no shared
+          GlassDB limiter or global fairness rule. It supersedes only the conflicting release/same-identity statements in
           ADR-024 and the late-cancelled-acquire assumption in ADR-025. It also narrows ADR-026's
           statement that release runs during serial fallback; release remains valid for abort and
           recovery work.
@@ -825,7 +988,7 @@ pub mod benchmark {
           group, access set, transaction identity, and snapshot-transparent. No glossary change is
           needed. Update <code>docs/architecture.md</code>,
           <code>docs/designs/object-storage-native.md</code>, and
-          <code>docs/guides/caching.md</code> where they describe the changed protocol and proof.
+          <code>docs/guides/caching.md</code> where they describe the changed protocol and receipts.
           Update <code>docs/guides/perf.md</code> only after measured results exist. Do not add a
           second design document or a public configuration guide.
         </p>
@@ -947,7 +1110,7 @@ pub mod benchmark {
           proof: "Installed",
           note: "lock CAS precondition retained"
         }))
-      }, "Every complete leaf group returned Locked. LockedTx has one Installed proof per group.");
+      }, "Every complete leaf group returned Locked. LockedTx has one Installed receipt per group.");
     }
 
     function acquireMixed(state) {
@@ -972,7 +1135,7 @@ pub mod benchmark {
         proofs: { installed: 0, observed: 0 },
         leafState: updated,
         everyInputRan: true
-      }, "All leaf inputs ran. Stable path order selected the L02 Conflict before the later storage error. Partial proofs were discarded.");
+      }, "All leaf inputs ran. Stable path order selected the L02 Conflict before the later storage error. Partial receipts were discarded.");
     }
 
     function retryRetained(state) {
@@ -1089,7 +1252,7 @@ pub mod benchmark {
         ...state,
         phase: "Validated",
         selectedOutcome: "snapshot valid"
-      }, "Physical proofs and, where required, logical states validated the complete point-read set at " + state.validationStart + ".");
+      }, "Logical point states and range-coverage receipts validated the complete access set at " + state.validationStart + ".");
     }
 
     function commit(state) {
@@ -1292,7 +1455,7 @@ pub mod benchmark {
         ["Finish routing", "FINISH_ROUTING"],
         ["Return a Conflict and a later error", "ACQUIRE_MIXED"],
         ["Retry the complete set", "RETRY_RETAINED"],
-        ["Validate Installed and Observed proofs", "VALIDATE"]
+        ["Validate locked states and range receipts", "VALIDATE"]
       ]
     },
     {
@@ -1403,7 +1566,7 @@ pub mod benchmark {
       const lock = document.createElement("span");
       lock.textContent = "lock: " + leaf.lock;
       const proof = document.createElement("span");
-      proof.textContent = "proof: " + leaf.proof;
+      proof.textContent = "receipt: " + leaf.proof;
       const note = document.createElement("span");
       note.textContent = leaf.note;
       card.append(name, lock, proof, note);

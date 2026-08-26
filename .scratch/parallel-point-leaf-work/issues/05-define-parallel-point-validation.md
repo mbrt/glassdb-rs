@@ -22,6 +22,7 @@ NodeStore::check_leaves_current(
 
 KeyResolver::effective_point_states(
     keys: &[KeyRef],
+    own_lock_holder: Option<&TxId>,
     validation_start: SequencePoint,
     limit: NonZeroUsize,
 ) -> Result<Vec<PointValidationState>, StorageError>
@@ -55,34 +56,35 @@ The zero-path and one-path cases use the direct paths from
 A one-leaf validation adds no queue and no backend operation beyond the check it
 already requires.
 
-For locked validation, keep `LockedTx::validated` as the small interface. Replace
-its scan of all groups with `groups.get(observed.path())`. An `Installed` lock
-proof validates only when its successful CAS precondition observation satisfies
-`same_state`. An `Observed` lock proof confirms that this transaction identity
-holds the required locks, but it does not reconstruct the state replaced by the
-earlier CAS and therefore does not take this physical shortcut. Do not add a
-second proof index or pass `LockedTx` into `NodeStore`.
+Physical point checking is only the optimistic path before locks are held.
+Locked point reads always use complete logical point validation, independent of
+whether their leaf hold receipt is `Installed` or `Observed`. A completed
+`LockedTx` proves that every required hold has one complete receipt. Its
+successful CAS or bounded retained-hold load also leaves cache evidence at the
+shared validation lower bound, so the normal logical leaf read is local. Cache
+eviction or topology churn can still require a backend check.
 
-An exact `Installed` proof can also validate an observed `Write` or `Create`
-holder when the holder is this transaction. The transaction cannot commit before
-its own validation, and a wound does not make it the effective writer. This
-exception avoids a complete logical pass and its possible backend reads during a
-transaction-body replay. An `Observed` proof, a mismatched `Installed` proof, or
-an exclusive holder with a different transaction identity disables the physical
-shortcut. The logical path then resolves the effective writer at the shared
-validation lower bound.
+Locked logical validation passes its transaction identity as
+`own_lock_holder`; optimistic validation passes `None`. The resolver therefore
+interprets an own exclusive hold as protection around the predecessor state,
+not as a foreign writer. Compare each point read's effective writer and, for an
+absent read, its membership version. Keep the existing exact `Installed`
+physical shortcut only for unchanged range coverage, where the alternative is
+a complete range re-scan. Do not pass `LockedTx` into `NodeStore`.
 
-After all physical path futures finish, `Algo` interprets the input-aligned
-results in normalized point-read order. For each read, an operational error is
-considered before `Changed`, a proof mismatch, or the exclusive-holder rule.
-An earlier need for logical fallback keeps the current behavior and suppresses
-a later physical error, although the later check has run.
+After all optimistic physical path futures finish, `Algo` interprets the
+input-aligned results in normalized point-read order. For each read, an
+operational error is considered before `Changed`. An earlier need for logical
+fallback keeps the current behavior and suppresses a later physical error,
+although the later check has run. Locked point validation skips this physical
+stage and runs the complete logical batch directly.
 
 ### Logical point revalidation
 
-When the physical shortcut fails, revalidate the complete point-read set. Do
-not route only the changed leaf. Carry each input ordinal as the payload through
-the path-batched `TreeRouter` design from
+When optimistic physical checking fails, or when point locks are held,
+revalidate the complete point-read set. Do not route only the changed leaf.
+Carry each input ordinal as the payload through the path-batched `TreeRouter`
+design from
 [Choose the point-key batch routing design](02-choose-point-key-batch-routing-design.md).
 Use cached `Requirement::Any` descent for interior nodes and
 `Requirement::AtLeast(validation_start)` for terminal leaves. Reprocess a
@@ -131,9 +133,9 @@ must cover the following validation cases in addition to its existing question:
   all-path execution, and stable outcome selection;
 - exact-state combination with evidence propagation, different revisions on
   one path, and independent absence observations;
-- direct keyed proof lookup, the exact `Installed` own-holder shortcut, and
-  mandatory logical fallback for an `Observed` proof or a foreign exclusive
-  holder;
+- complete `Installed` and `Observed` hold receipts, mandatory logical point
+  validation for both receipt kinds, own-holder interpretation, and the exact
+  `Installed` shortcut only for unchanged range coverage;
 - stable multi-leaf logical results and errors for committed, not-written,
   deleted, pending, unknown, aborted, and wounded holders; and
 - zero-key and one-key direct behavior, a warm post-lock replay with no added

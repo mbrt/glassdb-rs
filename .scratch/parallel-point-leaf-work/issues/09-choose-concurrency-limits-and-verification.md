@@ -101,9 +101,10 @@ combination, B-link correction, stable routed leaf groups, input-aligned
 physical results, and stable logical results and error selection. Cover exact
 state combination and evidence propagation, different revisions on one path,
 independent absence observations, and committed, not-written, deleted, pending,
-unknown, aborted, and wounded holders. An exact `Installed` own-holder proof
-can use the physical shortcut. An `Observed` proof, a mismatched proof, or a
-foreign exclusive holder must use logical validation.
+unknown, aborted, and wounded holders. Optimistic point validation uses the
+physical-first path. Locked point reads always use the complete logical batch
+and treat `Installed` and `Observed` hold receipts alike. Keep the exact
+`Installed` shortcut only for unchanged range coverage.
 
 Normal lock tests must gate at least 17 distinct leaf operations and prove that
 the seventeenth is not admitted while 16 are incomplete. A foreign-holder wait
@@ -116,8 +117,8 @@ physical locks without a foreground release. A cached complete same-identity
 hold returns `Observed` without a CAS. A partial hold runs one idempotent
 complete-leaf CAS. When a CAS lands but its result is unavailable, the next
 full-set retry recognizes the complete hold and adds no second CAS. A complete
-pass builds exactly one proof per current group and carries no partial proof or
-held-path state into retry.
+pass builds exactly one receipt per current group and carries no partial receipt
+or held-path state into retry.
 
 Serial-transition tests must gate an old-identity conditional write after
 dispatch and before result delivery. Both that timeout and a completed conflict

@@ -36,7 +36,7 @@ or an operational error occurs on another leaf. Its zero-input path returns
 directly, and its one-input path awaits that leaf operation directly. Thus a
 one-leaf transaction adds no queue, task, or backend operation.
 
-### Stable outcome and proofs
+### Stable outcome and receipts
 
 Interpret the complete result vector in the same ascending leaf-path order.
 The first item that is not `Locked` determines the aggregate result, regardless
@@ -55,14 +55,14 @@ though the later operation ran. This preserves current behavior and makes the
 choice independent of completion order.
 
 Do not keep an acquisition-phase set of paths that are believed to be locked.
-Each `Locked` result carries a private `Installed` or `Observed` proof for the
-current pass. Retain these proof values only until the aggregate result is
-known. If every item is `Locked`, require exactly one proof for each current
-group and build `LockedTx`. Otherwise discard all proof values but keep the
+Each `Locked` result carries a private `Installed` or `Observed` receipt for the
+current pass. Retain these receipt values only until the aggregate result is
+known. If every item is `Locked`, require exactly one receipt for each current
+group and build `LockedTx`. Otherwise discard all receipt values but keep the
 physical locks. An uncertain lock CAS can also have landed without returning a
-proof. The next retry handles both cases by rebuilding all groups from the
+receipt. The next retry handles both cases by rebuilding all groups from the
 complete `AccessSet` and inspecting each loaded leaf. Do not expose
-`PartialLockedTx`, a partial proof set, or a held-path retry input through the
+`PartialLockedTx`, a partial receipt set, or a held-path retry input through the
 interface.
 
 `AcquireOperation` performs the retained-lock check inside the existing
@@ -73,13 +73,14 @@ strength. If any required hold is absent, it stages the normal complete-leaf CAS
 and returns `Locked(Installed)` only after that CAS lands. Same-identity staging
 is idempotent, so it also reconciles an earlier uncertain CAS.
 
-`Requirement::Any` is sufficient for a point-only retained-lock check while the
-identity remains pending and normal retry never releases its locks. A structural
-change must reconcile or wound that identity before it can move the locks.
-Groups that contain range-scan membership work keep their validation-barrier
-requirement. An `Observed` proof establishes ownership, not the earlier CAS
-precondition; [Define parallel point validation](05-define-parallel-point-validation.md)
-therefore sends it through logical validation.
+Use `Requirement::AtLeast(validation_start)` for every retained-lock check. The
+operation can return `Observed` without a following CAS, so its loaded leaf must
+satisfy the same lower bound that locked logical validation uses. A successful
+`Installed` CAS advances its precondition evidence past that bound. A structural
+change must still reconcile or wound the pending transaction identity before it
+can move the locks. [Define parallel point validation](05-define-parallel-point-validation.md)
+sends every locked point read through logical validation, independent of
+whether its hold receipt is `Installed` or `Observed`.
 
 ### Serial-fallback identity renewal
 
@@ -150,7 +151,7 @@ must cover these acquisition cases:
 - a cached complete same-identity hold that returns `Observed` without a CAS,
   an absent or partial hold that runs the complete-leaf CAS, and an uncertain
   landed CAS that the next retry recognizes;
-- complete `LockedTx` proof matching without a partial proof set or held-path
+- complete `LockedTx` receipt matching without a partial receipt set or held-path
   state across retries;
 - combined point intentions and range-scan membership locks on one leaf;
 - a gated timeout after conditional-write dispatch but before result delivery,
