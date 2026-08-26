@@ -1,25 +1,42 @@
 # Choose concurrency limits and verification
 
 Type: prototype
-Status: open
+Status: resolved
 Blocked by: 02, 05, 06, 07, 08
 
 ## Question
 
 Which initial internal concurrency limit should each bounded phase use, can one value serve all phases, and what deterministic tests and benchmarks prove the agreed latency-wave, one-leaf, maximum-incomplete-future, all-input, stable-output, retained-lock retry, serial-fallback, and throughput contracts? Include foreign-holder waits that occupy bounded positions, a cached complete same-identity hold that adds no CAS, uncertain-CAS reconciliation, and renewed-identity entry into sorted serial acquisition. Use gated distinct-path tests plus 1, 2, 8, and 32-leaf measurements with warm and cold caches.
 
-The first resolution bounded each phase for one transaction but did not bound
-aggregate backend work from concurrent transactions. Re-evaluate the limit with
-500 concurrent 32-leaf transactions as a stress and long-duration workload.
-Decide the shared active-backend-operation limit, its ownership across
-`Database` instances that use the same provider capacity, fair admission, and
-the throughput and tail-latency rule that selects its value. Confirm whether 16
-remains the correct per-transaction limit below that shared bound.
+A reopened review asked whether 500 concurrent 32-leaf transactions also need
+a shared active-backend-operation limit, shared ownership across `Database`
+instances, and global fair admission. Use this workload as a stress and
+long-duration case, and confirm whether 16 remains the correct per-transaction
+phase limit.
+
+Final review decision: do not add a shared GlassDB limit. The backend owns
+aggregate queueing, connection control, retries, and provider throttling. Treat
+this ticket as a per-transaction phase decision. Make clear that a fixed phase
+limit is an absolute submission bound, not a guaranteed percentage of dynamic
+backend capacity.
 
 Use the findings in
 [Backend concurrency capacity research](../assets/backend-concurrency-capacity-research.md).
 
-## Prototype
+## Reopened prototype
+
+[Per-transaction phase capacity prototype](../assets/per-transaction-phase-capacity-prototype.html)
+separates the transaction-local phase bound from backend-owned aggregate
+capacity. It compares limits 8, 16, and 32, shows why one fixed value is not a
+stable capacity percentage, and treats 500 concurrent large transactions as a
+backend stress case instead of a GlassDB aggregate-admission target. Human
+review selected this direction.
+
+The validated primary source is on local throwaway branch
+`prototype/per-transaction-phase-capacity`, commit `d95746f4`, at
+`.scratch/parallel-point-leaf-work/assets/per-transaction-phase-capacity-prototype.html`.
+
+## Previous prototype
 
 [Point-leaf concurrency limit and verification demo](../assets/concurrency-limit-verification-prototype.html)
 proposes one common initial limit of sixteen. It selects the smallest limit at
@@ -34,8 +51,8 @@ The validated primary source is on local throwaway branch
 
 ## Previous answer
 
-This answer remains as decision history. Its per-transaction analysis is still
-useful, but its instruction not to add a shared limit is not settled.
+This answer remains as decision history. Its per-transaction analysis and its
+instruction not to add a shared limit match the final reviewed decision.
 
 ### Initial internal limits
 
@@ -157,3 +174,43 @@ count for every one-leaf workload. Any repeatable throughput regression greater
 than 5% against the parent revision rejects the design. Keep the existing
 direct-commit benchmark groups as one-leaf regression gates. Run `make test-all`
 after implementation and deterministic regressions are complete.
+
+## Answer
+
+Use one private, nonzero limit of 16 incomplete leaf futures for each bounded
+phase of one transaction. Apply it independently to point-key routing, physical
+point validation, logical point revalidation, normal lock acquisition, and
+committed write-back. Keep the sorted serial lock fallback outside this bound.
+
+Do not add a shared GlassDB active-backend-operation limit, a database-wide or
+process-wide semaphore, a shared backend handle, or global transaction
+fairness. The backend implementation and provider own aggregate queueing,
+connection use, retries, and throttling across transactions, `Database`
+instances, and application processes. This decision does not add a guarantee
+that current backend adapters have a hard local active-call limit.
+
+The value 16 is an absolute transaction-local bound, not a guaranteed share of
+backend capacity. For backend active capacity `C`, one transaction can submit
+at most `min(16, C)` immediately active calls, or `min(16, C) / C` of that
+capacity. The actual share under concurrent load depends on backend scheduling
+and provider behavior because GlassDB does not learn `C` or schedule aggregate
+backend work.
+
+A transaction pays only for supplied work. An eight-leaf phase still creates
+eight futures with a limit of 16. For `L` equal independent backend waits of
+duration `W`, limit `N` needs approximately `ceil(L/N)` waves. Thus, 32 leaves
+need four waves at 8, two waves at 16, and one wave at 32. Limit 16 removes two
+of the four limit-8 waves without doubling the per-transaction burst to 32.
+
+Use 500 concurrent 32-leaf transactions as a backend and deployment stress and
+long-duration case, not as an aggregate GlassDB admission target. At limit 16,
+their first phase admissions can contain as many as 8,000 incomplete leaf
+futures. This number is not a connection count. The stress case must measure
+the backend's actual queue, requests, connections, retries, provider errors,
+resource use, throughput, and p95 and p99 transaction latency.
+
+Keep the deterministic verification and performance gates specified above.
+Use a benchmark-only sweep of limits 8, 16, and 32. Retain 16 when it reaches at
+least 95% of the best stable throughput in each primary cell and meets the
+accepted latency objectives. Preserve the one-leaf backend operation sequence
+and count, and reject a repeatable throughput regression greater than 5%.
