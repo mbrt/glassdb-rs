@@ -1,7 +1,7 @@
 # Synthesize the implementation-ready design
 
 Type: prototype
-Status: open
+Status: claimed
 Blocked by: 03, 04, 05, 06, 07, 08, 09
 
 ## Question

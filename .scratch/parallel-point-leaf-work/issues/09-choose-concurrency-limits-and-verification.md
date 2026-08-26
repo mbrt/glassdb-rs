@@ -1,12 +1,23 @@
 # Choose concurrency limits and verification
 
 Type: prototype
-Status: resolved
+Status: open
 Blocked by: 02, 05, 06, 07, 08
 
 ## Question
 
 Which initial internal concurrency limit should each bounded phase use, can one value serve all phases, and what deterministic tests and benchmarks prove the agreed latency-wave, one-leaf, maximum-incomplete-future, all-input, stable-output, retained-lock retry, serial-fallback, and throughput contracts? Include foreign-holder waits that occupy bounded positions, a cached complete same-identity hold that adds no CAS, uncertain-CAS reconciliation, and renewed-identity entry into sorted serial acquisition. Use gated distinct-path tests plus 1, 2, 8, and 32-leaf measurements with warm and cold caches.
+
+The first resolution bounded each phase for one transaction but did not bound
+aggregate backend work from concurrent transactions. Re-evaluate the limit with
+500 concurrent 32-leaf transactions as a stress and long-duration workload.
+Decide the shared active-backend-operation limit, its ownership across
+`Database` instances that use the same provider capacity, fair admission, and
+the throughput and tail-latency rule that selects its value. Confirm whether 16
+remains the correct per-transaction limit below that shared bound.
+
+Use the findings in
+[Backend concurrency capacity research](../assets/backend-concurrency-capacity-research.md).
 
 ## Prototype
 
@@ -21,7 +32,10 @@ The validated primary source is on local throwaway branch
 `prototype/point-leaf-limit-16-throughput-knee`, commit `9a69dbeb`, at
 `.scratch/parallel-point-leaf-work/assets/concurrency-limit-verification-prototype.html`.
 
-## Answer
+## Previous answer
+
+This answer remains as decision history. Its per-transaction analysis is still
+useful, but its instruction not to add a shared limit is not settled.
 
 ### Initial internal limits
 

@@ -9,7 +9,7 @@ Produce an implementation-ready design for bounded parallel execution of indepen
 - Domain: GlassDB point-access transactions and data-leaf coordination.
 - Use `codebase-design` for module, interface, and seam decisions. Use `grilling` with `domain-modeling` for behavior decisions. Use `prototype` for routing, interface, and measurement artifacts.
 - A **leaf** is the physical B-link tree node and CAS unit. `Shard` names its entry body. `ShardCoordinator` names the module that orders mutations on one leaf path.
-- Apply one internal concurrency limit to each phase. Do not add public concurrency configuration unless measurements make it necessary.
+- Apply one per-transaction concurrency limit to each phase. Decide a separate shared active-backend-operation limit from throughput, tail latency, and deployment resource measurements. Do not add public concurrency configuration unless measurements make it necessary.
 - Use bounded `join_all` semantics: waiting futures count against the limit, every supplied input runs, and outputs return in stable input order. Do not add parking, replacement, or terminal-cutoff concepts to the generic interface. Committed write-back remains best-effort across leaves.
 - Put input combination in the domain interface that owns physical routing, logical resolution, or atomic leaf mutation. Do not add a shared routed point-leaf plan.
 - A **routed leaf group** (`RoutedLeafGroup<T>`) is the temporary `TreeRouter` output: one leaf observation and the ordered logical keys, with their domain payloads, routed to it. It records a routing result, not a durable ownership claim. The observation carries currentness evidence; there is no separate freshness field.
@@ -27,11 +27,10 @@ Produce an implementation-ready design for bounded parallel execution of indepen
 - [Bound normal leaf lock acquisition](issues/06-bound-normal-leaf-lock-acquisition.md): Bound the complete combined leaf set, retain locks across normal retries, and renew the transaction identity for every transition from parallel to sorted serial acquisition.
 - [Recognize retained leaf locks across normal retries](issues/07-parallelize-retry-release-before-serial-reacquisition.md): Inspect the coordinator-loaded leaf for a complete same-identity hold, skip its CAS without partial retry state, and use a renewed identity instead of foreground release for serial fallback.
 - [Bound committed leaf write-back](issues/08-bound-committed-leaf-write-back.md): Bound original `LockedTx` groups, keep stable split descendants inside one position, isolate leaf deferrals and failures, and aggregate hints after all inputs run.
-- [Choose concurrency limits and verification](issues/09-choose-concurrency-limits-and-verification.md): Start every bounded phase at 16, keep the smallest value at the measured throughput plateau, and accept at most one added backend-wait wave through 32 leaves.
 
 ## Not yet specified
 
-- None.
+- [Choose concurrency limits and verification](issues/09-choose-concurrency-limits-and-verification.md): Confirm the per-transaction limit and choose the shared active-backend-operation limit, ownership scope, fairness rule, and throughput-versus-tail-latency calibration under as many as 500 concurrent large transactions.
 
 ## Out of scope
 

@@ -1,0 +1,1502 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bounded parallel point-leaf implementation design</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17211b;
+      --muted: #5d6a62;
+      --paper: #f3f1e9;
+      --panel: #fffefa;
+      --line: #d8d8ce;
+      --accent: #176b55;
+      --accent-soft: #dcefe8;
+      --warn: #865e18;
+      --warn-soft: #fff0ca;
+      --danger: #8f3434;
+      --danger-soft: #fbe4e1;
+      --blue: #315f87;
+      --blue-soft: #e3eef7;
+      --shadow: 0 12px 35px rgb(31 43 35 / 8%);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(1220px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 42px 0 80px;
+    }
+
+    h1, h2, h3, h4 { line-height: 1.16; letter-spacing: -0.025em; }
+    h1 { max-width: 980px; margin: 12px 0 14px; font-size: clamp(2rem, 5vw, 3.35rem); }
+    h2 { margin: 0 0 18px; font-size: 1.55rem; }
+    h3 { margin: 0 0 10px; font-size: 1.08rem; }
+    h4 { margin: 0 0 6px; font-size: 0.98rem; }
+    p { margin: 0 0 14px; }
+    a { color: var(--accent); }
+
+    .eyebrow, .badge, .status {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 0.74rem;
+      font-weight: 780;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow { background: var(--accent); color: white; }
+    .badge { background: var(--accent-soft); color: var(--accent); }
+    .badge.warn, .status.pending { background: var(--warn-soft); color: var(--warn); }
+    .badge.blue { background: var(--blue-soft); color: var(--blue); }
+    .status.pass { background: var(--accent-soft); color: var(--accent); }
+    .status.fail { background: var(--danger-soft); color: var(--danger); }
+
+    .lede { max-width: 980px; color: var(--muted); font-size: 1.06rem; }
+
+    .notice {
+      margin-top: 22px;
+      border-left: 4px solid var(--warn);
+      border-radius: 8px;
+      background: var(--warn-soft);
+      padding: 14px 16px;
+    }
+
+    .section {
+      margin-top: 28px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      padding: clamp(20px, 3vw, 30px);
+    }
+
+    .summary-grid, .decision-grid, .interface-grid, .state-grid, .checks {
+      display: grid;
+      gap: 12px;
+    }
+
+    .summary-grid { grid-template-columns: repeat(4, 1fr); }
+    .decision-grid { grid-template-columns: repeat(2, 1fr); }
+    .interface-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .state-grid { grid-template-columns: repeat(6, minmax(105px, 1fr)); margin: 18px 0; }
+    .checks { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+    .summary-card, .decision-card, .interface-card, .stat, .check, .subpanel {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #faf9f4;
+    }
+
+    .summary-card, .decision-card, .interface-card { padding: 16px; }
+    .summary-card strong { display: block; margin: 8px 0 4px; font-size: 1.03rem; }
+    .summary-card p, .decision-card p { color: var(--muted); }
+    .decision-card.recommend { border-top: 4px solid var(--accent); }
+    .decision-card.open { border-top: 4px solid var(--warn); }
+    .decision-card ul { margin-bottom: 0; }
+
+    code, pre {
+      font: 0.88em/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    pre {
+      margin: 12px 0 0;
+      border-radius: 10px;
+      background: #15221c;
+      color: #e6f2eb;
+      padding: 14px;
+      overflow: auto;
+      white-space: pre;
+    }
+
+    ul, ol { margin: 9px 0 0; padding-left: 22px; }
+    li + li { margin-top: 6px; }
+
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid var(--line); padding: 10px 9px; text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: 0.73rem; letter-spacing: 0.045em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    .table-wrap { overflow-x: auto; }
+    .path { white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.83em; }
+
+    .order {
+      display: grid;
+      grid-template-columns: 34px minmax(160px, 0.55fr) minmax(280px, 1.45fr);
+      gap: 12px;
+      align-items: start;
+      padding: 13px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .order:last-child { border-bottom: 0; }
+    .order-number {
+      display: grid;
+      place-content: center;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: white;
+      font-weight: 800;
+    }
+
+    .toolbar, .button-row, .tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .toolbar { margin: 0 0 18px; justify-content: space-between; align-items: center; }
+
+    button {
+      border: 1px solid #bdc5be;
+      border-radius: 9px;
+      background: white;
+      color: var(--ink);
+      cursor: pointer;
+      padding: 8px 11px;
+      font: inherit;
+      font-weight: 670;
+    }
+
+    button:hover { border-color: var(--accent); color: var(--accent); }
+    button.primary, button.active { border-color: var(--accent); background: var(--accent); color: white; }
+    button.warn { border-color: var(--warn); color: var(--warn); }
+
+    .stat { padding: 12px; }
+    .stat span { display: block; color: var(--muted); font-size: 0.71rem; font-weight: 750; text-transform: uppercase; }
+    .stat strong { display: block; margin-top: 3px; font-size: 1.08rem; overflow-wrap: anywhere; }
+
+    .split {
+      display: grid;
+      grid-template-columns: 1.2fr 0.8fr;
+      gap: 16px;
+    }
+
+    .subpanel { padding: 15px; overflow: auto; }
+
+    .leaf-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .leaf {
+      min-height: 82px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 9px;
+      background: #f6f5ef;
+    }
+
+    .leaf strong, .leaf span { display: block; }
+    .leaf span { color: var(--muted); font-size: 0.76rem; }
+    .leaf.active { border-color: var(--blue); background: var(--blue-soft); }
+    .leaf.held { border-color: var(--accent); background: var(--accent-soft); }
+    .leaf.waiting { border-color: var(--warn); background: var(--warn-soft); }
+    .leaf.failed { border-color: var(--danger); background: var(--danger-soft); }
+
+    .event-log { margin: 0; padding-left: 20px; color: var(--muted); }
+    .event-log li:first-child { color: var(--ink); font-weight: 650; }
+    .empty { color: var(--muted); font-style: italic; }
+
+    .check {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: start;
+      padding: 12px;
+    }
+
+    .check p { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 0.88rem; }
+
+    .tabs {
+      margin: 20px 0 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .tabs button { border: 0; border-radius: 8px 8px 0 0; background: transparent; }
+    .tabs button.active { background: var(--accent-soft); color: var(--accent); }
+    .guide-copy { max-width: 900px; color: var(--muted); }
+    .steps { display: grid; gap: 9px; margin-top: 16px; }
+
+    .step {
+      display: grid;
+      grid-template-columns: 30px minmax(220px, 1fr) auto;
+      align-items: center;
+      gap: 10px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      padding: 10px;
+      background: #faf9f5;
+    }
+
+    .step-number {
+      display: grid;
+      place-content: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: #e7e8df;
+      font-weight: 800;
+    }
+
+    .step.done .step-number { background: var(--accent); color: white; }
+    .step.done { opacity: 0.72; }
+
+    .phase-flow {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .phase {
+      position: relative;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 11px;
+      background: #faf9f4;
+    }
+
+    .phase strong, .phase span { display: block; }
+    .phase span { margin-top: 4px; color: var(--muted); font-size: 0.78rem; }
+    .phase.current { border-color: var(--accent); background: var(--accent-soft); }
+
+    .scope {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .scope > div { border-radius: 12px; padding: 15px; }
+    .scope .in { background: var(--accent-soft); }
+    .scope .out { background: #ecece5; }
+
+    @media (max-width: 980px) {
+      .summary-grid { grid-template-columns: repeat(2, 1fr); }
+      .state-grid { grid-template-columns: repeat(3, 1fr); }
+      .phase-flow { grid-template-columns: repeat(3, 1fr); }
+    }
+
+    @media (max-width: 760px) {
+      .decision-grid, .interface-grid, .split, .checks, .scope { grid-template-columns: 1fr; }
+      .order { grid-template-columns: 34px 1fr; }
+      .order p { grid-column: 2; }
+    }
+
+    @media (max-width: 520px) {
+      main { width: min(100% - 18px, 1220px); padding-top: 22px; }
+      .summary-grid, .state-grid, .phase-flow { grid-template-columns: repeat(2, 1fr); }
+      .step { grid-template-columns: 30px 1fr; }
+      .step button { grid-column: 1 / -1; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <span class="eyebrow">Throwaway planning prototype</span>
+  <h1>Make independent point-leaf work parallel without changing the transaction protocol</h1>
+  <p class="lede">
+    This explorer asks whether the nine resolved decisions now form one implementation-ready
+    design. It makes the Rust interfaces, ownership seams, change order, difficult transitions,
+    tests, measurements, and documentation work concrete. It does not implement the design.
+  </p>
+  <div class="notice">
+    <strong>Limit 16 is a candidate, not measured evidence.</strong>
+    The implementation starts at 16 only so the benchmark can compare 8, 16, and 32. The
+    acceptance gate, not this prototype, selects the retained value.
+  </div>
+
+  <section class="section" aria-labelledby="shape-title">
+    <h2 id="shape-title">The complete shape</h2>
+    <div class="summary-grid">
+      <article class="summary-card">
+        <span class="badge">One generic seam</span>
+        <strong><code>join_all_bounded</code></strong>
+        <p>Foreground polling, stable outputs, every input, and no task per leaf.</p>
+      </article>
+      <article class="summary-card">
+        <span class="badge">Domain combination</span>
+        <strong>Route or mutate once per leaf</strong>
+        <p><code>TreeRouter</code>, <code>NodeStore</code>, <code>KeyResolver</code>, and <code>KeyLocker</code> select the unit.</p>
+      </article>
+      <article class="summary-card">
+        <span class="badge">One shared fact</span>
+        <strong><code>AccessSet</code></strong>
+        <p>Direct and logged commit paths share logical access facts, not physical routing.</p>
+      </article>
+      <article class="summary-card">
+        <span class="badge">One commit point</span>
+        <strong>The transaction object</strong>
+        <p>Cross-leaf work stays ordered around the existing logged commit point.</p>
+      </article>
+    </div>
+
+    <div class="phase-flow" id="phase-flow">
+      <div class="phase" data-phase="Routing"><strong>Routing</strong><span>Distinct node paths</span></div>
+      <div class="phase" data-phase="Acquisition"><strong>Acquisition</strong><span>Complete leaf groups</span></div>
+      <div class="phase" data-phase="Validation"><strong>Validation</strong><span>Physical, then logical</span></div>
+      <div class="phase" data-phase="Committed"><strong>Commit</strong><span>One transaction object</span></div>
+      <div class="phase" data-phase="Write-back"><strong>Write-back</strong><span>Original locked groups</span></div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="frontier-title">
+    <h2 id="frontier-title">Code-level decisions that complete the map</h2>
+    <p class="lede">These recommendations fill gaps that the behavior tickets did not express as exact Rust seams.</p>
+    <div class="decision-grid">
+      <article class="decision-card recommend">
+        <span class="badge">Recommended</span>
+        <h3>Use one private limit bundle</h3>
+        <p>
+          Add a crate-private <code>PointLeafLimits</code> in <code>glassdb-trans</code>. It has one
+          field for each measured phase, with every field initially set to 16. Storage interfaces
+          accept a <code>NonZeroUsize</code>; they do not own product policy.
+        </p>
+        <ul>
+          <li>No <code>DatabaseBuilder</code> setting and no database-wide semaphore.</li>
+          <li>A non-default <code>bench-internals</code> feature exposes one hidden benchmark opening function, not a builder setter.</li>
+          <li><code>PointLeafLimits::all(n)</code> supports the first sweep; separate fields permit a measured lower value for one phase.</li>
+        </ul>
+      </article>
+
+      <article class="decision-card recommend">
+        <span class="badge">Recommended</span>
+        <h3>Make the routed group contain no duplicate path</h3>
+        <p>
+          <code>RoutedLeafGroup&lt;T&gt;</code> contains one <code>LeafObservation</code> and ordered
+          raw keys with payloads. Its <code>path()</code> comes from the observation. It has no
+          currentness flag and no durable ownership meaning.
+        </p>
+        <ul>
+          <li>Groups return in physical path order.</li>
+          <li>Keys remain in original input order inside a group.</li>
+          <li>Each internal item keeps an ordinal until routing finishes.</li>
+        </ul>
+      </article>
+
+      <article class="decision-card recommend">
+        <span class="badge">Recommended</span>
+        <h3>Return a typed serial-renewal action to <code>AttemptDriver</code></h3>
+        <p>
+          <code>Algo</code> reports that the parallel acquisition episode must end.
+          <code>AttemptDriver</code> then makes the old identity <code>Wounded</code>, renews it,
+          arms a new retirement guard, and calls commit again in forced serial mode.
+        </p>
+        <ul>
+          <li>A hard timeout leaves its owner operation unresolved.</li>
+          <li>The new identity samples a new validation lower bound and reacquires collection-directory locks.</li>
+          <li>Point and range work retains the transaction body outcome; collection create/drop repeats the body.</li>
+        </ul>
+      </article>
+
+      <article class="decision-card open">
+        <span class="badge warn">Human choice</span>
+        <h3>Keep only a non-authoritative diagnostic hold ledger</h3>
+        <p>
+          The current <code>KeyLocker::tlocks</code> is both retry state and operator diagnostics.
+          Remove every correctness and release use. Keep a renamed ledger only if operators still
+          need confirmed local hold observations.
+        </p>
+        <ul>
+          <li>It can omit a CAS that landed without a result.</li>
+          <li>It never skips work, selects a proof, drives release, or enters serial mode.</li>
+          <li>The public diagnostic text must say that it is best-effort and non-authoritative.</li>
+        </ul>
+      </article>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="interfaces-title">
+    <h2 id="interfaces-title">Final internal interfaces</h2>
+    <div class="interface-grid">
+      <article class="interface-card">
+        <h3>Bounded foreground join</h3>
+        <pre>pub async fn join_all_bounded&lt;I&gt;(
+    futures: I,
+    limit: NonZeroUsize,
+) -&gt; Vec&lt;&lt;I::Item as Future&gt;::Output&gt;
+where
+    I: IntoIterator,
+    I::Item: Future;</pre>
+        <p>Zero and one inputs use direct paths. The future is conditionally <code>Send</code>; the interface does not require spawning.</p>
+      </article>
+
+      <article class="interface-card">
+        <h3>Point-key routing</h3>
+        <pre>pub struct RoutedLeafGroup&lt;T&gt; {
+    pub observation: LeafObservation,
+    pub keys: Vec&lt;(Vec&lt;u8&gt;, T)&gt;,
+}
+
+pub async fn group_keys_by_leaf&lt;T&gt;(
+    &amp;self,
+    items: impl IntoIterator&lt;Item = (KeyRef, T)&gt;,
+    requirement: Requirement,
+    limit: NonZeroUsize,
+) -&gt; Result&lt;Vec&lt;RoutedLeafGroup&lt;T&gt;&gt;, StorageError&gt;;
+
+pub async fn group_keys_by_leaf_fresh&lt;T&gt;(
+    &amp;self,
+    items: impl IntoIterator&lt;Item = (KeyRef, T)&gt;,
+    interior: Requirement,
+    leaf: Requirement,
+    limit: NonZeroUsize,
+) -&gt; Result&lt;Vec&lt;RoutedLeafGroup&lt;T&gt;&gt;, StorageError&gt;;</pre>
+        <p>Both methods use direct descent for zero or one item. Two or more items use the path-aware ready set owned by <code>TreeRouter</code>. Existing garbage-collection call sites pass one, so this effort does not parallelize garbage collection.</p>
+      </article>
+
+      <article class="interface-card">
+        <h3>Physical point validation</h3>
+        <pre>pub async fn check_leaves_current(
+    &amp;self,
+    observations: &amp;[LeafObservation],
+    validation_start: SequencePoint,
+    limit: NonZeroUsize,
+) -&gt; Vec&lt;Result&lt;LeafObservationCheck, StorageError&gt;&gt;;</pre>
+        <p>Outputs align with inputs. Exact equal states can share one check. Different revisions and independent absences cannot.</p>
+      </article>
+
+      <article class="interface-card">
+        <h3>Logical point validation</h3>
+        <pre>pub(crate) async fn effective_point_states(
+    &amp;self,
+    keys: &amp;[KeyRef],
+    validation_start: SequencePoint,
+    limit: NonZeroUsize,
+) -&gt; Result&lt;Vec&lt;PointValidationState&gt;, StorageError&gt;;</pre>
+        <p>The vector aligns with normalized point reads. One leaf resolves its keys serially; different leaves can wait in parallel.</p>
+      </article>
+
+      <article class="interface-card">
+        <h3>Selected <code>KeyLocker</code> fields and existing seams</h3>
+        <pre>struct KeyLocker {
+    normal_limit: NonZeroUsize,
+    write_back_limit: NonZeroUsize,
+}
+
+async fn lock_at(
+    &amp;self,
+    id: &amp;TxId,
+    accesses: &amp;AccessSet,
+    serial: bool,
+    scan_requirement: Requirement,
+) -&gt; Result&lt;LockOutcome, TransError&gt;;
+
+async fn write_back(
+    &amp;self,
+    id: &amp;TxId,
+    locked: &amp;LockedTx,
+) -&gt; Vec&lt;TxId&gt;;</pre>
+        <p>Callers still supply complete domain values. The normal branch uses the private bound. The sorted serial branch does not. Write-back bounds original <code>LockedTx</code> groups.</p>
+      </article>
+
+      <article class="interface-card">
+        <h3>Lock proof</h3>
+        <pre>enum LockProof {
+    Installed(LeafLockEvidence),
+    Observed(LeafLockEvidence),
+}
+
+struct LeafLockEvidence {
+    observation: LeafObservation,
+    held: HeldLeaf,
+}</pre>
+        <p>The proof supplies path, held strengths, and the write-back lower bound. Only <code>Installed</code> can take the exact physical validation shortcut.</p>
+      </article>
+
+      <article class="interface-card">
+        <h3>Coordinator observation receipt</h3>
+        <pre>pub(crate) struct CoordinatedOutcome {
+    pub(crate) outcome: FoldOutcome,
+    pub(crate) cas_precondition: Option&lt;LeafObservation&gt;,
+    pub(crate) loaded_observation: Option&lt;LeafObservation&gt;,
+}</pre>
+        <p>A landed staged member has a CAS precondition. A skipped complete same-identity hold has its loaded observation. Reroute, exhaustion, and shutdown have neither.</p>
+      </article>
+
+      <article class="interface-card">
+        <h3>Owner-level serial transition</h3>
+        <pre>pub enum AttemptControl {
+    Complete,
+    RenewForSerial { replay_body: bool },
+}
+
+Engine::retire_for_serial(
+    &amp;self,
+    &amp;mut EngineTransaction,
+)
+    -&gt; Result&lt;(), TransError&gt;;
+
+Engine::rebegin_for_serial(
+    &amp;self,
+    EngineTransaction,
+) -&gt; EngineTransaction;</pre>
+        <p><code>Algo::commit</code> and locked read validation return the control value. <code>AttemptDriver</code> owns the loop. Retirement closes old admission and persists <code>Wounded</code> before renewal.</p>
+      </article>
+
+      <article class="interface-card">
+        <h3>Feature-gated benchmark opening</h3>
+        <pre>#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod benchmark {
+    pub struct PointLeafLimits {
+        pub routing: NonZeroUsize,
+        pub physical_validation: NonZeroUsize,
+        pub logical_validation: NonZeroUsize,
+        pub normal_locking: NonZeroUsize,
+        pub write_back: NonZeroUsize,
+    }
+
+    impl PointLeafLimits {
+        pub fn all(limit: NonZeroUsize) -&gt; Self;
+    }
+
+    pub async fn open_with_point_leaf_limits(
+        builder: DatabaseBuilder,
+        limits: PointLeafLimits,
+    ) -&gt; Result&lt;Database, Error&gt;;
+}</pre>
+        <p>The free function consumes a configured builder through a crate-private hook. Production builds have no limit setting, and several benchmark clients can use the same explicit value without global state.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="files-title">
+    <h2 id="files-title">File-level change ledger</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>File</th><th>Change</th><th>Invariant owned there</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="path">crates/glassdb-concurr/src/join.rs<br>crates/glassdb-concurr/src/lib.rs</td>
+            <td>Add and export the generic bounded join. Add direct zero/one branches.</td>
+            <td>At most <code>N</code> incomplete futures; every input; stable output; drop safety.</td>
+          </tr>
+          <tr>
+            <td class="path">crates/glassdb-storage/src/tree_router.rs<br>crates/glassdb-storage/src/lib.rs<br>crates/glassdb-storage/Cargo.toml</td>
+            <td>Rename <code>LeafGroup</code>; replace serial per-key grouping with path-batched descent; keep direct one-item descent; add the futures dependency.</td>
+            <td>B-link correction, path convergence, terminal reprocessing, stable groups, smallest-ordinal error.</td>
+          </tr>
+          <tr>
+            <td class="path">crates/glassdb-storage/src/node_store.rs</td>
+            <td>Add input-aligned batch currentness checks grouped by physical path.</td>
+            <td>One path runs serially; exact states combine; evidence advances for every clone.</td>
+          </tr>
+          <tr>
+            <td class="path">crates/glassdb-trans/src/engine.rs</td>
+            <td>Add private phase limits and production defaults. Pass each limit to its owner during engine assembly.</td>
+            <td>No public setting; each phase invocation uses its own nonzero limit.</td>
+          </tr>
+          <tr>
+            <td class="path">crates/glassdb-trans/src/algo/direct_commit.rs</td>
+            <td>Depend on <code>TreeRouter</code>; reject zero policy and oversized values before routing; remove <code>KeyResolver::route_one_leaf</code>. Define <code>candidates</code> as static-policy-admissible one-leaf members.</td>
+            <td>One complete direct member, one leaf, stable counter meaning, no added one-key backend operation.</td>
+          </tr>
+          <tr>
+            <td class="path">crates/glassdb-trans/src/key_resolver.rs</td>
+            <td>Return input-aligned point states; route the complete set; bound leaf futures; select stable errors.</td>
+            <td>One validation lower bound and complete snapshot-transparent interpretation.</td>
+          </tr>
+          <tr>
+            <td class="path">crates/glassdb-trans/src/gc.rs</td>
+            <td>Pass a routing limit of one at the two existing grouping call sites.</td>
+            <td>The new router signature does not add parallel garbage-collection work.</td>
+          </tr>
+          <tr>
+            <td class="path">crates/glassdb-trans/src/shard_coord.rs<br>crates/glassdb-trans/src/node_locking.rs<br>crates/glassdb-trans/src/tlocker.rs</td>
+            <td>Return the loaded observation for skipped members; carry installed versus observed proofs; recognize complete retained holds; bound acquisition and write-back; remove foreground release control.</td>
+            <td>One ordered mutation stream per leaf; full-set retry; proof completeness; local write-back failure.</td>
+          </tr>
+          <tr>
+            <td class="path">crates/glassdb-trans/src/algo.rs<br>crates/glassdb-trans/src/algo/attempt.rs<br>crates/glassdb-trans/src/engine.rs<br>crates/glassdb/src/db.rs</td>
+            <td>Batch point validation; return serial-renewal control; retire and renew in an <code>AttemptDriver</code> inner loop; resample the validation lower bound.</td>
+            <td>Old identity is durably <code>Wounded</code> first; no point/range body replay; one transaction-object commit point.</td>
+          </tr>
+          <tr>
+            <td class="path">crates/glassdb/src/diagnostics.rs</td>
+            <td>If retained, describe the confirmed-hold ledger as best-effort and non-authoritative. Document stable <code>glassdb::write_back</code> failure events.</td>
+            <td>Operator visibility cannot become protocol state; local write-back failures remain diagnosable.</td>
+          </tr>
+          <tr>
+            <td class="path">crates/glassdb/Cargo.toml<br>crates/glassdb-trans/Cargo.toml<br>crates/glassdb-bench-scale/Cargo.toml<br>crates/glassdb-bench-scale/src/bin/perfbench/main.rs<br>crates/glassdb-bench-scale/src/bin/perfbench/point_leaves/<br>hack/aws-bench/run-perfbench.sh<br>hack/aws-bench/README.md<br>hack/aws-bench/compare.py</td>
+            <td>Add the non-default benchmark feature, the calibration scenario, its result shape, and paired comparison support.</td>
+            <td>Measured limit selection without a production setting or global state.</td>
+          </tr>
+          <tr>
+            <td class="path">docs/adr/064-bounded-point-leaf-work-and-renewed-serial-fallback.md<br>docs/architecture.md<br>docs/designs/object-storage-native.md<br>docs/guides/caching.md<br>docs/guides/perf.md (after measurements)</td>
+            <td>Add one decision record and update living descriptions of acquisition, validation proof, serial renewal, and write-back.</td>
+            <td>Frozen older ADR bodies remain unchanged; living documents match the implemented protocol.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="order-title">
+    <h2 id="order-title">Implementation order</h2>
+    <div class="order">
+      <span class="order-number">1</span>
+      <h3>Build the generic primitive</h3>
+      <p>Add <code>join_all_bounded</code> and prove its direct paths, bound, stable order, all-input behavior, and drop behavior before domain code depends on it.</p>
+    </div>
+    <div class="order">
+      <span class="order-number">2</span>
+      <h3>Make routing produce the canonical temporary value</h3>
+      <p>Add <code>RoutedLeafGroup</code> and path-batched descent. Move direct commit to <code>TreeRouter</code>. Remove <code>route_one_leaf</code> only after all callers move.</p>
+    </div>
+    <div class="order">
+      <span class="order-number">3</span>
+      <h3>Make validation input-aligned</h3>
+      <p>Add physical and logical batch interfaces. Integrate one shared lower bound while range validation stays in its current order.</p>
+    </div>
+    <div class="order">
+      <span class="order-number">4</span>
+      <h3>Add retained-lock proofs</h3>
+      <p>Teach the coordinator and <code>AcquireOperation</code> to produce <code>Installed</code> or <code>Observed</code>. Change <code>LockedTx::validated</code> to direct path lookup.</p>
+    </div>
+    <div class="order">
+      <span class="order-number">5</span>
+      <h3>Change retry and renewal as one safety unit</h3>
+      <p>Add bounded normal acquisition, full-set retry, durable <code>Wounded</code> retirement, and forced serial renewal. Only then remove foreground release as control state.</p>
+    </div>
+    <div class="order">
+      <span class="order-number">6</span>
+      <h3>Bound committed write-back</h3>
+      <p>Bound original <code>LockedTx</code> groups. Keep split descendants serial inside their original position and flatten hints only after all positions finish.</p>
+    </div>
+    <div class="order">
+      <span class="order-number">7</span>
+      <h3>Verify, calibrate, and record</h3>
+      <p>Add deterministic regressions, run the 8/16/32 benchmark sweep against the parent revision, write the new ADR, update only status/link lines in older ADRs, and run <code>make test-all</code>.</p>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="verification-title">
+    <h2 id="verification-title">Verification and rejection gates</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Surface</th><th>Deterministic regression</th><th>Acceptance</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>join_all_bounded</code></td>
+            <td>Zero, one, reverse completion, value errors, 17 gated futures at limit 16, all-input execution, and drop of active plus stored futures.</td>
+            <td>Stable input outputs; maximum incomplete count is 16.</td>
+          </tr>
+          <tr>
+            <td>Routing</td>
+            <td>Shared paths, cold 1/2/8/32 leaves, stale separator, converging right links, former leaf becoming index, stable error ordinal.</td>
+            <td>About <code>ceil(L/16)</code> cold waves; one key has the parent operation count.</td>
+          </tr>
+          <tr>
+            <td>Direct commit</td>
+            <td>Zero inline policy, oversized values, one eligible leaf, multi-leaf fallback, reroute, locked outcome, and candidate counters.</td>
+            <td>Static rejection does not descend; fallback reroutes independently through <code>KeyLocker</code>.</td>
+          </tr>
+          <tr>
+            <td>Physical validation</td>
+            <td>Exact-state clones, different revisions on one path, independent absences, stable mixed errors, 17 gated paths.</td>
+            <td>Every input gets a result and matching evidence advances.</td>
+          </tr>
+          <tr>
+            <td>Logical validation</td>
+            <td>Committed, not-written, deleted, pending, unknown, aborted, and wounded holders; stable result and error ordinals.</td>
+            <td>Only exact <code>Installed</code> own-holder evidence avoids logical work.</td>
+          </tr>
+          <tr>
+            <td>Normal acquisition</td>
+            <td>Foreign wait occupies one position; conflict and leaf-full retain locks; full and partial same-identity holds; uncertain landed CAS; stable mixed outcome.</td>
+            <td>No foreground release between normal passes and no partial proof enters retry.</td>
+          </tr>
+          <tr>
+            <td>Serial renewal</td>
+            <td>Gate old conditional write after dispatch; timeout and conflict threshold; old <code>Wounded</code> before new publish; new validation lower bound; collection-directory lock reacquisition; point/range one body run; collection change repeats body.</td>
+            <td>Late old write is abort-side; new identity uses sorted serial acquisition.</td>
+          </tr>
+          <tr>
+            <td>Write-back</td>
+            <td>17 original groups, split descendants, structural deferral, one-leaf failure, routing failure, stable duplicate hints, graceful shutdown.</td>
+            <td>Every original group runs; one position survives rerouting; no committed error escapes.</td>
+          </tr>
+          <tr>
+            <td>Simulation</td>
+            <td>Replay each new difficult case under normal and simulation builds with the same seed and schedule.</td>
+            <td>The selected outcomes and backend operation stream reproduce.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin-top: 24px;">Performance matrix</h3>
+    <ul>
+      <li>Exact 1, 2, 8, and 32 distinct-leaf fixtures: one pre-created key in each of that many collections.</li>
+      <li>Warm decoded cache and cache capacity zero; memory, simulated GCS, and simulated S3 backends.</li>
+      <li>Add explicit <code>none</code>, <code>gcs</code>, and <code>s3</code> delay profiles so bare memory is a real cell and reports do not hide the selected profile. Keep provider throttling for GCS and S3.</li>
+      <li>Point reads, logged blind overwrites with <code>InlinePolicy::none()</code>, and logged point read-modify-write transactions.</li>
+      <li>One and multiple <code>Database</code> clients, the existing worker sweep, at least three converged paired runs, and cross-run medians.</li>
+      <li>Record p50, p95, transactions per second, reads and writes per transaction, retries, lock calls, maximum active backend operations, and shutdown debt.</li>
+      <li>Treat peak backend work as a whole-workload measure. Caller-joined public reads can make it larger than 16; deterministic unit gates prove each internal phase limit.</li>
+      <li>Keep a candidate only if every one-leaf operation sequence matches the parent, every primary cell is at least 95% of the best candidate, and no repeatable parent regression exceeds 5%.</li>
+    </ul>
+  </section>
+
+  <section class="section" aria-labelledby="explorer-title">
+    <div class="toolbar">
+      <div>
+        <h2 id="explorer-title">Drive the difficult transitions</h2>
+        <p class="lede">The model shows the complete relevant state after each action. An invalid action records why it cannot run.</p>
+      </div>
+      <button id="reset" class="warn" type="button">Reset model</button>
+    </div>
+
+    <div class="button-row" id="free-play" aria-label="Free-play actions"></div>
+
+    <div class="state-grid">
+      <div class="stat"><span>Phase</span><strong id="state-phase"></strong></div>
+      <div class="stat"><span>Transaction identity</span><strong id="state-identity"></strong></div>
+      <div class="stat"><span>Acquisition mode</span><strong id="state-mode"></strong></div>
+      <div class="stat"><span>Transaction body runs</span><strong id="state-body-runs"></strong></div>
+      <div class="stat"><span>Validation lower bound</span><strong id="state-validation"></strong></div>
+      <div class="stat"><span>Selected outcome</span><strong id="state-outcome"></strong></div>
+      <div class="stat"><span>Routed groups</span><strong id="state-groups"></strong></div>
+      <div class="stat"><span>Incomplete positions</span><strong id="state-incomplete"></strong></div>
+      <div class="stat"><span>Backend waves</span><strong id="state-waves"></strong></div>
+      <div class="stat"><span>Current locks</span><strong id="state-locks"></strong></div>
+      <div class="stat"><span>Lock proofs</span><strong id="state-proofs"></strong></div>
+      <div class="stat"><span>Write-back hints</span><strong id="state-hints"></strong></div>
+    </div>
+
+    <div class="split">
+      <div class="subpanel">
+        <h3>Leaf state</h3>
+        <div class="leaf-grid" id="leaf-grid"></div>
+      </div>
+      <div class="subpanel">
+        <h3>Latest events</h3>
+        <ol class="event-log" id="event-log"></ol>
+      </div>
+    </div>
+
+    <h3 style="margin-top: 22px;">Live invariant checks</h3>
+    <div class="checks" id="checks"></div>
+
+    <div class="tabs" id="scenario-tabs" role="tablist"></div>
+    <div id="scenario-copy" class="guide-copy"></div>
+    <div id="scenario-steps" class="steps"></div>
+  </section>
+
+  <section class="section" aria-labelledby="record-title">
+    <h2 id="record-title">Minimal durable documentation</h2>
+    <div class="scope">
+      <div class="in">
+        <h3>Add one ADR when implementation starts</h3>
+        <p>
+          <code>ADR-064: Bounded point-leaf work and renewed serial fallback</code> records the bounded
+          per-transaction phase policy, retained normal retries, and renewed-identity serial
+          transition. It supersedes only the conflicting release/same-identity statements in
+          ADR-024 and the late-cancelled-acquire assumption in ADR-025. It also narrows ADR-026's
+          statement that release runs during serial fallback; release remains valid for abort and
+          recovery work.
+        </p>
+        <p>Older accepted ADR bodies stay frozen. Add only forward status or supersession links to ADR-064.</p>
+      </div>
+      <div class="out">
+        <h3>Update living documents only</h3>
+        <p>
+          <code>CONTEXT.md</code> already defines leaf, routing, leaf observation, routed leaf
+          group, access set, transaction identity, and snapshot-transparent. No glossary change is
+          needed. Update <code>docs/architecture.md</code>,
+          <code>docs/designs/object-storage-native.md</code>, and
+          <code>docs/guides/caching.md</code> where they describe the changed protocol and proof.
+          Update <code>docs/guides/perf.md</code> only after measured results exist. Do not add a
+          second design document or a public configuration guide.
+        </p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+  const DesignModel = (() => {
+    const LIMIT = 16;
+
+    function leaves(count) {
+      return Array.from({ length: count }, (_, index) => ({
+        path: "L" + String(index).padStart(2, "0"),
+        state: "queued",
+        lock: "none",
+        proof: "none",
+        note: "not admitted"
+      }));
+    }
+
+    function initialState() {
+      return {
+        phase: "Access set",
+        identity: "T0",
+        identityStatus: "Pending",
+        oldIdentity: null,
+        oldIdentityStatus: null,
+        mode: "parallel",
+        bodyRuns: 1,
+        collectionChanges: false,
+        validationStart: "not sampled",
+        groups: 0,
+        incomplete: 0,
+        waves: 0,
+        selectedOutcome: "none",
+        currentLocks: 0,
+        proofs: { installed: 0, observed: 0 },
+        hints: [],
+        leafState: [],
+        writeBackOriginal: 0,
+        writeBackFinished: 0,
+        splitDescendants: 0,
+        ownerOperationUnresolved: false,
+        oldWoundedBeforeRenewal: false,
+        oneLeafExtraOperations: 0,
+        routedEvidenceUsedAsProof: false,
+        everyInputRan: true,
+        events: ["AccessSet is ready. No physical routing is retained."]
+      };
+    }
+
+    function event(state, message) {
+      return { ...state, events: [message, ...state.events].slice(0, 12) };
+    }
+
+    function invalid(state, message) {
+      return event(state, "Action refused: " + message);
+    }
+
+    function route(state, count, collectionChanges) {
+      if (!["Access set", "Normal retry"].includes(state.phase)) {
+        return invalid(state, "routing starts from an access set or a normal retry");
+      }
+      const nextLeaves = leaves(count).map((leaf, index) => ({
+        ...leaf,
+        state: index < Math.min(count, LIMIT) ? "active" : "queued",
+        note: index < Math.min(count, LIMIT) ? "node path is incomplete" : "stored future"
+      }));
+      return event({
+        ...state,
+        phase: "Routing",
+        collectionChanges: Boolean(collectionChanges),
+        groups: count,
+        incomplete: Math.min(count, LIMIT),
+        waves: count === 0 ? 0 : Math.ceil(count / LIMIT),
+        leafState: nextLeaves,
+        selectedOutcome: "none",
+        oneLeafExtraOperations: count === 1 ? 0 : state.oneLeafExtraOperations
+      }, count === 1
+        ? "Direct one-item descent runs. The bounded multi-path queue is not constructed."
+        : count + " distinct leaf paths route in about " + Math.ceil(count / LIMIT) + " waves.");
+    }
+
+    function finishRouting(state) {
+      if (state.phase !== "Routing") {
+        return invalid(state, "routing must be active");
+      }
+      return event({
+        ...state,
+        phase: "Acquisition",
+        incomplete: Math.min(state.groups, LIMIT),
+        validationStart: state.validationStart === "not sampled" ? "v1" : state.validationStart,
+        leafState: state.leafState.map((leaf, index) => ({
+          ...leaf,
+          state: index < Math.min(state.groups, LIMIT) ? "active" : "queued",
+          note: index < Math.min(state.groups, LIMIT) ? "complete leaf operation" : "not admitted"
+        }))
+      }, "Routing returned stable temporary groups. Acquisition sampled validation lower bound " +
+        (state.validationStart === "not sampled" ? "v1." : state.validationStart + "."));
+    }
+
+    function acquireSuccess(state) {
+      if (state.phase !== "Acquisition") {
+        return invalid(state, "acquisition must follow routing");
+      }
+      return event({
+        ...state,
+        phase: "Validation",
+        incomplete: 0,
+        selectedOutcome: "Locked",
+        currentLocks: state.groups,
+        proofs: { installed: state.groups, observed: 0 },
+        leafState: state.leafState.map(leaf => ({
+          ...leaf,
+          state: "held",
+          lock: state.identity,
+          proof: "Installed",
+          note: "lock CAS precondition retained"
+        }))
+      }, "Every complete leaf group returned Locked. LockedTx has one Installed proof per group.");
+    }
+
+    function acquireMixed(state) {
+      if (state.phase !== "Acquisition" || state.groups < 3) {
+        return invalid(state, "the mixed case needs at least three acquiring groups");
+      }
+      const updated = state.leafState.map((leaf, index) => {
+        if (index === 2) {
+          return { ...leaf, state: "waiting", lock: "none", proof: "discarded", note: "Conflict" };
+        }
+        if (index === state.leafState.length - 1) {
+          return { ...leaf, state: "failed", lock: "unknown", proof: "discarded", note: "later storage error" };
+        }
+        return { ...leaf, state: "held", lock: state.identity, proof: "discarded", note: "confirmed hold retained physically" };
+      });
+      return event({
+        ...state,
+        phase: "Normal retry",
+        incomplete: 0,
+        selectedOutcome: "Conflict at L02",
+        currentLocks: Math.max(0, state.groups - 2),
+        proofs: { installed: 0, observed: 0 },
+        leafState: updated,
+        everyInputRan: true
+      }, "All leaf inputs ran. Stable path order selected the L02 Conflict before the later storage error. Partial proofs were discarded.");
+    }
+
+    function retryRetained(state) {
+      if (state.phase !== "Normal retry") {
+        return invalid(state, "a normal retry needs a completed Conflict or LeafFull pass");
+      }
+      const observed = state.leafState.filter(leaf => leaf.lock === state.identity).length;
+      const installed = state.groups - observed;
+      return event({
+        ...state,
+        phase: "Validation",
+        incomplete: 0,
+        selectedOutcome: "Locked after full-set retry",
+        currentLocks: state.groups,
+        proofs: { installed, observed },
+        leafState: state.leafState.map(leaf => ({
+          ...leaf,
+          state: "held",
+          lock: state.identity,
+          proof: leaf.lock === state.identity ? "Observed" : "Installed",
+          note: leaf.lock === state.identity ? "complete hold; no CAS" : "idempotent complete-leaf CAS"
+        }))
+      }, "The complete AccessSet was regrouped. Complete same-identity holds returned Observed without another CAS.");
+    }
+
+    function timeout(state) {
+      if (state.phase !== "Acquisition") {
+        return invalid(state, "a hard timeout applies only to parallel acquisition");
+      }
+      return event({
+        ...state,
+        phase: "Serial renewal required",
+        incomplete: 0,
+        selectedOutcome: "hard timeout",
+        ownerOperationUnresolved: true,
+        leafState: state.leafState.map((leaf, index) => index === 0
+          ? { ...leaf, state: "waiting", lock: "possibly " + state.identity, proof: "none", note: "conditional write result was dropped" }
+          : { ...leaf, state: "queued", note: "future dropped before or during admission" })
+      }, "The bounded join was dropped. The dispatched conditional write can still land, so the owner operation stays unresolved.");
+    }
+
+    function conflictThreshold(state) {
+      if (!["Acquisition", "Normal retry"].includes(state.phase)) {
+        return invalid(state, "the conflict threshold applies during a parallel acquisition episode");
+      }
+      return event({
+        ...state,
+        phase: "Serial renewal required",
+        incomplete: 0,
+        selectedOutcome: "conflict threshold",
+        ownerOperationUnresolved: false
+      }, "The completed conflict threshold selected the same serial-renewal rule as the timeout.");
+    }
+
+    function renewSerial(state) {
+      if (state.phase !== "Serial renewal required") {
+        return invalid(state, "the parallel episode must request serial renewal");
+      }
+      const replay = state.collectionChanges;
+      return event({
+        ...state,
+        phase: replay ? "Access set" : "Routing",
+        oldIdentity: state.identity,
+        oldIdentityStatus: "Wounded",
+        identity: state.identity === "T0" ? "T1" : state.identity + "r",
+        identityStatus: "Pending",
+        mode: "serial",
+        bodyRuns: state.bodyRuns + (replay ? 1 : 0),
+        validationStart: replay ? "not sampled" : "v2",
+        selectedOutcome: replay ? "body replay required" : "renewed for serial",
+        currentLocks: 0,
+        proofs: { installed: 0, observed: 0 },
+        oldWoundedBeforeRenewal: true,
+        ownerOperationUnresolved: false,
+        incomplete: replay ? 0 : 1,
+        leafState: replay ? [] : state.leafState.map((leaf, index) => ({
+          ...leaf,
+          state: index === 0 ? "active" : "queued",
+          lock: "old " + state.identity,
+          proof: "none",
+          note: index === 0 ? "new identity acquires in path order" : "waits for prior path"
+        }))
+      }, replay
+        ? "The old identity is durably Wounded. Collection create/drop repeats the transaction body under a forced-serial replacement."
+        : "The old identity is durably Wounded. The same AccessSet and normal outcome continue under a forced-serial replacement and new lower bound v2.");
+    }
+
+    function acquireSerial(state) {
+      if (state.mode !== "serial" || state.phase !== "Routing") {
+        return invalid(state, "the renewed point/range attempt must be ready in forced serial mode");
+      }
+      return event({
+        ...state,
+        phase: "Validation",
+        incomplete: 0,
+        selectedOutcome: "Locked in sorted order",
+        currentLocks: state.groups,
+        proofs: { installed: state.groups, observed: 0 },
+        leafState: state.leafState.map(leaf => ({
+          ...leaf,
+          state: "held",
+          lock: state.identity,
+          proof: "Installed",
+          note: "acquired in ascending path order"
+        }))
+      }, "The renewed identity reclaimed old abort-side locks as needed and acquired every group in ascending path order.");
+    }
+
+    function validate(state) {
+      if (state.phase !== "Validation") {
+        return invalid(state, "every required lock must be held first");
+      }
+      return event({
+        ...state,
+        phase: "Validated",
+        selectedOutcome: "snapshot valid"
+      }, "Physical proofs and, where required, logical states validated the complete point-read set at " + state.validationStart + ".");
+    }
+
+    function commit(state) {
+      if (state.phase !== "Validated") {
+        return invalid(state, "validation must finish before the commit point");
+      }
+      return event({
+        ...state,
+        phase: "Committed",
+        identityStatus: "Ok",
+        selectedOutcome: "committed",
+        incomplete: 0
+      }, "The transaction object became Ok. This is the one cross-leaf commit point.");
+    }
+
+    function startWriteBack(state) {
+      if (state.phase !== "Committed") {
+        return invalid(state, "write-back starts only after the durable commit point");
+      }
+      return event({
+        ...state,
+        phase: "Write-back",
+        writeBackOriginal: state.groups,
+        writeBackFinished: 0,
+        incomplete: Math.min(state.groups, LIMIT),
+        selectedOutcome: "best-effort publication",
+        leafState: state.leafState.map((leaf, index) => ({
+          ...leaf,
+          state: index < Math.min(state.groups, LIMIT) ? "active" : "queued",
+          note: index < Math.min(state.groups, LIMIT) ? "one original group position" : "stored group future"
+        }))
+      }, "Original LockedTx groups entered the bounded write-back pass in stable path order.");
+    }
+
+    function splitWriteBack(state) {
+      if (state.phase !== "Write-back" || state.groups === 0) {
+        return invalid(state, "a live write-back position must reroute");
+      }
+      const target = state.leafState[Math.min(2, state.leafState.length - 1)];
+      return event({
+        ...state,
+        splitDescendants: 2,
+        leafState: state.leafState.map(leaf => leaf.path === target.path
+          ? { ...leaf, state: "active", note: "rerouted to " + leaf.path + "a then " + leaf.path + "b inside one position" }
+          : leaf)
+      }, target.path + " split. Its two current descendants run serially inside the original bounded position.");
+    }
+
+    function finishWriteBack(state) {
+      if (state.phase !== "Write-back") {
+        return invalid(state, "write-back must be active");
+      }
+      const hints = state.leafState.flatMap((leaf, index) => index % 3 === 0 ? ["old-" + leaf.path] : []);
+      return event({
+        ...state,
+        phase: "Done",
+        incomplete: 0,
+        writeBackFinished: state.writeBackOriginal,
+        hints,
+        currentLocks: 0,
+        leafState: state.leafState.map((leaf, index) => ({
+          ...leaf,
+          state: index === 1 ? "failed" : "held",
+          lock: "released or recovery-owned",
+          note: index === 1 ? "local failure recorded; siblings continued" : "publication complete"
+        }))
+      }, "Every original group ran. Stable duplicate hints were flattened once after local failures and deferrals were isolated.");
+    }
+
+    function reduce(state, action) {
+      switch (action.type) {
+        case "RESET": return initialState();
+        case "ROUTE_ONE": return route(state, 1, false);
+        case "ROUTE_EIGHTEEN": return route(state, 18, false);
+        case "ROUTE_COLLECTIONS": return route(state, 3, true);
+        case "FINISH_ROUTING": return finishRouting(state);
+        case "ACQUIRE_SUCCESS": return acquireSuccess(state);
+        case "ACQUIRE_MIXED": return acquireMixed(state);
+        case "RETRY_RETAINED": return retryRetained(state);
+        case "TIMEOUT": return timeout(state);
+        case "CONFLICT_THRESHOLD": return conflictThreshold(state);
+        case "RENEW_SERIAL": return renewSerial(state);
+        case "ACQUIRE_SERIAL": return acquireSerial(state);
+        case "VALIDATE": return validate(state);
+        case "COMMIT": return commit(state);
+        case "START_WRITEBACK": return startWriteBack(state);
+        case "SPLIT_WRITEBACK": return splitWriteBack(state);
+        case "FINISH_WRITEBACK": return finishWriteBack(state);
+        default: return invalid(state, "unknown action");
+      }
+    }
+
+    function checks(state) {
+      const hasRenewal = state.oldIdentity !== null;
+      return [
+        {
+          name: "Bounded incomplete work",
+          status: state.incomplete <= LIMIT ? "pass" : "fail",
+          detail: state.incomplete + " incomplete positions; limit is " + LIMIT + ". Waiting work counts."
+        },
+        {
+          name: "Stable all-input result",
+          status: state.everyInputRan ? "pass" : "fail",
+          detail: "A domain outcome does not stop later admission. Selection uses stable input or path order."
+        },
+        {
+          name: "Routing is temporary evidence",
+          status: state.routedEvidenceUsedAsProof ? "fail" : "pass",
+          detail: "Only Installed or Observed can prove a lock. A routed leaf group cannot."
+        },
+        {
+          name: "One-leaf regression",
+          status: state.groups === 1
+            ? (state.oneLeafExtraOperations === 0 ? "pass" : "fail")
+            : "pending",
+          detail: state.groups === 1
+            ? "The bounded design added " + state.oneLeafExtraOperations + " backend operations."
+            : "Run the one-leaf case to inspect this gate."
+        },
+        {
+          name: "Identity-safe serial transition",
+          status: hasRenewal
+            ? (state.oldWoundedBeforeRenewal && state.oldIdentityStatus === "Wounded" ? "pass" : "fail")
+            : "pending",
+          detail: hasRenewal
+            ? state.oldIdentity + " is " + state.oldIdentityStatus + " before " + state.identity + " publishes."
+            : "Run a timeout or conflict-threshold case."
+        },
+        {
+          name: "Transaction body replay rule",
+          status: state.collectionChanges
+            ? (hasRenewal ? (state.bodyRuns === 2 ? "pass" : "fail") : "pending")
+            : (state.bodyRuns === 1 ? "pass" : "fail"),
+          detail: state.collectionChanges
+            ? "Collection create/drop repeats the body after renewal."
+            : "Point and range serial renewal retains one transaction-body outcome."
+        },
+        {
+          name: "One logged commit point",
+          status: ["Committed", "Write-back", "Done"].includes(state.phase)
+            ? (state.identityStatus === "Ok" ? "pass" : "fail")
+            : "pending",
+          detail: "Committed write-back never creates a second cross-leaf commit decision."
+        },
+        {
+          name: "Write-back position ownership",
+          status: state.splitDescendants > 0
+            ? (state.incomplete <= Math.min(state.writeBackOriginal, LIMIT) ? "pass" : "fail")
+            : "pending",
+          detail: state.splitDescendants > 0
+            ? "Split descendants stayed inside one original group position."
+            : "Run the split write-back case."
+        }
+      ];
+    }
+
+    return { initialState, reduce, checks };
+  })();
+
+  const actions = [
+    ["Route 1 leaf", "ROUTE_ONE"],
+    ["Route 18 leaves", "ROUTE_EIGHTEEN"],
+    ["Route collection changes", "ROUTE_COLLECTIONS"],
+    ["Finish routing", "FINISH_ROUTING"],
+    ["Acquire all", "ACQUIRE_SUCCESS"],
+    ["Return mixed outcomes", "ACQUIRE_MIXED"],
+    ["Retry retained locks", "RETRY_RETAINED"],
+    ["Hit hard timeout", "TIMEOUT"],
+    ["Hit conflict threshold", "CONFLICT_THRESHOLD"],
+    ["Retire and renew", "RENEW_SERIAL"],
+    ["Acquire serially", "ACQUIRE_SERIAL"],
+    ["Validate", "VALIDATE"],
+    ["Commit", "COMMIT"],
+    ["Start write-back", "START_WRITEBACK"],
+    ["Reroute one split group", "SPLIT_WRITEBACK"],
+    ["Finish write-back", "FINISH_WRITEBACK"]
+  ];
+
+  const scenarios = [
+    {
+      id: "one-leaf",
+      title: "One-leaf fast behavior",
+      copy: "Watch the direct routing and bounded-join branches. The design may change scheduling code, but it must add no backend operation to a one-leaf transaction.",
+      steps: [
+        ["Route the one logical key", "ROUTE_ONE"],
+        ["Finish its direct descent", "FINISH_ROUTING"],
+        ["Acquire the complete leaf group", "ACQUIRE_SUCCESS"],
+        ["Validate the snapshot", "VALIDATE"],
+        ["Commit once", "COMMIT"],
+        ["Start best-effort write-back", "START_WRITEBACK"],
+        ["Finish the one original group", "FINISH_WRITEBACK"]
+      ]
+    },
+    {
+      id: "retained",
+      title: "Full-set normal retry",
+      copy: "A lower-path Conflict wins over a later storage error, but every supplied leaf runs. The next pass rebuilds every group and recognizes complete same-identity holds without a CAS.",
+      steps: [
+        ["Route eighteen independent leaves", "ROUTE_EIGHTEEN"],
+        ["Finish routing", "FINISH_ROUTING"],
+        ["Return a Conflict and a later error", "ACQUIRE_MIXED"],
+        ["Retry the complete set", "RETRY_RETAINED"],
+        ["Validate Installed and Observed proofs", "VALIDATE"]
+      ]
+    },
+    {
+      id: "timeout",
+      title: "Late write and serial renewal",
+      copy: "A timeout drops a dispatched conditional write before its result is known. The old identity must become durably Wounded before a forced-serial replacement can publish.",
+      steps: [
+        ["Route eighteen independent leaves", "ROUTE_EIGHTEEN"],
+        ["Start normal parallel acquisition", "FINISH_ROUTING"],
+        ["Drop the pass at the hard timeout", "TIMEOUT"],
+        ["Retire and renew the identity", "RENEW_SERIAL"],
+        ["Acquire with the global path order", "ACQUIRE_SERIAL"],
+        ["Validate at the new lower bound", "VALIDATE"],
+        ["Commit the replacement identity", "COMMIT"]
+      ]
+    },
+    {
+      id: "collection",
+      title: "Collection-change replay",
+      copy: "Collection create/drop resources do not transfer to the replacement identity. This one case uses the existing wound-style transaction-body replay, but the renewed attempt remains forced serial.",
+      steps: [
+        ["Route a transaction with collection changes", "ROUTE_COLLECTIONS"],
+        ["Start normal acquisition", "FINISH_ROUTING"],
+        ["Reach the conflict threshold", "CONFLICT_THRESHOLD"],
+        ["Retire, renew, and repeat the body", "RENEW_SERIAL"]
+      ]
+    },
+    {
+      id: "writeback",
+      title: "Split during write-back",
+      copy: "One original LockedTx group can become two current leaves. Both descendants stay serial inside that original bounded position, while other original groups remain independent.",
+      steps: [
+        ["Route eighteen leaves", "ROUTE_EIGHTEEN"],
+        ["Finish routing", "FINISH_ROUTING"],
+        ["Acquire every group", "ACQUIRE_SUCCESS"],
+        ["Validate", "VALIDATE"],
+        ["Commit", "COMMIT"],
+        ["Start bounded write-back", "START_WRITEBACK"],
+        ["Split one original target", "SPLIT_WRITEBACK"],
+        ["Finish all original positions", "FINISH_WRITEBACK"]
+      ]
+    }
+  ];
+
+  let state = DesignModel.initialState();
+  let activeScenario = { id: scenarios[0].id, completed: 0 };
+
+  function dispatch(type, guided) {
+    state = DesignModel.reduce(state, { type });
+    if (guided) {
+      activeScenario.completed += 1;
+    }
+    render();
+  }
+
+  function startScenario(id) {
+    activeScenario.id = id;
+    activeScenario.completed = 0;
+    state = DesignModel.initialState();
+    render();
+  }
+
+  function text(id, value) {
+    document.getElementById(id).textContent = String(value);
+  }
+
+  function renderState() {
+    text("state-phase", state.phase);
+    text("state-identity", state.identity + " / " + state.identityStatus);
+    text("state-mode", state.mode);
+    text("state-body-runs", state.bodyRuns);
+    text("state-validation", state.validationStart);
+    text("state-outcome", state.selectedOutcome);
+    text("state-groups", state.groups);
+    text("state-incomplete", state.incomplete + " / 16");
+    text("state-waves", state.waves);
+    text("state-locks", state.currentLocks);
+    text("state-proofs", state.proofs.installed + " installed, " + state.proofs.observed + " observed");
+    text("state-hints", state.hints.length);
+
+    document.querySelectorAll("#phase-flow .phase").forEach(node => {
+      const current = node.dataset.phase;
+      const matches =
+        (current === "Routing" && state.phase === "Routing") ||
+        (current === "Acquisition" && ["Acquisition", "Normal retry", "Serial renewal required"].includes(state.phase)) ||
+        (current === "Validation" && ["Validation", "Validated"].includes(state.phase)) ||
+        (current === "Committed" && state.phase === "Committed") ||
+        (current === "Write-back" && ["Write-back", "Done"].includes(state.phase));
+      node.classList.toggle("current", matches);
+    });
+  }
+
+  function renderLeaves() {
+    const grid = document.getElementById("leaf-grid");
+    grid.replaceChildren();
+    if (state.leafState.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = "No physical leaf state is retained.";
+      grid.append(empty);
+      return;
+    }
+    state.leafState.forEach(leaf => {
+      const card = document.createElement("div");
+      card.className = "leaf " + leaf.state;
+      const name = document.createElement("strong");
+      name.textContent = leaf.path;
+      const lock = document.createElement("span");
+      lock.textContent = "lock: " + leaf.lock;
+      const proof = document.createElement("span");
+      proof.textContent = "proof: " + leaf.proof;
+      const note = document.createElement("span");
+      note.textContent = leaf.note;
+      card.append(name, lock, proof, note);
+      grid.append(card);
+    });
+  }
+
+  function renderEvents() {
+    const log = document.getElementById("event-log");
+    log.replaceChildren();
+    state.events.forEach(message => {
+      const item = document.createElement("li");
+      item.textContent = message;
+      log.append(item);
+    });
+  }
+
+  function renderChecks() {
+    const root = document.getElementById("checks");
+    root.replaceChildren();
+    DesignModel.checks(state).forEach(item => {
+      const card = document.createElement("div");
+      card.className = "check";
+      const name = document.createElement("strong");
+      name.textContent = item.name;
+      const status = document.createElement("span");
+      status.className = "status " + item.status;
+      status.textContent = item.status;
+      const detail = document.createElement("p");
+      detail.textContent = item.detail;
+      card.append(name, status, detail);
+      root.append(card);
+    });
+  }
+
+  function renderScenario() {
+    const tabs = document.getElementById("scenario-tabs");
+    tabs.replaceChildren();
+    scenarios.forEach(scenario => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = scenario.title;
+      button.classList.toggle("active", scenario.id === activeScenario.id);
+      button.addEventListener("click", () => startScenario(scenario.id));
+      tabs.append(button);
+    });
+
+    const scenario = scenarios.find(item => item.id === activeScenario.id);
+    document.getElementById("scenario-copy").textContent = scenario.copy;
+    const steps = document.getElementById("scenario-steps");
+    steps.replaceChildren();
+    scenario.steps.forEach((step, index) => {
+      const row = document.createElement("div");
+      row.className = "step" + (index < activeScenario.completed ? " done" : "");
+      const number = document.createElement("span");
+      number.className = "step-number";
+      number.textContent = index + 1;
+      const label = document.createElement("span");
+      label.textContent = step[0];
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = index < activeScenario.completed ? "Run again" : "Run step";
+      button.className = index === activeScenario.completed ? "primary" : "";
+      button.addEventListener("click", () => dispatch(step[1], index === activeScenario.completed));
+      row.append(number, label, button);
+      steps.append(row);
+    });
+  }
+
+  function render() {
+    renderState();
+    renderLeaves();
+    renderEvents();
+    renderChecks();
+    renderScenario();
+  }
+
+  const freePlay = document.getElementById("free-play");
+  actions.forEach(action => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = action[0];
+    button.addEventListener("click", () => dispatch(action[1], false));
+    freePlay.append(button);
+  });
+
+  document.getElementById("reset").addEventListener("click", () => {
+    state = DesignModel.initialState();
+    activeScenario.completed = 0;
+    render();
+  });
+
+  render();
+</script>
+</body>
+</html>
