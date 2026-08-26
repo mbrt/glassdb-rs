@@ -10,6 +10,10 @@ The release and write-back deduplication **mechanism** is generalized by
 (Release and WriteBack become installed resolvers); the batching decision is
 unchanged.
 
+[ADR-065](065-renewed-transaction-identity-on-serial-fallback.md) narrows this
+ADR's release rule: release remains valid for abort and recovery work, but
+sorted serial fallback does not use it as foreground control state.
+
 ## Context
 
 ADR-025 routed `Locker::lock_shard` / `lock_root` through a `Dedup` keyed on the

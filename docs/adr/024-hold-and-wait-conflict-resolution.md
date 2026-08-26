@@ -36,6 +36,10 @@ The `Clock`-based time-source detail is superseded by
 [ADR-058](058-process-wide-model-time.md); wait, refresh, and expiry semantics
 are unchanged.
 
+[ADR-065](065-renewed-transaction-identity-on-serial-fallback.md) supersedes
+this ADR's same-identity foreground-release transition to sorted serial
+acquisition. The hold-and-wait and lease-refresh decisions remain unchanged.
+
 [ADR-059](059-pin-foreign-wounds-until-owner-retirement.md) supersedes the
 finite aborted-object fence used by the lazy materialization discussion below.
 A foreign wound of either a missing or pending object is now pinned as
