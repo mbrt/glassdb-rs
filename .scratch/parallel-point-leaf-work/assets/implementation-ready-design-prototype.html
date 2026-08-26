@@ -374,19 +374,20 @@
     <div class="decision-grid">
       <article class="decision-card recommend">
         <span class="badge">Accepted</span>
-        <h3>Use one private limit bundle</h3>
+        <h3>Use one <code>EngineConfig</code> value owned by providers</h3>
         <p>
-          Add a crate-private <code>PointLeafLimits</code> in <code>glassdb-trans</code>. It has one
-          field for each measured phase, with every field initially set to 16. Storage interfaces
-          accept a <code>NonZeroUsize</code>; they do not own product policy.
+          Add one nonzero <code>EngineConfig::transaction_leaf_parallelism</code> value with default 16.
+          Copy it into each point-leaf provider when the engine graph is built. Domain methods do
+          not accept per-call limits.
         </p>
         <ul>
-          <li>No <code>DatabaseBuilder</code> setting, database-wide semaphore, process-wide semaphore, or shared backend handle.</li>
-          <li>A non-default <code>bench-internals</code> feature exposes one hidden benchmark opening function, not a builder setter.</li>
-          <li><code>PointLeafLimits::all(n)</code> supports the first sweep; separate fields permit a measured lower value for one phase.</li>
+          <li><code>TreeRouter</code>, <code>NodeStore</code>, <code>KeyResolver</code>, and <code>KeyLocker</code> each own a copy as <code>parallelism</code>.</li>
+          <li>Only the generic <code>join_all_bounded</code> primitive accepts a per-call limit.</li>
+          <li>No phase-limit bundle, <code>DatabaseBuilder</code> setting, benchmark feature, database-wide semaphore, process-wide semaphore, or shared backend handle.</li>
+          <li>Calibration changes the default or uses a temporary local seam, then removes that edit.</li>
           <li>The value is an absolute submission bound. It is not a guaranteed percentage of backend capacity.</li>
           <li>An eight-leaf phase creates eight futures. The unused positions reserve no work or backend capacity.</li>
-          <li>The five fields share a common numeric default, not runtime admission state.</li>
+          <li>The provider copies share no runtime admission state.</li>
         </ul>
       </article>
 
@@ -460,11 +461,13 @@
         <h3>Return a typed serial-renewal action to <code>AttemptDriver</code></h3>
         <p>
           <code>Algo</code> reports that the parallel acquisition episode must end.
-          <code>AttemptDriver</code> then makes the old identity <code>Wounded</code>, renews it,
-          arms a new retirement guard, and calls commit again in forced serial mode.
+          <code>AttemptDriver</code> ends the old identity through the general engine path, renews it
+          through <code>rebegin_transaction</code>, arms a new retirement guard, and calls commit
+          again in forced serial mode.
         </p>
         <ul>
-          <li>A hard timeout leaves its owner operation unresolved.</li>
+          <li>A hard timeout leaves its owner operation unresolved, so end pins <code>Wounded</code>. A completed conflict episode can end as <code>Aborted</code>.</li>
+          <li>The old identity is terminal on the abort side before the new identity can publish.</li>
           <li>The new identity samples a new validation lower bound and reacquires collection-directory locks.</li>
           <li>Point and range work retains the transaction body outcome; collection create/drop repeats the body.</li>
         </ul>
@@ -516,7 +519,6 @@ pub async fn group_keys_by_leaf&lt;T&gt;(
     &amp;self,
     items: impl IntoIterator&lt;Item = (KeyRef, T)&gt;,
     requirement: Requirement,
-    limit: NonZeroUsize,
 ) -&gt; Result&lt;Vec&lt;RoutedLeafGroup&lt;T&gt;&gt;, StorageError&gt;;
 
 pub async fn group_keys_by_leaf_fresh&lt;T&gt;(
@@ -524,9 +526,8 @@ pub async fn group_keys_by_leaf_fresh&lt;T&gt;(
     items: impl IntoIterator&lt;Item = (KeyRef, T)&gt;,
     interior: Requirement,
     leaf: Requirement,
-    limit: NonZeroUsize,
 ) -&gt; Result&lt;Vec&lt;RoutedLeafGroup&lt;T&gt;&gt;, StorageError&gt;;</pre>
-        <p>Both methods use direct descent for zero or one item. Two or more items use the path-aware ready set owned by <code>TreeRouter</code>. Existing garbage-collection call sites pass one, so this effort does not parallelize garbage collection.</p>
+        <p><code>TreeRouter</code> provides both methods and owns its parallelism from construction. Both methods use direct descent for zero or one item. Two or more items use its path-aware ready set. The garbage collector constructs a separate router with one, so this effort does not parallelize garbage collection.</p>
       </article>
 
       <article class="interface-card">
@@ -535,9 +536,8 @@ pub async fn group_keys_by_leaf_fresh&lt;T&gt;(
     &amp;self,
     observations: &amp;[LeafObservation],
     validation_start: SequencePoint,
-    limit: NonZeroUsize,
 ) -&gt; Vec&lt;Result&lt;LeafObservationCheck, StorageError&gt;&gt;;</pre>
-        <p>Outputs align with inputs. Exact equal states can share one check. Different revisions and independent absences cannot.</p>
+        <p><code>NodeStore</code> provides this method and owns its parallelism from construction. Outputs align with inputs. Exact equal states can share one check. Different revisions and independent absences cannot.</p>
       </article>
 
       <article class="interface-card">
@@ -547,16 +547,14 @@ pub async fn group_keys_by_leaf_fresh&lt;T&gt;(
     keys: &amp;[KeyRef],
     own_lock_holder: Option&lt;&amp;TxId&gt;,
     validation_start: SequencePoint,
-    limit: NonZeroUsize,
 ) -&gt; Result&lt;Vec&lt;PointValidationState&gt;, StorageError&gt;;</pre>
-        <p>The vector aligns with normalized point reads. Optimistic validation passes no holder. Locked validation passes its transaction identity after <code>LockedTx</code> has proved complete receipts, so an own exclusive hold is not resolved as a foreign writer. One leaf resolves its keys serially; different leaves can wait in parallel.</p>
+        <p><code>KeyResolver</code> provides this method and owns its parallelism from construction. The vector aligns with normalized point reads. Optimistic validation passes no holder. Locked validation passes its transaction identity after <code>LockedTx</code> has proved complete receipts, so an own exclusive hold is not resolved as a foreign writer. One leaf resolves its keys serially; different leaves can wait in parallel.</p>
       </article>
 
       <article class="interface-card">
         <h3>Selected <code>KeyLocker</code> fields and existing seams</h3>
         <pre>struct KeyLocker {
-    normal_limit: NonZeroUsize,
-    write_back_limit: NonZeroUsize,
+    parallelism: NonZeroUsize,
 }
 
 async fn lock_at(
@@ -572,7 +570,7 @@ async fn write_back(
     id: &amp;TxId,
     locked: &amp;LockedTx,
 ) -&gt; Vec&lt;TxId&gt;;</pre>
-        <p>Callers still supply complete domain values. The normal branch uses the private bound. The sorted serial branch does not. Write-back bounds original <code>LockedTx</code> groups.</p>
+        <p><code>KeyLocker</code> receives the same configuration value at construction and uses it for normal acquisition and write-back. Callers still supply complete domain values. The sorted serial branch does not use the bound. Write-back bounds original <code>LockedTx</code> groups.</p>
       </article>
 
       <article class="interface-card">
@@ -602,47 +600,38 @@ async fn write_back(
 
       <article class="interface-card">
         <h3>Owner-level serial transition</h3>
-        <pre>pub enum AttemptControl {
-    Complete,
-    RenewForSerial { replay_body: bool },
+        <pre>enum AcquisitionMode {
+    Parallel,
+    ForcedSerial,
 }
 
-Engine::retire_for_serial(
-    &amp;self,
-    &amp;mut EngineTransaction,
-)
-    -&gt; Result&lt;(), TransError&gt;;
-
-Engine::rebegin_for_serial(
-    &amp;self,
-    EngineTransaction,
-) -&gt; EngineTransaction;</pre>
-        <p><code>Algo::commit</code> and locked read validation return the control value. <code>AttemptDriver</code> owns the loop. Retirement closes old admission and persists <code>Wounded</code> before renewal.</p>
+pub enum AttemptControl {
+    Complete,
+    RenewForSerial { replay_body: bool },
+}</pre>
+        <p><code>Algo::commit</code> and locked read validation return the control value after the handle is marked forced serial. <code>AttemptDriver</code> owns the loop. It awaits the general <code>Engine::end</code> path, then calls the general <code>Engine::rebegin_transaction</code> path. <code>AttemptState::renew</code> preserves forced serial mode. Do not create the new identity if end fails.</p>
       </article>
 
       <article class="interface-card">
-        <h3>Feature-gated benchmark opening</h3>
-        <pre>#[cfg(feature = "bench-internals")]
-#[doc(hidden)]
-pub mod benchmark {
-    pub struct PointLeafLimits {
-        pub routing: NonZeroUsize,
-        pub physical_validation: NonZeroUsize,
-        pub logical_validation: NonZeroUsize,
-        pub normal_locking: NonZeroUsize,
-        pub write_back: NonZeroUsize,
-    }
+        <h3>Engine configuration</h3>
+        <pre>pub struct EngineConfig {
+    transaction_leaf_parallelism: NonZeroUsize,
+    // Existing fields remain.
+}
 
-    impl PointLeafLimits {
-        pub fn all(limit: NonZeroUsize) -&gt; Self;
-    }
+impl EngineConfig {
+    /// Sets how many leaf operations one transaction can run in parallel in each bounded phase.
+    pub fn set_transaction_leaf_parallelism(
+        &amp;mut self,
+        parallelism: NonZeroUsize,
+    );
+}
 
-    pub async fn open_with_point_leaf_limits(
-        builder: DatabaseBuilder,
-        limits: PointLeafLimits,
-    ) -&gt; Result&lt;Database, Error&gt;;
-}</pre>
-        <p>The free function consumes a configured builder through a crate-private hook. Production builds have no limit setting. Several benchmark <code>Database</code> instances can use the same explicit transaction-local value without global state. This interface does not set backend capacity.</p>
+NodeStore::new(objects, parallelism);
+TreeRouter::new(nodes, parallelism);
+KeyResolver::new(router, state, parallelism);
+Locker::new(/* existing dependencies */, parallelism);</pre>
+        <p>The default is 16. <code>Locker::new</code> forwards the value to <code>KeyLocker</code>. Engine assembly copies the same value to each foreground provider; the garbage collector constructs its separate router with one. Benchmark sweeps change the default or add and remove a temporary local seam. There is no lasting benchmark feature, benchmark type, or special opening function.</p>
       </article>
 
       <article class="interface-card">
@@ -683,8 +672,8 @@ struct TelemetryField&lt;T&gt; {
         <tbody>
           <tr>
             <td>Incomplete leaf futures in one bounded phase</td>
-            <td><code>glassdb-trans</code></td>
-            <td>Use the private phase limit. A wait remains incomplete and consumes one position.</td>
+            <td>The domain provider</td>
+            <td>Use its <code>parallelism</code>, copied from <code>EngineConfig::transaction_leaf_parallelism</code>. A wait remains incomplete and consumes one position.</td>
           </tr>
           <tr>
             <td>Active calls and queues across transactions and <code>Database</code> instances</td>
@@ -732,18 +721,18 @@ struct TelemetryField&lt;T&gt; {
           </tr>
           <tr>
             <td class="path">crates/glassdb-storage/src/tree_router.rs<br>crates/glassdb-storage/src/lib.rs<br>crates/glassdb-storage/Cargo.toml</td>
-            <td>Rename <code>LeafGroup</code>; replace serial per-key grouping with path-batched descent; keep direct one-item descent; add the futures dependency.</td>
+            <td>Rename <code>LeafGroup</code>; own routing parallelism from construction; replace serial per-key grouping with path-batched descent; keep direct one-item descent; add the futures dependency.</td>
             <td>B-link correction, path convergence, terminal reprocessing, stable groups, smallest-ordinal error.</td>
           </tr>
           <tr>
             <td class="path">crates/glassdb-storage/src/node_store.rs</td>
-            <td>Add input-aligned batch currentness checks grouped by physical path.</td>
+            <td>Own physical-validation parallelism from construction. Add input-aligned batch currentness checks grouped by physical path.</td>
             <td>One path runs serially; exact states combine; evidence advances for every clone.</td>
           </tr>
           <tr>
             <td class="path">crates/glassdb-trans/src/engine.rs</td>
-            <td>Add private phase limits and production defaults. Pass each limit to its owner during engine assembly.</td>
-            <td>No public setting; each phase invocation uses its own nonzero limit.</td>
+            <td>Add one nonzero <code>EngineConfig::transaction_leaf_parallelism</code> value with default 16. Copy it to each provider as <code>parallelism</code> during engine assembly.</td>
+            <td>One blessed value controls all bounded point-leaf phases without shared runtime admission state.</td>
           </tr>
           <tr>
             <td class="path">crates/glassdb-trans/src/algo/direct_commit.rs</td>
@@ -752,13 +741,13 @@ struct TelemetryField&lt;T&gt; {
           </tr>
           <tr>
             <td class="path">crates/glassdb-trans/src/key_resolver.rs<br>crates/glassdb-trans/src/key_state_resolver.rs</td>
-            <td>Return input-aligned point states; route the complete set; pass the optional own holder into entry interpretation; bound leaf futures; select stable errors.</td>
+            <td>Own logical-validation parallelism from construction; return input-aligned point states; route the complete set; pass the optional own holder into entry interpretation; bound leaf futures; select stable errors.</td>
             <td>One validation lower bound and complete snapshot-transparent interpretation.</td>
           </tr>
           <tr>
             <td class="path">crates/glassdb-trans/src/gc.rs</td>
-            <td>Pass a routing limit of one at the two existing grouping call sites.</td>
-            <td>The new router signature does not add parallel garbage-collection work.</td>
+            <td>Construct the garbage collector's separate <code>TreeRouter</code> with a parallelism of one.</td>
+            <td>Provider ownership does not add parallel garbage-collection work.</td>
           </tr>
           <tr>
             <td class="path">crates/glassdb-trans/src/shard_coord.rs<br>crates/glassdb-trans/src/node_locking.rs<br>crates/glassdb-trans/src/tlocker.rs</td>
@@ -767,8 +756,8 @@ struct TelemetryField&lt;T&gt; {
           </tr>
           <tr>
             <td class="path">crates/glassdb-trans/src/algo.rs<br>crates/glassdb-trans/src/algo/attempt.rs<br>crates/glassdb-trans/src/engine.rs<br>crates/glassdb/src/db.rs</td>
-            <td>Batch point validation; always use logical point validation after lock acquisition; return serial-renewal control; retire and renew in an <code>AttemptDriver</code> inner loop; resample the validation lower bound.</td>
-            <td>Old identity is durably <code>Wounded</code> first; no point/range body replay; one transaction-object commit point.</td>
+            <td>Batch point validation; always use logical point validation after lock acquisition; return serial-renewal control; preserve forced serial mode across general rebegin; use existing end and rebegin paths in an <code>AttemptDriver</code> inner loop; resample the validation lower bound.</td>
+            <td>Old identity is durably terminal on the abort side first; no point/range body replay; one transaction-object commit point.</td>
           </tr>
           <tr>
             <td class="path">crates/glassdb/src/diagnostics.rs</td>
@@ -776,13 +765,13 @@ struct TelemetryField&lt;T&gt; {
             <td>Operator visibility cannot become protocol state; local write-back failures remain diagnosable.</td>
           </tr>
           <tr>
-            <td class="path">crates/glassdb/Cargo.toml<br>crates/glassdb/src/db.rs<br>crates/glassdb/src/lib.rs<br>crates/glassdb-trans/Cargo.toml<br>crates/glassdb-bench-scale/Cargo.toml<br>crates/glassdb-bench-scale/src/bin/perfbench/main.rs<br>crates/glassdb-bench-scale/src/bin/perfbench/point_leaves.rs<br>crates/glassdb-bench-scale/src/bin/perfbench/telemetry.rs<br>crates/glassdb-bench-scale/src/bin/perfbench/backend.rs<br>hack/aws-bench/run-perfbench.sh<br>hack/aws-bench/deploy.sh<br>hack/aws-bench/cloudformation.yaml<br>hack/aws-bench/README.md<br>hack/aws-bench/compare.py<br>hack/aws-bench/test_compare.py</td>
-            <td>Add the non-default benchmark feature, transaction-local calibration, the 500-by-32 stress mode, active-call telemetry, source-qualified optional transport data, drain-inclusive timing, and paired comparison support.</td>
-            <td>Measured phase-limit selection without a production setting, shared limiter, or global state.</td>
+            <td class="path">crates/glassdb-bench-scale/Cargo.toml<br>crates/glassdb-bench-scale/src/bin/perfbench/main.rs<br>crates/glassdb-bench-scale/src/bin/perfbench/point_leaves.rs<br>crates/glassdb-bench-scale/src/bin/perfbench/telemetry.rs<br>crates/glassdb-bench-scale/src/bin/perfbench/backend.rs<br>hack/aws-bench/run-perfbench.sh<br>hack/aws-bench/deploy.sh<br>hack/aws-bench/cloudformation.yaml<br>hack/aws-bench/README.md<br>hack/aws-bench/compare.py<br>hack/aws-bench/test_compare.py</td>
+            <td>Add exact workloads, the 500-by-32 stress mode, active-call telemetry, source-qualified optional transport data, drain-inclusive timing, and paired comparison support. Change the default or use a temporary local seam for each calibration attempt, then remove the edit.</td>
+            <td>Measured selection of one <code>EngineConfig</code> value without a lasting benchmark interface, shared limiter, or global state.</td>
           </tr>
           <tr>
-            <td class="path">docs/adr/064-bounded-point-leaf-work-and-renewed-serial-fallback.md<br>docs/architecture.md<br>docs/designs/object-storage-native.md<br>docs/guides/caching.md<br>docs/guides/perf.md (after measurements)</td>
-            <td>Add one decision record and update living descriptions of acquisition receipts, locked validation, serial renewal, and write-back.</td>
+            <td class="path">docs/adr/064-bounded-parallel-point-leaf-work.md<br>docs/adr/065-renewed-transaction-identity-on-serial-fallback.md<br>docs/architecture.md<br>docs/designs/object-storage-native.md<br>docs/guides/caching.md<br>docs/guides/perf.md (after measurements)</td>
+            <td>Add two focused decision records and update living descriptions of acquisition receipts, locked validation, serial renewal, and write-back.</td>
             <td>Frozen older ADR bodies remain unchanged; living documents match the implemented protocol.</td>
           </tr>
         </tbody>
@@ -815,7 +804,7 @@ struct TelemetryField&lt;T&gt; {
     <div class="order">
       <span class="order-number">5</span>
       <h3>Change retry and renewal as one safety unit</h3>
-      <p>Add bounded normal acquisition, full-set retry, durable <code>Wounded</code> retirement, and forced serial renewal. Only then remove foreground release as control state.</p>
+      <p>Add bounded normal acquisition, full-set retry, durable abort-side retirement through the general end path, and forced serial renewal through general rebegin. Only then remove foreground release as control state.</p>
     </div>
     <div class="order">
       <span class="order-number">6</span>
@@ -825,7 +814,7 @@ struct TelemetryField&lt;T&gt; {
     <div class="order">
       <span class="order-number">7</span>
       <h3>Verify, calibrate, and record</h3>
-      <p>Add deterministic regressions, run the 8/16/32 benchmark sweep and the 500-by-32 backend stress case against the parent revision, write the new ADR, update only status/link lines in older ADRs, and run <code>make test-all</code>.</p>
+      <p>Add deterministic regressions, run the 8/16/32 benchmark sweep and the 500-by-32 backend stress case against the parent revision, write the two new ADRs, update only status/link lines in older ADRs, and run <code>make test-all</code>.</p>
     </div>
   </section>
 
@@ -869,7 +858,7 @@ struct TelemetryField&lt;T&gt; {
           </tr>
           <tr>
             <td>Serial renewal</td>
-            <td>Gate old conditional write after dispatch; timeout and conflict threshold; old <code>Wounded</code> before new publish; new validation lower bound; collection-directory lock reacquisition; point/range one body run; collection change repeats body.</td>
+            <td>Gate old conditional write after dispatch; timeout and conflict threshold; abort-side terminal old identity before new publish; timeout gives <code>Wounded</code>; completed conflict can give <code>Aborted</code>; new validation lower bound; collection-directory lock reacquisition; point/range one body run; collection change repeats body.</td>
             <td>Late old write is abort-side; new identity uses sorted serial acquisition.</td>
           </tr>
           <tr>
@@ -905,7 +894,7 @@ struct TelemetryField&lt;T&gt; {
       <li>One and multiple <code>Database</code> instances, the existing worker sweep, at least three converged paired runs, and cross-run medians.</li>
       <li>The primary selection cells are the 8-leaf and 32-leaf combinations of all three workloads, both cache states, all three delay profiles, and the converged one- and multiple-<code>Database</code> plateaus.</li>
       <li>Record p50, p95, p99, transactions per second, reads and writes per transaction, retries, lock calls, maximum active backend operations, and shutdown debt.</li>
-      <li>Treat peak backend work as a whole-workload measure. Caller-joined public reads can make it larger than 16; deterministic unit gates prove each internal phase limit.</li>
+      <li>Treat peak backend work as a whole-workload measure. Caller-joined public reads can make it larger than 16; deterministic unit gates prove each provider's bound.</li>
       <li>Run 500 concurrent 32-leaf transactions as separate cold-burst and long-duration cases on real S3 and GCS. Start with limit 16 and a paired parent run. At limit 16, the first admission can contain 8,000 incomplete leaf futures.</li>
       <li>For the stress case, also record p99 latency, the backend queue, provider requests, connections, retries, provider errors, CPU, memory, file descriptors, network use, and any deployment limit that is on the path.</li>
       <li>Use a bounded percentile accumulator for the long-duration case. Do not keep every transaction latency sample in memory.</li>
@@ -916,7 +905,7 @@ struct TelemetryField&lt;T&gt; {
       <li>Keep the existing direct-commit benchmark groups as one-leaf regression gates.</li>
       <li>Retain 16 only if every one-leaf operation sequence matches the parent, 16 reaches at least 95% of the best stable 8/16/32 throughput in every primary cell, it meets the accepted latency objectives, and no repeatable parent regression exceeds 5%.</li>
       <li>Use 32 if it gives more than 5% additional stable throughput or an accepted workload requires one transaction-local wave through 32 leaves.</li>
-      <li>If one phase reaches backend saturation earlier, give only that phase a measured lower internal limit.</li>
+      <li>Select one value for all providers. If no value meets the combined gates, reject this configuration design instead of adding a phase-specific field.</li>
     </ul>
   </section>
 
@@ -969,17 +958,22 @@ struct TelemetryField&lt;T&gt; {
     <h2 id="record-title">Minimal durable documentation</h2>
     <div class="scope">
       <div class="in">
-        <h3>Add one ADR when implementation starts</h3>
+        <h3>Add two ADRs when implementation starts</h3>
         <p>
-          <code>ADR-064: Bounded point-leaf work and renewed serial fallback</code> records the bounded
-          per-transaction phase policy, backend-owned aggregate capacity, retained normal retries,
-          and renewed-identity serial transition. It records that this effort adds no shared
-          GlassDB limiter or global fairness rule. It supersedes only the conflicting release/same-identity statements in
-          ADR-024 and the late-cancelled-acquire assumption in ADR-025. It also narrows ADR-026's
-          statement that release runs during serial fallback; release remains valid for abort and
-          recovery work.
+          <code>ADR-064: Bounded parallel point-leaf work</code> records the generic bounded join,
+          domain-owned grouping, the single provider-owned <code>EngineConfig</code> value,
+          backend-owned aggregate capacity, retained normal retries, and bounded committed
+          write-back. It records that this effort adds no shared GlassDB limiter or global fairness
+          rule.
         </p>
-        <p>Older accepted ADR bodies stay frozen. Add only forward status or supersession links to ADR-064.</p>
+        <p>
+          <code>ADR-065: Renewed transaction identity on serial fallback</code> records abort-side
+          retirement, general rebegin, forced serial mode, and the body-replay trade-off. It
+          supersedes only the conflicting release and same-identity statements in ADR-024 and the
+          late-cancelled-acquire assumption in ADR-025. It also narrows ADR-026's statement that
+          release runs during serial fallback; release remains valid for abort and recovery work.
+        </p>
+        <p>Older accepted ADR bodies stay frozen. Add only forward status or supersession links to ADR-065.</p>
       </div>
       <div class="out">
         <h3>Update living documents only</h3>
@@ -1034,7 +1028,7 @@ struct TelemetryField&lt;T&gt; {
         writeBackFinished: 0,
         splitDescendants: 0,
         ownerOperationUnresolved: false,
-        oldWoundedBeforeRenewal: false,
+        oldRetiredBeforeRenewal: false,
         oneLeafExtraOperations: 0,
         routedEvidenceUsedAsProof: false,
         everyInputRan: true,
@@ -1195,11 +1189,12 @@ struct TelemetryField&lt;T&gt; {
         return invalid(state, "the parallel episode must request serial renewal");
       }
       const replay = state.collectionChanges;
+      const oldStatus = state.ownerOperationUnresolved ? "Wounded" : "Aborted";
       return event({
         ...state,
         phase: replay ? "Access set" : "Routing",
         oldIdentity: state.identity,
-        oldIdentityStatus: "Wounded",
+        oldIdentityStatus: oldStatus,
         identity: state.identity === "T0" ? "T1" : state.identity + "r",
         identityStatus: "Pending",
         mode: "serial",
@@ -1208,7 +1203,7 @@ struct TelemetryField&lt;T&gt; {
         selectedOutcome: replay ? "body replay required" : "renewed for serial",
         currentLocks: 0,
         proofs: { installed: 0, observed: 0 },
-        oldWoundedBeforeRenewal: true,
+        oldRetiredBeforeRenewal: true,
         ownerOperationUnresolved: false,
         incomplete: replay ? 0 : 1,
         leafState: replay ? [] : state.leafState.map((leaf, index) => ({
@@ -1219,8 +1214,8 @@ struct TelemetryField&lt;T&gt; {
           note: index === 0 ? "new identity acquires in path order" : "waits for prior path"
         }))
       }, replay
-        ? "The old identity is durably Wounded. Collection create/drop repeats the transaction body under a forced-serial replacement."
-        : "The old identity is durably Wounded. The same AccessSet and normal outcome continue under a forced-serial replacement and new lower bound v2.");
+        ? "The general end path made the old identity " + oldStatus + ". Collection create/drop repeats the transaction body under a forced-serial replacement created by general rebegin."
+        : "The general end path made the old identity " + oldStatus + ". The same AccessSet and normal outcome continue after general rebegin in forced serial mode with new lower bound v2.");
     }
 
     function acquireSerial(state) {
@@ -1375,7 +1370,7 @@ struct TelemetryField&lt;T&gt; {
         {
           name: "Identity-safe serial transition",
           status: hasRenewal
-            ? (state.oldWoundedBeforeRenewal && state.oldIdentityStatus === "Wounded" ? "pass" : "fail")
+            ? (state.oldRetiredBeforeRenewal && ["Wounded", "Aborted"].includes(state.oldIdentityStatus) ? "pass" : "fail")
             : "pending",
           detail: hasRenewal
             ? state.oldIdentity + " is " + state.oldIdentityStatus + " before " + state.identity + " publishes."
@@ -1422,7 +1417,7 @@ struct TelemetryField&lt;T&gt; {
     ["Retry retained locks", "RETRY_RETAINED"],
     ["Hit hard timeout", "TIMEOUT"],
     ["Hit conflict threshold", "CONFLICT_THRESHOLD"],
-    ["Retire and renew", "RENEW_SERIAL"],
+    ["End and rebegin", "RENEW_SERIAL"],
     ["Acquire serially", "ACQUIRE_SERIAL"],
     ["Validate", "VALIDATE"],
     ["Commit", "COMMIT"],
@@ -1461,12 +1456,12 @@ struct TelemetryField&lt;T&gt; {
     {
       id: "timeout",
       title: "Late write and serial renewal",
-      copy: "A timeout drops a dispatched conditional write before its result is known. The old identity must become durably Wounded before a forced-serial replacement can publish.",
+      copy: "A timeout drops a dispatched conditional write before its result is known. The general end path must pin the old identity as Wounded before general rebegin creates a forced-serial replacement.",
       steps: [
         ["Route eighteen independent leaves", "ROUTE_EIGHTEEN"],
         ["Start normal parallel acquisition", "FINISH_ROUTING"],
         ["Drop the pass at the hard timeout", "TIMEOUT"],
-        ["Retire and renew the identity", "RENEW_SERIAL"],
+        ["End and rebegin the identity", "RENEW_SERIAL"],
         ["Acquire with the global path order", "ACQUIRE_SERIAL"],
         ["Validate at the new lower bound", "VALIDATE"],
         ["Commit the replacement identity", "COMMIT"]
@@ -1480,7 +1475,7 @@ struct TelemetryField&lt;T&gt; {
         ["Route a transaction with collection changes", "ROUTE_COLLECTIONS"],
         ["Start normal acquisition", "FINISH_ROUTING"],
         ["Reach the conflict threshold", "CONFLICT_THRESHOLD"],
-        ["Retire, renew, and repeat the body", "RENEW_SERIAL"]
+        ["End, rebegin, and repeat the body", "RENEW_SERIAL"]
       ]
     },
     {

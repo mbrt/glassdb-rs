@@ -64,12 +64,14 @@ expose these receipt variants or a partial acquisition type outside
 A hard timeout can drop a conditional leaf write before its result is recorded.
 A completed `Conflict` threshold has accounted for its futures, but it still
 uses the same uniform serial-transition rule. Before either parallel episode
-enters sorted serial acquisition, `AttemptDriver` gives the old identity a
-retirement handoff and makes its `Wounded` status durable. It then renews the
-transaction identity, preserves its wound-wait priority, rebuilds current
-groups, and starts sorted serial acquisition. The new identity reclaims any old
-abort-side locks as it reaches them. It does not wait for a foreground release
-sweep.
+enters sorted serial acquisition, `AttemptDriver` calls the general
+`Engine::end` path and waits for an abort-side terminal old identity. A dropped
+operation is pinned as `Wounded`; a completed conflict episode can be
+acknowledged as `Aborted`. It then calls the general
+`Engine::rebegin_transaction` path, preserves wound-wait priority, rebuilds
+current groups, and starts sorted serial acquisition. The new identity reclaims
+any old abort-side locks as it reaches them. It does not wait for a foreground
+release sweep.
 
 Deterministic simulation must cover a cached complete hold with no CAS, a
 partial hold with one complete-leaf CAS, an uncertain landed CAS recognized on

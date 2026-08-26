@@ -12,11 +12,11 @@ How should `KeyLocker` apply `join_all_bounded` to complete per-leaf lock operat
 
 ### Bounded normal acquisition
 
-Keep `KeyLocker::lock_at` as the domain interface. `KeyLocker` owns a private,
-nonzero normal-acquisition limit supplied when it is constructed; callers do
-not pass the limit on each call. The exact value remains for
-[Choose concurrency limits and verification](09-choose-concurrency-limits-and-verification.md).
-The sorted serial path does not use this limit.
+Keep `KeyLocker::lock_at` as the domain interface. `KeyLocker` owns the nonzero
+value as `parallelism`, copied from
+`EngineConfig::transaction_leaf_parallelism` when it is constructed. Callers do
+not pass the limit on each call. It uses the same value for normal acquisition
+and committed write-back. The sorted serial path does not use this limit.
 
 Keep the current complete operation for one physical leaf. `build_groups`
 already combines point intentions and range-scan membership locks that target
@@ -101,9 +101,12 @@ rule and removes the foreground release phase.
 `AttemptDriver`, which owns the coupled transaction handle and retirement guard,
 performs the identity transition:
 
-1. Give the old transaction identity a retirement handoff and make its
-   `Wounded` status durable before the replacement identity can publish.
-2. Renew the transaction identity while preserving its wound-wait priority.
+1. End the old transaction identity through the general `Engine::end` path and
+   make its abort-side terminal status durable before the replacement identity
+   can publish. A dropped operation is `Wounded`; a completed conflict episode
+   can be `Aborted`.
+2. Renew the transaction identity through the general
+   `Engine::rebegin_transaction` path while preserving its wound-wait priority.
 3. Force the renewed identity to start lock acquisition in the existing sorted
    serial mode.
 4. For transactions without collection create/drop changes, retain the
@@ -155,8 +158,9 @@ must cover these acquisition cases:
   state across retries;
 - combined point intentions and range-scan membership locks on one leaf;
 - a gated timeout after conditional-write dispatch but before result delivery,
-  and a completed conflict threshold, each proving a durable old-identity wound,
-  forced renewed-identity serial acquisition, safe handling of old locks, and no
-  transition-caused transaction-body replay for point/range transactions;
+  and a completed conflict threshold, each proving a durable abort-side old
+  identity, forced renewed-identity serial acquisition, safe handling of old
+  locks, and no transition-caused transaction-body replay for point/range
+  transactions;
 - transaction-body replay for the collection create/drop exception; and
 - deterministic admission, result choice, and backend operation streams.

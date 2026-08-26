@@ -17,22 +17,22 @@ follow their callers, but their semantic shapes are:
 NodeStore::check_leaves_current(
     observations: &[LeafObservation],
     validation_start: SequencePoint,
-    limit: NonZeroUsize,
 ) -> Vec<Result<LeafObservationCheck, StorageError>>
 
 KeyResolver::effective_point_states(
     keys: &[KeyRef],
     own_lock_holder: Option<&TxId>,
     validation_start: SequencePoint,
-    limit: NonZeroUsize,
 ) -> Result<Vec<PointValidationState>, StorageError>
 ```
 
-`Algo` samples `validation_start` once. It supplies that same lower bound and
-the same internal point-validation limit to physical checking, path-batched
-routing, terminal-leaf loads, and transaction-status resolution. These modules
-do not sample time. The exact limit remains for
-[Choose concurrency limits and verification](09-choose-concurrency-limits-and-verification.md).
+`NodeStore` provides the physical batch, and `KeyResolver` provides the logical
+batch. Each provider owns the same nonzero value as `parallelism`, copied from
+`EngineConfig::transaction_leaf_parallelism` when the engine graph is built.
+Their methods do not accept a limit. `Algo` samples `validation_start` once and
+supplies that same lower bound to physical checking, path-batched routing,
+terminal-leaf loads, and transaction-status resolution. These modules do not
+sample time.
 
 ### Physical point observations
 

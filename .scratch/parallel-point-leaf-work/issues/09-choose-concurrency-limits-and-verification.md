@@ -20,6 +20,12 @@ this ticket as a per-transaction phase decision. Make clear that a fixed phase
 limit is an absolute submission bound, not a guaranteed percentage of dynamic
 backend capacity.
 
+Implementation review decision: add one nonzero
+`EngineConfig::transaction_leaf_parallelism` value, initially 16. Copy it to
+each domain provider as `parallelism` when the engine graph is built. Do not
+expose limits on domain method calls, do not keep separate phase fields, and do
+not add a lasting benchmark-only opening or feature.
+
 Use the findings in
 [Backend concurrency capacity research](../assets/backend-concurrency-capacity-research.md).
 
@@ -56,10 +62,11 @@ instruction not to add a shared limit match the final reviewed decision.
 
 ### Initial internal limits
 
-Start every bounded point-leaf phase with the same private, nonzero limit of
-16. Apply it independently to one invocation for one transaction; do not add a
-database-wide semaphore or a public configuration option. The bounded units
-are:
+Start every bounded point-leaf phase with the same nonzero value of 16. Store it
+as `EngineConfig::transaction_leaf_parallelism` and copy it to the providers as
+`parallelism` when they are constructed. Apply it independently to one
+invocation for one transaction; do not add a database-wide semaphore. The
+bounded units are:
 
 - distinct node-path loads during point-key routing;
 - distinct observed leaf paths during physical point validation;
@@ -122,11 +129,13 @@ or held-path state into retry.
 
 Serial-transition tests must gate an old-identity conditional write after
 dispatch and before result delivery. Both that timeout and a completed conflict
-threshold must make the old `Wounded` status durable before identity renewal,
-then force the renewed identity into sorted serial acquisition. A late old
-write remains abort-side. Point and range transactions keep one execution of
-the transaction body for the transition. Collection create or drop keeps the
-existing wound-style replay of the transaction body.
+threshold must make the old identity durably terminal on the abort side before
+identity renewal, then force the renewed identity into sorted serial
+acquisition. The timeout is pinned as `Wounded`; the completed conflict episode
+can be acknowledged as `Aborted`. A late old write remains abort-side. Point
+and range transactions keep one execution of the transaction body for the
+transition. Collection create or drop keeps the existing wound-style replay of
+the transaction body.
 
 Committed write-back tests must cover the 16-position outer bound, split
 rerouting inside one position, structural deferral, local failure, all original
@@ -138,8 +147,10 @@ operation.
 
 ### Limit calibration and performance gates
 
-Use a benchmark-only internal setting to sweep limits 8, 16, and 32. Do not
-expose the sweep through `DatabaseBuilder`.
+Sweep limits 8, 16, and 32 by changing the `EngineConfig` default between
+benchmark attempts or by adding a temporary local benchmark seam. Remove the
+temporary seam after measurement. Do not keep a feature, benchmark-only type,
+or benchmark-only opening function.
 
 Build exact 1, 2, 8, and 32-leaf fixtures with one pre-created key in each of
 that many collections. Each collection root is one distinct leaf, so split
@@ -167,8 +178,9 @@ Use at least three converged, paired runs and their cross-run median.
 Keep limit 16 only when its median throughput is at least 95% of the best 8,
 16, or 32 result in every converged primary cell. Use 32 if it gives more than
 5% additional throughput, or if the accepted workload requires its one-wave
-32-leaf latency. If one phase reaches backend saturation earlier, give only
-that phase a measured lower internal limit. Do not add public configuration.
+32-leaf latency. Select one value for all phases. If no one value meets the
+gates, reject this design and revisit the configuration decision; do not add a
+phase field as an incidental benchmark result.
 
 The candidate must match the parent revision's backend operation sequence and
 count for every one-leaf workload. Any repeatable throughput regression greater
@@ -178,10 +190,14 @@ after implementation and deterministic regressions are complete.
 
 ## Answer
 
-Use one private, nonzero limit of 16 incomplete leaf futures for each bounded
-phase of one transaction. Apply it independently to point-key routing, physical
-point validation, logical point revalidation, normal lock acquisition, and
-committed write-back. Keep the sorted serial lock fallback outside this bound.
+Use one nonzero `EngineConfig::transaction_leaf_parallelism` value of 16 for
+all bounded phases of one transaction. Copy it to `TreeRouter`, `NodeStore`,
+`KeyResolver`, and `KeyLocker` as `parallelism` when they are constructed. These
+providers own their limit, so `group_keys_by_leaf`, `check_leaves_current`,
+`effective_point_states`, `lock_at`, and `write_back` do not accept it. Apply
+the value independently to point-key routing, physical point validation,
+logical point revalidation, normal lock acquisition, and committed write-back.
+Keep the sorted serial lock fallback outside this bound.
 
 Do not add a shared GlassDB active-backend-operation limit, a database-wide or
 process-wide semaphore, a shared backend handle, or global transaction
@@ -211,7 +227,8 @@ the backend's actual queue, requests, connections, retries, provider errors,
 resource use, throughput, and p95 and p99 transaction latency.
 
 Keep the deterministic verification and performance gates specified above.
-Use a benchmark-only sweep of limits 8, 16, and 32. Retain 16 when it reaches at
-least 95% of the best stable throughput in each primary cell and meets the
-accepted latency objectives. Preserve the one-leaf backend operation sequence
-and count, and reject a repeatable throughput regression greater than 5%.
+Sweep limits 8, 16, and 32 with temporary source edits and remove those edits
+after measurement. Retain 16 when it reaches at least 95% of the best stable
+throughput in each primary cell and meets the accepted latency objectives.
+Preserve the one-leaf backend operation sequence and count, and reject a
+repeatable throughput regression greater than 5%.

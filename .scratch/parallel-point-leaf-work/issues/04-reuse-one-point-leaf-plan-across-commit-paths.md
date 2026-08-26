@@ -56,9 +56,11 @@ This check keeps normal retry state inside the leaf operation. Do not expose or
 retain a partial routed plan or a partial receipt set.
 
 A transition from parallel to sorted serial acquisition ends the old identity's
-acquisition episode. `AttemptDriver` first gives that identity a retirement
-handoff and makes its `Wounded` status durable, then renews the identity and
-builds all physical lock state again. Do not run a foreground release sweep.
+acquisition episode. `AttemptDriver` first uses the general `Engine::end` path
+to make that identity terminal on the abort side, then uses the general
+`Engine::rebegin_transaction` path and builds all physical lock state again. A
+dropped acquisition is pinned as `Wounded`; a completed conflict episode can be
+acknowledged as `Aborted`. Do not run a foreground release sweep.
 
 Only a fully successful acquisition pass creates cross-phase physical state.
 `LockedTx`, owned by `KeyLocker`, retains each acquired path, `LeafRef`, point

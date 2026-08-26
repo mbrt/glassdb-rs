@@ -17,6 +17,13 @@ The validated primary source is on local throwaway branch `prototype/point-key-r
 
 Choose path-batched descent for two or more point-key items. Keep the existing direct descent for zero or one item. The batch design is internal to the `TreeRouter` interface and does not add a shared point-leaf plan or a public batch point-read interface. It does not change the sorted serial lock fallback.
 
+`TreeRouter` provides `group_keys_by_leaf` and
+`group_keys_by_leaf_fresh`. It owns its nonzero `parallelism` from
+construction, so neither method accepts a limit. Foreground routers receive the
+single `EngineConfig::transaction_leaf_parallelism` value. The garbage
+collector receives a separate router constructed with one, so this change does
+not parallelize garbage collection.
+
 Use `RoutedLeafGroup<T>` as the canonical completed-routing output. Each value
 contains one `LeafObservation` and the ordered raw keys with their domain
 payloads. The observation carries currentness evidence; do not add a separate

@@ -15,13 +15,17 @@ combines the final interfaces, capacity ownership, file changes, implementation
 order, verification gates, and difficult state transitions. Human review
 accepted the design after these final changes:
 
-- a private five-field phase-limit bundle, with every initial value set to 16;
-- no shared GlassDB backend-work limit or public concurrency setting;
-- temporary benchmark instrumentation only when it has no measurable effect;
+- one nonzero `EngineConfig` transaction leaf parallelism value, initially 16,
+  owned as `parallelism` by each provider after construction;
+- no per-call domain limit, phase-limit bundle, or shared GlassDB backend-work
+  limit;
+- no lasting benchmark-only opening or limit type, and temporary measurement
+  instrumentation only when it has no measurable effect;
 - logical validation for every locked point read, independent of how its hold
   was acquired;
-- owner-level transaction identity renewal before sorted serial acquisition;
-  and
+- owner-level transaction identity renewal through the general end and rebegin
+  paths before sorted serial acquisition;
+- two focused ADRs for the bounded-work and serial-renewal decisions; and
 - best-effort local hold observations for diagnostics only.
 
 This artifact is a planning prototype. It does not implement the design.
@@ -48,27 +52,51 @@ point-leaf plan. A `RoutedLeafGroup<T>` is a temporary routing result. A
 `LockedTx` is the retained in-memory result of one complete lock-acquisition
 pass. The transaction object remains the one cross-leaf commit point.
 
-### Transaction-local limits
+### Engine configuration and provider ownership
 
-Add this crate-private policy value in `glassdb-trans`:
+Add one lasting configuration value:
 
 ```rust
-struct PointLeafLimits {
-    routing: NonZeroUsize,
-    physical_validation: NonZeroUsize,
-    logical_validation: NonZeroUsize,
-    normal_locking: NonZeroUsize,
-    write_back: NonZeroUsize,
+pub struct EngineConfig {
+    transaction_leaf_parallelism: NonZeroUsize,
+    // Existing fields remain.
 }
 
-impl PointLeafLimits {
-    fn all(limit: NonZeroUsize) -> Self;
+impl EngineConfig {
+    /// Sets how many leaf operations one transaction can run in parallel in each bounded phase.
+    pub fn set_transaction_leaf_parallelism(&mut self, parallelism: NonZeroUsize);
 }
 ```
 
-Production engine assembly uses `PointLeafLimits::all(16)`. The fields have the
-same initial numeric value, but they do not share runtime admission state. Each
-limit applies to one invocation of one transaction phase:
+The default is 16. Engine assembly copies the same value to each provider when
+it constructs the runtime graph:
+
+- `TreeRouter` owns the bound for distinct node-path work during point-key
+  routing;
+- `NodeStore` owns the bound for distinct leaf-state work during optimistic
+  physical point validation;
+- `KeyResolver` owns the bound for routed leaf-group work during logical point
+  validation; and
+- `KeyLocker` owns one bound used for complete leaf-group work during normal
+  lock acquisition and original `LockedTx` group work during committed
+  write-back.
+
+The construction seams are:
+
+```rust
+NodeStore::new(objects, parallelism);
+TreeRouter::new(nodes, parallelism);
+KeyResolver::new(router, state, parallelism);
+Locker::new(coord, router, collection_state, monitor, retry, parallelism);
+```
+
+`Locker::new` forwards the value to its `KeyLocker`. The engine passes the same
+value to every foreground provider. The garbage collector constructs its own
+`TreeRouter` with one.
+
+These are copies of one configuration value, not independent knobs or shared
+runtime admission state. Each copy applies to one invocation of one transaction
+phase:
 
 - distinct node-path work during point-key routing;
 - distinct leaf-state work during optimistic physical point validation;
@@ -78,13 +106,18 @@ limit applies to one invocation of one transaction phase:
 
 A wait remains incomplete and consumes one position. Unused positions reserve
 no work or backend capacity. The sorted serial lock path does not use the
-normal-locking limit.
+configured parallelism.
+
+Domain methods do not accept a limit. The generic `join_all_bounded` primitive
+still accepts one because it has no provider or product configuration. The
+garbage collector constructs its separate `TreeRouter` with one, so this effort
+does not parallelize garbage collection.
 
 Do not add a `DatabaseBuilder` setting, database-wide or process-wide
-semaphore, shared backend handle, or global fairness rule. The backend and the
-provider own aggregate queues, calls, connections, retries, and throttling.
-The value 16 is an absolute transaction-local submission bound. It is not a
-capacity percentage.
+semaphore, shared backend handle, benchmark-only configuration type, or global
+fairness rule. The backend and the provider own aggregate queues, calls,
+connections, retries, and throttling. The value 16 is an absolute
+transaction-local submission bound. It is not a capacity percentage.
 
 ### Final internal interfaces
 
@@ -118,7 +151,6 @@ pub async fn group_keys_by_leaf<T>(
     &self,
     items: impl IntoIterator<Item = (KeyRef, T)>,
     requirement: Requirement,
-    limit: NonZeroUsize,
 ) -> Result<Vec<RoutedLeafGroup<T>>, StorageError>;
 
 pub async fn group_keys_by_leaf_fresh<T>(
@@ -126,7 +158,6 @@ pub async fn group_keys_by_leaf_fresh<T>(
     items: impl IntoIterator<Item = (KeyRef, T)>,
     interior: Requirement,
     leaf: Requirement,
-    limit: NonZeroUsize,
 ) -> Result<Vec<RoutedLeafGroup<T>>, StorageError>;
 ```
 
@@ -135,11 +166,11 @@ path, separate currentness flag, or durable ownership meaning. Return groups in
 physical-path order. Preserve original input order inside each group. Keep an
 internal input ordinal until routing and stable error selection finish.
 
-Zero and one item use direct descent. Multiple items use a path-aware ready set
-inside `TreeRouter`. Spend the limit on distinct physical paths, not keys. Keep
-B-link right-link correction, path convergence, and reprocessing when a former
-leaf becomes an index. Existing garbage-collection callers pass a limit of one;
-this work does not parallelize garbage collection.
+`TreeRouter` provides both methods and owns its construction-time
+`parallelism`. Zero and one item use direct descent. Multiple items use a
+path-aware ready set inside `TreeRouter`. Spend the limit on distinct physical
+paths, not keys. Keep B-link right-link correction, path convergence, and
+reprocessing when a former leaf becomes an index.
 
 #### Physical and logical point validation
 
@@ -148,7 +179,6 @@ pub async fn check_leaves_current(
     &self,
     observations: &[LeafObservation],
     validation_start: SequencePoint,
-    limit: NonZeroUsize,
 ) -> Vec<Result<LeafObservationCheck, StorageError>>;
 
 pub(crate) async fn effective_point_states(
@@ -156,13 +186,14 @@ pub(crate) async fn effective_point_states(
     keys: &[KeyRef],
     own_lock_holder: Option<&TxId>,
     validation_start: SequencePoint,
-    limit: NonZeroUsize,
 ) -> Result<Vec<PointValidationState>, StorageError>;
 ```
 
-`Algo` samples `validation_start` once and supplies it to every leaf and
-transaction-status read in that validation episode. Neither batch interface
-samples time.
+`NodeStore` provides `check_leaves_current` and owns its construction-time
+parallelism. `KeyResolver` provides `effective_point_states` and owns its
+construction-time parallelism. `Algo` samples `validation_start` once and
+supplies it to every leaf and transaction-status read in that validation
+episode. Neither batch interface samples time or accepts a limit.
 
 Physical checking is the optimistic path before point locks are held. Group by
 physical path in first-input order. One path checks its distinct states
@@ -198,8 +229,7 @@ re-scan. Range-validation phase order otherwise does not change.
 
 ```rust
 struct KeyLocker {
-    normal_limit: NonZeroUsize,
-    write_back_limit: NonZeroUsize,
+    parallelism: NonZeroUsize,
     observed_holds: Arc<Sharded<LockerShard>>,
 }
 
@@ -234,9 +264,10 @@ the cached leaf evidence sufficient for locked logical validation. A successful
 
 Build a `LockedTx` only after one complete pass returns exactly one receipt for
 every current routed group. Never carry partial receipts into another pass.
-Normal parallel acquisition uses the private bound. A foreign-holder wait keeps
-its bounded position while other positions can finish. Run every complete group
-and select the first non-`Locked` result in stable leaf-path order.
+Normal parallel acquisition uses `KeyLocker`'s construction-time bound. A
+foreign-holder wait keeps its bounded position while other positions can
+finish. Run every complete group and select the first non-`Locked` result in
+stable leaf-path order.
 
 A completed `Conflict` or `LeafFull` pass keeps any physical locks that landed.
 Discard its partial receipts, route the complete access set again, and retry the
@@ -253,28 +284,29 @@ written by `Monitor::record_tx_locks` remains protocol state.
 #### Serial transition
 
 ```rust
+enum AcquisitionMode {
+    Parallel,
+    ForcedSerial,
+}
+
 pub enum AttemptControl {
     Complete,
     RenewForSerial { replay_body: bool },
 }
-
-Engine::retire_for_serial(
-    &self,
-    &mut EngineTransaction,
-) -> Result<(), TransError>;
-
-Engine::rebegin_for_serial(
-    &self,
-    EngineTransaction,
-) -> EngineTransaction;
 ```
 
 `Algo` returns the control value when the parallel acquisition episode must
-end. `AttemptDriver` owns the renewal loop. It closes admission for the old
-transaction identity, persists `Wounded`, and only then creates the new
-transaction identity. A dropped or timed-out conditional write remains an
-unresolved owner operation until this retirement makes its late result
-abort-side.
+end. Before returning `RenewForSerial`, it marks the handle's acquisition mode
+as forced serial. `AttemptState::renew` preserves that mode.
+
+`AttemptDriver` owns the renewal loop and uses existing general interfaces. It
+first awaits `Engine::end(&mut EngineTransaction)`. This closes admission and
+makes the old identity terminal on the abort side. A dropped or timed-out
+conditional write remains an unresolved owner operation, so the existing end
+path pins the identity as `Wounded`; a completed conflict episode can be
+acknowledged as `Aborted`. If end fails, do not create the replacement identity.
+After successful end, call `Engine::rebegin_transaction(EngineTransaction)`.
+Do not add `retire_for_serial` or `rebegin_for_serial`.
 
 The new identity samples a new validation lower bound, reacquires collection
 directory locks, and enters sorted serial acquisition directly. The serial path
@@ -314,31 +346,13 @@ This map is best-effort local operator data:
 Document its per-acquisition maintenance cost. Do not describe it as pull-only
 or zero-cost. Keep `Monitor::record_tx_locks` separate and unchanged.
 
-#### Benchmark-only opening and telemetry
+#### Benchmark calibration and telemetry
 
-Production builds expose no limit setting. Add a non-default
-`bench-internals` feature in `glassdb`. Under that feature, expose a doc-hidden
-free opening function and a five-field benchmark value that converts to the
-private `glassdb-trans` policy. Do not add a builder setter or global state.
-
-```rust
-#[cfg(feature = "bench-internals")]
-#[doc(hidden)]
-pub mod benchmark {
-    pub struct PointLeafLimits {
-        pub routing: NonZeroUsize,
-        pub physical_validation: NonZeroUsize,
-        pub logical_validation: NonZeroUsize,
-        pub normal_locking: NonZeroUsize,
-        pub write_back: NonZeroUsize,
-    }
-
-    pub async fn open_with_point_leaf_limits(
-        builder: DatabaseBuilder,
-        limits: PointLeafLimits,
-    ) -> Result<Database, Error>;
-}
-```
+Do not add a feature-gated benchmark configuration, opening function, or
+lasting benchmark dependency. To sweep 8, 16, and 32, change the
+`EngineConfig` default between attempts or add a temporary local benchmark seam
+and remove it after measurement. Keep the source revision and raw result for
+each attempt.
 
 Use source-qualified optional stress fields:
 
@@ -376,35 +390,37 @@ from active-call or incomplete-leaf-future counters.
   `join_all_bounded`; keep direct zero and one paths.
 - `crates/glassdb-storage/src/tree_router.rs`, `src/lib.rs`, and `Cargo.toml`:
   add `RoutedLeafGroup`, path-batched descent, stable grouping and error
-  selection, and the required futures dependency.
-- `crates/glassdb-storage/src/node_store.rs`: add input-aligned batch
-  currentness checks, grouped by physical path.
-- `crates/glassdb-trans/src/engine.rs`: own the private phase-limit bundle and
-  production defaults, and pass each limit to its domain owner.
+  selection, the required futures dependency, and construction-time ownership
+  of routing parallelism.
+- `crates/glassdb-storage/src/node_store.rs`: add construction-time ownership of
+  physical-validation parallelism and input-aligned batch currentness checks
+  grouped by physical path.
+- `crates/glassdb-trans/src/engine.rs`: add the one nonzero
+  `EngineConfig::transaction_leaf_parallelism` value with default 16 and copy
+  it to each provider as `parallelism` during engine assembly.
 - `crates/glassdb-trans/src/algo/direct_commit.rs`: depend directly on
   `TreeRouter`; reject zero inline policy and oversized values before routing;
   remove `KeyResolver::route_one_leaf` after callers move; keep one-key backend
   operation count.
-- `crates/glassdb-trans/src/key_resolver.rs` and `key_state_resolver.rs`: route
-  the complete logical validation set, pass `own_lock_holder` into entry
+- `crates/glassdb-trans/src/key_resolver.rs` and `key_state_resolver.rs`: own
+  logical-validation parallelism at `KeyResolver` construction, route the
+  complete logical validation set, pass `own_lock_holder` into entry
   interpretation, return input-aligned point states, bound leaf futures, and
   select stable errors.
-- `crates/glassdb-trans/src/gc.rs`: pass a routing limit of one at the two
-  existing group-routing calls.
+- `crates/glassdb-trans/src/gc.rs`: construct its separate `TreeRouter` with a
+  parallelism of one.
 - `crates/glassdb-trans/src/shard_coord.rs`, `node_locking.rs`, and
   `tlocker.rs`: return loaded observations for skipped members, add hold
   receipts, recognize complete retained holds, bound normal acquisition and
   write-back, and remove foreground release control.
 - `crates/glassdb-trans/src/algo.rs`, `algo/attempt.rs`, `engine.rs`, and
   `crates/glassdb/src/db.rs`: add batch point validation, always use logical
-  validation for locked point reads, return owner-level renewal control, and
-  retire and renew inside `AttemptDriver`.
+  validation for locked point reads, preserve a forced-serial acquisition mode
+  across general rebegin, return owner-level renewal control, and use the
+  existing end and rebegin interfaces inside `AttemptDriver`.
 - `crates/glassdb/src/diagnostics.rs`: document best-effort local hold
   observations and stable write-back failure events without changing the
   public result shape.
-- `crates/glassdb/Cargo.toml`, `crates/glassdb/src/db.rs`,
-  `crates/glassdb/src/lib.rs`, and `crates/glassdb-trans/Cargo.toml`: add the
-  non-default benchmark opening and its internal conversion.
 - `crates/glassdb-bench-scale/Cargo.toml` and
   `src/bin/perfbench/{main,point_leaves,telemetry,backend}.rs`: add exact
   point-leaf fixtures, active-call telemetry, source-qualified optional data,
@@ -429,7 +445,7 @@ from active-call or incomplete-leaf-future counters.
 6. Bound original committed write-back groups and keep split descendants inside
    their original positions.
 7. Add deterministic regressions, calibrate 8/16/32 against the parent, run the
-   backend stress cases, update the decision record and living documentation,
+   backend stress cases, update the decision records and living documentation,
    and run `make test-all`.
 
 Do not combine steps 4 and 5 partly. Retained locks without complete receipts,
@@ -461,10 +477,10 @@ Use gates and counters, not elapsed-time assertions.
   selection; complete and partial same-identity holds; and a landed CAS whose
   result is lost.
 - Serial renewal: gate the old conditional write after dispatch and before
-  result delivery; cover timeout and conflict threshold; prove old `Wounded`
-  before new publication, a new lower bound, collection-directory lock
-  reacquisition, no point or range transaction-body replay, and collection
-  create/drop replay.
+  result delivery; cover timeout and conflict threshold; prove an abort-side
+  terminal old identity before new publication, a new lower bound,
+  collection-directory lock reacquisition, no point or range transaction-body
+  replay, and collection create/drop replay.
 - Write-back: 17 original groups, split descendants, structural deferral, one
   local failure, one routing failure, stable duplicate hints, every original
   group, and graceful shutdown.
@@ -524,31 +540,31 @@ Retain the production default of 16 only when all these conditions hold:
   instability, or unbounded benchmark memory.
 
 Use 32 if it gives more than 5% additional stable throughput or an accepted
-workload requires one transaction-local wave through 32 leaves. If one phase
-reaches backend saturation earlier, lower only that private phase field. Do not
-derive a shared GlassDB limit or capacity percentage from the stress result.
+workload requires one transaction-local wave through 32 leaves. Select one
+value for all providers. If no value meets the combined gates, reject this
+configuration design instead of adding a phase field. Do not derive a shared
+GlassDB limit or capacity percentage from the stress result.
 
 ### Decision record and living documentation
 
-During implementation, add
-`docs/adr/064-bounded-point-leaf-work-and-renewed-serial-fallback.md`. Keep it
-focused on these significant decisions and trade-offs:
+During implementation, add two focused decision records:
 
-- domain-owned grouping over one generic bounded join;
-- independent private transaction-phase limits with initial value 16;
-- no GlassDB aggregate backend scheduler;
-- retained physical locks across normal full-set retries;
-- durable old-identity retirement before forced serial renewal; and
-- bounded best-effort committed write-back.
+- `docs/adr/064-bounded-parallel-point-leaf-work.md` records domain-owned
+  grouping over one generic bounded join, one provider-owned `EngineConfig`
+  value with initial value 16, no GlassDB aggregate backend scheduler, retained
+  physical locks across normal full-set retries, and bounded best-effort
+  committed write-back.
+- `docs/adr/065-renewed-transaction-identity-on-serial-fallback.md` records the
+  durable abort-side old identity, general rebegin, forced-serial replacement,
+  and transaction-body replay trade-off.
 
-The new decision supersedes ADR-024's same-identity foreground-release
-serial-fallback rule and ADR-025's assumption that receipt-based release can
-always clear a late cancelled acquire. It narrows ADR-026's statement that
-release runs during serial fallback; release remains valid for abort and
-recovery work. Add only forward status or supersession links from those older
-decision records to ADR-064. Do not edit their accepted bodies. Other older
-decision records keep their current status unless implementation finds a direct
-contradiction.
+ADR-065 supersedes ADR-024's same-identity foreground-release serial-fallback
+rule and ADR-025's assumption that receipt-based release can always clear a
+late cancelled acquire. It narrows ADR-026's statement that release runs during
+serial fallback; release remains valid for abort and recovery work. Add only
+forward status or supersession links from those older decision records to
+ADR-065. Do not edit their accepted bodies. Other older decision records keep
+their current status unless implementation finds a direct contradiction.
 
 Update `docs/architecture.md`, `docs/designs/object-storage-native.md`, and
 `docs/guides/caching.md` for the implemented interfaces, hold receipts, locked

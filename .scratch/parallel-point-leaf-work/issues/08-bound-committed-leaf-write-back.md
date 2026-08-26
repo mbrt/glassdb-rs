@@ -11,8 +11,10 @@ How should `KeyLocker` use `join_all_bounded` for the original committed `Locked
 ## Answer
 
 `KeyLocker::write_back` supplies the original committed `LockedTx` groups to
-`join_all_bounded` in stable leaf-path order. It uses the committed-write-back
-phase limit. Each input carries one group's path, ordered intentions, and
+`join_all_bounded` in stable leaf-path order. `KeyLocker` uses its
+`parallelism`, which is the same value that it uses for normal acquisition and
+that it received from `EngineConfig::transaction_leaf_parallelism` at
+construction. Each input carries one group's path, ordered intentions, and
 installed or observed lock-proof lower bound. The generic zero- and one-input
 paths apply, so one original group does not construct the multi-future queue or
 add a backend operation. Do not spawn one task per leaf.
