@@ -81,7 +81,7 @@ impl HolderResolution {
 
 /// The effective committed state resolved from one loaded shard entry.
 #[derive(Debug, Clone)]
-struct EffectiveResolution {
+pub(crate) struct EffectiveResolution {
     writer: Option<TxId>,
     value: ResolvedValue,
     deleted: bool,
@@ -102,6 +102,20 @@ impl Default for EffectiveResolution {
 }
 
 impl EffectiveResolution {
+    /// Returns the effective writer projection.
+    pub(crate) fn into_writer(self) -> WriterResolution {
+        WriterResolution {
+            writer: self.writer,
+            value: self.value,
+            cache_hit: self.cache_hit,
+        }
+    }
+
+    /// Reports whether the resolved state represents a live key.
+    pub(crate) fn exists(&self) -> bool {
+        self.writer.is_some() && !self.deleted
+    }
+
     fn from_current(current: &CurrentState) -> Self {
         Self {
             writer: current.writer().cloned(),
@@ -111,24 +125,12 @@ impl EffectiveResolution {
         }
     }
 
-    fn into_writer(self) -> WriterResolution {
-        WriterResolution {
-            writer: self.writer,
-            value: self.value,
-            cache_hit: self.cache_hit,
-        }
-    }
-
     fn into_holders(self) -> HolderResolution {
         HolderResolution {
             writer: self.writer,
             deleted: self.deleted,
             pending: self.pending,
         }
-    }
-
-    fn exists(&self) -> bool {
-        self.writer.is_some() && !self.deleted
     }
 }
 
@@ -198,33 +200,6 @@ impl KeyStateResolver {
         Ok(pending)
     }
 
-    /// Resolves an entry's effective committed writer.
-    pub(crate) async fn resolve_writer(
-        &self,
-        key: &KeyRef,
-        entry: Option<&ShardEntry>,
-        requirement: Requirement,
-    ) -> Result<WriterResolution, TransError> {
-        Ok(self
-            .resolve_effective(key, entry, None, requirement)
-            .await?
-            .into_writer())
-    }
-
-    /// Resolves an entry's effective writer for point validation.
-    pub(crate) async fn resolve_writer_for_validation(
-        &self,
-        key: &KeyRef,
-        entry: Option<&ShardEntry>,
-        own_lock_holder: Option<&TxId>,
-        requirement: Requirement,
-    ) -> Result<WriterResolution, TransError> {
-        Ok(self
-            .resolve_effective(key, entry, own_lock_holder, requirement)
-            .await?
-            .into_writer())
-    }
-
     /// Resolves an entry's effective writer and live foreign holders from one
     /// status observation per holder.
     pub(crate) async fn resolve_holders(
@@ -253,22 +228,8 @@ impl KeyStateResolver {
         Ok(resolved.into_holders())
     }
 
-    /// Reports whether one loaded entry represents a live key.
-    pub(crate) async fn entry_exists(
-        &self,
-        key: &KeyRef,
-        entry: &ShardEntry,
-        own_lock_holder: Option<&TxId>,
-        requirement: Requirement,
-    ) -> Result<bool, TransError> {
-        Ok(self
-            .resolve_effective(key, Some(entry), own_lock_holder, requirement)
-            .await?
-            .exists())
-    }
-
     /// Resolves the effective committed state represented by one loaded entry.
-    async fn resolve_effective(
+    pub(crate) async fn resolve_effective(
         &self,
         key: &KeyRef,
         entry: Option<&ShardEntry>,
@@ -581,9 +542,10 @@ mod tests {
         let (state, _background) = harness.resolver();
         harness.clear_operations();
         let writer = state
-            .resolve_writer(key, Some(entry), Requirement::Any)
+            .resolve_effective(key, Some(entry), None, Requirement::Any)
             .await
-            .unwrap();
+            .unwrap()
+            .into_writer();
         assert_eq!(writer, expected.writer, "{context}: cold writer");
         harness.assert_operations(
             expected.operations.writer,
@@ -592,9 +554,10 @@ mod tests {
 
         harness.clear_operations();
         let writer = state
-            .resolve_writer(key, Some(entry), Requirement::Any)
+            .resolve_effective(key, Some(entry), None, Requirement::Any)
             .await
-            .unwrap();
+            .unwrap()
+            .into_writer();
         let mut warm_writer = expected.writer.clone();
         warm_writer.cache_hit = true;
         assert_eq!(writer, warm_writer, "{context}: warm writer");
@@ -618,9 +581,10 @@ mod tests {
         harness.clear_operations();
         assert_eq!(
             state
-                .entry_exists(key, entry, None, Requirement::Any)
+                .resolve_effective(key, Some(entry), None, Requirement::Any)
                 .await
-                .unwrap(),
+                .unwrap()
+                .exists(),
             expected.exists,
             "{context}: existence"
         );
@@ -830,9 +794,10 @@ mod tests {
             harness.clear_operations();
             assert!(
                 state
-                    .entry_exists(&key, &entry, Some(&holder), Requirement::Any,)
+                    .resolve_effective(&key, Some(&entry), Some(&holder), Requirement::Any)
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .exists(),
                 "the predecessor's inline value remains effective"
             );
             harness.assert_operations(0, &format!("own {lock_type} holder: existence"));

@@ -894,16 +894,6 @@ impl Monitor {
         Ok(self.resolve_tx_status_at(tid, requirement).await?.status())
     }
 
-    /// Returns whether `tid` is committed using transaction-state evidence no
-    /// older than `at`.
-    pub(crate) async fn committed_at(
-        &self,
-        tid: &TxId,
-        at: SequencePoint,
-    ) -> Result<bool, TransError> {
-        Ok(self.tx_status_at(tid, Requirement::AtLeast(at)).await? == TxCommitStatus::Ok)
-    }
-
     /// Waits for and returns a transaction's durable final status.
     pub(crate) async fn await_tx_final(&self, tid: &TxId) -> Result<TxFinalStatus, TransError> {
         loop {

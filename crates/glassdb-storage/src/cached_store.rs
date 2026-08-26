@@ -185,15 +185,6 @@ impl Requirement {
         }
     }
 
-    /// Reports whether this requirement is at least as strong as `required`.
-    pub fn covers(self, required: Self) -> bool {
-        match (self, required) {
-            (_, Requirement::Any) => true,
-            (Requirement::Any, Requirement::AtLeast(_)) => false,
-            (Requirement::AtLeast(loaded), Requirement::AtLeast(required)) => loaded >= required,
-        }
-    }
-
     /// Returns the stronger of two requirements.
     pub fn stricter(self, other: Self) -> Self {
         match (self, other) {
@@ -869,16 +860,15 @@ impl<C: Codec> TypedCachedStore<C> {
         })
     }
 
-    /// Checks whether an exact retained observation is current after `bound`.
+    /// Checks whether an exact retained observation is current under
+    /// `requirement`.
     pub(crate) async fn check_current(
         &self,
         observed: &Observation<C::Value>,
-        bound: SequencePoint,
+        requirement: Requirement,
     ) -> Result<ObservationCheck<C::Value>, StorageError> {
         Self::check_path(&observed.key)?;
-        self.store
-            .check_current::<C>(observed, Requirement::AtLeast(bound))
-            .await
+        self.store.check_current::<C>(observed, requirement).await
     }
 
     /// Creates a decoded object if it is absent.
@@ -2760,7 +2750,9 @@ mod tests {
 
         clear(&log);
         assert!(matches!(
-            s1.check_current(&obs, w).await.unwrap(),
+            s1.check_current(&obs, Requirement::AtLeast(w))
+                .await
+                .unwrap(),
             ObservationCheck::Current
         ));
         assert_eq!(count(&log, "read"), 0, "older bound needs no backend op");
@@ -2768,7 +2760,11 @@ mod tests {
 
         // A stricter bound checks again and observes the winner.
         let t = s1.store.timeline.now();
-        match s1.check_current(&obs, t).await.unwrap() {
+        match s1
+            .check_current(&obs, Requirement::AtLeast(t))
+            .await
+            .unwrap()
+        {
             ObservationCheck::Changed(cur) => assert_eq!(cur.value().unwrap().as_slice(), b"b"),
             ObservationCheck::Current => panic!("a stricter bound must observe the changed state"),
         }
@@ -2794,7 +2790,11 @@ mod tests {
         assert_eq!(current.value().unwrap().as_slice(), b"b");
 
         clear(&log);
-        match local.check_current(&observed, bound).await.unwrap() {
+        match local
+            .check_current(&observed, Requirement::AtLeast(bound))
+            .await
+            .unwrap()
+        {
             ObservationCheck::Changed(changed) => {
                 assert_eq!(changed.value().unwrap().as_slice(), b"b");
             }
@@ -3695,19 +3695,6 @@ mod tests {
         fn elapsed(&self) -> Duration {
             *self.elapsed.lock().unwrap()
         }
-    }
-
-    #[test]
-    fn requirement_coverage_follows_freshness_order() {
-        let earlier = Requirement::AtLeast(SequencePoint::from_raw(1));
-        let later = Requirement::AtLeast(SequencePoint::from_raw(2));
-
-        assert!(Requirement::Any.covers(Requirement::Any));
-        assert!(later.covers(Requirement::Any));
-        assert!(!Requirement::Any.covers(earlier));
-        assert!(earlier.covers(earlier));
-        assert!(later.covers(earlier));
-        assert!(!earlier.covers(later));
     }
 
     #[test]

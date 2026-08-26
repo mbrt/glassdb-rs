@@ -31,8 +31,8 @@ use glassdb_concurr::{Background, Backoff, RetryConfig, rt};
 use glassdb_data::{KeyRef, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxLog, TxWrite};
 use glassdb_storage::{
-    InlinePolicy, LeafObservationCheck, LockType, NodeStore, Requirement, SequencePoint,
-    SplitPolicy, Timeline, TreeRouter,
+    InlinePolicy, LeafObservationCheck, LockType, NodeStore, Requirement, SplitPolicy, Timeline,
+    TreeRouter,
 };
 
 use crate::access::{AccessSet, ReadAccess, WriteOp};
@@ -448,20 +448,13 @@ impl Algo {
         // The transaction body has finished and no CAS has yet certified its
         // reads, so optimistic validation must establish its own lower bound.
         let validation_start = self.timeline.now();
+        let requirement = Requirement::AtLeast(validation_start);
         if self
-            .validate(
-                &tx.accesses,
-                ValidationContext::Optimistic,
-                validation_start,
-            )
+            .validate(&tx.accesses, ValidationContext::Optimistic, requirement)
             .await?
             && self
                 .collection_commit
-                .validate(
-                    None,
-                    &tx.collections,
-                    Requirement::AtLeast(validation_start),
-                )
+                .validate(None, &tx.collections, requirement)
                 .await?
         {
             return Ok(());
@@ -496,20 +489,13 @@ impl Algo {
         // Read-only commit has no mutation receipt; this barrier separates the
         // completed body from the physical observations that certify it.
         let validation_start = self.timeline.now();
+        let requirement = Requirement::AtLeast(validation_start);
         if self
-            .validate(
-                &tx.accesses,
-                ValidationContext::Optimistic,
-                validation_start,
-            )
+            .validate(&tx.accesses, ValidationContext::Optimistic, requirement)
             .await?
             && self
                 .collection_commit
-                .validate(
-                    None,
-                    &tx.collections,
-                    Requirement::AtLeast(validation_start),
-                )
+                .validate(None, &tx.collections, requirement)
                 .await?
         {
             tx.commit();
@@ -555,7 +541,8 @@ impl Algo {
         // Capture before lock acquisition so every successful lock CAS is
         // eligible to certify the reads it protects against this same bound.
         let validation_start = self.timeline.now();
-        let locked = match self.acquire_locks(tx, validation_start).await? {
+        let requirement = Requirement::AtLeast(validation_start);
+        let locked = match self.acquire_locks(tx, requirement).await? {
             Acquired::Locked(l) => l,
             // A higher-priority peer aborted us: renew the id and re-run.
             Acquired::Wounded => return self.restart(tx).await,
@@ -581,16 +568,12 @@ impl Algo {
                     tx_id: &tx.id,
                     locked: &locked,
                 },
-                validation_start,
+                requirement,
             )
             .await?
             || !self
                 .collection_commit
-                .validate(
-                    Some(&tx.id),
-                    &tx.collections,
-                    Requirement::AtLeast(validation_start),
-                )
+                .validate(Some(&tx.id), &tx.collections, requirement)
                 .await?
         {
             self.locker.collections().release(&tx.id, &locks).await?;
@@ -640,12 +623,13 @@ impl Algo {
         // The escalated read-only path uses lock CASes as validation evidence,
         // so their shared lower bound must precede acquisition.
         let validation_start = self.timeline.now();
+        let requirement = Requirement::AtLeast(validation_start);
         let directory_locks = self
             .locker
             .collections()
             .lock(&tx.id, &tx.collections.data().reads, &[])
             .await?;
-        let locked = match self.acquire_locks(tx, validation_start).await? {
+        let locked = match self.acquire_locks(tx, requirement).await? {
             Acquired::Locked(locked) => locked,
             Acquired::Wounded => return self.restart(tx).await,
         };
@@ -659,16 +643,12 @@ impl Algo {
                     tx_id: &tx.id,
                     locked: &locked,
                 },
-                validation_start,
+                requirement,
             )
             .await?
             && self
                 .collection_commit
-                .validate(
-                    Some(&tx.id),
-                    &tx.collections,
-                    Requirement::AtLeast(validation_start),
-                )
+                .validate(Some(&tx.id), &tx.collections, requirement)
                 .await?
         {
             return Ok(());
@@ -743,7 +723,7 @@ impl Algo {
     async fn acquire_locks(
         &self,
         tx: &mut Handle,
-        validation_start: SequencePoint,
+        requirement: Requirement,
     ) -> Result<Acquired, TransError> {
         let mut serial = tx.renewals() >= SERIAL_FALLBACK_AFTER;
         let mut conflicts: usize = 0;
@@ -755,16 +735,15 @@ impl Algo {
             if self.was_wounded(tx).await {
                 return Ok(Acquired::Wounded);
             }
-            let scan_requirement = Requirement::AtLeast(validation_start);
             let outcome = if serial {
                 self.locker
                     .keys()
-                    .lock_at(&tx.id, &tx.accesses, true, scan_requirement)
+                    .lock_at(&tx.id, &tx.accesses, true, requirement)
                     .await
             } else {
                 let key_locker = self.locker.keys();
                 tokio::select! {
-                    res = key_locker.lock_at(&tx.id, &tx.accesses, false, scan_requirement) => res,
+                    res = key_locker.lock_at(&tx.id, &tx.accesses, false, requirement) => res,
                     _ = rt::sleep(MAX_DEADLOCK_TIMEOUT) => Err(TransError::LockTimeout),
                 }
             };
@@ -854,29 +833,34 @@ impl Algo {
         &self,
         accesses: &AccessSet,
         context: ValidationContext<'_>,
-        validation_start: SequencePoint,
+        requirement: Requirement,
     ) -> Result<bool, TransError> {
         let lock_validation = context.lock_validation();
+        let own_lock_holder = context.own_lock_holder();
         let physical_reads_valid = self
-            .validate_read_observations(accesses, validation_start, lock_validation)
+            .validate_read_observations(accesses, requirement, lock_validation)
             .await?;
         let physical_scans_valid = self
-            .validate_scan_observations(accesses, validation_start, lock_validation)
+            .validate_scan_observations(accesses, requirement, lock_validation)
             .await?;
-        Ok((physical_reads_valid
+        let reads_valid = physical_reads_valid
             || self
-                .validate_reads_inner(accesses, context.own_lock_holder(), validation_start)
-                .await?)
-            && (physical_scans_valid
-                || self
-                    .validate_scans_inner(accesses, context.own_lock_holder(), validation_start)
-                    .await?))
+                .validate_reads_inner(accesses, own_lock_holder, requirement)
+                .await?;
+        if !reads_valid {
+            return Ok(false);
+        }
+        let scans_valid = physical_scans_valid
+            || self
+                .validate_scans_inner(accesses, own_lock_holder, requirement)
+                .await?;
+        Ok(scans_valid)
     }
 
     async fn validate_read_observations(
         &self,
         accesses: &AccessSet,
-        validation_start: SequencePoint,
+        requirement: Requirement,
         lock_validation: Option<&LockedTx>,
     ) -> Result<bool, TransError> {
         if lock_validation.is_some() {
@@ -889,7 +873,7 @@ impl Algo {
             .collect::<Vec<_>>();
         let checks = self
             .shards
-            .check_leaves_current(&observations, validation_start)
+            .check_leaves_current(&observations, requirement)
             .await;
         for (read, check) in accesses.point_reads().iter().zip(checks) {
             if !matches!(check?, LeafObservationCheck::Current) {
@@ -905,7 +889,7 @@ impl Algo {
     async fn validate_scan_observations(
         &self,
         accesses: &AccessSet,
-        validation_start: SequencePoint,
+        requirement: Requirement,
         lock_validation: Option<&LockedTx>,
     ) -> Result<bool, TransError> {
         for coverage in accesses
@@ -917,7 +901,7 @@ impl Algo {
                 Some(locked) => locked.validated(&coverage.observation),
                 None => matches!(
                     self.shards
-                        .check_leaf_current(&coverage.observation, validation_start)
+                        .check_leaf_current(&coverage.observation, requirement)
                         .await?,
                     LeafObservationCheck::Current
                 ),
@@ -926,7 +910,7 @@ impl Algo {
                 return Ok(false);
             }
             for holder in &coverage.pending_membership {
-                if self.mon.committed_at(holder, validation_start).await? {
+                if self.mon.tx_status_at(holder, requirement).await? == TxCommitStatus::Ok {
                     return Ok(false);
                 }
             }
@@ -942,7 +926,7 @@ impl Algo {
         &self,
         accesses: &AccessSet,
         own_lock_holder: Option<&TxId>,
-        validation_start: SequencePoint,
+        requirement: Requirement,
     ) -> Result<bool, TransError> {
         if accesses.point_reads().is_empty() {
             return Ok(true);
@@ -954,7 +938,7 @@ impl Algo {
             .collect();
         let current = self
             .resolver
-            .effective_point_states(&keys, own_lock_holder, validation_start)
+            .effective_point_states(&keys, own_lock_holder, requirement)
             .await?;
         for (r, state) in accesses.point_reads().iter().zip(current) {
             if !r.validates(state.writer.as_ref(), state.membership_version) {
@@ -974,9 +958,8 @@ impl Algo {
         &self,
         accesses: &AccessSet,
         own_lock_holder: Option<&TxId>,
-        validation_start: SequencePoint,
+        requirement: Requirement,
     ) -> Result<bool, TransError> {
-        let requirement = Requirement::AtLeast(validation_start);
         for scan in accesses.range_scans() {
             let current = self
                 .resolver
@@ -999,7 +982,7 @@ impl Algo {
                     .iter()
                     .flat_map(|leaf| &leaf.pending_membership)
                 {
-                    if self.mon.committed_at(holder, validation_start).await? {
+                    if self.mon.tx_status_at(holder, requirement).await? == TxCommitStatus::Ok {
                         fast = false;
                         break;
                     }
@@ -2096,9 +2079,9 @@ mod tests {
             Vec::new(),
         );
 
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
         assert!(
-            tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "opaque evidence accepts its current value"
@@ -2106,9 +2089,9 @@ mod tests {
 
         let (peer, _peer_ctx) = new_algo_from_backend(tctx.backend.clone()).await;
         commit_writes(&peer, vec![wa(&keyp, b"v2")]).await;
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
         assert!(
-            !tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            !tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "opaque evidence rejects a superseded value"
@@ -2124,7 +2107,7 @@ mod tests {
         assert!(!read.validates(None, 1));
         let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
 
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
         let loaded = tctx
             .shards
             .load_leaf(&test_root_path(), Requirement::Any)
@@ -2137,13 +2120,13 @@ mod tests {
             })]));
         assert!(tctx.shards.commit_leaf(edit).await.unwrap());
         assert!(
-            tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "representing an unrelated absence does not change membership"
         );
 
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
         let loaded = tctx
             .shards
             .load_leaf(&test_root_path(), Requirement::Any)
@@ -2157,7 +2140,7 @@ mod tests {
         edit.set_locks(locks);
         assert!(tctx.shards.commit_leaf(edit).await.unwrap());
         assert!(
-            !tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            !tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "create-delete-reclaim returning to unmarked absence changes its generation"
@@ -2185,7 +2168,7 @@ mod tests {
         assert!(read.validates(Some(&writer), 0));
         assert!(read.validates(Some(&writer), 1));
         let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
 
         let external_timeline = Timeline::new();
         let external = NodeStore::new(
@@ -2209,7 +2192,7 @@ mod tests {
         assert!(external.commit_leaf(edit).await.unwrap());
 
         assert!(
-            !tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            !tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap()
         );
@@ -2246,7 +2229,7 @@ mod tests {
         let read = do_read(&tctx, &keyp).await;
         assert!(read.validates(Some(&previous), 0));
         let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
 
         // Finalize only the transaction object. The leaf still contains the
         // same pending lock, so leaf validation alone cannot detect that the
@@ -2262,13 +2245,13 @@ mod tests {
         tctx.tmon.commit_tx(log).await.unwrap();
 
         assert!(
-            !tm.validate_read_observations(&data, validation_start, None)
+            !tm.validate_read_observations(&data, requirement, None)
                 .await
                 .unwrap(),
             "an exclusive holder prevents the leaf-only shortcut"
         );
         assert!(
-            !tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            !tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "writer resolution at the validation watermark observes the committed holder"
@@ -2306,19 +2289,19 @@ mod tests {
         let read = do_read(&tctx, &keyp).await;
         assert!(read.validates(Some(&previous), 0));
         let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
 
         // Aborting the holder leaves the previously observed writer effective.
         // The exclusive holder prevents a physical shortcut, then writer
         // resolution at the validation watermark accepts the unchanged value.
         tctx.tmon.abort_owned_tx(&holder).await.unwrap();
         assert!(
-            !tm.validate_read_observations(&data, validation_start, None)
+            !tm.validate_read_observations(&data, requirement, None)
                 .await
                 .unwrap()
         );
         assert!(
-            tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap()
         );
@@ -2350,7 +2333,7 @@ mod tests {
 
         let read = do_read(&tctx, &ka).await;
         let observed = read.observation().clone();
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
 
         // Another transaction's disjoint lock CAS validates the same pre-CAS
         // leaf after our barrier and therefore advances its shared evidence.
@@ -2396,7 +2379,7 @@ mod tests {
         };
         assert!(!current_locked.validated(&observed));
         assert!(
-            !tm.validate_read_observations(&current_data, validation_start, Some(&current_locked),)
+            !tm.validate_read_observations(&current_data, requirement, Some(&current_locked),)
                 .await
                 .unwrap()
         );
@@ -2413,7 +2396,7 @@ mod tests {
         commit_writes(&tm, vec![wa(&ka, b"a0"), wa(&kb, b"b0")]).await;
 
         let read = do_read(&tctx, &ka).await;
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
 
         // A separate client rewrites the shared leaf for B. Its cache is
         // independent, so it cannot advance the retained observation of A in
@@ -2471,13 +2454,13 @@ mod tests {
         let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
         log.lock().unwrap().clear();
         assert!(
-            !tm.validate_read_observations(&data, validation_start, None)
+            !tm.validate_read_observations(&data, requirement, None)
                 .await
                 .unwrap(),
             "the retained physical revision changed"
         );
         assert!(
-            tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "logical validation accepts the unchanged writer"
@@ -2658,18 +2641,18 @@ mod tests {
             vec![result.into_access(test_collection(), range, Vec::new())],
         );
 
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
         assert!(
-            tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "opaque evidence accepts its current membership"
         );
 
         commit_writes(&tm, vec![wa(&key_ref(b"b"), b"1")]).await;
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
         assert!(
-            !tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            !tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "opaque evidence rejects a changed membership"

@@ -19,7 +19,6 @@ use crate::cached_store::{
 use crate::error::StorageError;
 use crate::node::{Node, NodeLocks};
 use crate::shard::Shard;
-use crate::timeline::SequencePoint;
 
 const NODE_LIST_PAGE_SIZE: usize = 128;
 
@@ -165,20 +164,21 @@ impl NodeStore {
         }
     }
 
-    /// Checks whether a retained leaf observation is still current after `bound`.
+    /// Checks whether a retained leaf observation satisfies `requirement`.
     pub async fn check_leaf_current(
         &self,
         observed: &LeafObservation,
-        bound: SequencePoint,
+        requirement: Requirement,
     ) -> Result<LeafObservationCheck, StorageError> {
-        self.nodes.check_current(observed, bound).await
+        self.nodes.check_current(observed, requirement).await
     }
 
-    /// Checks retained leaf observations with bounded work on distinct paths.
+    /// Checks retained leaf observations against `requirement` with bounded
+    /// work on distinct paths.
     pub async fn check_leaves_current(
         &self,
         observations: &[LeafObservation],
-        bound: SequencePoint,
+        requirement: Requirement,
     ) -> Vec<Result<LeafObservationCheck, StorageError>> {
         let mut by_path = BTreeMap::<ObjectPath, Vec<(usize, LeafObservation)>>::new();
         for (index, observation) in observations.iter().enumerate() {
@@ -199,14 +199,16 @@ impl NodeStore {
                     .iter()
                     .find(|(prior, _)| observation.same_state(prior))
                 {
-                    if matches!(result, Ok(LeafObservationCheck::Current)) {
+                    if matches!(result, Ok(LeafObservationCheck::Current))
+                        && let Requirement::AtLeast(bound) = requirement
+                    {
                         observation.advance_current_after(bound);
                     }
                     results.push((index, result.clone()));
                     continue;
                 }
 
-                let result = self.check_leaf_current(&observation, bound).await;
+                let result = self.check_leaf_current(&observation, requirement).await;
                 results.push((index, result.clone()));
                 checked.push((observation, result));
             }
@@ -683,7 +685,10 @@ mod tests {
         assert!(first.same_state(&second));
         let bound = first_store.timeline.now();
         let checks = first_store
-            .check_leaves_current(&[first.clone(), second.clone()], bound)
+            .check_leaves_current(
+                &[first.clone(), second.clone()],
+                Requirement::AtLeast(bound),
+            )
             .await;
 
         assert!(
@@ -726,7 +731,7 @@ mod tests {
 
         log.lock().unwrap().clear();
         let checks = validator
-            .check_leaves_current(&[first, second], timeline.now())
+            .check_leaves_current(&[first, second], Requirement::AtLeast(timeline.now()))
             .await;
 
         assert!(

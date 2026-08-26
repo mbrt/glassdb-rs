@@ -9,9 +9,7 @@ use std::num::NonZeroUsize;
 
 use glassdb_concurr::map_all_bounded;
 use glassdb_data::{CollectionAddress, KeyRef, TxId};
-use glassdb_storage::{
-    LeafLocator, Requirement, SequencePoint, ShardEntry, StorageError, TreeRouter,
-};
+use glassdb_storage::{LeafLocator, Requirement, ShardEntry, StorageError, TreeRouter};
 
 use crate::access::{LeafCoverage, ScanAccess, ScanEvidence, ScanMutation, ScanRange};
 use crate::error::{TransError, trans_to_storage};
@@ -25,9 +23,9 @@ pub struct ScanResult {
     evidence: ScanEvidence,
 }
 
-/// Current point state used by logical validation after physical leaf churn.
+/// The effective writer and owning-leaf generation for one point key.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PointValidationState {
+pub(crate) struct EffectivePointState {
     pub(crate) writer: Option<TxId>,
     pub(crate) membership_version: u64,
 }
@@ -185,9 +183,15 @@ impl KeyResolver {
                             None => false,
                             Some(entry) => self
                                 .state
-                                .entry_exists(&key_ref, entry, own_lock_holder, requirement)
+                                .resolve_effective(
+                                    &key_ref,
+                                    Some(entry),
+                                    own_lock_holder,
+                                    requirement,
+                                )
                                 .await
-                                .map_err(trans_to_storage)?,
+                                .map_err(trans_to_storage)?
+                                .exists(),
                         }
                     }
                 };
@@ -292,15 +296,14 @@ impl KeyResolver {
         &self,
         keys: &[KeyRef],
         own_lock_holder: Option<&TxId>,
-        validation_start: SequencePoint,
-    ) -> Result<Vec<PointValidationState>, StorageError> {
+        requirement: Requirement,
+    ) -> Result<Vec<EffectivePointState>, StorageError> {
         let items = keys
             .iter()
             .cloned()
             .enumerate()
             .map(|(ordinal, key)| (key.clone(), (ordinal, key)))
             .collect::<Vec<_>>();
-        let requirement = Requirement::AtLeast(validation_start);
         let groups = self
             .router
             .group_keys_by_leaf_fresh(items, Requirement::Any, requirement)
@@ -338,18 +341,14 @@ impl KeyResolver {
             for (raw_key, (ordinal, key)) in &group.keys {
                 let resolved = self
                     .state
-                    .resolve_writer_for_validation(
-                        key,
-                        leaf.lookup(raw_key),
-                        own_lock_holder,
-                        requirement,
-                    )
+                    .resolve_effective(key, leaf.lookup(raw_key), own_lock_holder, requirement)
                     .await
+                    .map(|resolved| resolved.into_writer())
                     .map_err(trans_to_storage);
                 match resolved {
                     Ok(resolved) => results.push((
                         *ordinal,
-                        Ok(PointValidationState {
+                        Ok(EffectivePointState {
                             writer: resolved.writer,
                             membership_version,
                         }),
@@ -398,8 +397,9 @@ impl KeyResolver {
         let loc = self.locate_key(key, requirement).await?;
         let writer = self
             .state
-            .resolve_writer(key, Self::entry_at(&loc, key.key())?, requirement)
-            .await?;
+            .resolve_effective(key, Self::entry_at(&loc, key.key())?, None, requirement)
+            .await?
+            .into_writer();
         Ok((writer, loc))
     }
 
@@ -718,7 +718,7 @@ mod tests {
         ));
         assert!(matches!(
             resolver
-                .effective_point_states(&[key], None, timeline.now())
+                .effective_point_states(&[key], None, Requirement::AtLeast(timeline.now()),)
                 .await,
             Err(StorageError::StaleCollection)
         ));
@@ -749,7 +749,11 @@ mod tests {
         let pb = key_ref(&b);
         let pc = key_ref(&c);
         let out = resolver
-            .effective_point_states(&[pa.clone(), pb.clone(), pc.clone()], None, timeline.now())
+            .effective_point_states(
+                &[pa.clone(), pb.clone(), pc.clone()],
+                None,
+                Requirement::AtLeast(timeline.now()),
+            )
             .await
             .unwrap();
 
@@ -772,15 +776,16 @@ mod tests {
         let (resolver, monitor, timeline, _background) = resolver_over(backend).await;
         commit_value(&monitor, key, &holder, false).await;
         let key = key_ref(key);
+        let requirement = Requirement::AtLeast(timeline.now());
 
         let foreign = resolver
-            .effective_point_states(std::slice::from_ref(&key), None, timeline.now())
+            .effective_point_states(std::slice::from_ref(&key), None, requirement)
             .await
             .unwrap();
         assert_eq!(foreign[0].writer, Some(holder.clone()));
 
         let own = resolver
-            .effective_point_states(std::slice::from_ref(&key), Some(&holder), timeline.now())
+            .effective_point_states(std::slice::from_ref(&key), Some(&holder), requirement)
             .await
             .unwrap();
         assert_eq!(own[0].writer, Some(predecessor));
