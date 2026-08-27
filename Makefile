@@ -1,4 +1,4 @@
-.PHONY: test test-sim test-all lint format build fuzz fuzz-min bench bench-score flamegraph
+.PHONY: test test-sim test-all lint format build clean fuzz fuzz-min bench bench-score flamegraph
 
 # Flags for every build under the in-repo deterministic simulation executor:
 # `--cfg sim` routes spawn/time/randomness through it, and `--cfg tokio_unstable`
@@ -7,6 +7,10 @@ SIM_RUSTFLAGS = --cfg sim --cfg tokio_unstable
 
 build:
 	cargo build --workspace
+
+clean:
+	cargo clean
+	cd fuzz && cargo clean
 
 test: lint
 	cargo test --workspace
