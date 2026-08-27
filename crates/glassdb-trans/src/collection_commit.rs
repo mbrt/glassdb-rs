@@ -55,10 +55,10 @@ impl CollectionAttempt {
         self.data = data;
     }
 
-    /// Carries logical accesses to a renewed identity without claiming the old
-    /// identity's physical resources.
-    pub(crate) fn renewed(self) -> Self {
-        Self::new(self.data)
+    /// Drops physical resources that belonged to the retired identity.
+    pub(crate) fn renew(&mut self) {
+        self.prepared.clear();
+        self.fenced_drops.clear();
     }
 
     /// Returns the complete recovery manifest for the committed transaction.
@@ -285,12 +285,12 @@ mod tests {
         attempt.prepared.insert(collection.clone());
         attempt.fenced_drops.insert(address(2));
 
-        let renewed = attempt.renewed();
+        attempt.renew();
 
-        assert_eq!(renewed.data.changes.len(), 1);
-        assert_eq!(renewed.data.changes[0].collection, collection);
-        assert!(renewed.prepared.is_empty());
-        assert!(renewed.fenced_drops.is_empty());
+        assert_eq!(attempt.data.changes.len(), 1);
+        assert_eq!(attempt.data.changes[0].collection, collection);
+        assert!(attempt.prepared.is_empty());
+        assert!(attempt.fenced_drops.is_empty());
     }
 
     #[test]

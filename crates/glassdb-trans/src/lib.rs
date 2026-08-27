@@ -23,7 +23,7 @@ mod wound_wait;
 pub use access::{
     AccessSet, ReadAccess, ReadEvidence, ScanAccess, ScanMutation, ScanRange, WriteAccess,
 };
-pub use algo::DirectCommitStats;
+pub use algo::{BodyOutcome, DirectCommitStats};
 pub use collections::{
     CollectionChange, CollectionData, CollectionOp, DirectoryRead, DirectoryReadKind,
     DirectorySnapshot,

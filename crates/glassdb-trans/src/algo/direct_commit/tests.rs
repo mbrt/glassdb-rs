@@ -115,11 +115,7 @@ async fn single_rw_stale_read_renews_and_converges() {
         &tm,
         AccessSet::new(vec![ra], vec![wa(&keyp, b"v3")], Vec::new()),
     );
-    let err = tm.commit(&mut h).await.unwrap_err();
-    assert!(
-        matches!(err, TransError::Wounded | TransError::Retry),
-        "a stale read is a transparent retry, got {err:?}"
-    );
+    assert_eq!(tm.commit(&mut h).await.unwrap(), BodyOutcome::ReplayBody);
     tm.end(&mut h).await.unwrap();
 
     // The stale write never committed: v2 is still current (the abandoned
@@ -520,6 +516,7 @@ async fn single_rw_observing_a_gate_uses_the_full_locked_path() {
         &tm,
         AccessSet::new(vec![read], vec![wa(&keyp, b"v2")], Vec::new()),
     );
+    let parallel_id = handle.id().clone();
     let committing_tm = tm.clone();
     let committing = tokio::spawn(async move {
         let result = committing_tm.commit(&mut handle).await;
@@ -533,7 +530,8 @@ async fn single_rw_observing_a_gate_uses_the_full_locked_path() {
         .await
         .unwrap();
     let (mut handle, result) = committing.await.unwrap();
-    result.unwrap();
+    assert_eq!(result.unwrap(), BodyOutcome::Complete);
+    assert_ne!(*handle.id(), parallel_id);
     tm.end(&mut handle).await.unwrap();
     assert!(
         tctx.locker.stats_and_reset().calls >= 1,
@@ -1299,11 +1297,7 @@ async fn direct_commit_superseded_read_replays_in_place() {
         &tm,
         AccessSet::new(vec![stale], vec![wa(&keyp, b"v3")], Vec::new()),
     );
-    let err = tm.commit(&mut h).await.unwrap_err();
-    assert!(
-        matches!(err, TransError::Retry),
-        "a superseded read replays its body in place, got {err:?}"
-    );
+    assert_eq!(tm.commit(&mut h).await.unwrap(), BodyOutcome::ReplayBody);
     tm.end(&mut h).await.unwrap();
     let status = tctx
         .tlogger
@@ -1411,8 +1405,8 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
     // Which member wins the round's claim depends on id order; that exactly
     // one does is the property under test.
     let (winner, mut replayed) = match (&r1, &r2) {
-        (Ok(()), Err(TransError::Retry)) => (h1.id().clone(), h2),
-        (Err(TransError::Retry), Ok(())) => (h2.id().clone(), h1),
+        (Ok(BodyOutcome::Complete), Ok(BodyOutcome::ReplayBody)) => (h1.id().clone(), h2),
+        (Ok(BodyOutcome::ReplayBody), Ok(BodyOutcome::Complete)) => (h2.id().clone(), h1),
         other => panic!("expected one commit and one replay, got {other:?}"),
     };
 

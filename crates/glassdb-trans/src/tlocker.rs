@@ -12,7 +12,7 @@
 //!
 //! [`Locker`] is the common lock boundary. Its key view owns how a transaction
 //! groups keys, the parallel/serial acquisition strategy, the hold-and-wait
-//! loop, and per-transaction held-lock bookkeeping; its collection view owns
+//! loop, and local hold diagnostics; its collection view owns
 //! collection locks and their committed effects. The data mutation *mechanism* — deduplicated
 //! load + resolve + CAS with retry — lives in the
 //! [`ShardCoordinator`](crate::shard_coord::ShardCoordinator) below it, which
@@ -52,9 +52,8 @@ use crate::shard_coord::{
 };
 use crate::wound_wait::{Reclaim, try_reclaim};
 
-/// One independent partition of the per-transaction held-lock bookkeeping: the
-/// shard/root paths each transaction holds and their lock type.
-type LockerShard = Mutex<HashMap<TxId, HashMap<ObjectPath, HeldLeaf>>>;
+/// One partition of the best-effort local hold observations.
+type ObservedHoldShard = Mutex<HashMap<TxId, HashMap<ObjectPath, HeldLeaf>>>;
 
 #[derive(Clone, Copy)]
 struct HeldLeaf {
@@ -84,7 +83,7 @@ pub struct TxLockSnapshot {
 /// Snapshot of distributed-locker activity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LockerStats {
-    /// Lock-acquisition calls, including serial-fallback re-locks.
+    /// Lock-acquisition calls, including acquisition by renewed identities.
     pub calls: u64,
 }
 
@@ -617,8 +616,8 @@ impl ShardOperation for WriteBackOperation {
     }
 }
 
-/// Drops every hold this transaction has in the shard, publishing nothing
-/// (ADR-024 serial-fallback release).
+/// Drops every hold this transaction has in one recovery-selected leaf,
+/// publishing nothing.
 #[derive(Clone)]
 struct ReleaseOperation {
     id: TxId,
@@ -890,13 +889,12 @@ pub(crate) enum LockOutcome {
     /// All locks held; drives write-back on commit.
     Locked(LockedTx),
     /// Lost a CAS-contention race or reached the absolute object limit without
-    /// adding a user key. Handled **internally** by [`super::algo::Algo`]: it
-    /// releases the partial locks and re-acquires under the **same id** after a
-    /// backoff — no renew and no body re-run (escalating to the serial order if
-    /// contention persists). Never surfaces to the database retry loop.
+    /// adding a user key. The caller retains landed same-identity holds and
+    /// retries the complete access set. Sustained parallel contention requests
+    /// owner-level renewal before sorted serial acquisition.
     Conflict,
-    /// A create reached a leaf's reserved content cap. The caller releases any
-    /// partial locks, backs off without serial escalation, and retries after the
+    /// A create reached a leaf's reserved content cap. The caller retains other
+    /// leaf holds, backs off without serial escalation, and retries after the
     /// background split has had an opportunity to run.
     LeafFull,
 }
@@ -950,13 +948,11 @@ pub(crate) struct KeyLocker {
     retry: RetryConfig,
     /// Maximum incomplete leaf operations in one transaction phase.
     parallelism: NonZeroUsize,
-    /// Per-transaction held-lock bookkeeping (which leaves a transaction
-    /// holds): recorded when an acquire lands, read to drive the serial-fallback
-    /// release, and surfaced for diagnostics. Shared across clones so the locker
-    /// the algorithm drives and any diagnostics clone see one map.
-    tlocks: Arc<Sharded<LockerShard>>,
-    /// Count of lock-acquisition calls (one per `lock()` attempt, including the
-    /// serial-fallback re-lock). Shared across clones. The coordinator cannot
+    /// Best-effort local observations of leaves held by each transaction.
+    /// Shared across clones so the locker and diagnostics see one map.
+    observed_holds: Arc<Sharded<ObservedHoldShard>>,
+    /// Count of lock-acquisition calls (one per `lock()` attempt). Shared across
+    /// clones. The coordinator cannot
     /// compute it — it only sees per-shard submissions — so the locker owns it.
     calls: Arc<AtomicU64>,
 }
@@ -1034,32 +1030,6 @@ impl KeyLocker {
         Ok(LockOutcome::Locked(LockedTx::from_receipts(
             groups, receipts,
         )?))
-    }
-
-    /// Releases every lock `id` holds across the leaves it has acquired,
-    /// **without publishing any value** and **leaving the transaction object
-    /// pending**. Unlike [`KeyLocker::write_back`] (the
-    /// post-commit release that republishes `current_writer` pointers), this
-    /// just clears `id` from the lock holders so the transaction can re-acquire
-    /// its locks from scratch under the same id.
-    ///
-    /// This is the deadlock-timeout serial fallback's release step (ADR-024):
-    /// when a parallel acquisition blocks past the deadlock budget, the
-    /// transaction drops the locks it grabbed out of order and re-acquires them
-    /// in the global sorted order, where one contender always makes progress.
-    /// Holding the out-of-order locks across the re-acquire would recreate the
-    /// very cycle serial locking exists to break, so they must be released
-    /// first. The held set is read from the coordinator's per-tx bookkeeping.
-    /// Idempotent and best-effort.
-    pub(crate) async fn release_locks(&self, id: &TxId) -> Result<(), TransError> {
-        for path in self.held_paths(id) {
-            // Every recorded hold came from a routed leaf. Release is an
-            // idempotent CAS loop: a stale seed can only lose its precondition
-            // and reload the winner.
-            self.release_leaf_at(id, &path, Requirement::Any).await?
-        }
-        self.clear_tx_locks(id);
-        Ok(())
     }
 
     /// Publishes `current_writer` pointers / tombstones and releases this
@@ -1145,7 +1115,7 @@ impl KeyLocker {
             tmon,
             retry,
             parallelism,
-            tlocks: Arc::new(Sharded::new(|_| Mutex::new(HashMap::new()))),
+            observed_holds: Arc::new(Sharded::new(|_| Mutex::new(HashMap::new()))),
             calls: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -1162,7 +1132,7 @@ impl KeyLocker {
     /// for stable display.
     fn tx_locks_snapshot(&self) -> Vec<TxLockSnapshot> {
         let mut out = Vec::new();
-        self.tlocks.each(|shard| {
+        self.observed_holds.each(|shard| {
             let m = shard.lock().unwrap();
             for (tx_id, locks) in m.iter() {
                 if locks.is_empty() {
@@ -1417,27 +1387,14 @@ impl KeyLocker {
 
     /// Records the aggregate entry and membership strengths held on one leaf.
     fn record_leaf_lock(&self, id: &TxId, path: &ObjectPath, typ: LockType, membership: LockType) {
-        let mut tlocks = self.tlocks.for_key(id.as_bytes()).lock().unwrap();
-        tlocks.entry(id.clone()).or_default().insert(
+        let mut observed_holds = self.observed_holds.for_key(id.as_bytes()).lock().unwrap();
+        observed_holds.entry(id.clone()).or_default().insert(
             path.clone(),
             HeldLeaf {
                 entry_lock: typ,
                 membership,
             },
         );
-    }
-
-    /// The leaf paths `id` currently holds, sorted ascending for a
-    /// deterministic release order (the simulation op-stream oracle requires the
-    /// backend CAS sequence to be reproducible).
-    fn held_paths(&self, id: &TxId) -> Vec<ObjectPath> {
-        let tlocks = self.tlocks.for_key(id.as_bytes()).lock().unwrap();
-        let mut paths: Vec<ObjectPath> = tlocks
-            .get(id)
-            .map(|m| m.keys().cloned().collect())
-            .unwrap_or_default();
-        paths.sort();
-        paths
     }
 
     /// Forgets process-local ownership after recovery takes responsibility for
@@ -1448,8 +1405,8 @@ impl KeyLocker {
 
     /// Drops `id`'s held-lock bookkeeping once its locks are released.
     fn clear_tx_locks(&self, id: &TxId) {
-        let mut tlocks = self.tlocks.for_key(id.as_bytes()).lock().unwrap();
-        tlocks.remove(id);
+        let mut observed_holds = self.observed_holds.for_key(id.as_bytes()).lock().unwrap();
+        observed_holds.remove(id);
     }
 }
 
@@ -2281,46 +2238,6 @@ mod tests {
         );
     }
 
-    // The deadlock-timeout serial fallback releases held locks *without*
-    // publishing a value (the transaction has not committed), leaving the tx
-    // pending so it can re-acquire under the same id (ADR-024).
-    #[tokio::test]
-    async fn release_locks_drops_held_locks_without_publishing() {
-        let (locker, ctx) = init_tl_test().await;
-        let key = b"key";
-        let tx = mk_tid(1, "tx");
-        ctx.monitor.begin_tx(&tx);
-
-        // A blind put installs both the key Create lock and the leaf
-        // membership-write lock.
-        let data = AccessSet::new(
-            Vec::new(),
-            vec![crate::access::WriteAccess::put(
-                key_ref(key),
-                Arc::from(&b"v"[..]),
-            )],
-            Vec::new(),
-        );
-        let out = locker
-            .keys()
-            .lock_at(&tx, &data, false, Requirement::Any)
-            .await
-            .unwrap();
-        assert!(matches!(out, LockOutcome::Locked(_)));
-        assert!(!locker.tx_locks_snapshot().is_empty());
-
-        locker.keys().release_locks(&tx).await.unwrap();
-
-        // The released create-lock left the fresh key with no holder and no
-        // committed writer, so the fold pruned the now-vestigial entry (ADR-029):
-        // a release publishes no value and leaves no dead entry behind.
-        assert!(
-            entry_of(&ctx, key).await.is_none(),
-            "vestigial entry pruned on release"
-        );
-        assert!(locker.tx_locks_snapshot().is_empty());
-    }
-
     #[tokio::test]
     async fn tx_locks_snapshot_lists_held_shards() {
         let (locker, ctx) = init_tl_test().await;
@@ -2908,8 +2825,8 @@ mod tests {
         assert_eq!(entry.current.writer(), Some(&writer));
     }
 
-    // Two transactions releasing disjoint keys of one shard (the serial-fallback
-    // release path) batch into one CAS round (ADR-026); neither publishes a value.
+    // Two recovery releases for disjoint keys of one shard batch into one CAS
+    // round (ADR-026); neither publishes a value.
     #[tokio::test(start_paused = true)]
     async fn concurrent_releases_share_one_cas() {
         let (locker, ctx, log, gate) = gated_locker_with(false).await;
@@ -2930,8 +2847,10 @@ mod tests {
         gate.arm();
         let (l1, l2) = (locker.clone(), locker.clone());
         let (t1, t2) = (tx1.clone(), tx2.clone());
-        let h1 = tokio::spawn(async move { l1.keys().release_locks(&t1).await });
-        let h2 = tokio::spawn(async move { l2.keys().release_locks(&t2).await });
+        let path1 = root_path();
+        let path2 = root_path();
+        let h1 = tokio::spawn(async move { l1.keys().release_leaf(&t1, &path1).await });
+        let h2 = tokio::spawn(async move { l2.keys().release_leaf(&t2, &path2).await });
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
         h1.await.unwrap().unwrap();
@@ -3051,7 +2970,11 @@ mod tests {
         ));
 
         // The older releases; the younger's hold-and-wait loop then re-acquires.
-        locker.keys().release_locks(&old).await.unwrap();
+        locker
+            .keys()
+            .release_leaf(&old, &root_path())
+            .await
+            .unwrap();
         assert!(matches!(
             hy.await.unwrap().unwrap(),
             ShardsOutcome::Locked(_)
@@ -3122,7 +3045,7 @@ mod tests {
         );
 
         // After the winner releases, the loser proceeds: progress, no livelock.
-        locker.keys().release_locks(&a).await.unwrap();
+        locker.keys().release_leaf(&a, &root_path()).await.unwrap();
         assert!(matches!(
             hb.await.unwrap().unwrap(),
             ShardsOutcome::Locked(_)
@@ -3253,7 +3176,11 @@ mod tests {
         waiting.abort();
         let _ = waiting.await;
 
-        locker.keys().release_locks(&old).await.unwrap();
+        locker
+            .keys()
+            .release_leaf(&old, &root_path())
+            .await
+            .unwrap();
         let other = mk_tid(3, "other");
         ctx.monitor.begin_tx(&other);
         lock_ok(&locker, &other, &group_of(key, put_intent(key))).await;

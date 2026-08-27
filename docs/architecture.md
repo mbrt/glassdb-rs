@@ -161,6 +161,14 @@ bound. GlassDB does not add an aggregate backend scheduler; backend adapters
 keep responsibility for queues, connections, retries, and provider throttling
 ([ADR-064](adr/064-bounded-parallel-point-leaf-work.md)).
 
+`Algo` owns every parallel-to-serial lock transition. It ends the old identity
+through the general end path and waits for a durable abort-side status before
+it renews the opaque handle. The replacement keeps its priority and cannot
+publish until the old identity is terminal. Point and range work continues
+without another body execution. Collection changes return `ReplayBody` because
+their physical resources belonged to the old identity
+([ADR-065](adr/065-renewed-transaction-identity-on-serial-fallback.md)).
+
 ```mermaid
 flowchart TD
   API["glassdb public API<br/>Database · Transaction · Collection<br/>metadata bootstrap · user body · retry loop · public errors"]
@@ -311,10 +319,10 @@ bookkeeping remain outside the coordinator.
 
 | Component             | Layer            | Speaks                       | Owns                                                                                                                  | Must not know                       |
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
-| `glassdb` (`tx_impl`) | API / retry      | `Engine`, closures, `Error`  | metadata bootstrap, operation admission, user body, retry loop, public handles/errors, cancel-safety                  | stores, locks, shards, tx logs, runtime wiring |
-| `Engine`              | runtime owner    | backend, database identity, engine configuration, logical keys, `AccessSet` | cache and store opening, permanent-collection verification, runtime construction and lifetime, dormant-to-live startup, read/scan/catalog entry points, transaction-attempt delegation and abandonment retirement, shutdown order, runtime stats/diagnostics | user closures, public handles/errors, body retry policy |
+| `glassdb` (`tx_impl`) | API / retry      | `Engine`, closures, `Error`, `BodyOutcome` | metadata bootstrap, operation admission, user body, body replay, final attempt end, public handles/errors | stores, locks, shards, tx logs, identity renewal, runtime wiring |
+| `Engine`              | runtime owner    | backend, database identity, engine configuration, logical keys, `AccessSet` | cache and store opening, permanent-collection verification, runtime construction and lifetime, dormant-to-live startup, read/scan/catalog entry points, transaction-attempt delegation, shutdown order, runtime stats/diagnostics | user closures, public handles/errors, body retry policy |
 | `AccessSet`           | access facts     | point reads, final key writes, range scans | normalization, deterministic order, merged point facts, counts, read-only projection, read predicates, structural direct-commit shape | routing, locking, I/O, commit policy |
-| `Algo`                | commit **policy** | `AccessSet`, `TxId`, `LockOutcome`, `TxCleanupHints` | transaction lifecycle, direct-vs-logged selection, cross-domain lock→validate→commit→write-back orchestration, abandoned-owner retirement, **read-version validation** (post-lock), conflict policy (wound, deadlock-timeout, parallel↔serial, backoff, same-id retry), GC candidate hints | shard routing, CAS details, caching, collection lifecycle implementation, GC execution, the split mechanism beyond its `SplitHintSink` producer handle |
+| `Algo`                | commit **policy** | `AccessSet`, `TxId`, `LockOutcome`, `BodyOutcome`, `TxCleanupHints` | transaction identity and cancellation retirement, direct-vs-logged selection, cross-domain lock→validate→commit→write-back orchestration, **read-version validation** (post-lock), conflict policy (wound restart, deadlock-timeout renewal, serial acquisition, backoff, same-id normal retry), body-replay decision, GC candidate hints | user-body execution, shard routing, CAS details, caching, collection lifecycle implementation, GC execution, the split mechanism beyond its `SplitHintSink` producer handle |
 | `DirectCommit`        | logless commit mechanism | direct point shape, `TxId`, `TreeRouter`, shard operations, `TxCleanupHints` | one-leaf and physical eligibility, atomic inline/tombstone publication, transaction-local recovery classification, predecessor cleanup hints | access normalization, transaction logs, range/catalog validation, waiting or wounding holders, GC execution |
 | `TxCleanupHints`      | maintenance seam | `TxId`                       | bounded ordered cleanup-candidate queue, drop-oldest loss policy, drain-time de-duplication | GC execution, transaction policy, backend storage |
 | `CollectionCommit`    | collection-commit **policy** | `CollectionAttempt`, catalog, lifecycle | same-ID collection retry state, recovery and committed-log fields, incarnation preparation, validation, drop fencing, post-commit/abort cleanup | key locking, key validation, the atomic commit decision |
@@ -357,22 +365,25 @@ async fn lock(
   derives a stable collection-address lock order. Neither interface exposes
   encoded record or node state.
 - **Up**: `LockOutcome::Locked(LockedTx)` on success, or `LockOutcome::Conflict`
-  when a CAS race was lost — both logical, never nodes. `Algo` maps `Conflict`
-  onto its policy: release and re-acquire under the same id, escalating to serial
-  and backing off.
+  when a CAS race was lost — both logical, never nodes. `Algo` maps a normal
+  `Conflict` to a complete-access-set retry under the same identity while it
+  keeps landed leaf holds. After sustained parallel conflict, `Algo` ends the
+  identity, renews it, and continues in serial mode.
 
 Read-version validation is **not** at this seam. Once `Locked` comes back, every
 touched key is locked and its value frozen, so `Algo` re-resolves each read's
 effective writer (via `Reader`, path-based) and compares it to the token the body
-observed. A mismatch means the value moved before the lock landed: `Algo` re-runs
-the body **holding its locks** (`Retry`). This is optimistic-concurrency policy
+observed. A mismatch means the value moved before the lock landed: `Algo`
+returns `ReplayBody` while it **holds its locks**. This is optimistic-concurrency policy
 over the logical read set, and it reuses the same routine as the read-only
 fast path — so validation lives in exactly one place, never in the locker.
 
 Because the deadlock timeout, serial-escalation decision, and backoff are
 *policy*, they live in `Algo`; the locker is bounded only by an internal
 CAS-retry budget and reports sustained contention back as `Conflict` rather than
-looping forever. This keeps efficient batch acquisition — many keys collapse
+looping forever. `Algo` owns the end/renew lifecycle transition, so the
+replacement identity becomes visible only after the old identity is durably
+abort-side. This keeps efficient batch acquisition — many keys collapse
 into one leaf CAS — behind the key-lock interface.
 
 ## Backend Abstraction
@@ -836,9 +847,9 @@ conflicts with current holders:
 - If the requester is **younger**, it **waits** for the holder to finish.
 
 Since an older transaction never waits for a younger one, the wait-for graph
-stays acyclic and no cycle can form. A wounded transaction observes
-`TransError::Wounded` and is restarted by the database retry loop with a renewed
-ID (`TxId::renew`) that preserves its original priority, so it is not starved.
+stays acyclic and no cycle can form. When `Algo` observes a wound, it ends and
+renews the identity (`TxId::renew`) before it asks the database loop to replay
+the body. The renewed ID preserves its original priority, so it is not starved.
 
 **Serial locking is kept as a safety net.** Parallel validation still arms a
 5-second timeout (`MAX_DEADLOCK_TIMEOUT`); if it fires — meaning sustained

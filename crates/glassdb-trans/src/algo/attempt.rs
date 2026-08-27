@@ -13,10 +13,17 @@ enum ReadValidationMode {
     Locked,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcquisitionMode {
+    Parallel,
+    ForcedSerial,
+}
+
 /// Correlated lifecycle state for one transaction handle.
 pub(super) struct AttemptState {
     phase: AttemptPhase,
     validation_mode: ReadValidationMode,
+    acquisition_mode: AcquisitionMode,
     renewals: usize,
 }
 
@@ -25,6 +32,7 @@ impl AttemptState {
         AttemptState {
             phase: AttemptPhase::New,
             validation_mode: ReadValidationMode::Optimistic,
+            acquisition_mode: AcquisitionMode::Parallel,
             renewals: 0,
         }
     }
@@ -65,19 +73,32 @@ impl AttemptState {
         }
     }
 
-    /// Starts a fresh identity after a genuine wound while preserving locked
-    /// validation and the serial-fallback history.
-    pub(super) fn renew(self) -> Self {
+    /// Forces all later lock acquisition for this attempt and its replacements
+    /// to use the sorted serial order.
+    pub(super) fn force_serial_acquisition(&mut self) {
+        match self.phase {
+            AttemptPhase::New | AttemptPhase::Engaged => {
+                self.acquisition_mode = AcquisitionMode::ForcedSerial;
+            }
+            AttemptPhase::Committed => {
+                panic!("cannot change lock acquisition for a committed transaction")
+            }
+        }
+    }
+
+    /// Starts a fresh identity while preserving locked validation and lock
+    /// acquisition mode.
+    pub(super) fn renew(&mut self) {
         match self.phase {
             // The engine renewal boundary historically accepts any active
             // opaque handle. Wound cleanup may also discover a concurrent
             // terminal outcome before the driver consumes and renews the
             // handle, so renewal must remain valid from every phase.
-            AttemptPhase::New | AttemptPhase::Engaged | AttemptPhase::Committed => AttemptState {
-                phase: AttemptPhase::New,
-                validation_mode: ReadValidationMode::Locked,
-                renewals: self.renewals + 1,
-            },
+            AttemptPhase::New | AttemptPhase::Engaged | AttemptPhase::Committed => {
+                self.phase = AttemptPhase::New;
+                self.validation_mode = ReadValidationMode::Locked;
+                self.renewals += 1;
+            }
         }
     }
 
@@ -87,6 +108,10 @@ impl AttemptState {
 
     pub(super) fn should_lock_reads(&self) -> bool {
         self.validation_mode == ReadValidationMode::Locked
+    }
+
+    pub(super) fn should_acquire_serially(&self) -> bool {
+        self.acquisition_mode == AcquisitionMode::ForcedSerial
     }
 
     pub(super) fn assert_resettable(&self) {
@@ -111,6 +136,7 @@ mod tests {
         direct.commit();
         assert_eq!(direct.phase, AttemptPhase::Committed);
         assert_eq!(direct.validation_mode, ReadValidationMode::Optimistic);
+        assert_eq!(direct.acquisition_mode, AcquisitionMode::Parallel);
 
         let mut retry = AttemptState::new();
         retry.force_locked_reads();
@@ -124,11 +150,12 @@ mod tests {
         assert_eq!(engaged.phase, AttemptPhase::Engaged);
         assert_eq!(engaged.validation_mode, ReadValidationMode::Locked);
 
-        let renewed = engaged.renew();
-        assert_eq!(renewed.phase, AttemptPhase::New);
-        assert_eq!(renewed.validation_mode, ReadValidationMode::Locked);
-        assert_eq!(renewed.renewals, 1);
-        assert!(!renewed.needs_abort());
+        engaged.renew();
+        assert_eq!(engaged.phase, AttemptPhase::New);
+        assert_eq!(engaged.validation_mode, ReadValidationMode::Locked);
+        assert_eq!(engaged.acquisition_mode, AcquisitionMode::Parallel);
+        assert_eq!(engaged.renewals, 1);
+        assert!(!engaged.needs_abort());
 
         let mut committed = AttemptState::new();
         committed.engage();
@@ -137,13 +164,16 @@ mod tests {
         assert_eq!(committed.validation_mode, ReadValidationMode::Locked);
         assert!(!committed.needs_abort());
 
-        let renewed_after_terminal_race = committed.renew();
-        assert_eq!(renewed_after_terminal_race.phase, AttemptPhase::New);
-        assert_eq!(
-            renewed_after_terminal_race.validation_mode,
-            ReadValidationMode::Locked
-        );
-        assert_eq!(renewed_after_terminal_race.renewals, 1);
+        committed.renew();
+        assert_eq!(committed.phase, AttemptPhase::New);
+        assert_eq!(committed.validation_mode, ReadValidationMode::Locked);
+        assert_eq!(committed.renewals, 1);
+
+        let mut serial = AttemptState::new();
+        serial.engage();
+        serial.force_serial_acquisition();
+        serial.renew();
+        assert!(serial.should_acquire_serially());
     }
 
     #[test]

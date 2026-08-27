@@ -500,9 +500,9 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
     // completion and cannot have dispatched its terminal commit.
     lock_landed.await.unwrap();
 
-    // Drop the future. `AttemptRetirementGuard::drop` fires here, calling
-    // `Algo::retire_abandoned` which spawns a background task that writes the
-    // pinned Wounded marker to the tx log via the (now-disarmed) backend.
+    // Drop the future. The engine transaction's retirement guard starts a
+    // background task that writes the pinned Wounded marker to the tx log via
+    // the now-disarmed backend.
     stalled.abort();
     let _ = stalled.await;
     drop(release_lock);

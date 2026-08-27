@@ -15,7 +15,7 @@ use glassdb_storage::{
 };
 
 use crate::access::{AccessSet, ScanMutation, ScanRange};
-use crate::algo::{Algo, DirectCommitStats, Handle};
+use crate::algo::{Algo, BodyOutcome, DirectCommitStats, Handle};
 use crate::collection_catalog::CollectionCatalog;
 use crate::collection_commit::CollectionCommit;
 use crate::collection_coordination::CollectionStateResolver;
@@ -241,29 +241,22 @@ impl Engine {
             .reset_with_collections(&mut tx.0, accesses, collection_data);
     }
 
-    /// Restarts a wounded attempt with a fresh identity and preserved priority.
-    pub fn rebegin_transaction(&self, tx: EngineTransaction) -> EngineTransaction {
-        EngineTransaction(self.algo.rebegin(tx.0))
-    }
-
-    /// Validates the read-only accesses of a transaction attempt.
-    pub async fn validate_reads(&self, tx: &mut EngineTransaction) -> Result<(), TransError> {
+    /// Validates read-only accesses and reports whether the body must run again.
+    pub async fn validate_reads(
+        &self,
+        tx: &mut EngineTransaction,
+    ) -> Result<BodyOutcome, TransError> {
         self.algo.validate_reads(&mut tx.0).await
     }
 
-    /// Commits a transaction attempt.
-    pub async fn commit(&self, tx: &mut EngineTransaction) -> Result<(), TransError> {
+    /// Commits an attempt or reports that the body must run again.
+    pub async fn commit(&self, tx: &mut EngineTransaction) -> Result<BodyOutcome, TransError> {
         self.algo.commit(&mut tx.0).await
     }
 
     /// Finalizes a transaction attempt, aborting it when necessary.
     pub async fn end(&self, tx: &mut EngineTransaction) -> Result<(), TransError> {
         self.algo.end(&mut tx.0).await
-    }
-
-    /// Hands an abandoned transaction identity to managed recovery.
-    pub fn retire_abandoned(&self, tx_id: &TxId) {
-        self.algo.retire_abandoned(tx_id);
     }
 
     /// Gracefully drains background work and closes engine storage.
