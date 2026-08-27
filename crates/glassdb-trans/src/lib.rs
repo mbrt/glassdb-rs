@@ -35,4 +35,4 @@ pub use monitor::ProtocolTiming;
 pub use reader::{ReadOutcome, ReadValue};
 pub use shard_coord::ShardCoordinatorStats;
 pub use split::{InlinePressureStats, SplitterStats};
-pub use tlocker::{HeldLeafSnapshot, LockerStats, TxLockSnapshot};
+pub use tlocker::LockerStats;

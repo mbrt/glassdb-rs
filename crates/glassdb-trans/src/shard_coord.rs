@@ -21,8 +21,8 @@
 //! owner packages its mutation decision and typed result in a `ShardOperation`:
 //! [`Locker`](crate::tlocker::Locker) supplies acquire / write-back / release,
 //! direct commit supplies atomic logless publication, and the splitter supplies
-//! leaf structural-gate acquisition. Per-transaction held-lock bookkeeping and
-//! cross-shard strategy stay with the `Locker`, not in the engine.
+//! leaf structural-gate acquisition. Cross-shard strategy stays with the
+//! `Locker`, not in the engine.
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -886,8 +886,7 @@ impl Worker<CasReq, TransError> for CasWorker {
 /// mutation flows (ADR-028): a [`Dedup`] over the CAS coordination objects
 /// that orders contending transactions, loads each object once, folds their
 /// resolvers, does one CAS, and deposits each transaction's outcome. Transaction
-/// lifecycle and per-transaction held-lock bookkeeping remain with their
-/// higher-level owners.
+/// lifecycle remains with its higher-level owner.
 #[derive(Clone)]
 pub struct ShardCoordinator {
     inner: Arc<CoordState>,

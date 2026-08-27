@@ -328,18 +328,14 @@ impl Database {
         *stats
     }
 
-    /// Returns a snapshot of the shard coordinator's and locker's live state,
-    /// intended for operators investigating hangs or unexpected contention. See
+    /// Returns a snapshot of the shard coordinator's live state, intended for
+    /// operators investigating hangs or unexpected contention. See
     /// [`crate::diagnostics`] for the data shape and how to enable the
     /// complementary `tracing` events.
-    ///
-    /// Acquisition maintains a best-effort local hold map. This call takes each
-    /// map shard's lock briefly while it copies the current observations.
     pub fn diagnostics(&self) -> Diagnostics {
         let engine = self.inner.engine.diagnostics();
         Diagnostics {
             coordinator_dedup: engine.coordinator_dedup,
-            transactions: engine.transactions,
         }
     }
 }

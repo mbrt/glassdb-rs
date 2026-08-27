@@ -77,7 +77,6 @@ const MAX_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_LEAF_FULL_WAIT: Duration = Duration::from_secs(30);
 
 struct AttemptRetirement {
-    locker: Locker,
     mon: Monitor,
     cleanup_hints: TxCleanupHints,
     background: Option<Weak<Background>>,
@@ -86,7 +85,6 @@ struct AttemptRetirement {
 impl AttemptRetirement {
     /// Hands an abandoned transaction identity to managed recovery.
     fn retire_abandoned(&self, tx_id: &TxId) {
-        self.locker.keys().forget_tx_locks(tx_id);
         // An optimistic read-only validation and a logless one-CAS commit have
         // no logged identity. Publishing an abort for either would invent a
         // transaction that peers never observed.
@@ -359,7 +357,6 @@ impl Algo {
             cleanup_hints.clone(),
         );
         let retirement = Arc::new(AttemptRetirement {
-            locker: locker.clone(),
             mon: mon.clone(),
             cleanup_hints: cleanup_hints.clone(),
             background: background.clone(),
@@ -1387,14 +1384,9 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(outcome, LockOutcome::Locked(_)));
-        assert!(!tctx.locker.tx_locks_snapshot().is_empty());
 
         fail_status_read.store(true, Ordering::SeqCst);
         drop(abandoned_handle);
-        assert!(
-            tctx.locker.tx_locks_snapshot().is_empty(),
-            "local ownership must be bounded by the synchronous handoff"
-        );
         tokio::time::timeout(Duration::from_secs(1), failure_reached.notified())
             .await
             .expect("retirement never attempted its status read");

@@ -31,37 +31,6 @@ fn panic_with_prepared_collection() -> ! {
     std::panic::panic_any(PREPARED_COLLECTION_PANIC)
 }
 
-// Committed read-write transactions return before their write-back runs (it is
-// spawned in the background), but a graceful shutdown drains the live tasks, so
-// afterwards no transaction still holds locks.
-#[tokio::test(start_paused = true)]
-async fn shutdown_after_many_commits_drains_background_write_back() {
-    let db = init_db(mem()).await;
-    let coll = db
-        .root_collection()
-        .create_collection_if_absent(b"demo-coll")
-        .await
-        .unwrap();
-
-    for _ in 0..256 {
-        let coll_ref = &coll;
-        db.tx(|tx| async move {
-            tx.write(coll_ref, b"k1", b"v1")?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-    }
-
-    db.shutdown().await;
-
-    let diag = db.diagnostics();
-    assert!(
-        diag.transactions.is_empty(),
-        "shutdown should drain the background write-back and release locks: {diag:?}",
-    );
-}
-
 #[tokio::test(start_paused = true)]
 async fn shutdown_rejects_every_public_async_entry_point() {
     let db = init_db(mem()).await;
@@ -185,7 +154,6 @@ async fn first_execution_stale_panic_discards_staged_data_and_catalog_changes() 
     assert_eq!(executions.load(Ordering::SeqCst), 1);
     assert_eq!(coll.read(b"staged").await.unwrap(), None);
     assert!(!db.collection_exists("temporary").await.unwrap());
-    assert!(db.diagnostics().transactions.is_empty());
     db.shutdown().await;
 }
 
@@ -254,11 +222,6 @@ async fn panicking_locked_replay_hands_off_its_retained_resources() {
         2,
         "the panicking body is not validated or replayed"
     );
-    assert!(
-        db.diagnostics().transactions.is_empty(),
-        "retirement handoff should release local lock ownership before the panic escapes"
-    );
-
     let peer = tokio::time::timeout(Duration::from_secs(5), coll.write(b"k", &write_int(7)))
         .await
         .expect("peer waited for the abandoned transaction's full lease");
@@ -330,7 +293,6 @@ async fn panicking_locked_replay_records_its_prepared_collection_for_recovery() 
         .expect("abandoned transaction retirement was not observed");
     assert_eq!(prepared_collections, 1);
     assert!(!db.collection_exists("temporary").await.unwrap());
-    assert!(db.diagnostics().transactions.is_empty());
 
     db.shutdown().await;
 }
@@ -392,10 +354,6 @@ async fn failed_finalization_keeps_the_retirement_guard_armed() {
     failed
         .await
         .expect("synchronous finalization did not reach the injected failure");
-    assert!(
-        db.diagnostics().transactions.is_empty(),
-        "failed finalization must synchronously hand off local ownership"
-    );
     tokio::time::timeout(Duration::from_secs(1), recovered)
         .await
         .expect("managed retirement did not retry the failed finalization")

@@ -28,7 +28,7 @@ use crate::monitor::{Monitor, ProtocolTiming};
 use crate::reader::{ReadOutcome, Reader};
 use crate::shard_coord::{ShardCoordinator, ShardCoordinatorStats};
 use crate::split::{Splitter, SplitterStats};
-use crate::tlocker::{Locker, LockerStats, TxLockSnapshot};
+use crate::tlocker::{Locker, LockerStats};
 
 /// Balances backend traffic and memory use for a default production client.
 const DEFAULT_CACHE_SIZE: usize = 512 * 1024 * 1024;
@@ -142,8 +142,6 @@ pub struct EngineStats {
 pub struct EngineDiagnostics {
     /// Per-object deduplication state inside the shard coordinator.
     pub coordinator_dedup: Vec<DedupKeySnapshot>,
-    /// Transactions with locally tracked locks.
-    pub transactions: Vec<TxLockSnapshot>,
 }
 
 /// Owns and mediates access to one database's transaction runtime.
@@ -282,7 +280,6 @@ impl Engine {
     pub fn diagnostics(&self) -> EngineDiagnostics {
         EngineDiagnostics {
             coordinator_dedup: self.coord.dedup_snapshot(),
-            transactions: self.locker.tx_locks_snapshot(),
         }
     }
 

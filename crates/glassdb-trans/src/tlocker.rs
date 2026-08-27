@@ -12,8 +12,8 @@
 //!
 //! [`Locker`] is the common lock boundary. Its key view owns how a transaction
 //! groups keys, the parallel/serial acquisition strategy, the hold-and-wait
-//! loop, and local hold diagnostics; its collection view owns
-//! collection locks and their committed effects. The data mutation *mechanism* — deduplicated
+//! loop; its collection view owns collection locks and their committed effects.
+//! The data mutation *mechanism* — deduplicated
 //! load + resolve + CAS with retry — lives in the
 //! [`ShardCoordinator`](crate::shard_coord::ShardCoordinator) below it, which
 //! the locker shares with the direct commit mechanism so every shard/root
@@ -25,15 +25,15 @@
 //! lowest contended shard and exactly one wins it (first-CAS-wins), guaranteeing
 //! progress where the parallel path could livelock.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::ops::{AddAssign, Sub};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use glassdb_concurr::{RetryConfig, join_all_bounded, rt, shard::Sharded};
+use glassdb_concurr::{RetryConfig, join_all_bounded, rt};
 use glassdb_data::{KeyRef, LeafRef, ObjectPath, TxId};
 use glassdb_storage::transaction::TxLock;
 use glassdb_storage::{
@@ -52,32 +52,10 @@ use crate::shard_coord::{
 };
 use crate::wound_wait::{Reclaim, try_reclaim};
 
-/// One partition of the best-effort local hold observations.
-type ObservedHoldShard = Mutex<HashMap<TxId, HashMap<ObjectPath, HeldLeaf>>>;
-
 #[derive(Clone, Copy)]
 struct HeldLeaf {
     entry_lock: LockType,
     membership: LockType,
-}
-
-/// Aggregate lock strengths locally held by one transaction on one leaf.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HeldLeafSnapshot {
-    pub path: ObjectPath,
-    pub entry_lock: LockType,
-    pub membership_lock: LockType,
-}
-
-/// Diagnostic snapshot of one transaction's locally-tracked held locks.
-///
-/// Returned by [`Locker::tx_locks_snapshot`] for operators investigating hangs.
-/// The leaf list is sorted by path for stable display. It summarizes lock
-/// strength without cloning the transaction's individual keys.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TxLockSnapshot {
-    pub tx_id: TxId,
-    pub leaves: Vec<HeldLeafSnapshot>,
 }
 
 /// Snapshot of distributed-locker activity.
@@ -127,7 +105,7 @@ struct KeyIntent {
 struct ShardGroup {
     /// The leaf's object path: the collection root `_r` for a small collection's
     /// single leaf, else a standalone node `_n`, resolved by descent. This is
-    /// the coordinator submit target and the recorded held-lock path.
+    /// the coordinator submit target.
     path: ObjectPath,
     leaf: LeafRef,
     /// Per-key intentions, in ascending raw-key order.
@@ -948,24 +926,10 @@ pub(crate) struct KeyLocker {
     retry: RetryConfig,
     /// Maximum incomplete leaf operations in one transaction phase.
     parallelism: NonZeroUsize,
-    /// Best-effort local observations of leaves held by each transaction.
-    /// Shared across clones so the locker and diagnostics see one map.
-    observed_holds: Arc<Sharded<ObservedHoldShard>>,
     /// Count of lock-acquisition calls (one per `lock()` attempt). Shared across
     /// clones. The coordinator cannot
     /// compute it — it only sees per-shard submissions — so the locker owns it.
     calls: Arc<AtomicU64>,
-}
-
-struct TxLocksCleanup<'a> {
-    locker: &'a KeyLocker,
-    id: &'a TxId,
-}
-
-impl Drop for TxLocksCleanup<'_> {
-    fn drop(&mut self) {
-        self.locker.clear_tx_locks(self.id);
-    }
 }
 
 impl Locker {
@@ -988,13 +952,6 @@ impl Locker {
     /// Returns and resets distributed-locker activity counters.
     pub fn stats_and_reset(&self) -> LockerStats {
         self.keys.stats_and_reset()
-    }
-
-    /// Returns one entry per transaction that currently holds any leaf lock,
-    /// with the held paths sorted by path. Output is sorted by transaction id
-    /// for stable display.
-    pub fn tx_locks_snapshot(&self) -> Vec<TxLockSnapshot> {
-        self.keys.tx_locks_snapshot()
     }
 
     /// Returns the data-leaf locking interface.
@@ -1045,9 +1002,6 @@ impl KeyLocker {
     /// former `current_writer` an overwrite replaced): these just lost a
     /// reference and are GC write-back hint candidates (ADR-022).
     pub(crate) async fn write_back(&self, id: &TxId, locked: &LockedTx) -> Vec<TxId> {
-        // Publication is already recoverable from the committed log. Keep the
-        // process-local diagnostic state equally safe if this future is dropped.
-        let _cleanup = TxLocksCleanup { locker: self, id };
         // A cancelled partial pass may lose these hints; GC's paged scan is
         // complete without them.
         let mut operations = Vec::with_capacity(locked.groups.len());
@@ -1115,7 +1069,6 @@ impl KeyLocker {
             tmon,
             retry,
             parallelism,
-            observed_holds: Arc::new(Sharded::new(|_| Mutex::new(HashMap::new()))),
             calls: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -1125,36 +1078,6 @@ impl KeyLocker {
         LockerStats {
             calls: self.calls.swap(0, Ordering::Relaxed),
         }
-    }
-
-    /// Returns one entry per transaction that currently holds any leaf lock,
-    /// with the held paths sorted by path. Output is sorted by transaction id
-    /// for stable display.
-    fn tx_locks_snapshot(&self) -> Vec<TxLockSnapshot> {
-        let mut out = Vec::new();
-        self.observed_holds.each(|shard| {
-            let m = shard.lock().unwrap();
-            for (tx_id, locks) in m.iter() {
-                if locks.is_empty() {
-                    continue;
-                }
-                let mut leaves = Vec::new();
-                for (p, held) in locks {
-                    leaves.push(HeldLeafSnapshot {
-                        path: p.clone(),
-                        entry_lock: held.entry_lock,
-                        membership_lock: held.membership,
-                    });
-                }
-                leaves.sort_by(|a, b| a.path.cmp(&b.path));
-                out.push(TxLockSnapshot {
-                    tx_id: tx_id.clone(),
-                    leaves,
-                });
-            }
-        });
-        out.sort_by(|a, b| a.tx_id.cmp(&b.tx_id));
-        out
     }
 
     async fn lock_shards_at(
@@ -1342,15 +1265,7 @@ impl KeyLocker {
                 requirement,
             };
             match self.coord.coordinate(operation).await? {
-                AcquireOutcome::Locked(receipt) => {
-                    self.record_leaf_lock(
-                        id,
-                        &group.path,
-                        receipt.held.entry_lock,
-                        receipt.held.membership,
-                    );
-                    return Ok(ShardOutcome::Locked(receipt));
-                }
+                AcquireOutcome::Locked(receipt) => return Ok(ShardOutcome::Locked(receipt)),
                 // Hold-and-wait (ADR-024): if the coordinated acquire reports
                 // [`AcquireOutcome::Wait`] — a key is held by a live holder this
                 // transaction cannot wound — it **waits** for that holder to
@@ -1383,30 +1298,6 @@ impl KeyLocker {
             },
             _ = rt::sleep(timeout) => Ok(Woke::PollTimeout),
         }
-    }
-
-    /// Records the aggregate entry and membership strengths held on one leaf.
-    fn record_leaf_lock(&self, id: &TxId, path: &ObjectPath, typ: LockType, membership: LockType) {
-        let mut observed_holds = self.observed_holds.for_key(id.as_bytes()).lock().unwrap();
-        observed_holds.entry(id.clone()).or_default().insert(
-            path.clone(),
-            HeldLeaf {
-                entry_lock: typ,
-                membership,
-            },
-        );
-    }
-
-    /// Forgets process-local ownership after recovery takes responsibility for
-    /// an abandoned transaction's durable locks.
-    pub(crate) fn forget_tx_locks(&self, id: &TxId) {
-        self.clear_tx_locks(id);
-    }
-
-    /// Drops `id`'s held-lock bookkeeping once its locks are released.
-    fn clear_tx_locks(&self, id: &TxId) {
-        let mut observed_holds = self.observed_holds.for_key(id.as_bytes()).lock().unwrap();
-        observed_holds.remove(id);
     }
 }
 
@@ -2006,7 +1897,6 @@ mod tests {
         assert!(loaded.node().structural_gate().holders().is_empty());
         assert!(loaded.node().membership_lock().holders().is_empty());
         assert_eq!(loaded.node().membership_version(), 2);
-        assert!(locker.tx_locks_snapshot().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -2236,28 +2126,6 @@ mod tests {
             inlined,
             "the inline value the acquisition carried forward is intact"
         );
-    }
-
-    #[tokio::test]
-    async fn tx_locks_snapshot_lists_held_shards() {
-        let (locker, ctx) = init_tl_test().await;
-        let key = b"key";
-        let tx = mk_tid(1, "tx");
-        ctx.monitor.begin_tx(&tx);
-
-        lock_ok(&locker, &tx, &group_of(key, put_intent(key))).await;
-
-        let snap = locker.tx_locks_snapshot();
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].tx_id, tx);
-        // A write intention records the held leaf (the small collection's root
-        // `_r`) as a write lock.
-        let shard_path = root_path();
-        assert!(snap[0].leaves.iter().any(|leaf| {
-            leaf.path == shard_path
-                && leaf.entry_lock == LockType::Write
-                && leaf.membership_lock == LockType::Write
-        }));
     }
 
     // Helper: commit a value for `key` so the shard records a `current_writer`,
@@ -2598,7 +2466,6 @@ mod tests {
                 )
                 .await;
         }
-        locker.keys().clear_tx_locks(id);
     }
 
     // Two committed transactions writing *disjoint* keys of one shard write back
@@ -2811,7 +2678,6 @@ mod tests {
         landed.notified().await;
         write_back.abort();
         assert!(write_back.await.unwrap_err().is_cancelled());
-        assert!(locker.tx_locks_snapshot().is_empty());
         hook.clear_after();
 
         let entry = entry_of(&ctx, key).await.unwrap();
@@ -2819,7 +2685,6 @@ mod tests {
         assert_eq!(entry.current.writer(), Some(&writer));
 
         locker.keys().write_back(&writer, &locked).await;
-        assert!(locker.tx_locks_snapshot().is_empty());
         let entry = entry_of(&ctx, key).await.unwrap();
         assert!(entry.lock_holders().is_empty());
         assert_eq!(entry.current.writer(), Some(&writer));
