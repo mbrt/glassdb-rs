@@ -130,13 +130,27 @@ pub(crate) enum FoldOutcome {
     InDoubt(String),
 }
 
-/// One member's policy outcome and the physical precondition certified by the
-/// coordinator's successful CAS. Only a staged member receives a
-/// `cas_precondition`; higher layers decide whether that receipt proves their
-/// own logical validation condition.
+/// The leaf observation that supports one coordinated outcome.
+pub(crate) enum CoordinationEvidence {
+    /// The member participated in the successful CAS that replaced this state.
+    Installed(LeafObservation),
+    /// The member's outcome was already true in this loaded state.
+    Observed(LeafObservation),
+}
+
+impl CoordinationEvidence {
+    /// Returns the leaf observation that supports the outcome.
+    pub(crate) fn observation(&self) -> &LeafObservation {
+        match self {
+            Self::Installed(observation) | Self::Observed(observation) => observation,
+        }
+    }
+}
+
+/// One member's policy outcome and the physical evidence from its round.
 pub(crate) struct CoordinatedOutcome {
     pub(crate) outcome: FoldOutcome,
-    pub(crate) cas_precondition: Option<LeafObservation>,
+    pub(crate) evidence: Option<CoordinationEvidence>,
 }
 
 /// Why the fold engine is (re-)running one resolver this attempt: a `Fresh`
@@ -799,7 +813,7 @@ impl CasWorker {
                     for (tx, member) in &members {
                         *member.slot.lock().unwrap() = Some(CoordinatedOutcome {
                             outcome: member.resolver.reroute_outcome(in_doubt.contains(tx)),
-                            cas_precondition: None,
+                            evidence: None,
                         });
                     }
                     return Ok(());
@@ -823,7 +837,7 @@ impl CasWorker {
                 )
                 .await?;
 
-            let cas_precondition = edit.observation().clone();
+            let loaded_observation = edit.observation().clone();
             let persist_result = self.persist(path, edit, &mut plan).await?;
             match persist_result {
                 PersistResult::Landed => {}
@@ -851,8 +865,14 @@ impl CasWorker {
                 if let Some(m) = members.get(&member.id) {
                     *m.slot.lock().unwrap() = Some(CoordinatedOutcome {
                         outcome: member.outcome,
-                        cas_precondition: (member.participation == Participation::Staged)
-                            .then(|| cas_precondition.clone()),
+                        evidence: Some(match member.participation {
+                            Participation::Staged => {
+                                CoordinationEvidence::Installed(loaded_observation.clone())
+                            }
+                            Participation::Skipped => {
+                                CoordinationEvidence::Observed(loaded_observation.clone())
+                            }
+                        }),
                     });
                 }
             }
@@ -864,7 +884,7 @@ impl CasWorker {
         for (tx, m) in &shard_members(batch) {
             *m.slot.lock().unwrap() = Some(CoordinatedOutcome {
                 outcome: m.resolver.exhausted_outcome(in_doubt.contains(tx)),
-                cas_precondition: None,
+                evidence: None,
             });
         }
         Ok(())
@@ -963,10 +983,9 @@ impl ShardCoordinator {
     /// Submits one operation's resolver through the [`Dedup`] and awaits its
     /// single-round [`CoordinatedOutcome`]. The worker merges it into any
     /// in-flight round for the shard, folds it, retries CAS contention / in-doubt
-    /// internally, and deposits the policy outcome plus any successful-CAS
-    /// precondition receipt into the slot. Returns `Ok(None)` if the coordinator
-    /// was shut down before the round ran, so the operation can preserve its
-    /// best-effort behavior.
+    /// internally, and deposits the policy outcome plus its physical evidence
+    /// into the slot. Returns `Ok(None)` if the coordinator was shut down before
+    /// the round ran, so the operation can preserve its best-effort behavior.
     ///
     /// `first_requirement` chooses the cache requirement for the round's first fold
     /// attempt: a direct submitter that just read this leaf while evaluating its
@@ -1310,7 +1329,8 @@ mod tests {
                 outcome,
                 Some(CoordinatedOutcome {
                     outcome: FoldOutcome::Locked { .. },
-                    cas_precondition: Some(_),
+                    evidence: Some(CoordinationEvidence::Installed(_)),
+                    ..
                 })
             ))
         }
@@ -1507,7 +1527,8 @@ mod tests {
             out,
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::Conflict,
-                cas_precondition: None,
+                evidence: Some(CoordinationEvidence::Observed(_)),
+                ..
             })
         ));
         coord.close().await;
@@ -1550,7 +1571,8 @@ mod tests {
             out,
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::Locked { .. },
-                cas_precondition: Some(_),
+                evidence: Some(CoordinationEvidence::Installed(_)),
+                ..
             })
         ));
         coord.close().await;
@@ -1562,8 +1584,8 @@ mod tests {
         );
     }
 
-    // A resolver that stages nothing (`Skip`) still gets its outcome delivered,
-    // but receives no CAS precondition and the round issues no CAS.
+    // A resolver that stages nothing (`Skip`) still gets its outcome and the
+    // loaded observation, but the round issues no CAS.
     #[tokio::test]
     async fn shard_skip_delivers_outcome_without_cas() {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
@@ -1581,7 +1603,7 @@ mod tests {
             out,
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::Released { .. },
-                cas_precondition: None,
+                evidence: Some(CoordinationEvidence::Observed(_)),
             })
         ));
         assert_eq!(shard_stores(&log), 0, "a skip stages nothing, so no CAS");
@@ -1821,7 +1843,8 @@ mod tests {
                 joiner.await.unwrap().unwrap(),
                 Some(CoordinatedOutcome {
                     outcome: FoldOutcome::Conflict,
-                    cas_precondition: None,
+                    evidence: Some(CoordinationEvidence::Observed(_)),
+                    ..
                 })
             ),
             "the second claimant folds nothing and does not land"
@@ -2064,7 +2087,8 @@ mod tests {
             &joined,
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::Reroute,
-                cas_precondition: None,
+                evidence: Some(CoordinationEvidence::Observed(_)),
+                ..
             })
         );
         if !expected {
@@ -2188,7 +2212,8 @@ mod tests {
             driver.await.unwrap().unwrap(),
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::Landed,
-                cas_precondition: None,
+                evidence: Some(CoordinationEvidence::Observed(_)),
+                ..
             })
         ));
         let joined = joiner.await.unwrap().unwrap();
@@ -2196,7 +2221,8 @@ mod tests {
             &joined,
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::Reroute,
-                cas_precondition: None,
+                evidence: Some(CoordinationEvidence::Observed(_)),
+                ..
             })
         );
         if !expected {
@@ -2328,7 +2354,8 @@ mod tests {
                 joiner.await.unwrap().unwrap(),
                 Some(CoordinatedOutcome {
                     outcome: FoldOutcome::Moved,
-                    cas_precondition: None,
+                    evidence: Some(CoordinationEvidence::Observed(_)),
+                    ..
                 })
             ),
             "the skipped member never staged, so its loss stays definitive"
@@ -2387,7 +2414,8 @@ mod tests {
                 joiner.await.unwrap().unwrap(),
                 Some(CoordinatedOutcome {
                     outcome: FoldOutcome::Replay,
-                    cas_precondition: None,
+                    evidence: Some(CoordinationEvidence::Observed(_)),
+                    ..
                 })
             ),
             "the excluded member folded nothing, so its loss is replayable"
@@ -2449,7 +2477,8 @@ mod tests {
                 joiner.await.unwrap().unwrap(),
                 Some(CoordinatedOutcome {
                     outcome: FoldOutcome::Replay,
-                    cas_precondition: None,
+                    evidence: Some(CoordinationEvidence::Observed(_)),
+                    ..
                 })
             ),
             "the skipped member issued no write, so it replays rather than doubting"
@@ -2600,14 +2629,16 @@ mod tests {
             overwrite.await.unwrap().unwrap(),
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::Locked { .. },
-                cas_precondition: Some(_),
+                evidence: Some(CoordinationEvidence::Installed(_)),
+                ..
             })
         ));
         assert!(matches!(
             create.await.unwrap().unwrap(),
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::LeafFull,
-                cas_precondition: None,
+                evidence: Some(CoordinationEvidence::Observed(_)),
+                ..
             })
         ));
         assert_eq!(shard_stores(&log), 1, "the admitted member still lands");
@@ -2728,7 +2759,8 @@ mod tests {
             outcome,
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::Conflict,
-                cas_precondition: None,
+                evidence: Some(CoordinationEvidence::Observed(_)),
+                ..
             })
         ));
         coord.close().await;
@@ -2782,7 +2814,8 @@ mod tests {
             outcome,
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::Conflict,
-                cas_precondition: None,
+                evidence: Some(CoordinationEvidence::Observed(_)),
+                ..
             })
         ));
         assert_eq!(hints.calls.load(Ordering::SeqCst), 0);
@@ -2935,14 +2968,16 @@ mod tests {
             outcome,
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::InDoubt(_),
-                cas_precondition: None,
+                evidence: Some(CoordinationEvidence::Observed(_)),
+                ..
             })
         ));
         assert!(matches!(
             skipped_outcome,
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::Moved,
-                cas_precondition: None,
+                evidence: Some(CoordinationEvidence::Observed(_)),
+                ..
             })
         ));
         assert_eq!(
@@ -3014,7 +3049,8 @@ mod tests {
             outcome,
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::Conflict,
-                cas_precondition: None,
+                evidence: Some(CoordinationEvidence::Observed(_)),
+                ..
             })
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -3365,7 +3401,8 @@ mod tests {
             retrying_outcome,
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::Moved,
-                cas_precondition: None,
+                evidence: None,
+                ..
             })
         ));
     }

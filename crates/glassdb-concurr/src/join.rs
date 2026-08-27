@@ -1,9 +1,11 @@
 //! Foreground bounded future collection.
 
 use std::future::Future;
+use std::iter;
 use std::num::NonZeroUsize;
 
-use futures::stream::{self, StreamExt};
+use futures::FutureExt;
+use futures::stream::{FuturesUnordered, StreamExt};
 
 /// Runs all supplied futures with bounded admission and returns stable outputs.
 ///
@@ -18,26 +20,34 @@ where
     I: IntoIterator,
     I::Item: Future,
 {
-    let mut futures = futures.into_iter();
-    let Some(first) = futures.next() else {
+    let mut inputs = futures.into_iter();
+    let Some(first) = inputs.next() else {
         return Vec::new();
     };
-    let Some(second) = futures.next() else {
+    let Some(second) = inputs.next() else {
         return vec![first.await];
     };
 
-    let mut outputs = stream::iter(
-        std::iter::once(first)
-            .chain(std::iter::once(second))
-            .chain(futures),
-    )
-    .enumerate()
-    .map(|(index, future)| async move { (index, future.await) })
-    .buffer_unordered(limit.get())
-    .collect::<Vec<_>>()
-    .await;
-    outputs.sort_unstable_by_key(|(index, _)| *index);
-    outputs.into_iter().map(|(_, output)| output).collect()
+    let mut remaining = iter::once(first).chain(iter::once(second)).chain(inputs);
+    let mut outputs: Vec<Option<<I::Item as Future>::Output>> = Vec::new();
+    let mut running = FuturesUnordered::new();
+    loop {
+        while running.len() < limit.get()
+            && let Some(future) = remaining.next()
+        {
+            let position = outputs.len();
+            outputs.push(None);
+            running.push(future.map(move |output| (position, output)));
+        }
+        let Some((position, output)) = running.next().await else {
+            break;
+        };
+        outputs[position] = Some(output);
+    }
+    outputs
+        .into_iter()
+        .map(|output| output.expect("an admitted future deposits its output"))
+        .collect()
 }
 
 /// Applies `operation` to every input with bounded join semantics.
@@ -61,12 +71,15 @@ where
 mod tests {
     use super::*;
 
+    use std::cell::Cell;
     use std::pin::Pin;
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
 
     use futures::future::{self, BoxFuture, FutureExt};
+    use tokio::sync::Notify;
     use tokio::sync::oneshot;
 
     #[tokio::test]
@@ -111,6 +124,31 @@ mod tests {
         first_tx.send(Ok(1)).unwrap();
 
         assert_eq!(joined.await.unwrap(), [Ok(1), Err(2), Ok(3)]);
+    }
+
+    #[tokio::test]
+    async fn completion_refills_the_bound_for_local_futures() {
+        let admitted = Rc::new(Cell::new(0));
+        let release = Arc::new(Notify::new());
+        let inputs = (0..4)
+            .map(|value| {
+                let admitted = admitted.clone();
+                let release = release.clone();
+                async move {
+                    admitted.set(admitted.get() + 1);
+                    if value == 0 {
+                        release.notified().await;
+                    }
+                    value
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut joined = Box::pin(join_all_bounded(inputs, NonZeroUsize::new(2).unwrap()));
+
+        assert!(futures::poll!(joined.as_mut()).is_pending());
+        assert_eq!(admitted.get(), 4, "completed inputs refill the bound");
+        release.notify_one();
+        assert_eq!(joined.await, [0, 1, 2, 3]);
     }
 
     struct CountedFuture {

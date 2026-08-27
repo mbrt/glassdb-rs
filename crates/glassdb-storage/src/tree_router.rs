@@ -935,11 +935,15 @@ fn routed_node_path<T>(item: &RoutedItem<T>, token: &str) -> Result<ObjectPath, 
 mod tests {
     use super::*;
 
+    use std::future::Future;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
 
+    use futures::future::poll_fn;
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
-    use glassdb_backend::middleware::{OpLog, RecordingBackend};
+    use glassdb_backend::middleware::{BackendOp, HookBackend, OpLog, RecordingBackend};
     use glassdb_data::{CollectionAddress, CollectionId};
 
     use crate::Timeline;
@@ -978,6 +982,14 @@ mod tests {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let log = recorder.log();
         (Arc::new(recorder), log)
+    }
+
+    fn hook_backend() -> Arc<HookBackend> {
+        HookBackend::new(Arc::new(MemoryBackend::new()))
+    }
+
+    fn limit(value: usize) -> NonZeroUsize {
+        NonZeroUsize::new(value).expect("test limits are nonzero")
     }
 
     fn take_reads(log: &OpLog) -> Vec<(String, String)> {
@@ -1628,6 +1640,157 @@ mod tests {
             .find(|group| group.path() == &node_path(1))
             .unwrap();
         assert_eq!(l1.keys, vec![(b"mango".to_vec(), 'm')]);
+    }
+
+    /// Holds backend reads until the test releases the current set.
+    struct ReadGate {
+        parked: AtomicUsize,
+        released: AtomicUsize,
+    }
+
+    impl ReadGate {
+        fn install(backend: &Arc<HookBackend>) -> Arc<Self> {
+            let gate = Arc::new(Self {
+                parked: AtomicUsize::new(0),
+                released: AtomicUsize::new(0),
+            });
+            backend.set_before({
+                let gate = gate.clone();
+                move |operation| {
+                    if !matches!(
+                        operation,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    ) {
+                        return Box::pin(std::future::ready(Ok(())));
+                    }
+                    let gate = gate.clone();
+                    Box::pin(async move {
+                        gate.park().await;
+                        Ok(())
+                    })
+                }
+            });
+            gate
+        }
+
+        async fn park(&self) {
+            let ticket = self.parked.fetch_add(1, Ordering::SeqCst);
+            while self.released.load(Ordering::SeqCst) <= ticket {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        fn release_parked(&self) -> usize {
+            let parked = self.parked.load(Ordering::SeqCst);
+            parked - self.released.swap(parked, Ordering::SeqCst)
+        }
+    }
+
+    async fn read_widths<F: Future>(routing: F, gate: &ReadGate) -> (F::Output, Vec<usize>) {
+        let mut routing = std::pin::pin!(routing);
+        let mut widths = Vec::new();
+        loop {
+            let mut stable = 0;
+            let mut seen = gate.parked.load(Ordering::SeqCst);
+            let settled = loop {
+                if let Poll::Ready(output) =
+                    poll_fn(|cx| Poll::Ready(routing.as_mut().poll(cx))).await
+                {
+                    break Some(output);
+                }
+                let parked = gate.parked.load(Ordering::SeqCst);
+                if parked == seen {
+                    stable += 1;
+                    if stable == 8 {
+                        break None;
+                    }
+                } else {
+                    seen = parked;
+                    stable = 0;
+                }
+                tokio::task::yield_now().await;
+            };
+            match settled {
+                Some(output) => return (output, widths),
+                None => {
+                    let width = gate.release_parked();
+                    assert!(width > 0, "routing stopped without loading a node");
+                    widths.push(width);
+                }
+            }
+        }
+    }
+
+    async fn seed_distinct_leaf_collections(
+        store: &NodeStore,
+        count: usize,
+    ) -> Vec<CollectionAddress> {
+        let mut collections = Vec::new();
+        for index in 0..count {
+            let id = CollectionId::from_slice(&[index as u8 + 1; 16]).unwrap();
+            let collection = CollectionAddress::new("db", id);
+            store
+                .create_root(&collection, &Node::leaf(Shard::from_entries([live(b"k")])))
+                .await
+                .unwrap();
+            collections.push(collection);
+        }
+        collections
+    }
+
+    #[tokio::test]
+    async fn distinct_cold_leaves_obey_the_routing_bound() {
+        for (leaves, expected) in [
+            (1usize, vec![1usize]),
+            (2, vec![2]),
+            (8, vec![8]),
+            (32, vec![16, 16]),
+        ] {
+            let backend = hook_backend();
+            let collections =
+                seed_distinct_leaf_collections(&store_over(backend.clone()).shards, leaves).await;
+            let gate = ReadGate::install(&backend);
+            let cold = store_over(backend);
+            let router = TreeRouter::new(cold.shards.clone(), limit(16));
+            let items = collections
+                .into_iter()
+                .map(|collection| (KeyRef::new(collection, b"k"), ()));
+            let (groups, widths) = read_widths(
+                router.group_keys_by_leaf_fresh(items, Requirement::Any, Requirement::Any),
+                &gate,
+            )
+            .await;
+
+            assert_eq!(groups.unwrap().len(), leaves);
+            assert_eq!(widths, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_bound_counts_paths_instead_of_keys() {
+        let backend = hook_backend();
+        seed_two_level(&store_over(backend.clone()).shards).await;
+        let gate = ReadGate::install(&backend);
+        let cold = store_over(backend);
+        let router = TreeRouter::new(cold.shards.clone(), limit(2));
+        let items = [b"cat".as_slice(), b"mango", b"apple", b"pear"]
+            .into_iter()
+            .map(|key| (KeyRef::new(collection(), key), ()));
+        let (groups, widths) = read_widths(
+            router.group_keys_by_leaf_fresh(items, Requirement::Any, Requirement::Any),
+            &gate,
+        )
+        .await;
+
+        assert_eq!(widths, vec![1, 2]);
+        assert_eq!(
+            groups
+                .unwrap()
+                .iter()
+                .map(|group| (group.path().clone(), group.keys.len()))
+                .collect::<Vec<_>>(),
+            vec![(node_path(0), 2), (node_path(1), 2)]
+        );
     }
 
     #[tokio::test]
