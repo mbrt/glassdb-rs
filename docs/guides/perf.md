@@ -7,6 +7,94 @@ version.
 Keep this document sorted by the most recent changes first. Each entry should
 include a reference to the commit or ADR that introduced the change.
 
+## ADRs 064-065: bounded parallel leaf work and renewed fallback identity
+
+[ADR-064](../adr/064-bounded-parallel-point-leaf-work.md) runs independent
+point-access work on distinct leaves with a transaction-local limit of 16.
+[ADR-065](../adr/065-renewed-transaction-identity-on-serial-fallback.md) gives a
+new transaction identity to an attempt that changes from parallel to sorted
+serial lock acquisition.
+
+### Setup
+
+- base: `24c4a979` (accepted ADRs, before implementation); target: `4e8251ef`
+- ratio = target / base (throughput >1 good; latency/operations <1 good)
+- the paired regression cell uses the in-memory backend, the S3 delay profile,
+  `delay-scale=0.2`, `prefix-depth=3`, one `Database`, one worker per shape,
+  100% home-collection affinity, 5,000 logical keys, and 10 keys for each
+  multi-key transaction
+- three interleaved pairs use a three-second minimum window, 10% throughput-CI
+  target, 30-second maximum window, three-second split quiet period, and
+  90-second drain bound. All cells converge with zero failures
+- per-side command: `perfbench --backend=memory --delays=s3 --delay-scale=0.2
+  --prefix-depth=3 --runs=1 --drain-timeout=90s mixed --modes=lo
+  --affinities=100 --databases=1 --workers-per-shape=1 --multi-keys=10
+  --num-keys=5000 --duration=3s --max-duration=30s --target-ci=0.10
+  --split-quiet=3s --split-settle-timeout=45s`
+- the focused `large_transactions` Criterion benchmark puts one logical key in
+  each of 16 or 64 independent collection-root leaves. It uses the S3 delay
+  profile, one rate-limit prefix per collection, and 10 samples per timed cell.
+  Like all groups in the `transactions` benchmark, it uses `20x` model time.
+  The same benchmark-only change was applied to the base
+- focused command: `cargo bench -p glassdb --bench transactions --
+  large_transactions`
+
+### Mixed-workload regression cell
+
+Cross-run medians are:
+
+| Shape | Metric | Base | Target | Target/base |
+| --- | --- | ---: | ---: | ---: |
+| `roMulti` | Throughput | `5.09 tx/s` | `14.56 tx/s` | `2.858` |
+| `roMulti` | p50 | `191.49 ms` | `63.02 ms` | `0.329` |
+| `roMulti` | p90 | `248.00 ms` | `103.26 ms` | `0.416` |
+| `rwMany` | Throughput | `4.80 tx/s` | `4.72 tx/s` | `0.984` |
+| `rwMany` | p50 | `205.27 ms` | `208.59 ms` | `1.016` |
+| `roSingle` | Throughput | `24.53 tx/s` | `26.30 tx/s` | `1.072` |
+| `rwSingle` | Throughput | `13.48 tx/s` | `12.59 tx/s` | `0.934` |
+
+The 10-key cell gives a clear multi-key read improvement. It does not establish
+a multi-key write change. The single-key throughput moves by less than 7%, and
+the branch adds no backend operation to the single-key paths. Aggregate backend
+operations per completed transaction increase from `4.24` to `4.62` (`1.089`),
+while transaction retries fall from `0.00361` to `0.00229` (`0.635`).
+
+### Large transactions
+
+| Workload | Leaves | Base median | Target median | Target/base |
+| --- | ---: | ---: | ---: | ---: |
+| Read-only | 16 | `36.29 ms` | `3.27 ms` | `0.090` |
+| Read-only | 64 | `143.81 ms` | `10.72 ms` | `0.075` |
+| Existing-key RMW | 16 | `14.12 ms` | `16.05 ms` | `1.136` |
+| Existing-key RMW | 64 | `14.84 ms` | `28.76 ms` | `1.938` |
+
+The read-only intervals do not overlap: base/target intervals are
+`34.28-37.53`/`3.16-3.34 ms` at 16 leaves and
+`138.31-148.00`/`10.53-10.86 ms` at 64 leaves. The result is consistent with one
+bounded wave at 16 leaves and four bounded waves at 64 leaves, instead of one
+serial wait per leaf.
+
+The write result records the cost of the bound. The base lock path submitted
+all leaf operations without a limit. The target uses one bounded wave at 16
+leaves and four waves at 64 leaves. Its intervals are `15.15-16.47 ms` and
+`28.58-29.00 ms`, versus base intervals of `13.40-14.35 ms` and
+`14.40-15.14 ms`. Thus the initial limit of 16 gives a large read benefit but
+reduces throughput for transactions that write much more than 16 independent
+leaves.
+
+### README graphs
+
+The updated worker sweep uses the target, the same S3 model, three runs, 5,000
+logical keys per collection, 100% affinity, five `Database` clients, and 1 then
+10 through 200 workers per shape. All 63 cells converge with zero failures and
+a maximum relative throughput-CI half-width of `0.0996`.
+
+At one worker per shape, `roMulti` reaches `14.72 tx/s` with `61.58 ms` p50.
+At 200 workers per shape, throughput is `2,520.09 tx/s` for `roSingle`,
+`866.84 tx/s` for `roMulti`, `644.45 tx/s` for `rwSingle`, and `189.89 tx/s`
+for `rwMany`. The graph now shows the low-concurrency multi-leaf read gain and
+the high-concurrency multi-key write limit.
+
 ## ADR-061: atomic logless commits within one leaf
 
 [ADR-061](../adr/061-atomic-logless-single-leaf-commits.md) generalizes direct

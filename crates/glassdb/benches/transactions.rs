@@ -1,10 +1,13 @@
 //! Transaction microbenchmarks ported from the Go `bench_test.go`.
 //!
-//! Each workload runs over three backends, matching the Go suite:
+//! Most workloads run over three backends, matching the Go suite:
 //! - `memory`: a bare in-memory backend.
 //! - `gcs` / `s3`: the same in-memory backend wrapped in [`DelayBackend`] with
-//!   the GCS/S3 latency profile. Process-wide model time is accelerated 1000x
-//!   so a wall-clock `cargo bench` run stays fast.
+//!   the GCS/S3 latency profile.
+//!
+//! The large-transaction workload uses the S3 profile and one independent leaf
+//! per logical key. All workloads use the same `20x` process-wide model-time
+//! speedup.
 //!
 //! Alongside the criterion timing, each (workload, backend) pair prints the
 //! per-operation backend counters derived from [`glassdb::Stats`] (the analog
@@ -16,6 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use futures::future::join_all;
 use tokio::runtime::Runtime;
 
 use glassdb::backend::memory::MemoryBackend;
@@ -28,7 +32,7 @@ use glassdb::{
 const STATS_ITERS: i64 = 30;
 
 fn runtime() -> Runtime {
-    glassdb_concurr::rt::set_model_time_speedup(1000.0)
+    glassdb_concurr::rt::set_model_time_speedup(20.0)
         .expect("configure benchmark model time before creating the runtime");
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -45,7 +49,17 @@ fn simulated(profile: fn() -> DelayOptions) -> Arc<dyn Backend> {
     )
 }
 
-/// The three backends used by every workload, each backed by fresh state.
+/// Uses one request-rate prefix for each large-transaction collection.
+fn simulated_s3_by_collection() -> Arc<dyn Backend> {
+    let mut options = s3_delays();
+    options.rate_limits.prefix_depth = 3;
+    Arc::new(
+        DelayBackend::new(Arc::new(MemoryBackend::new()), options)
+            .expect("built-in delay profile is valid"),
+    )
+}
+
+/// The three backends used by each standard workload, with fresh state.
 fn backends() -> Vec<(&'static str, Arc<dyn Backend>)> {
     vec![
         ("memory", Arc::new(MemoryBackend::new())),
@@ -113,6 +127,22 @@ async fn open_coll_with_inline(
     (db, coll)
 }
 
+async fn open_large_members(count: usize) -> (Database, Vec<(Collection, Vec<u8>)>) {
+    let db = Database::open("largetransactions", simulated_s3_by_collection())
+        .await
+        .expect("open benchmark database");
+    let mut members = Vec::with_capacity(count);
+    for index in 0..count {
+        let collection = db
+            .root_collection()
+            .create_collection_if_absent(format!("leaf-{index}").as_bytes())
+            .await
+            .expect("create benchmark collection");
+        members.push((collection, b"key".to_vec()));
+    }
+    (db, members)
+}
+
 fn make_keys(n: usize) -> Vec<Vec<u8>> {
     (0..n).map(|i| format!("key{i}").into_bytes()).collect()
 }
@@ -152,7 +182,7 @@ async fn single_rmw(db: &Database, coll: &Collection) {
 async fn multi_rmw(db: &Database, coll: &Collection, keys: &[Vec<u8>]) {
     db.tx(|tx| async move {
         // Read every key in parallel, then write each incremented value.
-        let vals = futures::future::join_all(keys.iter().map(|k| tx.read(coll, k))).await;
+        let vals = join_all(keys.iter().map(|k| tx.read(coll, k))).await;
         for (k, rv) in keys.iter().zip(vals) {
             let val = match rv {
                 Ok(Some(value)) => read_int(k, &value)?,
@@ -170,10 +200,44 @@ async fn multi_rmw(db: &Database, coll: &Collection, keys: &[Vec<u8>]) {
 async fn multi_read(db: &Database, coll: &Collection, keys: &[Vec<u8>]) {
     let _ = db
         .tx(|tx| async move {
-            let _ = futures::future::join_all(keys.iter().map(|k| tx.read(coll, k))).await;
+            let _ = join_all(keys.iter().map(|k| tx.read(coll, k))).await;
             Ok::<(), Error>(())
         })
         .await;
+}
+
+async fn large_read(db: &Database, members: &[(Collection, Vec<u8>)]) {
+    db.tx(|tx| async move {
+        let values = join_all(
+            members
+                .iter()
+                .map(|(collection, key)| tx.read(collection, key)),
+        )
+        .await;
+        for value in values {
+            value?;
+        }
+        Ok(())
+    })
+    .await
+    .expect("large read transaction");
+}
+
+async fn large_rmw(db: &Database, members: &[(Collection, Vec<u8>)]) {
+    db.tx(|tx| async move {
+        let values = join_all(
+            members
+                .iter()
+                .map(|(collection, key)| read_int_or_zero(&tx, collection, key)),
+        )
+        .await;
+        for ((collection, key), value) in members.iter().zip(values) {
+            tx.write(collection, key, &incremented_value(key, value?)?)?;
+        }
+        Ok(())
+    })
+    .await
+    .expect("large read-modify-write transaction");
 }
 
 async fn hundred_writes(db: &Database, coll: &Collection, base: usize) {
@@ -223,6 +287,21 @@ impl DirectWorkload {
     }
 }
 
+#[derive(Clone, Copy)]
+enum LargeWorkload {
+    Read,
+    Rmw,
+}
+
+impl LargeWorkload {
+    fn label(self) -> &'static str {
+        match self {
+            LargeWorkload::Read => "read",
+            LargeWorkload::Rmw => "rmw",
+        }
+    }
+}
+
 fn make_prefixed_keys(prefix: &str, n: usize) -> Vec<Vec<u8>> {
     (0..n)
         .map(|index| format!("{prefix}-{index:02}").into_bytes())
@@ -256,8 +335,7 @@ async fn run_direct_workload(
                 }
             }
             DirectWorkload::CrossKeyRmw => {
-                let values =
-                    futures::future::join_all(keys.iter().map(|key| tx.read(coll, key))).await;
+                let values = join_all(keys.iter().map(|key| tx.read(coll, key))).await;
                 for (index, result) in values.into_iter().enumerate() {
                     let source = &keys[index];
                     let destination = &keys[(index + 1) % keys.len()];
@@ -376,6 +454,40 @@ fn bench_multi_read(c: &mut Criterion, rt: &Runtime) {
             bch.iter(|| rt.block_on(multi_read(&db, &coll, &keys)));
         });
         rt.block_on(db.shutdown());
+    }
+    group.finish();
+}
+
+fn bench_large_transactions(c: &mut Criterion, rt: &Runtime) {
+    let mut group = c.benchmark_group("large_transactions");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(100));
+    group.measurement_time(Duration::from_secs(1));
+
+    for count in [16usize, 64] {
+        for workload in [LargeWorkload::Read, LargeWorkload::Rmw] {
+            let (db, members) = rt.block_on(open_large_members(count));
+            rt.block_on(large_rmw(&db, &members));
+
+            let label = format!("{}/{count}/s3", workload.label());
+            rt.block_on(report_stats(&label, &db, || async {
+                match workload {
+                    LargeWorkload::Read => large_read(&db, &members).await,
+                    LargeWorkload::Rmw => large_rmw(&db, &members).await,
+                }
+            }));
+            group.bench_function(&label, |bencher| {
+                bencher.iter(|| {
+                    rt.block_on(async {
+                        match workload {
+                            LargeWorkload::Read => large_read(&db, &members).await,
+                            LargeWorkload::Rmw => large_rmw(&db, &members).await,
+                        }
+                    });
+                });
+            });
+            rt.block_on(db.shutdown());
+        }
     }
     group.finish();
 }
@@ -724,6 +836,7 @@ fn benches(c: &mut Criterion) {
     bench_single_rmw(c, &rt);
     bench_multi_rmw(c, &rt);
     bench_multi_read(c, &rt);
+    bench_large_transactions(c, &rt);
     bench_hundred_writes(c, &rt);
     bench_concurr_multi_rmw(c, &rt);
     bench_shared_read(c, &rt);

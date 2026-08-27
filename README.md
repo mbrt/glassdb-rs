@@ -207,47 +207,35 @@ This is a lot slower than most databases, but still has a few advantages:
 1. Size scalability: object storage scales to petabytes and probably more, as
    cloud providers keep working on making them faster and more scalable.
 
-See how this translates in a dataset of 50k keys, where we vary the number of
-concurrent clients. Each client DB is performing 10 transactions in parallel,
-split in this way:
-
-- 10% updates (i.e. read + write) two separate random keys.
-- 60% strong reads to two separate random keys.
-- 30% weak reads to one random key (max staleness of 10s).
-
-For example, with 5 concurrent DBs we would have 50 parallel transactions at
-every moment.
-
-We did all the tests below by using Google Cloud Storage as a backend.
+The benchmark below uses 5,000 keys per collection. It runs single-key and
+10-key read-only and read-modify-write transaction shapes together. It varies
+each shape from 1 through 200 workers and opens up to five `Database` clients,
+each with an independent collection.
 
 ### Throughput
 
-Glass DB's throughput scales mostly linearly with the number of concurrent
-clients and transactions:
+GlassDB throughput scales mostly linearly with the number of concurrent
+workers:
 
 ![](docs/img/tx-throughput.png)
 
-The graph shows separately four different types of transactions, running
-concurrently: single and multi-key reads and read-writes.
+As you can see, median throughput increases almost linearly for single-key
+reads. It reaches 2.5k transactions per second with 200 workers per shape (800
+workers in total).
 
-As you can see the median throughput increases linearly (better for reads than
-for writes), touching 2.5k transactions per second with 200 concurrent workers.
-
-Note the plateau for multi-key read-writes, which is due to AWS throttling.
-Nothing in principle prevents us from scaling further, by spreading the load
-into more collections (which are independent of each other when S3 assigns them
-to different partitions).
+The multi-key read-modify-write shape reaches the modeled S3 write limit for its
+collection prefixes. More independent collections can add more provider
+partitions.
 
 ### Latency
 
-Latency is not Glass DB's forte, but you can see below that it stays mostly flat
-as we increase the number of concurrent clients and transactions:
+Read latency stays mostly flat as concurrency increases. Multi-key write latency
+rises when hitting S3 prefix write limits:
 
 ![](docs/img/tx-latency.png)
 
-Here the effects of the retries is more noticeable at higher percentiles, as
-expected. Some transactions will start taking longer, as they have to drop their
-work and restart after a conflict.
+The p50-p90 bands also show tail-latency growth. Transaction retries can add
+more delay after a conflict.
 
 ## Development
 
