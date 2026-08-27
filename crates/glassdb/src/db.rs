@@ -7,10 +7,11 @@ use std::time::Duration;
 
 use glassdb_backend::Backend;
 use glassdb_concurr::rt;
-use glassdb_data::{DatabaseId, TxId};
+use glassdb_data::DatabaseId;
 use glassdb_storage::{InlinePolicy, PersistentCacheConfig, PersistentCacheMedia, SplitPolicy};
 use glassdb_trans::{
-    AccessSet, CollectionData, Engine, EngineConfig, EngineTransaction, ProtocolTiming, TransError,
+    AccessSet, BodyOutcome, CollectionData, Engine, EngineConfig, EngineTransaction,
+    ProtocolTiming, TransError,
 };
 use tokio::sync::Notify;
 
@@ -327,18 +328,14 @@ impl Database {
         *stats
     }
 
-    /// Returns a snapshot of the shard coordinator's and locker's live state,
-    /// intended for operators investigating hangs or unexpected contention. See
+    /// Returns a snapshot of the shard coordinator's live state, intended for
+    /// operators investigating hangs or unexpected contention. See
     /// [`crate::diagnostics`] for the data shape and how to enable the
     /// complementary `tracing` events.
-    ///
-    /// Pull-only and zero cost unless called: each shard's lock is taken
-    /// briefly while collecting counts, then released.
     pub fn diagnostics(&self) -> Diagnostics {
         let engine = self.inner.engine.diagnostics();
         Diagnostics {
             coordinator_dedup: engine.coordinator_dedup,
-            transactions: engine.transactions,
         }
     }
 }
@@ -500,12 +497,11 @@ impl DbInner {
             stats.cache_hits += metrics.cache_hits;
             stats.writes += accesses.write_count() as u64;
 
-            let restart_after_wound = if fn_res.is_ok() {
+            if fn_res.is_ok() {
                 driver.install_accesses(accesses, collection_access);
                 match driver.commit().await {
-                    Ok(()) => break fn_res,
-                    Err(TransError::Wounded) => true,
-                    Err(TransError::Retry) => false,
+                    Ok(BodyOutcome::Complete) => break fn_res,
+                    Ok(BodyOutcome::ReplayBody) => {}
                     Err(e) => break Err(e.into()),
                 }
             } else {
@@ -515,18 +511,11 @@ impl DbInner {
                     .validate_body_error(accesses, collection_access)
                     .await
                 {
-                    Err(TransError::Retry) => false,
-                    Err(TransError::Wounded) => true,
+                    Ok(BodyOutcome::ReplayBody) => {}
                     _ => break fn_res,
                 }
-            };
-
-            if restart_after_wound {
-                // A higher-priority transaction aborted us. Release whatever
-                // we held and restart with a fresh id that preserves our
-                // priority, so we are not starved on the retry.
-                driver.restart_after_wound().await;
             }
+
             tx.reset();
             stats.retries += 1;
         };
@@ -544,27 +533,25 @@ impl DbInner {
 /// Drives the engine-side transitions for one public transaction.
 struct AttemptDriver<'a> {
     engine: &'a Engine,
-    resources: Option<AttemptResources<'a>>,
+    handle: Option<EngineTransaction>,
 }
 
 impl<'a> AttemptDriver<'a> {
     fn new(engine: &'a Engine) -> Self {
         Self {
             engine,
-            resources: None,
+            handle: None,
         }
     }
 
     /// Installs the accesses collected from the latest closure execution.
     fn install_accesses(&mut self, accesses: AccessSet, collection_access: CollectionData) {
-        match self.resources.as_mut() {
-            Some(resources) => {
-                self.engine
-                    .reset_transaction(&mut resources.handle, accesses, collection_access)
-            }
+        match self.handle.as_mut() {
+            Some(handle) => self
+                .engine
+                .reset_transaction(handle, accesses, collection_access),
             None => {
-                let handle = self.engine.begin_transaction(accesses, collection_access);
-                self.resources = Some(AttemptResources::new(self.engine, handle));
+                self.handle = Some(self.engine.begin_transaction(accesses, collection_access));
             }
         }
     }
@@ -574,157 +561,130 @@ impl<'a> AttemptDriver<'a> {
         &mut self,
         accesses: AccessSet,
         collection_access: CollectionData,
-    ) -> Result<(), TransError> {
+    ) -> Result<BodyOutcome, TransError> {
         self.install_accesses(
             accesses.into_read_only(),
             collection_access.into_read_only(),
         );
-        let resources = self
-            .resources
+        let handle = self
+            .handle
             .as_mut()
-            .expect("body-error validation installs attempt resources");
-        self.engine.validate_reads(&mut resources.handle).await
-    }
-
-    /// Restarts an attempt that a higher-priority transaction wounded.
-    async fn restart_after_wound(&mut self) {
-        let resources = self
-            .resources
-            .as_mut()
-            .expect("a wound is reported only for an active attempt");
-        let retired_id = resources.handle.id().clone();
-        let end_result = self.engine.end(&mut resources.handle).await;
-        if let Err(error) = &end_result {
-            tracing::debug!(
-                transaction = %retired_id,
-                error = ?error,
-                "wounded transaction retirement deferred to the abandonment guard"
-            );
-        }
-        let resources = self
-            .resources
-            .take()
-            .expect("the ended attempt remains active until it is renewed");
-        self.resources = Some(resources.rebegin(end_result.is_ok()));
+            .expect("body-error validation installs an attempt");
+        self.engine.validate_reads(handle).await
     }
 
     /// Commits the accesses installed for the latest closure execution.
-    async fn commit(&mut self) -> Result<(), TransError> {
-        let resources = self
-            .resources
+    async fn commit(&mut self) -> Result<BodyOutcome, TransError> {
+        let handle = self
+            .handle
             .as_mut()
             .expect("commit follows access installation");
-        self.engine.commit(&mut resources.handle).await
+        self.engine.commit(handle).await
     }
 
     /// Finalizes any active engine attempt.
     async fn finish(mut self) -> Result<(), TransError> {
-        let Some(resources) = self.resources.as_mut() else {
+        let Some(handle) = self.handle.as_mut() else {
             return Ok(());
         };
-        let result = self.engine.end(&mut resources.handle).await;
-        if result.is_ok() {
-            resources.retirement_guard.disarm();
-        }
-        result
-    }
-}
-
-/// Engine state for one active attempt and its abnormal-exit safety net.
-///
-/// Storing this as one optional value ensures the handle and armed guard exist
-/// together or not at all.
-struct AttemptResources<'a> {
-    handle: EngineTransaction,
-    retirement_guard: AttemptRetirementGuard<'a>,
-}
-
-impl<'a> AttemptResources<'a> {
-    fn new(engine: &'a Engine, handle: EngineTransaction) -> Self {
-        let tx_id = handle.id().clone();
-        Self {
-            handle,
-            retirement_guard: AttemptRetirementGuard::new(engine, tx_id),
-        }
-    }
-
-    fn rebegin(mut self, ended: bool) -> Self {
-        let engine = self.retirement_guard.engine;
-        if ended {
-            self.retirement_guard.disarm();
-        }
-        let handle = engine.rebegin_transaction(self.handle);
-        Self::new(engine, handle)
-    }
-}
-
-/// RAII safety net for [`DbInner::tx_impl`]: cancellation, unwinding, or failed
-/// finalization hands the currently armed transaction id to recovery. Before
-/// terminal dispatch this publishes a pinned wound so peers need not wait for
-/// the lock lease; after dispatch it preserves the possibly committed outcome.
-///
-/// Whether the armed id actually needs an abort is the engine's decision, not
-/// the guard's: an attempt that never took a logged identity is
-/// invisible to peers and must not be given an abort-side object it never had.
-struct AttemptRetirementGuard<'a> {
-    engine: &'a Engine,
-    armed: Option<TxId>,
-}
-
-impl<'a> AttemptRetirementGuard<'a> {
-    fn new(engine: &'a Engine, tx_id: TxId) -> Self {
-        Self {
-            engine,
-            armed: Some(tx_id),
-        }
-    }
-
-    /// Disarms the guard once the attempt has ended so `Drop` is a no-op.
-    fn disarm(&mut self) {
-        self.armed = None;
-    }
-}
-
-impl Drop for AttemptRetirementGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(id) = self.armed.take() {
-            self.engine.retire_abandoned(&id);
-        }
+        self.engine.end(handle).await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use glassdb_backend::memory::MemoryBackend;
+    use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture};
+    use glassdb_backend::{Backend, BackendError};
 
     use super::*;
 
-    #[tokio::test]
-    async fn wound_restart_renews_the_attempt_and_remains_finishable() {
-        let db = Database::open("attempts", MemoryBackend::new())
+    const SERIAL_TRANSITION_CONFLICTS: usize = 3 * 50;
+
+    fn fail_root_conflicts(backend: &HookBackend, failures: usize) -> Arc<AtomicUsize> {
+        let remaining = Arc::new(AtomicUsize::new(failures));
+        let hook_remaining = remaining.clone();
+        backend.set_before(move |operation| {
+            let fail = matches!(
+                operation,
+                BackendOp::WriteIf { path, .. } if path.ends_with("/_r")
+            ) && hook_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                    count.checked_sub(1)
+                })
+                .is_ok();
+            let result = if fail {
+                Err(BackendError::Precondition)
+            } else {
+                Ok(())
+            };
+            let future: HookFuture = Box::pin(async move { result });
+            future
+        });
+        remaining
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serial_renewal_does_not_replay_a_point_transaction_body() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()) as Arc<dyn Backend>);
+        let db = Database::builder("serialpoint", backend.clone())
+            .inline_policy(InlinePolicy::none())
+            .open()
             .await
             .unwrap();
-        let mut driver = AttemptDriver::new(&db.inner.engine);
-        driver.install_accesses(AccessSet::default(), CollectionData::default());
+        let remaining = fail_root_conflicts(&backend, SERIAL_TRANSITION_CONFLICTS);
+        let bodies = Arc::new(AtomicUsize::new(0));
 
-        let original_id = driver
-            .resources
-            .as_ref()
-            .expect("access installation starts an attempt")
-            .handle
-            .id()
-            .clone();
-        driver.restart_after_wound().await;
-        let renewed_id = driver
-            .resources
-            .as_ref()
-            .expect("wound restart keeps an active attempt")
-            .handle
-            .id()
-            .clone();
+        db.tx({
+            let bodies = bodies.clone();
+            move |tx| {
+                bodies.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let root = tx.root_collection();
+                    tx.write(&root, b"key", b"value")
+                }
+            }
+        })
+        .await
+        .unwrap();
 
-        assert_ne!(renewed_id, original_id);
-        driver.finish().await.unwrap();
+        assert_eq!(remaining.load(Ordering::SeqCst), 0);
+        assert_eq!(bodies.load(Ordering::SeqCst), 1);
+        db.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serial_renewal_replays_a_collection_change_body() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()) as Arc<dyn Backend>);
+        let db = Database::builder("serialcollection", backend.clone())
+            .inline_policy(InlinePolicy::none())
+            .open()
+            .await
+            .unwrap();
+        let remaining = fail_root_conflicts(&backend, SERIAL_TRANSITION_CONFLICTS);
+        let bodies = Arc::new(AtomicUsize::new(0));
+
+        let child = db
+            .tx({
+                let bodies = bodies.clone();
+                move |tx| {
+                    bodies.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        let root = tx.root_collection();
+                        let child = tx.create_collection(&root, b"child").await?;
+                        tx.write(&root, b"key", b"value")?;
+                        Ok(child)
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(remaining.load(Ordering::SeqCst), 0);
+        assert_eq!(bodies.load(Ordering::SeqCst), 2);
+        assert_eq!(child.name(), Some(b"child".as_slice()));
         db.shutdown().await;
     }
 }

@@ -470,7 +470,7 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
         !root_node.over_soft_cap(&tiny()),
         "recovery completes the parent split requested by publication"
     );
-    let router = TreeRouter::new(s.shards.clone());
+    let router = TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN);
     assert_eq!(
         router
             .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))

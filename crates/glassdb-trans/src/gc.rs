@@ -170,7 +170,7 @@ impl Gc {
         mon: Monitor,
         hints: TxCleanupHints,
     ) -> Self {
-        let router = TreeRouter::new(shards.clone());
+        let router = TreeRouter::new(shards.clone(), std::num::NonZeroUsize::MIN);
         Gc {
             bg,
             tl,
@@ -451,11 +451,11 @@ impl Gc {
     /// entry can name `txid` only if `txid` put it there.
     ///
     /// The recorded keys are routed to their leaves by descent
-    /// ([`TreeRouter::group_keys_by_leaf`]) so each touched leaf is fetched once —
-    /// a write and its write-lock name the same key, and sibling keys share a
-    /// leaf, so a per-key load would re-read the same leaf several times per
-    /// candidate. Each key carries the [`CheckKind`] that says which field to
-    /// inspect.
+    /// ([`TreeRouter::group_keys_by_leaf_fresh`]) so each touched leaf is fetched
+    /// once — a write and its write-lock name the same key, and sibling keys
+    /// share a leaf, so a per-key load would re-read the same leaf several times
+    /// per candidate. Each key carries the [`CheckKind`] that says which field
+    /// to inspect.
     async fn still_referenced(
         &self,
         tid: &TxId,
@@ -481,7 +481,11 @@ impl Gc {
                 .push((key, kind));
         }
         for items in by_collection.into_values() {
-            let groups = match self.router.group_keys_by_leaf(items, requirement).await {
+            let groups = match self
+                .router
+                .group_keys_by_leaf_fresh(items, requirement, requirement)
+                .await
+            {
                 Ok(groups) => groups,
                 // Reclaiming a collection removes every reference it could
                 // contain; its absent tree is therefore negative evidence.
@@ -554,9 +558,13 @@ impl Gc {
                 .push((key, ()));
         }
         for items in by_collection.into_values() {
-            match self.router.group_keys_by_leaf(items, requirement).await {
+            match self
+                .router
+                .group_keys_by_leaf_fresh(items, requirement, requirement)
+                .await
+            {
                 Ok(groups) => {
-                    leaf_paths.extend(groups.into_iter().map(|group| group.path));
+                    leaf_paths.extend(groups.into_iter().map(|group| group.path().clone()));
                 }
                 Err(StorageError::NotFound | StorageError::StaleCollection) => {}
                 Err(error) => return Err(error.into()),
@@ -698,7 +706,7 @@ mod tests {
             glassdb_storage::SplitPolicy::default(),
             Arc::new(NoSplitHints),
         );
-        let router = TreeRouter::new(shards.clone());
+        let router = TreeRouter::new(shards.clone(), std::num::NonZeroUsize::MIN);
         let locker = Locker::new(
             coord.clone(),
             router,
@@ -710,6 +718,7 @@ mod tests {
             ),
             mon.clone(),
             RetryConfig::default(),
+            std::num::NonZeroUsize::MIN,
         );
         let hints = TxCleanupHints::default();
         let gc = Gc::new(

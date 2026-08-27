@@ -16,8 +16,8 @@ use crate::error::TransError;
 use crate::key_state_resolver::KeyStateResolver;
 use crate::monitor::Monitor;
 use crate::shard_coord::{
-    CoordinatedOutcome, FoldOutcome, ResolveCtx, ShardOperation, ShardResolver, StageAdmission,
-    Step,
+    CoordinatedOutcome, CoordinationEvidence, FoldOutcome, ResolveCtx, ShardOperation,
+    ShardResolver, StageAdmission, Step,
 };
 use crate::wound_wait::{Reclaim, try_reclaim};
 
@@ -349,14 +349,17 @@ impl ShardOperation for StructuralGateOperation {
                     typ: LockType::Write,
                     ..
                 },
-            cas_precondition,
+            evidence,
         }) = outcome
         else {
             return Ok(StructuralGateOutcome::Deferred);
         };
-        let requirement = cas_precondition
-            .map(|observation| Requirement::AtLeast(observation.current_after()))
-            .unwrap_or(Requirement::Any);
+        let requirement = match evidence {
+            Some(CoordinationEvidence::Installed(observation)) => {
+                Requirement::AtLeast(observation.current_after())
+            }
+            Some(CoordinationEvidence::Observed(_)) | None => Requirement::Any,
+        };
         Ok(StructuralGateOutcome::Acquired(requirement))
     }
 }

@@ -263,6 +263,15 @@ those dependencies against `AtLeast(validation_start)`. If a state changed, the
 higher-level resolver compares its logical writer or membership evidence and
 the transaction retries when its result was invalidated.
 
+Point validation batches this work by physical leaf path. Optimistic validation
+checks exact retained leaf observations first and expands each result back to
+input order. If one changed, `KeyResolver` routes and resolves the complete
+logical point-read set with current terminal leaves. Validation after point
+locks are acquired always uses this logical path and ignores the validating
+transaction's own holder. Each provider applies the engine's transaction-local
+leaf parallelism bound; one shared lower bound applies to all work in the
+validation episode.
+
 A successful CAS invoked after the validation barrier can both validate its
 expected observation and install the mutation, so it needs no separate read.
 For read-only transactions, a concurrent write after validation can be ordered

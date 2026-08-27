@@ -11,6 +11,10 @@ this ADR's same-key merge **predicate** is dissolved there in favour of a
 monotonic in-fold resolution (both contenders join one round; the loser waits).
 The batching decision itself is unchanged.
 
+[ADR-065](065-renewed-transaction-identity-on-serial-fallback.md) supersedes
+this ADR's assumption that receipt-based release always clears a late cancelled
+acquire before sorted serial acquisition.
+
 ## Context
 
 In v1 the `Locker` wrapped every per-**key** lock/unlock request in

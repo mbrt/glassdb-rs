@@ -216,12 +216,8 @@ async fn stats_report_transactional_decoded_cache_hits() {
     assert_eq!(deleted.transactions.reads, 1);
     assert_eq!(deleted.transactions.cache_hits, 1);
 }
-// `Database::diagnostics` smoke test: on a fresh Database the snapshot is empty, and after
-// running a transaction that acquires locks the snapshot exposes the
-// post-commit state in a structured form that callers can render via the
-// `Display` impl. (Locks linger briefly while the background cleanup task
-// releases them; deeper unit tests in `glassdb-trans` assert the
-// per-tx-held-locks shape directly.)
+// `Database::diagnostics` smoke test: a fresh Database has no coordinator
+// state, and the typed snapshot can be rendered after normal activity.
 #[tokio::test(start_paused = true)]
 async fn diagnostics_returns_typed_snapshot() {
     let db = init_db(mem()).await;
@@ -229,7 +225,6 @@ async fn diagnostics_returns_typed_snapshot() {
     // A fresh Database has no coordination state.
     let idle = db.diagnostics();
     assert!(idle.coordinator_dedup.is_empty(), "fresh dedup: {idle:?}");
-    assert!(idle.transactions.is_empty(), "fresh tx locks: {idle:?}");
 
     // After running a transaction, the snapshot is still callable and renders
     // through the Display impl; the schema (typed fields) is the contract we

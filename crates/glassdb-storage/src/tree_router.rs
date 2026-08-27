@@ -13,7 +13,11 @@
 //! path) and never mutates the tree. Splitting and locking live above it.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 
+use futures::FutureExt;
+use futures::future::BoxFuture;
+use futures::stream::{FuturesUnordered, StreamExt};
 use glassdb_data::{CollectionAddress, KeyRef, NodeToken, ObjectPath};
 
 use crate::cached_store::Requirement;
@@ -38,18 +42,307 @@ impl LeafLocator {
     }
 }
 
-/// A group of keys routed to one leaf by [`TreeRouter::group_keys_by_leaf`]: the
-/// owning leaf and the raw keys (with their payloads) that landed in it.
-pub struct LeafGroup<T> {
-    pub path: ObjectPath,
+/// A group of keys routed to one leaf by
+/// [`TreeRouter::group_keys_by_leaf_fresh`]: the owning leaf and the raw keys
+/// (with their payloads) that landed in it.
+pub struct RoutedLeafGroup<T> {
     pub observation: LeafObservation,
     pub keys: Vec<(Vec<u8>, T)>,
 }
 
-impl<T> LeafGroup<T> {
+impl<T> RoutedLeafGroup<T> {
+    /// Returns the observed leaf's physical object path.
+    pub fn path(&self) -> &ObjectPath {
+        self.observation.path()
+    }
+
     /// Returns the observed node.
     pub fn node(&self) -> Option<&Node> {
         self.observation.value().map(AsRef::as_ref)
+    }
+}
+
+struct RoutedItem<T> {
+    ordinal: usize,
+    key: KeyRef,
+    raw_key: Vec<u8>,
+    payload: T,
+    stage: RouteStage,
+}
+
+#[derive(Clone, Copy)]
+enum RouteStage {
+    Interior,
+    Leaf,
+}
+
+struct PendingPath<T> {
+    items: Vec<RoutedItem<T>>,
+}
+
+impl<T> PendingPath<T> {
+    fn first_ordinal(&self) -> usize {
+        self.items
+            .iter()
+            .map(|item| item.ordinal)
+            .min()
+            .expect("a routed path has at least one item")
+    }
+
+    fn requirement(&self, interior: Requirement, leaf: Requirement) -> Requirement {
+        self.items
+            .iter()
+            .map(|item| route_requirement(item.stage, interior, leaf))
+            .fold(Requirement::Any, Requirement::stricter)
+    }
+}
+
+struct CompletedPath<T> {
+    observation: LeafObservation,
+    items: Vec<RoutedItem<T>>,
+}
+
+struct RoutingError {
+    ordinal: usize,
+    path: ObjectPath,
+    error: StorageError,
+}
+
+type PathLoad = (ObjectPath, Result<LeafObservation, StorageError>);
+
+struct BatchRouting<T> {
+    interior: Requirement,
+    leaf: Requirement,
+    pending: BTreeMap<ObjectPath, PendingPath<T>>,
+    active: BTreeMap<ObjectPath, PendingPath<T>>,
+    completed: BTreeMap<ObjectPath, CompletedPath<T>>,
+    first_error: Option<RoutingError>,
+}
+
+impl<T> BatchRouting<T> {
+    fn new(
+        items: impl IntoIterator<Item = (KeyRef, T)>,
+        interior: Requirement,
+        leaf: Requirement,
+    ) -> Self {
+        let mut routing = Self {
+            interior,
+            leaf,
+            pending: BTreeMap::new(),
+            active: BTreeMap::new(),
+            completed: BTreeMap::new(),
+            first_error: None,
+        };
+        for (ordinal, (key, payload)) in items.into_iter().enumerate() {
+            let path = ObjectPath::TreeRoot {
+                collection: key.collection().clone(),
+            };
+            routing.enqueue(
+                path,
+                RoutedItem {
+                    ordinal,
+                    raw_key: key.key().to_vec(),
+                    key,
+                    payload,
+                    stage: RouteStage::Interior,
+                },
+            );
+        }
+        routing
+    }
+
+    fn has_work(&self) -> bool {
+        !self.pending.is_empty() || !self.active.is_empty()
+    }
+
+    fn admit(&mut self) -> Option<(ObjectPath, Requirement)> {
+        let path = self
+            .pending
+            .iter()
+            .filter(|(path, _)| !self.active.contains_key(*path))
+            .min_by(|(left_path, left), (right_path, right)| {
+                (left.first_ordinal(), *left_path).cmp(&(right.first_ordinal(), *right_path))
+            })
+            .map(|(path, _)| path.clone())?;
+        let batch = self
+            .pending
+            .remove(&path)
+            .expect("an admitted path has pending items");
+        let requirement = batch.requirement(self.interior, self.leaf);
+        let previous = self.active.insert(path.clone(), batch);
+        debug_assert!(previous.is_none(), "a path has at most one active load");
+        Some((path, requirement))
+    }
+
+    fn complete(&mut self, path: ObjectPath, result: Result<LeafObservation, StorageError>) {
+        let batch = self
+            .active
+            .remove(&path)
+            .expect("every completed load has an active path batch");
+        let observation = match result {
+            Ok(observation) if observation.exists() => observation,
+            Ok(_) => {
+                self.record_load_error(path, &batch, StorageError::NotFound);
+                return;
+            }
+            Err(error) => {
+                self.record_load_error(path, &batch, error);
+                return;
+            }
+        };
+        self.route_loaded(path, batch, observation);
+    }
+
+    fn finish(self) -> Result<Vec<RoutedLeafGroup<T>>, StorageError> {
+        debug_assert!(self.pending.is_empty());
+        debug_assert!(self.active.is_empty());
+        if let Some(error) = self.first_error {
+            return Err(error.error);
+        }
+        Ok(self
+            .completed
+            .into_values()
+            .map(|mut group| {
+                group.items.sort_by_key(|item| item.ordinal);
+                RoutedLeafGroup {
+                    observation: group.observation,
+                    keys: group
+                        .items
+                        .into_iter()
+                        .map(|item| (item.raw_key, item.payload))
+                        .collect(),
+                }
+            })
+            .collect())
+    }
+
+    fn enqueue(&mut self, path: ObjectPath, item: RoutedItem<T>) {
+        self.pending
+            .entry(path)
+            .or_insert_with(|| PendingPath { items: Vec::new() })
+            .items
+            .push(item);
+    }
+
+    fn route_loaded(
+        &mut self,
+        path: ObjectPath,
+        batch: PendingPath<T>,
+        observation: LeafObservation,
+    ) {
+        let mut routed_items = batch.items;
+        if let Some(previous) = self.completed.remove(&path) {
+            routed_items.extend(previous.items);
+        }
+        routed_items.sort_by_key(|item| item.ordinal);
+
+        let node = observation
+            .value()
+            .cloned()
+            .expect("present node observations have a decoded node");
+        let mut finished = Vec::new();
+        for item in routed_items {
+            if let Some(item) = self.route_item(&path, &observation, &node, item) {
+                finished.push(item);
+            }
+        }
+        if !finished.is_empty() {
+            self.completed.insert(
+                path,
+                CompletedPath {
+                    observation,
+                    items: finished,
+                },
+            );
+        }
+    }
+
+    fn route_item(
+        &mut self,
+        path: &ObjectPath,
+        observation: &LeafObservation,
+        node: &Node,
+        mut item: RoutedItem<T>,
+    ) -> Option<RoutedItem<T>> {
+        let required = route_requirement(item.stage, self.interior, self.leaf);
+        if !required.is_satisfied_by(observation.current_after()) {
+            self.enqueue(path.clone(), item);
+            return None;
+        }
+
+        if !node.owns(&item.raw_key) {
+            let Some(token) = node.right_sibling() else {
+                return Some(item);
+            };
+            let target = match routed_node_path(&item, token) {
+                Ok(target) => target,
+                Err(error) => {
+                    self.record_error(item.ordinal, path.clone(), error);
+                    return None;
+                }
+            };
+            item.stage = match node.body() {
+                NodeBody::Leaf(_) => RouteStage::Leaf,
+                NodeBody::Index(_) => RouteStage::Interior,
+            };
+            self.enqueue(target, item);
+            return None;
+        }
+
+        match node.body() {
+            NodeBody::Index(index) => {
+                let Some(token) = index.child_for(&item.raw_key) else {
+                    self.record_error(
+                        item.ordinal,
+                        path.clone(),
+                        StorageError::other("descent reached an empty index node"),
+                    );
+                    return None;
+                };
+                let target = match routed_node_path(&item, token) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        self.record_error(item.ordinal, path.clone(), error);
+                        return None;
+                    }
+                };
+                item.stage = RouteStage::Interior;
+                self.enqueue(target, item);
+                None
+            }
+            NodeBody::Leaf(_) if self.leaf.is_satisfied_by(observation.current_after()) => {
+                Some(item)
+            }
+            NodeBody::Leaf(_) => {
+                item.stage = RouteStage::Leaf;
+                self.enqueue(path.clone(), item);
+                None
+            }
+        }
+    }
+
+    fn record_load_error(&mut self, path: ObjectPath, batch: &PendingPath<T>, error: StorageError) {
+        let first = batch
+            .items
+            .iter()
+            .min_by_key(|item| item.ordinal)
+            .expect("a routed path has at least one item");
+        let error = error.classify_collection_absence(first.key.collection());
+        self.record_error(first.ordinal, path, error);
+    }
+
+    fn record_error(&mut self, ordinal: usize, path: ObjectPath, error: StorageError) {
+        let replace = match &self.first_error {
+            Some(first) => (ordinal, &path) < (first.ordinal, &first.path),
+            None => true,
+        };
+        if replace {
+            self.first_error = Some(RoutingError {
+                ordinal,
+                path,
+                error,
+            });
+        }
     }
 }
 
@@ -303,12 +596,13 @@ impl<'a> LeafChain<'a> {
 #[derive(Clone)]
 pub struct TreeRouter {
     nodes: NodeStore,
+    parallelism: NonZeroUsize,
 }
 
 impl TreeRouter {
     /// Creates a router that reads nodes through `nodes`.
-    pub fn new(nodes: NodeStore) -> Self {
-        TreeRouter { nodes }
+    pub fn new(nodes: NodeStore, parallelism: NonZeroUsize) -> Self {
+        TreeRouter { nodes, parallelism }
     }
 
     /// Resolves the leaf that owns `key`, descending from the root `_r` and
@@ -433,53 +727,81 @@ impl TreeRouter {
 
     /// Routes `(key, payload)` items to their owning leaves, returning one
     /// group per touched leaf with its loaded node and version. Callers hand it
-    /// logical keys and never compute a location themselves; routing is by descent
-    /// from the collection root, not by any fixed hash (ADR-031).
+    /// logical keys and never compute a location themselves; routing is by
+    /// descent from the collection root, not by any fixed hash (ADR-031).
     ///
+    /// The interior-vs-leaf requirement split of [`leaf_for_fresh`] lets the
+    /// coordination hot path route keys without checking the root `_r`.
     /// Groups are keyed by leaf object path, so keys from different collections
     /// (distinct `_r`) never collide; input order is preserved within a group.
     /// Missing non-root collection trees are reported as
     /// [`StorageError::StaleCollection`] while the failing key still identifies
     /// its collection.
-    pub async fn group_keys_by_leaf<T>(
-        &self,
-        items: impl IntoIterator<Item = (KeyRef, T)>,
-        requirement: Requirement,
-    ) -> Result<Vec<LeafGroup<T>>, StorageError> {
-        self.group_keys_by_leaf_fresh(items, requirement, requirement)
-            .await
-    }
-
-    /// [`group_keys_by_leaf`] with the interior-vs-leaf requirement split of
-    /// [`leaf_for_fresh`], so the coordination hot path routes keys without
-    /// checking the root `_r` (ADR-031).
     ///
-    /// [`group_keys_by_leaf`]: Self::group_keys_by_leaf
     /// [`leaf_for_fresh`]: Self::leaf_for_fresh
     pub async fn group_keys_by_leaf_fresh<T>(
         &self,
         items: impl IntoIterator<Item = (KeyRef, T)>,
         interior: Requirement,
         leaf: Requirement,
-    ) -> Result<Vec<LeafGroup<T>>, StorageError> {
-        let mut groups: BTreeMap<ObjectPath, LeafGroup<T>> = BTreeMap::new();
-        for (key, payload) in items {
+    ) -> Result<Vec<RoutedLeafGroup<T>>, StorageError> {
+        let mut items = items.into_iter();
+        let Some(first) = items.next() else {
+            return Ok(Vec::new());
+        };
+        let Some(second) = items.next() else {
+            let (key, payload) = first;
             let raw_key = key.key().to_vec();
-            let loc = self
+            let locator = self
                 .leaf_for_fresh(key.collection(), &raw_key, interior, leaf)
                 .await
                 .map_err(|error| error.classify_collection_absence(key.collection()))?;
-            groups
-                .entry(loc.path.clone())
-                .or_insert_with(|| LeafGroup {
-                    path: loc.path,
-                    observation: loc.observation,
-                    keys: Vec::new(),
-                })
-                .keys
-                .push((raw_key, payload));
+            return Ok(vec![RoutedLeafGroup {
+                observation: locator.observation,
+                keys: vec![(raw_key, payload)],
+            }]);
+        };
+
+        self.group_keys_by_leaf_batched(
+            std::iter::once(first)
+                .chain(std::iter::once(second))
+                .chain(items),
+            interior,
+            leaf,
+        )
+        .await
+    }
+
+    async fn group_keys_by_leaf_batched<T>(
+        &self,
+        items: impl IntoIterator<Item = (KeyRef, T)>,
+        interior: Requirement,
+        leaf: Requirement,
+    ) -> Result<Vec<RoutedLeafGroup<T>>, StorageError> {
+        let mut routing = BatchRouting::new(items, interior, leaf);
+        let mut in_flight = FuturesUnordered::<BoxFuture<'static, PathLoad>>::new();
+
+        while routing.has_work() {
+            while in_flight.len() < self.parallelism.get() {
+                let Some((path, requirement)) = routing.admit() else {
+                    break;
+                };
+                let nodes = self.nodes.clone();
+                in_flight.push(
+                    async move {
+                        let result = nodes.load_node_at_state(&path, requirement).await;
+                        (path, result)
+                    }
+                    .boxed(),
+                );
+            }
+            let (path, result) = in_flight
+                .next()
+                .await
+                .expect("routing work keeps an active path load");
+            routing.complete(path, result);
         }
-        Ok(groups.into_values().collect())
+        routing.finish()
     }
 
     /// Reports whether descent for `key` reaches the node named `target`.
@@ -595,15 +917,33 @@ fn node_token(token: &str) -> Result<NodeToken, StorageError> {
         .map_err(|error| StorageError::with_source("invalid node reference", error))
 }
 
+fn route_requirement(stage: RouteStage, interior: Requirement, leaf: Requirement) -> Requirement {
+    match stage {
+        RouteStage::Interior => interior,
+        RouteStage::Leaf => leaf,
+    }
+}
+
+fn routed_node_path<T>(item: &RoutedItem<T>, token: &str) -> Result<ObjectPath, StorageError> {
+    Ok(ObjectPath::Node {
+        collection: item.key.collection().clone(),
+        token: node_token(token)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use std::future::Future;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
 
+    use futures::future::poll_fn;
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
-    use glassdb_backend::middleware::{OpLog, RecordingBackend};
+    use glassdb_backend::middleware::{BackendOp, HookBackend, OpLog, RecordingBackend};
     use glassdb_data::{CollectionAddress, CollectionId};
 
     use crate::Timeline;
@@ -634,7 +974,7 @@ mod tests {
     fn store_over(backend: Arc<dyn Backend>) -> TestStore {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        let shards = NodeStore::new(objects);
+        let shards = NodeStore::new(objects, std::num::NonZeroUsize::MIN);
         TestStore { shards, timeline }
     }
 
@@ -642,6 +982,14 @@ mod tests {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let log = recorder.log();
         (Arc::new(recorder), log)
+    }
+
+    fn hook_backend() -> Arc<HookBackend> {
+        HookBackend::new(Arc::new(MemoryBackend::new()))
+    }
+
+    fn limit(value: usize) -> NonZeroUsize {
+        NonZeroUsize::new(value).expect("test limits are nonzero")
     }
 
     fn take_reads(log: &OpLog) -> Vec<(String, String)> {
@@ -742,6 +1090,24 @@ mod tests {
         .unwrap();
     }
 
+    // One key takes a stale left route while another reaches the same right
+    // leaf directly, so their path batches converge after admission.
+    async fn seed_converging_leaf_paths(s: &NodeStore) {
+        let left = token(0);
+        let right = token(1);
+        store_leaf(s, 0, &[b"apple"], Some(b"m"), Some(1)).await;
+        store_leaf(s, 1, &[b"pear", b"zebra"], None, None).await;
+        s.create_root(
+            &collection(),
+            &Node::index(IndexNode::from_children([
+                (Vec::new(), left.to_string()),
+                (b"t".to_vec(), right.to_string()),
+            ])),
+        )
+        .await
+        .unwrap();
+    }
+
     // Three leaves behind one stale parent exercise both a bounded scan and
     // the leaf-to-leaf interface without involving another descent shape.
     async fn seed_three_leaf_chain(s: &NodeStore) {
@@ -807,7 +1173,7 @@ mod tests {
         let root = Node::leaf(Shard::from_entries([live(b"only")]));
         s.create_root(&collection(), &root).await.unwrap();
 
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN);
         let requirement = Requirement::AtLeast(s.timeline.now());
         let loc = router
             .leaf_for(&collection(), b"only", requirement)
@@ -828,7 +1194,7 @@ mod tests {
     #[tokio::test]
     async fn absent_collection_is_not_a_writable_empty_leaf() {
         let s = store();
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN);
         assert!(matches!(
             router
                 .leaf_for(&collection(), b"k", Requirement::AtLeast(s.timeline.now()))
@@ -863,7 +1229,7 @@ mod tests {
     async fn descends_index_to_correct_leaf() {
         let s = store();
         seed_two_level(&s).await;
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN);
 
         for (key, want_leaf) in [
             (b"apple".as_slice(), node_path(0)),
@@ -887,7 +1253,7 @@ mod tests {
         take_reads(&log);
 
         let cold = store_over(backend.clone());
-        let router = TreeRouter::new(cold.shards.clone());
+        let router = TreeRouter::new(cold.shards.clone(), std::num::NonZeroUsize::MIN);
         let loc = router
             .leaf_for(&collection(), b"pear", Requirement::Any)
             .await
@@ -919,7 +1285,7 @@ mod tests {
             .await
             .unwrap();
         take_reads(&log);
-        let loc = TreeRouter::new(terminal_warm.shards.clone())
+        let loc = TreeRouter::new(terminal_warm.shards.clone(), std::num::NonZeroUsize::MIN)
             .leaf_for(&collection(), b"pear", Requirement::Any)
             .await
             .unwrap();
@@ -937,7 +1303,7 @@ mod tests {
         take_reads(&log);
 
         let s = store_over(backend.clone());
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN);
         router
             .leaf_for(&collection(), b"pear", Requirement::Any)
             .await
@@ -968,7 +1334,7 @@ mod tests {
         }
         take_reads(&log);
         let bound = mixed.timeline.now();
-        let loc = TreeRouter::new(mixed.shards.clone())
+        let loc = TreeRouter::new(mixed.shards.clone(), std::num::NonZeroUsize::MIN)
             .leaf_for_fresh(
                 &collection(),
                 b"pear",
@@ -1000,7 +1366,7 @@ mod tests {
             .unwrap();
         take_reads(&log);
 
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN);
         let first = router
             .first_leaf_at(&collection(), b"apple", Requirement::Any)
             .await
@@ -1028,7 +1394,7 @@ mod tests {
         take_reads(&log);
 
         let bounded = store_over(backend.clone());
-        let leaves = TreeRouter::new(bounded.shards.clone())
+        let leaves = TreeRouter::new(bounded.shards.clone(), std::num::NonZeroUsize::MIN)
             .leaves_through(&collection(), b"apple", Some(b"mango"), Requirement::Any)
             .await
             .unwrap();
@@ -1053,7 +1419,7 @@ mod tests {
             .await
             .unwrap();
         take_reads(&log);
-        let leaves = TreeRouter::new(terminal_warm.shards.clone())
+        let leaves = TreeRouter::new(terminal_warm.shards.clone(), std::num::NonZeroUsize::MIN)
             .leaves(&collection(), Requirement::Any)
             .await
             .unwrap();
@@ -1082,7 +1448,7 @@ mod tests {
         take_reads(&log);
 
         let s = store_over(backend);
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN);
         let loc = router
             .leaf_for(&collection(), b"pear", Requirement::Any)
             .await
@@ -1130,7 +1496,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let router = TreeRouter::new(reader.shards.clone());
+        let router = TreeRouter::new(reader.shards.clone(), std::num::NonZeroUsize::MIN);
         router
             .leaf_for(&collection(), b"pear", Requirement::Any)
             .await
@@ -1203,7 +1569,7 @@ mod tests {
         take_reads(&log);
         let s = store_over(backend);
         assert!(
-            !TreeRouter::new(s.shards.clone())
+            !TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN)
                 .token_reachable_at_key(&collection(), b"pear", &token(0), Requirement::Any)
                 .await
                 .unwrap()
@@ -1225,7 +1591,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let router = TreeRouter::new(dangling.shards.clone());
+        let router = TreeRouter::new(dangling.shards.clone(), std::num::NonZeroUsize::MIN);
         assert!(
             !router
                 .token_reachable_at_key(&collection(), b"pear", &token(8), Requirement::Any)
@@ -1244,15 +1610,16 @@ mod tests {
     async fn group_keys_by_leaf_routes_and_preserves_order() {
         let s = store();
         seed_two_level(&s).await;
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN);
 
         let groups = router
-            .group_keys_by_leaf(
+            .group_keys_by_leaf_fresh(
                 [
                     (KeyRef::new(CollectionAddress::root("db"), b"cat"), 'c'),
                     (KeyRef::new(CollectionAddress::root("db"), b"mango"), 'm'),
                     (KeyRef::new(CollectionAddress::root("db"), b"apple"), 'a'),
                 ],
+                Requirement::AtLeast(s.timeline.now()),
                 Requirement::AtLeast(s.timeline.now()),
             )
             .await
@@ -1261,7 +1628,7 @@ mod tests {
         assert_eq!(groups.len(), 2, "keys split across two leaves");
         let l0 = groups
             .iter()
-            .find(|group| group.path == node_path(0))
+            .find(|group| group.path() == &node_path(0))
             .unwrap();
         assert_eq!(
             l0.keys,
@@ -1270,36 +1637,297 @@ mod tests {
         );
         let l1 = groups
             .iter()
-            .find(|group| group.path == node_path(1))
+            .find(|group| group.path() == &node_path(1))
             .unwrap();
         assert_eq!(l1.keys, vec![(b"mango".to_vec(), 'm')]);
+    }
+
+    /// Holds backend reads until the test releases the current set.
+    struct ReadGate {
+        parked: AtomicUsize,
+        released: AtomicUsize,
+    }
+
+    impl ReadGate {
+        fn install(backend: &Arc<HookBackend>) -> Arc<Self> {
+            let gate = Arc::new(Self {
+                parked: AtomicUsize::new(0),
+                released: AtomicUsize::new(0),
+            });
+            backend.set_before({
+                let gate = gate.clone();
+                move |operation| {
+                    if !matches!(
+                        operation,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    ) {
+                        return Box::pin(std::future::ready(Ok(())));
+                    }
+                    let gate = gate.clone();
+                    Box::pin(async move {
+                        gate.park().await;
+                        Ok(())
+                    })
+                }
+            });
+            gate
+        }
+
+        async fn park(&self) {
+            let ticket = self.parked.fetch_add(1, Ordering::SeqCst);
+            while self.released.load(Ordering::SeqCst) <= ticket {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        fn release_parked(&self) -> usize {
+            let parked = self.parked.load(Ordering::SeqCst);
+            parked - self.released.swap(parked, Ordering::SeqCst)
+        }
+    }
+
+    async fn read_widths<F: Future>(routing: F, gate: &ReadGate) -> (F::Output, Vec<usize>) {
+        let mut routing = std::pin::pin!(routing);
+        let mut widths = Vec::new();
+        loop {
+            let mut stable = 0;
+            let mut seen = gate.parked.load(Ordering::SeqCst);
+            let settled = loop {
+                if let Poll::Ready(output) =
+                    poll_fn(|cx| Poll::Ready(routing.as_mut().poll(cx))).await
+                {
+                    break Some(output);
+                }
+                let parked = gate.parked.load(Ordering::SeqCst);
+                if parked == seen {
+                    stable += 1;
+                    if stable == 8 {
+                        break None;
+                    }
+                } else {
+                    seen = parked;
+                    stable = 0;
+                }
+                tokio::task::yield_now().await;
+            };
+            match settled {
+                Some(output) => return (output, widths),
+                None => {
+                    let width = gate.release_parked();
+                    assert!(width > 0, "routing stopped without loading a node");
+                    widths.push(width);
+                }
+            }
+        }
+    }
+
+    async fn seed_distinct_leaf_collections(
+        store: &NodeStore,
+        count: usize,
+    ) -> Vec<CollectionAddress> {
+        let mut collections = Vec::new();
+        for index in 0..count {
+            let id = CollectionId::from_slice(&[index as u8 + 1; 16]).unwrap();
+            let collection = CollectionAddress::new("db", id);
+            store
+                .create_root(&collection, &Node::leaf(Shard::from_entries([live(b"k")])))
+                .await
+                .unwrap();
+            collections.push(collection);
+        }
+        collections
+    }
+
+    #[tokio::test]
+    async fn distinct_cold_leaves_obey_the_routing_bound() {
+        for (leaves, expected) in [
+            (1usize, vec![1usize]),
+            (2, vec![2]),
+            (8, vec![8]),
+            (32, vec![16, 16]),
+        ] {
+            let backend = hook_backend();
+            let collections =
+                seed_distinct_leaf_collections(&store_over(backend.clone()).shards, leaves).await;
+            let gate = ReadGate::install(&backend);
+            let cold = store_over(backend);
+            let router = TreeRouter::new(cold.shards.clone(), limit(16));
+            let items = collections
+                .into_iter()
+                .map(|collection| (KeyRef::new(collection, b"k"), ()));
+            let (groups, widths) = read_widths(
+                router.group_keys_by_leaf_fresh(items, Requirement::Any, Requirement::Any),
+                &gate,
+            )
+            .await;
+
+            assert_eq!(groups.unwrap().len(), leaves);
+            assert_eq!(widths, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_bound_counts_paths_instead_of_keys() {
+        let backend = hook_backend();
+        seed_two_level(&store_over(backend.clone()).shards).await;
+        let gate = ReadGate::install(&backend);
+        let cold = store_over(backend);
+        let router = TreeRouter::new(cold.shards.clone(), limit(2));
+        let items = [b"cat".as_slice(), b"mango", b"apple", b"pear"]
+            .into_iter()
+            .map(|key| (KeyRef::new(collection(), key), ()));
+        let (groups, widths) = read_widths(
+            router.group_keys_by_leaf_fresh(items, Requirement::Any, Requirement::Any),
+            &gate,
+        )
+        .await;
+
+        assert_eq!(widths, vec![1, 2]);
+        assert_eq!(
+            groups
+                .unwrap()
+                .iter()
+                .map(|group| (group.path().clone(), group.keys.len()))
+                .collect::<Vec<_>>(),
+            vec![(node_path(0), 2), (node_path(1), 2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn path_batched_grouping_loads_each_shared_path_once() {
+        let (backend, log) = recording_backend();
+        seed_two_level(&store_over(backend.clone())).await;
+        take_reads(&log);
+        let cold = store_over(backend);
+        let router = TreeRouter::new(cold.shards.clone(), NonZeroUsize::new(16).unwrap());
+
+        let groups = router
+            .group_keys_by_leaf_fresh(
+                [
+                    (KeyRef::new(collection(), b"pear"), 0),
+                    (KeyRef::new(collection(), b"apple"), 1),
+                    (KeyRef::new(collection(), b"mango"), 2),
+                    (KeyRef::new(collection(), b"cat"), 3),
+                ],
+                Requirement::Any,
+                Requirement::Any,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(groups.len(), 2);
+        let reads = take_reads(&log);
+        assert_eq!(reads.len(), 3);
+        assert_eq!(
+            reads
+                .iter()
+                .filter(|read| read.1 == root_path().to_string())
+                .count(),
+            1
+        );
+        assert_eq!(
+            reads
+                .iter()
+                .filter(|read| read.1 == node_path(0).to_string())
+                .count(),
+            1
+        );
+        assert_eq!(
+            reads
+                .iter()
+                .filter(|read| read.1 == node_path(1).to_string())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn converging_path_batches_reuse_the_loaded_leaf_and_preserve_order() {
+        let (backend, log) = recording_backend();
+        seed_converging_leaf_paths(&store_over(backend.clone())).await;
+        take_reads(&log);
+        let cold = store_over(backend);
+        let router = TreeRouter::new(cold.shards.clone(), NonZeroUsize::new(2).unwrap());
+
+        let groups = router
+            .group_keys_by_leaf_fresh(
+                [
+                    (KeyRef::new(collection(), b"pear"), 0),
+                    (KeyRef::new(collection(), b"zebra"), 1),
+                ],
+                Requirement::Any,
+                Requirement::Any,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].keys,
+            vec![(b"pear".to_vec(), 0), (b"zebra".to_vec(), 1)]
+        );
+        let reads = take_reads(&log);
+        assert_eq!(reads.len(), 3);
+        assert_eq!(
+            reads
+                .iter()
+                .filter(|read| read.1 == node_path(1).to_string())
+                .count(),
+            1,
+            "a converged batch reuses the active path load"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_grouped_key_uses_the_direct_descent_sequence() {
+        let (backend, log) = recording_backend();
+        seed_two_level(&store_over(backend.clone())).await;
+        take_reads(&log);
+        let cold = store_over(backend);
+
+        let groups = TreeRouter::new(cold.shards.clone(), NonZeroUsize::new(16).unwrap())
+            .group_keys_by_leaf_fresh(
+                [(KeyRef::new(collection(), b"pear"), ())],
+                Requirement::Any,
+                Requirement::Any,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            take_reads(&log),
+            [read("read", root_path()), read("read", node_path(1))]
+        );
     }
 
     #[tokio::test]
     async fn grouped_routing_classifies_the_collection_that_failed() {
         let s = store();
-        let router = TreeRouter::new(s.shards.clone());
+        let router = TreeRouter::new(s.shards.clone(), NonZeroUsize::new(2).unwrap());
         let root = CollectionAddress::root("db");
         let child = CollectionAddress::new("db", CollectionId::from_slice(&[1; 16]).unwrap());
         let requirement = Requirement::AtLeast(s.timeline.now());
 
         let root_error = router
-            .group_keys_by_leaf(
+            .group_keys_by_leaf_fresh(
                 [
                     (KeyRef::new(root.clone(), b"root"), ()),
                     (KeyRef::new(child.clone(), b"child"), ()),
                 ],
+                requirement,
                 requirement,
             )
             .await;
         assert!(matches!(root_error, Err(StorageError::NotFound)));
 
         let child_error = router
-            .group_keys_by_leaf(
+            .group_keys_by_leaf_fresh(
                 [
                     (KeyRef::new(child, b"child"), ()),
                     (KeyRef::new(root, b"root"), ()),
                 ],
+                requirement,
                 requirement,
             )
             .await;

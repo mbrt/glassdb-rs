@@ -18,11 +18,10 @@
 //! wait-for graph acyclic); two equal-priority transactions that would cycle are
 //! broken by escalating to the serial order. Lock acquisition has two modes: the
 //! default **parallel** path locks every shard concurrently; after a
-//! [`MAX_DEADLOCK_TIMEOUT`] wait or [`SERIAL_FALLBACK_AFTER`] failed attempts a
-//! transaction releases its locks and re-acquires them under the **serial**
-//! sorted order (same id, no body re-run), where first-CAS-wins on the lowest
-//! contended shard guarantees one contender makes progress. Only a genuine wound
-//! aborts-and-renews with priority preserved ([`TxId::renew`]).
+//! [`MAX_DEADLOCK_TIMEOUT`] wait or [`SERIAL_FALLBACK_AFTER`] failed attempts,
+//! the attempt owner ends the parallel identity and renews it before the
+//! **serial** sorted order. First-CAS-wins on the lowest contended shard then
+//! guarantees that one contender makes progress.
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -31,8 +30,8 @@ use glassdb_concurr::{Background, Backoff, RetryConfig, rt};
 use glassdb_data::{KeyRef, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxLog, TxWrite};
 use glassdb_storage::{
-    InlinePolicy, LeafObservationCheck, LockType, NodeStore, Requirement, SequencePoint,
-    SplitPolicy, Timeline,
+    InlinePolicy, LeafObservationCheck, LockType, NodeStore, Requirement, SplitPolicy, Timeline,
+    TreeRouter,
 };
 
 use crate::access::{AccessSet, ReadAccess, WriteOp};
@@ -67,15 +66,83 @@ const SERIAL_FALLBACK_AFTER: usize = 3;
 /// younger-or-equal transaction *waits* for a conflicting holder while keeping
 /// its locks; distinct priorities cannot cycle (wound-wait), but two
 /// equal-priority transactions can each wait on the other forever. This timeout
-/// bounds that wait: on elapse the transaction releases its locks and
-/// re-acquires them in the global sorted order, where one contender always
-/// completes. Reuses v1's 5s budget (ADR-002 / architecture.md).
+/// bounds that wait: on elapse the attempt owner ends the identity and renews
+/// it for the global sorted order, where one contender always completes. Reuses
+/// v1's 5s budget (ADR-002 / architecture.md).
 const MAX_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Upper bound for one continuous leaf-capacity retry episode. Revisions and
 /// reroutes do not extend it: until acquisition succeeds, capacity has not made
 /// foreground progress.
 const MAX_LEAF_FULL_WAIT: Duration = Duration::from_secs(30);
+
+struct AttemptRetirement {
+    mon: Monitor,
+    cleanup_hints: TxCleanupHints,
+    background: Option<Weak<Background>>,
+}
+
+impl AttemptRetirement {
+    /// Hands an abandoned transaction identity to managed recovery.
+    fn retire_abandoned(&self, tx_id: &TxId) {
+        // An optimistic read-only validation and a logless one-CAS commit have
+        // no logged identity. Publishing an abort for either would invent a
+        // transaction that peers never observed.
+        if !self.mon.is_tracked_local(tx_id) {
+            return;
+        }
+        let Some(bg) = self.background.as_ref().and_then(Weak::upgrade) else {
+            return;
+        };
+        let mon = self.mon.clone();
+        let cleanup_hints = self.cleanup_hints.clone();
+        let tx_id = tx_id.clone();
+        bg.spawn_waited(async move {
+            if mon.abort_owned_tx(&tx_id).await.is_ok() {
+                cleanup_hints.schedule(tx_id);
+            }
+        });
+    }
+}
+
+/// Hands the active identity to recovery if its owner future is abandoned.
+struct AttemptRetirementGuard {
+    retirement: Arc<AttemptRetirement>,
+    armed: Option<TxId>,
+}
+
+impl AttemptRetirementGuard {
+    fn new(retirement: Arc<AttemptRetirement>, tx_id: TxId) -> Self {
+        Self {
+            retirement,
+            armed: Some(tx_id),
+        }
+    }
+
+    fn arm(&mut self, tx_id: TxId) {
+        assert!(
+            self.armed.is_none(),
+            "cannot replace a live transaction identity"
+        );
+        self.armed = Some(tx_id);
+    }
+
+    fn disarm(&mut self) {
+        self.armed = None;
+    }
+
+    fn retire_current(&mut self) {
+        if let Some(tx_id) = self.armed.take() {
+            self.retirement.retire_abandoned(&tx_id);
+        }
+    }
+}
+
+impl Drop for AttemptRetirementGuard {
+    fn drop(&mut self) {
+        self.retire_current();
+    }
+}
 
 /// An opaque handle to an in-progress transaction managed by [`Algo`].
 pub struct Handle {
@@ -86,9 +153,10 @@ pub struct Handle {
     /// Per-transaction backoff for the internal CAS-contention retry in
     /// [`Algo::acquire_locks`] (a lost shard/root CAS race): advanced before each
     /// same-id re-lock so churning contenders spread out instead of busy-looping.
-    /// The lock-holding restart paths (`restart`, `revalidate`) and the read-only
-    /// validation paths deliberately do not back off.
+    /// Body replay after a wound or stale read and read-only validation do not
+    /// use this schedule.
     backoff: Backoff,
+    retirement: AttemptRetirementGuard,
 }
 
 impl Handle {
@@ -115,6 +183,10 @@ impl Handle {
         self.state.force_locked_reads();
     }
 
+    fn force_serial_acquisition(&mut self) {
+        self.state.force_serial_acquisition();
+    }
+
     fn needs_abort(&self) -> bool {
         self.state.needs_abort()
     }
@@ -126,19 +198,67 @@ impl Handle {
     fn renewals(&self) -> usize {
         self.state.renewals()
     }
+
+    fn should_acquire_serially(&self) -> bool {
+        self.state.should_acquire_serially() || self.renewals() >= SERIAL_FALLBACK_AFTER
+    }
+
+    fn renew(&mut self) {
+        let id = self.id.renew();
+        self.collections.renew();
+        self.state.renew();
+        self.id = id.clone();
+        self.retirement.arm(id);
+    }
 }
 
-/// Terminal outcome of [`Algo::acquire_locks`]. CAS contention and suspected
-/// deadlocks are resolved *inside* `acquire_locks` (release + same-id re-lock),
-/// so they are not represented here — only the two outcomes the commit path must
-/// act on remain. Read-version validation happens *after* this returns
-/// [`Acquired::Locked`], so a stale read is not an acquisition outcome.
+/// Reports whether an engine operation needs another user-body execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyOutcome {
+    /// The engine operation reached its normal result.
+    Complete,
+    /// The engine changed attempt state and needs fresh logical accesses.
+    ReplayBody,
+}
+
+enum AttemptOutcome {
+    Complete,
+    RenewForSerial {
+        replay_body: bool,
+        /// A cancelled lock-acquisition write may still land under the old
+        /// identity. Its owner operation must remain unresolved so retirement
+        /// pins that identity as `Wounded`.
+        pending_writes: bool,
+    },
+}
+
+impl AttemptOutcome {
+    fn has_pending_writes(&self) -> bool {
+        matches!(
+            self,
+            Self::RenewForSerial {
+                pending_writes: true,
+                ..
+            }
+        )
+    }
+}
+
+/// Outcome of one lock-acquisition episode. Read-version validation happens
+/// after [`Acquired::Locked`], so a stale read is not an acquisition outcome.
 enum Acquired {
     /// Every lock is held; proceed to validate reads, then the commit point.
     Locked(LockedTx),
     /// A higher-priority peer aborted this transaction: renew the id and re-run
     /// ([`TransError::Wounded`]).
     Wounded,
+    /// Parallel acquisition must end before the replacement identity enters
+    /// sorted serial acquisition.
+    RenewForSerial {
+        /// A cancelled acquisition write may still land after this function
+        /// returns. Retirement must keep the old identity pinned.
+        pending_writes: bool,
+    },
 }
 
 /// Describes whether validation runs before locks are acquired or while the
@@ -201,6 +321,7 @@ pub struct Algo {
     acquisition_retry: RetryConfig,
     split_policy: SplitPolicy,
     collection_commit: CollectionCommit,
+    retirement: Arc<AttemptRetirement>,
     // Weak so a captured `Algo` clone inside a spawned retirement task does not
     // keep [`Background`] alive past DB shutdown.
     background: Option<Weak<Background>>,
@@ -222,18 +343,24 @@ impl Algo {
         collection_commit: CollectionCommit,
         cleanup_hints: TxCleanupHints,
         background: Option<Weak<Background>>,
+        router: TreeRouter,
         resolver: KeyResolver,
         split_policy: SplitPolicy,
         inline_policy: InlinePolicy,
         split_hints: SplitHintSink,
     ) -> Self {
         let direct_commit = DirectCommit::new(
-            resolver.clone(),
+            router,
             coord,
             inline_policy,
             split_hints,
             cleanup_hints.clone(),
         );
+        let retirement = Arc::new(AttemptRetirement {
+            mon: mon.clone(),
+            cleanup_hints: cleanup_hints.clone(),
+            background: background.clone(),
+        });
         Algo {
             shards,
             resolver,
@@ -245,6 +372,7 @@ impl Algo {
             acquisition_retry,
             split_policy,
             collection_commit,
+            retirement,
             background,
         }
     }
@@ -262,56 +390,53 @@ impl Algo {
             accesses,
             collections: CollectionAttempt::new(collection_data),
             state: AttemptState::new(),
+            retirement: AttemptRetirementGuard::new(self.retirement.clone(), id.clone()),
             id,
             backoff: self.acquisition_retry.backoff(),
         }
     }
 
-    /// Restarts a wounded transaction, preserving its priority (timestamp) while
-    /// minting a fresh log identity ([`TxId::renew`]) so it keeps its wound-wait
-    /// rank and cannot be starved. Carries the backoff forward and records the
-    /// renewal (which drives the serial-locking escalation).
-    pub fn rebegin(&self, old: Handle) -> Handle {
-        let Handle {
-            accesses,
-            collections,
-            state,
-            id,
-            backoff,
-        } = old;
-        Handle {
-            id: id.renew(),
-            accesses,
-            collections: collections.renewed(),
-            state: state.renew(),
-            backoff,
+    /// Validates all reads and applies all writes.
+    pub async fn commit(&self, tx: &mut Handle) -> Result<BodyOutcome, TransError> {
+        loop {
+            match self.commit_once(tx).await {
+                Ok(AttemptOutcome::Complete) => return Ok(BodyOutcome::Complete),
+                Ok(AttemptOutcome::RenewForSerial { replay_body, .. }) => {
+                    self.renew_for_serial(tx).await?;
+                    if replay_body {
+                        return Ok(BodyOutcome::ReplayBody);
+                    }
+                }
+                Err(TransError::Wounded) => {
+                    self.renew_after_wound(tx).await;
+                    return Ok(BodyOutcome::ReplayBody);
+                }
+                Err(TransError::Retry) => return Ok(BodyOutcome::ReplayBody),
+                Err(error) => return Err(error),
+            }
         }
     }
 
-    /// Validates all reads and applies all writes. Returns [`TransError::Wounded`]
-    /// only when a higher-priority peer aborted this transaction, so it must
-    /// retry with a fresh id (priority preserved), or [`TransError::Retry`] when
-    /// the body must re-run in place — a read-only transaction whose reads
-    /// changed, a read-write transaction whose read moved before it locked the
-    /// key (re-run holding its locks, ADR-024), or a read-modify-write whose
-    /// certified logless loss leaves it holding nothing at all (ADR-053). CAS
-    /// contention and suspected deadlocks are handled internally.
-    pub async fn commit(&self, tx: &mut Handle) -> Result<(), TransError> {
-        let owner_operation = self.mon.begin_owner_operation(&tx.id)?;
-        let result = self.commit_inner(tx).await;
-        owner_operation.complete();
-        result
-    }
-
-    /// Validates the reads and range scans of a read-only transaction (the
-    /// error-recovery path in the db retry loop), returning [`TransError::Retry`]
-    /// if any was invalidated. The first attempt is optimistic; after a failure,
-    /// the next attempt validates with point and predicate read locks.
-    pub async fn validate_reads(&self, tx: &mut Handle) -> Result<(), TransError> {
-        let owner_operation = self.mon.begin_owner_operation(&tx.id)?;
-        let result = self.validate_attempt_reads(tx).await;
-        owner_operation.complete();
-        result
+    /// Validates the reads and range scans of a read-only transaction.
+    pub async fn validate_reads(&self, tx: &mut Handle) -> Result<BodyOutcome, TransError> {
+        loop {
+            match self.validate_reads_once(tx).await {
+                Ok(AttemptOutcome::Complete) => return Ok(BodyOutcome::Complete),
+                Ok(AttemptOutcome::RenewForSerial { replay_body, .. }) => {
+                    debug_assert!(
+                        !replay_body,
+                        "read-only validation cannot change collections"
+                    );
+                    self.renew_for_serial(tx).await?;
+                }
+                Err(TransError::Wounded) => {
+                    self.renew_after_wound(tx).await;
+                    return Ok(BodyOutcome::ReplayBody);
+                }
+                Err(TransError::Retry) => return Ok(BodyOutcome::ReplayBody),
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Replaces the transaction's access set before commit.
@@ -335,6 +460,42 @@ impl Algo {
     /// and releasing its locks lazily. An optimistic read-only attempt never
     /// engaged, so there is nothing to abort.
     pub async fn end(&self, tx: &mut Handle) -> Result<(), TransError> {
+        let result = self.end_inner(tx).await;
+        if result.is_ok() {
+            tx.retirement.disarm();
+        }
+        result
+    }
+
+    async fn commit_once(&self, tx: &mut Handle) -> Result<AttemptOutcome, TransError> {
+        let owner_operation = self.mon.begin_owner_operation(&tx.id)?;
+        let result = self.commit_inner(tx).await;
+        // Completing the guard proves that no old-identity write can land
+        // after retirement. Dropping it records the opposite fact.
+        if !result
+            .as_ref()
+            .is_ok_and(AttemptOutcome::has_pending_writes)
+        {
+            owner_operation.complete();
+        }
+        result
+    }
+
+    async fn validate_reads_once(&self, tx: &mut Handle) -> Result<AttemptOutcome, TransError> {
+        let owner_operation = self.mon.begin_owner_operation(&tx.id)?;
+        let result = self.validate_attempt_reads(tx).await;
+        // Completing the guard proves that no old-identity write can land
+        // after retirement. Dropping it records the opposite fact.
+        if !result
+            .as_ref()
+            .is_ok_and(AttemptOutcome::has_pending_writes)
+        {
+            owner_operation.complete();
+        }
+        result
+    }
+
+    async fn end_inner(&self, tx: &mut Handle) -> Result<(), TransError> {
         if !tx.needs_abort() {
             return Ok(());
         }
@@ -374,35 +535,26 @@ impl Algo {
         }
     }
 
-    /// Hands `tx_id` to managed recovery when its owner exits before
-    /// [`Algo::end`] succeeds. Process-local lock ownership is forgotten before
-    /// returning; the waited background task then pins a safe pre-dispatch
-    /// attempt as wounded. Total and idempotent.
-    ///
-    /// A no-op unless the transaction still holds a live logged identity. An
-    /// attempt that never took one — an optimistic read-only validation, or a
-    /// logless one-CAS commit (ADR-061) — is invisible to peers, so an aborted
-    /// object for its id would invent a transaction that never existed (and,
-    /// after a dispatched logless CAS, would not even be true).
-    pub fn retire_abandoned(&self, tx_id: &TxId) {
-        self.locker.keys().forget_tx_locks(tx_id);
-        if !self.mon.is_tracked_local(tx_id) {
-            return;
-        }
-        let Some(bg) = self.background.as_ref().and_then(|w| w.upgrade()) else {
-            return;
-        };
-        let mon = self.mon.clone();
-        let cleanup_hints = self.cleanup_hints.clone();
-        let tx_id = tx_id.clone();
-        bg.spawn_waited(async move {
-            if mon.abort_owned_tx(&tx_id).await.is_ok() {
-                cleanup_hints.schedule(tx_id);
-            }
-        });
+    async fn renew_for_serial(&self, tx: &mut Handle) -> Result<(), TransError> {
+        self.end(tx).await?;
+        tx.renew();
+        Ok(())
     }
 
-    async fn commit_inner(&self, tx: &mut Handle) -> Result<(), TransError> {
+    async fn renew_after_wound(&self, tx: &mut Handle) {
+        let retired_id = tx.id.clone();
+        if let Err(error) = self.end(tx).await {
+            tracing::debug!(
+                transaction = %retired_id,
+                error = ?error,
+                "wounded transaction retirement deferred to managed recovery"
+            );
+            tx.retirement.retire_current();
+        }
+        tx.renew();
+    }
+
+    async fn commit_inner(&self, tx: &mut Handle) -> Result<AttemptOutcome, TransError> {
         if !tx.accesses.has_writes() && !tx.collections.has_writes() {
             if tx.should_lock_reads() {
                 self.validate_coordination_keys(&tx.accesses)?;
@@ -422,7 +574,7 @@ impl Algo {
                 .try_commit(&tx.id, &tx.accesses, &mut tx.state)
                 .await?
             {
-                DirectAttempt::Committed => return Ok(()),
+                DirectAttempt::Committed => return Ok(AttemptOutcome::Complete),
                 // A certified logless loss reevaluates the body rather than
                 // publishing a holder that would make every subsequent direct
                 // attempt on the key ineligible (ADR-053). The id is unengaged —
@@ -435,7 +587,7 @@ impl Algo {
         self.commit_locked(tx).await
     }
 
-    async fn validate_attempt_reads(&self, tx: &mut Handle) -> Result<(), TransError> {
+    async fn validate_attempt_reads(&self, tx: &mut Handle) -> Result<AttemptOutcome, TransError> {
         if tx.accesses.has_writes() || tx.collections.has_writes() {
             return Err(TransError::other(
                 "cannot validate only reads when writes are present",
@@ -447,23 +599,16 @@ impl Algo {
         // The transaction body has finished and no CAS has yet certified its
         // reads, so optimistic validation must establish its own lower bound.
         let validation_start = self.timeline.now();
+        let requirement = Requirement::AtLeast(validation_start);
         if self
-            .validate(
-                &tx.accesses,
-                ValidationContext::Optimistic,
-                validation_start,
-            )
+            .validate(&tx.accesses, ValidationContext::Optimistic, requirement)
             .await?
             && self
                 .collection_commit
-                .validate(
-                    None,
-                    &tx.collections,
-                    Requirement::AtLeast(validation_start),
-                )
+                .validate(None, &tx.collections, requirement)
                 .await?
         {
-            return Ok(());
+            return Ok(AttemptOutcome::Complete);
         }
         tx.force_locked_reads();
         Err(TransError::Retry)
@@ -491,35 +636,28 @@ impl Algo {
     /// add commit latency.
     ///
     /// [`Retry`]: TransError::Retry
-    async fn commit_readonly(&self, tx: &mut Handle) -> Result<(), TransError> {
+    async fn commit_readonly(&self, tx: &mut Handle) -> Result<AttemptOutcome, TransError> {
         // Read-only commit has no mutation receipt; this barrier separates the
         // completed body from the physical observations that certify it.
         let validation_start = self.timeline.now();
+        let requirement = Requirement::AtLeast(validation_start);
         if self
-            .validate(
-                &tx.accesses,
-                ValidationContext::Optimistic,
-                validation_start,
-            )
+            .validate(&tx.accesses, ValidationContext::Optimistic, requirement)
             .await?
             && self
                 .collection_commit
-                .validate(
-                    None,
-                    &tx.collections,
-                    Requirement::AtLeast(validation_start),
-                )
+                .validate(None, &tx.collections, requirement)
                 .await?
         {
             tx.commit();
-            return Ok(());
+            return Ok(AttemptOutcome::Complete);
         }
         tx.force_locked_reads();
         Err(TransError::Retry)
     }
 
     /// Locked path for read-write transactions and escalated read-only retries.
-    async fn commit_locked(&self, tx: &mut Handle) -> Result<(), TransError> {
+    async fn commit_locked(&self, tx: &mut Handle) -> Result<AttemptOutcome, TransError> {
         let is_new = tx.engage();
 
         self.collection_commit
@@ -532,7 +670,7 @@ impl Algo {
                 .await;
             if let Err(error) = result {
                 if matches!(error, TransError::AlreadyFinalized) {
-                    return self.restart(tx).await;
+                    return Err(TransError::Wounded);
                 }
                 return Err(error);
             }
@@ -554,18 +692,25 @@ impl Algo {
         // Capture before lock acquisition so every successful lock CAS is
         // eligible to certify the reads it protects against this same bound.
         let validation_start = self.timeline.now();
-        let locked = match self.acquire_locks(tx, validation_start).await? {
+        let requirement = Requirement::AtLeast(validation_start);
+        let locked = match self.acquire_locks(tx, requirement).await? {
             Acquired::Locked(l) => l,
             // A higher-priority peer aborted us: renew the id and re-run.
-            Acquired::Wounded => return self.restart(tx).await,
+            Acquired::Wounded => return Err(TransError::Wounded),
+            Acquired::RenewForSerial { pending_writes } => {
+                return Ok(AttemptOutcome::RenewForSerial {
+                    replay_body: tx.collections.has_writes(),
+                    pending_writes,
+                });
+            }
         };
 
         // Record the held lock set so both the committed object (below) and the
         // refresher's pending object describe their own back-references, which
         // is what lets GC prune this transaction's locks by reverse check
-        // (ADR-022). This tracks the latest acquire; a `revalidate` re-run that
-        // drops keys may under-record, which only defers those stale locks to
-        // lazy reclaim, never a correctness loss.
+        // (ADR-022). This tracks the latest acquire; a body replay that drops
+        // keys may under-record, which only defers those stale locks to lazy
+        // reclaim, never a correctness loss.
         let mut locks = locked.locked_paths();
         locks.extend(directory_locks.into_durable_locks());
         self.mon.record_tx_locks(&tx.id, locks.clone());
@@ -580,20 +725,16 @@ impl Algo {
                     tx_id: &tx.id,
                     locked: &locked,
                 },
-                validation_start,
+                requirement,
             )
             .await?
             || !self
                 .collection_commit
-                .validate(
-                    Some(&tx.id),
-                    &tx.collections,
-                    Requirement::AtLeast(validation_start),
-                )
+                .validate(Some(&tx.id), &tx.collections, requirement)
                 .await?
         {
             self.locker.collections().release(&tx.id, &locks).await?;
-            return self.revalidate(tx).await;
+            return Err(TransError::Retry);
         }
 
         self.collection_commit
@@ -607,7 +748,7 @@ impl Algo {
         {
             if matches!(e, TransError::AlreadyFinalized) {
                 // An abort-side terminal status won between locking and commit.
-                return self.restart(tx).await;
+                return Err(TransError::Wounded);
             }
             return Err(e.context(format!("committing writes for tx {}", tx.id)));
         }
@@ -625,13 +766,13 @@ impl Algo {
         self.collection_commit
             .finish_committed(&tx.collections)
             .await;
-        Ok(())
+        Ok(AttemptOutcome::Complete)
     }
 
     /// Acquires and validates an escalated read-only attempt whose user body
     /// returned an error. The caller will abort through [`Algo::end`] after a
     /// successful validation, so this deliberately does not commit the handle.
-    async fn validate_locked_reads(&self, tx: &mut Handle) -> Result<(), TransError> {
+    async fn validate_locked_reads(&self, tx: &mut Handle) -> Result<AttemptOutcome, TransError> {
         self.validate_coordination_keys(&tx.accesses)?;
         if tx.engage() {
             self.mon.begin_tx(&tx.id);
@@ -639,14 +780,21 @@ impl Algo {
         // The escalated read-only path uses lock CASes as validation evidence,
         // so their shared lower bound must precede acquisition.
         let validation_start = self.timeline.now();
+        let requirement = Requirement::AtLeast(validation_start);
         let directory_locks = self
             .locker
             .collections()
             .lock(&tx.id, &tx.collections.data().reads, &[])
             .await?;
-        let locked = match self.acquire_locks(tx, validation_start).await? {
+        let locked = match self.acquire_locks(tx, requirement).await? {
             Acquired::Locked(locked) => locked,
-            Acquired::Wounded => return self.restart(tx).await,
+            Acquired::Wounded => return Err(TransError::Wounded),
+            Acquired::RenewForSerial { pending_writes } => {
+                return Ok(AttemptOutcome::RenewForSerial {
+                    replay_body: false,
+                    pending_writes,
+                });
+            }
         };
         let mut locks = locked.locked_paths();
         locks.extend(directory_locks.into_durable_locks());
@@ -658,22 +806,18 @@ impl Algo {
                     tx_id: &tx.id,
                     locked: &locked,
                 },
-                validation_start,
+                requirement,
             )
             .await?
             && self
                 .collection_commit
-                .validate(
-                    Some(&tx.id),
-                    &tx.collections,
-                    Requirement::AtLeast(validation_start),
-                )
+                .validate(Some(&tx.id), &tx.collections, requirement)
                 .await?
         {
-            return Ok(());
+            return Ok(AttemptOutcome::Complete);
         }
         self.locker.collections().release(&tx.id, &locks).await?;
-        self.revalidate(tx).await
+        Err(TransError::Retry)
     }
 
     /// Publishes the committed transaction's pointers and releases its locks.
@@ -705,46 +849,19 @@ impl Algo {
         }
     }
 
-    /// Signals the read-write restart after a genuine wound by returning
-    /// [`TransError::Wounded`] so the caller renews the id and re-runs.
-    /// Does not back off: the wound already made the identity terminal (its locks are
-    /// immediately reclaimable), the locker's CAS loop backs off real lock
-    /// contention, and a delay here would only slow the renewed retry.
-    async fn restart(&self, _tx: &mut Handle) -> Result<(), TransError> {
-        Err(TransError::Wounded)
-    }
-
-    /// Acquires every lock the transaction needs, resolving both **CAS
-    /// contention** and **suspected deadlocks** internally — without renewing
-    /// the id or re-running the body (ADR-020/024). Only one non-success outcome
-    /// leaves this loop: [`Acquired::Wounded`], a higher-priority peer having
-    /// aborted us (the one conflict that must renew the id and re-run).
+    /// Acquires every lock the transaction needs while retaining successful
+    /// leaf holds across complete-set retries.
     ///
-    /// - **CAS contention** (a shard/root lost its bounded CAS race): drop the
-    ///   partial locks ([`Locker::release_locks`]) and retry under the **same
-    ///   id** after backing off, so a transaction that merely lost a race never
-    ///   discards its executed body. Persistent contention escalates to the
-    ///   serial order, which removes the equal-priority livelock.
-    /// - **Leaf capacity** (a create reached the reserved content limit): drop
-    ///   the partial locks and retry under the **same id** after backing off,
-    ///   giving the hinted split time to make room. The first capacity failure
-    ///   starts [`MAX_LEAF_FULL_WAIT`]; later revisions and reroutes do not reset
-    ///   it, because acquisition still has no capacity. Capacity pressure does
-    ///   not count toward serial escalation.
-    /// - **Suspected deadlock** (the parallel wait exceeded
-    ///   [`MAX_DEADLOCK_TIMEOUT`]): drop the out-of-order locks and re-acquire in
-    ///   the global serial sorted order, where first-CAS-wins on the lowest
-    ///   contended shard guarantees one contender always completes. Serial mode
-    ///   cannot deadlock, so it arms no timeout.
-    ///
-    /// `tx.renewals()` (genuine-wound restarts) starts a heavily-restarted
-    /// transaction directly in the serial order as a backstop.
+    /// A parallel timeout or sustained completed conflict pass asks the attempt
+    /// owner to end this identity and renew it for sorted serial acquisition.
+    /// An attempt that already starts in serial mode keeps its sorted prefix and
+    /// retries without another renewal.
     async fn acquire_locks(
         &self,
         tx: &mut Handle,
-        validation_start: SequencePoint,
+        requirement: Requirement,
     ) -> Result<Acquired, TransError> {
-        let mut serial = tx.renewals() >= SERIAL_FALLBACK_AFTER;
+        let serial = tx.should_acquire_serially();
         let mut conflicts: usize = 0;
         let mut leaf_full_since: Option<rt::Instant> = None;
         loop {
@@ -754,36 +871,37 @@ impl Algo {
             if self.was_wounded(tx).await {
                 return Ok(Acquired::Wounded);
             }
-            let scan_requirement = Requirement::AtLeast(validation_start);
             let outcome = if serial {
                 self.locker
                     .keys()
-                    .lock_at(&tx.id, &tx.accesses, true, scan_requirement)
+                    .lock_at(&tx.id, &tx.accesses, true, requirement)
                     .await
             } else {
                 let key_locker = self.locker.keys();
                 tokio::select! {
-                    res = key_locker.lock_at(&tx.id, &tx.accesses, false, scan_requirement) => res,
+                    res = key_locker.lock_at(&tx.id, &tx.accesses, false, requirement) => res,
                     _ = rt::sleep(MAX_DEADLOCK_TIMEOUT) => Err(TransError::LockTimeout),
                 }
             };
             match outcome {
                 Ok(LockOutcome::Locked(l)) => return Ok(Acquired::Locked(l)),
-                // CAS contention: drop the partial locks and retry under the same
-                // id after backing off — no renew, no body re-run. Escalate to
-                // the serial order if contention persists.
+                // A complete failed pass keeps any leaf holds that landed. The
+                // next complete pass can recognize or idempotently complete
+                // those same-identity holds.
                 Ok(LockOutcome::Conflict) => {
-                    self.release_for_retry(tx).await?;
                     conflicts += 1;
-                    serial = serial || conflicts >= SERIAL_FALLBACK_AFTER;
+                    if !serial && conflicts >= SERIAL_FALLBACK_AFTER {
+                        tx.force_serial_acquisition();
+                        return Ok(Acquired::RenewForSerial {
+                            pending_writes: false,
+                        });
+                    }
                     rt::sleep(tx.backoff.next_delay()).await;
                 }
-                // Capacity is not lock contention: release anything acquired on
-                // other leaves and wait for the hinted split without escalating
-                // to the serial lock order or re-running the transaction body.
+                // Capacity is not lock contention. Retain other leaf holds and
+                // wait for the hinted split without serial escalation.
                 Ok(LockOutcome::LeafFull) => {
                     let since = *leaf_full_since.get_or_insert_with(rt::Instant::now);
-                    self.release_for_retry(tx).await?;
                     if since.elapsed() >= MAX_LEAF_FULL_WAIT {
                         return Err(TransError::other(format!(
                             "leaf capacity remained unavailable for {} seconds",
@@ -792,42 +910,17 @@ impl Algo {
                     }
                     rt::sleep(tx.backoff.next_delay()).await;
                 }
-                // Suspected deadlock: drop the out-of-order locks and re-acquire
-                // in the cannot-deadlock serial order, keeping our id.
+                // The dropped parallel acquisition can still publish. Leave its
+                // owner operation unresolved so end pins the old identity.
                 Err(TransError::LockTimeout) => {
-                    self.release_for_retry(tx).await?;
-                    serial = true;
+                    tx.force_serial_acquisition();
+                    return Ok(Acquired::RenewForSerial {
+                        pending_writes: true,
+                    });
                 }
                 Err(e) => return Err(e),
             }
         }
-    }
-
-    /// Releases every lock the transaction currently holds before an in-place,
-    /// same-id re-lock (the CAS-contention and deadlock-timeout retries). The
-    /// transaction object stays pending; only the shard/root lock entries clear.
-    async fn release_for_retry(&self, tx: &Handle) -> Result<(), TransError> {
-        self.locker
-            .keys()
-            .release_locks(&tx.id)
-            .await
-            .map_err(|e| e.context(format!("releasing locks before re-lock for tx {}", tx.id)))
-    }
-
-    /// Signals a stale dependency restart (ADR-024/032): a point read or scan
-    /// changed before its locks were held, so the body must re-run — but, unlike
-    /// [`Algo::restart`], **holding the locks already acquired** and **without
-    /// renewing the id**. Returns [`TransError::Retry`], which the db retry loop
-    /// re-runs in place (the
-    /// transaction object stays pending and its locks stay installed). Any lock
-    /// left on a key the re-run no longer touches is reclaimed lazily by the next
-    /// contender (ADR-021).
-    ///
-    /// Unlike [`Algo::restart`] this does **not** back off: the transaction holds
-    /// *live* locks here (its object is still pending), so sleeping would block
-    /// every peer waiting on those keys and only delay our own release.
-    async fn revalidate(&self, _tx: &mut Handle) -> Result<(), TransError> {
-        Err(TransError::Retry)
     }
 
     /// Reports whether the transaction was already aborted by a higher-priority
@@ -853,42 +946,50 @@ impl Algo {
         &self,
         accesses: &AccessSet,
         context: ValidationContext<'_>,
-        validation_start: SequencePoint,
+        requirement: Requirement,
     ) -> Result<bool, TransError> {
         let lock_validation = context.lock_validation();
+        let own_lock_holder = context.own_lock_holder();
         let physical_reads_valid = self
-            .validate_read_observations(accesses, validation_start, lock_validation)
+            .validate_read_observations(accesses, requirement, lock_validation)
             .await?;
         let physical_scans_valid = self
-            .validate_scan_observations(accesses, validation_start, lock_validation)
+            .validate_scan_observations(accesses, requirement, lock_validation)
             .await?;
-        let requirement = Requirement::AtLeast(validation_start);
-        Ok(
-            (physical_reads_valid || self.validate_reads_inner(accesses, requirement).await?)
-                && (physical_scans_valid
-                    || self
-                        .validate_scans_inner(accesses, context.own_lock_holder(), validation_start)
-                        .await?),
-        )
+        let reads_valid = physical_reads_valid
+            || self
+                .validate_reads_inner(accesses, own_lock_holder, requirement)
+                .await?;
+        if !reads_valid {
+            return Ok(false);
+        }
+        let scans_valid = physical_scans_valid
+            || self
+                .validate_scans_inner(accesses, own_lock_holder, requirement)
+                .await?;
+        Ok(scans_valid)
     }
 
     async fn validate_read_observations(
         &self,
         accesses: &AccessSet,
-        validation_start: SequencePoint,
+        requirement: Requirement,
         lock_validation: Option<&LockedTx>,
     ) -> Result<bool, TransError> {
-        for read in accesses.point_reads() {
-            let leaf_unchanged = match lock_validation {
-                Some(locked) => locked.validated(read.observation()),
-                None => matches!(
-                    self.shards
-                        .check_leaf_current(read.observation(), validation_start)
-                        .await?,
-                    LeafObservationCheck::Current
-                ),
-            };
-            if !leaf_unchanged {
+        if lock_validation.is_some() {
+            return Ok(false);
+        }
+        let observations = accesses
+            .point_reads()
+            .iter()
+            .map(|read| read.observation().clone())
+            .collect::<Vec<_>>();
+        let checks = self
+            .shards
+            .check_leaves_current(&observations, requirement)
+            .await;
+        for (read, check) in accesses.point_reads().iter().zip(checks) {
+            if !matches!(check?, LeafObservationCheck::Current) {
                 return Ok(false);
             }
             if read_observation_has_exclusive_holder(read)? {
@@ -901,7 +1002,7 @@ impl Algo {
     async fn validate_scan_observations(
         &self,
         accesses: &AccessSet,
-        validation_start: SequencePoint,
+        requirement: Requirement,
         lock_validation: Option<&LockedTx>,
     ) -> Result<bool, TransError> {
         for coverage in accesses
@@ -913,7 +1014,7 @@ impl Algo {
                 Some(locked) => locked.validated(&coverage.observation),
                 None => matches!(
                     self.shards
-                        .check_leaf_current(&coverage.observation, validation_start)
+                        .check_leaf_current(&coverage.observation, requirement)
                         .await?,
                     LeafObservationCheck::Current
                 ),
@@ -922,7 +1023,7 @@ impl Algo {
                 return Ok(false);
             }
             for holder in &coverage.pending_membership {
-                if self.mon.committed_at(holder, validation_start).await? {
+                if self.mon.tx_status_at(holder, requirement).await? == TxCommitStatus::Ok {
                     return Ok(false);
                 }
             }
@@ -937,6 +1038,7 @@ impl Algo {
     async fn validate_reads_inner(
         &self,
         accesses: &AccessSet,
+        own_lock_holder: Option<&TxId>,
         requirement: Requirement,
     ) -> Result<bool, TransError> {
         if accesses.point_reads().is_empty() {
@@ -949,12 +1051,9 @@ impl Algo {
             .collect();
         let current = self
             .resolver
-            .effective_point_states(&keys, requirement)
+            .effective_point_states(&keys, own_lock_holder, requirement)
             .await?;
-        for r in accesses.point_reads() {
-            let Some(state) = current.get(r.key()) else {
-                return Ok(false);
-            };
+        for (r, state) in accesses.point_reads().iter().zip(current) {
             if !r.validates(state.writer.as_ref(), state.membership_version) {
                 return Ok(false);
             }
@@ -972,9 +1071,8 @@ impl Algo {
         &self,
         accesses: &AccessSet,
         own_lock_holder: Option<&TxId>,
-        validation_start: SequencePoint,
+        requirement: Requirement,
     ) -> Result<bool, TransError> {
-        let requirement = Requirement::AtLeast(validation_start);
         for scan in accesses.range_scans() {
             let current = self
                 .resolver
@@ -997,7 +1095,7 @@ impl Algo {
                     .iter()
                     .flat_map(|leaf| &leaf.pending_membership)
                 {
-                    if self.mon.committed_at(holder, validation_start).await? {
+                    if self.mon.tx_status_at(holder, requirement).await? == TxCommitStatus::Ok {
                         fast = false;
                         break;
                     }
@@ -1203,8 +1301,9 @@ mod tests {
     pub(super) async fn read_outcome(tctx: &Tctx, key: &KeyRef) -> crate::reader::ReadOutcome {
         let reader = Reader::new(
             KeyResolver::new(
-                TreeRouter::new(tctx.shards.clone()),
+                TreeRouter::new(tctx.shards.clone(), std::num::NonZeroUsize::MIN),
                 KeyStateResolver::new(tctx.tmon.clone()),
+                std::num::NonZeroUsize::MIN,
             ),
             tctx.timeline.clone(),
             RetryConfig::default(),
@@ -1275,7 +1374,8 @@ mod tests {
         .await;
         let key = key_ref(b"abandoned");
         let data = AccessSet::new(Vec::new(), vec![wa(&key, b"uncommitted")], Vec::new());
-        let abandoned = begin_accesses(&algo, data.clone()).id;
+        let abandoned_handle = begin_accesses(&algo, data.clone());
+        let abandoned = abandoned_handle.id().clone();
         tctx.tmon.begin_tx(&abandoned);
         let outcome = tctx
             .locker
@@ -1284,14 +1384,9 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(outcome, LockOutcome::Locked(_)));
-        assert!(!tctx.locker.tx_locks_snapshot().is_empty());
 
         fail_status_read.store(true, Ordering::SeqCst);
-        algo.retire_abandoned(&abandoned);
-        assert!(
-            tctx.locker.tx_locks_snapshot().is_empty(),
-            "local ownership must be bounded by the synchronous handoff"
-        );
+        drop(abandoned_handle);
         tokio::time::timeout(Duration::from_secs(1), failure_reached.notified())
             .await
             .expect("retirement never attempted its status read");
@@ -1633,8 +1728,7 @@ mod tests {
             &tm,
             AccessSet::new(vec![ra], vec![wa(&ka, b"v3"), wa(&kb, &logged)], Vec::new()),
         );
-        let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(matches!(err, TransError::Retry), "got {err:?}");
+        assert_eq!(tm.commit(&mut h).await.unwrap(), BodyOutcome::ReplayBody);
 
         // The moved key is locked by us when the stale read is signalled: the
         // re-run owns the lock and cannot lose it again to the same race.
@@ -1644,14 +1738,32 @@ mod tests {
         tm.end(&mut h).await.unwrap();
     }
 
-    // ADR-024: a suspected deadlock is broken *inside* `Algo`, never surfaced. A
-    // transaction that cannot wound the holder of a lock it needs waits; the
-    // wait is bounded by `MAX_DEADLOCK_TIMEOUT`, after which the transaction
-    // releases its locks and re-acquires them in the cannot-deadlock serial
-    // order — under the *same id*, re-running no body. It never returns
-    // `LockTimeout`, and once the holder finalizes it commits.
+    #[tokio::test]
+    async fn wound_renews_the_identity_before_body_replay() {
+        let (tm, tctx) = new_algo().await;
+        let keyp = key_ref(b"k");
+        let value = vec![b'x'; InlinePolicy::default().max_value_bytes + 1];
+        let mut h = begin_accesses(
+            &tm,
+            AccessSet::new(Vec::new(), vec![wa(&keyp, &value)], Vec::new()),
+        );
+        let old_id = h.id().clone();
+        assert!(h.engage());
+        tctx.tmon.begin_tx(&old_id);
+        tctx.tmon.preempt_tx(&old_id).await.unwrap();
+
+        assert_eq!(tm.commit(&mut h).await.unwrap(), BodyOutcome::ReplayBody);
+        assert_ne!(*h.id(), old_id);
+        assert!(!h.id().older(&old_id));
+        assert!(!old_id.older(h.id()));
+
+        tm.end(&mut h).await.unwrap();
+    }
+
+    // ADR-065: a timed-out parallel acquisition asks its owner to make the old
+    // identity durably abort-side before it renews for sorted serial locking.
     #[tokio::test(start_paused = true)]
-    async fn deadlock_timeout_relocks_serially_keeping_id() {
+    async fn deadlock_timeout_renews_before_serial_acquisition() {
         use crate::tlocker::LockOutcome;
         use std::time::Duration;
         let (tm, tctx) = new_algo().await;
@@ -1689,25 +1801,30 @@ mod tests {
             (h, res)
         });
 
-        // Let the parallel wait time out and escalate to serial. Serial cannot
-        // wound the older peer either, so the transaction keeps waiting — it has
-        // not aborted and has surfaced no error.
+        // The parallel wait times out. The algorithm retires the old identity
+        // and continues under a renewed identity in serial mode.
         rt::sleep(MAX_DEADLOCK_TIMEOUT + Duration::from_secs(1)).await;
-        assert!(
-            !committing.is_finished(),
-            "younger keeps waiting on the older holder after escalating to serial"
-        );
+        assert!(!committing.is_finished());
 
-        // Finalizing the holder releases the younger, which commits under its
-        // original id without ever surfacing `LockTimeout`.
+        let old_status = tctx
+            .tlogger
+            .commit_status_at(&id_before, Requirement::Any)
+            .await
+            .unwrap();
+        assert_eq!(old_status.status, TxCommitStatus::Wounded);
+
+        // The replacement commits after the older holder becomes abort-side.
         tctx.tmon.abort_owned_tx(&holder).await.unwrap();
         let (mut h, res) = committing.await.unwrap();
-        res.expect("younger commits once the holder releases");
         assert_eq!(
-            *h.id(),
-            id_before,
-            "the id is preserved across the serial fallback (no renew)"
+            res.expect("renewed identity commits once the holder releases"),
+            BodyOutcome::Complete
         );
+        let renewed_id = h.id().clone();
+        assert_ne!(renewed_id, id_before);
+        assert!(!renewed_id.older(&id_before));
+        assert!(!id_before.older(&renewed_id));
+        assert_eq!(*h.id(), renewed_id);
         tm.end(&mut h).await.unwrap();
     }
 
@@ -1863,18 +1980,13 @@ mod tests {
         }
     }
 
-    // ADR-020/024: CAS contention is resolved *inside* `Algo`. A transaction that
-    // loses the shard-lock CAS repeatedly releases its (partial) locks and
-    // re-acquires them under the *same id* — no renew, no body re-run — escalating
-    // to the serial order. It never surfaces `Wounded` for a mere lost race, and
-    // commits unchanged once the contention clears. A budget far larger than the
-    // ~handful of parallel attempts that fit before the deadlock timeout forces
-    // the serial CAS budget to be exhausted, i.e. the `Conflict` path.
+    // ADR-065: sustained completed parallel conflicts renew once before sorted
+    // serial acquisition. They do not replay the transaction body.
     //
     // Direct publication is disabled explicitly so this test genuinely
-    // exercises the full locked path's same-id serial-fallback behaviour.
+    // exercises the full locked path's renewed serial-fallback behaviour.
     #[tokio::test(start_paused = true)]
-    async fn cas_contention_relocks_keeping_id() {
+    async fn cas_contention_renews_before_serial_acquisition() {
         let retry = RetryConfig {
             initial_interval: Duration::from_millis(10),
             max_interval: Duration::from_millis(20),
@@ -1891,6 +2003,7 @@ mod tests {
         config.set_retry_initial_interval(retry.initial_interval);
         config.set_retry_max_interval(retry.max_interval);
         config.set_inline_policy(InlinePolicy::none());
+        let status_backend = backend.clone();
         let engine = Engine::open(
             TEST_DB,
             DatabaseId::from_bytes([7; 16]),
@@ -1925,15 +2038,19 @@ mod tests {
             CollectionData::default(),
         );
         let id_before = h.id().clone();
-        engine
+        let outcome = engine
             .commit(&mut h)
             .await
-            .expect("commits despite sustained CAS contention");
-        assert_eq!(
-            *h.id(),
-            id_before,
-            "CAS contention retries under the same id (no renew)"
-        );
+            .expect("serial fallback commits after contention clears");
+        assert_eq!(outcome, BodyOutcome::Complete);
+        assert_ne!(*h.id(), id_before);
+        let status_objects = CachedStore::new(status_backend, 1024, Timeline::new(), None);
+        let status_logger = TLogger::new(status_objects.clone(), test_db_root());
+        let old_status = status_logger
+            .commit_status_at(&id_before, Requirement::Any)
+            .await
+            .unwrap();
+        assert_eq!(old_status.status, TxCommitStatus::Aborted);
         engine.end(&mut h).await.unwrap();
 
         // The whole budget was consumed, so the transaction did exhaust the
@@ -1966,6 +2083,7 @@ mod tests {
             assert_eq!(read.value.unwrap().value.as_ref(), b"v2");
         }
         engine.shutdown().await;
+        status_objects.shutdown().await;
     }
 
     // Builds an algo whose backend records every operation, so tests can prove
@@ -2093,9 +2211,9 @@ mod tests {
             Vec::new(),
         );
 
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
         assert!(
-            tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "opaque evidence accepts its current value"
@@ -2103,9 +2221,9 @@ mod tests {
 
         let (peer, _peer_ctx) = new_algo_from_backend(tctx.backend.clone()).await;
         commit_writes(&peer, vec![wa(&keyp, b"v2")]).await;
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
         assert!(
-            !tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            !tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "opaque evidence rejects a superseded value"
@@ -2121,7 +2239,7 @@ mod tests {
         assert!(!read.validates(None, 1));
         let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
 
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
         let loaded = tctx
             .shards
             .load_leaf(&test_root_path(), Requirement::Any)
@@ -2134,13 +2252,13 @@ mod tests {
             })]));
         assert!(tctx.shards.commit_leaf(edit).await.unwrap());
         assert!(
-            tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "representing an unrelated absence does not change membership"
         );
 
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
         let loaded = tctx
             .shards
             .load_leaf(&test_root_path(), Requirement::Any)
@@ -2154,7 +2272,7 @@ mod tests {
         edit.set_locks(locks);
         assert!(tctx.shards.commit_leaf(edit).await.unwrap());
         assert!(
-            !tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            !tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "create-delete-reclaim returning to unmarked absence changes its generation"
@@ -2182,15 +2300,18 @@ mod tests {
         assert!(read.validates(Some(&writer), 0));
         assert!(read.validates(Some(&writer), 1));
         let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
 
         let external_timeline = Timeline::new();
-        let external = NodeStore::new(CachedStore::new(
-            tctx.backend.clone(),
-            1 << 20,
-            external_timeline.clone(),
-            None,
-        ));
+        let external = NodeStore::new(
+            CachedStore::new(
+                tctx.backend.clone(),
+                1 << 20,
+                external_timeline.clone(),
+                None,
+            ),
+            std::num::NonZeroUsize::MIN,
+        );
         let loaded = external
             .load_leaf(
                 &test_root_path(),
@@ -2203,7 +2324,7 @@ mod tests {
         assert!(external.commit_leaf(edit).await.unwrap());
 
         assert!(
-            !tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            !tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap()
         );
@@ -2240,7 +2361,7 @@ mod tests {
         let read = do_read(&tctx, &keyp).await;
         assert!(read.validates(Some(&previous), 0));
         let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
 
         // Finalize only the transaction object. The leaf still contains the
         // same pending lock, so leaf validation alone cannot detect that the
@@ -2256,13 +2377,13 @@ mod tests {
         tctx.tmon.commit_tx(log).await.unwrap();
 
         assert!(
-            !tm.validate_read_observations(&data, validation_start, None)
+            !tm.validate_read_observations(&data, requirement, None)
                 .await
                 .unwrap(),
             "an exclusive holder prevents the leaf-only shortcut"
         );
         assert!(
-            !tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            !tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "writer resolution at the validation watermark observes the committed holder"
@@ -2300,19 +2421,19 @@ mod tests {
         let read = do_read(&tctx, &keyp).await;
         assert!(read.validates(Some(&previous), 0));
         let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
 
         // Aborting the holder leaves the previously observed writer effective.
         // The exclusive holder prevents a physical shortcut, then writer
         // resolution at the validation watermark accepts the unchanged value.
         tctx.tmon.abort_owned_tx(&holder).await.unwrap();
         assert!(
-            !tm.validate_read_observations(&data, validation_start, None)
+            !tm.validate_read_observations(&data, requirement, None)
                 .await
                 .unwrap()
         );
         assert!(
-            tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap()
         );
@@ -2344,7 +2465,7 @@ mod tests {
 
         let read = do_read(&tctx, &ka).await;
         let observed = read.observation().clone();
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
 
         // Another transaction's disjoint lock CAS validates the same pre-CAS
         // leaf after our barrier and therefore advances its shared evidence.
@@ -2390,13 +2511,21 @@ mod tests {
         };
         assert!(!current_locked.validated(&observed));
         assert!(
-            !tm.validate_read_observations(&current_data, validation_start, Some(&current_locked),)
+            !tm.validate_read_observations(&current_data, requirement, Some(&current_locked),)
                 .await
                 .unwrap()
         );
 
-        tctx.locker.keys().release_locks(&current).await.unwrap();
-        tctx.locker.keys().release_locks(&other).await.unwrap();
+        tctx.locker
+            .keys()
+            .release_leaf(&current, &test_root_path())
+            .await
+            .unwrap();
+        tctx.locker
+            .keys()
+            .release_leaf(&other, &test_root_path())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2407,18 +2536,21 @@ mod tests {
         commit_writes(&tm, vec![wa(&ka, b"a0"), wa(&kb, b"b0")]).await;
 
         let read = do_read(&tctx, &ka).await;
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
 
         // A separate client rewrites the shared leaf for B. Its cache is
         // independent, so it cannot advance the retained observation of A in
         // this database.
         let external_timeline = Timeline::new();
-        let external = NodeStore::new(CachedStore::new(
-            tctx.backend.clone(),
-            1 << 20,
-            external_timeline.clone(),
-            None,
-        ));
+        let external = NodeStore::new(
+            CachedStore::new(
+                tctx.backend.clone(),
+                1 << 20,
+                external_timeline.clone(),
+                None,
+            ),
+            std::num::NonZeroUsize::MIN,
+        );
         let leaf_path = test_root_path();
         let loaded = external
             .load_leaf(&leaf_path, Requirement::AtLeast(external_timeline.now()))
@@ -2462,13 +2594,13 @@ mod tests {
         let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
         log.lock().unwrap().clear();
         assert!(
-            !tm.validate_read_observations(&data, validation_start, None)
+            !tm.validate_read_observations(&data, requirement, None)
                 .await
                 .unwrap(),
             "the retained physical revision changed"
         );
         assert!(
-            tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "logical validation accepts the unchanged writer"
@@ -2479,7 +2611,11 @@ mod tests {
             "post-bound current evidence satisfies both validation steps locally"
         );
 
-        tctx.locker.keys().release_locks(&other).await.unwrap();
+        tctx.locker
+            .keys()
+            .release_leaf(&other, &test_root_path())
+            .await
+            .unwrap();
         drop(other_locked);
     }
 
@@ -2496,8 +2632,7 @@ mod tests {
         commit_writes(&tm2, vec![wa(&ka, b"a2")]).await;
 
         let mut h = begin_accesses(&tm, AccessSet::new(vec![ra, rb], Vec::new(), Vec::new()));
-        let err = tm.commit(&mut h).await.unwrap_err();
-        assert!(matches!(err, TransError::Retry), "got {err:?}");
+        assert_eq!(tm.commit(&mut h).await.unwrap(), BodyOutcome::ReplayBody);
         assert!(h.should_lock_reads());
         for key in [b"a".as_slice(), b"b"] {
             assert_eq!(
@@ -2610,8 +2745,9 @@ mod tests {
         writes: Vec<WriteAccess>,
     ) -> (AccessSet, Vec<Vec<u8>>) {
         let resolver = KeyResolver::new(
-            TreeRouter::new(tctx.shards.clone()),
+            TreeRouter::new(tctx.shards.clone(), std::num::NonZeroUsize::MIN),
             KeyStateResolver::new(tctx.tmon.clone()),
+            std::num::NonZeroUsize::MIN,
         );
         let scan = resolver
             .scan_keys(&test_collection(), &range, &[], None, None)
@@ -2634,8 +2770,9 @@ mod tests {
 
         let range = ScanRange::all();
         let resolver = KeyResolver::new(
-            TreeRouter::new(tctx.shards.clone()),
+            TreeRouter::new(tctx.shards.clone(), std::num::NonZeroUsize::MIN),
             KeyStateResolver::new(tctx.tmon.clone()),
+            std::num::NonZeroUsize::MIN,
         );
         let result = resolver
             .scan_keys(&test_collection(), &range, &[], None, None)
@@ -2647,18 +2784,18 @@ mod tests {
             vec![result.into_access(test_collection(), range, Vec::new())],
         );
 
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
         assert!(
-            tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "opaque evidence accepts its current membership"
         );
 
         commit_writes(&tm, vec![wa(&key_ref(b"b"), b"1")]).await;
-        let validation_start = tctx.timeline.now();
+        let requirement = Requirement::AtLeast(tctx.timeline.now());
         assert!(
-            !tm.validate(&data, ValidationContext::Optimistic, validation_start)
+            !tm.validate(&data, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "opaque evidence rejects a changed membership"
@@ -2688,8 +2825,10 @@ mod tests {
         commit_writes(&tm, vec![wa(&key_ref(b"b"), b"1")]).await;
 
         let mut stale = begin_accesses(&tm, data);
-        let err = tm.commit(&mut stale).await.unwrap_err();
-        assert!(matches!(err, TransError::Retry), "got {err:?}");
+        assert_eq!(
+            tm.commit(&mut stale).await.unwrap(),
+            BodyOutcome::ReplayBody
+        );
         assert!(
             stale.should_lock_reads(),
             "scan retry escalates to read locks"
@@ -2760,8 +2899,10 @@ mod tests {
         tctx.tmon.commit_tx(log).await.unwrap();
 
         let mut stale = begin_accesses(&tm, scan);
-        let err = tm.commit(&mut stale).await.unwrap_err();
-        assert!(matches!(err, TransError::Retry), "got {err:?}");
+        assert_eq!(
+            tm.commit(&mut stale).await.unwrap(),
+            BodyOutcome::ReplayBody
+        );
     }
 
     #[tokio::test]
@@ -2813,8 +2954,10 @@ mod tests {
         // into S1. The first locked validation only owns S0 and must retry.
         commit_writes(&tm, vec![wdel(&key_ref(b"b"))]).await;
         let mut handle = begin_accesses(&tm, stale);
-        let err = tm.commit(&mut handle).await.unwrap_err();
-        assert!(matches!(err, TransError::Retry), "got {err:?}");
+        assert_eq!(
+            tm.commit(&mut handle).await.unwrap(),
+            BodyOutcome::ReplayBody
+        );
 
         // The body re-runs while S0 stays locked. Its new frontier is `m`, so
         // the next validation adds S1 before committing.
@@ -2857,8 +3000,10 @@ mod tests {
         commit_writes(&tm, vec![wdel(&bp)]).await;
 
         let mut stale = begin_accesses(&tm, data);
-        let err = tm.commit(&mut stale).await.unwrap_err();
-        assert!(matches!(err, TransError::Retry), "got {err:?}");
+        assert_eq!(
+            tm.commit(&mut stale).await.unwrap(),
+            BodyOutcome::ReplayBody
+        );
     }
 
     // A pure split changes physical coverage but not logical membership. The
@@ -2963,8 +3108,10 @@ mod tests {
             .unwrap();
 
         let mut stale = begin_accesses(&tm, data);
-        let err = tm.commit(&mut stale).await.unwrap_err();
-        assert!(matches!(err, TransError::Retry), "got {err:?}");
+        assert_eq!(
+            tm.commit(&mut stale).await.unwrap(),
+            BodyOutcome::ReplayBody
+        );
     }
 
     // Rewrites the test collection's root `_r` (a single leaf holding `a`,`m`)

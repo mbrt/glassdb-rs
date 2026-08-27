@@ -1543,6 +1543,7 @@ dependencies = [
  "async-trait",
  "base64",
  "criterion",
+ "futures",
  "glassdb-backend",
  "glassdb-concurr",
  "glassdb-data",

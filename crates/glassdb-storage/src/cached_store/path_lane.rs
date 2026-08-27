@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex, Weak};
 use glassdb_concurr::shard::Sharded;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
+use super::Requirement;
 use super::knowledge::FetchResult;
 use super::persistent_bridge::PersistentPath;
-use super::{Requirement, satisfies};
 use crate::error::StorageError;
 use crate::timeline::SequencePoint;
 
@@ -100,7 +100,7 @@ impl PathCoordinator {
     ) -> ReadAdmission {
         let state = self.state(path);
         let flight = state.flight.lock().unwrap().clone();
-        if let Some(flight) = flight.filter(|flight| satisfies(flight.invoked, requirement)) {
+        if let Some(flight) = flight.filter(|flight| requirement.is_satisfied_by(flight.invoked)) {
             return ReadAdmission::Join(ReadWaiter { flight });
         }
         let permit = state

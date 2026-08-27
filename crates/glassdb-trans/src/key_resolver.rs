@@ -4,8 +4,10 @@
 //! of loaded nodes and entries belongs to
 //! [`KeyStateResolver`](crate::key_state_resolver::KeyStateResolver).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
+use glassdb_concurr::map_all_bounded;
 use glassdb_data::{CollectionAddress, KeyRef, TxId};
 use glassdb_storage::{LeafLocator, Requirement, ShardEntry, StorageError, TreeRouter};
 
@@ -21,9 +23,9 @@ pub struct ScanResult {
     evidence: ScanEvidence,
 }
 
-/// Current point state used by logical validation after physical leaf churn.
+/// The effective writer and owning-leaf generation for one point key.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PointValidationState {
+pub(crate) struct EffectivePointState {
     pub(crate) writer: Option<TxId>,
     pub(crate) membership_version: u64,
 }
@@ -54,32 +56,21 @@ impl ScanResult {
 pub(crate) struct KeyResolver {
     router: TreeRouter,
     state: KeyStateResolver,
+    parallelism: NonZeroUsize,
 }
 
 impl KeyResolver {
     /// Creates key resolution over a tree router and loaded-state resolver.
-    pub(crate) fn new(router: TreeRouter, state: KeyStateResolver) -> Self {
-        Self { router, state }
-    }
-
-    /// Routes a complete point dependency set and returns its one owning leaf.
-    /// A result of `None` means the keys currently span more than one leaf.
-    pub(crate) async fn route_one_leaf(
-        &self,
-        keys: impl IntoIterator<Item = KeyRef>,
-    ) -> Result<Option<glassdb_data::ObjectPath>, StorageError> {
-        let groups = self
-            .router
-            .group_keys_by_leaf_fresh(
-                keys.into_iter().map(|key| (key, ())),
-                Requirement::Any,
-                Requirement::Any,
-            )
-            .await?;
-        Ok(match groups.as_slice() {
-            [group] => Some(group.path.clone()),
-            _ => None,
-        })
+    pub(crate) fn new(
+        router: TreeRouter,
+        state: KeyStateResolver,
+        parallelism: NonZeroUsize,
+    ) -> Self {
+        Self {
+            router,
+            state,
+            parallelism,
+        }
     }
 
     /// Resolves one bounded, forward page and its membership dependencies.
@@ -192,9 +183,15 @@ impl KeyResolver {
                             None => false,
                             Some(entry) => self
                                 .state
-                                .entry_exists(&key_ref, entry, own_lock_holder, requirement)
+                                .resolve_effective(
+                                    &key_ref,
+                                    Some(entry),
+                                    own_lock_holder,
+                                    requirement,
+                                )
                                 .await
-                                .map_err(trans_to_storage)?,
+                                .map_err(trans_to_storage)?
+                                .exists(),
                         }
                     }
                 };
@@ -298,47 +295,91 @@ impl KeyResolver {
     pub(crate) async fn effective_point_states(
         &self,
         keys: &[KeyRef],
+        own_lock_holder: Option<&TxId>,
         requirement: Requirement,
-    ) -> Result<HashMap<KeyRef, PointValidationState>, StorageError> {
-        // Route the keys to their leaves and load each once; the key→leaf
-        // grouping (and its deterministic order) lives in `group_keys_by_leaf`.
-        // Each key rides along as its own payload so it can key the output map.
-        // Collect first so the returned future does not close over a borrowing
-        // iterator (which would not be higher-ranked / `Send` when the commit
-        // path spawns this resolution).
-        let items: Vec<(KeyRef, KeyRef)> = keys.iter().map(|k| (k.clone(), k.clone())).collect();
-        let groups = self.router.group_keys_by_leaf(items, requirement).await?;
+    ) -> Result<Vec<EffectivePointState>, StorageError> {
+        let items = keys
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(ordinal, key)| (key.clone(), (ordinal, key)))
+            .collect::<Vec<_>>();
+        let groups = self
+            .router
+            .group_keys_by_leaf_fresh(items, Requirement::Any, requirement)
+            .await?;
 
-        let mut out = HashMap::with_capacity(keys.len());
-        for group in &groups {
-            let membership_version = group.node().map_or(0, |node| node.membership_version());
-            if let Some(node) = group.node() {
-                self.state.ensure_collection_live(node).await?;
+        let group_results = map_all_bounded(groups, self.parallelism, |group| async move {
+            let first_ordinal = group
+                .keys
+                .first()
+                .map(|(_, (ordinal, _))| *ordinal)
+                .expect("a routed leaf group has at least one key");
+            let Some(node) = group.node() else {
+                return vec![(
+                    first_ordinal,
+                    Err(StorageError::other("routed leaf has no decoded node")),
+                )];
+            };
+            if let Err(error) = self.state.ensure_collection_live(node).await {
+                return vec![(first_ordinal, Err(error))];
             }
-            let leaf = group
-                .node()
-                .map(|node| {
-                    node.as_leaf().ok_or_else(|| {
-                        StorageError::other("descent grouped keys under a non-leaf node")
-                    })
-                })
-                .transpose()?;
-            for (raw_key, key) in &group.keys {
+            let membership_version = node.membership_version();
+            let leaf = match node.as_leaf() {
+                Some(leaf) => leaf,
+                None => {
+                    return vec![(
+                        first_ordinal,
+                        Err(StorageError::other(
+                            "descent grouped keys under a non-leaf node",
+                        )),
+                    )];
+                }
+            };
+
+            let mut results = Vec::with_capacity(group.keys.len());
+            for (raw_key, (ordinal, key)) in &group.keys {
                 let resolved = self
                     .state
-                    .resolve_writer(key, leaf.and_then(|leaf| leaf.lookup(raw_key)), requirement)
+                    .resolve_effective(key, leaf.lookup(raw_key), own_lock_holder, requirement)
                     .await
-                    .map_err(trans_to_storage)?;
-                out.insert(
-                    key.clone(),
-                    PointValidationState {
-                        writer: resolved.writer,
-                        membership_version,
-                    },
-                );
+                    .map(|resolved| resolved.into_writer())
+                    .map_err(trans_to_storage);
+                match resolved {
+                    Ok(resolved) => results.push((
+                        *ordinal,
+                        Ok(EffectivePointState {
+                            writer: resolved.writer,
+                            membership_version,
+                        }),
+                    )),
+                    Err(error) => {
+                        results.push((*ordinal, Err(error)));
+                        break;
+                    }
+                }
+            }
+            results
+        })
+        .await;
+
+        let mut states = std::iter::repeat_with(|| None)
+            .take(keys.len())
+            .collect::<Vec<_>>();
+        let mut errors = Vec::new();
+        for (ordinal, result) in group_results.into_iter().flatten() {
+            match result {
+                Ok(state) => states[ordinal] = Some(state),
+                Err(error) => errors.push((ordinal, error)),
             }
         }
-        Ok(out)
+        if let Some((_, error)) = errors.into_iter().min_by_key(|(ordinal, _)| *ordinal) {
+            return Err(error);
+        }
+        Ok(states
+            .into_iter()
+            .map(|state| state.expect("every point key has a validation state"))
+            .collect())
     }
 
     /// Resolves `key` to its owning leaf and effective writer, returning
@@ -356,8 +397,9 @@ impl KeyResolver {
         let loc = self.locate_key(key, requirement).await?;
         let writer = self
             .state
-            .resolve_writer(key, Self::entry_at(&loc, key.key())?, requirement)
-            .await?;
+            .resolve_effective(key, Self::entry_at(&loc, key.key())?, None, requirement)
+            .await?
+            .into_writer();
         Ok((writer, loc))
     }
 
@@ -461,14 +503,18 @@ mod tests {
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
-        let shards = NodeStore::new(objects);
+        let shards = NodeStore::new(objects, std::num::NonZeroUsize::MIN);
         shards
             .create_root(&collection(), &Node::leaf(Shard::new()))
             .await
             .unwrap();
         let state = KeyStateResolver::new(mon.clone());
         (
-            KeyResolver::new(TreeRouter::new(shards.clone()), state),
+            KeyResolver::new(
+                TreeRouter::new(shards.clone(), std::num::NonZeroUsize::MIN),
+                state,
+                std::num::NonZeroUsize::MIN,
+            ),
             mon,
             timeline,
             bg,
@@ -490,7 +536,10 @@ mod tests {
 
     async fn store_over(backend: Arc<dyn Backend>) -> TestStore {
         let timeline = Timeline::new();
-        let shards = NodeStore::new(CachedStore::new(backend, 1 << 20, timeline.clone(), None));
+        let shards = NodeStore::new(
+            CachedStore::new(backend, 1 << 20, timeline.clone(), None),
+            std::num::NonZeroUsize::MIN,
+        );
         shards
             .create_root(&collection(), &Node::leaf(Shard::new()))
             .await
@@ -646,7 +695,7 @@ mod tests {
     #[tokio::test]
     async fn missing_bound_collection_is_classified_during_routing() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (resolver, _monitor, _timeline, _background) = resolver_over(backend).await;
+        let (resolver, _monitor, timeline, _background) = resolver_over(backend).await;
         let collection = missing_collection();
         let key = KeyRef::new(collection.clone(), b"k");
         let range = ScanRange::all();
@@ -669,7 +718,7 @@ mod tests {
         ));
         assert!(matches!(
             resolver
-                .effective_point_states(&[key], Requirement::Any)
+                .effective_point_states(&[key], None, Requirement::AtLeast(timeline.now()),)
                 .await,
             Err(StorageError::StaleCollection)
         ));
@@ -694,31 +743,52 @@ mod tests {
         seed_writer(&seed_store, &b, &tomb, true).await;
         // `c` is deliberately left absent.
 
-        let (resolver, _mon, _timeline, _bg) = resolver_over(backend.clone()).await;
+        let (resolver, _mon, timeline, _bg) = resolver_over(backend.clone()).await;
 
         let pa = key_ref(&a);
         let pb = key_ref(&b);
         let pc = key_ref(&c);
         let out = resolver
-            .effective_point_states(&[pa.clone(), pb.clone(), pc.clone()], Requirement::Any)
+            .effective_point_states(
+                &[pa.clone(), pb.clone(), pc.clone()],
+                None,
+                Requirement::AtLeast(timeline.now()),
+            )
             .await
             .unwrap();
 
-        assert_eq!(
-            out.get(&pa).map(|state| state.writer.clone()),
-            Some(Some(live))
-        );
-        assert_eq!(
-            out.get(&pb).map(|state| state.writer.clone()),
-            Some(Some(tomb)),
-            "a tombstone still has a writer"
-        );
-        assert_eq!(
-            out.get(&pc).map(|state| state.writer.clone()),
-            Some(None),
-            "an absent key resolves to no writer"
-        );
-        assert!(out.values().all(|state| state.membership_version == 0));
+        assert_eq!(out[0].writer, Some(live));
+        assert_eq!(out[1].writer, Some(tomb), "a tombstone still has a writer");
+        assert_eq!(out[2].writer, None, "an absent key resolves to no writer");
+        assert!(out.iter().all(|state| state.membership_version == 0));
+    }
+
+    #[tokio::test]
+    async fn effective_point_states_treats_own_exclusive_hold_as_protection() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let seed_store = store_over(backend.clone()).await;
+        let key = b"held";
+        let predecessor = TxId::with_priority(1, b"predecessor");
+        let holder = TxId::with_priority(2, b"holder");
+        seed_writer(&seed_store, key, &predecessor, false).await;
+        seed_hold(&seed_store, key, &holder).await;
+
+        let (resolver, monitor, timeline, _background) = resolver_over(backend).await;
+        commit_value(&monitor, key, &holder, false).await;
+        let key = key_ref(key);
+        let requirement = Requirement::AtLeast(timeline.now());
+
+        let foreign = resolver
+            .effective_point_states(std::slice::from_ref(&key), None, requirement)
+            .await
+            .unwrap();
+        assert_eq!(foreign[0].writer, Some(holder.clone()));
+
+        let own = resolver
+            .effective_point_states(std::slice::from_ref(&key), Some(&holder), requirement)
+            .await
+            .unwrap();
+        assert_eq!(own[0].writer, Some(predecessor));
     }
 
     // `resolve_key` with `Any` reuses a shard already in the resolver's

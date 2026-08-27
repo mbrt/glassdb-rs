@@ -2,21 +2,7 @@
 
 ## Status
 
-**Shipped foundation.** The object-storage-native commit protocol remains
-current. Its fixed-hash collection layout below is retained as the historical
-design overview and decision index; dynamic B-link sharding and the separate
-`_i` collection record / `_r` tree root supersede it in
-[the dynamic-range design](dynamic-range-sharding.md) and
-[ADR-050](../adr/050-separate-collection-record-and-tree-root.md). The
-umbrella decision is [ADR-016](../adr/016-object-storage-native-layout.md) and each
-sub-decision has its own ADR (see [Decision records](#decision-records)). It is
-the living, mutable companion to the frozen ADRs and to the user-facing
-[architecture.md](../architecture.md). Remaining gaps are tracked as
-[Future improvements](#future-improvements) — ordinary work on top of the current
-design, not a follow-on version.
-
-For the motivation (the S3 metadata-update problem) and the umbrella decision,
-see [ADR-016](../adr/016-object-storage-native-layout.md).
+Accepted — implemented.
 
 ## Design at a glance
 
@@ -37,12 +23,12 @@ tags. No object tags anywhere.
     commits; directly committed values and tombstones are authoritative in the
     leaf. The first two encoded txid symbols select one of 4,096 deterministic
     listing shards.
-- **Protocol** — execute → lock (one shard GET + one CAS per shard) → validate
-  reads (re-resolve effective writers in `Algo`, post-lock) → commit (CAS the
-  transaction object to committed, attaching values) → async per-shard write-back
-  (publish current-writer pointers + release locks). An eligible complete
-  same-leaf point transaction instead validates and publishes directly in one
-  leaf CAS.
+- **Protocol** — execute → bounded parallel lock (one shard GET + one CAS per
+  leaf) → validate reads (re-resolve effective writers in `Algo`, post-lock) →
+  commit (CAS the transaction object to committed, attaching values) → async
+  per-shard write-back (publish current-writer pointers + release locks). An
+  eligible complete same-leaf point transaction instead validates and publishes
+  directly in one leaf CAS.
 - **Membership** — key create/delete write-lock the collection root (phantom
   prevention) and CAS the key's shard; listing OCC-validates the root version and
   enumerates, falling back to a root read lock under contention. Subcollections
@@ -108,13 +94,14 @@ implemented): a transaction keeps the locks it holds and waits for a conflicting
 holder it cannot wound, bounded by a deadlock timeout that escalates to the
 serial order, with a load-bearing lease refresher keeping its held locks alive.
 
-- **Parallel by default** — all touched shards are locked concurrently (then the
-  root last). An older transaction wounds a younger holder and proceeds; a
-  younger-or-equal one **waits** for the holder to finalize, then re-resolves and
-  proceeds (committed → help-forward, wounded/aborted → drop). Reads are validated in
-  `Algo` **after** locking; a read whose value moved before it was locked re-runs
-  the body **holding its locks** (`Retry`), not via a released-and-renewed
-  restart. Deadlock-/livelock-free for distinct priorities.
+- **Parallel by default** — touched leaves are locked with a transaction-local
+  bound (default 16; then the root last). An older transaction wounds a younger
+  holder and proceeds; a younger-or-equal one **waits** for the holder to
+  finalize, then re-resolves and proceeds (committed → help-forward,
+  wounded/aborted → drop). Reads are validated in `Algo` **after** locking; a
+  read whose value moved before it was locked re-runs the body **holding its
+  locks** (`Retry`), not via a released-and-renewed restart.
+  Deadlock-/livelock-free for distinct priorities.
 - **Deadlock timeout → serial sorted fallback (ADR-020/024)** — a parallel wait
   that exceeds `MAX_DEADLOCK_TIMEOUT` (5s) makes `Algo` release the locks
   (`Locker::release_locks`) and re-acquire them one shard at a time in ascending
@@ -155,6 +142,13 @@ a still-referenced or within-horizon object.
 Caching and batching are in place: the `ObjectCache` / `ValueCache` (ADR-023),
 asynchronous background write-back, and dedup-batched CAS on acquisition,
 release, and write-back (ADR-025/026).
+
+Point-key routing, physical point validation, logical point validation, normal
+lock acquisition, and committed write-back use the same provider-owned
+transaction-local bound. Routing combines keys by physical path. Committed
+write-back bounds original locked groups and processes split descendants
+serially inside one position. There is no GlassDB-wide backend scheduler
+([ADR-064](../adr/064-bounded-parallel-point-leaf-work.md)).
 
 The **logless direct commit**
 ([ADR-061](../adr/061-atomic-logless-single-leaf-commits.md), extending
@@ -393,6 +387,12 @@ Every design decision is captured in its own ADR.
   their final split decision. Unmarked point absence validates with the leaf
   membership generation, removed writers feed ordinary GC hints, and reclaimed
   direct-delete markers deliberately expand `InDoubt`.
+- **[ADR-064](../adr/064-bounded-parallel-point-leaf-work.md) — Bounded parallel
+  point-leaf work.** ✅ Implemented for routing, physical and logical point
+  validation, normal acquisition admission, and committed write-back. Domain
+  modules own physical grouping over one generic bounded foreground join. One
+  `EngineConfig` value defaults to 16 and is copied to each provider; aggregate
+  backend scheduling remains a backend responsibility.
 
 ## Design questions resolved
 

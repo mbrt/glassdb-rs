@@ -13,5 +13,7 @@ These are the principles from which GlassDB is founded:
   user code must be transparently retried. The only exception is when user code
   panics.
 - Correctness over speed. We prefer to be correct and slow than fast and wrong.
+- When Backend calls can be done in parallel, they must be. One example is
+  validating multiple leaves in a single transaction.
 - The user doesn't pay for what they don't use. Expensive background work should
   happen only if the user's workload justifies it.

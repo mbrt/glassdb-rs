@@ -176,6 +176,15 @@ pub enum Requirement {
 }
 
 impl Requirement {
+    /// Reports whether evidence confirmed current at `current_after` satisfies
+    /// this requirement.
+    pub fn is_satisfied_by(self, current_after: SequencePoint) -> bool {
+        match self {
+            Requirement::Any => true,
+            Requirement::AtLeast(bound) => current_after >= bound,
+        }
+    }
+
     /// Returns the stronger of two requirements.
     pub fn stricter(self, other: Self) -> Self {
         match (self, other) {
@@ -226,7 +235,7 @@ impl<V> CasResult<V> {
 }
 
 /// The outcome of checking whether a retained observation is still current.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ObservationCheck<V> {
     /// The observed state is still current after the required bound; its
     /// watermark has been advanced if a backend round-trip confirmed it.
@@ -299,6 +308,11 @@ impl<V> Observation<V> {
     /// The watermark after which the state was known to be current.
     pub fn current_after(&self) -> SequencePoint {
         self.evidence.get()
+    }
+
+    /// Advances this observation's currentness evidence without changing its state.
+    pub(crate) fn advance_current_after(&self, bound: SequencePoint) {
+        self.evidence.advance(bound);
     }
 
     /// The parsed physical object path this observation refers to.
@@ -440,7 +454,7 @@ impl CachedStore {
         obs: &Observation<C::Value>,
         req: Requirement,
     ) -> Result<ObservationCheck<C::Value>, StorageError> {
-        if satisfies(obs.evidence.get(), req) {
+        if req.is_satisfied_by(obs.evidence.get()) {
             return Ok(ObservationCheck::Current);
         }
         let key = obs.key.clone();
@@ -640,7 +654,7 @@ impl CachedStore {
                 },
                 ReadAdmission::Lead(permit) => {
                     if let Some(observed) = fallback
-                        && satisfies(observed.current_after(), req)
+                        && req.is_satisfied_by(observed.current_after())
                     {
                         return Ok(self.knowledge.result_from_observation(observed, true));
                     }
@@ -846,16 +860,15 @@ impl<C: Codec> TypedCachedStore<C> {
         })
     }
 
-    /// Checks whether an exact retained observation is current after `bound`.
+    /// Checks whether an exact retained observation is current under
+    /// `requirement`.
     pub(crate) async fn check_current(
         &self,
         observed: &Observation<C::Value>,
-        bound: SequencePoint,
+        requirement: Requirement,
     ) -> Result<ObservationCheck<C::Value>, StorageError> {
         Self::check_path(&observed.key)?;
-        self.store
-            .check_current::<C>(observed, Requirement::AtLeast(bound))
-            .await
+        self.store.check_current::<C>(observed, requirement).await
     }
 
     /// Creates a decoded object if it is absent.
@@ -900,14 +913,6 @@ impl<C: Codec> TypedCachedStore<C> {
             return Err(StorageError::other("delete requires a present observation"));
         }
         self.store.delete::<C>(expected).await
-    }
-}
-
-/// Reports whether an entry confirmed current at `evidence` satisfies `req`.
-fn satisfies(evidence: SequencePoint, req: Requirement) -> bool {
-    match req {
-        Requirement::Any => true,
-        Requirement::AtLeast(t) => evidence >= t,
     }
 }
 
@@ -2745,7 +2750,9 @@ mod tests {
 
         clear(&log);
         assert!(matches!(
-            s1.check_current(&obs, w).await.unwrap(),
+            s1.check_current(&obs, Requirement::AtLeast(w))
+                .await
+                .unwrap(),
             ObservationCheck::Current
         ));
         assert_eq!(count(&log, "read"), 0, "older bound needs no backend op");
@@ -2753,7 +2760,11 @@ mod tests {
 
         // A stricter bound checks again and observes the winner.
         let t = s1.store.timeline.now();
-        match s1.check_current(&obs, t).await.unwrap() {
+        match s1
+            .check_current(&obs, Requirement::AtLeast(t))
+            .await
+            .unwrap()
+        {
             ObservationCheck::Changed(cur) => assert_eq!(cur.value().unwrap().as_slice(), b"b"),
             ObservationCheck::Current => panic!("a stricter bound must observe the changed state"),
         }
@@ -2779,7 +2790,11 @@ mod tests {
         assert_eq!(current.value().unwrap().as_slice(), b"b");
 
         clear(&log);
-        match local.check_current(&observed, bound).await.unwrap() {
+        match local
+            .check_current(&observed, Requirement::AtLeast(bound))
+            .await
+            .unwrap()
+        {
             ObservationCheck::Changed(changed) => {
                 assert_eq!(changed.value().unwrap().as_slice(), b"b");
             }
@@ -3680,6 +3695,17 @@ mod tests {
         fn elapsed(&self) -> Duration {
             *self.elapsed.lock().unwrap()
         }
+    }
+
+    #[test]
+    fn requirement_satisfaction_follows_currentness_evidence() {
+        let earlier = SequencePoint::from_raw(1);
+        let later = SequencePoint::from_raw(2);
+
+        assert!(Requirement::Any.is_satisfied_by(earlier));
+        assert!(Requirement::AtLeast(earlier).is_satisfied_by(earlier));
+        assert!(Requirement::AtLeast(earlier).is_satisfied_by(later));
+        assert!(!Requirement::AtLeast(later).is_satisfied_by(earlier));
     }
 
     #[test]
