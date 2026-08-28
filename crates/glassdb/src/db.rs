@@ -506,13 +506,18 @@ impl DbInner {
                 }
             } else {
                 // The user function returned an error. It might be the result
-                // of a spurious read, so validate only the reads.
+                // of a spurious read, so validate only the reads. The error may
+                // escape only once validation has certified that snapshot: an
+                // attempt that could not finish proves nothing about the reads
+                // behind the error, so the caller learns about the failed
+                // validation instead.
                 match driver
                     .validate_body_error(accesses, collection_access)
                     .await
                 {
                     Ok(BodyOutcome::ReplayBody) => {}
-                    _ => break fn_res,
+                    Ok(BodyOutcome::Complete) => break fn_res,
+                    Err(e) => break Err(Error::from_read_validation(e)),
                 }
             }
 
