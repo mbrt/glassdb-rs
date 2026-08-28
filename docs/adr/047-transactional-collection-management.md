@@ -11,8 +11,8 @@ Topology participation and settlement are refined by
 collection record at `_i` from the data-tree root at `_r`; this ADR's lifecycle
 protocol otherwise remains unchanged.
 
-Constituent decision of the
-[dynamic-range-sharding design](../designs/dynamic-range-sharding.md). Depends
+Constituent decision of
+[ADR-031](031-dynamic-range-sharding.md). Depends
 on [ADR-046](046-incarnation-addressed-collections.md) for collection identity,
 physical layout, and path resolution.
 

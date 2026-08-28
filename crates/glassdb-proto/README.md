@@ -5,8 +5,7 @@
 
 Protobuf definitions for the persistent records of
 [GlassDB](https://github.com/mbrt/glassdb-rs), a stateless ACID key/value store on
-top of object storage. The wire format is compatible with the original
-[Go implementation](https://github.com/mbrt/glassdb).
+top of object storage.
 
 The `prost` bindings are pre-generated and checked into the repository, so
 building this crate does not require `protoc`. The optional `regen` feature

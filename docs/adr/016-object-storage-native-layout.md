@@ -74,11 +74,9 @@ This **replaces the on-storage format wholesale**. Both the S3 and GCS backends
 adopt the new layout, and on-disk / commit-protocol compatibility with the Go
 original is **dropped**.
 
-This ADR records only the umbrella direction. The sub-decisions each get their
-own ADR — sharded directory, unified transaction objects, commit/write-back,
-wound-wait at shard granularity, mark-sweep GC, and the slimmed `Backend` trait
-— and the overall effort, staging, and open questions are tracked in
-[`docs/designs/object-storage-native.md`](../designs/object-storage-native.md).
+This ADR records only the umbrella direction. Follow-on ADRs record the sharded
+directory, unified transaction objects, commit/write-back, wound-wait at shard
+granularity, mark-sweep garbage collection, and the slimmed `Backend` trait.
 
 ## Consequences
 

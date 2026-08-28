@@ -33,7 +33,7 @@ const FORBIDDEN: &[&str] = &[
     "tokio::net",
     "tokio::process",
     "tokio::signal",
-    // This lock is prohibited by the repository's concurrency policy.
+    // This lock is prohibited as it has non-obvious correctness issues.
     "tokio::sync::Mutex",
     // Native execution and host I/O must sit behind an explicit seam too.
     "std::thread",

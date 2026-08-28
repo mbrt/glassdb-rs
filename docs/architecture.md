@@ -1,13 +1,8 @@
 # Architecture
 
-This document describes the architecture and design choices of GlassDB. For the
-full design narrative and motivation, see the companion blog post:
-[Transactional Object
-Storage](https://blog.mbrt.dev/posts/transactional-object-storage) (written for
-the original Go version, but the design is identical). For the Rust-specific
-porting decisions — the concurrency model, time/determinism, error handling, and
-encoding fidelity — see [porting-go.md](archive/porting-go.md). For usage,
-performance benchmarks, and examples, see the [README](../README.md).
+This document describes the current architecture and design choices of GlassDB.
+For usage, performance benchmarks, and examples, see the
+[README](../README.md).
 
 ## Design Goals & Tradeoffs
 
@@ -64,10 +59,10 @@ single-object operations and conditional mutations for atomic state transitions.
 
 ## Crate Structure
 
-The port is a Cargo workspace whose crates mirror the original Go `internal/`
-and `backend/` package boundaries, so the mapping between the two codebases is
-one-to-one. The dependency DAG is enforced at compile time (e.g. `storage`
-cannot reach into `trans`):
+The Cargo workspace separates the public API, transaction engine, storage,
+backend implementations, data types, and concurrency support. Its dependency
+DAG is enforced at compile time (for example, `storage` cannot reach into
+`trans`):
 
 ```
 glassdb-data → glassdb-backend → glassdb-storage → glassdb-trans → glassdb
@@ -151,8 +146,7 @@ it owns identity, ordering, admission, and recovery across the heterogeneous
 round, while `Algo`, the `Locker`, and the `Splitter` supply each operation's
 target, resolver policy, and typed result as a `ShardOperation`. The operation
 types stay with their policy owners; the coordinator exposes one typed
-`coordinate` interface and keeps raw resolver submission private. For the full design see
-[designs/object-storage-native.md](designs/object-storage-native.md).
+`coordinate` interface and keeps raw resolver submission private.
 
 Independent point-leaf phases use one transaction-local parallelism value. Each
 provider combines work that targets one physical path, then uses bounded
@@ -575,8 +569,7 @@ transaction log for garbage collection.
 Because `Database::tx` takes the body by value (`|tx| async move { ... }`) and
 the framework owns the retry loop, a conflict simply reruns the closure.
 Dropping the transaction future at any point is equivalent to a crash: the
-commit protocol recovers any in-flight state (see
-[porting-go.md](archive/porting-go.md), "Cancel-safety contract").
+commit protocol and retirement machinery recover any in-flight state.
 
 ### Optimistic Concurrency Control
 
@@ -1129,6 +1122,18 @@ generated-ID domain. Every collection has an `_i` record containing a bounded,
 sorted directory from direct child name to child ID and an independent `_r`
 B-link root containing only node state. The parent entry—not physical-object
 presence—is authoritative for logical existence.
+
+For a small collection, `_r` is the only leaf. When it splits, `_r` becomes an
+index whose children are leaves over contiguous raw-key ranges. Each level has
+right-sibling links, so a traversal from cached index state can move right after
+a concurrent split and remain correct.
+
+```mermaid
+flowchart LR
+  Root["_r index"] --> Left["leaf · low range"]
+  Root --> Right["leaf · high range"]
+  Left -->|right sibling| Right
+```
 
 Transactional creation prepares an unreachable record/root pair at a fresh ID,
 then publishes `name → ID` through the ordinary commit protocol. A bound

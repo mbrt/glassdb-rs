@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted — implemented.
 
 Supersedes the fixed-hash key→shard mapping and fixed shard count of
 [ADR-016](016-object-storage-native-layout.md) (the "fixed `C` shards" clause),
@@ -35,8 +35,7 @@ must divide. The B-link split protocol and lack of merging remain unchanged.
 
 Coordination state lives in a fixed set of `C = 1024` **hash** shard objects per
 collection (ADR-016/017): `shard_index(key) = fnv1a(key) & (C-1)`, with `C`
-baked into the on-disk format. This has four limitations, all called out as
-deferred in [`object-storage-native.md`](../designs/object-storage-native.md):
+baked into the on-disk format. This has four limitations:
 
 1. **Capacity ceiling.** A collection is capped at `C × keys-per-shard`
    (~256k keys at the soft cap). Growing past that has no answer.

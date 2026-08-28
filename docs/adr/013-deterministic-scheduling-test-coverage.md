@@ -77,7 +77,7 @@ these tests prove the low-level nemesis actually produces the intended events.
 
 ### 3. Strengthen sim replay checks
 
-Extend the sim harness ([`sim.rs`](../../crates/glassdb/src/sim.rs)) with
+Extend the sim harness ([`sim/harness.rs`](../../crates/glassdb/src/sim/harness.rs)) with
 record-and-return entry points that decode fuzz inputs exactly like the fuzz
 targets. The committed corpus test
 ([`fuzz_corpus.rs`](../../crates/glassdb/tests/fuzz_corpus.rs)) replays each

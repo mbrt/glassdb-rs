@@ -152,7 +152,7 @@ flowchart TD
   dedicated fault tape, deinterleaved into disjoint streams for the crash nemesis,
   the outage nemesis, and each client transport; an empty tape reduces to pure
   seed-breadth sampling (PCT runs).
-- **Harness** ([`sim.rs`](../../crates/glassdb/src/sim.rs)). Clients run as
+- **Harness** ([`sim/harness.rs`](../../crates/glassdb/src/sim/harness.rs)). Clients run as
   executor-spawned tasks over a shared in-process `MemoryBackend` wrapped in
   `FaultBackend`/`RecordingBackend`; the acked-bounds invariant (ADR-008) is kept.
   The public entry points are plain `async fn`s; the deterministic driver

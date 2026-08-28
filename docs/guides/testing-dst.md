@@ -10,8 +10,8 @@ graded against the five stated intents:
 4. Fuzz-guided exploration of edge cases
 5. Efficient
 
-Sources: ADR-008/010/011/012/013/048, `porting-go.md`, the
-`rt`/`exec`/`fault` modules, and the upstream documentation for
+Sources: ADR-008/010/011/012/013/048, the `rt`/`exec`/`fault` modules, and the
+upstream documentation for
 [`madsim`](https://github.com/madsim-rs/madsim),
 [`turmoil`](https://github.com/tokio-rs/turmoil), and
 [`mad-turmoil`](https://github.com/s2-streamstore/mad-turmoil). The Turmoil

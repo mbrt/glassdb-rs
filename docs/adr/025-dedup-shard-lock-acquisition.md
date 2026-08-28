@@ -30,11 +30,10 @@ a single content CAS. A transaction groups its accessed keys by shard and locks
 each shard with one read-modify-write CAS. But the v2 `Locker` dropped the
 deduplication: every transaction independently does `load_shard → resolve → CAS`
 per shard, so unrelated transactions touching the same shard **serialize on
-  its CAS with bounded retries** (`CAS_RETRIES`). This is the "within-shard
-  false sharing" cost documented in ADR-020 and
-  [`docs/designs/object-storage-native.md`](../designs/object-storage-native.md): two transactions
-  writing _different_ keys in one shard never lock-conflict, yet each pays its
-  own GET + CAS and races the other, wasting round-trips under contention.
+  its CAS with bounded retries** (`CAS_RETRIES`). This is the within-shard false
+  sharing cost documented in ADR-020: two transactions writing _different_ keys
+  in one shard never lock-conflict, yet each pays its own GET + CAS and races the
+  other, wasting round-trips under contention.
 
 ADR-020 already names the fix — _"batching all of a shard's keys into one CAS is
 the efficiency win the sharded directory buys"_ — but only realised it _within_

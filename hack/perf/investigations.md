@@ -8,8 +8,6 @@ This file is evidence, not a record of accepted behavior:
 
 - [`docs/guides/perf.md`](../../docs/guides/perf.md) records metrics for landed
   performance-affecting changes.
-- [`docs/guides/perf-todos.md`](../../docs/guides/perf-todos.md) tracks open
-  performance work.
 - ADRs record significant decisions once accepted.
 
 ## 2026-08-21: root-leaf structural-gate coordinator rationale
