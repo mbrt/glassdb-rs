@@ -19,21 +19,14 @@
 - Keep implementation methods in order of visibility
 - Comments should be used to explain why something is done, not what
 - Functions' docstring should describe the function's purpose, not its implementation, nor callers
+- Use `make format` to auto-format the code
 
 ### Tests
 
-Always use `make test-all` to run tests. This runs format checks, linting
-(`clippy -D warnings`), and the test suite.
+Always use `make test-all` to run tests. This runs format checks, linting, and the test suite.
 
 - Test interfaces and intended behavior instead of internals
-- Prefer integration tests to mocks as much as possible
+- Avoid tautological tests
+- Strongly prefer integration tests over mocks
 - Always add deterministic regression tests when fixing bugs, they also serve as documentation
-- Express conditions derived from transaction reads as returned errors, which are read-validated and retried when the attempt observed an inconsistent snapshot; panics propagate without validation or replay
-
-### Formatting Code
-
-Use `make format` to auto-format the code:
-
-```bash
-make format
-```
+- Return errors instead of using assertions in transaction bodies, as they are not snapshot-transparent
