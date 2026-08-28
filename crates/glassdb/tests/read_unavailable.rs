@@ -158,6 +158,57 @@ async fn transient_read_unavailability_is_retried_transparently() {
     );
 }
 
+/// An error returned by a transaction body is snapshot-transparent only because
+/// its reads are validated before it escapes. When that validation cannot
+/// complete, the body's error must not escape: the value it was derived from may
+/// be a stale cached read that a committed writer already superseded. The caller
+/// learns about the failed validation instead, as the retry-safe
+/// `Error::Unavailable` (a read-only attempt stages no write, so nothing is in
+/// doubt).
+#[tokio::test(start_paused = true)]
+async fn body_error_does_not_escape_unvalidated_reads() {
+    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    seed_shared(mem.clone(), b"k", 10).await;
+
+    let (backend, faults) = ReadFaults::wrap(mem.clone());
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let coll = db
+        .open_collection(&CollectionPath::new(b"c").unwrap())
+        .await
+        .unwrap();
+
+    // The body reads through a healthy transport and derives an error from the
+    // value; the outage starts only once the body has returned, so it hits
+    // read validation alone.
+    let bodies = Arc::new(AtomicUsize::new(0));
+    let coll = &coll;
+    let faults = &faults;
+    let res: Result<(), Error> = db
+        .tx(|tx| {
+            let bodies = bodies.clone();
+            async move {
+                bodies.fetch_add(1, Ordering::SeqCst);
+                let value = tx.read(coll, b"k").await?;
+                faults.fail_key_reads_forever();
+                Err(Error::InvalidInput(format!(
+                    "k is {:?}, which the body rejects",
+                    value.map(|value| read_int(&value))
+                )))
+            }
+        })
+        .await;
+
+    assert!(
+        matches!(res, Err(Error::Unavailable(_))),
+        "an unvalidated body error must surface the failed validation, got {res:?}"
+    );
+    assert_eq!(
+        bodies.load(Ordering::SeqCst),
+        1,
+        "the body must not be replayed when validation could not complete"
+    );
+}
+
 /// A sustained read outage exhausts the bounded retry and surfaces as the
 /// dedicated `Error::Unavailable` — never `InDoubt` (no mutation is in question)
 /// and never a generic `Internal`.

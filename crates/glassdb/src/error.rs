@@ -108,6 +108,19 @@ impl Error {
             other => other.into(),
         }
     }
+
+    /// Maps a transaction-layer error raised while validating the reads behind a
+    /// transaction body's normal error outcome.
+    ///
+    /// Such an attempt stages no write, so a sustained outage leaves no mutation
+    /// in question and keeps the retry-safe [`Error::Unavailable`] rather than
+    /// the conservative [`Error::InDoubt`] of [`From`].
+    pub(crate) fn from_read_validation(e: TransError) -> Self {
+        match e {
+            TransError::Storage(StorageError::Unavailable(s)) => Error::Unavailable(s),
+            other => other.into(),
+        }
+    }
 }
 
 impl From<BackendError> for Error {
