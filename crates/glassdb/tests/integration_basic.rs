@@ -54,6 +54,26 @@ async fn rw() {
     assert_eq!(stats.transactions.retries, 0);
 }
 
+#[tokio::test(start_paused = true)]
+async fn handled_explicit_abort_does_not_override_a_commit_outcome() {
+    let db = init_db(mem()).await;
+    let coll = create_top(&db, b"abort").await;
+
+    let coll_ref = &coll;
+    db.tx(|tx| async move {
+        match tx.abort() {
+            Err(Error::Aborted) => {}
+            Err(error) => return Err(error),
+            Ok(()) => return Err(Error::internal("explicit abort returned no error")),
+        }
+        tx.write(coll_ref, b"key", b"value")
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(coll.read(b"key").await.unwrap().unwrap(), b"value");
+}
+
 #[tokio::test]
 async fn individually_oversized_key_is_invalid_input() {
     let policy = SplitPolicy::builder()

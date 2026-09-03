@@ -40,7 +40,7 @@ A body outcome that contains a value and proposes the staged changes for commit.
 _Avoid_: Success
 
 **Error outcome**:
-A body outcome that contains an error and rejects the staged changes.
+A body outcome that contains an error and rejects the staged changes. GlassDB validates its reads before it returns the outcome.
 _Avoid_: Body error
 
 **Explicit abort**:

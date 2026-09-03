@@ -276,17 +276,18 @@ impl Database {
     ///
     /// # Error outcomes
     ///
-    /// When `f` returns an error without an explicit abort, the attempt's writes
-    /// are discarded and its reads are validated. If those reads were
-    /// inconsistent, `f` is invoked again; otherwise the original error is
-    /// returned. Conditions derived from transaction reads must therefore return
-    /// an error, for example with [`crate::ensure_tx!`], rather than assert or
-    /// panic.
+    /// When `f` returns an error outcome, the attempt's writes are discarded and
+    /// its reads are validated. If those reads were inconsistent, `f` is invoked
+    /// again; otherwise the original error is returned. Conditions derived from
+    /// transaction reads must therefore return an error, for example with
+    /// [`crate::ensure_tx!`], rather than assert or panic.
     ///
     /// # Explicit abort
     ///
-    /// [`Transaction::abort`] rejects the staged changes and returns
-    /// [`Error::Aborted`] without read validation or body replay.
+    /// [`Transaction::abort`] returns [`Error::Aborted`]. When `f` returns this
+    /// error, GlassDB rejects the staged changes and validates the reads like it
+    /// does for other error outcomes. If `f` handles the error and returns a
+    /// commit outcome, the transaction can commit.
     ///
     /// # Panics
     ///
@@ -492,9 +493,6 @@ impl DbInner {
             // retains access to the same shared state to collect accesses and
             // reset between retries.
             let body_outcome = f(tx.handle()).await;
-            if tx.explicitly_aborted() {
-                break Err(Error::Aborted);
-            }
 
             // Collect the accesses produced by the transaction body.
             let (accesses, catalog_accesses) = tx.collect_accesses();

@@ -45,7 +45,6 @@ pub struct Transaction {
 struct TransactionInner {
     accesses: AccessOverlay,
     catalog: CatalogOverlay,
-    explicitly_aborted: bool,
 }
 
 pub(crate) struct TransactionMetrics {
@@ -307,9 +306,8 @@ impl Transaction {
             .drop_collection(parent, name, collection.address(), has_key_writes)
     }
 
-    /// Produces an explicit abort without read validation or body replay.
+    /// Returns the error for an explicit abort.
     pub fn abort(&self) -> Result<(), Error> {
-        self.inner.lock().unwrap().explicitly_aborted = true;
         Err(Error::Aborted)
     }
 
@@ -328,10 +326,6 @@ impl Transaction {
             db: self.db.clone(),
             inner: self.inner.clone(),
         }
-    }
-
-    pub(crate) fn explicitly_aborted(&self) -> bool {
-        self.inner.lock().unwrap().explicitly_aborted
     }
 
     pub(crate) fn reset(&self) {

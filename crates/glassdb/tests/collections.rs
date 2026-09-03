@@ -531,6 +531,44 @@ async fn failed_transaction_retries_invalidated_reads_without_publishing_changes
 }
 
 #[tokio::test]
+async fn explicit_abort_retries_invalidated_reads_without_publishing_changes() {
+    let backend = Arc::new(MemoryBackend::new());
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let peer = Database::open("example", backend).await.unwrap();
+    let root = db.root_collection();
+    let peer_root = peer.root_collection();
+    root.write(b"guard", b"old").await.unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    let result = db
+        .tx({
+            let root = root.clone();
+            let peer_root = peer_root.clone();
+            let attempts = attempts.clone();
+            move |tx| {
+                let root = root.clone();
+                let peer_root = peer_root.clone();
+                let attempts = attempts.clone();
+                async move {
+                    tx.read(&root, b"guard").await?.ok_or(Error::NotFound)?;
+                    let collection = tx.create_collection(&root, b"temporary-abort").await?;
+                    tx.write(&collection, b"k", b"v")?;
+                    tx.collection_exists(&collection, b"nested").await?;
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        peer_root.write(b"guard", b"new").await?;
+                    }
+                    tx.abort()
+                }
+            }
+        })
+        .await;
+
+    assert!(matches!(result, Err(Error::Aborted)));
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert!(!db.collection_exists("temporary-abort").await.unwrap());
+}
+
+#[tokio::test]
 async fn collection_creation_reuses_its_reserved_incarnation_across_retry() {
     let backend = Arc::new(MemoryBackend::new());
     let db = Database::open("example", backend.clone()).await.unwrap();

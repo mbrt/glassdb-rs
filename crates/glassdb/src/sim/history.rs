@@ -96,7 +96,7 @@ enum HistoryOutcome {
     /// The transaction returned a snapshot-transparent outcome and must appear
     /// exactly once.
     SnapshotTransparent,
-    /// A definitive failure or explicit abort with no database effect.
+    /// A definitive failure with no database effect.
     DefiniteNoEffect,
     /// The caller was told that a commit may or may not have happened.
     InDoubt,
@@ -185,6 +185,9 @@ fn selected_trace(op: &PublicOp) -> Result<Option<(&BodyTrace, bool, bool)>, Che
                 Ok(Some((trace, true, false)))
             }
             Some(trace) if trace.state == BodyState::ApplicationErrorOutcome => {
+                Ok(Some((trace, false, false)))
+            }
+            Some(trace) if trace.state == BodyState::ExplicitAbort => {
                 Ok(Some((trace, false, false)))
             }
             _ => Err(CheckError::new(format!(
@@ -1119,7 +1122,7 @@ async fn run_program(
             Ok(())
         }
         Err(Error::Aborted) => {
-            recorder.notify(program.op_id, HistoryOutcome::DefiniteNoEffect);
+            recorder.notify(program.op_id, HistoryOutcome::SnapshotTransparent);
             Ok(())
         }
         Err(error @ Error::InDoubt(_)) => {
@@ -1864,6 +1867,29 @@ mod tests {
         );
         check_history(&initial, std::slice::from_ref(&error), &initial).unwrap();
         assert!(check_history(&initial, &[error], &state(&[(0, 4), (1, 9)])).is_err());
+    }
+
+    #[test]
+    fn explicit_abort_is_a_snapshot_transparent_outcome_without_writes() {
+        let initial = state(&[(0, 4), (1, 0)]);
+        let abort = op(
+            0,
+            0,
+            Some(1),
+            HistoryOutcome::SnapshotTransparent,
+            trace(
+                vec![
+                    HistoryAction::Read {
+                        key: 0,
+                        value: Some(4),
+                    },
+                    HistoryAction::Write { key: 1, value: 9 },
+                ],
+                BodyState::ExplicitAbort,
+            ),
+        );
+        check_history(&initial, std::slice::from_ref(&abort), &initial).unwrap();
+        assert!(check_history(&initial, &[abort], &state(&[(0, 4), (1, 9)])).is_err());
     }
 
     #[test]
