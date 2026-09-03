@@ -112,7 +112,7 @@ impl Drop for FakeGcs {
         self.signal_shutdown();
         if let Some(task) = self.accept_task.take() {
             // Drop cannot await, so cancellation is the only way to ensure an
-            // abandoned test server cannot keep its listener or connections.
+            // stopped test server cannot keep its listener or connections.
             task.abort();
         }
     }

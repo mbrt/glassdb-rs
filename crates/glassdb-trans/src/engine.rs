@@ -6,27 +6,29 @@ use std::time::Duration;
 
 use glassdb_backend::{Backend, BackendError, BackendStats, StatsBackend};
 use glassdb_concurr::{Background, DedupKeySnapshot, RetryConfig};
-use glassdb_data::{CollectionAddress, CollectionId, DatabaseId, DbRoot, KeyRef, ObjectPath, TxId};
+use glassdb_data::{
+    CollectionAddress, CollectionId, DatabaseId, DbRoot, LogicalKey, ObjectPath, TxId,
+};
 use glassdb_storage::transaction::TLogger;
 use glassdb_storage::{
-    CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, Node, NodeStore,
-    PersistentCache, PersistentCacheConfig, PersistentCacheMedia, Requirement, Shard, SplitPolicy,
-    StorageError, StructuralLogStore, Timeline, TreeRouter,
+    CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, LeafBody, Node,
+    NodeStore, PersistentCache, PersistentCacheConfig, PersistentCacheMedia, Requirement,
+    SplitPolicy, StorageError, StructuralIntentStore, Timeline, TreeRouter,
 };
 
 use crate::access::{AccessSet, ScanMutation, ScanRange};
-use crate::algo::{Algo, BodyOutcome, DirectCommitStats, Handle};
+use crate::algo::{Algo, BodyDecision, DirectCommitStats, Handle};
 use crate::collection_catalog::CollectionCatalog;
 use crate::collection_commit::CollectionCommit;
 use crate::collection_coordination::CollectionStateResolver;
-use crate::collections::{CollectionData, CollectionLifecycle, DirectorySnapshot};
+use crate::collections::{CatalogAccesses, CollectionLifecycle, DirectorySnapshot};
 use crate::error::TransError;
 use crate::gc::{Gc, TxCleanupHints};
 use crate::key_resolver::{KeyResolver, ScanResult};
 use crate::key_state_resolver::KeyStateResolver;
+use crate::leaf_coord::{LeafCoordinator, LeafCoordinatorStats};
 use crate::monitor::{Monitor, ProtocolTiming};
 use crate::reader::{ReadOutcome, Reader};
-use crate::shard_coord::{ShardCoordinator, ShardCoordinatorStats};
 use crate::split::{Splitter, SplitterStats};
 use crate::tlocker::{Locker, LockerStats};
 
@@ -116,7 +118,7 @@ impl Default for EngineConfig {
 pub struct EngineTransaction(Handle);
 
 impl EngineTransaction {
-    /// Returns the attempt's transaction ID.
+    /// Returns the attempt's transaction identity.
     pub fn id(&self) -> &TxId {
         self.0.id()
     }
@@ -130,8 +132,8 @@ pub struct EngineStats {
     pub cache: CacheStats,
     /// Distributed-locker activity.
     pub locker: LockerStats,
-    /// Shared shard-coordinator activity.
-    pub coordinator: ShardCoordinatorStats,
+    /// Shared leaf-coordinator activity.
+    pub coordinator: LeafCoordinatorStats,
     /// Logless direct-commit coverage.
     pub direct_commit: DirectCommitStats,
     /// Background tree-split activity.
@@ -140,7 +142,7 @@ pub struct EngineStats {
 
 /// Live coordination state collected from one engine snapshot.
 pub struct EngineDiagnostics {
-    /// Per-object deduplication state inside the shard coordinator.
+    /// Per-object deduplication state inside the leaf coordinator.
     pub coordinator_dedup: Vec<DedupKeySnapshot>,
 }
 
@@ -152,7 +154,7 @@ pub struct Engine {
     resolver: KeyResolver,
     collection_catalog: CollectionCatalog,
     algo: Algo,
-    coord: ShardCoordinator,
+    coord: LeafCoordinator,
     locker: Locker,
     splitter: Splitter,
     // Subsystems hold weak references so this sole strong owner breaks task
@@ -193,7 +195,7 @@ impl Engine {
     /// Reads one logical key with the requested staleness allowance.
     pub async fn read(
         &self,
-        key: &KeyRef,
+        key: &LogicalKey,
         max_stale: Duration,
     ) -> Result<ReadOutcome, StorageError> {
         self.reader.read(key, max_stale).await
@@ -223,9 +225,9 @@ impl Engine {
     pub fn begin_transaction(
         &self,
         accesses: AccessSet,
-        collection_data: CollectionData,
+        catalog_accesses: CatalogAccesses,
     ) -> EngineTransaction {
-        EngineTransaction(self.algo.begin(accesses, collection_data))
+        EngineTransaction(self.algo.begin(accesses, catalog_accesses))
     }
 
     /// Replaces the logical accesses of an uncommitted transaction attempt.
@@ -233,22 +235,22 @@ impl Engine {
         &self,
         tx: &mut EngineTransaction,
         accesses: AccessSet,
-        collection_data: CollectionData,
+        catalog_accesses: CatalogAccesses,
     ) {
         self.algo
-            .reset_with_collections(&mut tx.0, accesses, collection_data);
+            .reset_with_collections(&mut tx.0, accesses, catalog_accesses);
     }
 
     /// Validates read-only accesses and reports whether the body must run again.
     pub async fn validate_reads(
         &self,
         tx: &mut EngineTransaction,
-    ) -> Result<BodyOutcome, TransError> {
+    ) -> Result<BodyDecision, TransError> {
         self.algo.validate_reads(&mut tx.0).await
     }
 
     /// Commits an attempt or reports that the body must run again.
-    pub async fn commit(&self, tx: &mut EngineTransaction) -> Result<BodyOutcome, TransError> {
+    pub async fn commit(&self, tx: &mut EngineTransaction) -> Result<BodyDecision, TransError> {
         self.algo.commit(&mut tx.0).await
     }
 
@@ -306,7 +308,7 @@ impl Engine {
         B: Backend + ?Sized,
     {
         match backend
-            .write_if_not_exists(path, Node::leaf(Shard::new()).encode())
+            .write_if_not_exists(path, Node::leaf(LeafBody::new()).encode())
             .await
         {
             Ok(_) => Ok(()),
@@ -329,8 +331,8 @@ struct AssemblyFoundation {
     backend: Arc<StatsBackend>,
     objects: CachedStore,
     records: CollectionStore,
-    shards: NodeStore,
-    structural_logs: StructuralLogStore,
+    nodes: NodeStore,
+    structural_intents: StructuralIntentStore,
     timeline: Timeline,
     tlogger: TLogger,
     background: Arc<Background>,
@@ -349,8 +351,8 @@ impl AssemblyFoundation {
         let objects =
             CachedStore::new(dyn_backend, config.cache_size, timeline.clone(), persistent);
         let records = CollectionStore::new(objects.clone());
-        let shards = NodeStore::new(objects.clone(), config.transaction_leaf_parallelism);
-        let structural_logs = StructuralLogStore::new(objects.clone());
+        let nodes = NodeStore::new(objects.clone(), config.transaction_leaf_parallelism);
+        let structural_intents = StructuralIntentStore::new(objects.clone());
         let tlogger = TLogger::new(objects.clone(), db_root);
         let background = Arc::new(Background::new());
         let monitor = Monitor::with_config(
@@ -364,8 +366,8 @@ impl AssemblyFoundation {
             backend,
             objects,
             records,
-            shards,
-            structural_logs,
+            nodes,
+            structural_intents,
             timeline,
             tlogger,
             background,
@@ -381,8 +383,8 @@ pub(crate) struct AssemblyFixture {
     foundation: AssemblyFoundation,
     pub(crate) objects: CachedStore,
     pub(crate) records: CollectionStore,
-    pub(crate) shards: NodeStore,
-    pub(crate) structural_logs: StructuralLogStore,
+    pub(crate) nodes: NodeStore,
+    pub(crate) structural_intents: StructuralIntentStore,
     pub(crate) timeline: Timeline,
     pub(crate) tlogger: TLogger,
     pub(crate) background: Arc<Background>,
@@ -403,8 +405,8 @@ impl AssemblyFixture {
         Self {
             objects: foundation.objects.clone(),
             records: foundation.records.clone(),
-            shards: foundation.shards.clone(),
-            structural_logs: foundation.structural_logs.clone(),
+            nodes: foundation.nodes.clone(),
+            structural_intents: foundation.structural_intents.clone(),
             timeline: foundation.timeline.clone(),
             tlogger: foundation.tlogger.clone(),
             background: foundation.background.clone(),
@@ -487,8 +489,8 @@ impl DormantEngine {
             backend,
             objects,
             records,
-            shards,
-            structural_logs,
+            nodes,
+            structural_intents,
             timeline,
             tlogger,
             background,
@@ -499,7 +501,7 @@ impl DormantEngine {
             CollectionStateResolver::new(records.clone(), tlogger.clone(), monitor.clone(), retry);
         let collection_catalog = CollectionCatalog::new(collection_state.clone());
         let key_state = KeyStateResolver::new(monitor.clone());
-        let router = TreeRouter::new(shards.clone(), transaction_leaf_parallelism);
+        let router = TreeRouter::new(nodes.clone(), transaction_leaf_parallelism);
         let resolver = KeyResolver::new(
             router.clone(),
             key_state.clone(),
@@ -510,8 +512,8 @@ impl DormantEngine {
         let (coord, splitter) = Splitter::with_coordinator(
             background_weak.clone(),
             records.clone(),
-            shards.clone(),
-            structural_logs.clone(),
+            nodes.clone(),
+            structural_intents.clone(),
             timeline.clone(),
             monitor.clone(),
             key_state,
@@ -523,7 +525,7 @@ impl DormantEngine {
         );
         let locker = Locker::new(
             coord.clone(),
-            TreeRouter::new(shards.clone(), transaction_leaf_parallelism),
+            TreeRouter::new(nodes.clone(), transaction_leaf_parallelism),
             collection_state,
             monitor.clone(),
             retry,
@@ -531,7 +533,7 @@ impl DormantEngine {
         );
         let collection_lifecycle = CollectionLifecycle::new(
             records,
-            shards.clone(),
+            nodes.clone(),
             monitor.clone(),
             retry,
             Arc::new(splitter.clone()),
@@ -539,8 +541,8 @@ impl DormantEngine {
         let gc = Gc::new(
             background_weak.clone(),
             tlogger,
-            shards.clone(),
-            structural_logs,
+            nodes.clone(),
+            structural_intents,
             timeline.clone(),
             locker.clone(),
             collection_lifecycle.clone(),
@@ -554,7 +556,7 @@ impl DormantEngine {
             split_policy,
         );
         let algo = Algo::new(
-            shards,
+            nodes,
             timeline,
             retry,
             locker.clone(),
@@ -633,7 +635,7 @@ async fn verify_permanent_collection(
         }
         Err(error) => return Err(error),
     }
-    match foundation.shards.load_root(&collection, requirement).await {
+    match foundation.nodes.load_root(&collection, requirement).await {
         Ok(_) => Ok(()),
         Err(StorageError::NotFound) => Err(StorageError::other(
             "initialized database is missing its permanent tree root",

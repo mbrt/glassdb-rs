@@ -23,7 +23,7 @@ pub(super) enum StepResult {
     ExplicitlyAborted,
 }
 
-/// Executes one generated program and distinguishes its definite success modes.
+/// Executes one generated program and distinguishes its definite outcomes.
 pub(super) async fn execute_step(
     db: &Database,
     program: &ApiTransaction,

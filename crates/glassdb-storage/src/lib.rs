@@ -1,5 +1,5 @@
-//! Decoded, byte-bounded physical-object storage plus shard/root coordination,
-//! transaction-log persistence, and structural split recovery records.
+//! Decoded, byte-bounded physical-object storage plus leaf/root coordination,
+//! transaction-log persistence, and structural intents for split recovery.
 
 pub mod cache;
 mod cache_stats;
@@ -8,12 +8,12 @@ mod collection_store;
 mod disk_cache;
 mod error;
 mod inline;
+mod leaf;
 mod lock;
 mod node;
 mod node_store;
-mod shard;
-mod structlog;
-mod structural_log_store;
+mod structural_intent;
+mod structural_intent_store;
 mod timeline;
 pub mod transaction;
 mod tree_router;
@@ -45,15 +45,15 @@ pub use disk_cache::{
 };
 pub use error::StorageError;
 pub use inline::InlinePolicy;
+pub use leaf::{CurrentState, LeafBody, LeafEntry};
 pub use lock::{EntryLockState, ExclusiveGate, LockType, SharedExclusiveLock};
 pub use node::{
     IndexNode, InvalidSplitPolicy, Node, NodeBody, NodeLocks, NodeToken, SplitPolicy,
     SplitPolicyBuilder,
 };
 pub use node_store::{LeafEdit, LeafObservation, LeafObservationCheck, LoadedLeaf, NodeStore};
-pub use shard::{CurrentState, Shard, ShardEntry};
-pub use structlog::{StructuralLog, StructuralLogPhase};
-pub use structural_log_store::StructuralLogStore;
+pub use structural_intent::{StructuralIntent, StructuralIntentPhase};
+pub use structural_intent_store::StructuralIntentStore;
 pub use timeline::{SequencePoint, Timeline};
-pub use tree_router::{LeafLocator, RoutedLeafGroup, TreeRouter};
+pub use tree_router::{RoutedLeaf, RoutedLeafGroup, TreeRouter};
 pub use version::Version;

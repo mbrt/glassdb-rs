@@ -69,7 +69,7 @@ async fn main() -> Result<(), glassdb::Error> {
     })
     .await?;
 
-    // Collection lifecycle changes compose with data in the same transaction.
+    // Collection lifecycle changes compose with key changes in the same transaction.
     let active = db
         .tx(|tx| async move {
             let root = tx.root_collection();

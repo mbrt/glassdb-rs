@@ -390,7 +390,7 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_data::TxId;
 
-    use crate::{Node, NodeStore, Shard, Timeline};
+    use crate::{LeafBody, Node, NodeStore, Timeline};
 
     fn collection_id(byte: u8) -> CollectionId {
         CollectionId::from_slice(&[byte; 16]).unwrap()
@@ -564,7 +564,7 @@ mod tests {
             None,
         );
         let records = CollectionStore::new(objects.clone());
-        let shards = NodeStore::new(objects, std::num::NonZeroUsize::MIN);
+        let nodes = NodeStore::new(objects, std::num::NonZeroUsize::MIN);
         let collection = CollectionAddress::new("db", collection_id(9));
 
         assert!(
@@ -574,8 +574,8 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            shards
-                .create_root(&collection, &Node::leaf(Shard::new()))
+            nodes
+                .create_root(&collection, &Node::leaf(LeafBody::new()))
                 .await
                 .unwrap()
         );
@@ -584,7 +584,7 @@ mod tests {
             .load_record(&collection, Requirement::AtLeast(timeline.now()))
             .await
             .unwrap();
-        let (mut root, root_before) = shards
+        let (mut root, root_before) = nodes
             .load_root(&collection, Requirement::AtLeast(timeline.now()))
             .await
             .unwrap();
@@ -596,7 +596,7 @@ mod tests {
             .load_record(&collection, Requirement::AtLeast(timeline.now()))
             .await
             .unwrap();
-        let (_, root_after_record_write) = shards
+        let (_, root_after_record_write) = nodes
             .load_root(&collection, Requirement::AtLeast(timeline.now()))
             .await
             .unwrap();
@@ -609,7 +609,7 @@ mod tests {
 
         root.add_membership_reader(TxId::from_bytes(vec![1]));
         assert!(
-            shards
+            nodes
                 .store_root(&collection, &root, &root_after_record_write)
                 .await
                 .unwrap()

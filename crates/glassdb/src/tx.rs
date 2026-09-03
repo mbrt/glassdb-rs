@@ -4,22 +4,22 @@
 //!
 //! [`Transaction`] is a cheap, `Send` handle over shared, interior-mutable state
 //! (`Arc<Mutex<TransactionInner>>`). It is passed *by value* into the transaction
-//! closure so the resulting future is `Send` and can be `tokio::spawn`-ed; the
+//! body so the resulting future is `Send` and can be `tokio::spawn`-ed; the
 //! framework keeps its own handle (see [`Transaction::handle`]) to read the collected
-//! accesses after the closure returns and to reset between retries. All methods
+//! accesses after the body returns and to reset between retries. All methods
 //! take `&self` and only hold the lock briefly — never across an `.await` — so
 //! several reads can run concurrently within a single transaction.
 
+mod access_overlay;
 mod catalog;
-mod data;
 
 use std::sync::{Arc, Mutex};
 
-use glassdb_data::{CollectionAddress, KeyRef};
-use glassdb_trans::{AccessSet, CollectionData};
+use glassdb_data::{CollectionAddress, LogicalKey};
+use glassdb_trans::{AccessSet, CatalogAccesses};
 
+use self::access_overlay::{AccessOverlay, OverlayRead};
 use self::catalog::{CatalogOverlay, CreateMode};
-use self::data::{DataOverlay, OverlayRead};
 use crate::collection::{Collection, CollectionPath, validate_collection_name};
 use crate::db::DbInner;
 use crate::error::Error;
@@ -43,9 +43,9 @@ pub struct Transaction {
 
 #[derive(Default)]
 struct TransactionInner {
-    data: DataOverlay,
+    accesses: AccessOverlay,
     catalog: CatalogOverlay,
-    aborted: bool,
+    explicitly_aborted: bool,
 }
 
 pub(crate) struct TransactionMetrics {
@@ -61,12 +61,12 @@ impl Transaction {
     /// `futures::future::join_all`) to fetch keys in parallel.
     pub async fn read(&self, c: &Collection, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         self.validate_handle(c)?;
-        let key = KeyRef::new(c.address().clone(), key);
+        let key = LogicalKey::new(c.address().clone(), key);
         // Brief lock to consult the per-transaction cache. The guard is dropped
         // before the backend read below so it is never held across `.await`.
         {
             let inner = self.inner.lock().unwrap();
-            match inner.data.read(&key) {
+            match inner.accesses.read(&key) {
                 OverlayRead::Known(value) => return Ok(value),
                 OverlayRead::Unknown => {}
             }
@@ -84,13 +84,13 @@ impl Transaction {
                 match value {
                     None => {
                         let mut inner = self.inner.lock().unwrap();
-                        inner.data.record_not_found(key, cache_hit, evidence);
+                        inner.accesses.record_not_found(key, cache_hit, evidence);
                         Ok(None)
                     }
                     Some(rv) => {
                         let mut inner = self.inner.lock().unwrap();
                         inner
-                            .data
+                            .accesses
                             .record_found(key, rv.value.clone(), cache_hit, evidence);
                         Ok(Some(rv.value.to_vec()))
                     }
@@ -116,7 +116,7 @@ impl Transaction {
             if inner.catalog.is_dropped(c.address()) {
                 return Err(Error::StaleCollection);
             }
-            let overlay = inner.data.scan_mutations(c.address());
+            let overlay = inner.accesses.scan_mutations(c.address());
             (overlay, inner.catalog.is_created(c.address()))
         };
 
@@ -138,7 +138,7 @@ impl Transaction {
             .map_err(Error::from_read)?;
         let keys = result.keys().to_vec();
         let access = result.into_access(c.address().clone(), range, overlay);
-        self.inner.lock().unwrap().data.record_scan(access);
+        self.inner.lock().unwrap().accesses.record_scan(access);
         Ok(KeyPage::new(keys, limit))
     }
 
@@ -150,8 +150,12 @@ impl Transaction {
                 "cannot write a collection after dropping it".into(),
             ));
         }
-        let key = KeyRef::new(c.address().clone(), key);
-        self.inner.lock().unwrap().data.write(key, Arc::from(value));
+        let key = LogicalKey::new(c.address().clone(), key);
+        self.inner
+            .lock()
+            .unwrap()
+            .accesses
+            .write(key, Arc::from(value));
         Ok(())
     }
 
@@ -163,8 +167,8 @@ impl Transaction {
                 "cannot write a collection after dropping it".into(),
             ));
         }
-        let key = KeyRef::new(c.address().clone(), key);
-        self.inner.lock().unwrap().data.delete(key);
+        let key = LogicalKey::new(c.address().clone(), key);
+        self.inner.lock().unwrap().accesses.delete(key);
         Ok(())
     }
 
@@ -297,15 +301,15 @@ impl Transaction {
         self.ensure_directory(collection.address()).await?;
 
         let mut inner = self.inner.lock().unwrap();
-        let has_data_writes = inner.data.has_writes_for(collection.address());
+        let has_key_writes = inner.accesses.has_writes_for(collection.address());
         inner
             .catalog
-            .drop_collection(parent, name, collection.address(), has_data_writes)
+            .drop_collection(parent, name, collection.address(), has_key_writes)
     }
 
-    /// Explicitly aborts the transaction. Returns [`Error::Aborted`].
+    /// Produces an explicit abort without read validation or body replay.
     pub fn abort(&self) -> Result<(), Error> {
-        self.inner.lock().unwrap().aborted = true;
+        self.inner.lock().unwrap().explicitly_aborted = true;
         Err(Error::Aborted)
     }
 
@@ -317,7 +321,7 @@ impl Transaction {
     }
 
     /// Returns another handle to the same transaction state. The framework
-    /// passes a handle to the user closure (which consumes it) while keeping one
+    /// passes a handle to the transaction body while keeping one
     /// to inspect the staged accesses and reset between retries.
     pub(crate) fn handle(&self) -> Transaction {
         Transaction {
@@ -326,25 +330,25 @@ impl Transaction {
         }
     }
 
-    pub(crate) fn aborted(&self) -> bool {
-        self.inner.lock().unwrap().aborted
+    pub(crate) fn explicitly_aborted(&self) -> bool {
+        self.inner.lock().unwrap().explicitly_aborted
     }
 
     pub(crate) fn reset(&self) {
         let mut inner = self.inner.lock().unwrap();
-        inner.data.reset();
+        inner.accesses.reset();
         inner.catalog.reset();
     }
 
-    pub(crate) fn collect_accesses(&self) -> (AccessSet, CollectionData) {
+    pub(crate) fn collect_accesses(&self) -> (AccessSet, CatalogAccesses) {
         let inner = self.inner.lock().unwrap();
-        (inner.data.accesses(), inner.catalog.accesses())
+        (inner.accesses.accesses(), inner.catalog.accesses())
     }
 
     pub(crate) fn metrics(&self) -> TransactionMetrics {
         let inner = self.inner.lock().unwrap();
         TransactionMetrics {
-            cache_hits: inner.data.cache_hits(),
+            cache_hits: inner.accesses.cache_hits(),
         }
     }
 
@@ -426,7 +430,7 @@ mod tests {
     // *while* a listing transaction is running — after it scanned the leaf but
     // before it validated — the create rewrites the covered leaf, bumping its
     // version. The listing's commit validation detects the changed snapshot and
-    // re-runs the transaction; the retry re-scans the fresh leaf and therefore
+    // re-runs the transaction; the retry re-scans a current leaf observation and
     // includes the racing key. A create is never silently dropped from a listing
     // it raced.
     #[tokio::test]
@@ -446,7 +450,7 @@ mod tests {
 
         // The listing runs in a read-only transaction. On its first attempt a
         // concurrent transaction commits a new key *after* the scan recorded the
-        // leaf version, modeling a create that lands mid-listing. That
+        // leaf observation revision, modeling a create that lands mid-listing. That
         // invalidates the recorded snapshot, forcing the listing to retry.
         let listed = db
             .tx(|tx| {

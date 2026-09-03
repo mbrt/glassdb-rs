@@ -5,7 +5,7 @@ async fn settlement_cancels_a_prepared_split_before_node_creation() {
     let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
     let operations = recorder.log();
     let s = store_with_backend(Arc::new(recorder));
-    let root = Node::leaf(Shard::from_entries(
+    let root = Node::leaf(LeafBody::from_entries(
         [b"a".as_slice(), b"b", b"c", b"d"]
             .iter()
             .map(|key| live(key)),
@@ -31,7 +31,7 @@ async fn settlement_cancels_a_prepared_split_before_node_creation() {
         .await
         .unwrap();
     let expected_listing =
-        ObjectPath::participant_structural_records_prefix(&db_root("db"), &participant);
+        ObjectPath::participant_structural_intents_prefix(&db_root("db"), &participant);
     let listings: Vec<_> = operations
         .lock()
         .unwrap()
@@ -99,7 +99,7 @@ async fn structural_split_failure_transition_table() {
     ] {
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
         let s = store_with_backend(backend.clone());
-        let root = Node::leaf(Shard::from_entries(
+        let root = Node::leaf(LeafBody::from_entries(
             [b"a".as_slice(), b"b", b"c", b"d"]
                 .iter()
                 .map(|key| live(key)),
@@ -110,7 +110,7 @@ async fn structural_split_failure_transition_table() {
 
         let root_path = root_path().to_string();
         let nodes_prefix = ObjectPath::nodes_prefix(&collection());
-        let structural_prefix = ObjectPath::structural_records_prefix(&db_root("db"));
+        let structural_prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
         let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         backend.set_before({
             let fired = fired.clone();
@@ -123,8 +123,9 @@ async fn structural_split_failure_transition_table() {
                         FailurePoint::StructuralGate => path == &root_path,
                         FailurePoint::ReadyPrecondition => {
                             path.starts_with(&structural_prefix)
-                                && StructuralLog::decode(value)
-                                    .is_ok_and(|intent| intent.phase == StructuralLogPhase::Ready)
+                                && StructuralIntent::decode(value).is_ok_and(|intent| {
+                                    intent.phase == StructuralIntentPhase::Ready
+                                })
                         }
                         FailurePoint::RootRewrite => {
                             path == &root_path
@@ -172,8 +173,8 @@ async fn structural_split_failure_transition_table() {
                         operation,
                         BackendOp::WriteIf { path, value, .. }
                             if path.starts_with(&structural_prefix)
-                                && StructuralLog::decode(value).is_ok_and(|intent| {
-                                    intent.phase == StructuralLogPhase::Ready
+                                && StructuralIntent::decode(value).is_ok_and(|intent| {
+                                    intent.phase == StructuralIntentPhase::Ready
                                 })
                     );
                 let result =
@@ -210,7 +211,7 @@ async fn structural_split_failure_transition_table() {
             assert_eq!(logs.len(), 1, "case {point:?}");
             assert_eq!(
                 logs[0].1.value().unwrap().phase,
-                StructuralLogPhase::Ready,
+                StructuralIntentPhase::Ready,
                 "case {point:?}"
             );
         } else {
@@ -448,14 +449,14 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
     let bg = Arc::new(Background::new());
     let sp = splitter(&s, &bg, tiny());
 
-    let intent = StructuralLog {
+    let intent = StructuralIntent {
         collection: collection(),
         source_token: Some(test_token("L")),
         source_version: String::new(),
         created_tokens: vec![test_token("R")],
         split_key: b"t".to_vec(),
         participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
-        phase: StructuralLogPhase::Ready,
+        phase: StructuralIntentPhase::Ready,
     };
     s.write_structural_intent("R", &intent).await.unwrap();
 
@@ -470,7 +471,7 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
         !root_node.over_soft_cap(&tiny()),
         "recovery completes the parent split requested by publication"
     );
-    let router = TreeRouter::new(s.shards.clone(), std::num::NonZeroUsize::MIN);
+    let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
     assert_eq!(
         router
             .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
@@ -482,7 +483,7 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
     );
     for key in [b"a".as_slice(), b"m", b"t"] {
         let leaf = router
-            .leaf_for(&collection(), key, Requirement::AtLeast(s.timeline.now()))
+            .route_key(&collection(), key, Requirement::AtLeast(s.timeline.now()))
             .await
             .unwrap();
         assert!(leaf.node().unwrap().as_leaf().unwrap().exists(key));
@@ -574,14 +575,14 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
     let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
     s.create_root(COLL, &root).await.unwrap();
 
-    let intent = StructuralLog {
+    let intent = StructuralIntent {
         collection: collection(),
         source_token: Some(test_token("L")),
         source_version: source_version.revision().unwrap().serialize().to_string(),
         created_tokens: vec![test_token("R")],
         split_key,
         participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
-        phase: StructuralLogPhase::Ready,
+        phase: StructuralIntentPhase::Ready,
     };
     s.write_structural_intent("R", &intent).await.unwrap();
     sp.mon.begin_tx(&id);
@@ -623,7 +624,7 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
 
 async fn recovery_that_needs_a_parent_split(
     participant: &TxId,
-) -> (TestStore, Arc<Background>, Splitter, StructuralLog) {
+) -> (TestStore, Arc<Background>, Splitter, StructuralIntent) {
     let s = store();
     s.store_node(
         COLL,
@@ -655,14 +656,14 @@ async fn recovery_that_needs_a_parent_split(
     .unwrap();
     let bg = Arc::new(Background::new());
     let sp = splitter(&s, &bg, tiny());
-    let intent = StructuralLog {
+    let intent = StructuralIntent {
         collection: collection(),
         source_token: Some(test_token("L")),
         source_version: String::new(),
         created_tokens: vec![test_token("R")],
         split_key: b"t".to_vec(),
         participant_id: participant.clone(),
-        phase: StructuralLogPhase::Ready,
+        phase: StructuralIntentPhase::Ready,
     };
     (s, bg, sp, intent)
 }
@@ -684,7 +685,7 @@ async fn sweep_defers_one_failed_parent_split_and_continues() {
     s.intent_store
         .write(
             &db_root("db"),
-            &StructuralRecordId::from(intent_ids[0].clone()),
+            &StructuralIntentId::from(intent_ids[0].clone()),
             &request_record,
         )
         .await
@@ -692,7 +693,7 @@ async fn sweep_defers_one_failed_parent_split_and_continues() {
     s.intent_store
         .write(
             &db_root("db"),
-            &StructuralRecordId::from(intent_ids[1].clone()),
+            &StructuralIntentId::from(intent_ids[1].clone()),
             &orphan_intent,
         )
         .await
@@ -734,7 +735,7 @@ async fn explicit_settlement_returns_a_parent_split_error() {
     s.intent_store
         .write(
             &db_root("db"),
-            &StructuralRecordId::from(test_token("request-intent")),
+            &StructuralIntentId::from(test_token("request-intent")),
             &intent,
         )
         .await

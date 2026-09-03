@@ -1,5 +1,5 @@
-//! The shard-mutation coordinator (ADR-028): the transaction-aware shared
-//! fold engine through which every shard/leaf entry mutation flows.
+//! The leaf-mutation coordinator (ADR-028): the transaction-aware shared
+//! fold engine through which every leaf/leaf entry mutation flows.
 //!
 //! The only coordination primitive is a content compare-and-swap on a B-link
 //! leaf: a node (`{prefix}/_n/<token>`) or the collection root (`{prefix}/_r`,
@@ -15,13 +15,13 @@
 //! heterogeneous mutations safely: transaction identity, oldest-first fold
 //! order, per-member in-doubt attribution, routing and capacity admission, and
 //! same-key exclusion for logless publication. It loads the leaf object once,
-//! **folds** the round's installed [`ShardOperation`] resolvers over a running
+//! **folds** the round's installed [`LeafOperation`] resolvers over a running
 //! staged entry map, drops vestigial entries, CASes once, recovers by
 //! reload-and-re-fold, and deposits each member's outcome (ADR-029). Each policy
-//! owner packages its mutation decision and typed result in a `ShardOperation`:
+//! owner packages its mutation decision and typed result in a `LeafOperation`:
 //! [`Locker`](crate::tlocker::Locker) supplies acquire / write-back / release,
 //! direct commit supplies atomic logless publication, and the splitter supplies
-//! leaf structural-gate acquisition. Cross-shard strategy stays with the
+//! leaf structural-gate acquisition. Cross-leaf strategy stays with the
 //! `Locker`, not in the engine.
 
 use std::cmp::Ordering as CmpOrdering;
@@ -36,7 +36,7 @@ use glassdb_concurr::{
 };
 use glassdb_data::{ObjectPath, TxId};
 use glassdb_storage::{
-    LeafEdit, LeafObservation, LockType, NodeLocks, NodeStore, Requirement, Shard, ShardEntry,
+    LeafBody, LeafEdit, LeafEntry, LeafObservation, LockType, NodeLocks, NodeStore, Requirement,
     SplitPolicy, StorageError,
 };
 
@@ -44,11 +44,11 @@ use crate::error::TransError;
 use crate::key_state_resolver::KeyStateResolver;
 use crate::monitor::Monitor;
 
-/// Maximum inner CAS retries on a single shard/root before treating the
+/// Maximum inner CAS retries on a single leaf/root before treating the
 /// operation as conflicted and restarting the transaction.
 pub(crate) const CAS_RETRIES: usize = 50;
 
-/// Counters for CAS activity across all coordinated shard operations.
+/// Counters for CAS activity across all coordinated leaf operations.
 #[derive(Default)]
 struct Stats {
     n_retries: AtomicU64,
@@ -56,13 +56,13 @@ struct Stats {
 
 /// Coordination work for one snapshot or accumulated interval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ShardCoordinatorStats {
+pub struct LeafCoordinatorStats {
     pub submissions: u64,
     pub rounds: u64,
     pub cas_retries: u64,
 }
 
-impl AddAssign for ShardCoordinatorStats {
+impl AddAssign for LeafCoordinatorStats {
     fn add_assign(&mut self, rhs: Self) {
         self.submissions += rhs.submissions;
         self.rounds += rhs.rounds;
@@ -70,7 +70,7 @@ impl AddAssign for ShardCoordinatorStats {
     }
 }
 
-impl Sub for ShardCoordinatorStats {
+impl Sub for LeafCoordinatorStats {
     type Output = Self;
 
     fn sub(self, rhs: Self) -> Self::Output {
@@ -105,14 +105,14 @@ pub(crate) enum FoldOutcome {
     LeafFull,
     /// A release or write-back completed (ADR-026). The current node state
     /// proved that the holder was removed or the corresponding CAS landed.
-    /// `superseded` carries the `current_writer` transaction ids a write-back
+    /// `superseded` carries the `current_writer` transaction identities a write-back
     /// overwrote — GC reverse-check candidates (ADR-022); empty for a release.
     Released { superseded: Vec<TxId> },
-    /// The submitted leaf no longer owns one of this operation's keys. The
+    /// The submitted leaf no longer covers one of this operation's keys. The
     /// caller must descend again and regroup before retrying.
     Reroute,
     /// A logless direct commit landed: this transaction's value is published in
-    /// the shard's version chain, or it was already there (idempotent, ADR-051).
+    /// the leaf's version chain, or it was already there (idempotent, ADR-051).
     Landed,
     /// A logless direct commit lost the race: the entry moved to another writer
     /// (or the key is now genuinely locked by someone else), so only the regular
@@ -203,7 +203,7 @@ pub(crate) enum Step {
     /// coordinator alone owns the node's topology, body reconstruction, and
     /// capacity admission.
     Stage {
-        entries: Vec<(Vec<u8>, ShardEntry)>,
+        entries: Vec<(Vec<u8>, LeafEntry)>,
         locks: NodeLocks,
         admission: StageAdmission,
         outcome: FoldOutcome,
@@ -231,17 +231,17 @@ pub(crate) struct ResolveCtx<'a> {
     pub(crate) cause: ReloadCause,
 }
 
-/// One operation's mutation decision over a shard, folded by the coordinator.
-/// The engine calls [`resolve`](ShardResolver::resolve), threads any staged
+/// One operation's mutation decision over a leaf, folded by the coordinator.
+/// The engine calls [`resolve`](LeafResolver::resolve), threads any staged
 /// entries, and deposits the returned outcome. Resolver implementations own the
 /// acquire, write-back, release, and direct-commit decisions; the coordinator
 /// owns the ordering, admission, and recovery contract they share (ADR-028).
 #[async_trait]
-pub(crate) trait ShardResolver: Send + Sync {
+pub(crate) trait LeafResolver: Send + Sync {
     /// Lets a resolver retain evidence from the leaf exactly as loaded, before
     /// any earlier-ordered member stages over it. Direct commit uses this to
     /// remember an exact own marker; other resolvers need no pre-fold state.
-    fn observe_loaded(&self, _entries: &BTreeMap<Vec<u8>, ShardEntry>) {}
+    fn observe_loaded(&self, _entries: &BTreeMap<Vec<u8>, LeafEntry>) {}
 
     /// Resolves this member against entries and node locks as currently staged
     /// this round. Resolvers cannot mutate node topology.
@@ -253,7 +253,7 @@ pub(crate) trait ShardResolver: Send + Sync {
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
-        staged: &BTreeMap<Vec<u8>, ShardEntry>,
+        staged: &BTreeMap<Vec<u8>, LeafEntry>,
         staged_locks: &NodeLocks,
     ) -> Result<Step, TransError>;
 
@@ -266,7 +266,7 @@ pub(crate) trait ShardResolver: Send + Sync {
     /// The outcome delivered when this round cannot produce a definitive
     /// result. `in_doubt` reports whether a CAS carrying *this member's* stage
     /// may have landed, so a non-idempotent resolver cannot downgrade
-    /// uncertainty while abandoning the round.
+    /// uncertainty while ending the round.
     fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome;
 
     /// The outcome delivered when a structural change invalidated routing.
@@ -275,7 +275,7 @@ pub(crate) trait ShardResolver: Send + Sync {
     }
 
     /// The outcome delivered when a peer already claimed one of this member's
-    /// [`publication_keys`](ShardResolver::publication_keys) as a logless
+    /// [`publication_keys`](LeafResolver::publication_keys) as a logless
     /// publication this round, so nothing was folded for it at all. Distinct
     /// from exhaustion: the peer's claim proves this member staged nothing,
     /// which a spent CAS budget does not, so a resolver may treat it as a
@@ -287,7 +287,7 @@ pub(crate) trait ShardResolver: Send + Sync {
     }
 
     /// The raw keys defining this member's leaf-local scope. The coordinator
-    /// verifies that the loaded leaf still owns every key before folding
+    /// verifies that the loaded leaf still covers every key before folding
     /// (ADR-031). This includes read-only dependencies when their placement
     /// matters. A resolver whose decision is valid for the leaf as a whole may
     /// leave the scope empty.
@@ -303,7 +303,7 @@ pub(crate) trait ShardResolver: Send + Sync {
         self.logless_publication_keys()
     }
 
-    /// The [`publication_keys`](ShardResolver::publication_keys) this member
+    /// The [`publication_keys`](LeafResolver::publication_keys) this member
     /// commits loglessly (ADR-051): their leaf state is the commit's only durable
     /// record, so no later publisher may stage over them in the same CAS. The
     /// coordinator lets at most one member stage per key per round and tells the
@@ -315,12 +315,12 @@ pub(crate) trait ShardResolver: Send + Sync {
     }
 }
 
-/// One complete operation submitted to the shared shard-mutation engine.
+/// One complete operation submitted to the shared leaf-mutation engine.
 ///
 /// The operation owns its target, transaction identity, first-load requirement,
 /// resolver policy, and typed result. The coordinator only runs the shared fold
 /// mechanism and returns the raw round result to the operation for translation.
-pub(crate) trait ShardOperation: ShardResolver {
+pub(crate) trait LeafOperation: LeafResolver {
     /// The result vocabulary exposed to this operation's caller.
     type Output;
 
@@ -337,11 +337,11 @@ pub(crate) trait ShardOperation: ShardResolver {
     fn complete(&self, outcome: Option<CoordinatedOutcome>) -> Result<Self::Output, TransError>;
 }
 
-/// One transaction's participation in a shard CAS batch: its installed resolver
+/// One transaction's participation in a leaf CAS batch: its installed resolver
 /// and where to deliver its outcome.
 #[derive(Clone)]
-struct ShardMember {
-    resolver: Arc<dyn ShardResolver>,
+struct LeafMember {
+    resolver: Arc<dyn LeafResolver>,
     slot: OutcomeSlot,
 }
 
@@ -361,7 +361,7 @@ struct ShardMember {
 #[derive(Clone)]
 struct CasReq {
     path: ObjectPath,
-    members: BTreeMap<TxId, ShardMember>,
+    members: BTreeMap<TxId, LeafMember>,
     first_requirement: Requirement,
 }
 
@@ -371,7 +371,7 @@ impl MergeRequest for CasReq {
         // at once — e.g. GC releasing a presumed-dead transaction's holds
         // (ADR-029) while that transaction's own acquire is still resolving on
         // the same object (ADR-025). Each submission carries its own outcome
-        // slot, but a fold round runs at most one resolver per transaction id
+        // slot, but a fold round runs at most one resolver per transaction identity
         // and the dedup delivers to *every* merged submission. Merging two
         // submissions that share an id would collapse them to a single map
         // entry — silently dropping one submission's resolver and its outcome
@@ -411,17 +411,17 @@ impl MergeRequest for CasReq {
 /// seam — never on the splitter's queue or policy. The splitter supplies the
 /// implementation.
 pub trait SplitHinter: Send + Sync {
-    /// Notes that `path`'s leaf was just stored holding `shard`. Best-effort: a
+    /// Notes that `path`'s leaf was just stored holding `leaf`. Best-effort: a
     /// spurious call only costs the splitter a reload and re-check, so the
     /// coordinator never blocks on it.
-    fn observe_leaf(&self, path: &ObjectPath, shard: &Shard);
+    fn observe_leaf(&self, path: &ObjectPath, leaf: &LeafBody);
 }
 
-/// State shared by the [`ShardCoordinator`] and its dedup [`CasWorker`]: the
+/// State shared by the [`LeafCoordinator`] and its dedup [`CasWorker`]: the
 /// storage handles, retry config, and stats.
 struct CoordCore {
     tmon: Monitor,
-    shards: NodeStore,
+    nodes: NodeStore,
     key_state: KeyStateResolver,
     retry: RetryConfig,
     stats: Stats,
@@ -437,14 +437,14 @@ struct CoordState {
 }
 
 /// The [`Dedup`] worker driving one merged round per CAS object (ADR-025): it
-/// loads the shard/root once, folds every merged member's resolver, does a single
+/// loads the leaf/root once, folds every merged member's resolver, does a single
 /// CAS, and deposits each member's [`FoldOutcome`] into its slot.
 struct CasWorker {
     core: Arc<CoordCore>,
 }
 
 /// Returns the merged request's members.
-fn shard_members(batch: &BatchHandle<CasReq, TransError>) -> BTreeMap<TxId, ShardMember> {
+fn leaf_members(batch: &BatchHandle<CasReq, TransError>) -> BTreeMap<TxId, LeafMember> {
     batch.merged().members
 }
 
@@ -461,7 +461,7 @@ struct MemberFold {
 }
 
 struct FoldPlan {
-    entries: BTreeMap<Vec<u8>, ShardEntry>,
+    entries: BTreeMap<Vec<u8>, LeafEntry>,
     locks: NodeLocks,
     members: Vec<MemberFold>,
 }
@@ -481,7 +481,7 @@ impl FoldPlan {
 }
 
 struct ProposedStage {
-    entries: Vec<(Vec<u8>, ShardEntry)>,
+    entries: Vec<(Vec<u8>, LeafEntry)>,
     locks: NodeLocks,
     admission: StageAdmission,
     outcome: FoldOutcome,
@@ -499,12 +499,12 @@ enum PersistResult {
 }
 
 impl CasWorker {
-    /// Builds the ordered mutation plan for one loaded shard attempt.
+    /// Builds the ordered mutation plan for one loaded leaf attempt.
     async fn fold_round(
         &self,
         path: &ObjectPath,
         edit: &LeafEdit,
-        members: &BTreeMap<TxId, ShardMember>,
+        members: &BTreeMap<TxId, LeafMember>,
         requirement: Requirement,
         reloaded: bool,
         in_doubt: &mut BTreeSet<TxId>,
@@ -522,9 +522,9 @@ impl CasWorker {
 
         // Oldest-first ordering makes the fold monotonic: a later member cannot
         // wound a member whose stage it has already observed (ADR-028).
-        let mut ordered: Vec<(&TxId, &ShardMember)> = members.iter().collect();
+        let mut ordered: Vec<(&TxId, &LeafMember)> = members.iter().collect();
         ordered.sort_by(|(a, _), (b, _)| fold_order(a, b));
-        // Marker evidence belongs to the loaded leaf version, not to the
+        // Marker evidence belongs to the loaded leaf observation, not to the
         // running fold order. Give every member a chance to retain it before a
         // preceding publisher can replace the corresponding entry in memory.
         for member in members.values() {
@@ -552,7 +552,7 @@ impl CasWorker {
                 .resolver
                 .leaf_scope_keys()
                 .iter()
-                .any(|&key| !edit.owns(key));
+                .any(|&key| !edit.covers(key));
             if needs_reroute {
                 plan.members.push(MemberFold {
                     id: tx.clone(),
@@ -657,23 +657,23 @@ impl CasWorker {
         &self,
         path: &ObjectPath,
         edit: &LeafEdit,
-        resolver: &dyn ShardResolver,
+        resolver: &dyn LeafResolver,
         in_doubt: bool,
-        entries: &BTreeMap<Vec<u8>, ShardEntry>,
+        entries: &BTreeMap<Vec<u8>, LeafEntry>,
         proposed: ProposedStage,
     ) -> Result<CapacityDecision, TransError> {
         let mut candidate_entries = entries.clone();
         for (key, entry) in &proposed.entries {
             candidate_entries.insert(key.clone(), entry.clone());
         }
-        let candidate_shard = Shard::from_entries(
+        let candidate_leaf = LeafBody::from_entries(
             candidate_entries
                 .values()
                 .filter(|entry| !entry.is_vestigial())
                 .cloned(),
         );
         let mut candidate_node = edit.node().clone();
-        candidate_node.set_leaf(candidate_shard.clone())?;
+        candidate_node.set_leaf(candidate_leaf.clone())?;
         candidate_node.set_locks(proposed.locks.clone());
         let (inline_publication, direct_adds_key, pressure_hint) = match proposed.admission {
             StageAdmission::InlinePublication {
@@ -699,7 +699,7 @@ impl CasWorker {
         // Splitting cannot make an intrinsically oversized entry fit. The
         // direct publisher falls back to an external value instead.
         if pressure_hint && !inline_entry_full {
-            self.core.hinter.observe_leaf(path, &candidate_shard);
+            self.core.hinter.observe_leaf(path, &candidate_leaf);
         }
         let outcome = if proposed.admission == StageAdmission::AddsKey {
             FoldOutcome::LeafFull
@@ -725,22 +725,22 @@ impl CasWorker {
         // Drop entries a member left vestigial (no holder, no
         // `current_writer`): they name no transaction and are
         // indistinguishable from absent, so pruning them here — in the
-        // same CAS that clears the last holder — keeps shards tidy on
+        // same CAS that clears the last holder — keeps nodes tidy on
         // every path (acquire / write-back / release, ADR-029) instead
         // of leaving dead entries for a later GC cycle.
-        let new_shard = Shard::from_entries(
+        let new_leaf = LeafBody::from_entries(
             std::mem::take(&mut plan.entries)
                 .into_values()
                 .filter(|entry| !entry.is_vestigial()),
         );
-        edit.set_entries(new_shard.clone());
+        edit.set_entries(new_leaf.clone());
         edit.set_locks(plan.locks.clone());
-        match self.core.shards.commit_leaf(edit).await {
+        match self.core.nodes.commit_leaf(edit).await {
             // Hint the background splitter if this write left the leaf
             // over the soft cap (ADR-031); the splitter reloads and
             // re-checks, so a spurious hint only costs one load.
             Ok(true) => {
-                self.core.hinter.observe_leaf(path, &new_shard);
+                self.core.hinter.observe_leaf(path, &new_leaf);
                 Ok(PersistResult::Landed)
             }
             Ok(false) => Ok(PersistResult::PreconditionMiss),
@@ -751,12 +751,12 @@ impl CasWorker {
         }
     }
 
-    /// Drives one merged shard round: load once, fold every member's resolver
+    /// Drives one merged leaf round: load once, fold every member's resolver
     /// (threading the staged entries), CAS once, and deposit each member's
     /// outcome. A member that stages nothing (e.g. it must wait) is delivered its
     /// own outcome, so the owner never blocks — its caller waits and re-submits
     /// while the other members make progress.
-    async fn run_shard(
+    async fn run_leaf(
         &self,
         path: &ObjectPath,
         batch: &BatchHandle<CasReq, TransError>,
@@ -779,19 +779,19 @@ impl CasWorker {
         // (and been help-forwarded to a peer), so a later precondition-miss must
         // not downgrade the ambiguity to a definitive loss. Commit-install
         // would otherwise misclassify a landed-but-unacked lock as `Moved` and
-        // unsafely abandon-and-rerun a committed object a peer already observed.
+        // unsafely discard the outcome and rerun a commit a peer already observed.
         //
         // It is per member rather than per round: a member the uncertain CAS did
         // not carry — one skipped for a same-key logless claim, or merged into
         // the batch afterwards — definitively did not land, and inheriting the
         // batch's ambiguity would strand it in-doubt over a write it never made.
         let mut in_doubt: BTreeSet<TxId> = BTreeSet::new();
-        // The first fold attempt may reuse a cached shard the submitter just
+        // The first fold attempt may reuse a cached leaf the submitter just
         // loaded (a direct same-leaf member; `Any` serves it without a
         // revalidation round-trip, ADR-030). A failed or in-doubt CAS
         // invalidates the exact seed observation, so later attempts can also use
         // `Any`: they either read the winner or reuse newer knowledge another
-        // operation already published. A stale cached shard only costs a CAS
+        // operation already published. A stale cached leaf only costs a CAS
         // miss and a reload, never correctness.
         for attempt in 0..CAS_RETRIES {
             if attempt > 0 {
@@ -803,13 +803,13 @@ impl CasWorker {
             } else {
                 Requirement::Any
             };
-            let edit = match self.core.shards.load_leaf(path, requirement).await {
+            let edit = match self.core.nodes.load_leaf(path, requirement).await {
                 Ok(loaded) => loaded.into_edit(),
                 // A root split can turn the routed root leaf into an index
                 // between grouping and this load. Deliver each resolver's
                 // reroute outcome so its caller rebuilds the current leaf set.
                 Err(StorageError::Precondition) => {
-                    let members = shard_members(batch);
+                    let members = leaf_members(batch);
                     for (tx, member) in &members {
                         *member.slot.lock().unwrap() = Some(CoordinatedOutcome {
                             outcome: member.resolver.reroute_outcome(in_doubt.contains(tx)),
@@ -825,7 +825,7 @@ impl CasWorker {
             // (ADR-025) — the window that turns N contenders' loads+CASes into
             // one. A cache-served first attempt still folds every current member
             // over the cached leaf; the CAS arbitrates if that leaf was stale.
-            let members = shard_members(batch);
+            let members = leaf_members(batch);
             let mut plan = self
                 .fold_round(
                     path,
@@ -847,7 +847,7 @@ impl CasWorker {
                     reloaded = true;
                     continue;
                 }
-                // Re-folding over a freshly-read shard is idempotent. Only the
+                // Re-folding over a freshly-read leaf is idempotent. Only the
                 // members this uncertain CAS actually carried inherit its doubt.
                 PersistResult::InDoubt(staged_ids) => {
                     in_doubt.extend(staged_ids);
@@ -881,7 +881,7 @@ impl CasWorker {
         // Bounded CAS budget exhausted under churn: each member gets its
         // resolver's exhaustion outcome. Acquirers conflict and release/re-lock;
         // write-backs re-descend because exhaustion does not prove convergence.
-        for (tx, m) in &shard_members(batch) {
+        for (tx, m) in &leaf_members(batch) {
             *m.slot.lock().unwrap() = Some(CoordinatedOutcome {
                 outcome: m.resolver.exhausted_outcome(in_doubt.contains(tx)),
                 evidence: None,
@@ -898,26 +898,26 @@ impl Worker<CasReq, TransError> for CasWorker {
         _key: &str,
         batch: &BatchHandle<CasReq, TransError>,
     ) -> Result<(), TransError> {
-        self.run_shard(&batch.merged().path, batch).await
+        self.run_leaf(&batch.merged().path, batch).await
     }
 }
 
-/// The transaction-aware shared fold engine through which every shard/root entry
+/// The transaction-aware shared fold engine through which every leaf/root entry
 /// mutation flows (ADR-028): a [`Dedup`] over the CAS coordination objects
 /// that orders contending transactions, loads each object once, folds their
 /// resolvers, does one CAS, and deposits each transaction's outcome. Transaction
 /// lifecycle remains with its higher-level owner.
 #[derive(Clone)]
-pub struct ShardCoordinator {
+pub struct LeafCoordinator {
     inner: Arc<CoordState>,
 }
 
-impl ShardCoordinator {
+impl LeafCoordinator {
     /// Creates a coordinator that reports capacity observations to `hinter` —
     /// normally the background [`Splitter`](crate::split::Splitter)'s queue.
     /// `policy` governs the coordinator's hard node-size limit.
     pub fn with_hinter(
-        shards: NodeStore,
+        nodes: NodeStore,
         key_state: KeyStateResolver,
         tmon: Monitor,
         retry: RetryConfig,
@@ -926,7 +926,7 @@ impl ShardCoordinator {
     ) -> Self {
         let core = Arc::new(CoordCore {
             tmon,
-            shards,
+            nodes,
             key_state,
             retry,
             stats: Stats::default(),
@@ -934,7 +934,7 @@ impl ShardCoordinator {
             hinter,
         });
         let dedup = Dedup::new(CasWorker { core: core.clone() });
-        ShardCoordinator {
+        LeafCoordinator {
             inner: Arc::new(CoordState { core, dedup }),
         }
     }
@@ -946,9 +946,9 @@ impl ShardCoordinator {
     }
 
     /// Returns and resets submission, worker-round, and inner-CAS retry counts.
-    pub fn stats_and_reset(&self) -> ShardCoordinatorStats {
+    pub fn stats_and_reset(&self) -> LeafCoordinatorStats {
         let dedup = self.inner.dedup.stats_and_reset();
-        ShardCoordinatorStats {
+        LeafCoordinatorStats {
             submissions: dedup.submissions,
             rounds: dedup.rounds,
             cas_retries: self.inner.core.stats.n_retries.swap(0, Ordering::Relaxed),
@@ -964,13 +964,13 @@ impl ShardCoordinator {
     /// result.
     pub(crate) async fn coordinate<O>(&self, operation: O) -> Result<O::Output, TransError>
     where
-        O: ShardOperation + 'static,
+        O: LeafOperation + 'static,
     {
         let operation = Arc::new(operation);
         let first_requirement = operation.first_requirement();
-        let resolver: Arc<dyn ShardResolver> = operation.clone();
+        let resolver: Arc<dyn LeafResolver> = operation.clone();
         let outcome = self
-            .submit_shard(
+            .submit_leaf(
                 operation.path(),
                 operation.id(),
                 resolver,
@@ -982,7 +982,7 @@ impl ShardCoordinator {
 
     /// Submits one operation's resolver through the [`Dedup`] and awaits its
     /// single-round [`CoordinatedOutcome`]. The worker merges it into any
-    /// in-flight round for the shard, folds it, retries CAS contention / in-doubt
+    /// in-flight round for the leaf, folds it, retries CAS contention / in-doubt
     /// internally, and deposits the policy outcome plus its physical evidence
     /// into the slot. Returns `Ok(None)` if the coordinator was shut down before
     /// the round ran, so the operation can preserve its best-effort behavior.
@@ -997,18 +997,18 @@ impl ShardCoordinator {
     /// `path` is the leaf's object path — the collection root `_r` for a small
     /// collection's single leaf, else a standalone node `_n` resolved by descent
     /// ([`TreeRouter`](glassdb_storage::TreeRouter)).
-    async fn submit_shard(
+    async fn submit_leaf(
         &self,
         path: &ObjectPath,
         id: &TxId,
-        resolver: Arc<dyn ShardResolver>,
+        resolver: Arc<dyn LeafResolver>,
         first_requirement: Requirement,
     ) -> Result<Option<CoordinatedOutcome>, TransError> {
         let slot: OutcomeSlot = Arc::new(Mutex::new(None));
         let mut members = BTreeMap::new();
         members.insert(
             id.clone(),
-            ShardMember {
+            LeafMember {
                 resolver,
                 slot: slot.clone(),
             },
@@ -1064,7 +1064,7 @@ mod tests {
     };
     use glassdb_concurr::Background;
     use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath};
-    use glassdb_storage::{CachedStore, CurrentState, LockType, Node, Shard, Timeline};
+    use glassdb_storage::{CachedStore, CurrentState, LeafBody, LockType, Node, Timeline};
 
     const COLL: &str = "coordp";
 
@@ -1079,12 +1079,12 @@ mod tests {
     struct NoSplitHints;
 
     impl SplitHinter for NoSplitHints {
-        fn observe_leaf(&self, _path: &ObjectPath, _shard: &Shard) {}
+        fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {}
     }
 
     // Every coordination round in these tests targets one leaf object. A
     // standalone node `_n/<token>` is the cleanest stand-in: it carries only key
-    // entries (no collection metadata), exactly what the shard fold operates on.
+    // entries (no collection metadata), exactly what the leaf fold operates on.
     fn leaf_path() -> ObjectPath {
         ObjectPath::Node {
             collection: collection(),
@@ -1097,12 +1097,12 @@ mod tests {
     }
 
     // A coordinator over `backend` with its own (large, non-evicting) cache, plus
-    // the shard store backing it (a clone sharing the cache, so a test can warm or
+    // the leaf store backing it (a clone sharing the cache, so a test can warm or
     // seed the cache the coordinator reads). The returned `Background` must be
     // kept alive for the monitor's lifetime.
     async fn coord_over(
         backend: Arc<dyn Backend>,
-    ) -> (ShardCoordinator, NodeStore, Timeline, Arc<Background>) {
+    ) -> (LeafCoordinator, NodeStore, Timeline, Arc<Background>) {
         coord_over_with(backend, SplitPolicy::default(), Arc::new(NoSplitHints)).await
     }
 
@@ -1110,7 +1110,7 @@ mod tests {
         backend: Arc<dyn Backend>,
         policy: SplitPolicy,
         hinter: Arc<dyn SplitHinter>,
-    ) -> (ShardCoordinator, NodeStore, Timeline, Arc<Background>) {
+    ) -> (LeafCoordinator, NodeStore, Timeline, Arc<Background>) {
         coord_over_retry(backend, policy, hinter, RetryConfig::default()).await
     }
 
@@ -1118,7 +1118,7 @@ mod tests {
     // does not pay the production retry delay.
     async fn coord_over_fast(
         backend: Arc<dyn Backend>,
-    ) -> (ShardCoordinator, NodeStore, Timeline, Arc<Background>) {
+    ) -> (LeafCoordinator, NodeStore, Timeline, Arc<Background>) {
         coord_over_retry(
             backend,
             SplitPolicy::default(),
@@ -1136,7 +1136,7 @@ mod tests {
         policy: SplitPolicy,
         hinter: Arc<dyn SplitHinter>,
         retry: RetryConfig,
-    ) -> (ShardCoordinator, NodeStore, Timeline, Arc<Background>) {
+    ) -> (LeafCoordinator, NodeStore, Timeline, Arc<Background>) {
         let seed_timeline = Timeline::new();
         let seed_store = NodeStore::new(
             CachedStore::new(backend.clone(), 1 << 20, seed_timeline, None),
@@ -1146,7 +1146,7 @@ mod tests {
             .store_node(
                 &collection(),
                 &leaf_token(),
-                &Node::leaf(Shard::new()),
+                &Node::leaf(LeafBody::new()),
                 None,
             )
             .await
@@ -1158,14 +1158,14 @@ mod tests {
         let timeline = foundation.timeline.clone();
         let bg = foundation.background.clone();
         let mon = foundation.monitor.clone();
-        let shards = foundation.shards.clone();
+        let nodes = foundation.nodes.clone();
         let key_state = KeyStateResolver::new(mon.clone());
         let coord =
-            ShardCoordinator::with_hinter(shards.clone(), key_state, mon, retry, policy, hinter);
-        (coord, shards, timeline, bg)
+            LeafCoordinator::with_hinter(nodes.clone(), key_state, mon, retry, policy, hinter);
+        (coord, nodes, timeline, bg)
     }
 
-    // A cold shard store over `backend` (its own empty cache), for asserting what
+    // A cold leaf store over `backend` (its own empty cache), for asserting what
     // actually landed in storage without touching the coordinator's cache.
     fn cold_store(backend: Arc<dyn Backend>) -> NodeStore {
         let timeline = Timeline::new();
@@ -1175,14 +1175,9 @@ mod tests {
         )
     }
 
-    fn entry(
-        key: &[u8],
-        typ: LockType,
-        holder: Option<&TxId>,
-        writer: Option<&TxId>,
-    ) -> ShardEntry {
+    fn entry(key: &[u8], typ: LockType, holder: Option<&TxId>, writer: Option<&TxId>) -> LeafEntry {
         let mut entry =
-            ShardEntry::new(key).with_current(writer.map_or(CurrentState::Absent, |writer| {
+            LeafEntry::new(key).with_current(writer.map_or(CurrentState::Absent, |writer| {
                 CurrentState::External {
                     writer: writer.clone(),
                 }
@@ -1199,20 +1194,20 @@ mod tests {
 
     // Replaces the leaf's entries with exactly `entries` (a plain CAS, no
     // coordinator).
-    async fn store_shard_entries(store: &NodeStore, path: &ObjectPath, entries: Vec<ShardEntry>) {
+    async fn store_leaf_entries(store: &NodeStore, path: &ObjectPath, entries: Vec<LeafEntry>) {
         let _ = store
             .store_node(
                 &collection(),
                 &leaf_token(),
-                &Node::leaf(Shard::new()),
+                &Node::leaf(LeafBody::new()),
                 None,
             )
             .await
             .unwrap();
         let loaded = store.load_leaf(path, Requirement::Any).await.unwrap();
-        let shard = Shard::from_entries(entries);
+        let leaf = LeafBody::from_entries(entries);
         let mut edit = loaded.into_edit();
-        edit.set_entries(shard);
+        edit.set_entries(leaf);
         assert!(store.commit_leaf(edit).await.unwrap());
     }
 
@@ -1229,7 +1224,7 @@ mod tests {
         );
     }
 
-    fn shard_reads(log: &OpLog) -> usize {
+    fn leaf_reads(log: &OpLog) -> usize {
         log.lock()
             .unwrap()
             .iter()
@@ -1237,7 +1232,7 @@ mod tests {
             .count()
     }
 
-    fn shard_stores(log: &OpLog) -> usize {
+    fn leaf_stores(log: &OpLog) -> usize {
         log.lock()
             .unwrap()
             .iter()
@@ -1248,7 +1243,7 @@ mod tests {
     }
 
     // Loads the leaf's entries from a cold store, for asserting what landed.
-    async fn cold_entries(store: &NodeStore, path: &ObjectPath) -> Shard {
+    async fn cold_entries(store: &NodeStore, path: &ObjectPath) -> LeafBody {
         store
             .load_leaf(path, Requirement::Any)
             .await
@@ -1265,11 +1260,11 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ShardResolver for StageLock {
+    impl LeafResolver for StageLock {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
-            staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            staged: &BTreeMap<Vec<u8>, LeafEntry>,
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             let mut e = staged
@@ -1305,7 +1300,7 @@ mod tests {
         }
     }
 
-    impl ShardOperation for StageLock {
+    impl LeafOperation for StageLock {
         type Output = bool;
 
         fn path(&self) -> &ObjectPath {
@@ -1340,11 +1335,11 @@ mod tests {
     struct SkipRelease;
 
     #[async_trait::async_trait]
-    impl ShardResolver for SkipRelease {
+    impl LeafResolver for SkipRelease {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            _staged: &BTreeMap<Vec<u8>, LeafEntry>,
             _staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             Ok(Step::Skip {
@@ -1377,11 +1372,11 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ShardResolver for Recorder {
+    impl LeafResolver for Recorder {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
-            staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            staged: &BTreeMap<Vec<u8>, LeafEntry>,
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             self.trace
@@ -1408,7 +1403,7 @@ mod tests {
         }
     }
 
-    // A hook that parks the next shard read while armed, letting a second submitter merge.
+    // A hook that parks the next leaf read while armed, letting a second submitter merge.
     struct Gate {
         notify: Arc<tokio::sync::Notify>,
         armed: std::sync::atomic::AtomicBool,
@@ -1456,7 +1451,7 @@ mod tests {
     }
 
     impl SplitHinter for HintCounter {
-        fn observe_leaf(&self, _path: &ObjectPath, _shard: &Shard) {
+        fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {
             self.calls.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -1464,9 +1459,9 @@ mod tests {
     // A typed operation drives one CAS and translates its exact precondition
     // receipt without exposing the shared outcome vocabulary to its caller.
     #[tokio::test]
-    async fn shard_stage_is_cas_persisted() {
+    async fn leaf_stage_is_cas_persisted() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (coord, _shards, _timeline, _bg) = coord_over(backend.clone()).await;
+        let (coord, _nodes, _timeline, _bg) = coord_over(backend.clone()).await;
         let tx = TxId::with_priority(1, b"t");
 
         let landed = coord
@@ -1480,14 +1475,14 @@ mod tests {
         assert!(landed);
         coord.close().await;
 
-        let shard = cold_entries(&cold_store(backend), &leaf()).await;
-        let e = shard.lookup(b"k").expect("the staged lock is persisted");
+        let leaf = cold_entries(&cold_store(backend), &leaf()).await;
+        let e = leaf.lookup(b"k").expect("the staged lock is persisted");
         assert_eq!(e.lock_type(), LockType::Write);
         assert_eq!(e.lock_holders(), std::slice::from_ref(&tx));
     }
 
     // A split can move a key to a right sibling after it was routed to this
-    // leaf. The coordinator must notice the loaded leaf no longer owns the key
+    // leaf. The coordinator must notice the loaded leaf no longer covers the key
     // and re-route (deliver the member's re-route outcome) rather than strand a
     // fresh entry in the wrong leaf (ADR-031, M1-S2).
     #[tokio::test]
@@ -1495,9 +1490,9 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (coord, store, _timeline, _bg) = coord_over(backend.clone()).await;
 
-        // Seed the leaf as a shrunk left half: it owns keys < "m" and links to a
+        // Seed the leaf as a shrunk left half: it covers keys < "m" and links to a
         // right sibling. "z" now lives in that sibling, not here.
-        let node = Node::leaf(Shard::from_entries([entry(
+        let node = Node::leaf(LeafBody::from_entries([entry(
             b"a",
             LockType::None,
             None,
@@ -1509,7 +1504,7 @@ mod tests {
 
         let tx = TxId::with_priority(1, b"t");
         let out = coord
-            .submit_shard(
+            .submit_leaf(
                 &leaf(),
                 &tx,
                 Arc::new(StageLock {
@@ -1534,28 +1529,28 @@ mod tests {
         coord.close().await;
 
         // The wrong leaf was never mutated: "z" was not stranded here, and the
-        // owned key "a" is untouched.
-        let shard = cold_entries(&cold_store(backend), &leaf()).await;
+        // covered key "a" is untouched.
+        let leaf = cold_entries(&cold_store(backend), &leaf()).await;
         assert!(
-            shard.lookup(b"z").is_none(),
+            leaf.lookup(b"z").is_none(),
             "moved key must not be recreated here"
         );
-        assert!(shard.lookup(b"a").is_some());
+        assert!(leaf.lookup(b"a").is_some());
     }
 
-    // An owned key still folds normally: the ownership re-check is transparent
-    // when the leaf legitimately owns the round's keys.
+    // A covered key still folds normally: the coverage re-check is transparent
+    // when the leaf covers the round's keys.
     #[tokio::test]
-    async fn owned_key_folds_normally_despite_a_high_key() {
+    async fn covered_key_folds_normally_despite_a_high_key() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (coord, store, _timeline, _bg) = coord_over(backend.clone()).await;
 
-        let node = Node::leaf(Shard::new()).with_high_key(Some(b"m".to_vec()));
+        let node = Node::leaf(LeafBody::new()).with_high_key(Some(b"m".to_vec()));
         replace_leaf_node(&store, &node).await;
 
         let tx = TxId::with_priority(1, b"t");
         let out = coord
-            .submit_shard(
+            .submit_leaf(
                 &leaf(),
                 &tx,
                 Arc::new(StageLock {
@@ -1577,26 +1572,26 @@ mod tests {
         ));
         coord.close().await;
 
-        let shard = cold_entries(&cold_store(backend), &leaf()).await;
+        let leaf = cold_entries(&cold_store(backend), &leaf()).await;
         assert!(
-            shard.lookup(b"a").is_some(),
-            "an owned key is locked as usual"
+            leaf.lookup(b"a").is_some(),
+            "a covered key is locked as usual"
         );
     }
 
     // A resolver that stages nothing (`Skip`) still gets its outcome and the
     // loaded observation, but the round issues no CAS.
     #[tokio::test]
-    async fn shard_skip_delivers_outcome_without_cas() {
+    async fn leaf_skip_delivers_outcome_without_cas() {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let log = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
-        let (coord, _shards, _timeline, _bg) = coord_over(backend).await;
+        let (coord, _nodes, _timeline, _bg) = coord_over(backend).await;
         log.lock().unwrap().clear();
         let tx = TxId::with_priority(1, b"t");
 
         let out = coord
-            .submit_shard(&leaf(), &tx, Arc::new(SkipRelease), Requirement::Any)
+            .submit_leaf(&leaf(), &tx, Arc::new(SkipRelease), Requirement::Any)
             .await
             .unwrap();
         assert!(matches!(
@@ -1606,7 +1601,7 @@ mod tests {
                 evidence: Some(CoordinationEvidence::Observed(_)),
             })
         ));
-        assert_eq!(shard_stores(&log), 0, "a skip stages nothing, so no CAS");
+        assert_eq!(leaf_stores(&log), 0, "a skip stages nothing, so no CAS");
         coord.close().await;
     }
 
@@ -1614,12 +1609,12 @@ mod tests {
     // from absent, so the CAS that folds the round drops it (ADR-029) while
     // keeping live pointers and newly staged locks.
     #[tokio::test]
-    async fn shard_prunes_vestigial_entries_on_cas() {
+    async fn leaf_prunes_vestigial_entries_on_cas() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (coord, shards, _timeline, _bg) = coord_over(backend.clone()).await;
+        let (coord, nodes, _timeline, _bg) = coord_over(backend.clone()).await;
         let writer = TxId::with_priority(1, b"w");
-        store_shard_entries(
-            &shards,
+        store_leaf_entries(
+            &nodes,
             &leaf(),
             vec![
                 entry(b"vestige", LockType::None, None, None),
@@ -1630,7 +1625,7 @@ mod tests {
 
         let tx = TxId::with_priority(2, b"t");
         coord
-            .submit_shard(
+            .submit_leaf(
                 &leaf(),
                 &tx,
                 Arc::new(StageLock {
@@ -1644,20 +1639,20 @@ mod tests {
             .unwrap();
         coord.close().await;
 
-        let shard = cold_entries(&cold_store(backend), &leaf()).await;
+        let leaf = cold_entries(&cold_store(backend), &leaf()).await;
         assert!(
-            shard.lookup(b"vestige").is_none(),
+            leaf.lookup(b"vestige").is_none(),
             "the vestigial entry is dropped by the CAS"
         );
-        assert!(shard.lookup(b"live").is_some(), "the live pointer is kept");
+        assert!(leaf.lookup(b"live").is_some(), "the live pointer is kept");
         assert!(
-            shard.lookup(b"lock").is_some(),
+            leaf.lookup(b"lock").is_some(),
             "the newly staged lock is kept"
         );
     }
 
     // ADR-030 at the coordinator: a lone round's first attempt reuses the cached
-    // shard when the submitter asks for `Any` (no backend read), while a current
+    // leaf when the submitter asks for `Any` (no backend read), while a current
     // lower bound revalidates it with one conditional read.
     #[tokio::test]
     async fn any_first_attempt_reuses_cache() {
@@ -1668,14 +1663,14 @@ mod tests {
         // Seed through a separate cache so the coordinator starts cold, then warm
         // its cache with one cold load.
         let writer = TxId::with_priority(1, b"w");
-        store_shard_entries(
+        store_leaf_entries(
             &cold_store(backend.clone()),
             &leaf(),
             vec![entry(b"seed", LockType::None, None, Some(&writer))],
         )
         .await;
-        let (coord, shards, timeline, _bg) = coord_over(backend.clone()).await;
-        shards
+        let (coord, nodes, timeline, _bg) = coord_over(backend.clone()).await;
+        nodes
             .load_leaf(&leaf_path(), Requirement::Any)
             .await
             .unwrap();
@@ -1683,18 +1678,18 @@ mod tests {
         let tx = TxId::with_priority(2, b"t");
         log.lock().unwrap().clear();
         coord
-            .submit_shard(&leaf(), &tx, Arc::new(SkipRelease), Requirement::Any)
+            .submit_leaf(&leaf(), &tx, Arc::new(SkipRelease), Requirement::Any)
             .await
             .unwrap();
         assert_eq!(
-            shard_reads(&log),
+            leaf_reads(&log),
             0,
-            "Any serves the cached shard with no backend read"
+            "Any serves the cached leaf with no backend read"
         );
 
         log.lock().unwrap().clear();
         coord
-            .submit_shard(
+            .submit_leaf(
                 &leaf(),
                 &tx,
                 Arc::new(SkipRelease),
@@ -1703,23 +1698,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            shard_reads(&log),
+            leaf_reads(&log),
             1,
-            "a current bound revalidates the cached shard once"
+            "a current bound revalidates the cached leaf once"
         );
         coord.close().await;
     }
 
-    // ADR-028: two transactions contending the same shard merge into one round —
+    // ADR-028: two transactions contending the same leaf merge into one round —
     // a single shared load and a single CAS — folded oldest-first, with the
     // younger member observing the older's staged entry (threading).
     #[tokio::test(start_paused = true)]
-    async fn same_shard_submits_merge_into_one_round() {
+    async fn same_leaf_submits_merge_into_one_round() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (backend, gate) = Gate::wrap(mem);
         let recorder = Arc::new(RecordingBackend::new(backend));
         let log = recorder.log();
-        let (coord, _shards, _timeline, _bg) = coord_over(recorder as Arc<dyn Backend>).await;
+        let (coord, _nodes, _timeline, _bg) = coord_over(recorder as Arc<dyn Backend>).await;
         log.lock().unwrap().clear();
 
         let trace: FoldTrace = Arc::new(Mutex::new(Vec::new()));
@@ -1731,7 +1726,7 @@ mod tests {
         gate.arm();
         let (c1, t1, tr1) = (coord.clone(), old.clone(), trace.clone());
         let driver = tokio::spawn(async move {
-            c1.submit_shard(
+            c1.submit_leaf(
                 &leaf(),
                 &t1,
                 Arc::new(Recorder {
@@ -1747,7 +1742,7 @@ mod tests {
 
         let (c2, t2, tr2) = (coord.clone(), young.clone(), trace.clone());
         let joiner = tokio::spawn(async move {
-            c2.submit_shard(
+            c2.submit_leaf(
                 &leaf(),
                 &t2,
                 Arc::new(Recorder {
@@ -1777,8 +1772,8 @@ mod tests {
             })
         ));
 
-        assert_eq!(shard_reads(&log), 1, "both members share one shard load");
-        assert_eq!(shard_stores(&log), 1, "both members land in one CAS");
+        assert_eq!(leaf_reads(&log), 1, "both members share one leaf load");
+        assert_eq!(leaf_stores(&log), 1, "both members land in one CAS");
         coord.close().await;
 
         let trace = trace.lock().unwrap();
@@ -1800,7 +1795,7 @@ mod tests {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (backend, gate) = Gate::wrap(mem);
         let backend = backend as Arc<dyn Backend>;
-        let (coord, _shards, _timeline, _bg) = coord_over(backend.clone()).await;
+        let (coord, _nodes, _timeline, _bg) = coord_over(backend.clone()).await;
         let first = TxId::with_priority(1, b"first");
         let second = TxId::with_priority(2, b"second");
 
@@ -1809,7 +1804,7 @@ mod tests {
         gate.arm();
         let (c1, t1) = (coord.clone(), first.clone());
         let driver = tokio::spawn(async move {
-            c1.submit_shard(
+            c1.submit_leaf(
                 &leaf(),
                 &t1,
                 Arc::new(StageInline::logless(b"k", &t1, b"first")),
@@ -1820,7 +1815,7 @@ mod tests {
         rt::sleep(Duration::from_secs(1)).await;
         let (c2, t2) = (coord.clone(), second.clone());
         let joiner = tokio::spawn(async move {
-            c2.submit_shard(
+            c2.submit_leaf(
                 &leaf(),
                 &t2,
                 Arc::new(StageInline::logless(b"k", &t2, b"second")),
@@ -1851,9 +1846,9 @@ mod tests {
         );
         coord.close().await;
 
-        let shard = cold_entries(&cold_store(backend), &leaf()).await;
+        let leaf = cold_entries(&cold_store(backend), &leaf()).await;
         assert_eq!(
-            shard.lookup(b"k").unwrap().current.inline().map(|v| &**v),
+            leaf.lookup(b"k").unwrap().current.inline().map(|v| &**v),
             Some(b"first".as_slice()),
             "the first commit survives the round intact"
         );
@@ -1861,7 +1856,7 @@ mod tests {
 
     // A logless direct-commit-shaped resolver (ADR-051): the entry it stages is
     // the only record of its commit, so it claims its key for the round and
-    // classifies an abandoned round the way `DirectCommitOperation` does — the
+    // classifies an unfinished round the way `DirectCommitOperation` does — the
     // ambiguity is irreducible only if its own stage rode a CAS that may have
     // landed. `replayable` models a read-modify-write, whose certified losses are
     // `Replay` rather than `Moved` (ADR-053), and makes exclusion observably
@@ -1892,14 +1887,14 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ShardResolver for LoglessCommitProbe {
+    impl LeafResolver for LoglessCommitProbe {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            _staged: &BTreeMap<Vec<u8>, LeafEntry>,
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
-            let e = ShardEntry::new(self.key.clone()).with_current(CurrentState::Inline {
+            let e = LeafEntry::new(self.key.clone()).with_current(CurrentState::Inline {
                 writer: self.tx.clone(),
                 value: self.value.clone(),
             });
@@ -1976,11 +1971,11 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ShardResolver for MultiPublisherProbe {
+    impl LeafResolver for MultiPublisherProbe {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            _staged: &BTreeMap<Vec<u8>, LeafEntry>,
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             if self.already_landed {
@@ -1992,7 +1987,7 @@ mod tests {
                 .keys
                 .iter()
                 .map(|key| {
-                    let entry = ShardEntry::new(key.clone()).with_current(CurrentState::Inline {
+                    let entry = LeafEntry::new(key.clone()).with_current(CurrentState::Inline {
                         writer: self.tx.clone(),
                         value: Arc::from(self.tx.as_bytes()),
                     });
@@ -2045,7 +2040,7 @@ mod tests {
         let backend = backend as Arc<dyn Backend>;
         let recording = Arc::new(RecordingBackend::new(backend.clone()));
         let log = recording.log();
-        let (coord, _shards, _timeline, _bg) = coord_over(recording.clone()).await;
+        let (coord, _nodes, _timeline, _bg) = coord_over(recording.clone()).await;
         let first = TxId::with_priority(1, b"first");
         let second = TxId::with_priority(2, b"second");
         log.lock().unwrap().clear();
@@ -2053,7 +2048,7 @@ mod tests {
         gate.arm();
         let (c1, t1) = (coord.clone(), first.clone());
         let driver = tokio::spawn(async move {
-            c1.submit_shard(
+            c1.submit_leaf(
                 &leaf(),
                 &t1,
                 Arc::new(MultiPublisherProbe::direct(&[b"a", b"b"], &t1)),
@@ -2064,7 +2059,7 @@ mod tests {
         rt::sleep(Duration::from_secs(1)).await;
         let (c2, t2) = (coord.clone(), second.clone());
         let joiner = tokio::spawn(async move {
-            c2.submit_shard(
+            c2.submit_leaf(
                 &leaf(),
                 &t2,
                 Arc::new(MultiPublisherProbe::publisher(&[b"b", b"c"], &t2)),
@@ -2097,13 +2092,13 @@ mod tests {
                 None => panic!("publisher received no outcome"),
             }
         }
-        assert_eq!(shard_stores(&log), 1);
+        assert_eq!(leaf_stores(&log), 1);
         coord.close().await;
 
-        let shard = cold_entries(&cold_store(backend), &leaf()).await;
-        assert_eq!(shard.lookup(b"a").unwrap().current.writer(), Some(&first));
-        assert_eq!(shard.lookup(b"b").unwrap().current.writer(), Some(&first));
-        assert!(shard.lookup(b"c").is_none(), "the loser staged no subset");
+        let leaf = cold_entries(&cold_store(backend), &leaf()).await;
+        assert_eq!(leaf.lookup(b"a").unwrap().current.writer(), Some(&first));
+        assert_eq!(leaf.lookup(b"b").unwrap().current.writer(), Some(&first));
+        assert!(leaf.lookup(b"c").is_none(), "the loser staged no subset");
     }
 
     #[tokio::test(start_paused = true)]
@@ -2113,7 +2108,7 @@ mod tests {
         let backend = backend as Arc<dyn Backend>;
         let recording = Arc::new(RecordingBackend::new(backend));
         let log = recording.log();
-        let (coord, _shards, _timeline, _bg) = coord_over(recording).await;
+        let (coord, _nodes, _timeline, _bg) = coord_over(recording).await;
         let first = TxId::with_priority(1, b"first");
         let second = TxId::with_priority(2, b"second");
         log.lock().unwrap().clear();
@@ -2121,7 +2116,7 @@ mod tests {
         gate.arm();
         let (c1, t1) = (coord.clone(), first.clone());
         let driver = tokio::spawn(async move {
-            c1.submit_shard(
+            c1.submit_leaf(
                 &leaf(),
                 &t1,
                 Arc::new(MultiPublisherProbe::direct(&[b"a", b"b"], &t1)),
@@ -2132,7 +2127,7 @@ mod tests {
         rt::sleep(Duration::from_secs(1)).await;
         let (c2, t2) = (coord.clone(), second.clone());
         let joiner = tokio::spawn(async move {
-            c2.submit_shard(
+            c2.submit_leaf(
                 &leaf(),
                 &t2,
                 Arc::new(MultiPublisherProbe::direct(&[b"c", b"d"], &t2)),
@@ -2155,7 +2150,7 @@ mod tests {
                 })
             ));
         }
-        assert_eq!(shard_stores(&log), 1);
+        assert_eq!(leaf_stores(&log), 1);
         coord.close().await;
     }
 
@@ -2164,17 +2159,17 @@ mod tests {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (backend, gate) = Gate::wrap(mem);
         let backend = backend as Arc<dyn Backend>;
-        let (coord, _shards, _timeline, _bg) = coord_over(backend.clone()).await;
+        let (coord, _nodes, _timeline, _bg) = coord_over(backend.clone()).await;
         let first = TxId::with_priority(1, b"first");
         let second = TxId::with_priority(2, b"second");
         let seed_store = cold_store(backend.clone());
-        store_shard_entries(
+        store_leaf_entries(
             &seed_store,
             &leaf(),
             [b"a".as_slice(), b"b".as_slice()]
                 .into_iter()
                 .map(|key| {
-                    ShardEntry::new(key).with_current(CurrentState::Inline {
+                    LeafEntry::new(key).with_current(CurrentState::Inline {
                         writer: first.clone(),
                         value: Arc::from(b"landed".as_slice()),
                     })
@@ -2186,7 +2181,7 @@ mod tests {
         gate.arm();
         let (c1, t1) = (coord.clone(), first.clone());
         let driver = tokio::spawn(async move {
-            c1.submit_shard(
+            c1.submit_leaf(
                 &leaf(),
                 &t1,
                 Arc::new(MultiPublisherProbe::landed(&[b"a", b"b"], &t1)),
@@ -2197,7 +2192,7 @@ mod tests {
         rt::sleep(Duration::from_secs(1)).await;
         let (c2, t2) = (coord.clone(), second.clone());
         let joiner = tokio::spawn(async move {
-            c2.submit_shard(
+            c2.submit_leaf(
                 &leaf(),
                 &t2,
                 Arc::new(MultiPublisherProbe::publisher(&[b"b", b"c"], &t2)),
@@ -2233,9 +2228,9 @@ mod tests {
         }
         coord.close().await;
 
-        let shard = cold_entries(&cold_store(backend), &leaf()).await;
-        assert_eq!(shard.lookup(b"b").unwrap().current.writer(), Some(&first));
-        assert!(shard.lookup(b"c").is_none());
+        let leaf = cold_entries(&cold_store(backend), &leaf()).await;
+        assert_eq!(leaf.lookup(b"b").unwrap().current.writer(), Some(&first));
+        assert!(leaf.lookup(b"c").is_none());
     }
 
     // Faults the first leaf CAS as in-doubt and lets every later one through.
@@ -2267,11 +2262,11 @@ mod tests {
     struct SkipCauseProbe;
 
     #[async_trait::async_trait]
-    impl ShardResolver for SkipCauseProbe {
+    impl LeafResolver for SkipCauseProbe {
         async fn resolve(
             &self,
             ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            _staged: &BTreeMap<Vec<u8>, LeafEntry>,
             _staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true });
@@ -2307,7 +2302,7 @@ mod tests {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (gated, gate) = Gate::wrap(mem);
         let backend = in_doubt_then_ok(gated as Arc<dyn Backend>) as Arc<dyn Backend>;
-        let (coord, _shards, _timeline, _bg) = coord_over(backend.clone()).await;
+        let (coord, _nodes, _timeline, _bg) = coord_over(backend.clone()).await;
         let first = TxId::with_priority(1, b"first");
         let second = TxId::with_priority(2, b"second");
 
@@ -2317,7 +2312,7 @@ mod tests {
         gate.arm();
         let (c1, t1) = (coord.clone(), first.clone());
         let driver = tokio::spawn(async move {
-            c1.submit_shard(
+            c1.submit_leaf(
                 &leaf(),
                 &t1,
                 Arc::new(LoglessCommitProbe::new(b"k", &t1, b"first")),
@@ -2328,7 +2323,7 @@ mod tests {
         rt::sleep(Duration::from_secs(1)).await;
         let (c2, t2) = (coord.clone(), second.clone());
         let joiner = tokio::spawn(async move {
-            c2.submit_shard(
+            c2.submit_leaf(
                 &leaf(),
                 &t2,
                 Arc::new(LoglessCommitProbe::new(b"k", &t2, b"second")),
@@ -2373,14 +2368,14 @@ mod tests {
     async fn an_excluded_logless_member_learns_a_replayable_loss() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (backend, gate) = Gate::wrap(mem);
-        let (coord, _shards, _timeline, _bg) = coord_over(backend as Arc<dyn Backend>).await;
+        let (coord, _nodes, _timeline, _bg) = coord_over(backend as Arc<dyn Backend>).await;
         let first = TxId::with_priority(1, b"first");
         let second = TxId::with_priority(2, b"second");
 
         gate.arm();
         let (c1, t1) = (coord.clone(), first.clone());
         let driver = tokio::spawn(async move {
-            c1.submit_shard(
+            c1.submit_leaf(
                 &leaf(),
                 &t1,
                 Arc::new(LoglessCommitProbe::replayable(b"k", &t1, b"first")),
@@ -2391,7 +2386,7 @@ mod tests {
         rt::sleep(Duration::from_secs(1)).await;
         let (c2, t2) = (coord.clone(), second.clone());
         let joiner = tokio::spawn(async move {
-            c2.submit_shard(
+            c2.submit_leaf(
                 &leaf(),
                 &t2,
                 Arc::new(LoglessCommitProbe::replayable(b"k", &t2, b"second")),
@@ -2433,14 +2428,14 @@ mod tests {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (gated, gate) = Gate::wrap(mem);
         let backend = in_doubt_then_ok(gated as Arc<dyn Backend>) as Arc<dyn Backend>;
-        let (coord, _shards, _timeline, _bg) = coord_over(backend).await;
+        let (coord, _nodes, _timeline, _bg) = coord_over(backend).await;
         let first = TxId::with_priority(1, b"first");
         let second = TxId::with_priority(2, b"second");
 
         gate.arm();
         let (c1, t1) = (coord.clone(), first.clone());
         let driver = tokio::spawn(async move {
-            c1.submit_shard(
+            c1.submit_leaf(
                 &leaf(),
                 &t1,
                 Arc::new(LoglessCommitProbe::replayable(b"k", &t1, b"first")),
@@ -2451,7 +2446,7 @@ mod tests {
         rt::sleep(Duration::from_secs(1)).await;
         let (c2, t2) = (coord.clone(), second.clone());
         let joiner = tokio::spawn(async move {
-            c2.submit_shard(
+            c2.submit_leaf(
                 &leaf(),
                 &t2,
                 Arc::new(LoglessCommitProbe::replayable(b"k", &t2, b"second")),
@@ -2494,13 +2489,13 @@ mod tests {
     // carry their own outcome slot, but a fold round runs one resolver per id and
     // the dedup delivers to every merged submission; merging them would collapse
     // the two slots into one and leave the loser a delivered-but-empty slot. The
-    // coordinator must instead serialize same-id submissions into separate rounds
+    // coordinator must instead serialize same-identity submissions into separate rounds
     // so each gets its own outcome rather than panicking.
     #[tokio::test(start_paused = true)]
     async fn same_tx_concurrent_submits_each_get_an_outcome() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (backend, gate) = Gate::wrap(mem);
-        let (coord, _shards, _timeline, _bg) = coord_over(backend as Arc<dyn Backend>).await;
+        let (coord, _nodes, _timeline, _bg) = coord_over(backend as Arc<dyn Backend>).await;
         let tx = TxId::with_priority(1, b"t");
 
         // The acquire submits first, becomes the dedup driver, and parks in the
@@ -2508,7 +2503,7 @@ mod tests {
         gate.arm();
         let (c1, t1) = (coord.clone(), tx.clone());
         let acquire = tokio::spawn(async move {
-            c1.submit_shard(
+            c1.submit_leaf(
                 &leaf(),
                 &t1,
                 Arc::new(StageLock {
@@ -2524,7 +2519,7 @@ mod tests {
 
         let (c2, t2) = (coord.clone(), tx.clone());
         let release = tokio::spawn(async move {
-            c2.submit_shard(&leaf(), &t2, Arc::new(SkipRelease), Requirement::Any)
+            c2.submit_leaf(&leaf(), &t2, Arc::new(SkipRelease), Requirement::Any)
                 .await
         });
         rt::sleep(Duration::from_secs(1)).await;
@@ -2570,10 +2565,10 @@ mod tests {
         overwritten.replace_write_lock(old.clone());
         let created = entry(b"z", LockType::Create, Some(&young), None);
 
-        let base_len = Node::leaf(Shard::from_entries([seed.clone()])).content_encoded_len();
+        let base_len = Node::leaf(LeafBody::from_entries([seed.clone()])).content_encoded_len();
         let overwrite_len =
-            Node::leaf(Shard::from_entries([overwritten.clone()])).content_encoded_len();
-        let full_node = Node::leaf(Shard::from_entries([overwritten, created]));
+            Node::leaf(LeafBody::from_entries([overwritten.clone()])).content_encoded_len();
+        let full_node = Node::leaf(LeafBody::from_entries([overwritten, created]));
         let content_limit = overwrite_len - 1;
         assert!(base_len <= content_limit);
         assert!(overwrite_len > content_limit);
@@ -2586,15 +2581,15 @@ mod tests {
             .build()
             .unwrap();
         let hints = Arc::new(HintCounter::default());
-        let (coord, shards, _timeline, _bg) =
+        let (coord, nodes, _timeline, _bg) =
             coord_over_with(backend.clone(), policy, hints.clone()).await;
-        store_shard_entries(&shards, &leaf(), vec![seed]).await;
+        store_leaf_entries(&nodes, &leaf(), vec![seed]).await;
         log.lock().unwrap().clear();
 
         gate.arm();
         let (c1, t1) = (coord.clone(), old.clone());
         let overwrite = tokio::spawn(async move {
-            c1.submit_shard(
+            c1.submit_leaf(
                 &leaf(),
                 &t1,
                 Arc::new(StageLock {
@@ -2610,7 +2605,7 @@ mod tests {
 
         let (c2, t2) = (coord.clone(), young.clone());
         let create = tokio::spawn(async move {
-            c2.submit_shard(
+            c2.submit_leaf(
                 &leaf(),
                 &t2,
                 Arc::new(StageLock {
@@ -2641,7 +2636,7 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(shard_stores(&log), 1, "the admitted member still lands");
+        assert_eq!(leaf_stores(&log), 1, "the admitted member still lands");
         assert_eq!(
             hints.calls.load(Ordering::SeqCst),
             2,
@@ -2649,13 +2644,13 @@ mod tests {
         );
         coord.close().await;
 
-        let shard = cold_entries(&cold_store(backend), &leaf()).await;
+        let leaf = cold_entries(&cold_store(backend), &leaf()).await;
         assert_eq!(
-            shard.lookup(b"a").unwrap().lock_holders(),
+            leaf.lookup(b"a").unwrap().lock_holders(),
             std::slice::from_ref(&old)
         );
         assert!(
-            shard.lookup(b"z").is_none(),
+            leaf.lookup(b"z").is_none(),
             "the full create was not staged"
         );
     }
@@ -2678,14 +2673,14 @@ mod tests {
     }
 
     #[async_trait]
-    impl ShardResolver for StageInline {
+    impl LeafResolver for StageInline {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            _staged: &BTreeMap<Vec<u8>, LeafEntry>,
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
-            let e = ShardEntry::new(self.key.clone()).with_current(CurrentState::Inline {
+            let e = LeafEntry::new(self.key.clone()).with_current(CurrentState::Inline {
                 writer: self.tx.clone(),
                 value: self.value.clone(),
             });
@@ -2717,13 +2712,13 @@ mod tests {
     // same entry carrying `value` inline.
     fn policy_rejecting_inline(key: &[u8], tx: &TxId, value: &[u8]) -> SplitPolicy {
         let external =
-            ShardEntry::new(key).with_current(CurrentState::External { writer: tx.clone() });
-        let inline = ShardEntry::new(key).with_current(CurrentState::Inline {
+            LeafEntry::new(key).with_current(CurrentState::External { writer: tx.clone() });
+        let inline = LeafEntry::new(key).with_current(CurrentState::Inline {
             writer: tx.clone(),
             value: Arc::from(value),
         });
-        let external_len = Node::leaf(Shard::from_entries([external])).encoded_len();
-        let inline_len = Node::leaf(Shard::from_entries([inline])).encoded_len();
+        let external_len = Node::leaf(LeafBody::from_entries([external])).encoded_len();
+        let inline_len = Node::leaf(LeafBody::from_entries([inline])).encoded_len();
         assert!(
             inline_len > external_len,
             "the inline payload must add bytes"
@@ -2743,11 +2738,11 @@ mod tests {
         let value = b"a-value-that-does-not-fit";
         let policy = policy_rejecting_inline(b"k", &tx, value);
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (coord, _shards, _timeline, _bg) =
+        let (coord, _nodes, _timeline, _bg) =
             coord_over_with(backend.clone(), policy, Arc::new(NoSplitHints)).await;
 
         let outcome = coord
-            .submit_shard(
+            .submit_leaf(
                 &leaf(),
                 &tx,
                 Arc::new(StageInline::logless(b"k", &tx, value)),
@@ -2765,8 +2760,8 @@ mod tests {
         ));
         coord.close().await;
 
-        let shard = cold_entries(&cold_store(backend), &leaf()).await;
-        assert!(shard.lookup(b"k").is_none(), "nothing was written");
+        let leaf = cold_entries(&cold_store(backend), &leaf()).await;
+        assert!(leaf.lookup(b"k").is_none(), "nothing was written");
     }
 
     // An inline entry may fit the physical object while still consuming more
@@ -2777,19 +2772,21 @@ mod tests {
     async fn a_logless_inline_entry_must_preserve_the_split_budget() {
         let tx = TxId::with_priority(1, b"t");
         let value = b"inline";
-        let inline = ShardEntry::new(b"k").with_current(CurrentState::Inline {
+        let inline = LeafEntry::new(b"k").with_current(CurrentState::Inline {
             writer: tx.clone(),
             value: Arc::from(value.as_slice()),
         });
-        let entry_len = Node::leaf(Shard::from_entries([inline.clone()])).content_encoded_len();
+        let entry_len = Node::leaf(LeafBody::from_entries([inline.clone()])).content_encoded_len();
         let policy = SplitPolicy::builder()
             .node_max_bytes(entry_len * 2 + 64)
             .split_headroom_bytes(65)
             .build()
             .unwrap();
-        assert!(Node::leaf(Shard::from_entries([inline])).encoded_len() <= policy.node_max_bytes());
         assert!(
-            !policy.entry_fits_split_budget(&ShardEntry::new(b"k").with_current(
+            Node::leaf(LeafBody::from_entries([inline])).encoded_len() <= policy.node_max_bytes()
+        );
+        assert!(
+            !policy.entry_fits_split_budget(&LeafEntry::new(b"k").with_current(
                 CurrentState::Inline {
                     writer: tx.clone(),
                     value: Arc::from(value.as_slice()),
@@ -2799,10 +2796,10 @@ mod tests {
 
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let hints = Arc::new(HintCounter::default());
-        let (coord, _shards, _timeline, _bg) =
+        let (coord, _nodes, _timeline, _bg) =
             coord_over_with(backend.clone(), policy, hints.clone()).await;
         let outcome = coord
-            .submit_shard(
+            .submit_leaf(
                 &leaf(),
                 &tx,
                 Arc::new(StageInline::logless(b"k", &tx, value)),
@@ -2821,8 +2818,8 @@ mod tests {
         assert_eq!(hints.calls.load(Ordering::SeqCst), 0);
         coord.close().await;
 
-        let shard = cold_entries(&cold_store(backend), &leaf()).await;
-        assert!(shard.lookup(b"k").is_none(), "nothing was written");
+        let leaf = cold_entries(&cold_store(backend), &leaf()).await;
+        assert!(leaf.lookup(b"k").is_none(), "nothing was written");
     }
 
     struct CapacityAfterInDoubt {
@@ -2833,11 +2830,11 @@ mod tests {
     }
 
     #[async_trait]
-    impl ShardResolver for CapacityAfterInDoubt {
+    impl LeafResolver for CapacityAfterInDoubt {
         async fn resolve(
             &self,
             ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            _staged: &BTreeMap<Vec<u8>, LeafEntry>,
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             let fold = self.folds.fetch_add(1, Ordering::SeqCst);
@@ -2854,7 +2851,7 @@ mod tests {
             } else {
                 Arc::from(vec![b'x'; 128])
             };
-            let entry = ShardEntry::new(self.key.clone()).with_current(CurrentState::Inline {
+            let entry = LeafEntry::new(self.key.clone()).with_current(CurrentState::Inline {
                 writer: self.tx.clone(),
                 value,
             });
@@ -2887,16 +2884,16 @@ mod tests {
     async fn unreconciled_member_does_not_restage_after_in_doubt() {
         let tx = TxId::with_priority(1, b"t");
         let skipped = TxId::with_priority(2, b"skipped");
-        let small = ShardEntry::new(b"k").with_current(CurrentState::Inline {
+        let small = LeafEntry::new(b"k").with_current(CurrentState::Inline {
             writer: tx.clone(),
             value: Arc::from(b"x".as_slice()),
         });
-        let large = ShardEntry::new(b"k").with_current(CurrentState::Inline {
+        let large = LeafEntry::new(b"k").with_current(CurrentState::Inline {
             writer: tx.clone(),
             value: Arc::from(vec![b'x'; 128]),
         });
-        let small_len = Node::leaf(Shard::from_entries([small])).encoded_len();
-        let large_len = Node::leaf(Shard::from_entries([large])).encoded_len();
+        let small_len = Node::leaf(LeafBody::from_entries([small])).encoded_len();
+        let large_len = Node::leaf(LeafBody::from_entries([large])).encoded_len();
         assert!(large_len > small_len);
         let policy = SplitPolicy::builder()
             .node_max_bytes(small_len)
@@ -2908,7 +2905,7 @@ mod tests {
         let (gated, gate) = Gate::wrap(mem);
         let hooked = Arc::new(HookBackend::new(gated as Arc<dyn Backend>));
         let backend: Arc<dyn Backend> = hooked.clone();
-        let (coord, _shards, _timeline, _bg) =
+        let (coord, _nodes, _timeline, _bg) =
             coord_over_with(backend, policy, Arc::new(NoSplitHints)).await;
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         hooked.set_before({
@@ -2934,7 +2931,7 @@ mod tests {
         let (driver_coord, driver_tx) = (coord.clone(), tx.clone());
         let driver = tokio::spawn(async move {
             driver_coord
-                .submit_shard(
+                .submit_leaf(
                     &leaf(),
                     &driver_tx,
                     Arc::new(CapacityAfterInDoubt {
@@ -2951,7 +2948,7 @@ mod tests {
         let (joiner_coord, joiner_tx) = (coord.clone(), skipped.clone());
         let joiner = tokio::spawn(async move {
             joiner_coord
-                .submit_shard(
+                .submit_leaf(
                     &leaf(),
                     &joiner_tx,
                     Arc::new(SkipCauseProbe),
@@ -2991,16 +2988,16 @@ mod tests {
     #[tokio::test]
     async fn proven_non_landing_clears_uncertainty_before_capacity_rejection() {
         let tx = TxId::with_priority(1, b"t");
-        let small = ShardEntry::new(b"k").with_current(CurrentState::Inline {
+        let small = LeafEntry::new(b"k").with_current(CurrentState::Inline {
             writer: tx.clone(),
             value: Arc::from(b"x".as_slice()),
         });
-        let large = ShardEntry::new(b"k").with_current(CurrentState::Inline {
+        let large = LeafEntry::new(b"k").with_current(CurrentState::Inline {
             writer: tx.clone(),
             value: Arc::from(vec![b'x'; 128]),
         });
-        let small_len = Node::leaf(Shard::from_entries([small])).encoded_len();
-        assert!(Node::leaf(Shard::from_entries([large])).encoded_len() > small_len);
+        let small_len = Node::leaf(LeafBody::from_entries([small])).encoded_len();
+        assert!(Node::leaf(LeafBody::from_entries([large])).encoded_len() > small_len);
         let policy = SplitPolicy::builder()
             .node_max_bytes(small_len)
             .split_headroom_bytes(0)
@@ -3028,11 +3025,11 @@ mod tests {
             }
         });
         let backend: Arc<dyn Backend> = hooked;
-        let (coord, _shards, _timeline, _bg) =
+        let (coord, _nodes, _timeline, _bg) =
             coord_over_with(backend, policy, Arc::new(NoSplitHints)).await;
 
         let outcome = coord
-            .submit_shard(
+            .submit_leaf(
                 &leaf(),
                 &tx,
                 Arc::new(CapacityAfterInDoubt {
@@ -3062,12 +3059,12 @@ mod tests {
     #[tokio::test]
     async fn submit_after_close_is_cancelled() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (coord, _shards, _timeline, _bg) = coord_over(backend).await;
+        let (coord, _nodes, _timeline, _bg) = coord_over(backend).await;
         coord.close().await;
 
         let tx = TxId::with_priority(1, b"t");
         let out = coord
-            .submit_shard(&leaf(), &tx, Arc::new(SkipRelease), Requirement::Any)
+            .submit_leaf(&leaf(), &tx, Arc::new(SkipRelease), Requirement::Any)
             .await
             .unwrap();
         assert!(
@@ -3112,11 +3109,11 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ShardResolver for StickyCommitProbe {
+    impl LeafResolver for StickyCommitProbe {
         async fn resolve(
             &self,
             ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            _staged: &BTreeMap<Vec<u8>, LeafEntry>,
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             if self.folds.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -3146,7 +3143,7 @@ mod tests {
 
         fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
             if in_doubt {
-                FoldOutcome::InDoubt("round abandoned after in-doubt CAS".into())
+                FoldOutcome::InDoubt("round ended after in-doubt CAS".into())
             } else {
                 FoldOutcome::Moved
             }
@@ -3161,13 +3158,13 @@ mod tests {
     // back in-doubt, its write may have landed durably and been help-forwarded to
     // a peer, so the in-doubt classification must stay *sticky* across a later
     // precondition-miss. Otherwise a commit that landed-but-unacked and was then
-    // superseded is misclassified `Moved`, and its caller abandons and re-runs a
-    // non-idempotent write a peer already observed — breaking the
-    // `final <= started` serializability bound.
+    // superseded is misclassified `Moved`, and its caller executes a
+    // non-idempotent transaction body again after a peer observed its write.
+    // This breaks the `final <= started` serializability bound.
     //
     // This pins the coordinator half of the fix in isolation: the uncertain
     // member declines to restage while an idempotent peer drives the later CAS.
-    // The *end-to-end* manifestation (a real commit being abandoned and
+    // The *end-to-end* manifestation (a real commit being interrupted and
     // double-applying under the true 3-way co-batched interleaving) is covered
     // deterministically by the committed fuzz reproducer
     // `fuzz/corpus/concurrent_tx/crash-95084997…`, which the corpus-replay test
@@ -3181,7 +3178,7 @@ mod tests {
         // The leaf must exist so the round's CAS is a `write_if` (the faulted op),
         // not a create.
         let seed = TxId::with_priority(1, b"seed");
-        store_shard_entries(
+        store_leaf_entries(
             &cold_store(mem.clone()),
             &leaf(),
             vec![entry(b"seed", LockType::None, None, Some(&seed))],
@@ -3189,7 +3186,7 @@ mod tests {
         .await;
         let (gated, gate) = Gate::wrap(mem);
         let backend: Arc<dyn Backend> = in_doubt_then_miss(gated as Arc<dyn Backend>);
-        let (coord, _shards, _timeline, _bg) = coord_over(backend).await;
+        let (coord, _nodes, _timeline, _bg) = coord_over(backend).await;
 
         let tx = TxId::with_priority(2, b"install");
         let retrying = TxId::with_priority(3, b"retrying");
@@ -3199,7 +3196,7 @@ mod tests {
             (coord.clone(), tx.clone(), seen_in_doubt.clone());
         let driver = tokio::spawn(async move {
             driver_coord
-                .submit_shard(
+                .submit_leaf(
                     &leaf(),
                     &driver_tx,
                     Arc::new(StickyCommitProbe {
@@ -3216,7 +3213,7 @@ mod tests {
         let (joiner_coord, joiner_tx) = (coord.clone(), retrying.clone());
         let joiner = tokio::spawn(async move {
             joiner_coord
-                .submit_shard(
+                .submit_leaf(
                     &leaf(),
                     &joiner_tx,
                     Arc::new(AlwaysStageProbe {
@@ -3247,7 +3244,7 @@ mod tests {
                 })
             ),
             "a landed-but-unacked CAS that is then superseded must classify InDoubt, \
-             not Moved (else the caller abandons and double-applies)"
+             not Moved (else the caller executes again and double-applies)"
         );
         assert!(matches!(
             retrying_outcome,
@@ -3267,11 +3264,11 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ShardResolver for AlwaysStageProbe {
+    impl LeafResolver for AlwaysStageProbe {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, ShardEntry>,
+            _staged: &BTreeMap<Vec<u8>, LeafEntry>,
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             Ok(Step::Stage {
@@ -3291,7 +3288,7 @@ mod tests {
 
         fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
             if in_doubt {
-                FoldOutcome::InDoubt("round abandoned after in-doubt CAS".into())
+                FoldOutcome::InDoubt("round ended after in-doubt CAS".into())
             } else {
                 FoldOutcome::Moved
             }
@@ -3333,7 +3330,7 @@ mod tests {
     async fn exhausted_budget_after_in_doubt_cas_stays_in_doubt() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let seed = TxId::with_priority(1, b"seed");
-        store_shard_entries(
+        store_leaf_entries(
             &cold_store(mem.clone()),
             &leaf(),
             vec![entry(b"seed", LockType::None, None, Some(&seed))],
@@ -3341,7 +3338,7 @@ mod tests {
         .await;
         let (gated, gate) = Gate::wrap(mem);
         let backend: Arc<dyn Backend> = in_doubt_then_miss_forever(gated as Arc<dyn Backend>);
-        let (coord, _shards, _timeline, _bg) = coord_over_fast(backend).await;
+        let (coord, _nodes, _timeline, _bg) = coord_over_fast(backend).await;
 
         let uncertain = TxId::with_priority(2, b"uncertain");
         let retrying = TxId::with_priority(3, b"retrying");
@@ -3351,7 +3348,7 @@ mod tests {
             (coord.clone(), uncertain.clone(), seen_in_doubt.clone());
         let driver = tokio::spawn(async move {
             driver_coord
-                .submit_shard(
+                .submit_leaf(
                     &leaf(),
                     &driver_tx,
                     Arc::new(StickyCommitProbe {
@@ -3368,7 +3365,7 @@ mod tests {
         let (joiner_coord, joiner_tx) = (coord.clone(), retrying.clone());
         let joiner = tokio::spawn(async move {
             joiner_coord
-                .submit_shard(
+                .submit_leaf(
                     &leaf(),
                     &joiner_tx,
                     Arc::new(AlwaysStageProbe {

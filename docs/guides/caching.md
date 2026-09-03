@@ -36,7 +36,7 @@ codec is an internal error. Cached values are immutable and shared, so a caller
 clones a value before modifying and submitting it.
 
 The cache holds physical objects such as collection records, tree nodes,
-transaction objects, and structural logs. It does not maintain a separate
+transaction objects, and structural intents. It does not maintain a separate
 materialized key-value cache. Higher layers derive a logical key value from its
 cached leaf and, when necessary, its writer's cached transaction object.
 
@@ -199,7 +199,7 @@ Mutation outcomes are reconciled conservatively while holding the lane:
 - Cancellation before dispatch has no cache effect.
 
 Read cancellation needs no invalidation because a read cannot mutate backend
-state. An abandoned mutation may still apply remotely, but it can never publish
+state. A cancelled mutation may still apply remotely, but it can never publish
 a delayed local result and is subsequently treated like a write from another
 database instance.
 
@@ -244,7 +244,7 @@ real-time edge rather than invocation or response order alone.
 
 Same-state validation merges evidence with a maximum, while a different state
 replaces discoverable knowledge. A conflict removes only the exact state it
-proved obsolete. An indeterminate or abandoned mutation removes usable
+proved obsolete. An indeterminate or cancelled mutation removes usable
 knowledge instead of choosing between the old and proposed states. Thus the
 cache either exposes a state supported by a definitive operation or exposes no
 state at all.

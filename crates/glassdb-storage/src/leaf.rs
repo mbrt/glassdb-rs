@@ -1,6 +1,6 @@
-//! The shard object: in-memory view and canonical protobuf encoding (ADR-017).
+//! A leaf body: its in-memory view and canonical protobuf encoding (ADR-017).
 //!
-//! A shard is the coordination unit for a contiguous range of keys (the leaf
+//! A leaf is the coordination unit for a contiguous range of keys (the leaf
 //! body of the ADR-031 B-link tree): it is at once the per-key lock table, the
 //! MVCC current-writer index, and the key directory. Its body is the
 //! compare-and-swap unit, so the encoding is canonical (entries sorted by key,
@@ -96,9 +96,9 @@ impl CurrentState {
     }
 }
 
-/// One key's coordination state within a shard.
+/// One key's coordination state within a leaf.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShardEntry {
+pub struct LeafEntry {
     /// Raw user key bytes; also the entry's sort key.
     pub key: Vec<u8>,
     /// The key's committed current value, separate from the lock state above.
@@ -106,10 +106,10 @@ pub struct ShardEntry {
     lock: EntryLockState,
 }
 
-impl ShardEntry {
+impl LeafEntry {
     /// Creates an unlocked entry for `key` with no committed value.
     pub fn new(key: impl Into<Vec<u8>>) -> Self {
-        ShardEntry {
+        LeafEntry {
             key: key.into(),
             current: CurrentState::Absent,
             lock: EntryLockState::default(),
@@ -192,7 +192,7 @@ impl ShardEntry {
     /// Returns the encoded size of the largest fixed coordination shape GlassDB
     /// can add for `key_len`: one generated write holder and an external current
     /// writer. Inline payloads and arbitrary compatibility IDs are sized exactly
-    /// through [`ShardEntry::encoded_len`] instead.
+    /// through [`LeafEntry::encoded_len`] instead.
     pub(crate) fn worst_case_encoded_len(key_len: usize) -> usize {
         let id_len = TxId::MAX_GENERATED_ENCODED_LEN;
         let current_len = nonempty_length_delimited_field(CURRENT_WRITER_TAG, id_len)
@@ -226,64 +226,64 @@ fn current_state_field_len(current: &CurrentState) -> usize {
     length_delimited_field(ENTRY_CURRENT_TAG, current_len)
 }
 
-/// A decoded shard: the coordination directory for the keys that map to it.
+/// A decoded leaf: the coordination directory for the keys that map to it.
 ///
 /// Entries are stored keyed by their raw key bytes, so iteration and encoding
 /// are in canonical key order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Shard {
-    entries: BTreeMap<Vec<u8>, ShardEntry>,
+pub struct LeafBody {
+    entries: BTreeMap<Vec<u8>, LeafEntry>,
 }
 
-impl Shard {
-    /// Creates an empty shard.
+impl LeafBody {
+    /// Creates an empty leaf.
     pub fn new() -> Self {
-        Shard::default()
+        LeafBody::default()
     }
 
-    /// Builds a shard from entries, keyed by their `key`. If two entries share a
+    /// Builds a leaf from entries, keyed by their `key`. If two entries share a
     /// key the later one wins.
-    pub fn from_entries<I: IntoIterator<Item = ShardEntry>>(entries: I) -> Self {
+    pub fn from_entries<I: IntoIterator<Item = LeafEntry>>(entries: I) -> Self {
         let entries = entries.into_iter().map(|e| (e.key.clone(), e)).collect();
-        Shard { entries }
+        LeafBody { entries }
     }
 
-    /// Returns the entry for `key`, or `None` if the shard has no record of it.
-    pub fn lookup(&self, key: &[u8]) -> Option<&ShardEntry> {
+    /// Returns the entry for `key`, or `None` if the leaf has no record of it.
+    pub fn lookup(&self, key: &[u8]) -> Option<&LeafEntry> {
         self.entries.get(key)
     }
 
     /// Reports whether `key` exists (has a committed value and is not
     /// tombstoned).
     pub fn exists(&self, key: &[u8]) -> bool {
-        self.lookup(key).is_some_and(ShardEntry::exists)
+        self.lookup(key).is_some_and(LeafEntry::exists)
     }
 
     /// Iterates the entries in canonical (key-sorted) order.
-    pub fn entries(&self) -> impl Iterator<Item = &ShardEntry> {
+    pub fn entries(&self) -> impl Iterator<Item = &LeafEntry> {
         self.entries.values()
     }
 
-    /// Number of entries in the shard.
+    /// Number of entries in the leaf.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Reports whether the shard has no entries.
+    /// Reports whether the leaf has no entries.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// Splits the shard at its median key: retains the lower half in `self` and
+    /// Splits the leaf at its median key: retains the lower half in `self` and
     /// returns the upper half together with the split key — the first key of the
-    /// upper half, which is the inclusive lower bound of the returned shard (and
+    /// upper half, which is the inclusive lower bound of the returned leaf (and
     /// the exclusive high-key of the retained one). The single home for the
     /// B-link leaf half-split (ADR-031). Requires at least two entries; the
-    /// caller must not split a shard that cannot be divided (a single hot key).
-    pub fn split_off_median(&mut self) -> (Shard, Vec<u8>) {
+    /// caller must not split a leaf that cannot be divided (a single hot key).
+    pub fn split_off_median(&mut self) -> (LeafBody, Vec<u8>) {
         debug_assert!(
             self.entries.len() >= 2,
-            "cannot split a shard with fewer than two entries"
+            "cannot split a leaf with fewer than two entries"
         );
         let mid = self.entries.len() / 2;
         let split_key = self
@@ -294,10 +294,10 @@ impl Shard {
             .expect("median index is in range");
         // `split_off` keeps keys < split_key in `self` and returns keys >=.
         let upper = self.entries.split_off(&split_key);
-        (Shard { entries: upper }, split_key)
+        (LeafBody { entries: upper }, split_key)
     }
 
-    /// Encodes the shard to its canonical protobuf body (the CAS unit).
+    /// Encodes the leaf to its canonical protobuf body (the CAS unit).
     pub fn encode(&self) -> Vec<u8> {
         self.to_pb().encode_to_vec()
     }
@@ -308,41 +308,41 @@ impl Shard {
         self.to_pb().encoded_len()
     }
 
-    /// Decodes a shard from its protobuf body.
+    /// Decodes a leaf from its protobuf body.
     pub fn decode(buf: &[u8]) -> Result<Self, StorageError> {
-        let raw = pb::Shard::decode(buf)
-            .map_err(|e| StorageError::with_source("unmarshalling shard", e))?;
-        Shard::from_pb(raw)
+        let raw = pb::LeafBody::decode(buf)
+            .map_err(|e| StorageError::with_source("unmarshalling leaf", e))?;
+        LeafBody::from_pb(raw)
     }
 
-    /// Builds the canonical protobuf message for the shard's entries. Shared with
+    /// Builds the canonical protobuf message for the leaf's entries. Shared with
     /// the B-link leaf encoding (ADR-031), where a leaf embeds this as a node
     /// body.
-    pub(crate) fn to_pb(&self) -> pb::Shard {
+    pub(crate) fn to_pb(&self) -> pb::LeafBody {
         let entries = self.entries.values().map(entry_to_proto).collect();
-        pb::Shard { entries }
+        pb::LeafBody { entries }
     }
 
-    /// Rebuilds a shard from its protobuf message, the inverse of [`to_pb`].
+    /// Rebuilds a leaf from its protobuf message, the inverse of [`to_pb`].
     ///
     /// [`to_pb`]: Self::to_pb
-    pub(crate) fn from_pb(raw: pb::Shard) -> Result<Self, StorageError> {
+    pub(crate) fn from_pb(raw: pb::LeafBody) -> Result<Self, StorageError> {
         let mut entries = BTreeMap::new();
         for e in raw.entries {
             let entry = entry_from_proto(e)?;
             if entries.insert(entry.key.clone(), entry).is_some() {
                 return Err(StorageError::other(
-                    "shard contains duplicate entries for a key",
+                    "leaf contains duplicate entries for a key",
                 ));
             }
         }
-        Ok(Shard { entries })
+        Ok(LeafBody { entries })
     }
 }
 
-fn entry_to_proto(e: &ShardEntry) -> pb::ShardEntry {
+fn entry_to_proto(e: &LeafEntry) -> pb::LeafEntry {
     let (lock_type, locked_by) = e.lock.to_wire();
-    pb::ShardEntry {
+    pb::LeafEntry {
         key: e.key.clone(),
         lock_type,
         locked_by,
@@ -350,10 +350,10 @@ fn entry_to_proto(e: &ShardEntry) -> pb::ShardEntry {
     }
 }
 
-fn entry_from_proto(e: pb::ShardEntry) -> Result<ShardEntry, StorageError> {
+fn entry_from_proto(e: pb::LeafEntry) -> Result<LeafEntry, StorageError> {
     let lock = EntryLockState::from_wire(e.lock_type, e.locked_by)
-        .map_err(|_| StorageError::other("shard entry has an invalid lock"))?;
-    Ok(ShardEntry {
+        .map_err(|_| StorageError::other("leaf entry has an invalid lock"))?;
+    Ok(LeafEntry {
         key: e.key,
         lock,
         current: current_from_proto(e.current)?,
@@ -386,7 +386,7 @@ fn current_from_proto(raw: Option<pb::CurrentState>) -> Result<CurrentState, Sto
     // authoritative.
     if raw.writer.is_empty() {
         return Err(StorageError::other(
-            "shard entry current value has no writer",
+            "leaf entry current value has no writer",
         ));
     }
     let writer = TxId::from_bytes(raw.writer);
@@ -398,7 +398,7 @@ fn current_from_proto(raw: Option<pb::CurrentState>) -> Result<CurrentState, Sto
         }),
         Some(State::Tombstone(_)) => Ok(CurrentState::Tombstone { writer }),
         None => Err(StorageError::other(
-            "shard entry current value has no state tag",
+            "leaf entry current value has no state tag",
         )),
     }
 }
@@ -409,19 +409,19 @@ mod tests {
 
     use crate::lock::lock_type_to_proto;
 
-    fn entry(key: &[u8]) -> ShardEntry {
-        ShardEntry::new(key)
+    fn entry(key: &[u8]) -> LeafEntry {
+        LeafEntry::new(key)
     }
 
     fn tx(bytes: &[u8]) -> TxId {
         TxId::from_bytes(bytes.to_vec())
     }
 
-    fn encode_entry(entry: &ShardEntry) -> Vec<u8> {
-        Shard::from_entries([entry.clone()]).encode()
+    fn encode_entry(entry: &LeafEntry) -> Vec<u8> {
+        LeafBody::from_entries([entry.clone()]).encode()
     }
 
-    fn with_lock(mut entry: ShardEntry, lock: EntryLockState) -> ShardEntry {
+    fn with_lock(mut entry: LeafEntry, lock: EntryLockState) -> LeafEntry {
         entry.replace_lock(lock);
         entry
     }
@@ -434,41 +434,41 @@ mod tests {
         let boundary_127 = TxId::from_bytes(vec![2; 127]);
         let boundary_128 = TxId::from_bytes(vec![3; 128]);
 
-        let mut normalized_none = ShardEntry::new(b"none");
+        let mut normalized_none = LeafEntry::new(b"none");
         normalized_none.replace_write_lock(short.clone());
         assert!(normalized_none.release_lock(&short));
 
-        let mut shared = ShardEntry::new(b"shared");
+        let mut shared = LeafEntry::new(b"shared");
         shared.acquire_read_lock(short.clone());
         shared.acquire_read_lock(boundary_128.clone());
 
-        let mut maximum = ShardEntry::new(b"external").with_current(CurrentState::External {
+        let mut maximum = LeafEntry::new(b"external").with_current(CurrentState::External {
             writer: generated.clone(),
         });
         maximum.replace_write_lock(generated.clone());
 
-        let mut inline_empty = ShardEntry::new(Vec::new()).with_current(CurrentState::Inline {
+        let mut inline_empty = LeafEntry::new(Vec::new()).with_current(CurrentState::Inline {
             writer: boundary_127,
             value: Arc::from(b"".as_slice()),
         });
         inline_empty.replace_create_lock(boundary_128.clone());
 
         let cases = [
-            ("absent", ShardEntry::new(Vec::new())),
+            ("absent", LeafEntry::new(Vec::new())),
             ("normalized-none", normalized_none),
             ("shared", shared),
             ("external", maximum.clone()),
             ("inline-empty", inline_empty),
             (
                 "inline-boundary",
-                ShardEntry::new(b"inline").with_current(CurrentState::Inline {
+                LeafEntry::new(b"inline").with_current(CurrentState::Inline {
                     writer: boundary_128,
                     value: Arc::from(vec![4; 128]),
                 }),
             ),
             (
                 "tombstone",
-                ShardEntry::new(b"tombstone")
+                LeafEntry::new(b"tombstone")
                     .with_current(CurrentState::Tombstone { writer: short }),
             ),
         ];
@@ -481,7 +481,7 @@ mod tests {
         }
         assert_eq!(
             maximum.encoded_len(),
-            ShardEntry::worst_case_encoded_len(maximum.key.len())
+            LeafEntry::worst_case_encoded_len(maximum.key.len())
         );
     }
 
@@ -489,7 +489,7 @@ mod tests {
     fn shared_entry_lock_acquisition_is_canonical_and_idempotent() {
         let first = tx(&[1]);
         let second = tx(&[2]);
-        let mut entry = ShardEntry::new(b"key");
+        let mut entry = LeafEntry::new(b"key");
 
         entry.acquire_read_lock(second.clone());
         entry.acquire_read_lock(first.clone());
@@ -501,7 +501,7 @@ mod tests {
         entry.acquire_read_lock(first.clone());
         assert_eq!(encode_entry(&entry), encoded);
 
-        let mut reverse = ShardEntry::new(b"key");
+        let mut reverse = LeafEntry::new(b"key");
         reverse.acquire_read_lock(first.clone());
         reverse.acquire_read_lock(second.clone());
         assert_eq!(encode_entry(&reverse), encoded);
@@ -529,7 +529,7 @@ mod tests {
         let writer = tx(&[3]);
         let creator = tx(&[4]);
         let unrelated = tx(&[5]);
-        let mut entry = ShardEntry::new(b"key");
+        let mut entry = LeafEntry::new(b"key");
 
         entry.replace_write_lock(writer.clone());
         assert_eq!(entry.lock_type(), LockType::Write);
@@ -563,23 +563,23 @@ mod tests {
     fn round_trip() {
         let mut read_lock = EntryLockState::read(tx(&[5]));
         read_lock.acquire_read(tx(&[6]));
-        let shard = Shard::from_entries([
+        let leaf = LeafBody::from_entries([
             with_lock(
-                ShardEntry::new(b"alpha").with_current(CurrentState::External {
+                LeafEntry::new(b"alpha").with_current(CurrentState::External {
                     writer: tx(&[9, 9]),
                 }),
                 EntryLockState::write(tx(&[1, 2, 3, 4])),
             ),
-            with_lock(ShardEntry::new(b"beta"), read_lock),
-            ShardEntry::new(b"gamma").with_current(CurrentState::Tombstone { writer: tx(&[7]) }),
-            ShardEntry::new(b"delta").with_current(CurrentState::Inline {
+            with_lock(LeafEntry::new(b"beta"), read_lock),
+            LeafEntry::new(b"gamma").with_current(CurrentState::Tombstone { writer: tx(&[7]) }),
+            LeafEntry::new(b"delta").with_current(CurrentState::Inline {
                 writer: tx(&[8]),
                 value: Arc::from(b"hello".as_slice()),
             }),
         ]);
 
-        let decoded = Shard::decode(&shard.encode()).unwrap();
-        assert_eq!(decoded, shard);
+        let decoded = LeafBody::decode(&leaf.encode()).unwrap();
+        assert_eq!(decoded, leaf);
     }
 
     // An empty inline value is a real value, not an absent one: the `state` tag
@@ -587,25 +587,25 @@ mod tests {
     #[test]
     fn empty_inline_value_is_distinct_from_external() {
         let inline =
-            Shard::from_entries([ShardEntry::new(b"k").with_current(CurrentState::Inline {
+            LeafBody::from_entries([LeafEntry::new(b"k").with_current(CurrentState::Inline {
                 writer: tx(&[1]),
                 value: Arc::from(b"".as_slice()),
             })]);
-        let external = Shard::from_entries([
-            ShardEntry::new(b"k").with_current(CurrentState::External { writer: tx(&[1]) })
+        let external = LeafBody::from_entries([
+            LeafEntry::new(b"k").with_current(CurrentState::External { writer: tx(&[1]) })
         ]);
 
         assert_ne!(inline.encode(), external.encode());
-        assert_eq!(Shard::decode(&inline.encode()).unwrap(), inline);
-        assert_eq!(Shard::decode(&external.encode()).unwrap(), external);
+        assert_eq!(LeafBody::decode(&inline.encode()).unwrap(), inline);
+        assert_eq!(LeafBody::decode(&external.encode()).unwrap(), external);
     }
 
     // No mutation can publish a current value without a writer or without a
     // state tag, so decoding one is corrupt state rather than a default.
     #[test]
     fn decoding_rejects_incomplete_current_values() {
-        let no_state = pb::Shard {
-            entries: vec![pb::ShardEntry {
+        let no_state = pb::LeafBody {
+            entries: vec![pb::LeafEntry {
                 key: b"k".to_vec(),
                 current: Some(pb::CurrentState {
                     writer: vec![1],
@@ -614,8 +614,8 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let no_writer = pb::Shard {
-            entries: vec![pb::ShardEntry {
+        let no_writer = pb::LeafBody {
+            entries: vec![pb::LeafEntry {
                 key: b"k".to_vec(),
                 current: Some(pb::CurrentState {
                     writer: Vec::new(),
@@ -625,8 +625,8 @@ mod tests {
             }],
         };
 
-        assert!(Shard::decode(&no_state.encode_to_vec()).is_err());
-        assert!(Shard::decode(&no_writer.encode_to_vec()).is_err());
+        assert!(LeafBody::decode(&no_state.encode_to_vec()).is_err());
+        assert!(LeafBody::decode(&no_writer.encode_to_vec()).is_err());
     }
 
     #[test]
@@ -668,8 +668,8 @@ mod tests {
         ];
 
         for (lock_type, locked_by, expected_type, expected_holders) in valid_locks {
-            let raw = pb::Shard {
-                entries: vec![pb::ShardEntry {
+            let raw = pb::LeafBody {
+                entries: vec![pb::LeafEntry {
                     key: b"k".to_vec(),
                     lock_type,
                     locked_by,
@@ -677,12 +677,12 @@ mod tests {
                 }],
             };
 
-            let shard = Shard::decode(&raw.encode_to_vec()).unwrap();
-            let entry = shard.lookup(b"k").unwrap();
+            let leaf = LeafBody::decode(&raw.encode_to_vec()).unwrap();
+            let entry = leaf.lookup(b"k").unwrap();
             assert_eq!(entry.lock_type(), expected_type);
             assert_eq!(entry.lock_holders(), expected_holders);
 
-            let canonical = pb::Shard::decode(shard.encode().as_slice()).unwrap();
+            let canonical = pb::LeafBody::decode(leaf.encode().as_slice()).unwrap();
             assert_eq!(
                 canonical.entries[0].lock_type,
                 lock_type_to_proto(expected_type) as i32
@@ -714,8 +714,8 @@ mod tests {
         ];
 
         for (lock_type, locked_by) in invalid_locks {
-            let raw = pb::Shard {
-                entries: vec![pb::ShardEntry {
+            let raw = pb::LeafBody {
+                entries: vec![pb::LeafEntry {
                     key: b"k".to_vec(),
                     lock_type,
                     locked_by,
@@ -723,66 +723,66 @@ mod tests {
                 }],
             };
 
-            let error = Shard::decode(&raw.encode_to_vec()).unwrap_err();
-            assert_eq!(error.to_string(), "shard entry has an invalid lock");
+            let error = LeafBody::decode(&raw.encode_to_vec()).unwrap_err();
+            assert_eq!(error.to_string(), "leaf entry has an invalid lock");
         }
     }
 
     #[test]
     fn decoding_treats_an_unspecified_empty_lock_as_unlocked() {
-        let raw = pb::Shard {
-            entries: vec![pb::ShardEntry {
+        let raw = pb::LeafBody {
+            entries: vec![pb::LeafEntry {
                 key: b"k".to_vec(),
                 ..Default::default()
             }],
         };
 
-        let shard = Shard::decode(&raw.encode_to_vec()).unwrap();
-        assert_eq!(shard.lookup(b"k").unwrap().lock_type(), LockType::None);
+        let leaf = LeafBody::decode(&raw.encode_to_vec()).unwrap();
+        assert_eq!(leaf.lookup(b"k").unwrap().lock_type(), LockType::None);
     }
 
     #[test]
     fn decoding_rejects_duplicate_entry_keys() {
-        let entry = pb::ShardEntry {
+        let entry = pb::LeafEntry {
             key: b"duplicate".to_vec(),
             lock_type: pb::lock::LockType::None as i32,
             ..Default::default()
         };
-        let raw = pb::Shard {
+        let raw = pb::LeafBody {
             entries: vec![entry.clone(), entry],
         };
 
-        let error = Shard::decode(&raw.encode_to_vec()).unwrap_err();
+        let error = LeafBody::decode(&raw.encode_to_vec()).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "shard contains duplicate entries for a key"
+            "leaf contains duplicate entries for a key"
         );
     }
 
     #[test]
     fn empty_round_trip() {
-        let shard = Shard::new();
-        assert!(shard.is_empty());
-        let decoded = Shard::decode(&shard.encode()).unwrap();
-        assert_eq!(decoded, shard);
+        let leaf = LeafBody::new();
+        assert!(leaf.is_empty());
+        let decoded = LeafBody::decode(&leaf.encode()).unwrap();
+        assert_eq!(decoded, leaf);
         assert!(decoded.is_empty());
     }
 
     #[test]
     fn encoding_is_canonical_regardless_of_input_order() {
-        let a = Shard::from_entries([entry(b"c"), entry(b"a"), entry(b"b")]);
-        let b = Shard::from_entries([entry(b"a"), entry(b"b"), entry(b"c")]);
+        let a = LeafBody::from_entries([entry(b"c"), entry(b"a"), entry(b"b")]);
+        let b = LeafBody::from_entries([entry(b"a"), entry(b"b"), entry(b"c")]);
         assert_eq!(a.encode(), b.encode());
     }
 
     #[test]
     fn encoding_is_canonical_regardless_of_holder_order() {
         let mk = |holders: Vec<TxId>| {
-            let mut entry = ShardEntry::new(b"k");
+            let mut entry = LeafEntry::new(b"k");
             for holder in holders {
                 entry.acquire_read_lock(holder);
             }
-            Shard::from_entries([entry])
+            LeafBody::from_entries([entry])
         };
         let a = mk(vec![TxId::from_bytes(vec![3]), TxId::from_bytes(vec![1])]);
         let b = mk(vec![TxId::from_bytes(vec![1]), TxId::from_bytes(vec![3])]);
@@ -792,34 +792,33 @@ mod tests {
     #[test]
     fn lookup_and_exists() {
         let locked_only = with_lock(
-            ShardEntry::new(b"locked-only"),
+            LeafEntry::new(b"locked-only"),
             EntryLockState::create(tx(&[3])),
         );
-        let shard = Shard::from_entries([
-            ShardEntry::new(b"live").with_current(CurrentState::External { writer: tx(&[1]) }),
-            ShardEntry::new(b"live-inline").with_current(CurrentState::Inline {
+        let leaf = LeafBody::from_entries([
+            LeafEntry::new(b"live").with_current(CurrentState::External { writer: tx(&[1]) }),
+            LeafEntry::new(b"live-inline").with_current(CurrentState::Inline {
                 writer: tx(&[4]),
                 value: Arc::from(b"v".as_slice()),
             }),
-            ShardEntry::new(b"tombstone")
-                .with_current(CurrentState::Tombstone { writer: tx(&[2]) }),
+            LeafEntry::new(b"tombstone").with_current(CurrentState::Tombstone { writer: tx(&[2]) }),
             locked_only,
         ]);
 
-        assert!(shard.exists(b"live"));
-        assert!(shard.exists(b"live-inline"));
+        assert!(leaf.exists(b"live"));
+        assert!(leaf.exists(b"live-inline"));
         // Tombstoned and not-yet-committed keys do not exist.
-        assert!(!shard.exists(b"tombstone"));
-        assert!(!shard.exists(b"locked-only"));
-        // A key the shard never saw is absent entirely.
-        assert!(shard.lookup(b"missing").is_none());
-        assert!(!shard.exists(b"missing"));
+        assert!(!leaf.exists(b"tombstone"));
+        assert!(!leaf.exists(b"locked-only"));
+        // A key the leaf never saw is absent entirely.
+        assert!(leaf.lookup(b"missing").is_none());
+        assert!(!leaf.exists(b"missing"));
 
-        let live = shard.lookup(b"live").unwrap();
+        let live = leaf.lookup(b"live").unwrap();
         assert_eq!(live.current.writer(), Some(&tx(&[1])));
         assert_eq!(live.current.inline(), None);
 
-        let inline = shard.lookup(b"live-inline").unwrap();
+        let inline = leaf.lookup(b"live-inline").unwrap();
         assert_eq!(inline.current.writer(), Some(&tx(&[4])));
         assert_eq!(
             inline.current.inline().map(AsRef::as_ref),
@@ -827,10 +826,9 @@ mod tests {
         );
         assert_eq!(inline.current.inline_len(), 1);
 
-        assert!(shard.lookup(b"tombstone").unwrap().current.is_tombstone());
+        assert!(leaf.lookup(b"tombstone").unwrap().current.is_tombstone());
         assert!(
-            shard
-                .lookup(b"locked-only")
+            leaf.lookup(b"locked-only")
                 .unwrap()
                 .current
                 .writer()
@@ -840,8 +838,8 @@ mod tests {
 
     #[test]
     fn entries_iterate_sorted() {
-        let shard = Shard::from_entries([entry(b"c"), entry(b"a"), entry(b"b")]);
-        let keys: Vec<&[u8]> = shard.entries().map(|e| e.key.as_slice()).collect();
+        let leaf = LeafBody::from_entries([entry(b"c"), entry(b"a"), entry(b"b")]);
+        let keys: Vec<&[u8]> = leaf.entries().map(|e| e.key.as_slice()).collect();
         assert_eq!(keys, vec![b"a".as_slice(), b"b", b"c"]);
     }
 
@@ -849,7 +847,7 @@ mod tests {
     fn split_off_median_partitions_at_the_split_key() {
         // Four entries split into two of two; the split key is the first key of
         // the upper half and is the exclusive bound between the halves.
-        let mut lower = Shard::from_entries([
+        let mut lower = LeafBody::from_entries([
             entry(b"apple"),
             entry(b"cat"),
             entry(b"mango"),
@@ -879,44 +877,44 @@ mod tests {
     #[test]
     fn split_off_median_of_odd_count_keeps_smaller_lower_half() {
         // Three entries split 1/2: mid = 3/2 = 1, so one stays and two move.
-        let mut lower = Shard::from_entries([entry(b"a"), entry(b"b"), entry(b"c")]);
+        let mut lower = LeafBody::from_entries([entry(b"a"), entry(b"b"), entry(b"c")]);
         let (upper, split_key) = lower.split_off_median();
         assert_eq!(split_key, b"b");
         assert_eq!(lower.len(), 1);
         assert_eq!(upper.len(), 2);
     }
 
-    // Golden vector: a fixed shard must always encode to these exact bytes.
+    // Golden vector: a fixed leaf must always encode to these exact bytes.
     // Changing the on-disk format must break this test.
     #[test]
     fn golden_encoding() {
-        let entry = ShardEntry::new(b"Hello").with_current(CurrentState::External {
+        let entry = LeafEntry::new(b"Hello").with_current(CurrentState::External {
             writer: tx(&[0xaa, 0xbb]),
         });
-        let shard =
-            Shard::from_entries([with_lock(entry, EntryLockState::write(tx(&[1, 2, 3, 4])))]);
-        let got = shard.encode();
+        let leaf =
+            LeafBody::from_entries([with_lock(entry, EntryLockState::write(tx(&[1, 2, 3, 4])))]);
+        let got = leaf.encode();
         let want = [
             0x0a, 0x17, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a, 0x04, 0x01,
             0x02, 0x03, 0x04, 0x22, 0x06, 0x0a, 0x02, 0xaa, 0xbb, 0x10, 0x01,
         ];
-        assert_eq!(got, want, "shard encoding drifted: {got:02x?}");
+        assert_eq!(got, want, "leaf encoding drifted: {got:02x?}");
     }
 
     // Golden vector for the inline current state (ADR-051).
     #[test]
     fn golden_inline_encoding() {
-        let entry = ShardEntry::new(b"Hello").with_current(CurrentState::Inline {
+        let entry = LeafEntry::new(b"Hello").with_current(CurrentState::Inline {
             writer: tx(&[0xaa, 0xbb]),
             value: Arc::from(b"hi".as_slice()),
         });
-        let shard =
-            Shard::from_entries([with_lock(entry, EntryLockState::write(tx(&[1, 2, 3, 4])))]);
-        let got = shard.encode();
+        let leaf =
+            LeafBody::from_entries([with_lock(entry, EntryLockState::write(tx(&[1, 2, 3, 4])))]);
+        let got = leaf.encode();
         let want = [
             0x0a, 0x19, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a, 0x04, 0x01,
             0x02, 0x03, 0x04, 0x22, 0x08, 0x0a, 0x02, 0xaa, 0xbb, 0x1a, 0x02, 0x68, 0x69,
         ];
-        assert_eq!(got, want, "inline shard encoding drifted: {got:02x?}");
+        assert_eq!(got, want, "inline leaf encoding drifted: {got:02x?}");
     }
 }

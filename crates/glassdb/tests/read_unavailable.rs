@@ -166,7 +166,7 @@ async fn transient_read_unavailability_is_retried_transparently() {
 /// `Error::Unavailable` (a read-only attempt stages no write, so nothing is in
 /// doubt).
 #[tokio::test(start_paused = true)]
-async fn body_error_does_not_escape_unvalidated_reads() {
+async fn error_outcome_does_not_escape_failed_validation() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     seed_shared(mem.clone(), b"k", 10).await;
 
@@ -200,7 +200,7 @@ async fn body_error_does_not_escape_unvalidated_reads() {
 
     assert!(
         matches!(res, Err(Error::Unavailable(_))),
-        "an unvalidated body error must surface the failed validation, got {res:?}"
+        "an unvalidated error outcome must surface the failed validation, got {res:?}"
     );
     assert_eq!(
         bodies.load(Ordering::SeqCst),

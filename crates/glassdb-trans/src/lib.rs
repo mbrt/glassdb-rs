@@ -12,10 +12,10 @@ mod error;
 mod gc;
 mod key_resolver;
 mod key_state_resolver;
+mod leaf_coord;
 mod monitor;
 mod node_locking;
 mod reader;
-mod shard_coord;
 mod split;
 mod tlocker;
 mod wound_wait;
@@ -23,16 +23,16 @@ mod wound_wait;
 pub use access::{
     AccessSet, ReadAccess, ReadEvidence, ScanAccess, ScanMutation, ScanRange, WriteAccess,
 };
-pub use algo::{BodyOutcome, DirectCommitStats};
+pub use algo::{BodyDecision, DirectCommitStats};
 pub use collections::{
-    CollectionChange, CollectionData, CollectionOp, DirectoryRead, DirectoryReadKind,
+    CatalogAccesses, CollectionChange, CollectionOp, DirectoryRead, DirectoryReadKind,
     DirectorySnapshot,
 };
 pub use engine::{Engine, EngineConfig, EngineDiagnostics, EngineStats, EngineTransaction};
 pub use error::TransError;
 pub use key_resolver::ScanResult;
+pub use leaf_coord::LeafCoordinatorStats;
 pub use monitor::ProtocolTiming;
 pub use reader::{ReadOutcome, ReadValue};
-pub use shard_coord::ShardCoordinatorStats;
 pub use split::{InlinePressureStats, SplitterStats};
 pub use tlocker::LockerStats;

@@ -25,7 +25,7 @@ const HISTORY_REGISTER_COUNT: usize = 2;
 const MAX_HISTORY_CLIENTS: usize = 3;
 const MAX_HISTORY_TXS_PER_CLIENT: usize = 4;
 const CHECK_BRANCH_BUDGET: usize = 1_000_000;
-const USER_ERROR_MARKER: &str = "history-user-error";
+const APPLICATION_ERROR_MARKER: &str = "history-user-error";
 
 /// The checker-owned abstract database state.
 type AbstractState = BTreeMap<u8, u8>;
@@ -61,19 +61,19 @@ enum HistoryAction {
     },
 }
 
-/// How a recorded transaction-body execution ended.
+/// State of one recorded transaction-body execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BodyResult {
-    /// The body was invoked but its future was dropped before returning.
+enum BodyState {
+    /// The body has not returned a body outcome.
     Incomplete,
-    /// The body returned normally and was eligible for commit.
-    Success,
-    /// The body returned a modeled, read-validated user error.
-    UserError,
-    /// The body explicitly aborted the transaction.
-    Aborted,
-    /// A database error prevented the body from becoming commit-eligible.
-    EngineError,
+    /// The body returned a commit outcome.
+    CommitOutcome,
+    /// The body returned a modeled application-error outcome.
+    ApplicationErrorOutcome,
+    /// The body returned an explicit-abort outcome.
+    ExplicitAbort,
+    /// The body returned an engine-error outcome.
+    EngineErrorOutcome,
 }
 
 /// One complete execution of a public transaction body.
@@ -86,24 +86,22 @@ struct BodyTrace {
     ordered_actions: Vec<HistoryAction>,
     /// The final mutation for every key touched by the local overlay.
     final_mutations: BTreeMap<u8, Option<u8>>,
-    /// The body's result before validation or commit.
-    result: BodyResult,
+    /// State of the body execution before validation or commit.
+    state: BodyState,
 }
 
 /// Public result classification used by the sequential specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HistoryOutcome {
-    /// A transaction returned success and must appear exactly once.
-    Success,
-    /// A stable read-derived error; its observations must appear once and its
-    /// staged mutations must not appear.
-    ValidatedBodyError,
+    /// The transaction returned a snapshot-transparent outcome and must appear
+    /// exactly once.
+    SnapshotTransparent,
     /// A definitive failure or explicit abort with no database effect.
     DefiniteNoEffect,
     /// The caller was told that a commit may or may not have happened.
     InDoubt,
-    /// The public future was dropped without a notification.
-    Abandoned,
+    /// The public transaction was interrupted without a notification.
+    Interrupted,
 }
 
 /// A public transaction invocation and every body execution caused by retries.
@@ -117,7 +115,7 @@ struct PublicOp {
     invocation_point: u64,
     /// Body executions in retry order.
     body_executions: Vec<BodyTrace>,
-    /// Checker-owned event point at public notification, absent for abandonment.
+    /// Checker-owned event point at public notification, absent for interruption.
     notification_point: Option<u64>,
     /// Public outcome.
     outcome: HistoryOutcome,
@@ -182,26 +180,20 @@ struct Search<'a> {
 fn selected_trace(op: &PublicOp) -> Result<Option<(&BodyTrace, bool, bool)>, CheckError> {
     let last = op.body_executions.last();
     match op.outcome {
-        HistoryOutcome::Success => last
-            .filter(|trace| trace.result == BodyResult::Success)
-            .map(|trace| Some((trace, true, false)))
-            .ok_or_else(|| {
-                CheckError::new(format!(
-                    "successful op {} has no commit-eligible body trace",
-                    op.op_id
-                ))
-            }),
-        HistoryOutcome::ValidatedBodyError => last
-            .filter(|trace| trace.result == BodyResult::UserError)
-            .map(|trace| Some((trace, false, false)))
-            .ok_or_else(|| {
-                CheckError::new(format!(
-                    "validated-error op {} has no user-error body trace",
-                    op.op_id
-                ))
-            }),
+        HistoryOutcome::SnapshotTransparent => match last {
+            Some(trace) if trace.state == BodyState::CommitOutcome => {
+                Ok(Some((trace, true, false)))
+            }
+            Some(trace) if trace.state == BodyState::ApplicationErrorOutcome => {
+                Ok(Some((trace, false, false)))
+            }
+            _ => Err(CheckError::new(format!(
+                "snapshot-transparent op {} has no matching body outcome",
+                op.op_id
+            ))),
+        },
         HistoryOutcome::InDoubt => last
-            .filter(|trace| trace.result == BodyResult::Success)
+            .filter(|trace| trace.state == BodyState::CommitOutcome)
             .map(|trace| Some((trace, true, true)))
             .ok_or_else(|| {
                 CheckError::new(format!(
@@ -209,10 +201,10 @@ fn selected_trace(op: &PublicOp) -> Result<Option<(&BodyTrace, bool, bool)>, Che
                     op.op_id
                 ))
             }),
-        // A dropped future that had not returned from a successful body cannot
+        // A dropped future that has no body outcome cannot
         // have entered the commit protocol and therefore has no optional effect.
-        HistoryOutcome::Abandoned => Ok(last
-            .filter(|trace| trace.result == BodyResult::Success)
+        HistoryOutcome::Interrupted => Ok(last
+            .filter(|trace| trace.state == BodyState::CommitOutcome)
             .map(|trace| (trace, true, true))),
         HistoryOutcome::DefiniteNoEffect => Ok(None),
     }
@@ -353,7 +345,7 @@ impl Search<'_> {
         prefix: &mut Vec<u64>,
     ) -> Result<bool, CheckError> {
         // Every remaining optional operation may be omitted. This is the exact
-        // completion rule for InDoubt and abandoned public futures.
+        // completion rule for in-doubt and interrupted public transactions.
         if mandatory == 0 && state == *self.final_state {
             self.witness = prefix.clone();
             return Ok(true);
@@ -395,8 +387,8 @@ impl Search<'_> {
 
 /// Checks whether a finite public history has a strict-serializable completion.
 ///
-/// Successful and validated-error operations are mandatory. In-doubt and
-/// commit-eligible abandoned operations may appear zero or one time. The
+/// Snapshot-transparent transactions are mandatory. In-doubt and commit-eligible
+/// interrupted transactions may appear zero or one time. The
 /// search is exact within its explicit branch budget and respects real-time
 /// order between definitively completed operations and later invocations.
 fn check_history(
@@ -433,13 +425,13 @@ fn check_history(
             }
         }
         match op.outcome {
-            HistoryOutcome::Abandoned if op.notification_point.is_some() => {
+            HistoryOutcome::Interrupted if op.notification_point.is_some() => {
                 return Err(CheckError::new(format!(
-                    "abandoned op {} has a notification",
+                    "interrupted op {} has a notification",
                     op.op_id
                 )));
             }
-            HistoryOutcome::Abandoned => {}
+            HistoryOutcome::Interrupted => {}
             _ if op.notification_point.is_none() => {
                 return Err(CheckError::new(format!(
                     "completed op {} has no notification",
@@ -455,12 +447,12 @@ fn check_history(
                     op.op_id, body_number, trace.body_number
                 )));
             }
-            if trace.result == BodyResult::Incomplete
+            if trace.state == BodyState::Incomplete
                 && (body_number + 1 != op.body_executions.len()
-                    || op.outcome != HistoryOutcome::Abandoned)
+                    || op.outcome != HistoryOutcome::Interrupted)
             {
                 return Err(CheckError::new(format!(
-                    "op {} has an incomplete body outside final abandonment",
+                    "op {} has an incomplete body outside final interruption",
                     op.op_id
                 )));
             }
@@ -576,7 +568,7 @@ pub enum HistoryInstruction {
         after: Option<u8>,
         limit: u8,
     },
-    /// Return a modeled user error unless a register equals the expected value.
+    /// Return a modeled application error unless a register equals the expected value.
     RequireEqual { register: u8, expected: Option<u8> },
     /// Explicitly abort the transaction.
     Abort,
@@ -801,7 +793,7 @@ impl HistoryRecorder {
             body_number,
             ordered_actions: Vec::new(),
             final_mutations: BTreeMap::new(),
-            result: BodyResult::Incomplete,
+            state: BodyState::Incomplete,
         });
         body_number
     }
@@ -816,7 +808,7 @@ impl HistoryRecorder {
             .body_executions
             .get_mut(trace.body_number)
             .expect("body completed without being started");
-        assert_eq!(body.result, BodyResult::Incomplete, "body completed twice");
+        assert_eq!(body.state, BodyState::Incomplete, "body completed twice");
         *body = trace;
     }
 
@@ -854,10 +846,10 @@ impl HistoryRecorder {
                     body_number: 0,
                     ordered_actions: actions,
                     final_mutations: BTreeMap::new(),
-                    result: BodyResult::Success,
+                    state: BodyState::CommitOutcome,
                 }],
                 notification_point: Some(notification),
-                outcome: Some(HistoryOutcome::Success),
+                outcome: Some(HistoryOutcome::SnapshotTransparent),
             },
         );
         assert!(previous.is_none(), "final read operation id collided");
@@ -882,18 +874,18 @@ impl HistoryRecorder {
                 invocation_point: operation.invocation_point,
                 body_executions: operation.body_executions.clone(),
                 notification_point: operation.notification_point,
-                outcome: operation.outcome.unwrap_or(HistoryOutcome::Abandoned),
+                outcome: operation.outcome.unwrap_or(HistoryOutcome::Interrupted),
             })
             .collect()
     }
 }
 
-fn user_error(detail: impl fmt::Display) -> Error {
-    Error::internal(format!("{USER_ERROR_MARKER}: {detail}"))
+fn application_error(detail: impl fmt::Display) -> Error {
+    Error::internal(format!("{APPLICATION_ERROR_MARKER}: {detail}"))
 }
 
-fn is_user_error(error: &Error) -> bool {
-    matches!(error, Error::Internal { msg, .. } if msg.starts_with(USER_ERROR_MARKER))
+fn is_application_error(error: &Error) -> bool {
+    matches!(error, Error::Internal { msg, .. } if msg.starts_with(APPLICATION_ERROR_MARKER))
 }
 
 fn byte_value(value: Option<Vec<u8>>, key: u8) -> Result<Option<u8>, Error> {
@@ -920,7 +912,7 @@ async fn interpret_body(
 ) -> Result<(), Error> {
     // Install an incomplete attempt before the first await. If the enclosing
     // public future is dropped during this body, an earlier retry attempt that
-    // reached commit cannot be mistaken for the abandoned attempt's effect.
+    // reached commit cannot be mistaken for the interrupted attempt's effect.
     let body_number = recorder.begin_body(program.op_id);
     let mut registers = [None::<Option<u8>>; HISTORY_REGISTER_COUNT];
     let mut actions = Vec::new();
@@ -1003,7 +995,7 @@ async fn interpret_body(
                             actions.push(HistoryAction::Write { key: *key, value });
                             mutations.insert(*key, Some(value));
                         }),
-                    _ => Err(user_error(format!(
+                    _ => Err(application_error(format!(
                         "register r{register} has no present value"
                     ))),
                 }
@@ -1019,7 +1011,7 @@ async fn interpret_body(
                             actions.push(HistoryAction::Write { key: *key, value });
                             mutations.insert(*key, Some(value));
                         }),
-                    None => Err(user_error(format!(
+                    None => Err(application_error(format!(
                         "register r{register} cannot be incremented"
                     ))),
                 }
@@ -1069,7 +1061,7 @@ async fn interpret_body(
                 if registers[*register as usize] == Some(*expected) {
                     Ok(())
                 } else {
-                    Err(user_error(format!(
+                    Err(application_error(format!(
                         "r{register} is {:?}, expected {expected:?}",
                         registers[*register as usize]
                     )))
@@ -1086,11 +1078,11 @@ async fn interpret_body(
         }
     }
 
-    let body_result = match &result {
-        Ok(()) => BodyResult::Success,
-        Err(Error::Aborted) => BodyResult::Aborted,
-        Err(error) if is_user_error(error) => BodyResult::UserError,
-        Err(_) => BodyResult::EngineError,
+    let body_state = match &result {
+        Ok(()) => BodyState::CommitOutcome,
+        Err(Error::Aborted) => BodyState::ExplicitAbort,
+        Err(error) if is_application_error(error) => BodyState::ApplicationErrorOutcome,
+        Err(_) => BodyState::EngineErrorOutcome,
     };
     recorder.complete_body(
         program.op_id,
@@ -1098,7 +1090,7 @@ async fn interpret_body(
             body_number,
             ordered_actions: actions,
             final_mutations: mutations,
-            result: body_result,
+            state: body_state,
         },
     );
     result
@@ -1119,11 +1111,11 @@ async fn run_program(
 
     match result {
         Ok(()) => {
-            recorder.notify(program.op_id, HistoryOutcome::Success);
+            recorder.notify(program.op_id, HistoryOutcome::SnapshotTransparent);
             Ok(())
         }
-        Err(error) if is_user_error(&error) => {
-            recorder.notify(program.op_id, HistoryOutcome::ValidatedBodyError);
+        Err(error) if is_application_error(&error) => {
+            recorder.notify(program.op_id, HistoryOutcome::SnapshotTransparent);
             Ok(())
         }
         Err(Error::Aborted) => {
@@ -1238,7 +1230,7 @@ mod tests {
         entries.iter().copied().collect()
     }
 
-    fn trace(actions: Vec<HistoryAction>, result: BodyResult) -> BodyTrace {
+    fn trace(actions: Vec<HistoryAction>, state: BodyState) -> BodyTrace {
         let mut final_mutations = BTreeMap::new();
         for action in &actions {
             match action {
@@ -1257,7 +1249,7 @@ mod tests {
             body_number: 0,
             ordered_actions: actions,
             final_mutations,
-            result,
+            state,
         }
     }
 
@@ -1289,7 +1281,7 @@ mod tests {
             id,
             invocation,
             Some(notification),
-            HistoryOutcome::Success,
+            HistoryOutcome::SnapshotTransparent,
             trace(
                 vec![
                     HistoryAction::Read {
@@ -1301,7 +1293,7 @@ mod tests {
                         value: from + 1,
                     },
                 ],
-                BodyResult::Success,
+                BodyState::CommitOutcome,
             ),
         )
     }
@@ -1381,7 +1373,7 @@ mod tests {
                                         if first_optional {
                                             HistoryOutcome::InDoubt
                                         } else {
-                                            HistoryOutcome::Success
+                                            HistoryOutcome::SnapshotTransparent
                                         },
                                         trace(
                                             vec![
@@ -1394,7 +1386,7 @@ mod tests {
                                                     value: first_write,
                                                 },
                                             ],
-                                            BodyResult::Success,
+                                            BodyState::CommitOutcome,
                                         ),
                                     ),
                                     op(
@@ -1404,7 +1396,7 @@ mod tests {
                                         if second_optional {
                                             HistoryOutcome::InDoubt
                                         } else {
-                                            HistoryOutcome::Success
+                                            HistoryOutcome::SnapshotTransparent
                                         },
                                         trace(
                                             vec![
@@ -1417,7 +1409,7 @@ mod tests {
                                                     value: second_write,
                                                 },
                                             ],
-                                            BodyResult::Success,
+                                            BodyState::CommitOutcome,
                                         ),
                                     ),
                                 ];
@@ -1457,10 +1449,10 @@ mod tests {
                         key as u64,
                         (position * 2) as u64,
                         Some((position * 2 + 1) as u64),
-                        HistoryOutcome::Success,
+                        HistoryOutcome::SnapshotTransparent,
                         trace(
                             vec![HistoryAction::Write { key, value: 1 }],
-                            BodyResult::Success,
+                            BodyState::CommitOutcome,
                         ),
                     )
                 })
@@ -1486,13 +1478,13 @@ mod tests {
             0,
             0,
             Some(1),
-            HistoryOutcome::Success,
+            HistoryOutcome::SnapshotTransparent,
             trace(
                 vec![
                     HistoryAction::Write { key: 0, value: 1 },
                     HistoryAction::Write { key: 1, value: 1 },
                 ],
-                BodyResult::Success,
+                BodyState::CommitOutcome,
             ),
         )];
         assert!(check_history(&initial, &history, &state(&[(0, 1), (1, 0)])).is_err());
@@ -1506,23 +1498,23 @@ mod tests {
             0,
             0,
             Some(1),
-            HistoryOutcome::Success,
+            HistoryOutcome::SnapshotTransparent,
             trace(
                 vec![HistoryAction::Write { key: 0, value: 1 }],
-                BodyResult::Success,
+                BodyState::CommitOutcome,
             ),
         );
         let stale_read = op(
             1,
             2,
             Some(3),
-            HistoryOutcome::Success,
+            HistoryOutcome::SnapshotTransparent,
             trace(
                 vec![HistoryAction::Read {
                     key: 0,
                     value: Some(0),
                 }],
-                BodyResult::Success,
+                BodyState::CommitOutcome,
             ),
         );
         assert!(check_history(&initial, &[write.clone(), stale_read], &state(&[(0, 1)])).is_err());
@@ -1531,13 +1523,13 @@ mod tests {
             1,
             0,
             Some(3),
-            HistoryOutcome::Success,
+            HistoryOutcome::SnapshotTransparent,
             trace(
                 vec![HistoryAction::Read {
                     key: 0,
                     value: Some(0),
                 }],
-                BodyResult::Success,
+                BodyState::CommitOutcome,
             ),
         );
         let concurrent_write = PublicOp {
@@ -1561,13 +1553,13 @@ mod tests {
             0,
             0,
             Some(3),
-            HistoryOutcome::Success,
+            HistoryOutcome::SnapshotTransparent,
             trace(
                 vec![
                     HistoryAction::Write { key: 0, value: 1 },
                     HistoryAction::Write { key: 1, value: 1 },
                 ],
-                BodyResult::Success,
+                BodyState::CommitOutcome,
             ),
         );
 
@@ -1575,10 +1567,10 @@ mod tests {
             1,
             1,
             Some(2),
-            HistoryOutcome::Success,
+            HistoryOutcome::SnapshotTransparent,
             trace(
                 vec![read_group(&[(1, Some(0)), (0, Some(0))])],
-                BodyResult::Success,
+                BodyState::CommitOutcome,
             ),
         );
         check_history(&initial, &[writer.clone(), before], &final_state).unwrap();
@@ -1587,10 +1579,10 @@ mod tests {
             1,
             1,
             Some(2),
-            HistoryOutcome::Success,
+            HistoryOutcome::SnapshotTransparent,
             trace(
                 vec![read_group(&[(0, Some(1)), (1, Some(1))])],
-                BodyResult::Success,
+                BodyState::CommitOutcome,
             ),
         );
         check_history(&initial, &[writer.clone(), after], &final_state).unwrap();
@@ -1599,10 +1591,10 @@ mod tests {
             1,
             1,
             Some(2),
-            HistoryOutcome::Success,
+            HistoryOutcome::SnapshotTransparent,
             trace(
                 vec![read_group(&[(0, Some(0)), (1, Some(1))])],
-                BodyResult::Success,
+                BodyState::CommitOutcome,
             ),
         );
         assert!(check_history(&initial, &[writer, torn], &final_state).is_err());
@@ -1621,17 +1613,17 @@ mod tests {
             0,
             0,
             Some(3),
-            HistoryOutcome::Success,
+            HistoryOutcome::SnapshotTransparent,
             trace(
                 vec![HistoryAction::Write { key: 1, value: 9 }],
-                BodyResult::Success,
+                BodyState::CommitOutcome,
             ),
         );
         let scan_without_insert = op(
             1,
             1,
             Some(2),
-            HistoryOutcome::Success,
+            HistoryOutcome::SnapshotTransparent,
             trace(
                 vec![HistoryAction::Scan {
                     start: 0,
@@ -1640,7 +1632,7 @@ mod tests {
                     limit: 3,
                     keys: vec![0],
                 }],
-                BodyResult::Success,
+                BodyState::CommitOutcome,
             ),
         );
         let final_state = state(&[(0, 0), (1, 9)]);
@@ -1668,7 +1660,7 @@ mod tests {
             1,
             2,
             Some(3),
-            HistoryOutcome::Success,
+            HistoryOutcome::SnapshotTransparent,
             trace(
                 vec![HistoryAction::Scan {
                     start: 0,
@@ -1677,7 +1669,7 @@ mod tests {
                     limit: 3,
                     keys: vec![0, 1],
                 }],
-                BodyResult::Success,
+                BodyState::CommitOutcome,
             ),
         );
         check_history(&initial, &[prior_insert, complete_scan], &final_state).unwrap();
@@ -1690,7 +1682,7 @@ mod tests {
             0,
             0,
             Some(1),
-            HistoryOutcome::Success,
+            HistoryOutcome::SnapshotTransparent,
             trace(
                 vec![
                     HistoryAction::Delete { key: 0 },
@@ -1703,7 +1695,7 @@ mod tests {
                         keys: vec![1],
                     },
                 ],
-                BodyResult::Success,
+                BodyState::CommitOutcome,
             ),
         )];
         check_history(&initial, &history, &state(&[(1, 1), (2, 2)])).unwrap();
@@ -1757,20 +1749,20 @@ mod tests {
             0,
             0,
             Some(1),
-            HistoryOutcome::Success,
+            HistoryOutcome::SnapshotTransparent,
             trace(
                 vec![HistoryAction::Write { key: 0, value: 1 }],
-                BodyResult::Success,
+                BodyState::CommitOutcome,
             ),
         );
         let second = op(
             1,
             2,
             Some(3),
-            HistoryOutcome::Success,
+            HistoryOutcome::SnapshotTransparent,
             trace(
                 vec![HistoryAction::Write { key: 0, value: 2 }],
-                BodyResult::Success,
+                BodyState::CommitOutcome,
             ),
         );
         assert!(
@@ -1797,7 +1789,7 @@ mod tests {
     #[test]
     fn optional_effects_apply_zero_or_once_and_reject_double_apply() {
         let initial = state(&[(0, 0)]);
-        for outcome in [HistoryOutcome::InDoubt, HistoryOutcome::Abandoned] {
+        for outcome in [HistoryOutcome::InDoubt, HistoryOutcome::Interrupted] {
             let notification = (outcome == HistoryOutcome::InDoubt).then_some(1);
             let optional = op(
                 0,
@@ -1812,7 +1804,7 @@ mod tests {
                         },
                         HistoryAction::Write { key: 0, value: 1 },
                     ],
-                    BodyResult::Success,
+                    BodyState::CommitOutcome,
                 ),
             );
             check_history(&initial, std::slice::from_ref(&optional), &initial).unwrap();
@@ -1822,19 +1814,19 @@ mod tests {
     }
 
     #[test]
-    fn abandoned_incomplete_retry_cannot_reuse_an_earlier_commit_eligible_body() {
+    fn interrupted_incomplete_retry_cannot_reuse_an_earlier_commit_outcome() {
         let initial = state(&[(0, 0)]);
-        let mut abandoned = increment(0, 0, 1, 0);
-        abandoned.notification_point = None;
-        abandoned.outcome = HistoryOutcome::Abandoned;
-        abandoned.body_executions.push(BodyTrace {
+        let mut interrupted = increment(0, 0, 1, 0);
+        interrupted.notification_point = None;
+        interrupted.outcome = HistoryOutcome::Interrupted;
+        interrupted.body_executions.push(BodyTrace {
             body_number: 1,
             ordered_actions: Vec::new(),
             final_mutations: BTreeMap::new(),
-            result: BodyResult::Incomplete,
+            state: BodyState::Incomplete,
         });
-        check_history(&initial, std::slice::from_ref(&abandoned), &initial).unwrap();
-        assert!(check_history(&initial, &[abandoned], &state(&[(0, 1)])).is_err());
+        check_history(&initial, std::slice::from_ref(&interrupted), &initial).unwrap();
+        assert!(check_history(&initial, &[interrupted], &state(&[(0, 1)])).is_err());
     }
 
     #[test]
@@ -1852,13 +1844,13 @@ mod tests {
     }
 
     #[test]
-    fn validated_error_discards_writes_and_obeys_observations() {
+    fn application_error_is_an_error_outcome_without_writes() {
         let initial = state(&[(0, 4), (1, 0)]);
         let error = op(
             0,
             0,
             Some(1),
-            HistoryOutcome::ValidatedBodyError,
+            HistoryOutcome::SnapshotTransparent,
             trace(
                 vec![
                     HistoryAction::Read {
@@ -1867,7 +1859,7 @@ mod tests {
                     },
                     HistoryAction::Write { key: 1, value: 9 },
                 ],
-                BodyResult::UserError,
+                BodyState::ApplicationErrorOutcome,
             ),
         );
         check_history(&initial, std::slice::from_ref(&error), &initial).unwrap();
@@ -1881,7 +1873,7 @@ mod tests {
             0,
             0,
             Some(1),
-            HistoryOutcome::Success,
+            HistoryOutcome::SnapshotTransparent,
             trace(
                 vec![
                     HistoryAction::Write { key: 0, value: 7 },
@@ -1890,7 +1882,7 @@ mod tests {
                         value: Some(7),
                     },
                 ],
-                BodyResult::Success,
+                BodyState::CommitOutcome,
             ),
         )];
         check_history(&initial, &history, &state(&[(0, 7)])).unwrap();

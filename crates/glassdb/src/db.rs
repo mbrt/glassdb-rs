@@ -10,7 +10,7 @@ use glassdb_concurr::rt;
 use glassdb_data::DatabaseId;
 use glassdb_storage::{InlinePolicy, PersistentCacheConfig, PersistentCacheMedia, SplitPolicy};
 use glassdb_trans::{
-    AccessSet, BodyOutcome, CollectionData, Engine, EngineConfig, EngineTransaction,
+    AccessSet, BodyDecision, CatalogAccesses, Engine, EngineConfig, EngineTransaction,
     ProtocolTiming, TransError,
 };
 use tokio::sync::Notify;
@@ -54,7 +54,7 @@ impl DatabaseBuilder {
     /// Sets the delay before the first retry of a transient
     /// transaction-coordination operation (polling a peer transaction's commit
     /// status, writing a transaction's final log, or reacquiring locks under the
-    /// same identity after exhausted shard contention). The delay grows
+    /// same identity after exhausted leaf contention). The delay grows
     /// exponentially up to [`DatabaseBuilder::retry_max_interval`].
     pub fn retry_initial_interval(mut self, interval: Duration) -> Self {
         self.engine_config.set_retry_initial_interval(interval);
@@ -188,13 +188,13 @@ impl Database {
     /// drained as a finite pass; a leaf blocked by a live structural holder is
     /// deferred to lazy recovery rather than waited on.
     /// Idempotent; safe to call from multiple [`Database`] clones concurrently.
-    /// Managed abandonment retirement is part of the drain and can wait
+    /// Managed transaction retirement is part of the drain and can wait
     /// indefinitely on storage or protocol recovery. Cancelling this future is
     /// safe; a later call resumes the shutdown.
     ///
     /// Dropping the last [`Database`] still aborts background work, but
     /// `shutdown` additionally waits for those tasks to stop. It cannot wait for
-    /// a backend mutation whose future was previously abandoned by cancellation.
+    /// a backend mutation whose future was previously cancelled.
     pub async fn shutdown(&self) {
         self.inner.operations.shutdown().await;
         self.inner.engine.shutdown().await;
@@ -274,13 +274,19 @@ impl Database {
     /// as `|tx| async move { ... }`. The framework owns the retry loop and may
     /// invoke `f` multiple times, so `f` must be `FnMut`.
     ///
-    /// # Body errors
+    /// # Error outcomes
     ///
-    /// When `f` returns an error, the attempt's writes are discarded and its
-    /// reads are validated. If those reads were inconsistent, `f` is invoked
-    /// again; otherwise the original error is returned. Conditions derived from
-    /// transaction reads must therefore return an error, for example with
-    /// [`crate::ensure_tx!`], rather than assert or panic.
+    /// When `f` returns an error without an explicit abort, the attempt's writes
+    /// are discarded and its reads are validated. If those reads were
+    /// inconsistent, `f` is invoked again; otherwise the original error is
+    /// returned. Conditions derived from transaction reads must therefore return
+    /// an error, for example with [`crate::ensure_tx!`], rather than assert or
+    /// panic.
+    ///
+    /// # Explicit abort
+    ///
+    /// [`Transaction::abort`] rejects the staged changes and returns
+    /// [`Error::Aborted`] without read validation or body replay.
     ///
     /// # Panics
     ///
@@ -328,9 +334,9 @@ impl Database {
         *stats
     }
 
-    /// Returns a snapshot of the shard coordinator's live state, intended for
+    /// Returns a snapshot of the leaf coordinator's live state, intended for
     /// operators investigating hangs or unexpected contention. See
-    /// [`crate::diagnostics`] for the data shape and how to enable the
+    /// [`crate::diagnostics`] for the snapshot shape and how to enable the
     /// complementary `tracing` events.
     pub fn diagnostics(&self) -> Diagnostics {
         let engine = self.inner.engine.diagnostics();
@@ -482,41 +488,41 @@ impl DbInner {
         let mut driver = AttemptDriver::new(&self.engine);
 
         let result: Result<T, Error> = loop {
-            // Hand a fresh handle to the user closure (which consumes it); `tx`
+            // Hand a fresh handle to the transaction body; `tx`
             // retains access to the same shared state to collect accesses and
             // reset between retries.
-            let fn_res = f(tx.handle()).await;
-            if tx.aborted() {
+            let body_outcome = f(tx.handle()).await;
+            if tx.explicitly_aborted() {
                 break Err(Error::Aborted);
             }
 
-            // Collect the accesses produced by the user function.
-            let (accesses, collection_access) = tx.collect_accesses();
+            // Collect the accesses produced by the transaction body.
+            let (accesses, catalog_accesses) = tx.collect_accesses();
             let metrics = tx.metrics();
             stats.reads += accesses.read_count() as u64;
             stats.cache_hits += metrics.cache_hits;
             stats.writes += accesses.write_count() as u64;
 
-            if fn_res.is_ok() {
-                driver.install_accesses(accesses, collection_access);
+            if body_outcome.is_ok() {
+                driver.install_accesses(accesses, catalog_accesses);
                 match driver.commit().await {
-                    Ok(BodyOutcome::Complete) => break fn_res,
-                    Ok(BodyOutcome::ReplayBody) => {}
+                    Ok(BodyDecision::ReturnOutcome) => break body_outcome,
+                    Ok(BodyDecision::ReplayBody) => {}
                     Err(e) => break Err(e.into()),
                 }
             } else {
-                // The user function returned an error. It might be the result
-                // of a spurious read, so validate only the reads. The error may
+                // The transaction body returned an error outcome. It might be based
+                // on a spurious read, so validate only the reads. The error may
                 // escape only once validation has certified that snapshot: an
                 // attempt that could not finish proves nothing about the reads
                 // behind the error, so the caller learns about the failed
                 // validation instead.
                 match driver
-                    .validate_body_error(accesses, collection_access)
+                    .validate_error_outcome(accesses, catalog_accesses)
                     .await
                 {
-                    Ok(BodyOutcome::ReplayBody) => {}
-                    Ok(BodyOutcome::Complete) => break fn_res,
+                    Ok(BodyDecision::ReplayBody) => {}
+                    Ok(BodyDecision::ReturnOutcome) => break body_outcome,
                     Err(e) => break Err(Error::from_read_validation(e)),
                 }
             }
@@ -549,37 +555,34 @@ impl<'a> AttemptDriver<'a> {
         }
     }
 
-    /// Installs the accesses collected from the latest closure execution.
-    fn install_accesses(&mut self, accesses: AccessSet, collection_access: CollectionData) {
+    /// Installs the accesses collected from the latest transaction-body execution.
+    fn install_accesses(&mut self, accesses: AccessSet, catalog_accesses: CatalogAccesses) {
         match self.handle.as_mut() {
             Some(handle) => self
                 .engine
-                .reset_transaction(handle, accesses, collection_access),
+                .reset_transaction(handle, accesses, catalog_accesses),
             None => {
-                self.handle = Some(self.engine.begin_transaction(accesses, collection_access));
+                self.handle = Some(self.engine.begin_transaction(accesses, catalog_accesses));
             }
         }
     }
 
     /// Validates the reads that led the transaction body to return an error.
-    async fn validate_body_error(
+    async fn validate_error_outcome(
         &mut self,
         accesses: AccessSet,
-        collection_access: CollectionData,
-    ) -> Result<BodyOutcome, TransError> {
-        self.install_accesses(
-            accesses.into_read_only(),
-            collection_access.into_read_only(),
-        );
+        catalog_accesses: CatalogAccesses,
+    ) -> Result<BodyDecision, TransError> {
+        self.install_accesses(accesses.into_read_only(), catalog_accesses.into_read_only());
         let handle = self
             .handle
             .as_mut()
-            .expect("body-error validation installs an attempt");
+            .expect("error-outcome validation installs an attempt");
         self.engine.validate_reads(handle).await
     }
 
-    /// Commits the accesses installed for the latest closure execution.
-    async fn commit(&mut self) -> Result<BodyOutcome, TransError> {
+    /// Commits the accesses installed for the latest transaction-body execution.
+    async fn commit(&mut self) -> Result<BodyDecision, TransError> {
         let handle = self
             .handle
             .as_mut()

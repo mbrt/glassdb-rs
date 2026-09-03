@@ -44,12 +44,12 @@ pub enum CollectionOp {
 
 /// Collection-management accesses carried beside ordinary key accesses.
 #[derive(Debug, Clone, Default)]
-pub struct CollectionData {
+pub struct CatalogAccesses {
     pub reads: Vec<DirectoryRead>,
     pub changes: Vec<CollectionChange>,
 }
 
-impl CollectionData {
+impl CatalogAccesses {
     /// Reports whether the transaction changes a collection binding.
     pub fn has_writes(&self) -> bool {
         !self.changes.is_empty()

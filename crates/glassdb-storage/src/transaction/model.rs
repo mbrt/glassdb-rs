@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use glassdb_data::{CollectionAddress, KeyRef, LeafRef, TxId};
+use glassdb_data::{CollectionAddress, LeafRef, LogicalKey, TxId};
 
 use crate::cached_store::Observation;
 use crate::error::StorageError;
@@ -151,7 +151,7 @@ pub enum TxCollectionOp {
 /// A single write within a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxWrite {
-    pub key: KeyRef,
+    pub key: LogicalKey,
     pub value: Arc<[u8]>,
     pub deleted: bool,
     pub prev_writer: TxId,
@@ -161,7 +161,7 @@ pub struct TxWrite {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxLock {
     Entry {
-        key: KeyRef,
+        key: LogicalKey,
         typ: LockType,
     },
     Membership {

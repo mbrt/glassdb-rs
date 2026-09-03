@@ -5,7 +5,7 @@
 
 Core data types for [GlassDB](https://github.com/mbrt/glassdb-rs), a stateless
 ACID key/value store on top of object storage: database, collection, and
-transaction identifiers, plus the encoding of the object-storage paths that hold
+transaction identities, plus the encoding of the object-storage paths that hold
 them.
 
 > [!NOTE]

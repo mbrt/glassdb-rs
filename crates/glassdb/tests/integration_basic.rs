@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use glassdb::{Database, Error, InlinePolicy, ProtocolTiming, SplitPolicy};
 use glassdb_data::TxId;
-use glassdb_storage::{CurrentState, Node, Shard, ShardEntry};
+use glassdb_storage::{CurrentState, LeafBody, LeafEntry, Node};
 
 #[path = "integration_support/mod.rs"]
 pub mod integration_support;
@@ -21,7 +21,7 @@ fn split_unsafe_boundary_key(policy: &SplitPolicy, value: &[u8], fill: u8) -> Ve
     let mut boundary = None;
     for len in 1..policy.content_limit() {
         let key = vec![fill; len];
-        let inline = ShardEntry::new(key.clone()).with_current(CurrentState::Inline {
+        let inline = LeafEntry::new(key.clone()).with_current(CurrentState::Inline {
             writer: writer.clone(),
             value: Arc::from(value),
         });
@@ -95,14 +95,14 @@ async fn boundary_inline_falls_back_before_it_can_strand_a_leaf() {
     let second = vec![b'z'; first.len()];
     assert!(policy.key_fits(&second));
     let boundary_writer = TxId::with_priority(1, b"boundary");
-    let inline_entry = ShardEntry::new(first.clone()).with_current(CurrentState::Inline {
+    let inline_entry = LeafEntry::new(first.clone()).with_current(CurrentState::Inline {
         writer: boundary_writer,
         value: Arc::from(inline_value.as_slice()),
     });
-    let mut create_entry = ShardEntry::new(second.clone());
+    let mut create_entry = LeafEntry::new(second.clone());
     create_entry.replace_create_lock(TxId::with_priority(2, b"creator"));
     assert!(
-        Node::leaf(Shard::from_entries([inline_entry, create_entry])).content_encoded_len()
+        Node::leaf(LeafBody::from_entries([inline_entry, create_entry])).content_encoded_len()
             > policy.content_limit(),
         "the old inline publication must make the second accepted key hit LeafFull"
     );

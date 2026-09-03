@@ -182,7 +182,7 @@ impl LockState {
     }
 }
 
-/// A valid lock state for one shard entry.
+/// A valid lock state for one leaf entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EntryLockState {
     state: LockState,

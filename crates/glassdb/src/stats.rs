@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use glassdb_backend::BackendStats;
 use glassdb_storage::CacheStats;
-use glassdb_trans::{DirectCommitStats, LockerStats, ShardCoordinatorStats, SplitterStats};
+use glassdb_trans::{DirectCommitStats, LeafCoordinatorStats, LockerStats, SplitterStats};
 
 /// Transaction activity for one snapshot or accumulated interval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -68,8 +68,8 @@ pub struct Stats {
     pub cache: CacheStats,
     /// Distributed-locker activity.
     pub locker: LockerStats,
-    /// Shared shard-coordinator activity.
-    pub coordinator: ShardCoordinatorStats,
+    /// Shared leaf-coordinator activity.
+    pub coordinator: LeafCoordinatorStats,
     /// Logless direct-commit coverage.
     pub direct_commit: DirectCommitStats,
     /// Background tree-split activity.
@@ -131,7 +131,7 @@ mod tests {
                 ..Default::default()
             },
             locker: LockerStats { calls: 6 },
-            coordinator: ShardCoordinatorStats {
+            coordinator: LeafCoordinatorStats {
                 submissions: 10,
                 rounds: 8,
                 cas_retries: 2,
@@ -174,7 +174,7 @@ mod tests {
                 ..Default::default()
             },
             locker: LockerStats { calls: 10 },
-            coordinator: ShardCoordinatorStats {
+            coordinator: LeafCoordinatorStats {
                 submissions: 14,
                 rounds: 10,
                 cas_retries: 3,
@@ -219,7 +219,7 @@ mod tests {
                     ..Default::default()
                 },
                 locker: LockerStats { calls: 4 },
-                coordinator: ShardCoordinatorStats {
+                coordinator: LeafCoordinatorStats {
                     submissions: 4,
                     rounds: 2,
                     cas_retries: 1,

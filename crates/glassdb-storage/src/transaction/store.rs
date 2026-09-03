@@ -38,7 +38,7 @@ impl TxStatus {
     }
 }
 
-/// One backend page of transaction IDs from a deterministic log shard.
+/// One backend page of transaction identities from a deterministic log shard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxListPage {
     pub ids: Vec<TxId>,
@@ -151,7 +151,7 @@ impl TLogger {
         ObjectPath::transaction_shard(id)
     }
 
-    /// Lists one page of transaction IDs from `shard`.
+    /// Lists one page of transaction identities from `shard`.
     pub async fn list_transaction_ids(
         &self,
         shard: usize,
@@ -240,7 +240,7 @@ mod tests {
     use glassdb_backend::middleware::{
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
     };
-    use glassdb_data::{CollectionAddress, CollectionId, KeyRef, LeafRef};
+    use glassdb_data::{CollectionAddress, CollectionId, LeafRef, LogicalKey};
     use tokio::sync::Notify;
 
     fn db_root() -> DbRoot {
@@ -297,7 +297,7 @@ mod tests {
         let mut wrong_database =
             TxLog::new(TxId::from_bytes(vec![5, 6, 7, 8]), TxCommitStatus::Pending);
         wrong_database.writes.push(TxWrite {
-            key: KeyRef::new(test_collection("other", 1), b"key"),
+            key: LogicalKey::new(test_collection("other", 1), b"key"),
             value: Arc::from(&b"value"[..]),
             deleted: false,
             prev_writer: TxId::default(),
@@ -487,7 +487,7 @@ mod tests {
         let id = TxId::from_bytes(vec![1, 2, 3, 4]);
         let collection = test_collection("db", 1);
         let child = test_collection("db", 2);
-        let key = KeyRef::new(collection.clone(), b"hello");
+        let key = LogicalKey::new(collection.clone(), b"hello");
         let log = TxLog {
             id: id.clone(),
             timestamp: Some(UNIX_EPOCH + Duration::from_millis(1_700_000_000_000)),
@@ -649,7 +649,7 @@ mod tests {
     async fn get_returns_log_and_version() {
         let t = new_tlogger();
         let id = TxId::from_bytes(vec![1, 2, 3, 4]);
-        let key = KeyRef::new(test_collection("db", 1), b"hello");
+        let key = LogicalKey::new(test_collection("db", 1), b"hello");
         let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
         log.timestamp = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
         log.writes = vec![TxWrite {

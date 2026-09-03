@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
 use glassdb_concurr::map_all_bounded;
-use glassdb_data::{CollectionAddress, KeyRef, TxId};
-use glassdb_storage::{LeafLocator, Requirement, ShardEntry, StorageError, TreeRouter};
+use glassdb_data::{CollectionAddress, LogicalKey, TxId};
+use glassdb_storage::{LeafEntry, Requirement, RoutedLeaf, StorageError, TreeRouter};
 
 use crate::access::{LeafCoverage, ScanAccess, ScanEvidence, ScanMutation, ScanRange};
 use crate::error::{TransError, trans_to_storage};
@@ -23,9 +23,9 @@ pub struct ScanResult {
     evidence: ScanEvidence,
 }
 
-/// The effective writer and owning-leaf generation for one point key.
+/// The effective writer and routed-leaf generation for one point access.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EffectivePointState {
+pub(crate) struct EffectivePointAccessState {
     pub(crate) writer: Option<TxId>,
     pub(crate) membership_version: u64,
 }
@@ -101,7 +101,7 @@ impl KeyResolver {
     /// Returns the committed value a resolved writer recorded for `key`.
     pub(crate) async fn committed_value(
         &self,
-        key: &KeyRef,
+        key: &LogicalKey,
         writer: &TxId,
     ) -> Result<KeyCommitStatus, TransError> {
         self.state.committed_value(key, writer).await
@@ -160,7 +160,7 @@ impl KeyResolver {
                 .collect();
             let overlay_keys: Vec<Vec<u8>> = overlay
                 .keys()
-                .take_while(|key| node.owns(key))
+                .take_while(|key| node.covers(key))
                 .cloned()
                 .collect();
             let leaf_overlay: BTreeMap<Vec<u8>, bool> = overlay_keys
@@ -178,13 +178,13 @@ impl KeyResolver {
                 let present = match leaf_overlay.get(key.as_slice()) {
                     Some(present) => *present,
                     None => {
-                        let key_ref = KeyRef::new(collection.clone(), &key);
+                        let logical_key = LogicalKey::new(collection.clone(), &key);
                         match leaf.lookup(&key) {
                             None => false,
                             Some(entry) => self
                                 .state
                                 .resolve_effective(
-                                    &key_ref,
+                                    &logical_key,
                                     Some(entry),
                                     own_lock_holder,
                                     requirement,
@@ -208,7 +208,7 @@ impl KeyResolver {
             covered.push(coverage);
 
             let target = cap.or(range.end.as_deref());
-            if target.is_some_and(|target| node.owns(target)) {
+            if target.is_some_and(|target| node.covers(target)) {
                 break;
             }
             let Some(next) = self
@@ -266,7 +266,7 @@ impl KeyResolver {
 
     async fn leaf_coverage(
         &self,
-        loc: &LeafLocator,
+        loc: &RoutedLeaf,
         own_lock_holder: Option<&TxId>,
         requirement: Requirement,
     ) -> Result<LeafCoverage, StorageError> {
@@ -290,14 +290,14 @@ impl KeyResolver {
         })
     }
 
-    /// Resolves effective writers and owning-leaf generations against one
+    /// Resolves effective writers and routed-leaf generations against one
     /// shared freshness requirement.
     pub(crate) async fn effective_point_states(
         &self,
-        keys: &[KeyRef],
+        keys: &[LogicalKey],
         own_lock_holder: Option<&TxId>,
         requirement: Requirement,
-    ) -> Result<Vec<EffectivePointState>, StorageError> {
+    ) -> Result<Vec<EffectivePointAccessState>, StorageError> {
         let items = keys
             .iter()
             .cloned()
@@ -306,7 +306,7 @@ impl KeyResolver {
             .collect::<Vec<_>>();
         let groups = self
             .router
-            .group_keys_by_leaf_fresh(items, Requirement::Any, requirement)
+            .route_keys_with_requirements(items, Requirement::Any, requirement)
             .await?;
 
         let group_results = map_all_bounded(groups, self.parallelism, |group| async move {
@@ -348,7 +348,7 @@ impl KeyResolver {
                 match resolved {
                     Ok(resolved) => results.push((
                         *ordinal,
-                        Ok(EffectivePointState {
+                        Ok(EffectivePointAccessState {
                             writer: resolved.writer,
                             membership_version,
                         }),
@@ -382,8 +382,8 @@ impl KeyResolver {
             .collect())
     }
 
-    /// Resolves `key` to its owning leaf and effective writer, returning
-    /// the located leaf alongside. An absent key resolves to no writer.
+    /// Resolves `key` to its routed leaf and effective writer.
+    /// An absent key resolves to no writer.
     ///
     /// `requirement` is forwarded to the descent: same-leaf direct commit passes
     /// [`Requirement::Any`] so its eligibility check reuses a leaf already
@@ -391,9 +391,9 @@ impl KeyResolver {
     /// copy is caught by the publication's version-conditional CAS (ADR-030).
     pub(crate) async fn resolve_key(
         &self,
-        key: &KeyRef,
+        key: &LogicalKey,
         requirement: Requirement,
-    ) -> Result<(WriterResolution, LeafLocator), TransError> {
+    ) -> Result<(WriterResolution, RoutedLeaf), TransError> {
         let loc = self.locate_key(key, requirement).await?;
         let writer = self
             .state
@@ -405,16 +405,16 @@ impl KeyResolver {
 
     async fn locate_key(
         &self,
-        key: &KeyRef,
+        key: &LogicalKey,
         requirement: Requirement,
-    ) -> Result<LeafLocator, TransError> {
+    ) -> Result<RoutedLeaf, TransError> {
         // Interior index nodes are served from cache (ADR-031 hot-path
         // invariant); only the terminal leaf honors the caller's `requirement`
         // (the fast path's `Any` reuse, else a current lower bound), so the root `_r`
         // is not revalidated on every commit.
         let loc = self
             .router
-            .leaf_for_fresh(key.collection(), key.key(), Requirement::Any, requirement)
+            .route_key_with_requirements(key.collection(), key.key(), Requirement::Any, requirement)
             .await
             .map_err(|error| error.classify_collection_absence(key.collection()))?;
         if let Some(node) = loc.node() {
@@ -427,9 +427,9 @@ impl KeyResolver {
     }
 
     fn entry_at<'a>(
-        loc: &'a LeafLocator,
+        loc: &'a RoutedLeaf,
         raw_key: &[u8],
-    ) -> Result<Option<&'a ShardEntry>, TransError> {
+    ) -> Result<Option<&'a LeafEntry>, TransError> {
         let leaf = loc
             .node()
             .map(|node| {
@@ -460,7 +460,7 @@ mod tests {
     use glassdb_data::{CollectionId, DbRoot, ObjectPath};
     use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
-        CachedStore, CurrentState, Node, NodeStore, Shard, ShardEntry, Timeline, TreeRouter,
+        CachedStore, CurrentState, LeafBody, LeafEntry, Node, NodeStore, Timeline, TreeRouter,
     };
 
     use crate::monitor::Monitor;
@@ -477,8 +477,8 @@ mod tests {
         }
     }
 
-    fn key_ref(key: &[u8]) -> KeyRef {
-        KeyRef::new(collection(), key)
+    fn logical_key(key: &[u8]) -> LogicalKey {
+        LogicalKey::new(collection(), key)
     }
 
     fn missing_collection() -> CollectionAddress {
@@ -503,15 +503,15 @@ mod tests {
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
-        let shards = NodeStore::new(objects, std::num::NonZeroUsize::MIN);
-        shards
-            .create_root(&collection(), &Node::leaf(Shard::new()))
+        let nodes = NodeStore::new(objects, std::num::NonZeroUsize::MIN);
+        nodes
+            .create_root(&collection(), &Node::leaf(LeafBody::new()))
             .await
             .unwrap();
         let state = KeyStateResolver::new(mon.clone());
         (
             KeyResolver::new(
-                TreeRouter::new(shards.clone(), std::num::NonZeroUsize::MIN),
+                TreeRouter::new(nodes.clone(), std::num::NonZeroUsize::MIN),
                 state,
                 std::num::NonZeroUsize::MIN,
             ),
@@ -522,7 +522,7 @@ mod tests {
     }
 
     struct TestStore {
-        shards: NodeStore,
+        nodes: NodeStore,
         timeline: Timeline,
     }
 
@@ -530,24 +530,24 @@ mod tests {
         type Target = NodeStore;
 
         fn deref(&self) -> &Self::Target {
-            &self.shards
+            &self.nodes
         }
     }
 
     async fn store_over(backend: Arc<dyn Backend>) -> TestStore {
         let timeline = Timeline::new();
-        let shards = NodeStore::new(
+        let nodes = NodeStore::new(
             CachedStore::new(backend, 1 << 20, timeline.clone(), None),
             std::num::NonZeroUsize::MIN,
         );
-        shards
-            .create_root(&collection(), &Node::leaf(Shard::new()))
+        nodes
+            .create_root(&collection(), &Node::leaf(LeafBody::new()))
             .await
             .unwrap();
-        TestStore { shards, timeline }
+        TestStore { nodes, timeline }
     }
 
-    async fn effective_writer(resolver: &KeyResolver, key: &KeyRef) -> Option<TxId> {
+    async fn effective_writer(resolver: &KeyResolver, key: &LogicalKey) -> Option<TxId> {
         resolver
             .resolve_key(key, Requirement::Any)
             .await
@@ -565,7 +565,7 @@ mod tests {
             .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
             .await
             .unwrap();
-        let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
+        let mut entries: BTreeMap<Vec<u8>, LeafEntry> = loaded
             .entries()
             .entries()
             .cloned()
@@ -580,10 +580,10 @@ mod tests {
                 writer: writer.clone(),
             }
         };
-        entries.insert(key.to_vec(), ShardEntry::new(key).with_current(current));
-        let new_shard = Shard::from_entries(entries.into_values());
+        entries.insert(key.to_vec(), LeafEntry::new(key).with_current(current));
+        let new_leaf = LeafBody::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
-        edit.set_entries(new_shard);
+        edit.set_entries(new_leaf);
         assert!(store.commit_leaf(edit).await.unwrap());
     }
 
@@ -593,7 +593,7 @@ mod tests {
         seed_entry(
             store,
             key,
-            ShardEntry::new(key).with_current(CurrentState::Inline {
+            LeafEntry::new(key).with_current(CurrentState::Inline {
                 writer: writer.clone(),
                 value: Arc::from(value),
             }),
@@ -614,22 +614,22 @@ mod tests {
     }
 
     // Replaces `key`'s entry in the collection's leaf `_r` with `entry`.
-    async fn seed_entry(store: &TestStore, key: &[u8], entry: ShardEntry) {
+    async fn seed_entry(store: &TestStore, key: &[u8], entry: LeafEntry) {
         let path = root_path();
         let loaded = store
             .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
             .await
             .unwrap();
-        let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
+        let mut entries: BTreeMap<Vec<u8>, LeafEntry> = loaded
             .entries()
             .entries()
             .cloned()
             .map(|e| (e.key.clone(), e))
             .collect();
         entries.insert(key.to_vec(), entry);
-        let new_shard = Shard::from_entries(entries.into_values());
+        let new_leaf = LeafBody::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
-        edit.set_entries(new_shard);
+        edit.set_entries(new_leaf);
         assert!(store.commit_leaf(edit).await.unwrap());
     }
 
@@ -640,7 +640,7 @@ mod tests {
         mon.begin_tx(writer);
         let mut tl = TxLog::new(writer.clone(), TxCommitStatus::Ok);
         tl.writes = vec![TxWrite {
-            key: key_ref(key),
+            key: logical_key(key),
             value: Arc::from(b"v".as_slice()),
             deleted,
             prev_writer: TxId::default(),
@@ -658,18 +658,18 @@ mod tests {
             .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
             .await
             .unwrap();
-        let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
+        let mut entries: BTreeMap<Vec<u8>, LeafEntry> = loaded
             .entries()
             .entries()
             .cloned()
             .map(|e| (e.key.clone(), e))
             .collect();
-        let mut entry = ShardEntry::new(key);
+        let mut entry = LeafEntry::new(key);
         entry.replace_write_lock(holder.clone());
         entries.insert(key.to_vec(), entry);
-        let new_shard = Shard::from_entries(entries.into_values());
+        let new_leaf = LeafBody::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
-        edit.set_entries(new_shard);
+        edit.set_entries(new_leaf);
         assert!(store.commit_leaf(edit).await.unwrap());
     }
 
@@ -681,7 +681,7 @@ mod tests {
             .count()
     }
 
-    fn count_shard_reads(log: &OpLog) -> usize {
+    fn count_leaf_reads(log: &OpLog) -> usize {
         log.lock()
             .unwrap()
             .iter()
@@ -697,7 +697,7 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (resolver, _monitor, timeline, _background) = resolver_over(backend).await;
         let collection = missing_collection();
-        let key = KeyRef::new(collection.clone(), b"k");
+        let key = LogicalKey::new(collection.clone(), b"k");
         let range = ScanRange::all();
 
         assert!(matches!(
@@ -745,9 +745,9 @@ mod tests {
 
         let (resolver, _mon, timeline, _bg) = resolver_over(backend.clone()).await;
 
-        let pa = key_ref(&a);
-        let pb = key_ref(&b);
-        let pc = key_ref(&c);
+        let pa = logical_key(&a);
+        let pb = logical_key(&b);
+        let pc = logical_key(&c);
         let out = resolver
             .effective_point_states(
                 &[pa.clone(), pb.clone(), pc.clone()],
@@ -775,7 +775,7 @@ mod tests {
 
         let (resolver, monitor, timeline, _background) = resolver_over(backend).await;
         commit_value(&monitor, key, &holder, false).await;
-        let key = key_ref(key);
+        let key = logical_key(key);
         let requirement = Requirement::AtLeast(timeline.now());
 
         let foreign = resolver
@@ -791,12 +791,12 @@ mod tests {
         assert_eq!(own[0].writer, Some(predecessor));
     }
 
-    // `resolve_key` with `Any` reuses a shard already in the resolver's
+    // `resolve_key` with `Any` reuses a leaf already in the resolver's
     // cache without any backend read, while a current bound revalidates it with one
     // conditional read (ADR-030). This lets a same-leaf direct candidate reuse
-    // the shard the transaction body cached, adding no shard load at commit.
+    // the leaf the transaction body cached, adding no leaf load at commit.
     #[tokio::test]
-    async fn resolve_key_any_reuses_cached_shard() {
+    async fn resolve_key_any_reuses_cached_leaf() {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let log = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
@@ -808,7 +808,7 @@ mod tests {
         seed_writer(&seed_store, key, &writer, false).await;
 
         let (resolver, _mon, timeline, _bg) = resolver_over(backend.clone()).await;
-        let key_path = key_ref(key);
+        let key_path = logical_key(key);
 
         // Warm the resolver's own cache with one cold load.
         resolver
@@ -817,28 +817,28 @@ mod tests {
             .unwrap();
         log.lock().unwrap().clear();
 
-        // `Any` serves the cached shard: no backend read at all.
+        // `Any` serves the cached leaf: no backend read at all.
         let (resolved, _) = resolver
             .resolve_key(&key_path, Requirement::Any)
             .await
             .unwrap();
         assert_eq!(resolved.writer, Some(writer.clone()), "still resolves");
         assert_eq!(
-            count_shard_reads(&log),
+            count_leaf_reads(&log),
             0,
-            "Any reuses the cached shard without a backend read"
+            "Any reuses the cached leaf without a backend read"
         );
 
-        // A current bound revalidates the cached shard with one conditional read.
+        // A current bound revalidates the cached leaf with one conditional read.
         log.lock().unwrap().clear();
         resolver
             .resolve_key(&key_path, Requirement::AtLeast(timeline.now()))
             .await
             .unwrap();
         assert_eq!(
-            count_shard_reads(&log),
+            count_leaf_reads(&log),
             1,
-            "a current bound revalidates the cached shard"
+            "a current bound revalidates the cached leaf"
         );
     }
 
@@ -855,15 +855,15 @@ mod tests {
 
         let (resolver, _mon, _timeline, _bg) = resolver_over(backend).await;
         assert_eq!(
-            effective_writer(&resolver, &key_ref(b"live-key")).await,
+            effective_writer(&resolver, &logical_key(b"live-key")).await,
             Some(live)
         );
         assert_eq!(
-            effective_writer(&resolver, &key_ref(b"dead-key")).await,
+            effective_writer(&resolver, &logical_key(b"dead-key")).await,
             Some(dead)
         );
         assert_eq!(
-            effective_writer(&resolver, &key_ref(b"missing")).await,
+            effective_writer(&resolver, &logical_key(b"missing")).await,
             None
         );
     }
@@ -886,12 +886,12 @@ mod tests {
         seed_locked(&seed_store, b"dead-key", &tomb).await;
 
         assert_eq!(
-            effective_writer(&resolver, &key_ref(b"live-key")).await,
+            effective_writer(&resolver, &logical_key(b"live-key")).await,
             Some(live),
             "a committed exclusive holder is help-forwarded as the writer"
         );
         assert_eq!(
-            effective_writer(&resolver, &key_ref(b"dead-key")).await,
+            effective_writer(&resolver, &logical_key(b"dead-key")).await,
             Some(tomb),
             "a help-forwarded tombstone still resolves its writer"
         );
@@ -913,7 +913,10 @@ mod tests {
         let reader = Reader::new(resolver, timeline, RetryConfig::default());
         log.lock().unwrap().clear();
 
-        let out = reader.read(&key_ref(b"k"), Duration::MAX).await.unwrap();
+        let out = reader
+            .read(&logical_key(b"k"), Duration::MAX)
+            .await
+            .unwrap();
         let value = out.value.expect("inline value is present");
         assert_eq!(value.value.as_ref(), b"hello");
         assert_eq!(value.version.writer, writer);
@@ -939,7 +942,10 @@ mod tests {
         let reader = Reader::new(resolver, timeline, RetryConfig::default());
         log.lock().unwrap().clear();
 
-        let out = reader.read(&key_ref(b"k"), Duration::MAX).await.unwrap();
+        let out = reader
+            .read(&logical_key(b"k"), Duration::MAX)
+            .await
+            .unwrap();
         assert!(out.value.is_none());
         let (_, _, evidence) = out.into_parts();
         assert!(evidence.validates(Some(&writer), 0));
@@ -965,7 +971,10 @@ mod tests {
         seed_hold(&seed_store, b"k", &new).await;
 
         let reader = Reader::new(resolver, timeline, RetryConfig::default());
-        let out = reader.read(&key_ref(b"k"), Duration::MAX).await.unwrap();
+        let out = reader
+            .read(&logical_key(b"k"), Duration::MAX)
+            .await
+            .unwrap();
         let value = out.value.expect("the holder committed a live value");
         // `commit_value` writes b"v"; the stale inline b"old-value" must not win.
         assert_eq!(value.value.as_ref(), b"v");
@@ -983,12 +992,15 @@ mod tests {
 
         let first = TxId::with_priority(1, b"first");
         seed_inline(&seed_store, b"k", &first, b"same").await;
-        let before = reader.read(&key_ref(b"k"), Duration::MAX).await.unwrap();
+        let before = reader
+            .read(&logical_key(b"k"), Duration::MAX)
+            .await
+            .unwrap();
 
         let second = TxId::with_priority(2, b"second");
         seed_inline(&seed_store, b"k", &second, b"same").await;
         let after = reader
-            .read(&key_ref(b"k"), Duration::from_secs(0))
+            .read(&logical_key(b"k"), Duration::from_secs(0))
             .await
             .unwrap();
 

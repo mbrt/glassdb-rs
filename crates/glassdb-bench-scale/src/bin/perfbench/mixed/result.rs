@@ -332,7 +332,7 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use glassdb::{BackendStats, DirectCommitStats, ShardCoordinatorStats, TransactionStats};
+    use glassdb::{BackendStats, DirectCommitStats, LeafCoordinatorStats, TransactionStats};
 
     use super::*;
 
@@ -364,7 +364,7 @@ mod tests {
                     obj_writes: 4,
                     obj_lists: 0,
                 },
-                coordinator: ShardCoordinatorStats {
+                coordinator: LeafCoordinatorStats {
                     submissions: 12,
                     rounds: 4,
                     cas_retries: 2,
@@ -386,7 +386,7 @@ mod tests {
                     obj_writes: 2,
                     obj_lists: 2,
                 },
-                coordinator: ShardCoordinatorStats {
+                coordinator: LeafCoordinatorStats {
                     submissions: 3,
                     rounds: 1,
                     cas_retries: 0,

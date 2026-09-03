@@ -4,7 +4,7 @@
 //! A complete point transaction whose dependencies and inline-admissible outputs
 //! share one leaf first attempts ADR-061's logless one-CAS commit. Other
 //! read-write transactions validate their reads and install locks with one
-//! read-modify-write CAS per touched shard, flip their transaction object to
+//! read-modify-write CAS per touched leaf, flip their transaction object to
 //! committed, then publish `current_writer` pointers and release their locks.
 //! A read-only transaction starts on a pure optimistic fast path. If validation
 //! fails, retries lock their point reads and scan predicates so sustained churn
@@ -17,17 +17,17 @@
 //! and proceeds. Distinct priorities cannot deadlock (wound-wait keeps the
 //! wait-for graph acyclic); two equal-priority transactions that would cycle are
 //! broken by escalating to the serial order. Lock acquisition has two modes: the
-//! default **parallel** path locks every shard concurrently; after a
+//! default **parallel** path locks every leaf concurrently; after a
 //! [`MAX_DEADLOCK_TIMEOUT`] wait or [`SERIAL_FALLBACK_AFTER`] failed attempts,
 //! the attempt owner ends the parallel identity and renews it before the
-//! **serial** sorted order. First-CAS-wins on the lowest contended shard then
+//! **serial** sorted order. First-CAS-wins on the lowest contended leaf then
 //! guarantees that one contender makes progress.
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use glassdb_concurr::{Background, Backoff, RetryConfig, rt};
-use glassdb_data::{KeyRef, TxId};
+use glassdb_data::{LogicalKey, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxLog, TxWrite};
 use glassdb_storage::{
     InlinePolicy, LeafObservationCheck, LockType, NodeStore, Requirement, SplitPolicy, Timeline,
@@ -36,12 +36,12 @@ use glassdb_storage::{
 
 use crate::access::{AccessSet, ReadAccess, WriteOp};
 use crate::collection_commit::{CollectionAttempt, CollectionCommit};
-use crate::collections::CollectionData;
+use crate::collections::CatalogAccesses;
 use crate::error::TransError;
 use crate::gc::TxCleanupHints;
 use crate::key_resolver::KeyResolver;
+use crate::leaf_coord::LeafCoordinator;
 use crate::monitor::{Monitor, OwnerAbortOutcome};
-use crate::shard_coord::ShardCoordinator;
 use crate::split::SplitHintSink;
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
@@ -55,8 +55,8 @@ use direct_commit::{DirectAttempt, DirectCommit};
 /// Number of failed parallel-locking attempts before a transaction escalates to
 /// the serial sorted-locking fallback (ADR-020). The parallel path is fast but
 /// can *livelock* two equal-priority transactions that each grab a different
-/// shard first; after this many failures the transaction switches to sorted
-/// acquisition, where first-CAS-wins on the lowest contended shard guarantees
+/// leaf first; after this many failures the transaction switches to sorted
+/// acquisition, where first-CAS-wins on the lowest contended leaf guarantees
 /// one of them makes progress.
 const SERIAL_FALLBACK_AFTER: usize = 3;
 
@@ -83,8 +83,8 @@ struct AttemptRetirement {
 }
 
 impl AttemptRetirement {
-    /// Hands an abandoned transaction identity to managed recovery.
-    fn retire_abandoned(&self, tx_id: &TxId) {
+    /// Hands an unfinished transaction identity to managed recovery.
+    fn retire_unfinished(&self, tx_id: &TxId) {
         // An optimistic read-only validation and a logless one-CAS commit have
         // no logged identity. Publishing an abort for either would invent a
         // transaction that peers never observed.
@@ -105,7 +105,7 @@ impl AttemptRetirement {
     }
 }
 
-/// Hands the active identity to recovery if its owner future is abandoned.
+/// Hands the active identity to recovery if its owner future does not finish.
 struct AttemptRetirementGuard {
     retirement: Arc<AttemptRetirement>,
     armed: Option<TxId>,
@@ -133,7 +133,7 @@ impl AttemptRetirementGuard {
 
     fn retire_current(&mut self) {
         if let Some(tx_id) = self.armed.take() {
-            self.retirement.retire_abandoned(&tx_id);
+            self.retirement.retire_unfinished(&tx_id);
         }
     }
 }
@@ -151,8 +151,8 @@ pub struct Handle {
     state: AttemptState,
     id: TxId,
     /// Per-transaction backoff for the internal CAS-contention retry in
-    /// [`Algo::acquire_locks`] (a lost shard/root CAS race): advanced before each
-    /// same-id re-lock so churning contenders spread out instead of busy-looping.
+    /// [`Algo::acquire_locks`] (a lost leaf/root CAS race): advanced before each
+    /// same-identity re-lock so churning contenders spread out instead of busy-looping.
     /// Body replay after a wound or stale read and read-only validation do not
     /// use this schedule.
     backoff: Backoff,
@@ -212,11 +212,11 @@ impl Handle {
     }
 }
 
-/// Reports whether an engine operation needs another user-body execution.
+/// Reports whether GlassDB can return a body outcome or must execute the body again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BodyOutcome {
-    /// The engine operation reached its normal result.
-    Complete,
+pub enum BodyDecision {
+    /// The body outcome can be returned.
+    ReturnOutcome,
     /// The engine changed attempt state and needs fresh logical accesses.
     ReplayBody,
 }
@@ -309,7 +309,7 @@ fn read_observation_has_exclusive_holder(read: &ReadAccess) -> Result<bool, Tran
 /// Coordinates transactions: read validation, locking, commit, and write-back.
 #[derive(Clone)]
 pub struct Algo {
-    shards: NodeStore,
+    nodes: NodeStore,
     resolver: KeyResolver,
     locker: Locker,
     direct_commit: DirectCommit,
@@ -334,11 +334,11 @@ impl Algo {
     /// share the process-wide model-time domain.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        shards: NodeStore,
+        nodes: NodeStore,
         timeline: Timeline,
         acquisition_retry: RetryConfig,
         locker: Locker,
-        coord: ShardCoordinator,
+        coord: LeafCoordinator,
         mon: Monitor,
         collection_commit: CollectionCommit,
         cleanup_hints: TxCleanupHints,
@@ -362,7 +362,7 @@ impl Algo {
             background: background.clone(),
         });
         Algo {
-            shards,
+            nodes,
             resolver,
             locker,
             direct_commit,
@@ -384,11 +384,11 @@ impl Algo {
 
     /// Starts a new transaction with its key and collection-management accesses.
     /// The id's random prefix and timestamp are deterministic under `--cfg sim`.
-    pub fn begin(&self, accesses: AccessSet, collection_data: CollectionData) -> Handle {
+    pub fn begin(&self, accesses: AccessSet, catalog_accesses: CatalogAccesses) -> Handle {
         let id = TxId::new_at(rt::system_now());
         Handle {
             accesses,
-            collections: CollectionAttempt::new(collection_data),
+            collections: CollectionAttempt::new(catalog_accesses),
             state: AttemptState::new(),
             retirement: AttemptRetirementGuard::new(self.retirement.clone(), id.clone()),
             id,
@@ -397,31 +397,31 @@ impl Algo {
     }
 
     /// Validates all reads and applies all writes.
-    pub async fn commit(&self, tx: &mut Handle) -> Result<BodyOutcome, TransError> {
+    pub async fn commit(&self, tx: &mut Handle) -> Result<BodyDecision, TransError> {
         loop {
             match self.commit_once(tx).await {
-                Ok(AttemptOutcome::Complete) => return Ok(BodyOutcome::Complete),
+                Ok(AttemptOutcome::Complete) => return Ok(BodyDecision::ReturnOutcome),
                 Ok(AttemptOutcome::RenewForSerial { replay_body, .. }) => {
                     self.renew_for_serial(tx).await?;
                     if replay_body {
-                        return Ok(BodyOutcome::ReplayBody);
+                        return Ok(BodyDecision::ReplayBody);
                     }
                 }
                 Err(TransError::Wounded) => {
                     self.renew_after_wound(tx).await;
-                    return Ok(BodyOutcome::ReplayBody);
+                    return Ok(BodyDecision::ReplayBody);
                 }
-                Err(TransError::Retry) => return Ok(BodyOutcome::ReplayBody),
+                Err(TransError::Retry) => return Ok(BodyDecision::ReplayBody),
                 Err(error) => return Err(error),
             }
         }
     }
 
     /// Validates the reads and range scans of a read-only transaction.
-    pub async fn validate_reads(&self, tx: &mut Handle) -> Result<BodyOutcome, TransError> {
+    pub async fn validate_reads(&self, tx: &mut Handle) -> Result<BodyDecision, TransError> {
         loop {
             match self.validate_reads_once(tx).await {
-                Ok(AttemptOutcome::Complete) => return Ok(BodyOutcome::Complete),
+                Ok(AttemptOutcome::Complete) => return Ok(BodyDecision::ReturnOutcome),
                 Ok(AttemptOutcome::RenewForSerial { replay_body, .. }) => {
                     debug_assert!(
                         !replay_body,
@@ -431,9 +431,9 @@ impl Algo {
                 }
                 Err(TransError::Wounded) => {
                     self.renew_after_wound(tx).await;
-                    return Ok(BodyOutcome::ReplayBody);
+                    return Ok(BodyDecision::ReplayBody);
                 }
-                Err(TransError::Retry) => return Ok(BodyOutcome::ReplayBody),
+                Err(TransError::Retry) => return Ok(BodyDecision::ReplayBody),
                 Err(error) => return Err(error),
             }
         }
@@ -450,10 +450,10 @@ impl Algo {
         &self,
         tx: &mut Handle,
         accesses: AccessSet,
-        collection_data: CollectionData,
+        catalog_accesses: CatalogAccesses,
     ) {
         self.reset(tx, accesses);
-        tx.collections.replace_data(collection_data);
+        tx.collections.replace_accesses(catalog_accesses);
     }
 
     /// Aborts a non-committed, engaged transaction, acknowledging it when safe
@@ -568,7 +568,9 @@ impl Algo {
         // one leaf CAS with no transaction object (ADR-061). It writes nothing
         // unless it commits, so a non-landing attempt is classified rather than
         // failed (ADR-053).
-        if tx.collections.data().reads.is_empty() && tx.collections.data().changes.is_empty() {
+        if tx.collections.accesses().reads.is_empty()
+            && tx.collections.accesses().changes.is_empty()
+        {
             match self
                 .direct_commit
                 .try_commit(&tx.id, &tx.accesses, &mut tx.state)
@@ -627,7 +629,7 @@ impl Algo {
     }
 
     /// Read-only fast path: re-resolve each read's effective writer against the
-    /// shards and commit if none changed. The first attempt takes no locks; a
+    /// nodes and commit if none changed. The first attempt takes no locks; a
     /// failed validation makes the next attempt use the locked path.
     ///
     /// A failed validation does not back off before signalling [`Retry`]: the
@@ -684,8 +686,8 @@ impl Algo {
             .collections()
             .lock(
                 &tx.id,
-                &tx.collections.data().reads,
-                &tx.collections.data().changes,
+                &tx.collections.accesses().reads,
+                &tx.collections.accesses().changes,
             )
             .await?;
 
@@ -757,7 +759,7 @@ impl Algo {
         if let Err(error) = self
             .locker
             .collections()
-            .write_back(&tx.id, &tx.collections.data().changes, &locks)
+            .write_back(&tx.id, &tx.collections.accesses().changes, &locks)
             .await
         {
             tracing::debug!(%error, "collection-directory write-back deferred");
@@ -784,7 +786,7 @@ impl Algo {
         let directory_locks = self
             .locker
             .collections()
-            .lock(&tx.id, &tx.collections.data().reads, &[])
+            .lock(&tx.id, &tx.collections.accesses().reads, &[])
             .await?;
         let locked = match self.acquire_locks(tx, requirement).await? {
             Acquired::Locked(locked) => locked,
@@ -985,7 +987,7 @@ impl Algo {
             .map(|read| read.observation().clone())
             .collect::<Vec<_>>();
         let checks = self
-            .shards
+            .nodes
             .check_leaves_current(&observations, requirement)
             .await;
         for (read, check) in accesses.point_reads().iter().zip(checks) {
@@ -1013,7 +1015,7 @@ impl Algo {
             let leaf_unchanged = match lock_validation {
                 Some(locked) => locked.validated(&coverage.observation),
                 None => matches!(
-                    self.shards
+                    self.nodes
                         .check_leaf_current(&coverage.observation, requirement)
                         .await?,
                     LeafObservationCheck::Current
@@ -1033,8 +1035,8 @@ impl Algo {
 
     /// Re-resolves every read's effective writer and reports whether they all
     /// still match what the transaction observed (a consistent snapshot exists).
-    /// The read set is resolved in one shard-batched pass (each touched shard is
-    /// loaded once) rather than one shard load per key.
+    /// The read set is resolved in one leaf-batched pass (each touched leaf is
+    /// loaded once) rather than one leaf load per key.
     async fn validate_reads_inner(
         &self,
         accesses: &AccessSet,
@@ -1044,7 +1046,7 @@ impl Algo {
         if accesses.point_reads().is_empty() {
             return Ok(true);
         }
-        let keys: Vec<KeyRef> = accesses
+        let keys: Vec<LogicalKey> = accesses
             .point_reads()
             .iter()
             .map(|read| read.key().clone())
@@ -1178,8 +1180,8 @@ mod tests {
     };
     use glassdb_storage::transaction::{TLogger, TxCommitStatus};
     use glassdb_storage::{
-        CachedStore, CollectionRecord, CollectionStore, CurrentState, Node, NodeStore, Shard,
-        ShardEntry, StorageError, TreeRouter,
+        CachedStore, CollectionRecord, CollectionStore, CurrentState, LeafBody, LeafEntry, Node,
+        NodeStore, StorageError, TreeRouter,
     };
     use tokio::sync::Notify;
 
@@ -1199,8 +1201,8 @@ mod tests {
         }
     }
 
-    pub(super) fn key_ref(key: &[u8]) -> KeyRef {
-        KeyRef::new(test_collection(), key)
+    pub(super) fn logical_key(key: &[u8]) -> LogicalKey {
+        LogicalKey::new(test_collection(), key)
     }
 
     pub(super) struct Tctx {
@@ -1208,7 +1210,7 @@ mod tests {
         pub(super) tlogger: TLogger,
         pub(super) tmon: Monitor,
         pub(super) records: CollectionStore,
-        pub(super) shards: NodeStore,
+        pub(super) nodes: NodeStore,
         pub(super) timeline: Timeline,
         pub(super) locker: Locker,
         _engine: EngineFixture,
@@ -1262,8 +1264,8 @@ mod tests {
             .await
             .unwrap();
         foundation
-            .shards
-            .create_root(&test_collection(), &Node::leaf(Shard::new()))
+            .nodes
+            .create_root(&test_collection(), &Node::leaf(LeafBody::new()))
             .await
             .unwrap();
 
@@ -1276,7 +1278,7 @@ mod tests {
                 tlogger: foundation.tlogger.clone(),
                 tmon: foundation.monitor.clone(),
                 records: foundation.records.clone(),
-                shards: foundation.shards.clone(),
+                nodes: foundation.nodes.clone(),
                 timeline: foundation.timeline.clone(),
                 locker: engine.locker.clone(),
                 _engine: engine,
@@ -1284,24 +1286,24 @@ mod tests {
         )
     }
 
-    pub(super) fn wa(key: &KeyRef, val: &[u8]) -> WriteAccess {
+    pub(super) fn wa(key: &LogicalKey, val: &[u8]) -> WriteAccess {
         WriteAccess::put(key.clone(), Arc::from(val))
     }
 
-    pub(super) fn wdel(key: &KeyRef) -> WriteAccess {
+    pub(super) fn wdel(key: &LogicalKey) -> WriteAccess {
         WriteAccess::delete(key.clone())
     }
 
-    pub(super) async fn do_read(tctx: &Tctx, key: &KeyRef) -> ReadAccess {
+    pub(super) async fn do_read(tctx: &Tctx, key: &LogicalKey) -> ReadAccess {
         let outcome = read_outcome(tctx, key).await;
         let (_, _, evidence) = outcome.into_parts();
         ReadAccess::new(key.clone(), evidence)
     }
 
-    pub(super) async fn read_outcome(tctx: &Tctx, key: &KeyRef) -> crate::reader::ReadOutcome {
+    pub(super) async fn read_outcome(tctx: &Tctx, key: &LogicalKey) -> crate::reader::ReadOutcome {
         let reader = Reader::new(
             KeyResolver::new(
-                TreeRouter::new(tctx.shards.clone(), std::num::NonZeroUsize::MIN),
+                TreeRouter::new(tctx.nodes.clone(), std::num::NonZeroUsize::MIN),
                 KeyStateResolver::new(tctx.tmon.clone()),
                 std::num::NonZeroUsize::MIN,
             ),
@@ -1315,7 +1317,7 @@ mod tests {
     }
 
     pub(super) fn begin_accesses(tm: &Algo, accesses: AccessSet) -> Handle {
-        tm.begin(accesses, CollectionData::default())
+        tm.begin(accesses, CatalogAccesses::default())
     }
 
     pub(super) async fn commit_access(tm: &Algo, accesses: AccessSet) -> Handle {
@@ -1329,9 +1331,9 @@ mod tests {
         commit_access(tm, AccessSet::new(Vec::new(), ws, Vec::new())).await
     }
 
-    pub(super) async fn entry(tctx: &Tctx, key: &[u8]) -> Option<ShardEntry> {
+    pub(super) async fn entry(tctx: &Tctx, key: &[u8]) -> Option<LeafEntry> {
         let loaded = tctx
-            .shards
+            .nodes
             .load_leaf(&test_root_path(), Requirement::AtLeast(tctx.timeline.now()))
             .await
             .unwrap();
@@ -1339,7 +1341,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn abandoned_retirement_hands_off_local_locks_when_its_status_read_fails() {
+    async fn interrupted_retirement_hands_off_local_locks_when_its_status_read_fails() {
         let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let backend = Arc::new(HookBackend::new(inner));
         let fail_status_read = Arc::new(AtomicBool::new(false));
@@ -1372,28 +1374,28 @@ mod tests {
             true,
         )
         .await;
-        let key = key_ref(b"abandoned");
-        let data = AccessSet::new(Vec::new(), vec![wa(&key, b"uncommitted")], Vec::new());
-        let abandoned_handle = begin_accesses(&algo, data.clone());
-        let abandoned = abandoned_handle.id().clone();
-        tctx.tmon.begin_tx(&abandoned);
+        let key = logical_key(b"interrupted");
+        let accesses = AccessSet::new(Vec::new(), vec![wa(&key, b"uncommitted")], Vec::new());
+        let interrupted_handle = begin_accesses(&algo, accesses.clone());
+        let interrupted = interrupted_handle.id().clone();
+        tctx.tmon.begin_tx(&interrupted);
         let outcome = tctx
             .locker
             .keys()
-            .lock_at(&abandoned, &data, false, Requirement::Any)
+            .lock_at(&interrupted, &accesses, false, Requirement::Any)
             .await
             .unwrap();
         assert!(matches!(outcome, LockOutcome::Locked(_)));
 
         fail_status_read.store(true, Ordering::SeqCst);
-        drop(abandoned_handle);
+        drop(interrupted_handle);
         tokio::time::timeout(Duration::from_secs(1), failure_reached.notified())
             .await
             .expect("retirement never attempted its status read");
 
         let (peer, peer_ctx) = new_algo_from_backend(backend).await;
-        peer_ctx.tmon.preempt_tx(&abandoned).await.unwrap();
-        let mut peer_handle = begin_accesses(&peer, data);
+        peer_ctx.tmon.preempt_tx(&interrupted).await.unwrap();
+        let mut peer_handle = begin_accesses(&peer, accesses);
         tokio::time::timeout(Duration::from_secs(1), peer.commit(&mut peer_handle))
             .await
             .expect("protocol helping did not make progress")
@@ -1404,7 +1406,7 @@ mod tests {
     #[tokio::test]
     async fn direct_write_new() {
         let (tm, tctx) = new_algo().await;
-        let keyp = key_ref(b"k");
+        let keyp = logical_key(b"k");
         let val = b"v";
 
         let mut h = begin_accesses(
@@ -1429,7 +1431,7 @@ mod tests {
             "a direct create has no transaction object"
         );
 
-        // The shard entry points at the committed writer and the lock is gone.
+        // The leaf entry points at the committed writer and the lock is gone.
         let e = entry(&tctx, b"k").await.unwrap();
         assert_eq!(e.current.writer(), Some(&tid));
         assert!(e.lock_holders().is_empty());
@@ -1443,8 +1445,8 @@ mod tests {
     #[tokio::test]
     async fn commit_records_locks() {
         let (tm, tctx) = new_algo().await;
-        let readp = key_ref(b"r");
-        let writep = key_ref(b"w");
+        let readp = logical_key(b"r");
+        let writep = logical_key(b"w");
 
         // Seed the read key so it resolves to a committed value.
         commit_writes(&tm, vec![wa(&readp, b"seed")]).await;
@@ -1487,7 +1489,7 @@ mod tests {
             TEST_DB,
             CollectionId::from_slice(&[2; 16]).expect("fixed ID has the required width"),
         );
-        let earlier_data = CollectionData {
+        let earlier_accesses = CatalogAccesses {
             reads: Vec::new(),
             changes: vec![CollectionChange {
                 parent: test_collection(),
@@ -1497,7 +1499,7 @@ mod tests {
                 op: CollectionOp::Create,
             }],
         };
-        let active_data = CollectionData {
+        let active_accesses = CatalogAccesses {
             reads: Vec::new(),
             changes: vec![CollectionChange {
                 parent: test_collection(),
@@ -1507,12 +1509,12 @@ mod tests {
                 op: CollectionOp::Create,
             }],
         };
-        let mut handle = tm.begin(AccessSet::default(), earlier_data);
+        let mut handle = tm.begin(AccessSet::default(), earlier_accesses);
         tm.collection_commit
             .prepare(&mut handle.collections)
             .await
             .unwrap();
-        handle.collections.replace_data(active_data);
+        handle.collections.replace_accesses(active_accesses);
         tm.collection_commit
             .prepare(&mut handle.collections)
             .await
@@ -1540,7 +1542,7 @@ mod tests {
         );
         let handle = tm.begin(
             AccessSet::default(),
-            CollectionData {
+            CatalogAccesses {
                 reads: Vec::new(),
                 changes: vec![CollectionChange {
                     parent: test_collection(),
@@ -1589,7 +1591,7 @@ mod tests {
         );
         let mut handle = tm.begin(
             AccessSet::default(),
-            CollectionData {
+            CatalogAccesses {
                 reads: Vec::new(),
                 changes: vec![CollectionChange {
                     parent: test_collection(),
@@ -1617,14 +1619,14 @@ mod tests {
             .load_record(&prepared, Requirement::Any)
             .await
             .expect("committed collection record must survive cleanup");
-        tctx.shards
+        tctx.nodes
             .load_root(&prepared, Requirement::Any)
             .await
             .expect("committed collection tree root must survive cleanup");
     }
 
     #[tokio::test]
-    async fn a_retried_body_clears_an_abandoned_partial_drop() {
+    async fn a_retried_body_clears_a_discarded_partial_drop() {
         let (tm, tctx) = new_algo().await;
         let dropped = CollectionAddress::new(
             TEST_DB,
@@ -1637,14 +1639,14 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            tctx.shards
-                .create_root(&dropped, &Node::leaf(Shard::new()))
+            tctx.nodes
+                .create_root(&dropped, &Node::leaf(LeafBody::new()))
                 .await
                 .unwrap()
         );
         let mut handle = tm.begin(
             AccessSet::default(),
-            CollectionData {
+            CatalogAccesses {
                 reads: Vec::new(),
                 changes: vec![CollectionChange {
                     parent: test_collection(),
@@ -1662,12 +1664,14 @@ mod tests {
             .fence(&id, &mut handle.collections)
             .await
             .unwrap();
-        handle.collections.replace_data(CollectionData::default());
+        handle
+            .collections
+            .replace_accesses(CatalogAccesses::default());
 
         tm.commit(&mut handle).await.unwrap();
 
         let (root, _) = tctx
-            .shards
+            .nodes
             .load_root(&dropped, Requirement::AtLeast(tctx.timeline.now()))
             .await
             .unwrap();
@@ -1684,7 +1688,7 @@ mod tests {
     #[tokio::test]
     async fn read_then_write_round_trips() {
         let (tm, tctx) = new_algo().await;
-        let keyp = key_ref(b"k");
+        let keyp = logical_key(b"k");
 
         let h = commit_writes(&tm, vec![wa(&keyp, b"init")]).await;
         let _ = h;
@@ -1711,8 +1715,8 @@ mod tests {
     async fn stale_read_write_retries_holding_locks() {
         let (tm, tctx) = new_algo().await;
         let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
-        let ka = key_ref(b"k");
-        let kb = key_ref(b"k2");
+        let ka = logical_key(b"k");
+        let kb = logical_key(b"k2");
 
         // Seed both keys so the writes are overwrites (not creates), keeping the
         // transaction on the read-write path rather than a membership change.
@@ -1728,7 +1732,7 @@ mod tests {
             &tm,
             AccessSet::new(vec![ra], vec![wa(&ka, b"v3"), wa(&kb, &logged)], Vec::new()),
         );
-        assert_eq!(tm.commit(&mut h).await.unwrap(), BodyOutcome::ReplayBody);
+        assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
 
         // The moved key is locked by us when the stale read is signalled: the
         // re-run owns the lock and cannot lose it again to the same race.
@@ -1741,7 +1745,7 @@ mod tests {
     #[tokio::test]
     async fn wound_renews_the_identity_before_body_replay() {
         let (tm, tctx) = new_algo().await;
-        let keyp = key_ref(b"k");
+        let keyp = logical_key(b"k");
         let value = vec![b'x'; InlinePolicy::default().max_value_bytes + 1];
         let mut h = begin_accesses(
             &tm,
@@ -1752,7 +1756,7 @@ mod tests {
         tctx.tmon.begin_tx(&old_id);
         tctx.tmon.preempt_tx(&old_id).await.unwrap();
 
-        assert_eq!(tm.commit(&mut h).await.unwrap(), BodyOutcome::ReplayBody);
+        assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
         assert_ne!(*h.id(), old_id);
         assert!(!h.id().older(&old_id));
         assert!(!old_id.older(h.id()));
@@ -1767,7 +1771,7 @@ mod tests {
         use crate::tlocker::LockOutcome;
         use std::time::Duration;
         let (tm, tctx) = new_algo().await;
-        let keyp = key_ref(b"k");
+        let keyp = logical_key(b"k");
 
         // An older holder takes the key's write lock and does not finalize.
         let holder = TxId::with_priority(0, b"holder");
@@ -1818,7 +1822,7 @@ mod tests {
         let (mut h, res) = committing.await.unwrap();
         assert_eq!(
             res.expect("renewed identity commits once the holder releases"),
-            BodyOutcome::Complete
+            BodyDecision::ReturnOutcome
         );
         let renewed_id = h.id().clone();
         assert_ne!(renewed_id, id_before);
@@ -1858,37 +1862,37 @@ mod tests {
         assert!(policy.key_fits(&second));
 
         let writer = TxId::with_priority(1, b"old");
-        let unsafe_entry = ShardEntry::new(first.clone()).with_current(CurrentState::Inline {
+        let unsafe_entry = LeafEntry::new(first.clone()).with_current(CurrentState::Inline {
             writer,
             value: Arc::from(vec![b'v'; 128]),
         });
         assert!(!policy.entry_fits_split_budget(&unsafe_entry));
         let creator = TxId::with_priority(2, b"new");
-        let mut create_entry = ShardEntry::new(second.clone());
+        let mut create_entry = LeafEntry::new(second.clone());
         create_entry.replace_create_lock(creator);
         assert!(
-            Node::leaf(Shard::from_entries([unsafe_entry.clone(), create_entry]))
+            Node::leaf(LeafBody::from_entries([unsafe_entry.clone(), create_entry]))
                 .content_encoded_len()
                 > policy.content_limit(),
             "the accepted second key must reproduce LeafFull"
         );
         assert!(
-            Node::leaf(Shard::from_entries([unsafe_entry.clone()])).encoded_len()
+            Node::leaf(LeafBody::from_entries([unsafe_entry.clone()])).encoded_len()
                 <= policy.node_max_bytes(),
             "the grandfathered singleton itself must remain storable"
         );
 
         let path = test_root_path();
         let loaded = tctx
-            .shards
+            .nodes
             .load_leaf(&path, Requirement::AtLeast(tctx.timeline.now()))
             .await
             .unwrap();
         let mut edit = loaded.into_edit();
-        edit.set_entries(Shard::from_entries([unsafe_entry]));
-        assert!(tctx.shards.commit_leaf(edit).await.unwrap());
+        edit.set_entries(LeafBody::from_entries([unsafe_entry]));
+        assert!(tctx.nodes.commit_leaf(edit).await.unwrap());
 
-        let key = key_ref(&second);
+        let key = logical_key(&second);
         let mut handle = begin_accesses(
             &tm,
             AccessSet::new(Vec::new(), vec![wa(&key, b"value")], Vec::new()),
@@ -1992,7 +1996,7 @@ mod tests {
             max_interval: Duration::from_millis(20),
         };
         const ACQUISITION_RETRIES: usize = 8;
-        let failures = ACQUISITION_RETRIES * crate::shard_coord::CAS_RETRIES;
+        let failures = ACQUISITION_RETRIES * crate::leaf_coord::CAS_RETRIES;
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (backend, flaky) = FlakyCas::wrap(mem, test_root_path().to_string(), failures);
         Engine::prepare_permanent_collection(backend.as_ref(), TEST_DB)
@@ -2012,10 +2016,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let keyp = key_ref(b"k");
-        let keyp2 = key_ref(b"k2");
+        let keyp = logical_key(b"k");
+        let keyp2 = logical_key(b"k2");
 
-        // Seed the keys over a clean connection so their shards exist (the lock
+        // Seed the keys over a clean connection so their nodes exist (the lock
         // CAS is then a `write_if`, the thing we fault).
         let mut seed = engine.begin_transaction(
             AccessSet::new(
@@ -2023,7 +2027,7 @@ mod tests {
                 vec![wa(&keyp, b"v1"), wa(&keyp2, b"v1")],
                 Vec::new(),
             ),
-            CollectionData::default(),
+            CatalogAccesses::default(),
         );
         engine.commit(&mut seed).await.unwrap();
         engine.end(&mut seed).await.unwrap();
@@ -2035,14 +2039,14 @@ mod tests {
                 vec![wa(&keyp, b"v2"), wa(&keyp2, b"v2")],
                 Vec::new(),
             ),
-            CollectionData::default(),
+            CatalogAccesses::default(),
         );
         let id_before = h.id().clone();
         let outcome = engine
             .commit(&mut h)
             .await
             .expect("serial fallback commits after contention clears");
-        assert_eq!(outcome, BodyOutcome::Complete);
+        assert_eq!(outcome, BodyDecision::ReturnOutcome);
         assert_ne!(*h.id(), id_before);
         let status_objects = CachedStore::new(status_backend, 1024, Timeline::new(), None);
         let status_logger = TLogger::new(status_objects.clone(), test_db_root());
@@ -2061,7 +2065,7 @@ mod tests {
         assert!(attempts.len() > failures);
         let acquisition_gaps: Vec<_> = (1..=ACQUISITION_RETRIES)
             .map(|round| {
-                let next = round * crate::shard_coord::CAS_RETRIES;
+                let next = round * crate::leaf_coord::CAS_RETRIES;
                 attempts[next].duration_since(attempts[next - 1])
             })
             .collect();
@@ -2077,7 +2081,7 @@ mod tests {
                 "configured capped acquisition delay was {delay:?}"
             );
         }
-        // It still committed: the shards point at our writer with no live lock.
+        // It still committed: the nodes point at our writer with no live lock.
         for key in [&keyp, &keyp2] {
             let read = engine.read(key, Duration::ZERO).await.unwrap();
             assert_eq!(read.value.unwrap().value.as_ref(), b"v2");
@@ -2097,8 +2101,8 @@ mod tests {
     }
 
     // CAS-write counts by object kind, the fingerprint of a commit path: a
-    // logless direct commit (ADR-051) issues one shard write and no tx object at
-    // all; the locked path issues one tx-object write and two shard writes (the
+    // logless direct commit (ADR-051) issues one leaf write and no tx object at
+    // all; the locked path issues one tx-object write and two leaf writes (the
     // lock CAS then the write-back CAS that publishes the pointer — run
     // synchronously here because tests build the algo with no background
     // executor). Node-level
@@ -2130,7 +2134,7 @@ mod tests {
         c
     }
 
-    // Transaction shards use two symbols from the same alphabet as path type
+    // Transaction nodes use two symbols from the same alphabet as path type
     // markers. In particular, a transaction can live under `/_t/_n/`; path
     // substring checks would mistake its object create for a standalone-node
     // write and make commit-path counts depend on random transaction entropy.
@@ -2156,7 +2160,7 @@ mod tests {
 
     // Backend reads against leaf objects: `read` is a cold full read (cache
     // miss), `read_if_modified` a revalidation of a cached copy.
-    pub(super) fn shard_reads(log: &OpLog) -> (usize, usize) {
+    pub(super) fn leaf_reads(log: &OpLog) -> (usize, usize) {
         let (mut full, mut revalidate) = (0, 0);
         for o in log.lock().unwrap().iter() {
             if !matches!(
@@ -2187,7 +2191,7 @@ mod tests {
     #[tokio::test]
     async fn readonly_validates() {
         let (tm, tctx) = new_algo().await;
-        let keyp = key_ref(b"k");
+        let keyp = logical_key(b"k");
 
         commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
         let r = do_read(&tctx, &keyp).await;
@@ -2200,12 +2204,12 @@ mod tests {
     #[tokio::test]
     async fn opaque_point_read_evidence_tracks_validation() {
         let (tm, tctx) = new_algo().await;
-        let keyp = key_ref(b"k");
+        let keyp = logical_key(b"k");
         commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
 
         let outcome = read_outcome(&tctx, &keyp).await;
         let (_, _, evidence) = outcome.into_parts();
-        let data = AccessSet::new(
+        let accesses = AccessSet::new(
             vec![ReadAccess::new(keyp.clone(), evidence)],
             Vec::new(),
             Vec::new(),
@@ -2213,7 +2217,7 @@ mod tests {
 
         let requirement = Requirement::AtLeast(tctx.timeline.now());
         assert!(
-            tm.validate(&data, ValidationContext::Optimistic, requirement)
+            tm.validate(&accesses, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "opaque evidence accepts its current value"
@@ -2223,7 +2227,7 @@ mod tests {
         commit_writes(&peer, vec![wa(&keyp, b"v2")]).await;
         let requirement = Requirement::AtLeast(tctx.timeline.now());
         assert!(
-            !tm.validate(&data, ValidationContext::Optimistic, requirement)
+            !tm.validate(&accesses, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "opaque evidence rejects a superseded value"
@@ -2233,26 +2237,26 @@ mod tests {
     #[tokio::test]
     async fn unmarked_absence_validates_representation_churn_but_not_membership_aba() {
         let (tm, tctx) = new_algo().await;
-        let key = key_ref(b"missing");
+        let key = logical_key(b"missing");
         let read = do_read(&tctx, &key).await;
         assert!(read.validates(None, 0));
         assert!(!read.validates(None, 1));
-        let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
+        let accesses = AccessSet::new(vec![read], Vec::new(), Vec::new());
 
         let requirement = Requirement::AtLeast(tctx.timeline.now());
         let loaded = tctx
-            .shards
+            .nodes
             .load_leaf(&test_root_path(), Requirement::Any)
             .await
             .unwrap();
         let mut edit = loaded.into_edit();
-        edit.set_entries(Shard::from_entries([ShardEntry::new(b"other")
+        edit.set_entries(LeafBody::from_entries([LeafEntry::new(b"other")
             .with_current(CurrentState::Tombstone {
                 writer: TxId::with_priority(1, b"representation"),
             })]));
-        assert!(tctx.shards.commit_leaf(edit).await.unwrap());
+        assert!(tctx.nodes.commit_leaf(edit).await.unwrap());
         assert!(
-            tm.validate(&data, ValidationContext::Optimistic, requirement)
+            tm.validate(&accesses, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "representing an unrelated absence does not change membership"
@@ -2260,19 +2264,19 @@ mod tests {
 
         let requirement = Requirement::AtLeast(tctx.timeline.now());
         let loaded = tctx
-            .shards
+            .nodes
             .load_leaf(&test_root_path(), Requirement::Any)
             .await
             .unwrap();
         let mut edit = loaded.into_edit();
-        edit.set_entries(Shard::new());
+        edit.set_entries(LeafBody::new());
         let mut locks = edit.locks().clone();
         locks.advance_membership_version();
         locks.advance_membership_version();
         edit.set_locks(locks);
-        assert!(tctx.shards.commit_leaf(edit).await.unwrap());
+        assert!(tctx.nodes.commit_leaf(edit).await.unwrap());
         assert!(
-            !tm.validate(&data, ValidationContext::Optimistic, requirement)
+            !tm.validate(&accesses, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "create-delete-reclaim returning to unmarked absence changes its generation"
@@ -2282,24 +2286,24 @@ mod tests {
     #[tokio::test]
     async fn tombstone_read_is_invalidated_when_its_exact_marker_is_reclaimed() {
         let (tm, tctx) = new_algo().await;
-        let key = key_ref(b"deleted");
+        let key = logical_key(b"deleted");
         let writer = TxId::with_priority(1, b"deleter");
         let loaded = tctx
-            .shards
+            .nodes
             .load_leaf(&test_root_path(), Requirement::Any)
             .await
             .unwrap();
         let mut edit = loaded.into_edit();
-        edit.set_entries(Shard::from_entries([ShardEntry::new(b"deleted")
+        edit.set_entries(LeafBody::from_entries([LeafEntry::new(b"deleted")
             .with_current(CurrentState::Tombstone {
                 writer: writer.clone(),
             })]));
-        assert!(tctx.shards.commit_leaf(edit).await.unwrap());
+        assert!(tctx.nodes.commit_leaf(edit).await.unwrap());
 
         let read = do_read(&tctx, &key).await;
         assert!(read.validates(Some(&writer), 0));
         assert!(read.validates(Some(&writer), 1));
-        let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
+        let accesses = AccessSet::new(vec![read], Vec::new(), Vec::new());
         let requirement = Requirement::AtLeast(tctx.timeline.now());
 
         let external_timeline = Timeline::new();
@@ -2320,11 +2324,11 @@ mod tests {
             .await
             .unwrap();
         let mut edit = loaded.into_edit();
-        edit.set_entries(Shard::new());
+        edit.set_entries(LeafBody::new());
         assert!(external.commit_leaf(edit).await.unwrap());
 
         assert!(
-            !tm.validate(&data, ValidationContext::Optimistic, requirement)
+            !tm.validate(&accesses, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap()
         );
@@ -2333,7 +2337,7 @@ mod tests {
     #[tokio::test]
     async fn point_read_re_resolves_writer_at_validation_watermark() {
         let (tm, tctx) = new_algo().await;
-        let keyp = key_ref(b"k");
+        let keyp = logical_key(b"k");
         let previous = commit_writes(&tm, vec![wa(&keyp, b"v1")])
             .await
             .id()
@@ -2360,7 +2364,7 @@ mod tests {
 
         let read = do_read(&tctx, &keyp).await;
         assert!(read.validates(Some(&previous), 0));
-        let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
+        let accesses = AccessSet::new(vec![read], Vec::new(), Vec::new());
         let requirement = Requirement::AtLeast(tctx.timeline.now());
 
         // Finalize only the transaction object. The leaf still contains the
@@ -2377,13 +2381,13 @@ mod tests {
         tctx.tmon.commit_tx(log).await.unwrap();
 
         assert!(
-            !tm.validate_read_observations(&data, requirement, None)
+            !tm.validate_read_observations(&accesses, requirement, None)
                 .await
                 .unwrap(),
             "an exclusive holder prevents the leaf-only shortcut"
         );
         assert!(
-            !tm.validate(&data, ValidationContext::Optimistic, requirement)
+            !tm.validate(&accesses, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "writer resolution at the validation watermark observes the committed holder"
@@ -2393,7 +2397,7 @@ mod tests {
     #[tokio::test]
     async fn point_read_accepts_aborted_holder_at_validation_watermark() {
         let (tm, tctx) = new_algo().await;
-        let keyp = key_ref(b"k");
+        let keyp = logical_key(b"k");
         let previous = commit_writes(&tm, vec![wa(&keyp, b"v1")])
             .await
             .id()
@@ -2420,7 +2424,7 @@ mod tests {
 
         let read = do_read(&tctx, &keyp).await;
         assert!(read.validates(Some(&previous), 0));
-        let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
+        let accesses = AccessSet::new(vec![read], Vec::new(), Vec::new());
         let requirement = Requirement::AtLeast(tctx.timeline.now());
 
         // Aborting the holder leaves the previously observed writer effective.
@@ -2428,12 +2432,12 @@ mod tests {
         // resolution at the validation watermark accepts the unchanged value.
         tctx.tmon.abort_owned_tx(&holder).await.unwrap();
         assert!(
-            !tm.validate_read_observations(&data, requirement, None)
+            !tm.validate_read_observations(&accesses, requirement, None)
                 .await
                 .unwrap()
         );
         assert!(
-            tm.validate(&data, ValidationContext::Optimistic, requirement)
+            tm.validate(&accesses, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap()
         );
@@ -2442,8 +2446,8 @@ mod tests {
     #[tokio::test]
     async fn locked_validation_requires_its_own_cas_receipt() {
         let (tm, tctx) = new_algo().await;
-        let ka = key_ref(b"a");
-        let kb = key_ref(b"b");
+        let ka = logical_key(b"a");
+        let kb = logical_key(b"b");
         commit_writes(&tm, vec![wa(&ka, b"a0"), wa(&kb, b"b0")]).await;
 
         // `commit_writes` publishes pointers in a background task. This test is
@@ -2531,8 +2535,8 @@ mod tests {
     #[tokio::test]
     async fn newer_shared_evidence_runs_logical_validation_without_io() {
         let (tm, tctx, log) = new_recording_algo_big_cache().await;
-        let ka = key_ref(b"a");
-        let kb = key_ref(b"b");
+        let ka = logical_key(b"a");
+        let kb = logical_key(b"b");
         commit_writes(&tm, vec![wa(&ka, b"a0"), wa(&kb, b"b0")]).await;
 
         let read = do_read(&tctx, &ka).await;
@@ -2556,7 +2560,7 @@ mod tests {
             .load_leaf(&leaf_path, Requirement::AtLeast(external_timeline.now()))
             .await
             .unwrap();
-        let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
+        let mut entries: BTreeMap<Vec<u8>, LeafEntry> = loaded
             .entries()
             .entries()
             .cloned()
@@ -2566,7 +2570,7 @@ mod tests {
             writer: TxId::with_priority(3, b"external"),
         };
         let mut edit = loaded.into_edit();
-        edit.set_entries(Shard::from_entries(entries.into_values()));
+        edit.set_entries(LeafBody::from_entries(entries.into_values()));
         assert!(external.commit_leaf(edit).await.unwrap());
 
         // A local disjoint lock observes that external version and publishes a
@@ -2591,22 +2595,22 @@ mod tests {
             _ => panic!("disjoint lock acquisition must succeed"),
         };
 
-        let data = AccessSet::new(vec![read], Vec::new(), Vec::new());
+        let accesses = AccessSet::new(vec![read], Vec::new(), Vec::new());
         log.lock().unwrap().clear();
         assert!(
-            !tm.validate_read_observations(&data, requirement, None)
+            !tm.validate_read_observations(&accesses, requirement, None)
                 .await
                 .unwrap(),
             "the retained physical revision changed"
         );
         assert!(
-            tm.validate(&data, ValidationContext::Optimistic, requirement)
+            tm.validate(&accesses, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "logical validation accepts the unchanged writer"
         );
         assert_eq!(
-            shard_reads(&log),
+            leaf_reads(&log),
             (0, 0),
             "post-bound current evidence satisfies both validation steps locally"
         );
@@ -2623,8 +2627,8 @@ mod tests {
     async fn readonly_retry_locks_its_complete_point_read_set() {
         let (tm, tctx) = new_algo().await;
         let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
-        let ka = key_ref(b"a");
-        let kb = key_ref(b"b");
+        let ka = logical_key(b"a");
+        let kb = logical_key(b"b");
 
         commit_writes(&tm2, vec![wa(&ka, b"a1"), wa(&kb, b"b1")]).await;
         let ra = do_read(&tctx, &ka).await;
@@ -2632,7 +2636,7 @@ mod tests {
         commit_writes(&tm2, vec![wa(&ka, b"a2")]).await;
 
         let mut h = begin_accesses(&tm, AccessSet::new(vec![ra, rb], Vec::new(), Vec::new()));
-        assert_eq!(tm.commit(&mut h).await.unwrap(), BodyOutcome::ReplayBody);
+        assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
         assert!(h.should_lock_reads());
         for key in [b"a".as_slice(), b"b"] {
             assert_eq!(
@@ -2661,7 +2665,7 @@ mod tests {
     #[tokio::test]
     async fn readonly_after_delete_not_found() {
         let (tm, tctx) = new_algo().await;
-        let keyp = key_ref(b"k");
+        let keyp = logical_key(b"k");
 
         commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
         let deleted_by = commit_writes(&tm, vec![wdel(&keyp)]).await.id().clone();
@@ -2676,7 +2680,7 @@ mod tests {
     #[tokio::test]
     async fn delete_round_trips() {
         let (tm, tctx) = new_algo().await;
-        let keyp = key_ref(b"k");
+        let keyp = logical_key(b"k");
 
         commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
         let r = do_read(&tctx, &keyp).await;
@@ -2693,8 +2697,8 @@ mod tests {
     #[tokio::test]
     async fn multi_key_commit() {
         let (tm, tctx) = new_algo().await;
-        let k1 = key_ref(b"k1");
-        let k2 = key_ref(b"k2");
+        let k1 = logical_key(b"k1");
+        let k2 = logical_key(b"k2");
 
         let mut h = begin_accesses(
             &tm,
@@ -2713,11 +2717,11 @@ mod tests {
     async fn seed_live_keys(tctx: &Tctx, keys: &[&[u8]]) {
         let path = test_root_path();
         let loaded = tctx
-            .shards
+            .nodes
             .load_leaf(&path, Requirement::AtLeast(tctx.timeline.now()))
             .await
             .unwrap();
-        let mut entries: std::collections::BTreeMap<Vec<u8>, ShardEntry> = loaded
+        let mut entries: std::collections::BTreeMap<Vec<u8>, LeafEntry> = loaded
             .entries()
             .entries()
             .cloned()
@@ -2727,13 +2731,13 @@ mod tests {
             let w = TxId::with_priority((i as u64) + 1, b"seed");
             entries.insert(
                 k.to_vec(),
-                ShardEntry::new(*k).with_current(CurrentState::External { writer: w }),
+                LeafEntry::new(*k).with_current(CurrentState::External { writer: w }),
             );
         }
-        let shard = Shard::from_entries(entries.into_values());
+        let leaf = LeafBody::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
-        edit.set_entries(shard);
-        assert!(tctx.shards.commit_leaf(edit).await.unwrap());
+        edit.set_entries(leaf);
+        assert!(tctx.nodes.commit_leaf(edit).await.unwrap());
     }
 
     // Builds a read-only listing transaction's [`AccessSet`] from a fresh scan of the
@@ -2745,7 +2749,7 @@ mod tests {
         writes: Vec<WriteAccess>,
     ) -> (AccessSet, Vec<Vec<u8>>) {
         let resolver = KeyResolver::new(
-            TreeRouter::new(tctx.shards.clone(), std::num::NonZeroUsize::MIN),
+            TreeRouter::new(tctx.nodes.clone(), std::num::NonZeroUsize::MIN),
             KeyStateResolver::new(tctx.tmon.clone()),
             std::num::NonZeroUsize::MIN,
         );
@@ -2755,8 +2759,8 @@ mod tests {
             .unwrap();
         let keys = scan.keys().to_vec();
         let access = scan.into_access(test_collection(), range, Vec::new());
-        let data = AccessSet::new(Vec::new(), writes, vec![access]);
-        (data, keys)
+        let accesses = AccessSet::new(Vec::new(), writes, vec![access]);
+        (accesses, keys)
     }
 
     async fn scan_accesses(tctx: &Tctx) -> (AccessSet, Vec<Vec<u8>>) {
@@ -2770,7 +2774,7 @@ mod tests {
 
         let range = ScanRange::all();
         let resolver = KeyResolver::new(
-            TreeRouter::new(tctx.shards.clone(), std::num::NonZeroUsize::MIN),
+            TreeRouter::new(tctx.nodes.clone(), std::num::NonZeroUsize::MIN),
             KeyStateResolver::new(tctx.tmon.clone()),
             std::num::NonZeroUsize::MIN,
         );
@@ -2778,7 +2782,7 @@ mod tests {
             .scan_keys(&test_collection(), &range, &[], None, None)
             .await
             .unwrap();
-        let data = AccessSet::new(
+        let accesses = AccessSet::new(
             Vec::new(),
             Vec::new(),
             vec![result.into_access(test_collection(), range, Vec::new())],
@@ -2786,16 +2790,16 @@ mod tests {
 
         let requirement = Requirement::AtLeast(tctx.timeline.now());
         assert!(
-            tm.validate(&data, ValidationContext::Optimistic, requirement)
+            tm.validate(&accesses, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "opaque evidence accepts its current membership"
         );
 
-        commit_writes(&tm, vec![wa(&key_ref(b"b"), b"1")]).await;
+        commit_writes(&tm, vec![wa(&logical_key(b"b"), b"1")]).await;
         let requirement = Requirement::AtLeast(tctx.timeline.now());
         assert!(
-            !tm.validate(&data, ValidationContext::Optimistic, requirement)
+            !tm.validate(&accesses, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
             "opaque evidence rejects a changed membership"
@@ -2811,23 +2815,23 @@ mod tests {
         let (tm, tctx) = new_algo().await;
         seed_live_keys(&tctx, &[b"a", b"c"]).await;
 
-        let (data, keys) = scan_accesses(&tctx).await;
+        let (accesses, keys) = scan_accesses(&tctx).await;
         assert_eq!(keys, vec![b"a".to_vec(), b"c".to_vec()]);
 
         // No concurrent change: the listing validates and commits.
         tctx.locker.stats_and_reset();
-        let mut h = begin_accesses(&tm, data.clone());
+        let mut h = begin_accesses(&tm, accesses.clone());
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
         assert_eq!(tctx.locker.stats_and_reset().calls, 0);
 
         // A create between the scan and (re-)validation bumps the covered leaf.
-        commit_writes(&tm, vec![wa(&key_ref(b"b"), b"1")]).await;
+        commit_writes(&tm, vec![wa(&logical_key(b"b"), b"1")]).await;
 
-        let mut stale = begin_accesses(&tm, data);
+        let mut stale = begin_accesses(&tm, accesses);
         assert_eq!(
             tm.commit(&mut stale).await.unwrap(),
-            BodyOutcome::ReplayBody
+            BodyDecision::ReplayBody
         );
         assert!(
             stale.should_lock_reads(),
@@ -2860,7 +2864,7 @@ mod tests {
     #[tokio::test]
     async fn scan_rechecks_pending_membership_holder_that_commits() {
         let (tm, tctx) = new_algo().await;
-        let key_path = key_ref(b"new");
+        let key_path = logical_key(b"new");
         let holder = TxId::with_priority(1, b"holder");
         tctx.tmon.begin_tx(&holder);
         let holder_data = AccessSet::new(Vec::new(), vec![wa(&key_path, b"value")], Vec::new());
@@ -2901,19 +2905,19 @@ mod tests {
         let mut stale = begin_accesses(&tm, scan);
         assert_eq!(
             tm.commit(&mut stale).await.unwrap(),
-            BodyOutcome::ReplayBody
+            BodyDecision::ReplayBody
         );
     }
 
     #[tokio::test]
     async fn scan_with_write_records_predicate_locks() {
         let (tm, tctx) = new_algo().await;
-        let key_path = key_ref(b"a");
+        let key_path = logical_key(b"a");
         seed_live_keys(&tctx, &[b"a"]).await;
-        let (data, _) =
+        let (accesses, _) =
             scan_accesses_for_range(&tctx, ScanRange::all(), vec![wa(&key_path, b"updated")]).await;
 
-        let mut handle = begin_accesses(&tm, data);
+        let mut handle = begin_accesses(&tm, accesses);
         tm.commit(&mut handle).await.unwrap();
         let log = tctx
             .tlogger
@@ -2944,25 +2948,28 @@ mod tests {
             end: None,
             limit: Some(2),
         };
-        let (stale, keys) =
-            scan_accesses_for_range(&tctx, range.clone(), vec![wa(&key_ref(b"a"), b"updated")])
-                .await;
+        let (stale, keys) = scan_accesses_for_range(
+            &tctx,
+            range.clone(),
+            vec![wa(&logical_key(b"a"), b"updated")],
+        )
+        .await;
         assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
         assert_eq!(stale.range_scans()[0].frontier(), Some(b"b".as_slice()));
 
         // Removing the old frontier means the refreshed two-key page reaches
         // into S1. The first locked validation only owns S0 and must retry.
-        commit_writes(&tm, vec![wdel(&key_ref(b"b"))]).await;
+        commit_writes(&tm, vec![wdel(&logical_key(b"b"))]).await;
         let mut handle = begin_accesses(&tm, stale);
         assert_eq!(
             tm.commit(&mut handle).await.unwrap(),
-            BodyOutcome::ReplayBody
+            BodyDecision::ReplayBody
         );
 
         // The body re-runs while S0 stays locked. Its new frontier is `m`, so
         // the next validation adds S1 before committing.
         let (fresh, keys) =
-            scan_accesses_for_range(&tctx, range, vec![wa(&key_ref(b"a"), b"updated")]).await;
+            scan_accesses_for_range(&tctx, range, vec![wa(&logical_key(b"a"), b"updated")]).await;
         assert_eq!(keys, vec![b"a".to_vec(), b"m".to_vec()]);
         assert_eq!(fresh.range_scans()[0].frontier(), Some(b"m".as_slice()));
         tm.reset(&mut handle, fresh);
@@ -2991,18 +2998,18 @@ mod tests {
     #[tokio::test]
     async fn scan_detects_racing_delete() {
         let (tm, tctx) = new_algo().await;
-        let bp = key_ref(b"b");
+        let bp = logical_key(b"b");
         seed_live_keys(&tctx, &[b"a", b"b"]).await;
 
-        let (data, keys) = scan_accesses(&tctx).await;
+        let (accesses, keys) = scan_accesses(&tctx).await;
         assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
 
         commit_writes(&tm, vec![wdel(&bp)]).await;
 
-        let mut stale = begin_accesses(&tm, data);
+        let mut stale = begin_accesses(&tm, accesses);
         assert_eq!(
             tm.commit(&mut stale).await.unwrap(),
-            BodyOutcome::ReplayBody
+            BodyDecision::ReplayBody
         );
     }
 
@@ -3013,14 +3020,14 @@ mod tests {
         let (tm, tctx) = new_algo().await;
         seed_live_keys(&tctx, &[b"a", b"m"]).await;
 
-        let (data, _keys) = scan_accesses(&tctx).await;
+        let (accesses, _keys) = scan_accesses(&tctx).await;
 
         // Grow the tree in place: rewrite `_r` from its single leaf into an index
         // root pointing at two fresh leaves (the shape the background splitter
         // produces), so the covered leaf set is no longer just `_r`.
         split_root_in_place(&tctx).await;
 
-        let mut stable = begin_accesses(&tm, data);
+        let mut stable = begin_accesses(&tm, accesses);
         tm.commit(&mut stable).await.unwrap();
         tm.end(&mut stable).await.unwrap();
     }
@@ -3037,15 +3044,15 @@ mod tests {
 
         // Two-leaf tree: index root over S0(a,c | high "m") -> S1(m,p).
         let leaf = |ks: &[&[u8]], high: Option<&[u8]>, right: Option<&str>| {
-            Node::leaf(Shard::from_entries(ks.iter().map(|k| {
-                ShardEntry::new(*k).with_current(CurrentState::External {
+            Node::leaf(LeafBody::from_entries(ks.iter().map(|k| {
+                LeafEntry::new(*k).with_current(CurrentState::External {
                     writer: TxId::with_priority(1, b"seed"),
                 })
             })))
             .with_high_key(high.map(<[u8]>::to_vec))
             .with_right_sibling(right.map(str::to_string))
         };
-        tctx.shards
+        tctx.nodes
             .store_node(
                 &test_collection(),
                 &s0_token,
@@ -3054,7 +3061,7 @@ mod tests {
             )
             .await
             .unwrap();
-        tctx.shards
+        tctx.nodes
             .store_node(
                 &test_collection(),
                 &s1_token,
@@ -3068,16 +3075,16 @@ mod tests {
             (b"m".to_vec(), s1_token.to_string()),
         ]));
         let cur = tctx
-            .shards
+            .nodes
             .load_leaf(&test_root_path(), Requirement::AtLeast(tctx.timeline.now()))
             .await
             .unwrap();
-        tctx.shards
+        tctx.nodes
             .store_root(&test_collection(), &root, cur.observation())
             .await
             .unwrap();
 
-        let (data, keys) = scan_accesses(&tctx).await;
+        let (accesses, keys) = scan_accesses(&tctx).await;
         assert_eq!(
             keys,
             vec![b"a".to_vec(), b"c".to_vec(), b"m".to_vec(), b"p".to_vec()]
@@ -3086,7 +3093,7 @@ mod tests {
         // Append a key past the current maximum: it lands in the last covered
         // leaf S1, bumping its version.
         let (s1, ver) = tctx
-            .shards
+            .nodes
             .load_node(
                 &test_collection(),
                 &s1_token,
@@ -3094,23 +3101,23 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut entries: Vec<ShardEntry> = s1.as_leaf().unwrap().entries().cloned().collect();
-        entries.push(ShardEntry::new(b"z").with_current(CurrentState::External {
+        let mut entries: Vec<LeafEntry> = s1.as_leaf().unwrap().entries().cloned().collect();
+        entries.push(LeafEntry::new(b"z").with_current(CurrentState::External {
             writer: TxId::with_priority(2, b"boundary"),
         }));
-        let mut new_s1 = Node::leaf(Shard::from_entries(entries));
+        let mut new_s1 = Node::leaf(LeafBody::from_entries(entries));
         let membership_writer = TxId::with_priority(2, b"membership");
         new_s1.set_membership_writer(membership_writer.clone());
         new_s1.remove_membership_holder(&membership_writer);
-        tctx.shards
+        tctx.nodes
             .store_node(&test_collection(), &s1_token, &new_s1, Some(&ver))
             .await
             .unwrap();
 
-        let mut stale = begin_accesses(&tm, data);
+        let mut stale = begin_accesses(&tm, accesses);
         assert_eq!(
             tm.commit(&mut stale).await.unwrap(),
-            BodyOutcome::ReplayBody
+            BodyDecision::ReplayBody
         );
     }
 
@@ -3124,24 +3131,24 @@ mod tests {
         let s1_token = NodeToken::from_bytes([1; 16]);
 
         let loaded = tctx
-            .shards
+            .nodes
             .load_leaf(&test_root_path(), Requirement::AtLeast(tctx.timeline.now()))
             .await
             .unwrap();
-        let entries: Vec<ShardEntry> = loaded.entries().entries().cloned().collect();
+        let entries: Vec<LeafEntry> = loaded.entries().entries().cloned().collect();
         let (lower, upper): (Vec<_>, Vec<_>) = entries
             .into_iter()
             .partition(|e| e.key.as_slice() < b"m".as_slice());
 
-        let s0 = Node::leaf(Shard::from_entries(lower))
+        let s0 = Node::leaf(LeafBody::from_entries(lower))
             .with_high_key(Some(b"m".to_vec()))
             .with_right_sibling(Some(s1_token.to_string()));
-        tctx.shards
+        tctx.nodes
             .store_node(&test_collection(), &s0_token, &s0, None)
             .await
             .unwrap();
-        let s1 = Node::leaf(Shard::from_entries(upper));
-        tctx.shards
+        let s1 = Node::leaf(LeafBody::from_entries(upper));
+        tctx.nodes
             .store_node(&test_collection(), &s1_token, &s1, None)
             .await
             .unwrap();
@@ -3151,7 +3158,7 @@ mod tests {
             (b"m".to_vec(), s1_token.to_string()),
         ]));
         assert!(
-            tctx.shards
+            tctx.nodes
                 .store_root(&test_collection(), &root, loaded.observation())
                 .await
                 .unwrap(),

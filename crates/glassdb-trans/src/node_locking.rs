@@ -1,6 +1,6 @@
 //! Shared node-lock policy for leaf mutations and structural operations.
 //!
-//! The shard coordinator owns the shared transactional fold mechanics. This
+//! The leaf coordinator owns the shared transactional fold mechanics. This
 //! module owns the wound-wait transitions applied to membership locks and the
 //! full-node quiescing sequence required before a split closes the structural
 //! gate.
@@ -8,17 +8,17 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use glassdb_data::{CollectionAddress, KeyRef, ObjectPath, TxId};
+use glassdb_data::{CollectionAddress, LogicalKey, ObjectPath, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
-use glassdb_storage::{LockType, NodeLocks, Requirement, ShardEntry};
+use glassdb_storage::{LeafEntry, LockType, NodeLocks, Requirement};
 
 use crate::error::TransError;
 use crate::key_state_resolver::KeyStateResolver;
-use crate::monitor::Monitor;
-use crate::shard_coord::{
-    CoordinatedOutcome, CoordinationEvidence, FoldOutcome, ResolveCtx, ShardOperation,
-    ShardResolver, StageAdmission, Step,
+use crate::leaf_coord::{
+    CoordinatedOutcome, CoordinationEvidence, FoldOutcome, LeafOperation, LeafResolver, ResolveCtx,
+    StageAdmission, Step,
 };
+use crate::monitor::Monitor;
 use crate::wound_wait::{Reclaim, try_reclaim};
 
 /// Wound-wait policy over one node's structural gate and membership lock.
@@ -42,7 +42,7 @@ impl<'a> NodeLockReconciler<'a> {
     pub(crate) async fn quiesce_entries(
         &self,
         collection: &CollectionAddress,
-        entries: &BTreeMap<Vec<u8>, ShardEntry>,
+        entries: &BTreeMap<Vec<u8>, LeafEntry>,
         requirement: Requirement,
     ) -> Result<QuiescedEntries, TransError> {
         let mut resolved_entries = BTreeMap::new();
@@ -50,7 +50,7 @@ impl<'a> NodeLockReconciler<'a> {
             let resolved = self
                 .key_state
                 .resolve_holders(
-                    &KeyRef::new(collection.clone(), key),
+                    &LogicalKey::new(collection.clone(), key),
                     Some(entry),
                     Some(self.id),
                     requirement,
@@ -251,7 +251,7 @@ impl<'a> NodeLockReconciler<'a> {
     }
 }
 
-/// Acquires a leaf structural gate through the shared shard-mutation engine.
+/// Acquires a leaf structural gate through the shared leaf-mutation engine.
 pub(crate) struct StructuralGateOperation {
     id: TxId,
     path: ObjectPath,
@@ -272,11 +272,11 @@ impl StructuralGateOperation {
 }
 
 #[async_trait]
-impl ShardResolver for StructuralGateOperation {
+impl LeafResolver for StructuralGateOperation {
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
-        staged: &BTreeMap<Vec<u8>, ShardEntry>,
+        staged: &BTreeMap<Vec<u8>, LeafEntry>,
         staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
         let collection = match &self.path {
@@ -327,7 +327,7 @@ impl ShardResolver for StructuralGateOperation {
     }
 }
 
-impl ShardOperation for StructuralGateOperation {
+impl LeafOperation for StructuralGateOperation {
     type Output = StructuralGateOutcome;
 
     fn path(&self) -> &ObjectPath {
@@ -366,6 +366,6 @@ impl ShardOperation for StructuralGateOperation {
 
 /// Result of reconciling all entry holders before gate installation.
 pub(crate) enum QuiescedEntries {
-    Ready(BTreeMap<Vec<u8>, ShardEntry>),
+    Ready(BTreeMap<Vec<u8>, LeafEntry>),
     Wait(TxId),
 }

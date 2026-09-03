@@ -4,11 +4,11 @@ use std::collections::{BTreeSet, VecDeque};
 use std::mem;
 
 use glassdb_concurr::{RetryConfig, rt};
-use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, StructuralRecordId, TxId};
+use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, StructuralIntentId, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
     CollectionStore, LeafObservation, LockType, NodeStore, Observation, Requirement, StorageError,
-    StructuralLog, StructuralLogPhase, StructuralLogStore, Timeline, TreeRouter,
+    StructuralIntent, StructuralIntentPhase, StructuralIntentStore, Timeline, TreeRouter,
 };
 
 use crate::error::TransError;
@@ -23,8 +23,8 @@ use super::{
 #[derive(Clone)]
 pub(super) struct StructuralRecovery {
     records: CollectionStore,
-    shards: NodeStore,
-    intent_store: StructuralLogStore,
+    nodes: NodeStore,
+    intent_store: StructuralIntentStore,
     router: TreeRouter,
     mon: Monitor,
     structural_nodes: StructuralNodeAccess,
@@ -36,20 +36,20 @@ pub(super) struct StructuralRecovery {
 
 /// Proves that one structural intent is still in its cancellable state.
 pub(super) struct PreparedIntent {
-    observed: Observation<StructuralLog>,
-    intent: StructuralLog,
+    observed: Observation<StructuralIntent>,
+    intent: StructuralIntent,
 }
 
 /// Retains the exact cancellable observation after split coordination starts.
 pub(super) struct PreparedIntentCleanup {
-    observed: Observation<StructuralLog>,
+    observed: Observation<StructuralIntent>,
 }
 
 /// Proves that a structural intent may require durable recovery.
 pub(super) struct ReadyIntent {
-    expected: Observation<StructuralLog>,
-    intent: StructuralLog,
-    observed: Option<Observation<StructuralLog>>,
+    expected: Observation<StructuralIntent>,
+    intent: StructuralIntent,
+    observed: Option<Observation<StructuralIntent>>,
 }
 
 /// The result of advancing one prepared intent to its recoverable state.
@@ -82,9 +82,9 @@ struct SweepAction {
     scanned: bool,
     active: bool,
     completed: bool,
-    intents: VecDeque<(StructuralRecordId, Observation<StructuralLog>)>,
+    intents: VecDeque<(StructuralIntentId, Observation<StructuralIntent>)>,
     participants: VecDeque<(CollectionAddress, TxId)>,
-    intent_id: Option<StructuralRecordId>,
+    intent_id: Option<StructuralIntentId>,
     intent: Option<IntentRecovery>,
     participant: Option<TxId>,
     settlement: Option<ParticipantSettlement>,
@@ -109,7 +109,7 @@ pub(super) enum RecoveryStep {
 }
 
 struct SweepFailure {
-    intent: Option<StructuralRecordId>,
+    intent: Option<StructuralIntentId>,
     participant: Option<TxId>,
     error: TransError,
 }
@@ -117,13 +117,13 @@ struct SweepFailure {
 /// One globally discovered batch and the participants represented in it.
 struct RecoverySweep {
     active: bool,
-    intents: Vec<(StructuralRecordId, Observation<StructuralLog>)>,
+    intents: Vec<(StructuralIntentId, Observation<StructuralIntent>)>,
     participants: BTreeSet<(CollectionAddress, TxId)>,
 }
 
 /// Resumable recovery of one exact structural intent.
 struct IntentRecovery {
-    observed: Observation<StructuralLog>,
+    observed: Observation<StructuralIntent>,
     phase: IntentRecoveryPhase,
 }
 
@@ -146,12 +146,12 @@ struct ParticipantSettlement {
     collection: CollectionAddress,
     participant: TxId,
     status_checked: bool,
-    intents: VecDeque<Observation<StructuralLog>>,
+    intents: VecDeque<Observation<StructuralIntent>>,
 }
 
 enum ParticipantSettlementStep {
     Completed,
-    Recover(Observation<StructuralLog>),
+    Recover(Observation<StructuralIntent>),
 }
 
 impl PreparedIntent {
@@ -186,11 +186,11 @@ impl PreparedIntent {
         (!self.intent.is_root()).then(|| &self.intent.created_tokens[0])
     }
 
-    fn from_observation(observed: Observation<StructuralLog>) -> Result<Self, TransError> {
+    fn from_observation(observed: Observation<StructuralIntent>) -> Result<Self, TransError> {
         let intent = observed
             .value()
             .filter(|intent| {
-                intent.phase == StructuralLogPhase::Preparing
+                intent.phase == StructuralIntentPhase::Preparing
                     && if intent.is_root() {
                         intent.created_tokens.len() == 2
                     } else {
@@ -207,7 +207,7 @@ impl PreparedIntent {
         let mut intent = self.intent;
         intent.source_version = source_version;
         intent.split_key = split_key;
-        intent.phase = StructuralLogPhase::Ready;
+        intent.phase = StructuralIntentPhase::Ready;
         ReadyIntent {
             expected: self.observed,
             intent,
@@ -222,7 +222,7 @@ impl ReadyIntent {
         &self.intent.participant_id
     }
 
-    fn confirm(&mut self, observed: Observation<StructuralLog>) -> Result<(), TransError> {
+    fn confirm(&mut self, observed: Observation<StructuralIntent>) -> Result<(), TransError> {
         let matches = observed
             .value()
             .is_some_and(|intent| intent.as_ref() == &self.intent);
@@ -235,7 +235,7 @@ impl ReadyIntent {
         Ok(())
     }
 
-    fn observation(&self) -> &Observation<StructuralLog> {
+    fn observation(&self) -> &Observation<StructuralIntent> {
         self.observed
             .as_ref()
             .expect("only an acknowledged Ready intent may create nodes")
@@ -270,8 +270,8 @@ impl StructuralRecovery {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         records: CollectionStore,
-        shards: NodeStore,
-        intent_store: StructuralLogStore,
+        nodes: NodeStore,
+        intent_store: StructuralIntentStore,
         router: TreeRouter,
         mon: Monitor,
         structural_nodes: StructuralNodeAccess,
@@ -282,7 +282,7 @@ impl StructuralRecovery {
     ) -> Self {
         Self {
             records,
-            shards,
+            nodes,
             intent_store,
             router,
             mon,
@@ -306,7 +306,7 @@ impl StructuralRecovery {
         } else {
             vec![NodeToken::new_random()]
         };
-        let intent_id = StructuralRecordId::from(
+        let intent_id = StructuralIntentId::from(
             created_tokens
                 .last()
                 .expect("a split always reserves at least one token"),
@@ -316,14 +316,14 @@ impl StructuralRecovery {
             .write(
                 collection.db_root_component(),
                 &intent_id,
-                &StructuralLog {
+                &StructuralIntent {
                     collection: collection.clone(),
                     source_token: source_token.cloned(),
                     source_version: String::new(),
                     created_tokens,
                     split_key: Vec::new(),
                     participant_id: participant.clone(),
-                    phase: StructuralLogPhase::Preparing,
+                    phase: StructuralIntentPhase::Preparing,
                 },
             )
             .await?;
@@ -676,7 +676,7 @@ impl StructuralRecovery {
         Ok(self.mon.tx_status(id).await?.is_final())
     }
 
-    fn begin_intent(observed: Observation<StructuralLog>) -> IntentRecovery {
+    fn begin_intent(observed: Observation<StructuralIntent>) -> IntentRecovery {
         IntentRecovery {
             observed,
             phase: IntentRecoveryPhase::Classify,
@@ -780,13 +780,13 @@ impl StructuralRecovery {
 
     async fn classify_intent(
         &self,
-        observed: &Observation<StructuralLog>,
+        observed: &Observation<StructuralIntent>,
     ) -> Result<IntentRecoveryPhase, TransError> {
         let intent = observed
             .value()
             .ok_or_else(|| TransError::other("structural intent disappeared after listing"))?
             .clone();
-        if intent.phase == StructuralLogPhase::Preparing {
+        if intent.phase == StructuralIntentPhase::Preparing {
             if self.mon.tx_status(&intent.participant_id).await? == TxCommitStatus::Pending {
                 return Err(TransError::Retry);
             }
@@ -861,11 +861,11 @@ impl StructuralRecovery {
             for (token, reachable) in created_tokens.iter().zip(reachable) {
                 if !reachable {
                     match self
-                        .shards
+                        .nodes
                         .load_node_state(collection, token, requirement)
                         .await
                     {
-                        Ok(node) => self.shards.delete_node(&node).await?,
+                        Ok(node) => self.nodes.delete_node(&node).await?,
                         Err(StorageError::NotFound) => {}
                         Err(error) => return Err(error.into()),
                     }
@@ -884,12 +884,12 @@ impl StructuralRecovery {
     ) -> Result<bool, TransError> {
         for _ in 0..PARENT_RETRIES {
             let node = match token {
-                Some(token) => match self.shards.load_node(collection, token, requirement).await {
+                Some(token) => match self.nodes.load_node(collection, token, requirement).await {
                     Ok((node, _)) => node,
                     Err(StorageError::NotFound) => return Ok(true),
                     Err(error) => return Err(error.into()),
                 },
-                None => match self.shards.load_root_node(collection, requirement).await? {
+                None => match self.nodes.load_root_node(collection, requirement).await? {
                     Some((node, _)) => node,
                     None => return Ok(true),
                 },
