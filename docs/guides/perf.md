@@ -1310,8 +1310,7 @@ Designed in [ADR-024](../adr/024-hold-and-wait-conflict-resolution.md).
 
 ## v2 MVP
 
-Described in [object-storage-native.md](../designs/object-storage-native.md) and implemented by
-ADRs (016 - 023).
+Implemented by ADRs 016–023.
 
 ### compare-refs summary
 

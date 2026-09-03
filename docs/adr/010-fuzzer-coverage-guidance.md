@@ -70,7 +70,7 @@ Here byte mutations do map to structured workload changes, and engine coverage
 genuinely depends on workload shape, so coverage can reward useful structure. But
 the value is capped: the structural space is tiny and almost-always-valid
 (`KEY_COUNT = 4`, `MAX_CLIENTS = 4`, `MAX_OPS_PER_CLIENT = 8`, three op types in
-[`crates/glassdb/src/sim.rs`](../../crates/glassdb/src/sim.rs)), and `arbitrary` is
+[`crates/glassdb/src/sim/rmw.rs`](../../crates/glassdb/src/sim/rmw.rs)), and `arbitrary` is
 total — there is no rare "valid structure" needle for coverage to discover. Random
 generation saturates this coverage almost immediately, so guidance buys little over
 random here.

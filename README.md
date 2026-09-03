@@ -9,9 +9,9 @@ Google Cloud Storage) that is _stateless_ and supports _ACID transactions_.
 Clients import Glass DB as a library and don't need to deploy, nor depend on any
 additional services. Everything is built on top of object storage.
 
-This is the async (`tokio`-based) Rust implementation, ported from the original
-[Go project](https://github.com/mbrt/glassdb). The commit protocol and on-disk
-format is compatible with the original project.
+This project started as the Rust implementation of the original [Go
+project](https://github.com/mbrt/glassdb). The commit protocol and on-disk
+format evolved past the original and is no longer compatible.
 
 The interface is inspired by [BoltDB](https://github.com/boltdb/bolt) and
 Apple's [FoundationDB](https://github.com/apple/foundationdb).
@@ -31,9 +31,8 @@ improve. Interfaces and file formats are _not_ stable and can still change at
 any point.
 
 For a deep dive into the internals, see the [architecture
-doc](docs/architecture.md) and the companion [blog
-post](https://blog.mbrt.dev/posts/transactional-object-storage) (created for the
-Go version, but still relevant).
+doc](docs/architecture.md) and an earlier (now outdated)
+[overview](https://blog.mbrt.dev/posts/transactional-object-storage).
 
 We support both [Google GCS](https://cloud.google.com/storage/) and [Amazon
 S3](https://aws.amazon.com/s3/). Adding [Azure Blob
@@ -259,6 +258,5 @@ details.
 ## Design notes
 
 See [architecture.md](docs/architecture.md) for the design decisions behind the
-implementation (concurrency model, time/determinism, error handling, and
-encoding fidelity), and [porting-go.md](docs/archive/porting-go.md) for the (historical)
-Go porting related tradeoffs.
+implementation, including the concurrency model, time and determinism, error
+handling, and persistent encodings.

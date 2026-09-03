@@ -4,8 +4,8 @@
 
 Accepted — implemented.
 
-Constituent decision of the
-[dynamic-range-sharding design](../designs/dynamic-range-sharding.md).
+Constituent decision of
+[ADR-031](031-dynamic-range-sharding.md).
 
 This supersedes the clauses in ADR-016, ADR-018, and ADR-031
 that derive physical collection addresses from logical names, make physical

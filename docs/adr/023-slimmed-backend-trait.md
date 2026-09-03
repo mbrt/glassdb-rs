@@ -46,9 +46,8 @@ native metadata PATCH (`ifMetagenerationMatch`) and encodes both `generation` an
 
 The v2 layout ([ADR-017](017-shard-object.md)–[ADR-021](021-wound-wait-leases-shard.md))
 keeps **all** coordination state in object **content** and mutates it **only by
-content CAS**. The shard/root I/O
-([`crates/glassdb-storage/src/shard_store.rs`](../../crates/glassdb-storage/src/shard_store.rs))
-uses just `read` / `write_if` / `write_if_not_exists`, always with `Tags::new()`.
+content CAS**. The shard/root I/O uses just `read` / `write_if` /
+`write_if_not_exists`, always with `Tags::new()`.
 So `set_tags_if`, `get_metadata`, `delete_if`, the S3 nonce, and all
 tags / `WriterId` are dead weight once v1 is gone — **with one exception**.
 
@@ -173,10 +172,8 @@ sequencing is:
 
 - The trait is a small, store-agnostic, content-CAS-only surface where every
   method maps to a primitive S3 and GCS both provide natively — no emulation.
-- The cached conditional-GET read of *Direction at a glance* becomes real: the
-  version-conditional `read_if_modified` lets the cache revalidate the tagless
-  coordination objects (Group E in
-  [`docs/designs/object-storage-native.md`](../designs/object-storage-native.md)).
+- The version-conditional `read_if_modified` lets the cache revalidate tagless
+  coordination objects.
 - The `ObjectCache` / `Locker` caching layer is **preserved and re-pointed**,
   not rewritten: the cache logic is reused, with only its revalidation condition
   

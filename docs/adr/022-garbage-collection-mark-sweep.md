@@ -100,8 +100,7 @@ leaves are **transaction objects**. A transaction object is referenced when:
 - a shard entry names its txid in `current_writer` (the MVCC pointer) or in
   `locked_by` (a held lock), per
   [`ShardEntry`](../../crates/glassdb-storage/src/shard.rs); or
-- a collection root names its txid in `membership_locked_by`
-  ([`CollectionRoot`](../../crates/glassdb-storage/src/root.rs)).
+- a collection root names its txid in `membership_locked_by`.
 
 ```
 live = ⋃ over all shards   ( current_writer ∪ locked_by )
@@ -119,10 +118,10 @@ the size of the **whole database**, paid every cycle even when almost nothing is
 garbage. For a large store that is infeasible.
 
 The transaction object already records **its own back-references**. A
-[`TxLog`](../../crates/glassdb-storage/src/tlogger.rs) carries the full set of
+[`TxLog`](../../crates/glassdb-storage/src/transaction/model.rs) carries the full set of
 paths the transaction locked (`locks`) and wrote (`writes`), and every write
 records the `prev_writer` it superseded
-([`TxWrite`](../../crates/glassdb-storage/src/tlogger.rs)). So instead of marking
+([`TxWrite`](../../crates/glassdb-storage/src/transaction/model.rs)). So instead of marking
 forward from all shards, GC works **backward from a batch of candidate `_t/`
 objects**: each candidate names exactly the entries that can reference it, so
 confirming it is dead costs a GET of *those* entries only — never a database-wide
