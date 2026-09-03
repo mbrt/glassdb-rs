@@ -3,27 +3,27 @@
 use std::collections::BTreeMap;
 
 use super::super::tests::{
-    Tctx, begin_accesses, commit_access, commit_writes, do_read, entry, key_ref, new_algo,
-    new_algo_from_backend, new_recording_algo, new_recording_algo_big_cache, read_outcome,
-    shard_reads, test_collection, test_root_path, wa, wdel, write_counts,
+    Tctx, begin_accesses, commit_access, commit_writes, do_read, entry, leaf_reads, logical_key,
+    new_algo, new_algo_from_backend, new_recording_algo, new_recording_algo_big_cache,
+    read_outcome, test_collection, test_root_path, wa, wdel, write_counts,
 };
 use super::super::*;
 use super::*;
 use crate::key_state_resolver::KeyStateResolver;
-use crate::shard_coord::{FoldOutcome, ReloadCause, ResolveCtx, ShardResolver, Step};
+use crate::leaf_coord::{FoldOutcome, LeafResolver, ReloadCause, ResolveCtx, Step};
 use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend};
 use glassdb_backend::{Backend, memory::MemoryBackend};
 use glassdb_data::{CollectionAddress, CollectionId, NodeToken};
 use glassdb_storage::{
-    CollectionRecord, CurrentState, IndexNode, Node, NodeLocks, Shard, ShardEntry,
+    CollectionRecord, CurrentState, IndexNode, LeafBody, LeafEntry, Node, NodeLocks,
 };
 
 /// Runs one resolver fold and retains its complete classification.
 async fn fold_step(
-    resolver: &dyn ShardResolver,
+    resolver: &dyn LeafResolver,
     tctx: &Tctx,
     cause: ReloadCause,
-    staged: &BTreeMap<Vec<u8>, ShardEntry>,
+    staged: &BTreeMap<Vec<u8>, LeafEntry>,
     locks: &NodeLocks,
 ) -> Step {
     let key_state = KeyStateResolver::new(tctx.tmon.clone());
@@ -41,10 +41,10 @@ async fn fold_step(
 /// `cause` and node-lock combinations that a live interleaving can only
 /// produce by luck.
 async fn fold(
-    resolver: &dyn ShardResolver,
+    resolver: &dyn LeafResolver,
     tctx: &Tctx,
     cause: ReloadCause,
-    staged: &BTreeMap<Vec<u8>, ShardEntry>,
+    staged: &BTreeMap<Vec<u8>, LeafEntry>,
     locks: &NodeLocks,
 ) -> FoldOutcome {
     match fold_step(resolver, tctx, cause, staged, locks).await {
@@ -55,7 +55,7 @@ async fn fold(
 fn put_resolver(
     tm: &Algo,
     id: TxId,
-    key: KeyRef,
+    key: LogicalKey,
     read_writer: Option<Option<TxId>>,
     value: &[u8],
 ) -> DirectCommitOperation {
@@ -83,7 +83,7 @@ fn put_resolver(
 }
 
 async fn membership_version(tctx: &Tctx) -> u64 {
-    tctx.shards
+    tctx.nodes
         .load_leaf(&test_root_path(), Requirement::AtLeast(tctx.timeline.now()))
         .await
         .unwrap()
@@ -103,7 +103,7 @@ async fn membership_version(tctx: &Tctx) -> u64 {
 async fn single_rw_stale_read_renews_and_converges() {
     let (tm, tctx) = new_algo().await;
     let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
-    let keyp = key_ref(b"k");
+    let keyp = logical_key(b"k");
 
     commit_writes(&tm2, vec![wa(&keyp, b"v1")]).await;
     let ra = do_read(&tctx, &keyp).await;
@@ -115,10 +115,10 @@ async fn single_rw_stale_read_renews_and_converges() {
         &tm,
         AccessSet::new(vec![ra], vec![wa(&keyp, b"v3")], Vec::new()),
     );
-    assert_eq!(tm.commit(&mut h).await.unwrap(), BodyOutcome::ReplayBody);
+    assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
     tm.end(&mut h).await.unwrap();
 
-    // The stale write never committed: v2 is still current (the abandoned
+    // The stale write never committed: v2 is still current (the discarded
     // attempt's object is unreferenced, so help-forward cannot promote it).
     assert!(
         do_read(&tctx, &keyp).await.validates(Some(h2.id()), 0),
@@ -233,7 +233,7 @@ impl InDoubtCas {
                         .is_ok();
                 let result = if fail {
                     Err(glassdb_backend::BackendError::Unavailable(
-                        "simulated in-doubt shard CAS".into(),
+                        "simulated in-doubt leaf CAS".into(),
                     ))
                 } else {
                     Ok(())
@@ -254,13 +254,13 @@ impl InDoubtCas {
 /// disjoint-key contention within one leaf object. With split deferred, every
 /// key lives in the collection's single leaf `_r` (ADR-031), so any distinct
 /// key qualifies.
-fn same_shard_sibling(base: &[u8]) -> Vec<u8> {
+fn same_leaf_sibling(base: &[u8]) -> Vec<u8> {
     let sib = b"sibling".to_vec();
     assert_ne!(sib, base, "sibling must differ from the base key");
     sib
 }
 
-fn shard_stores(log: &OpLog, path: &str) -> usize {
+fn leaf_stores(log: &OpLog, path: &str) -> usize {
     log.lock()
         .unwrap()
         .iter()
@@ -268,9 +268,9 @@ fn shard_stores(log: &OpLog, path: &str) -> usize {
         .count()
 }
 
-// ADR-028: the logless direct commit is folded by the same shard coordinator
+// ADR-028: the logless direct commit is folded by the same leaf coordinator
 // as ordinary lock acquisition, so a direct commit and a disjoint-key
-// acquire contending one shard batch into a single CAS round instead of
+// acquire contending one leaf batch into a single CAS round instead of
 // racing two separate loads+CASes. The commit publishes its value and the
 // acquire installs its lock in the one store.
 #[tokio::test(start_paused = true)]
@@ -282,20 +282,20 @@ async fn direct_commit_merges_with_disjoint_acquire() {
     let (tm, tctx) = new_algo_from_backend(rec).await;
 
     let ka = b"k".to_vec();
-    let kb = same_shard_sibling(&ka);
-    let kap = key_ref(&ka);
-    let kbp = key_ref(&kb);
+    let kb = same_leaf_sibling(&ka);
+    let kap = logical_key(&ka);
+    let kbp = logical_key(&kb);
 
     // Seed keys A and B committed: the direct commit builds on A's
     // predecessor, and the disjoint acquire overwrites an existing B, so it
-    // takes no membership root lock and the round stays a single shard CAS.
+    // takes no membership root lock and the round stays a single leaf CAS.
     commit_writes(&tm, vec![wa(&kap, b"v1")]).await;
     commit_writes(&tm, vec![wa(&kbp, b"vb1")]).await;
 
     let txb = TxId::with_priority(2_000_000_000, b"acquire");
     tctx.tmon.begin_tx(&txb);
 
-    let shard_path = test_root_path().to_string();
+    let leaf_path = test_root_path().to_string();
     log.lock().unwrap().clear();
     gate.arm();
 
@@ -341,12 +341,12 @@ async fn direct_commit_merges_with_disjoint_acquire() {
     );
 
     assert_eq!(
-        shard_stores(&log, &shard_path),
+        leaf_stores(&log, &leaf_path),
         1,
         "direct commit and disjoint acquire share one CAS"
     );
 
-    // Both mutations landed in the shared shard write.
+    // Both mutations landed in the shared leaf write.
     let ea = entry(&tctx, &ka).await.unwrap();
     assert_eq!(
         ea.current,
@@ -373,13 +373,13 @@ async fn direct_commit_batched_in_doubt_recovers() {
     let (tm, tctx) = new_algo_from_backend(backend).await;
 
     let ka = b"k".to_vec();
-    let kb = same_shard_sibling(&ka);
-    let kap = key_ref(&ka);
-    let kbp = key_ref(&kb);
+    let kb = same_leaf_sibling(&ka);
+    let kap = logical_key(&ka);
+    let kbp = logical_key(&kb);
 
     // Seed keys A and B committed (un-gated, before arming): the commit has
     // a predecessor and the acquire overwrites an existing B, so it takes no
-    // membership root lock and the round stays a single shard CAS.
+    // membership root lock and the round stays a single leaf CAS.
     commit_writes(&tm, vec![wa(&kap, b"v1")]).await;
     commit_writes(&tm, vec![wa(&kbp, b"vb1")]).await;
 
@@ -448,7 +448,7 @@ fn logged_value() -> Vec<u8> {
 #[tokio::test]
 async fn an_overwrite_over_the_inline_budget_takes_the_locked_path() {
     let (tm, tctx, log) = new_recording_algo().await;
-    let keyp = key_ref(b"k");
+    let keyp = logical_key(b"k");
 
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
     let r = do_read(&tctx, &keyp).await;
@@ -474,7 +474,7 @@ async fn an_overwrite_over_the_inline_budget_takes_the_locked_path() {
     );
     assert_eq!(c.tx, 1, "one committed-object write: {c:?}");
 
-    // The commit landed: the shard points at us with no live lock, a
+    // The commit landed: the leaf points at us with no live lock, a
     // committed `_t/` object exists, and the value reads back as ours.
     let e = entry(&tctx, b"k").await.unwrap();
     assert_eq!(e.current.writer(), Some(&tid));
@@ -492,20 +492,20 @@ async fn an_overwrite_over_the_inline_budget_takes_the_locked_path() {
 #[tokio::test(start_paused = true)]
 async fn single_rw_observing_a_gate_uses_the_full_locked_path() {
     let (tm, tctx) = new_algo().await;
-    let keyp = key_ref(b"k");
+    let keyp = logical_key(b"k");
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
     let read = do_read(&tctx, &keyp).await;
 
     let gate = TxId::with_priority(0, b"gate");
     tctx.tmon.begin_tx(&gate);
     let (mut root, version) = tctx
-        .shards
+        .nodes
         .load_root(&test_collection(), Requirement::Any)
         .await
         .unwrap();
     root.set_structural_gate(gate.clone());
     assert!(
-        tctx.shards
+        tctx.nodes
             .store_root(&test_collection(), &root, &version)
             .await
             .unwrap()
@@ -530,7 +530,7 @@ async fn single_rw_observing_a_gate_uses_the_full_locked_path() {
         .await
         .unwrap();
     let (mut handle, result) = committing.await.unwrap();
-    assert_eq!(result.unwrap(), BodyOutcome::Complete);
+    assert_eq!(result.unwrap(), BodyDecision::ReturnOutcome);
     assert_ne!(*handle.id(), parallel_id);
     tm.end(&mut handle).await.unwrap();
     assert!(
@@ -540,21 +540,21 @@ async fn single_rw_observing_a_gate_uses_the_full_locked_path() {
     assert!(do_read(&tctx, &keyp).await.validates(Some(handle.id()), 0));
 }
 
-// ADR-030: a warm single read-write commit reuses the shard the read cached
+// ADR-030: a warm single read-write commit reuses the leaf the read cached
 // for both its eligibility check and its lock-install fold (`Any`), so
-// it issues no backend shard read for either. The successful install CAS
+// it issues no backend leaf read for either. The successful install CAS
 // supplies the write-back's lower bound too, so write-back also reuses the
 // installed cached state. A revalidating eligibility, install, or write-back
 // would add a `read_if_modified`, so pinning the total to zero guards the
 // receipt propagation. A large cache keeps this deterministic (nothing is
 // evicted between the read and the commit).
 #[tokio::test]
-async fn single_rw_commit_reuses_cached_shard() {
+async fn single_rw_commit_reuses_cached_leaf() {
     let (tm, tctx, log) = new_recording_algo_big_cache().await;
-    let keyp = key_ref(b"k");
+    let keyp = logical_key(b"k");
 
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
-    // The read warms the shard in the object cache.
+    // The read warms the leaf in the object cache.
     let r = do_read(&tctx, &keyp).await;
 
     log.lock().unwrap().clear();
@@ -565,8 +565,8 @@ async fn single_rw_commit_reuses_cached_shard() {
     tm.commit(&mut h).await.unwrap();
     tm.end(&mut h).await.unwrap();
 
-    let (full, revalidate) = shard_reads(&log);
-    assert_eq!(full, 0, "no cold shard read on a warm commit");
+    let (full, revalidate) = leaf_reads(&log);
+    assert_eq!(full, 0, "no cold leaf read on a warm commit");
     assert_eq!(
         revalidate, 0,
         "eligibility, install, and write-back reuse cache/CAS evidence"
@@ -578,7 +578,7 @@ async fn single_rw_commit_reuses_cached_shard() {
 #[tokio::test]
 async fn a_blind_put_over_the_inline_budget_takes_the_locked_path() {
     let (tm, tctx, log) = new_recording_algo().await;
-    let keyp = key_ref(b"k");
+    let keyp = logical_key(b"k");
 
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
 
@@ -613,7 +613,7 @@ async fn a_blind_put_over_the_inline_budget_takes_the_locked_path() {
 #[tokio::test]
 async fn a_committed_holder_keeps_the_next_writer_on_the_direct_path() {
     let (tm, tctx) = new_algo().await;
-    let keyp = key_ref(b"k");
+    let keyp = logical_key(b"k");
     let leaf_path = test_root_path();
     let raw = b"k".to_vec();
 
@@ -631,11 +631,11 @@ async fn a_committed_holder_keeps_the_next_writer_on_the_direct_path() {
     // Recreate the commit window before write-back: the lock is still held by
     // the committed H1 while the pointer lags at its predecessor H0.
     let loaded = tctx
-        .shards
+        .nodes
         .load_leaf(&leaf_path, Requirement::AtLeast(tctx.timeline.now()))
         .await
         .unwrap();
-    let windowed = Shard::from_entries(loaded.entries().entries().cloned().map(|mut e| {
+    let windowed = LeafBody::from_entries(loaded.entries().entries().cloned().map(|mut e| {
         if e.key == raw {
             e.replace_write_lock(h1.clone());
             e.current = CurrentState::External { writer: h0.clone() };
@@ -644,7 +644,7 @@ async fn a_committed_holder_keeps_the_next_writer_on_the_direct_path() {
     }));
     let mut edit = loaded.into_edit();
     edit.set_entries(windowed);
-    assert!(tctx.shards.commit_leaf(edit).await.unwrap());
+    assert!(tctx.nodes.commit_leaf(edit).await.unwrap());
 
     // The window is observably at the committed holder H1 (v2), not the
     // lagging pointer H0: the shared resolver already help-forwards it.
@@ -679,7 +679,7 @@ async fn a_committed_holder_keeps_the_next_writer_on_the_direct_path() {
 #[tokio::test]
 async fn direct_commit_overwrites_in_one_leaf_cas() {
     let (tm, tctx, log) = new_recording_algo().await;
-    let keyp = key_ref(b"k");
+    let keyp = logical_key(b"k");
 
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
     let r = do_read(&tctx, &keyp).await;
@@ -718,7 +718,7 @@ async fn direct_commit_overwrites_in_one_leaf_cas() {
 #[tokio::test]
 async fn direct_commit_replaces_a_committed_holder() {
     let (tm, tctx) = new_algo().await;
-    let keyp = key_ref(b"k");
+    let keyp = logical_key(b"k");
     let leaf_path = test_root_path();
     let raw = b"k".to_vec();
 
@@ -734,11 +734,11 @@ async fn direct_commit_replaces_a_committed_holder() {
     // The locked path's commit window: the lock is still held by the committed
     // H1 while the current state lags at its predecessor H0.
     let loaded = tctx
-        .shards
+        .nodes
         .load_leaf(&leaf_path, Requirement::AtLeast(tctx.timeline.now()))
         .await
         .unwrap();
-    let windowed = Shard::from_entries(loaded.entries().entries().cloned().map(|mut e| {
+    let windowed = LeafBody::from_entries(loaded.entries().entries().cloned().map(|mut e| {
         if e.key == raw {
             e.replace_write_lock(h1.clone());
             e.current = CurrentState::External { writer: h0.clone() };
@@ -747,7 +747,7 @@ async fn direct_commit_replaces_a_committed_holder() {
     }));
     let mut edit = loaded.into_edit();
     edit.set_entries(windowed);
-    assert!(tctx.shards.commit_leaf(edit).await.unwrap());
+    assert!(tctx.nodes.commit_leaf(edit).await.unwrap());
 
     let mut h = begin_accesses(
         &tm,
@@ -784,7 +784,7 @@ async fn direct_commit_replaces_a_committed_holder() {
 #[tokio::test]
 async fn direct_commit_blocked_after_uncertain_cas_stays_in_doubt() {
     let (tm, tctx) = new_algo().await;
-    let keyp = key_ref(b"k");
+    let keyp = logical_key(b"k");
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
 
     let seed = entry(&tctx, b"k").await.unwrap();
@@ -833,7 +833,7 @@ async fn direct_membership_change_neither_waits_for_nor_wounds_a_live_holder() {
     let direct = put_resolver(
         &tm,
         TxId::with_priority(1, b"direct"),
-        key_ref(b"new"),
+        logical_key(b"new"),
         None,
         b"value",
     );
@@ -855,7 +855,7 @@ async fn direct_commit_replays_an_absence_read_from_an_older_generation() {
     let direct = put_resolver(
         &tm,
         TxId::with_priority(1, b"direct"),
-        key_ref(b"missing"),
+        logical_key(b"missing"),
         Some(None),
         b"value",
     );
@@ -879,7 +879,7 @@ async fn direct_commit_replays_an_absence_read_from_an_older_generation() {
 #[tokio::test]
 async fn a_blind_put_after_an_uncertain_cas_never_republishes_over_a_newer_writer() {
     let (tm, tctx) = new_algo().await;
-    let keyp = key_ref(b"k");
+    let keyp = logical_key(b"k");
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
     let seed = entry(&tctx, b"k").await.unwrap();
     let locks = NodeLocks::default();
@@ -922,7 +922,7 @@ async fn a_blind_put_after_an_uncertain_cas_never_republishes_over_a_newer_write
 
     let superseded = BTreeMap::from([(
         b"k".to_vec(),
-        ShardEntry::new(b"k".to_vec()).with_current(CurrentState::Inline {
+        LeafEntry::new(b"k".to_vec()).with_current(CurrentState::Inline {
             writer: TxId::with_priority(10, b"newer"),
             value: Arc::from(b"v3".as_slice()),
         }),
@@ -944,8 +944,8 @@ async fn a_blind_put_after_an_uncertain_cas_never_republishes_over_a_newer_write
 #[tokio::test]
 async fn any_exact_output_marker_proves_a_mixed_member_landed() {
     let (tm, tctx) = new_algo().await;
-    let ka = key_ref(b"a");
-    let kb = key_ref(b"b");
+    let ka = logical_key(b"a");
+    let kb = logical_key(b"b");
     let id = TxId::with_priority(9, b"mixed");
     let member = direct_member(&AccessSet::new(
         Vec::new(),
@@ -965,11 +965,11 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
     let predecessors = BTreeMap::from([
         (
             b"a".to_vec(),
-            ShardEntry::new(b"a").with_current(CurrentState::External { writer: pa }),
+            LeafEntry::new(b"a").with_current(CurrentState::External { writer: pa }),
         ),
         (
             b"b".to_vec(),
-            ShardEntry::new(b"b").with_current(CurrentState::External { writer: pb }),
+            LeafEntry::new(b"b").with_current(CurrentState::External { writer: pb }),
         ),
     ]);
     assert!(matches!(
@@ -987,14 +987,14 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
     let recovered = BTreeMap::from([
         (
             b"a".to_vec(),
-            ShardEntry::new(b"a").with_current(CurrentState::Inline {
+            LeafEntry::new(b"a").with_current(CurrentState::Inline {
                 writer: TxId::with_priority(10, b"later"),
                 value: Arc::from(b"a3".as_slice()),
             }),
         ),
         (
             b"b".to_vec(),
-            ShardEntry::new(b"b").with_current(CurrentState::Tombstone { writer: id.clone() }),
+            LeafEntry::new(b"b").with_current(CurrentState::Tombstone { writer: id.clone() }),
         ),
     ]);
     assert!(matches!(
@@ -1019,7 +1019,7 @@ async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
     let id = TxId::with_priority(9, b"deletes");
     let member = direct_member(&AccessSet::new(
         Vec::new(),
-        vec![wdel(&key_ref(b"a")), wdel(&key_ref(b"b"))],
+        vec![wdel(&logical_key(b"a")), wdel(&logical_key(b"b"))],
         Vec::new(),
     ))
     .unwrap();
@@ -1063,7 +1063,7 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
     let id = TxId::with_priority(9, b"deletes");
     let member = direct_member(&AccessSet::new(
         Vec::new(),
-        vec![wdel(&key_ref(b"a")), wdel(&key_ref(b"b"))],
+        vec![wdel(&logical_key(b"a")), wdel(&logical_key(b"b"))],
         Vec::new(),
     ))
     .unwrap();
@@ -1077,7 +1077,7 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
     let predecessor = TxId::with_priority(1, b"predecessor");
     let unchanged = BTreeMap::from([(
         b"a".to_vec(),
-        ShardEntry::new(b"a").with_current(CurrentState::Tombstone {
+        LeafEntry::new(b"a").with_current(CurrentState::Tombstone {
             writer: predecessor,
         }),
     )]);
@@ -1116,7 +1116,7 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
 #[tokio::test]
 async fn direct_commit_replays_only_a_certified_superseded_read() {
     let (tm, tctx) = new_algo().await;
-    let keyp = key_ref(b"k");
+    let keyp = logical_key(b"k");
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
     let seed = entry(&tctx, b"k").await.unwrap();
     let current = seed.current.writer().cloned().unwrap();
@@ -1206,7 +1206,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
         (b"k".to_vec(), seed),
         (
             b"other".to_vec(),
-            ShardEntry::new(b"other").with_current(CurrentState::Inline {
+            LeafEntry::new(b"other").with_current(CurrentState::Inline {
                 writer: other_writer,
                 value: Arc::from(b"four".as_slice()),
             }),
@@ -1282,7 +1282,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
 #[tokio::test]
 async fn direct_commit_superseded_read_replays_in_place() {
     let (tm, tctx) = new_algo().await;
-    let keyp = key_ref(b"k");
+    let keyp = logical_key(b"k");
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
 
     // Read v1, then let a later commit supersede it. Both versions are this
@@ -1297,7 +1297,7 @@ async fn direct_commit_superseded_read_replays_in_place() {
         &tm,
         AccessSet::new(vec![stale], vec![wa(&keyp, b"v3")], Vec::new()),
     );
-    assert_eq!(tm.commit(&mut h).await.unwrap(), BodyOutcome::ReplayBody);
+    assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
     tm.end(&mut h).await.unwrap();
     let status = tctx
         .tlogger
@@ -1347,9 +1347,9 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
     let (tm, tctx) = new_algo_from_backend(backend).await;
 
     let ka = b"k".to_vec();
-    let kb = same_shard_sibling(&ka);
-    let kap = key_ref(&ka);
-    let kbp = key_ref(&kb);
+    let kb = same_leaf_sibling(&ka);
+    let kap = logical_key(&ka);
+    let kbp = logical_key(&kb);
     commit_writes(&tm, vec![wa(&kap, b"v1")]).await;
     commit_writes(&tm, vec![wa(&kbp, b"vb1")]).await;
 
@@ -1405,8 +1405,8 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
     // Which member wins the round's claim depends on id order; that exactly
     // one does is the property under test.
     let (winner, mut replayed) = match (&r1, &r2) {
-        (Ok(BodyOutcome::Complete), Ok(BodyOutcome::ReplayBody)) => (h1.id().clone(), h2),
-        (Ok(BodyOutcome::ReplayBody), Ok(BodyOutcome::Complete)) => (h2.id().clone(), h1),
+        (Ok(BodyDecision::ReturnOutcome), Ok(BodyDecision::ReplayBody)) => (h1.id().clone(), h2),
+        (Ok(BodyDecision::ReplayBody), Ok(BodyDecision::ReturnOutcome)) => (h2.id().clone(), h1),
         other => panic!("expected one commit and one replay, got {other:?}"),
     };
 
@@ -1455,7 +1455,7 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
 #[tokio::test]
 async fn direct_create_uses_one_leaf_cas() {
     let (tm, tctx, log) = new_recording_algo().await;
-    let keyp = key_ref(b"new");
+    let keyp = logical_key(b"new");
     let absent = do_read(&tctx, &keyp).await;
 
     log.lock().unwrap().clear();
@@ -1485,7 +1485,7 @@ async fn direct_create_uses_one_leaf_cas() {
 #[tokio::test]
 async fn direct_delete_uses_one_leaf_cas() {
     let (tm, tctx, log) = new_recording_algo().await;
-    let keyp = key_ref(b"k");
+    let keyp = logical_key(b"k");
 
     commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
     let r = do_read(&tctx, &keyp).await;
@@ -1511,8 +1511,8 @@ async fn direct_delete_uses_one_leaf_cas() {
 #[tokio::test]
 async fn direct_multi_key_put_uses_one_leaf_cas() {
     let (tm, tctx, log) = new_recording_algo().await;
-    let ka = key_ref(b"a");
-    let kb = key_ref(b"b");
+    let ka = logical_key(b"a");
+    let kb = logical_key(b"b");
 
     commit_writes(&tm, vec![wa(&ka, b"v1"), wa(&kb, b"v1")]).await;
 
@@ -1528,7 +1528,7 @@ async fn direct_multi_key_put_uses_one_leaf_cas() {
     assert_eq!(c.leaf, 1, "the multi-key write is one leaf CAS: {c:?}");
     assert_eq!(c.tx, 0, "the member has no transaction object: {c:?}");
     let writer = h.id().clone();
-    for (key, key_ref) in [(b"a".as_slice(), &ka), (b"b".as_slice(), &kb)] {
+    for (key, logical_key) in [(b"a".as_slice(), &ka), (b"b".as_slice(), &kb)] {
         assert_eq!(
             entry(&tctx, key).await.unwrap().current,
             CurrentState::Inline {
@@ -1537,7 +1537,7 @@ async fn direct_multi_key_put_uses_one_leaf_cas() {
             }
         );
         assert_eq!(
-            read_outcome(&tctx, key_ref)
+            read_outcome(&tctx, logical_key)
                 .await
                 .value
                 .unwrap()
@@ -1554,8 +1554,8 @@ async fn direct_blind_puts_cover_two_eight_and_thirty_two_keys() {
     tm.direct_commit_stats_and_reset();
 
     for count in [2usize, 8, 32] {
-        let keys: Vec<KeyRef> = (0..count)
-            .map(|index| key_ref(format!("n{count}-{index:02}").as_bytes()))
+        let keys: Vec<LogicalKey> = (0..count)
+            .map(|index| logical_key(format!("n{count}-{index:02}").as_bytes()))
             .collect();
         log.lock().unwrap().clear();
         let mut h = begin_accesses(
@@ -1592,8 +1592,8 @@ async fn direct_blind_puts_cover_two_eight_and_thirty_two_keys() {
 #[tokio::test]
 async fn multi_key_aggregate_rejection_is_atomic_and_does_not_hint() {
     let (tm, tctx, log) = new_recording_algo().await;
-    let keys: Vec<KeyRef> = (0..32)
-        .map(|index| key_ref(format!("large-{index:02}").as_bytes()))
+    let keys: Vec<LogicalKey> = (0..32)
+        .map(|index| logical_key(format!("large-{index:02}").as_bytes()))
         .collect();
     let value = vec![b'v'; 600];
     assert!(InlinePolicy::default().admits_value(value.len()));
@@ -1637,8 +1637,8 @@ async fn multi_key_aggregate_rejection_is_atomic_and_does_not_hint() {
 #[tokio::test]
 async fn cross_key_aggregate_rejection_does_not_hint() {
     let (tm, tctx) = new_algo().await;
-    let source = key_ref(b"source");
-    let destination = key_ref(b"destination");
+    let source = logical_key(b"source");
+    let destination = logical_key(b"destination");
     let predecessor = TxId::with_priority(0, b"predecessor");
     let member = DirectMember {
         keys: vec![
@@ -1671,7 +1671,7 @@ async fn cross_key_aggregate_rejection_does_not_hint() {
     );
     let staged = BTreeMap::from([(
         source.key().to_vec(),
-        ShardEntry::new(source.key()).with_current(CurrentState::Inline {
+        LeafEntry::new(source.key()).with_current(CurrentState::Inline {
             writer: predecessor,
             value: Arc::from(b"12345678".as_slice()),
         }),
@@ -1699,10 +1699,10 @@ async fn cross_key_aggregate_rejection_does_not_hint() {
 #[tokio::test]
 async fn direct_mixed_member_is_atomic_and_advances_membership_once() {
     let (tm, tctx, log) = new_recording_algo().await;
-    let ka = key_ref(b"a");
-    let kb = key_ref(b"b");
-    let kc = key_ref(b"c");
-    let kd = key_ref(b"d");
+    let ka = logical_key(b"a");
+    let kb = logical_key(b"b");
+    let kc = logical_key(b"c");
+    let kd = logical_key(b"d");
 
     commit_writes(&tm, vec![wa(&ka, b"a1"), wa(&kc, b"c1")]).await;
     let before = membership_version(&tctx).await;
@@ -1787,7 +1787,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     let l2 = NodeToken::from_bytes([2; 16]);
     let seed = TxId::with_priority(1, b"seed");
     let seeded_l0 = || {
-        Node::leaf(Shard::from_entries([ShardEntry::new(b"a").with_current(
+        Node::leaf(LeafBody::from_entries([LeafEntry::new(b"a").with_current(
             CurrentState::Inline {
                 writer: seed.clone(),
                 value: Arc::from(b"a0".as_slice()),
@@ -1795,18 +1795,18 @@ async fn direct_commit_reroutes_once_then_falls_back() {
         )]))
     };
     assert!(
-        tctx.shards
+        tctx.nodes
             .store_node(&test_collection(), &l0, &seeded_l0(), None)
             .await
             .unwrap()
     );
     let root = tctx
-        .shards
+        .nodes
         .load_leaf(&test_root_path(), Requirement::AtLeast(tctx.timeline.now()))
         .await
         .unwrap();
     assert!(
-        tctx.shards
+        tctx.nodes
             .store_root(
                 &test_collection(),
                 &Node::index(IndexNode::from_children([(Vec::new(), l0.to_string(),)])),
@@ -1830,7 +1830,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
         direct
             .try_commit(
                 &direct_id,
-                &AccessSet::new(Vec::new(), vec![wa(&key_ref(b"z"), b"z1")], Vec::new()),
+                &AccessSet::new(Vec::new(), vec![wa(&logical_key(b"z"), b"z1")], Vec::new()),
                 &mut state,
             )
             .await
@@ -1838,13 +1838,13 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     gate.wait_until_blocked().await;
 
     assert!(
-        peer.shards
-            .store_node(&test_collection(), &l1, &Node::leaf(Shard::new()), None)
+        peer.nodes
+            .store_node(&test_collection(), &l1, &Node::leaf(LeafBody::new()), None)
             .await
             .unwrap()
     );
     let (_, observed_l0) = peer
-        .shards
+        .nodes
         .load_node(&test_collection(), &l0, Requirement::Any)
         .await
         .unwrap();
@@ -1852,7 +1852,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
         .with_high_key(Some(b"m".to_vec()))
         .with_right_sibling(Some(l1.to_string()));
     assert!(
-        peer.shards
+        peer.nodes
             .store_node(&test_collection(), &l0, &bounded_l0, Some(&observed_l0),)
             .await
             .unwrap()
@@ -1866,21 +1866,21 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     gate.wait_until_blocked().await;
 
     assert!(
-        peer.shards
-            .store_node(&test_collection(), &l2, &Node::leaf(Shard::new()), None)
+        peer.nodes
+            .store_node(&test_collection(), &l2, &Node::leaf(LeafBody::new()), None)
             .await
             .unwrap()
     );
     let (_, observed_l1) = peer
-        .shards
+        .nodes
         .load_node(&test_collection(), &l1, Requirement::Any)
         .await
         .unwrap();
-    let bounded_l1 = Node::leaf(Shard::new())
+    let bounded_l1 = Node::leaf(LeafBody::new())
         .with_high_key(Some(b"y".to_vec()))
         .with_right_sibling(Some(l2.to_string()));
     assert!(
-        peer.shards
+        peer.nodes
             .store_node(&test_collection(), &l1, &bounded_l1, Some(&observed_l1))
             .await
             .unwrap()
@@ -1910,12 +1910,12 @@ async fn cross_leaf_member_uses_the_logged_protocol() {
         .create_record(&other, &CollectionRecord::new())
         .await
         .unwrap();
-    tctx.shards
-        .create_root(&other, &Node::leaf(Shard::new()))
+    tctx.nodes
+        .create_root(&other, &Node::leaf(LeafBody::new()))
         .await
         .unwrap();
-    let ka = key_ref(b"a");
-    let kb = KeyRef::new(other, b"b");
+    let ka = logical_key(b"a");
+    let kb = LogicalKey::new(other, b"b");
 
     log.lock().unwrap().clear();
     tctx.locker.stats_and_reset();
@@ -1941,8 +1941,8 @@ async fn cross_leaf_member_uses_the_logged_protocol() {
 #[tokio::test]
 async fn direct_cross_key_read_modify_write_uses_one_leaf_cas() {
     let (tm, tctx, log) = new_recording_algo().await;
-    let ka = key_ref(b"a");
-    let kb = key_ref(b"b");
+    let ka = logical_key(b"a");
+    let kb = logical_key(b"b");
 
     commit_writes(&tm, vec![wa(&ka, b"v1"), wa(&kb, b"v1")]).await;
     let ra = do_read(&tctx, &ka).await;

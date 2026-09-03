@@ -44,19 +44,26 @@ pub enum CollectionOp {
 
 /// Collection-management accesses carried beside ordinary key accesses.
 #[derive(Debug, Clone, Default)]
-pub struct CollectionData {
+pub struct CatalogAccesses {
     pub reads: Vec<DirectoryRead>,
     pub changes: Vec<CollectionChange>,
 }
 
-impl CollectionData {
+impl CatalogAccesses {
     /// Reports whether the transaction changes a collection binding.
     pub fn has_writes(&self) -> bool {
         !self.changes.is_empty()
     }
 
-    /// Retains only directory observations used to validate a user error.
+    /// Retains only durable directory observations used to validate an error outcome.
     pub fn into_read_only(mut self) -> Self {
+        let created = self
+            .changes
+            .iter()
+            .filter(|change| matches!(change.op, CollectionOp::Create))
+            .map(|change| change.collection.clone())
+            .collect::<std::collections::HashSet<_>>();
+        self.reads.retain(|read| !created.contains(&read.parent));
         self.changes.clear();
         self
     }
@@ -67,4 +74,56 @@ impl CollectionData {
 pub struct DirectorySnapshot {
     pub children: Vec<(Vec<u8>, CollectionId)>,
     pub version: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn address(byte: u8) -> CollectionAddress {
+        CollectionAddress::new(
+            "db",
+            CollectionId::from_slice(&[byte; 16]).expect("fixed ID has the required width"),
+        )
+    }
+
+    #[test]
+    fn read_only_accesses_discard_reads_inside_a_staged_creation() {
+        let root = CollectionAddress::root("db");
+        let created = address(1);
+        let durable = address(2);
+        let accesses = CatalogAccesses {
+            reads: vec![
+                DirectoryRead {
+                    parent: root.clone(),
+                    kind: DirectoryReadKind::Entry {
+                        name: b"created".to_vec(),
+                        collection: None,
+                    },
+                },
+                DirectoryRead {
+                    parent: created.clone(),
+                    kind: DirectoryReadKind::Listing { version: 0 },
+                },
+                DirectoryRead {
+                    parent: durable.clone(),
+                    kind: DirectoryReadKind::Listing { version: 7 },
+                },
+            ],
+            changes: vec![CollectionChange {
+                parent: root,
+                name: b"created".to_vec(),
+                collection: created.clone(),
+                expected: None,
+                op: CollectionOp::Create,
+            }],
+        };
+
+        let read_only = accesses.into_read_only();
+
+        assert!(read_only.changes.is_empty());
+        assert_eq!(read_only.reads.len(), 2);
+        assert!(read_only.reads.iter().any(|read| read.parent == durable));
+        assert!(read_only.reads.iter().all(|read| read.parent != created));
+    }
 }

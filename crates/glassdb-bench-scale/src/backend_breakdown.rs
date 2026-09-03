@@ -45,7 +45,7 @@ pub struct BackendBreakdown {
     pub collection_record: OperationCounts,
     pub node: OperationCounts,
     pub transaction_log: OperationCounts,
-    pub structural_log: OperationCounts,
+    pub structural_intent: OperationCounts,
     pub other: OperationCounts,
 }
 
@@ -56,7 +56,7 @@ impl BackendBreakdown {
             ("backend.collection_record", self.collection_record),
             ("backend.node", self.node),
             ("backend.transaction_log", self.transaction_log),
-            ("backend.structural_log", self.structural_log),
+            ("backend.structural_intent", self.structural_intent),
             ("backend.other", self.other),
         ]
     }
@@ -86,7 +86,7 @@ impl Sub for BackendBreakdown {
             collection_record: self.collection_record - other.collection_record,
             node: self.node - other.node,
             transaction_log: self.transaction_log - other.transaction_log,
-            structural_log: self.structural_log - other.structural_log,
+            structural_intent: self.structural_intent - other.structural_intent,
             other: self.other - other.other,
         }
     }
@@ -98,7 +98,7 @@ enum ObjectRole {
     CollectionRecord,
     Node,
     TransactionLog,
-    StructuralLog,
+    StructuralIntent,
     Other,
 }
 
@@ -129,7 +129,7 @@ struct Counters {
     collection_record: AtomicCounts,
     node: AtomicCounts,
     transaction_log: AtomicCounts,
-    structural_log: AtomicCounts,
+    structural_intent: AtomicCounts,
     other: AtomicCounts,
 }
 
@@ -140,7 +140,7 @@ impl Counters {
             ObjectRole::CollectionRecord => &self.collection_record,
             ObjectRole::Node => &self.node,
             ObjectRole::TransactionLog => &self.transaction_log,
-            ObjectRole::StructuralLog => &self.structural_log,
+            ObjectRole::StructuralIntent => &self.structural_intent,
             ObjectRole::Other => &self.other,
         }
     }
@@ -151,7 +151,7 @@ impl Counters {
             collection_record: self.collection_record.snapshot(),
             node: self.node.snapshot(),
             transaction_log: self.transaction_log.snapshot(),
-            structural_log: self.structural_log.snapshot(),
+            structural_intent: self.structural_intent.snapshot(),
             other: self.other.snapshot(),
         }
     }
@@ -232,7 +232,7 @@ fn classify_object(path: &ObjectPath) -> ObjectRole {
         ObjectPath::CollectionRecord { .. } => ObjectRole::CollectionRecord,
         ObjectPath::TreeRoot { .. } | ObjectPath::Node { .. } => ObjectRole::Node,
         ObjectPath::Transaction { .. } => ObjectRole::TransactionLog,
-        ObjectPath::StructuralRecord { .. } => ObjectRole::StructuralLog,
+        ObjectPath::StructuralIntent { .. } => ObjectRole::StructuralIntent,
     }
 }
 
@@ -298,7 +298,7 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use glassdb_backend::memory::MemoryBackend;
-    use glassdb_data::{CollectionAddress, DbRoot, NodeToken, StructuralRecordId, TxId};
+    use glassdb_data::{CollectionAddress, DbRoot, NodeToken, StructuralIntentId, TxId};
 
     use super::*;
 
@@ -341,12 +341,12 @@ mod tests {
                 ObjectRole::TransactionLog,
             ),
             (
-                ObjectPath::StructuralRecord {
+                ObjectPath::StructuralIntent {
                     db_root,
                     participant,
-                    record_id: StructuralRecordId::from(NodeToken::from_bytes([2; 16])),
+                    intent_id: StructuralIntentId::from(NodeToken::from_bytes([2; 16])),
                 },
-                ObjectRole::StructuralLog,
+                ObjectRole::StructuralIntent,
             ),
         ];
 
@@ -364,9 +364,9 @@ mod tests {
             "db/_c/0000000000000000000000/_i/_n/token",
             "db/_c/0000000000000000000000/_n/_t",
             "db/_t/_n/not-a-transaction",
-            "db/_s/_t/record",
+            "db/_s/_t/intent",
             "db/_t/0F/",
-            "db/_s/record",
+            "db/_s/intent",
             "db/unknown",
         ] {
             assert_eq!(classify(path), ObjectRole::Other, "classified {path:?}");

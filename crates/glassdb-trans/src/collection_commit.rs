@@ -7,14 +7,14 @@ use glassdb_storage::transaction::{TxCollectionChange, TxCollectionOp, TxLock};
 use glassdb_storage::{Requirement, SplitPolicy};
 
 use crate::collection_catalog::CollectionCatalog;
-use crate::collections::{CollectionData, CollectionLifecycle, CollectionOp};
+use crate::collections::{CatalogAccesses, CollectionLifecycle, CollectionOp};
 use crate::error::TransError;
 use crate::monitor::{Monitor, TxRecoveryManifest};
 
 /// Collection accesses and physical resources retained across one transaction
 /// identity's body retries.
 pub(crate) struct CollectionAttempt {
-    data: CollectionData,
+    accesses: CatalogAccesses,
     prepared: BTreeSet<CollectionAddress>,
     fenced_drops: BTreeSet<CollectionAddress>,
 }
@@ -31,28 +31,28 @@ pub(crate) struct CollectionCommit {
 
 impl CollectionAttempt {
     /// Starts collection tracking for one transaction identity.
-    pub(crate) fn new(data: CollectionData) -> Self {
+    pub(crate) fn new(accesses: CatalogAccesses) -> Self {
         Self {
-            data,
+            accesses,
             prepared: BTreeSet::new(),
             fenced_drops: BTreeSet::new(),
         }
     }
 
     /// Returns the logical collection accesses from the current body run.
-    pub(crate) fn data(&self) -> &CollectionData {
-        &self.data
+    pub(crate) fn accesses(&self) -> &CatalogAccesses {
+        &self.accesses
     }
 
     /// Reports whether the current body changes a collection binding.
     pub(crate) fn has_writes(&self) -> bool {
-        self.data.has_writes()
+        self.accesses.has_writes()
     }
 
     /// Replaces logical accesses while retaining resources owned by the same
     /// transaction identity.
-    pub(crate) fn replace_data(&mut self, data: CollectionData) {
-        self.data = data;
+    pub(crate) fn replace_accesses(&mut self, accesses: CatalogAccesses) {
+        self.accesses = accesses;
     }
 
     /// Drops physical resources that belonged to the retired identity.
@@ -84,7 +84,7 @@ impl CollectionAttempt {
     }
 
     fn encoded_changes(&self) -> Vec<TxCollectionChange> {
-        self.data
+        self.accesses
             .changes
             .iter()
             .map(|change| TxCollectionChange {
@@ -100,7 +100,7 @@ impl CollectionAttempt {
     }
 
     fn created_collections(&self) -> impl Iterator<Item = &CollectionAddress> {
-        self.data
+        self.accesses
             .changes
             .iter()
             .filter(|change| change.op == CollectionOp::Create)
@@ -108,7 +108,7 @@ impl CollectionAttempt {
     }
 
     fn active_drops(&self) -> BTreeSet<CollectionAddress> {
-        self.data
+        self.accesses
             .changes
             .iter()
             .filter(|change| change.op == CollectionOp::Drop)
@@ -142,12 +142,12 @@ impl CollectionCommit {
         attempt: &mut CollectionAttempt,
     ) -> Result<(), TransError> {
         let active_drops = attempt.active_drops();
-        let abandoned = attempt
+        let discarded = attempt
             .fenced_drops
             .difference(&active_drops)
             .cloned()
             .collect::<Vec<_>>();
-        self.lifecycle.clear_aborted_drops(id, &abandoned).await?;
+        self.lifecycle.clear_aborted_drops(id, &discarded).await?;
         attempt
             .fenced_drops
             .retain(|drop| active_drops.contains(drop));
@@ -182,7 +182,7 @@ impl CollectionCommit {
         let created = attempt.created_collections().cloned().collect::<Vec<_>>();
         attempt.prepared.extend(created);
         self.lifecycle
-            .prepare_collections(&attempt.data.changes)
+            .prepare_collections(&attempt.accesses.changes)
             .await
     }
 
@@ -197,8 +197,8 @@ impl CollectionCommit {
         self.catalog
             .validate(
                 id,
-                &attempt.data.reads,
-                &attempt.data.changes,
+                &attempt.accesses.reads,
+                &attempt.accesses.changes,
                 requirement,
                 &self.split_policy,
             )
@@ -212,9 +212,11 @@ impl CollectionCommit {
         attempt: &mut CollectionAttempt,
     ) -> Result<(), TransError> {
         // Remember every target before its fencing starts so a partial attempt
-        // is recoverable by a same-id body retry or abort.
+        // is recoverable by a same-identity body retry or abort.
         attempt.fenced_drops.extend(attempt.active_drops());
-        self.lifecycle.fence_drops(id, &attempt.data.changes).await
+        self.lifecycle
+            .fence_drops(id, &attempt.accesses.changes)
+            .await
     }
 
     /// Reclaims physical collection objects that the committed logical changes
@@ -278,7 +280,7 @@ mod tests {
     #[test]
     fn renewed_attempt_keeps_accesses_without_old_physical_resources() {
         let collection = address(1);
-        let mut attempt = CollectionAttempt::new(CollectionData {
+        let mut attempt = CollectionAttempt::new(CatalogAccesses {
             reads: Vec::new(),
             changes: vec![create_change(collection.clone())],
         });
@@ -287,8 +289,8 @@ mod tests {
 
         attempt.renew();
 
-        assert_eq!(attempt.data.changes.len(), 1);
-        assert_eq!(attempt.data.changes[0].collection, collection);
+        assert_eq!(attempt.accesses.changes.len(), 1);
+        assert_eq!(attempt.accesses.changes[0].collection, collection);
         assert!(attempt.prepared.is_empty());
         assert!(attempt.fenced_drops.is_empty());
     }
@@ -297,7 +299,7 @@ mod tests {
     fn durable_projections_preserve_prepared_roots_from_prior_body_runs() {
         let earlier = address(1);
         let active = address(2);
-        let mut attempt = CollectionAttempt::new(CollectionData {
+        let mut attempt = CollectionAttempt::new(CatalogAccesses {
             reads: Vec::new(),
             changes: vec![create_change(active.clone())],
         });

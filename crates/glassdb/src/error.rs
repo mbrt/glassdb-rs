@@ -26,7 +26,7 @@ pub enum Error {
     /// The collection still has direct child collections.
     #[error("collection is not empty")]
     NotEmpty,
-    /// The transaction was explicitly aborted by the user.
+    /// The transaction body returned an explicit abort.
     #[error("aborted transaction")]
     Aborted,
     /// A conditional operation's precondition failed.

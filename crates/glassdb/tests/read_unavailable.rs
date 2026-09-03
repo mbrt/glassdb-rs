@@ -166,7 +166,7 @@ async fn transient_read_unavailability_is_retried_transparently() {
 /// `Error::Unavailable` (a read-only attempt stages no write, so nothing is in
 /// doubt).
 #[tokio::test(start_paused = true)]
-async fn body_error_does_not_escape_unvalidated_reads() {
+async fn error_outcome_does_not_escape_failed_validation() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     seed_shared(mem.clone(), b"k", 10).await;
 
@@ -200,7 +200,47 @@ async fn body_error_does_not_escape_unvalidated_reads() {
 
     assert!(
         matches!(res, Err(Error::Unavailable(_))),
-        "an unvalidated body error must surface the failed validation, got {res:?}"
+        "an unvalidated error outcome must surface the failed validation, got {res:?}"
+    );
+    assert_eq!(
+        bodies.load(Ordering::SeqCst),
+        1,
+        "the body must not be replayed when validation could not complete"
+    );
+}
+
+/// An explicit abort is an error outcome. It must not escape until GlassDB has
+/// validated the reads that led to it.
+#[tokio::test(start_paused = true)]
+async fn explicit_abort_does_not_escape_failed_validation() {
+    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    seed_shared(mem.clone(), b"k", 10).await;
+
+    let (backend, faults) = ReadFaults::wrap(mem.clone());
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let coll = db
+        .open_collection(&CollectionPath::new(b"c").unwrap())
+        .await
+        .unwrap();
+
+    let bodies = Arc::new(AtomicUsize::new(0));
+    let coll = &coll;
+    let faults = &faults;
+    let result: Result<(), Error> = db
+        .tx(|tx| {
+            let bodies = bodies.clone();
+            async move {
+                bodies.fetch_add(1, Ordering::SeqCst);
+                tx.read(coll, b"k").await?;
+                faults.fail_key_reads_forever();
+                tx.abort()
+            }
+        })
+        .await;
+
+    assert!(
+        matches!(result, Err(Error::Unavailable(_))),
+        "an unvalidated explicit abort must surface the failed validation, got {result:?}"
     );
     assert_eq!(
         bodies.load(Ordering::SeqCst),

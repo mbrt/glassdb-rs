@@ -7,14 +7,14 @@ its rightful owner?**
 ## Mechanism vs. policy
 
 - Check that the *mechanism* (generic engines: dedup, fold loops, CAS/retry)
-  stays free of *policy* (locking, wound-wait, commit, transaction ids). Policy
+  stays free of *policy* (locking, wound-wait, commit, transaction identities). Policy
   should live in the pluggable pieces owners install (e.g. resolvers), not baked
   into the engine.
 - Flag it when an engine names a domain concept (`LockType`, wound-wait,
   membership, `TxCommitStatus`): the concept has likely leaked in from a caller
   and should move out.
 - Watch for **asymmetry**: when two similar things are handled differently (e.g.
-  shards via installed resolvers but roots via engine-internal special-casing),
+  leaves via installed resolvers but roots via engine-internal special-casing),
   suspect that the odd one out has policy baked into the mechanism. Ask for them
   to be made symmetric.
 

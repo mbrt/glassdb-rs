@@ -3,14 +3,14 @@
 //!
 //! A node is the unit of the dynamic, range-partitioned coordination directory.
 //! It is either a **leaf** — the per-key coordination entries of ADR-017 (a
-//! [`Shard`]) for a contiguous key range — or an **index**, an ordered map from
+//! [`LeafBody`]) for a contiguous key range — or an **index**, an ordered map from
 //! separator keys to child-node tokens. Every node self-describes the range it
-//! owns through a **high-key** (the exclusive upper bound; absent means
+//! covers through a **high-key** (the exclusive upper bound; absent means
 //! +infinity) and a **right-sibling** pointer, the two fields that let a descent
 //! detect a concurrent split and self-correct by stepping right rather than
 //! restarting from the root.
 //!
-//! Like the shard and root objects, a node body is a compare-and-swap unit, so
+//! Like the leaf and root objects, a node body is a compare-and-swap unit, so
 //! the encoding is canonical (leaf entries and index separators sorted, holder
 //! sets sorted) and golden-anchored. This module is inert data plus encode/
 //! decode, pure lookups, and the in-memory split primitives ([`Node::split`]);
@@ -24,12 +24,12 @@ use glassdb_proto as pb;
 use prost::Message;
 
 use crate::error::StorageError;
+use crate::leaf::{LeafBody, LeafEntry};
 use crate::lock::{ExclusiveGate, LockType, SharedExclusiveLock};
-use crate::shard::{Shard, ShardEntry};
 use crate::wire_size::{length_delimited_field, nonempty_length_delimited_field};
 use glassdb_data::{NodeToken as ValidatedNodeToken, TxId};
 
-const SHARD_ENTRIES_TAG: u32 = 1;
+const LEAF_ENTRIES_TAG: u32 = 1;
 const INDEX_ENTRIES_TAG: u32 = 1;
 const INDEX_SEPARATOR_TAG: u32 = 1;
 const INDEX_CHILD_TAG: u32 = 2;
@@ -41,10 +41,10 @@ const NODE_INDEX_TAG: u32 = 4;
 pub type NodeToken = String;
 
 /// An index node body: the separator keys of an interior node, each mapping the
-/// inclusive lower bound of a key range to the child node that owns it.
+/// inclusive lower bound of a key range to its routed child node.
 ///
 /// Separators are held sorted, so iteration and encoding are canonical and the
-/// child owning a key is found by a single predecessor lookup.
+/// routed child for a key is found by a single predecessor lookup.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IndexNode {
     children: BTreeMap<Vec<u8>, NodeToken>,
@@ -60,7 +60,7 @@ impl IndexNode {
         }
     }
 
-    /// Returns the token of the child that owns `key`: the child whose separator
+    /// Returns the token of the routed child for `key`: the child whose separator
     /// is the greatest one not exceeding `key`. Falls back to the leftmost child
     /// when `key` precedes every separator (a defensive case a well-formed
     /// descent never hits, since the node's low bound is its first separator).
@@ -219,7 +219,7 @@ impl SplitPolicy {
 
     /// Reports whether one exact leaf entry fits the per-entry budget that
     /// preserves room for another independently admissible entry.
-    pub fn entry_fits_split_budget(&self, entry: &ShardEntry) -> bool {
+    pub fn entry_fits_split_budget(&self, entry: &LeafEntry) -> bool {
         Node::leaf_entry_content_encoded_len(entry) <= self.content_limit() / 2
     }
 
@@ -299,7 +299,7 @@ impl Default for SplitPolicyBuilder {
 
 impl Default for SplitPolicy {
     fn default() -> Self {
-        // A ~256-entry leaf soft cap mirrors the old fixed keys-per-shard target
+        // A ~256-entry leaf soft cap mirrors the old fixed keys-per-leaf target
         // (ADR-017), and keeps each object small for the backend.
         SplitPolicyBuilder::default()
             .build()
@@ -420,7 +420,7 @@ impl NodeLocks {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeBody {
     /// A leaf: the ADR-017 coordination entries for the node's key range.
-    Leaf(Shard),
+    Leaf(LeafBody),
     /// An index: separator keys mapping ranges to child nodes.
     Index(IndexNode),
 }
@@ -429,7 +429,7 @@ pub enum NodeBody {
 /// make descent self-correcting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
-    /// Exclusive upper bound of the owned key range; `None` means +infinity.
+    /// Exclusive upper bound of the covered key range; `None` means +infinity.
     high_key: Option<Vec<u8>>,
     /// Right-sibling token at the same level; `None` means none (rightmost).
     right_sibling: Option<NodeToken>,
@@ -438,18 +438,18 @@ pub struct Node {
 }
 
 impl Node {
-    /// Creates a leaf node owning the whole key space (high-key +infinity, no
-    /// right sibling) from `shard` — the shape of a brand-new root.
-    pub fn leaf(shard: Shard) -> Self {
+    /// Creates a leaf node that covers the whole key space (high-key +infinity, no
+    /// right sibling) from `leaf` — the shape of a brand-new root.
+    pub fn leaf(leaf: LeafBody) -> Self {
         Node {
             high_key: None,
             right_sibling: None,
-            body: NodeBody::Leaf(shard),
+            body: NodeBody::Leaf(leaf),
             locks: NodeLocks::default(),
         }
     }
 
-    /// Creates an index node owning the whole key space from `index`.
+    /// Creates an index node that covers the whole key space from `index`.
     pub fn index(index: IndexNode) -> Self {
         Node {
             high_key: None,
@@ -473,7 +473,7 @@ impl Node {
         self
     }
 
-    /// The exclusive upper bound of the owned range, or `None` for +infinity.
+    /// The exclusive upper bound of the covered range, or `None` for +infinity.
     pub fn high_key(&self) -> Option<&[u8]> {
         self.high_key.as_deref()
     }
@@ -490,9 +490,9 @@ impl Node {
     }
 
     /// Replaces the leaf body while preserving bounds and node coordination.
-    pub fn set_leaf(&mut self, shard: Shard) -> Result<(), StorageError> {
+    pub fn set_leaf(&mut self, leaf: LeafBody) -> Result<(), StorageError> {
         if matches!(self.body, NodeBody::Leaf(_)) {
-            self.body = NodeBody::Leaf(shard);
+            self.body = NodeBody::Leaf(leaf);
             Ok(())
         } else {
             Err(StorageError::other("node is not a leaf"))
@@ -583,19 +583,17 @@ impl Node {
     }
 
     /// Returns the exact node-content size of a leaf containing only `entry`.
-    pub fn leaf_entry_content_encoded_len(entry: &ShardEntry) -> usize {
-        let shard_len = length_delimited_field(SHARD_ENTRIES_TAG, entry.encoded_len());
-        length_delimited_field(NODE_LEAF_TAG, shard_len)
+    pub fn leaf_entry_content_encoded_len(entry: &LeafEntry) -> usize {
+        let leaf_len = length_delimited_field(LEAF_ENTRIES_TAG, entry.encoded_len());
+        length_delimited_field(NODE_LEAF_TAG, leaf_len)
     }
 
     /// Returns the node-content size of a leaf containing the largest fixed
     /// coordination shape GlassDB can add for a key of `key_len` bytes.
     pub fn worst_case_leaf_entry_len(key_len: usize) -> usize {
-        let shard_len = length_delimited_field(
-            SHARD_ENTRIES_TAG,
-            ShardEntry::worst_case_encoded_len(key_len),
-        );
-        length_delimited_field(NODE_LEAF_TAG, shard_len)
+        let leaf_len =
+            length_delimited_field(LEAF_ENTRIES_TAG, LeafEntry::worst_case_encoded_len(key_len));
+        length_delimited_field(NODE_LEAF_TAG, leaf_len)
     }
 
     /// Returns the node-content size of the smallest parent that can contain a
@@ -618,7 +616,7 @@ impl Node {
     }
 
     /// The leaf body, or `None` if this is an index node.
-    pub fn as_leaf(&self) -> Option<&Shard> {
+    pub fn as_leaf(&self) -> Option<&LeafBody> {
         match &self.body {
             NodeBody::Leaf(s) => Some(s),
             NodeBody::Index(_) => None,
@@ -633,10 +631,10 @@ impl Node {
         }
     }
 
-    /// Reports whether the node still owns `key`, i.e. `key` is below the
+    /// Reports whether the node still covers `key`, i.e. `key` is below the
     /// high-key. A `false` result means a split has moved `key` to the right and
     /// the descent must follow the right-sibling link (the B-link property).
-    pub fn owns(&self, key: &[u8]) -> bool {
+    pub fn covers(&self, key: &[u8]) -> bool {
         match &self.high_key {
             None => true,
             Some(hk) => key < hk.as_slice(),
@@ -649,9 +647,9 @@ impl Node {
     /// large a single entry is (single-hot-key relief is out of scope).
     pub fn over_soft_cap(&self, policy: &SplitPolicy) -> bool {
         match &self.body {
-            NodeBody::Leaf(shard) => {
-                shard.len() >= 2
-                    && (shard.len() > policy.leaf_max_entries()
+            NodeBody::Leaf(leaf) => {
+                leaf.len() >= 2
+                    && (leaf.len() > policy.leaf_max_entries()
                         || self.content_encoded_len() > policy.node_soft_max_bytes())
             }
             NodeBody::Index(index) => {
@@ -674,11 +672,11 @@ impl Node {
     /// caller's multi-step protocol.
     pub fn split(&mut self, right_token: &str) -> Option<(Node, Vec<u8>)> {
         let (right_body, split_key) = match &mut self.body {
-            NodeBody::Leaf(shard) => {
-                if shard.len() < 2 {
+            NodeBody::Leaf(leaf) => {
+                if leaf.len() < 2 {
                     return None;
                 }
-                let (upper, split_key) = shard.split_off_median();
+                let (upper, split_key) = leaf.split_off_median();
                 (NodeBody::Leaf(upper), split_key)
             }
             NodeBody::Index(index) => {
@@ -733,7 +731,7 @@ impl Node {
 
     pub(crate) fn to_pb(&self) -> pb::Node {
         let body = match &self.body {
-            NodeBody::Leaf(shard) => pb::node::Body::Leaf(shard.to_pb()),
+            NodeBody::Leaf(leaf) => pb::node::Body::Leaf(leaf.to_pb()),
             NodeBody::Index(index) => pb::node::Body::Index(index.to_pb()),
         };
         pb::Node {
@@ -757,8 +755,8 @@ impl Node {
     pub(crate) fn from_pb(raw: pb::Node) -> Result<Self, StorageError> {
         let body = match raw.body {
             Some(pb::node::Body::Index(index)) => NodeBody::Index(IndexNode::from_pb(index)),
-            Some(pb::node::Body::Leaf(leaf)) => NodeBody::Leaf(Shard::from_pb(leaf)?),
-            None => NodeBody::Leaf(Shard::new()),
+            Some(pb::node::Body::Leaf(leaf)) => NodeBody::Leaf(LeafBody::from_pb(leaf)?),
+            None => NodeBody::Leaf(LeafBody::new()),
         };
         let structure = ExclusiveGate::from_pb(raw.structure_lock).map_err(|_| {
             StorageError::other("node structural gate must be empty or have one write holder")
@@ -787,16 +785,16 @@ mod tests {
 
     use glassdb_data::TxId;
 
-    use crate::shard::{CurrentState, ShardEntry};
+    use crate::leaf::{CurrentState, LeafEntry};
 
-    fn entry(key: &[u8], writer: u8) -> ShardEntry {
-        ShardEntry::new(key).with_current(CurrentState::External {
+    fn entry(key: &[u8], writer: u8) -> LeafEntry {
+        LeafEntry::new(key).with_current(CurrentState::External {
             writer: TxId::from_bytes(vec![writer]),
         })
     }
 
-    fn golden_entry() -> ShardEntry {
-        let mut entry = ShardEntry::new(b"Hello").with_current(CurrentState::External {
+    fn golden_entry() -> LeafEntry {
+        let mut entry = LeafEntry::new(b"Hello").with_current(CurrentState::External {
             writer: TxId::from_bytes(vec![0xaa, 0xbb]),
         });
         entry.replace_write_lock(TxId::from_bytes(vec![1, 2, 3, 4]));
@@ -805,9 +803,12 @@ mod tests {
 
     #[test]
     fn leaf_round_trip_preserves_bounds() {
-        let node = Node::leaf(Shard::from_entries([entry(b"apple", 1), entry(b"cat", 2)]))
-            .with_high_key(Some(b"m".to_vec()))
-            .with_right_sibling(Some("sibToken".to_string()));
+        let node = Node::leaf(LeafBody::from_entries([
+            entry(b"apple", 1),
+            entry(b"cat", 2),
+        ]))
+        .with_high_key(Some(b"m".to_vec()))
+        .with_right_sibling(Some("sibToken".to_string()));
 
         let decoded = Node::decode(&node.encode()).unwrap();
         assert_eq!(decoded, node);
@@ -820,7 +821,7 @@ mod tests {
     fn round_trip_preserves_node_locks_and_membership_version() {
         let gate = TxId::from_bytes(vec![2]);
         let writer = TxId::from_bytes(vec![1]);
-        let mut node = Node::leaf(Shard::new());
+        let mut node = Node::leaf(LeafBody::new());
         node.set_structural_gate(gate.clone());
         node.set_membership_writer(writer.clone());
 
@@ -885,7 +886,7 @@ mod tests {
     #[test]
     fn membership_version_tracks_write_lock_activity() {
         let id = TxId::from_bytes(vec![1]);
-        let mut node = Node::leaf(Shard::new());
+        let mut node = Node::leaf(LeafBody::new());
 
         node.add_membership_reader(id.clone());
         assert_eq!(node.membership_version(), 0);
@@ -921,7 +922,7 @@ mod tests {
         assert_eq!(decoded, node);
 
         let idx = decoded.as_index().unwrap();
-        // The child owning a key is the greatest separator not exceeding it.
+        // The routed child is the greatest separator not exceeding the key.
         assert_eq!(idx.child_for(b"apple"), Some("L0"));
         assert_eq!(idx.child_for(b"f"), Some("L1"));
         assert_eq!(idx.child_for(b"kiwi"), Some("L1"));
@@ -933,7 +934,7 @@ mod tests {
         // A leaf with an existing high-key and right-sibling splits: the new
         // sibling inherits both bounds, the source is rebounded to the split key
         // and linked to the sibling token.
-        let mut src = Node::leaf(Shard::from_entries([
+        let mut src = Node::leaf(LeafBody::from_entries([
             entry(b"apple", 1),
             entry(b"cat", 2),
             entry(b"mango", 3),
@@ -972,7 +973,7 @@ mod tests {
 
     #[test]
     fn leaf_split_preserves_membership_generation_in_both_outputs() {
-        let mut src = Node::leaf(Shard::from_entries([
+        let mut src = Node::leaf(LeafBody::from_entries([
             entry(b"a", 1),
             entry(b"b", 2),
             entry(b"c", 3),
@@ -1019,11 +1020,11 @@ mod tests {
     #[test]
     fn split_of_undersized_node_is_none() {
         assert!(
-            Node::leaf(Shard::from_entries([entry(b"only", 1)]))
+            Node::leaf(LeafBody::from_entries([entry(b"only", 1)]))
                 .split("r")
                 .is_none()
         );
-        assert!(Node::leaf(Shard::new()).split("r").is_none());
+        assert!(Node::leaf(LeafBody::new()).split("r").is_none());
         let one_child = Node::index(IndexNode::from_children([(b"".to_vec(), "L0".to_string())]));
         assert!(one_child.clone().split("r").is_none());
     }
@@ -1036,9 +1037,9 @@ mod tests {
             .index_max_children(2)
             .build()
             .unwrap();
-        let two = Node::leaf(Shard::from_entries([entry(b"a", 1), entry(b"b", 2)]));
+        let two = Node::leaf(LeafBody::from_entries([entry(b"a", 1), entry(b"b", 2)]));
         assert!(!two.over_soft_cap(&tiny), "at the cap is not over it");
-        let three = Node::leaf(Shard::from_entries([
+        let three = Node::leaf(LeafBody::from_entries([
             entry(b"a", 1),
             entry(b"b", 2),
             entry(b"c", 3),
@@ -1066,7 +1067,9 @@ mod tests {
             .index_max_children(1000)
             .build()
             .unwrap();
-        assert!(!Node::leaf(Shard::from_entries([entry(b"solo", 1)])).over_soft_cap(&byte_policy));
+        assert!(
+            !Node::leaf(LeafBody::from_entries([entry(b"solo", 1)])).over_soft_cap(&byte_policy)
+        );
         for (kind, node) in [("leaf", two), ("index", two_index)] {
             let at_limit = SplitPolicy::builder()
                 .leaf_max_entries(usize::MAX)
@@ -1109,7 +1112,7 @@ mod tests {
         );
 
         let entry = entry(b"boundary", 1);
-        let entry_len = Node::leaf(Shard::from_entries([entry.clone()])).content_encoded_len();
+        let entry_len = Node::leaf(LeafBody::from_entries([entry.clone()])).content_encoded_len();
         let admitting = SplitPolicy::builder()
             .node_max_bytes(entry_len * 2)
             .split_headroom_bytes(0)
@@ -1129,10 +1132,10 @@ mod tests {
     fn maximum_key_admission_matches_real_nodes_at_the_exact_limit() {
         let maximum_key = vec![b'k'; 128];
         let id = TxId::with_priority(7, b"maximum");
-        let mut entry = ShardEntry::new(maximum_key.clone())
+        let mut entry = LeafEntry::new(maximum_key.clone())
             .with_current(CurrentState::External { writer: id.clone() });
         entry.replace_write_lock(id);
-        let leaf = Node::leaf(Shard::from_entries([entry]));
+        let leaf = Node::leaf(LeafBody::from_entries([entry]));
 
         let parent = Node::index(IndexNode::from_children([
             (
@@ -1194,15 +1197,15 @@ mod tests {
     }
 
     #[test]
-    fn owns_reflects_high_key() {
-        let plus_inf = Node::leaf(Shard::new());
-        assert!(plus_inf.owns(b"anything"));
+    fn covers_reflects_high_key() {
+        let plus_inf = Node::leaf(LeafBody::new());
+        assert!(plus_inf.covers(b"anything"));
 
-        let bounded = Node::leaf(Shard::new()).with_high_key(Some(b"m".to_vec()));
-        assert!(bounded.owns(b"apple"));
+        let bounded = Node::leaf(LeafBody::new()).with_high_key(Some(b"m".to_vec()));
+        assert!(bounded.covers(b"apple"));
         // The high-key is an exclusive upper bound.
-        assert!(!bounded.owns(b"m"));
-        assert!(!bounded.owns(b"zebra"));
+        assert!(!bounded.covers(b"m"));
+        assert!(!bounded.covers(b"zebra"));
     }
 
     #[test]
@@ -1229,10 +1232,10 @@ mod tests {
         for key_len in [
             0, 1, 81, 82, 83, 84, 127, 128, 16_335, 16_336, 16_338, 16_339, 16_383, 16_384,
         ] {
-            let mut entry = ShardEntry::new(vec![b'k'; key_len])
+            let mut entry = LeafEntry::new(vec![b'k'; key_len])
                 .with_current(CurrentState::External { writer: id.clone() });
             entry.replace_write_lock(id.clone());
-            let actual = Node::leaf(Shard::from_entries([entry.clone()])).content_encoded_len();
+            let actual = Node::leaf(LeafBody::from_entries([entry.clone()])).content_encoded_len();
 
             assert_eq!(
                 Node::leaf_entry_content_encoded_len(&entry),
@@ -1268,7 +1271,7 @@ mod tests {
         // A Node protobuf with no body (the wire default) is a fresh empty root.
         let raw = pb::Node::default();
         let node = Node::from_pb(raw).unwrap();
-        assert!(node.as_leaf().is_some_and(Shard::is_empty));
+        assert!(node.as_leaf().is_some_and(LeafBody::is_empty));
         assert_eq!(node.high_key(), None);
         assert_eq!(node.right_sibling(), None);
     }
@@ -1277,7 +1280,7 @@ mod tests {
     // Changing the on-disk format must break these tests.
     #[test]
     fn golden_leaf_encoding() {
-        let node = Node::leaf(Shard::from_entries([golden_entry()]))
+        let node = Node::leaf(LeafBody::from_entries([golden_entry()]))
             .with_high_key(Some(b"m".to_vec()))
             .with_right_sibling(Some("sib".to_string()));
         let got = node.encode();
@@ -1292,7 +1295,7 @@ mod tests {
 
     #[test]
     fn released_node_lock_is_omitted_from_encoding() {
-        let never_locked = Node::leaf(Shard::from_entries([entry(b"a", 1)]));
+        let never_locked = Node::leaf(LeafBody::from_entries([entry(b"a", 1)]));
         let mut released = never_locked.clone();
         let holder = TxId::from_bytes(vec![0x11]);
         released.set_structural_gate(holder.clone());
@@ -1305,7 +1308,7 @@ mod tests {
     // break this test.
     #[test]
     fn golden_node_locks_encoding() {
-        let mut node = Node::leaf(Shard::from_entries([golden_entry()]));
+        let mut node = Node::leaf(LeafBody::from_entries([golden_entry()]));
         node.set_structural_gate(TxId::from_bytes(vec![0x11]));
         node.set_membership_writer(TxId::from_bytes(vec![0x22]));
 

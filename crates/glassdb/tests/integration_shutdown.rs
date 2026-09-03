@@ -79,7 +79,7 @@ async fn cancelled_tx_future_does_not_block_followups() {
     let coll_ref = &coll;
     // The closure stages a write and then blocks forever; the outer timeout
     // drops the entire `Database::tx` future. Because engine attempts begin only
-    // after a closure returns, cancelling here discards the staged state without
+    // after a transaction body returns, cancelling here discards the staged state without
     // requiring engine cleanup.
     let r = tokio::time::timeout(Duration::from_millis(50), async {
         db.tx(|tx| async move {
@@ -103,9 +103,9 @@ async fn cancelled_tx_future_does_not_block_followups() {
     assert_eq!(read_int(&val), 2);
 }
 
-/// A panic is an abnormal exit, not a returned outcome: even if a read becomes
-/// stale, it escapes without validation or replay and all body-local changes
-/// remain unpublished.
+/// A panic interrupts the transaction instead of returning a body outcome. Even
+/// if a read becomes stale, it escapes without validation or replay and all
+/// body-local changes remain unpublished.
 #[tokio::test]
 async fn first_execution_stale_panic_discards_staged_data_and_catalog_changes() {
     let backend = mem();
@@ -224,12 +224,12 @@ async fn panicking_locked_replay_hands_off_its_retained_resources() {
     );
     let peer = tokio::time::timeout(Duration::from_secs(5), coll.write(b"k", &write_int(7)))
         .await
-        .expect("peer waited for the abandoned transaction's full lease");
+        .expect("peer waited for the interrupted transaction's full lease");
     peer.unwrap();
     assert_eq!(
         read_int(&coll.read(b"k").await.unwrap().unwrap()),
         7,
-        "the abandoned execution's staged value stays invisible"
+        "the interrupted execution's staged value stays invisible"
     );
 
     db.shutdown().await;
@@ -290,14 +290,14 @@ async fn panicking_locked_replay_records_its_prepared_collection_for_recovery() 
         .expect("collection preparation was not observed");
     let prepared_collections = retired
         .await
-        .expect("abandoned transaction retirement was not observed");
+        .expect("interrupted transaction retirement was not observed");
     assert_eq!(prepared_collections, 1);
     assert!(!db.collection_exists("temporary").await.unwrap());
 
     db.shutdown().await;
 }
 
-/// If ordinary finalization fails, the body result still wins and the armed
+/// If ordinary finalization fails, the body outcome still wins and the armed
 /// guard transfers the held identity to managed retirement.
 #[tokio::test(start_paused = true)]
 async fn failed_finalization_keeps_the_retirement_guard_armed() {
@@ -341,14 +341,14 @@ async fn failed_finalization_keeps_the_retirement_guard_armed() {
                 } else {
                     retirement.arm();
                 }
-                Err::<(), _>(Error::InvalidInput("body result".into()))
+                Err::<(), _>(Error::InvalidInput("body outcome".into()))
             }
         })
         .await;
 
     assert!(matches!(
         result,
-        Err(Error::InvalidInput(message)) if message == "body result"
+        Err(Error::InvalidInput(message)) if message == "body outcome"
     ));
     assert_eq!(executions.load(Ordering::SeqCst), 2);
     failed
@@ -361,7 +361,7 @@ async fn failed_finalization_keeps_the_retirement_guard_armed() {
 
     tokio::time::timeout(Duration::from_secs(5), coll.write(b"guard", b"peer"))
         .await
-        .expect("peer waited for the abandoned transaction's full lease")
+        .expect("peer waited for the unfinished transaction's full lease")
         .unwrap();
     db.shutdown().await;
 }
@@ -494,9 +494,9 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
 /// The locked path installs its lock before writing its committed transaction
 /// object, so a future dropped in that window leaves a lock behind whose object
 /// never landed. The path takes its logged identity *before* those writes, so the
-/// cancellation guard can finalize the id: a peer then resolves the abandoned
-/// holder immediately instead of waiting out the unknown-transaction grace
-/// period.
+/// cancellation guard can finalize the identity. A peer then resolves the
+/// cancelled holder immediately instead of waiting out the unknown-transaction
+/// grace period.
 #[tokio::test(start_paused = true)]
 async fn cancelled_single_rw_commit_unblocks_peer_promptly() {
     use std::time::Duration;

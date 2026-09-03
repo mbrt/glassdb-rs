@@ -208,15 +208,15 @@ pub struct NodeLock {
     #[prost(bytes = "vec", repeated, tag = "2")]
     pub locked_by: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
-/// A shard object: the coordination directory (lock table, MVCC current-writer
-/// index, and key directory) for the keys that map to it. See ADR-017.
+/// A leaf body: the point-access coordination entries for one terminal node.
+/// See ADR-017.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Shard {
+pub struct LeafBody {
     #[prost(message, repeated, tag = "1")]
-    pub entries: ::prost::alloc::vec::Vec<ShardEntry>,
+    pub entries: ::prost::alloc::vec::Vec<LeafEntry>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ShardEntry {
+pub struct LeafEntry {
     /// Raw user key bytes; also the entry's sort key.
     #[prost(bytes = "vec", tag = "1")]
     pub key: ::prost::alloc::vec::Vec<u8>,
@@ -267,7 +267,7 @@ pub mod current_state {
 /// self-correcting across concurrent splits.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Node {
-    /// Exclusive upper bound of the key range this node owns. Empty means
+    /// Exclusive upper bound of the key range this node covers. Empty means
     /// +infinity: the rightmost node at its level.
     #[prost(bytes = "vec", tag = "1")]
     pub high_key: ::prost::alloc::vec::Vec<u8>,
@@ -282,7 +282,7 @@ pub struct Node {
     #[prost(uint64, tag = "7")]
     pub membership_version: u64,
     /// A transaction preparing collection deletion. Its final status determines
-    /// whether this is an ignorable abandoned intent or a durable stale-handle
+    /// whether this is an ignorable obsolete intent or a durable stale-handle
     /// fence.
     #[prost(bytes = "vec", tag = "8")]
     pub collection_delete_intent: ::prost::alloc::vec::Vec<u8>,
@@ -295,17 +295,17 @@ pub mod node {
     pub enum Body {
         /// A leaf node: the per-key coordination entries for its range.
         #[prost(message, tag = "3")]
-        Leaf(super::Shard),
+        Leaf(super::LeafBody),
         /// An index node: separator keys mapping ranges to child nodes.
         #[prost(message, tag = "4")]
         Index(super::IndexNode),
     }
 }
-/// A split write-ahead record. It lives at
-/// `{db}/_s/<participant_id>/<record_id>` until the created nodes are either
-/// reachable or reclaimed.
+/// A structural intent for one split. It lives at
+/// `{db}/_s/<participant_id>/<intent_id>` until the created nodes are reachable
+/// or reclaimed.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct StructuralLog {
+pub struct StructuralIntent {
     #[prost(string, tag = "1")]
     pub prefix: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
@@ -318,14 +318,14 @@ pub struct StructuralLog {
     pub split_key: ::prost::alloc::vec::Vec<u8>,
     #[prost(bool, tag = "6")]
     pub is_root: bool,
-    /// The lifecycle-topology participant that owns this record.
+    /// The topology participant that owns this intent.
     #[prost(bytes = "vec", tag = "7")]
     pub participant_id: ::prost::alloc::vec::Vec<u8>,
-    #[prost(enumeration = "structural_log::Phase", tag = "8")]
+    #[prost(enumeration = "structural_intent::Phase", tag = "8")]
     pub phase: i32,
 }
-/// Nested message and enum types in `StructuralLog`.
-pub mod structural_log {
+/// Nested message and enum types in `StructuralIntent`.
+pub mod structural_intent {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Phase {
@@ -353,8 +353,8 @@ pub mod structural_log {
         }
     }
 }
-/// An index node body: an ordered list of separator entries. The child owning a
-/// key is the last entry whose separator_key is <= the key.
+/// An index node body: an ordered list of separator entries. Routing selects the
+/// last child whose separator_key is <= the key.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct IndexNode {
     #[prost(message, repeated, tag = "1")]

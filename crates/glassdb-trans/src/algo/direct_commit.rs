@@ -4,10 +4,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use glassdb_data::{KeyRef, ObjectPath, TxId};
+use glassdb_data::{LogicalKey, ObjectPath, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
-    CurrentState, InlinePolicy, NodeLocks, Requirement, ShardEntry, StorageError, TreeRouter,
+    CurrentState, InlinePolicy, LeafEntry, NodeLocks, Requirement, StorageError, TreeRouter,
 };
 
 use super::attempt::AttemptState;
@@ -15,9 +15,9 @@ use crate::access::{AccessSet, ReadPredicate, WriteOp};
 use crate::error::TransError;
 use crate::gc::TxCleanupHints;
 use crate::key_state_resolver::HolderResolution;
-use crate::shard_coord::{
-    CoordinatedOutcome, FoldOutcome, ReloadCause, ResolveCtx, ShardCoordinator, ShardOperation,
-    ShardResolver, StageAdmission, Step,
+use crate::leaf_coord::{
+    CoordinatedOutcome, FoldOutcome, LeafCoordinator, LeafOperation, LeafResolver, ReloadCause,
+    ResolveCtx, StageAdmission, Step,
 };
 use crate::split::SplitHintSink;
 
@@ -58,7 +58,7 @@ struct DirectCommitCounters {
 #[derive(Clone)]
 pub(super) struct DirectCommit {
     router: TreeRouter,
-    coord: ShardCoordinator,
+    coord: LeafCoordinator,
     inline_policy: InlinePolicy,
     split_hints: SplitHintSink,
     cleanup_hints: TxCleanupHints,
@@ -69,7 +69,7 @@ impl DirectCommit {
     /// Creates the direct-commit path over the engine's shared collaborators.
     pub(super) fn new(
         router: TreeRouter,
-        coord: ShardCoordinator,
+        coord: LeafCoordinator,
         inline_policy: InlinePolicy,
         split_hints: SplitHintSink,
         cleanup_hints: TxCleanupHints,
@@ -172,7 +172,7 @@ impl DirectCommit {
             .collect::<Vec<_>>();
         let groups = self
             .router
-            .group_keys_by_leaf_fresh(keys, Requirement::Any, Requirement::Any)
+            .route_keys_with_requirements(keys, Requirement::Any, Requirement::Any)
             .await?;
         Ok(match groups.as_slice() {
             [group] => Some(group.path().clone()),
@@ -184,7 +184,7 @@ impl DirectCommit {
 /// One normalized point dependency and its optional final mutation.
 #[derive(Clone)]
 struct DirectKey {
-    key: KeyRef,
+    key: LogicalKey,
     raw_key: Vec<u8>,
     read: Option<ReadPredicate>,
     write: Option<DirectWrite>,
@@ -258,7 +258,7 @@ impl DirectCommitOperation {
     async fn resolve_keys(
         &self,
         ctx: &ResolveCtx<'_>,
-        staged: &BTreeMap<Vec<u8>, ShardEntry>,
+        staged: &BTreeMap<Vec<u8>, LeafEntry>,
     ) -> Result<Vec<HolderResolution>, TransError> {
         let mut resolutions = Vec::with_capacity(self.member.keys.len());
         for key in self.member.keys.iter() {
@@ -317,7 +317,7 @@ impl DirectCommitOperation {
     async fn resolve_fresh(
         &self,
         ctx: &ResolveCtx<'_>,
-        staged: &BTreeMap<Vec<u8>, ShardEntry>,
+        staged: &BTreeMap<Vec<u8>, LeafEntry>,
         staged_locks: &NodeLocks,
         resolutions: &[HolderResolution],
     ) -> Result<Step, TransError> {
@@ -416,7 +416,7 @@ impl DirectCommitOperation {
             };
             entries.push((
                 key.raw_key.clone(),
-                ShardEntry::new(key.raw_key.clone()).with_current(current),
+                LeafEntry::new(key.raw_key.clone()).with_current(current),
             ));
         }
         if changes_membership {
@@ -457,7 +457,7 @@ impl DirectCommitOperation {
     }
 
     /// Whether any current state is an exact output marker for this member.
-    fn has_marker(&self, entries: &BTreeMap<Vec<u8>, ShardEntry>) -> bool {
+    fn has_marker(&self, entries: &BTreeMap<Vec<u8>, LeafEntry>) -> bool {
         self.member.output_keys().any(|key| {
             entries
                 .get(&key.raw_key)
@@ -538,8 +538,8 @@ impl DirectCommitOperation {
 }
 
 #[async_trait]
-impl ShardResolver for DirectCommitOperation {
-    fn observe_loaded(&self, entries: &BTreeMap<Vec<u8>, ShardEntry>) {
+impl LeafResolver for DirectCommitOperation {
+    fn observe_loaded(&self, entries: &BTreeMap<Vec<u8>, LeafEntry>) {
         if self.has_marker(entries) {
             self.remember_landed();
         }
@@ -548,7 +548,7 @@ impl ShardResolver for DirectCommitOperation {
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
-        staged: &BTreeMap<Vec<u8>, ShardEntry>,
+        staged: &BTreeMap<Vec<u8>, LeafEntry>,
         staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
         if self.proven_landed() || self.has_marker(staged) {
@@ -601,7 +601,7 @@ impl ShardResolver for DirectCommitOperation {
     }
 }
 
-impl ShardOperation for DirectCommitOperation {
+impl LeafOperation for DirectCommitOperation {
     type Output = DirectMutationOutcome;
 
     fn path(&self) -> &ObjectPath {
@@ -646,7 +646,7 @@ impl ShardOperation for DirectCommitOperation {
     }
 }
 
-/// Result of one direct-commit operation at the shard-mutation seam.
+/// Result of one direct-commit operation at the leaf-mutation seam.
 enum DirectMutationOutcome {
     Landed(Vec<TxId>),
     InDoubt(String),

@@ -8,7 +8,7 @@ use glassdb_concurr::{RetryConfig, rt};
 use glassdb_data::{CollectionAddress, NodeToken, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
-    CollectionRecord, CollectionStore, Node, NodeStore, Requirement, Shard, StorageError,
+    CollectionRecord, CollectionStore, LeafBody, Node, NodeStore, Requirement, StorageError,
 };
 
 use super::{CollectionChange, CollectionOp};
@@ -34,7 +34,7 @@ pub trait TopologySettler: Send + Sync {
 #[derive(Clone)]
 pub struct CollectionLifecycle {
     records: CollectionStore,
-    shards: NodeStore,
+    nodes: NodeStore,
     monitor: Monitor,
     retry: RetryConfig,
     // A drop must outlive every pre-existing topology participant before its
@@ -46,14 +46,14 @@ impl CollectionLifecycle {
     /// Creates collection lifecycle access over the shared stores.
     pub fn new(
         records: CollectionStore,
-        shards: NodeStore,
+        nodes: NodeStore,
         monitor: Monitor,
         retry: RetryConfig,
         topology: Arc<dyn TopologySettler>,
     ) -> Self {
         Self {
             records,
-            shards,
+            nodes,
             monitor,
             retry,
             topology,
@@ -80,11 +80,11 @@ impl CollectionLifecycle {
                     .map_err(TransError::from)?;
             }
             if !self
-                .shards
-                .create_root(&change.collection, &Node::leaf(Shard::new()))
+                .nodes
+                .create_root(&change.collection, &Node::leaf(LeafBody::new()))
                 .await?
             {
-                self.shards
+                self.nodes
                     .load_root(&change.collection, Requirement::Any)
                     .await
                     .map_err(TransError::from)?;
@@ -105,7 +105,7 @@ impl CollectionLifecycle {
             .map(|change| &change.collection)
         {
             self.freeze_topology(collection, id).await?;
-            let nodes = self.shards.list_nodes(collection, Requirement::Any).await?;
+            let nodes = self.nodes.list_nodes(collection, Requirement::Any).await?;
             for (token, _) in nodes {
                 self.fence_node(collection, &token, id).await?;
             }
@@ -114,14 +114,14 @@ impl CollectionLifecycle {
         Ok(())
     }
 
-    /// Clears an abandoned transaction's delete preparation.
+    /// Clears delete preparation from a discarded body execution.
     pub(crate) async fn clear_aborted_drops(
         &self,
         id: &TxId,
         collections: &[CollectionAddress],
     ) -> Result<(), TransError> {
         for collection in collections {
-            let nodes = self.shards.list_nodes(collection, Requirement::Any).await?;
+            let nodes = self.nodes.list_nodes(collection, Requirement::Any).await?;
             for (token, _) in nodes {
                 self.clear_node_fence(collection, &token, id).await?;
             }
@@ -136,16 +136,16 @@ impl CollectionLifecycle {
         collections: &[CollectionAddress],
     ) -> Result<(), TransError> {
         for collection in collections {
-            let nodes = self.shards.list_nodes(collection, Requirement::Any).await?;
+            let nodes = self.nodes.list_nodes(collection, Requirement::Any).await?;
             for (_, observed) in nodes {
-                self.shards.delete_node(&observed).await?;
+                self.nodes.delete_node(&observed).await?;
             }
             let observed = self
-                .shards
+                .nodes
                 .load_root_state(collection, Requirement::Any)
                 .await?;
             if observed.exists() {
-                self.shards.delete_root(&observed).await?;
+                self.nodes.delete_root(&observed).await?;
             }
             let observed = self
                 .records
@@ -216,7 +216,7 @@ impl CollectionLifecycle {
         let mut backoff = self.retry.backoff();
         loop {
             let (mut node, observed) = match self
-                .shards
+                .nodes
                 .load_node(collection, token, Requirement::Any)
                 .await
             {
@@ -241,7 +241,7 @@ impl CollectionLifecycle {
             // first and makes us retry, or loses and then observes the intent.
             node.set_collection_delete_intent(id.clone());
             if self
-                .shards
+                .nodes
                 .store_node(collection, token, &node, Some(&observed))
                 .await?
             {
@@ -258,7 +258,7 @@ impl CollectionLifecycle {
     ) -> Result<(), TransError> {
         let mut backoff = self.retry.backoff();
         loop {
-            let (mut root, observed) = self.shards.load_root(collection, Requirement::Any).await?;
+            let (mut root, observed) = self.nodes.load_root(collection, Requirement::Any).await?;
             if root.collection_delete_intent() == Some(id) {
                 return Ok(());
             }
@@ -273,7 +273,7 @@ impl CollectionLifecycle {
             // As for standalone nodes, the exact-revision rewrite closes the
             // final race without leaving a separate gate to recover on abort.
             root.set_collection_delete_intent(id.clone());
-            if self.shards.store_root(collection, &root, &observed).await? {
+            if self.nodes.store_root(collection, &root, &observed).await? {
                 return Ok(());
             }
             rt::sleep(backoff.next_delay()).await;
@@ -327,14 +327,14 @@ impl CollectionLifecycle {
     ) -> Result<(), TransError> {
         loop {
             let (mut node, observed) = self
-                .shards
+                .nodes
                 .load_node(collection, token, Requirement::Any)
                 .await?;
             if !node.remove_collection_delete_intent(id) {
                 return Ok(());
             }
             if self
-                .shards
+                .nodes
                 .store_node(collection, token, &node, Some(&observed))
                 .await?
             {
@@ -350,7 +350,7 @@ impl CollectionLifecycle {
     ) -> Result<(), TransError> {
         loop {
             let (mut root, observed) =
-                match self.shards.load_root(collection, Requirement::Any).await {
+                match self.nodes.load_root(collection, Requirement::Any).await {
                     Ok(root) => root,
                     Err(StorageError::NotFound) => return Ok(()),
                     Err(error) => return Err(error.into()),
@@ -358,7 +358,7 @@ impl CollectionLifecycle {
             if !root.remove_collection_delete_intent(id) {
                 break;
             }
-            if self.shards.store_root(collection, &root, &observed).await? {
+            if self.nodes.store_root(collection, &root, &observed).await? {
                 break;
             }
         }
@@ -391,7 +391,7 @@ mod tests {
     use glassdb_concurr::Background;
     use glassdb_data::{DbRoot, NodeToken, ObjectPath};
     use glassdb_storage::transaction::TLogger;
-    use glassdb_storage::{CachedStore, CurrentState, Shard, ShardEntry, Timeline};
+    use glassdb_storage::{CachedStore, CurrentState, LeafBody, LeafEntry, Timeline};
     use tokio::sync::Notify;
 
     use super::*;
@@ -478,7 +478,7 @@ mod tests {
 
     struct TestStore {
         records: CollectionStore,
-        shards: NodeStore,
+        nodes: NodeStore,
         objects: CachedStore,
         timeline: Timeline,
     }
@@ -488,14 +488,14 @@ mod tests {
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
         TestStore {
             records: CollectionStore::new(objects.clone()),
-            shards: NodeStore::new(objects.clone(), std::num::NonZeroUsize::MIN),
+            nodes: NodeStore::new(objects.clone(), std::num::NonZeroUsize::MIN),
             objects,
             timeline,
         }
     }
 
-    fn live_entry(key: &[u8]) -> ShardEntry {
-        ShardEntry::new(key).with_current(CurrentState::External {
+    fn live_entry(key: &[u8]) -> LeafEntry {
+        LeafEntry::new(key).with_current(CurrentState::External {
             writer: TxId::from_bytes(vec![9]),
         })
     }
@@ -519,14 +519,14 @@ mod tests {
         };
         let primary_lifecycle = CollectionLifecycle::new(
             primary.records.clone(),
-            primary.shards.clone(),
+            primary.nodes.clone(),
             monitor.clone(),
             retry,
             Arc::new(UnexpectedTopologySettler),
         );
         let peer_lifecycle = CollectionLifecycle::new(
             peer.records.clone(),
-            peer.shards.clone(),
+            peer.nodes.clone(),
             monitor.clone(),
             retry,
             Arc::new(UnexpectedTopologySettler),
@@ -534,17 +534,17 @@ mod tests {
         let split_id = TxId::from_bytes(vec![2]);
         let drop_id = TxId::from_bytes(vec![1]);
 
-        let mut source = Node::leaf(Shard::from_entries([live_entry(b"a"), live_entry(b"z")]));
+        let mut source = Node::leaf(LeafBody::from_entries([live_entry(b"a"), live_entry(b"z")]));
         source.set_structural_gate(split_id.clone());
         assert!(
             primary
-                .shards
+                .nodes
                 .store_node(&collection(), &node_token(SOURCE_TOKEN), &source, None,)
                 .await
                 .unwrap()
         );
         let (mut shrunk, source_version) = primary
-            .shards
+            .nodes
             .load_node(&collection(), &node_token(SOURCE_TOKEN), Requirement::Any)
             .await
             .unwrap();
@@ -552,7 +552,7 @@ mod tests {
         shrunk.remove_structural_gate(&split_id);
         assert!(
             primary
-                .shards
+                .nodes
                 .store_node(&collection(), &node_token(RIGHT_TOKEN), &right, None)
                 .await
                 .unwrap()
@@ -573,7 +573,7 @@ mod tests {
             });
             gate.wait_until_entered().await;
             let shrink_landed = peer
-                .shards
+                .nodes
                 .store_node(
                     &collection(),
                     &node_token(SOURCE_TOKEN),
@@ -587,11 +587,11 @@ mod tests {
             shrink_landed
         } else {
             let shrinking = tokio::spawn({
-                let shards = primary.shards.clone();
+                let nodes = primary.nodes.clone();
                 let shrunk = shrunk.clone();
                 let source_version = source_version.clone();
                 async move {
-                    shards
+                    nodes
                         .store_node(
                             &collection(),
                             &node_token(SOURCE_TOKEN),
@@ -614,7 +614,7 @@ mod tests {
 
         let verifier = store(backend);
         let (final_source, _) = verifier
-            .shards
+            .nodes
             .load_node(&collection(), &node_token(SOURCE_TOKEN), Requirement::Any)
             .await
             .unwrap();

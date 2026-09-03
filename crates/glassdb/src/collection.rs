@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use glassdb_data::{CollectionAddress, DatabaseId, KeyRef, MAX_COLLECTION_NAME_BYTES};
+use glassdb_data::{CollectionAddress, DatabaseId, LogicalKey, MAX_COLLECTION_NAME_BYTES};
 
 use crate::db::DbInner;
 use crate::error::Error;
@@ -98,7 +98,7 @@ impl Collection {
         max_staleness: Duration,
     ) -> Result<Option<Vec<u8>>, Error> {
         let _guard = self.db.admit_operation()?;
-        let key = KeyRef::new(self.address.clone(), key);
+        let key = LogicalKey::new(self.address.clone(), key);
         match self.db.engine.read(&key, max_staleness).await {
             Ok(outcome) => Ok(outcome.value.map(|rv| rv.value.to_vec())),
             Err(e) => Err(Error::from_read(e)),
@@ -119,7 +119,7 @@ impl Collection {
 
     /// Atomically reads `key`, applies `f`, and writes the result back.
     ///
-    /// The callback may run more than once when its read is invalidated. If it
+    /// The update function may run more than once when its read is invalidated. If it
     /// panics, the payload propagates without read validation or replay and no
     /// staged write from that execution is published.
     pub async fn update<F>(&self, key: &[u8], f: F) -> Result<Vec<u8>, Error>
@@ -129,7 +129,7 @@ impl Collection {
         // The transaction body is rerun on conflict, so it must be `FnMut`. An
         // `async move` block would move `f` into the future (making the closure
         // `FnOnce`), so share it through an `Arc<Mutex<_>>` cloned per attempt.
-        // The user callback is synchronous, so the guard is never held across an
+        // The update function is synchronous, so the guard is never held across an
         // `.await`.
         let f = Arc::new(Mutex::new(f));
         self.db

@@ -1,6 +1,6 @@
 //! Operator diagnostics for hang-prone coordination paths.
 //!
-//! [`Database::diagnostics`] returns a [`Diagnostics`] snapshot of the shard
+//! [`Database::diagnostics`] returns a [`Diagnostics`] snapshot of the leaf
 //! coordinator's live dedup state. It reads existing coordinator state only
 //! when called and does not maintain separate diagnostic state.
 //!
@@ -21,11 +21,11 @@ use std::fmt;
 
 pub use glassdb_concurr::DedupKeySnapshot;
 
-/// A snapshot of the shard coordinator's live state. Returned by
+/// A snapshot of the leaf coordinator's live state. Returned by
 /// [`crate::Database::diagnostics`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostics {
-    /// Per-object dedup state inside the shard coordinator.
+    /// Per-object dedup state inside the leaf coordinator.
     ///
     /// Contains one entry per path with live coordination state, sorted by key.
     pub coordinator_dedup: Vec<DedupKeySnapshot>,

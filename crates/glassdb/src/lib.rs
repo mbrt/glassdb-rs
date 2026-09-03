@@ -10,7 +10,7 @@
 //! future mid-flight is equivalent to a crash and is recovered by the commit
 //! protocol, so it never corrupts data. Cancel by wrapping the future with
 //! `tokio::time::timeout`, `tokio::select!`, or aborting a `JoinHandle`. Locks
-//! held by an abandoned local attempt are synchronously handed to managed
+//! held by an interrupted local attempt are synchronously handed to managed
 //! retirement; helpers and garbage collection may reclaim their physical
 //! resources later. See [`Database::tx`] for details.
 //!
@@ -65,7 +65,7 @@ pub use glassdb_storage::{
     SplitPolicyBuilder,
 };
 pub use glassdb_trans::{
-    DirectCommitStats, InlinePressureStats, LockerStats, ProtocolTiming, ShardCoordinatorStats,
+    DirectCommitStats, InlinePressureStats, LeafCoordinatorStats, LockerStats, ProtocolTiming,
     SplitterStats,
 };
 

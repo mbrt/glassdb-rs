@@ -16,7 +16,7 @@ _Avoid_: Object key, object path
 ## Transaction execution
 
 **Transaction body**:
-The caller-supplied computation that produces a transaction's staged changes and normal outcome. GlassDB may execute it more than once.
+The caller-supplied computation that stages transaction changes and returns a body outcome when it completes. GlassDB may execute it more than once.
 _Avoid_: Callback, user closure
 
 **Point access**:
@@ -28,26 +28,45 @@ The point reads, final key writes, and range scans from one execution of a trans
 _Avoid_: Data, transaction data
 
 **Transaction identity**:
-A durable protocol identity that correlates one transaction's locks, status, and recovery resources. Replacing it does not by itself repeat the transaction body or discard that body's access set and normal outcome.
+A durable protocol identity that correlates one transaction's locks, status, and recovery resources. Replacing it does not by itself repeat the transaction body or discard that body's access set and body outcome.
 _Avoid_: Lock owner ID
 
-**Normal outcome**:
-A value or error returned by a transaction body and therefore eligible for snapshot validation and transparent retry.
+**Body outcome**:
+The value returned by one execution of a transaction body. GlassDB can discard the outcome and execute the body again.
+_Avoid_: Normal outcome
+
+**Commit outcome**:
+A body outcome that contains a value and proposes the staged changes for commit.
 _Avoid_: Success
 
-**Abnormal abandonment**:
-A transaction body ending without a normal outcome because its future is dropped, it unwinds, or its process stops.
+**Error outcome**:
+A body outcome that contains an error and rejects the staged changes. GlassDB validates its reads before it returns the outcome.
 _Avoid_: Body error
 
+**Explicit abort**:
+An error outcome that identifies a deliberate request to reject the transaction's staged changes.
+_Avoid_: Transaction cancellation
+
+**Transaction interruption**:
+A transaction operation that ends without returning because of cancellation, panic, or process failure. It can occur before or after a body outcome exists.
+_Avoid_: Abnormal abandonment
+
+**Transaction cancellation**:
+A transaction interruption caused by dropping the transaction future before it returns. Cancellation does not prove that the transaction had no effect.
+_Avoid_: Explicit abort
+
 **Snapshot-transparent**:
-A transaction outcome that cannot expose an inconsistent snapshot because its reads are validated before it escapes.
+A body outcome that cannot expose an inconsistent snapshot because its reads are validated before it escapes.
+
+**Cancellation-safe**:
+A transaction is cancellation-safe when cancellation cannot cause a partial logical commit or leave durable protocol resources without a recovery owner. It does not guarantee rollback.
 
 **Protocol-clean retirement**:
-The state in which an abandoned transaction can no longer publish new effects and every remaining durable resource has a recovery owner. Physical reclamation may complete later.
+The state in which an interrupted transaction can no longer publish new effects and every remaining durable resource has a recovery owner. Physical reclamation may complete later.
 _Avoid_: Immediate cleanup, complete deletion
 
 **Retirement handoff**:
-The synchronous transfer of responsibility for an abandoned transaction to managed recovery work before control leaves its owner. Protocol-clean retirement may follow asynchronously.
+The synchronous transfer of responsibility for an interrupted transaction to managed recovery work before control leaves its owner. Protocol-clean retirement may follow asynchronously.
 _Avoid_: Synchronous cleanup
 
 ## Point routing

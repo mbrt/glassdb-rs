@@ -2,7 +2,7 @@
 //!
 //! A key's value no longer lives in a per-key object; it lives in the
 //! transaction object of whichever transaction last committed it. Reading a key
-//! therefore resolves its shard entry to an *effective writer* — delegated to
+//! therefore resolves its leaf entry to an *effective writer* — delegated to
 //! the [`KeyResolver`], the shared home for that coordination step — and then
 //! materializes the value from that writer's decoded transaction object through
 //! the [`Monitor`].
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use glassdb_concurr::{RetryConfig, rt};
-use glassdb_data::KeyRef;
+use glassdb_data::LogicalKey;
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{Requirement, StorageError, Timeline, Version};
 
@@ -65,7 +65,7 @@ impl ReadOutcome {
     }
 }
 
-/// Reads values by resolving a key's shard entry to its effective committed
+/// Reads values by resolving a key's leaf entry to its effective committed
 /// writer (via the [`KeyResolver`]) and materializing the value from that writer's
 /// transaction object.
 #[derive(Clone)]
@@ -96,7 +96,7 @@ impl Reader {
     /// dropping the future at any `.await` (e.g. via `tokio::time::timeout`).
     pub async fn read(
         &self,
-        key: &KeyRef,
+        key: &LogicalKey,
         max_stale: Duration,
     ) -> Result<ReadOutcome, StorageError> {
         let mut backoff = self.retry.backoff();
@@ -111,11 +111,11 @@ impl Reader {
         self.read_once(key, max_stale).await
     }
 
-    /// A single read attempt: local cache then shard resolution. Wrapped by
+    /// A single read attempt: local cache then leaf resolution. Wrapped by
     /// [`Reader::read`] for in-place retries.
     async fn read_once(
         &self,
-        key: &KeyRef,
+        key: &LogicalKey,
         max_stale: Duration,
     ) -> Result<ReadOutcome, StorageError> {
         // Bounded-staleness reads are the one foreground operation that owns a
@@ -128,7 +128,7 @@ impl Reader {
     /// materializes the value from that writer's transaction object.
     async fn resolve_value(
         &self,
-        key: &KeyRef,
+        key: &LogicalKey,
         requirement: glassdb_storage::Requirement,
     ) -> Result<ReadOutcome, StorageError> {
         let mut requirement = requirement;

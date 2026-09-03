@@ -1,4 +1,4 @@
-//! The unified transaction object: the canonical `_t/<ss>/<txid>` body
+//! The unified transaction object for a transaction identity.
 //! (ADR-019/035).
 //!
 //! Values live *only* in this object. While **pending** it is small (lease +
@@ -12,7 +12,7 @@
 //! the public v2 body facade over the canonical transaction-log codec.
 
 use crate::error::StorageError;
-use glassdb_data::KeyRef;
+use glassdb_data::LogicalKey;
 
 use crate::transaction::{TxCommitStatus, TxLog, TxLogCodec, TxWrite};
 
@@ -41,7 +41,7 @@ pub fn status(buf: &[u8]) -> Result<TxCommitStatus, StorageError> {
 /// Returns the write the transaction recorded for `key`, or `None`
 /// if it wrote nothing there. This is how a reader materializes a key's value
 /// from the committed writer's object.
-pub fn find_write<'a>(obj: &'a TxLog, key: &KeyRef) -> Option<&'a TxWrite> {
+pub fn find_write<'a>(obj: &'a TxLog, key: &LogicalKey) -> Option<&'a TxWrite> {
     obj.writes.iter().find(|write| &write.key == key)
 }
 
@@ -50,14 +50,14 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
 
-    use glassdb_data::{CollectionAddress, KeyRef, TxId};
+    use glassdb_data::{CollectionAddress, LogicalKey, TxId};
 
     use super::*;
     use crate::lock::LockType;
     use crate::transaction::{TxCommitStatus, TxLock, TxWrite};
 
-    fn key(key: &[u8]) -> KeyRef {
-        KeyRef::new(CollectionAddress::root("db"), key)
+    fn key(key: &[u8]) -> LogicalKey {
+        LogicalKey::new(CollectionAddress::root("db"), key)
     }
 
     fn committed_object() -> TxLog {

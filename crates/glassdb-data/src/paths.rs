@@ -1,4 +1,4 @@
-//! Collection/key references and physical backend-object paths.
+//! Collection addresses, logical keys, and physical backend-object paths.
 
 use std::sync::Arc;
 
@@ -132,11 +132,11 @@ impl std::fmt::Display for NodeToken {
     }
 }
 
-/// The canonical random identity component of a structural-log record.
+/// The canonical random identity component of a structural intent.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct StructuralRecordId(Arc<str>);
+pub struct StructuralIntentId(Arc<str>);
 
-impl StructuralRecordId {
+impl StructuralIntentId {
     /// Maximum number of bytes in the encoded path component.
     pub const MAX_ENCODED_LEN: usize = NodeToken::MAX_ENCODED_LEN;
 
@@ -146,33 +146,33 @@ impl StructuralRecordId {
     }
 }
 
-impl TryFrom<&str> for StructuralRecordId {
+impl TryFrom<&str> for StructuralIntentId {
     type Error = PathError;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         validate_random_component(
-            "structural record ID",
+            "structural intent ID",
             value,
-            StructuralRecordId::MAX_ENCODED_LEN,
+            StructuralIntentId::MAX_ENCODED_LEN,
         )?;
-        Ok(StructuralRecordId(Arc::from(value)))
+        Ok(StructuralIntentId(Arc::from(value)))
     }
 }
 
-impl TryFrom<String> for StructuralRecordId {
+impl TryFrom<String> for StructuralIntentId {
     type Error = PathError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         validate_random_component(
-            "structural record ID",
+            "structural intent ID",
             &value,
-            StructuralRecordId::MAX_ENCODED_LEN,
+            StructuralIntentId::MAX_ENCODED_LEN,
         )?;
-        Ok(StructuralRecordId(Arc::from(value)))
+        Ok(StructuralIntentId(Arc::from(value)))
     }
 }
 
-impl std::str::FromStr for StructuralRecordId {
+impl std::str::FromStr for StructuralIntentId {
     type Err = PathError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -180,25 +180,25 @@ impl std::str::FromStr for StructuralRecordId {
     }
 }
 
-impl From<NodeToken> for StructuralRecordId {
+impl From<NodeToken> for StructuralIntentId {
     fn from(value: NodeToken) -> Self {
-        StructuralRecordId(value.0)
+        StructuralIntentId(value.0)
     }
 }
 
-impl From<&NodeToken> for StructuralRecordId {
+impl From<&NodeToken> for StructuralIntentId {
     fn from(value: &NodeToken) -> Self {
-        StructuralRecordId(value.0.clone())
+        StructuralIntentId(value.0.clone())
     }
 }
 
-impl AsRef<str> for StructuralRecordId {
+impl AsRef<str> for StructuralIntentId {
     fn as_ref(&self) -> &str {
         self.as_str()
     }
 }
 
-impl std::fmt::Display for StructuralRecordId {
+impl std::fmt::Display for StructuralIntentId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
@@ -296,15 +296,15 @@ impl CollectionAddress {
 
 /// A logical key stored inside a collection leaf.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct KeyRef {
+pub struct LogicalKey {
     collection: CollectionAddress,
     key: Arc<[u8]>,
 }
 
-impl KeyRef {
-    /// Creates a logical key reference.
+impl LogicalKey {
+    /// Creates a logical key.
     pub fn new(collection: CollectionAddress, key: impl AsRef<[u8]>) -> Self {
-        KeyRef {
+        LogicalKey {
             collection,
             key: Arc::from(key.as_ref()),
         }
@@ -387,11 +387,11 @@ pub enum ObjectPath {
         collection: CollectionAddress,
         token: NodeToken,
     },
-    /// A participant-owned structural-log record.
-    StructuralRecord {
+    /// A participant-owned structural intent.
+    StructuralIntent {
         db_root: DbRoot,
         participant: TxId,
-        record_id: StructuralRecordId,
+        intent_id: StructuralIntentId,
     },
 }
 
@@ -411,13 +411,13 @@ impl ObjectPath {
         transaction::shard_prefix(db_root.as_str(), shard)
     }
 
-    /// Returns the database-wide structural-record listing prefix.
-    pub fn structural_records_prefix(db_root: &DbRoot) -> String {
+    /// Returns the database-wide structural-intent listing prefix.
+    pub fn structural_intents_prefix(db_root: &DbRoot) -> String {
         structural::directory(db_root.as_str())
     }
 
-    /// Returns one participant's structural-record listing prefix.
-    pub fn participant_structural_records_prefix(db_root: &DbRoot, participant: &TxId) -> String {
+    /// Returns one participant's structural-intent listing prefix.
+    pub fn participant_structural_intents_prefix(db_root: &DbRoot, participant: &TxId) -> String {
         structural::participant_directory(db_root.as_str(), participant)
     }
 }
@@ -440,11 +440,11 @@ impl std::fmt::Display for ObjectPath {
             ObjectPath::Node { collection, token } => {
                 tree::write_node(f, &collection.physical_prefix(), token.as_str())
             }
-            ObjectPath::StructuralRecord {
+            ObjectPath::StructuralIntent {
                 db_root,
                 participant,
-                record_id,
-            } => structural::write_record(f, db_root.as_str(), participant, record_id.as_str()),
+                intent_id,
+            } => structural::write_intent(f, db_root.as_str(), participant, intent_id.as_str()),
         }
     }
 }
@@ -557,19 +557,19 @@ mod tests {
         assert_eq!(NodeToken::try_from(token.to_string()).unwrap(), token);
         assert_eq!(token.as_str().parse::<NodeToken>().unwrap(), token);
 
-        let record_id = StructuralRecordId::try_from(token.as_str()).unwrap();
-        assert_eq!(record_id.as_str(), token.as_str());
-        assert_eq!(StructuralRecordId::from(&token), record_id);
-        assert_eq!(StructuralRecordId::from(token.clone()), record_id);
+        let intent_id = StructuralIntentId::try_from(token.as_str()).unwrap();
+        assert_eq!(intent_id.as_str(), token.as_str());
+        assert_eq!(StructuralIntentId::from(&token), intent_id);
+        assert_eq!(StructuralIntentId::from(token.clone()), intent_id);
 
         for invalid in ["", "000000000000000000000", "00000000000000000000000"] {
             assert!(NodeToken::try_from(invalid).is_err());
-            assert!(StructuralRecordId::try_from(invalid).is_err());
+            assert!(StructuralIntentId::try_from(invalid).is_err());
         }
 
         let invalid_alphabet = "000000000000000000000!";
         assert!(NodeToken::try_from(invalid_alphabet).is_err());
-        assert!(StructuralRecordId::try_from(invalid_alphabet).is_err());
+        assert!(StructuralIntentId::try_from(invalid_alphabet).is_err());
 
         let noncanonical = "0000000000000000000001";
         assert_eq!(
@@ -581,7 +581,7 @@ mod tests {
             Err(PathError::InvalidComponent { .. })
         ));
         assert!(matches!(
-            StructuralRecordId::try_from(noncanonical),
+            StructuralIntentId::try_from(noncanonical),
             Err(PathError::InvalidComponent { .. })
         ));
     }
@@ -602,7 +602,7 @@ mod tests {
         let collection = CollectionAddress::root("db");
         let token = NodeToken::from_bytes([7; NODE_TOKEN_BYTES]);
         let participant = TxId::from_bytes(b"participant".to_vec());
-        let record_id = StructuralRecordId::from(NodeToken::from_bytes([9; NODE_TOKEN_BYTES]));
+        let intent_id = StructuralIntentId::from(NodeToken::from_bytes([9; NODE_TOKEN_BYTES]));
         let paths = [
             ObjectPath::DatabaseMetadata {
                 db_root: db_root.clone(),
@@ -618,10 +618,10 @@ mod tests {
                 collection: collection.clone(),
             },
             ObjectPath::Node { collection, token },
-            ObjectPath::StructuralRecord {
+            ObjectPath::StructuralIntent {
                 db_root,
                 participant,
-                record_id,
+                intent_id,
             },
         ];
 
@@ -650,9 +650,9 @@ mod tests {
             ("db/_t/00/0F8310", ErrorKind::Parse),
             ("db/_t/!!/!!", ErrorKind::Decode),
             ("db/_s/participant", ErrorKind::Parse),
-            ("db/_s//record", ErrorKind::Parse),
-            ("db/_s/!/record", ErrorKind::Decode),
-            ("db/_s/participant/record/extra", ErrorKind::Parse),
+            ("db/_s//intent", ErrorKind::Parse),
+            ("db/_s/!/intent", ErrorKind::Decode),
+            ("db/_s/participant/intent/extra", ErrorKind::Parse),
         ];
 
         for (path, expected) in cases {
@@ -690,7 +690,7 @@ mod tests {
             collection
         );
 
-        let key = KeyRef::new(collection, b"Hello");
+        let key = LogicalKey::new(collection, b"Hello");
         assert_eq!(key.key(), b"Hello");
         assert_eq!(key.collection().db_root(), "db");
     }
@@ -723,7 +723,7 @@ mod tests {
         let collection_prefix = "db/_c/0000000000000000000000";
         let token = NodeToken::from_bytes([0; NODE_TOKEN_BYTES]);
         let participant = TxId::from_bytes(vec![1, 2, 3, 4]);
-        let record_id = StructuralRecordId::from(token.clone());
+        let intent_id = StructuralIntentId::from(token.clone());
 
         assert_eq!(collection.physical_prefix(), collection_prefix);
         assert_eq!(
@@ -757,10 +757,10 @@ mod tests {
             "db/_t/0F/0F8310"
         );
         assert_eq!(
-            ObjectPath::StructuralRecord {
+            ObjectPath::StructuralIntent {
                 db_root: db_root.clone(),
                 participant: participant.clone(),
-                record_id,
+                intent_id,
             }
             .to_string(),
             "db/_s/0F8310/0000000000000000000000"
@@ -774,9 +774,9 @@ mod tests {
             "db/_t/0F/"
         );
         assert_eq!(ObjectPath::transaction_shard(&participant), 16);
-        assert_eq!(ObjectPath::structural_records_prefix(&db_root), "db/_s/");
+        assert_eq!(ObjectPath::structural_intents_prefix(&db_root), "db/_s/");
         assert_eq!(
-            ObjectPath::participant_structural_records_prefix(&db_root, &participant),
+            ObjectPath::participant_structural_intents_prefix(&db_root, &participant),
             "db/_s/0F8310/"
         );
     }

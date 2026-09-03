@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use glassdb_data::{CollectionAddress, CollectionId};
 use glassdb_trans::{
-    CollectionChange, CollectionData, CollectionOp, DirectoryRead, DirectoryReadKind,
+    CatalogAccesses, CollectionChange, CollectionOp, DirectoryRead, DirectoryReadKind,
     DirectorySnapshot,
 };
 
@@ -167,7 +167,7 @@ impl CatalogOverlay {
         parent: CollectionAddress,
         name: Vec<u8>,
         collection: &CollectionAddress,
-        has_data_writes: bool,
+        has_key_writes: bool,
     ) -> Result<(), Error> {
         if self
             .dropped_bindings
@@ -206,9 +206,9 @@ impl CatalogOverlay {
         if target_not_empty {
             return Err(Error::NotEmpty);
         }
-        if has_data_writes {
+        if has_key_writes {
             return Err(Error::InvalidInput(
-                "cannot drop a collection after staging data writes to it".into(),
+                "cannot drop a collection after staging key writes to it".into(),
             ));
         }
         self.directories
@@ -286,13 +286,13 @@ impl CatalogOverlay {
         self.created.clear();
         self.dropped.clear();
         self.dropped_bindings.clear();
-        // Reusing an incarnation across body retries avoids abandoning a
+        // Reusing an incarnation across body retries avoids discarding a
         // prepared collection under a no-longer-reachable physical prefix.
     }
 
     /// Serializes the accumulated logical accesses for the commit engine.
-    pub(super) fn accesses(&self) -> CollectionData {
-        CollectionData {
+    pub(super) fn accesses(&self) -> CatalogAccesses {
+        CatalogAccesses {
             reads: self.reads.clone(),
             changes: self.changes.values().cloned().collect(),
         }

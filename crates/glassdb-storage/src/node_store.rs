@@ -17,8 +17,8 @@ use crate::cached_store::{
     CachedStore, CasResult, Codec, Observation, ObservationCheck, Requirement,
 };
 use crate::error::StorageError;
+use crate::leaf::LeafBody;
 use crate::node::{Node, NodeLocks};
-use crate::shard::Shard;
 
 const NODE_LIST_PAGE_SIZE: usize = 128;
 
@@ -58,7 +58,7 @@ impl LoadedLeaf {
     }
 
     /// Returns the loaded leaf entries.
-    pub fn entries(&self) -> &Shard {
+    pub fn entries(&self) -> &LeafBody {
         self.edit.entries()
     }
 
@@ -72,11 +72,11 @@ impl LoadedLeaf {
         self.edit.observation()
     }
 
-    /// Reports whether this loaded leaf still owns `key` — i.e. `key` is below
-    /// its high-key. A `false` result means a split moved `key` to a right
+    /// Reports whether this loaded leaf still covers `key` below its high-key.
+    /// A `false` result means a split moved `key` to a right
     /// sibling after the key was routed here, so a caller must re-descend.
-    pub fn owns(&self, key: &[u8]) -> bool {
-        self.edit.owns(key)
+    pub fn covers(&self, key: &[u8]) -> bool {
+        self.edit.covers(key)
     }
 
     /// Converts this loaded leaf into an observation-bound mutation.
@@ -97,14 +97,14 @@ impl LeafEdit {
     }
 
     /// Returns the staged leaf entries.
-    pub fn entries(&self) -> &Shard {
+    pub fn entries(&self) -> &LeafBody {
         self.node
             .as_leaf()
             .expect("LeafEdit is always created from a leaf node")
     }
 
     /// Replaces the staged leaf entries without changing topology.
-    pub fn set_entries(&mut self, entries: Shard) {
+    pub fn set_entries(&mut self, entries: LeafBody) {
         self.node
             .set_leaf(entries)
             .expect("LeafEdit is always created from a leaf node");
@@ -125,9 +125,9 @@ impl LeafEdit {
         &self.observation
     }
 
-    /// Reports whether this edited leaf still owns `key`.
-    pub fn owns(&self, key: &[u8]) -> bool {
-        self.node.owns(key)
+    /// Reports whether this edited leaf still covers `key`.
+    pub fn covers(&self, key: &[u8]) -> bool {
+        self.node.covers(key)
     }
 }
 
@@ -542,7 +542,7 @@ fn validate_node_path(path: &ObjectPath) -> Result<(), StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ShardEntry, Timeline};
+    use crate::{LeafEntry, Timeline};
 
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
@@ -594,7 +594,7 @@ mod tests {
         let store = store_over(backend.clone());
         assert!(
             store
-                .store_node(&collection(), token, &Node::leaf(Shard::new()), None)
+                .store_node(&collection(), token, &Node::leaf(LeafBody::new()), None)
                 .await
                 .unwrap()
         );
@@ -752,7 +752,7 @@ mod tests {
         let path = node_path(1);
         assert!(
             store
-                .store_node(&collection(), &token(1), &Node::leaf(Shard::new()), None,)
+                .store_node(&collection(), &token(1), &Node::leaf(LeafBody::new()), None,)
                 .await
                 .unwrap()
         );
@@ -760,7 +760,7 @@ mod tests {
         let loaded = store.load_leaf(&path, Requirement::Any).await.unwrap();
         let previous_revision = loaded.observation().revision().cloned();
         let mut edit = loaded.into_edit();
-        edit.set_entries(Shard::from_entries([ShardEntry::new(b"new".as_slice())]));
+        edit.set_entries(LeafBody::from_entries([LeafEntry::new(b"new".as_slice())]));
         assert!(store.commit_leaf(edit).await.unwrap());
 
         let committed = store.load_leaf(&path, Requirement::Any).await.unwrap();
@@ -775,7 +775,7 @@ mod tests {
     async fn leaf_edit_commits_bounded_changes_without_changing_topology() {
         let store = store_over(Arc::new(MemoryBackend::new()));
         let path = node_path(1);
-        let original = Node::leaf(Shard::new())
+        let original = Node::leaf(LeafBody::new())
             .with_high_key(Some(b"m".to_vec()))
             .with_right_sibling(Some("right".to_string()));
         assert!(
@@ -786,7 +786,7 @@ mod tests {
         );
 
         let loaded = store.load_leaf(&path, Requirement::Any).await.unwrap();
-        let entries = Shard::from_entries([ShardEntry::new(b"key".as_slice())]);
+        let entries = LeafBody::from_entries([LeafEntry::new(b"key".as_slice())]);
         let mut locks = NodeLocks::default();
         let holder = TxId::from_bytes(b"holder".to_vec());
         locks.set_membership_writer(holder.clone());
@@ -813,7 +813,7 @@ mod tests {
         for token in [token(1), token(2)] {
             assert!(
                 store
-                    .store_node(&collection(), &token, &Node::leaf(Shard::new()), None)
+                    .store_node(&collection(), &token, &Node::leaf(LeafBody::new()), None)
                     .await
                     .unwrap()
             );
@@ -824,7 +824,7 @@ mod tests {
             .await
             .unwrap()
             .into_edit();
-        edit.set_entries(Shard::from_entries([ShardEntry::new(
+        edit.set_entries(LeafBody::from_entries([LeafEntry::new(
             b"left-key".as_slice(),
         )]));
         assert_eq!(edit.path(), &left_path);
@@ -845,7 +845,7 @@ mod tests {
         let path = node_path(1);
         assert!(
             store
-                .store_node(&collection(), &token(1), &Node::leaf(Shard::new()), None,)
+                .store_node(&collection(), &token(1), &Node::leaf(LeafBody::new()), None,)
                 .await
                 .unwrap()
         );
@@ -860,8 +860,12 @@ mod tests {
             .await
             .unwrap()
             .into_edit();
-        winner.set_entries(Shard::from_entries([ShardEntry::new(b"winner".as_slice())]));
-        stale.set_entries(Shard::from_entries([ShardEntry::new(b"stale".as_slice())]));
+        winner.set_entries(LeafBody::from_entries([LeafEntry::new(
+            b"winner".as_slice(),
+        )]));
+        stale.set_entries(LeafBody::from_entries([LeafEntry::new(
+            b"stale".as_slice(),
+        )]));
 
         assert!(store.commit_leaf(winner).await.unwrap());
         assert!(!store.commit_leaf(stale).await.unwrap());
@@ -882,7 +886,7 @@ mod tests {
         for token in &expected {
             assert!(
                 store
-                    .store_node(&collection(), token, &Node::leaf(Shard::new()), None)
+                    .store_node(&collection(), token, &Node::leaf(LeafBody::new()), None)
                     .await
                     .unwrap()
             );

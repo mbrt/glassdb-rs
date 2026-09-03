@@ -8,7 +8,7 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use glassdb_data::{CollectionAddress, KeyRef, TxId};
+use glassdb_data::{CollectionAddress, LogicalKey, TxId};
 use glassdb_storage::LeafObservation;
 
 /// Opaque validation evidence retained by a transactional point read.
@@ -68,17 +68,17 @@ impl ReadPredicate {
 /// A single key read within a transaction.
 #[derive(Debug, Clone)]
 pub struct ReadAccess {
-    key: KeyRef,
+    key: LogicalKey,
     evidence: ReadEvidence,
 }
 
 impl ReadAccess {
     /// Creates point-read access from its logical key and opaque validation evidence.
-    pub fn new(key: KeyRef, evidence: ReadEvidence) -> Self {
+    pub fn new(key: LogicalKey, evidence: ReadEvidence) -> Self {
         Self { key, evidence }
     }
 
-    pub(crate) fn key(&self) -> &KeyRef {
+    pub(crate) fn key(&self) -> &LogicalKey {
         &self.key
     }
 
@@ -98,7 +98,7 @@ impl ReadAccess {
 /// A single key write within a transaction.
 #[derive(Debug, Clone)]
 pub struct WriteAccess {
-    key: KeyRef,
+    key: LogicalKey,
     op: WriteOp,
 }
 
@@ -110,21 +110,21 @@ pub(crate) enum WriteOp {
 }
 
 impl WriteAccess {
-    pub fn put(key: KeyRef, value: Arc<[u8]>) -> Self {
+    pub fn put(key: LogicalKey, value: Arc<[u8]>) -> Self {
         Self {
             key,
             op: WriteOp::Put(value),
         }
     }
 
-    pub fn delete(key: KeyRef) -> Self {
+    pub fn delete(key: LogicalKey) -> Self {
         Self {
             key,
             op: WriteOp::Delete,
         }
     }
 
-    pub(crate) fn key(&self) -> &KeyRef {
+    pub(crate) fn key(&self) -> &LogicalKey {
         &self.key
     }
 
@@ -388,7 +388,7 @@ impl DirectShape<'_> {
 /// One key's optional point-read fact and optional final key write.
 #[derive(Clone, Copy)]
 pub(crate) struct PointAccess<'a> {
-    pub(crate) key: &'a KeyRef,
+    pub(crate) key: &'a LogicalKey,
     pub(crate) read: Option<&'a ReadAccess>,
     pub(crate) write: Option<&'a WriteAccess>,
 }
@@ -463,17 +463,17 @@ impl<'a> Iterator for PointAccesses<'a> {
 }
 
 trait KeyedAccess {
-    fn key(&self) -> &KeyRef;
+    fn key(&self) -> &LogicalKey;
 }
 
 impl KeyedAccess for ReadAccess {
-    fn key(&self) -> &KeyRef {
+    fn key(&self) -> &LogicalKey {
         self.key()
     }
 }
 
 impl KeyedAccess for WriteAccess {
-    fn key(&self) -> &KeyRef {
+    fn key(&self) -> &LogicalKey {
         self.key()
     }
 }
@@ -500,11 +500,11 @@ mod tests {
 
     use super::*;
 
-    fn key(raw: &[u8]) -> KeyRef {
-        KeyRef::new(CollectionAddress::root("accesstest"), raw)
+    fn key(raw: &[u8]) -> LogicalKey {
+        LogicalKey::new(CollectionAddress::root("accesstest"), raw)
     }
 
-    async fn point_read(key: KeyRef, last_writer: Option<TxId>) -> ReadAccess {
+    async fn point_read(key: LogicalKey, last_writer: Option<TxId>) -> ReadAccess {
         let store = CachedStore::new(
             Arc::new(MemoryBackend::new()),
             1024 * 1024,

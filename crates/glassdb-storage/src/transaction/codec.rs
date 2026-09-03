@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glassdb_data::{
-    CollectionAddress, CollectionId, KeyRef, LeafRef, MAX_COLLECTION_NAME_BYTES, NodeToken,
+    CollectionAddress, CollectionId, LeafRef, LogicalKey, MAX_COLLECTION_NAME_BYTES, NodeToken,
     ObjectPath, TxId,
 };
 use glassdb_proto as pb;
@@ -31,7 +31,7 @@ impl TxLogCodec {
             .timestamp
             .ok_or_else(|| StorageError::other("transaction log has no persisted timestamp"))?;
         if log.id.is_unset() {
-            return Err(StorageError::other("empty transaction ID"));
+            return Err(StorageError::other("empty transaction identity"));
         }
         validate_database_membership(log, expected_db_root)?;
 
@@ -222,7 +222,7 @@ fn decode_writes(collection: &CollectionAddress, encoded: &[pb::Write]) -> Vec<T
     encoded
         .iter()
         .map(|write| TxWrite {
-            key: KeyRef::new(collection.clone(), &write.key),
+            key: LogicalKey::new(collection.clone(), &write.key),
             value: write_value(write),
             deleted: write_deleted(write),
             prev_writer: TxId::from_bytes(write.prev_tid.clone()),
@@ -234,7 +234,7 @@ fn decode_entry_locks(collection: &CollectionAddress, encoded: &[pb::EntryLock])
     encoded
         .iter()
         .map(|lock| TxLock::Entry {
-            key: KeyRef::new(collection.clone(), &lock.key),
+            key: LogicalKey::new(collection.clone(), &lock.key),
             typ: parse_lock_type(lock.lock_type),
         })
         .collect()
@@ -504,13 +504,13 @@ mod tests {
             status: TxCommitStatus::Pending,
             writes: vec![
                 TxWrite {
-                    key: KeyRef::new(parent.clone(), b"value"),
+                    key: LogicalKey::new(parent.clone(), b"value"),
                     value: Arc::from(&b"contents"[..]),
                     deleted: false,
                     prev_writer: TxId::from_bytes(vec![9]),
                 },
                 TxWrite {
-                    key: KeyRef::new(parent.clone(), b"deleted"),
+                    key: LogicalKey::new(parent.clone(), b"deleted"),
                     value: Arc::from(&[][..]),
                     deleted: true,
                     prev_writer: TxId::from_bytes(vec![8]),
@@ -518,7 +518,7 @@ mod tests {
             ],
             locks: vec![
                 TxLock::Entry {
-                    key: KeyRef::new(parent.clone(), b"entry"),
+                    key: LogicalKey::new(parent.clone(), b"entry"),
                     typ: LockType::Write,
                 },
                 TxLock::Membership {
@@ -663,13 +663,13 @@ mod tests {
         let mut log = log_with_status(TxCommitStatus::Ok);
         log.writes = vec![
             TxWrite {
-                key: KeyRef::new(collection("first", 1), b"a"),
+                key: LogicalKey::new(collection("first", 1), b"a"),
                 value: Arc::from(&b"a"[..]),
                 deleted: false,
                 prev_writer: TxId::default(),
             },
             TxWrite {
-                key: KeyRef::new(collection("second", 1), b"b"),
+                key: LogicalKey::new(collection("second", 1), b"b"),
                 value: Arc::from(&b"b"[..]),
                 deleted: false,
                 prev_writer: TxId::default(),
@@ -690,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn status_only_decode_ignores_unrelated_semantic_body_errors() {
+    fn status_only_decode_ignores_unrelated_semantic_payload_errors() {
         let mut encoded = encoded_log();
         encoded.writes.push(pb::CollectionWrites {
             collection_id: vec![1],

@@ -2,17 +2,18 @@
 //! reverse mark-sweep (ADR-022).
 //!
 //! In the v2 object-native layout a committed transaction object *is* the value
-//! store: a key's live value lives in the object its shard entry's
+//! store: a key's live value lives in the object its leaf entry's
 //! `current_writer` points at, and readers help-forward through it. So a
-//! transaction object is **live** exactly while some shard still references its
-//! txid (`current_writer` or `locked_by`), and GC is a reachability problem, not
+//! transaction object is **live** exactly while some leaf still references its
+//! transaction identity (`current_writer` or `locked_by`). Thus, GC is a
+//! reachability problem, not
 //! a timer.
 //!
-//! A forward mark (list every shard, union the referenced txids) costs the whole
+//! A forward mark (list every leaf, union the referenced transaction identities) costs the whole
 //! database per cycle. Instead each candidate `_t/` object records its own
 //! back-references (its `locks ∪ writes`), so GC works **backward**: it reads a
 //! batch of candidates and confirms each one dead by GET-ing only the handful of
-//! shards it names — never a database-wide scan. Useful reverse-check candidates
+//! leaves it names — never a database-wide scan. Useful reverse-check candidates
 //! come through [`TxCleanupHints`]; paged walks of the sharded
 //! `{db}/_t/{ss}/` namespace make the candidate set complete regardless of lost
 //! hints.
@@ -26,9 +27,9 @@
 //! pinned until its owner acknowledges retirement; and an acknowledged aborted
 //! object is retained for the ordinary finite cleanup horizon.
 //!
-//! Lock reclamation flows through the shard-mutation coordinator (ADR-029): GC
+//! Lock reclamation flows through the leaf coordinator (ADR-029): GC
 //! calls the [`Locker`]'s stateless per-object unlock methods rather than issuing
-//! its own shard/root CAS, so every mutation goes through one place.
+//! its own leaf/root CAS, so every mutation goes through one place.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
@@ -36,10 +37,10 @@ use std::time::UNIX_EPOCH;
 
 use glassdb_backend as backend;
 use glassdb_concurr::{Background, rt};
-use glassdb_data::{KeyRef, TxId, shuffle};
+use glassdb_data::{LogicalKey, TxId, shuffle};
 use glassdb_storage::transaction::{TLogger, TxCollectionOp, TxCommitStatus, TxLock, TxLog};
 use glassdb_storage::{
-    NodeStore, Observation, Requirement, StorageError, StructuralLogStore, Timeline, TreeRouter,
+    NodeStore, Observation, Requirement, StorageError, StructuralIntentStore, Timeline, TreeRouter,
 };
 
 use crate::collections::CollectionLifecycle;
@@ -53,7 +54,7 @@ use crate::tlocker::Locker;
 /// Maximum number of transaction objects returned by one listing request.
 const GC_LIST_PAGE: usize = 128;
 
-/// Maximum listing requests issued by one cycle. Empty shards still cost a
+/// Maximum listing requests issued by one cycle. Empty transaction-log shards still cost a
 /// request, so this bounds work independently of how sparse the log namespace
 /// is.
 const GC_LIST_REQUEST_BUDGET: usize = 64;
@@ -113,13 +114,13 @@ pub struct Gc {
     // strong owner.
     bg: Weak<Background>,
     tl: TLogger,
-    structural_logs: StructuralLogStore,
+    structural_intents: StructuralIntentStore,
     collection_lifecycle: CollectionLifecycle,
     router: TreeRouter,
     locker: Locker,
     mon: Monitor,
     timeline: Timeline,
-    // Txids whose latest known leaf reference disappeared.
+    // Transaction identities whose latest known leaf reference disappeared.
     hints: TxCleanupHints,
 }
 
@@ -154,7 +155,7 @@ impl TxScan {
 }
 
 impl Gc {
-    /// Creates a collector over the transaction, node, and structural-log
+    /// Creates a collector over the transaction, node, and structural-intent
     /// stores, locker, and monitor. Freshness barriers use `timeline`; lease
     /// horizons use model time so they remain deterministic under the DST
     /// executor.
@@ -162,19 +163,19 @@ impl Gc {
     pub(crate) fn new(
         bg: Weak<Background>,
         tl: TLogger,
-        shards: NodeStore,
-        structural_logs: StructuralLogStore,
+        nodes: NodeStore,
+        structural_intents: StructuralIntentStore,
         timeline: Timeline,
         locker: Locker,
         collection_lifecycle: CollectionLifecycle,
         mon: Monitor,
         hints: TxCleanupHints,
     ) -> Self {
-        let router = TreeRouter::new(shards.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(nodes.clone(), std::num::NonZeroUsize::MIN);
         Gc {
             bg,
             tl,
-            structural_logs,
+            structural_intents,
             collection_lifecycle,
             router,
             locker,
@@ -223,7 +224,7 @@ impl Gc {
     }
 
     /// Returns at most one non-empty transaction-log page, advancing through a
-    /// shuffled shard order while staying within the per-cycle request budget.
+    /// shuffled transaction-log shard order within the per-cycle request budget.
     async fn next_list_page(&self, scan: &mut TxScan) -> Vec<TxId> {
         let limit = backend::ListLimit::new(GC_LIST_PAGE).unwrap();
 
@@ -445,13 +446,13 @@ impl Gc {
         }
     }
 
-    /// Reports whether any entry the candidate recorded still names its txid: a
+    /// Reports whether any entry the candidate recorded still names its transaction identity: a
     /// written key's `current_writer` or a locked key's `locked_by`. Checking
-    /// only the recorded set is equivalent to scanning every shard, because an
-    /// entry can name `txid` only if `txid` put it there.
+    /// only the recorded set is equivalent to scanning every leaf, because an
+    /// entry can name the identity only if that transaction put it there.
     ///
     /// The recorded keys are routed to their leaves by descent
-    /// ([`TreeRouter::group_keys_by_leaf_fresh`]) so each touched leaf is fetched
+    /// ([`TreeRouter::route_keys_with_requirements`]) so each touched leaf is fetched
     /// once — a write and its write-lock name the same key, and sibling keys
     /// share a leaf, so a per-key load would re-read the same leaf several times
     /// per candidate. Each key carries the [`CheckKind`] that says which field
@@ -462,7 +463,7 @@ impl Gc {
         log: &TxLog,
         requirement: Requirement,
     ) -> Result<bool, TransError> {
-        let mut items: Vec<(KeyRef, CheckKind)> = log
+        let mut items: Vec<(LogicalKey, CheckKind)> = log
             .writes
             .iter()
             .map(|write| (write.key.clone(), CheckKind::Writer))
@@ -483,7 +484,7 @@ impl Gc {
         for items in by_collection.into_values() {
             let groups = match self
                 .router
-                .group_keys_by_leaf_fresh(items, requirement, requirement)
+                .route_keys_with_requirements(items, requirement, requirement)
                 .await
             {
                 Ok(groups) => groups,
@@ -535,7 +536,7 @@ impl Gc {
         locks: &[TxLock],
         requirement: Requirement,
     ) -> Result<bool, TransError> {
-        let mut key_locks: Vec<(KeyRef, ())> = Vec::new();
+        let mut key_locks: Vec<(LogicalKey, ())> = Vec::new();
         let mut leaf_paths = BTreeSet::new();
         let mut topology = BTreeSet::new();
         for lock in locks {
@@ -560,7 +561,7 @@ impl Gc {
         for items in by_collection.into_values() {
             match self
                 .router
-                .group_keys_by_leaf_fresh(items, requirement, requirement)
+                .route_keys_with_requirements(items, requirement, requirement)
                 .await
             {
                 Ok(groups) => {
@@ -576,7 +577,7 @@ impl Gc {
         self.locker.collections().release(tid, locks).await?;
         for collection in topology {
             let records = self
-                .structural_logs
+                .structural_intents
                 .list_for_participant(collection.db_root_component(), tid, requirement)
                 .await?;
             if !records.is_empty() {
@@ -591,10 +592,10 @@ impl Gc {
     }
 }
 
-/// Which shard-entry field a liveness check consults for a recorded key: a
+/// Which leaf-entry field a liveness check consults for a recorded key: a
 /// written key is referenced while it is the entry's `current_writer`; a locked
 /// key while it appears in `locked_by`. Rides along as the per-key payload of
-/// [`Gc::still_referenced`]'s batched shard load.
+/// [`Gc::still_referenced`]'s batched leaf load.
 enum CheckKind {
     Writer,
     Holder,
@@ -607,7 +608,7 @@ mod tests {
     use crate::collections::TopologySettler;
     use crate::engine::{AssemblyFixture, EngineConfig};
     use crate::key_state_resolver::KeyStateResolver;
-    use crate::shard_coord::{ShardCoordinator, SplitHinter};
+    use crate::leaf_coord::{LeafCoordinator, SplitHinter};
     use crate::tlocker::LockOutcome;
     use async_trait::async_trait;
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
@@ -616,7 +617,7 @@ mod tests {
     use glassdb_data::{CollectionAddress, CollectionId, DbRoot, ObjectPath};
     use glassdb_storage::transaction::{TxCollectionChange, TxCollectionOp, TxWrite};
     use glassdb_storage::{
-        CollectionRecord, CollectionStore, CurrentState, LockType, Node, Shard, ShardEntry,
+        CollectionRecord, CollectionStore, CurrentState, LeafBody, LeafEntry, LockType, Node,
         Timeline, TreeRouter,
     };
     use std::collections::BTreeMap;
@@ -628,7 +629,7 @@ mod tests {
     struct NoSplitHints;
 
     impl SplitHinter for NoSplitHints {
-        fn observe_leaf(&self, _path: &ObjectPath, _shard: &Shard) {}
+        fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {}
     }
 
     #[async_trait]
@@ -664,7 +665,7 @@ mod tests {
         hints: TxCleanupHints,
         tl: TLogger,
         records: CollectionStore,
-        shards: NodeStore,
+        nodes: NodeStore,
         timeline: Timeline,
         locker: Locker,
         mon: Monitor,
@@ -680,8 +681,8 @@ mod tests {
         let foundation = AssemblyFixture::new(backend, DbRoot::try_from("db").unwrap(), &config);
         let tl = foundation.tlogger.clone();
         let records = foundation.records.clone();
-        let structural_logs = foundation.structural_logs.clone();
-        let shards = foundation.shards.clone();
+        let structural_intents = foundation.structural_intents.clone();
+        let nodes = foundation.nodes.clone();
         let timeline = foundation.timeline.clone();
         assert!(
             records
@@ -690,23 +691,23 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            shards
-                .create_root(&collection(), &Node::leaf(Shard::new()))
+            nodes
+                .create_root(&collection(), &Node::leaf(LeafBody::new()))
                 .await
                 .unwrap()
         );
         let bg = foundation.background.clone();
         let mon = foundation.monitor.clone();
         let key_state = KeyStateResolver::new(mon.clone());
-        let coord = ShardCoordinator::with_hinter(
-            shards.clone(),
+        let coord = LeafCoordinator::with_hinter(
+            nodes.clone(),
             key_state,
             mon.clone(),
             RetryConfig::default(),
             glassdb_storage::SplitPolicy::default(),
             Arc::new(NoSplitHints),
         );
-        let router = TreeRouter::new(shards.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(nodes.clone(), std::num::NonZeroUsize::MIN);
         let locker = Locker::new(
             coord.clone(),
             router,
@@ -724,13 +725,13 @@ mod tests {
         let gc = Gc::new(
             Arc::downgrade(&bg),
             tl.clone(),
-            shards.clone(),
-            structural_logs,
+            nodes.clone(),
+            structural_intents,
             timeline.clone(),
             locker.clone(),
             CollectionLifecycle::new(
                 records.clone(),
-                shards.clone(),
+                nodes.clone(),
                 mon.clone(),
                 RetryConfig::default(),
                 Arc::new(UnexpectedTopologySettler),
@@ -743,7 +744,7 @@ mod tests {
             hints,
             tl,
             records,
-            shards,
+            nodes,
             timeline,
             locker,
             mon,
@@ -790,8 +791,8 @@ mod tests {
         assert_eq!(hints.pending(), scheduled[2..]);
     }
 
-    fn key_path(k: &[u8]) -> KeyRef {
-        KeyRef::new(collection(), k)
+    fn key_path(k: &[u8]) -> LogicalKey {
+        LogicalKey::new(collection(), k)
     }
 
     fn write_lock(k: &[u8]) -> TxLock {
@@ -801,29 +802,29 @@ mod tests {
         }
     }
 
-    async fn store_entry(ctx: &Ctx, _key: &[u8], entry: ShardEntry) {
+    async fn store_entry(ctx: &Ctx, _key: &[u8], entry: LeafEntry) {
         let path = root_path();
         let loaded = ctx
-            .shards
+            .nodes
             .load_leaf(&path, Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
-        let mut entries: BTreeMap<Vec<u8>, ShardEntry> = loaded
+        let mut entries: BTreeMap<Vec<u8>, LeafEntry> = loaded
             .entries()
             .entries()
             .cloned()
             .map(|e| (e.key.clone(), e))
             .collect();
         entries.insert(entry.key.clone(), entry);
-        let shard = Shard::from_entries(entries.into_values());
+        let leaf = LeafBody::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
-        edit.set_entries(shard);
-        assert!(ctx.shards.commit_leaf(edit).await.unwrap());
+        edit.set_entries(leaf);
+        assert!(ctx.nodes.commit_leaf(edit).await.unwrap());
     }
 
-    async fn lookup_entry(ctx: &Ctx, key: &[u8]) -> Option<ShardEntry> {
+    async fn lookup_entry(ctx: &Ctx, key: &[u8]) -> Option<LeafEntry> {
         let loaded = ctx
-            .shards
+            .nodes
             .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
@@ -850,14 +851,14 @@ mod tests {
         }
     }
 
-    fn writer_entry(key: &[u8], writer: &TxId) -> ShardEntry {
-        ShardEntry::new(key).with_current(CurrentState::External {
+    fn writer_entry(key: &[u8], writer: &TxId) -> LeafEntry {
+        LeafEntry::new(key).with_current(CurrentState::External {
             writer: writer.clone(),
         })
     }
 
-    fn locked_entry(key: &[u8], holder: &TxId) -> ShardEntry {
-        let mut entry = ShardEntry::new(key);
+    fn locked_entry(key: &[u8], holder: &TxId) -> LeafEntry {
+        let mut entry = LeafEntry::new(key);
         entry.replace_write_lock(holder.clone());
         entry
     }
@@ -917,7 +918,7 @@ mod tests {
         store_entry(
             &ctx,
             b"k",
-            ShardEntry::new(b"k").with_current(CurrentState::Inline {
+            LeafEntry::new(b"k").with_current(CurrentState::Inline {
                 writer: logless.clone(),
                 value: Arc::from(&b"v2"[..]),
             }),
@@ -946,8 +947,8 @@ mod tests {
             .create_record(&prepared, &CollectionRecord::new())
             .await
             .unwrap();
-        ctx.shards
-            .create_root(&prepared, &Node::leaf(Shard::new()))
+        ctx.nodes
+            .create_root(&prepared, &Node::leaf(LeafBody::new()))
             .await
             .unwrap();
         let mut log = committed(id.clone(), PAST_HORIZON, &[], &[]);
@@ -959,7 +960,7 @@ mod tests {
 
         assert!(is_gone(&ctx.tl, &id).await);
         assert!(matches!(
-            ctx.shards.load_root(&prepared, Requirement::Any).await,
+            ctx.nodes.load_root(&prepared, Requirement::Any).await,
             Err(StorageError::NotFound)
         ));
     }
@@ -976,8 +977,8 @@ mod tests {
             .create_record(&prepared, &CollectionRecord::new())
             .await
             .unwrap();
-        ctx.shards
-            .create_root(&prepared, &Node::leaf(Shard::new()))
+        ctx.nodes
+            .create_root(&prepared, &Node::leaf(LeafBody::new()))
             .await
             .unwrap();
         let mut log = committed(id.clone(), PAST_HORIZON, &[], &[]);
@@ -990,7 +991,7 @@ mod tests {
 
         assert!(is_gone(&ctx.tl, &id).await);
         assert!(matches!(
-            ctx.shards.load_root(&prepared, Requirement::Any).await,
+            ctx.nodes.load_root(&prepared, Requirement::Any).await,
             Err(StorageError::NotFound)
         ));
         assert!(matches!(
@@ -1012,8 +1013,8 @@ mod tests {
             .create_record(&prepared, &CollectionRecord::new())
             .await
             .unwrap();
-        ctx.shards
-            .create_root(&prepared, &Node::leaf(Shard::new()))
+        ctx.nodes
+            .create_root(&prepared, &Node::leaf(LeafBody::new()))
             .await
             .unwrap();
         let mut log = committed(id.clone(), PAST_HORIZON, &[], &[]);
@@ -1063,7 +1064,7 @@ mod tests {
         run_once(&ctx.gc).await;
         assert!(is_gone(&ctx.tl, &id).await);
         assert!(matches!(
-            ctx.shards.load_root(&prepared, Requirement::Any).await,
+            ctx.nodes.load_root(&prepared, Requirement::Any).await,
             Err(StorageError::NotFound)
         ));
     }
@@ -1105,9 +1106,9 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let mut child_node = Node::leaf(Shard::new());
+        let mut child_node = Node::leaf(LeafBody::new());
         child_node.set_collection_delete_intent(id.clone());
-        assert!(ctx.shards.create_root(&child, &child_node).await.unwrap());
+        assert!(ctx.nodes.create_root(&child, &child_node).await.unwrap());
 
         let mut log = committed(id.clone(), PAST_HORIZON, &[b"k"], &[]);
         log.locks.extend([
@@ -1143,7 +1144,7 @@ mod tests {
         assert_eq!(parent_record.child(b"child"), None);
         assert!(!parent_record.directory_lock().contains(&id));
         assert!(matches!(
-            ctx.shards.load_root(&child, Requirement::Any).await,
+            ctx.nodes.load_root(&child, Requirement::Any).await,
             Err(StorageError::NotFound)
         ));
     }
@@ -1156,7 +1157,7 @@ mod tests {
             "db",
             CollectionId::from_slice(&[9; 16]).expect("fixed ID has the required width"),
         );
-        let key = KeyRef::new(missing, b"k");
+        let key = LogicalKey::new(missing, b"k");
         let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
         log.timestamp = Some(base() - PAST_HORIZON);
         log.writes.push(TxWrite {
@@ -1349,11 +1350,11 @@ mod tests {
         assert!(is_gone(&ctx.tl, &t).await);
     }
 
-    // ADR-029: GC's lock reclamation flows through the shard-mutation coordinator
+    // ADR-029: GC's lock reclamation flows through the leaf coordinator
     // (via the locker's unlock methods), so a GC release and a live disjoint-key
-    // acquire contending one shard batch into a *single* CAS round instead of GC
+    // acquire contending one leaf batch into a *single* CAS round instead of GC
     // racing its own store. The release clears (and prunes) the dead holder's
-    // entry and the acquire installs its lock, all in one shard write.
+    // entry and the acquire installs its lock, all in one leaf write.
     #[tokio::test(start_paused = true)]
     async fn gc_release_merges_into_live_acquire_round() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -1363,9 +1364,9 @@ mod tests {
         let ctx = new_ctx_with(rec).await;
 
         let ka = b"key-a".to_vec();
-        let kb = same_shard_sibling(&ka);
-        let shard_path = root_path();
-        let shard_path_string = shard_path.to_string();
+        let kb = same_leaf_sibling(&ka);
+        let leaf_path = root_path();
+        let leaf_path_string = leaf_path.to_string();
 
         // Seed both entries in the one shared leaf `_r`: a dead transaction holds
         // A's write lock (no committed writer), so GC's release will clear and
@@ -1374,20 +1375,20 @@ mod tests {
         // root lock — the round stays one leaf CAS.
         let dead = tx(1);
         let seed = tx(9);
-        let shard = Shard::from_entries([locked_entry(&ka, &dead), writer_entry(&kb, &seed)]);
+        let leaf = LeafBody::from_entries([locked_entry(&ka, &dead), writer_entry(&kb, &seed)]);
         let loaded = ctx
-            .shards
-            .load_leaf(&shard_path, Requirement::AtLeast(ctx.timeline.now()))
+            .nodes
+            .load_leaf(&leaf_path, Requirement::AtLeast(ctx.timeline.now()))
             .await
             .unwrap();
         let mut edit = loaded.into_edit();
-        edit.set_entries(shard);
-        assert!(ctx.shards.commit_leaf(edit).await.unwrap());
+        edit.set_entries(leaf);
+        assert!(ctx.nodes.commit_leaf(edit).await.unwrap());
 
         let live = TxId::with_priority(2_000_000_000, b"live");
         ctx.mon.begin_tx(&live);
 
-        let before = count_stores(&log, &shard_path_string);
+        let before = count_stores(&log, &leaf_path_string);
         gate.arm();
 
         // Drive GC's release and the live acquire concurrently: the first becomes
@@ -1401,7 +1402,7 @@ mod tests {
                 .await
         });
         let locker = ctx.locker.clone();
-        let data = crate::access::AccessSet::new(
+        let accesses = crate::access::AccessSet::new(
             Vec::new(),
             vec![crate::access::WriteAccess::put(
                 key_path(&kb),
@@ -1414,7 +1415,7 @@ mod tests {
         let acquire = tokio::spawn(async move {
             locker
                 .keys()
-                .lock_at(&live2, &data, false, lock_requirement)
+                .lock_at(&live2, &accesses, false, lock_requirement)
                 .await
         });
 
@@ -1431,9 +1432,9 @@ mod tests {
         );
 
         assert_eq!(
-            count_stores(&log, &shard_path_string) - before,
+            count_stores(&log, &leaf_path_string) - before,
             1,
-            "GC release and the live acquire share a single shard CAS"
+            "GC release and the live acquire share a single leaf CAS"
         );
         // The dead holder's entry was cleared and, being vestigial, pruned; the
         // live acquirer holds B's lock.
@@ -1459,7 +1460,7 @@ mod tests {
     /// A distinct key that shares the collection's single leaf `_r` with `base`
     /// (ADR-031, split deferred), for exercising a GC release and a live acquire
     /// contending one leaf object.
-    fn same_shard_sibling(base: &[u8]) -> Vec<u8> {
+    fn same_leaf_sibling(base: &[u8]) -> Vec<u8> {
         let sib = b"sibling".to_vec();
         assert_ne!(sib, base, "sibling must differ from the base key");
         sib

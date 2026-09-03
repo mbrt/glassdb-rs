@@ -7,7 +7,10 @@ use glassdb_concurr::entropy::fill_bytes;
 /// Offset of the big-endian UnixNano timestamp within the ID.
 const TX_ID_TS_OFF: usize = 8;
 
-/// A transaction identifier. Ported from the Go `data.TxID` (`[]byte`).
+/// A transaction identity.
+///
+/// `TxId` is the short Rust name for `TransactionIdentity`. It preserves the
+/// persisted representation of the Go `data.TxID` (`[]byte`).
 ///
 /// The layout is `[8 bytes random][8 bytes big-endian UnixNano timestamp]`. The
 /// random bytes come first so that transaction-log keys keep a high-entropy
@@ -16,10 +19,10 @@ const TX_ID_TS_OFF: usize = 8;
 /// suffix encodes the transaction priority used by the wound-wait rule: an
 /// earlier timestamp means an older, higher-priority transaction.
 ///
-/// A `TxId` can also hold an arbitrary byte sequence (e.g. when decoded from a
+/// A `TxId` can also hold an arbitrary byte sequence (for example, when decoded from a
 /// storage tag).
 ///
-/// [`Ord`] compares the complete ID bytes for identity-keyed collections and is
+/// [`Ord`] compares the complete identity bytes for identity-keyed collections and is
 /// not wound-wait priority order; use [`TxId::older`] for priority decisions.
 ///
 /// The bytes are stored behind an `Arc` so that cloning an id - which happens
@@ -29,14 +32,14 @@ const TX_ID_TS_OFF: usize = 8;
 pub struct TxId(Arc<[u8]>);
 
 impl TxId {
-    /// Maximum number of protobuf bytes used by an ID minted by GlassDB.
+    /// Maximum number of protobuf bytes used by an identity minted by GlassDB.
     ///
-    /// [`TxId::from_bytes`] deliberately preserves arbitrary persisted IDs, so
+    /// [`TxId::from_bytes`] deliberately preserves arbitrary persisted identities, so
     /// this is a bound on generated and renewed IDs rather than every value the
-    /// compatibility wrapper can hold.
+    /// compatibility representation can hold.
     pub const MAX_GENERATED_ENCODED_LEN: usize = 16;
 
-    /// Generates a new random 128-bit transaction ID.
+    /// Generates a new random 128-bit transaction identity.
     ///
     /// The timestamp suffix is random rather than clock-derived: this keeps the
     /// `data` crate free of any clock dependency. Production code mints IDs via
@@ -48,7 +51,7 @@ impl TxId {
         TxId(b.into())
     }
 
-    /// Builds a transaction ID from a random prefix and an explicit instant,
+    /// Builds a transaction identity from a random prefix and an explicit instant,
     /// whose UnixNano timestamp determines the wound-wait priority. The caller
     /// supplies the instant (typically the monitor's clock), so the `data` crate
     /// never sources time itself. Instants at or before the Unix epoch saturate
@@ -64,7 +67,7 @@ impl TxId {
         TxId(b.into())
     }
 
-    /// Builds a transaction ID from an explicit timestamp and random prefix.
+    /// Builds a transaction identity from an explicit timestamp and random prefix.
     /// Meant for tests that need deterministic priorities. At most the first 8
     /// bytes of `prefix` are used.
     pub fn with_priority(unix_nanos: u64, prefix: &[u8]) -> Self {
@@ -75,7 +78,7 @@ impl TxId {
         TxId(b.into())
     }
 
-    /// Returns a transaction ID that preserves the priority (timestamp) of
+    /// Returns a transaction identity that preserves the priority of
     /// `self` but uses a fresh random prefix. A wounded transaction reuses its
     /// priority on restart to avoid starvation, while the new prefix gives it a
     /// distinct log object that lands in a different storage partition.
@@ -100,23 +103,23 @@ impl TxId {
         self.priority() < other.priority()
     }
 
-    /// Wraps raw bytes as a transaction ID.
+    /// Wraps raw bytes as a transaction identity.
     pub fn from_bytes(b: impl Into<Vec<u8>>) -> Self {
         let v: Vec<u8> = b.into();
         TxId(v.into())
     }
 
-    /// Returns the raw bytes of the ID.
+    /// Returns the raw bytes of the identity.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
-    /// Consumes the ID and returns the owned bytes.
+    /// Consumes the identity and returns the owned bytes.
     pub fn into_bytes(self) -> Vec<u8> {
         self.0.to_vec()
     }
 
-    /// Reports whether the ID is unset.
+    /// Reports whether the identity is unset.
     pub fn is_unset(&self) -> bool {
         self.0.is_empty()
     }
@@ -232,7 +235,10 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..1000 {
             let id = TxId::new_random();
-            assert!(seen.insert(id.into_bytes()), "duplicate TxID generated");
+            assert!(
+                seen.insert(id.into_bytes()),
+                "duplicate transaction identity generated"
+            );
         }
     }
 }

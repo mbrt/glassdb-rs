@@ -3,7 +3,7 @@
 use glassdb_concurr::entropy::fill_bytes;
 
 /// Randomizes `values` using the same deterministic-under-simulation entropy as
-/// transaction IDs and node tokens.
+/// transaction identities and node tokens.
 pub fn shuffle<T>(values: &mut [T]) {
     for upper in (1..values.len()).rev() {
         let mut bytes = [0; 8];

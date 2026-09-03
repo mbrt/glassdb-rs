@@ -70,7 +70,7 @@ fn is_committed_tx_log(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-fn shard_cas(op: &BackendOp<'_>) -> bool {
+fn leaf_cas(op: &BackendOp<'_>) -> bool {
     matches!(op, BackendOp::WriteIf { path, .. }
         if path.contains("/_n/") || path.ends_with("/_r"))
 }
@@ -191,10 +191,10 @@ async fn seed(coll: &Collection, key: &[u8], v: i64) {
     coll.write(key, &write_int(v)).await.unwrap();
 }
 
-/// Lets a committed transaction's background write-back (the spawned shard CAS
+/// Lets a committed transaction's background write-back (the spawned leaf CAS
 /// that publishes `current_writer` and releases locks) settle before a hook is
 /// armed, so the hook fires on the operation under test rather than a lingering
-/// write-back's shard CAS. Deterministic under `start_paused`: the paused clock
+/// write-back's leaf CAS. Deterministic under `start_paused`: the paused clock
 /// auto-advances and the ready write-back task is polled to completion.
 async fn settle_writebacks() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -244,11 +244,11 @@ async fn increment_with(
 /// The logless one-CAS path (ADR-051): a lost ack on the commit CAS is
 /// *resolved to committed* by reading the leaf back — the entry now holds this
 /// transaction's exact inline value, so the write demonstrably landed. The
-/// engine returns success (not in-doubt) and the value is applied exactly once.
+/// engine returns a commit outcome (not in-doubt) and applies the value exactly once.
 /// Unlike v1's logless path, the published state itself is the disambiguating
 /// coordination evidence.
 #[tokio::test(start_paused = true)]
-async fn single_rw_lost_ack_on_shard_cas_resolves_committed() {
+async fn single_rw_lost_ack_on_leaf_cas_resolves_committed() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = HookBackend::new(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
@@ -266,7 +266,7 @@ async fn single_rw_lost_ack_on_shard_cas_resolves_committed() {
 
     // Trap the commit CAS (the first `write_if` on the coordination leaf — the
     // root `/_r` here): let it land, then lose the ack.
-    let _ = arm_after(&backend, lost_ack_after(shard_cas));
+    let _ = arm_after(&backend, lost_ack_after(leaf_cas));
 
     increment(&db, &coll, b"k")
         .await
@@ -293,7 +293,7 @@ async fn locked_single_rw_lost_ack_on_lock_cas_resolves_committed() {
     seed(&coll, b"k", 10).await;
     settle_writebacks().await;
 
-    let _ = arm_after(&backend, lost_ack_after(shard_cas));
+    let _ = arm_after(&backend, lost_ack_after(leaf_cas));
 
     increment_padded(&db, &coll, b"k")
         .await
@@ -338,7 +338,7 @@ async fn single_rw_lost_ack_then_moved_surfaces_in_doubt() {
     let _ = arm_after(
         &backend,
         lost_ack_after_racing(
-            shard_cas,
+            leaf_cas,
             Box::new(move || {
                 Box::pin(async move {
                     other_coll.write(b"k", &write_int(99)).await.unwrap();
@@ -384,7 +384,7 @@ async fn single_rw_in_doubt_not_landed_retries_and_commits() {
     // Trap the commit CAS (the first `write_if` on the leaf `_r`): report it as
     // in-doubt *without* applying it, modelling a write that never landed. The
     // hook is one-shot, so the engine's idempotent re-issue lands.
-    arm_before(&backend, fail_before(shard_cas, || not_applied("write_if")));
+    arm_before(&backend, fail_before(leaf_cas, || not_applied("write_if")));
 
     increment(&db, &coll, b"k")
         .await
@@ -400,11 +400,12 @@ async fn single_rw_in_doubt_not_landed_retries_and_commits() {
 /// the commit point — lands but loses its ack, the engine must recover the
 /// outcome transparently instead of surfacing the uncertainty.
 ///
-/// It recovers by reading the log status back. The log is keyed by tx id and
-/// only this client writes `committed` under it, so a final `committed` status
-/// is necessarily its own landed write and resolves to success. Reading rather
-/// than re-issuing the conditional write keeps the commit point driven exactly
-/// once, so no extra attempt widens the window in which GC could reclaim the
+/// It recovers by reading the log status back. The log is keyed by transaction
+/// identity, and only this client writes `committed` under it. Thus, a final
+/// `committed` status is its own landed write and resolves to a commit outcome.
+/// Reading instead of issuing the conditional write again keeps the commit
+/// point driven exactly once. Thus, no extra attempt widens the window in
+/// which GC could reclaim the
 /// very record the engine needs to read (ADR-057).
 #[tokio::test(start_paused = true)]
 async fn logged_commit_lost_ack_recovers_transparently() {
@@ -483,7 +484,7 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
     // Trap the first leaf lock CAS (a `write_if` on the leaf `_r` — how a
     // lock is installed in v2). Let it land, then lose the ack: the lock is
     // actually applied but the locker observes `Unavailable`.
-    let _ = arm_after(&backend, lost_ack_after(shard_cas));
+    let _ = arm_after(&backend, lost_ack_after(leaf_cas));
 
     // Inline publication is disabled so this fixture takes the locked,
     // log-based path. Capture `coll` by reference so the body stays `FnMut`
@@ -529,7 +530,7 @@ async fn clean_conflict_on_single_rw_still_commits() {
     // and the second attempt (hook consumed) commits.
     arm_before(
         &backend,
-        fail_before(shard_cas, || BackendError::Precondition),
+        fail_before(leaf_cas, || BackendError::Precondition),
     );
 
     increment(&db, &coll, b"k")

@@ -89,13 +89,13 @@ message NodeLock {
     repeated bytes locked_by = 2;
 }
 
-// A shard object: the coordination directory (lock table, MVCC current-writer
-// index, and key directory) for the keys that map to it. See ADR-017.
-message Shard {
-    repeated ShardEntry entries = 1;
+// A leaf body: the point-access coordination entries for one terminal node.
+// See ADR-017.
+message LeafBody {
+    repeated LeafEntry entries = 1;
 }
 
-message ShardEntry {
+message LeafEntry {
     // Raw user key bytes; also the entry's sort key.
     bytes key = 1;
     // Lock currently held on the key.
@@ -133,7 +133,7 @@ message CurrentState {
 // ranges to child nodes). The high-key and right-sibling make tree descent
 // self-correcting across concurrent splits.
 message Node {
-    // Exclusive upper bound of the key range this node owns. Empty means
+    // Exclusive upper bound of the key range this node covers. Empty means
     // +infinity: the rightmost node at its level.
     bytes high_key = 1;
     // Identity token of the right-sibling node at the same level. Empty means
@@ -141,7 +141,7 @@ message Node {
     string right_sibling = 2;
     oneof body {
         // A leaf node: the per-key coordination entries for its range.
-        Shard leaf = 3;
+        LeafBody leaf = 3;
         // An index node: separator keys mapping ranges to child nodes.
         IndexNode index = 4;
     }
@@ -149,15 +149,15 @@ message Node {
     NodeLock membership_lock = 6;
     uint64 membership_version = 7;
     // A transaction preparing collection deletion. Its final status determines
-    // whether this is an ignorable abandoned intent or a durable stale-handle
+    // whether this is an ignorable obsolete intent or a durable stale-handle
     // fence.
     bytes collection_delete_intent = 8;
 }
 
-// A split write-ahead record. It lives at
-// `{db}/_s/<participant_id>/<record_id>` until the created nodes are either
-// reachable or reclaimed.
-message StructuralLog {
+// A structural intent for one split. It lives at
+// `{db}/_s/<participant_id>/<intent_id>` until the created nodes are reachable
+// or reclaimed.
+message StructuralIntent {
     enum Phase {
         PREPARING = 0;
         READY = 1;
@@ -169,13 +169,13 @@ message StructuralLog {
     repeated string created_tokens = 4;
     bytes split_key = 5;
     bool is_root = 6;
-    // The lifecycle-topology participant that owns this record.
+    // The topology participant that owns this intent.
     bytes participant_id = 7;
     Phase phase = 8;
 }
 
-// An index node body: an ordered list of separator entries. The child owning a
-// key is the last entry whose separator_key is <= the key.
+// An index node body: an ordered list of separator entries. Routing selects the
+// last child whose separator_key is <= the key.
 message IndexNode {
     repeated IndexEntry entries = 1;
 }

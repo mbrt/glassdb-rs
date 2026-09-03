@@ -1,9 +1,9 @@
-//! Transaction-local key/value reads, writes, and range-scan state.
+//! Transaction-local point accesses and range-scan state.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use glassdb_data::{CollectionAddress, KeyRef};
+use glassdb_data::{CollectionAddress, LogicalKey};
 use glassdb_trans::{AccessSet, ReadAccess, ReadEvidence, ScanAccess, ScanMutation, WriteAccess};
 
 /// The result of consulting the transaction-local point-read state.
@@ -14,15 +14,15 @@ pub(super) enum OverlayRead {
 
 /// Accumulates key/value accesses for one execution of a transaction body.
 #[derive(Default)]
-pub(super) struct DataOverlay {
-    staged: HashMap<KeyRef, StagedValue>,
-    reads: HashMap<KeyRef, ReadState>,
+pub(super) struct AccessOverlay {
+    staged: HashMap<LogicalKey, StagedValue>,
+    reads: HashMap<LogicalKey, ReadState>,
     scans: Vec<ScanAccess>,
 }
 
-impl DataOverlay {
+impl AccessOverlay {
     /// Returns the transaction-local result for a point read, when known.
-    pub(super) fn read(&self, key: &KeyRef) -> OverlayRead {
+    pub(super) fn read(&self, key: &LogicalKey) -> OverlayRead {
         if let Some(staged) = self.staged.get(key) {
             return OverlayRead::Known(staged.read());
         }
@@ -35,7 +35,7 @@ impl DataOverlay {
     /// Records an absent point read and its validation evidence.
     pub(super) fn record_not_found(
         &mut self,
-        key: KeyRef,
+        key: LogicalKey,
         cache_hit: bool,
         evidence: ReadEvidence,
     ) {
@@ -51,7 +51,7 @@ impl DataOverlay {
     /// Records a present point read and its validation evidence.
     pub(super) fn record_found(
         &mut self,
-        key: KeyRef,
+        key: LogicalKey,
         value: Arc<[u8]>,
         cache_hit: bool,
         evidence: ReadEvidence,
@@ -96,12 +96,12 @@ impl DataOverlay {
     }
 
     /// Stages a value replacement for commit.
-    pub(super) fn write(&mut self, key: KeyRef, value: Arc<[u8]>) {
+    pub(super) fn write(&mut self, key: LogicalKey, value: Arc<[u8]>) {
         self.staged.insert(key, StagedValue::Put(value));
     }
 
     /// Stages a key deletion for commit.
-    pub(super) fn delete(&mut self, key: KeyRef) {
+    pub(super) fn delete(&mut self, key: LogicalKey) {
         self.staged.insert(key, StagedValue::Delete);
     }
 
@@ -144,7 +144,7 @@ impl DataOverlay {
         self.reads.values().filter(|read| read.cache_hit()).count() as u64
     }
 
-    fn record_read(&mut self, key: KeyRef, mut state: ReadState) {
+    fn record_read(&mut self, key: LogicalKey, mut state: ReadState) {
         // Concurrent reads can both miss local state. Preserve a cache hit
         // observed by either result while still counting the key only once.
         if self.reads.get(&key).is_some_and(ReadState::cache_hit) {

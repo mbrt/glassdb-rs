@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use glassdb_data::{KeyRef, TxId};
+use glassdb_data::{LogicalKey, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
-use glassdb_storage::{CurrentState, LockType, Node, Requirement, ShardEntry, StorageError};
+use glassdb_storage::{CurrentState, LeafEntry, LockType, Node, Requirement, StorageError};
 
 use crate::error::{TransError, trans_to_storage};
 use crate::monitor::{KeyCommitStatus, Monitor, TxFinalStatus};
@@ -40,7 +40,7 @@ impl ResolvedValue {
     }
 }
 
-/// The effective writer resolved from one loaded shard entry.
+/// The effective writer resolved from one loaded leaf entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WriterResolution {
     pub(crate) writer: Option<TxId>,
@@ -62,7 +62,7 @@ pub(crate) struct HolderResolution {
 impl HolderResolution {
     /// Returns the current state that should remain after applying this
     /// resolution to `entry`.
-    pub(crate) fn resolved_current(&self, entry: Option<&ShardEntry>) -> CurrentState {
+    pub(crate) fn resolved_current(&self, entry: Option<&LeafEntry>) -> CurrentState {
         let Some(writer) = self.writer.clone() else {
             return CurrentState::Absent;
         };
@@ -79,7 +79,7 @@ impl HolderResolution {
     }
 }
 
-/// The effective committed state resolved from one loaded shard entry.
+/// The effective committed state resolved from one loaded leaf entry.
 #[derive(Debug, Clone)]
 pub(crate) struct EffectiveResolution {
     writer: Option<TxId>,
@@ -135,7 +135,7 @@ impl EffectiveResolution {
 }
 
 /// Resolves transaction-dependent state already present in loaded B-link
-/// nodes and shard entries.
+/// nodes and leaf entries.
 #[derive(Clone)]
 pub(crate) struct KeyStateResolver {
     monitor: Monitor,
@@ -150,7 +150,7 @@ impl KeyStateResolver {
     /// Returns the committed value recorded by `writer` for `key`.
     pub(crate) async fn committed_value(
         &self,
-        key: &KeyRef,
+        key: &LogicalKey,
         writer: &TxId,
     ) -> Result<KeyCommitStatus, TransError> {
         self.monitor.committed_value(key, writer).await
@@ -204,8 +204,8 @@ impl KeyStateResolver {
     /// status observation per holder.
     pub(crate) async fn resolve_holders(
         &self,
-        key: &KeyRef,
-        entry: Option<&ShardEntry>,
+        key: &LogicalKey,
+        entry: Option<&LeafEntry>,
         own_lock_holder: Option<&TxId>,
         requirement: Requirement,
     ) -> Result<HolderResolution, TransError> {
@@ -231,8 +231,8 @@ impl KeyStateResolver {
     /// Resolves the effective committed state represented by one loaded entry.
     pub(crate) async fn resolve_effective(
         &self,
-        key: &KeyRef,
-        entry: Option<&ShardEntry>,
+        key: &LogicalKey,
+        entry: Option<&LeafEntry>,
         own_lock_holder: Option<&TxId>,
         requirement: Requirement,
     ) -> Result<EffectiveResolution, TransError> {
@@ -245,7 +245,7 @@ impl KeyStateResolver {
         }
         if entry.lock_holders().len() > 1 {
             return Err(TransError::other(
-                "exclusive shard entry has more than one holder",
+                "exclusive leaf entry has more than one holder",
             ));
         }
         let Some(holder) = entry.lock_holders().first() else {
@@ -341,7 +341,7 @@ mod tests {
 
         async fn seed_transaction(
             &self,
-            key: &KeyRef,
+            key: &LogicalKey,
             holder: &TxId,
             typ: LockType,
             status: TxCommitStatus,
@@ -514,7 +514,7 @@ mod tests {
         current: CurrentState,
         typ: LockType,
         holders: Vec<TxId>,
-    ) -> ShardEntry {
+    ) -> LeafEntry {
         let mut holders = holders.into_iter();
         let first = holders.next().expect("a held lock needs a holder");
         let mut lock = match typ {
@@ -527,15 +527,15 @@ mod tests {
             assert_eq!(typ, LockType::Read, "only read locks may be shared");
             lock.acquire_read(holder);
         }
-        let mut entry = ShardEntry::new(key).with_current(current);
+        let mut entry = LeafEntry::new(key).with_current(current);
         entry.replace_lock(lock);
         entry
     }
 
     async fn assert_projections(
         harness: &ResolutionHarness,
-        key: &KeyRef,
-        entry: &ShardEntry,
+        key: &LogicalKey,
+        entry: &LeafEntry,
         expected: &ProjectionExpectation,
         context: &str,
     ) {
@@ -600,7 +600,7 @@ mod tests {
         typ: LockType,
     ) {
         let harness = ResolutionHarness::new();
-        let key = KeyRef::new(CollectionAddress::root("db"), b"key");
+        let key = LogicalKey::new(CollectionAddress::root("db"), b"key");
         let predecessor = TxId::with_priority(1, b"previous");
         let holder = TxId::with_priority(2, b"holder");
         let current = current_case.current(&predecessor);
@@ -692,7 +692,7 @@ mod tests {
     async fn shared_reader_resolution_matrix() {
         for current_case in CurrentCase::ALL {
             let harness = ResolutionHarness::new();
-            let key = KeyRef::new(CollectionAddress::root("db"), b"key");
+            let key = LogicalKey::new(CollectionAddress::root("db"), b"key");
             let predecessor = TxId::with_priority(1, b"previous");
             let pending = TxId::with_priority(2, b"pending");
             let committed = TxId::with_priority(3, b"committed");
@@ -747,7 +747,7 @@ mod tests {
     async fn own_holder_is_excluded_from_resolution() {
         for lock_type in [LockType::Write, LockType::Read] {
             let harness = ResolutionHarness::new();
-            let key = KeyRef::new(CollectionAddress::root("db"), b"key");
+            let key = LogicalKey::new(CollectionAddress::root("db"), b"key");
             let predecessor = TxId::with_priority(1, b"previous");
             let holder = TxId::with_priority(2, b"holder");
             harness
@@ -810,7 +810,7 @@ mod tests {
     #[tokio::test]
     async fn holder_resolution_is_coherent_across_commit() {
         let (monitor, _background) = new_monitor();
-        let key = KeyRef::new(CollectionAddress::root("db"), b"key");
+        let key = LogicalKey::new(CollectionAddress::root("db"), b"key");
         let predecessor = TxId::with_priority(1, b"predecessor");
         let holder = TxId::with_priority(2, b"holder");
 

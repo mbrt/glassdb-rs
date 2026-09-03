@@ -114,7 +114,7 @@ impl RmwAcct {
 }
 
 /// Attempts a single op in its own transaction, updating `acct`: `started` is
-/// bumped before the attempt, `acked` only on success. A failure leaves the op
+/// bumped before the attempt, `acked` only after a commit outcome. A failure leaves the op
 /// counted in `started` but not `acked` (i.e. in-doubt).
 async fn run_one(
     db: &Database,
