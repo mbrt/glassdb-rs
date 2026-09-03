@@ -15,7 +15,7 @@ on:
         default: 30
 
 permissions:
-  contents: write           # push corpus commit to main
+  contents: read
 
 concurrency:
   group: fuzz
@@ -26,12 +26,14 @@ env:
 
 jobs:
   fuzz:
+    environment: fuzz-corpus-writer
     runs-on: ubuntu-latest
     steps:
 
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0      # need full history to compare Rust vs corpus commits
+        persist-credentials: false
 
     - name: Decide whether fuzzing is needed
       id: changes
@@ -108,8 +110,19 @@ jobs:
         if-no-files-found: ignore
         retention-days: 30
 
+    - name: Create corpus push token
+      if: steps.changes.outputs.run == 'true'
+      id: push-token
+      uses: actions/create-github-app-token@v3
+      with:
+        client-id: ${{ vars.FUZZ_APP_CLIENT_ID }}
+        private-key: ${{ secrets.FUZZ_APP_PRIVATE_KEY }}
+        permission-contents: write
+
     - name: Commit and push corpus updates
       if: steps.changes.outputs.run == 'true'
+      env:
+        GH_TOKEN: ${{ steps.push-token.outputs.token }}
       run: |
         git config user.name  "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -119,4 +132,5 @@ jobs:
           exit 0
         fi
         git commit -m "ci(fuzz): update minimized corpus"
-        git push
+        gh auth setup-git
+        git push origin HEAD:main
