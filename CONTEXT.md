@@ -87,8 +87,16 @@ _Avoid_: Fresh leaf, leaf version, freshness observation
 One leaf observation and the ordered logical keys associated with it by one routing operation. The group records that routing result; it is not a durable ownership claim.
 _Avoid_: Leaf group, owning leaf group, point-leaf plan
 
+**Separator**:
+A logical key in a parent index that bounds one child's range: keys at or above it route to that child. A child split publishes a new separator into its parent.
+_Avoid_: Index key, boundary key
+
 ## Topology changes
 
 **Structural intent**:
 A durable claim for one planned topology change, owned by a topology participant until the change is completed or recovered.
 _Avoid_: Structural log, structural record
+
+**Structural gate**:
+An exclusive, durably recorded claim on one node that admits changes to the node's shape. One transaction identity holds it at a time, and a release or a recovery fence must remove it before another shape change starts.
+_Avoid_: Structure lock, structure-write lock

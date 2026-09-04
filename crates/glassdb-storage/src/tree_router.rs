@@ -25,6 +25,13 @@ use crate::error::StorageError;
 use crate::node::{Node, NodeBody};
 use crate::node_store::{LeafObservation, NodeStore};
 
+/// Bounds a self-correcting right-link walk, which steps right only to pass
+/// splits that moved a key after the descent read its parent, so it is expected
+/// to be a few hops. A longer chain means a cycle or corrupt right-links.
+/// Ordered scans follow the same links unbounded, because their length is the
+/// collection's width rather than a sign of corruption.
+const MAX_SELF_CORRECTING_HOPS: usize = 4096;
+
 /// A routing result for a key or range endpoint.
 ///
 /// The result retains the observed physical path and leaf observation. It does
@@ -407,9 +414,12 @@ impl<'a> DescentCursor<'a> {
 
     /// Moves right until the current node covers `key`.
     async fn normalize_at(&mut self, key: &[u8]) -> Result<(), StorageError> {
-        while !self.current.node().covers(key) {
+        for _ in 0..MAX_SELF_CORRECTING_HOPS {
+            if self.current.node().covers(key) {
+                return Ok(());
+            }
             let Some(token) = self.current.node().right_sibling() else {
-                break;
+                return Ok(());
             };
             let token = node_token(token)?;
             let cache_hit = self.current.cache_hit;
@@ -419,7 +429,9 @@ impl<'a> DescentCursor<'a> {
                 .await?
                 .after(cache_hit);
         }
-        Ok(())
+        Err(StorageError::other(
+            "routing exceeded the right-link hop bound",
+        ))
     }
 
     /// Advances one index level and returns the normalized index it left.
@@ -857,6 +869,23 @@ impl TreeRouter {
         cursor.run_until(key, FindParent { parent: None }).await
     }
 
+    /// Returns the observed node named `token`, without descending to it.
+    ///
+    /// Routing by key self-corrects rightward past a node a split has moved, so
+    /// a caller holding a child token from an index reads that exact child here.
+    pub async fn leaf_at(
+        &self,
+        collection: &CollectionAddress,
+        token: &NodeToken,
+        requirement: Requirement,
+    ) -> Result<RoutedLeaf, StorageError> {
+        let located = self.load_child(collection, token, requirement).await?;
+        if located.observation.is_absent() {
+            return Err(StorageError::NotFound);
+        }
+        Ok(located.into_locator())
+    }
+
     async fn start_descent<'a>(
         &'a self,
         collection: &'a CollectionAddress,
@@ -1120,6 +1149,22 @@ mod tests {
         s.create_root(
             &collection(),
             &Node::index(IndexNode::from_children([(Vec::new(), first.to_string())])),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Corrupt right-links: L0 and L1 point at each other and share a high-key,
+    // so neither ever covers a key above it and a walk never terminates.
+    async fn seed_right_link_cycle(s: &NodeStore) {
+        store_leaf(s, 0, &[b"apple"], Some(b"m"), Some(1)).await;
+        store_leaf(s, 1, &[b"cat"], Some(b"m"), Some(0)).await;
+        s.create_root(
+            &collection(),
+            &Node::index(IndexNode::from_children([(
+                Vec::new(),
+                token(0).to_string(),
+            )])),
         )
         .await
         .unwrap();
@@ -1943,5 +1988,54 @@ mod tests {
             )
             .await;
         assert!(matches!(child_error, Err(StorageError::StaleCollection)));
+    }
+
+    #[tokio::test]
+    async fn leaf_at_reads_the_named_child_without_self_correcting() {
+        let s = store();
+        seed_stale_leaf_parent(&s).await;
+        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let requirement = Requirement::AtLeast(s.timeline.now());
+
+        // Routing steps right off L0, which no longer covers "pear".
+        let routed = router
+            .route_key(&collection(), b"pear", requirement)
+            .await
+            .unwrap();
+        assert_eq!(routed.path, node_path(1));
+
+        let named = router
+            .leaf_at(&collection(), &token(0), requirement)
+            .await
+            .unwrap();
+        assert_eq!(named.path, node_path(0));
+        assert!(
+            !named.node().unwrap().covers(b"pear"),
+            "naming a child must not follow its right-link"
+        );
+        assert!(matches!(
+            router.leaf_at(&collection(), &token(9), requirement).await,
+            Err(StorageError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_right_link_cycle_fails_routing_instead_of_walking_forever() {
+        let s = store();
+        seed_right_link_cycle(&s).await;
+        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+
+        let routing = router
+            .route_key(
+                &collection(),
+                b"zebra",
+                Requirement::AtLeast(s.timeline.now()),
+            )
+            .await
+            .expect_err("a cycle must not route");
+        assert!(
+            routing.to_string().contains("right-link hop bound"),
+            "unexpected routing error: {routing}"
+        );
     }
 }
