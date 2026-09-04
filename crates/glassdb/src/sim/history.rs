@@ -1155,7 +1155,7 @@ impl SimWorkload for HistoryWorkload {
     fn open_db(
         backend: &Arc<dyn Backend>,
         media: Option<SimMedia>,
-    ) -> impl Future<Output = Result<Database, Error>> + Send {
+    ) -> impl Future<Output = Result<Database, Error>> {
         // Three preseeded keys exceed the two-entry leaf cap. The same public
         // histories therefore cross a B-link split without exposing topology
         // to the oracle.
@@ -1226,7 +1226,7 @@ impl SimWorkload for HistoryWorkload {
 }
 
 #[cfg(test)]
-mod tests {
+mod sim_tests {
     use super::*;
 
     fn state(entries: &[(u8, u8)]) -> AbstractState {

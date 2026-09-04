@@ -11,9 +11,8 @@
 //! deterministic executor with the `sim` harness feature:
 //!
 //! ```bash
-//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo test --profile sim-test -p glassdb --features sim
+//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo test --profile sim-test -p glassdb --features sim --test sim
 //! ```
-#![cfg(all(sim, feature = "sim"))]
 
 use std::path::{Path, PathBuf};
 

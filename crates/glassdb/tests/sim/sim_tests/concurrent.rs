@@ -5,7 +5,7 @@
 //! harness feature:
 //!
 //! ```bash
-//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo test -p glassdb --features sim
+//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo test -p glassdb --features sim --test sim
 //! ```
 //!
 //! The central guarantee is that, for a fixed workload, schedule tape, and seed,
@@ -13,11 +13,7 @@
 //! on every run. Two interleavings can reach the same final state while issuing
 //! different operations, so an identical op stream — not just a matching final
 //! result — is what proves the schedule itself replayed deterministically.
-#![cfg(all(sim, feature = "sim"))]
-
-mod sim_support;
-
-use sim_support::{
+use crate::sim_support::{
     assert_no_divergence, assert_slow_mutation_modes, fault_tape, record_faults_with_tape, tape,
 };
 

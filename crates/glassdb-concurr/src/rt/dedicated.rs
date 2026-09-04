@@ -89,7 +89,12 @@ where
     }
 }
 
-fn spawn_native<N, F>(name: N, future: F) -> Result<DedicatedJoinHandle<F::Output>, SpawnError>
+/// Drives `future` on one newly created, named operating-system thread.
+#[cfg(not(sim))]
+pub fn spawn_dedicated<N, F>(
+    name: N,
+    future: F,
+) -> Result<DedicatedJoinHandle<F::Output>, SpawnError>
 where
     N: Into<String>,
     F: Future + Send + 'static,
@@ -110,37 +115,20 @@ where
     Ok(DedicatedJoinHandle { result, abort })
 }
 
-/// Drives `future` on one newly created, named operating-system thread.
-#[cfg(not(sim))]
-pub fn spawn_dedicated<N, F>(
-    name: N,
-    future: F,
-) -> Result<DedicatedJoinHandle<F::Output>, SpawnError>
-where
-    N: Into<String>,
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    spawn_native(name, future)
-}
-
-/// Drives `future` as an ordinary deterministic task when simulation is
-/// active, or on one named operating-system thread otherwise.
+/// Drives `future` as an ordinary task on the active deterministic executor.
+///
+/// Panics if no deterministic executor is active.
 #[cfg(sim)]
 pub fn spawn_dedicated<N, F>(
-    name: N,
+    _name: N,
     future: F,
 ) -> Result<DedicatedJoinHandle<F::Output>, SpawnError>
 where
     N: Into<String>,
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
+    F: Future + 'static,
+    F::Output: 'static,
 {
-    if crate::exec::executor::in_sim() {
-        let abort = CancellationToken::new();
-        let result = crate::exec::executor::det_spawn(drive(future, abort.clone()));
-        Ok(DedicatedJoinHandle { result, abort })
-    } else {
-        spawn_native(name, future)
-    }
+    let abort = CancellationToken::new();
+    let result = crate::exec::executor::det_spawn(drive(future, abort.clone()));
+    Ok(DedicatedJoinHandle { result, abort })
 }

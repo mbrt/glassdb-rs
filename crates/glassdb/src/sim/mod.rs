@@ -1,3 +1,5 @@
+#![cfg(sim)]
+
 //! Deterministic-simulation workloads and execution harness.
 //!
 //! The shared [`SimWorkload`] harness runs concurrent clients over a deterministic

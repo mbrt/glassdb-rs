@@ -95,7 +95,7 @@ fn assert_reachable(actual: &[ApiModel], account: &ApiAcct) {
 }
 
 #[cfg(test)]
-mod tests {
+mod sim_tests {
     use super::*;
 
     #[test]

@@ -25,8 +25,6 @@
 //! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run membership <crash-file>
 //! ```
 #![no_main]
-#![recursion_limit = "256"]
-
 use libfuzzer_sys::fuzz_target;
 
 // The decode-and-run logic lives in the generic `glassdb::sim::replay_input` so

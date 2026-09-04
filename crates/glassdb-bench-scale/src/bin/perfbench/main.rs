@@ -1,5 +1,3 @@
-#![recursion_limit = "256"]
-
 //! Database-level GlassDB performance scenarios.
 
 mod backend;

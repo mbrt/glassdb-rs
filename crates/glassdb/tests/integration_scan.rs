@@ -7,7 +7,6 @@ use glassdb::{Backend, CollectionPath, Database, Error, InlinePolicy};
 use glassdb_storage::Node;
 use tokio::sync::Barrier;
 
-#[path = "integration_support/mod.rs"]
 pub mod integration_support;
 
 use integration_support::{

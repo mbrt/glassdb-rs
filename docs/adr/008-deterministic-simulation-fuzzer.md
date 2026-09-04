@@ -12,6 +12,10 @@ The deterministic-time builder and `Clock` details are superseded by
 [ADR-058](058-process-wide-model-time.md); deterministic wall time now belongs
 to the runtime seam.
 
+The whole-engine-suite simulation test gate is superseded by
+[ADR-069](069-deterministic-only-simulation-builds.md), which selects only tests
+that start the deterministic executor.
+
 ## Context
 
 GlassDB's correctness rests on a serializable concurrency-control protocol.

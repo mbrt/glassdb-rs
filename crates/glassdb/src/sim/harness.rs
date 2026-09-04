@@ -239,15 +239,15 @@ fn spawn_nemeses(
 /// drive. Implementors supply only what varies between workloads; the backbone,
 /// per-client transports, crash-and-restart client tasks, and fault nemeses are
 /// all provided by the harness.
-pub trait SimWorkload: Clone + Default + Send + Sync + 'static {
+pub trait SimWorkload: Clone + Default + 'static {
     /// A single client operation, run in its own transaction.
-    type Op: Clone + Send + Sync + 'static;
+    type Op: Clone + 'static;
     /// Shared oracle state, updated as ops run and checked in [`verify`]. Carries
     /// its own interior mutability (e.g. a `Mutex`); use `()` when no state is
     /// needed.
     ///
     /// [`verify`]: SimWorkload::verify
-    type State: Send + Sync + 'static;
+    type State: 'static;
 
     /// This run's per-client op sequences. Clients run concurrently.
     fn clients(&self) -> &[Vec<Self::Op>];
@@ -265,7 +265,7 @@ pub trait SimWorkload: Clone + Default + Send + Sync + 'static {
     fn open_db(
         backend: &Arc<dyn Backend>,
         media: Option<SimMedia>,
-    ) -> impl Future<Output = Result<Database, Error>> + Send {
+    ) -> impl Future<Output = Result<Database, Error>> {
         open_det_db(
             backend,
             SplitPolicy::default(),
@@ -276,7 +276,7 @@ pub trait SimWorkload: Clone + Default + Send + Sync + 'static {
 
     /// Creates and seeds this workload's collection(s) before the clients start,
     /// over the faultless backbone (so setup cannot fail spuriously).
-    fn seed(&self, db: &Database) -> impl Future<Output = ()> + Send;
+    fn seed(&self, db: &Database) -> impl Future<Output = ()>;
 
     /// Runs one op in its own transaction, updating `state`. Returns the op's
     /// result so the client loop can stop (and leave it in-doubt) on failure.
@@ -284,7 +284,7 @@ pub trait SimWorkload: Clone + Default + Send + Sync + 'static {
         db: &Database,
         op: &Self::Op,
         state: &Self::State,
-    ) -> impl Future<Output = Result<(), Error>> + Send;
+    ) -> impl Future<Output = Result<(), Error>>;
 
     /// Reads the final committed state and asserts the workload invariant.
     /// Panics on any violation. `failures_enabled` selects the exact vs. relaxed
@@ -294,7 +294,7 @@ pub trait SimWorkload: Clone + Default + Send + Sync + 'static {
         db: &Database,
         state: &Self::State,
         failures_enabled: bool,
-    ) -> impl Future<Output = ()> + Send;
+    ) -> impl Future<Output = ()>;
 
     /// An optional concurrent read-only observer spawned alongside the clients
     /// (e.g. the Cycle ring snapshotter). Spawned in a fixed order — after the
@@ -555,7 +555,7 @@ pub async fn run_and_record_with_faults<W: SimWorkload>(
 }
 
 #[cfg(test)]
-mod tests {
+mod sim_tests {
     use super::*;
 
     #[test]
@@ -618,12 +618,14 @@ mod tests {
         async fn verify(&self, _db: &Database, _state: &Self::State, _failures_enabled: bool) {}
     }
 
-    #[tokio::test]
+    #[test]
     #[should_panic(expected = "client task failed")]
-    async fn client_task_panics_reach_the_harness() {
-        run_and_assert(PanickingWorkload {
-            clients: vec![vec![()]],
-        })
-        .await;
+    fn client_task_panics_reach_the_harness() {
+        glassdb_concurr::exec::block_on(async {
+            run_and_assert(PanickingWorkload {
+                clients: vec![vec![()]],
+            })
+            .await;
+        });
     }
 }

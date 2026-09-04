@@ -165,7 +165,7 @@ impl Scheduler for LowestFirst {
 }
 
 #[cfg(test)]
-mod tests {
+mod sim_tests {
     use super::*;
 
     #[test]

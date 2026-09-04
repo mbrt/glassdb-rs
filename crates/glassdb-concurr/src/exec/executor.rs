@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use crate::rng::Rng;
 
-use super::scheduler::{Scheduler, TaskId};
+use super::scheduler::{Scheduler, TapeScheduler, TaskId};
 
 /// Maximum number of scheduler steps (task polls plus virtual-time advances) a
 /// single [`block_on_with`] run may take before it is declared non-terminating
@@ -66,7 +66,7 @@ impl Ord for TimerEntry {
 }
 
 struct Task {
-    future: Pin<Box<dyn Future<Output = ()> + Send>>,
+    future: Pin<Box<dyn Future<Output = ()>>>,
 }
 
 struct Inner {
@@ -141,7 +141,7 @@ impl Handle {
         self.inner.borrow().now
     }
 
-    fn spawn_raw(&self, fut: Pin<Box<dyn Future<Output = ()> + Send>>) -> TaskId {
+    fn spawn_raw(&self, fut: Pin<Box<dyn Future<Output = ()>>>) -> TaskId {
         let mut inner = self.inner.borrow_mut();
         let id = TaskId(inner.next_task);
         inner.next_task += 1;
@@ -185,8 +185,8 @@ impl Drop for CurrentGuard {
 /// Spawns `f` onto the running executor, returning a receiver for its result.
 pub(crate) fn det_spawn<F>(f: F) -> tokio::sync::oneshot::Receiver<F::Output>
 where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
+    F: Future + 'static,
+    F::Output: 'static,
 {
     let h = current().expect("rt::spawn called outside the simulation executor");
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -264,6 +264,15 @@ impl Future for DetYield {
     }
 }
 
+/// Runs `root` to completion with an empty schedule tape and entropy seed zero.
+pub fn block_on<F, T>(root: F) -> T
+where
+    F: Future<Output = T> + 'static,
+    T: 'static,
+{
+    block_on_with(TapeScheduler::new(Vec::new()), 0, root)
+}
+
 /// Runs `root` to completion on a fresh deterministic executor driven by
 /// `scheduler`, returning its output. Background tasks still pending when `root`
 /// completes are dropped (matching `tokio`'s `block_on`).
@@ -280,8 +289,8 @@ impl Future for DetYield {
 pub fn block_on_with<S, F, T>(scheduler: S, entropy_seed: u64, root: F) -> T
 where
     S: Scheduler + 'static,
-    F: Future<Output = T> + Send + 'static,
-    T: Send + 'static,
+    F: Future<Output = T> + 'static,
+    T: 'static,
 {
     block_on_with_budget(scheduler, entropy_seed, DEFAULT_STEP_BUDGET, root)
 }
@@ -293,8 +302,8 @@ where
 fn block_on_with_budget<S, F, T>(mut scheduler: S, entropy_seed: u64, budget: u64, root: F) -> T
 where
     S: Scheduler + 'static,
-    F: Future<Output = T> + Send + 'static,
-    T: Send + 'static,
+    F: Future<Output = T> + 'static,
+    T: 'static,
 {
     // Seed tokio's `select!` branch-poll RNG from `entropy_seed` so that even a
     // non-`biased` `select!` (ours or one inside a dependency) replays
@@ -334,11 +343,11 @@ where
     let prev = CURRENT.with(|c| c.borrow_mut().replace(handle.clone()));
     let _guard = CurrentGuard(prev);
 
-    let out: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+    let out = Rc::new(RefCell::new(None));
     let o2 = out.clone();
     handle.spawn_raw(Box::pin(async move {
         let v = root.await;
-        *o2.lock().unwrap() = Some(v);
+        *o2.borrow_mut() = Some(v);
     }));
     drain_spawn_notifications(&handle, &mut scheduler);
 
@@ -354,11 +363,7 @@ where
         },
     )));
 
-    let result = out
-        .lock()
-        .unwrap()
-        .take()
-        .expect("root task did not complete");
+    let result = out.borrow_mut().take().expect("root task did not complete");
 
     // Drop background tasks BEFORE the `CurrentGuard` clears `CURRENT`. Some
     // futures invoke `rt::spawn` from their `Drop` (e.g. `Dedup::DriverGuard`
@@ -384,7 +389,7 @@ where
 
 fn run_loop<T>(
     handle: &Handle,
-    out: &Arc<Mutex<Option<T>>>,
+    out: &Rc<RefCell<Option<T>>>,
     scheduler: &mut dyn Scheduler,
     budget: u64,
 ) {
@@ -414,7 +419,7 @@ fn run_loop<T>(
 
         drain_spawn_notifications(handle, scheduler);
 
-        if out.lock().unwrap().is_some() {
+        if out.borrow().is_some() {
             return;
         }
 
@@ -487,7 +492,7 @@ fn run_loop<T>(
                 }
             }
             None => {
-                if out.lock().unwrap().is_some() {
+                if out.borrow().is_some() {
                     return;
                 }
                 panic!(
@@ -500,7 +505,7 @@ fn run_loop<T>(
 }
 
 #[cfg(test)]
-mod tests {
+mod sim_tests {
     use super::super::scheduler::LowestFirst;
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};

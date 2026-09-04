@@ -1,5 +1,3 @@
-#![cfg_attr(sim, recursion_limit = "256")]
-
 //! GlassDB: a stateless ACID key/value store on top of object storage.
 //!
 //! Public API: [`Database`] opens a database over a
@@ -28,7 +26,7 @@ pub mod diagnostics;
 mod error;
 mod iter;
 mod scan;
-#[cfg(feature = "sim")]
+#[cfg(all(feature = "sim", sim))]
 pub mod sim;
 mod stats;
 mod tx;

@@ -7,8 +7,6 @@
 //! normalized bounded membership scans; long-lived snapshot reads are
 //! intentionally not generated.
 #![no_main]
-#![recursion_limit = "256"]
-
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| glassdb::sim::replay_input::<glassdb::sim::HistoryWorkload>(data));
