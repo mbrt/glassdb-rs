@@ -1491,7 +1491,7 @@ mod tests {
                     ) && gate.armed.load(SeqCst)
                         && gate
                             .skip
-                            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                            .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
                             .is_err();
                     if wait {
                         gate.armed.store(false, SeqCst);

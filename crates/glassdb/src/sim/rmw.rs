@@ -227,7 +227,7 @@ impl SimWorkload for RmwWorkload {
     fn open_db(
         backend: &std::sync::Arc<dyn glassdb_backend::Backend>,
         media: Option<SimMedia>,
-    ) -> impl Future<Output = Result<Database, Error>> + Send {
+    ) -> impl Future<Output = Result<Database, Error>> {
         // Two distinct direct increments fill a leaf, so the existing
         // contention/fault schedules also cover pressure-driven structural
         // work without adding a second lifecycle oracle or workload.
@@ -290,38 +290,40 @@ impl SimWorkload for RmwWorkload {
 }
 
 #[cfg(test)]
-mod tests {
+mod sim_tests {
     use std::sync::Arc;
 
     use super::*;
     use glassdb_backend::{Backend, memory::MemoryBackend};
 
-    #[tokio::test]
-    async fn missing_preseeded_key_is_not_treated_as_zero() {
-        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let db = open_det_db(
-            &backend,
-            SplitPolicy::default(),
-            InlinePolicy::default(),
-            None,
-        )
-        .await
-        .unwrap();
-        let collection = db
-            .root_collection()
-            .create_collection_if_absent(INCREMENT_COLLECTION)
+    #[test]
+    fn missing_preseeded_key_is_not_treated_as_zero() {
+        glassdb_concurr::exec::block_on(async {
+            let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+            let db = open_det_db(
+                &backend,
+                SplitPolicy::default(),
+                InlinePolicy::default(),
+                None,
+            )
             .await
             .unwrap();
-        let collection = &collection;
+            let collection = db
+                .root_collection()
+                .create_collection_if_absent(INCREMENT_COLLECTION)
+                .await
+                .unwrap();
+            let collection = &collection;
 
-        let result = db
-            .tx(|tx| async move {
-                read_int_from_tx(&tx, collection, b"missing")
-                    .await
-                    .map(|_| ())
-            })
-            .await;
-        assert!(matches!(result, Err(Error::NotFound)));
-        db.shutdown().await;
+            let result = db
+                .tx(|tx| async move {
+                    read_int_from_tx(&tx, collection, b"missing")
+                        .await
+                        .map(|_| ())
+                })
+                .await;
+            assert!(matches!(result, Err(Error::NotFound)));
+            db.shutdown().await;
+        });
     }
 }

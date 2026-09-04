@@ -40,6 +40,21 @@ This costs ownership of a small executor, media model, and `--cfg sim` seam.
 | Fuzz-guided edge-case exploration     | **Strong** — schedule/backend/media tapes + PCT depth bound                            | **Weak** — own seeded scheduler, not byte-guidable                     | **Weak** — own seeded scheduler and event sampling                         | **Weak** — same as turmoil                                                  |
 | Efficient                             | **Strong** — single thread, narrow in-memory models, virtual time                      | **Partial** — full runtime + simulated net + RPC                       | **Partial** — per-host runtimes and general network/filesystem models      | **Partial** — turmoil overhead + cheap overrides                            |
 
+## Tests structure
+
+Driven by `make test-sim`. The target selects the `sim` integration test target
+in each participating crate and applies the `sim_test` substring filter to test
+names. This filter prevents ordinary unit tests from running under `--cfg sim`
+while the simulation lint still compiles their simulation branches.
+
+It's therefore required to place deterministic tests in a module named
+`sim_tests` (or using `tests/sim/main.rs`), and strart the source root with
+`#![cfg(sim)]`.
+
+Simulation tests ouside such a module compile but do not run through `make test`
+sim. The normal test suite enforces these rules with
+[`simulation_test_policy.rs`](../../crates/glassdb/tests/simulation_test_policy.rs).
+
 ## The four approaches in one paragraph each
 
 - **Current — in-repo `DetExecutor` (ADR-011).** A single-threaded executor with
@@ -151,7 +166,9 @@ authority. Those facts drive the comparison:
   services, while entropy callers use the separate entropy facade. The runtime
   seam is enforced by a test. Tests run the _real_ engine suite under
   `--cfg sim`; library users see nothing. Faults are ordinary `Backend`
-  middleware. _Cons:_ these seams are a standing discipline, and the sim build
+  middleware. Focused simulation tests run the real engine inside the
+  deterministic executor, while a separate lint pass compiles all simulation
+  branches. _Cons:_ these seams are a standing discipline, and the sim build
   needs `--cfg sim --cfg tokio_unstable`.
 
 - **madsim — Partial.** Requires `--cfg madsim`, the workspace-wide tokio alias,

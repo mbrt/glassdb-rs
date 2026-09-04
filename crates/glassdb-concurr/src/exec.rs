@@ -1,3 +1,5 @@
+#![cfg(sim)]
+
 //! Deterministic simulation execution.
 //!
 //! This module is the control plane used to start a simulation with a chosen
@@ -7,11 +9,11 @@
 pub(crate) mod executor;
 mod scheduler;
 
-pub use executor::block_on_with;
+pub use executor::{block_on, block_on_with};
 pub use scheduler::{PctScheduler, RandomScheduler, Scheduler, TapeScheduler, TaskId};
 
 #[cfg(test)]
-mod tests {
+mod sim_tests {
     use std::sync::{Arc, Mutex};
 
     use super::executor::{DetYield, det_spawn};

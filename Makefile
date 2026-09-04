@@ -21,6 +21,12 @@ test-all: test test-sim
 lint:
 	cargo fmt --all -- --check
 	cargo clippy --all-targets --all-features -- -D warnings
+	# Compile and lint every simulation branch without running ordinary tests under
+	# the deterministic runtime adapters.
+	RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo clippy --lib --tests \
+		-p glassdb-data -p glassdb-concurr -p glassdb-backend \
+		-p glassdb-storage -p glassdb-trans -p glassdb \
+		--features glassdb-storage/sim,glassdb/sim -- -D warnings
 
 format:
 	cargo fmt --all
@@ -47,18 +53,19 @@ bench-score:
 flamegraph:
 	hack/perf/profile.sh
 
-# Run the test suite under the in-repo deterministic simulation executor
-# (ADR-011, `--cfg sim`). The cloud backend crates (s3/gcs) use real
-# tokio/reqwest/aws-sdk and are excluded. Storage and `glassdb` enable their
-# respective simulation harnesses so each crate owns its committed corpus
-# replay.
+# Run only tests that start the in-repo deterministic simulation executor
+# (ADR-011, `--cfg sim`). Storage and `glassdb` enable their simulation
+# harnesses so each crate owns its committed corpus replay. The final `sim_test`
+# is a substring filter over each full test name. Put every selected test in a
+# `sim_tests` module. The stable test policy discovers source roots marked with
+# `#![cfg(sim)]` and enforces this.
 test-sim:
 	RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo test --profile sim-test \
-		-p glassdb-data -p glassdb-concurr -p glassdb-backend -p glassdb-trans
-	RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo test --profile sim-test \
-		-p glassdb-storage --features sim
-	RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo test --profile sim-test \
-		-p glassdb --features sim
+		-p glassdb-concurr -p glassdb-backend \
+		-p glassdb-storage -p glassdb \
+		--lib --test sim \
+		--features glassdb-storage/sim,glassdb/sim \
+		sim_test
 
 # Run the deterministic concurrency fuzzers. Requires the nightly toolchain and
 # cargo-fuzz (`cargo install cargo-fuzz`). `cargo fuzz` sets its own RUSTFLAGS

@@ -3,11 +3,7 @@
 //! key and collection-lifecycle calls are checked against an exact state model
 //! while a tape-guided scheduler and fault injector explore interleavings and
 //! failures.
-#![cfg(all(sim, feature = "sim"))]
-
-mod sim_support;
-
-use sim_support::{assert_slow_mutation_modes, fault_tape, tape};
+use crate::sim_support::{assert_slow_mutation_modes, fault_tape, tape};
 
 use glassdb::exec::{TapeScheduler, block_on_with};
 use glassdb::sim::{

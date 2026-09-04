@@ -1,9 +1,9 @@
 //! Replays the committed fuzz corpora through the same harnesses as the fuzzer,
 //! on stable (no nightly/cargo-fuzz/sanitizer). This is a regression guard:
 //! every input the fuzzer has ever found interesting must still satisfy its
-//! invariant (the serializability bound for `concurrent_tx`, the ring invariant
+//! invariant (the serializability bound for `concurrent-tx`, the ring invariant
 //! for `cycle`, the sorted-listing + membership bound for `membership`, and
-//! the modeled key and collection-lifecycle states for `api_correctness`, and
+//! the modeled key and collection-lifecycle states for `api-correctness`, and
 //! exact point/group-and-range transaction serializability for `history`), both
 //! without and with the persistent cache enabled.
 //!
@@ -11,9 +11,8 @@
 //! deterministic executor with the `sim` harness feature:
 //!
 //! ```bash
-//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo test --profile sim-test -p glassdb --features sim
+//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo test --profile sim-test -p glassdb --features sim --test sim
 //! ```
-#![cfg(all(sim, feature = "sim"))]
 
 use std::path::{Path, PathBuf};
 
@@ -82,7 +81,7 @@ fn replay_committed_corpus(target: &str, replay: ReplayFn) {
 
 #[test]
 fn replays_committed_corpus() {
-    replay_committed_corpus("concurrent_tx", record_input::<RmwWorkload>);
+    replay_committed_corpus("concurrent-tx", record_input::<RmwWorkload>);
 }
 
 #[test]
@@ -97,7 +96,7 @@ fn replays_committed_membership_corpus() {
 
 #[test]
 fn replays_committed_api_correctness_corpus() {
-    replay_committed_corpus("api_correctness", record_input::<ApiWorkload>);
+    replay_committed_corpus("api-correctness", record_input::<ApiWorkload>);
 }
 
 #[test]

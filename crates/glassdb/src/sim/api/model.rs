@@ -205,7 +205,7 @@ enum ApiTransitionError {
 }
 
 #[cfg(test)]
-mod tests {
+mod sim_tests {
     use super::*;
 
     type CollectionState = (usize, Option<u8>, Option<Option<u8>>);

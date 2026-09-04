@@ -1,10 +1,8 @@
 //! Runtime indirection seam.
 //!
 //! Production builds delegate to real `tokio`. Under `--cfg sim`, task spawning
-//! and time route through the in-repo deterministic executor (`crate::exec`)
-//! when one is running on the current thread, and fall back to real `tokio`
-//! otherwise (so ordinary `#[tokio::test]` unit tests still work under a `sim`
-//! build).
+//! and time require the in-repo deterministic executor (`crate::exec`) to be
+//! active on the current thread.
 //!
 //! `tokio::sync` and `tokio::select!` are runtime-agnostic and are used directly
 //! elsewhere (non-`biased` selects stay deterministic under sim via the seeded
@@ -27,8 +25,8 @@ pub use sim::*;
 #[error("operation timed out")]
 pub struct TimedOut;
 
-#[cfg(test)]
-mod tests {
+#[cfg(all(test, not(sim)))]
+mod native_tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -56,7 +54,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn ambient_runtime_satisfies_the_facade_contract() {
-        assert!(!super::in_sim());
         runtime_facade_contract().await;
     }
 
@@ -125,25 +122,52 @@ mod tests {
             .expect("detached task did not finish")
             .unwrap();
     }
+}
 
-    #[cfg(sim)]
+#[cfg(all(test, sim))]
+mod sim_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use super::{DedicatedJoinError, spawn_dedicated};
+
+    struct DropNotice(Arc<AtomicBool>);
+
+    impl Drop for DropNotice {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn runtime_facade_contract() {
+        let sleep_started = super::Instant::now();
+        let task = super::spawn(async {
+            super::sleep(Duration::from_millis(5)).await;
+            41
+        });
+        assert_eq!(task.await.unwrap(), 41);
+        assert_eq!(sleep_started.elapsed(), Duration::from_millis(5));
+
+        let timeout_started = super::Instant::now();
+        assert_eq!(
+            super::timeout(Duration::from_millis(7), std::future::pending::<()>()).await,
+            Err(super::TimedOut)
+        );
+        assert_eq!(timeout_started.elapsed(), Duration::from_millis(7));
+
+        let task = spawn_dedicated("glassdb-runtime-contract", async { 42 }).unwrap();
+        assert_eq!(task.await.unwrap(), 42);
+    }
+
     #[test]
     fn active_simulation_preserves_runtime_and_dedicated_task_contracts() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        struct DropNotice(Arc<AtomicBool>);
-
-        impl Drop for DropNotice {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
         let caller = std::thread::current().id();
         let dropped_at_shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_notice = dropped_at_shutdown.clone();
-        crate::exec::block_on_with(crate::exec::TapeScheduler::new(Vec::new()), 0, async move {
+        crate::exec::block_on(async move {
             runtime_facade_contract().await;
 
             let success = spawn_dedicated("not-a-native-thread", async move {
@@ -175,5 +199,25 @@ mod tests {
         });
 
         assert!(dropped_at_shutdown.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn simulation_tasks_can_hold_thread_local_state() {
+        let value = crate::exec::block_on(async {
+            let value = Rc::new(RefCell::new(41));
+            let task_value = value.clone();
+            let task = super::spawn(async move {
+                *task_value.borrow_mut() += 1;
+            });
+            task.await.unwrap();
+            Rc::try_unwrap(value).unwrap().into_inner()
+        });
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    #[should_panic(expected = "rt::spawn called outside the simulation executor")]
+    fn simulation_spawn_requires_an_active_executor() {
+        drop(super::spawn(async {}));
     }
 }

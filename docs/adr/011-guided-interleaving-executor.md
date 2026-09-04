@@ -8,6 +8,9 @@ The separate `Clock` detail is superseded by
 [ADR-058](058-process-wide-model-time.md), which makes wall and monotonic model
 time one process-wide runtime property.
 
+The ambient Tokio fallback and whole-suite simulation test gate are superseded
+by [ADR-069](069-deterministic-only-simulation-builds.md).
+
 Follow-up to [ADR-010](010-fuzzer-coverage-guidance.md) and the runtime side of
 [ADR-008](008-deterministic-simulation-fuzzer.md).
 

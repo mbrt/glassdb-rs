@@ -4,9 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
-readme = "README.md"
 description = "Prost-generated data serialization protobuf for GlassDB (internal crate)."
+
+[lints]
+workspace = true
 
 [features]
 # `regen` is an opt-in toggle for the `regen-proto` helper binary that

@@ -1,3 +1,5 @@
+pub mod rust_sources;
+
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 

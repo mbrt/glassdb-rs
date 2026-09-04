@@ -1957,7 +1957,7 @@ mod tests {
                     let fail = armed
                         && flaky
                             .remaining
-                            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                            .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
                             .is_ok();
                     let result = if fail {
                         Err(glassdb_backend::BackendError::Precondition)

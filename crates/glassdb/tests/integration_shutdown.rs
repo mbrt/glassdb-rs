@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use futures::FutureExt;
 use glassdb::{Database, Error, InlinePolicy};
 
-#[path = "integration_support/mod.rs"]
 pub mod integration_support;
 
 use integration_support::{

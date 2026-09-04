@@ -5,7 +5,7 @@
 //! feature:
 //!
 //! ```bash
-//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo test -p glassdb --features sim
+//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo test -p glassdb --features sim --test sim
 //! ```
 //!
 //! The Cycle workload is the serializability oracle the commutative
@@ -13,11 +13,7 @@
 //! rotates three consecutive ring edges, an operation that does not commute, so
 //! any isolation or atomicity break splits, shrinks, or grows the ring. The
 //! harness asserts the ring is still a single cycle of length `N`.
-#![cfg(all(sim, feature = "sim"))]
-
-mod sim_support;
-
-use sim_support::{assert_slow_mutation_modes, fault_tape, tape};
+use crate::sim_support::{assert_slow_mutation_modes, fault_tape, tape};
 
 use glassdb::exec::{TapeScheduler, block_on_with};
 use glassdb::sim::{

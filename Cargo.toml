@@ -22,7 +22,6 @@ version = "0.2.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/mbrt/glassdb-rs"
-homepage = "https://github.com/mbrt/glassdb-rs"
 
 # `--cfg sim` activates the in-repo deterministic simulation executor (see
 # ADR-011). Declaring it here keeps `#[cfg(sim)]` attributes from tripping the

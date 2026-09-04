@@ -131,10 +131,11 @@ pub(super) fn with_tape(
 }
 
 #[cfg(test)]
-mod tests {
+mod sim_tests {
     use std::num::NonZeroUsize;
 
     use glassdb_backend::{BackendError, Version, memory::MemoryBackend};
+    use glassdb_concurr::exec;
 
     use super::*;
 
@@ -145,89 +146,96 @@ mod tests {
         with_plan(inner, plan)
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn delays_before_forwarding() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (slow, _) = wrapper(
-            inner.clone(),
-            SlowMutationPlan {
-                ordinal: 0,
-                point: DelayPoint::Before,
-                duration: Duration::from_secs(10),
-            },
-        );
-        let task = tokio::spawn({
-            let slow = slow.clone();
-            async move { slow.write_if_not_exists("p", b"v".to_vec()).await }
-        });
+    #[test]
+    fn delays_before_forwarding() {
+        exec::block_on_with(exec::TapeScheduler::new(vec![0, 1]), 0, async {
+            let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+            let (slow, _) = wrapper(
+                inner.clone(),
+                SlowMutationPlan {
+                    ordinal: 0,
+                    point: DelayPoint::Before,
+                    duration: Duration::from_secs(10),
+                },
+            );
+            let start = rt::Instant::now();
+            let task = rt::spawn({
+                let slow = slow.clone();
+                async move { slow.write_if_not_exists("p", b"v".to_vec()).await }
+            });
 
-        tokio::task::yield_now().await;
-        assert!(matches!(inner.read("p").await, Err(BackendError::NotFound)));
-        assert!(!task.is_finished());
-        tokio::time::advance(Duration::from_secs(10)).await;
-        task.await.unwrap().unwrap();
-        assert_eq!(inner.read("p").await.unwrap().contents, b"v");
+            rt::yield_now().await;
+            assert!(matches!(inner.read("p").await, Err(BackendError::NotFound)));
+            task.await.unwrap().unwrap();
+            assert_eq!(start.elapsed(), Duration::from_secs(10));
+            assert_eq!(inner.read("p").await.unwrap().contents, b"v");
+        });
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn delays_after_the_mutation_lands() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (slow, _) = wrapper(
-            inner.clone(),
-            SlowMutationPlan {
-                ordinal: 0,
-                point: DelayPoint::After,
-                duration: Duration::from_secs(10),
-            },
-        );
-        let task = tokio::spawn({
-            let slow = slow.clone();
-            async move { slow.write_if_not_exists("p", b"v".to_vec()).await }
-        });
+    #[test]
+    fn delays_after_the_mutation_lands() {
+        exec::block_on_with(exec::TapeScheduler::new(vec![0, 1]), 0, async {
+            let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+            let (slow, _) = wrapper(
+                inner.clone(),
+                SlowMutationPlan {
+                    ordinal: 0,
+                    point: DelayPoint::After,
+                    duration: Duration::from_secs(10),
+                },
+            );
+            let start = rt::Instant::now();
+            let task = rt::spawn({
+                let slow = slow.clone();
+                async move { slow.write_if_not_exists("p", b"v".to_vec()).await }
+            });
 
-        tokio::task::yield_now().await;
-        assert_eq!(inner.read("p").await.unwrap().contents, b"v");
-        assert!(!task.is_finished());
-        tokio::time::advance(Duration::from_secs(10)).await;
-        task.await.unwrap().unwrap();
+            rt::yield_now().await;
+            assert_eq!(inner.read("p").await.unwrap().contents, b"v");
+            task.await.unwrap().unwrap();
+            assert_eq!(start.elapsed(), Duration::from_secs(10));
+        });
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn only_mutations_consume_the_one_shot_ordinal() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let initial = inner
-            .write_if_not_exists("p", b"v1".to_vec())
-            .await
-            .unwrap();
-        let (slow, controller) = wrapper(
-            inner.clone(),
-            SlowMutationPlan {
-                ordinal: 1,
-                point: DelayPoint::Before,
-                duration: Duration::from_secs(10),
-            },
-        );
+    #[test]
+    fn only_mutations_consume_the_one_shot_ordinal() {
+        exec::block_on_with(exec::TapeScheduler::new(vec![0, 1]), 0, async {
+            let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+            let initial = inner
+                .write_if_not_exists("p", b"v1".to_vec())
+                .await
+                .unwrap();
+            let (slow, controller) = wrapper(
+                inner.clone(),
+                SlowMutationPlan {
+                    ordinal: 1,
+                    point: DelayPoint::Before,
+                    duration: Duration::from_secs(10),
+                },
+            );
 
-        slow.read("p").await.unwrap();
-        slow.read_if_modified("p", &Version::new("different"))
-            .await
-            .unwrap();
-        slow.list("", None, NonZeroUsize::new(10).unwrap())
-            .await
-            .unwrap();
-        let updated = slow.write_if("p", b"v2".to_vec(), &initial).await.unwrap();
+            slow.read("p").await.unwrap();
+            slow.read_if_modified("p", &Version::new("different"))
+                .await
+                .unwrap();
+            slow.list("", None, NonZeroUsize::new(10).unwrap())
+                .await
+                .unwrap();
+            let updated = slow.write_if("p", b"v2".to_vec(), &initial).await.unwrap();
 
-        let delete = tokio::spawn({
-            let slow = slow.clone();
-            async move { slow.delete_if("p", &updated).await }
+            let start = rt::Instant::now();
+            let delete = rt::spawn({
+                let slow = slow.clone();
+                async move { slow.delete_if("p", &updated).await }
+            });
+            rt::yield_now().await;
+            assert!(controller.injected());
+            assert_eq!(inner.read("p").await.unwrap().contents, b"v2");
+            delete.await.unwrap().unwrap();
+            assert_eq!(start.elapsed(), Duration::from_secs(10));
+
+            slow.write_if_not_exists("q", b"v".to_vec()).await.unwrap();
+            assert_eq!(inner.read("q").await.unwrap().contents, b"v");
         });
-        tokio::task::yield_now().await;
-        assert!(controller.injected());
-        assert!(!delete.is_finished());
-        tokio::time::advance(Duration::from_secs(10)).await;
-        delete.await.unwrap().unwrap();
-
-        slow.write_if_not_exists("q", b"v".to_vec()).await.unwrap();
-        assert_eq!(inner.read("q").await.unwrap().contents, b"v");
     }
 }

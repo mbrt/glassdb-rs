@@ -51,7 +51,7 @@ impl Admission {
 
     pub(super) fn reserve_payload(self: &Arc<Self>, bytes: u64) -> Option<PayloadReservation> {
         self.queued_payload_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current
                     .checked_add(bytes)
                     .filter(|next| *next <= MAX_QUEUED_PAYLOAD_BYTES)
@@ -80,7 +80,7 @@ impl Admission {
 
     pub(super) fn reserve_optional(self: &Arc<Self>) -> Option<OptionalReservation> {
         self.optional_queued
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < OPTIONAL_QUEUE_ITEMS).then_some(current + 1)
             })
             .ok()?;

@@ -26,7 +26,7 @@ pub mod diagnostics;
 mod error;
 mod iter;
 mod scan;
-#[cfg(feature = "sim")]
+#[cfg(all(feature = "sim", sim))]
 pub mod sim;
 mod stats;
 mod tx;

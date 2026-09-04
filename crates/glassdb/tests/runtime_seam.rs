@@ -12,9 +12,12 @@
 //! state. Both follow the runtime's active model-time domain. Raw clocks bypass
 //! that domain and can silently escape simulated or accelerated time.
 
+pub mod integration_support;
+
 use std::path::{Path, PathBuf};
 
 use glob::Pattern;
+use integration_support::rust_sources;
 
 // Module prefixes are intentional: importing or calling any API from these
 // runtime-coupled surfaces needs an explicit simulation-aware design.
@@ -71,22 +74,6 @@ const EXEMPT_SEAM_GLOBS: &[&str] = &[
 // this list exact so a production file named `tests.rs` cannot evade the guard.
 const OUT_OF_LINE_TEST_MODULES: &[&str] = &["crates/glassdb-trans/src/algo/direct_commit/tests.rs"];
 
-fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| {
-        panic!("read source dir {}: {e}", dir.display());
-    }) {
-        let path = entry.expect("read source entry").path();
-        if path.is_dir() {
-            if path.file_name().is_some_and(|name| name == "tests") {
-                continue;
-            }
-            collect_rs_files(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
-        }
-    }
-}
-
 fn is_exempt_seam_file(path: &Path) -> bool {
     EXEMPT_SEAM_GLOBS.iter().any(|glob| {
         Pattern::new(glob)
@@ -99,6 +86,11 @@ fn is_out_of_line_test_module(path: &Path) -> bool {
     OUT_OF_LINE_TEST_MODULES
         .iter()
         .any(|test_module| path == Path::new(test_module))
+}
+
+fn is_in_test_directory(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == "tests")
 }
 
 fn unclassified_tokio_use(line: &str) -> Option<&str> {
@@ -158,21 +150,17 @@ fn sim_controlled_code_uses_only_reviewed_runtime_apis() {
         workspace.join("crates/glassdb-concurr/src"),
     ];
 
-    let mut files = Vec::new();
-    for root in roots {
-        collect_rs_files(&root, &mut files);
-    }
+    let sources = rust_sources::collect(&workspace, &roots);
 
     let mut violations = Vec::new();
-    for path in files {
-        let rel = path.strip_prefix(&workspace).unwrap_or(&path);
-        if is_exempt_seam_file(rel) || is_out_of_line_test_module(rel) {
+    for source in sources {
+        if is_in_test_directory(&source.path)
+            || is_exempt_seam_file(&source.path)
+            || is_out_of_line_test_module(&source.path)
+        {
             continue;
         }
-        let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            panic!("read source file {}: {e}", path.display());
-        });
-        let lines: Vec<_> = contents.lines().collect();
+        let lines: Vec<_> = source.text.lines().collect();
         let mut test_attribute = false;
         for (idx, line) in lines.iter().copied().enumerate() {
             let trimmed = line.trim_start();
@@ -193,13 +181,13 @@ fn sim_controlled_code_uses_only_reviewed_runtime_apis() {
             if let Some(pattern) = FORBIDDEN.iter().find(|pattern| trimmed.contains(**pattern)) {
                 violations.push(format!(
                     "{}:{} contains `{pattern}`",
-                    rel.display(),
+                    source.path.display(),
                     idx + 1
                 ));
             } else if let Some(usage) = unclassified_tokio_use(trimmed) {
                 violations.push(format!(
                     "{}:{} contains unclassified `{usage}`",
-                    rel.display(),
+                    source.path.display(),
                     idx + 1
                 ));
             }
@@ -216,14 +204,12 @@ fn sim_controlled_code_uses_only_reviewed_runtime_apis() {
 #[test]
 fn synthetic_s3_time_uses_the_model_time_seam() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut files = vec![
+    let roots = vec![
         workspace.join("crates/glassdb-backend-s3/src/lib.rs"),
         workspace.join("crates/glassdb-backend-s3/src/fake_server.rs"),
+        workspace.join("crates/glassdb-backend-s3/src/fake_server"),
     ];
-    collect_rs_files(
-        &workspace.join("crates/glassdb-backend-s3/src/fake_server"),
-        &mut files,
-    );
+    let sources = rust_sources::collect(&workspace, &roots);
     let timing = [
         "tokio::time",
         "SystemTime::now(",
@@ -231,21 +217,17 @@ fn synthetic_s3_time_uses_the_model_time_seam() {
         "std::time::Instant::now(",
     ];
     let mut violations = Vec::new();
-    for path in files {
-        let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            panic!("read source file {}: {e}", path.display());
-        });
-        let lines: Vec<_> = contents.lines().collect();
+    for source in sources {
+        let lines: Vec<_> = source.text.lines().collect();
         for (idx, line) in lines.iter().copied().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("//") {
                 continue;
             }
             if let Some(pattern) = timing.iter().find(|pattern| trimmed.contains(**pattern)) {
-                let rel = path.strip_prefix(&workspace).unwrap_or(&path);
                 violations.push(format!(
                     "{}:{} contains `{pattern}`",
-                    rel.display(),
+                    source.path.display(),
                     idx + 1
                 ));
             }

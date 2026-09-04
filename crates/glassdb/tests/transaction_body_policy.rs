@@ -5,8 +5,11 @@
 //! can retry that attempt. Panics bypass validation and replay even though
 //! framework-owned attempt resources are retired safely.
 
+pub mod integration_support;
+
 use std::path::{Component, Path, PathBuf};
 
+use integration_support::rust_sources;
 use proc_macro2::Span;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -28,25 +31,6 @@ const FORBIDDEN_MACROS: &[&str] = &[
 ];
 
 const FORBIDDEN_METHODS: &[&str] = &["expect", "expect_err", "unwrap", "unwrap_err"];
-
-fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).unwrap_or_else(|error| {
-        panic!("read source directory {}: {error}", dir.display());
-    }) {
-        let path = entry.expect("read source entry").path();
-        if path.is_dir() {
-            if path
-                .file_name()
-                .is_some_and(|name| matches!(name.to_str(), Some(".git" | "target")))
-            {
-                continue;
-            }
-            collect_rs_files(&path, out);
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
-            out.push(path);
-        }
-    }
-}
 
 fn is_user_workload_source(path: &Path) -> bool {
     let components: Vec<_> = path
@@ -216,22 +200,16 @@ fn policy_recognizes_panicking_transaction_bodies() {
 #[test]
 fn user_transaction_bodies_return_errors_instead_of_panicking() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut files = Vec::new();
-    collect_rs_files(&workspace.join("crates"), &mut files);
-    collect_rs_files(&workspace.join("fuzz"), &mut files);
-    files.sort();
+    let roots = [workspace.join("crates"), workspace.join("fuzz")];
+    let sources = rust_sources::collect(&workspace, &roots);
 
     let mut inspected = 0;
     let mut violations = Vec::new();
-    for path in files {
-        let relative = path.strip_prefix(&workspace).unwrap_or(&path);
-        if !is_user_workload_source(relative) {
+    for source in sources {
+        if !is_user_workload_source(&source.path) {
             continue;
         }
-        let contents = std::fs::read_to_string(&path).unwrap_or_else(|error| {
-            panic!("read source file {}: {error}", path.display());
-        });
-        let (file_inspected, mut file_violations) = inspect_source(relative, &contents);
+        let (file_inspected, mut file_violations) = inspect_source(&source.path, &source.text);
         inspected += file_inspected;
         violations.append(&mut file_violations);
     }

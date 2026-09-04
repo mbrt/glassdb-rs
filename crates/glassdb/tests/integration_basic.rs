@@ -8,7 +8,6 @@ use glassdb::{Database, Error, InlinePolicy, ProtocolTiming, SplitPolicy};
 use glassdb_data::TxId;
 use glassdb_storage::{CurrentState, LeafBody, LeafEntry, Node};
 
-#[path = "integration_support/mod.rs"]
 pub mod integration_support;
 
 use integration_support::{

@@ -1,45 +1,40 @@
-//! Process and simulation-aware entropy.
+//! Process and simulation entropy.
 //!
 //! Callers use the same interface in every build. Native execution draws from
-//! the process RNG; an active deterministic executor draws from its seeded
-//! stream so simulations remain replayable.
+//! the process RNG; simulation draws from the active deterministic executor's
+//! seeded stream.
 
 /// Fills `bytes` from the active entropy source.
 pub fn fill_bytes(bytes: &mut [u8]) {
     #[cfg(sim)]
-    if crate::exec::executor::in_sim() {
+    {
         crate::exec::executor::fill_random(bytes);
-        return;
     }
-    // Ordinary Tokio tests in a simulation build do not require a deterministic
-    // executor and keep using the process RNG.
-    fill_native(bytes);
+    #[cfg(not(sim))]
+    {
+        use rand::Rng;
+        rand::rng().fill_bytes(bytes);
+    }
 }
 
 /// Samples a uniformly distributed value in `[0, 1)` from the active entropy
 /// source.
 pub fn uniform_unit() -> f64 {
     #[cfg(sim)]
-    if crate::exec::executor::in_sim() {
+    {
         let mut bytes = [0; 8];
         fill_bytes(&mut bytes);
-        return ((u64::from_le_bytes(bytes) >> 11) as f64) / ((1u64 << 53) as f64);
+        ((u64::from_le_bytes(bytes) >> 11) as f64) / ((1u64 << 53) as f64)
     }
-    uniform_unit_native()
-}
-
-fn fill_native(bytes: &mut [u8]) {
-    use rand::Rng;
-    rand::rng().fill_bytes(bytes);
-}
-
-fn uniform_unit_native() -> f64 {
-    use rand::RngExt;
-    rand::rng().random::<f64>()
+    #[cfg(not(sim))]
+    {
+        use rand::RngExt;
+        rand::rng().random::<f64>()
+    }
 }
 
 #[cfg(all(test, sim))]
-mod tests {
+mod sim_tests {
     use super::*;
 
     #[test]

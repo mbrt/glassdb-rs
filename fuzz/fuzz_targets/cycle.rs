@@ -3,7 +3,7 @@
 //! libFuzzer bytes are split into an `rng_seed`, a [`CycleWorkload`], a
 //! [`FaultConfig`], and the remaining bytes, which are deinterleaved into
 //! *schedule*, *backend-fault*, and *cache-media* tapes — the same layout as the
-//! `concurrent_tx` target. The harness runs the decoded workload both without
+//! `concurrent-tx` target. The harness runs the decoded workload both without
 //! and with the persistent cache; the cached run uses only basic media delays
 //! and pre-effect failures. It lays down a ring (`key(i) -> (i + 1) % N`) and
 //! runs every client as its own task over a shared in-process backend on the
@@ -23,7 +23,6 @@
 //! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run cycle <crash-file>
 //! ```
 #![no_main]
-
 use libfuzzer_sys::fuzz_target;
 
 // The decode-and-run logic lives in the generic `glassdb::sim::replay_input` so

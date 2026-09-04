@@ -2,7 +2,6 @@
 
 use glassdb::{Database, Error, InlinePolicy};
 
-#[path = "integration_support/mod.rs"]
 pub mod integration_support;
 
 use integration_support::{create_top, init_db, mem, open_top, read_int, rmw, write_int};

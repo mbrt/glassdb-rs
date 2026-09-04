@@ -5,7 +5,7 @@
 //! feature:
 //!
 //! ```bash
-//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo test -p glassdb --features sim
+//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo test -p glassdb --features sim --test sim
 //! ```
 //!
 //! The membership workload drives the B-link tree the increment/cycle workloads
@@ -15,11 +15,7 @@
 //! asserts every committed listing is strictly sorted and drawn from the key
 //! universe, and that the final key set matches the per-key membership
 //! accounting across tape, PCT, fault, and recovery schedules.
-#![cfg(all(sim, feature = "sim"))]
-
-mod sim_support;
-
-use sim_support::{assert_slow_mutation_modes, fault_tape, tape};
+use crate::sim_support::{assert_slow_mutation_modes, fault_tape, tape};
 
 use glassdb::exec::{TapeScheduler, block_on_with};
 use glassdb::sim::{

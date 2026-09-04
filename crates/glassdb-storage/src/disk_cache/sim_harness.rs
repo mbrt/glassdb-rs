@@ -1,3 +1,5 @@
+#![cfg(sim)]
+
 //! Isolated deterministic fault harness for the persistent cache.
 
 use std::collections::HashMap;
@@ -337,7 +339,8 @@ fn decode(data: &[u8]) -> DecodedInput {
         .first()
         .map_or(0, |count| usize::from(*count) % (MAX_COMMANDS + 1));
     let mut commands = Vec::with_capacity(requested);
-    for bytes in command_tape[command_tape.len().min(1)..].chunks_exact(6) {
+    let (command_chunks, _) = command_tape[command_tape.len().min(1)..].as_chunks::<6>();
+    for bytes in command_chunks {
         if commands.len() == requested {
             break;
         }
@@ -396,7 +399,7 @@ fn digest_record(revision: &[u8], body: &[u8], sequence_point: u64) -> [u8; 32] 
 }
 
 #[cfg(test)]
-mod tests {
+mod sim_tests {
     use super::CommandKind;
 
     #[test]

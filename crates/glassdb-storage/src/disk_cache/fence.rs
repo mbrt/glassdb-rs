@@ -88,7 +88,7 @@ impl FenceTracker {
 
     pub(super) fn begin(&self, context: Arc<dyn FenceContext>) -> Option<FenceGuard> {
         self.active_fences
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < MAX_ACTIVE_FENCES).then_some(current + 1)
             })
             .ok()?;

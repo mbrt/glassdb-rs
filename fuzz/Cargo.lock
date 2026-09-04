@@ -32,12 +32,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
-name = "base64"
-version = "0.22.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
-
-[[package]]
 name = "bitflags"
 version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -291,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "glassdb"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arbitrary",
  "futures",
@@ -310,7 +304,7 @@ dependencies = [
 
 [[package]]
 name = "glassdb-backend"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "glassdb-concurr",
@@ -323,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "glassdb-concurr"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -336,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "glassdb-data"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "glassdb-concurr",
 ]
@@ -352,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "glassdb-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "prost",
  "prost-types",
@@ -360,10 +354,10 @@ dependencies = [
 
 [[package]]
 name = "glassdb-storage"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
- "base64",
+ "futures",
  "glassdb-backend",
  "glassdb-concurr",
  "glassdb-data",
@@ -380,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "glassdb-trans"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "futures",

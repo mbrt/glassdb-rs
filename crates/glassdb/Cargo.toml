@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 readme = "../../README.md"
 description = "A stateless, ACID, serializable key/value store on top of object storage."
 keywords = ["database", "acid", "key-value", "object-storage", "transactions"]
@@ -41,8 +40,9 @@ s3 = ["dep:glassdb-backend-s3"]
 s3-fake-server = ["s3", "glassdb-backend-s3/fake-server"]
 # Pull in the Google Cloud Storage backend (reqwest/gcp_auth dependency).
 gcs = ["dep:glassdb-backend-gcs"]
-# Expose the deterministic-simulation workload harness (`glassdb::sim`) used by
-# the `fuzz/` crate and the op-stream self-check. See ADR-008 and ADR-011.
+# With `--cfg sim`, expose the deterministic-simulation workload harness
+# (`glassdb::sim`) used by the `fuzz/` crate and the op-stream self-check. See
+# ADR-008, ADR-011, and ADR-069.
 sim = ["dep:arbitrary", "glassdb-storage/sim"]
 
 # The cloud backends are feature-gated, so docs.rs would otherwise not show

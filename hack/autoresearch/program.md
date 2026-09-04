@@ -57,7 +57,7 @@ correctness contract; changing them invalidates the experiment):
   - `crates/glassdb/tests/proptest_concurrent.rs`
   - `crates/glassdb/tests/integration.rs`
   - `crates/glassdb/benches/transactions.rs`
-  - everything under `fuzz/**` (the `concurrent_tx` fuzz target)
+  - everything under `fuzz/**` (the `concurrent-tx` fuzz target)
 
   These define strict serializability and the public-API contract; they are the
   invariant your experiments must preserve. You may NEVER edit, weaken, skip,

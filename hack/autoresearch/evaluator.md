@@ -33,7 +33,7 @@ permitted, not even a "mechanical" one):
    - `crates/glassdb/tests/proptest_concurrent.rs`
    - `crates/glassdb/tests/integration.rs`
    - `crates/glassdb/benches/transactions.rs`
-   - anything under `fuzz/**` (the `concurrent_tx` fuzz target and its config)
+   - anything under `fuzz/**` (the `concurrent-tx` fuzz target and its config)
 2. Autoresearch fixed infrastructure:
    - anything under `crates/glassdb-bench-score/**` (the `autoresearch` scoring
      harness — this defines the metric) or `crates/glassdb-bench-scale/**` (the

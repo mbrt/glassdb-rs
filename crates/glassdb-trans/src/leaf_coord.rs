@@ -2481,7 +2481,7 @@ mod tests {
         coord.close().await;
     }
 
-    // Regression (fuzz `concurrent_tx`,
+    // Regression (fuzz `concurrent-tx`,
     // corpus/cd4e97be8a631c59fe32bc49de539f38056bcb40): one transaction can have
     // two operations in flight on the same leaf at once — GC releasing a
     // presumed-dead transaction's holds (ADR-029) while that transaction's own
@@ -3167,7 +3167,7 @@ mod tests {
     // The *end-to-end* manifestation (a real commit being interrupted and
     // double-applying under the true 3-way co-batched interleaving) is covered
     // deterministically by the committed fuzz reproducer
-    // `fuzz/corpus/concurrent_tx/crash-95084997…`, which the corpus-replay test
+    // `fuzz/corpus/concurrent-tx/crash-95084997…`, which the corpus-replay test
     // (`crates/glassdb/tests/fuzz_corpus.rs`) replays through the sim scheduler.
     // That interleaving cannot be forced by the plain-tokio in-doubt harness
     // (`crates/glassdb/tests/in_doubt.rs`), whose 2-step lost-ack→moved case
