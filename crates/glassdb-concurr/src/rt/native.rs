@@ -112,11 +112,6 @@ impl Add<Duration> for Instant {
     }
 }
 
-/// Reports whether the deterministic executor is active.
-pub fn in_sim() -> bool {
-    false
-}
-
 struct WallAnchor {
     system: SystemTime,
     instant: Instant,

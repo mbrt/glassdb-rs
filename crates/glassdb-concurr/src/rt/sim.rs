@@ -15,15 +15,6 @@ use crate::exec::executor;
 
 use super::TimedOut;
 
-/// Reports whether the deterministic executor is active.
-pub fn in_sim() -> bool {
-    executor::in_sim()
-}
-
-fn now_nanos() -> u64 {
-    executor::now_nanos()
-}
-
 /// A monotonic instant on the deterministic executor's virtual clock.
 /// Nanoseconds since the run started.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -31,11 +22,11 @@ pub struct Instant(u64);
 
 impl Instant {
     pub fn now() -> Self {
-        Instant(now_nanos())
+        Instant(executor::now_nanos())
     }
 
     pub fn elapsed(&self) -> Duration {
-        Duration::from_nanos(now_nanos().saturating_sub(self.0))
+        Duration::from_nanos(executor::now_nanos().saturating_sub(self.0))
     }
 
     pub fn duration_since(&self, earlier: Instant) -> Duration {
@@ -63,7 +54,9 @@ impl Add<Duration> for Instant {
 pub fn system_now() -> SystemTime {
     use std::time::UNIX_EPOCH;
     const SIM_WALL_BASE_SECS: u64 = 1_700_000_000;
-    UNIX_EPOCH + Duration::from_secs(SIM_WALL_BASE_SECS) + Duration::from_nanos(now_nanos())
+    UNIX_EPOCH
+        + Duration::from_secs(SIM_WALL_BASE_SECS)
+        + Duration::from_nanos(executor::now_nanos())
 }
 
 /// Returns one in simulation builds so shard geometry is independent of

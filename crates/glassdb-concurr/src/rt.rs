@@ -54,7 +54,6 @@ mod native_tests {
 
     #[tokio::test(start_paused = true)]
     async fn ambient_runtime_satisfies_the_facade_contract() {
-        assert!(!super::in_sim());
         runtime_facade_contract().await;
     }
 

@@ -131,11 +131,6 @@ fn current() -> Option<Handle> {
     CURRENT.with(|c| c.borrow().clone())
 }
 
-/// Reports whether a deterministic executor is running on this thread.
-pub fn in_sim() -> bool {
-    CURRENT.with(|c| c.borrow().is_some())
-}
-
 impl Handle {
     fn now(&self) -> u64 {
         self.inner.borrow().now
