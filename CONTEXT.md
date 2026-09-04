@@ -96,3 +96,7 @@ _Avoid_: Index key, boundary key
 **Structural intent**:
 A durable claim for one planned topology change, owned by a topology participant until the change is completed or recovered.
 _Avoid_: Structural log, structural record
+
+**Structural gate**:
+An exclusive, durably recorded claim on one node that admits changes to the node's shape. One transaction identity holds it at a time, and a release or a recovery fence must remove it before another shape change starts.
+_Avoid_: Structure lock, structure-write lock

@@ -143,7 +143,33 @@ impl StructuralNodeAccess {
         }
     }
 
-    /// Acquires a source node's structure-write lock under wound-wait.
+    /// Registers a new split identity and acquires one node's structural gate
+    /// under wound-wait.
+    ///
+    /// `None` reports that the gate was not taken — contention, a wait, or a
+    /// lost CAS — and that the identity is already retired, so the caller can
+    /// retry without cleanup of its own. An error retires it likewise.
+    async fn begin_gated_split(
+        &self,
+        collection: &CollectionAddress,
+        token: Option<&NodeToken>,
+    ) -> Result<Option<(TxId, Node, LeafObservation)>, TransError> {
+        let id = TxId::new_at(rt::system_now());
+        self.mon.begin_tx(&id);
+        match self.acquire_structural_gate(collection, token, &id).await {
+            Ok(Some((node, observation))) => Ok(Some((id, node, observation))),
+            Ok(None) => {
+                self.finalize_split(&id).await;
+                Ok(None)
+            }
+            Err(error) => {
+                self.finalize_split(&id).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Acquires a source node's structural gate under wound-wait.
     async fn acquire_structural_gate(
         &self,
         collection: &CollectionAddress,
@@ -350,7 +376,6 @@ impl StructuralNodeAccess {
         release
     }
 }
-
 struct SeparatorPublication {
     separator: PendingSeparator,
     start: Requirement,
@@ -457,136 +482,113 @@ impl SeparatorPublisher {
                 ObjectPath::Node { token, .. } => Some(token.clone()),
                 _ => return Err(TransError::other("router returned a non-node parent path")),
             };
-            let lock_id = TxId::new_at(rt::system_now());
-            self.structure.mon.begin_tx(&lock_id);
-            let acquired = match self
+            let Some((lock_id, locked_parent, locked_version)) = self
                 .structure
-                .acquire_structural_gate(&separator.collection, parent_token.as_ref(), &lock_id)
-                .await
-            {
-                Ok(acquired) => acquired,
-                Err(error) => {
-                    self.structure.finalize_split(&lock_id).await;
-                    return Err(error);
-                }
-            };
-            let Some((locked_parent, locked_version)) = acquired else {
-                self.structure.finalize_split(&lock_id).await;
+                .begin_gated_split(&separator.collection, parent_token.as_ref())
+                .await?
+            else {
                 continue;
             };
-            let Some(index) = locked_parent.as_index() else {
-                self.structure
-                    .finish_without_split(&separator.collection, parent_token.as_ref(), &lock_id)
-                    .await?;
-                return Ok(SeparatorPublicationOutcome::Published);
-            };
-            if index.child_for(&separator.split_key) == Some(separator.new_token.as_str()) {
-                self.structure
-                    .finish_without_split(&separator.collection, parent_token.as_ref(), &lock_id)
-                    .await?;
-                return Ok(SeparatorPublicationOutcome::Published);
-            }
-            let missing = match self
-                .missing_separators(
-                    &separator.collection,
-                    &locked_parent,
-                    &separator.split_key,
-                    Requirement::AtLeast(locked_version.current_after()),
-                )
-                .await
-            {
-                Ok(missing) => missing,
-                Err(error) => {
-                    let _ = self
-                        .structure
-                        .finish_without_split(
-                            &separator.collection,
-                            parent_token.as_ref(),
-                            &lock_id,
-                        )
-                        .await;
-                    return Err(error);
-                }
-            };
-            if missing.is_empty() {
-                self.structure
-                    .finish_without_split(&separator.collection, parent_token.as_ref(), &lock_id)
-                    .await?;
-                return Ok(SeparatorPublicationOutcome::Published);
-            }
-            let mut new_index = index.clone();
-            for edge in &missing {
-                new_index.insert_child(edge.separator.clone(), edge.child.to_string());
-            }
-            let mut updated = locked_parent.clone();
-            updated.set_index(new_index)?;
-            let content_limit = self.policy.content_limit();
-            if updated.content_encoded_len() > content_limit
-                || updated.encoded_len() > self.policy.node_max_bytes()
-            {
-                self.structure
-                    .finish_without_split(&separator.collection, parent_token.as_ref(), &lock_id)
-                    .await?;
-                if locked_parent.over_soft_cap(&self.policy) {
-                    return Ok(SeparatorPublicationOutcome::ParentRequiresSplit(
-                        ParentRequiresSplit {
-                            path: parent.path,
-                            continuation: ParentSplitContinuation::ResumePublication,
-                        },
-                    ));
-                }
-                return Err(TransError::InvalidInput(
-                    "separator exceeds the coordination node size limit".into(),
-                ));
-            }
-
-            updated.remove_structural_gate(&lock_id);
-            let stored = match self
-                .structure
-                .store_structural_node(
-                    &separator.collection,
+            let published = self
+                .publish_into_gated_parent(
+                    separator,
+                    &parent.path,
                     parent_token.as_ref(),
-                    &updated,
+                    &locked_parent,
                     &locked_version,
+                    &lock_id,
                 )
-                .await
-            {
-                Ok(stored) => stored,
-                Err(error) => {
-                    let _ = self
-                        .structure
-                        .finish_without_split(
-                            &separator.collection,
-                            parent_token.as_ref(),
-                            &lock_id,
-                        )
-                        .await;
-                    return Err(error);
-                }
-            };
-            if stored {
-                self.structure
-                    .finish_without_split(&separator.collection, parent_token.as_ref(), &lock_id)
-                    .await?;
-                if updated.over_soft_cap(&self.policy) {
-                    return Ok(SeparatorPublicationOutcome::ParentRequiresSplit(
-                        ParentRequiresSplit {
-                            path: parent.path,
-                            continuation: ParentSplitContinuation::CompletePublication,
-                        },
-                    ));
-                }
-                return Ok(SeparatorPublicationOutcome::Published);
-            }
-            let _ = self
-                .structure
-                .release_structural_gate(&separator.collection, parent_token.as_ref(), &lock_id)
                 .await;
-            self.structure.finalize_split(&lock_id).await;
+            let released = self
+                .structure
+                .finish_without_split(&separator.collection, parent_token.as_ref(), &lock_id)
+                .await;
+            match published? {
+                Some(outcome) => {
+                    released?;
+                    return Ok(outcome);
+                }
+                None => {
+                    let _ = released;
+                    continue;
+                }
+            }
         }
 
         self.defer(publication.separator.clone());
         Err(TransError::Retry)
+    }
+
+    /// Merges every unindexed edge up to `separator` into the gated parent.
+    ///
+    /// `None` reports a lost CAS, which the caller retries. The gate stays
+    /// installed on every path, because the caller releases it once.
+    async fn publish_into_gated_parent(
+        &self,
+        separator: &PendingSeparator,
+        parent_path: &ObjectPath,
+        parent_token: Option<&NodeToken>,
+        parent: &Node,
+        version: &LeafObservation,
+        lock_id: &TxId,
+    ) -> Result<Option<SeparatorPublicationOutcome>, TransError> {
+        let Some(index) = parent.as_index() else {
+            return Ok(Some(SeparatorPublicationOutcome::Published));
+        };
+        if index.child_for(&separator.split_key) == Some(separator.new_token.as_str()) {
+            return Ok(Some(SeparatorPublicationOutcome::Published));
+        }
+        let missing = self
+            .missing_separators(
+                &separator.collection,
+                parent,
+                &separator.split_key,
+                Requirement::AtLeast(version.current_after()),
+            )
+            .await?;
+        if missing.is_empty() {
+            return Ok(Some(SeparatorPublicationOutcome::Published));
+        }
+        let mut new_index = index.clone();
+        for edge in &missing {
+            new_index.insert_child(edge.separator.clone(), edge.child.to_string());
+        }
+        let mut updated = parent.clone();
+        updated.set_index(new_index)?;
+        let content_limit = self.policy.content_limit();
+        if updated.content_encoded_len() > content_limit
+            || updated.encoded_len() > self.policy.node_max_bytes()
+        {
+            if parent.over_soft_cap(&self.policy) {
+                return Ok(Some(SeparatorPublicationOutcome::ParentRequiresSplit(
+                    ParentRequiresSplit {
+                        path: parent_path.clone(),
+                        continuation: ParentSplitContinuation::ResumePublication,
+                    },
+                )));
+            }
+            return Err(TransError::InvalidInput(
+                "separator exceeds the coordination node size limit".into(),
+            ));
+        }
+
+        updated.remove_structural_gate(lock_id);
+        if !self
+            .structure
+            .store_structural_node(&separator.collection, parent_token, &updated, version)
+            .await?
+        {
+            return Ok(None);
+        }
+        if updated.over_soft_cap(&self.policy) {
+            return Ok(Some(SeparatorPublicationOutcome::ParentRequiresSplit(
+                ParentRequiresSplit {
+                    path: parent_path.clone(),
+                    continuation: ParentSplitContinuation::CompletePublication,
+                },
+            )));
+        }
+        Ok(Some(SeparatorPublicationOutcome::Published))
     }
 
     /// Returns the right-link edges through `split_key` that `parent` does not
@@ -1625,7 +1627,7 @@ impl Splitter {
             .await
     }
 
-    /// Acquires a source node's structure-write lock under wound-wait. A leaf,
+    /// Acquires a source node's structural gate under wound-wait. A leaf,
     /// including the fixed root while it is a leaf, joins the shared coordinator
     /// round. An index uses the direct structural CAS path.
     async fn acquire_structural_gate(
@@ -3935,6 +3937,10 @@ mod tests {
             blocked_root.as_index().unwrap().len(),
             1,
             "separator is not published while the parent CAS is blocked"
+        );
+        assert!(
+            blocked_root.structural_gate().holders().is_empty(),
+            "a publication that gives up releases the parent gate"
         );
         let (blocked_coordination, _) = s
             .records
