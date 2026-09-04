@@ -272,10 +272,7 @@ impl StructuralNodeAccess {
                 node.set_leaf(LeafBody::from_entries(entries.into_values()))?;
             }
             node.set_locks(locks);
-            if self
-                .store_structural_node(collection, token, &node, &observation)
-                .await?
-            {
+            if self.store_structural_node(&node, &observation).await? {
                 let (_, locked_observation) = match token {
                     Some(token) => {
                         self.nodes
@@ -325,30 +322,23 @@ impl StructuralNodeAccess {
             if !node.remove_structural_gate(id) {
                 return Ok(());
             }
-            if self
-                .store_structural_node(collection, token, &node, &observation)
-                .await?
-            {
+            if self.store_structural_node(&node, &observation).await? {
                 return Ok(());
             }
         }
         Err(TransError::Retry)
     }
 
+    /// Compare-and-swaps `node` over the object `observation` was taken from.
     async fn store_structural_node(
         &self,
-        collection: &CollectionAddress,
-        token: Option<&NodeToken>,
         node: &Node,
         observation: &LeafObservation,
     ) -> Result<bool, TransError> {
-        match token {
-            Some(token) => Ok(self
-                .nodes
-                .store_node(collection, token, node, Some(observation))
-                .await?),
-            None => Ok(self.nodes.store_root(collection, node, observation).await?),
-        }
+        Ok(self
+            .nodes
+            .store_node_at(observation.path(), node, observation)
+            .await?)
     }
 
     async fn finalize_split(&self, id: &TxId) {
@@ -493,7 +483,6 @@ impl SeparatorPublisher {
                 .publish_into_gated_parent(
                     separator,
                     &parent.path,
-                    parent_token.as_ref(),
                     &locked_parent,
                     &locked_version,
                     &lock_id,
@@ -527,7 +516,6 @@ impl SeparatorPublisher {
         &self,
         separator: &PendingSeparator,
         parent_path: &ObjectPath,
-        parent_token: Option<&NodeToken>,
         parent: &Node,
         version: &LeafObservation,
         lock_id: &TxId,
@@ -575,7 +563,7 @@ impl SeparatorPublisher {
         updated.remove_structural_gate(lock_id);
         if !self
             .structure
-            .store_structural_node(&separator.collection, parent_token, &updated, version)
+            .store_structural_node(&updated, version)
             .await?
         {
             return Ok(None);
@@ -1656,13 +1644,11 @@ impl Splitter {
     /// Stores a complete root or non-root node against an expected observation.
     async fn store_structural_node(
         &self,
-        collection: &CollectionAddress,
-        token: Option<&NodeToken>,
         node: &Node,
         observation: &LeafObservation,
     ) -> Result<bool, TransError> {
         self.structural_nodes
-            .store_structural_node(collection, token, node, observation)
+            .store_structural_node(node, observation)
             .await
     }
 
@@ -1733,10 +1719,7 @@ impl Splitter {
         writers: &[TxId],
     ) -> SplitAttemptOutcome {
         node.remove_structural_gate(worker);
-        match self
-            .store_structural_node(collection, target.source_token(), &node, observation)
-            .await
-        {
+        match self.store_structural_node(&node, observation).await {
             Ok(true) => {
                 self.record_reclamation(writers, true);
                 SplitAttemptOutcome::retry_cleanly(Ok(()))
@@ -1866,14 +1849,10 @@ impl Splitter {
     /// intent.
     async fn store_split_root(
         &self,
-        collection: &CollectionAddress,
         index: &Node,
         observation: &LeafObservation,
     ) -> Result<(), TransError> {
-        if self
-            .store_structural_node(collection, None, index, observation)
-            .await?
-        {
+        if self.store_structural_node(index, observation).await? {
             Ok(())
         } else {
             Err(TransError::Retry)
@@ -2124,10 +2103,7 @@ impl Splitter {
         {
             return SplitAttemptOutcome::recovery_required(ready, error);
         }
-        if let Err(error) = self
-            .store_split_root(collection, &index, &observation)
-            .await
-        {
+        if let Err(error) = self.store_split_root(&index, &observation).await {
             return SplitAttemptOutcome::recovery_required(ready, error);
         }
         self.record_completed_split(
