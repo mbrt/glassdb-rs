@@ -24,7 +24,7 @@ fn replay_corpus_file(path: &Path) -> Result<(), String> {
 
 #[test]
 fn replays_committed_disk_cache_corpus() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/disk_cache");
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/disk-cache");
     let mut paths = Vec::new();
     for entry in std::fs::read_dir(&dir).expect("read disk-cache corpus dir") {
         let path = entry.expect("read disk-cache corpus entry").path();

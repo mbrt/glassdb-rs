@@ -7,6 +7,7 @@
 //! normalized bounded membership scans; long-lived snapshot reads are
 //! intentionally not generated.
 #![no_main]
+#![recursion_limit = "256"]
 
 use libfuzzer_sys::fuzz_target;
 

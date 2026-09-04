@@ -13,9 +13,10 @@
 //! failures.
 //!
 //! ```bash
-//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run api_correctness <crash-file>
+//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run api-correctness <crash-file>
 //! ```
 #![no_main]
+#![recursion_limit = "256"]
 
 use libfuzzer_sys::fuzz_target;
 

@@ -617,7 +617,7 @@ mod tests {
                 operation,
                 BackendOp::WriteIf { path, .. } if path.ends_with("/_r")
             ) && hook_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                     count.checked_sub(1)
                 })
                 .is_ok();

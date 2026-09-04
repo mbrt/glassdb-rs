@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 readme = "../../README.md"
 description = "A stateless, ACID, serializable key/value store on top of object storage."
 keywords = ["database", "acid", "key-value", "object-storage", "transactions"]

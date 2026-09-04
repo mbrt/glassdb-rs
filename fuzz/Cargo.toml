@@ -18,7 +18,7 @@ glassdb = { path = "../crates/glassdb", features = ["sim"] }
 glassdb-storage = { path = "../crates/glassdb-storage", features = ["sim"] }
 
 [[bin]]
-name = "concurrent_tx"
+name = "concurrent-tx"
 path = "fuzz_targets/concurrent_tx.rs"
 test = false
 doc = false
@@ -39,7 +39,7 @@ doc = false
 bench = false
 
 [[bin]]
-name = "api_correctness"
+name = "api-correctness"
 path = "fuzz_targets/api_correctness.rs"
 test = false
 doc = false
@@ -53,7 +53,7 @@ doc = false
 bench = false
 
 [[bin]]
-name = "disk_cache"
+name = "disk-cache"
 path = "fuzz_targets/disk_cache.rs"
 test = false
 doc = false

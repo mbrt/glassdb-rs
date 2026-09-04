@@ -22,9 +22,10 @@
 //! flags to it):
 //!
 //! ```bash
-//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run concurrent_tx <crash-file>
+//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run concurrent-tx <crash-file>
 //! ```
 #![no_main]
+#![recursion_limit = "256"]
 
 use libfuzzer_sys::fuzz_target;
 

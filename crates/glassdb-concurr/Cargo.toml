@@ -4,8 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
-readme = "README.md"
 description = "Concurrency utilities for GlassDB (internal crate)."
 
 [lints]

@@ -3,7 +3,7 @@
 //! libFuzzer bytes are split into an `rng_seed`, a [`MembershipWorkload`], a
 //! [`FaultConfig`], and the remaining bytes, which are deinterleaved into
 //! *schedule*, *backend-fault*, and *cache-media* tapes — the same layout as the
-//! `concurrent_tx` and `cycle` targets. The harness runs the decoded workload
+//! `concurrent-tx` and `cycle` targets. The harness runs the decoded workload
 //! both without and with the persistent cache; the cached run uses only basic
 //! media delays and pre-effect failures. Each client owns a disjoint slice of a
 //! small key universe and concurrently creates, deletes, and lists keys over a
@@ -25,6 +25,7 @@
 //! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run membership <crash-file>
 //! ```
 #![no_main]
+#![recursion_limit = "256"]
 
 use libfuzzer_sys::fuzz_target;
 

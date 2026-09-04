@@ -44,10 +44,10 @@ fi
 # pass `--cfg madsim` through the environment (cargo-fuzz appends its own flags).
 run_fuzz() {
 	local secs="$1"
-	echo "== serializability fuzz (concurrent_tx, ${secs}s) =="
+	echo "== serializability fuzz (concurrent-tx, ${secs}s) =="
 	(
 		cd fuzz
-		RUSTFLAGS="--cfg madsim" cargo +nightly fuzz run concurrent_tx -- \
+		RUSTFLAGS="--cfg madsim" cargo +nightly fuzz run concurrent-tx -- \
 			-max_total_time="${secs}"
 	)
 }

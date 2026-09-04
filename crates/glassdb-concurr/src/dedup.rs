@@ -841,7 +841,7 @@ impl<R, E, W> OwnerPermit<R, E, W> {
     fn reserve(inner: Arc<Inner<R, E, W>>) -> Self {
         inner
             .active_owners
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |owners| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |owners| {
                 owners.checked_add(1)
             })
             .expect("dedup: active owner count overflowed");
@@ -854,7 +854,7 @@ impl<R, E, W> Drop for OwnerPermit<R, E, W> {
         let owners = self
             .inner
             .active_owners
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |owners| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |owners| {
                 owners.checked_sub(1)
             })
             .expect("dedup: released an unreserved owner");
@@ -928,7 +928,7 @@ where
     fn next_driver(&self) -> DriverId {
         let id = self
             .next_driver
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .expect("dedup: exhausted driver identifiers");
