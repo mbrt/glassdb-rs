@@ -93,10 +93,18 @@ const CANDIDATE_QUEUE_CAP: usize = 4096;
 /// re-queuing it for a later sweep. Descent works meanwhile through right-links.
 const PARENT_RETRIES: usize = 8;
 
-/// Safety bound on the leaf right-link hops walked while reconciling separators,
-/// so a malformed or concurrently-mutated chain can never spin the splitter. A
-/// well-formed chain up to a split key is far shorter than this.
+/// Safety bound on the leaf right-link hops walked while reconciling
+/// separators, so a malformed or concurrently-mutated chain can never spin the
+/// splitter. A well-formed chain up to a split key is far shorter than this.
 const MAX_RECONCILE_HOPS: usize = 4096;
+
+/// A right-link edge that a parent index does not name yet: the separator that
+/// bounds the child's range, and the child it routes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MissingSeparator {
+    separator: Vec<u8>,
+    child: NodeToken,
+}
 
 /// A leaf separator a split could not publish into its parent index on the
 /// first try (a lost CAS): re-driven by a later [`Splitter`] sweep so the
@@ -507,8 +515,8 @@ impl SeparatorPublisher {
                 return Ok(SeparatorPublicationOutcome::Published);
             }
             let mut new_index = index.clone();
-            for (split_key, token) in &missing {
-                new_index.insert_child(split_key.clone(), token.to_string());
+            for edge in &missing {
+                new_index.insert_child(edge.separator.clone(), edge.child.to_string());
             }
             let mut updated = locked_parent.clone();
             updated.set_index(new_index)?;
@@ -581,14 +589,20 @@ impl SeparatorPublisher {
         Err(TransError::Retry)
     }
 
-    /// Returns the unpublished right-link edges through `split_key` in chain order.
+    /// Returns the right-link edges through `split_key` that `parent` does not
+    /// name yet, in chain order.
+    ///
+    /// A split publishes its separator into the parent as a follow-on step, so
+    /// the index can lag behind the leaf chain until a later sweep reconciles it
+    /// (ADR-031). `parent` is the caller's own observed index, so the result
+    /// reconciles against the version the caller goes on to write.
     async fn missing_separators(
         &self,
         collection: &CollectionAddress,
         parent: &Node,
         split_key: &[u8],
         requirement: Requirement,
-    ) -> Result<Vec<(Vec<u8>, NodeToken)>, TransError> {
+    ) -> Result<Vec<MissingSeparator>, TransError> {
         let Some(index) = parent.as_index() else {
             return Ok(Vec::new());
         };
@@ -596,37 +610,41 @@ impl SeparatorPublisher {
             return Ok(Vec::new());
         };
         let start = node_token(start)?;
+        let mut current = self.router.leaf_at(collection, &start, requirement).await?;
         let mut missing = Vec::new();
-        let (mut cur, _) = self
-            .structure
-            .nodes
-            .load_node(collection, &start, requirement)
-            .await?;
         for _ in 0..MAX_RECONCILE_HOPS {
-            let (Some(right), Some(boundary)) = (cur.right_sibling(), cur.high_key()) else {
-                break;
+            let Some(node) = current.node() else {
+                return Err(StorageError::NotFound.into());
             };
-            if boundary > split_key {
-                break;
+            let (Some(right), Some(separator)) = (node.right_sibling(), node.high_key()) else {
+                return Ok(missing);
+            };
+            if separator > split_key {
+                return Ok(missing);
             }
             let right = right.to_string();
-            let right_token = node_token(&right)?;
-            let boundary = boundary.to_vec();
-            if index.child_for(&boundary) != Some(right.as_str()) {
-                missing.push((boundary.clone(), right_token.clone()));
+            let separator = separator.to_vec();
+            if index.child_for(&separator) != Some(right.as_str()) {
+                missing.push(MissingSeparator {
+                    separator: separator.clone(),
+                    child: node_token(&right)?,
+                });
             }
-            let reached_target = boundary.as_slice() == split_key;
-            let (next, _) = self
-                .structure
-                .nodes
-                .load_node(collection, &right_token, requirement)
-                .await?;
-            cur = next;
-            if reached_target {
-                break;
+            if separator == split_key {
+                return Ok(missing);
             }
+            let Some(next) = self
+                .router
+                .next_leaf(collection, &current, requirement)
+                .await?
+            else {
+                return Ok(missing);
+            };
+            current = next;
         }
-        Ok(missing)
+        Err(TransError::other(
+            "separator reconciliation exceeded the right-link hop bound",
+        ))
     }
 }
 
@@ -4008,5 +4026,143 @@ mod tests {
         fn block(&self, on: bool) {
             self.blocked.store(on, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    // A stale parent over a three-leaf chain: the root names only L0, while the
+    // right-links have moved keys at and above "m" to L1 and "t" to L4.
+    async fn seed_unpublished_leaf_chain(s: &TestStore, children: &[(&[u8], &str)]) -> Node {
+        s.store_node(
+            COLL,
+            "L0",
+            &leaf_node(&[b"apple"], Some(b"m"), Some("L1")),
+            None,
+        )
+        .await
+        .unwrap();
+        s.store_node(
+            COLL,
+            "L1",
+            &leaf_node(&[b"mango"], Some(b"t"), Some("L4")),
+            None,
+        )
+        .await
+        .unwrap();
+        s.store_node(COLL, "L4", &leaf_node(&[b"zebra"], None, None), None)
+            .await
+            .unwrap();
+        let root =
+            Node::index(IndexNode::from_children(children.iter().map(
+                |(separator, child)| (separator.to_vec(), test_token(child).to_string()),
+            )));
+        s.create_root(COLL, &root).await.unwrap();
+        root
+    }
+
+    async fn publisher(s: &TestStore, bg: &Arc<Background>) -> SeparatorPublisher {
+        splitter(s, bg, SplitPolicy::default()).publisher
+    }
+
+    #[tokio::test]
+    async fn missing_separators_reports_every_unindexed_edge_in_chain_order() {
+        let s = store();
+        let bg = Arc::new(Background::new());
+        let parent = seed_unpublished_leaf_chain(&s, &[(b"", "L0")]).await;
+
+        assert_eq!(
+            publisher(&s, &bg)
+                .await
+                .missing_separators(&collection(), &parent, b"t", Requirement::Any)
+                .await
+                .unwrap(),
+            [
+                MissingSeparator {
+                    separator: b"m".to_vec(),
+                    child: test_token("L1"),
+                },
+                MissingSeparator {
+                    separator: b"t".to_vec(),
+                    child: test_token("L4"),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_separators_stops_at_the_split_key() {
+        let s = store();
+        let bg = Arc::new(Background::new());
+        let parent = seed_unpublished_leaf_chain(&s, &[(b"", "L0")]).await;
+
+        assert_eq!(
+            publisher(&s, &bg)
+                .await
+                .missing_separators(&collection(), &parent, b"m", Requirement::Any)
+                .await
+                .unwrap(),
+            [MissingSeparator {
+                separator: b"m".to_vec(),
+                child: test_token("L1"),
+            }],
+            "an edge past the split key belongs to a later publication"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_separators_is_empty_when_the_parent_names_every_edge() {
+        let s = store();
+        let bg = Arc::new(Background::new());
+        let parent =
+            seed_unpublished_leaf_chain(&s, &[(b"", "L0"), (b"m", "L1"), (b"t", "L4")]).await;
+        let publisher = publisher(&s, &bg).await;
+
+        for split_key in [b"m".as_slice(), b"t".as_slice()] {
+            assert!(
+                publisher
+                    .missing_separators(&collection(), &parent, split_key, Requirement::Any)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a current index has nothing to publish for {split_key:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn separator_reconciliation_fails_on_a_right_link_cycle() {
+        let s = store();
+        let bg = Arc::new(Background::new());
+        // L0 and L1 point at each other and share a high-key, so neither ever
+        // reaches the split key and the walk would never terminate.
+        s.store_node(
+            COLL,
+            "L0",
+            &leaf_node(&[b"apple"], Some(b"m"), Some("L1")),
+            None,
+        )
+        .await
+        .unwrap();
+        s.store_node(
+            COLL,
+            "L1",
+            &leaf_node(&[b"cat"], Some(b"m"), Some("L0")),
+            None,
+        )
+        .await
+        .unwrap();
+        let parent = Node::index(IndexNode::from_children([(
+            Vec::new(),
+            test_token("L0").to_string(),
+        )]));
+        s.create_root(COLL, &parent).await.unwrap();
+
+        let error = publisher(&s, &bg)
+            .await
+            .missing_separators(&collection(), &parent, b"t", Requirement::Any)
+            .await
+            .expect_err("a cycle must not reconcile");
+        assert!(
+            error.to_string().contains("right-link hop bound"),
+            "unexpected reconciliation error: {error}"
+        );
     }
 }

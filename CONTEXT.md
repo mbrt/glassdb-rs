@@ -87,6 +87,10 @@ _Avoid_: Fresh leaf, leaf version, freshness observation
 One leaf observation and the ordered logical keys associated with it by one routing operation. The group records that routing result; it is not a durable ownership claim.
 _Avoid_: Leaf group, owning leaf group, point-leaf plan
 
+**Separator**:
+A logical key in a parent index that bounds one child's range: keys at or above it route to that child. A child split publishes a new separator into its parent.
+_Avoid_: Index key, boundary key
+
 ## Topology changes
 
 **Structural intent**:
