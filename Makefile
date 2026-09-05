@@ -40,14 +40,14 @@ format:
 bench:
 	cargo bench -p glassdb
 
-# Print the autoresearch performance metric: latency-stabilized op-cost score
+# Print the backend-operation performance score
 # (lower is better) plus memory/CPU secondary axes. Append `-- --json` args for
 # machine-readable output.
 bench-score:
-	@cargo run --release -p glassdb-bench-score --bin autoresearch -- --count 3
+	@cargo run --release -p glassdb-bench-score --bin bench-score -- --count 3
 
 # Record a CPU flamegraph to guide profiling work (a diagnostic aid only -
-# excluded from `test`, `bench-score`, and the autoresearch gate; it changes no
+# excluded from `test` and `bench-score`; it changes no
 # source and is not part of any metric). Tunable via TARGET/COUNT/OUT; see
 # hack/perf/README.md.
 flamegraph:

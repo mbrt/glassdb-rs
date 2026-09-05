@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
 #
-# CPU profiling recipe for glassdb-rs. This is a diagnostic aid only: it is NOT
-# part of any test, the benchmark metric, or the autoresearch correctness gate,
-# and it never edits source. The profiler attaches to the compiled binary, so it
-# can target even the frozen benchmark crates without touching them. See
-# hack/perf/README.md for the full story (including the in-memory caveat when
-# profiling the `autoresearch` target).
+# CPU profiling recipe for glassdb-rs. The profiler attaches to the compiled
+# binary to measure CPU use. See hack/perf/README.md for the limits of profiling
+# the `bench-score` target.
 #
 # Usage:
-#   hack/perf/profile.sh                 # flamegraph of the autoresearch harness
+#   hack/perf/profile.sh                 # flamegraph of the bench-score harness
 #   TARGET=bench hack/perf/profile.sh    # flamegraph of the transactions bench
 #
 # Tunables (env):
-#   TARGET    autoresearch | bench   what to profile (default autoresearch)
-#   COUNT     suite repeats fed to the autoresearch harness (default 50); more
+#   TARGET    bench-score | bench   what to profile (default bench-score)
+#   COUNT     suite repeats fed to the bench-score harness (default 50); more
 #             repeats => more samples => a less noisy profile
 #   OUT       output directory for artifacts (default hack/perf)
 
@@ -21,7 +18,7 @@ set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
-TARGET="${TARGET:-autoresearch}"
+TARGET="${TARGET:-bench-score}"
 COUNT="${COUNT:-50}"
 OUT="${OUT:-hack/perf}"
 
@@ -32,10 +29,10 @@ folded="$OUT/flamegraph.folded"
 # Cargo selector + the args passed to the profiled binary, per target. The
 # `transactions` bench wraps the in-memory backend in a latency-injecting
 # DelayBackend, so its profile is closer to the real round-trip-bound cost than
-# the in-memory `autoresearch` harness (see README).
+# the in-memory `bench-score` harness (see README).
 case "$TARGET" in
-autoresearch)
-	cargo_sel=(-p glassdb-bench-score --bin autoresearch)
+bench-score)
+	cargo_sel=(-p glassdb-bench-score --bin bench-score)
 	run_args=(--count "$COUNT")
 	;;
 bench)
@@ -43,7 +40,7 @@ bench)
 	run_args=(--bench)
 	;;
 *)
-	echo "unknown TARGET '$TARGET' (use 'autoresearch' or 'bench')" >&2
+	echo "unknown TARGET '$TARGET' (use 'bench-score' or 'bench')" >&2
 	exit 2
 	;;
 esac

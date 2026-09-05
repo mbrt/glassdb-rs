@@ -11,7 +11,7 @@ perfbench inline-pressure
 ```
 
 Raw backend latency remains in `backendbench`; Criterion owns microbenchmarks;
-`autoresearch` owns the deterministic backend-operation cost score.
+`bench-score` owns the deterministic backend-operation cost score.
 
 ## Mixed workload
 

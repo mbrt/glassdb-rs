@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render a compact Markdown comparison from PR autoresearch JSON artifacts."""
+"""Render a compact Markdown comparison from PR bench-score JSON artifacts."""
 
 from __future__ import annotations
 

@@ -1,19 +1,15 @@
 # Profiling glassdb-rs (hack/perf)
 
-A small, general-purpose CPU-profiling recipe. It is a **diagnostic aid only**:
-it changes no source, is not part of any test or benchmark metric, and is not
-part of the autoresearch correctness gate. Use it whenever you want to see where
-CPU time goes - guiding the autoresearch CPU/allocation work is one use, but it
-is not tied to that loop.
+A CPU-profiling recipe. Use it to identify where CPU time goes. The profiler
+attaches to a compiled benchmark executable.
 
 Manual experiments that use this or other performance tooling are recorded in
-[`investigations.md`](investigations.md). The autonomous autoresearch loop keeps
-its separate, format-constrained log under [`hack/autoresearch`](../autoresearch/).
+[`investigations.md`](investigations.md).
 
 ## Usage
 
 ```bash
-hack/perf/profile.sh                 # flamegraph of the autoresearch harness
+hack/perf/profile.sh                 # flamegraph of the bench-score harness
 TARGET=bench hack/perf/profile.sh    # flamegraph of the transactions bench
 make flamegraph                      # same as the default invocation
 ```
@@ -26,29 +22,28 @@ Artifacts are written under `hack/perf/` (and are gitignored): `flamegraph.svg`
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `TARGET` | `autoresearch` | What to profile: `autoresearch` or `bench`. |
-| `COUNT` | `50` | Suite repeats for the `autoresearch` target; more repeats give more samples and a less noisy profile. |
+| `TARGET` | `bench-score` | What to profile: `bench-score` or `bench`. |
+| `COUNT` | `50` | Suite repeats for the `bench-score` target; more repeats give more samples and a less noisy profile. |
 | `OUT` | `hack/perf` | Output directory for artifacts. |
 
 ## Targets
 
-- **`autoresearch`** - the single-client scoring harness
+- **`bench-score`** - the single-client scoring harness
   (`glassdb-bench-score`), run against a latency-stabilized in-memory backend.
-  Best for the CPU/allocation hot spots that show up as the loop's secondary
-  axes. See the caveat below.
+  Use it to inspect CPU use and allocations. See the caveat below.
 - **`bench`** - the `transactions` Criterion microbenchmark (`glassdb`), whose
   `DelayBackend` injects a compressed S3/GCS latency profile. Its profile is
   closer to the real, round-trip-bound cost model. The profiler attaches to the
-  compiled benchmark binary, so the frozen benchmark source is never edited.
+  compiled benchmark binary.
 
 ## The in-memory caveat
 
-The `autoresearch` harness injects a fixed 1 ms delay over the in-memory backend
+The `bench-score` harness injects a fixed 1 ms delay over the in-memory backend
 to stabilize deferred work, while real glassdb cost is dominated by much longer
 and variable object-storage round-trips (the metric weights each backend op at
 ~31-70ms). Its flamegraph therefore still over-weights the codec, allocator,
 and harness machinery and under-represents the paths that actually dominate in
-production. Read an `autoresearch` profile as a guide to the CPU/allocation
+production. Read a `bench-score` profile as a guide to the CPU/allocation
 tie-breakers only; for a production-shaped picture, profile the `bench` target
 instead.
 

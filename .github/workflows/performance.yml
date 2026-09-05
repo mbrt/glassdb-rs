@@ -67,15 +67,15 @@ jobs:
         # spurious compile errors against outdated generated types.
         cargo build --release --manifest-path .perf-main/Cargo.toml \
           --target-dir "$CARGO_TARGET_DIR/main" \
-          --package glassdb-bench-score --bin autoresearch
-        install -m 755 "$CARGO_TARGET_DIR/main/release/autoresearch" \
-          "$PERF_BIN/main-autoresearch"
+          --package glassdb-bench-score --bin bench-score
+        install -m 755 "$CARGO_TARGET_DIR/main/release/bench-score" \
+          "$PERF_BIN/main-bench-score"
 
         cargo build --release \
           --target-dir "$CARGO_TARGET_DIR/pr" \
-          --package glassdb-bench-score --bin autoresearch
-        install -m 755 "$CARGO_TARGET_DIR/pr/release/autoresearch" \
-          "$PERF_BIN/pr-autoresearch"
+          --package glassdb-bench-score --bin bench-score
+        install -m 755 "$CARGO_TARGET_DIR/pr/release/bench-score" \
+          "$PERF_BIN/pr-bench-score"
 
     - name: Measure backend-operation score
       timeout-minutes: 3
@@ -92,11 +92,11 @@ jobs:
         for repetition in $(seq 1 11); do
           printf -v repetition_id '%02d' "$repetition"
           if (( repetition % 2 == 1 )); then
-            run_score main "$PERF_BIN/main-autoresearch" "$repetition_id"
-            run_score pr "$PERF_BIN/pr-autoresearch" "$repetition_id"
+            run_score main "$PERF_BIN/main-bench-score" "$repetition_id"
+            run_score pr "$PERF_BIN/pr-bench-score" "$repetition_id"
           else
-            run_score pr "$PERF_BIN/pr-autoresearch" "$repetition_id"
-            run_score main "$PERF_BIN/main-autoresearch" "$repetition_id"
+            run_score pr "$PERF_BIN/pr-bench-score" "$repetition_id"
+            run_score main "$PERF_BIN/main-bench-score" "$repetition_id"
           fi
         done
 

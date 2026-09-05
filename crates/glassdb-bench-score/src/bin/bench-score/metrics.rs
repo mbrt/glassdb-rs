@@ -1,13 +1,10 @@
-//! Process-wide measurement helpers for the scoring harness.
+//! Process-wide measurements for the backend-operation scoring harness.
 //!
 //! These are the Rust analogs of the runtime introspection the Go harness uses:
 //! a counting global allocator stands in for `runtime.ReadMemStats`
 //! (`Mallocs`/`TotalAlloc`), and [`cpu_ns`] wraps `getrusage` exactly like the
 //! Go `cpuNs`. Go's `mutexWaitNsPerTx` (from `runtime/metrics`) has no portable
 //! Rust equivalent and is intentionally dropped.
-//!
-//! This file is part of the autoresearch fixed infrastructure: it defines how
-//! the metric is measured and must NOT be modified by autoresearch experiments.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};

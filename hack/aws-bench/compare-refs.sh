@@ -3,8 +3,8 @@
 # Compare GlassDB transaction performance between two engine versions (git
 # refs) under the in-memory backend with simulated S3 latency and throttling.
 #
-# It builds `perfbench` + `autoresearch` from current refs, falling back to the
-# retired `rtbench`/`mixbench` binaries when comparing historical refs. The base
+# It builds `perfbench` + `bench-score` from current refs, falling back to the
+# retired `rtbench`/`mixbench` and `autoresearch` names for historical refs. The base
 # ref (default `main`, built in a reused detached git worktree) and from the
 # target tree (the current worktree by default), interleaves paired workload
 # repetitions into `out-refs/`, and diffs them with `compare.py`. Throughput and
@@ -22,7 +22,7 @@
 # successfully.
 #
 # Each run leaves a small, trackable digest at $OUT/summary.md (the per-section
-# ratio summaries plus the deterministic autoresearch score). It is the only
+# ratio summaries plus the deterministic backend-operation score). It is the only
 # out-refs artifact that is not gitignored, so it can be committed to follow the
 # numbers over time. The worktrees built for the base/target refs are removed at
 # the end of every run (same as `--clean`).
@@ -49,7 +49,7 @@
 #   CONTENTION_DURATION=8s / 3s duration per contention configuration
 #   INLINE_PROFILES=s3,gcs  latency profiles for the inline-pressure scenario
 #   INLINE_SETTLE_TIMEOUT=5s / 3s  maximum wait for each demanded split
-#   COUNT=5 / 3             autoresearch suite repeats (reports the median)
+#   COUNT=5 / 3             bench-score suite repeats (reports the median)
 #   MIX_DURATION=2s / 1s    mixed minimum measured window per cell
 #   MIX_MAX_DURATION=60s / 20s  mixed per-cell time cap (upper bound)
 #   MIX_TARGET_CI=0.1 / 0.2 mixed target throughput 95% CI half-width; the
@@ -232,9 +232,17 @@ if ! command -v timeout >/dev/null 2>&1; then
 fi
 
 build_bins() {
-  local dir="$1" perf_source mix_source rt_source
+  local dir="$1" perf_source mix_source rt_source score_bin=bench-score
   log "building performance binaries in $dir (release)"
-  (cd "$dir" && cargo build --release --bin autoresearch >&2)
+  # Select from source so an artifact left by another ref cannot select the
+  # wrong executable. Historical refs still build the former name.
+  if [ ! -f "$dir/crates/glassdb-bench-score/src/bin/bench-score/main.rs" ]; then
+    score_bin=autoresearch
+  fi
+  (cd "$dir" && cargo build --release --bin "$score_bin" >&2)
+  if [ "$score_bin" != bench-score ]; then
+    install -m 755 "$dir/target/release/$score_bin" "$dir/target/release/bench-score"
+  fi
   perf_source="$dir/crates/glassdb-bench-scale/src/bin/perfbench/main.rs"
   mix_source="$dir/crates/glassdb-bench-scale/src/bin/mixbench.rs"
   rt_source="$dir/crates/glassdb-bench-scale/src/bin/rtbench/main.rs"
@@ -469,8 +477,8 @@ run_aux_side() {
 
   local de="$OUT/efficiency/$label"
   mkdir -p "$de"
-  log "$label autoresearch (--count $COUNT)"
-  run_bounded "$bindir/autoresearch" --json --count "$COUNT" >"$de/score.json"
+  log "$label bench-score (--count $COUNT)"
+  run_bounded "$bindir/bench-score" --json --count "$COUNT" >"$de/score.json"
 }
 
 # --- Build both sides ------------------------------------------------------
@@ -619,7 +627,7 @@ mkdir -p "$OUT"
   fi
   echo "- each line ends in a \`=> better/WORSE/~same\` verdict read in that"
   echo "  metric's own direction, so no axis has to be interpreted by hand"
-  echo "- \`autoresearch-*\` is **deterministic** (single-client backend ops/tx,"
+  echo "- \`bench-score*\` is **deterministic** (single-client backend ops/tx,"
   echo "  lower is better) — the most trustworthy signal; \`mix-*\` cells run"
   echo "  until their throughput 95% CI reaches --target-ci, so a converged"
   echo "  ratio is significant — \`[unconverged]\` marks a cell that hit its time"

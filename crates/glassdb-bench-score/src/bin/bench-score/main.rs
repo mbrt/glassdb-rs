@@ -1,4 +1,4 @@
-//! The autoresearch scoring harness for glassdb-rs.
+//! The backend-operation scoring harness for glassdb-rs.
 //!
 //! It runs a fixed suite of single-client workloads against a latency-stabilized
 //! in-memory backend and reports a single primary score plus secondary axes. The
@@ -8,19 +8,14 @@
 //!
 //! Ported from the Go `hack/autoresearch/bench`. Go's `mutexWaitNsPerTx`
 //! (from `runtime/metrics`) has no portable Rust equivalent and is dropped.
-//!
-//! This file is part of the autoresearch fixed infrastructure: it defines the
-//! metric and must NOT be modified by autoresearch experiments.
 
 mod metrics;
 mod workloads;
 
 use std::cmp::Ordering;
 use std::error::Error;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use clap::Parser;
 use serde::Serialize;
@@ -32,10 +27,6 @@ use glassdb::backend::middleware::{
 use glassdb::{Database, Stats};
 
 use crate::metrics::Sample;
-
-/// Path (relative to the repo root, where the harness is run from) of the log
-/// the `--record` flag appends a score line to.
-const LOG_PATH: &str = "hack/autoresearch/log.md";
 
 // A short fixed delay makes background-operation batching depend on protocol
 // behavior rather than small code-layout and runner-speed differences. Keeping
@@ -111,7 +102,7 @@ struct SuiteResult {
 static GLOBAL: metrics::CountingAlloc = metrics::CountingAlloc;
 
 #[derive(Parser)]
-#[command(about = "Autoresearch scoring harness for glassdb-rs")]
+#[command(name = "bench-score", about = "Backend-operation score for glassdb-rs")]
 struct Args {
     /// Emit machine-readable JSON instead of a human-readable table.
     #[arg(long)]
@@ -119,9 +110,6 @@ struct Args {
     /// Run the suite this many times and report the median.
     #[arg(long, default_value_t = 1)]
     count: usize,
-    /// Append a score-record line to the log.
-    #[arg(long)]
-    record: bool,
 }
 
 fn main() {
@@ -143,12 +131,6 @@ fn main() {
 
     let mut final_run = median_run(runs);
     final_run.scores = scores;
-
-    if args.record
-        && let Err(e) = append_record(&final_run)
-    {
-        eprintln!("warning: could not record: {e}");
-    }
 
     if args.json {
         println!(
@@ -173,6 +155,8 @@ fn benchmark_runtime() -> tokio::runtime::Runtime {
 async fn run_suite() -> Result<SuiteResult, Box<dyn Error>> {
     let mut results = Vec::with_capacity(workloads::NAMES.len());
     for &name in workloads::NAMES {
+        // Keep the database name stable so a binary rename does not change
+        // the measured paths and allocations.
         let db = Database::open("autoresearch", benchmark_backend()).await?;
         let sample = workloads::run(name, &db).await?;
         db.shutdown().await;
@@ -291,27 +275,6 @@ fn emit_text(res: &SuiteResult) {
     println!("  allocs/tx:      {:.1}", res.secondary.allocs_per_tx);
     println!("  ns/tx:          {:.0}", res.secondary.ns_per_tx);
     println!("  cpu ns/tx:      {:.0}", res.secondary.cpu_ns_per_tx);
-}
-
-fn append_record(res: &SuiteResult) -> std::io::Result<()> {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let mut f = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(LOG_PATH)?;
-    writeln!(
-        f,
-        "- score-record unix={ts} primary={:.2} allocBytesPerTx={:.0} allocsPerTx={:.1} \
-         nsPerTx={:.0} cpuNsPerTx={:.0}",
-        res.score,
-        res.secondary.alloc_bytes_per_tx,
-        res.secondary.allocs_per_tx,
-        res.secondary.ns_per_tx,
-        res.secondary.cpu_ns_per_tx,
-    )
 }
 
 #[cfg(test)]

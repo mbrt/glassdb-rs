@@ -128,7 +128,8 @@ This project makes the following specific tradeoffs:
 - High throughput is better than low latency.
 - Allows stale reads if explicitly requested, but defaults to strong consistency
   in all cases.
-- Values are in the range 1KB to 1MB.
+- Small key-value records are the target workload (<=1 KiB), but larger values
+  work as well, depending on transaction size.
 
 Glass DB makes sense in contexts where there are many writers that rarely write
 to the same keys or reads are more frequent than writes.
