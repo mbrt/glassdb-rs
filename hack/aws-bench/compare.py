@@ -12,12 +12,12 @@
 """Compare two GlassDB performance result sets and report how they differ.
 
 Generic two-directory comparator. Each side is a directory of result files
-produced by `perfbench`, `autoresearch`, or a historical benchmark binary:
+produced by `perfbench`, `bench-score`, or a historical benchmark binary:
 
 * `mixed.json`      -> current mixed-workload affinity grid;
 * `contention.json` -> current overlapping-RMW contention matrix;
 * `inline-pressure.json` -> current direct-commit recovery phase sequence;
-* `score.json`      -> autoresearch primary score + per-workload cost/ops per tx;
+* `score.json`      -> backend-operation score + per-workload cost/ops per tx;
 
 Legacy `mixbench.json` plus `rtbench` throughput, sample, stats, deadlock,
 inline-pressure, and diagnostics CSVs remain readable for reference-to-reference
@@ -67,7 +67,7 @@ import seaborn as sns
 # the efficiency number comparable across versions.
 OP_COLS = ["obj-write", "obj-read", "obj-list", "meta-write", "meta-read"]
 
-# autoresearch JSON op-count fields (camelCase) that sum into ops/tx.
+# bench-score JSON op-count fields (camelCase) that sum into ops/tx.
 SCORE_OP_FIELDS = ["objReads", "objWrites", "objLists", "metaReads", "metaWrites"]
 
 
@@ -701,7 +701,7 @@ def contention_stats_table(a: pd.DataFrame, b: pd.DataFrame):
 
 
 def efficiency_table(a: dict, b: dict):
-    """Per-workload autoresearch cost/tx and ops/tx, plus the primary score."""
+    """Per-workload bench-score cost/tx and ops/tx, plus the primary score."""
 
     def by_name(d: dict) -> dict:
         return {w["name"]: w for w in d.get("workloads", [])}
@@ -940,7 +940,7 @@ def append_summary(path: Path, title: str, summaries: list[str]) -> None:
     The shell driver points every comparison at the same file so the result is
     one compact, trackable digest per run. Each line carries its own polarity
     verdict (`=> better/WORSE/~same`) and, where relevant, a sample-size note and
-    a `[noisy]`/`[unconverged]` tag; the autoresearch section is deterministic,
+    a `[noisy]`/`[unconverged]` tag; the bench-score section is deterministic,
     Mixed cells run to a target CI (flagged `[unconverged]` if the time cap is
     hit first), and the contention section is indicative only."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1464,14 +1464,14 @@ def main() -> int:
     if a_sc is not None and b_sc is not None:
         sa, sb = a_sc.get("score"), b_sc.get("score")
         if sa is not None and sb is not None:
-            print("\n## Autoresearch primary score (cost/tx geomean, lower = better)\n")
+            print("\n## Backend-operation score (cost/tx geomean, lower = better)\n")
             score_ratio = _ratio(sb, sa)
             print(f"{la}={sa:.2f}  {lb}={sb:.2f}  ratio({lb}/{la})={score_ratio:.3f}")
             # Deterministic single-client backend-ops-per-tx cost: the direction
             # is spelled out because a *lower* score is better (unlike throughput),
             # which is the axis most easily misread.
             summaries.append(
-                "autoresearch-score (cost/tx geomean, lower=better) [deterministic]: "
+                "bench-score (cost/tx geomean, lower=better) [deterministic]: "
                 f"{la}={sa:.2f} {lb}={sb:.2f} ratio b/a={score_ratio:.3f}"
                 f"{_verdict(score_ratio, True)}"
             )
@@ -1485,15 +1485,15 @@ def main() -> int:
             "opsPerTx_b",
             "ops-ratio",
         ]
-        print_table(f"Autoresearch per-workload cost/ops per tx ({lb}/{la})", tbl[cols])
+        print_table(f"Backend-operation cost/ops per tx ({lb}/{la})", tbl[cols])
         if not tbl.empty:
             summaries.append(
                 summarize(
-                    "autoresearch-cost/tx", tbl["cost-ratio"], lower_is_better=True
+                    "bench-score-cost/tx", tbl["cost-ratio"], lower_is_better=True
                 )
             )
             summaries.append(
-                summarize("autoresearch-ops/tx", tbl["ops-ratio"], lower_is_better=True)
+                summarize("bench-score-ops/tx", tbl["ops-ratio"], lower_is_better=True)
             )
             # Per-workload cost so a big localized change (e.g. singleRMW) is not
             # diluted by the geomean; this is the deterministic signal that most
@@ -1501,7 +1501,7 @@ def main() -> int:
             for _, row in tbl.sort_values("cost-ratio").iterrows():
                 summaries.append(
                     summarize(
-                        f"autoresearch-cost/tx[{row['workload']}]",
+                        f"bench-score-cost/tx[{row['workload']}]",
                         pd.Series([row["cost-ratio"]]),
                         lower_is_better=True,
                     )

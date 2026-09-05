@@ -1,4 +1,4 @@
-//! The fixed suite of single-client workloads, ported from the Go
+//! Fixed workloads for one client, ported from the Go
 //! `hack/autoresearch/bench/workloads.go`. Iteration counts are deliberately
 //! constant so the primary score stays comparable across runs and machines.
 //!
@@ -7,9 +7,6 @@
 //! [`Measure::begin`]/[`Measure::end`]. Go's `ReadMulti` becomes a parallel
 //! `futures::future::join_all` of `tx.read`, matching the rest of the repo's
 //! benchmarks.
-//!
-//! This file is part of the autoresearch fixed infrastructure: it defines the
-//! measured workloads and must NOT be modified by autoresearch experiments.
 
 use futures::future::join_all;
 

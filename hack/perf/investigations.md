@@ -1,7 +1,6 @@
 # Performance investigations
 
-This is the log for manual performance investigations that do not belong to the
-autonomous [`autoresearch`](../autoresearch/README.md) loop. Entries may describe
+This is the log for manual performance investigations. Entries may describe
 temporary instrumentation, inconclusive variants, and design candidates.
 
 This file is evidence, not a record of accepted behavior:
