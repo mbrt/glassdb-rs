@@ -34,7 +34,7 @@ use glassdb_storage::{
     TreeRouter,
 };
 
-use crate::access::{AccessSet, ReadAccess, WriteOp};
+use crate::access::{AccessSet, LeafCoverage, ReadAccess, WriteOp};
 use crate::collection_commit::{CollectionAttempt, CollectionCommit};
 use crate::collections::CatalogAccesses;
 use crate::error::TransError;
@@ -1012,7 +1012,7 @@ impl Algo {
             .iter()
             .flat_map(|scan| scan.covered())
         {
-            let leaf_unchanged = match lock_validation {
+            let unchanged = match lock_validation {
                 Some(locked) => locked.validated(&coverage.observation),
                 None => matches!(
                     self.nodes
@@ -1021,13 +1021,8 @@ impl Algo {
                     LeafObservationCheck::Current
                 ),
             };
-            if !leaf_unchanged {
+            if !unchanged || self.any_committed([coverage], requirement).await? {
                 return Ok(false);
-            }
-            for holder in &coverage.pending_membership {
-                if self.mon.tx_status_at(holder, requirement).await? == TxCommitStatus::Ok {
-                    return Ok(false);
-                }
             }
         }
         Ok(true)
@@ -1086,24 +1081,12 @@ impl Algo {
                     requirement,
                 )
                 .await?;
-            let mut fast = current.len() == scan.covered().len()
+            let unchanged = current.len() == scan.covered().len()
                 && !current.iter().zip(scan.covered()).any(|(now, observed)| {
                     now.path != observed.path
                         || now.membership_version != observed.membership_version
                 });
-            if fast {
-                for holder in scan
-                    .covered()
-                    .iter()
-                    .flat_map(|leaf| &leaf.pending_membership)
-                {
-                    if self.mon.tx_status_at(holder, requirement).await? == TxCommitStatus::Ok {
-                        fast = false;
-                        break;
-                    }
-                }
-            }
-            if fast {
+            if unchanged && !self.any_committed(scan.covered(), requirement).await? {
                 continue;
             }
 
@@ -1123,6 +1106,22 @@ impl Algo {
             }
         }
         Ok(true)
+    }
+
+    /// Reports whether any recorded membership holder has committed.
+    async fn any_committed<'a>(
+        &self,
+        covered: impl IntoIterator<Item = &'a LeafCoverage>,
+        requirement: Requirement,
+    ) -> Result<bool, TransError> {
+        for leaf in covered {
+            for holder in &leaf.pending_membership {
+                if self.mon.tx_status_at(holder, requirement).await? == TxCommitStatus::Ok {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Builds and writes the committed transaction object (the commit point).
