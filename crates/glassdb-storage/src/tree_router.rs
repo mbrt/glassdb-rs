@@ -77,6 +77,7 @@ struct RoutedItem<T> {
     raw_key: Vec<u8>,
     payload: T,
     stage: RouteStage,
+    right_hops: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -154,6 +155,7 @@ impl<T> BatchRouting<T> {
                     key,
                     payload,
                     stage: RouteStage::Interior,
+                    right_hops: 0,
                 },
             );
         }
@@ -273,6 +275,14 @@ impl<T> BatchRouting<T> {
         node: &Node,
         mut item: RoutedItem<T>,
     ) -> Option<RoutedItem<T>> {
+        if item.right_hops >= MAX_SELF_CORRECTING_HOPS {
+            self.record_error(
+                item.ordinal,
+                path.clone(),
+                StorageError::other("routing exceeded the right-link hop bound"),
+            );
+            return None;
+        }
         let required = route_requirement(item.stage, self.interior, self.leaf);
         if !required.is_satisfied_by(observation.current_after()) {
             self.enqueue(path.clone(), item);
@@ -294,6 +304,7 @@ impl<T> BatchRouting<T> {
                 NodeBody::Leaf(_) => RouteStage::Leaf,
                 NodeBody::Index(_) => RouteStage::Interior,
             };
+            item.right_hops += 1;
             self.enqueue(target, item);
             return None;
         }
@@ -316,6 +327,7 @@ impl<T> BatchRouting<T> {
                     }
                 };
                 item.stage = RouteStage::Interior;
+                item.right_hops = 0;
                 self.enqueue(target, item);
                 None
             }
@@ -2017,6 +2029,121 @@ mod tests {
             router.leaf_at(&collection(), &token(9), requirement).await,
             Err(StorageError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn grouped_routing_bounds_right_link_walks() {
+        let s = store();
+        let first = NodeToken::from_bytes(0_u128.to_le_bytes());
+        for hop in 0..=MAX_SELF_CORRECTING_HOPS {
+            let token = NodeToken::from_bytes((hop as u128).to_le_bytes());
+            let next = NodeToken::from_bytes((hop as u128 + 1).to_le_bytes());
+            let node = if hop == MAX_SELF_CORRECTING_HOPS {
+                leaf(&[b"pear", b"zebra"], None, None)
+            } else {
+                leaf(&[], Some(b"m"), Some(&next))
+            };
+            s.store_node(&collection(), &token, &node, None)
+                .await
+                .unwrap();
+        }
+        s.create_root(
+            &collection(),
+            &Node::index(IndexNode::from_children([(Vec::new(), first.to_string())])),
+        )
+        .await
+        .unwrap();
+
+        // A finite overlong walk must fail before the cyclic batch can hang
+        // if its correction bound is removed.
+        for s in [s, {
+            let cyclic = store();
+            seed_right_link_cycle(&cyclic).await;
+            cyclic
+        }] {
+            let router = TreeRouter::new(s.nodes.clone(), limit(2));
+            let result = router
+                .route_keys_with_requirements(
+                    [
+                        (LogicalKey::new(collection(), b"pear"), ()),
+                        (LogicalKey::new(collection(), b"zebra"), ()),
+                    ],
+                    Requirement::Any,
+                    Requirement::Any,
+                )
+                .await;
+            let error = result
+                .err()
+                .expect("an excessive right-link walk must fail");
+            assert!(
+                error.to_string().contains("right-link hop bound"),
+                "unexpected routing error: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grouped_routing_counts_right_hops_per_key_and_level() {
+        let s = store();
+        let hops = MAX_SELF_CORRECTING_HOPS / 2 + 1;
+        let leaf_start = hops + 1;
+        let last = leaf_start + hops;
+        let token_at = |index: usize| NodeToken::from_bytes((index as u128).to_le_bytes());
+        for index in 0..=last {
+            let node = if index < leaf_start {
+                Node::index(IndexNode::from_children([(
+                    Vec::new(),
+                    token_at(leaf_start).to_string(),
+                )]))
+            } else if index == last {
+                leaf(&[b"pear", b"zebra"], None, None)
+            } else {
+                leaf(&[], None, None)
+            };
+            let node = if index == hops || index == last {
+                node
+            } else {
+                node.with_high_key(Some(b"m".to_vec()))
+                    .with_right_sibling(Some(token_at(index + 1).to_string()))
+            };
+            s.store_node(&collection(), &token_at(index), &node, None)
+                .await
+                .unwrap();
+        }
+        s.create_root(
+            &collection(),
+            &Node::index(IndexNode::from_children([(
+                Vec::new(),
+                token_at(0).to_string(),
+            )])),
+        )
+        .await
+        .unwrap();
+
+        let router = TreeRouter::new(s.nodes.clone(), limit(2));
+        let groups = router
+            .route_keys_with_requirements(
+                [
+                    (LogicalKey::new(collection(), b"pear"), ()),
+                    (LogicalKey::new(collection(), b"zebra"), ()),
+                ],
+                Requirement::Any,
+                Requirement::Any,
+            )
+            .await
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].path(),
+            &ObjectPath::Node {
+                collection: collection(),
+                token: token_at(last),
+            }
+        );
+        assert_eq!(
+            groups[0].keys,
+            vec![(b"pear".to_vec(), ()), (b"zebra".to_vec(), ())]
+        );
     }
 
     #[tokio::test]
