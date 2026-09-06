@@ -55,7 +55,8 @@ features = ["s3", "gcs"]
 glob = "0.3"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "rt-multi-thread", "test-util"] }
 proptest = "1.9.0"
-criterion = "0.8.2"
+criterion = "=0.8.2"
+serde_json = "1"
 async-trait = "0.1.89"
 rayon = "1.12.0"
 proc-macro2 = { version = "1", features = ["span-locations"] }
@@ -66,5 +67,10 @@ syn = { version = "2", features = ["full", "visit"] }
 # test-sim run) from executing it — run it with `cargo bench`.
 [[bench]]
 name = "transactions"
+harness = false
+test = false
+
+[[bench]]
+name = "diagnostics"
 harness = false
 test = false

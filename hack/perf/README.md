@@ -9,9 +9,9 @@ Manual experiments that use this or other performance tooling are recorded in
 ## Usage
 
 ```bash
-hack/perf/profile.sh                 # flamegraph of the bench-score harness
-TARGET=bench hack/perf/profile.sh    # flamegraph of the transactions bench
-make flamegraph                      # same as the default invocation
+hack/perf/profile.sh
+FILTER=diagnostic/rmw_inline_1024 hack/perf/profile.sh
+make flamegraph
 ```
 
 Artifacts are written under `hack/perf/` (and are gitignored): `flamegraph.svg`
@@ -22,30 +22,23 @@ Artifacts are written under `hack/perf/` (and are gitignored): `flamegraph.svg`
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `TARGET` | `bench-score` | What to profile: `bench-score` or `bench`. |
-| `COUNT` | `50` | Suite repeats for the `bench-score` target; more repeats give more samples and a less noisy profile. |
+| `FILTER` | `diagnostic` | Criterion case filter. |
+| `SECONDS_PER_CASE` | `10` | Profiling duration per selected case. |
 | `OUT` | `hack/perf` | Output directory for artifacts. |
 
-## Targets
+## Target
 
-- **`bench-score`** - the single-client scoring harness
-  (`glassdb-bench-score`), run against a latency-stabilized in-memory backend.
-  Use it to inspect CPU use and allocations. See the caveat below.
-- **`bench`** - the `transactions` Criterion microbenchmark (`glassdb`), whose
-  `DelayBackend` injects a compressed S3/GCS latency profile. Its profile is
-  closer to the real, round-trip-bound cost model. The profiler attaches to the
-  compiled benchmark binary.
+The script profiles the self-contained `diagnostics` Criterion target.
+Preparation and the cost pass appear in the profile; use the transaction
+stacks to inspect measured work.
+`FILTER` selects cases within this target.
 
 ## The in-memory caveat
 
-The `bench-score` harness injects a fixed 1 ms delay over the in-memory backend
-to stabilize deferred work, while real glassdb cost is dominated by much longer
-and variable object-storage round-trips (the metric weights each backend op at
-~31-70ms). Its flamegraph therefore still over-weights the codec, allocator,
-and harness machinery and under-represents the paths that actually dominate in
-production. Read a `bench-score` profile as a guide to the CPU/allocation
-tie-breakers only; for a production-shaped picture, profile the `bench` target
-instead.
+These diagnostics use memory without provider delay and a 20× engine model
+clock. A CPU profile explains local execution costs; it does not predict
+object-storage latency or waiting time. Use `perfbench` and real-provider
+measurements for workload behavior.
 
 ## Profiler
 

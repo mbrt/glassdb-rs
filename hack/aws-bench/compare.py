@@ -12,12 +12,11 @@
 """Compare two GlassDB performance result sets and report how they differ.
 
 Generic two-directory comparator. Each side is a directory of result files
-produced by `perfbench`, `bench-score`, or a historical benchmark binary:
+produced by `perfbench` or a historical workload benchmark binary:
 
 * `mixed.json`      -> current mixed-workload affinity grid;
 * `contention.json` -> current overlapping-RMW contention matrix;
 * `inline-pressure.json` -> current direct-commit recovery phase sequence;
-* `score.json`      -> backend-operation score + per-workload cost/ops per tx;
 
 Legacy `mixbench.json` plus `rtbench` throughput, sample, stats, deadlock,
 inline-pressure, and diagnostics CSVs remain readable for reference-to-reference
@@ -66,9 +65,6 @@ import seaborn as sns
 # coordination into object reads/writes), so summing every class is what makes
 # the efficiency number comparable across versions.
 OP_COLS = ["obj-write", "obj-read", "obj-list", "meta-write", "meta-read"]
-
-# bench-score JSON op-count fields (camelCase) that sum into ops/tx.
-SCORE_OP_FIELDS = ["objReads", "objWrites", "objLists", "metaReads", "metaWrites"]
 
 
 def read_csv(input_dir: Path, name: str) -> pd.DataFrame | None:
@@ -700,37 +696,6 @@ def contention_stats_table(a: pd.DataFrame, b: pd.DataFrame):
     return merged
 
 
-def efficiency_table(a: dict, b: dict):
-    """Per-workload bench-score cost/tx and ops/tx, plus the primary score."""
-
-    def by_name(d: dict) -> dict:
-        return {w["name"]: w for w in d.get("workloads", [])}
-
-    wa, wb = by_name(a), by_name(b)
-    rows = []
-    for name in sorted(set(wa) & set(wb)):
-        x, y = wa[name], wb[name]
-
-        def ops_per_tx(w: dict) -> float:
-            txn = w.get("txn", 0) or 0
-            if txn == 0:
-                return float("nan")
-            return sum(w.get(f, 0) for f in SCORE_OP_FIELDS) / txn
-
-        rows.append(
-            {
-                "workload": name,
-                "costPerTx_a": x.get("costPerTx", float("nan")),
-                "costPerTx_b": y.get("costPerTx", float("nan")),
-                "cost-ratio": _ratio(y.get("costPerTx", 0), x.get("costPerTx", 0)),
-                "opsPerTx_a": ops_per_tx(x),
-                "opsPerTx_b": ops_per_tx(y),
-                "ops-ratio": _ratio(ops_per_tx(y), ops_per_tx(x)),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
 def _mixed_cells(report: Any) -> list[dict]:
     """Flatten current perfbench runs while retaining legacy mixbench arrays."""
     if isinstance(report, list):
@@ -940,7 +905,7 @@ def append_summary(path: Path, title: str, summaries: list[str]) -> None:
     The shell driver points every comparison at the same file so the result is
     one compact, trackable digest per run. Each line carries its own polarity
     verdict (`=> better/WORSE/~same`) and, where relevant, a sample-size note and
-    a `[noisy]`/`[unconverged]` tag; the bench-score section is deterministic,
+    a `[noisy]`/`[unconverged]` tag.
     Mixed cells run to a target CI (flagged `[unconverged]` if the time cap is
     hit first), and the contention section is indicative only."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1459,53 +1424,6 @@ def main() -> int:
                     noisy=True,
                 )
             )
-
-    a_sc, b_sc = read_json(args.a, "score.json"), read_json(args.b, "score.json")
-    if a_sc is not None and b_sc is not None:
-        sa, sb = a_sc.get("score"), b_sc.get("score")
-        if sa is not None and sb is not None:
-            print("\n## Backend-operation score (cost/tx geomean, lower = better)\n")
-            score_ratio = _ratio(sb, sa)
-            print(f"{la}={sa:.2f}  {lb}={sb:.2f}  ratio({lb}/{la})={score_ratio:.3f}")
-            # Deterministic single-client backend-ops-per-tx cost: the direction
-            # is spelled out because a *lower* score is better (unlike throughput),
-            # which is the axis most easily misread.
-            summaries.append(
-                "bench-score (cost/tx geomean, lower=better) [deterministic]: "
-                f"{la}={sa:.2f} {lb}={sb:.2f} ratio b/a={score_ratio:.3f}"
-                f"{_verdict(score_ratio, True)}"
-            )
-        tbl = efficiency_table(a_sc, b_sc)
-        cols = [
-            "workload",
-            "costPerTx_a",
-            "costPerTx_b",
-            "cost-ratio",
-            "opsPerTx_a",
-            "opsPerTx_b",
-            "ops-ratio",
-        ]
-        print_table(f"Backend-operation cost/ops per tx ({lb}/{la})", tbl[cols])
-        if not tbl.empty:
-            summaries.append(
-                summarize(
-                    "bench-score-cost/tx", tbl["cost-ratio"], lower_is_better=True
-                )
-            )
-            summaries.append(
-                summarize("bench-score-ops/tx", tbl["ops-ratio"], lower_is_better=True)
-            )
-            # Per-workload cost so a big localized change (e.g. singleRMW) is not
-            # diluted by the geomean; this is the deterministic signal that most
-            # cleanly attributes a single-RW / read / batch effect.
-            for _, row in tbl.sort_values("cost-ratio").iterrows():
-                summaries.append(
-                    summarize(
-                        f"bench-score-cost/tx[{row['workload']}]",
-                        pd.Series([row["cost-ratio"]]),
-                        lower_is_better=True,
-                    )
-                )
 
     a_mx = read_first_json(args.a, "mixed.json", "mixbench.json")
     b_mx = read_first_json(args.b, "mixed.json", "mixbench.json")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render a compact Markdown comparison from PR bench-score JSON artifacts."""
+"""Report meaningful changes from Criterion, cost-pass, and perfbench artifacts."""
 
 from __future__ import annotations
 
@@ -7,223 +7,259 @@ import argparse
 import json
 import math
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
-
-SCORE_RUNS = 11
-WORKLOADS = (
-    "singleRMW",
-    "multiRMW10",
-    "batchRead10",
-    "batchWrite100",
-    "readRepeat",
-)
-SECONDARY = (
-    ("Allocation bytes/tx", "allocBytesPerTx", 0),
-    ("Allocations/tx", "allocsPerTx", 1),
-    ("Wall ns/tx", "nsPerTx", 0),
-    ("CPU ns/tx", "cpuNsPerTx", 0),
-)
 
 
 class ReportError(ValueError):
-    """The result artifact is incomplete or has an incompatible schema."""
+    """An artifact is missing, invalid, or not comparable."""
 
 
-@dataclass(frozen=True)
-class ScoreRun:
-    score: float
-    backend_latency_ms: int
-    workloads: dict[str, float]
-    secondary: dict[str, float]
+@dataclass
+class Metric:
+    unit: str
+    kind: str
+    values: list[float] = field(default_factory=list)
+    lower: list[float] = field(default_factory=list)
+    upper: list[float] = field(default_factory=list)
+
+    def add(self, value, lower=None, upper=None) -> None:
+        value = number(value)
+        lower = value if lower is None else number(lower)
+        upper = value if upper is None else number(upper)
+        if not lower <= value <= upper:
+            raise ReportError("invalid measurement interval")
+        self.values.append(value)
+        self.lower.append(lower)
+        self.upper.append(upper)
 
 
-def _number(value: Any, field: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ReportError(f"{field} must be a number")
-    result = float(value)
-    if not math.isfinite(result):
-        raise ReportError(f"{field} must be finite")
-    return result
+def number(value) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ReportError(f"invalid nonnegative measurement: {value!r}")
+    return float(value)
 
 
-def _nonnegative(value: Any, field: str) -> float:
-    result = _number(value, field)
-    if result < 0:
-        raise ReportError(f"{field} must be nonnegative")
-    return result
-
-
-def _positive_integer(value: Any, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ReportError(f"{field} must be a positive integer")
-    return value
-
-
-def _object(value: Any, field: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ReportError(f"{field} must be an object")
-    return value
-
-
-def _array(value: Any, field: str) -> list[Any]:
-    if not isinstance(value, list):
-        raise ReportError(f"{field} must be an array")
-    return value
-
-
-def _read_json(path: Path) -> Any:
+def read_json(path: Path):
     try:
         return json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, ValueError) as error:
         raise ReportError(f"cannot read {path}: {error}") from error
 
 
-def _result_files(path: Path) -> list[Path]:
-    files = sorted(path.glob("*.json"))
-    expected_names = [f"{run:02d}.json" for run in range(1, SCORE_RUNS + 1)]
-    if [result.name for result in files] != expected_names:
-        raise ReportError(
-            f"{path} must contain score runs {expected_names}; "
-            f"found {[result.name for result in files]}"
-        )
-    return files
+def read_costs(path: Path):
+    prefix = "diagnostic-costs: "
+    try:
+        records = [
+            line[len(prefix) :]
+            for line in path.read_text().splitlines()
+            if line.startswith(prefix)
+        ]
+        if len(records) != 1:
+            raise ReportError("expected one diagnostic cost record")
+        return json.loads(records[0])
+    except (OSError, ValueError) as error:
+        raise ReportError(f"cannot read costs from {path}: {error}") from error
 
 
-def load_score_runs(path: Path) -> list[ScoreRun]:
-    runs = []
-    for result_path in _result_files(path):
-        raw = _object(_read_json(result_path), str(result_path))
-        workload_rows = _array(raw.get("workloads"), f"{result_path}: workloads")
-        workloads: dict[str, float] = {}
-        for index, row_value in enumerate(workload_rows):
-            row = _object(row_value, f"{result_path}: workloads[{index}]")
-            name = row.get("name")
-            if not isinstance(name, str):
-                raise ReportError(f"{result_path}: workload name must be a string")
-            if name in workloads:
-                raise ReportError(f"{result_path}: duplicate workload {name}")
-            workloads[name] = _nonnegative(
-                row.get("costPerTx"), f"{result_path}: {name}.costPerTx"
+def add(
+    metrics: dict, name: str, unit: str, kind: str, value, lower=None, upper=None
+) -> None:
+    metric = metrics.setdefault(name, Metric(unit, kind))
+    metric.add(value, lower, upper)
+
+
+def load_side(root: Path, manifest: dict, side: str) -> tuple[dict, list[str]]:
+    metrics, warnings = {}, []
+    expected = set(manifest["cases"])
+    for repetition in range(1, manifest["repetitions"] + 1):
+        directory = root / side / f"{repetition:02d}"
+        for name in sorted(expected):
+            try:
+                # These private Criterion 0.8.2 artifacts must be checked on upgrades.
+                estimate = read_json(
+                    directory / "criterion/diagnostic" / name / "new/estimates.json"
+                )["mean"]
+                interval = estimate["confidence_interval"]
+                add(
+                    metrics,
+                    f"{name}: mean group time",
+                    "ns/group",
+                    "time",
+                    estimate["point_estimate"],
+                    interval["lower_bound"],
+                    interval["upper_bound"],
+                )
+            except (ReportError, KeyError, TypeError) as error:
+                warnings.append(
+                    f"{side}/{repetition}/{name}: missing or invalid Criterion measurement ({error})"
+                )
+        try:
+            costs = read_costs(directory / "criterion.log")
+            if costs["schemaVersion"] != 1:
+                raise ReportError("unsupported cost schema")
+            rows = {row["name"]: row for row in costs["cases"]}
+            if set(rows) != expected or len(rows) != len(costs["cases"]):
+                raise ReportError("cost case set changed")
+            for name, row in rows.items():
+                if number(row["transactions"]) == 0:
+                    raise ReportError("no completed transactions")
+                for window in ("workload", "shutdown", "combined"):
+                    for counter in (
+                        "reads",
+                        "writes",
+                        "lists",
+                        "readBodyBytes",
+                        "writeBodyBytes",
+                        "coordinatorSubmissions",
+                        "coordinatorRounds",
+                    ):
+                        unit = "bytes/tx" if "Bytes" in counter else "count/tx"
+                        add(
+                            metrics,
+                            f"{name}/{window}: {counter}",
+                            unit,
+                            "cost",
+                            row[window][counter],
+                        )
+        except (ReportError, KeyError, TypeError) as error:
+            warnings.append(f"{side}/{repetition}: invalid cost measurements ({error})")
+        try:
+            mixed = read_json(directory / "mixed.json")
+            if (
+                mixed["schemaVersion"] != 1
+                or mixed["scenario"] != "mixed"
+                or mixed["backend"] != "memory"
+                or mixed["modelTimeSpeedup"] != 5
+            ):
+                raise ReportError("unsupported mixed schema or backend model")
+            if len(mixed["runs"]) != 1 or len(mixed["runs"][0]["cells"]) != 1:
+                raise ReportError("expected one mixed cell")
+            cell = mixed["runs"][0]["cells"][0]
+            if (
+                cell["failures"]
+                or cell["mode"] != "lo"
+                or cell["affinityPct"] != 100
+                or cell["databases"] != 1
+                or cell["workersPerShape"] != 1
+            ):
+                raise ReportError("mixed cell failed or settings changed")
+            shapes = cell["shapes"]
+            if len(shapes) != 4 or {shape["shape"] for shape in shapes} != {
+                "rwSingle",
+                "rwMany",
+                "roSingle",
+                "roMulti",
+            }:
+                raise ReportError("mixed shape set changed")
+            for shape in shapes:
+                name = shape["shape"]
+                if number(shape["committed"]) < 100 or not shape["converged"]:
+                    warnings.append(
+                        f"{side}/{repetition}/{name}: insufficient latency/throughput observations"
+                    )
+                    continue
+                for key, unit, kind in (
+                    ("meanMs", "model ms/tx", "time"),
+                    ("p90Ms", "model ms/tx", "time"),
+                    ("txPerSec", "tx/model s", "rate"),
+                ):
+                    add(metrics, f"mixed/{name}: {key}", unit, kind, shape[key])
+        except (ReportError, KeyError, TypeError, IndexError) as error:
+            warnings.append(
+                f"{side}/{repetition}: invalid mixed measurements ({error})"
             )
-        if set(workloads) != set(WORKLOADS):
-            raise ReportError(
-                f"{result_path}: workloads are {sorted(workloads)}; "
-                f"expected {sorted(WORKLOADS)}"
-            )
+    return metrics, warnings
 
-        secondary_raw = _object(raw.get("secondary"), f"{result_path}: secondary")
-        secondary = {
-            field: _nonnegative(secondary_raw.get(field), f"{result_path}: {field}")
-            for _, field, _ in SECONDARY
-        }
-        runs.append(
-            ScoreRun(
-                score=_nonnegative(raw.get("score"), f"{result_path}: score"),
-                backend_latency_ms=_positive_integer(
-                    raw.get("backendLatencyMs"),
-                    f"{result_path}: backendLatencyMs",
-                ),
-                workloads=workloads,
-                secondary=secondary,
-            )
+
+def changed(base: Metric, candidate: Metric) -> tuple[bool, bool]:
+    """Return (report change, warn about uncertainty), without a numeric gate."""
+    before, after = statistics.median(base.values), statistics.median(candidate.values)
+    separated = max(base.upper) < min(candidate.lower) or max(candidate.upper) < min(
+        base.lower
+    )
+    movement = abs(after - before) / before if before else (math.inf if after else 0)
+    substantial = movement >= 0.05 if base.kind != "cost" else before != after
+    spread = max(
+        max(base.upper) - min(base.lower), max(candidate.upper) - min(candidate.lower)
+    )
+    noisy = spread > 0.1 * max(before, after) if max(before, after) else False
+    return substantial and separated, (substantial and not separated) or noisy
+
+
+def escape(text: str) -> str:
+    return str(text).replace("|", "\\|").replace("\n", " ").replace("`", "'")
+
+
+def render_report(root: Path, base_label: str, candidate_label: str) -> str:
+    manifest = read_json(root / "manifest.json")
+    if (
+        manifest.get("schemaVersion") != 1
+        or not isinstance(manifest.get("repetitions"), int)
+        or manifest["repetitions"] < 3
+    ):
+        raise ReportError("unsupported comparison manifest")
+    base, warnings_a = load_side(root, manifest, "main")
+    candidate, warnings_b = load_side(root, manifest, "pr")
+    warnings = [*manifest.get("warnings", []), *warnings_a, *warnings_b]
+    rows = []
+    for name in sorted(set(base) | set(candidate)):
+        if (
+            name not in base
+            or name not in candidate
+            or len(base[name].values) != manifest["repetitions"]
+            or len(candidate[name].values) != manifest["repetitions"]
+        ):
+            warnings.append(f"{name}: incomplete paired measurements")
+            continue
+        a, b = base[name], candidate[name]
+        report, uncertain = changed(a, b)
+        if uncertain:
+            warnings.append(f"{name}: noisy or inconclusive")
+        if not report:
+            continue
+        before, after = statistics.median(a.values), statistics.median(b.values)
+        delta = after - before
+        relative = f"{delta / before:+.1%}" if before else "new from zero"
+        if a.kind == "cost":
+            direction = "changed"
+        else:
+            improved = after > before if a.kind == "rate" else after < before
+            direction = "improved" if improved else "regressed"
+        rows.append(
+            f"| {escape(name)} | {before:,.3f} | {after:,.3f} | {delta:+,.3f} ({relative}) | {a.unit} | {direction} |"
         )
-    return runs
-
-
-def _values(items: Iterable[Any], field: str) -> list[float]:
-    return [float(getattr(item, field)) for item in items]
-
-
-def _summary(values: Iterable[float], digits: int = 2) -> str:
-    samples = list(values)
-    median = statistics.median(samples)
-    low, high = min(samples), max(samples)
-    if math.isclose(low, high):
-        return f"{median:,.{digits}f}"
-    return f"{median:,.{digits}f} ({low:,.{digits}f}–{high:,.{digits}f})"
-
-
-def _change(base: Iterable[float], candidate: Iterable[float]) -> str:
-    base_median = statistics.median(base)
-    candidate_median = statistics.median(candidate)
-    if base_median == 0:
-        return "n/a"
-    return f"{(candidate_median / base_median - 1.0) * 100:+.2f}%"
-
-
-def _escape(value: str) -> str:
-    return value.replace("|", "\\|")
-
-
-def render_report(input_dir: Path, base_label: str, candidate_label: str) -> str:
-    base_scores = load_score_runs(input_dir / "score" / "main")
-    candidate_scores = load_score_runs(input_dir / "score" / "pr")
-    backend_latencies = {
-        run.backend_latency_ms for run in [*base_scores, *candidate_scores]
-    }
-    if len(backend_latencies) != 1:
-        raise ReportError(
-            "score runs must use one backend latency; "
-            f"found {sorted(backend_latencies)} ms"
-        )
-    backend_latency_ms = next(iter(backend_latencies))
-
-    base_score_values = _values(base_scores, "score")
-    candidate_score_values = _values(candidate_scores, "score")
     lines = [
         "# Performance comparison",
         "",
-        f"- Base: `{_escape(base_label)}`",
-        f"- Candidate: `{_escape(candidate_label)}`",
-        f"- Backend model: fixed {backend_latency_ms} ms operation latency over memory.",
-        "- Numeric changes are informational and never fail the PR check.",
+        f"Base: `{escape(base_label)}`; candidate: `{escape(candidate_label)}`.",
         "",
-        "## Backend-operation score",
-        "",
-        "Lower is better. Values are medians with the observed min–max range "
-        "from 11 interleaved runs.",
-        "",
-        "| Metric | Main | PR | Change |",
-        "| --- | ---: | ---: | ---: |",
-        f"| Primary weighted cost/tx | {_summary(base_score_values)} | "
-        f"{_summary(candidate_score_values)} | "
-        f"{_change(base_score_values, candidate_score_values)} |",
     ]
-    for workload in WORKLOADS:
-        base = [run.workloads[workload] for run in base_scores]
-        candidate = [run.workloads[workload] for run in candidate_scores]
-        lines.append(
-            f"| `{workload}` cost/tx | {_summary(base)} | {_summary(candidate)} | "
-            f"{_change(base, candidate)} |"
-        )
-
-    lines.extend(
-        [
+    if rows:
+        lines += [
+            "| Metric | Base | Candidate | Change | Unit | Result |",
+            "| --- | ---: | ---: | ---: | --- | --- |",
+            *rows,
             "",
-            "> The fixed backend latency runs on a single-thread runtime so deferred "
-            "protocol work is scheduled consistently; the primary remains "
-            "operation-count based.",
-            "",
-            "<details>",
-            "<summary>Latency-stabilized in-memory secondary metrics (informational)</summary>",
-            "",
-            "Lower is better. These values use the same interleaved runs; their "
-            "observed ranges show the run-to-run variability.",
-            "",
-            "| Metric | Main | PR | Change |",
-            "| --- | ---: | ---: | ---: |",
         ]
-    )
-    for label, field, digits in SECONDARY:
-        base = [run.secondary[field] for run in base_scores]
-        candidate = [run.secondary[field] for run in candidate_scores]
-        lines.append(
-            f"| {label} | {_summary(base, digits)} | {_summary(candidate, digits)} | "
-            f"{_change(base, candidate)} |"
-        )
-    lines.extend(["", "</details>", ""])
+    else:
+        lines += ["No meaningful changes detected in complete measurements.", ""]
+    if warnings:
+        lines += [
+            "## Measurement warnings",
+            "",
+            *[f"- {escape(warning)}" for warning in sorted(set(warnings))],
+            "",
+        ]
+    lines += [
+        "Full results and logs are retained as artifacts.",
+        "",
+    ]
     return "\n".join(lines)
 
 
@@ -234,10 +270,9 @@ def main() -> int:
     parser.add_argument("--candidate-label", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-
-    report = render_report(args.input, args.base_label, args.candidate_label)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(report)
+    args.output.write_text(
+        render_report(args.input, args.base_label, args.candidate_label)
+    )
     return 0
 
 

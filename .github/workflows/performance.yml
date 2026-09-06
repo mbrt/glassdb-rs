@@ -2,8 +2,7 @@ name: Performance comparison
 
 on:
   pull_request:
-    branches:
-      - main
+    branches: [main]
 
 permissions:
   contents: read
@@ -20,102 +19,50 @@ jobs:
   compare:
     name: Compare to main
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target/performance
+      PERF_RESULTS: ${{ github.workspace }}/target/performance/results/ci
     steps:
-
-    - name: Initialize result artifact
-      env:
-        PERF_BIN: ${{ runner.temp }}/glassdb-performance-bin
-        PERF_RESULTS: ${{ runner.temp }}/glassdb-performance-results
-      run: |
-        install -d "$PERF_BIN" \
-          "$PERF_RESULTS/score/main" "$PERF_RESULTS/score/pr"
-
     - uses: actions/checkout@v4
-
-    - name: Check out main baseline
-      uses: actions/checkout@v4
       with:
-        ref: ${{ github.event.pull_request.base.sha }}
-        path: .perf-main
+        fetch-depth: 0
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
     - uses: Swatinem/rust-cache@v2
       with:
-        workspaces: . -> target/performance
+        workspaces: |
+          . -> target/performance/main
+          . -> target/performance/pr
 
-    - name: Test performance report generator
-      run: python3 -m unittest hack.ci.test_perf_report
+    - name: Test comparison tools
+      run: python3 -m unittest hack.ci.test_perf_report hack.ci.test_perf_compare
 
-    - name: Use candidate benchmark harness for both revisions
-      run: |
-        # Harness changes must not appear as engine performance changes.
-        rsync --archive --delete crates/glassdb-bench-score/ \
-          .perf-main/crates/glassdb-bench-score/
-
-    - name: Build baseline and candidate benchmarks
-      env:
-        PERF_BIN: ${{ runner.temp }}/glassdb-performance-bin
-      run: |
-        # Build baseline and candidate into separate target dirs. They are
-        # distinct source trees, so sharing one target dir lets cargo reuse a
-        # stale artifact from the other tree (e.g. glassdb-proto), producing
-        # spurious compile errors against outdated generated types.
-        cargo build --release --manifest-path .perf-main/Cargo.toml \
-          --target-dir "$CARGO_TARGET_DIR/main" \
-          --package glassdb-bench-score --bin bench-score
-        install -m 755 "$CARGO_TARGET_DIR/main/release/bench-score" \
-          "$PERF_BIN/main-bench-score"
-
-        cargo build --release \
-          --target-dir "$CARGO_TARGET_DIR/pr" \
-          --package glassdb-bench-score --bin bench-score
-        install -m 755 "$CARGO_TARGET_DIR/pr/release/bench-score" \
-          "$PERF_BIN/pr-bench-score"
-
-    - name: Measure backend-operation score
-      timeout-minutes: 3
-      env:
-        PERF_BIN: ${{ runner.temp }}/glassdb-performance-bin
-        PERF_RESULTS: ${{ runner.temp }}/glassdb-performance-results
-      run: |
-        run_score() {
-          local side="$1" binary="$2" repetition="$3"
-          "$binary" --json --count 1 \
-            > "$PERF_RESULTS/score/$side/$repetition.json"
-        }
-
-        for repetition in $(seq 1 11); do
-          printf -v repetition_id '%02d' "$repetition"
-          if (( repetition % 2 == 1 )); then
-            run_score main "$PERF_BIN/main-bench-score" "$repetition_id"
-            run_score pr "$PERF_BIN/pr-bench-score" "$repetition_id"
-          else
-            run_score pr "$PERF_BIN/pr-bench-score" "$repetition_id"
-            run_score main "$PERF_BIN/main-bench-score" "$repetition_id"
-          fi
-        done
-
-    - name: Render job summary
+    - name: Build the same candidate harness against both revisions
       env:
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        CANDIDATE_SHA: ${{ github.sha }}
-        PERF_RESULTS: ${{ runner.temp }}/glassdb-performance-results
+      run: >-
+        python3 hack/ci/perf_compare.py --base "$BASE_SHA"
+        --output "$PERF_RESULTS" --build-only
+
+    - name: Measure paired diagnostics and mixed workload
+      timeout-minutes: 5
+      # The driver enforces a 270-second runtime budget, excluding compilation.
+      run: python3 hack/ci/perf_compare.py --output "$PERF_RESULTS" --run-only
+
+    - name: Render job summary
+      if: ${{ always() }}
       run: |
-        python3 hack/ci/perf_report.py \
-          --input "$PERF_RESULTS" \
-          --base-label "main (${BASE_SHA:0:12})" \
-          --candidate-label "PR merge (${CANDIDATE_SHA:0:12})" \
-          --output "$PERF_RESULTS/report.md"
-        cat "$PERF_RESULTS/report.md" >> "$GITHUB_STEP_SUMMARY"
+        if [ -f "$PERF_RESULTS/report.md" ]; then
+          cat "$PERF_RESULTS/report.md" >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo 'Performance comparison failed before measurements. See build logs.' >> "$GITHUB_STEP_SUMMARY"
+        fi
 
     - name: Hide old performance comments
       if: >-
-        github.event.pull_request.head.repo.full_name == github.repository &&
+        success() && github.event.pull_request.head.repo.full_name == github.repository &&
         github.actor != 'dependabot[bot]'
       continue-on-error: true
       uses: actions/github-script@v9
@@ -133,14 +80,11 @@ jobs:
               comment.body.includes('# Performance comparison')
             )
             .map(comment => comment.node_id)
-
           for (const id of commentIds) {
             await github.graphql(`
               mutation {
                 minimizeComment(input: {classifier: OUTDATED, subjectId: "${id}"}) {
-                  minimizedComment {
-                    isMinimized
-                  }
+                  minimizedComment { isMinimized }
                 }
               }
             `)
@@ -148,12 +92,11 @@ jobs:
 
     - name: Comment on pull request
       if: >-
-        github.event.pull_request.head.repo.full_name == github.repository &&
+        success() && github.event.pull_request.head.repo.full_name == github.repository &&
         github.actor != 'dependabot[bot]'
       continue-on-error: true
       env:
         GH_TOKEN: ${{ github.token }}
-        PERF_RESULTS: ${{ runner.temp }}/glassdb-performance-results
         PR_NUMBER: ${{ github.event.pull_request.number }}
       run: >-
         gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY"
@@ -164,6 +107,8 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: performance-results
-        path: ${{ runner.temp }}/glassdb-performance-results
-        if-no-files-found: error
+        path: |
+          ${{ env.PERF_RESULTS }}
+          !${{ env.PERF_RESULTS }}/bin/**
+        if-no-files-found: warn
         retention-days: 7

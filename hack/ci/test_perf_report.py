@@ -1,97 +1,220 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import tempfile
 import unittest
-from pathlib import Path
 
 from hack.ci import perf_report
 
 
 class PerfReportTest(unittest.TestCase):
-    def setUp(self) -> None:
+    def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        self.write(
+            self.root / "manifest.json",
+            {"schemaVersion": 1, "repetitions": 3, "cases": ["example"]},
+        )
         for side in ("main", "pr"):
-            (self.root / "score" / side).mkdir(parents=True)
-        for repetition in range(1, perf_report.SCORE_RUNS + 1):
-            self._write_score("main", repetition, 99.0 + repetition)
-            self._write_score("pr", repetition, 89.0 + repetition)
+            for repetition in range(1, 4):
+                path = self.root / side / f"{repetition:02d}"
+                self.write(
+                    path / "criterion/diagnostic/example/new/estimates.json",
+                    {
+                        "mean": {
+                            "point_estimate": 100,
+                            "confidence_interval": {
+                                "lower_bound": 99,
+                                "upper_bound": 101,
+                            },
+                        }
+                    },
+                )
+                counters = {
+                    key: 0
+                    for key in (
+                        "reads",
+                        "writes",
+                        "lists",
+                        "readBodyBytes",
+                        "writeBodyBytes",
+                        "coordinatorSubmissions",
+                        "coordinatorRounds",
+                    )
+                }
+                self.write(
+                    path / "criterion.log",
+                    {
+                        "schemaVersion": 1,
+                        "cases": [
+                            {
+                                "name": "example",
+                                "transactions": 30,
+                                **{
+                                    window: counters.copy()
+                                    for window in ("workload", "shutdown", "combined")
+                                },
+                            }
+                        ],
+                    },
+                )
+                self.write(
+                    path / "mixed.json",
+                    {
+                        "schemaVersion": 1,
+                        "scenario": "mixed",
+                        "backend": "memory",
+                        "modelTimeSpeedup": 5,
+                        "runs": [
+                            {
+                                "cells": [
+                                    {
+                                        "mode": "lo",
+                                        "affinityPct": 100,
+                                        "databases": 1,
+                                        "workersPerShape": 1,
+                                        "failures": 0,
+                                        "shapes": [
+                                            {
+                                                "shape": name,
+                                                "committed": 200,
+                                                "converged": True,
+                                                "meanMs": 10,
+                                                "p90Ms": 20,
+                                                "txPerSec": 100,
+                                            }
+                                            for name in (
+                                                "rwSingle",
+                                                "rwMany",
+                                                "roSingle",
+                                                "roMulti",
+                                            )
+                                        ],
+                                    }
+                                ]
+                            }
+                        ],
+                    },
+                )
 
-    def tearDown(self) -> None:
+    def tearDown(self):
         self.temp.cleanup()
 
-    def _write_score(self, side: str, repetition: int, score: float) -> None:
-        result = {
-            "score": score,
-            "backendLatencyMs": 1,
-            "secondary": {
-                "allocBytesPerTx": score * 100,
-                "allocsPerTx": score,
-                "nsPerTx": score * 1000,
-                "cpuNsPerTx": score * 900,
-            },
-            "workloads": [
-                {"name": name, "costPerTx": score + index}
-                for index, name in enumerate(perf_report.WORKLOADS)
-            ],
-        }
-        path = self.root / "score" / side / f"{repetition:02d}.json"
-        path.write_text(json.dumps(result))
+    @staticmethod
+    def write(path, value):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.name == "criterion.log":
+            path.write_text(
+                "Benchmarking diagnostic/example\n\ndiagnostic-costs: "
+                + json.dumps(value)
+                + "\nFinal summary\n"
+            )
+        else:
+            path.write_text(json.dumps(value))
 
-    def test_render_report_aggregates_score_and_secondary_metrics(self) -> None:
-        report = perf_report.render_report(
-            self.root, "main | aaa", "PR merge (bbb)"
+    def edit(self, relative, change):
+        for repetition in range(1, 4):
+            path = self.root / "pr" / f"{repetition:02d}" / relative
+            raw = path.read_text()
+            if path.name == "criterion.log":
+                raw = raw.split("diagnostic-costs: ", 1)[1].splitlines()[0]
+            value = json.loads(raw)
+            change(value)
+            self.write(path, value)
+
+    def report(self):
+        return perf_report.render_report(self.root, "base", "candidate")
+
+    def test_unchanged_rows_are_hidden(self):
+        report = self.report()
+        self.assertIn("No meaningful changes detected", report)
+        self.assertNotIn("| Metric", report)
+        self.assertNotIn("Measurement warnings", report)
+
+    def test_mean_and_p90_changes_have_correct_direction(self):
+        def change(value):
+            shapes = value["runs"][0]["cells"][0]["shapes"]
+            shapes[0]["p90Ms"] = 30
+            shapes[1]["txPerSec"] = 120
+            shapes[2]["meanMs"] = 8
+
+        self.edit("mixed.json", change)
+        report = self.report()
+        self.assertIn("mixed/rwSingle: p90Ms | 20.000 | 30.000", report)
+        self.assertIn("mixed/rwMany: txPerSec | 100.000 | 120.000", report)
+        self.assertIn("mixed/roSingle: meanMs | 10.000 | 8.000", report)
+        self.assertIn("regressed", report)
+        self.assertIn("improved", report)
+        self.assertNotIn("mixed/roMulti:", report)
+
+    def test_small_timing_change_is_hidden(self):
+        self.edit(
+            "mixed.json",
+            lambda value: value["runs"][0]["cells"][0]["shapes"][0].update(meanMs=10.4),
         )
+        self.assertNotIn("| Metric", self.report())
 
-        self.assertIn("- Base: `main \\| aaa`", report)
-        self.assertIn("105.00 (100.00–110.00)", report)
-        self.assertIn("95.00 (90.00–100.00)", report)
-        self.assertIn("-9.52%", report)
-        self.assertIn("`batchWrite100` cost/tx", report)
-        self.assertIn("fixed 1 ms operation latency over memory", report)
-        self.assertIn(
-            "Latency-stabilized in-memory secondary metrics (informational)", report
+    def test_criterion_interval_prevents_false_regression(self):
+        self.edit(
+            "criterion/diagnostic/example/new/estimates.json",
+            lambda value: value.update(
+                mean={
+                    "point_estimate": 110,
+                    "confidence_interval": {"lower_bound": 98, "upper_bound": 122},
+                }
+            ),
         )
-        self.assertIn("10,500 (10,000–11,000)", report)
-        self.assertIn("| Allocations/tx | 105.0 (100.0–110.0)", report)
-        self.assertIn("| Wall ns/tx | 105,000 (100,000–110,000)", report)
-        self.assertIn("| CPU ns/tx | 94,500 (90,000–99,000)", report)
-        self.assertNotIn("Focused contention mix", report)
-        self.assertNotIn("Focused one-key RMW contention", report)
+        report = self.report()
+        self.assertNotIn("| Metric", report)
+        self.assertIn("inconclusive", report)
 
-    def test_missing_repetition_is_rejected(self) -> None:
-        (self.root / "score" / "main" / "11.json").unlink()
+    def test_repeatable_cost_change_from_zero_is_visible(self):
+        self.edit(
+            "criterion.log",
+            lambda value: value["cases"][0]["shutdown"].update(writeBodyBytes=0.125),
+        )
+        report = self.report()
+        self.assertIn("example/shutdown: writeBodyBytes", report)
+        self.assertIn("new from zero", report)
 
-        with self.assertRaisesRegex(perf_report.ReportError, "score runs"):
-            perf_report.render_report(self.root, "main", "PR")
+    def test_missing_run_is_not_reported_as_unchanged(self):
+        (self.root / "pr/03/mixed.json").unlink()
+        report = self.report()
+        self.assertIn("Measurement warnings", report)
+        self.assertIn("incomplete paired measurements", report)
 
-    def test_unexpected_workload_is_rejected(self) -> None:
-        path = self.root / "score" / "pr" / "01.json"
-        result = json.loads(path.read_text())
-        result["workloads"][0]["name"] = "unexpected"
-        path.write_text(json.dumps(result))
+    def test_missing_case_is_not_silently_intersected(self):
+        self.edit("criterion.log", lambda value: value.update(cases=[]))
+        self.assertIn("cost case set changed", self.report())
 
-        with self.assertRaisesRegex(perf_report.ReportError, "workloads are"):
-            perf_report.render_report(self.root, "main", "PR")
+    def test_invalid_numbers_and_low_sample_counts_are_warnings(self):
+        self.edit(
+            "mixed.json",
+            lambda value: value["runs"][0]["cells"][0]["shapes"][0].update(
+                committed=20
+            ),
+        )
+        self.assertIn("insufficient latency/throughput observations", self.report())
+        self.edit(
+            "criterion.log",
+            lambda value: value["cases"][0]["workload"].update(reads=float("nan")),
+        )
+        self.assertIn("invalid cost measurements", self.report())
 
-    def test_missing_secondary_metric_is_rejected(self) -> None:
-        path = self.root / "score" / "pr" / "01.json"
-        result = json.loads(path.read_text())
-        del result["secondary"]["cpuNsPerTx"]
-        path.write_text(json.dumps(result))
+    def test_missing_malformed_or_duplicate_cost_records_are_warnings(self):
+        for contents in (
+            "Benchmark failed before costs\n",
+            "diagnostic-costs: invalid JSON\n",
+            "diagnostic-costs: {}\ndiagnostic-costs: {}\n",
+        ):
+            with self.subTest(contents=contents):
+                (self.root / "pr/03/criterion.log").write_text(contents)
+                self.assertIn("invalid cost measurements", self.report())
 
-        with self.assertRaisesRegex(perf_report.ReportError, "cpuNsPerTx"):
-            perf_report.render_report(self.root, "main", "PR")
-
-    def test_mismatched_backend_latency_is_rejected(self) -> None:
-        path = self.root / "score" / "pr" / "01.json"
-        result = json.loads(path.read_text())
-        result["backendLatencyMs"] = 2
-        path.write_text(json.dumps(result))
-
-        with self.assertRaisesRegex(perf_report.ReportError, "one backend latency"):
-            perf_report.render_report(self.root, "main", "PR")
+    def test_model_mismatch_is_not_compared(self):
+        self.edit("mixed.json", lambda value: value.update(modelTimeSpeedup=1))
+        self.assertIn("unsupported mixed schema or backend model", self.report())
 
 
 if __name__ == "__main__":

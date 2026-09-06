@@ -2,48 +2,31 @@
 #
 # CPU profiling recipe for glassdb-rs. The profiler attaches to the compiled
 # binary to measure CPU use. See hack/perf/README.md for the limits of profiling
-# the `bench-score` target.
+# the in-memory Criterion target.
 #
 # Usage:
-#   hack/perf/profile.sh                 # flamegraph of the bench-score harness
-#   TARGET=bench hack/perf/profile.sh    # flamegraph of the transactions bench
+#   hack/perf/profile.sh
+#   FILTER=diagnostic/rmw_inline_1024 hack/perf/profile.sh
 #
 # Tunables (env):
-#   TARGET    bench-score | bench   what to profile (default bench-score)
-#   COUNT     suite repeats fed to the bench-score harness (default 50); more
-#             repeats => more samples => a less noisy profile
+#   FILTER    Criterion case filter (default diagnostic)
+#   SECONDS_PER_CASE  profiling time per case (default 10)
 #   OUT       output directory for artifacts (default hack/perf)
 
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
-TARGET="${TARGET:-bench-score}"
-COUNT="${COUNT:-50}"
+FILTER="${FILTER:-diagnostic}"
+SECONDS_PER_CASE="${SECONDS_PER_CASE:-10}"
 OUT="${OUT:-hack/perf}"
 
 mkdir -p "$OUT"
 svg="$OUT/flamegraph.svg"
 folded="$OUT/flamegraph.folded"
 
-# Cargo selector + the args passed to the profiled binary, per target. The
-# `transactions` bench wraps the in-memory backend in a latency-injecting
-# DelayBackend, so its profile is closer to the real round-trip-bound cost than
-# the in-memory `bench-score` harness (see README).
-case "$TARGET" in
-bench-score)
-	cargo_sel=(-p glassdb-bench-score --bin bench-score)
-	run_args=(--count "$COUNT")
-	;;
-bench)
-	cargo_sel=(-p glassdb --bench transactions)
-	run_args=(--bench)
-	;;
-*)
-	echo "unknown TARGET '$TARGET' (use 'bench-score' or 'bench')" >&2
-	exit 2
-	;;
-esac
+cargo_sel=(-p glassdb --bench diagnostics)
+run_args=(--bench "$FILTER" --profile-time "$SECONDS_PER_CASE")
 
 if ! cargo flamegraph --version >/dev/null 2>&1; then
 	echo "cargo-flamegraph not found; install it with:" >&2
