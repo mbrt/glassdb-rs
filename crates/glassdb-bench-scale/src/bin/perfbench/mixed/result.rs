@@ -194,6 +194,7 @@ struct ShapeResult {
     shape: String,
     committed: usize,
     tx_per_sec: f64,
+    mean_ms: f64,
     p50_ms: f64,
     p90_ms: f64,
     /// Achieved relative half-width of the throughput 95% CI (`z/sqrt(committed)`,
@@ -221,6 +222,7 @@ impl ShapeResult {
             shape: measurement.shape.to_string(),
             committed: count,
             tx_per_sec: if secs > 0.0 { count as f64 / secs } else { 0.0 },
+            mean_ms: measurement.results.avg().as_secs_f64() * 1000.0,
             p50_ms,
             p90_ms,
             rel_ci: measurement.results.rate_rel_ci(),
@@ -445,6 +447,7 @@ mod tests {
         {
           "committed": 3,
           "converged": true,
+          "meanMs": 20.0,
           "p50Ms": 20.0,
           "p90Ms": 30.0,
           "relCi": 1.1316065276116665,
@@ -454,6 +457,7 @@ mod tests {
         {
           "committed": 0,
           "converged": false,
+          "meanMs": 0.0,
           "p50Ms": 0.0,
           "p90Ms": 0.0,
           "relCi": 99.0,

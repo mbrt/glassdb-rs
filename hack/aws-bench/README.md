@@ -10,8 +10,8 @@ perfbench contention
 perfbench inline-pressure
 ```
 
-Raw backend latency remains in `backendbench`; Criterion owns microbenchmarks;
-`bench-score` owns the deterministic backend-operation cost score.
+Raw backend latency remains in `backendbench`. Criterion owns controlled
+timing diagnostics and their separate backend-cost measurement pass.
 
 ## Mixed workload
 
@@ -123,35 +123,47 @@ scales are useful only as explicitly approximate probes.
 
 ## Comparing references
 
-`compare-refs.sh` builds each reference in its own worktree, alternates paired
-focused runs, runs the adaptive mixed sweep, and appends target/base ratios to
-`out-refs/summary.md`:
+`compare-refs.sh` uses the same comparison driver as CI. It copies the
+candidate's benchmark sources into disposable snapshots of both revisions,
+then builds each against its own engine. The current source tree is not
+changed. Unsupported engine APIs fail the comparison; old workloads are not
+silently substituted.
 
 ```bash
 # main against the current worktree
 hack/aws-bench/compare-refs.sh
 
-# smaller windows, no plots
+# compatibility spelling for the same bounded comparison
 hack/aws-bench/compare-refs.sh --summary
 
 # explicit references
-BASE=main TARGET=my-branch LABEL_A=main LABEL_B=candidate \
+BASE=main TARGET=my-branch OUT=/tmp/glassdb-comparison \
   hack/aws-bench/compare-refs.sh
 ```
 
-Current references use `perfbench`. Historical references are run through their
-retired `mixbench` and `rtbench` binaries, and `compare.py` retains readers for
-their JSON and CSV artifacts. The mixed grid is compared only when both sides
-support the same affinity workload; the old `shared/per-shape` grid is not
-silently paired with it. When only one side supports process-wide model time,
-the script requires `DELAY_SCALE=1`; it never compares different timing models
-under acceleration.
+The output directory must be new. By default it is a timestamped directory
+under `target/performance/results`. It contains `report.md`, a manifest, raw
+Criterion estimates, mixed results, and logs containing the cost snapshots.
+Three paired runs alternate revision order. Runtime, including preparation and shutdown,
+is limited to 270 seconds; compilation is separate.
 
-Common knobs include `MIX_MODES`, `MIX_AFFINITIES`, `MIX_DATABASES`,
-`MIX_WORKERS`, `MIX_NUM_KEYS`, `MIX_HOT_KEYS`, `MIX_MULTI_KEYS`,
-`MIX_SPLIT_QUIET`, `MIX_SPLIT_SETTLE_TIMEOUT`, `MIX_DURATION`,
-`MIX_MAX_DURATION`, `MIX_TARGET_CI`, `NUM_RUNS`, `DRAIN_TIMEOUT`,
-`CONTENTION_DURATION`, and `COMMAND_TIMEOUT`.
+See [diagnostic definitions](../../crates/glassdb/benches/README.md). The report
+shows timing/throughput changes of at least 5% only when the observed ranges
+are separated. Criterion ranges include its mean confidence intervals.
+Backend request/body-byte changes have no percentage cutoff, but must also be
+repeatable. Missing, failed, or unreliable measurements produce warnings.
+Numeric regressions do not fail CI.
+
+The short mixed preset runs one Database with one worker per shape, 128 keys,
+and a ten-second measurement window. It uses the S3 delay model at 5x model
+time. Its mean and p90 are transaction observations, not Criterion sample
+percentiles. Reported latency and throughput use model seconds, not wall
+seconds. At least 100 transactions per shape are required for the report.
+
+The former full reference sweep and historical-binary fallbacks are removed.
+Run `perfbench` directly for larger sweeps and split/GC investigations.
+`compare.py` still compares existing workload JSON/CSV artifacts, including
+historical ones. It no longer reads weighted-score artifacts.
 
 ## Real S3 runner
 

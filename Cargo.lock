@@ -1409,6 +1409,7 @@ dependencies = [
  "proptest",
  "prost",
  "rayon",
+ "serde_json",
  "syn",
  "thiserror",
  "tokio",
@@ -1488,19 +1489,6 @@ dependencies = [
  "glassdb-data",
  "mimalloc",
  "rand 0.10.1",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "glassdb-bench-score"
-version = "0.2.1"
-dependencies = [
- "clap",
- "futures",
- "glassdb",
- "libc",
  "serde",
  "serde_json",
  "tokio",

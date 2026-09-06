@@ -1,4 +1,4 @@
-.PHONY: test test-sim test-all lint format build clean fuzz fuzz-min bench bench-score flamegraph
+.PHONY: test test-sim test-all lint format build clean fuzz fuzz-min bench bench-diagnostics flamegraph
 
 # Flags for every build under the in-repo deterministic simulation executor:
 # `--cfg sim` routes spawn/time/randomness through it, and `--cfg tokio_unstable`
@@ -14,6 +14,7 @@ clean:
 
 test: lint
 	cargo test --workspace
+	python3 -m unittest hack.ci.test_perf_report hack.ci.test_perf_compare
 
 # Run both the normal and deterministic-simulation suites.
 test-all: test test-sim
@@ -40,15 +41,13 @@ format:
 bench:
 	cargo bench -p glassdb
 
-# Print the backend-operation performance score
-# (lower is better) plus memory/CPU secondary axes. Append `-- --json` args for
-# machine-readable output.
-bench-score:
-	@cargo run --release -p glassdb-bench-score --bin bench-score -- --count 3
+# Run the selected Criterion cases and a separate backend-cost pass.
+bench-diagnostics:
+	cargo bench -p glassdb --bench diagnostics -- --noplot
 
 # Record a CPU flamegraph to guide profiling work (a diagnostic aid only -
-# excluded from `test` and `bench-score`; it changes no
-# source and is not part of any metric). Tunable via TARGET/COUNT/OUT; see
+# excluded from `test` and benchmarks; it changes no
+# source and is not part of any metric). Tunable via FILTER/SECONDS_PER_CASE/OUT; see
 # hack/perf/README.md.
 flamegraph:
 	hack/perf/profile.sh
