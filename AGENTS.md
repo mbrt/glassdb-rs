@@ -30,3 +30,7 @@ Always use `make test-all` to run tests. This runs format checks, linting, and t
 - Strongly prefer integration tests over mocks
 - Always add deterministic regression tests when fixing bugs, they also serve as documentation
 - Return errors instead of using assertions in transaction bodies, as they are not snapshot-transparent
+
+## Verification
+
+After implementing a sizable chunk of work, ask for an adversarial review to a sub-agent, while passing the [reviewing-changes.md](docs/guides/reviewing-changes.md) guide and fix its findings. If they conflict with what was explicitly agreed with the user, stop and ask them.

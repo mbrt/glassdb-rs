@@ -4,7 +4,7 @@ Record only meaningful architectural decisions and explicit trade-offs in ADRs (
 
 ## Discussion
 
-Make sure important decisions and trade-offs are first discussed with the user. Use the `glassdb-grill` skill when necessary.
+Make sure important decisions and trade-offs are first discussed with the user. Use the `glassdb-grill` skill to discuss them.
 
 Questions should revolve around:
 
@@ -27,4 +27,4 @@ After settling decisions, proceed with writing the ADR. When writing a new ADR:
 
 - When new ADRs make older ones obsolete, mark them as such and link to the new ADR
 - ADRs are frozen when accepted, except for their status and links to newer ADRs
-- Update [docs/architecture.md](./docs/architecture.md) to keep it up to date with accepted ADRs, and avoid updating it with the ones still under discussion
+- Update [docs/architecture.md](./docs/architecture.md) to keep it up to date with accepted ADRs, but only after the implementation lands

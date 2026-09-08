@@ -7,9 +7,9 @@ Interview the user relentlessly until you reach a shared understanding. Map this
 
 ## Workflow
 
-1. Start with stating your current understanding of the design (high level) and ask the user questions to navigate the tree
-2. Ask questions to clarify
-3. When settled (or asked to stop), state the current shared design, highlight changes from the initial understanding.
+1. Start with stating your current understanding of the design (high level) once
+2. Ask questions to clarify in rounds (all rounds go here)
+3. When settled (or asked to stop), state the current shared design, highlight changes from the initial understanding and stop
 
 ## Methodology
 
@@ -36,6 +36,8 @@ Each round the user answers reshapes the tree: settled decisions push the fronti
 
 Make sure to sort questions by importance. Explore breadth before depth. Strive for getting the most value out of each round and minimize questions. 
 
+Number questions progressively. If round one askes 3 questions they should be Q1, Q2, Q3. Round two should start with Q4.
+
 ### Questions
 
 Make sure to:
@@ -53,13 +55,13 @@ Format a round like so:
 ```
 [Estimated questions left: <total number>]
 
-❓ **Q1** - **<question title>**: <question body, might be multiple paragraphs, including multiple choices>
+❓ **Q<n>** - **<question title>**: <question body, might be multiple paragraphs, including multiple choices>
 
 ➡️ <your recommended answer>
 
 ---
 
-❓ **Q2** - **<question title>**: <question body, might be multiple paragraphs, including multiple choices>
+❓ **Q<n+1>** - **<question title>**: <question body, might be multiple paragraphs, including multiple choices>
 
 ➡️ <your recommended answer>
 ```
