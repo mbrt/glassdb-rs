@@ -3,6 +3,12 @@
 This glossary defines domain language for all parts of GlassDB. It groups terms
 by project area.
 
+## Database access
+
+**Database instance**:
+A local runtime created by one successful database open. Cloned handles share that instance; separate opens create separate instances, including within one process.
+_Avoid_: Collector
+
 ## Data model
 
 **Collection**:
@@ -100,3 +106,17 @@ _Avoid_: Structural log, structural record
 **Structural gate**:
 An exclusive, durably recorded claim on one node that admits changes to the node's shape. One transaction identity holds it at a time, and a release or a recovery fence must remove it before another shape change starts.
 _Avoid_: Structure lock, structure-write lock
+
+## Maintenance
+
+**GC candidate**:
+A transaction identity selected for a check of its remaining references and recovery resources. Selection does not prove that its transaction object can be deleted.
+_Avoid_: Cleanup candidate
+
+**GC backlog**:
+Known GC work that is ready to run but has not completed. Retained live values, pinned transaction markers, and work awaiting its next permitted check do not by themselves constitute GC backlog.
+_Avoid_: Cleanup backlog, transaction-object count, garbage count
+
+**GC scan**:
+A traversal of stored transaction objects to find GC candidates independently of local hints. Scans of structural intents belong to structural recovery.
+_Avoid_: Recovery scan (when referring to transaction-object GC)

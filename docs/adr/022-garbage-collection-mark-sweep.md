@@ -39,6 +39,11 @@ pending-to-aborted and finite tombstone fence below. A collector changes dead
 must not delete the marker. Ordinary finite retention starts only after the
 owner acknowledges `Wounded` as `Aborted`.
 
+[ADR-070](070-demand-driven-garbage-collection.md) refines candidate scheduling
+with cleanup driven by hints and due retries, bounded parallel work, and
+independent adaptive GC scans. That change is accepted but not yet
+implemented.
+
 ## Context
 
 In v1 garbage collection is **time-based**
