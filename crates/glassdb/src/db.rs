@@ -487,13 +487,10 @@ impl DbInner {
         Fut: Future<Output = Result<T, Error>> + Send,
         T: Send,
     {
-        let tx = Transaction::new(self.clone());
         let mut driver = AttemptDriver::new(&self.engine);
 
         let result: Result<T, Error> = loop {
-            // Hand a fresh handle to the transaction body; `tx`
-            // retains access to the same shared state to collect accesses and
-            // reset between retries.
+            let tx = Transaction::new(self.clone(), driver.handle.collection_reservations());
             let body_outcome = f(tx.handle()).await;
 
             // Collect the accesses produced by the transaction body.
@@ -503,11 +500,11 @@ impl DbInner {
             stats.cache_hits += metrics.cache_hits;
             stats.writes += accesses.write_count() as u64;
 
-            let identity_renewed = if body_outcome.is_ok() {
+            if body_outcome.is_ok() {
                 driver.install_accesses(accesses, catalog_accesses);
                 match driver.commit().await {
                     Ok(BodyDecision::ReturnOutcome) => break body_outcome,
-                    Ok(BodyDecision::ReplayBody { identity_renewed }) => identity_renewed,
+                    Ok(BodyDecision::ReplayBody) => {}
                     Err(e) => break Err(e.into()),
                 }
             } else {
@@ -521,13 +518,11 @@ impl DbInner {
                     .validate_error_outcome(accesses, catalog_accesses)
                     .await
                 {
-                    Ok(BodyDecision::ReplayBody { identity_renewed }) => identity_renewed,
+                    Ok(BodyDecision::ReplayBody) => {}
                     Ok(BodyDecision::ReturnOutcome) => break body_outcome,
                     Err(e) => break Err(Error::from_read_validation(e)),
                 }
-            };
-
-            tx.reset(identity_renewed);
+            }
             stats.retries += 1;
         };
 
@@ -544,27 +539,21 @@ impl DbInner {
 /// Drives the engine-side transitions for one public transaction.
 struct AttemptDriver<'a> {
     engine: &'a Engine,
-    handle: Option<EngineTransaction>,
+    handle: EngineTransaction,
 }
 
 impl<'a> AttemptDriver<'a> {
     fn new(engine: &'a Engine) -> Self {
         Self {
             engine,
-            handle: None,
+            handle: engine.begin_transaction(AccessSet::default(), CatalogAccesses::default()),
         }
     }
 
     /// Installs the accesses collected from the latest transaction-body execution.
     fn install_accesses(&mut self, accesses: AccessSet, catalog_accesses: CatalogAccesses) {
-        match self.handle.as_mut() {
-            Some(handle) => self
-                .engine
-                .reset_transaction(handle, accesses, catalog_accesses),
-            None => {
-                self.handle = Some(self.engine.begin_transaction(accesses, catalog_accesses));
-            }
-        }
+        self.engine
+            .reset_transaction(&mut self.handle, accesses, catalog_accesses);
     }
 
     /// Validates the reads that led the transaction body to return an error.
@@ -574,28 +563,17 @@ impl<'a> AttemptDriver<'a> {
         catalog_accesses: CatalogAccesses,
     ) -> Result<BodyDecision, TransError> {
         self.install_accesses(accesses.into_read_only(), catalog_accesses.into_read_only());
-        let handle = self
-            .handle
-            .as_mut()
-            .expect("error-outcome validation installs an attempt");
-        self.engine.validate_reads(handle).await
+        self.engine.validate_reads(&mut self.handle).await
     }
 
     /// Commits the accesses installed for the latest transaction-body execution.
     async fn commit(&mut self) -> Result<BodyDecision, TransError> {
-        let handle = self
-            .handle
-            .as_mut()
-            .expect("commit follows access installation");
-        self.engine.commit(handle).await
+        self.engine.commit(&mut self.handle).await
     }
 
     /// Finalizes any active engine attempt.
     async fn finish(mut self) -> Result<(), TransError> {
-        let Some(handle) = self.handle.as_mut() else {
-            return Ok(());
-        };
-        self.engine.end(handle).await
+        self.engine.end(&mut self.handle).await
     }
 }
 
@@ -661,6 +639,54 @@ mod tests {
         assert_eq!(remaining.load(Ordering::SeqCst), 0);
         assert_eq!(bodies.load(Ordering::SeqCst), 1);
         db.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_replay_reuses_collection_ids_owned_by_the_same_identity() {
+        let backend = Arc::new(MemoryBackend::new());
+        let db = Database::open("collectionreplay", backend.clone())
+            .await
+            .unwrap();
+        let peer = Database::open("collectionreplay", backend).await.unwrap();
+        let peer_root = peer.root_collection();
+        peer_root.write(b"key", b"initial").await.unwrap();
+        let incarnations = Arc::new(Mutex::new(Vec::new()));
+        let bodies = Arc::new(AtomicUsize::new(0));
+
+        let child = db
+            .tx({
+                let incarnations = incarnations.clone();
+                let bodies = bodies.clone();
+                move |tx| {
+                    let incarnations = incarnations.clone();
+                    let peer_root = peer_root.clone();
+                    let first = bodies.fetch_add(1, Ordering::SeqCst) == 0;
+                    async move {
+                        let root = tx.root_collection();
+                        tx.read(&root, b"key").await?;
+                        let child = tx.create_collection(&root, b"child").await?;
+                        incarnations.lock().unwrap().push(child.address().clone());
+                        if first {
+                            peer_root.write(b"key", b"changed").await?;
+                        }
+                        tx.write(&root, b"key", b"committed")?;
+                        Ok(child)
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(bodies.load(Ordering::SeqCst), 2);
+        {
+            let incarnations = incarnations.lock().unwrap();
+            assert_eq!(incarnations[0], incarnations[1]);
+            assert_eq!(child.address(), &incarnations[1]);
+        }
+        child.write(b"child-key", b"value").await.unwrap();
+        assert_eq!(child.read(b"child-key").await.unwrap().unwrap(), b"value");
+        db.shutdown().await;
+        peer.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]

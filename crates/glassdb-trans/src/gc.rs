@@ -27,6 +27,7 @@ use scan::{GcScan, PAGE_SIZE};
 const HINT_CAPACITY: usize = 4096;
 const SCAN_CAPACITY: usize = 2 * PAGE_SIZE;
 const MAX_CHECKS: usize = 8;
+const ADMISSION_BATCH: usize = 64;
 
 type Check = BoxFuture<'static, (TxId, Result<GcOutcome, TransError>)>;
 type Listing = BoxFuture<'static, (GcScan, Result<Option<Vec<TxId>>, StorageError>)>;
@@ -34,9 +35,146 @@ type Listing = BoxFuture<'static, (GcScan, Result<Option<Vec<TxId>>, StorageErro
 struct Candidate {
     due: rt::Instant,
     from_scan: bool,
-    running: bool,
+    state: CandidateState,
     reported_again: bool,
     failures: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CandidateState {
+    Ready,
+    Deferred,
+    Running,
+}
+
+/// Bounds local work and preserves scan capacity under a stream of hints.
+#[derive(Default)]
+struct Candidates {
+    entries: BTreeMap<TxId, Candidate>,
+    ready: [BTreeSet<(rt::Instant, TxId)>; 2],
+    deferred: BTreeSet<(rt::Instant, TxId)>,
+    counts: [usize; 2],
+    running: [usize; 2],
+}
+
+impl Candidates {
+    fn admit(&mut self, tid: TxId, from_scan: bool, now: rt::Instant, counters: &Counters) {
+        if let Some(candidate) = self.entries.get_mut(&tid) {
+            if from_scan && !candidate.from_scan {
+                self.counts[0] -= 1;
+                self.counts[1] += 1;
+                match candidate.state {
+                    CandidateState::Ready => {
+                        self.ready[0].remove(&(candidate.due, tid.clone()));
+                        self.ready[1].insert((candidate.due, tid));
+                    }
+                    CandidateState::Running => {
+                        self.running[0] -= 1;
+                        self.running[1] += 1;
+                    }
+                    CandidateState::Deferred => {}
+                }
+                candidate.from_scan = true;
+            }
+            candidate.reported_again |= candidate.state == CandidateState::Running;
+            return;
+        }
+        let origin = usize::from(from_scan);
+        let capacity = if from_scan {
+            SCAN_CAPACITY
+        } else {
+            HINT_CAPACITY
+        };
+        if self.counts[origin] >= capacity {
+            counters.dropped_candidates.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.counts[origin] += 1;
+        self.ready[origin].insert((now, tid.clone()));
+        self.entries.insert(
+            tid,
+            Candidate {
+                due: now,
+                from_scan,
+                state: CandidateState::Ready,
+                reported_again: false,
+                failures: 0,
+            },
+        );
+    }
+
+    fn promote_due(&mut self, now: rt::Instant) {
+        for _ in 0..ADMISSION_BATCH {
+            if !self.next_due().is_some_and(|due| due <= now) {
+                break;
+            }
+            let (due, tid) = self.deferred.pop_first().unwrap();
+            let candidate = self.entries.get_mut(&tid).unwrap();
+            candidate.state = CandidateState::Ready;
+            self.ready[usize::from(candidate.from_scan)].insert((due, tid));
+        }
+    }
+
+    fn take_ready(&mut self) -> Option<TxId> {
+        // Keep a check slot available for scans despite continuous hint traffic.
+        let origin = if self.running[1] == 0 && !self.ready[1].is_empty() {
+            1
+        } else {
+            (0..2)
+                .filter(|&i| !self.ready[i].is_empty())
+                .min_by_key(|&i| self.ready[i].first())
+                .unwrap_or(0)
+        };
+        let (_, tid) = self.ready[origin].pop_first()?;
+        self.entries.get_mut(&tid).unwrap().state = CandidateState::Running;
+        self.running[origin] += 1;
+        Some(tid)
+    }
+
+    fn complete(&mut self, tid: &TxId) -> Candidate {
+        let candidate = self.entries.remove(tid).unwrap();
+        let origin = usize::from(candidate.from_scan);
+        self.counts[origin] -= 1;
+        self.running[origin] -= 1;
+        candidate
+    }
+
+    fn defer(&mut self, tid: TxId, mut candidate: Candidate, due: rt::Instant) {
+        candidate.state = CandidateState::Deferred;
+        candidate.reported_again = false;
+        candidate.due = due;
+        self.counts[usize::from(candidate.from_scan)] += 1;
+        self.deferred.insert((due, tid.clone()));
+        self.entries.insert(tid, candidate);
+    }
+
+    fn ready_len(&self) -> usize {
+        self.ready.iter().map(BTreeSet::len).sum()
+    }
+
+    fn oldest_ready(&self) -> Option<rt::Instant> {
+        self.ready
+            .iter()
+            .filter_map(|queue| queue.first().map(|(due, _)| *due))
+            .min()
+    }
+
+    fn next_due(&self) -> Option<rt::Instant> {
+        self.deferred.first().map(|(due, _)| *due)
+    }
+
+    fn record_backlog(&self, counters: &Counters) {
+        counters
+            .ready
+            .store(self.ready_len() as u64, Ordering::Relaxed);
+        counters
+            .waiting
+            .store(self.deferred.len() as u64, Ordering::Relaxed);
+        counters
+            .in_flight
+            .store(self.running.iter().sum::<usize>() as u64, Ordering::Relaxed);
+        *counters.oldest_ready.lock().unwrap() = self.oldest_ready();
+    }
 }
 
 /// Owns GC scheduling and reclamation without delaying candidate producers.
@@ -105,7 +243,8 @@ impl Gc {
             retry_delay * 40,
         );
         let mut next_scan = rt::Instant::now() + retry_delay;
-        let mut candidates = BTreeMap::<TxId, Candidate>::new();
+        let mut candidates = Candidates::default();
+        let mut scanned = VecDeque::new();
         let mut checks = FuturesUnordered::<Check>::new();
         let mut listing = FuturesUnordered::<Listing>::new();
         let mut concurrency = 1;
@@ -113,18 +252,21 @@ impl Gc {
         let mut scan_failed = false;
         loop {
             let now = rt::Instant::now();
-            for tid in hints.drain() {
-                Self::admit(&mut candidates, tid, false, now, &counters);
+            let (reports, more_hints) = hints.drain();
+            for tid in reports {
+                candidates.admit(tid, false, now, &counters);
             }
-            let ready = candidates
-                .values()
-                .filter(|c| !c.running && c.due <= now)
-                .count();
+            for _ in 0..ADMISSION_BATCH {
+                let Some(tid) = scanned.pop_front() else {
+                    break;
+                };
+                candidates.admit(tid, true, now, &counters);
+            }
+            candidates.promote_due(now);
+            let ready = candidates.ready_len();
             let oldest = candidates
-                .values()
-                .filter(|c| !c.running && c.due <= now)
-                .map(|c| now.duration_since(c.due))
-                .max()
+                .oldest_ready()
+                .map(|due| now.saturating_duration_since(due))
                 .unwrap_or_default();
             if ready > concurrency || oldest >= retry_delay / 16 {
                 concurrency = (concurrency * 2).min(MAX_CHECKS);
@@ -132,16 +274,9 @@ impl Gc {
                 concurrency = 1;
             }
             while checks.len() < concurrency {
-                let scan_running = candidates.values().any(|c| c.running && c.from_scan);
-                let selected = candidates
-                    .iter()
-                    .filter(|(_, c)| !c.running && c.due <= now)
-                    .min_by_key(|(_, c)| (scan_running || !c.from_scan, c.due))
-                    .map(|(tid, _)| tid.clone());
-                let Some(tid) = selected else {
+                let Some(tid) = candidates.take_ready() else {
                     break;
                 };
-                candidates.get_mut(&tid).unwrap().running = true;
                 let gc = gc.clone();
                 checks.push(
                     async move {
@@ -151,8 +286,9 @@ impl Gc {
                     .boxed(),
                 );
             }
-            let scan_count = candidates.values().filter(|c| c.from_scan).count();
-            let can_list = scan.is_some() && scan_count + PAGE_SIZE <= SCAN_CAPACITY;
+            let scan_count = candidates.counts[1];
+            let can_list =
+                scan.is_some() && scanned.is_empty() && scan_count + PAGE_SIZE <= SCAN_CAPACITY;
             if can_list && now >= next_scan {
                 let mut current = scan.take().unwrap();
                 listing.push(
@@ -163,12 +299,10 @@ impl Gc {
                     .boxed(),
                 );
             }
-            Self::record_backlog(&candidates, now, &counters);
-            let next_due = candidates
-                .values()
-                .filter(|c| !c.running && c.due > now)
-                .map(|c| c.due)
-                .min();
+            candidates.record_backlog(&counters);
+            let next_due = candidates.next_due();
+            let local_work =
+                more_hints || !scanned.is_empty() || next_due.is_some_and(|due| due <= now);
             let deadline = next_due
                 .into_iter()
                 .chain(can_list.then_some(next_scan))
@@ -184,9 +318,7 @@ impl Gc {
                             if !scan_failed { cadence.observe(scan_useful); }
                             scan_useful = false;
                             scan_failed = false;
-                            for tid in ids {
-                                Self::admit(&mut candidates, tid, true, rt::Instant::now(), &counters);
-                            }
+                            scanned.extend(ids);
                             let delay = cadence.delay();
                             if continued { delay.min(retry_delay) } else { delay }
                         }
@@ -201,103 +333,44 @@ impl Gc {
                     scan = Some(current);
                 }
                 Some((tid, result)) = checks.next(), if !checks.is_empty() => {
-                    let mut candidate = candidates.remove(&tid).unwrap();
-                    let retry = match result {
-                        Ok(GcOutcome::Reclaimed) => {
-                            counters.progress.fetch_add(1, Ordering::Relaxed);
-                            scan_useful |= candidate.from_scan;
-                            None
+                    let mut completed = Some((tid, result));
+                    for _ in 0..MAX_CHECKS {
+                        let Some((tid, result)) = completed.take() else { break; };
+                        let mut candidate = candidates.complete(&tid);
+                        let retry = match result {
+                            Ok(GcOutcome::Reclaimed) => {
+                                counters.progress.fetch_add(1, Ordering::Relaxed);
+                                scan_useful |= candidate.from_scan;
+                                None
+                            }
+                            Ok(GcOutcome::Progress) => {
+                                counters.progress.fetch_add(1, Ordering::Relaxed);
+                                scan_useful |= candidate.from_scan;
+                                Some(retry_delay)
+                            }
+                            Ok(GcOutcome::Deferred(delay)) => Some(delay),
+                            Ok(GcOutcome::Retained) => candidate.reported_again.then_some(retry_delay),
+                            Err(error) => {
+                                tracing::debug!(tx = %tid, error = %error, "GC candidate check deferred");
+                                counters.failures.fetch_add(1, Ordering::Relaxed);
+                                scan_failed |= candidate.from_scan;
+                                candidate.failures = candidate.failures.saturating_add(1);
+                                Some(retry_delay * (1u32 << candidate.failures.min(4)))
+                            }
+                        };
+                        if let Some(delay) = retry {
+                            candidates.defer(tid, candidate, rt::Instant::now() + delay);
                         }
-                        Ok(GcOutcome::Progress) => {
-                            counters.progress.fetch_add(1, Ordering::Relaxed);
-                            scan_useful |= candidate.from_scan;
-                            Some(retry_delay)
-                        }
-                        Ok(GcOutcome::Deferred(delay)) => Some(delay),
-                        Ok(GcOutcome::Retained) => candidate.reported_again.then_some(retry_delay),
-                        Err(error) => {
-                            tracing::debug!(tx = %tid, error = %error, "GC candidate check deferred");
-                            counters.failures.fetch_add(1, Ordering::Relaxed);
-                            scan_failed |= candidate.from_scan;
-                            candidate.failures = candidate.failures.saturating_add(1);
-                            Some(retry_delay * (1u32 << candidate.failures.min(4)))
-                        }
-                    };
-                    if let Some(delay) = retry {
-                        candidate.running = false;
-                        candidate.reported_again = false;
-                        candidate.due = rt::Instant::now() + delay;
-                        candidates.insert(tid, candidate);
+                        completed = checks.next().now_or_never().flatten();
                     }
                 }
+                _ = std::future::ready(()), if local_work => {}
                 _ = hints.wake.notified() => {}
                 _ = rt::sleep(deadline.saturating_duration_since(rt::Instant::now())) => {}
             }
             // GC admission must yield to transaction tasks even on an in-memory backend.
             rt::yield_now().await;
         }
-    }
-
-    fn admit(
-        candidates: &mut BTreeMap<TxId, Candidate>,
-        tid: TxId,
-        from_scan: bool,
-        now: rt::Instant,
-        counters: &Arc<Counters>,
-    ) {
-        if let Some(candidate) = candidates.get_mut(&tid) {
-            candidate.from_scan |= from_scan;
-            candidate.reported_again |= candidate.running;
-            return;
-        }
-        let count = candidates
-            .values()
-            .filter(|c| c.from_scan == from_scan)
-            .count();
-        let capacity = if from_scan {
-            SCAN_CAPACITY
-        } else {
-            HINT_CAPACITY
-        };
-        if count >= capacity {
-            counters.dropped_candidates.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        candidates.insert(
-            tid,
-            Candidate {
-                due: now,
-                from_scan,
-                running: false,
-                reported_again: false,
-                failures: 0,
-            },
-        );
-    }
-
-    fn record_backlog(
-        candidates: &BTreeMap<TxId, Candidate>,
-        now: rt::Instant,
-        counters: &Counters,
-    ) {
-        let mut ready = 0;
-        let mut deferred = 0;
-        let mut running = 0;
-        let mut oldest: Option<rt::Instant> = None;
-        for candidate in candidates.values() {
-            if candidate.running {
-                running += 1;
-            } else if candidate.due > now {
-                deferred += 1;
-            } else {
-                ready += 1;
-                oldest = Some(oldest.map_or(candidate.due, |due| due.min(candidate.due)));
-            }
-        }
-        counters.ready.store(ready, Ordering::Relaxed);
-        counters.waiting.store(deferred, Ordering::Relaxed);
-        counters.in_flight.store(running, Ordering::Relaxed);
-        *counters.oldest_ready.lock().unwrap() = oldest;
     }
 }
 
@@ -331,9 +404,12 @@ impl GcHints {
                     .dropped_candidates
                     .fetch_add(1, Ordering::Relaxed);
             }
+            let wake = queue.is_empty();
             queue.push_back(tid);
             drop(queue);
-            self.wake.notify_one();
+            if wake {
+                self.wake.notify_one();
+            }
         }
     }
 
@@ -342,13 +418,11 @@ impl GcHints {
         self.queue.lock().unwrap().iter().cloned().collect()
     }
 
-    fn drain(&self) -> Vec<TxId> {
-        let queued = std::mem::take(&mut *self.queue.lock().unwrap());
-        let mut seen = BTreeSet::new();
-        queued
-            .into_iter()
-            .filter(|tid| seen.insert(tid.clone()))
-            .collect()
+    fn drain(&self) -> (Vec<TxId>, bool) {
+        let mut queue = self.queue.lock().unwrap();
+        let count = queue.len().min(ADMISSION_BATCH);
+        let reports = queue.drain(..count).collect();
+        (reports, !queue.is_empty())
     }
 }
 

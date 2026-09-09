@@ -113,13 +113,6 @@ impl AccessOverlay {
         })
     }
 
-    /// Discards key accesses from the completed body attempt.
-    pub(super) fn reset(&mut self) {
-        self.staged.clear();
-        self.reads.clear();
-        self.scans.clear();
-    }
-
     /// Builds the immutable access set for the commit engine.
     pub(super) fn accesses(&self) -> AccessSet {
         let mut writes = Vec::new();

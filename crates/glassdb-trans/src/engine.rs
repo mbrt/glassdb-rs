@@ -19,7 +19,7 @@ use glassdb_storage::{
 use crate::access::{AccessSet, ScanMutation, ScanRange};
 use crate::algo::{Algo, BodyDecision, DirectCommitStats, Handle};
 use crate::collection_catalog::CollectionCatalog;
-use crate::collection_commit::CollectionCommit;
+use crate::collection_commit::{CollectionCommit, CollectionReservations};
 use crate::collection_coordination::CollectionStateResolver;
 use crate::collections::{CatalogAccesses, CollectionLifecycle, DirectorySnapshot};
 use crate::error::TransError;
@@ -121,6 +121,11 @@ impl EngineTransaction {
     /// Returns the attempt's transaction identity.
     pub fn id(&self) -> &TxId {
         self.0.id()
+    }
+
+    /// Returns collection-ID reservations owned by the current identity.
+    pub fn collection_reservations(&self) -> CollectionReservations {
+        self.0.collection_reservations()
     }
 }
 

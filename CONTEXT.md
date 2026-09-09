@@ -7,7 +7,6 @@ by project area.
 
 **Database instance**:
 A local runtime created by one successful database open. Cloned handles share that instance; separate opens create separate instances, including within one process.
-_Avoid_: Collector
 
 ## Data model
 

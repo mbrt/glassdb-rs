@@ -115,12 +115,7 @@ async fn single_rw_stale_read_renews_and_converges() {
         &tm,
         AccessSet::new(vec![ra], vec![wa(&keyp, b"v3")], Vec::new()),
     );
-    assert_eq!(
-        tm.commit(&mut h).await.unwrap(),
-        BodyDecision::ReplayBody {
-            identity_renewed: false
-        }
-    );
+    assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
     tm.end(&mut h).await.unwrap();
 
     // The stale write never committed: v2 is still current (the discarded
@@ -1302,12 +1297,7 @@ async fn direct_commit_superseded_read_replays_in_place() {
         &tm,
         AccessSet::new(vec![stale], vec![wa(&keyp, b"v3")], Vec::new()),
     );
-    assert_eq!(
-        tm.commit(&mut h).await.unwrap(),
-        BodyDecision::ReplayBody {
-            identity_renewed: false
-        }
-    );
+    assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
     tm.end(&mut h).await.unwrap();
     let status = tctx
         .tlogger
@@ -1415,18 +1405,8 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
     // Which member wins the round's claim depends on id order; that exactly
     // one does is the property under test.
     let (winner, mut replayed) = match (&r1, &r2) {
-        (
-            Ok(BodyDecision::ReturnOutcome),
-            Ok(BodyDecision::ReplayBody {
-                identity_renewed: false,
-            }),
-        ) => (h1.id().clone(), h2),
-        (
-            Ok(BodyDecision::ReplayBody {
-                identity_renewed: false,
-            }),
-            Ok(BodyDecision::ReturnOutcome),
-        ) => (h2.id().clone(), h1),
+        (Ok(BodyDecision::ReturnOutcome), Ok(BodyDecision::ReplayBody)) => (h1.id().clone(), h2),
+        (Ok(BodyDecision::ReplayBody), Ok(BodyDecision::ReturnOutcome)) => (h2.id().clone(), h1),
         other => panic!("expected one commit and one replay, got {other:?}"),
     };
 
@@ -1984,5 +1964,53 @@ async fn direct_cross_key_read_modify_write_uses_one_leaf_cas() {
             writer: h.id().clone(),
             value: Arc::from(b"v2".as_slice()),
         }
+    );
+}
+
+#[tokio::test]
+async fn direct_publication_reports_external_predecessors_only() {
+    let (tm, tctx) = new_algo().await;
+    let key = logical_key(b"k");
+    let large = vec![b'x'; InlinePolicy::default().max_value_bytes + 1];
+    commit_writes(&tm, vec![wa(&key, &large)]).await;
+    let logged = entry(&tctx, b"k").await.unwrap();
+    assert!(matches!(logged.current, CurrentState::External { .. }));
+    let writer = logged.current.writer().unwrap().clone();
+    commit_writes(&tm, vec![wa(&key, b"inline")]).await;
+    assert_eq!(tm.cleanup_hints.pending(), vec![writer.clone()]);
+    commit_writes(&tm, vec![wa(&key, b"next")]).await;
+    commit_writes(&tm, vec![wdel(&key)]).await;
+    commit_writes(&tm, vec![wa(&key, b"after-delete")]).await;
+    assert_eq!(tm.cleanup_hints.pending(), vec![writer]);
+}
+
+#[tokio::test]
+async fn an_absence_read_uses_locked_cleanup_for_a_finalized_membership_writer() {
+    let (tm, tctx) = new_algo().await;
+    let holder = TxId::with_priority(1, b"membership-holder");
+    tctx.tmon.begin_tx(&holder);
+    tctx.tmon
+        .commit_tx(TxLog::new(holder.clone(), TxCommitStatus::Ok))
+        .await
+        .unwrap();
+    let mut locks = NodeLocks::default();
+    locks.set_membership_writer(holder);
+    let mut direct = put_resolver(
+        &tm,
+        TxId::with_priority(2, b"direct"),
+        logical_key(b"missing"),
+        Some(None),
+        b"value",
+    );
+    Arc::make_mut(&mut direct.member.keys)[0].read =
+        Some(ReadPredicate::new(None, Some(locks.membership_version())));
+    assert!(
+        matches!(
+            fold_step(&direct, &tctx, ReloadCause::Fresh, &BTreeMap::new(), &locks).await,
+            Step::Skip {
+                outcome: FoldOutcome::Moved
+            }
+        ),
+        "the locked path must persist cleanup; replay alone sees the same generation"
     );
 }

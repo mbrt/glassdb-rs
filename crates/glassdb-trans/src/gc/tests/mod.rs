@@ -176,9 +176,7 @@ async fn owner_replays_when_gc_reclaims_prepared_collections_during_lock_acquisi
 
         assert_eq!(
             engine.algo.commit(&mut handle).await.unwrap(),
-            BodyDecision::ReplayBody {
-                identity_renewed: true
-            }
+            BodyDecision::ReplayBody
         );
         assert!(triggered.load(Ordering::SeqCst));
         assert_ne!(handle.id(), &old_id);
@@ -363,7 +361,14 @@ async fn is_gone(tl: &TLogger, id: &TxId) -> bool {
 }
 
 async fn run_once(ctx: &Ctx) {
-    let mut candidates = ctx.hints.drain();
+    let mut candidates = Vec::new();
+    loop {
+        let (batch, more) = ctx.hints.drain();
+        candidates.extend(batch);
+        if !more {
+            break;
+        }
+    }
     let page = ctx
         .tl
         .scan_transaction_ids(0, 0, None, backend::ListLimit::new(1000).unwrap())
@@ -1092,4 +1097,89 @@ async fn a_ready_hint_queue_does_not_starve_the_scan() {
     assert!(ctx.gc.stats_and_reset().lists > 0);
     assert!(is_gone(&ctx.tl, &id).await);
     bg.shutdown().await;
+}
+
+#[test]
+fn candidate_capacity_is_preserved_across_deferrals_and_completion() {
+    let now = rt::Instant::now();
+    let counters = Counters::default();
+    let mut candidates = Candidates::default();
+    let ids: Vec<_> = (0u64..HINT_CAPACITY as u64)
+        .map(|i| TxId::from_bytes(i.to_be_bytes().to_vec()))
+        .collect();
+    for id in &ids {
+        candidates.admit(id.clone(), false, now, &counters);
+    }
+    let overflow = TxId::from_bytes(b"overflow".to_vec());
+    candidates.admit(overflow.clone(), false, now, &counters);
+    assert_eq!(counters.take().dropped_candidates, 1);
+    for _ in 0..HINT_CAPACITY {
+        let id = candidates.take_ready().unwrap();
+        let candidate = candidates.complete(&id);
+        candidates.defer(id, candidate, now + Duration::from_secs(1));
+    }
+    candidates.record_backlog(&counters);
+    assert_eq!(counters.diagnostics().deferred, HINT_CAPACITY as u64);
+    assert_eq!(counters.diagnostics().ready, 0);
+    candidates.admit(overflow.clone(), false, now, &counters);
+    assert_eq!(counters.take().dropped_candidates, 1);
+
+    candidates.promote_due(now + Duration::from_secs(1));
+    candidates.record_backlog(&counters);
+    assert_eq!(counters.diagnostics().ready, ADMISSION_BATCH as u64);
+    assert_eq!(
+        counters.diagnostics().deferred,
+        (HINT_CAPACITY - ADMISSION_BATCH) as u64
+    );
+    let id = candidates.take_ready().unwrap();
+    candidates.complete(&id);
+    candidates.admit(overflow, false, now, &counters);
+    assert_eq!(counters.take().dropped_candidates, 0);
+    assert_eq!(candidates.oldest_ready(), Some(now));
+}
+
+#[test]
+fn scan_reports_preserve_candidates_in_each_scheduling_state() {
+    let now = rt::Instant::now();
+    let counters = Counters::default();
+    let mut candidates = Candidates::default();
+    let hint = tx(1);
+    let ready_scan = tx(2);
+    let deferred_scan = tx(3);
+    candidates.admit(hint.clone(), false, now, &counters);
+    candidates.admit(ready_scan.clone(), false, now, &counters);
+    candidates.admit(ready_scan.clone(), true, now, &counters);
+    assert_eq!(candidates.take_ready(), Some(ready_scan.clone()));
+    candidates.complete(&ready_scan);
+
+    let running = candidates.take_ready().unwrap();
+    assert_eq!(running, hint);
+    candidates.admit(running.clone(), true, now, &counters);
+    let candidate = candidates.complete(&running);
+    assert!(candidate.reported_again);
+    candidates.defer(running.clone(), candidate, now + Duration::from_secs(1));
+
+    candidates.admit(deferred_scan.clone(), false, now, &counters);
+    assert_eq!(candidates.take_ready(), Some(deferred_scan.clone()));
+    let candidate = candidates.complete(&deferred_scan);
+    candidates.defer(
+        deferred_scan.clone(),
+        candidate,
+        now + Duration::from_secs(2),
+    );
+    candidates.admit(deferred_scan.clone(), true, now, &counters);
+    candidates.admit(deferred_scan.clone(), false, now, &counters);
+    candidates.record_backlog(&counters);
+    assert_eq!(counters.diagnostics().in_flight, 0);
+    assert_eq!(counters.diagnostics().deferred, 2);
+    candidates.promote_due(now + Duration::from_secs(1));
+    assert_eq!(candidates.take_ready(), Some(running.clone()));
+    assert!(!candidates.complete(&running).reported_again);
+    assert_eq!(candidates.take_ready(), None);
+    candidates.promote_due(now + Duration::from_secs(2));
+    assert_eq!(candidates.take_ready(), Some(deferred_scan.clone()));
+    candidates.complete(&deferred_scan);
+    candidates.record_backlog(&counters);
+    assert_eq!(counters.diagnostics(), GcDiagnostics::default());
+    assert_eq!(candidates.next_due(), None);
 }

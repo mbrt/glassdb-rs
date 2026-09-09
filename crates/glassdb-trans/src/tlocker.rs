@@ -717,7 +717,7 @@ enum EntryResolution {
 }
 
 /// The staged result of a write-back: the entry changes to apply and the
-/// `current_writer`s they superseded (GC candidates, ADR-022).
+/// transaction-object references they superseded (GC candidates, ADR-022).
 struct WritebackStaged {
     changes: Vec<(Vec<u8>, LeafEntry)>,
     superseded: Vec<TxId>,
@@ -834,7 +834,7 @@ fn writeback_changes(
         let mut e = e.clone();
         match intent.desired {
             Desired::Put | Desired::Delete => {
-                if let Some(prev) = e.current.writer()
+                if let CurrentState::External { writer: prev } = &e.current
                     && prev != id
                 {
                     superseded.push(prev.clone());
@@ -1014,9 +1014,9 @@ impl KeyLocker {
     /// Cancellation can leave a partial pass, but the committed log remains
     /// authoritative and every landed CAS is safe to repeat.
     ///
-    /// Returns the transaction identities each published pointer *superseded* (the
-    /// former `current_writer` an overwrite replaced): these just lost a
-    /// reference and are GC write-back hint candidates (ADR-022).
+    /// Returns displaced external transaction-object references as GC candidates.
+    /// Inline values and tombstones can have logless writers; GC scans discover
+    /// any transaction objects behind those states.
     pub(crate) async fn write_back(&self, id: &TxId, locked: &LockedTx) -> Vec<TxId> {
         // A cancelled partial pass may lose these hints; GC's paged scan is
         // complete without them.
@@ -2166,6 +2166,44 @@ mod tests {
             inlined,
             "the existing inline value survives lock reconciliation"
         );
+    }
+
+    #[tokio::test]
+    async fn write_back_does_not_report_inline_or_tombstone_writers() {
+        let (locker, ctx) = init_tl_test().await;
+        let key = b"key";
+        let previous = mk_tid(1, "previous");
+        let writer = mk_tid(2, "writer");
+        for current in [
+            CurrentState::Inline {
+                writer: previous.clone(),
+                value: Arc::from(b"value".as_slice()),
+            },
+            CurrentState::Tombstone {
+                writer: previous.clone(),
+            },
+        ] {
+            let mut entry = LeafEntry::new(key).with_current(current);
+            entry.replace_write_lock(writer.clone());
+            replace_root(&ctx, &Node::leaf(LeafBody::from_entries([entry]))).await;
+            let group = group_of(key, put_intent(key)).remove(&root_path()).unwrap();
+            let hints = locker
+                .keys()
+                .write_back_routed(
+                    &writer,
+                    &group.path,
+                    Arc::new(group.intents),
+                    Requirement::Any,
+                )
+                .await;
+            assert!(hints.is_empty());
+            assert_eq!(
+                entry_of(&ctx, key).await.unwrap().current,
+                CurrentState::External {
+                    writer: writer.clone()
+                }
+            );
+        }
     }
 
     // A replayed cleanup for the same writer must likewise preserve an inline

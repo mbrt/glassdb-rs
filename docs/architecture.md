@@ -276,11 +276,21 @@ constructed and owned by `Locker`; `Algo` keeps collection locking beside key
 locking so the shared barrier, combined durable lock receipt, atomic commit
 point, and write-back ordering remain explicit transaction-wide policy.
 
-`BodyDecision` reports whether an identity changed during the engine call,
-including an internal serial-acquisition renewal before a later validation
-retry. The facade keeps collection ID reservations for body retries under the
-same identity and clears them after renewal. This prevents GC for a retired
-identity from deleting collection objects reused by a later attempt.
+`BodyDecision` reports only whether to return the body outcome or replay the
+body. `CollectionAttempt` owns collection-ID reservations together with the
+prepared resources for one transaction identity. Each body execution starts with
+fresh key and catalog accesses and a handle to those reservations. Body replay
+under the same identity reuses the IDs; identity renewal replaces the
+reservations along with the physical-resource bookkeeping. Old body handles
+retain only the retired identity's reservations. The public transaction loop
+does not interpret identity changes or reset reservation state. This prevents GC
+for a retired identity from deleting collection objects reused by a later
+attempt.
+
+The engine handle is allocated before the first body execution so its identity
+owns reservations from the first collection creation. Allocation is local;
+transaction-log publication and locking still start only when required by the
+commit protocol.
 
 Routing traversal is centralized in `TreeRouter`, but use of that mechanism is
 intentionally distributed. `KeyResolver`, the key-lock view, `Gc`, and
@@ -806,7 +816,10 @@ A non-landing direct attempt is classified as a whole
 ([ADR-053](adr/053-replay-definitive-logless-rmw-losses.md)). A read-dependent
 member whose loss is certified replays its body under the same, still-unengaged
 id; a blind member and a member requiring coordination take the regular locked
-path. Within one coordinator round, an earlier direct member claims all of its
+path. If pruning a finalized membership holder changes the temporary generation
+and read validation fails, the locked path makes that cleanup durable. Replaying
+against a generation change that was never stored would repeat the same failure.
+Within one coordinator round, an earlier direct member claims all of its
 output keys. Any later publisher that overlaps those claims is excluded as a
 whole, while disjoint direct members may share the same physical leaf CAS.
 
@@ -1222,7 +1235,10 @@ recovery share the `ScanCadence` interval controller from `glassdb-concurr`.
   candidates through `GcHints`. Reports use bounded in-memory work and never
   wait for queue space, backend requests, or GC completion. A busy queue drops
   the report; a full queue drops its oldest hint. Both losses are counted.
-  Hints wake `Gc` without causing a LIST.
+  Hints wake `Gc` without causing a LIST. Direct publication and logged
+  write-back report displaced external transaction-object references. Inline
+  values and tombstones can have logless writers, so their writer identities
+  alone do not produce predecessor hints; scans find any remaining objects.
 - **Local scheduling.** Each independently opened `Database` instance owns its
   GC state; cloned handles share it. `Gc` de-duplicates
   candidates, retains safety-horizon deferrals and failed checks with due times,
@@ -1231,7 +1247,10 @@ recovery share the `ScanCadence` interval controller from `glassdb-concurr`.
   4,096 hint-origin candidates and reserves space for 2,000 scan-origin
   candidates, in addition to the bounded producer queue. Scan-origin checks
   receive reserved execution capacity. Transient errors receive delayed retries.
-  Live objects return through later hints or scans.
+  Live objects return through later hints or scans. Each scheduling turn admits
+  up to 64 hints and 64 scanned candidates, promotes up to 64 due retries, and
+  drains up to eight completed checks before yielding. Ready and deferred
+  indexes avoid full candidate-map scans for admission and scheduling.
 - **Safety horizon and pinned wounds.** The ADR-021 lease acts as the sweep
   horizon: a candidate other than `Wounded` is kept within the horizon, because
   the non-atomic reverse check can race a lock a live transaction has taken but
@@ -1310,7 +1329,11 @@ more than once across Database instances. Discards combine producer queue loss
 and candidate admission loss.
 `Database::diagnostics` reports known ready and deferred work, running checks,
 oldest ready-check age, and current prefix count. These measures do not estimate
-undiscovered garbage or count retained live objects as GC backlog.
+undiscovered garbage or count retained live objects as GC backlog. Reporting
+uses scheduling-index lengths and the oldest ready entry instead of scanning
+all candidates. Each waiting candidate adds one ordered-index entry; updates
+cost logarithmic time. Diagnostics describe the last scheduling turn, and due
+retries enter the ready count as bounded promotion batches process them.
 
 Background tasks stop when the last `Database` handle is dropped or the instance
 shuts down. An application can add GC capacity by opening a Database instance

@@ -35,7 +35,7 @@ use glassdb_storage::{
 };
 
 use crate::access::{AccessSet, LeafCoverage, ReadAccess, WriteOp};
-use crate::collection_commit::{CollectionAttempt, CollectionCommit};
+use crate::collection_commit::{CollectionAttempt, CollectionCommit, CollectionReservations};
 use crate::collections::CatalogAccesses;
 use crate::error::TransError;
 use crate::gc::GcHints;
@@ -165,6 +165,11 @@ impl Handle {
         &self.id
     }
 
+    /// Returns collection-ID reservations owned by the current identity.
+    pub(crate) fn collection_reservations(&self) -> CollectionReservations {
+        self.collections.reservations()
+    }
+
     /// Whether this read-only attempt is past its optimistic first try and must
     /// use the locked validation path.
     fn should_lock_reads(&self) -> bool {
@@ -218,10 +223,7 @@ pub enum BodyDecision {
     /// The body outcome can be returned.
     ReturnOutcome,
     /// The engine changed attempt state and needs fresh logical accesses.
-    ReplayBody {
-        /// The previous identity was retired; its collection IDs cannot be reused.
-        identity_renewed: bool,
-    },
+    ReplayBody,
 }
 
 enum AttemptOutcome {
@@ -401,28 +403,21 @@ impl Algo {
 
     /// Validates all reads and applies all writes.
     pub async fn commit(&self, tx: &mut Handle) -> Result<BodyDecision, TransError> {
-        let initial_renewals = tx.renewals();
         loop {
             match self.commit_once(tx).await {
                 Ok(AttemptOutcome::Complete) => return Ok(BodyDecision::ReturnOutcome),
                 Ok(AttemptOutcome::RenewForSerial { replay_body, .. }) => {
                     self.renew_for_serial(tx).await?;
                     if replay_body {
-                        return Ok(BodyDecision::ReplayBody {
-                            identity_renewed: true,
-                        });
+                        return Ok(BodyDecision::ReplayBody);
                     }
                 }
                 Err(TransError::Wounded) => {
                     self.renew_after_wound(tx).await;
-                    return Ok(BodyDecision::ReplayBody {
-                        identity_renewed: true,
-                    });
+                    return Ok(BodyDecision::ReplayBody);
                 }
                 Err(TransError::Retry) => {
-                    return Ok(BodyDecision::ReplayBody {
-                        identity_renewed: tx.renewals() != initial_renewals,
-                    });
+                    return Ok(BodyDecision::ReplayBody);
                 }
                 Err(error) => return Err(error),
             }
@@ -431,7 +426,6 @@ impl Algo {
 
     /// Validates the reads and range scans of a read-only transaction.
     pub async fn validate_reads(&self, tx: &mut Handle) -> Result<BodyDecision, TransError> {
-        let initial_renewals = tx.renewals();
         loop {
             match self.validate_reads_once(tx).await {
                 Ok(AttemptOutcome::Complete) => return Ok(BodyDecision::ReturnOutcome),
@@ -444,14 +438,10 @@ impl Algo {
                 }
                 Err(TransError::Wounded) => {
                     self.renew_after_wound(tx).await;
-                    return Ok(BodyDecision::ReplayBody {
-                        identity_renewed: true,
-                    });
+                    return Ok(BodyDecision::ReplayBody);
                 }
                 Err(TransError::Retry) => {
-                    return Ok(BodyDecision::ReplayBody {
-                        identity_renewed: tx.renewals() != initial_renewals,
-                    });
+                    return Ok(BodyDecision::ReplayBody);
                 }
                 Err(error) => return Err(error),
             }
@@ -1773,12 +1763,7 @@ mod tests {
             &tm,
             AccessSet::new(vec![ra], vec![wa(&ka, b"v3"), wa(&kb, &logged)], Vec::new()),
         );
-        assert_eq!(
-            tm.commit(&mut h).await.unwrap(),
-            BodyDecision::ReplayBody {
-                identity_renewed: false
-            }
-        );
+        assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
 
         // The moved key is locked by us when the stale read is signalled: the
         // re-run owns the lock and cannot lose it again to the same race.
@@ -1802,12 +1787,7 @@ mod tests {
         tctx.tmon.begin_tx(&old_id);
         tctx.tmon.preempt_tx(&old_id).await.unwrap();
 
-        assert_eq!(
-            tm.commit(&mut h).await.unwrap(),
-            BodyDecision::ReplayBody {
-                identity_renewed: true
-            }
-        );
+        assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
         assert_ne!(*h.id(), old_id);
         assert!(!h.id().older(&old_id));
         assert!(!old_id.older(h.id()));
@@ -2056,9 +2036,7 @@ mod tests {
         let old_id = handle.id().clone();
         assert_eq!(
             algo.commit(&mut handle).await.unwrap(),
-            BodyDecision::ReplayBody {
-                identity_renewed: true
-            },
+            BodyDecision::ReplayBody,
         );
         assert_ne!(handle.id(), &old_id);
         assert_eq!(flaky.remaining(), 0);
@@ -2717,12 +2695,7 @@ mod tests {
         commit_writes(&tm2, vec![wa(&ka, b"a2")]).await;
 
         let mut h = begin_accesses(&tm, AccessSet::new(vec![ra, rb], Vec::new(), Vec::new()));
-        assert_eq!(
-            tm.commit(&mut h).await.unwrap(),
-            BodyDecision::ReplayBody {
-                identity_renewed: false
-            }
-        );
+        assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
         assert!(h.should_lock_reads());
         for key in [b"a".as_slice(), b"b"] {
             assert_eq!(
@@ -2917,9 +2890,7 @@ mod tests {
         let mut stale = begin_accesses(&tm, accesses);
         assert_eq!(
             tm.commit(&mut stale).await.unwrap(),
-            BodyDecision::ReplayBody {
-                identity_renewed: false
-            }
+            BodyDecision::ReplayBody
         );
         assert!(
             stale.should_lock_reads(),
@@ -2993,9 +2964,7 @@ mod tests {
         let mut stale = begin_accesses(&tm, scan);
         assert_eq!(
             tm.commit(&mut stale).await.unwrap(),
-            BodyDecision::ReplayBody {
-                identity_renewed: false
-            }
+            BodyDecision::ReplayBody
         );
     }
 
@@ -3053,9 +3022,7 @@ mod tests {
         let mut handle = begin_accesses(&tm, stale);
         assert_eq!(
             tm.commit(&mut handle).await.unwrap(),
-            BodyDecision::ReplayBody {
-                identity_renewed: false
-            }
+            BodyDecision::ReplayBody
         );
 
         // The body re-runs while S0 stays locked. Its new frontier is `m`, so
@@ -3101,9 +3068,7 @@ mod tests {
         let mut stale = begin_accesses(&tm, accesses);
         assert_eq!(
             tm.commit(&mut stale).await.unwrap(),
-            BodyDecision::ReplayBody {
-                identity_renewed: false
-            }
+            BodyDecision::ReplayBody
         );
     }
 
@@ -3211,9 +3176,7 @@ mod tests {
         let mut stale = begin_accesses(&tm, accesses);
         assert_eq!(
             tm.commit(&mut stale).await.unwrap(),
-            BodyDecision::ReplayBody {
-                identity_renewed: false
-            }
+            BodyDecision::ReplayBody
         );
     }
 

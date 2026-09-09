@@ -218,9 +218,9 @@ struct DirectCommitOperation {
     member: DirectMember,
     inline: InlinePolicy,
     split_hints: SplitHintSink,
-    /// Output writers replaced by the last proposed publication. The outer
+    /// Output states replaced by the last proposed publication. The outer
     /// option distinguishes "not staged" from a staged create over absence.
-    staged_over: Mutex<Option<BTreeMap<Vec<u8>, Option<TxId>>>>,
+    staged_over: Mutex<Option<BTreeMap<Vec<u8>, CurrentState>>>,
     /// Once any exact output marker is observed, the leaf CAS atomically proves
     /// the whole member landed even if a later fold or CAS replaces it.
     landed_proven: AtomicBool,
@@ -245,11 +245,16 @@ impl DirectCommitOperation {
         }
     }
 
-    /// Returns distinct committed writers displaced by the landed member.
+    /// Returns transaction-object references displaced by the landed member.
     fn predecessors(&self) -> Vec<TxId> {
         let mut predecessors = BTreeSet::new();
         if let Some(staged) = self.staged_over.lock().unwrap().as_ref() {
-            predecessors.extend(staged.values().flatten().cloned());
+            // Inline values and tombstones can have logless writers. Scans find
+            // any transaction objects that remain behind those states.
+            predecessors.extend(staged.values().filter_map(|state| match state {
+                CurrentState::External { writer } => Some(writer.clone()),
+                _ => None,
+            }));
         }
         predecessors.into_iter().collect()
     }
@@ -360,9 +365,16 @@ impl DirectCommitOperation {
                 })
             })
         {
-            return Ok(Step::Skip {
-                outcome: FoldOutcome::Replay,
-            });
+            // Releasing a finalized membership writer advances the staged
+            // generation. A skipped publication would discard that change, so
+            // replaying the same absence read could never converge. The locked
+            // path makes the cleanup durable before validating the read.
+            let outcome = if locks.membership_version() != staged_locks.membership_version() {
+                FoldOutcome::Moved
+            } else {
+                FoldOutcome::Replay
+            };
+            return Ok(Step::Skip { outcome });
         }
 
         let output_keys: BTreeSet<&[u8]> = self
@@ -401,7 +413,10 @@ impl DirectCommitOperation {
             let Some(write) = &key.write else {
                 continue;
             };
-            predecessors.insert(key.raw_key.clone(), state.writer.clone());
+            predecessors.insert(
+                key.raw_key.clone(),
+                state.resolved_current(staged.get(&key.raw_key)),
+            );
             let current = match write {
                 DirectWrite::Put(value) => {
                     adds_key |= state.writer.is_none() || state.deleted;
@@ -492,12 +507,12 @@ impl DirectCommitOperation {
             let predecessor = staged
                 .get(&key.raw_key)
                 .expect("every direct output records its predecessor");
-            if predecessor != &state.writer {
+            if predecessor.writer() != state.writer.as_ref() {
                 return false;
             }
             durable_witness |= match key.write.as_ref().expect("output key has a write") {
                 DirectWrite::Put(_) => true,
-                DirectWrite::Delete => predecessor.is_some(),
+                DirectWrite::Delete => predecessor.writer().is_some(),
             };
         }
         durable_witness
