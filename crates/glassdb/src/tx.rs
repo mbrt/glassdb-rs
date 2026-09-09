@@ -328,10 +328,10 @@ impl Transaction {
         }
     }
 
-    pub(crate) fn reset(&self) {
+    pub(crate) fn reset(&self, identity_renewed: bool) {
         let mut inner = self.inner.lock().unwrap();
         inner.accesses.reset();
-        inner.catalog.reset();
+        inner.catalog.reset(identity_renewed);
     }
 
     pub(crate) fn collect_accesses(&self) -> (AccessSet, CatalogAccesses) {

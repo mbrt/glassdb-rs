@@ -1,8 +1,9 @@
-//! Operator diagnostics for hang-prone coordination paths.
+//! Operator diagnostics for coordination and local GC work.
 //!
 //! [`Database::diagnostics`] returns a [`Diagnostics`] snapshot of the leaf
-//! coordinator's live dedup state. It reads existing coordinator state only
-//! when called and does not maintain separate diagnostic state.
+//! coordinator's live dedup state and the Database instance's GC work.
+//! GC gauges report the latest scheduling state; ready-work age advances
+//! between snapshots.
 //!
 //! The signal is tuned to orphan-key hangs in the coordination layer: an entry
 //! with a non-empty queue but no active operation is the visible signature of
@@ -20,11 +21,14 @@
 use std::fmt;
 
 pub use glassdb_concurr::DedupKeySnapshot;
+pub use glassdb_trans::GcDiagnostics;
 
-/// A snapshot of the leaf coordinator's live state. Returned by
+/// A snapshot of local GC work and the leaf coordinator's live state. Returned by
 /// [`crate::Database::diagnostics`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostics {
+    /// Local GC backlog and scan scope.
+    pub gc: GcDiagnostics,
     /// Per-object dedup state inside the leaf coordinator.
     ///
     /// Contains one entry per path with live coordination state, sorted by key.
@@ -34,6 +38,15 @@ pub struct Diagnostics {
 impl fmt::Display for Diagnostics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Diagnostics:")?;
+        writeln!(
+            f,
+            "  GC: ready={} deferred={} in_flight={} oldest_ready={:?} prefixes={}",
+            self.gc.ready,
+            self.gc.deferred,
+            self.gc.in_flight,
+            self.gc.oldest_ready_age,
+            self.gc.prefix_count
+        )?;
         writeln!(
             f,
             "  coordinator dedup ({} paths):",

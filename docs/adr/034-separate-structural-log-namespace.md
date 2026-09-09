@@ -9,7 +9,7 @@ Refines only the structural-record placement in
 [ADR-032](032-node-locking-and-coordinated-splits.md).
 
 [ADR-070](070-demand-driven-garbage-collection.md) refines recovery cadence with
-independent adaptive scans. That change is accepted but not yet implemented;
+independent adaptive scans. That change is implemented;
 structural recovery keeps its own namespace, rules, and work budget.
 
 ## Context

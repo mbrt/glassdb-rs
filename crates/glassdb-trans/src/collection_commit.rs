@@ -249,7 +249,7 @@ impl CollectionCommit {
         let drops = attempt.fenced_drops.iter().cloned().collect::<Vec<_>>();
         self.lifecycle.clear_aborted_drops(id, &drops).await?;
         let prepared = attempt.prepared.iter().cloned().collect::<Vec<_>>();
-        self.lifecycle.reclaim(&prepared).await
+        self.lifecycle.reclaim(&prepared).await.map(|_| ())
     }
 }
 

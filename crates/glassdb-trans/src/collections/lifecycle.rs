@@ -119,26 +119,49 @@ impl CollectionLifecycle {
         &self,
         id: &TxId,
         collections: &[CollectionAddress],
-    ) -> Result<(), TransError> {
+    ) -> Result<bool, TransError> {
+        let mut changed = false;
         for collection in collections {
-            let nodes = self.nodes.list_nodes(collection, Requirement::Any).await?;
-            for (token, _) in nodes {
-                self.clear_node_fence(collection, &token, id).await?;
+            let mut cursor = None;
+            loop {
+                let page = self
+                    .nodes
+                    .scan_nodes(collection, cursor.as_ref(), Requirement::Any)
+                    .await?;
+                for (token, _) in page.nodes {
+                    changed |= self.clear_node_fence(collection, &token, id).await?;
+                }
+                match page.next {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
             }
-            self.clear_root_fence(collection, id).await?;
+            changed |= self.clear_root_fence(collection, id).await?;
         }
-        Ok(())
+        Ok(changed)
     }
 
     /// Reclaims physical objects for collections no longer discoverable.
     pub(crate) async fn reclaim(
         &self,
         collections: &[CollectionAddress],
-    ) -> Result<(), TransError> {
+    ) -> Result<bool, TransError> {
+        let mut changed = false;
         for collection in collections {
-            let nodes = self.nodes.list_nodes(collection, Requirement::Any).await?;
-            for (_, observed) in nodes {
-                self.nodes.delete_node(&observed).await?;
+            let mut cursor = None;
+            loop {
+                let page = self
+                    .nodes
+                    .scan_nodes(collection, cursor.as_ref(), Requirement::Any)
+                    .await?;
+                for (_, observed) in page.nodes {
+                    self.nodes.delete_node(&observed).await?;
+                    changed = true;
+                }
+                match page.next {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
             }
             let observed = self
                 .nodes
@@ -146,6 +169,7 @@ impl CollectionLifecycle {
                 .await?;
             if observed.exists() {
                 self.nodes.delete_root(&observed).await?;
+                changed = true;
             }
             let observed = self
                 .records
@@ -153,9 +177,10 @@ impl CollectionLifecycle {
                 .await?;
             if observed.exists() {
                 self.records.delete_record(&observed).await?;
+                changed = true;
             }
         }
-        Ok(())
+        Ok(changed)
     }
 
     async fn freeze_topology(
@@ -324,21 +349,21 @@ impl CollectionLifecycle {
         collection: &CollectionAddress,
         token: &NodeToken,
         id: &TxId,
-    ) -> Result<(), TransError> {
+    ) -> Result<bool, TransError> {
         loop {
             let (mut node, observed) = self
                 .nodes
                 .load_node(collection, token, Requirement::Any)
                 .await?;
             if !node.remove_collection_delete_intent(id) {
-                return Ok(());
+                return Ok(false);
             }
             if self
                 .nodes
                 .store_node(collection, token, &node, Some(&observed))
                 .await?
             {
-                return Ok(());
+                return Ok(true);
             }
         }
     }
@@ -347,18 +372,20 @@ impl CollectionLifecycle {
         &self,
         collection: &CollectionAddress,
         id: &TxId,
-    ) -> Result<(), TransError> {
+    ) -> Result<bool, TransError> {
+        let mut changed = false;
         loop {
             let (mut root, observed) =
                 match self.nodes.load_root(collection, Requirement::Any).await {
                     Ok(root) => root,
-                    Err(StorageError::NotFound) => return Ok(()),
+                    Err(StorageError::NotFound) => return Ok(changed),
                     Err(error) => return Err(error.into()),
                 };
             if !root.remove_collection_delete_intent(id) {
                 break;
             }
             if self.nodes.store_root(collection, &root, &observed).await? {
+                changed = true;
                 break;
             }
         }
@@ -366,14 +393,14 @@ impl CollectionLifecycle {
             let (mut record, observed) =
                 match self.records.load_record(collection, Requirement::Any).await {
                     Ok(record) => record,
-                    Err(StorageError::NotFound) => return Ok(()),
+                    Err(StorageError::NotFound) => return Ok(changed),
                     Err(error) => return Err(error.into()),
                 };
             if !record.remove_topology_freeze(id) {
-                return Ok(());
+                return Ok(changed);
             }
             if self.records.store_record(&record, &observed).await? {
-                return Ok(());
+                return Ok(true);
             }
         }
     }
@@ -633,5 +660,94 @@ mod tests {
     #[tokio::test]
     async fn collection_fence_prevents_a_late_in_flight_shrink() {
         run_fence_shrink_race(false).await;
+    }
+
+    #[tokio::test]
+    async fn reclamation_deletes_each_page_before_listing_more_nodes() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let primary = store(backend.clone());
+        let background = Arc::new(Background::new());
+        let monitor = Monitor::with_config(
+            TLogger::new(primary.objects.clone(), DbRoot::try_from("db").unwrap()),
+            primary.timeline.clone(),
+            Arc::downgrade(&background),
+            RetryConfig::default(),
+            crate::monitor::ProtocolTiming::default(),
+        );
+        let lifecycle = CollectionLifecycle::new(
+            primary.records.clone(),
+            primary.nodes.clone(),
+            monitor,
+            RetryConfig::default(),
+            Arc::new(UnexpectedTopologySettler),
+        );
+        let collection = collection();
+        primary
+            .records
+            .create_record(&collection, &CollectionRecord::new())
+            .await
+            .unwrap();
+        primary
+            .nodes
+            .create_root(&collection, &Node::leaf(LeafBody::new()))
+            .await
+            .unwrap();
+        for i in 0u16..257 {
+            let mut bytes = [0; 16];
+            bytes[..2].copy_from_slice(&i.to_be_bytes());
+            primary
+                .nodes
+                .store_node(
+                    &collection,
+                    &NodeToken::from_bytes(bytes),
+                    &Node::leaf(LeafBody::new()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        backend.set_before({
+            let events = events.clone();
+            move |op| {
+                match op {
+                    BackendOp::List { path, .. } => {
+                        events.lock().unwrap().push(("list", path.to_string()))
+                    }
+                    BackendOp::DeleteIf { path, .. } => {
+                        events.lock().unwrap().push(("delete", path.to_string()))
+                    }
+                    _ => {}
+                }
+                Box::pin(async { Ok(()) })
+            }
+        });
+        assert!(
+            lifecycle
+                .reclaim(std::slice::from_ref(&collection))
+                .await
+                .unwrap()
+        );
+        let events = events.lock().unwrap();
+        let first_delete = events.iter().position(|(op, _)| *op == "delete").unwrap();
+        let second_list = events
+            .iter()
+            .enumerate()
+            .filter(|(_, (op, _))| *op == "list")
+            .nth(1)
+            .unwrap()
+            .0;
+        assert!(
+            first_delete < second_list,
+            "cleanup must not retain the whole collection"
+        );
+        let deleted: Vec<_> = events
+            .iter()
+            .filter(|(op, _)| *op == "delete")
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(deleted.len(), 259);
+        assert!(deleted[257].ends_with("/_r"));
+        assert!(deleted[258].ends_with("/_i"));
     }
 }

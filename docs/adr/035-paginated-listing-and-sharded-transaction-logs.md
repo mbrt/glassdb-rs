@@ -17,8 +17,7 @@ loop and are not transaction-log records or GC candidates.
 [ADR-070](070-demand-driven-garbage-collection.md) supersedes the two-character
 transaction directory with a hierarchy that permits broad and narrow scans,
 and refines scheduling with independent adaptive GC scans. That change is
-accepted but not yet implemented. The paginated backend contract remains
-unchanged.
+implemented. The paginated backend contract remains unchanged.
 
 ## Context
 

@@ -30,6 +30,7 @@ pub use collections::{
 };
 pub use engine::{Engine, EngineConfig, EngineDiagnostics, EngineStats, EngineTransaction};
 pub use error::TransError;
+pub use gc::{GcDiagnostics, GcStats};
 pub use key_resolver::ScanResult;
 pub use leaf_coord::LeafCoordinatorStats;
 pub use monitor::ProtocolTiming;

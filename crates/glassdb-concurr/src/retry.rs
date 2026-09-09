@@ -68,6 +68,40 @@ fn jittered(d: Duration) -> Duration {
     Duration::from_secs_f64(min + crate::entropy::uniform_unit() * span)
 }
 
+/// Adjusts scan intervals from recent progress within fixed bounds.
+pub struct ScanCadence {
+    minimum: Duration,
+    maximum: Duration,
+    productive: f64,
+}
+
+impl ScanCadence {
+    /// Starts a scan schedule at its minimum interval.
+    pub fn new(minimum: Duration, maximum: Duration) -> Self {
+        Self {
+            minimum,
+            maximum,
+            productive: 1.0,
+        }
+    }
+
+    /// Updates the demand estimate from whether a scan made useful progress.
+    pub fn observe(&mut self, useful: bool) {
+        self.productive = 0.75 * self.productive + 0.25 * f64::from(useful);
+    }
+
+    /// Returns an interval with random variation within the configured bounds.
+    pub fn delay(&self) -> Duration {
+        let seconds = self.minimum.as_secs_f64()
+            / self
+                .productive
+                .powi(2)
+                .max(self.minimum.as_secs_f64() / self.maximum.as_secs_f64());
+        Duration::from_secs_f64(seconds * (0.9 + 0.2 * crate::entropy::uniform_unit()))
+            .clamp(self.minimum, self.maximum)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

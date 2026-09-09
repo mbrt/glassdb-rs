@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use glassdb_backend::BackendStats;
 use glassdb_storage::CacheStats;
-use glassdb_trans::{DirectCommitStats, LeafCoordinatorStats, LockerStats, SplitterStats};
+use glassdb_trans::{DirectCommitStats, GcStats, LeafCoordinatorStats, LockerStats, SplitterStats};
 
 /// Transaction activity for one snapshot or accumulated interval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -74,6 +74,8 @@ pub struct Stats {
     pub direct_commit: DirectCommitStats,
     /// Background tree-split activity.
     pub splitter: SplitterStats,
+    /// Garbage collection activity.
+    pub gc: GcStats,
 }
 
 impl AddAssign for Stats {
@@ -85,6 +87,7 @@ impl AddAssign for Stats {
         self.coordinator += rhs.coordinator;
         self.direct_commit += rhs.direct_commit;
         self.splitter += rhs.splitter;
+        self.gc += rhs.gc;
     }
 }
 
@@ -100,6 +103,7 @@ impl Sub for Stats {
             coordinator: self.coordinator - other.coordinator,
             direct_commit: self.direct_commit - other.direct_commit,
             splitter: self.splitter - other.splitter,
+            gc: self.gc - other.gc,
         }
     }
 }
@@ -140,6 +144,7 @@ mod tests {
                 candidates: 7,
                 landed: 5,
             },
+            gc: GcStats::default(),
             splitter: SplitterStats {
                 candidates: 3,
                 completed: 2,
@@ -183,6 +188,7 @@ mod tests {
                 candidates: 11,
                 landed: 8,
             },
+            gc: GcStats::default(),
             splitter: SplitterStats {
                 candidates: 5,
                 completed: 3,
@@ -228,6 +234,7 @@ mod tests {
                     candidates: 4,
                     landed: 3,
                 },
+                gc: GcStats::default(),
                 splitter: SplitterStats {
                     candidates: 2,
                     completed: 1,

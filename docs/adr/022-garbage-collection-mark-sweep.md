@@ -41,8 +41,7 @@ owner acknowledges `Wounded` as `Aborted`.
 
 [ADR-070](070-demand-driven-garbage-collection.md) refines candidate scheduling
 with cleanup driven by hints and due retries, bounded parallel work, and
-independent adaptive GC scans. That change is accepted but not yet
-implemented.
+independent adaptive GC scans. That change is implemented.
 
 ## Context
 

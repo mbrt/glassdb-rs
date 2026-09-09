@@ -692,8 +692,11 @@ impl LeafOperation for ReleaseOperation {
         match outcome {
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::Released { .. },
-                ..
-            }) => Ok(ReleaseOutcome::Released),
+                evidence,
+            }) => Ok(ReleaseOutcome::Released(matches!(
+                evidence,
+                Some(CoordinationEvidence::Installed(_))
+            ))),
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::Wait(holder),
                 ..
@@ -734,7 +737,7 @@ enum AcquireOutcome {
 }
 
 enum ReleaseOutcome {
-    Released,
+    Released(bool),
     Wait(TxId),
 }
 
@@ -1063,7 +1066,7 @@ impl KeyLocker {
         &self,
         id: &TxId,
         path: &ObjectPath,
-    ) -> Result<(), TransError> {
+    ) -> Result<bool, TransError> {
         // A release stages no decision that can become unsafe from a stale
         // seed; its CAS arbitrates with any newer leaf and retries on conflict.
         self.release_leaf_at(id, path, Requirement::Any).await
@@ -1233,7 +1236,7 @@ impl KeyLocker {
         id: &TxId,
         path: &ObjectPath,
         requirement: Requirement,
-    ) -> Result<(), TransError> {
+    ) -> Result<bool, TransError> {
         let operation = ReleaseOperation {
             id: id.clone(),
             path: path.clone(),
@@ -1242,7 +1245,7 @@ impl KeyLocker {
         let mut backoff = self.retry.backoff();
         loop {
             match self.coord.coordinate(operation.clone()).await? {
-                ReleaseOutcome::Released => return Ok(()),
+                ReleaseOutcome::Released(changed) => return Ok(changed),
                 ReleaseOutcome::Wait(holder) => {
                     let delay = backoff.next_delay();
                     if let Woke::Finalized = self.wait_for_holder(&holder, delay).await? {
@@ -1406,7 +1409,13 @@ mod tests {
         let locker = Locker::new(
             coord.clone(),
             router,
-            CollectionStateResolver::new(records, tl, mon.clone(), RetryConfig::default()),
+            CollectionStateResolver::new(
+                records,
+                tl,
+                timeline.clone(),
+                mon.clone(),
+                RetryConfig::default(),
+            ),
             mon.clone(),
             RetryConfig::default(),
             parallelism,

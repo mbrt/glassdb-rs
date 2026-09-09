@@ -279,15 +279,18 @@ impl CatalogOverlay {
     }
 
     /// Discards catalog accesses from the completed body attempt.
-    pub(super) fn reset(&mut self) {
+    pub(super) fn reset(&mut self, identity_renewed: bool) {
         self.directories.clear();
         self.reads.clear();
         self.changes.clear();
         self.created.clear();
         self.dropped.clear();
         self.dropped_bindings.clear();
-        // Reusing an incarnation across body retries avoids discarding a
-        // prepared collection under a no-longer-reachable physical prefix.
+        // Reuse preparation only while the same identity owns it. A retired
+        // identity's GC can remove its resources after the next body starts.
+        if identity_renewed {
+            self.reservations.clear();
+        }
     }
 
     /// Serializes the accumulated logical accesses for the commit engine.

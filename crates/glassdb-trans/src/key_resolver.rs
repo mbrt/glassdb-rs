@@ -118,112 +118,126 @@ impl KeyResolver {
         cap: Option<&[u8]>,
         requirement: Requirement,
     ) -> Result<ScanResult, StorageError> {
-        let Some(mut loc) = self
-            .router
-            .first_leaf_at(collection, &range.start, requirement)
-            .await
-            .map_err(|error| error.classify_collection_absence(collection))?
-        else {
-            return Err(StorageError::NotFound.classify_collection_absence(collection));
-        };
-
-        if range.is_empty() {
-            return Ok(ScanResult::new(ScanEvidence::new(
-                Vec::new(),
-                Vec::new(),
-                Some(range.start.clone()),
-            )));
-        }
-
-        let mut overlay: BTreeMap<Vec<u8>, bool> = overlay
-            .iter()
-            .filter(|mutation| Self::in_scan_window(range, &mutation.key, cap))
-            .map(|mutation| (mutation.key.clone(), mutation.present))
-            .collect();
-        let mut keys = Vec::new();
-        let mut covered = Vec::new();
-
+        let mut requirement = requirement;
         loop {
-            let coverage = self
-                .leaf_coverage(&loc, own_lock_holder, requirement)
-                .await?;
-            let node = loc
-                .node()
-                .ok_or_else(|| StorageError::other("existing leaf has no decoded node"))?;
-            let leaf = node
-                .as_leaf()
-                .ok_or_else(|| StorageError::other("leaf scan reached a non-leaf node"))?;
-            let mut candidates: BTreeSet<Vec<u8>> = leaf
-                .entries()
-                .filter(|entry| Self::in_scan_window(range, &entry.key, cap))
-                .map(|entry| entry.key.clone())
-                .collect();
-            let overlay_keys: Vec<Vec<u8>> = overlay
-                .keys()
-                .take_while(|key| node.covers(key))
-                .cloned()
-                .collect();
-            let leaf_overlay: BTreeMap<Vec<u8>, bool> = overlay_keys
-                .into_iter()
-                .map(|key| {
-                    let present = overlay
-                        .remove(&key)
-                        .expect("overlay key was selected from the map");
-                    (key, present)
-                })
-                .collect();
-            candidates.extend(leaf_overlay.keys().cloned());
+            let result: Result<ScanResult, TransError> = async {
+                let Some(mut loc) = self
+                    .router
+                    .first_leaf_at(collection, &range.start, requirement)
+                    .await
+                    .map_err(|error| error.classify_collection_absence(collection))?
+                else {
+                    return Err(StorageError::NotFound
+                        .classify_collection_absence(collection)
+                        .into());
+                };
 
-            for key in candidates {
-                let present = match leaf_overlay.get(key.as_slice()) {
-                    Some(present) => *present,
-                    None => {
-                        let logical_key = LogicalKey::new(collection.clone(), &key);
-                        match leaf.lookup(&key) {
-                            None => false,
-                            Some(entry) => self
-                                .state
-                                .resolve_effective(
-                                    &logical_key,
-                                    Some(entry),
-                                    own_lock_holder,
-                                    requirement,
-                                )
-                                .await
-                                .map_err(trans_to_storage)?
-                                .exists(),
+                if range.is_empty() {
+                    return Ok(ScanResult::new(ScanEvidence::new(
+                        Vec::new(),
+                        Vec::new(),
+                        Some(range.start.clone()),
+                    )));
+                }
+
+                let mut overlay: BTreeMap<Vec<u8>, bool> = overlay
+                    .iter()
+                    .filter(|mutation| Self::in_scan_window(range, &mutation.key, cap))
+                    .map(|mutation| (mutation.key.clone(), mutation.present))
+                    .collect();
+                let mut keys = Vec::new();
+                let mut covered = Vec::new();
+
+                loop {
+                    let coverage = self
+                        .leaf_coverage(&loc, own_lock_holder, requirement)
+                        .await?;
+                    let node = loc
+                        .node()
+                        .ok_or_else(|| StorageError::other("existing leaf has no decoded node"))?;
+                    let leaf = node
+                        .as_leaf()
+                        .ok_or_else(|| StorageError::other("leaf scan reached a non-leaf node"))?;
+                    let mut candidates: BTreeSet<Vec<u8>> = leaf
+                        .entries()
+                        .filter(|entry| Self::in_scan_window(range, &entry.key, cap))
+                        .map(|entry| entry.key.clone())
+                        .collect();
+                    let overlay_keys: Vec<Vec<u8>> = overlay
+                        .keys()
+                        .take_while(|key| node.covers(key))
+                        .cloned()
+                        .collect();
+                    let leaf_overlay: BTreeMap<Vec<u8>, bool> = overlay_keys
+                        .into_iter()
+                        .map(|key| {
+                            let present = overlay
+                                .remove(&key)
+                                .expect("overlay key was selected from the map");
+                            (key, present)
+                        })
+                        .collect();
+                    candidates.extend(leaf_overlay.keys().cloned());
+
+                    for key in candidates {
+                        let present = match leaf_overlay.get(key.as_slice()) {
+                            Some(present) => *present,
+                            None => {
+                                let logical_key = LogicalKey::new(collection.clone(), &key);
+                                match leaf.lookup(&key) {
+                                    None => false,
+                                    Some(entry) => self
+                                        .state
+                                        .resolve_effective(
+                                            &logical_key,
+                                            Some(entry),
+                                            own_lock_holder,
+                                            requirement,
+                                        )
+                                        .await?
+                                        .exists(),
+                                }
+                            }
+                        };
+                        if !present {
+                            continue;
+                        }
+                        keys.push(key);
+                        if range.limit.is_some_and(|limit| keys.len() == limit) {
+                            covered.push(coverage);
+                            let frontier = keys.last().cloned();
+                            return Ok(ScanResult::new(ScanEvidence::new(keys, covered, frontier)));
                         }
                     }
-                };
-                if !present {
-                    continue;
-                }
-                keys.push(key);
-                if range.limit.is_some_and(|limit| keys.len() == limit) {
                     covered.push(coverage);
-                    let frontier = keys.last().cloned();
-                    return Ok(ScanResult::new(ScanEvidence::new(keys, covered, frontier)));
+
+                    let target = cap.or(range.end.as_deref());
+                    if target.is_some_and(|target| node.covers(target)) {
+                        break;
+                    }
+                    let Some(next) = self
+                        .router
+                        .next_leaf(collection, &loc, requirement)
+                        .await
+                        .map_err(|error| error.classify_collection_absence(collection))?
+                    else {
+                        break;
+                    };
+                    loc = next;
                 }
-            }
-            covered.push(coverage);
 
-            let target = cap.or(range.end.as_deref());
-            if target.is_some_and(|target| node.covers(target)) {
-                break;
+                let frontier = cap.map(<[u8]>::to_vec).or_else(|| range.end.clone());
+                Ok(ScanResult::new(ScanEvidence::new(keys, covered, frontier)))
             }
-            let Some(next) = self
-                .router
-                .next_leaf(collection, &loc, requirement)
-                .await
-                .map_err(|error| error.classify_collection_absence(collection))?
-            else {
-                break;
-            };
-            loc = next;
+            .await;
+            match result {
+                Err(TransError::ValidateRetry(fresh)) => {
+                    requirement = requirement.stricter(fresh);
+                    glassdb_concurr::rt::yield_now().await;
+                }
+                result => return result.map_err(trans_to_storage),
+            }
         }
-
-        let frontier = cap.map(<[u8]>::to_vec).or_else(|| range.end.clone());
-        Ok(ScanResult::new(ScanEvidence::new(keys, covered, frontier)))
     }
 
     /// Loads only a scan's physical validation dependencies, without resolving
@@ -298,88 +312,105 @@ impl KeyResolver {
         own_lock_holder: Option<&TxId>,
         requirement: Requirement,
     ) -> Result<Vec<EffectivePointAccessState>, StorageError> {
-        let items = keys
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(ordinal, key)| (key.clone(), (ordinal, key)))
-            .collect::<Vec<_>>();
-        let groups = self
-            .router
-            .route_keys_with_requirements(items, Requirement::Any, requirement)
-            .await?;
+        let mut requirement = requirement;
+        loop {
+            let result: Result<Vec<EffectivePointAccessState>, TransError> = async {
+                let items = keys
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(ordinal, key)| (key.clone(), (ordinal, key)))
+                    .collect::<Vec<_>>();
+                let groups = self
+                    .router
+                    .route_keys_with_requirements(items, Requirement::Any, requirement)
+                    .await?;
 
-        let group_results = map_all_bounded(groups, self.parallelism, |group| async move {
-            let first_ordinal = group
-                .keys
-                .first()
-                .map(|(_, (ordinal, _))| *ordinal)
-                .expect("a routed leaf group has at least one key");
-            let Some(node) = group.node() else {
-                return vec![(
-                    first_ordinal,
-                    Err(StorageError::other("routed leaf has no decoded node")),
-                )];
-            };
-            if let Err(error) = self.state.ensure_collection_live(node).await {
-                return vec![(first_ordinal, Err(error))];
-            }
-            let membership_version = node.membership_version();
-            let leaf = match node.as_leaf() {
-                Some(leaf) => leaf,
-                None => {
-                    return vec![(
-                        first_ordinal,
-                        Err(StorageError::other(
-                            "descent grouped keys under a non-leaf node",
-                        )),
-                    )];
-                }
-            };
+                let group_results = map_all_bounded(groups, self.parallelism, |group| async move {
+                    let first_ordinal = group
+                        .keys
+                        .first()
+                        .map(|(_, (ordinal, _))| *ordinal)
+                        .expect("a routed leaf group has at least one key");
+                    let Some(node) = group.node() else {
+                        return vec![(
+                            first_ordinal,
+                            Err(TransError::other("routed leaf has no decoded node")),
+                        )];
+                    };
+                    if let Err(error) = self.state.ensure_collection_live(node).await {
+                        return vec![(first_ordinal, Err(TransError::from(error)))];
+                    }
+                    let membership_version = node.membership_version();
+                    let leaf = match node.as_leaf() {
+                        Some(leaf) => leaf,
+                        None => {
+                            return vec![(
+                                first_ordinal,
+                                Err(TransError::other(
+                                    "descent grouped keys under a non-leaf node",
+                                )),
+                            )];
+                        }
+                    };
 
-            let mut results = Vec::with_capacity(group.keys.len());
-            for (raw_key, (ordinal, key)) in &group.keys {
-                let resolved = self
-                    .state
-                    .resolve_effective(key, leaf.lookup(raw_key), own_lock_holder, requirement)
-                    .await
-                    .map(|resolved| resolved.into_writer())
-                    .map_err(trans_to_storage);
-                match resolved {
-                    Ok(resolved) => results.push((
-                        *ordinal,
-                        Ok(EffectivePointAccessState {
-                            writer: resolved.writer,
-                            membership_version,
-                        }),
-                    )),
-                    Err(error) => {
-                        results.push((*ordinal, Err(error)));
-                        break;
+                    let mut results = Vec::with_capacity(group.keys.len());
+                    for (raw_key, (ordinal, key)) in &group.keys {
+                        let resolved = self
+                            .state
+                            .resolve_effective(
+                                key,
+                                leaf.lookup(raw_key),
+                                own_lock_holder,
+                                requirement,
+                            )
+                            .await
+                            .map(|resolved| resolved.into_writer());
+                        match resolved {
+                            Ok(resolved) => results.push((
+                                *ordinal,
+                                Ok(EffectivePointAccessState {
+                                    writer: resolved.writer,
+                                    membership_version,
+                                }),
+                            )),
+                            Err(error) => {
+                                results.push((*ordinal, Err(error)));
+                                break;
+                            }
+                        }
+                    }
+                    results
+                })
+                .await;
+
+                let mut states = std::iter::repeat_with(|| None)
+                    .take(keys.len())
+                    .collect::<Vec<_>>();
+                let mut errors = Vec::new();
+                for (ordinal, result) in group_results.into_iter().flatten() {
+                    match result {
+                        Ok(state) => states[ordinal] = Some(state),
+                        Err(error) => errors.push((ordinal, error)),
                     }
                 }
+                if let Some((_, error)) = errors.into_iter().min_by_key(|(ordinal, _)| *ordinal) {
+                    return Err(error);
+                }
+                Ok(states
+                    .into_iter()
+                    .map(|state| state.expect("every point key has a validation state"))
+                    .collect())
             }
-            results
-        })
-        .await;
-
-        let mut states = std::iter::repeat_with(|| None)
-            .take(keys.len())
-            .collect::<Vec<_>>();
-        let mut errors = Vec::new();
-        for (ordinal, result) in group_results.into_iter().flatten() {
+            .await;
             match result {
-                Ok(state) => states[ordinal] = Some(state),
-                Err(error) => errors.push((ordinal, error)),
+                Err(TransError::ValidateRetry(fresh)) => {
+                    requirement = requirement.stricter(fresh);
+                    glassdb_concurr::rt::yield_now().await;
+                }
+                result => return result.map_err(trans_to_storage),
             }
         }
-        if let Some((_, error)) = errors.into_iter().min_by_key(|(ordinal, _)| *ordinal) {
-            return Err(error);
-        }
-        Ok(states
-            .into_iter()
-            .map(|state| state.expect("every point key has a validation state"))
-            .collect())
     }
 
     /// Resolves `key` to its routed leaf and effective writer.
@@ -394,13 +425,26 @@ impl KeyResolver {
         key: &LogicalKey,
         requirement: Requirement,
     ) -> Result<(WriterResolution, RoutedLeaf), TransError> {
-        let loc = self.locate_key(key, requirement).await?;
-        let writer = self
-            .state
-            .resolve_effective(key, Self::entry_at(&loc, key.key())?, None, requirement)
-            .await?
-            .into_writer();
-        Ok((writer, loc))
+        let mut requirement = requirement;
+        loop {
+            let result: Result<_, TransError> = async {
+                let loc = self.locate_key(key, requirement).await?;
+                let writer = self
+                    .state
+                    .resolve_effective(key, Self::entry_at(&loc, key.key())?, None, requirement)
+                    .await?
+                    .into_writer();
+                Ok((writer, loc))
+            }
+            .await;
+            match result {
+                Err(TransError::ValidateRetry(fresh)) => {
+                    requirement = requirement.stricter(fresh);
+                    glassdb_concurr::rt::yield_now().await;
+                }
+                result => return result,
+            }
+        }
     }
 
     async fn locate_key(

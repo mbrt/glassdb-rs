@@ -53,7 +53,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use glassdb_concurr::{Background, RetryConfig, rt};
+use glassdb_concurr::{Background, RetryConfig, ScanCadence, rt};
 use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxLog};
 use glassdb_storage::{
@@ -64,7 +64,7 @@ use tokio::sync::Notify;
 
 use crate::collections::TopologySettler;
 use crate::error::TransError;
-use crate::gc::TxCleanupHints;
+use crate::gc::GcHints;
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{LeafCoordinator, SplitHinter};
 use crate::monitor::{Monitor, TxRecoveryManifest};
@@ -82,7 +82,7 @@ use recovery::{
 const SPLIT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Back off empty structural-intent listings independently of split candidates.
-const STRUCTURAL_RECOVERY_IDLE_INTERVAL: Duration = Duration::from_secs(60);
+const STRUCTURAL_RECOVERY_IDLE_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Upper bound on the buffered split-candidate queue. Candidates are only hints:
 /// the splitter reloads and re-checks each one, so dropping the oldest when full
@@ -1199,7 +1199,7 @@ pub struct Splitter {
     // Paces collection-record and node CAS retries. Transaction-status polling remains
     // entirely owned by Monitor.
     retry: RetryConfig,
-    cleanup_hints: TxCleanupHints,
+    cleanup_hints: GcHints,
     stats: Arc<Stats>,
 }
 
@@ -1219,7 +1219,7 @@ impl Splitter {
         db_root: DbRoot,
         policy: SplitPolicy,
         inline: InlinePolicy,
-        cleanup_hints: TxCleanupHints,
+        cleanup_hints: GcHints,
     ) -> (LeafCoordinator, Self) {
         let candidates = SplitCandidates::with_policies(policy, inline);
         let coord = LeafCoordinator::with_hinter(
@@ -1296,7 +1296,7 @@ impl Splitter {
         coord: LeafCoordinator,
         candidates: SplitCandidates,
         retry: RetryConfig,
-        cleanup_hints: TxCleanupHints,
+        cleanup_hints: GcHints,
     ) -> Self {
         let router = TreeRouter::new(nodes.clone(), std::num::NonZeroUsize::MIN);
         let structural_nodes =
@@ -1351,12 +1351,19 @@ impl Splitter {
         });
         let recovery = self.clone();
         bg.spawn(async move {
+            let minimum = recovery.mon.protocol_timing().pending_timeout();
+            let mut cadence = ScanCadence::new(minimum, STRUCTURAL_RECOVERY_IDLE_INTERVAL);
             loop {
-                let active = recovery.recover_structural_intents().await;
-                let delay = if active {
-                    recovery.mon.protocol_timing().pending_timeout()
-                } else {
-                    STRUCTURAL_RECOVERY_IDLE_INTERVAL
+                let delay = match recovery.recover_structural_intents().await {
+                    Ok(progress) => {
+                        cadence.observe(progress);
+                        if recovery.recovery.has_continuation() {
+                            cadence.delay().min(minimum)
+                        } else {
+                            cadence.delay()
+                        }
+                    }
+                    Err(_) => minimum,
                 };
                 tokio::select! {
                     _ = rt::sleep(delay) => {}
@@ -2137,17 +2144,17 @@ impl Splitter {
     }
 
     /// Runs one durable structural-recovery sweep.
-    async fn recover_structural_intents(&self) -> bool {
+    async fn recover_structural_intents(&self) -> Result<bool, TransError> {
         let action = self.recovery.begin_sweep();
         match self.drive_recovery_action(action).await {
-            Ok(active) => active,
+            Ok(active) => Ok(active),
             Err(error) => {
                 tracing::debug!(
                     target: "glassdb::splitter",
                     error = %error,
                     "structural recovery action failed"
                 );
-                true
+                Err(error)
             }
         }
     }
@@ -2156,7 +2163,13 @@ impl Splitter {
     async fn drive_recovery_action(&self, mut action: RecoveryAction) -> Result<bool, TransError> {
         loop {
             match self.recovery.advance(&mut action).await? {
-                RecoveryStep::Completed { active } => return Ok(active),
+                RecoveryStep::Completed { active, failed } => {
+                    return if failed {
+                        Err(TransError::Retry)
+                    } else {
+                        Ok(active)
+                    };
+                }
                 RecoveryStep::SplitParent { path, participant } => {
                     let result = Box::pin(self.split_path_joined(&path, &participant)).await;
                     action.resume_parent_split(result);
@@ -2521,14 +2534,14 @@ mod tests {
         bg: &Arc<Background>,
         candidates: SplitCandidates,
     ) -> Splitter {
-        splitter_with_candidates_and_hints(store, bg, candidates, TxCleanupHints::default())
+        splitter_with_candidates_and_hints(store, bg, candidates, GcHints::default())
     }
 
     fn splitter_with_candidates_and_hints(
         store: &TestStore,
         bg: &Arc<Background>,
         candidates: SplitCandidates,
-        cleanup_hints: TxCleanupHints,
+        cleanup_hints: GcHints,
     ) -> Splitter {
         let mon = store.foundation.monitor_for(
             bg,
@@ -2544,7 +2557,7 @@ mod tests {
         mon: Monitor,
         candidates: SplitCandidates,
     ) -> Splitter {
-        splitter_with_monitor_and_hints(store, bg, mon, candidates, TxCleanupHints::default())
+        splitter_with_monitor_and_hints(store, bg, mon, candidates, GcHints::default())
     }
 
     fn splitter_with_monitor_and_hints(
@@ -2552,7 +2565,7 @@ mod tests {
         bg: &Arc<Background>,
         mon: Monitor,
         candidates: SplitCandidates,
-        cleanup_hints: TxCleanupHints,
+        cleanup_hints: GcHints,
     ) -> Splitter {
         let key_state = KeyStateResolver::new(mon.clone());
         let coord = LeafCoordinator::with_hinter(
@@ -2618,7 +2631,6 @@ mod tests {
         }
     }
 
-    #[path = "recovery.rs"]
     mod recovery_tests;
 
     #[test]
@@ -2687,7 +2699,7 @@ mod tests {
         let bg = Arc::new(Background::new());
         let candidates = SplitCandidates::with_policy(tiny());
         candidates.observe_leaf(&root_path(), root.as_leaf().unwrap());
-        let cleanup_hints = TxCleanupHints::default();
+        let cleanup_hints = GcHints::default();
         let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, cleanup_hints.clone());
 
         sp.run_once().await;
@@ -2808,7 +2820,7 @@ mod tests {
         let bg = Arc::new(Background::new());
         let candidates = SplitCandidates::with_policy(tiny());
         candidates.observe_leaf(&root_path(), root.as_leaf().unwrap());
-        let cleanup_hints = TxCleanupHints::default();
+        let cleanup_hints = GcHints::default();
         let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, cleanup_hints.clone());
 
         sp.run_once().await;
@@ -2854,7 +2866,7 @@ mod tests {
         let bg = Arc::new(Background::new());
         let candidates = SplitCandidates::with_policy(tiny());
         candidates.observe_leaf(&node_path("L"), source.as_leaf().unwrap());
-        let cleanup_hints = TxCleanupHints::default();
+        let cleanup_hints = GcHints::default();
         let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, cleanup_hints.clone());
 
         sp.run_once().await;
@@ -3686,6 +3698,7 @@ mod tests {
             crate::collection_coordination::CollectionStateResolver::new(
                 other.records.clone(),
                 other_transactions,
+                other.timeline.clone(),
                 other_mon.clone(),
                 RetryConfig::default(),
             ),
@@ -3951,7 +3964,7 @@ mod tests {
             2,
             "the deferred separator is republished by a later sweep"
         );
-        assert!(sp.recover_structural_intents().await);
+        assert!(sp.recover_structural_intents().await.unwrap());
         assert!(
             s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
                 .await

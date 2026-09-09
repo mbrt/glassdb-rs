@@ -115,7 +115,12 @@ async fn single_rw_stale_read_renews_and_converges() {
         &tm,
         AccessSet::new(vec![ra], vec![wa(&keyp, b"v3")], Vec::new()),
     );
-    assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
+    assert_eq!(
+        tm.commit(&mut h).await.unwrap(),
+        BodyDecision::ReplayBody {
+            identity_renewed: false
+        }
+    );
     tm.end(&mut h).await.unwrap();
 
     // The stale write never committed: v2 is still current (the discarded
@@ -1297,7 +1302,12 @@ async fn direct_commit_superseded_read_replays_in_place() {
         &tm,
         AccessSet::new(vec![stale], vec![wa(&keyp, b"v3")], Vec::new()),
     );
-    assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
+    assert_eq!(
+        tm.commit(&mut h).await.unwrap(),
+        BodyDecision::ReplayBody {
+            identity_renewed: false
+        }
+    );
     tm.end(&mut h).await.unwrap();
     let status = tctx
         .tlogger
@@ -1405,8 +1415,18 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
     // Which member wins the round's claim depends on id order; that exactly
     // one does is the property under test.
     let (winner, mut replayed) = match (&r1, &r2) {
-        (Ok(BodyDecision::ReturnOutcome), Ok(BodyDecision::ReplayBody)) => (h1.id().clone(), h2),
-        (Ok(BodyDecision::ReplayBody), Ok(BodyDecision::ReturnOutcome)) => (h2.id().clone(), h1),
+        (
+            Ok(BodyDecision::ReturnOutcome),
+            Ok(BodyDecision::ReplayBody {
+                identity_renewed: false,
+            }),
+        ) => (h1.id().clone(), h2),
+        (
+            Ok(BodyDecision::ReplayBody {
+                identity_renewed: false,
+            }),
+            Ok(BodyDecision::ReturnOutcome),
+        ) => (h2.id().clone(), h1),
         other => panic!("expected one commit and one replay, got {other:?}"),
     };
 

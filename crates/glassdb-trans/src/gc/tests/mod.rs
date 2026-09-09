@@ -1,0 +1,1095 @@
+use super::*;
+use crate::collection_coordination::CollectionStateResolver;
+use crate::collections::TopologySettler;
+use crate::engine::{AssemblyFixture, EngineConfig};
+use crate::key_state_resolver::KeyStateResolver;
+use crate::leaf_coord::{LeafCoordinator, SplitHinter};
+use crate::tlocker::LockOutcome;
+use async_trait::async_trait;
+use glassdb_backend as backend;
+use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
+use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
+use glassdb_concurr::RetryConfig;
+use glassdb_data::{CollectionAddress, CollectionId, DbRoot, LogicalKey, ObjectPath};
+use glassdb_storage::transaction::{
+    TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxLog, TxWrite,
+};
+use glassdb_storage::{
+    CollectionRecord, CollectionStore, CurrentState, LeafBody, LeafEntry, LockType, Node,
+    Requirement, Timeline, TreeRouter,
+};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime};
+
+struct UnexpectedTopologySettler;
+
+struct NoSplitHints;
+
+impl SplitHinter for NoSplitHints {
+    fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {}
+}
+
+#[async_trait]
+impl TopologySettler for UnexpectedTopologySettler {
+    async fn settle_topology_participant(
+        &self,
+        _collection: &CollectionAddress,
+        _id: &TxId,
+    ) -> Result<(), TransError> {
+        panic!("GC tests must not settle topology participants")
+    }
+}
+
+fn collection() -> glassdb_data::CollectionAddress {
+    glassdb_data::CollectionAddress::root("db")
+}
+
+fn root_path() -> ObjectPath {
+    ObjectPath::TreeRoot {
+        collection: collection(),
+    }
+}
+
+fn base() -> SystemTime {
+    rt::system_now()
+}
+
+// Comfortably past the 45s (timeout + skew) safety horizon.
+const PAST_HORIZON: Duration = Duration::from_secs(120);
+
+struct Ctx {
+    gc: Gc,
+    hints: GcHints,
+    tl: TLogger,
+    records: CollectionStore,
+    nodes: NodeStore,
+    timeline: Timeline,
+    locker: Locker,
+    mon: Monitor,
+}
+
+#[tokio::test]
+async fn owner_replays_when_gc_reclaims_prepared_collections_during_lock_acquisition() {
+    use crate::access::{AccessSet, WriteAccess};
+    use crate::algo::BodyDecision;
+    use crate::collections::{CatalogAccesses, CollectionChange, CollectionOp};
+    use crate::engine::engine_fixture;
+    use glassdb_backend::middleware::{BackendOp, HookBackend};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Cover routing, key-lock CAS, and nested directory-lock CAS races.
+    for phase in 0..3 {
+        let backend = Arc::new(MemoryBackend::new());
+        let peer = new_ctx_with(backend.clone()).await;
+        let hooked = HookBackend::new(backend);
+        let config = EngineConfig::default();
+        let db_root = DbRoot::try_from("db").unwrap();
+        let owner = AssemblyFixture::new(hooked.clone(), db_root.clone(), &config);
+        let engine = engine_fixture(&owner, db_root, config, false);
+        let prepared = CollectionAddress::new(
+            "db",
+            glassdb_data::CollectionId::from_slice(&[7; 16]).unwrap(),
+        );
+        let mut changes = vec![CollectionChange {
+            parent: collection(),
+            name: b"new".to_vec(),
+            collection: prepared.clone(),
+            expected: None,
+            op: CollectionOp::Create,
+        }];
+        if phase == 2 {
+            changes.push(CollectionChange {
+                parent: prepared.clone(),
+                name: b"nested".to_vec(),
+                collection: CollectionAddress::new(
+                    "db",
+                    glassdb_data::CollectionId::from_slice(&[8; 16]).unwrap(),
+                ),
+                expected: None,
+                op: CollectionOp::Create,
+            });
+        }
+        let mut handle = engine.algo.begin(
+            AccessSet::new(
+                Vec::new(),
+                vec![WriteAccess::put(
+                    LogicalKey::new(prepared.clone(), b"key"),
+                    b"value".to_vec().into(),
+                )],
+                Vec::new(),
+            ),
+            CatalogAccesses {
+                reads: Vec::new(),
+                changes,
+            },
+        );
+        let old_id = handle.id().clone();
+        let triggered = Arc::new(AtomicBool::new(false));
+        hooked.set_before({
+            let triggered = triggered.clone();
+            let old_id = old_id.clone();
+            let path = if phase == 2 {
+                ObjectPath::CollectionRecord {
+                    collection: prepared,
+                }
+            } else {
+                ObjectPath::TreeRoot {
+                    collection: prepared,
+                }
+            }
+            .to_string();
+            let owner_monitor = owner.monitor.clone();
+            move |operation| {
+                let matches_kind = if phase == 0 {
+                    matches!(
+                        operation,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    )
+                } else {
+                    matches!(operation, BackendOp::WriteIf { .. })
+                };
+                let pause = matches_kind
+                    && operation.path() == path
+                    && !triggered.swap(true, Ordering::SeqCst);
+                let peer_monitor = peer.mon.clone();
+                let gc = peer.gc.clone();
+                let old_id = old_id.clone();
+                let owner_monitor = owner_monitor.clone();
+                Box::pin(async move {
+                    if pause {
+                        peer_monitor.preempt_tx(&old_id).await.unwrap();
+                        assert_eq!(
+                            gc.check_candidate(&old_id).await.unwrap(),
+                            GcOutcome::Progress
+                        );
+                        assert_eq!(
+                            owner_monitor.tx_status(&old_id).await.unwrap(),
+                            TxCommitStatus::Pending
+                        );
+                    }
+                    Ok(())
+                })
+            }
+        });
+
+        assert_eq!(
+            engine.algo.commit(&mut handle).await.unwrap(),
+            BodyDecision::ReplayBody {
+                identity_renewed: true
+            }
+        );
+        assert!(triggered.load(Ordering::SeqCst));
+        assert_ne!(handle.id(), &old_id);
+        assert_eq!(
+            owner
+                .tlogger
+                .commit_status_at(&old_id, Requirement::Any)
+                .await
+                .unwrap()
+                .status,
+            TxCommitStatus::Aborted
+        );
+        engine.algo.end(&mut handle).await.unwrap();
+    }
+}
+
+async fn new_ctx() -> Ctx {
+    new_ctx_with(Arc::new(MemoryBackend::new())).await
+}
+
+async fn new_ctx_with(backend: Arc<dyn Backend>) -> Ctx {
+    new_ctx_with_interval(backend, Duration::from_secs(15)).await
+}
+
+async fn new_ctx_with_interval(backend: Arc<dyn Backend>, retry_delay: Duration) -> Ctx {
+    let mut config = EngineConfig::default();
+    config.set_cache_size(1 << 20);
+    let foundation = AssemblyFixture::new(backend, DbRoot::try_from("db").unwrap(), &config);
+    let tl = foundation.tlogger.clone();
+    let records = foundation.records.clone();
+    let structural_intents = foundation.structural_intents.clone();
+    let nodes = foundation.nodes.clone();
+    let timeline = foundation.timeline.clone();
+    assert!(
+        records
+            .create_record(&collection(), &CollectionRecord::new())
+            .await
+            .unwrap()
+    );
+    assert!(
+        nodes
+            .create_root(&collection(), &Node::leaf(LeafBody::new()))
+            .await
+            .unwrap()
+    );
+    let mon = foundation.monitor.clone();
+    let key_state = KeyStateResolver::new(mon.clone());
+    let coord = LeafCoordinator::with_hinter(
+        nodes.clone(),
+        key_state,
+        mon.clone(),
+        RetryConfig::default(),
+        glassdb_storage::SplitPolicy::default(),
+        Arc::new(NoSplitHints),
+    );
+    let router = TreeRouter::new(nodes.clone(), std::num::NonZeroUsize::MIN);
+    let locker = Locker::new(
+        coord.clone(),
+        router,
+        CollectionStateResolver::new(
+            records.clone(),
+            tl.clone(),
+            timeline.clone(),
+            mon.clone(),
+            RetryConfig::default(),
+        ),
+        mon.clone(),
+        RetryConfig::default(),
+        std::num::NonZeroUsize::MIN,
+    );
+    let hints = GcHints::default();
+    let gc = Gc::new(
+        tl.clone(),
+        nodes.clone(),
+        structural_intents,
+        timeline.clone(),
+        locker.clone(),
+        CollectionLifecycle::new(
+            records.clone(),
+            nodes.clone(),
+            mon.clone(),
+            RetryConfig::default(),
+            Arc::new(UnexpectedTopologySettler),
+        ),
+        mon.clone(),
+        hints.clone(),
+        retry_delay,
+    );
+    Ctx {
+        gc,
+        hints,
+        tl,
+        records,
+        nodes,
+        timeline,
+        locker,
+        mon,
+    }
+}
+
+fn tx(n: u8) -> TxId {
+    TxId::from_bytes(vec![n])
+}
+
+fn key_path(k: &[u8]) -> LogicalKey {
+    LogicalKey::new(collection(), k)
+}
+
+fn write_lock(k: &[u8]) -> TxLock {
+    TxLock::Entry {
+        key: key_path(k),
+        typ: LockType::Write,
+    }
+}
+
+async fn store_entry(ctx: &Ctx, _key: &[u8], entry: LeafEntry) {
+    let path = root_path();
+    let loaded = ctx
+        .nodes
+        .load_leaf(&path, Requirement::AtLeast(ctx.timeline.now()))
+        .await
+        .unwrap();
+    let mut entries: BTreeMap<Vec<u8>, LeafEntry> = loaded
+        .entries()
+        .entries()
+        .cloned()
+        .map(|e| (e.key.clone(), e))
+        .collect();
+    entries.insert(entry.key.clone(), entry);
+    let leaf = LeafBody::from_entries(entries.into_values());
+    let mut edit = loaded.into_edit();
+    edit.set_entries(leaf);
+    assert!(ctx.nodes.commit_leaf(edit).await.unwrap());
+}
+
+async fn lookup_entry(ctx: &Ctx, key: &[u8]) -> Option<LeafEntry> {
+    let loaded = ctx
+        .nodes
+        .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
+        .await
+        .unwrap();
+    loaded.entries().lookup(key).cloned()
+}
+
+fn committed(id: TxId, offset: Duration, writes: &[&[u8]], locks: &[&[u8]]) -> TxLog {
+    TxLog {
+        id,
+        timestamp: Some(base() - offset),
+        status: TxCommitStatus::Ok,
+        writes: writes
+            .iter()
+            .map(|k| TxWrite {
+                key: key_path(k),
+                value: Arc::from(&b"v"[..]),
+                deleted: false,
+                prev_writer: TxId::default(),
+            })
+            .collect(),
+        locks: locks.iter().map(|k| write_lock(k)).collect(),
+        collection_changes: Vec::new(),
+        prepared_collections: Vec::new(),
+    }
+}
+
+fn writer_entry(key: &[u8], writer: &TxId) -> LeafEntry {
+    LeafEntry::new(key).with_current(CurrentState::External {
+        writer: writer.clone(),
+    })
+}
+
+fn locked_entry(key: &[u8], holder: &TxId) -> LeafEntry {
+    let mut entry = LeafEntry::new(key);
+    entry.replace_write_lock(holder.clone());
+    entry
+}
+
+async fn is_gone(tl: &TLogger, id: &TxId) -> bool {
+    matches!(
+        tl.get_at(id, Requirement::Any).await,
+        Err(StorageError::NotFound)
+    )
+}
+
+async fn run_once(ctx: &Ctx) {
+    let mut candidates = ctx.hints.drain();
+    let page = ctx
+        .tl
+        .scan_transaction_ids(0, 0, None, backend::ListLimit::new(1000).unwrap())
+        .await
+        .unwrap();
+    candidates.extend(page.ids);
+    let candidates: BTreeSet<_> = candidates.into_iter().collect();
+    for tid in candidates {
+        let _ = ctx.gc.check_candidate(&tid).await;
+    }
+}
+
+// A committed object whose written key has since been overwritten by a newer
+// writer holds no reference and is swept. Fed via the paged list (no hint),
+// so the list feed is exercised too.
+#[tokio::test(start_paused = true)]
+async fn committed_unreferenced_is_collected() {
+    let ctx = new_ctx().await;
+    let (old, new) = (tx(1), tx(2));
+    ctx.tl
+        .set(&committed(old.clone(), PAST_HORIZON, &[b"k"], &[]))
+        .await
+        .unwrap();
+    // The key now points at a newer writer, not `old`.
+    store_entry(&ctx, b"k", writer_entry(b"k", &new)).await;
+
+    run_once(&ctx).await;
+
+    assert!(is_gone(&ctx.tl, &old).await);
+}
+
+// ADR-051: the successor that superseded a committed writer may be a logless
+// commit with no transaction object of its own. Liveness is decided by the
+// entry's writer id, not by that successor's existence, so the predecessor is
+// still swept.
+#[tokio::test(start_paused = true)]
+async fn committed_superseded_by_a_logless_writer_is_collected() {
+    let ctx = new_ctx().await;
+    let (old, logless) = (tx(1), tx(2));
+    ctx.tl
+        .set(&committed(old.clone(), PAST_HORIZON, &[b"k"], &[]))
+        .await
+        .unwrap();
+    store_entry(
+        &ctx,
+        b"k",
+        LeafEntry::new(b"k").with_current(CurrentState::Inline {
+            writer: logless.clone(),
+            value: Arc::from(&b"v2"[..]),
+        }),
+    )
+    .await;
+
+    run_once(&ctx).await;
+
+    assert!(is_gone(&ctx.tl, &old).await);
+    assert!(
+        is_gone(&ctx.tl, &logless).await,
+        "the logless successor never had an object to collect"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn committed_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
+    let ctx = new_ctx().await;
+    let id = tx(1);
+    let prepared = CollectionAddress::new(
+        "db",
+        CollectionId::from_slice(&[7; 16]).expect("fixed ID has the required width"),
+    );
+    ctx.records
+        .create_record(&prepared, &CollectionRecord::new())
+        .await
+        .unwrap();
+    ctx.nodes
+        .create_root(&prepared, &Node::leaf(LeafBody::new()))
+        .await
+        .unwrap();
+    let mut log = committed(id.clone(), PAST_HORIZON, &[], &[]);
+    log.prepared_collections.push(prepared.clone());
+    ctx.tl.set(&log).await.unwrap();
+
+    run_once(&ctx).await;
+
+    assert!(is_gone(&ctx.tl, &id).await);
+    assert!(matches!(
+        ctx.nodes.load_root(&prepared, Requirement::Any).await,
+        Err(StorageError::NotFound)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborted_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
+    let ctx = new_ctx().await;
+    let id = tx(1);
+    let prepared = CollectionAddress::new(
+        "db",
+        CollectionId::from_slice(&[7; 16]).expect("fixed ID has the required width"),
+    );
+    ctx.records
+        .create_record(&prepared, &CollectionRecord::new())
+        .await
+        .unwrap();
+    ctx.nodes
+        .create_root(&prepared, &Node::leaf(LeafBody::new()))
+        .await
+        .unwrap();
+    let mut log = committed(id.clone(), PAST_HORIZON, &[], &[]);
+    log.status = TxCommitStatus::Aborted;
+    log.prepared_collections.push(prepared.clone());
+    ctx.tl.set(&log).await.unwrap();
+    ctx.hints.schedule(id.clone());
+
+    run_once(&ctx).await;
+
+    assert!(is_gone(&ctx.tl, &id).await);
+    assert!(matches!(
+        ctx.nodes.load_root(&prepared, Requirement::Any).await,
+        Err(StorageError::NotFound)
+    ));
+    assert!(matches!(
+        ctx.records.load_record(&prepared, Requirement::Any).await,
+        Err(StorageError::NotFound)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn collection_cleanup_conflict_keeps_the_recovery_manifest() {
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let ctx = new_ctx_with(backend.clone()).await;
+    let id = tx(1);
+    let prepared = CollectionAddress::new(
+        "db",
+        CollectionId::from_slice(&[7; 16]).expect("fixed ID has the required width"),
+    );
+    ctx.records
+        .create_record(&prepared, &CollectionRecord::new())
+        .await
+        .unwrap();
+    ctx.nodes
+        .create_root(&prepared, &Node::leaf(LeafBody::new()))
+        .await
+        .unwrap();
+    let mut log = committed(id.clone(), PAST_HORIZON, &[], &[]);
+    log.prepared_collections.push(prepared.clone());
+    ctx.tl.set(&log).await.unwrap();
+
+    let root_path = ObjectPath::CollectionRecord {
+        collection: prepared.clone(),
+    }
+    .to_string();
+    let fail_once = Arc::new(AtomicBool::new(true));
+    backend.set_before({
+        let fail_once = fail_once.clone();
+        move |operation| {
+            let fail = matches!(
+                operation,
+                BackendOp::DeleteIf { path, .. }
+                    if *path == root_path && fail_once.swap(false, Ordering::SeqCst)
+            );
+            let future: HookFuture = Box::pin(async move {
+                if fail {
+                    Err(BackendError::Precondition)
+                } else {
+                    Ok(())
+                }
+            });
+            future
+        }
+    });
+    ctx.hints.schedule(id.clone());
+
+    run_once(&ctx).await;
+
+    assert!(
+        !is_gone(&ctx.tl, &id).await,
+        "cleanup conflicts must retain the only durable orphan manifest"
+    );
+    assert!(
+        ctx.records
+            .load_record(&prepared, Requirement::Any)
+            .await
+            .is_ok()
+    );
+
+    backend.clear_before();
+    ctx.hints.schedule(id.clone());
+    run_once(&ctx).await;
+    assert!(is_gone(&ctx.tl, &id).await);
+    assert!(matches!(
+        ctx.nodes.load_root(&prepared, Requirement::Any).await,
+        Err(StorageError::NotFound)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn committed_drop_is_recovered_while_the_log_stores_a_live_value() {
+    let ctx = new_ctx().await;
+    let id = tx(1);
+    let child = CollectionAddress::new(
+        "db",
+        CollectionId::from_slice(&[8; 16]).expect("fixed ID has the required width"),
+    );
+
+    store_entry(&ctx, b"k", writer_entry(b"k", &id)).await;
+    let (mut parent_record, parent_observed) = ctx
+        .records
+        .load_record(&collection(), Requirement::AtLeast(ctx.timeline.now()))
+        .await
+        .unwrap();
+    assert!(
+        parent_record
+            .add_child(b"child".to_vec(), child.id())
+            .unwrap()
+    );
+    parent_record.set_directory_writer(id.clone());
+    assert!(
+        ctx.records
+            .store_record(&parent_record, &parent_observed)
+            .await
+            .unwrap()
+    );
+
+    let mut child_record = CollectionRecord::new();
+    child_record.add_directory_reader(id.clone());
+    assert!(child_record.set_topology_freeze(id.clone()));
+    assert!(
+        ctx.records
+            .create_record(&child, &child_record)
+            .await
+            .unwrap()
+    );
+    let mut child_node = Node::leaf(LeafBody::new());
+    child_node.set_collection_delete_intent(id.clone());
+    assert!(ctx.nodes.create_root(&child, &child_node).await.unwrap());
+
+    let mut log = committed(id.clone(), PAST_HORIZON, &[b"k"], &[]);
+    log.locks.extend([
+        TxLock::Directory {
+            collection: collection(),
+            typ: LockType::Write,
+        },
+        TxLock::Directory {
+            collection: child.clone(),
+            typ: LockType::Read,
+        },
+    ]);
+    log.collection_changes.push(TxCollectionChange {
+        parent: collection(),
+        name: b"child".to_vec(),
+        collection: child.clone(),
+        op: TxCollectionOp::Drop,
+    });
+    ctx.tl.set(&log).await.unwrap();
+    ctx.hints.schedule(id.clone());
+
+    run_once(&ctx).await;
+
+    assert!(
+        !is_gone(&ctx.tl, &id).await,
+        "the live root value still needs its transaction object"
+    );
+    let (parent_record, _) = ctx
+        .records
+        .load_record(&collection(), Requirement::AtLeast(ctx.timeline.now()))
+        .await
+        .unwrap();
+    assert_eq!(parent_record.child(b"child"), None);
+    assert!(!parent_record.directory_lock().contains(&id));
+    assert!(matches!(
+        ctx.nodes.load_root(&child, Requirement::Any).await,
+        Err(StorageError::NotFound)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn committed_references_in_a_reclaimed_collection_are_absent() {
+    let ctx = new_ctx().await;
+    let id = tx(1);
+    let missing = CollectionAddress::new(
+        "db",
+        CollectionId::from_slice(&[9; 16]).expect("fixed ID has the required width"),
+    );
+    let key = LogicalKey::new(missing, b"k");
+    let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+    log.timestamp = Some(base() - PAST_HORIZON);
+    log.writes.push(TxWrite {
+        key: key.clone(),
+        value: Arc::from(&b"v"[..]),
+        deleted: false,
+        prev_writer: TxId::default(),
+    });
+    log.locks.push(TxLock::Entry {
+        key,
+        typ: LockType::Write,
+    });
+    ctx.tl.set(&log).await.unwrap();
+    ctx.hints.schedule(id.clone());
+
+    run_once(&ctx).await;
+
+    assert!(is_gone(&ctx.tl, &id).await);
+}
+
+// A committed object still named by its key's `current_writer` is the live
+// value: it must never be collected.
+#[tokio::test(start_paused = true)]
+async fn committed_still_referenced_is_kept() {
+    let ctx = new_ctx().await;
+    let t = tx(1);
+    ctx.tl
+        .set(&committed(t.clone(), PAST_HORIZON, &[b"k"], &[]))
+        .await
+        .unwrap();
+    store_entry(&ctx, b"k", writer_entry(b"k", &t)).await;
+    ctx.hints.schedule(t.clone());
+
+    run_once(&ctx).await;
+
+    let log = ctx.tl.get_at(&t, Requirement::Any).await.unwrap();
+    let log = log.value().unwrap();
+    assert_eq!(log.status, TxCommitStatus::Ok);
+}
+
+// A recent pending object (within the safety horizon) is kept: it may be a
+// live transaction whose lock this non-atomic check cannot yet rule out.
+#[tokio::test(start_paused = true)]
+async fn recent_pending_is_kept() {
+    let ctx = new_ctx().await;
+    let t = tx(1);
+    let mut log = TxLog::new(t.clone(), TxCommitStatus::Pending);
+    log.timestamp = Some(base());
+    log.locks = vec![write_lock(b"k")];
+    ctx.tl.set(&log).await.unwrap();
+    store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
+    ctx.hints.schedule(t.clone());
+
+    run_once(&ctx).await;
+
+    let got = ctx.tl.get_at(&t, Requirement::Any).await.unwrap();
+    let got = got.value().unwrap();
+    assert_eq!(got.status, TxCommitStatus::Pending);
+    // Its lock is untouched.
+    let e = lookup_entry(&ctx, b"k").await.unwrap();
+    assert_eq!(e.lock_holders(), std::slice::from_ref(&t));
+}
+
+// A dead pending object past the horizon is pinned as wounded and its locks
+// are released. No Database instance may delete it before owner acknowledgement.
+#[tokio::test(start_paused = true)]
+async fn dead_pending_is_wounded_and_locks_released() {
+    let ctx = new_ctx().await;
+    let t = tx(1);
+    let mut log = TxLog::new(t.clone(), TxCommitStatus::Pending);
+    log.timestamp = Some(base() - PAST_HORIZON);
+    log.locks = vec![write_lock(b"k")];
+    ctx.tl.set(&log).await.unwrap();
+    store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
+
+    ctx.hints.schedule(t.clone());
+    run_once(&ctx).await;
+
+    // Death is durable...
+    let got = ctx.tl.get_at(&t, Requirement::Any).await.unwrap();
+    let got = got.value().unwrap();
+    assert_eq!(got.status, TxCommitStatus::Wounded);
+    // ...its lock is released (the now-vestigial entry pruned)...
+    assert!(lookup_entry(&ctx, b"k").await.is_none());
+    // ...and the wound remains pinned.
+    assert!(!is_gone(&ctx.tl, &t).await);
+
+    // An effect already in flight when the wound landed may appear after
+    // the first cleanup pass. The pinned record makes another pass clean it
+    // without relying on a finite tombstone window.
+    store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
+    ctx.hints.schedule(t.clone());
+    run_once(&ctx).await;
+    assert!(lookup_entry(&ctx, b"k").await.is_none());
+
+    tokio::time::sleep(PAST_HORIZON * 2).await;
+    ctx.hints.schedule(t.clone());
+    run_once(&ctx).await;
+    let got = ctx.tl.get_at(&t, Requirement::Any).await.unwrap();
+    assert_eq!(got.value().unwrap().status, TxCommitStatus::Wounded);
+}
+
+// An acknowledged aborted object still within its cleanup horizon keeps its
+// locks and remains available to ordinary late observers.
+#[tokio::test(start_paused = true)]
+async fn recent_aborted_tombstone_is_kept() {
+    let ctx = new_ctx().await;
+    let t = tx(1);
+    let mut log = TxLog::new(t.clone(), TxCommitStatus::Aborted);
+    log.timestamp = Some(base());
+    log.locks = vec![write_lock(b"k")];
+    ctx.tl.set(&log).await.unwrap();
+    store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
+    ctx.hints.schedule(t.clone());
+
+    run_once(&ctx).await;
+
+    assert!(!is_gone(&ctx.tl, &t).await);
+    let e = lookup_entry(&ctx, b"k").await.unwrap();
+    assert_eq!(e.lock_holders(), std::slice::from_ref(&t));
+}
+
+// An aborted object past its tombstone lease has its recorded lock pruned
+// (the vestigial entry removed) and is then deleted.
+#[tokio::test(start_paused = true)]
+async fn expired_aborted_prunes_locks_and_is_deleted() {
+    let ctx = new_ctx().await;
+    let t = tx(1);
+    let mut log = TxLog::new(t.clone(), TxCommitStatus::Aborted);
+    log.timestamp = Some(base() - PAST_HORIZON);
+    log.locks = vec![write_lock(b"k")];
+    ctx.tl.set(&log).await.unwrap();
+    store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
+    ctx.hints.schedule(t.clone());
+
+    run_once(&ctx).await;
+
+    assert!(is_gone(&ctx.tl, &t).await);
+    assert!(lookup_entry(&ctx, b"k").await.is_none());
+}
+
+// A shared hint for a logless writer has no object and is a harmless no-op.
+#[tokio::test(start_paused = true)]
+async fn logless_cleanup_hint_is_a_noop() {
+    let ctx = new_ctx().await;
+    let t = tx(9);
+    ctx.hints.schedule(t.clone());
+    run_once(&ctx).await;
+    assert!(is_gone(&ctx.tl, &t).await);
+}
+
+// ADR-029: GC's lock reclamation flows through the leaf coordinator
+// (via the locker's unlock methods), so a GC release and a live disjoint-key
+// acquire contending one leaf batch into a *single* CAS round instead of GC
+// racing its own store. The release clears (and prunes) the dead holder's
+// entry and the acquire installs its lock, all in one leaf write.
+#[tokio::test(start_paused = true)]
+async fn gc_release_merges_into_live_acquire_round() {
+    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let (backend, gate) = Gate::wrap(mem);
+    let rec = Arc::new(RecordingBackend::new(backend));
+    let log = rec.log();
+    let ctx = new_ctx_with(rec).await;
+
+    let ka = b"key-a".to_vec();
+    let kb = same_leaf_sibling(&ka);
+    let leaf_path = root_path();
+    let leaf_path_string = leaf_path.to_string();
+
+    // Seed both entries in the one shared leaf `_r`: a dead transaction holds
+    // A's write lock (no committed writer), so GC's release will clear and
+    // prune the now-vestigial entry; B exists committed, so the live
+    // overwrite takes a Write lock (not a Create) and needs no membership
+    // root lock — the round stays one leaf CAS.
+    let dead = tx(1);
+    let seed = tx(9);
+    let leaf = LeafBody::from_entries([locked_entry(&ka, &dead), writer_entry(&kb, &seed)]);
+    let loaded = ctx
+        .nodes
+        .load_leaf(&leaf_path, Requirement::AtLeast(ctx.timeline.now()))
+        .await
+        .unwrap();
+    let mut edit = loaded.into_edit();
+    edit.set_entries(leaf);
+    assert!(ctx.nodes.commit_leaf(edit).await.unwrap());
+
+    let mut dead_log = TxLog::new(dead.clone(), TxCommitStatus::Aborted);
+    dead_log.timestamp = Some(base() - PAST_HORIZON);
+    dead_log.locks = vec![write_lock(&ka)];
+    ctx.tl.set(&dead_log).await.unwrap();
+
+    let live = TxId::with_priority(2_000_000_000, b"live");
+    ctx.mon.begin_tx(&live);
+
+    let before = count_stores(&log, &leaf_path_string);
+    gate.arm();
+
+    // Drive GC's release and the live acquire concurrently: the first becomes
+    // the dedup driver and parks in the gated load; the second queues and
+    // merges into its round.
+    let gc = ctx.gc.clone();
+    let dead2 = dead.clone();
+    let release = tokio::spawn(async move { gc.check_candidate(&dead2).await });
+    let locker = ctx.locker.clone();
+    let accesses = crate::access::AccessSet::new(
+        Vec::new(),
+        vec![crate::access::WriteAccess::put(
+            key_path(&kb),
+            Arc::from(&b"v2"[..]),
+        )],
+        Vec::new(),
+    );
+    let live2 = live.clone();
+    let lock_requirement = Requirement::AtLeast(ctx.timeline.now());
+    let acquire = tokio::spawn(async move {
+        locker
+            .keys()
+            .lock_at(&live2, &accesses, false, lock_requirement)
+            .await
+    });
+
+    // Under paused time this fires only once both tasks are parked (driver in
+    // the gated load, the second queued); then release the load.
+    rt::sleep(std::time::Duration::from_millis(50)).await;
+    gate.release();
+
+    release.await.unwrap().unwrap();
+    let outcome = acquire.await.unwrap().unwrap();
+    assert!(
+        matches!(outcome, LockOutcome::Locked(_)),
+        "the live acquire must lock"
+    );
+
+    assert_eq!(
+        count_stores(&log, &leaf_path_string) - before,
+        1,
+        "GC release and the live acquire share a single leaf CAS"
+    );
+    // The dead holder's entry was cleared and, being vestigial, pruned; the
+    // live acquirer holds B's lock.
+    assert!(
+        lookup_entry(&ctx, &ka).await.is_none(),
+        "GC released and pruned the dead holder's entry"
+    );
+    assert_eq!(
+        lookup_entry(&ctx, &kb).await.unwrap().lock_holders(),
+        std::slice::from_ref(&live)
+    );
+}
+
+/// Counts the CAS stores (conditional write / create) issued against `path`.
+fn count_stores(log: &glassdb_backend::middleware::OpLog, path: &str) -> usize {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.path == path && (r.op == "write_if" || r.op == "write_if_not_exists"))
+        .count()
+}
+
+/// A distinct key that shares the collection's single leaf `_r` with `base`
+/// (ADR-031, split deferred), for exercising a GC release and a live acquire
+/// contending one leaf object.
+fn same_leaf_sibling(base: &[u8]) -> Vec<u8> {
+    let sib = b"sibling".to_vec();
+    assert_ne!(sib, base, "sibling must differ from the base key");
+    sib
+}
+
+/// Controls a hook that skips one routing read, then gates the coordinator load.
+struct Gate {
+    notify: Arc<tokio::sync::Notify>,
+    armed: std::sync::atomic::AtomicBool,
+    skip: std::sync::atomic::AtomicUsize,
+}
+
+impl Gate {
+    fn wrap(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
+        let gate = Arc::new(Self {
+            notify: Arc::new(tokio::sync::Notify::new()),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            skip: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let backend = HookBackend::new(inner);
+        backend.set_before({
+            let gate = gate.clone();
+            move |op| {
+                use std::sync::atomic::Ordering::SeqCst;
+                let wait = matches!(
+                    op,
+                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                ) && gate.armed.load(SeqCst)
+                    && gate
+                        .skip
+                        .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                        .is_err();
+                if wait {
+                    gate.armed.store(false, SeqCst);
+                }
+                let notify = gate.notify.clone();
+                let future: HookFuture = Box::pin(async move {
+                    if wait {
+                        notify.notified().await;
+                    }
+                    Ok(())
+                });
+                future
+            }
+        });
+        (backend, gate)
+    }
+
+    fn arm(&self) {
+        self.skip.store(1, std::sync::atomic::Ordering::SeqCst);
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn release(&self) {
+        self.notify.notify_one();
+    }
+}
+#[tokio::test(start_paused = true)]
+async fn cached_candidate_converges_after_a_peer_deletes_it() {
+    use glassdb_backend::middleware::RecordingBackend;
+    use glassdb_storage::CachedStore;
+
+    let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+    let operations = backend.log();
+    let backend = Arc::new(backend);
+    let ctx = new_ctx_with(backend.clone()).await;
+    let id = tx(14);
+    ctx.tl
+        .set(&committed(id.clone(), PAST_HORIZON, &[], &[]))
+        .await
+        .unwrap();
+    let peer = TLogger::new(
+        CachedStore::new(backend, 1 << 20, Timeline::new(), None),
+        DbRoot::try_from("db").unwrap(),
+    );
+    let observed = peer.get_at(&id, Requirement::Any).await.unwrap();
+    peer.delete(&observed).await.unwrap();
+    operations.lock().unwrap().clear();
+
+    assert_eq!(
+        ctx.gc.check_candidate(&id).await.unwrap(),
+        GcOutcome::Reclaimed
+    );
+    assert!(
+        operations
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|operation| operation.op == "delete_if"),
+        "a cached final candidate needs no presence check"
+    );
+    assert!(is_gone(&ctx.tl, &id).await);
+    assert_eq!(
+        ctx.gc.check_candidate(&id).await.unwrap(),
+        GcOutcome::Retained
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn hinted_candidates_wake_gc_without_a_list() {
+    let ctx = new_ctx().await;
+    let id = tx(11);
+    ctx.tl
+        .set(&committed(id.clone(), PAST_HORIZON, &[], &[]))
+        .await
+        .unwrap();
+    let bg = Arc::new(glassdb_concurr::Background::new());
+    ctx.gc.start(&bg);
+    ctx.hints.schedule_all([id.clone(), id.clone()]);
+    for _ in 0..64 {
+        rt::yield_now().await;
+    }
+    assert!(is_gone(&ctx.tl, &id).await);
+    let stats = ctx.gc.stats_and_reset();
+    assert_eq!(stats.lists, 0);
+    assert_eq!(stats.progress, 1);
+    bg.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_transient_failure_keeps_the_candidate_until_retry() {
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let ctx = new_ctx_with_interval(backend.clone(), Duration::from_millis(10)).await;
+    let id = tx(12);
+    ctx.tl
+        .set(&committed(id.clone(), PAST_HORIZON, &[], &[]))
+        .await
+        .unwrap();
+    let failed = Arc::new(AtomicBool::new(false));
+    backend.set_before(move |op| {
+        let fail = matches!(op, BackendOp::DeleteIf { .. }) && !failed.swap(true, Ordering::SeqCst);
+        Box::pin(async move {
+            if fail {
+                Err(BackendError::Unavailable("retry".into()))
+            } else {
+                Ok(())
+            }
+        })
+    });
+    let bg = Arc::new(glassdb_concurr::Background::new());
+    ctx.gc.start(&bg);
+    ctx.hints.schedule(id.clone());
+    for _ in 0..32 {
+        rt::yield_now().await;
+    }
+    assert!(!is_gone(&ctx.tl, &id).await);
+    assert_eq!(ctx.gc.diagnostics().deferred, 1);
+    for _ in 0..20 {
+        tokio::time::advance(Duration::from_millis(2)).await;
+        for _ in 0..8 {
+            rt::yield_now().await;
+        }
+    }
+    assert!(is_gone(&ctx.tl, &id).await);
+    let stats = ctx.gc.stats_and_reset();
+    assert_eq!(stats.failures, 1);
+    assert_eq!(stats.progress, 1);
+    bg.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_ready_hint_queue_does_not_starve_the_scan() {
+    let ctx =
+        new_ctx_with_interval(Arc::new(MemoryBackend::new()), Duration::from_millis(10)).await;
+    let id = tx(13);
+    ctx.tl
+        .set(&committed(id.clone(), PAST_HORIZON, &[], &[]))
+        .await
+        .unwrap();
+    let bg = Arc::new(glassdb_concurr::Background::new());
+    ctx.hints
+        .schedule_all((0u64..2000).map(|i| TxId::from_bytes(i.to_be_bytes().to_vec())));
+    ctx.gc.start(&bg);
+    rt::yield_now().await;
+    tokio::time::advance(Duration::from_millis(11)).await;
+    for _ in 0..64 {
+        rt::yield_now().await;
+    }
+    assert!(ctx.gc.stats_and_reset().lists > 0);
+    assert!(is_gone(&ctx.tl, &id).await);
+    bg.shutdown().await;
+}

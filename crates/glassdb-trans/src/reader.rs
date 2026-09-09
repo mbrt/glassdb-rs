@@ -134,11 +134,15 @@ impl Reader {
         let mut requirement = requirement;
         let mut refreshed = false;
         loop {
-            let (resolved, leaf) = self
-                .resolver
-                .resolve_key(key, requirement)
-                .await
-                .map_err(trans_to_storage)?;
+            let (resolved, leaf) = match self.resolver.resolve_key(key, requirement).await {
+                Ok(resolved) => resolved,
+                Err(crate::error::TransError::ValidateRetry(fresh)) => {
+                    requirement = requirement.stricter(fresh);
+                    rt::yield_now().await;
+                    continue;
+                }
+                Err(error) => return Err(trans_to_storage(error)),
+            };
             let mut cache_hit = leaf.cache_hit;
             cache_hit &= resolved.cache_hit;
             let leaf = leaf.observation;
@@ -173,11 +177,15 @@ impl Reader {
                 }
                 ResolvedValue::External | ResolvedValue::Unresolved => {}
             }
-            let cv = self
-                .resolver
-                .committed_value(key, &writer)
-                .await
-                .map_err(trans_to_storage)?;
+            let cv = match self.resolver.committed_value(key, &writer).await {
+                Ok(value) => value,
+                Err(crate::error::TransError::ValidateRetry(fresh)) => {
+                    requirement = requirement.stricter(fresh);
+                    rt::yield_now().await;
+                    continue;
+                }
+                Err(error) => return Err(trans_to_storage(error)),
+            };
             if cv.status != TxCommitStatus::Ok {
                 // The resolved writer's transaction object is not authoritatively
                 // committed. A staleness-tolerant resolution can name a writer
@@ -222,6 +230,180 @@ impl Reader {
                 cache_hit,
                 ReadEvidence::new(last_writer, leaf),
             ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{AssemblyFixture, EngineConfig};
+    use crate::key_state_resolver::KeyStateResolver;
+    use glassdb_backend::memory::MemoryBackend;
+    use glassdb_data::{CollectionAddress, DbRoot, TxId};
+    use glassdb_storage::transaction::{TxLog, TxWrite};
+    use glassdb_storage::{CurrentState, LeafBody, LeafEntry, Node, TreeRouter};
+    use std::num::NonZeroUsize;
+
+    #[tokio::test]
+    async fn reclaimed_transaction_bodies_refresh_cached_writers_and_holders() {
+        for (held, operation) in [(false, 0), (true, 0), (true, 1), (true, 2), (true, 3)] {
+            let backend = Arc::new(MemoryBackend::new());
+            let local = AssemblyFixture::new(
+                backend.clone(),
+                DbRoot::try_from("db").unwrap(),
+                &EngineConfig::default(),
+            );
+            let peer = AssemblyFixture::new(
+                backend,
+                DbRoot::try_from("db").unwrap(),
+                &EngineConfig::default(),
+            );
+            let collection = CollectionAddress::root("db");
+            let key = LogicalKey::new(collection.clone(), b"key");
+            let old = TxId::from_bytes(vec![1]);
+            let mut log = TxLog::new(old.clone(), TxCommitStatus::Ok);
+            log.writes.push(TxWrite {
+                key: key.clone(),
+                value: Arc::from(&b"old"[..]),
+                deleted: false,
+                prev_writer: TxId::default(),
+            });
+            let local_log = local.tlogger.set(&log).await.unwrap();
+            let mut entry = LeafEntry::new(b"key");
+            if held {
+                entry.replace_write_lock(old.clone());
+            } else {
+                entry.current = CurrentState::External {
+                    writer: old.clone(),
+                };
+            }
+            local
+                .nodes
+                .create_root(&collection, &Node::leaf(LeafBody::from_entries([entry])))
+                .await
+                .unwrap();
+            let resolver = KeyResolver::new(
+                TreeRouter::new(local.nodes.clone(), NonZeroUsize::MIN),
+                KeyStateResolver::new(local.monitor.clone()),
+                NonZeroUsize::MIN,
+            );
+            let reader = Reader::new(
+                resolver.clone(),
+                local.timeline.clone(),
+                RetryConfig::default(),
+            );
+            let (value, _, _) = reader.read(&key, Duration::MAX).await.unwrap().into_parts();
+            assert_eq!(value.unwrap().value.as_ref(), b"old");
+            let (_, root) = peer
+                .nodes
+                .load_root(&collection, Requirement::Any)
+                .await
+                .unwrap();
+            let updated = Node::leaf(LeafBody::from_entries([LeafEntry::new(b"key")
+                .with_current(CurrentState::Inline {
+                    writer: TxId::from_bytes(vec![2]),
+                    value: Arc::from(&b"new"[..]),
+                })]));
+            peer.nodes
+                .store_root(&collection, &updated, &root)
+                .await
+                .unwrap();
+            let observed = peer.tlogger.get_at(&old, Requirement::Any).await.unwrap();
+            peer.tlogger.delete(&observed).await.unwrap();
+            local.tlogger.delete(&local_log).await.unwrap();
+            assert!(matches!(
+                local.tlogger.get_at(&old, Requirement::Any).await,
+                Err(StorageError::NotFound)
+            ));
+            match operation {
+                0 => {
+                    let (value, _, _) =
+                        reader.read(&key, Duration::MAX).await.unwrap().into_parts();
+                    assert_eq!(value.unwrap().value.as_ref(), b"new");
+                }
+                1 => {
+                    let page = resolver
+                        .scan_keys(
+                            &collection,
+                            &crate::access::ScanRange::all(),
+                            &[],
+                            None,
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(page.keys(), &[b"key".to_vec()]);
+                }
+                2 => {
+                    let states = resolver
+                        .effective_point_states(std::slice::from_ref(&key), None, Requirement::Any)
+                        .await
+                        .unwrap();
+                    assert_eq!(states[0].writer, Some(TxId::from_bytes(vec![2])));
+                }
+                _ => {
+                    use crate::access::{AccessSet, WriteAccess};
+                    use crate::collection_coordination::CollectionStateResolver;
+                    use crate::leaf_coord::{LeafCoordinator, SplitHinter};
+                    use crate::tlocker::{LockOutcome, Locker};
+                    struct NoSplitHints;
+                    impl SplitHinter for NoSplitHints {
+                        fn observe_leaf(&self, _: &glassdb_data::ObjectPath, _: &LeafBody) {}
+                    }
+                    let coord = LeafCoordinator::with_hinter(
+                        local.nodes.clone(),
+                        KeyStateResolver::new(local.monitor.clone()),
+                        local.monitor.clone(),
+                        RetryConfig::default(),
+                        glassdb_storage::SplitPolicy::default(),
+                        Arc::new(NoSplitHints),
+                    );
+                    let state = CollectionStateResolver::new(
+                        local.records.clone(),
+                        local.tlogger.clone(),
+                        local.timeline.clone(),
+                        local.monitor.clone(),
+                        RetryConfig::default(),
+                    );
+                    let locker = Locker::new(
+                        coord,
+                        TreeRouter::new(local.nodes.clone(), NonZeroUsize::MIN),
+                        state,
+                        local.monitor.clone(),
+                        RetryConfig::default(),
+                        NonZeroUsize::MIN,
+                    );
+                    let writer = TxId::from_bytes(vec![3]);
+                    local.monitor.begin_tx(&writer);
+                    let accesses = AccessSet::new(
+                        Vec::new(),
+                        vec![WriteAccess::put(key.clone(), Arc::from(&b"next"[..]))],
+                        Vec::new(),
+                    );
+                    assert!(matches!(
+                        locker
+                            .keys()
+                            .lock_at(&writer, &accesses, false, Requirement::Any)
+                            .await
+                            .unwrap(),
+                        LockOutcome::Locked(_)
+                    ));
+                    let (node, _) = peer
+                        .nodes
+                        .load_root(&collection, Requirement::AtLeast(peer.timeline.now()))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        node.as_leaf()
+                            .unwrap()
+                            .lookup(b"key")
+                            .unwrap()
+                            .lock_holders(),
+                        std::slice::from_ref(&writer)
+                    );
+                }
+            }
         }
     }
 }

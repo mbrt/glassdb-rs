@@ -328,6 +328,7 @@ impl Database {
             coordinator: engine.coordinator,
             direct_commit: engine.direct_commit,
             splitter: engine.splitter,
+            gc: engine.gc,
             ..Default::default()
         };
         let mut stats = self.inner.stats.lock().unwrap();
@@ -335,13 +336,14 @@ impl Database {
         *stats
     }
 
-    /// Returns a snapshot of the leaf coordinator's live state, intended for
-    /// operators investigating hangs or unexpected contention. See
+    /// Returns local GC work and the leaf coordinator's live state for
+    /// operators investigating GC backlog, hangs, or contention. See
     /// [`crate::diagnostics`] for the snapshot shape and how to enable the
     /// complementary `tracing` events.
     pub fn diagnostics(&self) -> Diagnostics {
         let engine = self.inner.engine.diagnostics();
         Diagnostics {
+            gc: engine.gc,
             coordinator_dedup: engine.coordinator_dedup,
         }
     }
@@ -501,11 +503,11 @@ impl DbInner {
             stats.cache_hits += metrics.cache_hits;
             stats.writes += accesses.write_count() as u64;
 
-            if body_outcome.is_ok() {
+            let identity_renewed = if body_outcome.is_ok() {
                 driver.install_accesses(accesses, catalog_accesses);
                 match driver.commit().await {
                     Ok(BodyDecision::ReturnOutcome) => break body_outcome,
-                    Ok(BodyDecision::ReplayBody) => {}
+                    Ok(BodyDecision::ReplayBody { identity_renewed }) => identity_renewed,
                     Err(e) => break Err(e.into()),
                 }
             } else {
@@ -519,13 +521,13 @@ impl DbInner {
                     .validate_error_outcome(accesses, catalog_accesses)
                     .await
                 {
-                    Ok(BodyDecision::ReplayBody) => {}
+                    Ok(BodyDecision::ReplayBody { identity_renewed }) => identity_renewed,
                     Ok(BodyDecision::ReturnOutcome) => break body_outcome,
                     Err(e) => break Err(Error::from_read_validation(e)),
                 }
-            }
+            };
 
-            tx.reset();
+            tx.reset(identity_renewed);
             stats.retries += 1;
         };
 
@@ -671,15 +673,19 @@ mod tests {
             .unwrap();
         let remaining = fail_root_conflicts(&backend, SERIAL_TRANSITION_CONFLICTS);
         let bodies = Arc::new(AtomicUsize::new(0));
+        let incarnations = Arc::new(Mutex::new(Vec::new()));
 
         let child = db
             .tx({
                 let bodies = bodies.clone();
+                let incarnations = incarnations.clone();
                 move |tx| {
                     bodies.fetch_add(1, Ordering::SeqCst);
+                    let incarnations = incarnations.clone();
                     async move {
                         let root = tx.root_collection();
                         let child = tx.create_collection(&root, b"child").await?;
+                        incarnations.lock().unwrap().push(child.address().clone());
                         tx.write(&root, b"key", b"value")?;
                         Ok(child)
                     }
@@ -690,6 +696,10 @@ mod tests {
 
         assert_eq!(remaining.load(Ordering::SeqCst), 0);
         assert_eq!(bodies.load(Ordering::SeqCst), 2);
+        {
+            let incarnations = incarnations.lock().unwrap();
+            assert_ne!(incarnations[0], incarnations[1]);
+        }
         assert_eq!(child.name(), Some(b"child".as_slice()));
         db.shutdown().await;
     }

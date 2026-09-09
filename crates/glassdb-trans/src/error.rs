@@ -3,7 +3,7 @@
 //! while wrapping storage/backend errors.
 
 use glassdb_backend::{BackendError, Cause};
-use glassdb_storage::StorageError;
+use glassdb_storage::{Requirement, StorageError};
 
 /// Errors produced by the transaction engine.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -22,9 +22,9 @@ pub enum TransError {
     /// with a fresh attempt that preserves the original priority.
     #[error("transaction was wounded")]
     Wounded,
-    /// Internal: re-run validation without retrying the whole transaction.
+    /// Internal: resolve a stale reference again at the supplied observation bound.
     #[error("retry validation")]
-    ValidateRetry,
+    ValidateRetry(Requirement),
     /// Internal: locking timed out (suspected deadlock).
     #[error("lock timeout")]
     LockTimeout,

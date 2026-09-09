@@ -13,7 +13,7 @@ use glassdb_storage::{
 use super::attempt::AttemptState;
 use crate::access::{AccessSet, ReadPredicate, WriteOp};
 use crate::error::TransError;
-use crate::gc::TxCleanupHints;
+use crate::gc::GcHints;
 use crate::key_state_resolver::HolderResolution;
 use crate::leaf_coord::{
     CoordinatedOutcome, FoldOutcome, LeafCoordinator, LeafOperation, LeafResolver, ReloadCause,
@@ -61,7 +61,7 @@ pub(super) struct DirectCommit {
     coord: LeafCoordinator,
     inline_policy: InlinePolicy,
     split_hints: SplitHintSink,
-    cleanup_hints: TxCleanupHints,
+    cleanup_hints: GcHints,
     counters: Arc<DirectCommitCounters>,
 }
 
@@ -72,7 +72,7 @@ impl DirectCommit {
         coord: LeafCoordinator,
         inline_policy: InlinePolicy,
         split_hints: SplitHintSink,
-        cleanup_hints: TxCleanupHints,
+        cleanup_hints: GcHints,
     ) -> Self {
         DirectCommit {
             router,

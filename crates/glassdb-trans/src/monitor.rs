@@ -14,7 +14,7 @@ use glassdb_storage::transaction::{
     TLogger, TxCollectionChange, TxCommitStatus, TxLifecycleRelation, TxLock, TxLog, TxRecordState,
     TxStatus,
 };
-use glassdb_storage::{Observation, Requirement, SequencePoint, StorageError, Timeline};
+use glassdb_storage::{Observation, Requirement, StorageError, Timeline};
 use hashlink::LinkedHashMap;
 use tokio::sync::oneshot;
 
@@ -375,10 +375,28 @@ struct PendingWrite {
     expected: Option<Observation<TxLog>>,
 }
 
-#[derive(Clone, Copy)]
-struct FinalStatus {
-    status: TxCommitStatus,
-    watermark: SequencePoint,
+/// A durable status that can no longer change, even after owner acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalStatus {
+    Committed,
+    Aborted,
+}
+
+impl FinalStatus {
+    fn from_status(status: TxCommitStatus) -> Option<Self> {
+        match status {
+            TxCommitStatus::Ok => Some(Self::Committed),
+            TxCommitStatus::Aborted => Some(Self::Aborted),
+            TxCommitStatus::Unknown | TxCommitStatus::Pending | TxCommitStatus::Wounded => None,
+        }
+    }
+
+    fn status(self) -> TxCommitStatus {
+        match self {
+            Self::Committed => TxCommitStatus::Ok,
+            Self::Aborted => TxCommitStatus::Aborted,
+        }
+    }
 }
 
 struct FinalStatusCache {
@@ -824,7 +842,8 @@ impl Monitor {
             }
             status = self
                 .advance_abort_transition(tid, &status.observation, transition)
-                .await?;
+                .await?
+                .0;
             let outcome = match status.status {
                 TxCommitStatus::Ok => Some(OwnerAbortOutcome::Committed),
                 TxCommitStatus::Aborted => Some(OwnerAbortOutcome::Acknowledged),
@@ -861,7 +880,8 @@ impl Monitor {
         loop {
             status = self
                 .advance_abort_transition(tid, &status.observation, transition)
-                .await?;
+                .await?
+                .0;
             match status.status {
                 TxCommitStatus::Ok => return Ok(TxFinalStatus::Committed),
                 TxCommitStatus::Aborted => return Ok(TxFinalStatus::Aborted),
@@ -892,6 +912,23 @@ impl Monitor {
         requirement: Requirement,
     ) -> Result<TxCommitStatus, TransError> {
         Ok(self.resolve_tx_status_at(tid, requirement).await?.status())
+    }
+
+    /// Checks for a durable wound that local owner state may not yet reflect.
+    pub(crate) async fn has_durable_wound(&self, tid: &TxId) -> Result<bool, TransError> {
+        let status = self
+            .inner
+            .tl
+            .commit_status_at(tid, self.current_requirement())
+            .await?;
+        let wounded = matches!(
+            status.status,
+            TxCommitStatus::Wounded | TxCommitStatus::Aborted
+        );
+        if wounded {
+            self.record_durable_observation(tid, &status.observation);
+        }
+        Ok(wounded)
     }
 
     /// Waits for and returns a transaction's durable final status.
@@ -935,11 +972,12 @@ impl Monitor {
     }
 
     /// Conditionally pins an exact foreign transaction observation as wounded.
+    /// The boolean reports a confirmed state change made by this call.
     pub(crate) async fn try_wound_observed(
         &self,
         tid: &TxId,
         expected: &Observation<TxLog>,
-    ) -> Result<TxStatus, TransError> {
+    ) -> Result<(TxStatus, bool), TransError> {
         self.advance_abort_transition(tid, expected, AbortTransition::EnsureWounded)
             .await
     }
@@ -1042,7 +1080,7 @@ impl Monitor {
         tid: &TxId,
         expected: &Observation<TxLog>,
         transition: AbortTransition,
-    ) -> Result<TxStatus, TransError> {
+    ) -> Result<(TxStatus, bool), TransError> {
         let mut expected = expected.clone();
         let mut backoff = self.inner.retry.backoff();
         loop {
@@ -1051,7 +1089,7 @@ impl Monitor {
             let target = match classify_abort_observation(transition, record_state) {
                 AbortObservationAction::Settled => {
                     self.record_durable_observation(tid, &current.observation);
-                    return Ok(current);
+                    return Ok((current, false));
                 }
                 AbortObservationAction::Write(target) => target,
             };
@@ -1064,7 +1102,7 @@ impl Monitor {
             match r {
                 Ok(observed) => {
                     self.record_durable_observation(tid, &observed);
-                    return Ok(TxStatus::from_observation(observed));
+                    return Ok((TxStatus::from_observation(observed), true));
                 }
                 Err(StorageError::Precondition) => {
                     // The version moved under us (a commit, a pending-log
@@ -1076,7 +1114,7 @@ impl Monitor {
                         .read_tx_status_retrying_unavailable(tid, &mut backoff)
                         .await?;
                     self.record_durable_observation(tid, &st.observation);
-                    return Ok(st);
+                    return Ok((st, false));
                 }
                 // In-doubt: the abort write may or may not have landed. Forcing
                 // a not-yet-final log to an abort-side state is idempotent and
@@ -1095,7 +1133,7 @@ impl Monitor {
                     if classify_abort_observation(transition, record_state)
                         == AbortObservationAction::Settled
                     {
-                        return Ok(st);
+                        return Ok((st, false));
                     }
                     expected = st.observation;
                 }
@@ -1399,9 +1437,7 @@ impl Monitor {
         }
 
         let status_cache_hit = evidence.cache_hit;
-        let tl = self
-            .final_log(tid, status, requirement, evidence.observation)
-            .await?;
+        let tl = self.final_log(tid, status, evidence.observation).await?;
         let cache_hit = status_cache_hit && tl.cache_hit();
         let tl = tl
             .value()
@@ -1433,7 +1469,6 @@ impl Monitor {
         &self,
         tid: &TxId,
         expected_status: TxCommitStatus,
-        requirement: Option<Requirement>,
         known: Option<Observation<TxLog>>,
     ) -> Result<Observation<TxLog>, TransError> {
         if let Some(observed) = known
@@ -1443,18 +1478,17 @@ impl Monitor {
         {
             return Ok(observed);
         }
-        let cached = self.inner.final_status.lock().unwrap().get(tid);
-        let mut observed = match requirement {
-            Some(requirement) => {
-                let requirement = match cached {
-                    Some(status) => requirement.stricter(Requirement::AtLeast(status.watermark)),
-                    None => requirement,
-                };
-                self.inner.tl.get_at(tid, requirement).await
-            }
-            None => self.inner.tl.get_at(tid, self.current_requirement()).await,
-        }
-        .map_err(|error| TransError::Storage(error.context(format!("getting TID {tid}"))))?;
+        let mut observed = self
+            .inner
+            .tl
+            .get_at(tid, self.current_requirement())
+            .await
+            .map_err(|error| match error {
+                // Commit status is permanent, but a reclaimed body means the
+                // referring leaf observation must be resolved again.
+                StorageError::NotFound => TransError::ValidateRetry(self.current_requirement()),
+                error => TransError::Storage(error.context(format!("getting TID {tid}"))),
+            })?;
         if observed
             .value()
             .is_some_and(|log| log.status != expected_status)
@@ -1464,8 +1498,9 @@ impl Monitor {
                 .tl
                 .get_at(tid, self.current_requirement())
                 .await
-                .map_err(|error| {
-                    TransError::Storage(error.context(format!("refreshing TID {tid}")))
+                .map_err(|error| match error {
+                    StorageError::NotFound => TransError::ValidateRetry(self.current_requirement()),
+                    error => TransError::Storage(error.context(format!("refreshing TID {tid}"))),
                 })?;
         }
         if !observed
@@ -1504,23 +1539,21 @@ impl Monitor {
             .lock()
             .unwrap()
             .get(tid)
-            .map(|entry| entry.status)
+            .map(FinalStatus::status)
     }
 
     fn remember_final(&self, tid: &TxId, observed: &Observation<TxLog>) {
         let Some(log) = observed.value() else {
             return;
         };
-        if !log.status.is_immutable() {
+        let Some(status) = FinalStatus::from_status(log.status) else {
             return;
-        }
-        self.inner.final_status.lock().unwrap().insert(
-            tid.clone(),
-            FinalStatus {
-                status: log.status,
-                watermark: observed.current_after(),
-            },
-        );
+        };
+        self.inner
+            .final_status
+            .lock()
+            .unwrap()
+            .insert(tid.clone(), status);
     }
 
     /// Records an exact durable observation in local owner state. Wounded is
@@ -1677,7 +1710,7 @@ impl Monitor {
             RemoteLivenessDecision::Owned(evidence) => Ok(evidence),
             RemoteLivenessDecision::Live => TxStatusEvidence::observed(status),
             RemoteLivenessDecision::Expired => {
-                let wounded = self.try_wound_observed(tid, &status.observation).await?;
+                let (wounded, _) = self.try_wound_observed(tid, &status.observation).await?;
                 TxStatusEvidence::observed(wounded)
             }
         }
@@ -1743,7 +1776,7 @@ impl Monitor {
             .commit_status_at(tid, self.current_requirement())
             .await?;
         if refreshed.observation.is_absent() {
-            let wounded = self.try_wound_observed(tid, &refreshed.observation).await?;
+            let (wounded, _) = self.try_wound_observed(tid, &refreshed.observation).await?;
             return TxStatusEvidence::observed(wounded);
         }
         match TxRecordState::try_from_observation(&refreshed.observation)? {
@@ -2279,17 +2312,26 @@ mod tests {
     }
 
     #[test]
+    fn final_status_rejects_statuses_that_can_change() {
+        for status in [
+            TxCommitStatus::Unknown,
+            TxCommitStatus::Pending,
+            TxCommitStatus::Wounded,
+        ] {
+            assert_eq!(FinalStatus::from_status(status), None);
+        }
+        for status in [TxCommitStatus::Ok, TxCommitStatus::Aborted] {
+            assert_eq!(FinalStatus::from_status(status).unwrap().status(), status);
+        }
+    }
+
+    #[test]
     fn final_status_cache_is_count_bounded_and_lru() {
-        let timeline = Timeline::new();
-        let watermark = timeline.now();
         let mut cache = FinalStatusCache::new(2);
         let first = TxId::from_bytes(b"first".to_vec());
         let second = TxId::from_bytes(b"second".to_vec());
         let third = TxId::from_bytes(b"third".to_vec());
-        let status = FinalStatus {
-            status: TxCommitStatus::Ok,
-            watermark,
-        };
+        let status = FinalStatus::Committed;
 
         cache.insert(first.clone(), status);
         cache.insert(second.clone(), status);
@@ -3017,7 +3059,9 @@ mod tests {
 
     #[tokio::test]
     async fn committed_value() {
-        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let operations = backend.log();
+        let b: Arc<dyn Backend> = Arc::new(backend);
         let (mon1, _t1) = new_test_monitor(b.clone());
         let (mon2, _t2) = new_test_monitor(b.clone());
         let key = logical_key(b"key");
@@ -3040,11 +3084,23 @@ mod tests {
         assert_eq!(cs.status, TxCommitStatus::Ok);
         assert_eq!(&*cs.value.value, b"val1");
 
+        operations.lock().unwrap().clear();
+        let cs = mon2
+            .committed_value_at(&key, &tx, mon2.current_requirement())
+            .await
+            .unwrap();
+        assert_eq!(&*cs.value.value, b"val1");
+        assert!(cs.cache_hit);
+
         // A key the transaction didn't write.
         let key2 = logical_key(b"key2");
         let cs = mon2.committed_value(&key2, &tx).await.unwrap();
         assert_eq!(cs.status, TxCommitStatus::Ok);
         assert!(cs.value.not_written);
+        assert!(
+            operations.lock().unwrap().is_empty(),
+            "cached immutable values need no backend request at a later bound"
+        );
     }
 
     #[tokio::test]
@@ -3136,7 +3192,11 @@ mod tests {
             .unwrap()
             .observation;
         assert_eq!(
-            mon.try_wound_observed(&tx, &observed).await.unwrap().status,
+            mon.try_wound_observed(&tx, &observed)
+                .await
+                .unwrap()
+                .0
+                .status,
             TxCommitStatus::Wounded
         );
         assert_eq!(mon.tx_status(&tx).await.unwrap(), TxCommitStatus::Wounded);
@@ -3365,6 +3425,7 @@ mod tests {
             mon.try_wound_observed(&tx, &committed)
                 .await
                 .unwrap()
+                .0
                 .status,
             TxCommitStatus::Ok
         );

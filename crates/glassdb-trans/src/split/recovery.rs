@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::mem;
+use std::sync::{Arc, Mutex};
 
 use glassdb_concurr::{RetryConfig, rt};
 use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, StructuralIntentId, TxId};
@@ -32,6 +33,7 @@ pub(super) struct StructuralRecovery {
     timeline: Timeline,
     db_root: DbRoot,
     retry: RetryConfig,
+    scan_cursor: Arc<Mutex<Option<glassdb_backend::ListCursor>>>,
 }
 
 /// Proves that one structural intent is still in its cancellable state.
@@ -81,6 +83,7 @@ enum RecoveryActionKind {
 struct SweepAction {
     scanned: bool,
     active: bool,
+    failed: bool,
     completed: bool,
     intents: VecDeque<(StructuralIntentId, Observation<StructuralIntent>)>,
     participants: VecDeque<(CollectionAddress, TxId)>,
@@ -104,7 +107,7 @@ enum ParentSplitState {
 
 /// Work that the split scheduler must perform before recovery can resume.
 pub(super) enum RecoveryStep {
-    Completed { active: bool },
+    Completed { active: bool, failed: bool },
     SplitParent { path: ObjectPath, participant: TxId },
 }
 
@@ -116,7 +119,6 @@ struct SweepFailure {
 
 /// One globally discovered batch and the participants represented in it.
 struct RecoverySweep {
-    active: bool,
     intents: Vec<(StructuralIntentId, Observation<StructuralIntent>)>,
     participants: BTreeSet<(CollectionAddress, TxId)>,
 }
@@ -291,6 +293,7 @@ impl StructuralRecovery {
             timeline,
             db_root,
             retry,
+            scan_cursor: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -392,12 +395,18 @@ impl StructuralRecovery {
         }
     }
 
-    /// Starts one background sweep of all unresolved structural intents.
+    /// Reports whether a structural-intent traversal remains incomplete.
+    pub(super) fn has_continuation(&self) -> bool {
+        self.scan_cursor.lock().unwrap().is_some()
+    }
+
+    /// Starts one bounded background sweep of unresolved structural intents.
     pub(super) fn begin_sweep(&self) -> RecoveryAction {
         RecoveryAction {
             kind: RecoveryActionKind::Sweep(SweepAction {
                 scanned: false,
                 active: false,
+                failed: false,
                 completed: false,
                 intents: VecDeque::new(),
                 participants: VecDeque::new(),
@@ -477,6 +486,7 @@ impl StructuralRecovery {
         if sweep.completed {
             return Ok(RecoveryStep::Completed {
                 active: sweep.active,
+                failed: sweep.failed,
             });
         }
         if parent_result.is_some() && sweep.intent.is_none() {
@@ -487,7 +497,6 @@ impl StructuralRecovery {
         if !sweep.scanned {
             let discovered = self.scan().await?;
             sweep.scanned = true;
-            sweep.active = discovered.active;
             sweep.intents = discovered.intents.into();
             sweep.participants = discovered.participants.into_iter().collect();
         }
@@ -504,6 +513,7 @@ impl StructuralRecovery {
                     participant,
                     error,
                 }) => {
+                    sweep.failed |= !matches!(error, TransError::Retry);
                     tracing::debug!(
                         target: "glassdb::splitter",
                         intent = ?intent,
@@ -526,6 +536,7 @@ impl StructuralRecovery {
         if let Some(intent) = sweep.intent.as_mut() {
             match self.advance_intent(intent, parent_result).await {
                 Ok(IntentRecoveryStep::Completed) => {
+                    sweep.active = true;
                     sweep.intent = None;
                     if sweep.settlement.is_none() {
                         sweep.intent_id = None;
@@ -606,6 +617,7 @@ impl StructuralRecovery {
         sweep.completed = true;
         Ok(Some(RecoveryStep::Completed {
             active: sweep.active,
+            failed: sweep.failed,
         }))
     }
 
@@ -616,7 +628,10 @@ impl StructuralRecovery {
         mut parent_result: Option<Result<(), TransError>>,
     ) -> Result<RecoveryStep, TransError> {
         if action.completed {
-            return Ok(RecoveryStep::Completed { active: false });
+            return Ok(RecoveryStep::Completed {
+                active: false,
+                failed: false,
+            });
         }
         if parent_result.is_some() && action.intent.is_none() {
             return Err(TransError::other(
@@ -641,7 +656,10 @@ impl StructuralRecovery {
             match self.advance_participant(&mut action.settlement).await? {
                 ParticipantSettlementStep::Completed => {
                     action.completed = true;
-                    return Ok(RecoveryStep::Completed { active: false });
+                    return Ok(RecoveryStep::Completed {
+                        active: false,
+                        failed: false,
+                    });
                 }
                 ParticipantSettlementStep::Recover(observed) => {
                     action.intent = Some(Self::begin_intent(observed));
@@ -655,18 +673,27 @@ impl StructuralRecovery {
         // one sweep epoch for intent discovery; each intent's own freshness
         // then gates its source fencing and reachability.
         let recovery_start = Requirement::AtLeast(self.timeline.now());
-        let intents = self
+        let cursor = self.scan_cursor.lock().unwrap().clone();
+        let page = match self
             .intent_store
-            .list(&self.db_root, recovery_start)
-            .await?;
-        let active = !intents.is_empty();
+            .scan_page(&self.db_root, cursor.as_ref(), recovery_start)
+            .await
+        {
+            Ok(page) => page,
+            Err(StorageError::InvalidCursor) => {
+                *self.scan_cursor.lock().unwrap() = None;
+                return Err(StorageError::InvalidCursor);
+            }
+            Err(error) => return Err(error),
+        };
+        *self.scan_cursor.lock().unwrap() = page.next;
+        let intents = page.intents;
         let participants = intents
             .iter()
             .filter_map(|(_, observed)| observed.value())
             .map(|intent| (intent.collection.clone(), intent.participant_id.clone()))
             .collect();
         Ok(RecoverySweep {
-            active,
             intents,
             participants,
         })

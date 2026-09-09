@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted — not yet implemented.
+Accepted — implemented.
 
 Refines GC scheduling in
 [ADR-022](022-garbage-collection-mark-sweep.md), transaction-object placement and
