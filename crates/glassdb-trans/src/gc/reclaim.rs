@@ -18,8 +18,8 @@
 //! `{db}/_t/{a}/{b}/{encoded-txid}`. This file owns candidate filtering,
 //! reference checks, and reclamation.
 //!
-//! GC filters candidates by durable status and the safety horizon, using Monitor
-//! to pin expired pending transactions as wounded before reclaiming their effects.
+//! GC skips missing and pending logs without resolving them (ADR-071). It filters
+//! final candidates by durable status and the safety horizon.
 //! The GC scheduler then captures a new reference-check requirement. This order
 //! prevents cached absence from before eligibility from authorizing deletion.
 //! A wounded marker remains pinned until its owner acknowledges retirement;
@@ -41,14 +41,11 @@ use glassdb_storage::{Observation, Requirement, StorageError};
 
 use super::Gc;
 use crate::error::TransError;
-use crate::monitor::Monitor;
+use crate::monitor::ProtocolTiming;
 
 /// Whether a transaction's durable state permits reclamation of its effects.
 pub(super) enum GcEligibility {
-    Ready {
-        observation: Observation<TxLog>,
-        changed: bool,
-    },
+    Ready(Observation<TxLog>),
     Deferred(Duration),
     Retained,
 }
@@ -67,10 +64,10 @@ struct Reclamation {
     changed: bool,
 }
 
-/// Resolves a GC candidate's durable state and safety horizon.
+/// Selects candidates whose durable state and safety horizon permit reclamation.
 pub(super) async fn filter_candidate(
     tl: &TLogger,
-    mon: &Monitor,
+    timing: ProtocolTiming,
     tid: &TxId,
     requirement: Requirement,
 ) -> Result<GcEligibility, TransError> {
@@ -79,39 +76,18 @@ pub(super) async fn filter_candidate(
     // create a wound marker merely because a scan or hint named an ID.
     let status = tl.commit_status_at(tid, requirement).await?;
     match TxRecordState::try_from_observation(&status.observation)? {
-        TxRecordState::Missing => return Ok(GcEligibility::Retained),
-        TxRecordState::Wounded => {
-            return Ok(GcEligibility::Ready {
-                observation: status.observation,
-                changed: false,
-            });
-        }
-        _ => {}
+        TxRecordState::Missing | TxRecordState::Pending => return Ok(GcEligibility::Retained),
+        TxRecordState::Wounded => return Ok(GcEligibility::Ready(status.observation)),
+        TxRecordState::Committed | TxRecordState::Aborted => {}
     }
     let now = rt::system_now();
-    if !mon.protocol_timing().is_expired(status.last_update, now) {
-        let due = status.last_update
-            + mon.protocol_timing().max_clock_skew()
-            + mon.protocol_timing().pending_timeout();
+    if !timing.is_expired(status.last_update, now) {
+        let due = status.last_update + timing.max_clock_skew() + timing.pending_timeout();
         return Ok(GcEligibility::Deferred(
             due.duration_since(now).unwrap_or_default() + Duration::from_nanos(1),
         ));
     }
-    if status.status == TxCommitStatus::Pending {
-        let (wounded, changed) = mon.try_wound_observed(tid, &status.observation).await?;
-        // A winning commit or refresh invalidates the expiry decision.
-        if wounded.status != TxCommitStatus::Wounded {
-            return Ok(GcEligibility::Retained);
-        }
-        return Ok(GcEligibility::Ready {
-            observation: wounded.observation,
-            changed,
-        });
-    }
-    Ok(GcEligibility::Ready {
-        observation: status.observation,
-        changed: false,
-    })
+    Ok(GcEligibility::Ready(status.observation))
 }
 
 impl GcOutcome {

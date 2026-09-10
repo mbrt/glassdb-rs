@@ -561,9 +561,8 @@ impl DormantEngine {
             timeline.clone(),
             locker.clone(),
             collection_lifecycle.clone(),
-            monitor.clone(),
+            monitor.protocol_timing(),
             cleanup_hints.clone(),
-            monitor.protocol_timing().pending_timeout(),
         );
         let collection_commit = CollectionCommit::new(
             collection_catalog.clone(),

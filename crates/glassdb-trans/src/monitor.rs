@@ -973,7 +973,7 @@ impl Monitor {
 
     /// Conditionally pins an exact foreign transaction observation as wounded.
     /// The boolean reports a confirmed state change made by this call.
-    pub(crate) async fn try_wound_observed(
+    async fn try_wound_observed(
         &self,
         tid: &TxId,
         expected: &Observation<TxLog>,

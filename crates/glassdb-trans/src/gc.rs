@@ -20,7 +20,7 @@ use tokio::sync::Notify;
 
 use crate::collections::CollectionLifecycle;
 use crate::error::TransError;
-use crate::monitor::Monitor;
+use crate::monitor::ProtocolTiming;
 use crate::tlocker::Locker;
 use reclaim::{GcEligibility, GcOutcome};
 use scan::{GcScan, PAGE_SIZE};
@@ -187,10 +187,9 @@ pub(crate) struct Gc {
     collection_lifecycle: CollectionLifecycle,
     router: TreeRouter,
     locker: Locker,
-    mon: Monitor,
+    timing: ProtocolTiming,
     timeline: Timeline,
     hints: GcHints,
-    retry_delay: Duration,
 }
 
 impl Gc {
@@ -203,9 +202,8 @@ impl Gc {
         timeline: Timeline,
         locker: Locker,
         collection_lifecycle: CollectionLifecycle,
-        mon: Monitor,
+        timing: ProtocolTiming,
         hints: GcHints,
-        retry_delay: Duration,
     ) -> Self {
         Self {
             tl,
@@ -213,10 +211,9 @@ impl Gc {
             collection_lifecycle,
             router: TreeRouter::new(nodes, std::num::NonZeroUsize::MIN),
             locker,
-            mon,
+            timing,
             timeline,
             hints,
-            retry_delay,
         }
     }
 
@@ -236,7 +233,7 @@ impl Gc {
     async fn run(self) {
         let tl = self.tl.clone();
         let hints = self.hints.clone();
-        let retry_delay = self.retry_delay;
+        let retry_delay = self.timing.pending_timeout();
         let gc = self;
         let counters = hints.counters.clone();
         let mut scan = Some(GcScan::new(tl, counters.clone(), retry_delay));
@@ -282,11 +279,11 @@ impl Gc {
                     break;
                 };
                 let tl = gc.tl.clone();
-                let mon = gc.mon.clone();
+                let timing = gc.timing;
                 filters.push(
                     async move {
                         let result =
-                            reclaim::filter_candidate(&tl, &mon, &tid, status_requirement).await;
+                            reclaim::filter_candidate(&tl, timing, &tid, status_requirement).await;
                         (tid, result)
                     }
                     .boxed(),
@@ -351,10 +348,8 @@ impl Gc {
                         let gc = gc.clone();
                         checks.push(async move {
                             let result = match result {
-                                Ok(GcEligibility::Ready { observation, changed }) => {
-                                    gc.check_candidate(&tid, &observation, requirement).await.map(|outcome| {
-                                        if changed { GcOutcome::Progress } else { outcome }
-                                    })
+                                Ok(GcEligibility::Ready(observation)) => {
+                                    gc.check_candidate(&tid, &observation, requirement).await
                                 }
                                 Ok(GcEligibility::Deferred(delay)) => Ok(GcOutcome::Deferred(delay)),
                                 Ok(GcEligibility::Retained) => Ok(GcOutcome::Retained),

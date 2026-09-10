@@ -4,6 +4,7 @@ use crate::collections::TopologySettler;
 use crate::engine::{AssemblyFixture, EngineConfig};
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{LeafCoordinator, SplitHinter};
+use crate::monitor::Monitor;
 use crate::tlocker::LockOutcome;
 use async_trait::async_trait;
 use glassdb_backend as backend;
@@ -203,9 +204,13 @@ async fn new_ctx_with(backend: Arc<dyn Backend>) -> Ctx {
     new_ctx_with_interval(backend, Duration::from_secs(15)).await
 }
 
-async fn new_ctx_with_interval(backend: Arc<dyn Backend>, retry_delay: Duration) -> Ctx {
+async fn new_ctx_with_interval(backend: Arc<dyn Backend>, pending_timeout: Duration) -> Ctx {
     let mut config = EngineConfig::default();
     config.set_cache_size(1 << 20);
+    config.set_protocol_timing(ProtocolTiming::new(
+        pending_timeout,
+        ProtocolTiming::default().max_clock_skew(),
+    ));
     let foundation = AssemblyFixture::new(backend, DbRoot::try_from("db").unwrap(), &config);
     let tl = foundation.tlogger.clone();
     let records = foundation.records.clone();
@@ -263,9 +268,8 @@ async fn new_ctx_with_interval(backend: Arc<dyn Backend>, retry_delay: Duration)
             RetryConfig::default(),
             Arc::new(UnexpectedTopologySettler),
         ),
-        mon.clone(),
+        mon.protocol_timing(),
         hints.clone(),
-        retry_delay,
     );
     Ctx {
         gc,
@@ -366,23 +370,15 @@ async fn is_gone(tl: &TLogger, id: &TxId) -> bool {
 async fn check_candidate(gc: &Gc, tid: &TxId) -> Result<GcOutcome, TransError> {
     let status = reclaim::filter_candidate(
         &gc.tl,
-        &gc.mon,
+        gc.timing,
         tid,
         Requirement::AtLeast(gc.timeline.now()),
     )
     .await?;
     let requirement = Requirement::AtLeast(gc.timeline.now());
     match status {
-        GcEligibility::Ready {
-            observation,
-            changed,
-        } => {
-            let outcome = gc.check_candidate(tid, &observation, requirement).await?;
-            Ok(if changed {
-                GcOutcome::Progress
-            } else {
-                outcome
-            })
+        GcEligibility::Ready(observation) => {
+            gc.check_candidate(tid, &observation, requirement).await
         }
         GcEligibility::Deferred(delay) => Ok(GcOutcome::Deferred(delay)),
         GcEligibility::Retained => Ok(GcOutcome::Retained),
@@ -781,33 +777,63 @@ async fn committed_membership_lock_is_released_before_deletion() {
     assert_eq!(ctx.coord.stats_and_reset().submissions, 1);
 }
 
-// A recent pending object (within the safety horizon) is kept: it may be a
-// live transaction whose lock this non-atomic check cannot yet rule out.
 #[tokio::test(start_paused = true)]
-async fn recent_pending_is_kept() {
-    let ctx = new_ctx().await;
-    let t = tx(1);
-    let mut log = TxLog::new(t.clone(), TxCommitStatus::Pending);
-    log.timestamp = Some(base());
-    log.locks = vec![write_lock(b"k")];
-    ctx.tl.set(&log).await.unwrap();
-    store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
-    ctx.hints.schedule(t.clone());
+async fn pending_candidates_keep_their_locks_without_writes_or_retries() {
+    for age in [Duration::ZERO, PAST_HORIZON] {
+        let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let operations = backend.log();
+        let ctx = new_ctx_with(Arc::new(backend)).await;
+        let id = tx(1);
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Pending);
+        log.timestamp = Some(base() - age);
+        log.locks = vec![write_lock(b"k")];
+        ctx.tl.set(&log).await.unwrap();
+        store_entry(&ctx, b"k", locked_entry(b"k", &id)).await;
+        operations.lock().unwrap().clear();
 
-    run_once(&ctx).await;
+        let background = Background::new();
+        ctx.gc.start(&background);
+        ctx.hints.schedule(id.clone());
+        for _ in 0..64 {
+            rt::yield_now().await;
+        }
+        background.shutdown().await;
 
-    let got = ctx.tl.get_at(&t, Requirement::Any).await.unwrap();
-    let got = got.value().unwrap();
-    assert_eq!(got.status, TxCommitStatus::Pending);
-    // Its lock is untouched.
-    let e = lookup_entry(&ctx, b"k").await.unwrap();
-    assert_eq!(e.lock_holders(), std::slice::from_ref(&t));
+        let path = ObjectPath::Transaction {
+            db_root: DbRoot::try_from("db").unwrap(),
+            id: id.clone(),
+        }
+        .to_string();
+        {
+            let operations = operations.lock().unwrap();
+            assert!(!operations.is_empty(), "GC must check the hinted candidate");
+            assert!(
+                operations
+                    .iter()
+                    .all(|op| { op.path == path && matches!(op.op, "read" | "read_if_modified") }),
+                "a pending candidate must only read its log"
+            );
+        }
+        let stats = ctx.gc.stats_and_reset();
+        assert_eq!(stats.progress, 0);
+        assert_eq!(stats.failures, 0);
+        let diagnostics = ctx.gc.diagnostics();
+        assert_eq!(diagnostics.ready, 0);
+        assert_eq!(diagnostics.deferred, 0);
+        assert_eq!(diagnostics.in_flight, 0);
+        let got = ctx.tl.get_at(&id, Requirement::Any).await.unwrap();
+        assert_eq!(got.value().unwrap().status, TxCommitStatus::Pending);
+        assert_eq!(
+            lookup_entry(&ctx, b"k").await.unwrap().lock_holders(),
+            std::slice::from_ref(&id)
+        );
+    }
 }
 
-// A dead pending object past the horizon is pinned as wounded and its locks
-// are released. No Database instance may delete it before owner acknowledgement.
+// Monitor establishes the wound before GC can reclaim aborted effects.
+// No Database instance may delete the marker before owner acknowledgement.
 #[tokio::test(start_paused = true)]
-async fn dead_pending_is_wounded_and_locks_released() {
+async fn monitor_wounds_pending_before_gc_releases_locks() {
     let ctx = new_ctx().await;
     let t = tx(1);
     let mut log = TxLog::new(t.clone(), TxCommitStatus::Pending);
@@ -816,6 +842,17 @@ async fn dead_pending_is_wounded_and_locks_released() {
     ctx.tl.set(&log).await.unwrap();
     store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
 
+    assert_eq!(
+        check_candidate(&ctx.gc, &t).await.unwrap(),
+        GcOutcome::Retained
+    );
+    assert_eq!(
+        ctx.mon
+            .tx_status_at(&t, Requirement::AtLeast(ctx.timeline.now()))
+            .await
+            .unwrap(),
+        TxCommitStatus::Wounded
+    );
     ctx.hints.schedule(t.clone());
     run_once(&ctx).await;
 
