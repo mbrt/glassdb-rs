@@ -155,7 +155,11 @@ class PerfReportTest(unittest.TestCase):
             self.timing_pair(repetition, 100, after)
         report = self.report()
         self.assertNotIn("| Metric", report)
-        self.assertIn("95% simultaneous interval", report)
+        self.assertRegex(
+            report,
+            r"example: mean group time: noisy or inconclusive\s*"
+            r"\[-\d+\.\d+%, \+\d+\.\d+%\]",
+        )
         self.assertIn("No conclusive changes", report)
         self.assertNotIn("No meaningful changes detected", report)
 

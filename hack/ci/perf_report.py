@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
-
 MIXED_SHAPES = ("rwSingle", "rwMany", "roSingle", "roMulti")
 MIXED_METRICS = (
     ("meanMs", "model ms/tx", "time"),
@@ -347,11 +346,7 @@ def render_report(root: Path, base_label: str, candidate_label: str) -> str:
             else "—"
         )
         if comparison.uncertain:
-            detail = (
-                f" (paired change {comparison.relative:+.1%}; 95% simultaneous interval {interval})"
-                if comparison.interval is not None
-                else ""
-            )
+            detail = f" {interval}" if comparison.interval is not None else ""
             warnings.append(f"{name}: noisy or inconclusive{detail}")
         if not comparison.report:
             continue
@@ -397,12 +392,12 @@ def render_report(root: Path, base_label: str, candidate_label: str) -> str:
         lines += [
             "## Measurement warnings",
             "",
+            "Timing ranges are simultaneous 95% confidence intervals for the change.",
+            "",
             *[f"- {escape(warning)}" for warning in sorted(set(warnings))],
             "",
         ]
     lines += [
-        "Timing/rate changes use paired process measurements; a regression or improvement requires an estimated change of at least 1% and a 95% simultaneous interval that excludes zero. Bonferroni correction covers all planned timing/rate comparisons. Criterion bootstrap standard errors set a floor on uncertainty. Cost changes have no percentage cutoff.",
-        "",
         "Full results and logs are retained as artifacts.",
         "",
     ]
