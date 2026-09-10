@@ -351,6 +351,11 @@ impl Gc {
         .await;
         // All candidates must be eligible before this shared reference bound.
         let requirement = Requirement::AtLeast(self.timeline.now());
+        // The fresh requirement forces all caches to be invalidated. There
+        // might be writers are refreshing leaves concurrently anyway, so let's
+        // give them a chance by yielding now. This has no downside, as GC work
+        // is always in the background and there's no hurry.
+        rt::yield_now().await;
         map_all_bounded(filtered, limit, |(tid, result)| async move {
             let result = match result {
                 Ok(GcEligibility::Ready(observation)) => {

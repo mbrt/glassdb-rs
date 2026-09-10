@@ -1226,6 +1226,42 @@ async fn concurrent_candidates_share_one_leaf_validation() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn reference_checks_reuse_a_concurrent_writer_observation() {
+    let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+    let operations = backend.log();
+    let ctx = new_ctx_with(Arc::new(backend)).await;
+    let id = tx(1);
+    ctx.tl
+        .set(&committed(id.clone(), PAST_HORIZON, &[b"k"], &[b"k"]))
+        .await
+        .unwrap();
+    store_entry(&ctx, b"k", writer_entry(b"k", &tx(2))).await;
+    operations.lock().unwrap().clear();
+
+    // Poll GC first so the writer refreshes the leaf after the reference bound.
+    let (outcomes, ()) = tokio::join!(
+        biased;
+        ctx.gc.clone().check_batch(vec![id.clone()], NonZeroUsize::MIN),
+        store_entry(&ctx, b"k", writer_entry(b"k", &tx(3))),
+    );
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Reclaimed);
+    assert!(is_gone(&ctx.tl, &id).await);
+    let root = root_path().to_string();
+    assert_eq!(
+        operations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| op.path == root && matches!(op.op, "read" | "read_if_modified"))
+            .count(),
+        1,
+        "GC must reuse the writer's observation without another leaf read"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn reference_checks_follow_candidate_filtering() {
     let backend = Arc::new(MemoryBackend::new());
     let hooked = HookBackend::new(backend.clone());
