@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import re
 import shutil
@@ -20,8 +21,11 @@ if __package__:
 else:
     import perf_report
 
-REPETITIONS = 3
-RUNTIME_LIMIT = 270
+REPETITIONS = 4
+DIAGNOSTIC_REPETITIONS = 8
+# Eight diagnostic pairs preserve sensitivity after multiple-comparison
+# correction. Include fixture preparation and shutdown in the runtime budget.
+RUNTIME_LIMIT = 600
 CASES = (
     "warm_read",
     "warm_read_external",
@@ -168,6 +172,7 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
     manifest = {
         "schemaVersion": 1,
         "repetitions": REPETITIONS,
+        "diagnosticRepetitions": DIAGNOSTIC_REPETITIONS,
         "cases": CASES,
         "mixedArgs": MIXED_ARGS,
         "runtimeLimitSeconds": RUNTIME_LIMIT,
@@ -198,54 +203,103 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
 
 
 def measure(output: Path, manifest: dict) -> None:
+    for side in ("main", "pr"):
+        if (output / side).exists():
+            raise FileExistsError(
+                f"measurement directory already exists: {output / side}"
+            )
     start = time.monotonic()
+    manifest["platform"] = platform.platform()
+    manifest["cpuModel"] = platform.processor()
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.exists():
+        manifest["cpuModel"] = next(
+            (
+                line.split(":", 1)[1].strip()
+                for line in cpuinfo.read_text().splitlines()
+                if line.startswith("model name")
+            ),
+            manifest["cpuModel"],
+        )
+    if hasattr(os, "sched_getaffinity"):
+        manifest["cpuAffinity"] = sorted(os.sched_getaffinity(0))
+
+    def run(side, repetition, name, command):
+        directory = output / side / f"{repetition:02d}"
+        directory.mkdir(parents=True, exist_ok=True)
+        remaining = manifest["runtimeLimitSeconds"] - (time.monotonic() - start)
+        if remaining <= 0:
+            raise TimeoutError("comparison runtime budget exhausted")
+        print(f"{side} repetition {repetition}: {name}", flush=True)
+        with (directory / f"{name}.log").open("w") as log:
+            subprocess.run(
+                command,
+                cwd=directory,
+                env={**os.environ, "CRITERION_HOME": str(directory / "criterion")},
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=remaining,
+                check=True,
+            )
+        return directory
+
+    def sides(repetition, case_index=0):
+        return ("main", "pr") if (repetition + case_index) % 2 else ("pr", "main")
+
     try:
-        for repetition in range(1, manifest["repetitions"] + 1):
-            sides = ("main", "pr") if repetition % 2 else ("pr", "main")
-            for side in sides:
-                directory = output / side / f"{repetition:02d}"
-                directory.mkdir(parents=True, exist_ok=False)
-                env = {
-                    **os.environ,
-                    "CRITERION_HOME": str(directory / "criterion"),
-                }
-                commands = [
-                    (
-                        "criterion",
+        # Keep each case's pair close in time. Running whole suites (and mixed
+        # workloads) between the two measurements confounds the ratio with host drift.
+        for repetition in range(
+            1, manifest.get("diagnosticRepetitions", manifest["repetitions"]) + 1
+        ):
+            costs = {side: [] for side in ("main", "pr")}
+            for index, case in enumerate(manifest["cases"]):
+                for side in sides(repetition, index):
+                    directory = run(
+                        side,
+                        repetition,
+                        f"criterion-{case}",
                         [
                             manifest[side]["diagnostics"],
                             "--bench",
                             "--noplot",
+                            f"^diagnostic/{re.escape(case)}$",
                         ],
-                    ),
-                    (
-                        "mixed",
-                        [
-                            manifest[side]["perfbench"],
-                            "--output",
-                            str(directory / "mixed.json"),
-                            *manifest["mixedArgs"],
-                        ],
-                    ),
-                ]
-                for name, command in commands:
-                    remaining = manifest["runtimeLimitSeconds"] - (
-                        time.monotonic() - start
                     )
-                    if remaining <= 0:
-                        raise TimeoutError("comparison runtime budget exhausted")
-                    print(f"{side} repetition {repetition}: {name}", flush=True)
-                    with (directory / f"{name}.log").open("w") as log:
-                        subprocess.run(
-                            command,
-                            cwd=directory,
-                            env=env,
-                            stdout=log,
-                            stderr=subprocess.STDOUT,
-                            timeout=remaining,
-                            check=True,
+                    record = perf_report.read_costs(directory / f"criterion-{case}.log")
+                    try:
+                        valid = record["schemaVersion"] == 1 and [
+                            row["name"] for row in record["cases"]
+                        ] == [case]
+                    except (KeyError, TypeError) as error:
+                        raise perf_report.ReportError(
+                            f"invalid cost record for {side}/{case}: {error}"
+                        ) from error
+                    if not valid:
+                        raise perf_report.ReportError(
+                            f"unexpected cost case for {side}/{case}"
                         )
-    except (subprocess.SubprocessError, TimeoutError) as error:
+                    costs[side].extend(record["cases"])
+                    # Preserve completed cost rows even if a later case fails.
+                    (directory / "criterion.log").write_text(
+                        "diagnostic-costs: "
+                        + json.dumps({"schemaVersion": 1, "cases": costs[side]})
+                        + "\n"
+                    )
+        for repetition in range(1, manifest["repetitions"] + 1):
+            for side in sides(repetition):
+                run(
+                    side,
+                    repetition,
+                    "mixed",
+                    [
+                        manifest[side]["perfbench"],
+                        "--output",
+                        str(output / side / f"{repetition:02d}" / "mixed.json"),
+                        *manifest["mixedArgs"],
+                    ],
+                )
+    except (subprocess.SubprocessError, TimeoutError, perf_report.ReportError) as error:
         manifest["warnings"].append(
             f"Measurement failed: {error}. See the per-run logs."
         )

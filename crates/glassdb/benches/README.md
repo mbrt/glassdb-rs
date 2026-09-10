@@ -58,6 +58,9 @@ does not instrument Criterion timing. Requests, successful read-body bytes,
 attempted write-body bytes, and coordinator counters are normalized by the
 number of completed transactions (90 for the concurrent case).
 The engine counts DELETE requests as writes; they add no write-body bytes.
+This short pass can finish before the GC safety horizon. The longer timed
+workload can include reclamation on the same runtime thread as writers, so
+unchanged cost rows do not establish unchanged GC work in the timing window.
 
 Workload, shutdown, and combined windows are separate. Fresh-client reads
 close their client after each measured read; other cases close after the pass.
@@ -85,4 +88,9 @@ private `estimates.json` format with validation; verify the reader when upgradin
 
 Use a comparison of unchanged engine code to check noise before interpreting
 small changes. Full artifacts are retained even when the report hides unchanged
-rows. Three paired runs are an initial budget, not proof of statistical power.
+rows. CI measures each diagnostic case in eight back-to-back process pairs,
+with balanced revision order. The report uses variation between pairs to
+test statistical significance separately from the 1% effect threshold, with
+Bonferroni correction across the planned timing metrics. The two-second
+measurement window, model clock, and background work remain part of the workload.
+Eight pairs are a bounded sample, not proof of statistical power.

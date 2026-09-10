@@ -47,8 +47,8 @@ jobs:
         --output "$PERF_RESULTS" --build-only
 
     - name: Measure paired diagnostics and mixed workload
-      timeout-minutes: 5
-      # The driver enforces a 270-second runtime budget, excluding compilation.
+      timeout-minutes: 11
+      # The driver enforces a 600-second runtime budget, excluding compilation.
       run: python3 hack/ci/perf_compare.py --output "$PERF_RESULTS" --run-only
 
     - name: Render job summary

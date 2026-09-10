@@ -340,7 +340,7 @@ fn benches(c: &mut Criterion) {
         .sampling_mode(SamplingMode::Flat)
         .warm_up_time(Duration::from_millis(500))
         .measurement_time(Duration::from_secs(2))
-        .noise_threshold(0.05);
+        .noise_threshold(0.01);
     for case in CASES {
         let mut fixture = None;
         group.throughput(Throughput::Elements(case.transactions()));

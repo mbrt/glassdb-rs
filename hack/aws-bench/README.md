@@ -144,14 +144,38 @@ BASE=main TARGET=my-branch OUT=/tmp/glassdb-comparison \
 The output directory must be new. By default it is a timestamped directory
 under `target/performance/results`. It contains `report.md`, a manifest, raw
 Criterion estimates, mixed results, and logs containing the cost snapshots.
-Three paired runs alternate revision order. Runtime, including preparation and shutdown,
-is limited to 270 seconds; compilation is separate.
+Each diagnostic case has eight process pairs, with the two revisions run
+back-to-back and each revision first four times. The mixed workload has four balanced pairs.
+Runtime, including preparation and shutdown, is limited to 600 seconds;
+compilation is separate. The manifest records the host platform, CPU model,
+and available CPU affinity.
 
 See [diagnostic definitions](../../crates/glassdb/benches/README.md). The report
-shows timing/throughput changes of at least 5% only when the observed ranges
-are separated. Criterion ranges include its mean confidence intervals.
+uses the mean of paired log ratios for timing/throughput changes. Its simultaneous 95%
+Student-t interval uses variation between process pairs, with one observation
+per pair; Criterion samples within one process are not independent repetitions.
+Bonferroni correction covers every planned timing/rate comparison, including
+missing measurements: eight diagnostic means plus three metrics for each of
+four mixed shapes. The 95% confidence level applies to the whole family, which
+limits false alarms when many metrics are inspected. See
+[NIST's Bonferroni method](https://www.itl.nist.gov/div898/handbook/prc/section4/prc463.htm).
+A regression or improvement requires an estimated change of at least 1%
+and a repeat interval that excludes zero. Criterion's bootstrap standard errors
+set a floor on the interval's variance: the log standard error is approximated
+by `standard_error / mean`, and independent process variances propagate through
+the paired mean. Taking the larger of this variance and the observed paired
+variance avoids counting sampling noise twice. This can widen the ordinary
+paired interval, but cannot narrow it. Individual process intervals may overlap
+while the combined result is significant. An interval wholly within ±1%
+resolves a small effect; other unreported effects remain inconclusive.
+The repeat interval assumes approximately normal,
+independent log ratios; it is an estimate of
+repeatability on this host, not a guarantee across hosts. See the
+[NIST guidance on paired comparisons](https://www.itl.nist.gov/div898/handbook/eda/section3/eda353.htm).
 Backend request/body-byte changes have no percentage cutoff, but must also be
-repeatable. Missing, failed, or unreliable measurements produce warnings.
+repeatable. Unresolved effects are reported as inconclusive,
+including when the estimated change is below 1%. Missing or failed measurements
+also produce warnings; these are not reported as evidence of no change.
 Numeric regressions do not fail CI.
 
 The short mixed preset runs one Database with one worker per shape, 128 keys,
