@@ -588,59 +588,21 @@ impl Gc {
         Ok(false)
     }
 
-    /// Releases `tid` from every leaf its recorded `locks` name, grouping the
-    /// paths by descent so each leaf is visited once (targeted pruning, never a
-    /// whole-key-space scan). Each release flows through the locker's
-    /// coordinator-backed unlock method (ADR-029) — one deduplicated fold round
-    /// per object that clears `tid` and drops any entry it thereby leaves
-    /// vestigial — so GC issues no leaf CAS of its own. `current_writer` is
-    /// never touched.
+    /// Reclaims recorded locks while retaining unresolved structural recovery.
     async fn release_locks(
         &self,
         tid: &TxId,
         locks: &[TxLock],
         requirement: Requirement,
     ) -> Result<Reclamation, TransError> {
-        let mut changed = false;
-        let mut key_locks: Vec<(LogicalKey, ())> = Vec::new();
-        let mut leaf_paths = BTreeSet::new();
-        let mut topology = BTreeSet::new();
-        for lock in locks {
-            match lock {
-                TxLock::Entry { key, .. } => key_locks.push((key.clone(), ())),
-                TxLock::Membership { leaf, .. } => {
-                    leaf_paths.insert(leaf.object_path());
-                }
-                TxLock::Directory { .. } => {}
-                TxLock::Topology { collection } => {
-                    topology.insert(collection.clone());
-                }
-            }
-        }
-        let mut by_collection = std::collections::BTreeMap::new();
-        for (key, ()) in key_locks {
-            by_collection
-                .entry(key.collection().clone())
-                .or_insert_with(Vec::new)
-                .push((key, ()));
-        }
-        for items in by_collection.into_values() {
-            match self
-                .router
-                .route_keys_with_requirements(items, requirement, requirement)
-                .await
-            {
-                Ok(groups) => {
-                    leaf_paths.extend(groups.into_iter().map(|group| group.path().clone()));
-                }
-                Err(StorageError::NotFound | StorageError::StaleCollection) => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        for path in leaf_paths {
-            changed |= self.locker.keys().release_leaf(tid, &path).await?;
-        }
-        changed |= self.locker.collections().release(tid, locks).await?;
+        let mut changed = self.locker.release(tid, locks, requirement).await?;
+        let topology: BTreeSet<_> = locks
+            .iter()
+            .filter_map(|lock| match lock {
+                TxLock::Topology { collection } => Some(collection),
+                _ => None,
+            })
+            .collect();
         for collection in topology {
             let records = self
                 .structural_intents
@@ -655,7 +617,7 @@ impl Gc {
             changed |= self
                 .locker
                 .collections()
-                .release_topology_participant(&collection, tid)
+                .release_topology_participant(collection, tid)
                 .await?;
         }
         Ok(Reclamation {

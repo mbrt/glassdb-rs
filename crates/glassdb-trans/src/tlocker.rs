@@ -25,7 +25,7 @@
 //! lowest contended leaf and exactly one wins it (first-CAS-wins), guaranteeing
 //! progress where the parallel path could livelock.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::ops::{AddAssign, Sub};
 use std::sync::Arc;
@@ -33,12 +33,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use glassdb_concurr::{RetryConfig, join_all_bounded, rt};
+use glassdb_concurr::{RetryConfig, join_all_bounded, map_all_bounded, rt};
 use glassdb_data::{LeafRef, LogicalKey, ObjectPath, TxId};
 use glassdb_storage::transaction::TxLock;
 use glassdb_storage::{
     CurrentState, EntryLockState, LeafEntry, LeafObservation, LockType, NodeLocks, Requirement,
-    TreeRouter,
+    StorageError, TreeRouter,
 };
 
 use crate::access::{AccessSet, WriteOp};
@@ -961,13 +961,29 @@ impl Locker {
     ) -> Self {
         Locker {
             keys: KeyLocker::new(coord, router, tmon.clone(), retry, parallelism),
-            collections: CollectionLocker::new(collection_state),
+            collections: CollectionLocker::new(collection_state, parallelism),
         }
     }
 
     /// Returns and resets distributed-locker activity counters.
     pub fn stats_and_reset(&self) -> LockerStats {
         self.keys.stats_and_reset()
+    }
+
+    /// Releases recorded entry, membership, and directory locks held by `id`.
+    ///
+    /// The caller must establish that these locks can be released safely.
+    /// Topology participants require separate structural recovery checks and
+    /// are left in place. Returns whether any recorded lock was removed.
+    pub(crate) async fn release(
+        &self,
+        id: &TxId,
+        locks: &[TxLock],
+        requirement: Requirement,
+    ) -> Result<bool, TransError> {
+        let keys_released = self.keys.release(id, locks, requirement).await?;
+        let coll_released = self.collections.release(id, locks).await?;
+        Ok(keys_released || coll_released)
     }
 
     /// Returns the data-leaf locking interface.
@@ -1070,6 +1086,53 @@ impl KeyLocker {
         // A release stages no decision that can become unsafe from a stale
         // seed; its CAS arbitrates with any newer leaf and retries on conflict.
         self.release_leaf_at(id, path, Requirement::Any).await
+    }
+
+    /// Releases recorded entry and membership locks without changing committed values.
+    async fn release(
+        &self,
+        id: &TxId,
+        locks: &[TxLock],
+        requirement: Requirement,
+    ) -> Result<bool, TransError> {
+        let mut by_collection = BTreeMap::new();
+        let mut leaf_paths = BTreeSet::new();
+        for lock in locks {
+            match lock {
+                TxLock::Entry { key, .. } => {
+                    by_collection
+                        .entry(key.collection().clone())
+                        .or_insert_with(Vec::new)
+                        .push((key.clone(), ()));
+                }
+                TxLock::Membership { leaf, .. } => {
+                    leaf_paths.insert(leaf.object_path());
+                }
+                TxLock::Directory { .. } | TxLock::Topology { .. } => {}
+            }
+        }
+        for items in by_collection.into_values() {
+            match self
+                .router
+                .route_keys_with_requirements(items, requirement, requirement)
+                .await
+            {
+                Ok(groups) => {
+                    leaf_paths.extend(groups.into_iter().map(|group| group.path().clone()));
+                }
+                Err(StorageError::NotFound | StorageError::StaleCollection) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let results = map_all_bounded(leaf_paths, self.parallelism, |path| async move {
+            self.release_leaf(id, &path).await
+        })
+        .await;
+        let mut changed = false;
+        for result in results {
+            changed |= result?;
+        }
+        Ok(changed)
     }
 
     fn new(
@@ -2396,15 +2459,15 @@ mod tests {
         }
     }
 
-    /// Holds every conditional leaf write while it is armed.
-    struct WriteBatchGate {
+    /// Holds matching backend operations while it is armed.
+    struct BatchGate {
         armed: AtomicBool,
         parked: AtomicUsize,
         released: AtomicUsize,
     }
 
-    impl WriteBatchGate {
-        fn install(backend: &Arc<HookBackend>) -> Arc<Self> {
+    impl BatchGate {
+        fn install(backend: &Arc<HookBackend>, kind: GateKind) -> Arc<Self> {
             let gate = Arc::new(Self {
                 armed: AtomicBool::new(false),
                 parked: AtomicUsize::new(0),
@@ -2414,8 +2477,14 @@ mod tests {
                 let gate = gate.clone();
                 move |operation| {
                     let gate = gate.clone();
-                    let wait = gate.armed.load(Ordering::SeqCst)
-                        && matches!(operation, BackendOp::WriteIf { .. });
+                    let matches = match kind {
+                        GateKind::Read => matches!(
+                            operation,
+                            BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                        ),
+                        GateKind::Write => matches!(operation, BackendOp::WriteIf { .. }),
+                    };
+                    let wait = gate.armed.load(Ordering::SeqCst) && matches;
                     let future: HookFuture = Box::pin(async move {
                         if wait {
                             gate.park().await;
@@ -2445,9 +2514,9 @@ mod tests {
         }
     }
 
-    async fn write_widths<F: Future>(
+    async fn operation_widths<F: Future>(
         operation: F,
-        gate: &WriteBatchGate,
+        gate: &BatchGate,
     ) -> (F::Output, Vec<usize>) {
         let mut operation = std::pin::pin!(operation);
         let mut widths = Vec::new();
@@ -2476,16 +2545,16 @@ mod tests {
                 Some(output) => return (output, widths),
                 None => {
                     let width = gate.release_parked();
-                    assert!(width > 0, "leaf work stopped without a conditional write");
+                    assert!(width > 0, "work stopped without a gated backend operation");
                     widths.push(width);
                 }
             }
         }
     }
 
-    async fn batch_gated_locker(parallelism: NonZeroUsize) -> (Locker, TlCtx, Arc<WriteBatchGate>) {
+    async fn batch_gated_locker(parallelism: NonZeroUsize) -> (Locker, TlCtx, Arc<BatchGate>) {
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
-        let gate = WriteBatchGate::install(&backend);
+        let gate = BatchGate::install(&backend, GateKind::Write);
         let (locker, ctx) =
             new_test_locker_with_parallelism(backend, SplitPolicy::default(), parallelism).await;
         (locker, ctx, gate)
@@ -2561,6 +2630,154 @@ mod tests {
             .count()
     }
 
+    async fn seed_directory_locks(
+        ctx: &TlCtx,
+        id: &TxId,
+    ) -> (Vec<TxLock>, Vec<crate::collections::CollectionChange>) {
+        use crate::collections::{CollectionChange, CollectionOp};
+        let mut locks = Vec::new();
+        let mut changes = Vec::new();
+        for index in 1..=5 {
+            let parent =
+                CollectionAddress::new("test", CollectionId::from_slice(&[index; 16]).unwrap());
+            let child = CollectionAddress::new(
+                "test",
+                CollectionId::from_slice(&[index + 10; 16]).unwrap(),
+            );
+            let mut record = CollectionRecord::new();
+            record.set_directory_writer(id.clone());
+            assert!(
+                ctx._foundation
+                    .records
+                    .create_record(&parent, &record)
+                    .await
+                    .unwrap()
+            );
+            locks.push(TxLock::Directory {
+                collection: parent.clone(),
+                typ: LockType::Write,
+            });
+            changes.push(CollectionChange {
+                parent,
+                name: b"child".to_vec(),
+                collection: child,
+                expected: None,
+                op: CollectionOp::Create,
+            });
+        }
+        // Repeated metadata must not create competing operations on one record.
+        locks.extend(locks.clone());
+        (locks, changes)
+    }
+
+    #[tokio::test]
+    async fn directory_release_and_write_back_obey_the_bound() {
+        use glassdb_storage::transaction::TxLog;
+        for write_back in [false, true] {
+            let (locker, ctx, gate) = batch_gated_locker(NonZeroUsize::new(2).unwrap()).await;
+            let id = mk_tid(1, "directory");
+            let (locks, changes) = seed_directory_locks(&ctx, &id).await;
+            let mut log = TxLog::new(
+                id.clone(),
+                if write_back {
+                    TxCommitStatus::Ok
+                } else {
+                    TxCommitStatus::Aborted
+                },
+            );
+            log.locks = locks.clone();
+            ctx._foundation.tlogger.set(&log).await.unwrap();
+            gate.arm();
+            let (changed, widths) = operation_widths(
+                async {
+                    if write_back {
+                        locker.collections().write_back(&id, &changes, &locks).await
+                    } else {
+                        locker.collections().release(&id, &locks).await
+                    }
+                },
+                &gate,
+            )
+            .await;
+            assert!(changed.unwrap());
+            assert_eq!(widths, vec![2, 2, 1]);
+            for change in &changes {
+                let (record, _) = ctx
+                    ._foundation
+                    .records
+                    .load_record(&change.parent, Requirement::AtLeast(ctx.timeline.now()))
+                    .await
+                    .unwrap();
+                assert!(!record.directory_lock().contains(&id));
+                assert_eq!(
+                    record.child(b"child"),
+                    write_back.then_some(change.collection.id())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_reference_checks_obey_the_bound() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let gate = BatchGate::install(&backend, GateKind::Read);
+        let (locker, ctx) = new_test_locker_with_parallelism(
+            backend,
+            SplitPolicy::default(),
+            NonZeroUsize::new(2).unwrap(),
+        )
+        .await;
+        let id = mk_tid(1, "directory");
+        let (locks, _) = seed_directory_locks(&ctx, &id).await;
+        gate.arm();
+        let (referenced, widths) = operation_widths(
+            locker.collections().is_referenced(
+                &id,
+                &locks,
+                Requirement::AtLeast(ctx.timeline.now()),
+            ),
+            &gate,
+        )
+        .await;
+        assert!(referenced.unwrap());
+        assert_eq!(widths, vec![2, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn directory_reference_read_failure_is_not_absence() {
+        use glassdb_backend::BackendError;
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let (locker, ctx) = new_test_locker_with_parallelism(
+            backend.clone(),
+            SplitPolicy::default(),
+            NonZeroUsize::new(2).unwrap(),
+        )
+        .await;
+        let id = mk_tid(1, "directory");
+        let (locks, _) = seed_directory_locks(&ctx, &id).await;
+        backend.set_before(|operation| {
+            let fail = matches!(
+                operation,
+                BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+            );
+            Box::pin(async move {
+                if fail {
+                    Err(BackendError::Unavailable("record unavailable".into()))
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        let result = locker
+            .collections()
+            .is_referenced(&id, &locks, Requirement::AtLeast(ctx.timeline.now()))
+            .await;
+        assert!(matches!(
+            result,
+            Err(TransError::Storage(StorageError::Unavailable(_)))
+        ));
+    }
+
     #[tokio::test]
     async fn parallel_lock_acquisition_obeys_the_leaf_bound() {
         let (locker, ctx, gate) = batch_gated_locker(NonZeroUsize::new(2).unwrap()).await;
@@ -2569,7 +2786,7 @@ mod tests {
         ctx.monitor.begin_tx(&tx);
 
         gate.arm();
-        let (outcome, widths) = write_widths(
+        let (outcome, widths) = operation_widths(
             locker
                 .keys()
                 .lock_leaves_at(&tx, &groups, false, Requirement::Any),
@@ -2579,6 +2796,37 @@ mod tests {
 
         assert!(matches!(outcome.unwrap(), LeafSetOutcome::Locked(_)));
         assert_eq!(widths, vec![2, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn recorded_lock_release_obeys_the_leaf_bound() {
+        let (locker, ctx, gate) = batch_gated_locker(NonZeroUsize::new(2).unwrap()).await;
+        let groups = groups_on_distinct_leaves(&ctx, 5).await;
+        let tx = mk_tid(1, "tx");
+        ctx.monitor.begin_tx(&tx);
+        let receipts = lock_ok(&locker, &tx, &groups).await;
+        let paths: Vec<_> = groups.keys().cloned().collect();
+        let locked = LockedTx::from_receipts(groups, receipts).unwrap();
+        ctx.monitor.preempt_tx(&tx).await.unwrap();
+        let locks = locked.locked_paths();
+
+        gate.arm();
+        let (changed, widths) = operation_widths(
+            locker.release(&tx, &locks, Requirement::AtLeast(ctx.timeline.now())),
+            &gate,
+        )
+        .await;
+
+        assert!(changed.unwrap());
+        assert_eq!(widths, vec![2, 2, 1]);
+        for path in &paths {
+            let leaf = ctx
+                .nodes
+                .load_leaf(path, Requirement::AtLeast(ctx.timeline.now()))
+                .await
+                .unwrap();
+            assert!(leaf.entries().lookup(b"key").is_none());
+        }
     }
 
     #[tokio::test]
@@ -2607,7 +2855,7 @@ mod tests {
 
         gate.arm();
         let (superseded, widths) =
-            write_widths(locker.keys().write_back(&tx, &locked), &gate).await;
+            operation_widths(locker.keys().write_back(&tx, &locked), &gate).await;
 
         assert!(superseded.is_empty());
         assert_eq!(widths, vec![2, 2, 1]);

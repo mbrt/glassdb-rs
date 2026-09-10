@@ -1,8 +1,9 @@
 //! Transactional state resolution, locking, and write-back for collection records.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
-use glassdb_concurr::{RetryConfig, rt};
+use glassdb_concurr::{RetryConfig, map_all_bounded, rt};
 use glassdb_data::{CollectionAddress, TxId};
 use glassdb_storage::transaction::{
     TLogger, TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock,
@@ -45,16 +46,18 @@ pub(crate) struct CollectionLocker {
     records: CollectionStore,
     monitor: Monitor,
     retry: RetryConfig,
+    parallelism: NonZeroUsize,
 }
 
 impl CollectionLocker {
     /// Creates collection locking over shared collection-state resolution.
-    pub(crate) fn new(state: CollectionStateResolver) -> Self {
+    pub(crate) fn new(state: CollectionStateResolver, parallelism: NonZeroUsize) -> Self {
         Self {
             records: state.records.clone(),
             monitor: state.monitor.clone(),
             retry: state.retry,
             state,
+            parallelism,
         }
     }
 
@@ -91,14 +94,19 @@ impl CollectionLocker {
         changes: &[CollectionChange],
         locks: &[TxLock],
     ) -> Result<bool, TransError> {
-        let mut changed = false;
-        for parent in Self::locked_collections(locks) {
-            changed |= self
-                .state
-                .apply_committed_write_back(parent, id, changes)
-                .await?;
-        }
-        Ok(changed)
+        let results = map_all_bounded(
+            Self::locked_collections(locks),
+            self.parallelism,
+            |parent| async move {
+                self.state
+                    .apply_committed_write_back(&parent, id, changes)
+                    .await
+            },
+        )
+        .await;
+        results
+            .into_iter()
+            .try_fold(false, |changed, result| Ok(changed | result?))
     }
 
     /// Recovers committed directory effects from durable metadata.
@@ -114,25 +122,15 @@ impl CollectionLocker {
 
     /// Releases every recorded directory lock held by `id`.
     pub(crate) async fn release(&self, id: &TxId, locks: &[TxLock]) -> Result<bool, TransError> {
-        let mut changed = false;
-        for parent in Self::locked_collections(locks) {
-            loop {
-                let (mut record, observed) =
-                    match self.records.load_record(parent, Requirement::Any).await {
-                        Ok(record) => record,
-                        Err(StorageError::NotFound) => break,
-                        Err(error) => return Err(error.into()),
-                    };
-                if !record.remove_directory_holder(id) {
-                    break;
-                }
-                if self.records.store_record(&record, &observed).await? {
-                    changed = true;
-                    break;
-                }
-            }
-        }
-        Ok(changed)
+        let results = map_all_bounded(
+            Self::locked_collections(locks),
+            self.parallelism,
+            |parent| async move { self.release_directory(&parent, id).await },
+        )
+        .await;
+        results
+            .into_iter()
+            .try_fold(false, |changed, result| Ok(changed | result?))
     }
 
     /// Reports whether any recorded directory still refers to `id`.
@@ -142,14 +140,21 @@ impl CollectionLocker {
         locks: &[TxLock],
         requirement: Requirement,
     ) -> Result<bool, TransError> {
-        for collection in Self::locked_collections(locks) {
-            if let Ok((record, _)) = self.records.load_record(collection, requirement).await
-                && record.directory_lock().contains(id)
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        let results = map_all_bounded(
+            Self::locked_collections(locks),
+            self.parallelism,
+            |parent| async move {
+                match self.records.load_record(&parent, requirement).await {
+                    Ok((record, _)) => Ok(record.directory_lock().contains(id)),
+                    Err(StorageError::NotFound) => Ok(false),
+                    Err(error) => Err(TransError::from(error)),
+                }
+            },
+        )
+        .await;
+        results
+            .into_iter()
+            .try_fold(false, |referenced, result| Ok(referenced | result?))
     }
 
     /// Removes a settled structural operation from collection topology.
@@ -220,11 +225,35 @@ impl CollectionLocker {
         }
     }
 
-    fn locked_collections(locks: &[TxLock]) -> impl Iterator<Item = &CollectionAddress> {
-        locks.iter().filter_map(|lock| match lock {
-            TxLock::Directory { collection, .. } => Some(collection),
-            _ => None,
-        })
+    async fn release_directory(
+        &self,
+        parent: &CollectionAddress,
+        id: &TxId,
+    ) -> Result<bool, TransError> {
+        loop {
+            let (mut record, observed) =
+                match self.records.load_record(parent, Requirement::Any).await {
+                    Ok(record) => record,
+                    Err(StorageError::NotFound) => return Ok(false),
+                    Err(error) => return Err(error.into()),
+                };
+            if !record.remove_directory_holder(id) {
+                return Ok(false);
+            }
+            if self.records.store_record(&record, &observed).await? {
+                return Ok(true);
+            }
+        }
+    }
+
+    fn locked_collections(locks: &[TxLock]) -> BTreeSet<CollectionAddress> {
+        locks
+            .iter()
+            .filter_map(|lock| match lock {
+                TxLock::Directory { collection, .. } => Some(collection.clone()),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -460,7 +489,11 @@ mod tests {
             monitor,
             RetryConfig::default(),
         );
-        (CollectionLocker::new(state), records, background)
+        (
+            CollectionLocker::new(state, NonZeroUsize::MIN),
+            records,
+            background,
+        )
     }
 
     #[tokio::test]
