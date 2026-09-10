@@ -368,24 +368,18 @@ async fn is_gone(tl: &TLogger, id: &TxId) -> bool {
 }
 
 async fn check_candidate(gc: &Gc, tid: &TxId) -> Result<GcOutcome, TransError> {
-    let status = reclaim::filter_candidate(
-        &gc.tl,
-        gc.timing,
-        tid,
-        Requirement::AtLeast(gc.timeline.now()),
-    )
-    .await?;
+    let status = gc
+        .filter_candidate(tid, Requirement::AtLeast(gc.timeline.now()))
+        .await?;
     let requirement = Requirement::AtLeast(gc.timeline.now());
     match status {
-        GcEligibility::Ready(observation) => {
-            gc.check_candidate(tid, &observation, requirement).await
-        }
+        GcEligibility::Ready(observation) => gc.try_reclaim(tid, &observation, requirement).await,
         GcEligibility::Deferred(delay) => Ok(GcOutcome::Deferred(delay)),
         GcEligibility::Retained => Ok(GcOutcome::Retained),
     }
 }
 
-async fn run_once(ctx: &Ctx) {
+async fn check_hints_and_scan_page(ctx: &Ctx) {
     let mut candidates = Vec::new();
     loop {
         let (batch, more) = ctx.hints.drain();
@@ -420,7 +414,7 @@ async fn committed_unreferenced_is_collected() {
     // The key now points at a newer writer, not `old`.
     store_entry(&ctx, b"k", writer_entry(b"k", &new)).await;
 
-    run_once(&ctx).await;
+    check_hints_and_scan_page(&ctx).await;
 
     assert!(is_gone(&ctx.tl, &old).await);
     assert_eq!(
@@ -452,7 +446,7 @@ async fn committed_superseded_by_a_logless_writer_is_collected() {
     )
     .await;
 
-    run_once(&ctx).await;
+    check_hints_and_scan_page(&ctx).await;
 
     assert!(is_gone(&ctx.tl, &old).await);
     assert!(
@@ -481,7 +475,7 @@ async fn committed_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
     log.prepared_collections.push(prepared.clone());
     ctx.tl.set(&log).await.unwrap();
 
-    run_once(&ctx).await;
+    check_hints_and_scan_page(&ctx).await;
 
     assert!(is_gone(&ctx.tl, &id).await);
     assert!(matches!(
@@ -512,7 +506,7 @@ async fn aborted_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
     ctx.tl.set(&log).await.unwrap();
     ctx.hints.schedule(id.clone());
 
-    run_once(&ctx).await;
+    check_hints_and_scan_page(&ctx).await;
 
     assert!(is_gone(&ctx.tl, &id).await);
     assert!(matches!(
@@ -571,7 +565,7 @@ async fn collection_cleanup_conflict_keeps_the_recovery_manifest() {
     });
     ctx.hints.schedule(id.clone());
 
-    run_once(&ctx).await;
+    check_hints_and_scan_page(&ctx).await;
 
     assert!(
         !is_gone(&ctx.tl, &id).await,
@@ -586,7 +580,7 @@ async fn collection_cleanup_conflict_keeps_the_recovery_manifest() {
 
     backend.clear_before();
     ctx.hints.schedule(id.clone());
-    run_once(&ctx).await;
+    check_hints_and_scan_page(&ctx).await;
     assert!(is_gone(&ctx.tl, &id).await);
     assert!(matches!(
         ctx.nodes.load_root(&prepared, Requirement::Any).await,
@@ -655,7 +649,7 @@ async fn committed_drop_is_recovered_while_the_log_stores_a_live_value() {
     ctx.tl.set(&log).await.unwrap();
     ctx.hints.schedule(id.clone());
 
-    run_once(&ctx).await;
+    check_hints_and_scan_page(&ctx).await;
 
     assert!(
         !is_gone(&ctx.tl, &id).await,
@@ -698,7 +692,7 @@ async fn committed_references_in_a_reclaimed_collection_are_absent() {
     ctx.tl.set(&log).await.unwrap();
     ctx.hints.schedule(id.clone());
 
-    run_once(&ctx).await;
+    check_hints_and_scan_page(&ctx).await;
 
     assert!(is_gone(&ctx.tl, &id).await);
 }
@@ -716,7 +710,7 @@ async fn committed_still_referenced_is_kept() {
     store_entry(&ctx, b"k", writer_entry(b"k", &t)).await;
     ctx.hints.schedule(t.clone());
 
-    run_once(&ctx).await;
+    check_hints_and_scan_page(&ctx).await;
 
     let log = ctx.tl.get_at(&t, Requirement::Any).await.unwrap();
     let log = log.value().unwrap();
@@ -733,7 +727,7 @@ async fn committed_entry_lock_keeps_the_log_and_lock() {
         .unwrap();
     store_entry(&ctx, b"k", locked_entry(b"k", &id)).await;
 
-    run_once(&ctx).await;
+    check_hints_and_scan_page(&ctx).await;
 
     assert!(!is_gone(&ctx.tl, &id).await);
     assert_eq!(
@@ -765,7 +759,7 @@ async fn committed_membership_lock_is_released_before_deletion() {
     edit.set_locks(locks);
     assert!(ctx.nodes.commit_leaf(edit).await.unwrap());
 
-    run_once(&ctx).await;
+    check_hints_and_scan_page(&ctx).await;
 
     assert!(is_gone(&ctx.tl, &id).await);
     let loaded = ctx
@@ -854,7 +848,7 @@ async fn monitor_wounds_pending_before_gc_releases_locks() {
         TxCommitStatus::Wounded
     );
     ctx.hints.schedule(t.clone());
-    run_once(&ctx).await;
+    check_hints_and_scan_page(&ctx).await;
 
     // Death is durable...
     let got = ctx.tl.get_at(&t, Requirement::Any).await.unwrap();
@@ -870,12 +864,12 @@ async fn monitor_wounds_pending_before_gc_releases_locks() {
     // without relying on a finite tombstone window.
     store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
     ctx.hints.schedule(t.clone());
-    run_once(&ctx).await;
+    check_hints_and_scan_page(&ctx).await;
     assert!(lookup_entry(&ctx, b"k").await.is_none());
 
     tokio::time::sleep(PAST_HORIZON * 2).await;
     ctx.hints.schedule(t.clone());
-    run_once(&ctx).await;
+    check_hints_and_scan_page(&ctx).await;
     let got = ctx.tl.get_at(&t, Requirement::Any).await.unwrap();
     assert_eq!(got.value().unwrap().status, TxCommitStatus::Wounded);
 }
@@ -893,7 +887,7 @@ async fn recent_aborted_tombstone_is_kept() {
     store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
     ctx.hints.schedule(t.clone());
 
-    run_once(&ctx).await;
+    check_hints_and_scan_page(&ctx).await;
 
     assert!(!is_gone(&ctx.tl, &t).await);
     let e = lookup_entry(&ctx, b"k").await.unwrap();
@@ -913,7 +907,7 @@ async fn expired_aborted_prunes_locks_and_is_deleted() {
     store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
     ctx.hints.schedule(t.clone());
 
-    run_once(&ctx).await;
+    check_hints_and_scan_page(&ctx).await;
 
     assert!(is_gone(&ctx.tl, &t).await);
     assert!(lookup_entry(&ctx, b"k").await.is_none());
@@ -925,7 +919,7 @@ async fn logless_cleanup_hint_is_a_noop() {
     let ctx = new_ctx().await;
     let t = tx(9);
     ctx.hints.schedule(t.clone());
-    run_once(&ctx).await;
+    check_hints_and_scan_page(&ctx).await;
     assert!(is_gone(&ctx.tl, &t).await);
 }
 
