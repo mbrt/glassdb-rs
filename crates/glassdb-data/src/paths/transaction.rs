@@ -73,10 +73,12 @@ pub(super) fn scan_prefix(prefix: &str, depth: u8, index: usize) -> Result<Strin
 }
 
 fn decode_parts(source: &str, a: &str, b: &str, encoded: &str) -> Result<TxId, PathError> {
+    let shard = shard_for_encoding(encoded).as_bytes();
     if a.len() != 1
         || b.len() != 1
         || encoded.is_empty()
-        || format!("{a}{b}") != shard_for_encoding(encoded)
+        || a.as_bytes() != &shard[..1]
+        || b.as_bytes() != &shard[1..]
     {
         return Err(PathError::Parse(source.to_string()));
     }

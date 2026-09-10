@@ -349,25 +349,36 @@ impl Gc {
             (tid, result)
         })
         .await;
-        // All candidates must be eligible before this shared reference bound.
-        let requirement = Requirement::AtLeast(self.timeline.now());
-        // The fresh requirement forces all caches to be invalidated. There
-        // might be writers are refreshing leaves concurrently anyway, so let's
-        // give them a chance by yielding now. This has no downside, as GC work
-        // is always in the background and there's no hurry.
-        rt::yield_now().await;
-        map_all_bounded(filtered, limit, |(tid, result)| async move {
-            let result = match result {
+        let mut ready = Vec::new();
+        let mut results = Vec::with_capacity(filtered.len());
+        for (tid, result) in filtered {
+            let outcome = match result {
                 Ok(GcEligibility::Ready(observation)) => {
-                    gc.try_reclaim(&tid, &observation, requirement).await
+                    ready.push((tid, observation));
+                    continue;
                 }
                 Ok(GcEligibility::Deferred(delay)) => Ok(GcOutcome::Deferred(delay)),
                 Ok(GcEligibility::Retained) => Ok(GcOutcome::Retained),
                 Err(error) => Err(error),
             };
-            (tid, result)
-        })
-        .await
+            results.push((tid, outcome));
+        }
+        if ready.is_empty() {
+            return results;
+        }
+        // Eligibility must precede the reference bound. Yield so concurrent
+        // writers can publish observations that satisfy it; otherwise GC adds
+        // backend reads for leaves those writers are already refreshing.
+        let requirement = Requirement::AtLeast(self.timeline.now());
+        rt::yield_now().await;
+        results.extend(
+            map_all_bounded(ready, limit, |(tid, observation)| async move {
+                let result = gc.try_reclaim(&tid, &observation, requirement).await;
+                (tid, result)
+            })
+            .await,
+        );
+        results
     }
 
     /// Selects candidates whose durable state and safety horizon permit reclamation.

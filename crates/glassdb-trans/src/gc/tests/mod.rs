@@ -1226,6 +1226,37 @@ async fn concurrent_candidates_share_one_leaf_validation() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn young_final_candidates_complete_without_a_reference_pass() {
+    let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+    let operations = backend.log();
+    let ctx = new_ctx_with(Arc::new(backend)).await;
+    let ids = vec![tx(1), tx(2)];
+    for (id, status) in ids
+        .iter()
+        .zip([TxCommitStatus::Ok, TxCommitStatus::Aborted])
+    {
+        let mut log = committed(id.clone(), Duration::ZERO, &[b"k"], &[b"k"]);
+        log.status = status;
+        ctx.tl.set(&log).await.unwrap();
+    }
+    operations.lock().unwrap().clear();
+
+    let outcomes = ctx
+        .gc
+        .clone()
+        .check_batch(ids.clone(), NonZeroUsize::new(2).unwrap())
+        .now_or_never()
+        .expect("ineligible cached candidates must not schedule reference work");
+
+    assert_eq!(outcomes.len(), ids.len());
+    for ((id, outcome), expected) in outcomes.into_iter().zip(ids) {
+        assert_eq!(id, expected);
+        assert!(matches!(outcome, Ok(GcOutcome::Deferred(delay)) if !delay.is_zero()));
+    }
+    assert!(operations.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
 async fn reference_checks_reuse_a_concurrent_writer_observation() {
     let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
     let operations = backend.log();

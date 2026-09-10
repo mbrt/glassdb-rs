@@ -438,16 +438,14 @@ impl std::fmt::Display for ObjectPath {
                 write!(f, "{db_root}/{DATABASE_METADATA_OBJECT}")
             }
             ObjectPath::CollectionRecord { collection } => {
-                tree::write_collection_record(f, &collection.physical_prefix())
+                tree::write_collection_record(f, collection)
             }
             ObjectPath::Transaction { db_root, id } => {
                 transaction::write_object(f, db_root.as_str(), id)
             }
-            ObjectPath::TreeRoot { collection } => {
-                tree::write_tree_root(f, &collection.physical_prefix())
-            }
+            ObjectPath::TreeRoot { collection } => tree::write_tree_root(f, collection),
             ObjectPath::Node { collection, token } => {
-                tree::write_node(f, &collection.physical_prefix(), token.as_str())
+                tree::write_node(f, collection, token.as_str())
             }
             ObjectPath::StructuralIntent {
                 db_root,
@@ -659,6 +657,8 @@ mod tests {
             ("db/_t/00/0F8310", ErrorKind::Parse),
             ("db/_t/0F/0F8310", ErrorKind::Parse),
             ("db/_t/!/!/!!", ErrorKind::Decode),
+            ("db/_t/0/0/é", ErrorKind::Parse),
+            ("db/_t/0/0/€", ErrorKind::Decode),
             ("db/_s/participant", ErrorKind::Parse),
             ("db/_s//intent", ErrorKind::Parse),
             ("db/_s/!/intent", ErrorKind::Decode),
