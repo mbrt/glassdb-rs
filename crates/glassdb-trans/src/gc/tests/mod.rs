@@ -66,6 +66,7 @@ struct Ctx {
     records: CollectionStore,
     nodes: NodeStore,
     timeline: Timeline,
+    coord: LeafCoordinator,
     locker: Locker,
     mon: Monitor,
 }
@@ -160,8 +161,9 @@ async fn owner_replays_when_gc_reclaims_prepared_collections_during_lock_acquisi
                 Box::pin(async move {
                     if pause {
                         peer_monitor.preempt_tx(&old_id).await.unwrap();
+
                         assert_eq!(
-                            gc.check_candidate(&old_id).await.unwrap(),
+                            check_candidate(&gc, &old_id).await.unwrap(),
                             GcOutcome::Progress
                         );
                         assert_eq!(
@@ -272,6 +274,7 @@ async fn new_ctx_with_interval(backend: Arc<dyn Backend>, retry_delay: Duration)
         records,
         nodes,
         timeline,
+        coord,
         locker,
         mon,
     }
@@ -360,6 +363,32 @@ async fn is_gone(tl: &TLogger, id: &TxId) -> bool {
     )
 }
 
+async fn check_candidate(gc: &Gc, tid: &TxId) -> Result<GcOutcome, TransError> {
+    let status = reclaim::filter_candidate(
+        &gc.tl,
+        &gc.mon,
+        tid,
+        Requirement::AtLeast(gc.timeline.now()),
+    )
+    .await?;
+    let requirement = Requirement::AtLeast(gc.timeline.now());
+    match status {
+        GcEligibility::Ready {
+            observation,
+            changed,
+        } => {
+            let outcome = gc.check_candidate(tid, &observation, requirement).await?;
+            Ok(if changed {
+                GcOutcome::Progress
+            } else {
+                outcome
+            })
+        }
+        GcEligibility::Deferred(delay) => Ok(GcOutcome::Deferred(delay)),
+        GcEligibility::Retained => Ok(GcOutcome::Retained),
+    }
+}
+
 async fn run_once(ctx: &Ctx) {
     let mut candidates = Vec::new();
     loop {
@@ -377,7 +406,7 @@ async fn run_once(ctx: &Ctx) {
     candidates.extend(page.ids);
     let candidates: BTreeSet<_> = candidates.into_iter().collect();
     for tid in candidates {
-        let _ = ctx.gc.check_candidate(&tid).await;
+        let _ = check_candidate(&ctx.gc, &tid).await;
     }
 }
 
@@ -389,7 +418,7 @@ async fn committed_unreferenced_is_collected() {
     let ctx = new_ctx().await;
     let (old, new) = (tx(1), tx(2));
     ctx.tl
-        .set(&committed(old.clone(), PAST_HORIZON, &[b"k"], &[]))
+        .set(&committed(old.clone(), PAST_HORIZON, &[b"k"], &[b"k"]))
         .await
         .unwrap();
     // The key now points at a newer writer, not `old`.
@@ -398,6 +427,11 @@ async fn committed_unreferenced_is_collected() {
     run_once(&ctx).await;
 
     assert!(is_gone(&ctx.tl, &old).await);
+    assert_eq!(
+        ctx.coord.stats_and_reset().submissions,
+        0,
+        "an unreferenced committed object needs no key-lock release"
+    );
 }
 
 // ADR-051: the successor that superseded a committed writer may be a logless
@@ -693,6 +727,60 @@ async fn committed_still_referenced_is_kept() {
     assert_eq!(log.status, TxCommitStatus::Ok);
 }
 
+#[tokio::test(start_paused = true)]
+async fn committed_entry_lock_keeps_the_log_and_lock() {
+    let ctx = new_ctx().await;
+    let id = tx(1);
+    ctx.tl
+        .set(&committed(id.clone(), PAST_HORIZON, &[b"k"], &[b"k"]))
+        .await
+        .unwrap();
+    store_entry(&ctx, b"k", locked_entry(b"k", &id)).await;
+
+    run_once(&ctx).await;
+
+    assert!(!is_gone(&ctx.tl, &id).await);
+    assert_eq!(
+        lookup_entry(&ctx, b"k").await.unwrap().lock_holders(),
+        std::slice::from_ref(&id)
+    );
+    assert_eq!(ctx.coord.stats_and_reset().submissions, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn committed_membership_lock_is_released_before_deletion() {
+    let ctx = new_ctx().await;
+    let id = tx(1);
+    let mut log = committed(id.clone(), PAST_HORIZON, &[b"k"], &[b"k"]);
+    log.locks.push(TxLock::Membership {
+        leaf: glassdb_data::LeafRef::root(collection()),
+        typ: LockType::Write,
+    });
+    ctx.tl.set(&log).await.unwrap();
+    store_entry(&ctx, b"k", writer_entry(b"k", &tx(2))).await;
+    let loaded = ctx
+        .nodes
+        .load_leaf(&root_path(), Requirement::Any)
+        .await
+        .unwrap();
+    let mut locks = loaded.locks().clone();
+    locks.set_membership_writer(id.clone());
+    let mut edit = loaded.into_edit();
+    edit.set_locks(locks);
+    assert!(ctx.nodes.commit_leaf(edit).await.unwrap());
+
+    run_once(&ctx).await;
+
+    assert!(is_gone(&ctx.tl, &id).await);
+    let loaded = ctx
+        .nodes
+        .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
+        .await
+        .unwrap();
+    assert!(loaded.node().membership_lock().holders().is_empty());
+    assert_eq!(ctx.coord.stats_and_reset().submissions, 1);
+}
+
 // A recent pending object (within the safety horizon) is kept: it may be a
 // live transaction whose lock this non-atomic check cannot yet rule out.
 #[tokio::test(start_paused = true)]
@@ -855,7 +943,7 @@ async fn gc_release_merges_into_live_acquire_round() {
     // merges into its round.
     let gc = ctx.gc.clone();
     let dead2 = dead.clone();
-    let release = tokio::spawn(async move { gc.check_candidate(&dead2).await });
+    let release = tokio::spawn(async move { check_candidate(&gc, &dead2).await });
     let locker = ctx.locker.clone();
     let accesses = crate::access::AccessSet::new(
         Vec::new(),
@@ -996,7 +1084,7 @@ async fn cached_candidate_converges_after_a_peer_deletes_it() {
     operations.lock().unwrap().clear();
 
     assert_eq!(
-        ctx.gc.check_candidate(&id).await.unwrap(),
+        check_candidate(&ctx.gc, &id).await.unwrap(),
         GcOutcome::Reclaimed
     );
     assert!(
@@ -1008,8 +1096,9 @@ async fn cached_candidate_converges_after_a_peer_deletes_it() {
         "a cached final candidate needs no presence check"
     );
     assert!(is_gone(&ctx.tl, &id).await);
+
     assert_eq!(
-        ctx.gc.check_candidate(&id).await.unwrap(),
+        check_candidate(&ctx.gc, &id).await.unwrap(),
         GcOutcome::Retained
     );
 }
@@ -1033,6 +1122,124 @@ async fn hinted_candidates_wake_gc_without_a_list() {
     assert_eq!(stats.lists, 0);
     assert_eq!(stats.progress, 1);
     bg.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_candidates_share_one_leaf_validation() {
+    let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+    let operations = backend.log();
+    let ctx = new_ctx_with(Arc::new(backend)).await;
+    for id in [tx(1), tx(2)] {
+        ctx.tl
+            .set(&committed(id.clone(), PAST_HORIZON, &[b"k"], &[b"k"]))
+            .await
+            .unwrap();
+        ctx.hints.schedule(id);
+    }
+    store_entry(&ctx, b"k", writer_entry(b"k", &tx(3))).await;
+    operations.lock().unwrap().clear();
+    let bg = Background::new();
+    ctx.gc.start(&bg);
+    for _ in 0..64 {
+        rt::yield_now().await;
+    }
+    bg.shutdown().await;
+
+    assert_eq!(ctx.gc.stats_and_reset().progress, 2);
+    let root = root_path().to_string();
+    let operations = operations.lock().unwrap();
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|op| op.path == root && matches!(op.op, "read" | "read_if_modified"))
+            .count(),
+        1,
+        "concurrent checks must reuse the same validated leaf"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn reference_checks_follow_candidate_filtering() {
+    let backend = Arc::new(MemoryBackend::new());
+    let hooked = HookBackend::new(backend.clone());
+    let ctx = new_ctx_with(hooked.clone()).await;
+    let id = tx(2);
+    let mut log = committed(id.clone(), Duration::ZERO, &[b"k"], &[b"k"]);
+    log.status = TxCommitStatus::Pending;
+    ctx.tl.set(&log).await.unwrap();
+    store_entry(&ctx, b"k", writer_entry(b"k", &tx(3))).await;
+    let entered = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    hooked.set_before({
+        let path = ObjectPath::Transaction {
+            db_root: DbRoot::try_from("db").unwrap(),
+            id: id.clone(),
+        }
+        .to_string();
+        let entered = entered.clone();
+        let resume = resume.clone();
+        move |op| {
+            let pause = op.path() == path
+                && matches!(
+                    op,
+                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                );
+            let entered = entered.clone();
+            let resume = resume.clone();
+            Box::pin(async move {
+                if pause {
+                    entered.notify_one();
+                    resume.notified().await;
+                }
+                Ok(())
+            })
+        }
+    });
+    ctx.hints.schedule(id.clone());
+    let bg = Background::new();
+    ctx.gc.start(&bg);
+    entered.notified().await;
+
+    // Cache absence after the status bound, before the peer's commit. A
+    // reference check using that first bound would wrongly accept this leaf.
+    ctx.nodes
+        .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
+        .await
+        .unwrap();
+    let peer = AssemblyFixture::new(
+        backend,
+        DbRoot::try_from("db").unwrap(),
+        &EngineConfig::default(),
+    );
+    let mut edit = peer
+        .nodes
+        .load_leaf(&root_path(), Requirement::Any)
+        .await
+        .unwrap()
+        .into_edit();
+    edit.set_entries(LeafBody::from_entries([locked_entry(b"k", &id)]));
+    assert!(peer.nodes.commit_leaf(edit).await.unwrap());
+    log.status = TxCommitStatus::Ok;
+    // Native paused time does not advance wall time. The old timestamp stands
+    // for a filter delayed until after this commit's safety horizon.
+    log.timestamp = Some(base() - PAST_HORIZON);
+    let pending = peer.tlogger.get_at(&id, Requirement::Any).await.unwrap();
+    peer.tlogger.set_if(&log, &pending).await.unwrap();
+    resume.notify_one();
+    for _ in 0..64 {
+        rt::yield_now().await;
+    }
+    bg.shutdown().await;
+
+    let stats = ctx.gc.stats_and_reset();
+    assert_eq!(stats.progress, 0);
+    assert_eq!(stats.failures, 0);
+    let diagnostics = ctx.gc.diagnostics();
+    assert_eq!(diagnostics.ready, 0);
+    assert_eq!(diagnostics.deferred, 0);
+    assert_eq!(diagnostics.in_flight, 0);
+    assert!(!is_gone(&ctx.tl, &id).await);
+    assert!(lookup_entry(&ctx, b"k").await.unwrap().is_locked_by(&id));
 }
 
 #[tokio::test(start_paused = true)]

@@ -15,38 +15,49 @@
 //! batch of candidates and confirms each one dead by GET-ing only the handful of
 //! leaves it names — never a database-wide scan. Useful reverse-check candidates
 //! come from GC scheduling through hints and scans of
-//! `{db}/_t/{a}/{b}/{encoded-txid}`. This file owns reclamation safety.
+//! `{db}/_t/{a}/{b}/{encoded-txid}`. This file owns candidate filtering,
+//! reference checks, and reclamation.
 //!
-//! Safety rests on the ADR-021 lease as a horizon (`is_expired`): a candidate
-//! other than `Wounded` is kept within the horizon, because the non-atomic
-//! reverse check can race a lock a live transaction has taken but not yet
-//! published (ADR-024's lazy object materialization). Past the horizon, resolution is by status:
-//! a committed object is deleted only once its complete record proves it
-//! unreferenced; a dead pending one is first **wounded** so its death remains
-//! pinned until its owner acknowledges retirement. Wounded effects can be
-//! reclaimed immediately without deleting the marker. An acknowledged aborted
-//! object is retained for the ordinary finite cleanup horizon.
+//! GC filters candidates by durable status and the safety horizon, using Monitor
+//! to pin expired pending transactions as wounded before reclaiming their effects.
+//! The GC scheduler then captures a new reference-check requirement. This order
+//! prevents cached absence from before eligibility from authorizing deletion.
+//! A wounded marker remains pinned until its owner acknowledges retirement;
+//! only committed or acknowledged aborted objects can be deleted.
 //!
 //! Lock reclamation flows through the leaf coordinator (ADR-029): GC
 //! calls the [`crate::tlocker::Locker`]'s stateless per-object unlock methods rather than issuing
 //! its own leaf/root CAS, so every mutation goes through one place.
 
 use std::collections::BTreeSet;
-use std::time::UNIX_EPOCH;
+use std::time::Duration;
 
 use glassdb_concurr::rt;
 use glassdb_data::{LogicalKey, TxId};
-use glassdb_storage::transaction::{TxCollectionOp, TxCommitStatus, TxLock, TxLog};
+use glassdb_storage::transaction::{
+    TLogger, TxCollectionOp, TxCommitStatus, TxLock, TxLog, TxRecordState,
+};
 use glassdb_storage::{Observation, Requirement, StorageError};
 
 use super::Gc;
 use crate::error::TransError;
+use crate::monitor::Monitor;
+
+/// Whether a transaction's durable state permits reclamation of its effects.
+pub(super) enum GcEligibility {
+    Ready {
+        observation: Observation<TxLog>,
+        changed: bool,
+    },
+    Deferred(Duration),
+    Retained,
+}
 
 /// Result of a GC candidate check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum GcOutcome {
     Retained,
-    Deferred(std::time::Duration),
+    Deferred(Duration),
     Reclaimed,
     Progress,
 }
@@ -54,6 +65,53 @@ pub(super) enum GcOutcome {
 struct Reclamation {
     complete: bool,
     changed: bool,
+}
+
+/// Resolves a GC candidate's durable state and safety horizon.
+pub(super) async fn filter_candidate(
+    tl: &TLogger,
+    mon: &Monitor,
+    tid: &TxId,
+    requirement: Requirement,
+) -> Result<GcEligibility, TransError> {
+    // GC needs exact durable evidence for reclamation. A status cached
+    // without its log cannot authorize deletion, and absence must not
+    // create a wound marker merely because a scan or hint named an ID.
+    let status = tl.commit_status_at(tid, requirement).await?;
+    match TxRecordState::try_from_observation(&status.observation)? {
+        TxRecordState::Missing => return Ok(GcEligibility::Retained),
+        TxRecordState::Wounded => {
+            return Ok(GcEligibility::Ready {
+                observation: status.observation,
+                changed: false,
+            });
+        }
+        _ => {}
+    }
+    let now = rt::system_now();
+    if !mon.protocol_timing().is_expired(status.last_update, now) {
+        let due = status.last_update
+            + mon.protocol_timing().max_clock_skew()
+            + mon.protocol_timing().pending_timeout();
+        return Ok(GcEligibility::Deferred(
+            due.duration_since(now).unwrap_or_default() + Duration::from_nanos(1),
+        ));
+    }
+    if status.status == TxCommitStatus::Pending {
+        let (wounded, changed) = mon.try_wound_observed(tid, &status.observation).await?;
+        // A winning commit or refresh invalidates the expiry decision.
+        if wounded.status != TxCommitStatus::Wounded {
+            return Ok(GcEligibility::Retained);
+        }
+        return Ok(GcEligibility::Ready {
+            observation: wounded.observation,
+            changed,
+        });
+    }
+    Ok(GcEligibility::Ready {
+        observation: status.observation,
+        changed: false,
+    })
 }
 
 impl GcOutcome {
@@ -67,62 +125,24 @@ impl GcOutcome {
 }
 
 impl Gc {
-    /// The reverse liveness check for one candidate (ADR-022): read it, keep it
-    /// if within the safety horizon, else resolve by status.
-    pub(super) async fn check_candidate(&self, tid: &TxId) -> Result<GcOutcome, TransError> {
-        // GC has no preceding transaction barrier or CAS receipt: it must
-        // establish one candidate-check epoch before deciding that no durable
-        // leaf still references the transaction. The same epoch is propagated
-        // through routing and release so the decision is one coherent sweep.
-        let candidate_check = Requirement::AtLeast(self.timeline.now());
-        let observed = match self.tl.get_at(tid, candidate_check).await {
-            Ok(v) => v,
-            // Already reclaimed (or never existed): nothing to do.
-            Err(StorageError::NotFound) => return Ok(GcOutcome::Retained),
-            Err(e) => return Err(e.into()),
-        };
+    /// Reclaims an eligible candidate after checking its recorded references.
+    pub(super) async fn check_candidate(
+        &self,
+        tid: &TxId,
+        observed: &Observation<TxLog>,
+        requirement: Requirement,
+    ) -> Result<GcOutcome, TransError> {
         let log = observed
             .value()
-            .ok_or_else(|| StorageError::other("transaction disappeared after a present read"))?;
-
-        // Wounded is pinned independently of time. Cleanup is deliberately
-        // repeatable because an owner operation already in flight when the
-        // wound landed may publish another described effect before quiescing.
-        if log.status == TxCommitStatus::Wounded {
-            return self
-                .reclaim_wounded(tid, log, &observed, candidate_check)
-                .await;
-        }
-
-        // Within the horizon: keep. A recent pending object may be a live
-        // transaction whose lock this non-atomic check has not observed yet
-        // (ADR-024 materializes the object lazily, after the locks are taken);
-        // a recent committed/aborted one is left for a later cycle.
-        let ts = log.timestamp.unwrap_or(UNIX_EPOCH);
-        if !self.mon.protocol_timing().is_expired(ts, rt::system_now()) {
-            let due = ts
-                + self.mon.protocol_timing().max_clock_skew()
-                + self.mon.protocol_timing().pending_timeout();
-            return Ok(GcOutcome::Deferred(
-                due.duration_since(rt::system_now()).unwrap_or_default()
-                    + std::time::Duration::from_nanos(1),
-            ));
-        }
-
+            .ok_or_else(|| StorageError::other("GC candidate has no transaction log"))?;
         match log.status {
             TxCommitStatus::Ok => {
-                self.reclaim_committed(tid, log, &observed, candidate_check)
+                self.reclaim_committed(tid, log, observed, requirement)
                     .await
             }
-            TxCommitStatus::Aborted => {
-                self.reclaim_aborted(tid, log, &observed, candidate_check)
-                    .await
-            }
-            TxCommitStatus::Pending => {
-                self.reclaim_dead_pending(tid, log, &observed, candidate_check)
-                    .await
-            }
-            TxCommitStatus::Unknown | TxCommitStatus::Wounded => Ok(GcOutcome::Retained),
+            TxCommitStatus::Aborted => self.reclaim_aborted(tid, log, observed, requirement).await,
+            TxCommitStatus::Wounded => self.reclaim_wounded(tid, log, observed, requirement).await,
+            TxCommitStatus::Pending | TxCommitStatus::Unknown => Ok(GcOutcome::Retained),
         }
     }
 
@@ -170,7 +190,15 @@ impl Gc {
         if self.still_referenced(tid, log, requirement).await? {
             return Ok(GcOutcome::from_progress(changed));
         }
-        let released = self.release_locks(tid, &log.locks, requirement).await?;
+        // The liveness check already ruled out every recorded entry lock.
+        // Membership and topology effects still need their own cleanup.
+        let remaining: Vec<_> = log
+            .locks
+            .iter()
+            .filter(|lock| !matches!(lock, TxLock::Entry { .. }))
+            .cloned()
+            .collect();
+        let released = self.release_locks(tid, &remaining, requirement).await?;
         changed |= released.changed;
         if !released.complete {
             return Ok(GcOutcome::from_progress(changed));
@@ -236,38 +264,6 @@ impl Gc {
             .reclaim(&log.prepared_collections)
             .await?;
         Ok(reclaimed)
-    }
-
-    /// A dead pending candidate is first pinned as `Wounded` (ADR-059), never
-    /// made eligible for deletion by GC. If a live owner committed or
-    /// refreshed first, the CAS loses and the candidate is left alone. Otherwise
-    /// known abort-owned effects are reclaimed while the wound remains durable.
-    async fn reclaim_dead_pending(
-        &self,
-        tid: &TxId,
-        log: &TxLog,
-        observation: &Observation<TxLog>,
-        requirement: Requirement,
-    ) -> Result<GcOutcome, TransError> {
-        let (wounded, changed) = self.mon.try_wound_observed(tid, observation).await?;
-        match wounded.status {
-            TxCommitStatus::Wounded => {
-                let wounded_log = wounded
-                    .observation
-                    .value()
-                    .map_or(log, std::convert::AsRef::as_ref);
-                let outcome = self
-                    .reclaim_wounded(tid, wounded_log, &wounded.observation, requirement)
-                    .await?;
-                Ok(if changed {
-                    GcOutcome::Progress
-                } else {
-                    outcome
-                })
-            }
-            // Committed or refreshed first: it was alive. Leave it.
-            _ => Ok(GcOutcome::Retained),
-        }
     }
 
     /// Reports whether any entry the candidate recorded still names its transaction identity: a

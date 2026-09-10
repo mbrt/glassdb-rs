@@ -13,7 +13,8 @@ use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered}
 use glassdb_concurr::{Background, ScanCadence, rt};
 use glassdb_data::TxId;
 use glassdb_storage::{
-    NodeStore, StorageError, StructuralIntentStore, Timeline, TreeRouter, transaction::TLogger,
+    NodeStore, Requirement, StorageError, StructuralIntentStore, Timeline, TreeRouter,
+    transaction::TLogger,
 };
 use tokio::sync::Notify;
 
@@ -21,7 +22,7 @@ use crate::collections::CollectionLifecycle;
 use crate::error::TransError;
 use crate::monitor::Monitor;
 use crate::tlocker::Locker;
-use reclaim::GcOutcome;
+use reclaim::{GcEligibility, GcOutcome};
 use scan::{GcScan, PAGE_SIZE};
 
 const HINT_CAPACITY: usize = 4096;
@@ -29,6 +30,7 @@ const SCAN_CAPACITY: usize = 2 * PAGE_SIZE;
 const MAX_CHECKS: usize = 8;
 const ADMISSION_BATCH: usize = 64;
 
+type Filter = BoxFuture<'static, (TxId, Result<GcEligibility, TransError>)>;
 type Check = BoxFuture<'static, (TxId, Result<GcOutcome, TransError>)>;
 type Listing = BoxFuture<'static, (GcScan, Result<Option<Vec<TxId>>, StorageError>)>;
 
@@ -245,6 +247,7 @@ impl Gc {
         let mut next_scan = rt::Instant::now() + retry_delay;
         let mut candidates = Candidates::default();
         let mut scanned = VecDeque::new();
+        let mut filters = FuturesUnordered::<Filter>::new();
         let mut checks = FuturesUnordered::<Check>::new();
         let mut listing = FuturesUnordered::<Listing>::new();
         let mut concurrency = 1;
@@ -270,17 +273,20 @@ impl Gc {
                 .unwrap_or_default();
             if ready > concurrency || oldest >= retry_delay / 16 {
                 concurrency = (concurrency * 2).min(MAX_CHECKS);
-            } else if ready == 0 && checks.is_empty() {
+            } else if ready == 0 && filters.is_empty() && checks.is_empty() {
                 concurrency = 1;
             }
-            while checks.len() < concurrency {
+            let status_requirement = Requirement::AtLeast(gc.timeline.now());
+            while filters.len() + checks.len() < concurrency {
                 let Some(tid) = candidates.take_ready() else {
                     break;
                 };
-                let gc = gc.clone();
-                checks.push(
+                let tl = gc.tl.clone();
+                let mon = gc.mon.clone();
+                filters.push(
                     async move {
-                        let result = gc.check_candidate(&tid).await;
+                        let result =
+                            reclaim::filter_candidate(&tl, &mon, &tid, status_requirement).await;
                         (tid, result)
                     }
                     .boxed(),
@@ -331,6 +337,32 @@ impl Gc {
                     };
                     next_scan = rt::Instant::now() + delay;
                     scan = Some(current);
+                }
+                Some(filtered) = filters.next(), if !filters.is_empty() => {
+                    let mut ready = vec![filtered];
+                    while ready.len() < MAX_CHECKS {
+                        let Some(filtered) = filters.next().now_or_never().flatten() else { break; };
+                        ready.push(filtered);
+                    }
+                    // Eligibility must be established before this bound. All
+                    // completed filters can then share fresh reference evidence.
+                    let requirement = Requirement::AtLeast(gc.timeline.now());
+                    for (tid, result) in ready {
+                        let gc = gc.clone();
+                        checks.push(async move {
+                            let result = match result {
+                                Ok(GcEligibility::Ready { observation, changed }) => {
+                                    gc.check_candidate(&tid, &observation, requirement).await.map(|outcome| {
+                                        if changed { GcOutcome::Progress } else { outcome }
+                                    })
+                                }
+                                Ok(GcEligibility::Deferred(delay)) => Ok(GcOutcome::Deferred(delay)),
+                                Ok(GcEligibility::Retained) => Ok(GcOutcome::Retained),
+                                Err(error) => Err(error),
+                            };
+                            (tid, result)
+                        }.boxed());
+                    }
                 }
                 Some((tid, result)) = checks.next(), if !checks.is_empty() => {
                     let mut completed = Some((tid, result));
