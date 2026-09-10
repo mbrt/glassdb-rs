@@ -73,7 +73,7 @@ struct Ctx {
 }
 
 #[tokio::test]
-async fn owner_replays_when_gc_reclaims_prepared_collections_during_lock_acquisition() {
+async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
     use crate::access::{AccessSet, WriteAccess};
     use crate::algo::BodyDecision;
     use crate::collections::{CatalogAccesses, CollectionChange, CollectionOp};
@@ -134,11 +134,11 @@ async fn owner_replays_when_gc_reclaims_prepared_collections_during_lock_acquisi
             let old_id = old_id.clone();
             let path = if phase == 2 {
                 ObjectPath::CollectionRecord {
-                    collection: prepared,
+                    collection: prepared.clone(),
                 }
             } else {
                 ObjectPath::TreeRoot {
-                    collection: prepared,
+                    collection: prepared.clone(),
                 }
             }
             .to_string();
@@ -159,14 +159,21 @@ async fn owner_replays_when_gc_reclaims_prepared_collections_during_lock_acquisi
                 let gc = peer.gc.clone();
                 let old_id = old_id.clone();
                 let owner_monitor = owner_monitor.clone();
+                let records = peer.records.clone();
+                let timeline = peer.timeline.clone();
+                let prepared = prepared.clone();
                 Box::pin(async move {
                     if pause {
                         peer_monitor.preempt_tx(&old_id).await.unwrap();
 
                         assert_eq!(
                             check_candidate(&gc, &old_id).await.unwrap(),
-                            GcOutcome::Progress
+                            GcOutcome::Retained
                         );
+                        records
+                            .load_record(&prepared, Requirement::AtLeast(timeline.now()))
+                            .await
+                            .unwrap();
                         assert_eq!(
                             owner_monitor.tx_status(&old_id).await.unwrap(),
                             TxCommitStatus::Pending
@@ -772,13 +779,16 @@ async fn committed_membership_lock_is_released_before_deletion() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn pending_candidates_keep_their_locks_without_writes_or_retries() {
-    for age in [Duration::ZERO, PAST_HORIZON] {
+async fn pending_and_wounded_candidates_only_read_their_logs() {
+    for (status, age) in [TxCommitStatus::Pending, TxCommitStatus::Wounded]
+        .into_iter()
+        .flat_map(|status| [Duration::ZERO, PAST_HORIZON].map(|age| (status, age)))
+    {
         let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let operations = backend.log();
         let ctx = new_ctx_with(Arc::new(backend)).await;
         let id = tx(1);
-        let mut log = TxLog::new(id.clone(), TxCommitStatus::Pending);
+        let mut log = TxLog::new(id.clone(), status);
         log.timestamp = Some(base() - age);
         log.locks = vec![write_lock(b"k")];
         ctx.tl.set(&log).await.unwrap();
@@ -787,9 +797,11 @@ async fn pending_candidates_keep_their_locks_without_writes_or_retries() {
 
         let background = Background::new();
         ctx.gc.start(&background);
-        ctx.hints.schedule(id.clone());
-        for _ in 0..64 {
-            rt::yield_now().await;
+        for _ in 0..2 {
+            ctx.hints.schedule(id.clone());
+            for _ in 0..64 {
+                rt::yield_now().await;
+            }
         }
         background.shutdown().await;
 
@@ -805,7 +817,7 @@ async fn pending_candidates_keep_their_locks_without_writes_or_retries() {
                 operations
                     .iter()
                     .all(|op| { op.path == path && matches!(op.op, "read" | "read_if_modified") }),
-                "a pending candidate must only read its log"
+                "pending and wounded candidates must only read their logs"
             );
         }
         let stats = ctx.gc.stats_and_reset();
@@ -816,7 +828,7 @@ async fn pending_candidates_keep_their_locks_without_writes_or_retries() {
         assert_eq!(diagnostics.deferred, 0);
         assert_eq!(diagnostics.in_flight, 0);
         let got = ctx.tl.get_at(&id, Requirement::Any).await.unwrap();
-        assert_eq!(got.value().unwrap().status, TxCommitStatus::Pending);
+        assert_eq!(got.value().unwrap().status, status);
         assert_eq!(
             lookup_entry(&ctx, b"k").await.unwrap().lock_holders(),
             std::slice::from_ref(&id)
@@ -824,53 +836,52 @@ async fn pending_candidates_keep_their_locks_without_writes_or_retries() {
     }
 }
 
-// Monitor establishes the wound before GC can reclaim aborted effects.
-// No Database instance may delete the marker before owner acknowledgement.
 #[tokio::test(start_paused = true)]
-async fn monitor_wounds_pending_before_gc_releases_locks() {
+async fn lock_acquisition_resolves_a_wound_that_gc_leaves_alone() {
+    use crate::access::{AccessSet, WriteAccess};
+
     let ctx = new_ctx().await;
-    let t = tx(1);
-    let mut log = TxLog::new(t.clone(), TxCommitStatus::Pending);
+    let wounded = tx(1);
+    let mut log = TxLog::new(wounded.clone(), TxCommitStatus::Wounded);
     log.timestamp = Some(base() - PAST_HORIZON);
     log.locks = vec![write_lock(b"k")];
     ctx.tl.set(&log).await.unwrap();
-    store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
-
-    assert_eq!(
-        check_candidate(&ctx.gc, &t).await.unwrap(),
-        GcOutcome::Retained
-    );
-    assert_eq!(
-        ctx.mon
-            .tx_status_at(&t, Requirement::AtLeast(ctx.timeline.now()))
+    store_entry(&ctx, b"k", locked_entry(b"k", &wounded)).await;
+    check_hints_and_scan_page(&ctx).await;
+    assert!(
+        lookup_entry(&ctx, b"k")
             .await
-            .unwrap(),
-        TxCommitStatus::Wounded
+            .unwrap()
+            .is_locked_by(&wounded)
     );
-    ctx.hints.schedule(t.clone());
-    check_hints_and_scan_page(&ctx).await;
 
-    // Death is durable...
-    let got = ctx.tl.get_at(&t, Requirement::Any).await.unwrap();
-    let got = got.value().unwrap();
-    assert_eq!(got.status, TxCommitStatus::Wounded);
-    // ...its lock is released (the now-vestigial entry pruned)...
-    assert!(lookup_entry(&ctx, b"k").await.is_none());
-    // ...and the wound remains pinned.
-    assert!(!is_gone(&ctx.tl, &t).await);
-
-    // An effect already in flight when the wound landed may appear after
-    // the first cleanup pass. The pinned record makes another pass clean it
-    // without relying on a finite tombstone window.
-    store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
-    ctx.hints.schedule(t.clone());
+    let contender = tx(2);
+    ctx.mon.begin_tx(&contender);
+    let accesses = AccessSet::new(
+        Vec::new(),
+        vec![WriteAccess::put(
+            LogicalKey::new(collection(), b"k"),
+            b"value".to_vec().into(),
+        )],
+        Vec::new(),
+    );
+    let outcome = ctx
+        .locker
+        .keys()
+        .lock_at(
+            &contender,
+            &accesses,
+            false,
+            Requirement::AtLeast(ctx.timeline.now()),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, LockOutcome::Locked(_)));
+    let entry = lookup_entry(&ctx, b"k").await.unwrap();
+    assert!(!entry.is_locked_by(&wounded));
+    assert!(entry.is_locked_by(&contender));
     check_hints_and_scan_page(&ctx).await;
-    assert!(lookup_entry(&ctx, b"k").await.is_none());
-
-    tokio::time::sleep(PAST_HORIZON * 2).await;
-    ctx.hints.schedule(t.clone());
-    check_hints_and_scan_page(&ctx).await;
-    let got = ctx.tl.get_at(&t, Requirement::Any).await.unwrap();
+    let got = ctx.tl.get_at(&wounded, Requirement::Any).await.unwrap();
     assert_eq!(got.value().unwrap().status, TxCommitStatus::Wounded);
 }
 

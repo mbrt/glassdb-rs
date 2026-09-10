@@ -4,8 +4,9 @@
 
 Accepted — implemented.
 
-[ADR-071](071-gc-skips-pending-transactions.md) supersedes candidate-driven
-wounding: GC skips missing and pending transaction logs.
+[ADR-071](071-gc-skips-pending-and-wounded-transactions.md) supersedes
+candidate-driven wounding and cleanup of wounded candidates: GC skips missing,
+pending, and wounded transaction logs.
 
 The lock-reclamation *mechanism* (the "stale-lock and empty-entry pruning" CAS)
 is refined by [ADR-029](029-gc-through-shard-coordinator.md): GC's release now

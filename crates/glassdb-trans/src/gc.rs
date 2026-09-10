@@ -4,7 +4,8 @@
 //! identity. GC checks these recorded references instead of scanning every leaf
 //! (ADR-022). A committed log stays live while a reference names it.
 //!
-//! GC skips missing and pending logs (ADR-071). It filters final candidates by
+//! GC skips missing, pending, and wounded logs (ADR-071). It filters
+//! committed and acknowledged aborted candidates by
 //! durable status and the safety horizon before capturing a fresh requirement
 //! for reference checks. Cached absence from before eligibility cannot authorize
 //! deletion. Wounded markers stay pinned until owner acknowledgement (ADR-059).
@@ -355,8 +356,9 @@ impl Gc {
         // create a wound marker merely because a scan or hint named an ID.
         let status = self.tl.commit_status_at(tid, requirement).await?;
         match TxRecordState::try_from_observation(&status.observation)? {
-            TxRecordState::Missing | TxRecordState::Pending => return Ok(GcEligibility::Retained),
-            TxRecordState::Wounded => return Ok(GcEligibility::Ready(status.observation)),
+            TxRecordState::Missing | TxRecordState::Pending | TxRecordState::Wounded => {
+                return Ok(GcEligibility::Retained);
+            }
             TxRecordState::Committed | TxRecordState::Aborted => {}
         }
         let now = rt::system_now();
@@ -386,8 +388,9 @@ impl Gc {
                     .await
             }
             TxCommitStatus::Aborted => self.reclaim_aborted(tid, log, observed, requirement).await,
-            TxCommitStatus::Wounded => self.reclaim_wounded(tid, log, observed, requirement).await,
-            TxCommitStatus::Pending | TxCommitStatus::Unknown => Ok(GcOutcome::Retained),
+            TxCommitStatus::Pending | TxCommitStatus::Unknown | TxCommitStatus::Wounded => {
+                Ok(GcOutcome::Retained)
+            }
         }
     }
 
@@ -468,20 +471,6 @@ impl Gc {
         }
         self.tl.delete(observation).await?;
         Ok(GcOutcome::Reclaimed)
-    }
-
-    /// Reclaims effects described by an unacknowledged wound but never removes
-    /// the transaction marker. Only the owner may make it GC-eligible by
-    /// changing it to `Aborted`.
-    async fn reclaim_wounded(
-        &self,
-        tid: &TxId,
-        log: &TxLog,
-        _observation: &Observation<TxLog>,
-        requirement: Requirement,
-    ) -> Result<GcOutcome, TransError> {
-        let reclaimed = self.cleanup_aborted_effects(tid, log, requirement).await?;
-        Ok(GcOutcome::from_progress(reclaimed.changed))
     }
 
     async fn cleanup_aborted_effects(

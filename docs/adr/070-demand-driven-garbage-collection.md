@@ -4,6 +4,9 @@
 
 Accepted — implemented.
 
+[ADR-071](071-gc-skips-pending-and-wounded-transactions.md) supersedes GC
+resolution of pending candidates and cleanup of wounded candidates.
+
 Refines GC scheduling in
 [ADR-022](022-garbage-collection-mark-sweep.md), transaction-object placement and
 GC scans in

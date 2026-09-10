@@ -8,7 +8,7 @@ use glassdb_concurr::{exec, rt};
 use glassdb_trans::ProtocolTiming;
 
 #[test]
-fn old_identity_gc_preserves_the_replayed_collection() {
+fn gc_preserves_wounded_preparations_and_the_replayed_collection() {
     use glassdb_data::{CollectionAddress, ObjectPath};
     use glassdb_storage::InlinePolicy;
     use std::sync::Mutex;
@@ -72,13 +72,12 @@ fn old_identity_gc_preserves_the_replayed_collection() {
         .await
         .unwrap();
         rt::sleep(Duration::from_secs(2)).await;
-        // Timed-out acquisition pins its marker even after GC removes its roots.
+        // The interrupted acquisition cannot prove retirement. GC must leave
+        // its prepared root with the pinned wound, even after repeated scans.
         let gc = db.stats().gc;
-        assert!(gc.progress > 0, "{gc:?}");
-        assert!(matches!(
-            backend.read(&roots[0]).await,
-            Err(BackendError::NotFound)
-        ));
+        assert!(gc.lists > 0, "{gc:?}");
+        assert_eq!(gc.progress, 0, "{gc:?}");
+        backend.read(&roots[0]).await.unwrap();
         assert_eq!(
             child.read(b"key").await.unwrap(),
             Some(b"survives GC".to_vec())
