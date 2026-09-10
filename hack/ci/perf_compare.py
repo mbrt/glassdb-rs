@@ -24,6 +24,7 @@ REPETITIONS = 3
 RUNTIME_LIMIT = 270
 CASES = (
     "warm_read",
+    "warm_read_external",
     "fresh_client_read",
     "rmw_inline_1024",
     "rmw_external_1025",

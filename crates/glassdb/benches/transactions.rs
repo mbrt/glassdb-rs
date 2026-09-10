@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use futures::future::join_all;
+use futures::{FutureExt, future::join_all};
 use tokio::runtime::Runtime;
 
 use glassdb::backend::memory::MemoryBackend;
@@ -653,7 +653,52 @@ fn bench_direct_commit_uncontended(c: &mut Criterion, rt: &Runtime) {
     group.finish();
 }
 
+/// Runs competing transactions requested by the measured workload.
+async fn run_contender<F, W>(mut requests: tokio::sync::mpsc::Receiver<usize>, mut work: F)
+where
+    F: FnMut(usize) -> W,
+    W: std::future::Future<Output = ()>,
+{
+    // An unlimited writer can repeatedly invalidate a measured transaction.
+    // A closed queue also lets the last transaction finish before shutdown.
+    while let Some(next) = requests.recv().await {
+        work(next).await;
+    }
+}
+
+async fn verify_contender_requests() {
+    let (requests, receiver) = tokio::sync::mpsc::channel(1);
+    let calls = AtomicUsize::new(0);
+    let contender = run_contender(receiver, |_| async {
+        if calls.fetch_add(1, Ordering::Relaxed) > 0 {
+            // Bound a broken free-running loop so this regression fails
+            // without hanging the test runtime.
+            std::future::pending::<()>().await;
+        }
+    });
+    tokio::pin!(contender);
+    assert!(contender.as_mut().now_or_never().is_none());
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "an idle contender must not write"
+    );
+    requests.try_send(0).unwrap();
+    assert!(contender.as_mut().now_or_never().is_none());
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "each request permits one competing transaction"
+    );
+    drop(requests);
+    assert!(
+        contender.now_or_never().is_some(),
+        "closing requests must finish the contender"
+    );
+}
+
 fn bench_direct_commit_leaf_contention(c: &mut Criterion, rt: &Runtime) {
+    rt.block_on(verify_contender_requests());
     let mut group = c.benchmark_group("direct_commit_leaf_contention");
     group.sample_size(10);
     group.warm_up_time(Duration::from_millis(100));
@@ -695,54 +740,51 @@ fn bench_direct_commit_leaf_contention(c: &mut Criterion, rt: &Runtime) {
                     8,
                 ));
 
-                let background_sequence = Arc::new(AtomicUsize::new(background_initial));
-                let task_sequence = background_sequence.clone();
+                let background_sequence = AtomicUsize::new(background_initial);
+                let (requests, receiver) = tokio::sync::mpsc::channel(1);
                 let task_db = background_db.clone();
                 let task_coll = background_coll.clone();
                 let task_keys = background_keys.clone();
                 let contender = rt.spawn(async move {
-                    loop {
-                        let next = task_sequence.fetch_add(1, Ordering::Relaxed);
+                    run_contender(receiver, |next| {
                         run_direct_workload(workload, &task_db, &task_coll, &task_keys, next, 8)
-                            .await;
-                    }
+                    })
+                    .await;
                 });
 
                 let measured_sequence = AtomicUsize::new(measured_initial);
+                let run = || async {
+                    let background_next = background_sequence.fetch_add(1, Ordering::Relaxed);
+                    requests
+                        .send(background_next)
+                        .await
+                        .expect("contender is running");
+                    let next = measured_sequence.fetch_add(1, Ordering::Relaxed);
+                    run_direct_workload(
+                        workload,
+                        &measured_db,
+                        &measured_coll,
+                        &measured_keys,
+                        next,
+                        8,
+                    )
+                    .await;
+                };
                 let label = format!("{}/{count}/{backend_name}", workload.label());
                 let stats = rt.block_on(report_stats(
                     &format!("direct_commit_leaf_contention/{label}"),
                     &measured_db,
-                    || {
-                        let next = measured_sequence.fetch_add(1, Ordering::Relaxed);
-                        run_direct_workload(
-                            workload,
-                            &measured_db,
-                            &measured_coll,
-                            &measured_keys,
-                            next,
-                            8,
-                        )
-                    },
+                    &run,
                 ));
                 verify_direct_gate(&label, &stats, false);
 
                 group.bench_function(&label, |bch| {
-                    bch.iter(|| {
-                        let next = measured_sequence.fetch_add(1, Ordering::Relaxed);
-                        rt.block_on(run_direct_workload(
-                            workload,
-                            &measured_db,
-                            &measured_coll,
-                            &measured_keys,
-                            next,
-                            8,
-                        ));
-                    });
+                    bch.iter(|| rt.block_on(run()));
                 });
 
-                contender.abort();
-                let _ = rt.block_on(contender);
+                drop(requests);
+                rt.block_on(contender)
+                    .expect("contender completes its transactions");
                 rt.block_on(background_db.shutdown());
                 rt.block_on(measured_db.shutdown());
             }

@@ -29,6 +29,7 @@ deterministic.
 | Case | Condition | Transactions per iteration |
 | --- | --- | ---: |
 | `warm_read` | One key, 256-byte value, warmed client caches | 1 |
+| `warm_read_external` | One key, 1,025-byte value stored in a transaction log, warmed client caches | 1 |
 | `fresh_client_read` | Same contents; reopen client and collection before each read | 1 |
 | `rmw_inline_1024` | One key; 1,024-byte value at the default inline limit | 1 |
 | `rmw_external_1025` | One key; 1,025-byte value above that limit | 1 |
@@ -68,8 +69,9 @@ Body bytes exclude paths, headers, LIST response bodies, and transport overhead.
 There is no combined score or automatic performance gate. Timing results
 depend on the host. Real-provider costs require separate measurements.
 Exact protocol guarantees belong in integration/simulation tests, not timing
-assertions. Fixture preparation and transaction-completion checks run with the
-benchmarks, not through `make test-all`.
+assertions. Fixture preparation, transaction completion, and zero backend reads
+for warmed inline writes are checked by the benchmark harness. `make test-all`
+runs all benchmark targets in test mode, including these checks.
 
 ## Comparison artifacts
 
