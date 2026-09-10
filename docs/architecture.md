@@ -278,14 +278,9 @@ point, and write-back ordering remain explicit transaction-wide policy.
 
 `BodyDecision` reports only whether to return the body outcome or replay the
 body. `CollectionAttempt` owns collection-ID reservations together with the
-prepared resources for one transaction identity. Each body execution starts with
-fresh key and catalog accesses and a handle to those reservations. Body replay
-under the same identity reuses the IDs; identity renewal replaces the
-reservations along with the physical-resource bookkeeping. Old body handles
-retain only the retired identity's reservations. The public transaction loop
-does not interpret identity changes or reset reservation state. This prevents GC
-for a retired identity from deleting collection objects reused by a later
-attempt.
+prepared resources for one transaction identity. Body replay reuses these
+reservations; identity renewal replaces them so later attempts cannot reuse
+resources that GC can reclaim for the retired identity.
 
 The engine handle is allocated before the first body execution so its identity
 owns reservations from the first collection creation. Allocation is local;

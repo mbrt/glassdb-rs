@@ -3627,9 +3627,39 @@ mod tests {
         let s = store_with_backend(backend.clone());
         let other = store_with_backend(backend);
         let bg = Arc::new(Background::new());
-        let (sp, mon) = splitter_and_monitor(&s, &bg, tiny());
+        let (sp, _) = splitter_and_monitor(&s, &bg, tiny());
         let holder = TxId::with_priority(1, b"committed");
-        mon.begin_tx(&holder);
+        let other_bg = Arc::new(Background::new());
+        let other_transactions = other.foundation.tlogger.clone();
+        let other_mon = other.foundation.monitor_for(
+            &other_bg,
+            RetryConfig::default(),
+            crate::monitor::ProtocolTiming::default(),
+        );
+        let other_key_state = KeyStateResolver::new(other_mon.clone());
+        let other_coord = LeafCoordinator::with_hinter(
+            other.nodes.clone(),
+            other_key_state,
+            other_mon.clone(),
+            RetryConfig::default(),
+            SplitPolicy::default(),
+            Arc::new(NoSplitHints),
+        );
+        let other_locker = crate::tlocker::Locker::new(
+            other_coord,
+            TreeRouter::new(other.nodes.clone(), std::num::NonZeroUsize::MIN),
+            crate::collection_coordination::CollectionStateResolver::new(
+                other.records.clone(),
+                other_transactions,
+                other.timeline.clone(),
+                other_mon.clone(),
+                RetryConfig::default(),
+            ),
+            other_mon.clone(),
+            RetryConfig::default(),
+            std::num::NonZeroUsize::MIN,
+        );
+        other_mon.begin_tx(&holder);
         let mut log = TxLog::new(holder.clone(), TxCommitStatus::Ok);
         log.writes.push(TxWrite {
             key: LogicalKey::new(collection(), b"d"),
@@ -3637,18 +3667,39 @@ mod tests {
             deleted: false,
             prev_writer: TxId::from_bytes(vec![1]),
         });
-        mon.commit_tx(log).await.unwrap();
 
-        let mut entries: Vec<_> = [b"a".as_slice(), b"b", b"c", b"d"]
+        let entries: Vec<_> = [b"a".as_slice(), b"b", b"c", b"d"]
             .iter()
             .map(|key| live(key))
             .collect();
-        let upper = entries.last_mut().unwrap();
-        upper.replace_write_lock(holder.clone());
         let node = Node::leaf(LeafBody::from_entries(entries));
         s.store_node(COLL, "L", &node, None).await.unwrap();
         let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
         s.create_root(COLL, &root).await.unwrap();
+
+        let accesses = crate::access::AccessSet::new(
+            Vec::new(),
+            vec![crate::access::WriteAccess::put(
+                LogicalKey::new(collection(), b"d"),
+                Arc::from(b"new-d".as_slice()),
+            )],
+            Vec::new(),
+        );
+        let crate::tlocker::LockOutcome::Locked(locked) = other_locker
+            .keys()
+            .lock_at(
+                &holder,
+                &accesses,
+                false,
+                Requirement::AtLeast(other.timeline.now()),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("entry lock must be acquired before the split");
+        };
+        log.locks = locked.locked_paths();
+        other_mon.commit_tx(log).await.unwrap();
 
         sp.split_path(&node_path("L")).await.unwrap();
 
@@ -3676,45 +3727,7 @@ mod tests {
 
         // A different instance still targeting the pre-split source must
         // re-descend and converge without recreating the removed holder.
-        let other_bg = Arc::new(Background::new());
-        let other_transactions = other.foundation.tlogger.clone();
-        let other_mon = other.foundation.monitor_for(
-            &other_bg,
-            RetryConfig::default(),
-            crate::monitor::ProtocolTiming::default(),
-        );
-        let other_key_state = KeyStateResolver::new(other_mon.clone());
-        let other_coord = LeafCoordinator::with_hinter(
-            other.nodes.clone(),
-            other_key_state,
-            other_mon.clone(),
-            RetryConfig::default(),
-            SplitPolicy::default(),
-            Arc::new(NoSplitHints),
-        );
-        let other_locker = crate::tlocker::Locker::new(
-            other_coord,
-            TreeRouter::new(other.nodes.clone(), std::num::NonZeroUsize::MIN),
-            crate::collection_coordination::CollectionStateResolver::new(
-                other.records.clone(),
-                other_transactions,
-                other.timeline.clone(),
-                other_mon.clone(),
-                RetryConfig::default(),
-            ),
-            other_mon,
-            RetryConfig::default(),
-            std::num::NonZeroUsize::MIN,
-        );
-        other_locker
-            .keys()
-            .write_back_one_put(
-                &holder,
-                &node_path("L"),
-                b"d",
-                &LogicalKey::new(collection(), b"d"),
-            )
-            .await;
+        other_locker.keys().write_back(&holder, &locked).await;
         let current = TreeRouter::new(other.nodes.clone(), std::num::NonZeroUsize::MIN)
             .route_key(&collection(), b"d", Requirement::Any)
             .await

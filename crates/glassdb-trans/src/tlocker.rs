@@ -1057,26 +1057,6 @@ impl KeyLocker {
         superseded
     }
 
-    /// Publishes one committed put and releases its lock, aimed at an explicit
-    /// leaf path rather than at a held [`LockedTx`], so a test can direct a
-    /// delayed write-back at a path a split may already have retired.
-    #[cfg(test)]
-    pub(crate) async fn write_back_one_put(
-        &self,
-        id: &TxId,
-        leaf_path: &ObjectPath,
-        raw_key: &[u8],
-        key: &LogicalKey,
-    ) -> Vec<TxId> {
-        let intents = Arc::new(vec![KeyIntent {
-            raw_key: raw_key.to_vec(),
-            key: key.clone(),
-            desired: Desired::Put,
-        }]);
-        self.write_back_routed(id, leaf_path, intents, Requirement::Any)
-            .await
-    }
-
     /// Releases `id` from one exact leaf path.
     pub(crate) async fn release_leaf(
         &self,
