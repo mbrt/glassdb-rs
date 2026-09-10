@@ -10,10 +10,23 @@ use glassdb_storage::{StorageError, transaction::TLogger};
 
 use super::Counters;
 
+// Matches MAX_LIST_PAGE_SIZE in both the S3 and GCS adapters, so each LIST can
+// amortize its request cost over a full page. Backends can return shorter pages.
 pub(super) const PAGE_SIZE: usize = 1000;
+// Initial scheduling limit per generation: permits progress across several
+// prefixes while bounding active cursors. Older generations retain their
+// cursors separately; this is not a limit on concurrent LIST requests.
 const MAX_TRAVERSALS: usize = 8;
+// ADR-070 uses four distinct prefixes to reduce single-sample noise while
+// reacting sooner than a full 64-prefix pass. Uniform transaction IDs let
+// these samples estimate the whole namespace.
 const SAMPLE_SIZE: usize = 4;
+// ADR-070's initial traversal budget: narrow after 64 nonterminal pages rather
+// than waiting for a large traversal to finish.
 const NARROW_PAGES: usize = 64;
+// Broaden only when a prefix is estimated to fit in 32 pages at the observed
+// page capacity. Half the narrowing threshold leaves room for estimation noise
+// and growth without immediately reversing the depth change (ADR-070).
 const BROADEN_PAGES: f64 = 32.0;
 
 struct Traversal {

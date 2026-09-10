@@ -97,6 +97,7 @@ enum CandidateState {
 #[derive(Default)]
 struct Candidates {
     entries: BTreeMap<TxId, Candidate>,
+    hint_delay: Duration,
     hints: CandidateQueue,
     scans: CandidateQueue,
     deferred: BTreeSet<(rt::Instant, TxId)>,
@@ -110,6 +111,13 @@ struct CandidateQueue {
 }
 
 impl Candidates {
+    fn new(hint_delay: Duration) -> Self {
+        Self {
+            hint_delay,
+            ..Self::default()
+        }
+    }
+
     fn admit(&mut self, tid: TxId, from_scan: bool, now: rt::Instant, counters: &Counters) {
         if let Some(candidate) = self.entries.get_mut(&tid) {
             if from_scan && !candidate.from_scan {
@@ -128,7 +136,7 @@ impl Candidates {
                 }
                 candidate.from_scan = true;
             }
-            candidate.reported_again |= candidate.state == CandidateState::Running;
+            candidate.reported_again |= !from_scan && candidate.state == CandidateState::Running;
             return;
         }
         let queue = self.queue_mut(from_scan);
@@ -142,13 +150,25 @@ impl Candidates {
             return;
         }
         queue.count += 1;
-        queue.ready.insert((now, tid.clone()));
+        let delay = if from_scan {
+            Duration::ZERO
+        } else {
+            self.hint_delay
+        };
+        let due = now + delay;
+        let state = if delay.is_zero() {
+            self.queue_mut(from_scan).ready.insert((due, tid.clone()));
+            CandidateState::Ready
+        } else {
+            self.deferred.insert((due, tid.clone()));
+            CandidateState::Deferred
+        };
         self.entries.insert(
             tid,
             Candidate {
-                due: now,
+                due,
                 from_scan,
-                state: CandidateState::Ready,
+                state,
                 reported_again: false,
                 failures: 0,
             },
@@ -648,7 +668,7 @@ impl Scheduler {
         let retry_delay = gc.timing.pending_timeout();
         let counters = gc.hints.counters.clone();
         Self {
-            candidates: Candidates::default(),
+            candidates: Candidates::new(retry_delay + gc.timing.max_clock_skew()),
             scanned: VecDeque::new(),
             checks: OptionFuture::default(),
             checking: false,
@@ -792,7 +812,9 @@ impl Scheduler {
                     Some(self.retry_delay)
                 }
                 Ok(GcOutcome::Deferred(delay)) => Some(delay),
-                Ok(GcOutcome::Retained) => candidate.reported_again.then_some(self.retry_delay),
+                Ok(GcOutcome::Retained) => candidate
+                    .reported_again
+                    .then_some(self.candidates.hint_delay),
                 Err(error) => {
                     tracing::debug!(tx = %tid, error = %error, "GC candidate check deferred");
                     self.counters.failures.fetch_add(1, Ordering::Relaxed);

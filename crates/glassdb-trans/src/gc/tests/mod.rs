@@ -386,6 +386,16 @@ async fn check_candidate(gc: &Gc, tid: &TxId) -> Result<GcOutcome, TransError> {
     }
 }
 
+async fn wait_for_hint_deadline(ctx: &Ctx) {
+    for _ in 0..64 {
+        rt::yield_now().await;
+    }
+    tokio::time::advance(ctx.gc.timing.pending_timeout() + ctx.gc.timing.max_clock_skew()).await;
+    for _ in 0..64 {
+        rt::yield_now().await;
+    }
+}
+
 async fn check_hints_and_scan_page(ctx: &Ctx) {
     let mut candidates = Vec::new();
     loop {
@@ -799,9 +809,7 @@ async fn pending_and_wounded_candidates_only_read_their_logs() {
         ctx.gc.start(&background);
         for _ in 0..2 {
             ctx.hints.schedule(id.clone());
-            for _ in 0..64 {
-                rt::yield_now().await;
-            }
+            wait_for_hint_deadline(&ctx).await;
         }
         background.shutdown().await;
 
@@ -812,11 +820,15 @@ async fn pending_and_wounded_candidates_only_read_their_logs() {
         .to_string();
         {
             let operations = operations.lock().unwrap();
-            assert!(!operations.is_empty(), "GC must check the hinted candidate");
             assert!(
-                operations
-                    .iter()
-                    .all(|op| { op.path == path && matches!(op.op, "read" | "read_if_modified") }),
+                operations.iter().any(|op| op.path == path),
+                "GC must check the hinted candidate"
+            );
+            assert!(
+                operations.iter().all(|op| {
+                    op.op == "list"
+                        || (op.path == path && matches!(op.op, "read" | "read_if_modified"))
+                }),
                 "pending and wounded candidates must only read their logs"
             );
         }
@@ -1146,7 +1158,7 @@ async fn cached_candidate_converges_after_a_peer_deletes_it() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn hinted_candidates_wake_gc_without_a_list() {
+async fn hinted_candidates_wait_without_restarting_the_deadline() {
     let ctx = new_ctx().await;
     let id = tx(11);
     ctx.tl
@@ -1159,9 +1171,24 @@ async fn hinted_candidates_wake_gc_without_a_list() {
     for _ in 0..64 {
         rt::yield_now().await;
     }
+    assert!(!is_gone(&ctx.tl, &id).await);
+    assert_eq!(ctx.gc.diagnostics().deferred, 1);
+    let delay = ctx.gc.timing.pending_timeout() + ctx.gc.timing.max_clock_skew();
+    tokio::time::advance(delay / 2).await;
+    for _ in 0..64 {
+        rt::yield_now().await;
+    }
+    ctx.hints.schedule(id.clone());
+    for _ in 0..64 {
+        rt::yield_now().await;
+    }
+    assert!(!is_gone(&ctx.tl, &id).await);
+    tokio::time::advance(delay / 2).await;
+    for _ in 0..64 {
+        rt::yield_now().await;
+    }
     assert!(is_gone(&ctx.tl, &id).await);
     let stats = ctx.gc.stats_and_reset();
-    assert_eq!(stats.lists, 0);
     assert_eq!(stats.progress, 1);
     bg.shutdown().await;
 }
@@ -1182,9 +1209,7 @@ async fn concurrent_candidates_share_one_leaf_validation() {
     operations.lock().unwrap().clear();
     let bg = Background::new();
     ctx.gc.start(&bg);
-    for _ in 0..64 {
-        rt::yield_now().await;
-    }
+    wait_for_hint_deadline(&ctx).await;
     bg.shutdown().await;
 
     assert_eq!(ctx.gc.stats_and_reset().progress, 2);
@@ -1307,9 +1332,7 @@ async fn a_transient_failure_keeps_the_candidate_until_retry() {
     let bg = Arc::new(glassdb_concurr::Background::new());
     ctx.gc.start(&bg);
     ctx.hints.schedule(id.clone());
-    for _ in 0..32 {
-        rt::yield_now().await;
-    }
+    wait_for_hint_deadline(&ctx).await;
     assert!(!is_gone(&ctx.tl, &id).await);
     assert_eq!(ctx.gc.diagnostics().deferred, 1);
     for _ in 0..20 {
@@ -1327,24 +1350,42 @@ async fn a_transient_failure_keeps_the_candidate_until_retry() {
 
 #[tokio::test(start_paused = true)]
 async fn a_ready_hint_queue_does_not_starve_the_scan() {
-    let ctx =
-        new_ctx_with_interval(Arc::new(MemoryBackend::new()), Duration::from_millis(10)).await;
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let ctx = new_ctx_with_interval(backend.clone(), Duration::from_millis(10)).await;
     let id = tx(13);
     ctx.tl
         .set(&committed(id.clone(), PAST_HORIZON, &[], &[]))
         .await
         .unwrap();
+    let reclaimed_with_ready_hints = Arc::new(AtomicBool::new(false));
+    backend.set_before({
+        let counters = ctx.hints.counters.clone();
+        let reclaimed_with_ready_hints = reclaimed_with_ready_hints.clone();
+        move |op| {
+            if matches!(op, BackendOp::DeleteIf { .. }) {
+                reclaimed_with_ready_hints
+                    .store(counters.diagnostics().ready > 0, Ordering::SeqCst);
+            }
+            Box::pin(async { Ok(()) })
+        }
+    });
     let bg = Arc::new(glassdb_concurr::Background::new());
     ctx.hints
         .schedule_all((0u64..2000).map(|i| TxId::from_bytes(i.to_be_bytes().to_vec())));
     ctx.gc.start(&bg);
-    rt::yield_now().await;
-    tokio::time::advance(Duration::from_millis(11)).await;
+    for _ in 0..64 {
+        rt::yield_now().await;
+    }
+    tokio::time::advance(
+        ctx.gc.timing.pending_timeout() + ctx.gc.timing.max_clock_skew() + Duration::from_millis(1),
+    )
+    .await;
     for _ in 0..64 {
         rt::yield_now().await;
     }
     assert!(ctx.gc.stats_and_reset().lists > 0);
     assert!(is_gone(&ctx.tl, &id).await);
+    assert!(reclaimed_with_ready_hints.load(Ordering::SeqCst));
     bg.shutdown().await;
 }
 
@@ -1405,7 +1446,7 @@ fn scan_reports_preserve_candidates_in_each_scheduling_state() {
     assert_eq!(running, hint);
     candidates.admit(running.clone(), true, now, &counters);
     let candidate = candidates.complete(&running);
-    assert!(candidate.reported_again);
+    assert!(!candidate.reported_again);
     candidates.defer(running.clone(), candidate, now + Duration::from_secs(1));
 
     candidates.admit(deferred_scan.clone(), false, now, &counters);
@@ -1431,4 +1472,61 @@ fn scan_reports_preserve_candidates_in_each_scheduling_state() {
     candidates.record_backlog(&counters);
     assert_eq!(counters.diagnostics(), GcDiagnostics::default());
     assert_eq!(candidates.next_due(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn only_a_hint_during_a_check_requests_a_delayed_follow_up() {
+    let ctx = new_ctx().await;
+    let mut scheduler = Scheduler::new(&ctx.gc);
+    let now = rt::Instant::now();
+    let id = tx(20);
+    scheduler
+        .candidates
+        .admit(id.clone(), true, now, &scheduler.counters);
+    assert_eq!(scheduler.candidates.take_ready(), Some(id.clone()));
+    scheduler
+        .candidates
+        .admit(id.clone(), true, now, &scheduler.counters);
+    scheduler.complete_checks(vec![(id.clone(), Ok(GcOutcome::Retained))]);
+    assert_eq!(scheduler.candidates.next_due(), None);
+
+    scheduler
+        .candidates
+        .admit(id.clone(), true, now, &scheduler.counters);
+    assert_eq!(scheduler.candidates.take_ready(), Some(id.clone()));
+    scheduler
+        .candidates
+        .admit(id.clone(), false, now, &scheduler.counters);
+    scheduler.complete_checks(vec![(id.clone(), Ok(GcOutcome::Retained))]);
+    let delay = ctx.gc.timing.pending_timeout() + ctx.gc.timing.max_clock_skew();
+    let due = now + delay;
+    assert_eq!(scheduler.candidates.next_due(), Some(due));
+    scheduler.candidates.admit(
+        id.clone(),
+        false,
+        now + Duration::from_secs(1),
+        &scheduler.counters,
+    );
+    assert_eq!(scheduler.candidates.next_due(), Some(due));
+    scheduler
+        .candidates
+        .promote_due(now + (delay - Duration::from_nanos(1)));
+    assert_eq!(scheduler.candidates.take_ready(), None);
+    scheduler.candidates.promote_due(due);
+    assert_eq!(scheduler.candidates.take_ready(), Some(id));
+}
+
+#[test]
+fn scan_admission_does_not_advance_a_hint_deadline() {
+    let now = rt::Instant::now();
+    let delay = Duration::from_secs(45);
+    let mut candidates = Candidates::new(delay);
+    let counters = Counters::default();
+    let id = tx(21);
+    candidates.admit(id.clone(), false, now, &counters);
+    candidates.admit(id.clone(), true, now + delay / 2, &counters);
+    assert_eq!(candidates.next_due(), Some(now + delay));
+    assert_eq!(candidates.take_ready(), None);
+    candidates.promote_due(now + delay);
+    assert_eq!(candidates.take_ready(), Some(id));
 }

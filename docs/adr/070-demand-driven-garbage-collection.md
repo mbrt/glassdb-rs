@@ -56,12 +56,19 @@ mutations can still affect transaction latency; increasing backlog must not
 cause unlimited GC concurrency. Cleanup delay can grow without bound during
 sustained overload.
 
-### Hints start GC directly
+### Hints share delayed checks
 
 Local hints wake GC without causing a LIST. The `Database` instance de-duplicates
 GC candidates and retains deferred checks with retry times in bounded memory.
-The safety horizon controls eligibility, not worker frequency. Transient
-failures receive delayed retries.
+The first admitted hint schedules a check after the pending timeout plus the
+clock-skew allowance. Further hints and scans preserve that deadline. Scan-only
+candidates can be checked immediately. The observed log's safety horizon can
+defer a check further; hints cannot bring it forward. This trades longer storage
+and buffering for fewer premature requests.
+
+A hint received during a check can request one follow-up after the same delay
+from completion if the candidate is retained. Repeated scan observations alone
+do not request a follow-up. Progress and failure retries keep their own delays.
 
 Ready candidates receive bounded parallel work without a fixed pause between
 batches. With no ready work, GC sleeps until a hint arrives or a retry is
