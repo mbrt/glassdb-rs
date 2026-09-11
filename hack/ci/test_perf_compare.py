@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import subprocess
 import json
 import sys
@@ -130,8 +131,38 @@ class MeasurementTest(unittest.TestCase):
                 self.assertFalse((self.root / "pr").exists())
                 self.assertFalse(self.order())
 
+    @unittest.skipUnless(hasattr(os, "sched_getaffinity"), "CPU affinity requires Linux")
+    def test_measurements_control_cpu_placement_and_restore_driver_affinity(self):
+        affinity = os.sched_getaffinity(0)
+        self.addCleanup(os.sched_setaffinity, 0, affinity)
+        manifest = self.manifest(cases=("a",))
+        perf_compare.measure(self.root, manifest)
+        self.assertEqual(manifest["cpuAffinity"], sorted(affinity)[:4])
+        self.assertEqual(manifest["diagnosticCpu"], min(affinity))
+        for row in self.order():
+            expected = sorted(affinity)[:4] if row[1] == "mixed" else [min(affinity)]
+            self.assertEqual(row[3], expected)
+        self.assertEqual(os.sched_getaffinity(0), affinity)
+
+    def test_fixed_latency_measurements_use_the_requested_profile(self):
+        manifest = self.manifest(cases=("a",))
+        manifest["mixedArgs"] = ["--latency-jitter=false"]
+        perf_compare.measure(self.root, manifest)
+        self.assertFalse(manifest["warnings"])
+        for side in ("main", "pr"):
+            result = json.loads((self.root / side / "01/mixed.json").read_text())
+            self.assertIs(result["latencyJitter"], False)
+
+    def test_wrong_latency_profile_fails_before_counting_the_pair(self):
+        self.configure(latencyJitter=True)
+        manifest = self.manifest(cases=("a",))
+        manifest["mixedArgs"] = ["--latency-jitter=false"]
+        with self.assertRaisesRegex(perf_compare.perf_report.ReportError, "latency profile"):
+            perf_compare.measure(self.root, manifest)
+        self.assertEqual(manifest["completedPairs"]["mixed"], 0)
+
     def test_resolved_benchmarks_stop_and_uncertain_benchmarks_get_more_pairs(self):
-        self.configure(factors={"b": [1.014, 1.026], "mixed": [1.014, 1.026]})
+        self.configure(factors={"b": [1.028, 1.052], "mixed": [1.028, 1.052]})
         manifest = self.manifest()
         perf_compare.measure(self.root, manifest)
         self.assertEqual(manifest["completedPairs"], {"a": 4, "b": 8, "mixed": 8})
@@ -169,7 +200,7 @@ class MeasurementTest(unittest.TestCase):
             perf_compare.measure(self.root, self.manifest())
 
     def test_clear_changes_and_small_effects_stop_at_the_first_checkpoint(self):
-        self.configure(factors={"a": [1.012], "b": [0.985]})
+        self.configure(factors={"a": [1.024], "b": [0.970]})
         manifest = self.manifest()
         perf_compare.measure(self.root, manifest)
         self.assertEqual(set(manifest["completedPairs"].values()), {4})
@@ -267,7 +298,8 @@ case = 'mixed' if '--output' in sys.argv else sys.argv[-1].removeprefix('^diagno
 factors = settings.get('factors', {}).get(case, [1])
 factor = factors[(repetition - 1) % len(factors)] if side == 'pr' else 1
 with (root / 'order.jsonl').open('a') as log:
-    log.write(json.dumps([repetition, case, side]) + '\n')
+    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None
+    log.write(json.dumps([repetition, case, side, affinity]) + '\n')
 if settings.get('failAt') == [repetition, case, side]:
     sys.exit(7)
 if settings.get('hangAt') == [repetition, case, side]:
@@ -279,6 +311,7 @@ if case == 'mixed':
         for name in ('rwSingle', 'rwMany', 'roSingle', 'roMulti')]
     shapes[0]['p50Ms'] *= factor
     result = {'schemaVersion': 1, 'scenario': 'mixed', 'backend': 'memory',
+        'latencyJitter': settings.get('latencyJitter', '--latency-jitter=false' not in sys.argv),
         'modelTimeSpeedup': 5, 'runs': [{'cells': [{'mode': 'lo',
             'affinityPct': 100, 'databases': 1, 'workersPerShape': 1,
             'failures': 0, 'shapes': shapes}]}]}

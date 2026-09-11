@@ -17,6 +17,9 @@ pub(super) struct Options {
     /// Cloud latency profile simulated by memory and fakes3.
     #[arg(long, default_value = "s3", value_parser = ["gcs", "s3"], global = true)]
     delays: String,
+    /// Vary simulated provider latency around its mean.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, global = true)]
+    pub(super) latency_jitter: bool,
     /// Enable simulated per-object and per-prefix throttling.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, global = true)]
     enable_throttling: bool,
@@ -105,6 +108,17 @@ impl Options {
             "s3" => s3_delays(),
             other => return Err(format!("unknown delay profile {other:?}").into()),
         };
+        if !self.latency_jitter {
+            for latency in [
+                &mut delays.latency.meta_read,
+                &mut delays.latency.meta_write,
+                &mut delays.latency.obj_read,
+                &mut delays.latency.obj_write,
+                &mut delays.latency.list,
+            ] {
+                latency.std_dev = Duration::ZERO;
+            }
+        }
         if !self.enable_throttling {
             delays.rate_limits.same_obj_write_ps = RateLimit::Unlimited;
             delays.rate_limits.prefix_read_ps = RateLimit::Unlimited;
@@ -169,5 +183,42 @@ fn required_env(name: &str) -> Result<String, Box<dyn Error>> {
     match std::env::var(name) {
         Ok(value) if !value.is_empty() => Ok(value),
         _ => Err(format!("environment variable ${name} is required").into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[tokio::test(start_paused = true)]
+    async fn fixed_latency_keeps_backend_waits_and_throttling() -> Result<(), Box<dyn Error>> {
+        let cli = crate::Cli::try_parse_from([
+            "perfbench",
+            "--delays=gcs",
+            "--latency-jitter=false",
+            "mixed",
+        ])?;
+        let backend = cli.backend.initialize().await?.backend();
+        let version = backend.write_if_not_exists("db/key", vec![7]).await?;
+        let mut elapsed = Vec::new();
+        for _ in 0..2 {
+            let start = tokio::time::Instant::now();
+            assert_eq!(backend.read("db/key").await?.contents, vec![7]);
+            elapsed.push(start.elapsed());
+        }
+        assert_eq!(elapsed[0], elapsed[1]);
+        assert!(elapsed[0] >= Duration::from_millis(57));
+        assert!(elapsed[0] <= Duration::from_millis(58));
+
+        // The object limiter admits an initial burst. Check the next window
+        // after that burst has used more than its one-write-per-second budget.
+        let version = backend.write_if("db/key", vec![8], &version).await?;
+        let version = backend.write_if("db/key", vec![9], &version).await?;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let start = tokio::time::Instant::now();
+        backend.write_if("db/key", vec![10], &version).await?;
+        assert!(start.elapsed() >= Duration::from_millis(500));
+        Ok(())
     }
 }

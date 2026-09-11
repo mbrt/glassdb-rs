@@ -151,14 +151,20 @@ and throughput results are resolved; all four transaction shapes keep running
 together. Mixed runs retain their ten-second window so GC remains part of the
 workload. Each benchmark reaches the first checkpoint before unresolved
 benchmarks receive more pairs. Benchmark order reverses at alternate checkpoints
-so the mixed workload is not always last.
+so the mixed workload is not always last. On Linux, diagnostics use one fixed CPU
+to limit migration. Mixed measurements use a fixed pool of up to four CPUs,
+matching the CI runner's runtime width. The driver restores its original CPU
+affinity afterward.
+The comparison uses `--latency-jitter=false`: provider mean latencies and
+throttling remain enabled, while random provider variation is removed from
+the code comparison. Other benchmark invocations retain latency jitter by default.
 The final checkpoint at 32 pairs is the normal measurement limit; there is no
 shared runtime budget. A full comparison is expected to take about 40 minutes
 if no benchmark resolves early. Each benchmark process has a two-minute timeout
 to catch hangs, including preparation and shutdown. CI allows 90 minutes for
 measurement and two hours for the whole job, including compilation and reporting.
-The manifest records the host platform, CPU model,
-and available CPU affinity. It also records the planned checkpoints and each
+The manifest records executable hashes, host platform, CPU model,
+and measurement CPU affinity. It also records the planned checkpoints and each
 benchmark's completed pair count. A process timeout fails the comparison;
 the report still uses the last completed checkpoint for each benchmark and leaves
 unresolved results inconclusive. Later samples and unfinished pairs remain in
@@ -183,22 +189,26 @@ shows the median of each revision's run estimates, not a pooled transaction
 percentile. Criterion samples are averages of iteration groups, so those
 diagnostics retain mean group time; their sample percentiles are not transaction
 p50 or p90.
-A regression or improvement requires an estimated change of at least 1%
+A regression or improvement requires an estimated change of at least 2%
 and a repeat interval that excludes zero. Criterion's bootstrap standard errors
 set a floor on the interval's variance: the log standard error is approximated
 by `standard_error / mean`, and independent process variances propagate through
 the paired mean. Taking the larger of this variance and the observed paired
 variance avoids counting sampling noise twice. This can widen the ordinary
 paired interval, but cannot narrow it. Individual process intervals may overlap
-while the combined result is significant. An interval wholly within ±1%
+while the combined result is significant. An interval wholly within ±2%
 resolves a small effect; other unreported effects remain inconclusive.
 The repeat interval assumes approximately normal,
 independent log ratios; it is an estimate of
 repeatability on this host, not a guarantee across hosts. See the
 [NIST guidance on paired comparisons](https://www.itl.nist.gov/div898/handbook/eda/section3/eda353.htm).
 Backend request/body-byte changes have no percentage cutoff, but must also be
-repeatable. Unresolved effects are reported as inconclusive,
-including when the estimated change is below 1%. Missing or failed measurements
+repeatable: their observed ranges must not overlap. Unequal medians with
+overlapping cost ranges remain inconclusive unless the complete range spans
+at most 1% of the larger median. This permits small variations in object size.
+Within-revision spread above 10% also produces a warning, even for equal medians.
+Unresolved timing effects are reported as inconclusive,
+including when the estimated change is below 2%. Missing or failed measurements
 also produce warnings; these are not reported as evidence of no change.
 Numeric regressions do not fail CI.
 

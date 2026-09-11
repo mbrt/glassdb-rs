@@ -40,6 +40,9 @@ CASES = (
 MIXED_ARGS = [
     "--backend=memory",
     "--delays=s3",
+    # Random provider delays obscure code changes in short percentile samples.
+    # Keep provider means, throttling, and the full measurement window.
+    "--latency-jitter=false",
     "--delay-scale=0.2",
     "--runs=1",
     "--drain-timeout=10s",
@@ -165,6 +168,10 @@ def build(source: Path, target: Path, output: Path, side: str) -> dict:
     result["lockSha256"] = hashlib.sha256(
         (source / "Cargo.lock").read_bytes()
     ).hexdigest()
+    result["executableSha256"] = {
+        name: hashlib.sha256(Path(result[name]).read_bytes()).hexdigest()
+        for name in ("diagnostics", "perfbench")
+    }
     return result
 
 
@@ -228,10 +235,12 @@ def measure(output: Path, manifest: dict) -> None:
             ),
             manifest["cpuModel"],
         )
-    if hasattr(os, "sched_getaffinity"):
-        manifest["cpuAffinity"] = sorted(os.sched_getaffinity(0))
+    affinity = os.sched_getaffinity(0) if hasattr(os, "sched_getaffinity") else None
 
     def run(side, repetition, name, command):
+        if affinity:
+            cpus = manifest["cpuAffinity"] if name == "mixed" else [min(affinity)]
+            os.sched_setaffinity(0, cpus)
         directory = output / side / f"{repetition:02d}"
         directory.mkdir(parents=True, exist_ok=True)
         print(f"{side} repetition {repetition}: {name}", flush=True)
@@ -248,6 +257,11 @@ def measure(output: Path, manifest: dict) -> None:
         return directory
 
     try:
+        if affinity:
+            # CPU diagnostics need no migration. Mixed measurements retain the
+            # CI runner's four-CPU width so runtime contention stays comparable.
+            manifest["cpuAffinity"] = sorted(affinity)[:4]
+            manifest["diagnosticCpu"] = min(affinity)
         active = set(manifest["completedPairs"])
         benchmarks = list(enumerate((*manifest["cases"], "mixed")))
         for stage, checkpoint in enumerate(manifest["checkpoints"]):
@@ -281,7 +295,9 @@ def measure(output: Path, manifest: dict) -> None:
                             ]
                             log_name = f"criterion-{name}"
                         directory = run(side, repetition, log_name, command)
-                        _, warnings = perf_report.read_measurement(directory, name)
+                        _, warnings = perf_report.read_measurement(
+                            directory, name, mixed_args=manifest["mixedArgs"]
+                        )
                         if warnings:
                             raise perf_report.ReportError("; ".join(warnings))
                     # A timeout during either side leaves this pair uncounted.
@@ -309,6 +325,8 @@ def measure(output: Path, manifest: dict) -> None:
         )
         raise
     finally:
+        if affinity:
+            os.sched_setaffinity(0, affinity)
         manifest["runtimeSeconds"] = time.monotonic() - start
         (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
         (output / "report.md").write_text(

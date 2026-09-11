@@ -80,7 +80,7 @@ runs all benchmark targets in test mode, including these checks.
 
 The driver copies the candidate's benchmark sources and Cargo benchmark
 declarations into the baseline snapshot. It records harness identity, compiler
-version, both resolved lockfile hashes, and fixed workload settings. Each
+version, executable hashes, both resolved lockfile hashes, and workload settings. Each
 revision keeps its engine dependency graph; identical harnesses do not imply
 identical engine dependencies.
 Criterion 0.8.2 is pinned in the benchmark dependencies. The report reads its
@@ -91,15 +91,19 @@ small changes. Full artifacts are retained even when the report hides unchanged
 rows. CI checks each benchmark after 8, 16, and 32 back-to-back process pairs,
 with balanced revision order at every checkpoint. Resolved benchmarks stop;
 unresolved benchmarks receive more pairs until the final checkpoint at 32.
+On Linux, diagnostics use one fixed CPU to limit migration. Mixed measurements
+use a fixed pool of up to four CPUs, matching the CI runner's runtime width.
 Each process has a two-minute timeout to catch hangs; elapsed time across
 completed processes does not stop sampling.
 The report uses variation between pairs to
-test statistical significance separately from the 1% effect threshold, with
+test statistical significance separately from the 2% effect threshold, with
 Bonferroni correction across all planned timing metrics and checkpoints,
 including unused checks. A process timeout fails the comparison while preserving
 verdicts from completed checkpoints. The two-second diagnostic
 measurement window, model clock, and background work remain part of the workload.
-The mixed workload uses ten-second runs and reports transaction p50,
+The mixed workload uses fixed S3 mean latencies, retains throttling, and runs
+for ten seconds. Random provider delays would add sampling noise unrelated to
+the code change. It reports transaction p50,
 p90, and throughput. All four transaction shapes run until all twelve metrics
 are resolved or a limit is reached. Its intervals retain one observation per process pair;
 pooling transactions as independent samples would hide variation between runs.

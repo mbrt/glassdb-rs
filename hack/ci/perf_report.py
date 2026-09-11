@@ -17,7 +17,12 @@ MIXED_METRICS = (
     ("p90Ms", "model ms/tx", "time"),
     ("txPerSec", "tx/model s", "rate"),
 )
-TIMING_THRESHOLD = 0.01
+# Unchanged-engine controls retain about 1–2% uncertainty after 32 pairs.
+# Keep the effect floor separate from the test for a repeatable direction.
+TIMING_THRESHOLD = 0.02
+# Allow small object-size variation only when the complete cost range is tight.
+# This does not suppress changes between disjoint cost ranges.
+COST_NOISE_THRESHOLD = 0.01
 
 
 class ReportError(ValueError):
@@ -99,13 +104,24 @@ def add(
 
 
 def read_measurement(
-    directory: Path, name: str, *, legacy_cases: set[str] | None = None
+    directory: Path,
+    name: str,
+    *,
+    legacy_cases: set[str] | None = None,
+    mixed_args: list[str] | tuple[str, ...] = (),
 ) -> tuple[dict, list[str]]:
     """Read and validate one benchmark process's artifacts."""
     metrics, warnings = {}, []
     side, repetition = directory.parent.name, directory.name
     if name == "mixed":
-        load_mixed(directory, metrics, warnings, side, repetition)
+        load_mixed(
+            directory,
+            metrics,
+            warnings,
+            side,
+            repetition,
+            latency_jitter="--latency-jitter=false" not in mixed_args,
+        )
     else:
         load_diagnostics(
             directory,
@@ -191,7 +207,7 @@ def load_diagnostics(
         warnings.append(f"{side}/{repetition}: invalid cost measurements ({error})")
 
 
-def load_mixed(directory, metrics, warnings, side, repetition):
+def load_mixed(directory, metrics, warnings, side, repetition, *, latency_jitter=True):
     try:
         mixed = read_json(directory / "mixed.json")
         if (
@@ -201,6 +217,8 @@ def load_mixed(directory, metrics, warnings, side, repetition):
             or mixed["modelTimeSpeedup"] != 5
         ):
             raise ReportError("unsupported mixed schema or backend model")
+        if mixed.get("latencyJitter", True) is not latency_jitter:
+            raise ReportError("mixed latency profile differs from comparison settings")
         if len(mixed["runs"]) != 1 or len(mixed["runs"][0]["cells"]) != 1:
             raise ReportError("expected one mixed cell")
         cell = mixed["runs"][0]["cells"][0]
@@ -288,11 +306,17 @@ def compare(base: Metric, candidate: Metric, family_size: int = 1) -> Comparison
             max(candidate.upper) - min(candidate.lower),
         )
         noisy = spread > 0.1 * max(before, after) if max(before, after) else False
+        small = (
+            max(*base.upper, *candidate.upper) - min(*base.lower, *candidate.lower)
+            <= COST_NOISE_THRESHOLD * max(before, after)
+        )
+        # Small overlapping ranges are expected for variable-size objects.
+        # Unequal medians alone do not make their costs inconclusive.
         return Comparison(
             (after - before) / before if before else None,
             None,
             before != after and separated,
-            (before != after and not separated) or noisy,
+            (before != after and not separated and not small) or noisy,
         )
 
     # Each fresh process pair is one observation. Criterion's narrow intervals
@@ -320,7 +344,7 @@ def compare(base: Metric, candidate: Metric, family_size: int = 1) -> Comparison
     relative = math.expm1(mean)
     lower, upper = math.expm1(mean - half), math.expm1(mean + half)
     # Effect size and statistical significance answer different questions:
-    # a small repeatable change must not need an interval wholly beyond 1%.
+    # a small repeatable change must not need an interval wholly beyond the floor.
     increase = relative >= TIMING_THRESHOLD and lower > 0
     decrease = relative <= -TIMING_THRESHOLD and upper < 0
     report = increase or decrease
@@ -421,6 +445,7 @@ def analyze_benchmark(root: Path, manifest: dict, name: str) -> BenchmarkResult:
                 directory,
                 name,
                 legacy_cases=None if adaptive else set(manifest["cases"]),
+                mixed_args=manifest.get("mixedArgs", ()),
             )
             result.warnings.extend(warnings)
             for key, sample in samples.items():

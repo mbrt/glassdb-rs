@@ -165,7 +165,7 @@ class PerfReportTest(unittest.TestCase):
         self.assertNotIn("No meaningful changes detected", report)
 
     def test_repeatable_regression_remains_visible(self):
-        for repetition, after in enumerate((101.8, 102.0, 102.2), 1):
+        for repetition, after in enumerate((102.8, 103.0, 103.2), 1):
             self.timing_pair(repetition, 100, after)
         report = self.report()
         self.assertIn("example: mean group time |", report)
@@ -173,11 +173,46 @@ class PerfReportTest(unittest.TestCase):
         self.assertNotIn("inconclusive", report)
 
     def test_significance_is_tested_against_zero_not_the_size_threshold(self):
-        for repetition, after in enumerate((101.18, 101.20, 101.22), 1):
+        for repetition, after in enumerate((102.18, 102.20, 102.22), 1):
             self.timing_pair(repetition, 100, after)
         report = self.report()
-        self.assertIn("+1.2%", report)
+        self.assertIn("+2.2%", report)
         self.assertIn("regressed", report)
+
+    def test_repeatable_subthreshold_effect_is_not_reported(self):
+        for repetition, after in enumerate((100.98, 101.00, 101.02), 1):
+            self.timing_pair(repetition, 100, after)
+        report = self.report()
+        self.assertIn("No meaningful changes detected", report)
+        self.assertNotIn("regressed", report)
+
+    def test_process_noise_control_retains_sensitivity_in_both_directions(self):
+        # Paired log changes (%) from 32 unchanged warm-external-read runs.
+        # Keep the observed process noise when adding known 3% effects.
+        noise = (
+            -0.413, -0.332, 0.237, -0.763, 0.440, -0.267, -0.573, -1.435,
+            -0.066, 0.013, -0.254, 2.728, 0.252, -1.897, -0.230, 1.276,
+            -1.344, -0.727, 1.832, -1.678, 1.344, -0.332, -1.084, 0.019,
+            1.916, -1.892, 0.239, -0.314, 2.757, -1.035, 1.293, -1.925,
+        )
+        for effect in (0, -0.03, 0.03):
+            with self.subTest(effect=effect):
+                base = perf_report.Metric("ns", "time")
+                candidate = perf_report.Metric("ns", "time")
+                for count, change in enumerate(noise, 1):
+                    base.add(100, standard_error=0.05)
+                    candidate.add(
+                        100 * (1 + effect) * math.exp(change / 100),
+                        standard_error=0.05,
+                    )
+                    if count in (8, 16, 32):
+                        result = perf_report.compare(base, candidate, family_size=60)
+                        if not result.uncertain:
+                            break
+                self.assertFalse(result.uncertain)
+                self.assertEqual(result.report, effect != 0)
+                if effect:
+                    self.assertGreater(result.relative * effect, 0)
 
     def test_paired_comparison_cancels_shared_host_drift(self):
         for repetition, before in enumerate((100, 200, 400), 1):
@@ -221,7 +256,7 @@ class PerfReportTest(unittest.TestCase):
                 shutil.copytree(
                     self.root / side / "03", self.root / side / f"{repetition:02d}"
                 )
-        for repetition, after in enumerate((101.8, 102.0, 102.2, 102.0) * 2, 1):
+        for repetition, after in enumerate((102.8, 103.0, 103.2, 103.0) * 2, 1):
             for side, mean in (("main", 100), ("pr", after)):
                 self.write(
                     self.root
@@ -231,23 +266,23 @@ class PerfReportTest(unittest.TestCase):
                     {
                         "mean": {
                             "point_estimate": mean,
-                            "standard_error": mean * 0.0055,
+                            "standard_error": mean * 0.008,
                             "confidence_interval": {
-                                "lower_bound": mean * 0.989,
-                                "upper_bound": mean * 1.011,
+                                "lower_bound": mean * 0.984,
+                                "upper_bound": mean * 1.016,
                             },
                         }
                     },
                 )
         report = self.report()
-        self.assertIn("+2.0%", report)
+        self.assertIn("+3.0%", report)
         self.assertIn("regressed", report)
         self.assertNotIn("inconclusive", report)
 
     def test_simultaneous_intervals_protect_against_multiple_false_alarms(self):
         base = perf_report.Metric("ns", "time")
         candidate = perf_report.Metric("ns", "time")
-        for after in (100.72, 101.08, 101.33, 100.98):
+        for after in (101.44, 102.16, 102.66, 101.96):
             base.add(100, standard_error=0.05)
             candidate.add(after, standard_error=0.05)
         self.assertTrue(perf_report.compare(base, candidate).report)
@@ -308,7 +343,7 @@ class PerfReportTest(unittest.TestCase):
 
     def test_planned_checks_protect_against_a_false_early_decision(self):
         manifest = self.adaptive_manifest([8], 8)
-        for repetition, after in enumerate((100.8, 102.8) * 4, 1):
+        for repetition, after in enumerate((101.6, 105.6) * 4, 1):
             self.timing_pair(repetition, 100, after)
         self.assertIn("regressed", self.report())
         # Even unused future checks consume confidence. Reusing a fixed-sample
@@ -519,6 +554,46 @@ class PerfReportTest(unittest.TestCase):
         report = self.report()
         self.assertIn("example/shutdown: writeBodyBytes", report)
         self.assertIn("new from zero", report)
+
+    def test_small_overlapping_cost_variation_is_not_a_warning(self):
+        base = perf_report.Metric("bytes/tx", "cost")
+        candidate = perf_report.Metric("bytes/tx", "cost")
+        for before, after in zip((1854.5, 1854.5, 1855.5), (1854.5, 1855.5, 1855.5)):
+            base.add(before)
+            candidate.add(after)
+        result = perf_report.compare(base, candidate)
+        self.assertFalse(result.report)
+        self.assertFalse(result.uncertain)
+
+    def test_small_repeatable_cost_change_remains_visible(self):
+        base = perf_report.Metric("bytes/tx", "cost")
+        candidate = perf_report.Metric("bytes/tx", "cost")
+        for _ in range(3):
+            base.add(1854.5)
+            candidate.add(1855.5)
+        result = perf_report.compare(base, candidate)
+        self.assertTrue(result.report)
+        self.assertFalse(result.uncertain)
+
+    def test_large_cost_variation_remains_inconclusive(self):
+        base = perf_report.Metric("count/tx", "cost")
+        candidate = perf_report.Metric("count/tx", "cost")
+        for before, after in zip((1, 2, 1), (2, 1, 2)):
+            base.add(before)
+            candidate.add(after)
+        result = perf_report.compare(base, candidate)
+        self.assertFalse(result.report)
+        self.assertTrue(result.uncertain)
+
+    def test_moderate_overlapping_cost_increase_remains_inconclusive(self):
+        base = perf_report.Metric("bytes/tx", "cost")
+        candidate = perf_report.Metric("bytes/tx", "cost")
+        for before, after in zip((100, 100, 109), (109, 109, 109)):
+            base.add(before)
+            candidate.add(after)
+        result = perf_report.compare(base, candidate)
+        self.assertFalse(result.report)
+        self.assertTrue(result.uncertain)
 
     def test_missing_run_is_not_reported_as_unchanged(self):
         (self.root / "pr/03/mixed.json").unlink()
