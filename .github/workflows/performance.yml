@@ -19,7 +19,7 @@ jobs:
   compare:
     name: Compare to main
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 120
     env:
       PERF_RESULTS: ${{ github.workspace }}/target/performance/results/ci
     steps:
@@ -46,9 +46,10 @@ jobs:
         python3 hack/ci/perf_compare.py --base "$BASE_SHA"
         --output "$PERF_RESULTS" --build-only
 
-    - name: Measure paired diagnostics and mixed workload
-      timeout-minutes: 11
-      # The driver enforces a 600-second runtime budget, excluding compilation.
+    - name: Measure paired workloads until resolved or 32 pairs complete
+      timeout-minutes: 90
+      # A full 32-pair comparison takes about 40 minutes. This guards the driver;
+      # individual benchmark processes have their own two-minute timeout.
       run: python3 hack/ci/perf_compare.py --output "$PERF_RESULTS" --run-only
 
     - name: Render job summary

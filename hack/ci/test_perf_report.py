@@ -84,6 +84,7 @@ class PerfReportTest(unittest.TestCase):
                                                 "committed": 200,
                                                 "converged": True,
                                                 "meanMs": 10,
+                                                "p50Ms": 10,
                                                 "p90Ms": 20,
                                                 "txPerSec": 100,
                                             }
@@ -287,6 +288,91 @@ class PerfReportTest(unittest.TestCase):
                 perf_report.t_critical(2, family_size), expected, places=8
             )
 
+    def adaptive_manifest(self, checkpoints, pairs):
+        for side in ("main", "pr"):
+            for repetition in range(1, pairs + 1):
+                directory = self.root / side / f"{repetition:02d}"
+                if repetition > 3:
+                    shutil.copytree(self.root / side / "03", directory)
+                shutil.copy2(
+                    directory / "criterion.log", directory / "criterion-example.log"
+                )
+        manifest = {
+            "schemaVersion": 2,
+            "cases": ["example"],
+            "checkpoints": checkpoints,
+            "completedPairs": {"example": pairs, "mixed": pairs},
+        }
+        self.write(self.root / "manifest.json", manifest)
+        return manifest
+
+    def test_planned_checks_protect_against_a_false_early_decision(self):
+        manifest = self.adaptive_manifest([8], 8)
+        for repetition, after in enumerate((100.8, 102.8) * 4, 1):
+            self.timing_pair(repetition, 100, after)
+        self.assertIn("regressed", self.report())
+        # Even unused future checks consume confidence. Reusing a fixed-sample
+        # interval here would let this first look stop the benchmark too early.
+        manifest["checkpoints"] = [8, 16, 32]
+        self.write(self.root / "manifest.json", manifest)
+        report = self.report()
+        self.assertNotIn("regressed", report)
+        self.assertIn("example: mean group time: noisy or inconclusive", report)
+        self.assertFalse(
+            perf_report.analyze_benchmark(self.root, manifest, "example").resolved
+        )
+
+    def test_samples_between_checkpoints_cannot_change_the_verdict(self):
+        manifest = self.adaptive_manifest([4, 8], 4)
+        before = perf_report.analyze_benchmark(self.root, manifest, "example")
+        for side in ("main", "pr"):
+            for repetition in (5, 6):
+                shutil.copytree(
+                    self.root / side / "04", self.root / side / f"{repetition:02d}"
+                )
+        for repetition in (5, 6):
+            self.timing_pair(repetition, 100, 1000)
+        manifest["completedPairs"]["example"] = 6
+        self.write(self.root / "manifest.json", manifest)
+        after = perf_report.analyze_benchmark(self.root, manifest, "example")
+        self.assertEqual(after.metrics, before.metrics)
+        self.assertEqual(after.pairs, 4)
+        report = self.report()
+        self.assertIn("using checkpoint at 4 pairs", report)
+        self.assertNotIn("regressed", report)
+
+    def test_missing_adaptive_measurements_do_not_reduce_the_correction(self):
+        self.adaptive_manifest([4, 8], 4)
+        for repetition in range(1, 5):
+            self.timing_pair(repetition, 100, 102)
+        before = next(
+            row for row in self.report().splitlines() if row.startswith("| example:")
+        )
+        (self.root / "pr/04/mixed.json").unlink()
+        report = self.report()
+        after = next(
+            row for row in report.splitlines() if row.startswith("| example:")
+        )
+        self.assertEqual(after, before)
+        self.assertIn("incomplete paired measurements", report)
+
+    def test_invalid_checkpoint_plans_are_rejected(self):
+        manifest = self.adaptive_manifest([4, 8], 4)
+        for changes in (
+            {"checkpoints": []},
+            {"checkpoints": [3, 8]},
+            {"checkpoints": [4, 4]},
+            {"checkpoints": [8, 4]},
+            {"checkpoints": [False, 8]},
+            {"completedPairs": {"example": 4}},
+            {"completedPairs": {"example": -1, "mixed": 4}},
+            {"completedPairs": {"example": 9, "mixed": 4}},
+        ):
+            with self.subTest(changes=changes):
+                self.write(self.root / "manifest.json", {**manifest, **changes})
+                with self.assertRaises(perf_report.ReportError):
+                    self.report()
+
     def test_diagnostics_can_have_more_repetitions_than_mixed(self):
         self.write(
             self.root / "manifest.json",
@@ -310,18 +396,75 @@ class PerfReportTest(unittest.TestCase):
         self.assertNotIn("| Metric", report)
         self.assertNotIn("Measurement warnings", report)
 
-    def test_mean_and_p90_changes_have_correct_direction(self):
+    def test_mixed_can_have_more_repetitions_than_diagnostics(self):
+        self.write(
+            self.root / "manifest.json",
+            {
+                "schemaVersion": 1,
+                "repetitions": 4,
+                "diagnosticRepetitions": 3,
+                "cases": ["example"],
+            },
+        )
+        for side in ("main", "pr"):
+            self.write(
+                self.root / side / "04/mixed.json",
+                json.loads((self.root / side / "03/mixed.json").read_text()),
+            )
+        self.assertNotIn("Measurement warnings", self.report())
+        (self.root / "pr/04/mixed.json").unlink()
+        self.assertIn("incomplete paired measurements", self.report())
+
+    def test_mixed_latency_compares_percentiles_instead_of_mean(self):
+        self.edit(
+            "mixed.json",
+            lambda value: value["runs"][0]["cells"][0]["shapes"][0].update(
+                meanMs=100
+            ),
+        )
+        report = self.report()
+        self.assertIn("No meaningful changes detected", report)
+        self.assertNotIn("meanMs", report)
+
+    def test_more_transactions_do_not_hide_variation_between_mixed_runs(self):
+        for repetition, p50 in enumerate((10.1, 11.2, 10.9), 1):
+            path = self.root / "pr" / f"{repetition:02d}" / "mixed.json"
+            value = json.loads(path.read_text())
+            value["runs"][0]["cells"][0]["shapes"][0]["p50Ms"] = p50
+            self.write(path, value)
+        before = self.report()
+        self.assertIn("mixed/rwSingle: p50Ms: noisy or inconclusive", before)
+        self.assertNotIn("| Metric", before)
+        self.edit(
+            "mixed.json",
+            lambda value: value["runs"][0]["cells"][0]["shapes"][0].update(
+                committed=1_000_000
+            ),
+        )
+        self.assertEqual(self.report(), before)
+
+    def test_missing_mixed_percentile_is_not_reported_as_unchanged(self):
+        self.edit(
+            "mixed.json",
+            lambda value: value["runs"][0]["cells"][0]["shapes"][0].pop("p50Ms"),
+        )
+        report = self.report()
+        self.assertIn("invalid mixed measurements", report)
+        self.assertIn("incomplete paired measurements", report)
+        self.assertNotIn("No meaningful changes detected", report)
+
+    def test_p50_and_p90_changes_have_correct_direction(self):
         def change(value):
             shapes = value["runs"][0]["cells"][0]["shapes"]
             shapes[0]["p90Ms"] = 30
             shapes[1]["txPerSec"] = 120
-            shapes[2]["meanMs"] = 8
+            shapes[2]["p50Ms"] = 8
 
         self.edit("mixed.json", change)
         report = self.report()
         self.assertIn("mixed/rwSingle: p90Ms | 20.000 | 30.000", report)
         self.assertIn("mixed/rwMany: txPerSec | 100.000 | 120.000", report)
-        self.assertIn("mixed/roSingle: meanMs | 10.000 | 8.000", report)
+        self.assertIn("mixed/roSingle: p50Ms | 10.000 | 8.000", report)
         self.assertIn("regressed", report)
         self.assertIn("improved", report)
         self.assertNotIn("mixed/roMulti:", report)
@@ -330,7 +473,7 @@ class PerfReportTest(unittest.TestCase):
         self.edit(
             "mixed.json",
             lambda value: value["runs"][0]["cells"][0]["shapes"][0].update(
-                meanMs=10.04
+                p50Ms=10.04
             ),
         )
         self.assertNotIn("| Metric", self.report())

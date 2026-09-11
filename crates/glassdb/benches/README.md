@@ -88,9 +88,18 @@ private `estimates.json` format with validation; verify the reader when upgradin
 
 Use a comparison of unchanged engine code to check noise before interpreting
 small changes. Full artifacts are retained even when the report hides unchanged
-rows. CI measures each diagnostic case in eight back-to-back process pairs,
-with balanced revision order. The report uses variation between pairs to
+rows. CI checks each benchmark after 8, 16, and 32 back-to-back process pairs,
+with balanced revision order at every checkpoint. Resolved benchmarks stop;
+unresolved benchmarks receive more pairs until the final checkpoint at 32.
+Each process has a two-minute timeout to catch hangs; elapsed time across
+completed processes does not stop sampling.
+The report uses variation between pairs to
 test statistical significance separately from the 1% effect threshold, with
-Bonferroni correction across the planned timing metrics. The two-second
+Bonferroni correction across all planned timing metrics and checkpoints,
+including unused checks. A process timeout fails the comparison while preserving
+verdicts from completed checkpoints. The two-second diagnostic
 measurement window, model clock, and background work remain part of the workload.
-Eight pairs are a bounded sample, not proof of statistical power.
+The mixed workload uses ten-second runs and reports transaction p50,
+p90, and throughput. All four transaction shapes run until all twelve metrics
+are resolved or a limit is reached. Its intervals retain one observation per process pair;
+pooling transactions as independent samples would hide variation between runs.

@@ -13,7 +13,7 @@ from pathlib import Path
 
 MIXED_SHAPES = ("rwSingle", "rwMany", "roSingle", "roMulti")
 MIXED_METRICS = (
-    ("meanMs", "model ms/tx", "time"),
+    ("p50Ms", "model ms/tx", "time"),
     ("p90Ms", "model ms/tx", "time"),
     ("txPerSec", "tx/model s", "rate"),
 )
@@ -91,25 +91,48 @@ def add(
     upper=None,
     standard_error=0,
 ) -> None:
-    metric = metrics.setdefault(name, Metric(unit, kind))
+    metric = metrics.get(name)
+    if metric is None:
+        metric = Metric(unit, kind)
     metric.add(value, lower, upper, standard_error)
+    metrics[name] = metric
 
 
-def load_side(root: Path, manifest: dict, side: str) -> tuple[dict, list[str]]:
+def read_measurement(
+    directory: Path, name: str, *, legacy_cases: set[str] | None = None
+) -> tuple[dict, list[str]]:
+    """Read and validate one benchmark process's artifacts."""
     metrics, warnings = {}, []
-    expected = set(manifest["cases"])
-    for repetition in range(
-        1, manifest.get("diagnosticRepetitions", manifest["repetitions"]) + 1
-    ):
-        directory = root / side / f"{repetition:02d}"
-        load_diagnostics(directory, expected, metrics, warnings, side, repetition)
-    for repetition in range(1, manifest["repetitions"] + 1):
-        directory = root / side / f"{repetition:02d}"
+    side, repetition = directory.parent.name, directory.name
+    if name == "mixed":
         load_mixed(directory, metrics, warnings, side, repetition)
+    else:
+        load_diagnostics(
+            directory,
+            {name},
+            metrics,
+            warnings,
+            side,
+            repetition,
+            cost_log=(
+                "criterion.log" if legacy_cases is not None else f"criterion-{name}.log"
+            ),
+            cost_cases=legacy_cases,
+        )
     return metrics, warnings
 
 
-def load_diagnostics(directory, expected, metrics, warnings, side, repetition):
+def load_diagnostics(
+    directory,
+    expected,
+    metrics,
+    warnings,
+    side,
+    repetition,
+    *,
+    cost_log="criterion.log",
+    cost_cases=None,
+):
     for name in sorted(expected):
         try:
             # These private Criterion 0.8.2 artifacts must be checked on upgrades.
@@ -132,13 +155,18 @@ def load_diagnostics(directory, expected, metrics, warnings, side, repetition):
                 f"{side}/{repetition}/{name}: missing or invalid Criterion measurement ({error})"
             )
     try:
-        costs = read_costs(directory / "criterion.log")
+        costs = read_costs(directory / cost_log)
         if costs["schemaVersion"] != 1:
             raise ReportError("unsupported cost schema")
         rows = {row["name"]: row for row in costs["cases"]}
-        if set(rows) != expected or len(rows) != len(costs["cases"]):
+        if (
+            set(rows) != (expected if cost_cases is None else cost_cases)
+            or len(rows) != len(costs["cases"])
+        ):
             raise ReportError("cost case set changed")
         for name, row in rows.items():
+            if name not in expected:
+                continue
             if number(row["transactions"]) == 0:
                 raise ReportError("no completed transactions")
             for window in ("workload", "shutdown", "combined"):
@@ -306,40 +334,138 @@ def escape(text: str) -> str:
     return str(text).replace("|", "\\|").replace("\n", " ").replace("`", "'")
 
 
-def render_report(root: Path, base_label: str, candidate_label: str) -> str:
-    manifest = read_json(root / "manifest.json")
+def validate_manifest(manifest: dict) -> None:
+    cases = manifest.get("cases")
+    if (
+        not isinstance(cases, (list, tuple))
+        or any(
+            not isinstance(name, str) or not name or name == "mixed" for name in cases
+        )
+        or len(set(cases)) != len(cases)
+    ):
+        raise ReportError("invalid benchmark case list")
+    if manifest.get("schemaVersion") == 2:
+        checkpoints = manifest.get("checkpoints")
+        counts = manifest.get("completedPairs")
+        if (
+            not isinstance(checkpoints, list)
+            or not checkpoints
+            or any(type(n) is not int or n < 4 or n % 2 for n in checkpoints)
+            or checkpoints != sorted(set(checkpoints))
+            or not isinstance(counts, dict)
+            or set(counts) != {*cases, "mixed"}
+            or any(
+                type(n) is not int or not 0 <= n <= checkpoints[-1]
+                for n in counts.values()
+            )
+        ):
+            raise ReportError("invalid checkpoint plan or completed pair counts")
+        return
     if (
         manifest.get("schemaVersion") != 1
-        or not isinstance(manifest.get("repetitions"), int)
+        or type(manifest.get("repetitions")) is not int
         or manifest["repetitions"] < 3
-        or not isinstance(
-            manifest.get("diagnosticRepetitions", manifest["repetitions"]), int
-        )
+        or type(manifest.get("diagnosticRepetitions", manifest["repetitions"]))
+        is not int
         or manifest.get("diagnosticRepetitions", manifest["repetitions"]) < 3
     ):
         raise ReportError("unsupported comparison manifest")
-    base, warnings_a = load_side(root, manifest, "main")
-    candidate, warnings_b = load_side(root, manifest, "pr")
-    warnings = [*manifest.get("warnings", []), *warnings_a, *warnings_b]
-    # Include every planned comparison, even if its measurements are missing.
-    family_size = len(manifest["cases"]) + len(MIXED_SHAPES) * len(MIXED_METRICS)
-    rows = []
-    for name in sorted(set(base) | set(candidate)):
+
+
+@dataclass
+class BenchmarkResult:
+    pairs: int
+    metrics: dict[str, tuple[Metric, Metric, Comparison]] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def resolved(self) -> bool:
+        return bool(self.metrics) and not self.warnings and all(
+            not comparison.uncertain
+            for base, _, comparison in self.metrics.values()
+            if base.kind != "cost"
+        )
+
+
+def analyze_benchmark(root: Path, manifest: dict, name: str) -> BenchmarkResult:
+    """Evaluate a benchmark at its last completed, planned checkpoint."""
+    adaptive = manifest["schemaVersion"] == 2
+    if adaptive:
+        completed = manifest["completedPairs"][name]
+        repetitions = max(
+            (n for n in manifest["checkpoints"] if n <= completed), default=0
+        )
+    else:
         repetitions = (
             manifest["repetitions"]
-            if name.startswith("mixed/")
+            if name == "mixed"
             else manifest.get("diagnosticRepetitions", manifest["repetitions"])
         )
+        completed = repetitions
+    result = BenchmarkResult(repetitions)
+    if not repetitions:
+        result.warnings.append(
+            f"{name}: no completed checkpoint ({completed} complete pairs)"
+        )
+        return result
+    if completed != repetitions:
+        result.warnings.append(
+            f"{name}: stopped after {completed} complete pairs; using checkpoint at {repetitions} pairs"
+        )
+    sides = []
+    for side in ("main", "pr"):
+        metrics = {}
+        for repetition in range(1, repetitions + 1):
+            directory = root / side / f"{repetition:02d}"
+            samples, warnings = read_measurement(
+                directory,
+                name,
+                legacy_cases=None if adaptive else set(manifest["cases"]),
+            )
+            result.warnings.extend(warnings)
+            for key, sample in samples.items():
+                add(
+                    metrics,
+                    key,
+                    sample.unit,
+                    sample.kind,
+                    sample.values[0],
+                    sample.lower[0],
+                    sample.upper[0],
+                    sample.standard_errors[0],
+                )
+        sides.append(metrics)
+    base, candidate = sides
+    # Include every planned comparison, even if its measurements are missing.
+    # All checkpoints share the error budget; stopping early cannot narrow it.
+    family_size = len(manifest["cases"]) + len(MIXED_SHAPES) * len(MIXED_METRICS)
+    if adaptive:
+        family_size *= len(manifest["checkpoints"])
+    for name in sorted(set(base) | set(candidate)):
         if (
             name not in base
             or name not in candidate
             or len(base[name].values) != repetitions
             or len(candidate[name].values) != repetitions
         ):
-            warnings.append(f"{name}: incomplete paired measurements")
+            result.warnings.append(f"{name}: incomplete paired measurements")
             continue
         a, b = base[name], candidate[name]
-        comparison = compare(a, b, family_size)
+        result.metrics[name] = (a, b, compare(a, b, family_size))
+    return result
+
+
+def render_report(root: Path, base_label: str, candidate_label: str) -> str:
+    manifest = read_json(root / "manifest.json")
+    validate_manifest(manifest)
+    warnings = list(manifest.get("warnings", []))
+    metrics = {}
+    for name in (*manifest["cases"], "mixed"):
+        result = analyze_benchmark(root, manifest, name)
+        metrics.update(result.metrics)
+        warnings.extend(result.warnings)
+    rows = []
+    for name, (a, b, comparison) in sorted(metrics.items()):
         interval = (
             f"[{comparison.interval[0]:+.1%}, {comparison.interval[1]:+.1%}]"
             if comparison.interval is not None

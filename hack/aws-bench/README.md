@@ -144,21 +144,45 @@ BASE=main TARGET=my-branch OUT=/tmp/glassdb-comparison \
 The output directory must be new. By default it is a timestamped directory
 under `target/performance/results`. It contains `report.md`, a manifest, raw
 Criterion estimates, mixed results, and logs containing the cost snapshots.
-Each diagnostic case has eight process pairs, with the two revisions run
-back-to-back and each revision first four times. The mixed workload has four balanced pairs.
-Runtime, including preparation and shutdown, is limited to 600 seconds;
-compilation is separate. The manifest records the host platform, CPU model,
-and available CPU affinity.
+Each benchmark uses checkpoints at 8, 16, and 32 process pairs. Revisions run
+back-to-back, with balanced order at every checkpoint. A diagnostic stops when
+its timing result is resolved. The mixed workload stops when all twelve timing
+and throughput results are resolved; all four transaction shapes keep running
+together. Mixed runs retain their ten-second window so GC remains part of the
+workload. Each benchmark reaches the first checkpoint before unresolved
+benchmarks receive more pairs. Benchmark order reverses at alternate checkpoints
+so the mixed workload is not always last.
+The final checkpoint at 32 pairs is the normal measurement limit; there is no
+shared runtime budget. A full comparison is expected to take about 40 minutes
+if no benchmark resolves early. Each benchmark process has a two-minute timeout
+to catch hangs, including preparation and shutdown. CI allows 90 minutes for
+measurement and two hours for the whole job, including compilation and reporting.
+The manifest records the host platform, CPU model,
+and available CPU affinity. It also records the planned checkpoints and each
+benchmark's completed pair count. A process timeout fails the comparison;
+the report still uses the last completed checkpoint for each benchmark and leaves
+unresolved results inconclusive. Later samples and unfinished pairs remain in
+the artifacts but cannot produce a new verdict. Invalid results from completed
+processes and subprocess failures still fail the comparison.
 
 See [diagnostic definitions](../../crates/glassdb/benches/README.md). The report
 uses the mean of paired log ratios for timing/throughput changes. Its simultaneous 95%
 Student-t interval uses variation between process pairs, with one observation
 per pair; Criterion samples within one process are not independent repetitions.
-Bonferroni correction covers every planned timing/rate comparison, including
-missing measurements: eight diagnostic means plus three metrics for each of
-four mixed shapes. The 95% confidence level applies to the whole family, which
-limits false alarms when many metrics are inspected. See
+Bonferroni correction covers every planned metric at every checkpoint, including
+unused checks and missing measurements: eight diagnostic means plus three
+metrics for each of four mixed shapes (p50 latency, p90 latency, and throughput),
+at three checkpoints. The 95% confidence level applies to all 60 intervals.
+This accounts for stopping early and inspecting multiple metrics. See
 [NIST's Bonferroni method](https://www.itl.nist.gov/div898/handbook/prc/section4/prc463.htm).
+Each mixed percentile is computed from the transactions in one run; the report
+combines the resulting paired run estimates. Pooling transactions from all
+runs as independent observations would discard shared cache, scheduling, and
+host effects and could make uncertainty appear smaller than it is. The table
+shows the median of each revision's run estimates, not a pooled transaction
+percentile. Criterion samples are averages of iteration groups, so those
+diagnostics retain mean group time; their sample percentiles are not transaction
+p50 or p90.
 A regression or improvement requires an estimated change of at least 1%
 and a repeat interval that excludes zero. Criterion's bootstrap standard errors
 set a floor on the interval's variance: the log standard error is approximated
@@ -180,7 +204,7 @@ Numeric regressions do not fail CI.
 
 The short mixed preset runs one Database with one worker per shape, 128 keys,
 and a ten-second measurement window. It uses the S3 delay model at 5x model
-time. Its mean and p90 are transaction observations, not Criterion sample
+time. Its p50 and p90 are transaction observations, not Criterion sample
 percentiles. Reported latency and throughput use model seconds, not wall
 seconds. At least 100 transactions per shape are required for the report.
 
