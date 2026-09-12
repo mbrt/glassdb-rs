@@ -29,6 +29,7 @@ deterministic.
 | Case | Condition | Transactions per iteration |
 | --- | --- | ---: |
 | `warm_read` | One key, 256-byte value, warmed client caches | 1 |
+| `warm_read_external` | One key, 1,025-byte value stored in a transaction log, warmed client caches | 1 |
 | `fresh_client_read` | Same contents; reopen client and collection before each read | 1 |
 | `rmw_inline_1024` | One key; 1,024-byte value at the default inline limit | 1 |
 | `rmw_external_1025` | One key; 1,025-byte value above that limit | 1 |
@@ -57,6 +58,9 @@ does not instrument Criterion timing. Requests, successful read-body bytes,
 attempted write-body bytes, and coordinator counters are normalized by the
 number of completed transactions (90 for the concurrent case).
 The engine counts DELETE requests as writes; they add no write-body bytes.
+This short pass can finish before the GC safety horizon. The longer timed
+workload can include reclamation on the same runtime thread as writers, so
+unchanged cost rows do not establish unchanged GC work in the timing window.
 
 Workload, shutdown, and combined windows are separate. Fresh-client reads
 close their client after each measured read; other cases close after the pass.
@@ -68,14 +72,15 @@ Body bytes exclude paths, headers, LIST response bodies, and transport overhead.
 There is no combined score or automatic performance gate. Timing results
 depend on the host. Real-provider costs require separate measurements.
 Exact protocol guarantees belong in integration/simulation tests, not timing
-assertions. Fixture preparation and transaction-completion checks run with the
-benchmarks, not through `make test-all`.
+assertions. Fixture preparation, transaction completion, and zero backend reads
+for warmed inline writes are checked by the benchmark harness. `make test-all`
+runs all benchmark targets in test mode, including these checks.
 
 ## Comparison artifacts
 
 The driver copies the candidate's benchmark sources and Cargo benchmark
 declarations into the baseline snapshot. It records harness identity, compiler
-version, both resolved lockfile hashes, and fixed workload settings. Each
+version, executable hashes, both resolved lockfile hashes, and workload settings. Each
 revision keeps its engine dependency graph; identical harnesses do not imply
 identical engine dependencies.
 Criterion 0.8.2 is pinned in the benchmark dependencies. The report reads its
@@ -83,4 +88,22 @@ private `estimates.json` format with validation; verify the reader when upgradin
 
 Use a comparison of unchanged engine code to check noise before interpreting
 small changes. Full artifacts are retained even when the report hides unchanged
-rows. Three paired runs are an initial budget, not proof of statistical power.
+rows. CI checks each benchmark after 8, 16, and 32 back-to-back process pairs,
+with balanced revision order at every checkpoint. Resolved benchmarks stop;
+unresolved benchmarks receive more pairs until the final checkpoint at 32.
+On Linux, diagnostics use one fixed CPU to limit migration. Mixed measurements
+use a fixed pool of up to four CPUs, matching the CI runner's runtime width.
+Each process has a two-minute timeout to catch hangs; elapsed time across
+completed processes does not stop sampling.
+The report uses variation between pairs to
+test statistical significance separately from the 2% effect threshold, with
+Bonferroni correction across all planned timing metrics and checkpoints,
+including unused checks. A process timeout fails the comparison while preserving
+verdicts from completed checkpoints. The two-second diagnostic
+measurement window, model clock, and background work remain part of the workload.
+The mixed workload uses fixed S3 mean latencies, retains throttling, and runs
+for ten seconds. Random provider delays would add sampling noise unrelated to
+the code change. It reports transaction p50,
+p90, and throughput. All four transaction shapes run until all twelve metrics
+are resolved or a limit is reached. Its intervals retain one observation per process pair;
+pooling transactions as independent samples would hide variation between runs.

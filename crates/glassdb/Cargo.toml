@@ -62,15 +62,12 @@ rayon = "1.12.0"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 syn = { version = "2", features = ["full", "visit"] }
 
-# Transaction microbenchmarks ported from the Go `bench_test.go`. `harness =
-# false` lets criterion own `main`; `test = false` keeps `cargo test` (and the
-# test-sim run) from executing it — run it with `cargo bench`.
+# Criterion owns benchmark entry points. `make test` discovers these targets
+# with `--all-targets` and runs them in Criterion test mode.
 [[bench]]
 name = "transactions"
 harness = false
-test = false
 
 [[bench]]
 name = "diagnostics"
 harness = false
-test = false

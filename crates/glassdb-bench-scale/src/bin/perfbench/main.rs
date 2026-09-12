@@ -59,6 +59,7 @@ struct Report<T> {
     scenario: &'static str,
     backend: String,
     model_time_speedup: f64,
+    latency_jitter: bool,
     runs: Vec<T>,
 }
 
@@ -86,6 +87,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             scenario: "mixed",
             backend: backend.clone(),
             model_time_speedup,
+            latency_jitter: cli.backend.latency_jitter,
             runs: mixed::run(handle, &factory, options, execution)?,
         })?,
         Command::Contention(options) => serde_json::to_value(Report {
@@ -93,6 +95,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             scenario: "contention",
             backend: backend.clone(),
             model_time_speedup,
+            latency_jitter: cli.backend.latency_jitter,
             runs: contention::run(handle, &factory, options, execution)?,
         })?,
         Command::InlinePressure(options) => serde_json::to_value(Report {
@@ -100,6 +103,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             scenario: "inline-pressure",
             backend,
             model_time_speedup,
+            latency_jitter: cli.backend.latency_jitter,
             runs: inline_pressure::run(handle, &factory, options, execution)?,
         })?,
     };

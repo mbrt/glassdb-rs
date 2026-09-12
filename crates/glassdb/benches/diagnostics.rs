@@ -1,5 +1,6 @@
 //! Bounded, named conditions for revision comparisons. Wall time is statistical.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -7,16 +8,21 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use criterion::{Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
 use futures::future::try_join_all;
-use glassdb::{Backend, Collection, Database, Error, Stats};
+use glassdb::middleware::RecordingBackend;
+use glassdb::{Backend, Collection, Database, Error, InlinePolicy, Stats};
 use glassdb_backend::memory::MemoryBackend;
 use glassdb_backend::{BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
+use glassdb_data::ObjectPath;
 use serde_json::{Value, json};
+
+const EXTERNAL_VALUE_BYTES: usize = 1025;
 
 const COST_ITERATIONS: usize = 30;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Case {
     WarmRead,
+    WarmExternalRead,
     FreshRead,
     InlineRmw,
     ExternalRmw,
@@ -29,6 +35,7 @@ impl Case {
     fn name(self) -> &'static str {
         match self {
             Self::WarmRead => "warm_read",
+            Self::WarmExternalRead => "warm_read_external",
             Self::FreshRead => "fresh_client_read",
             Self::InlineRmw => "rmw_inline_1024",
             Self::ExternalRmw => "rmw_external_1025",
@@ -46,13 +53,15 @@ impl Case {
         match self {
             Self::InlineRmw => 1024,
             Self::ExternalRmw => 1025,
+            Self::WarmExternalRead => EXTERNAL_VALUE_BYTES,
             _ => 256,
         }
     }
 }
 
-const CASES: [Case; 7] = [
+const CASES: [Case; 8] = [
     Case::WarmRead,
+    Case::WarmExternalRead,
     Case::FreshRead,
     Case::InlineRmw,
     Case::ExternalRmw,
@@ -169,7 +178,7 @@ impl Fixture {
 
     async fn run(&self, case: Case) -> Result<(), Error> {
         match case {
-            Case::WarmRead | Case::FreshRead | Case::LargeRead => {
+            Case::WarmRead | Case::WarmExternalRead | Case::FreshRead | Case::LargeRead => {
                 let (coll, key) = &self.members[0];
                 let value = coll
                     .read(key)
@@ -285,6 +294,38 @@ async fn measure_cost(case: Case) -> Value {
         "shutdown": shutdown.json(n), "combined": combined.json(n)})
 }
 
+async fn verify_inline_write_reads(case: Case) {
+    // Freeze scan deadlines so a slow test host cannot add unrelated GC reads.
+    // Keep one task runnable to prevent Tokio's idle-time auto-advance.
+    tokio::time::pause();
+    let keep_time = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let fixture = Fixture::prepare(case, Arc::new(MemoryBackend::new())).await;
+    let before = fixture.db.stats();
+    for _ in 0..COST_ITERATIONS {
+        fixture
+            .run(case)
+            .await
+            .expect("inline write regression workload");
+    }
+    let workload = fixture.db.stats() - before;
+    assert_eq!(
+        workload.transactions.completed,
+        COST_ITERATIONS as u64 * case.transactions()
+    );
+    assert_eq!(
+        workload.backend.obj_reads, 0,
+        "warmed inline writes must not cause transaction-object lookups"
+    );
+    fixture.db.shutdown().await;
+    keep_time.abort();
+    let _ = keep_time.await;
+    tokio::time::resume();
+}
+
 fn benches(c: &mut Criterion) {
     glassdb_concurr::rt::set_model_time_speedup(20.0)
         .expect("configure diagnostic model time before creating the runtime");
@@ -299,13 +340,19 @@ fn benches(c: &mut Criterion) {
         .sampling_mode(SamplingMode::Flat)
         .warm_up_time(Duration::from_millis(500))
         .measurement_time(Duration::from_secs(2))
-        .noise_threshold(0.05);
+        .noise_threshold(0.01);
     for case in CASES {
         let mut fixture = None;
         group.throughput(Throughput::Elements(case.transactions()));
         group.bench_function(case.name(), |b| {
             // Unselected cases do no setup; selected cases keep one fixture across samples.
             let fixture = fixture.get_or_insert_with(|| {
+                if case == Case::WarmExternalRead {
+                    rt.block_on(verify_transaction_log_cache());
+                }
+                if matches!(case, Case::InlineRmw | Case::SharedLeafRmw) {
+                    rt.block_on(verify_inline_write_reads(case));
+                }
                 costs.push(rt.block_on(measure_cost(case)));
                 rt.block_on(Fixture::prepare(case, Arc::new(MemoryBackend::new())))
             });
@@ -421,4 +468,75 @@ impl Backend for BodyBytes {
     ) -> Result<ListPage, BackendError> {
         self.inner.list(prefix, cursor, limit).await
     }
+}
+
+/// Checks that repeated transactional reads reuse cached transaction contents.
+async fn verify_transaction_log_cache() {
+    const READS: u64 = 30;
+    let backend = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
+    let operations = backend.log();
+    let writer = Database::builder("logcache", backend.clone())
+        .inline_policy(InlinePolicy::none())
+        .open()
+        .await
+        .expect("open log-cache writer");
+    let value = vec![7; EXTERNAL_VALUE_BYTES];
+    writer
+        .root_collection()
+        .write(b"key", &value)
+        .await
+        .expect("seed logged value");
+    writer.shutdown().await;
+
+    let reader = Database::open("logcache", backend)
+        .await
+        .expect("open log-cache reader");
+    let collection = reader.root_collection();
+    operations.lock().unwrap().clear();
+    assert_eq!(collection.read(b"key").await.unwrap().unwrap(), value);
+    let logs: BTreeSet<_> = operations
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|operation| {
+            matches!(operation.op, "read" | "read_if_modified")
+                && matches!(
+                    ObjectPath::try_from(operation.path.as_str()),
+                    Ok(ObjectPath::Transaction { .. })
+                )
+        })
+        .map(|operation| operation.path.clone())
+        .collect();
+    assert!(
+        !logs.is_empty(),
+        "the cold read must load a transaction log"
+    );
+    operations.lock().unwrap().clear();
+
+    let before = reader.stats();
+    for _ in 0..READS {
+        assert_eq!(collection.read(b"key").await.unwrap().unwrap(), value);
+    }
+    let warm = reader.stats() - before;
+    assert_eq!(warm.transactions.completed, READS);
+    assert!(
+        warm.backend.obj_reads > 0,
+        "reads must still validate leaves"
+    );
+    // Count attempts, including conditional requests that transfer no body.
+    // Other transaction objects can belong to background work.
+    let repeated: Vec<_> = operations
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|operation| {
+            logs.contains(&operation.path) && matches!(operation.op, "read" | "read_if_modified")
+        })
+        .cloned()
+        .collect();
+    assert!(
+        repeated.is_empty(),
+        "cached transaction logs were read again: {repeated:?}"
+    );
+    reader.shutdown().await;
 }

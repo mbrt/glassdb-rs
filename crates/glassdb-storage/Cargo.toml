@@ -37,10 +37,8 @@ rayon = "1.12.0"
 tempfile = "3.27.0"
 tokio = { version = "1", features = ["macros", "rt", "time", "test-util"] }
 
-# Cache microbenchmarks. `harness = false` lets criterion own `main`; `test =
-# false` keeps `cargo test` (and the test-sim run) from executing it — run it
-# with `cargo bench`.
+# Criterion owns the cache benchmark entry point. `make test` runs it in
+# Criterion test mode through Cargo target discovery.
 [[bench]]
 name = "cache"
 harness = false
-test = false

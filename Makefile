@@ -13,7 +13,8 @@ clean:
 	cd fuzz && cargo clean
 
 test: lint
-	cargo test --workspace
+	cargo test --workspace --all-targets
+	cargo test --workspace --doc
 	python3 -m unittest hack.ci.test_perf_report hack.ci.test_perf_compare
 
 # Run both the normal and deterministic-simulation suites.

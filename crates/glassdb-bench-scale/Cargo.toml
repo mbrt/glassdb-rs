@@ -44,5 +44,8 @@ aws-sdk-s3 = { version = "1.137.0", default-features = false, features = [
 aws-smithy-http-client = { version = "1.1.13", default-features = false, features = ["default-client"] }
 aws-smithy-runtime-api = "1"
 
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["test-util"] }
+
 [target.'cfg(target_env = "musl")'.dependencies]
 mimalloc = "0.1.52"

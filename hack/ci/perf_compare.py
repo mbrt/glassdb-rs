@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import re
 import shutil
@@ -20,10 +21,15 @@ if __package__:
 else:
     import perf_report
 
-REPETITIONS = 3
-RUNTIME_LIMIT = 270
+# Planned checks bound the cost of repeated statistical decisions. Each count is
+# even so both revisions run first equally often at every possible stopping point.
+CHECKPOINTS = [8, 16, 32]
+# Measured processes take about 3–11 seconds, including setup and shutdown.
+# Guard each process against hangs without cutting short the planned samples.
+PROCESS_TIMEOUT = 120
 CASES = (
     "warm_read",
+    "warm_read_external",
     "fresh_client_read",
     "rmw_inline_1024",
     "rmw_external_1025",
@@ -34,6 +40,9 @@ CASES = (
 MIXED_ARGS = [
     "--backend=memory",
     "--delays=s3",
+    # Random provider delays obscure code changes in short percentile samples.
+    # Keep provider means, throttling, and the full measurement window.
+    "--latency-jitter=false",
     "--delay-scale=0.2",
     "--runs=1",
     "--drain-timeout=10s",
@@ -159,17 +168,22 @@ def build(source: Path, target: Path, output: Path, side: str) -> dict:
     result["lockSha256"] = hashlib.sha256(
         (source / "Cargo.lock").read_bytes()
     ).hexdigest()
+    result["executableSha256"] = {
+        name: hashlib.sha256(Path(result[name]).read_bytes()).hexdigest()
+        for name in ("diagnostics", "perfbench")
+    }
     return result
 
 
 def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
     output.mkdir(parents=True, exist_ok=False)
     manifest = {
-        "schemaVersion": 1,
-        "repetitions": REPETITIONS,
+        "schemaVersion": 2,
+        "checkpoints": CHECKPOINTS,
+        "completedPairs": {name: 0 for name in (*CASES, "mixed")},
         "cases": CASES,
         "mixedArgs": MIXED_ARGS,
-        "runtimeLimitSeconds": RUNTIME_LIMIT,
+        "processTimeoutSeconds": PROCESS_TIMEOUT,
         "base": base,
         "candidate": candidate or "working tree",
         "rustc": capture(["rustc", "--version"], repo).strip(),
@@ -197,59 +211,122 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
 
 
 def measure(output: Path, manifest: dict) -> None:
+    perf_report.validate_manifest(manifest)
+    if manifest["schemaVersion"] != 2 or any(manifest["completedPairs"].values()):
+        raise ValueError("measurement requires a new checkpoint comparison")
+    process_timeout = perf_report.number(manifest.get("processTimeoutSeconds"))
+    if process_timeout == 0:
+        raise ValueError("process timeout must be positive")
+    for side in ("main", "pr"):
+        if (output / side).exists():
+            raise FileExistsError(
+                f"measurement directory already exists: {output / side}"
+            )
     start = time.monotonic()
+    manifest["platform"] = platform.platform()
+    manifest["cpuModel"] = platform.processor()
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.exists():
+        manifest["cpuModel"] = next(
+            (
+                line.split(":", 1)[1].strip()
+                for line in cpuinfo.read_text().splitlines()
+                if line.startswith("model name")
+            ),
+            manifest["cpuModel"],
+        )
+    affinity = os.sched_getaffinity(0) if hasattr(os, "sched_getaffinity") else None
+
+    def run(side, repetition, name, command):
+        if affinity:
+            cpus = manifest["cpuAffinity"] if name == "mixed" else [min(affinity)]
+            os.sched_setaffinity(0, cpus)
+        directory = output / side / f"{repetition:02d}"
+        directory.mkdir(parents=True, exist_ok=True)
+        print(f"{side} repetition {repetition}: {name}", flush=True)
+        with (directory / f"{name}.log").open("w") as log:
+            subprocess.run(
+                command,
+                cwd=directory,
+                env={**os.environ, "CRITERION_HOME": str(directory / "criterion")},
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=process_timeout,
+                check=True,
+            )
+        return directory
+
     try:
-        for repetition in range(1, manifest["repetitions"] + 1):
-            sides = ("main", "pr") if repetition % 2 else ("pr", "main")
-            for side in sides:
-                directory = output / side / f"{repetition:02d}"
-                directory.mkdir(parents=True, exist_ok=False)
-                env = {
-                    **os.environ,
-                    "CRITERION_HOME": str(directory / "criterion"),
-                }
-                commands = [
-                    (
-                        "criterion",
-                        [
-                            manifest[side]["diagnostics"],
-                            "--bench",
-                            "--noplot",
-                        ],
-                    ),
-                    (
-                        "mixed",
-                        [
-                            manifest[side]["perfbench"],
-                            "--output",
-                            str(directory / "mixed.json"),
-                            *manifest["mixedArgs"],
-                        ],
-                    ),
-                ]
-                for name, command in commands:
-                    remaining = manifest["runtimeLimitSeconds"] - (
-                        time.monotonic() - start
+        if affinity:
+            # CPU diagnostics need no migration. Mixed measurements retain the
+            # CI runner's four-CPU width so runtime contention stays comparable.
+            manifest["cpuAffinity"] = sorted(affinity)[:4]
+            manifest["diagnosticCpu"] = min(affinity)
+        active = set(manifest["completedPairs"])
+        benchmarks = list(enumerate((*manifest["cases"], "mixed")))
+        for stage, checkpoint in enumerate(manifest["checkpoints"]):
+            # Alternate order so mixed is not always measured after diagnostics.
+            benchmark_order = benchmarks if stage % 2 == 0 else reversed(benchmarks)
+            for index, name in benchmark_order:
+                if name not in active:
+                    continue
+                for repetition in range(
+                    manifest["completedPairs"][name] + 1, checkpoint + 1
+                ):
+                    # Adjacent pairs limit host drift.
+                    sides = (
+                        ("main", "pr") if (repetition + index) % 2 else ("pr", "main")
                     )
-                    if remaining <= 0:
-                        raise TimeoutError("comparison runtime budget exhausted")
-                    print(f"{side} repetition {repetition}: {name}", flush=True)
-                    with (directory / f"{name}.log").open("w") as log:
-                        subprocess.run(
-                            command,
-                            cwd=directory,
-                            env=env,
-                            stdout=log,
-                            stderr=subprocess.STDOUT,
-                            timeout=remaining,
-                            check=True,
+                    for side in sides:
+                        if name == "mixed":
+                            command = [
+                                manifest[side]["perfbench"],
+                                "--output",
+                                str(output / side / f"{repetition:02d}" / "mixed.json"),
+                                *manifest["mixedArgs"],
+                            ]
+                            log_name = "mixed"
+                        else:
+                            command = [
+                                manifest[side]["diagnostics"],
+                                "--bench",
+                                "--noplot",
+                                f"^diagnostic/{re.escape(name)}$",
+                            ]
+                            log_name = f"criterion-{name}"
+                        directory = run(side, repetition, log_name, command)
+                        _, warnings = perf_report.read_measurement(
+                            directory, name, mixed_args=manifest["mixedArgs"]
                         )
-    except (subprocess.SubprocessError, TimeoutError) as error:
+                        if warnings:
+                            raise perf_report.ReportError("; ".join(warnings))
+                    # A timeout during either side leaves this pair uncounted.
+                    manifest["completedPairs"][name] = repetition
+                result = perf_report.analyze_benchmark(output, manifest, name)
+                if result.warnings:
+                    raise perf_report.ReportError("; ".join(result.warnings))
+                state = "resolved" if result.resolved else "inconclusive"
+                print(f"{name}: {checkpoint} pairs, {state}", flush=True)
+                if result.resolved:
+                    active.remove(name)
+                (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
+            if not active:
+                break
+    except subprocess.TimeoutExpired as error:
+        manifest["warnings"].append(
+            f"Benchmark process timed out after {error.timeout:g} seconds; "
+            "results use each benchmark's last completed checkpoint. "
+            f"Command: {error.cmd}"
+        )
+        raise
+    except (subprocess.SubprocessError, perf_report.ReportError) as error:
         manifest["warnings"].append(
             f"Measurement failed: {error}. See the per-run logs."
         )
         raise
     finally:
+        if affinity:
+            os.sched_setaffinity(0, affinity)
         manifest["runtimeSeconds"] = time.monotonic() - start
         (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
         (output / "report.md").write_text(
