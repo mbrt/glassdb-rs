@@ -29,6 +29,12 @@ pub struct NodeStore {
     parallelism: NonZeroUsize,
 }
 
+/// One bounded page of standalone node observations.
+pub struct NodePage {
+    pub nodes: Vec<(NodeToken, Observation<Node>)>,
+    pub next: Option<backend::ListCursor>,
+}
+
 /// A B-link leaf loaded for one coordination round.
 pub struct LoadedLeaf {
     edit: LeafEdit,
@@ -385,39 +391,54 @@ impl NodeStore {
         collection: &CollectionAddress,
         requirement: Requirement,
     ) -> Result<Vec<(NodeToken, Observation<Node>)>, StorageError> {
-        let list_prefix = ObjectPath::nodes_prefix(collection);
-        let limit = backend::ListLimit::new(NODE_LIST_PAGE_SIZE).unwrap();
         let mut cursor = None;
         let mut nodes = Vec::new();
         loop {
             let page = self
-                .nodes
-                .list(&list_prefix, cursor.as_ref(), limit)
+                .scan_nodes(collection, cursor.as_ref(), requirement)
                 .await?;
-            for path in page.objects {
-                let ObjectPath::Node {
-                    collection: listed_collection,
-                    token,
-                } = path.object_path()
-                else {
-                    return Err(StorageError::other("node listing returned a non-node path"));
-                };
-                if listed_collection != collection {
-                    return Err(StorageError::other(
-                        "node listing returned a different collection",
-                    ));
-                }
-                let token = token.clone();
-                let observed = self.nodes.read(path, requirement).await?;
-                if observed.exists() {
-                    nodes.push((token, observed));
-                }
-            }
+            nodes.extend(page.nodes);
             match page.next {
                 Some(next) => cursor = Some(next),
                 None => return Ok(nodes),
             }
         }
+    }
+
+    /// Reads one page of standalone nodes, including unreachable structural nodes.
+    pub async fn scan_nodes(
+        &self,
+        collection: &CollectionAddress,
+        cursor: Option<&backend::ListCursor>,
+        requirement: Requirement,
+    ) -> Result<NodePage, StorageError> {
+        let list_prefix = ObjectPath::nodes_prefix(collection);
+        let limit = backend::ListLimit::new(NODE_LIST_PAGE_SIZE).unwrap();
+        let page = self.nodes.list(&list_prefix, cursor, limit).await?;
+        let mut nodes = Vec::new();
+        for path in page.objects {
+            let ObjectPath::Node {
+                collection: listed_collection,
+                token,
+            } = path.object_path()
+            else {
+                return Err(StorageError::other("node listing returned a non-node path"));
+            };
+            if listed_collection != collection {
+                return Err(StorageError::other(
+                    "node listing returned a different collection",
+                ));
+            }
+            let token = token.clone();
+            let observed = self.nodes.read(path, requirement).await?;
+            if observed.exists() {
+                nodes.push((token, observed));
+            }
+        }
+        Ok(NodePage {
+            nodes,
+            next: page.next,
+        })
     }
 
     /// Loads the leaf node at `_r` or `_n/<token>`.

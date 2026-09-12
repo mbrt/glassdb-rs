@@ -307,7 +307,7 @@ async fn structural_recovery_defers_while_the_source_writer_is_live() {
     let intent = nonroot_intent("L", "R", b"m");
     s.write_structural_intent("R", &intent).await.unwrap();
 
-    assert!(sp.recover_structural_intents().await);
+    assert!(!sp.recover_structural_intents().await.unwrap());
     assert!(
         s.load_node(COLL, "R", Requirement::AtLeast(s.timeline.now()))
             .await
@@ -322,7 +322,7 @@ async fn structural_recovery_defers_while_the_source_writer_is_live() {
     );
 
     sp.mon.abort_owned_tx(&id).await.unwrap();
-    assert!(sp.recover_structural_intents().await);
+    assert!(sp.recover_structural_intents().await.unwrap());
     assert!(matches!(
         s.load_node(COLL, "R", Requirement::AtLeast(s.timeline.now()))
             .await,
@@ -400,7 +400,7 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
     s.write_structural_intent("R", &intent).await.unwrap();
 
     assert!(
-        sp.recover_structural_intents().await,
+        !sp.recover_structural_intents().await.unwrap(),
         "recovery must defer to the live split rather than reclaim its child"
     );
     assert!(
@@ -460,7 +460,7 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
     };
     s.write_structural_intent("R", &intent).await.unwrap();
 
-    assert!(sp.recover_structural_intents().await);
+    assert!(sp.recover_structural_intents().await.unwrap());
 
     let (root_node, _) = s
         .load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
@@ -594,7 +594,7 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
     gate.arm();
     let recovering = {
         let sp = sp.clone();
-        tokio::spawn(async move { sp.recover_structural_intents().await })
+        tokio::spawn(async move { sp.recover_structural_intents().await.unwrap() })
     };
     gate.wait_until_entered().await;
 
@@ -707,7 +707,7 @@ async fn sweep_defers_one_failed_parent_split_and_continues() {
     action.resume_parent_split(Err(TransError::Retry));
     assert!(matches!(
         sp.recovery.advance(&mut action).await.unwrap(),
-        RecoveryStep::Completed { active: true }
+        RecoveryStep::Completed { active: true, .. }
     ));
 
     assert!(matches!(

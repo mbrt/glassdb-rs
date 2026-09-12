@@ -793,16 +793,12 @@ impl CasWorker {
         // `Any`: they either read the winner or reuse newer knowledge another
         // operation already published. A stale cached leaf only costs a CAS
         // miss and a reload, never correctness.
+        let mut requirement = first_requirement;
         for attempt in 0..CAS_RETRIES {
             if attempt > 0 {
                 rt::sleep(backoff.next_delay()).await;
                 self.core.stats.n_retries.fetch_add(1, Ordering::Relaxed);
             }
-            let requirement = if attempt == 0 {
-                first_requirement
-            } else {
-                Requirement::Any
-            };
             let edit = match self.core.nodes.load_leaf(path, requirement).await {
                 Ok(loaded) => loaded.into_edit(),
                 // A root split can turn the routed root leaf into an index
@@ -826,16 +822,18 @@ impl CasWorker {
             // one. A cache-served first attempt still folds every current member
             // over the cached leaf; the CAS arbitrates if that leaf was stale.
             let members = leaf_members(batch);
-            let mut plan = self
-                .fold_round(
-                    path,
-                    &edit,
-                    &members,
-                    first_requirement,
-                    reloaded,
-                    &mut in_doubt,
-                )
-                .await?;
+            let mut plan = match self
+                .fold_round(path, &edit, &members, requirement, reloaded, &mut in_doubt)
+                .await
+            {
+                Ok(plan) => plan,
+                Err(TransError::ValidateRetry(fresh)) => {
+                    requirement = requirement.stricter(fresh);
+                    reloaded = true;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
 
             let loaded_observation = edit.observation().clone();
             let persist_result = self.persist(path, edit, &mut plan).await?;

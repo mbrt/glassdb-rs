@@ -30,15 +30,15 @@ use glassdb_concurr::{Background, Backoff, RetryConfig, rt};
 use glassdb_data::{LogicalKey, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxLog, TxWrite};
 use glassdb_storage::{
-    InlinePolicy, LeafObservationCheck, LockType, NodeStore, Requirement, SplitPolicy, Timeline,
-    TreeRouter,
+    InlinePolicy, LeafObservationCheck, LockType, NodeStore, Requirement, SplitPolicy,
+    StorageError, Timeline, TreeRouter,
 };
 
 use crate::access::{AccessSet, LeafCoverage, ReadAccess, WriteOp};
-use crate::collection_commit::{CollectionAttempt, CollectionCommit};
+use crate::collection_commit::{CollectionAttempt, CollectionCommit, CollectionReservations};
 use crate::collections::CatalogAccesses;
 use crate::error::TransError;
-use crate::gc::TxCleanupHints;
+use crate::gc::GcHints;
 use crate::key_resolver::KeyResolver;
 use crate::leaf_coord::LeafCoordinator;
 use crate::monitor::{Monitor, OwnerAbortOutcome};
@@ -78,7 +78,7 @@ const MAX_LEAF_FULL_WAIT: Duration = Duration::from_secs(30);
 
 struct AttemptRetirement {
     mon: Monitor,
-    cleanup_hints: TxCleanupHints,
+    cleanup_hints: GcHints,
     background: Option<Weak<Background>>,
 }
 
@@ -163,6 +163,11 @@ impl Handle {
     /// The transaction's ID.
     pub fn id(&self) -> &TxId {
         &self.id
+    }
+
+    /// Returns collection-ID reservations owned by the current identity.
+    pub(crate) fn collection_reservations(&self) -> CollectionReservations {
+        self.collections.reservations()
     }
 
     /// Whether this read-only attempt is past its optimistic first try and must
@@ -314,7 +319,7 @@ pub struct Algo {
     locker: Locker,
     direct_commit: DirectCommit,
     mon: Monitor,
-    cleanup_hints: TxCleanupHints,
+    cleanup_hints: GcHints,
     timeline: Timeline,
     // Factory for each transaction's same-identity acquisition schedule. Other
     // coordination loops own independent schedules from the same engine policy.
@@ -341,7 +346,7 @@ impl Algo {
         coord: LeafCoordinator,
         mon: Monitor,
         collection_commit: CollectionCommit,
-        cleanup_hints: TxCleanupHints,
+        cleanup_hints: GcHints,
         background: Option<Weak<Background>>,
         router: TreeRouter,
         resolver: KeyResolver,
@@ -411,7 +416,9 @@ impl Algo {
                     self.renew_after_wound(tx).await;
                     return Ok(BodyDecision::ReplayBody);
                 }
-                Err(TransError::Retry) => return Ok(BodyDecision::ReplayBody),
+                Err(TransError::Retry) => {
+                    return Ok(BodyDecision::ReplayBody);
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -433,7 +440,9 @@ impl Algo {
                     self.renew_after_wound(tx).await;
                     return Ok(BodyDecision::ReplayBody);
                 }
-                Err(TransError::Retry) => return Ok(BodyDecision::ReplayBody),
+                Err(TransError::Retry) => {
+                    return Ok(BodyDecision::ReplayBody);
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -470,6 +479,7 @@ impl Algo {
     async fn commit_once(&self, tx: &mut Handle) -> Result<AttemptOutcome, TransError> {
         let owner_operation = self.mon.begin_owner_operation(&tx.id)?;
         let result = self.commit_inner(tx).await;
+        let result = self.resolve_reclaimed_resources(tx, result).await;
         // Completing the guard proves that no old-identity write can land
         // after retirement. Dropping it records the opposite fact.
         if !result
@@ -484,6 +494,7 @@ impl Algo {
     async fn validate_reads_once(&self, tx: &mut Handle) -> Result<AttemptOutcome, TransError> {
         let owner_operation = self.mon.begin_owner_operation(&tx.id)?;
         let result = self.validate_attempt_reads(tx).await;
+        let result = self.resolve_reclaimed_resources(tx, result).await;
         // Completing the guard proves that no old-identity write can land
         // after retirement. Dropping it records the opposite fact.
         if !result
@@ -491,6 +502,27 @@ impl Algo {
             .is_ok_and(AttemptOutcome::has_pending_writes)
         {
             owner_operation.complete();
+        }
+        result
+    }
+
+    /// Resolves attempt failures caused by a wounded owner's reclaimed resources.
+    async fn resolve_reclaimed_resources(
+        &self,
+        tx: &Handle,
+        result: Result<AttemptOutcome, TransError>,
+    ) -> Result<AttemptOutcome, TransError> {
+        if tx.needs_abort()
+            && matches!(
+                result,
+                Err(TransError::Storage(StorageError::NotFound | StorageError::StaleCollection)
+                    | TransError::StaleCollection)
+            )
+            // Local Pending status cannot rule out a peer's wound. Keep the
+            // owner operation active until this durable read also completes.
+            && self.mon.has_durable_wound(&tx.id).await?
+        {
+            return Err(TransError::Wounded);
         }
         result
     }
@@ -1983,6 +2015,34 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn stale_read_replay_reports_an_earlier_internal_renewal() {
+        let (backend, flaky) = FlakyCas::wrap(
+            Arc::new(MemoryBackend::new()),
+            test_root_path().to_string(),
+            SERIAL_FALLBACK_AFTER * crate::leaf_coord::CAS_RETRIES,
+        );
+        let (algo, context) = new_algo_from_backend(backend).await;
+        let key = logical_key(b"key");
+        let logged = vec![1; InlinePolicy::default().max_value_bytes + 1];
+        commit_writes(&algo, vec![wa(&key, &logged)]).await;
+        let stale = do_read(&context, &key).await;
+        commit_writes(&algo, vec![wa(&key, b"changed")]).await;
+        flaky.arm();
+        let mut handle = begin_accesses(
+            &algo,
+            AccessSet::new(vec![stale], vec![wa(&key, &logged)], Vec::new()),
+        );
+        let old_id = handle.id().clone();
+        assert_eq!(
+            algo.commit(&mut handle).await.unwrap(),
+            BodyDecision::ReplayBody,
+        );
+        assert_ne!(handle.id(), &old_id);
+        assert_eq!(flaky.remaining(), 0);
+        algo.end(&mut handle).await.unwrap();
+    }
+
     // ADR-065: sustained completed parallel conflicts renew once before sorted
     // serial acquisition. They do not replay the transaction body.
     //
@@ -2134,7 +2194,7 @@ mod tests {
     }
 
     // Transaction nodes use two symbols from the same alphabet as path type
-    // markers. In particular, a transaction can live under `/_t/_n/`; path
+    // markers. In particular, a transaction can live under `/_t/_/n/`; path
     // substring checks would mistake its object create for a standalone-node
     // write and make commit-path counts depend on random transaction entropy.
     #[test]
@@ -2145,7 +2205,7 @@ mod tests {
             id,
         }
         .to_string();
-        assert!(path.contains("/_t/_n/"), "test id mapped to {path:?}");
+        assert!(path.contains("/_t/_/n/"), "test id mapped to {path:?}");
         let log = Arc::new(std::sync::Mutex::new(vec![OpRecord {
             op: "write_if_not_exists",
             path,

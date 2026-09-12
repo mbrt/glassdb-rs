@@ -1,8 +1,9 @@
 //! Collection-specific state and phases within the transaction commit protocol.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
 
-use glassdb_data::{CollectionAddress, TxId};
+use glassdb_data::{CollectionAddress, CollectionId, TxId};
 use glassdb_storage::transaction::{TxCollectionChange, TxCollectionOp, TxLock};
 use glassdb_storage::{Requirement, SplitPolicy};
 
@@ -15,8 +16,35 @@ use crate::monitor::{Monitor, TxRecoveryManifest};
 /// identity's body retries.
 pub(crate) struct CollectionAttempt {
     accesses: CatalogAccesses,
+    reservations: CollectionReservations,
     prepared: BTreeSet<CollectionAddress>,
     fenced_drops: BTreeSet<CollectionAddress>,
+}
+
+/// Issues reusable collection IDs within one transaction identity.
+#[derive(Clone)]
+pub struct CollectionReservations {
+    ids: Arc<Mutex<HashMap<CollectionBinding, CollectionId>>>,
+}
+
+type CollectionBinding = (CollectionAddress, Vec<u8>);
+
+impl CollectionReservations {
+    /// Reserves the same collection ID for repeated creation of one binding.
+    pub fn reserve(&self, parent: &CollectionAddress, name: &[u8]) -> CollectionId {
+        *self
+            .ids
+            .lock()
+            .unwrap()
+            .entry((parent.clone(), name.to_vec()))
+            .or_insert_with(CollectionId::new_random)
+    }
+
+    fn new() -> Self {
+        Self {
+            ids: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 /// Coordinates the collection-specific phases around the shared transaction
@@ -34,9 +62,15 @@ impl CollectionAttempt {
     pub(crate) fn new(accesses: CatalogAccesses) -> Self {
         Self {
             accesses,
+            reservations: CollectionReservations::new(),
             prepared: BTreeSet::new(),
             fenced_drops: BTreeSet::new(),
         }
+    }
+
+    /// Returns collection-ID reservations owned by the current identity.
+    pub(crate) fn reservations(&self) -> CollectionReservations {
+        self.reservations.clone()
     }
 
     /// Returns the logical collection accesses from the current body run.
@@ -57,6 +91,8 @@ impl CollectionAttempt {
 
     /// Drops physical resources that belonged to the retired identity.
     pub(crate) fn renew(&mut self) {
+        // Old body handles must never allocate from the replacement identity.
+        self.reservations = CollectionReservations::new();
         self.prepared.clear();
         self.fenced_drops.clear();
     }
@@ -249,7 +285,7 @@ impl CollectionCommit {
         let drops = attempt.fenced_drops.iter().cloned().collect::<Vec<_>>();
         self.lifecycle.clear_aborted_drops(id, &drops).await?;
         let prepared = attempt.prepared.iter().cloned().collect::<Vec<_>>();
-        self.lifecycle.reclaim(&prepared).await
+        self.lifecycle.reclaim(&prepared).await.map(|_| ())
     }
 }
 
@@ -286,9 +322,14 @@ mod tests {
         });
         attempt.prepared.insert(collection.clone());
         attempt.fenced_drops.insert(address(2));
+        let retired_reservations = attempt.reservations();
+        let parent = CollectionAddress::root("db");
+        let old_id = retired_reservations.reserve(&parent, b"child");
 
         attempt.renew();
 
+        assert_ne!(attempt.reservations().reserve(&parent, b"child"), old_id);
+        assert_eq!(retired_reservations.reserve(&parent, b"child"), old_id);
         assert_eq!(attempt.accesses.changes.len(), 1);
         assert_eq!(attempt.accesses.changes[0].collection, collection);
         assert!(attempt.prepared.is_empty());

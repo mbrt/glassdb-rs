@@ -135,7 +135,7 @@ mod tests {
         let transactions = TLogger::new(objects, DbRoot::try_from("db").unwrap());
         let monitor = Monitor::with_config(
             transactions.clone(),
-            timeline,
+            timeline.clone(),
             Arc::downgrade(&background),
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
@@ -143,6 +143,7 @@ mod tests {
         let state = CollectionStateResolver::new(
             records.clone(),
             transactions,
+            timeline,
             monitor.clone(),
             RetryConfig::default(),
         );

@@ -1,4 +1,4 @@
-//! Foreground bounded future collection.
+//! Bounded future collection.
 
 use std::future::Future;
 use std::iter;
@@ -28,6 +28,19 @@ where
         return vec![first.await];
     };
 
+    // A complete batch needs no refill queue. For small batches, join_all also
+    // stores futures together instead of allocating a queue entry per input.
+    if limit.get() >= 2
+        && inputs
+            .size_hint()
+            .1
+            .is_some_and(|left| left <= limit.get() - 2)
+    {
+        return futures::future::join_all(
+            iter::once(first).chain(iter::once(second)).chain(inputs),
+        )
+        .await;
+    }
     let mut remaining = iter::once(first).chain(iter::once(second)).chain(inputs);
     let mut outputs: Vec<Option<<I::Item as Future>::Output>> = Vec::new();
     let mut running = FuturesUnordered::new();
@@ -93,17 +106,19 @@ mod tests {
 
     #[tokio::test]
     async fn maps_inputs_and_returns_stable_outputs() {
-        let outputs = map_all_bounded(
-            [3, 1, 2],
-            NonZeroUsize::new(2).unwrap(),
-            |input| async move {
-                tokio::task::yield_now().await;
-                input * 2
-            },
-        )
-        .await;
+        for limit in [2, 3, 16] {
+            let outputs = map_all_bounded(
+                [3, 1, 2],
+                NonZeroUsize::new(limit).unwrap(),
+                |input| async move {
+                    tokio::task::yield_now().await;
+                    input * 2
+                },
+            )
+            .await;
 
-        assert_eq!(outputs, [6, 2, 4]);
+            assert_eq!(outputs, [6, 2, 4]);
+        }
     }
 
     #[tokio::test]
@@ -173,20 +188,30 @@ mod tests {
 
     #[tokio::test]
     async fn limits_incomplete_futures_and_drops_all_inputs() {
-        let polls = Arc::new(AtomicUsize::new(0));
-        let drops = Arc::new(AtomicUsize::new(0));
-        let inputs = (0..17)
-            .map(|_| CountedFuture {
-                polls: polls.clone(),
-                drops: drops.clone(),
-            })
-            .collect::<Vec<_>>();
-        let mut joined = Box::pin(join_all_bounded(inputs, NonZeroUsize::new(16).unwrap()));
+        for count in [1, 2, 16, 17] {
+            for known_length in [false, true] {
+                let polls = Arc::new(AtomicUsize::new(0));
+                let drops = Arc::new(AtomicUsize::new(0));
+                let mut inputs = (0..count)
+                    .map(|_| CountedFuture {
+                        polls: polls.clone(),
+                        drops: drops.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter();
+                let inputs: Box<dyn Iterator<Item = CountedFuture>> = if known_length {
+                    Box::new(inputs)
+                } else {
+                    Box::new(iter::from_fn(move || inputs.next()))
+                };
+                let mut joined = Box::pin(join_all_bounded(inputs, NonZeroUsize::new(16).unwrap()));
 
-        assert!(futures::poll!(joined.as_mut()).is_pending());
-        assert_eq!(polls.load(Ordering::SeqCst), 16);
+                assert!(futures::poll!(joined.as_mut()).is_pending());
+                assert_eq!(polls.load(Ordering::SeqCst), count.min(16));
 
-        drop(joined);
-        assert_eq!(drops.load(Ordering::SeqCst), 17);
+                drop(joined);
+                assert_eq!(drops.load(Ordering::SeqCst), count);
+            }
+        }
     }
 }

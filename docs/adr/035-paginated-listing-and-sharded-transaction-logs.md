@@ -14,6 +14,11 @@ safety, horizon, and reclamation decisions are unchanged.
 structural records: they stay in the independent `_s` namespace and recovery
 loop and are not transaction-log records or GC candidates.
 
+[ADR-070](070-demand-driven-garbage-collection.md) supersedes the two-character
+transaction directory with a hierarchy that permits broad and narrow scans,
+and refines scheduling with independent adaptive GC scans. That change is
+implemented. The paginated backend contract remains unchanged.
+
 ## Context
 
 `Backend::list` returns every immediate child of a directory in one `Vec`. The

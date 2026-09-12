@@ -411,6 +411,15 @@ impl ObjectPath {
         transaction::shard_prefix(db_root.as_str(), shard)
     }
 
+    /// Returns a transaction listing prefix at one of the three supported depths.
+    pub fn transaction_scan_prefix(
+        db_root: &DbRoot,
+        depth: u8,
+        index: usize,
+    ) -> Result<String, PathError> {
+        transaction::scan_prefix(db_root.as_str(), depth, index)
+    }
+
     /// Returns the database-wide structural-intent listing prefix.
     pub fn structural_intents_prefix(db_root: &DbRoot) -> String {
         structural::directory(db_root.as_str())
@@ -429,16 +438,14 @@ impl std::fmt::Display for ObjectPath {
                 write!(f, "{db_root}/{DATABASE_METADATA_OBJECT}")
             }
             ObjectPath::CollectionRecord { collection } => {
-                tree::write_collection_record(f, &collection.physical_prefix())
+                tree::write_collection_record(f, collection)
             }
             ObjectPath::Transaction { db_root, id } => {
                 transaction::write_object(f, db_root.as_str(), id)
             }
-            ObjectPath::TreeRoot { collection } => {
-                tree::write_tree_root(f, &collection.physical_prefix())
-            }
+            ObjectPath::TreeRoot { collection } => tree::write_tree_root(f, collection),
             ObjectPath::Node { collection, token } => {
-                tree::write_node(f, &collection.physical_prefix(), token.as_str())
+                tree::write_node(f, collection, token.as_str())
             }
             ObjectPath::StructuralIntent {
                 db_root,
@@ -648,7 +655,10 @@ mod tests {
             ("db/_n/", ErrorKind::Parse),
             ("db/_n/token/extra", ErrorKind::Parse),
             ("db/_t/00/0F8310", ErrorKind::Parse),
-            ("db/_t/!!/!!", ErrorKind::Decode),
+            ("db/_t/0F/0F8310", ErrorKind::Parse),
+            ("db/_t/!/!/!!", ErrorKind::Decode),
+            ("db/_t/0/0/é", ErrorKind::Parse),
+            ("db/_t/0/0/€", ErrorKind::Decode),
             ("db/_s/participant", ErrorKind::Parse),
             ("db/_s//intent", ErrorKind::Parse),
             ("db/_s/!/intent", ErrorKind::Decode),
@@ -754,7 +764,7 @@ mod tests {
                 id: participant.clone(),
             }
             .to_string(),
-            "db/_t/0F/0F8310"
+            "db/_t/0/F/0F8310"
         );
         assert_eq!(
             ObjectPath::StructuralIntent {
@@ -771,7 +781,7 @@ mod tests {
         );
         assert_eq!(
             ObjectPath::transaction_shard_prefix(&db_root, 16),
-            "db/_t/0F/"
+            "db/_t/0/F/"
         );
         assert_eq!(ObjectPath::transaction_shard(&participant), 16);
         assert_eq!(ObjectPath::structural_intents_prefix(&db_root), "db/_s/");

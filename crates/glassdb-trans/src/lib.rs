@@ -24,12 +24,14 @@ pub use access::{
     AccessSet, ReadAccess, ReadEvidence, ScanAccess, ScanMutation, ScanRange, WriteAccess,
 };
 pub use algo::{BodyDecision, DirectCommitStats};
+pub use collection_commit::CollectionReservations;
 pub use collections::{
     CatalogAccesses, CollectionChange, CollectionOp, DirectoryRead, DirectoryReadKind,
     DirectorySnapshot,
 };
 pub use engine::{Engine, EngineConfig, EngineDiagnostics, EngineStats, EngineTransaction};
 pub use error::TransError;
+pub use gc::{GcDiagnostics, GcStats};
 pub use key_resolver::ScanResult;
 pub use leaf_coord::LeafCoordinatorStats;
 pub use monitor::ProtocolTiming;

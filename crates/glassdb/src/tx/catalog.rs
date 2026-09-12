@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use glassdb_data::{CollectionAddress, CollectionId};
 use glassdb_trans::{
-    CatalogAccesses, CollectionChange, CollectionOp, DirectoryRead, DirectoryReadKind,
-    DirectorySnapshot,
+    CatalogAccesses, CollectionChange, CollectionOp, CollectionReservations, DirectoryRead,
+    DirectoryReadKind, DirectorySnapshot,
 };
 
 use crate::error::Error;
@@ -18,7 +18,6 @@ pub(super) enum CreateMode {
 }
 
 /// Accumulates collection-catalog accesses for one public transaction.
-#[derive(Default)]
 pub(super) struct CatalogOverlay {
     directories: HashMap<CollectionAddress, DirectoryState>,
     reads: Vec<DirectoryRead>,
@@ -26,7 +25,7 @@ pub(super) struct CatalogOverlay {
     created: HashSet<CollectionAddress>,
     dropped: HashSet<CollectionAddress>,
     dropped_bindings: HashSet<(CollectionAddress, Vec<u8>)>,
-    reservations: HashMap<(CollectionAddress, Vec<u8>), CollectionId>,
+    reservations: CollectionReservations,
 }
 
 struct DirectoryState {
@@ -36,6 +35,18 @@ struct DirectoryState {
 }
 
 impl CatalogOverlay {
+    pub(super) fn new(reservations: CollectionReservations) -> Self {
+        Self {
+            directories: HashMap::new(),
+            reads: Vec::new(),
+            changes: BTreeMap::new(),
+            created: HashSet::new(),
+            dropped: HashSet::new(),
+            dropped_bindings: HashSet::new(),
+            reservations,
+        }
+    }
+
     /// Reports whether a collection was created by the current body attempt.
     pub(super) fn is_created(&self, collection: &CollectionAddress) -> bool {
         self.created.contains(collection)
@@ -133,14 +144,7 @@ impl CatalogOverlay {
                 "cannot recreate a collection binding after dropping it in one transaction".into(),
             ));
         }
-        let id = match self.reservations.get(&binding).copied() {
-            Some(id) => id,
-            None => {
-                let id = CollectionId::new_random();
-                self.reservations.insert(binding.clone(), id);
-                id
-            }
-        };
+        let id = self.reservations.reserve(parent, name);
         let address = CollectionAddress::new(parent.db_root(), id);
         self.directories
             .get_mut(parent)
@@ -276,18 +280,6 @@ impl CatalogOverlay {
                 current: children,
                 version: snapshot.version,
             });
-    }
-
-    /// Discards catalog accesses from the completed body attempt.
-    pub(super) fn reset(&mut self) {
-        self.directories.clear();
-        self.reads.clear();
-        self.changes.clear();
-        self.created.clear();
-        self.dropped.clear();
-        self.dropped_bindings.clear();
-        // Reusing an incarnation across body retries avoids discarding a
-        // prepared collection under a no-longer-reachable physical prefix.
     }
 
     /// Serializes the accumulated logical accesses for the commit engine.

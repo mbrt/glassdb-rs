@@ -164,7 +164,7 @@ impl From<TransError> for Error {
             TransError::Other { msg, source } => Error::Internal { msg, source },
             TransError::Retry
             | TransError::Wounded
-            | TransError::ValidateRetry
+            | TransError::ValidateRetry(_)
             | TransError::LockTimeout
             | TransError::NoSingleWrite => {
                 Error::internal(format!("transaction control-flow error escaped: {e}"))

@@ -38,7 +38,7 @@ impl TxStatus {
     }
 }
 
-/// One backend page of transaction identities from a deterministic log shard.
+/// One backend page of transaction identities from a scan prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxListPage {
     pub ids: Vec<TxId>,
@@ -61,7 +61,10 @@ impl TLogger {
         }
     }
 
-    /// Returns transaction status with an explicit generic requirement bound.
+    /// Returns transaction status, revalidating mutable state at `requirement`.
+    ///
+    /// Cached committed and aborted statuses remain valid after object deletion.
+    /// Their observations can predate `requirement`.
     pub async fn commit_status_at(
         &self,
         id: &TxId,
@@ -78,7 +81,10 @@ impl TLogger {
         Ok(TxStatus::from_observation(observation))
     }
 
-    /// Reads the full transaction object with an explicit requirement bound.
+    /// Reads transaction contents, revalidating mutable state at `requirement`.
+    ///
+    /// Cached committed and aborted contents remain valid after object deletion.
+    /// Their observations can predate `requirement` and do not prove presence.
     pub async fn get_at(
         &self,
         id: &TxId,
@@ -158,7 +164,19 @@ impl TLogger {
         cursor: Option<&backend::ListCursor>,
         limit: backend::ListLimit,
     ) -> Result<TxListPage, StorageError> {
-        let prefix = ObjectPath::transaction_shard_prefix(&self.db_root, shard);
+        self.scan_transaction_ids(2, shard, cursor, limit).await
+    }
+
+    /// Lists transaction identities at the requested prefix depth.
+    pub async fn scan_transaction_ids(
+        &self,
+        depth: u8,
+        index: usize,
+        cursor: Option<&backend::ListCursor>,
+        limit: backend::ListLimit,
+    ) -> Result<TxListPage, StorageError> {
+        let prefix = ObjectPath::transaction_scan_prefix(&self.db_root, depth, index)
+            .map_err(|error| StorageError::with_source("transaction scan prefix", error))?;
         let page = self.logs.list(&prefix, cursor, limit).await?;
         let ids = page
             .objects
@@ -670,29 +688,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalized_logs_are_served_from_the_typed_cache() {
-        let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
-        let operations = backend.log();
-        let timeline = Timeline::new();
-        let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone(), None);
-        let logger = TLogger::new(objects, db_root());
-        let id = TxId::from_bytes(vec![4, 3, 2, 1]);
-        logger
-            .set(&TxLog::new(id.clone(), TxCommitStatus::Aborted))
-            .await
-            .unwrap();
-        operations.lock().unwrap().clear();
+    async fn final_contents_remain_cached_after_peer_deletion() {
+        for status in [TxCommitStatus::Ok, TxCommitStatus::Aborted] {
+            let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+            let operations = backend.log();
+            let backend = Arc::new(backend);
+            let timeline = Timeline::new();
+            let logger = TLogger::new(
+                CachedStore::new(backend.clone(), 1 << 20, timeline.clone(), None),
+                db_root(),
+            );
+            let peer = TLogger::new(
+                CachedStore::new(backend, 1 << 20, Timeline::new(), None),
+                db_root(),
+            );
+            let id = TxId::from_bytes(vec![4, 3, 2, 4]);
+            logger.set(&TxLog::new(id.clone(), status)).await.unwrap();
+            let observed = peer.get_at(&id, Requirement::Any).await.unwrap();
+            peer.delete(&observed).await.unwrap();
+            operations.lock().unwrap().clear();
 
-        logger.get_at(&id, Requirement::Any).await.unwrap();
-        logger.get_at(&id, Requirement::Any).await.unwrap();
-
-        let conditional_reads = operations
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|operation| operation.op == "read_if_modified")
-            .count();
-        assert_eq!(conditional_reads, 0);
+            let bound = Requirement::AtLeast(timeline.now());
+            let observed = logger.get_at(&id, bound).await.unwrap();
+            assert_eq!(observed.value().unwrap().status, status);
+            assert!(!bound.is_satisfied_by(observed.current_after()));
+            assert_eq!(
+                logger.commit_status_at(&id, bound).await.unwrap().status,
+                status,
+            );
+            assert!(
+                operations.lock().unwrap().is_empty(),
+                "immutable contents and status need no presence check"
+            );
+        }
     }
 
     #[tokio::test]
@@ -788,5 +816,52 @@ mod tests {
         let mut expected: Vec<TxId> = ids.to_vec();
         expected.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         assert_eq!(listed, expected);
+    }
+
+    #[tokio::test]
+    async fn recursive_scans_page_only_the_selected_scope() {
+        let t = new_tlogger();
+        let ids = [
+            TxId::from_bytes(vec![1, 2]),
+            TxId::from_bytes(vec![1, 3]),
+            TxId::from_bytes(vec![2, 0]),
+            TxId::from_bytes(vec![80, 3]),
+        ];
+        for id in &ids {
+            t.set(&TxLog::new(id.clone(), TxCommitStatus::Aborted))
+                .await
+                .unwrap();
+        }
+        let shard = t.transaction_shard(&ids[0]);
+        for (depth, index) in [(0, 0), (1, shard / 64), (2, shard)] {
+            let mut cursor = None;
+            let mut found = Vec::new();
+            loop {
+                let page = t
+                    .scan_transaction_ids(
+                        depth,
+                        index,
+                        cursor.as_ref(),
+                        backend::ListLimit::new(1).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                found.extend(page.ids);
+                match page.next {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
+            }
+            let expected: Vec<_> = ids
+                .iter()
+                .filter(|id| match depth {
+                    0 => true,
+                    1 => t.transaction_shard(id) / 64 == index,
+                    _ => t.transaction_shard(id) == index,
+                })
+                .cloned()
+                .collect();
+            assert_eq!(found, expected);
+        }
     }
 }

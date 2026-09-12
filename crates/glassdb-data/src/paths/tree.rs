@@ -61,16 +61,29 @@ pub(super) fn parse_object(path: &str) -> Option<Result<ObjectPath, PathError>> 
     None
 }
 
-pub(super) fn write_collection_record(f: &mut fmt::Formatter<'_>, prefix: &str) -> fmt::Result {
-    write!(f, "{prefix}/{COLLECTION_RECORD_MARKER}")
+pub(super) fn write_collection_record(
+    f: &mut fmt::Formatter<'_>,
+    collection: &CollectionAddress,
+) -> fmt::Result {
+    write_collection_prefix(f, collection)?;
+    write!(f, "/{COLLECTION_RECORD_MARKER}")
 }
 
-pub(super) fn write_tree_root(f: &mut fmt::Formatter<'_>, prefix: &str) -> fmt::Result {
-    write!(f, "{prefix}/{TREE_ROOT_MARKER}")
+pub(super) fn write_tree_root(
+    f: &mut fmt::Formatter<'_>,
+    collection: &CollectionAddress,
+) -> fmt::Result {
+    write_collection_prefix(f, collection)?;
+    write!(f, "/{TREE_ROOT_MARKER}")
 }
 
-pub(super) fn write_node(f: &mut fmt::Formatter<'_>, prefix: &str, token: &str) -> fmt::Result {
-    write!(f, "{prefix}/{NODE_MARKER}/{token}")
+pub(super) fn write_node(
+    f: &mut fmt::Formatter<'_>,
+    collection: &CollectionAddress,
+    token: &str,
+) -> fmt::Result {
+    write_collection_prefix(f, collection)?;
+    write!(f, "/{NODE_MARKER}/{token}")
 }
 
 pub(super) fn nodes_prefix(prefix: &str) -> String {
@@ -81,4 +94,16 @@ fn parse_collection(prefix: &str) -> Result<CollectionAddress, PathError> {
     let (db_root, id) = parse_collection_prefix(prefix)?;
     DbRoot::try_from(db_root)?;
     Ok(CollectionAddress::new(db_root, id))
+}
+
+fn write_collection_prefix(
+    f: &mut fmt::Formatter<'_>,
+    collection: &CollectionAddress,
+) -> fmt::Result {
+    write!(
+        f,
+        "{}/_c/{}",
+        collection.db_root(),
+        base64::encode(collection.id().as_bytes())
+    )
 }

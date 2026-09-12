@@ -19,11 +19,11 @@ use glassdb_storage::{
 use crate::access::{AccessSet, ScanMutation, ScanRange};
 use crate::algo::{Algo, BodyDecision, DirectCommitStats, Handle};
 use crate::collection_catalog::CollectionCatalog;
-use crate::collection_commit::CollectionCommit;
+use crate::collection_commit::{CollectionCommit, CollectionReservations};
 use crate::collection_coordination::CollectionStateResolver;
 use crate::collections::{CatalogAccesses, CollectionLifecycle, DirectorySnapshot};
 use crate::error::TransError;
-use crate::gc::{Gc, TxCleanupHints};
+use crate::gc::{Gc, GcDiagnostics, GcHints, GcStats};
 use crate::key_resolver::{KeyResolver, ScanResult};
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{LeafCoordinator, LeafCoordinatorStats};
@@ -122,6 +122,11 @@ impl EngineTransaction {
     pub fn id(&self) -> &TxId {
         self.0.id()
     }
+
+    /// Returns collection-ID reservations owned by the current identity.
+    pub fn collection_reservations(&self) -> CollectionReservations {
+        self.0.collection_reservations()
+    }
 }
 
 /// Runtime counters collected from one engine snapshot.
@@ -138,10 +143,14 @@ pub struct EngineStats {
     pub direct_commit: DirectCommitStats,
     /// Background tree-split activity.
     pub splitter: SplitterStats,
+    /// Garbage collection activity.
+    pub gc: GcStats,
 }
 
 /// Live coordination state collected from one engine snapshot.
 pub struct EngineDiagnostics {
+    /// Local GC queues and scan scope.
+    pub gc: GcDiagnostics,
     /// Per-object deduplication state inside the leaf coordinator.
     pub coordinator_dedup: Vec<DedupKeySnapshot>,
 }
@@ -157,6 +166,7 @@ pub struct Engine {
     coord: LeafCoordinator,
     locker: Locker,
     splitter: Splitter,
+    gc: Gc,
     // Subsystems hold weak references so this sole strong owner breaks task
     // capture cycles when the engine is dropped.
     background: Arc<Background>,
@@ -275,12 +285,14 @@ impl Engine {
             coordinator: self.coord.stats_and_reset(),
             direct_commit: self.algo.direct_commit_stats_and_reset(),
             splitter: self.splitter.stats_and_reset(),
+            gc: self.gc.stats_and_reset(),
         }
     }
 
     /// Returns the engine's live coordination diagnostics.
     pub fn diagnostics(&self) -> EngineDiagnostics {
         EngineDiagnostics {
+            gc: self.gc.diagnostics(),
             coordinator_dedup: self.coord.dedup_snapshot(),
         }
     }
@@ -435,7 +447,6 @@ impl AssemblyFixture {
 /// A complete engine whose maintenance tasks have not started.
 struct DormantEngine {
     engine: Engine,
-    gc: Gc,
 }
 
 impl DormantEngine {
@@ -467,7 +478,7 @@ impl DormantEngine {
 
     /// Starts maintenance work and returns the live engine.
     fn start(self) -> Engine {
-        self.gc.start();
+        self.engine.gc.start(&self.engine.background);
         self.engine.splitter.start();
         self.engine
     }
@@ -497,8 +508,13 @@ impl DormantEngine {
             monitor,
         } = foundation;
         let background_weak = Arc::downgrade(&background);
-        let collection_state =
-            CollectionStateResolver::new(records.clone(), tlogger.clone(), monitor.clone(), retry);
+        let collection_state = CollectionStateResolver::new(
+            records.clone(),
+            tlogger.clone(),
+            timeline.clone(),
+            monitor.clone(),
+            retry,
+        );
         let collection_catalog = CollectionCatalog::new(collection_state.clone());
         let key_state = KeyStateResolver::new(monitor.clone());
         let router = TreeRouter::new(nodes.clone(), transaction_leaf_parallelism);
@@ -508,7 +524,7 @@ impl DormantEngine {
             transaction_leaf_parallelism,
         );
         let reader = Reader::new(resolver.clone(), timeline.clone(), retry);
-        let cleanup_hints = TxCleanupHints::default();
+        let cleanup_hints = GcHints::default();
         let (coord, splitter) = Splitter::with_coordinator(
             background_weak.clone(),
             records.clone(),
@@ -539,14 +555,13 @@ impl DormantEngine {
             Arc::new(splitter.clone()),
         );
         let gc = Gc::new(
-            background_weak.clone(),
-            tlogger,
+            tlogger.clone(),
             nodes.clone(),
             structural_intents,
             timeline.clone(),
             locker.clone(),
             collection_lifecycle.clone(),
-            monitor.clone(),
+            monitor.protocol_timing(),
             cleanup_hints.clone(),
         );
         let collection_commit = CollectionCommit::new(
@@ -581,9 +596,10 @@ impl DormantEngine {
             coord,
             locker,
             splitter,
+            gc,
             background,
         };
-        Self { engine, gc }
+        Self { engine }
     }
 }
 

@@ -4,6 +4,10 @@
 
 Accepted — implemented.
 
+[ADR-071](071-gc-skips-pending-and-wounded-transactions.md) supersedes
+candidate-driven wounding and cleanup of wounded candidates: GC skips missing,
+pending, and wounded transaction logs.
+
 This refines the lazy pending-object protocol in
 [ADR-021](021-wound-wait-leases-shard.md),
 [ADR-022](022-garbage-collection-mark-sweep.md), and

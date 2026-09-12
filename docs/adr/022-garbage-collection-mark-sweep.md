@@ -4,6 +4,10 @@
 
 Accepted — implemented.
 
+[ADR-071](071-gc-skips-pending-and-wounded-transactions.md) supersedes
+candidate-driven wounding and cleanup of wounded candidates: GC skips missing,
+pending, and wounded transaction logs.
+
 The lock-reclamation *mechanism* (the "stale-lock and empty-entry pruning" CAS)
 is refined by [ADR-029](029-gc-through-shard-coordinator.md): GC's release now
 flows through the shard-mutation coordinator ([ADR-028](028-shard-mutation-coordinator.md))
@@ -38,6 +42,10 @@ pending-to-aborted and finite tombstone fence below. A collector changes dead
 `Pending` to pinned `Wounded`, may repeatedly reclaim described effects, and
 must not delete the marker. Ordinary finite retention starts only after the
 owner acknowledges `Wounded` as `Aborted`.
+
+[ADR-070](070-demand-driven-garbage-collection.md) refines candidate scheduling
+with cleanup driven by hints and due retries, bounded parallel work, and
+independent adaptive GC scans. That change is implemented.
 
 ## Context
 

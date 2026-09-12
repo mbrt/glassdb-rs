@@ -21,6 +21,6 @@ pub use dedup::{
     BatchHandle, Dedup, DedupError, DedupKeySnapshot, DedupStats, MergeRequest, Worker,
 };
 pub use join::{join_all_bounded, map_all_bounded};
-pub use retry::{Backoff, RetryConfig};
+pub use retry::{Backoff, RetryConfig, ScanCadence};
 pub use rng::Rng;
 pub use tape::Tape;

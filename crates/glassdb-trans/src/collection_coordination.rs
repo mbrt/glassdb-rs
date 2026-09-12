@@ -1,14 +1,15 @@
 //! Transactional state resolution, locking, and write-back for collection records.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
-use glassdb_concurr::{RetryConfig, rt};
+use glassdb_concurr::{RetryConfig, map_all_bounded, rt};
 use glassdb_data::{CollectionAddress, TxId};
 use glassdb_storage::transaction::{
     TLogger, TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock,
 };
 use glassdb_storage::{
-    CollectionRecord, CollectionStore, LockType, Observation, Requirement, StorageError,
+    CollectionRecord, CollectionStore, LockType, Observation, Requirement, StorageError, Timeline,
 };
 
 use crate::collections::{CollectionChange, CollectionOp, DirectoryRead};
@@ -33,6 +34,7 @@ impl LockedDirectories {
 pub(crate) struct CollectionStateResolver {
     records: CollectionStore,
     transactions: TLogger,
+    timeline: Timeline,
     monitor: Monitor,
     retry: RetryConfig,
 }
@@ -44,16 +46,18 @@ pub(crate) struct CollectionLocker {
     records: CollectionStore,
     monitor: Monitor,
     retry: RetryConfig,
+    parallelism: NonZeroUsize,
 }
 
 impl CollectionLocker {
     /// Creates collection locking over shared collection-state resolution.
-    pub(crate) fn new(state: CollectionStateResolver) -> Self {
+    pub(crate) fn new(state: CollectionStateResolver, parallelism: NonZeroUsize) -> Self {
         Self {
             records: state.records.clone(),
             monitor: state.monitor.clone(),
             retry: state.retry,
             state,
+            parallelism,
         }
     }
 
@@ -89,13 +93,20 @@ impl CollectionLocker {
         id: &TxId,
         changes: &[CollectionChange],
         locks: &[TxLock],
-    ) -> Result<(), TransError> {
-        for parent in Self::locked_collections(locks) {
-            self.state
-                .apply_committed_write_back(parent, id, changes)
-                .await?;
-        }
-        Ok(())
+    ) -> Result<bool, TransError> {
+        let results = map_all_bounded(
+            Self::locked_collections(locks),
+            self.parallelism,
+            |parent| async move {
+                self.state
+                    .apply_committed_write_back(&parent, id, changes)
+                    .await
+            },
+        )
+        .await;
+        results
+            .into_iter()
+            .try_fold(false, |changed, result| Ok(changed | result?))
     }
 
     /// Recovers committed directory effects from durable metadata.
@@ -104,30 +115,22 @@ impl CollectionLocker {
         id: &TxId,
         changes: &[TxCollectionChange],
         locks: &[TxLock],
-    ) -> Result<(), TransError> {
+    ) -> Result<bool, TransError> {
         let changes = CollectionStateResolver::recover_changes(changes);
         self.write_back(id, &changes, locks).await
     }
 
     /// Releases every recorded directory lock held by `id`.
-    pub(crate) async fn release(&self, id: &TxId, locks: &[TxLock]) -> Result<(), TransError> {
-        for parent in Self::locked_collections(locks) {
-            loop {
-                let (mut record, observed) =
-                    match self.records.load_record(parent, Requirement::Any).await {
-                        Ok(record) => record,
-                        Err(StorageError::NotFound) => break,
-                        Err(error) => return Err(error.into()),
-                    };
-                if !record.remove_directory_holder(id) {
-                    break;
-                }
-                if self.records.store_record(&record, &observed).await? {
-                    break;
-                }
-            }
-        }
-        Ok(())
+    pub(crate) async fn release(&self, id: &TxId, locks: &[TxLock]) -> Result<bool, TransError> {
+        let results = map_all_bounded(
+            Self::locked_collections(locks),
+            self.parallelism,
+            |parent| async move { self.release_directory(&parent, id).await },
+        )
+        .await;
+        results
+            .into_iter()
+            .try_fold(false, |changed, result| Ok(changed | result?))
     }
 
     /// Reports whether any recorded directory still refers to `id`.
@@ -137,14 +140,21 @@ impl CollectionLocker {
         locks: &[TxLock],
         requirement: Requirement,
     ) -> Result<bool, TransError> {
-        for collection in Self::locked_collections(locks) {
-            if let Ok((record, _)) = self.records.load_record(collection, requirement).await
-                && record.directory_lock().contains(id)
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        let results = map_all_bounded(
+            Self::locked_collections(locks),
+            self.parallelism,
+            |parent| async move {
+                match self.records.load_record(&parent, requirement).await {
+                    Ok((record, _)) => Ok(record.directory_lock().contains(id)),
+                    Err(StorageError::NotFound) => Ok(false),
+                    Err(error) => Err(TransError::from(error)),
+                }
+            },
+        )
+        .await;
+        results
+            .into_iter()
+            .try_fold(false, |referenced, result| Ok(referenced | result?))
     }
 
     /// Removes a settled structural operation from collection topology.
@@ -152,19 +162,19 @@ impl CollectionLocker {
         &self,
         collection: &CollectionAddress,
         id: &TxId,
-    ) -> Result<(), TransError> {
+    ) -> Result<bool, TransError> {
         loop {
             let (mut record, observed) =
                 match self.records.load_record(collection, Requirement::Any).await {
                     Ok(record) => record,
-                    Err(StorageError::NotFound) => return Ok(()),
+                    Err(StorageError::NotFound) => return Ok(false),
                     Err(error) => return Err(error.into()),
                 };
             if !record.remove_topology_participant(id) {
-                return Ok(());
+                return Ok(false);
             }
             if self.records.store_record(&record, &observed).await? {
-                return Ok(());
+                return Ok(true);
             }
         }
     }
@@ -215,11 +225,35 @@ impl CollectionLocker {
         }
     }
 
-    fn locked_collections(locks: &[TxLock]) -> impl Iterator<Item = &CollectionAddress> {
-        locks.iter().filter_map(|lock| match lock {
-            TxLock::Directory { collection, .. } => Some(collection),
-            _ => None,
-        })
+    async fn release_directory(
+        &self,
+        parent: &CollectionAddress,
+        id: &TxId,
+    ) -> Result<bool, TransError> {
+        loop {
+            let (mut record, observed) =
+                match self.records.load_record(parent, Requirement::Any).await {
+                    Ok(record) => record,
+                    Err(StorageError::NotFound) => return Ok(false),
+                    Err(error) => return Err(error.into()),
+                };
+            if !record.remove_directory_holder(id) {
+                return Ok(false);
+            }
+            if self.records.store_record(&record, &observed).await? {
+                return Ok(true);
+            }
+        }
+    }
+
+    fn locked_collections(locks: &[TxLock]) -> BTreeSet<CollectionAddress> {
+        locks
+            .iter()
+            .filter_map(|lock| match lock {
+                TxLock::Directory { collection, .. } => Some(collection.clone()),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -228,12 +262,14 @@ impl CollectionStateResolver {
     pub(crate) fn new(
         records: CollectionStore,
         transactions: TLogger,
+        timeline: Timeline,
         monitor: Monitor,
         retry: RetryConfig,
     ) -> Self {
         Self {
             records,
             transactions,
+            timeline,
             monitor,
             retry,
         }
@@ -260,6 +296,7 @@ impl CollectionStateResolver {
         requirement: Requirement,
     ) -> Result<(CollectionRecord, Observation<CollectionRecord>), TransError> {
         let mut backoff = self.retry.backoff();
+        let mut requirement = requirement;
         loop {
             let (mut record, observed) = self
                 .records
@@ -293,7 +330,16 @@ impl CollectionStateResolver {
             };
             match self.monitor.await_tx_final(&holder).await? {
                 TxFinalStatus::Committed => {
-                    self.help_committed_write_back(parent, &holder).await?;
+                    match self.help_committed_write_back(parent, &holder).await {
+                        Ok(()) => {}
+                        Err(TransError::Storage(StorageError::NotFound)) => {
+                            // GC can reclaim a log after another instance removes
+                            // its directory holder. A cached record must reload.
+                            requirement = Requirement::AtLeast(self.timeline.now());
+                            rt::sleep(backoff.next_delay()).await;
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 TxFinalStatus::Aborted => {
                     record.remove_directory_holder(&holder);
@@ -310,17 +356,17 @@ impl CollectionStateResolver {
         parent: &CollectionAddress,
         id: &TxId,
         changes: &[CollectionChange],
-    ) -> Result<(), TransError> {
+    ) -> Result<bool, TransError> {
         let mut backoff = self.retry.backoff();
         loop {
             let (mut record, observed) =
                 match self.records.load_record(parent, Requirement::Any).await {
                     Ok(record) => record,
-                    Err(StorageError::NotFound) => return Ok(()),
+                    Err(StorageError::NotFound) => return Ok(false),
                     Err(error) => return Err(error.into()),
                 };
             if !record.directory_lock().contains(id) {
-                return Ok(());
+                return Ok(false);
             }
             let mut changed = false;
             for change in changes.iter().filter(|change| &change.parent == parent) {
@@ -356,7 +402,7 @@ impl CollectionStateResolver {
             }
             record.remove_directory_holder(id);
             if self.records.store_record(&record, &observed).await? {
-                return Ok(());
+                return Ok(true);
             }
             rt::sleep(backoff.next_delay()).await;
         }
@@ -384,7 +430,9 @@ impl CollectionStateResolver {
             )));
         }
         let changes = Self::recover_changes(&log.collection_changes);
-        self.apply_committed_write_back(parent, id, &changes).await
+        self.apply_committed_write_back(parent, id, &changes)
+            .await
+            .map(|_| ())
     }
 
     fn recover_changes(changes: &[TxCollectionChange]) -> Vec<CollectionChange> {
@@ -429,7 +477,7 @@ mod tests {
         let background = Arc::new(Background::new());
         let monitor = Monitor::with_config(
             transactions.clone(),
-            timeline,
+            timeline.clone(),
             Arc::downgrade(&background),
             RetryConfig::default(),
             ProtocolTiming::default(),
@@ -437,10 +485,15 @@ mod tests {
         let state = CollectionStateResolver::new(
             records.clone(),
             transactions,
+            timeline,
             monitor,
             RetryConfig::default(),
         );
-        (CollectionLocker::new(state), records, background)
+        (
+            CollectionLocker::new(state, NonZeroUsize::MIN),
+            records,
+            background,
+        )
     }
 
     #[tokio::test]
@@ -464,5 +517,67 @@ mod tests {
             .unwrap();
         assert_eq!(record.directory_lock().lock_type(), LockType::Write);
         assert_eq!(record.directory_lock().holders(), std::slice::from_ref(&id));
+    }
+
+    #[tokio::test]
+    async fn reclaimed_log_refreshes_a_cached_directory_holder() {
+        use crate::engine::{AssemblyFixture, EngineConfig};
+        use glassdb_data::CollectionId;
+        use glassdb_storage::transaction::TxLog;
+
+        let backend = Arc::new(MemoryBackend::new());
+        let local = AssemblyFixture::new(
+            backend.clone(),
+            DbRoot::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let peer = AssemblyFixture::new(
+            backend,
+            DbRoot::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let parent = CollectionAddress::root("db");
+        let old = TxId::from_bytes(vec![1]);
+        let local_log = local
+            .tlogger
+            .set(&TxLog::new(old.clone(), TxCommitStatus::Ok))
+            .await
+            .unwrap();
+        assert_eq!(
+            local.monitor.tx_status(&old).await.unwrap(),
+            TxCommitStatus::Ok
+        );
+        let mut record = CollectionRecord::new();
+        record.set_directory_writer(old.clone());
+        local.records.create_record(&parent, &record).await.unwrap();
+        let (mut record, observed) = peer
+            .records
+            .load_record(&parent, Requirement::Any)
+            .await
+            .unwrap();
+        record.remove_directory_holder(&old);
+        let child = CollectionId::from_slice(&[1; 16]).unwrap();
+        record.add_child(b"child".to_vec(), child).unwrap();
+        peer.records.store_record(&record, &observed).await.unwrap();
+        let observed = peer.tlogger.get_at(&old, Requirement::Any).await.unwrap();
+        peer.tlogger.delete(&observed).await.unwrap();
+        local.tlogger.delete(&local_log).await.unwrap();
+        assert!(matches!(
+            local.tlogger.get_at(&old, Requirement::Any).await,
+            Err(StorageError::NotFound)
+        ));
+        let resolver = CollectionStateResolver::new(
+            local.records.clone(),
+            local.tlogger.clone(),
+            local.timeline.clone(),
+            local.monitor.clone(),
+            RetryConfig::default(),
+        );
+        let resolved = resolver
+            .resolve(&parent, None, Requirement::Any)
+            .await
+            .unwrap();
+        assert_eq!(resolved.child(b"child"), Some(child));
+        assert!(!resolved.directory_lock().contains(&old));
     }
 }

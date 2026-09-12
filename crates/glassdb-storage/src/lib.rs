@@ -51,9 +51,11 @@ pub use node::{
     IndexNode, InvalidSplitPolicy, Node, NodeBody, NodeLocks, NodeToken, SplitPolicy,
     SplitPolicyBuilder,
 };
-pub use node_store::{LeafEdit, LeafObservation, LeafObservationCheck, LoadedLeaf, NodeStore};
+pub use node_store::{
+    LeafEdit, LeafObservation, LeafObservationCheck, LoadedLeaf, NodePage, NodeStore,
+};
 pub use structural_intent::{StructuralIntent, StructuralIntentPhase};
-pub use structural_intent_store::StructuralIntentStore;
+pub use structural_intent_store::{StructuralIntentPage, StructuralIntentStore};
 pub use timeline::{SequencePoint, Timeline};
 pub use tree_router::{RoutedLeaf, RoutedLeafGroup, TreeRouter};
 pub use version::Version;

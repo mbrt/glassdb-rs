@@ -17,6 +17,12 @@ pub struct StructuralIntentStore {
     structural_intents: crate::cached_store::TypedCachedStore<StructuralIntent>,
 }
 
+/// One bounded page of structural recovery observations.
+pub struct StructuralIntentPage {
+    pub intents: Vec<(StructuralIntentId, Observation<StructuralIntent>)>,
+    pub next: Option<backend::ListCursor>,
+}
+
 impl Codec for StructuralIntent {
     type Value = StructuralIntent;
 
@@ -102,6 +108,17 @@ impl StructuralIntentStore {
         self.list_under(&prefix, requirement).await
     }
 
+    /// Reads one page of unresolved structural intents for background recovery.
+    pub async fn scan_page(
+        &self,
+        db_root: &DbRoot,
+        cursor: Option<&backend::ListCursor>,
+        requirement: Requirement,
+    ) -> Result<StructuralIntentPage, StorageError> {
+        let prefix = ObjectPath::structural_intents_prefix(db_root);
+        self.read_page(&prefix, cursor, requirement).await
+    }
+
     /// Lists only the unresolved structural intents owned by `participant`.
     pub async fn list_for_participant(
         &self,
@@ -127,31 +144,49 @@ impl StructuralIntentStore {
         prefix: &str,
         requirement: Requirement,
     ) -> Result<Vec<(StructuralIntentId, Observation<StructuralIntent>)>, StorageError> {
-        let limit = backend::ListLimit::new(STRUCTURAL_LIST_PAGE_SIZE).unwrap();
         let mut cursor = None;
         let mut intents = Vec::new();
         loop {
-            let page = self
-                .structural_intents
-                .list(prefix, cursor.as_ref(), limit)
-                .await?;
-            for path in page.objects {
-                let ObjectPath::StructuralIntent { intent_id, .. } = path.object_path() else {
-                    return Err(StorageError::other(
-                        "structural listing returned a non-structural path",
-                    ));
-                };
-                let intent_id = intent_id.clone();
-                let observed = self.structural_intents.read(path, requirement).await?;
-                if observed.exists() {
-                    intents.push((intent_id, observed));
-                }
-            }
+            let page = self.read_page(prefix, cursor.as_ref(), requirement).await?;
+            intents.extend(page.intents);
             match page.next {
                 Some(next) => cursor = Some(next),
                 None => return Ok(intents),
             }
         }
+    }
+
+    async fn read_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&backend::ListCursor>,
+        requirement: Requirement,
+    ) -> Result<StructuralIntentPage, StorageError> {
+        let page = self
+            .structural_intents
+            .list(
+                prefix,
+                cursor,
+                backend::ListLimit::new(STRUCTURAL_LIST_PAGE_SIZE).unwrap(),
+            )
+            .await?;
+        let mut intents = Vec::new();
+        for path in page.objects {
+            let ObjectPath::StructuralIntent { intent_id, .. } = path.object_path() else {
+                return Err(StorageError::other(
+                    "structural listing returned a non-structural path",
+                ));
+            };
+            let intent_id = intent_id.clone();
+            let observed = self.structural_intents.read(path, requirement).await?;
+            if observed.exists() {
+                intents.push((intent_id, observed));
+            }
+        }
+        Ok(StructuralIntentPage {
+            intents,
+            next: page.next,
+        })
     }
 }
 

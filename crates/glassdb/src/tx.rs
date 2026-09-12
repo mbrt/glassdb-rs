@@ -6,7 +6,7 @@
 //! (`Arc<Mutex<TransactionInner>>`). It is passed *by value* into the transaction
 //! body so the resulting future is `Send` and can be `tokio::spawn`-ed; the
 //! framework keeps its own handle (see [`Transaction::handle`]) to read the collected
-//! accesses after the body returns and to reset between retries. All methods
+//! accesses after the body returns. Each body execution has fresh access state. All methods
 //! take `&self` and only hold the lock briefly — never across an `.await` — so
 //! several reads can run concurrently within a single transaction.
 
@@ -16,7 +16,7 @@ mod catalog;
 use std::sync::{Arc, Mutex};
 
 use glassdb_data::{CollectionAddress, LogicalKey};
-use glassdb_trans::{AccessSet, CatalogAccesses};
+use glassdb_trans::{AccessSet, CatalogAccesses, CollectionReservations};
 
 use self::access_overlay::{AccessOverlay, OverlayRead};
 use self::catalog::{CatalogOverlay, CreateMode};
@@ -41,7 +41,6 @@ pub struct Transaction {
     inner: Arc<Mutex<TransactionInner>>,
 }
 
-#[derive(Default)]
 struct TransactionInner {
     accesses: AccessOverlay,
     catalog: CatalogOverlay,
@@ -311,27 +310,24 @@ impl Transaction {
         Err(Error::Aborted)
     }
 
-    pub(crate) fn new(db: Arc<DbInner>) -> Self {
+    pub(crate) fn new(db: Arc<DbInner>, reservations: CollectionReservations) -> Self {
         Transaction {
             db,
-            inner: Arc::new(Mutex::new(TransactionInner::default())),
+            inner: Arc::new(Mutex::new(TransactionInner {
+                accesses: AccessOverlay::default(),
+                catalog: CatalogOverlay::new(reservations),
+            })),
         }
     }
 
     /// Returns another handle to the same transaction state. The framework
     /// passes a handle to the transaction body while keeping one
-    /// to inspect the staged accesses and reset between retries.
+    /// to inspect the staged accesses after the body returns.
     pub(crate) fn handle(&self) -> Transaction {
         Transaction {
             db: self.db.clone(),
             inner: self.inner.clone(),
         }
-    }
-
-    pub(crate) fn reset(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.accesses.reset();
-        inner.catalog.reset();
     }
 
     pub(crate) fn collect_accesses(&self) -> (AccessSet, CatalogAccesses) {

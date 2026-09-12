@@ -1966,3 +1966,51 @@ async fn direct_cross_key_read_modify_write_uses_one_leaf_cas() {
         }
     );
 }
+
+#[tokio::test]
+async fn direct_publication_reports_external_predecessors_only() {
+    let (tm, tctx) = new_algo().await;
+    let key = logical_key(b"k");
+    let large = vec![b'x'; InlinePolicy::default().max_value_bytes + 1];
+    commit_writes(&tm, vec![wa(&key, &large)]).await;
+    let logged = entry(&tctx, b"k").await.unwrap();
+    assert!(matches!(logged.current, CurrentState::External { .. }));
+    let writer = logged.current.writer().unwrap().clone();
+    commit_writes(&tm, vec![wa(&key, b"inline")]).await;
+    assert_eq!(tm.cleanup_hints.pending(), vec![writer.clone()]);
+    commit_writes(&tm, vec![wa(&key, b"next")]).await;
+    commit_writes(&tm, vec![wdel(&key)]).await;
+    commit_writes(&tm, vec![wa(&key, b"after-delete")]).await;
+    assert_eq!(tm.cleanup_hints.pending(), vec![writer]);
+}
+
+#[tokio::test]
+async fn an_absence_read_uses_locked_cleanup_for_a_finalized_membership_writer() {
+    let (tm, tctx) = new_algo().await;
+    let holder = TxId::with_priority(1, b"membership-holder");
+    tctx.tmon.begin_tx(&holder);
+    tctx.tmon
+        .commit_tx(TxLog::new(holder.clone(), TxCommitStatus::Ok))
+        .await
+        .unwrap();
+    let mut locks = NodeLocks::default();
+    locks.set_membership_writer(holder);
+    let mut direct = put_resolver(
+        &tm,
+        TxId::with_priority(2, b"direct"),
+        logical_key(b"missing"),
+        Some(None),
+        b"value",
+    );
+    Arc::make_mut(&mut direct.member.keys)[0].read =
+        Some(ReadPredicate::new(None, Some(locks.membership_version())));
+    assert!(
+        matches!(
+            fold_step(&direct, &tctx, ReloadCause::Fresh, &BTreeMap::new(), &locks).await,
+            Step::Skip {
+                outcome: FoldOutcome::Moved
+            }
+        ),
+        "the locked path must persist cleanup; replay alone sees the same generation"
+    );
+}
