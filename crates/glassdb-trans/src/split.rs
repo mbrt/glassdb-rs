@@ -272,29 +272,11 @@ impl StructuralNodeAccess {
                 node.set_leaf(LeafBody::from_entries(entries.into_values()))?;
             }
             node.set_locks(locks);
-            if self.store_structural_node(&node, &observation).await? {
-                let (_, locked_observation) = match token {
-                    Some(token) => {
-                        self.nodes
-                            .load_node(
-                                collection,
-                                token,
-                                Requirement::AtLeast(observation.current_after()),
-                            )
-                            .await?
-                    }
-                    None => {
-                        let (root, observation) = self
-                            .nodes
-                            .load_root(
-                                collection,
-                                Requirement::AtLeast(observation.current_after()),
-                            )
-                            .await?;
-                        (root, observation)
-                    }
-                };
-                return Ok(Some((node, locked_observation)));
+            // The CAS receipt is the gated state itself. A re-read reports
+            // whatever revision this database knows of by then, which the caller
+            // would then pair with the body it gated.
+            if let Some(gated) = self.store_structural_node(&node, &observation).await? {
+                return Ok(Some((node, gated)));
             }
         }
         Ok(None)
@@ -322,19 +304,24 @@ impl StructuralNodeAccess {
             if !node.remove_structural_gate(id) {
                 return Ok(());
             }
-            if self.store_structural_node(&node, &observation).await? {
+            if self
+                .store_structural_node(&node, &observation)
+                .await?
+                .is_some()
+            {
                 return Ok(());
             }
         }
         Err(TransError::Retry)
     }
 
-    /// Compare-and-swaps `node` over the object `observation` was taken from.
+    /// Compare-and-swaps `node` over the object `observation` was taken from,
+    /// reporting the observation of the state it installed.
     async fn store_structural_node(
         &self,
         node: &Node,
         observation: &LeafObservation,
-    ) -> Result<bool, TransError> {
+    ) -> Result<Option<LeafObservation>, TransError> {
         Ok(self
             .nodes
             .store_node_at(observation.path(), node, observation)
@@ -561,10 +548,11 @@ impl SeparatorPublisher {
         }
 
         updated.remove_structural_gate(lock_id);
-        if !self
+        if self
             .structure
             .store_structural_node(&updated, version)
             .await?
+            .is_none()
         {
             return Ok(None);
         }
@@ -1653,7 +1641,7 @@ impl Splitter {
         &self,
         node: &Node,
         observation: &LeafObservation,
-    ) -> Result<bool, TransError> {
+    ) -> Result<Option<LeafObservation>, TransError> {
         self.structural_nodes
             .store_structural_node(node, observation)
             .await
@@ -1727,11 +1715,11 @@ impl Splitter {
     ) -> SplitAttemptOutcome {
         node.remove_structural_gate(worker);
         match self.store_structural_node(&node, observation).await {
-            Ok(true) => {
+            Ok(Some(_)) => {
                 self.record_reclamation(writers, true);
                 SplitAttemptOutcome::retry_cleanly(Ok(()))
             }
-            Ok(false) => {
+            Ok(None) => {
                 self.cancel_preparing_split(collection, target, worker, Err(TransError::Retry))
                     .await
             }
@@ -1859,7 +1847,11 @@ impl Splitter {
         index: &Node,
         observation: &LeafObservation,
     ) -> Result<(), TransError> {
-        if self.store_structural_node(index, observation).await? {
+        if self
+            .store_structural_node(index, observation)
+            .await?
+            .is_some()
+        {
             Ok(())
         } else {
             Err(TransError::Retry)
@@ -2619,11 +2611,17 @@ mod tests {
         Node::leaf(LeafBody::from_entries(entries))
     }
 
+    /// A recorded source revision that no stored node carries, so recovery
+    /// reads the worker that recorded it as unable to publish.
+    fn superseded_source_version() -> String {
+        "superseded-source-version".to_string()
+    }
+
     fn nonroot_intent(source: &str, right: &str, split_key: &[u8]) -> StructuralIntent {
         StructuralIntent {
             collection: collection(),
             source_token: Some(test_token(source)),
-            source_version: String::new(),
+            source_version: superseded_source_version(),
             created_tokens: vec![test_token(right)],
             split_key: split_key.to_vec(),
             participant_id: TxId::from_bytes(b"structural-participant".to_vec()),

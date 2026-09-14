@@ -304,7 +304,8 @@ async fn structural_recovery_defers_while_the_source_writer_is_live() {
         .unwrap();
     let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
     s.create_root(COLL, &root).await.unwrap();
-    let intent = nonroot_intent("L", "R", b"m");
+    let mut intent = nonroot_intent("L", "R", b"m");
+    intent.source_version = gated_revision(&s, "L").await;
     s.write_structural_intent("R", &intent).await.unwrap();
 
     assert!(!sp.recover_structural_intents().await.unwrap());
@@ -336,24 +337,14 @@ async fn structural_recovery_defers_while_the_source_writer_is_live() {
     );
 }
 
-/// Regression: structural recovery must fence an in-flight split by reading
-/// the source *freshly*, not from a snapshot it cached before the split took
+/// Structural recovery must fence an in-flight non-root split against the
+/// source as it stands, not against a snapshot it cached before the split took
 /// the gate.
-///
-/// A split acquires its source structural gate before writing its structural
-/// intent, so the intent's watermark is at least as fresh as that gate.
-/// Recovery once fenced (and tested reachability) at a single sweep-start
-/// epoch, which a pre-split cached snapshot — no gate, no sibling — could
-/// satisfy; recovery then judged the live split unapplied and deleted its
-/// freshly created, now-live child, breaking the leaf right-link chain.
-/// Pinning the reads to the intent's own watermark forces recovery past the
-/// gate write.
 ///
 /// Here `s` (recovery) caches the pre-gate source, a peer sharing the backend
 /// then takes the gate and creates the child, and recovery must defer instead
-/// of reclaiming the child. Reading the source from the stale cache (as the
-/// buggy sweep epoch allowed) reclaims `R`; the fresh read observes the live
-/// holder and defers.
+/// of reclaiming the child. A bound allocated before any of that is satisfied
+/// by the stale entry, and recovery reclaims `R`.
 #[tokio::test]
 async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
     let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -394,9 +385,10 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
         .await
         .unwrap();
 
-    // The intent is written after the gate, so its watermark is at least as
-    // fresh; recovery reading at that watermark must observe the live gate.
-    let intent = nonroot_intent("L", "R", b"m");
+    // The intent is written after the gate and records the gated revision, so
+    // recovery can tell that the split's publish CAS can still land.
+    let mut intent = nonroot_intent("L", "R", b"m");
+    intent.source_version = gated_revision(&peer, "L").await;
     s.write_structural_intent("R", &intent).await.unwrap();
 
     assert!(
@@ -409,6 +401,179 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
             .is_ok(),
         "the live split's child must survive recovery"
     );
+    assert_eq!(
+        s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the in-flight split's intent is left for a later sweep"
+    );
+}
+
+/// An intent must be fenced against the revision its own worker recorded, not
+/// against whatever holds the source gate now. A later split gating the same
+/// source cannot keep an abandoned intent's orphan alive, because the abandoned
+/// worker's publish CAS died the moment the source moved past that revision.
+#[tokio::test]
+async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
+    let s = store();
+    let bg = Arc::new(Background::new());
+    let sp = splitter(&s, &bg, tiny());
+    let abandoned = TxId::with_priority(1, b"abandoned-split");
+    let newcomer = TxId::with_priority(2, b"later-split");
+    sp.mon.begin_tx(&newcomer);
+
+    let mut source = leaf_node(&[b"a", b"b"], None, None);
+    source.set_structural_gate(abandoned.clone());
+    s.store_node(COLL, "L", &source, None).await.unwrap();
+    let mut intent = nonroot_intent("L", "R", b"m");
+    intent.source_version = gated_revision(&s, "L").await;
+
+    // The abandoned worker loses the source to a later split of the same node.
+    let (mut source, version) = s
+        .load_node(COLL, "L", Requirement::AtLeast(s.timeline.now()))
+        .await
+        .unwrap();
+    source.remove_structural_gate(&abandoned);
+    source.set_structural_gate(newcomer.clone());
+    assert!(
+        s.store_node(COLL, "L", &source, Some(&version))
+            .await
+            .unwrap()
+    );
+
+    s.store_node(COLL, "R", &leaf_node(&[b"m", b"n"], None, None), None)
+        .await
+        .unwrap();
+    let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
+    s.create_root(COLL, &root).await.unwrap();
+    s.write_structural_intent("R", &intent).await.unwrap();
+
+    assert!(
+        sp.recover_structural_intents().await.unwrap(),
+        "a later split's gate must not shield an abandoned intent from recovery"
+    );
+    assert!(matches!(
+        s.load_node(COLL, "R", Requirement::AtLeast(s.timeline.now()))
+            .await,
+        Err(StorageError::NotFound)
+    ));
+    assert!(
+        s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Regression: recovery must classify a Ready intent under a currentness
+/// barrier it allocates after observing that intent, not under the watermark
+/// the observation carries.
+///
+/// A cache entry's watermark is allocated *before* the backend read that fills
+/// it, so an entry read concurrently with a split can carry a watermark newer
+/// than the intent's while holding source state from before the split gated it.
+/// Recovery once classified at the intent's own watermark, accepted exactly
+/// such an entry, read a revision the worker never published from, judged the
+/// live root split unapplied, and deleted both children - which the splitter
+/// then published a root index over, leaving the tree pointing at absent nodes.
+///
+/// The peer owns the live split and follows the worker's durable order:
+/// Preparing intent, gate, Ready intent carrying the gated revision, children.
+/// It takes the gate only once the paused sweep has allocated the watermark of
+/// the read that discovers the intent, and `s` has cached the ungated root at a
+/// newer one.
+#[tokio::test]
+async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
+    let intents_prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+    let (backend, gate) = OpGate::wrap(
+        Arc::new(MemoryBackend::new()),
+        move |op| matches!(op, BackendOp::Read { path } if path.starts_with(&intents_prefix)),
+    );
+    let backend: Arc<dyn Backend> = backend;
+    let s = store_with_backend(backend.clone());
+    // The live splitter models a separately opened database, so it owns a
+    // distinct cache and timeline over the shared backend.
+    let peer = store_with_backend(backend);
+    let bg = Arc::new(Background::new());
+    let sp = splitter(&s, &bg, tiny());
+    let worker = TxId::with_priority(1, b"inflight-root-split");
+    let participant = TxId::with_priority(1, b"root-split-participant");
+    sp.mon.begin_tx(&worker);
+    sp.mon.begin_tx(&participant);
+
+    peer.create_root(COLL, &leaf_node(&[b"a", b"b", b"m", b"n"], None, None))
+        .await
+        .unwrap();
+    let mut intent = StructuralIntent {
+        collection: collection(),
+        source_token: None,
+        source_version: String::new(),
+        created_tokens: vec![test_token("L"), test_token("R")],
+        split_key: b"m".to_vec(),
+        participant_id: participant.clone(),
+        phase: StructuralIntentPhase::Preparing,
+    };
+    let prepared = peer.write_structural_intent("R", &intent).await.unwrap();
+
+    gate.arm();
+    let recovering = {
+        let sp = sp.clone();
+        tokio::spawn(async move { sp.recover_structural_intents().await.unwrap() })
+    };
+    // The sweep is paused inside the read that discovers the intent, so that
+    // read's watermark is already allocated while the root is still ungated.
+    gate.wait_until_entered().await;
+    s.load_root(COLL, Requirement::AtLeast(s.timeline.now()))
+        .await
+        .unwrap();
+
+    let (mut root, version) = peer
+        .load_root(COLL, Requirement::AtLeast(peer.timeline.now()))
+        .await
+        .unwrap();
+    root.set_structural_gate(worker.clone());
+    assert!(peer.store_root(COLL, &root, &version).await.unwrap());
+    let (_, gated) = peer
+        .load_root_node(COLL, Requirement::AtLeast(peer.timeline.now()))
+        .await
+        .unwrap()
+        .unwrap();
+    intent.source_version = gated.revision().unwrap().serialize().to_string();
+    intent.phase = StructuralIntentPhase::Ready;
+    assert!(
+        peer.intent_store
+            .update(&prepared, &canonical_intent(&intent))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    peer.store_node(
+        COLL,
+        "L",
+        &leaf_node(&[b"a", b"b"], Some(b"m"), Some("R")),
+        None,
+    )
+    .await
+    .unwrap();
+    peer.store_node(COLL, "R", &leaf_node(&[b"m", b"n"], None, None), None)
+        .await
+        .unwrap();
+    gate.release();
+
+    assert!(
+        !recovering.await.unwrap(),
+        "recovery must defer to the live root split rather than reclaim its children"
+    );
+    for token in ["L", "R"] {
+        assert!(
+            s.load_node(COLL, token, Requirement::AtLeast(s.timeline.now()))
+                .await
+                .is_ok(),
+            "the live root split's child {token} must survive recovery"
+        );
+    }
     assert_eq!(
         s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
             .await
@@ -452,7 +617,7 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
     let intent = StructuralIntent {
         collection: collection(),
         source_token: Some(test_token("L")),
-        source_version: String::new(),
+        source_version: superseded_source_version(),
         created_tokens: vec![test_token("R")],
         split_key: b"t".to_vec(),
         participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
@@ -496,14 +661,29 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
     );
 }
 
-struct FirstSourceWriteGate {
+/// Returns the revision a worker holding `token`'s structural gate would record
+/// in its Ready intent.
+async fn gated_revision(store: &TestStore, token: &str) -> String {
+    let (_, observed) = store
+        .load_node(COLL, token, Requirement::AtLeast(store.timeline.now()))
+        .await
+        .unwrap();
+    observed.revision().unwrap().serialize().to_string()
+}
+
+/// Pauses the first backend operation a test selects, so the test can
+/// interleave concurrent work at exactly that point.
+struct OpGate {
     armed: std::sync::atomic::AtomicBool,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
 
-impl FirstSourceWriteGate {
-    fn wrap(inner: Arc<dyn Backend>, source_path: String) -> (Arc<HookBackend>, Arc<Self>) {
+impl OpGate {
+    fn wrap(
+        inner: Arc<dyn Backend>,
+        selects: impl Fn(&BackendOp<'_>) -> bool + Send + Sync + 'static,
+    ) -> (Arc<HookBackend>, Arc<Self>) {
         let gate = Arc::new(Self {
             armed: std::sync::atomic::AtomicBool::new(false),
             entered: tokio::sync::Notify::new(),
@@ -513,14 +693,8 @@ impl FirstSourceWriteGate {
         backend.set_before({
             let gate = gate.clone();
             move |op| {
-                let wait = matches!(
-                    op,
-                    BackendOp::WriteIf { path, .. }
-                        if path == &source_path
-                            && gate
-                                .armed
-                                .swap(false, std::sync::atomic::Ordering::SeqCst)
-                );
+                let wait =
+                    selects(op) && gate.armed.swap(false, std::sync::atomic::Ordering::SeqCst);
                 let gate = gate.clone();
                 let future: HookFuture = Box::pin(async move {
                     if wait {
@@ -551,8 +725,10 @@ impl FirstSourceWriteGate {
 #[tokio::test]
 async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
     let source_path = node_path("L").to_string();
-    let (backend, gate) =
-        FirstSourceWriteGate::wrap(Arc::new(MemoryBackend::new()), source_path.clone());
+    let (backend, gate) = OpGate::wrap(
+        Arc::new(MemoryBackend::new()),
+        move |op| matches!(op, BackendOp::WriteIf { path, .. } if path == &source_path),
+    );
     let backend: Arc<dyn Backend> = backend;
     let s = store_with_backend(backend.clone());
     // This writer models a separately opened database, so it owns a
@@ -659,7 +835,7 @@ async fn recovery_that_needs_a_parent_split(
     let intent = StructuralIntent {
         collection: collection(),
         source_token: Some(test_token("L")),
-        source_version: String::new(),
+        source_version: superseded_source_version(),
         created_tokens: vec![test_token("R")],
         split_key: b"t".to_vec(),
         participant_id: participant.clone(),

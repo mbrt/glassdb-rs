@@ -32,6 +32,10 @@ _Avoid_: Point, point item
 The point reads, final key writes, and range scans from one execution of a transaction body.
 _Avoid_: Data, transaction data
 
+**Validation barrier**:
+The currentness barrier one transaction allocates to open validation, and the landmark its key locking, collection locking, and status flip are organized around. The access set's retained observations are rechecked at or after it, which is why transaction body reads may accept any watermark.
+_Avoid_: Validation watermark, validation timestamp
+
 **Transaction identity**:
 A durable protocol identity that correlates one transaction's locks, status, and recovery resources. Replacing it does not by itself repeat the transaction body or discard that body's access set and body outcome.
 _Avoid_: Lock owner ID
@@ -74,6 +78,24 @@ _Avoid_: Immediate cleanup, complete deletion
 The synchronous transfer of responsibility for an interrupted transaction to managed recovery work before control leaves its owner. Protocol-clean retirement may follow asynchronously.
 _Avoid_: Synchronous cleanup
 
+## Currentness
+
+**Sequence point**:
+A point on one database-local timeline, which orders currentness evidence within one open database. It is neither wall time nor comparable across database instances.
+_Avoid_: Timestamp, epoch, logical clock
+
+**Currentness barrier**:
+A sequence point allocated to separate finished work from work not yet started: no operation that definitively completed before the allocation reaches it, and every operation invoked after it does.
+_Avoid_: Anchor, epoch, fresh read
+
+**Currentness watermark**:
+The sequence point an observation carries, after which its state was known to be current. It is allocated before the read or mutation that produced the observation, so it states nothing about the state after that operation.
+_Avoid_: Anchor, observation timestamp, read watermark
+
+**Freshness requirement**:
+The rule a read applies to decide whether existing evidence can serve it: accept any watermark, or only a watermark that reached a stated bound. A reader states that bound as a currentness barrier.
+_Avoid_: Consistency level, staleness policy
+
 ## Point routing
 
 **Leaf**:
@@ -85,7 +107,7 @@ The resolution of a logical key or range endpoint to a leaf by descent through a
 _Avoid_: Shard calculation, ownership proof
 
 **Leaf observation**:
-An exact observed state of one leaf, with evidence that the state was current after a stated lower bound. It does not claim that the state is current now.
+An exact observed state of one leaf, with a currentness watermark after which that state was known to be current. It does not claim that the state is current now.
 _Avoid_: Fresh leaf, leaf version, freshness observation
 
 **Routed leaf group**:

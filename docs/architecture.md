@@ -304,6 +304,16 @@ that classifies phases, fences source writers, checks reachability, cleans
 unreachable nodes, and settles finalized topology participants. `Splitter`
 only executes a requested recursive parent split and supplies its result back to
 the action. It does not inspect durable phases or call `StructuralIntentStore`.
+Recovery fences a source writer against the source revision the Ready
+transition recorded, not against the structural gate the source carries now. A
+worker publishes its split with one compare-and-swap expecting that revision and
+does not read the source again first, so the revision alone says whether the
+worker can still land, and a later split of the same source cannot shield an
+abandoned intent. Recovery bounds these reads by a currentness barrier it
+allocates once it holds the Ready record, because a cache entry's watermark is
+allocated before the read that fills it and therefore cannot order a read after
+the gate.
+
 The background loop reads at most one 128-object page of the independent `_s/`
 namespace per sweep and retains its cursor. Successful reclamation shortens its
 delay; live intents and no-ops lengthen it, up to ten minutes. A pending cursor

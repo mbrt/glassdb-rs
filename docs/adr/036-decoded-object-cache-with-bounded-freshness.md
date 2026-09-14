@@ -17,6 +17,11 @@ It refines only the caching part of
 [ADR-023](023-slimmed-backend-trait.md): the slim `Backend` trait, opaque content
 versions, and version-conditional read remain unchanged.
 
+Terminology below was later aligned with `CONTEXT.md` as errata, with no change
+to any decision: what this ADR called a "validation watermark" is a *currentness
+watermark*, distinct from the *validation barrier* a transaction allocates to
+open validation. `LogicalTime` is now `SequencePoint`, retained here as written.
+
 ## Context
 
 The storage layer currently has two cache facades over one LRU:
@@ -73,7 +78,7 @@ through it but remains an uncached pass-through because a prefix has no object
 version. The one-off database-metadata check/create performed while opening a
 database may continue to use `Backend` directly.
 
-### Freshness is a local validation watermark
+### Freshness is a local currentness watermark
 
 Each cache entry is one of:
 
@@ -247,7 +252,7 @@ satisfy an older validation bound: for example, evidence at `T2` remains valid
 for `AtLeast(T1)` after an in-doubt write at `T3`, where `T1 < T2 < T3`.
 
 Cache publication is conditional so delayed operations cannot replace newer
-knowledge. Validation watermarks never regress. Concurrent validations of one
+knowledge. Currentness watermarks never regress. Concurrent validations of one
 path may be coalesced only when the in-flight operation's start time satisfies
 the waiter's requested bound.
 
@@ -259,7 +264,7 @@ Tests use an injected monotonic clock and a controllable backend rather than
 elapsed real time.
 
 A small reference state machine covers `Present`, `Absent`, and `Missing`
-entries; opaque revisions; validation watermarks; and read, create, CAS, delete,
+entries; opaque revisions; currentness watermarks; and read, create, CAS, delete,
 conflict, and in-doubt outcomes. Model-based tests vary invocation, backend
 linearization, and response order independently and assert that:
 

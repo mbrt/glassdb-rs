@@ -878,7 +878,8 @@ impl CasWorker {
         }
         // Bounded CAS budget exhausted under churn: each member gets its
         // resolver's exhaustion outcome. Acquirers conflict and release/re-lock;
-        // write-backs re-descend because exhaustion does not prove convergence.
+        // write-backs re-descend and releases re-submit, because exhaustion does
+        // not prove convergence.
         for (tx, m) in &leaf_members(batch) {
             *m.slot.lock().unwrap() = Some(CoordinatedOutcome {
                 outcome: m.resolver.exhausted_outcome(in_doubt.contains(tx)),

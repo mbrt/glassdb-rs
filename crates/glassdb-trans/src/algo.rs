@@ -2394,7 +2394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn point_read_re_resolves_writer_at_validation_watermark() {
+    async fn point_read_re_resolves_writer_at_validation_barrier() {
         let (tm, tctx) = new_algo().await;
         let keyp = logical_key(b"k");
         let previous = commit_writes(&tm, vec![wa(&keyp, b"v1")])
@@ -2449,12 +2449,12 @@ mod tests {
             !tm.validate(&accesses, ValidationContext::Optimistic, requirement)
                 .await
                 .unwrap(),
-            "writer resolution at the validation watermark observes the committed holder"
+            "writer resolution at the validation barrier observes the committed holder"
         );
     }
 
     #[tokio::test]
-    async fn point_read_accepts_aborted_holder_at_validation_watermark() {
+    async fn point_read_accepts_aborted_holder_at_validation_barrier() {
         let (tm, tctx) = new_algo().await;
         let keyp = logical_key(b"k");
         let previous = commit_writes(&tm, vec![wa(&keyp, b"v1")])
@@ -2488,7 +2488,7 @@ mod tests {
 
         // Aborting the holder leaves the previously observed writer effective.
         // The exclusive holder prevents a physical shortcut, then writer
-        // resolution at the validation watermark accepts the unchanged value.
+        // resolution at the validation barrier accepts the unchanged value.
         tctx.tmon.abort_owned_tx(&holder).await.unwrap();
         assert!(
             !tm.validate_read_observations(&accesses, requirement, None)
