@@ -1,6 +1,6 @@
 //! Shared node-lock policy for leaf mutations and structural operations.
 //!
-//! The leaf coordinator owns the shared transactional fold mechanics. This
+//! The leaf coordinator owns the shared transaction mutation protocol. This
 //! module owns the wound-wait transitions applied to membership locks and the
 //! full-node quiescing sequence required before a split closes the structural
 //! gate.
@@ -15,7 +15,8 @@ use glassdb_storage::{LeafEntry, LeafObservation, LockType, NodeLocks, Requireme
 use crate::error::TransError;
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{
-    CoordinatedOutcome, FoldOutcome, LeafOperation, LeafResolver, ResolveCtx, StageAdmission, Step,
+    CoordinatedOutcome, LeafOperation, LeafResolver, MemberOutcome, ResolveCtx, StageAdmission,
+    Step,
 };
 use crate::monitor::Monitor;
 use crate::wound_wait::{Reclaim, try_reclaim};
@@ -292,14 +293,14 @@ impl LeafResolver for StructuralGateOperation {
             QuiescedEntries::Ready(entries) => entries,
             QuiescedEntries::Wait(holder) => {
                 return Ok(Step::Skip {
-                    outcome: FoldOutcome::Wait(holder),
+                    outcome: MemberOutcome::Wait(holder),
                 });
             }
         };
         let mut locks = staged_locks.clone();
         if let Some(holder) = reconciler.acquire_structural_gate(&mut locks).await? {
             return Ok(Step::Skip {
-                outcome: FoldOutcome::Wait(holder),
+                outcome: MemberOutcome::Wait(holder),
             });
         }
         let entries = entries
@@ -310,7 +311,7 @@ impl LeafResolver for StructuralGateOperation {
             entries,
             locks,
             admission: StageAdmission::ExistingKeys,
-            outcome: FoldOutcome::Locked {
+            outcome: MemberOutcome::Locked {
                 typ: LockType::Write,
                 membership: LockType::None,
             },
@@ -321,8 +322,8 @@ impl LeafResolver for StructuralGateOperation {
         false
     }
 
-    fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
-        FoldOutcome::Conflict
+    fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
+        MemberOutcome::Conflict
     }
 }
 
@@ -344,7 +345,7 @@ impl LeafOperation for StructuralGateOperation {
     fn complete(&self, outcome: Option<CoordinatedOutcome>) -> Result<Self::Output, TransError> {
         let Some(CoordinatedOutcome {
             outcome:
-                FoldOutcome::Locked {
+                MemberOutcome::Locked {
                     typ: LockType::Write,
                     ..
                 },

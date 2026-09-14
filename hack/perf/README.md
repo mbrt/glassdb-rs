@@ -16,7 +16,8 @@ make flamegraph
 
 Artifacts are written under `hack/perf/` (and are gitignored): `flamegraph.svg`
 (open in a browser) and, when the collapse tool is available,
-`flamegraph.folded` (a greppable, text-readable stack collapse).
+`flamegraph.folded` (folded stacks: one semicolon-separated call stack and its
+sample count per line).
 
 ### Tunables (env)
 

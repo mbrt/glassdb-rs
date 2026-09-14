@@ -6,7 +6,7 @@ Accepted (implemented).
 
 The coordinator's current responsibility boundary is described in
 [`architecture.md`](../architecture.md#component-responsibilities). Its
-transaction-aware fold contract does not change this ADR's GC policy or its
+transaction-aware coordination contract does not change this ADR's GC policy or its
 single-coordinator reclamation decision.
 
 Closes the one exception carved out by
@@ -21,16 +21,17 @@ The `Clock`-based time-source detail is superseded by
 [ADR-058](058-process-wide-model-time.md); reclamation behavior is unchanged.
 
 [ADR-062](062-splitter-driven-tombstone-reclamation.md) adds
-structural-gate-owned compaction of quiescent tombstones. Ordinary fold
-finalization still prunes only holder-free entries in `Absent` state, and
+structural-gate-owned compaction of quiescent tombstones. Ordinary preparation for
+persistence still prunes only holder-free entries in `Absent` state, and
 transaction-object GC does not become a leaf scanner.
 
 ## Context
 
 [ADR-028](028-shard-mutation-coordinator.md) established a single invariant:
 **every shard/root entry mutation flows through one `ShardCoordinator`**, which
-loads each coordination object once, folds the round's installed resolvers over
-it, CASes once, and recovers precondition/in-doubt by reload-and-re-fold. Lock
+loads each coordination object once per attempt, builds a mutation plan from
+the round's installed resolvers, and CASes once. It recovers after a precondition
+miss or in-doubt result by reloading and rebuilding the mutation plan. Lock
 acquisition, commit-install, write-back, and release all became resolvers the
 callers (`Locker`, `Algo`) install. The invariant is what removed the "racing
 CASes" on a hot shard: contending mutations serialize and batch through one
@@ -53,10 +54,10 @@ Underneath the racing CAS sit two structural facts:
 - **Pruning is the collector's private extra.** GC does one thing the `Locker`
   release does not: when clearing the last holder leaves an entry **vestigial**
   (no lock, no `current_writer`, not a live tombstone) it removes the entry
-  (ADR-022 "stale-lock and empty-entry pruning"). The coordinator's fold, by
-  contrast, only ever stages entries; it never removes one. So even a GC release
-  routed through the coordinator would leave the vestigial entries GC exists to
-  reclaim, and nothing else prunes them.
+  (ADR-022 "stale-lock and empty-entry pruning"). The coordinator's mutation
+  planning, by contrast, only ever stages entries; it never removes one. So even
+  a GC release routed through the coordinator would leave the vestigial entries
+  GC exists to reclaim, and nothing else prunes them.
 
 The result is that ADR-028's invariant is "true except for GC," and the one
 exception carries a real cost (a racing CAS) and a real duplication (a second
@@ -65,8 +66,8 @@ copy of release).
 ## Decision
 
 Bring GC's lock reclamation inside the coordinator, and make vestigial-entry
-pruning a property of the fold — so the ADR-028 invariant holds with no
-exceptions.
+pruning a coordinator guarantee before persistence — so the ADR-028 invariant
+holds with no exceptions.
 
 ### The invariant, strengthened
 
@@ -75,16 +76,16 @@ exceptions.
 
 GC stops being the documented carve-out. Every mutation of a shard entry or a
 root — acquire, commit-install, write-back, `Locker` release, and now **GC's
-reclamation release** — is a resolver folded by the one coordinator. "No shard
+reclamation release** — uses a resolver evaluated by the one coordinator. "No shard
 CAS outside the coordinator" becomes a checkable property of the whole engine,
 not an aspiration with a footnote.
 
 ### Responsibilities
 
 - **ShardCoordinator (mechanism, unchanged in spirit).** Still the sole owner of
-  the shard/root `Dedup`, the single load + fold + CAS + reload-recover round,
+  the shard/root `Dedup`, the load + plan + CAS + reload-recover round,
   and the per-member outcome side-channel. Its one new mechanism duty is
-  **finalizing the fold by dropping vestigial entries** (below). It remains
+  **dropping vestigial entries before persistence** (below). It remains
   ignorant of locks, transaction ids, wound-wait, commit, and _now_ GC.
 - **GC (policy, one responsibility relocated).** GC keeps every ADR-022 policy
   decision — candidate selection, the safety horizon, reverse liveness check,
@@ -100,7 +101,7 @@ not an aspiration with a footnote.
   shared or installed by another module. GC reaches that behaviour only through
   the `Locker`'s unlock methods, so there is one definition and one installer.
 
-### Vestigial pruning belongs to the fold, not to any caller
+### The coordinator prunes vestigial entries before persistence
 
 Pruning moves from a GC-private CAS step to a **mechanism** guarantee: when the
 coordinator finalizes a round it drops any entry left **vestigial** — no holder
@@ -109,11 +110,11 @@ it is never vestigial). A vestigial entry carries **no information**: it names n
 transaction and reports "key absent" identically to having no entry at all. So
 removing it is a semantic no-op that only shrinks the object.
 
-Making this a fold property (rather than a capability each release resolver
+Making this a coordinator guarantee (rather than a capability each release resolver
 opts into) means:
 
 - GC's release becomes _exactly_ the `Locker`'s release — no GC-specific
-  resolver, no removal signal threaded through the fold contract.
+  resolver, no removal signal threaded through the coordination contract.
 - **Every** mutation path leaves no dead entry behind: an aborted create that a
   `Locker` release clears, a read lock dropped off a never-committed key, and a
   GC reclamation all tidy up in the same CAS that clears the last holder —
@@ -122,8 +123,8 @@ opts into) means:
 
 ## Correctness
 
-The claim is that routing GC's release through the coordinator and pruning in
-the fold **preserves ADR-022's safety argument exactly**, while removing the
+The claim is that routing GC's release through the coordinator and pruning before
+persistence **preserves ADR-022's safety argument exactly**, while removing the
 racing CAS.
 
 - **GC's safety invariant is untouched.** ADR-022's contract — never delete an
@@ -135,28 +136,29 @@ racing CAS.
   or dead-pending only after a successful `pending → aborted` force-abort) and
   **never** releases a committed candidate, so a coordinator release can never
   race a live owner's own write-back on the same object.
-- **Release is idempotent and commutes in the fold.** A release stages the
-  removal of exactly one txid from the entries that name it and publishes
-  nothing. Folded alongside other members (a disjoint acquire, a write-back, a
-  second release), it neither reads nor writes their keys, so the round's
-  linearization is independent of fold order — the same property ADR-028 already
-  relies on for the `Locker`'s release. Re-running it on reload (precondition or
-  in-doubt recovery) re-clears an already-absent holder: a no-op, inheriting
-  ADR-009 parity. So the coordinator's existing reload-recover loop subsumes GC's
-  hand-rolled retry with no new CAS site and no new in-doubt case.
+- **Release is idempotent and commutes within a mutation plan.** A release
+  stages the removal of exactly one txid from the entries that name it and
+  publishes nothing. Planned alongside other members (a disjoint acquire, a
+  write-back, a second release), it neither reads nor writes their keys, so the
+  round's linearization is independent of member evaluation order — the same
+  property ADR-028 already relies on for the `Locker`'s release. Re-running it
+  on reload (precondition or in-doubt recovery) re-clears an already-absent
+  holder: a no-op, inheriting ADR-009 parity. So the coordinator's existing
+  reload-recover loop subsumes GC's hand-rolled retry with no new CAS site and
+  no new in-doubt case.
 - **The reference set still only shrinks.** ADR-022's reverse check is safe
   because a candidate's references move monotonically away from it. A release
   through the coordinator only ever _removes_ the candidate's txid, never adds a
   reference, so the monotonic-shrink property the check depends on is preserved.
-- **Pruning cannot drop a live reference.** The fold removes an entry only when
-  it is vestigial — no holder and no `current_writer`. Such an entry references
-  **no** txid, so pruning it removes nothing from the live set of ADR-022's
-  reachability graph. In particular it can never make a still-referenced
-  transaction object look collectable: a referenced object is named by a
-  `current_writer` or a `locked_by`, neither of which a vestigial entry has. The
-  prune is safe on **every** fold path, not just GC's — an acquire or write-back
-  round that incidentally leaves an unrelated entry vestigial may drop it with
-  the same reasoning.
+- **Pruning cannot drop a live reference.** The coordinator removes an entry
+  only when it is vestigial — no holder and no `current_writer`. Such an entry
+  references **no** txid, so pruning it removes nothing from the live set of
+  ADR-022's reachability graph. In particular it can never make a
+  still-referenced transaction object look collectable: a referenced object is
+  named by a `current_writer` or a `locked_by`, neither of which a vestigial
+  entry has. The prune is safe on **every** coordinated mutation path, not just
+  GC's — an acquire or write-back round that incidentally leaves an unrelated
+  entry vestigial may drop it with the same reasoning.
 - **`current_writer` is still never cleared by GC.** Pruning removes only
   entries with no `current_writer`; the live value pointer is replaced solely by
   a newer writer's write-back, exactly as before.
@@ -171,7 +173,7 @@ racing CAS.
 - **Release semantics live in one place.** The release resolvers stay private to
   the `Locker`, and GC drives them through the `Locker`'s unlock methods rather
   than re-implementing or sharing them; ADR-022's "targeted pruning" stops being
-  a GC-private CAS and becomes a fold guarantee that tidies every path. GC's
+  a GC-private CAS and becomes a coordinator guarantee that tidies every path. GC's
   reclamation shrinks to candidate policy plus a call into the `Locker`'s unlock
   step.
 - **The DST op-stream shape changes.** Fewer, differently-shaped shard writes

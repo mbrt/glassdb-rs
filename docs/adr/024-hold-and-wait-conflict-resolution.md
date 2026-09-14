@@ -140,7 +140,7 @@ the MVP replaced with release-and-retry.
 
 A v2 shard entry co-locates a key's **lock state** (`locked_by` / `lock_type`)
 and its **version pointer** (`current_writer`) in one object, so the first cut
-folded optimistic read validation into the shard CAS: the lock attempt compared
+combined optimistic read validation with the shard CAS: the lock attempt compared
 the read's observed token against the resolved entry and bailed out with a
 `StaleRead` restart. That coupled the locker to optimistic-concurrency *policy*
 and left the read's shard **unlocked** on a stale bail-out, so the body re-run had
@@ -160,10 +160,11 @@ mechanism and read validation exists in exactly one place.
 
 Validating after locking is correct and is *not* a new TOCTOU window: a peer can
 only change a read key's effective writer by committing a write to it, which
-requires the write lock this transaction holds; a peer that committed *before* we
-locked is caught by the post-lock re-resolve, exactly as the folded check was. The
-cost is one effective-writer resolve per read after locking instead of folding it
-into the lock CAS — the same shape v1 used (`GetMetadata` after lock).
+requires the write lock this transaction holds; a peer that committed *before*
+we locked is caught by the post-lock re-resolve, as it was by the check within
+the lock attempt. The cost is one effective-writer resolve per read after
+locking instead of including it in the lock CAS — the same shape v1 used
+(`GetMetadata` after lock).
 
 ### The pending object stays lazily created (no upfront prepare)
 

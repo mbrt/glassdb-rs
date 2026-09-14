@@ -10,7 +10,7 @@ The error types were a fairly literal port of the Go original, which reports
 errors by string concatenation. Two habits leaked through and lost information:
 
 - **Causes were flattened to strings.** Foreign errors (AWS SDK, `reqwest`,
-  `prost`, base64/path decoding) and our own typed errors were folded into a
+  `prost`, base64/path decoding) and our own typed errors were converted into a
   message with `format!("…: {e}")`, so the underlying
   `std::error::Error::source` chain was discarded. Some sites went further and
   dropped the cause entirely with `map_err(|_| …)`.

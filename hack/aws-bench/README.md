@@ -52,7 +52,7 @@ cargo run --release -p glassdb-bench-scale --bin perfbench -- \
 Every shape runs until all shapes reach the requested throughput confidence
 interval, or the cell reaches `--max-duration`. Capped shapes are marked
 unconverged. Whole-cell results include backend operations and transaction
-retries plus coordinator submissions, rounds, CAS retries, fold width, and
+retries plus coordinator submissions, rounds, CAS retries, members per round, and
 direct-path coverage, all derived from the public `Database::stats()` counters.
 
 ### Worker and affinity sweep plots

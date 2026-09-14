@@ -10,10 +10,11 @@ pending, and wounded transaction logs.
 
 The lock-reclamation *mechanism* (the "stale-lock and empty-entry pruning" CAS)
 is refined by [ADR-029](029-gc-through-shard-coordinator.md): GC's release now
-flows through the shard-mutation coordinator ([ADR-028](028-shard-mutation-coordinator.md))
-and vestigial-entry pruning becomes a fold property. ADR-029 did not itself
-change the original GC policy; ADR-059 later changes the abort-side retention
-part of that policy as noted below.
+flows through the shard-mutation coordinator
+([ADR-028](028-shard-mutation-coordinator.md)) and vestigial-entry pruning
+becomes a coordinator guarantee. ADR-029 did not itself change the original GC
+policy; ADR-059 later changes the abort-side retention part of that policy as
+noted below.
 
 [ADR-035](035-paginated-listing-and-sharded-transaction-logs.md) refines the
 flat `_t/` candidate walk into a paginated traversal over deterministic shards.

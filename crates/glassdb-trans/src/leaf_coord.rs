@@ -1,5 +1,5 @@
 //! The leaf-mutation coordinator (ADR-028): the transaction-aware shared
-//! fold engine through which every leaf/leaf entry mutation flows.
+//! mutation engine through which every leaf entry mutation flows.
 //!
 //! The only coordination primitive is a content compare-and-swap on a B-link
 //! leaf: a node (`{prefix}/_n/<token>`) or the collection root (`{prefix}/_r`,
@@ -8,17 +8,18 @@
 //! per-object mutation is submitted to a [`Dedup`] keyed on the object path, so
 //! several transactions merge into one owner-driven load + CAS. N GET+CAS
 //! round-trips collapse to one; the [`Dedup`] fans out one shared result, so
-//! each transaction's own outcome ([`FoldOutcome`]) travels back through a
+//! each transaction's own outcome ([`MemberOutcome`]) travels back through a
 //! per-submission slot the caller reads once its submission resolves.
 //!
 //! The coordinator owns the cross-operation protocol required to combine
-//! heterogeneous mutations safely: transaction identity, oldest-first fold
+//! heterogeneous mutations safely: transaction identity, oldest-first member
 //! order, per-member in-doubt attribution, routing and capacity admission, and
-//! same-key exclusion for logless publication. It loads the leaf object once,
-//! **folds** the round's installed [`LeafOperation`] resolvers over a running
-//! staged entry map, drops vestigial entries, CASes once, recovers by
-//! reload-and-re-fold, and deposits each member's outcome (ADR-029). Each policy
-//! owner packages its mutation decision and typed result in a `LeafOperation`:
+//! same-key exclusion for logless publication. Each attempt loads the leaf,
+//! builds a mutation plan from the round's installed [`LeafOperation`] resolvers,
+//! and persists staged changes with one CAS after removing vestigial entries.
+//! Recovery reloads the leaf and rebuilds the plan before the coordinator
+//! delivers each member's outcome (ADR-029). Each policy owner packages its
+//! mutation decision and typed result in a `LeafOperation`:
 //! [`Locker`](crate::tlocker::Locker) supplies acquire / write-back / release,
 //! direct commit supplies atomic logless publication, and the splitter supplies
 //! leaf structural-gate acquisition. Cross-leaf strategy stays with the
@@ -82,13 +83,12 @@ impl Sub for LeafCoordinatorStats {
     }
 }
 
-/// One transaction's outcome for a single deduplicated CAS round, deposited by
-/// the engine into that transaction's [`OutcomeSlot`] and read by its caller once
-/// the [`Dedup`] submission resolves. The worker transports values without
-/// inspecting their variants, while this closed enum deliberately defines the
-/// result vocabulary shared by the installed resolver kinds (ADR-028).
+/// The policy outcome for one round member (ADR-028).
+/// An outcome proposed with staged changes requires a successful CAS before
+/// delivery. A skipped member's outcome can also depend on earlier staged
+/// changes. [`CoordinatedOutcome`] pairs the delivered outcome with its evidence.
 #[derive(Clone, Debug)]
-pub(crate) enum FoldOutcome {
+pub(crate) enum MemberOutcome {
     /// A lock was installed (Acquire), carrying the strongest entry intention
     /// and the membership scope held on the leaf.
     Locked { typ: LockType, membership: LockType },
@@ -123,8 +123,8 @@ pub(crate) enum FoldOutcome {
     /// body may be reevaluated against the current version under the same id
     /// rather than publishing a holder (ADR-053).
     Replay,
-    /// A commit-critical CAS was in-doubt (`Unavailable`) and the re-fold could
-    /// not prove whether it landed, so the commit may or may not have happened:
+    /// A commit-critical CAS was in-doubt (`Unavailable`) and resolver evaluation
+    /// could not prove whether it landed, so the commit may or may not have happened:
     /// the one irreducible ambiguity, surfaced rather than risking a
     /// double-apply.
     InDoubt(String),
@@ -135,7 +135,7 @@ pub(crate) enum CoordinationEvidence {
     /// The member participated in the successful CAS that installed this state.
     Installed(CasReceipt<Node>),
     /// The loaded state retained by a member that staged no change. Its outcome
-    /// can also depend on another member's changes in the completed fold.
+    /// can also depend on another member's changes in the mutation plan.
     Observed(LeafObservation),
 }
 
@@ -166,18 +166,14 @@ impl CoordinationEvidence {
 
 /// One member's policy outcome and the physical evidence from its round.
 pub(crate) struct CoordinatedOutcome {
-    pub(crate) outcome: FoldOutcome,
+    pub(crate) outcome: MemberOutcome,
     pub(crate) evidence: Option<CoordinationEvidence>,
 }
 
-/// Why the fold engine is (re-)running one resolver this attempt: a `Fresh`
-/// first pass, or a re-fold after a CAS that failed precondition
-/// (`Reloaded { in_doubt: false }`) or came back in-doubt
-/// (`Reloaded { in_doubt: true }`). The in-doubt bit is the member's own: it is
-/// set only for the members whose stage rode the uncertain CAS. Only the direct
-/// commit resolver consults it — to distinguish a definitive loss from an
-/// irreducible `InDoubt` — so every other resolver ignores it and stays
-/// idempotent across re-folds.
+/// Whether a resolver is evaluated on the first attempt or after a reload.
+/// Reloads can follow a CAS conflict, an uncertain CAS, or a stale transaction
+/// dependency. `in_doubt` records unresolved uncertainty only for this member
+/// from a prior CAS that included its staged changes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReloadCause {
     Fresh,
@@ -213,8 +209,8 @@ pub(crate) enum StageAdmission {
     AddsKey,
 }
 
-/// One resolver's decision for the current fold step: either stage entry and
-/// node-lock changes alongside its member outcome, or stage nothing.
+/// One resolver's proposed decision: either stage entry and node-lock changes
+/// alongside its member outcome, or stage nothing.
 pub(crate) enum Step {
     /// Apply these entry changes and replace the running node-lock state. The
     /// coordinator alone owns the node's topology, body reconstruction, and
@@ -223,24 +219,24 @@ pub(crate) enum Step {
         entries: Vec<(Vec<u8>, LeafEntry)>,
         locks: NodeLocks,
         admission: StageAdmission,
-        outcome: FoldOutcome,
+        outcome: MemberOutcome,
     },
-    /// Stage nothing; deliver `outcome` to the member regardless of the CAS. A
-    /// logless member that reports `Landed` also protects its existing markers
-    /// from later publishers in this fold.
-    Skip { outcome: FoldOutcome },
+    /// Propose no changes. Delivery still waits for successful persistence if
+    /// another member staged changes, because this outcome can depend on them.
+    /// A logless member that reports `Landed` also protects its existing markers
+    /// from later publishers in this mutation plan.
+    Skip { outcome: MemberOutcome },
 }
 
 impl Step {
-    fn outcome(&self) -> &FoldOutcome {
+    fn outcome(&self) -> &MemberOutcome {
         match self {
             Step::Stage { outcome, .. } | Step::Skip { outcome } => outcome,
         }
     }
 }
 
-/// The shared handles a resolver may consult mid-fold: loaded key-state
-/// resolution, the transaction monitor, and why this fold is running.
+/// Transaction-state services and retry context for one resolver evaluation.
 pub(crate) struct ResolveCtx<'a> {
     pub(crate) key_state: &'a KeyStateResolver,
     pub(crate) tmon: &'a Monitor,
@@ -248,16 +244,15 @@ pub(crate) struct ResolveCtx<'a> {
     pub(crate) cause: ReloadCause,
 }
 
-/// One operation's mutation decision over a leaf, folded by the coordinator.
-/// The engine calls [`resolve`](LeafResolver::resolve), threads any staged
-/// entries, and deposits the returned outcome. Resolver implementations own the
-/// acquire, write-back, release, and direct-commit decisions; the coordinator
+/// The policy for one round member's mutation decision on a staged leaf state.
+/// Resolver implementations own the acquire, write-back, release, and
+/// direct-commit decisions; the coordinator
 /// owns the ordering, admission, and recovery contract they share (ADR-028).
 #[async_trait]
 pub(crate) trait LeafResolver: Send + Sync {
     /// Lets a resolver retain evidence from the leaf exactly as loaded, before
     /// any earlier-ordered member stages over it. Direct commit uses this to
-    /// remember an exact own marker; other resolvers need no pre-fold state.
+    /// remember an exact own marker; other resolvers need no initial leaf state.
     fn observe_loaded(&self, _entries: &BTreeMap<Vec<u8>, LeafEntry>) {}
 
     /// Resolves this member against entries and node locks as currently staged
@@ -284,27 +279,27 @@ pub(crate) trait LeafResolver: Send + Sync {
     /// result. `in_doubt` reports whether a CAS carrying *this member's* stage
     /// may have landed, so a non-idempotent resolver cannot downgrade
     /// uncertainty while ending the round.
-    fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome;
+    fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome;
 
     /// The outcome delivered when a structural change invalidated routing.
-    fn reroute_outcome(&self, in_doubt: bool) -> FoldOutcome {
+    fn reroute_outcome(&self, in_doubt: bool) -> MemberOutcome {
         self.exhausted_outcome(in_doubt)
     }
 
     /// The outcome delivered when a peer already claimed one of this member's
     /// [`publication_keys`](LeafResolver::publication_keys) as a logless
-    /// publication this round, so nothing was folded for it at all. Distinct
+    /// publication this attempt, so this member staged nothing. Distinct
     /// from exhaustion: the peer's claim proves this member staged nothing,
     /// which a spent CAS budget does not, so a resolver may treat it as a
     /// certified loss rather than an unknown one (ADR-053). `in_doubt` still
     /// reports whether an *earlier* attempt of this round carried this member's
     /// own stage.
-    fn excluded_outcome(&self, in_doubt: bool) -> FoldOutcome {
+    fn excluded_outcome(&self, in_doubt: bool) -> MemberOutcome {
         self.exhausted_outcome(in_doubt)
     }
 
     /// The raw keys defining this member's leaf-local scope. The coordinator
-    /// verifies that the loaded leaf still covers every key before folding
+    /// verifies that the loaded leaf still covers every key before evaluation
     /// (ADR-031). This includes read-only dependencies when their placement
     /// matters. A resolver whose decision is valid for the leaf as a whole may
     /// leave the scope empty.
@@ -335,7 +330,7 @@ pub(crate) trait LeafResolver: Send + Sync {
 /// One complete operation submitted to the shared leaf-mutation engine.
 ///
 /// The operation owns its target, transaction identity, first-load requirement,
-/// resolver policy, and typed result. The coordinator only runs the shared fold
+/// resolver policy, and typed result. The coordinator runs the shared mutation
 /// mechanism and returns the raw round result to the operation for translation.
 pub(crate) trait LeafOperation: LeafResolver {
     /// The result vocabulary exposed to this operation's caller.
@@ -347,7 +342,7 @@ pub(crate) trait LeafOperation: LeafResolver {
     /// Returns the transaction identity used to order this operation.
     fn id(&self) -> &TxId;
 
-    /// Returns the cache requirement for the first fold attempt.
+    /// Returns the cache requirement for the first mutation attempt.
     fn first_requirement(&self) -> Requirement;
 
     /// Translates the shared round result into this operation's result.
@@ -371,7 +366,7 @@ struct LeafMember {
 /// small collection's single leaf, else a standalone node `_n`, resolved by
 /// descent. `members` maps each contending transaction to its installed
 /// resolver and outcome slot. `first_requirement` is the cache requirement for the
-/// round's first fold attempt: `Any` lets a lone round reuse a leaf the
+/// round's first mutation attempt: `Any` lets a lone round reuse a leaf the
 /// submitter just cached (the logless direct commit) without a
 /// revalidation round-trip. A failed mutation invalidates that exact seed, so
 /// retries use `Any` to consume the winner or newer shared knowledge.
@@ -388,7 +383,7 @@ impl MergeRequest for CasReq {
         // at once — e.g. GC releasing a presumed-dead transaction's holds
         // (ADR-029) while that transaction's own acquire is still resolving on
         // the same object (ADR-025). Each submission carries its own outcome
-        // slot, but a fold round runs at most one resolver per transaction identity
+        // slot, but a coordinator round runs at most one resolver per transaction identity
         // and the dedup delivers to *every* merged submission. Merging two
         // submissions that share an id would collapse them to a single map
         // entry — silently dropping one submission's resolver and its outcome
@@ -399,7 +394,7 @@ impl MergeRequest for CasReq {
             return None;
         }
         // Otherwise union distinct-id leaf members into one round (ADR-028):
-        // even same-key conflicting writers share a single load + CAS. The fold
+        // even same-key conflicting writers share a single load + CAS. Planning
         // resolves the conflict in-round by wound-wait order — the older member
         // stages its lock and the younger emits `Wait` — so there is no benefit
         // to keeping contenders in separate batches.
@@ -453,9 +448,8 @@ struct CoordState {
     dedup: Dedup<CasReq, TransError, CasWorker>,
 }
 
-/// The [`Dedup`] worker driving one merged round per CAS object (ADR-025): it
-/// loads the leaf/root once, folds every merged member's resolver, does a single
-/// CAS, and deposits each member's [`FoldOutcome`] into its slot.
+/// The [`Dedup`] worker responsible for planning, persistence, retries, and
+/// outcome delivery for one coordinator round per leaf (ADR-025).
 struct CasWorker {
     core: Arc<CoordCore>,
 }
@@ -471,19 +465,19 @@ enum Participation {
     Staged,
 }
 
-struct MemberFold {
+struct PlannedMember {
     id: TxId,
-    outcome: FoldOutcome,
+    outcome: MemberOutcome,
     participation: Participation,
 }
 
-struct FoldPlan {
+struct MutationPlan {
     entries: BTreeMap<Vec<u8>, LeafEntry>,
     locks: NodeLocks,
-    members: Vec<MemberFold>,
+    members: Vec<PlannedMember>,
 }
 
-impl FoldPlan {
+impl MutationPlan {
     fn staged_ids(&self) -> impl Iterator<Item = &TxId> {
         self.members.iter().filter_map(|member| {
             (member.participation == Participation::Staged).then_some(&member.id)
@@ -501,12 +495,12 @@ struct ProposedStage {
     entries: Vec<(Vec<u8>, LeafEntry)>,
     locks: NodeLocks,
     admission: StageAdmission,
-    outcome: FoldOutcome,
+    outcome: MemberOutcome,
 }
 
 enum CapacityDecision {
     Admitted(ProposedStage),
-    Rejected(FoldOutcome),
+    Rejected(MemberOutcome),
 }
 
 enum PersistResult {
@@ -518,7 +512,7 @@ enum PersistResult {
 
 impl CasWorker {
     /// Builds the ordered mutation plan for one loaded leaf attempt.
-    async fn fold_round(
+    async fn plan_mutation(
         &self,
         path: &ObjectPath,
         edit: &LeafEdit,
@@ -526,8 +520,8 @@ impl CasWorker {
         requirement: Requirement,
         reloaded: bool,
         in_doubt: &mut BTreeSet<TxId>,
-    ) -> Result<FoldPlan, TransError> {
-        let mut plan = FoldPlan {
+    ) -> Result<MutationPlan, TransError> {
+        let mut plan = MutationPlan {
             entries: edit
                 .entries()
                 .entries()
@@ -538,12 +532,12 @@ impl CasWorker {
             members: Vec::with_capacity(members.len()),
         };
 
-        // Oldest-first ordering makes the fold monotonic: a later member cannot
+        // Oldest-first planning prevents backtracking: a later member cannot
         // wound a member whose stage it has already observed (ADR-028).
         let mut ordered: Vec<(&TxId, &LeafMember)> = members.iter().collect();
-        ordered.sort_by(|(a, _), (b, _)| fold_order(a, b));
+        ordered.sort_by(|(a, _), (b, _)| compare_member_priority(a, b));
         // Marker evidence belongs to the loaded leaf observation, not to the
-        // running fold order. Give every member a chance to retain it before a
+        // member evaluation order. Give every member a chance to retain it before a
         // preceding publisher can replace the corresponding entry in memory.
         for member in members.values() {
             member.resolver.observe_loaded(&plan.entries);
@@ -572,7 +566,7 @@ impl CasWorker {
                 .iter()
                 .any(|&key| !edit.covers(key));
             if needs_reroute {
-                plan.members.push(MemberFold {
+                plan.members.push(PlannedMember {
                     id: tx.clone(),
                     outcome: member.resolver.reroute_outcome(member_in_doubt),
                     participation: Participation::Skipped,
@@ -585,7 +579,7 @@ impl CasWorker {
                 .iter()
                 .any(|&key| protected_markers.contains(key));
             if protected_marker_conflict {
-                plan.members.push(MemberFold {
+                plan.members.push(PlannedMember {
                     id: tx.clone(),
                     outcome: member.resolver.excluded_outcome(member_in_doubt),
                     participation: Participation::Skipped,
@@ -597,7 +591,7 @@ impl CasWorker {
                 .resolver
                 .resolve(&ctx, &plan.entries, &plan.locks)
                 .await?;
-            if member_in_doubt && !matches!(step.outcome(), FoldOutcome::InDoubt(_)) {
+            if member_in_doubt && !matches!(step.outcome(), MemberOutcome::InDoubt(_)) {
                 in_doubt.remove(tx);
             }
             let member_in_doubt = in_doubt.contains(tx);
@@ -634,14 +628,14 @@ impl CasWorker {
                                     .map(<[u8]>::to_vec),
                             );
                             plan.locks = proposed.locks;
-                            plan.members.push(MemberFold {
+                            plan.members.push(PlannedMember {
                                 id: tx.clone(),
                                 outcome: proposed.outcome,
                                 participation: Participation::Staged,
                             });
                         }
                         CapacityDecision::Rejected(outcome) => {
-                            plan.members.push(MemberFold {
+                            plan.members.push(PlannedMember {
                                 id: tx.clone(),
                                 outcome,
                                 participation: Participation::Skipped,
@@ -650,7 +644,7 @@ impl CasWorker {
                     }
                 }
                 Step::Skip { outcome } => {
-                    if matches!(&outcome, FoldOutcome::Landed) {
+                    if matches!(&outcome, MemberOutcome::Landed) {
                         protected_markers.extend(
                             member
                                 .resolver
@@ -659,7 +653,7 @@ impl CasWorker {
                                 .map(<[u8]>::to_vec),
                         );
                     }
-                    plan.members.push(MemberFold {
+                    plan.members.push(PlannedMember {
                         id: tx.clone(),
                         outcome,
                         participation: Participation::Skipped,
@@ -720,21 +714,21 @@ impl CasWorker {
             self.core.hinter.observe_leaf(path, &candidate_leaf);
         }
         let outcome = if proposed.admission == StageAdmission::AddsKey {
-            FoldOutcome::LeafFull
+            MemberOutcome::LeafFull
         } else if in_doubt {
             resolver.exhausted_outcome(true)
         } else {
-            FoldOutcome::Conflict
+            MemberOutcome::Conflict
         };
         Ok(CapacityDecision::Rejected(outcome))
     }
 
-    /// Persists one fold plan and classifies what happened to its staged members.
+    /// Persists one mutation plan and classifies its storage result.
     async fn persist(
         &self,
         path: &ObjectPath,
         mut edit: LeafEdit,
-        plan: &mut FoldPlan,
+        plan: &mut MutationPlan,
     ) -> Result<PersistResult, TransError> {
         if !plan.is_dirty() {
             return Ok(PersistResult::Unchanged(edit.observation().clone()));
@@ -769,11 +763,9 @@ impl CasWorker {
         }
     }
 
-    /// Drives one merged leaf round: load once, fold every member's resolver
-    /// (threading the staged entries), CAS once, and deposit each member's
-    /// outcome. A member that stages nothing (e.g. it must wait) is delivered its
-    /// own outcome, so the owner never blocks — its caller waits and re-submits
-    /// while the other members make progress.
+    /// Completes one coordinator round and delivers each member's outcome.
+    /// A member that must wait for a holder receives its own wait outcome,
+    /// so other members can complete while that caller waits and re-submits.
     async fn run_leaf(
         &self,
         path: &ObjectPath,
@@ -788,11 +780,11 @@ impl CasWorker {
             rt::yield_now().await;
         }
         let mut backoff = self.core.retry.backoff();
-        // Whether the current fold is a re-fold, so a resolver can tell its first
-        // pass from a retry after a CAS that did not land.
+        // Resolvers must distinguish the first attempt from recovery after a CAS
+        // failure or a stale transaction dependency.
         let mut reloaded = false;
         // The members whose changes rode a CAS that came back in-doubt. For them
-        // in-doubt is *sticky* across re-folds until their resolver returns a
+        // in-doubt is *sticky* across planning retries until their resolver returns a
         // reconciled, non-InDoubt decision: that write may have landed durably
         // (and been help-forwarded to a peer), so a later precondition-miss must
         // not downgrade the ambiguity to a definitive loss. Commit-install
@@ -804,7 +796,7 @@ impl CasWorker {
         // the batch afterwards — definitively did not land, and inheriting the
         // batch's ambiguity would strand it in-doubt over a write it never made.
         let mut in_doubt: BTreeSet<TxId> = BTreeSet::new();
-        // The first fold attempt may reuse a cached leaf the submitter just
+        // The first mutation attempt may reuse a cached leaf the submitter just
         // loaded (a direct same-leaf member; `Any` serves it without a
         // revalidation round-trip, ADR-030). A failed or in-doubt CAS
         // invalidates the exact seed observation, so later attempts can also use
@@ -837,11 +829,11 @@ impl CasWorker {
             // Read the merged set *after* obtaining the leaf so this round
             // absorbs every member that queued while the load I/O was in flight
             // (ADR-025) — the window that turns N contenders' loads+CASes into
-            // one. A cache-served first attempt still folds every current member
-            // over the cached leaf; the CAS arbitrates if that leaf was stale.
+            // one. A cache-served first attempt still builds a plan for all current
+            // members from the cached leaf; the CAS arbitrates if that leaf was stale.
             let members = leaf_members(batch);
             let mut plan = match self
-                .fold_round(path, &edit, &members, requirement, reloaded, &mut in_doubt)
+                .plan_mutation(path, &edit, &members, requirement, reloaded, &mut in_doubt)
                 .await
             {
                 Ok(plan) => plan,
@@ -864,7 +856,7 @@ impl CasWorker {
                     reloaded = true;
                     continue;
                 }
-                // Re-folding over a freshly-read leaf is idempotent. Only the
+                // Rebuilding the plan from a reloaded leaf is idempotent. Only the
                 // members this uncertain CAS actually carried inherit its doubt.
                 PersistResult::InDoubt(staged_ids) => {
                     in_doubt.extend(staged_ids);
@@ -923,11 +915,9 @@ impl Worker<CasReq, TransError> for CasWorker {
     }
 }
 
-/// The transaction-aware shared fold engine through which every leaf/root entry
-/// mutation flows (ADR-028): a [`Dedup`] over the CAS coordination objects
-/// that orders contending transactions, loads each object once, folds their
-/// resolvers, does one CAS, and deposits each transaction's outcome. Transaction
-/// lifecycle remains with its higher-level owner.
+/// Coordinates leaf entry mutations and leaf structural-gate acquisition
+/// across transactions (ADR-028). Owns batching, mutation planning, persistence,
+/// and recovery; transaction lifecycle remains with its higher-level owner.
 #[derive(Clone)]
 pub struct LeafCoordinator {
     inner: Arc<CoordState>,
@@ -1003,12 +993,12 @@ impl LeafCoordinator {
 
     /// Submits one operation's resolver through the [`Dedup`] and awaits its
     /// single-round [`CoordinatedOutcome`]. The worker merges it into any
-    /// in-flight round for the leaf, folds it, retries CAS contention / in-doubt
+    /// in-flight round for the leaf, evaluates it, retries CAS contention / in-doubt
     /// internally, and deposits the policy outcome plus its physical evidence
     /// into the slot. Returns `Ok(None)` if the coordinator was shut down before
     /// the round ran, so the operation can preserve its best-effort behavior.
     ///
-    /// `first_requirement` chooses the cache requirement for the round's first fold
+    /// `first_requirement` chooses the cache requirement for the round's first mutation
     /// attempt: a direct submitter that just read this leaf while evaluating its
     /// complete point member passes `Any` so the round reuses the cached copy
     /// instead of revalidating it (ADR-030); skip-capable
@@ -1054,13 +1044,13 @@ impl LeafCoordinator {
     }
 }
 
-/// Total order for the monotonic fold: oldest wound-wait priority first, with a
+/// Member evaluation order: oldest wound-wait priority first, with a
 /// deterministic full-id byte tiebreak for equal-priority members. The tiebreak
 /// is **round-local** — it only fixes who stages first this round, never who
 /// wins a wound ([`should_wound`] ignores it) — so a renewed id (fresh prefix,
-/// same priority) can reorder the fold without ever flipping a persistent wound
+/// same priority) can reorder member evaluation without ever flipping a persistent wound
 /// winner, which is what would let equal-priority peers livelock (ADR-002/028).
-fn fold_order(a: &TxId, b: &TxId) -> CmpOrdering {
+fn compare_member_priority(a: &TxId, b: &TxId) -> CmpOrdering {
     if a.older(b) {
         CmpOrdering::Less
     } else if b.older(a) {
@@ -1105,7 +1095,7 @@ mod tests {
 
     // Every coordination round in these tests targets one leaf object. A
     // standalone node `_n/<token>` is the cleanest stand-in: it carries only key
-    // entries (no collection metadata), exactly what the leaf fold operates on.
+    // entries (no collection metadata), exactly what leaf mutation planning operates on.
     fn leaf_path() -> ObjectPath {
         ObjectPath::Node {
             collection: collection(),
@@ -1301,7 +1291,7 @@ mod tests {
                 entries: vec![(self.key.clone(), e)],
                 locks: staged_locks.clone(),
                 admission: self.admission,
-                outcome: FoldOutcome::Locked {
+                outcome: MemberOutcome::Locked {
                     typ: LockType::Write,
                     membership: LockType::None,
                 },
@@ -1312,8 +1302,8 @@ mod tests {
             false
         }
 
-        fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
-            FoldOutcome::Conflict
+        fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
+            MemberOutcome::Conflict
         }
 
         fn leaf_scope_keys(&self) -> Vec<&[u8]> {
@@ -1344,7 +1334,7 @@ mod tests {
             Ok(matches!(
                 outcome,
                 Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::Locked { .. },
+                    outcome: MemberOutcome::Locked { .. },
                     evidence: Some(CoordinationEvidence::Installed(_)),
                     ..
                 })
@@ -1364,7 +1354,7 @@ mod tests {
             _staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             Ok(Step::Skip {
-                outcome: FoldOutcome::Released {
+                outcome: MemberOutcome::Released {
                     superseded: Vec::new(),
                 },
             })
@@ -1374,22 +1364,22 @@ mod tests {
             true
         }
 
-        fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
-            FoldOutcome::Released {
+        fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
+            MemberOutcome::Released {
                 superseded: Vec::new(),
             }
         }
     }
 
-    // The fold trace: each member records its id and the keys it saw already
-    // staged when its turn came, so a test can assert fold order and threading.
-    type FoldTrace = Arc<Mutex<Vec<(TxId, Vec<Vec<u8>>)>>>;
+    // Each member records its id and the previously staged keys so tests can
+    // check evaluation order and which admitted changes later members observe.
+    type ResolverTrace = Arc<Mutex<Vec<(TxId, Vec<Vec<u8>>)>>>;
 
-    // Records what it observed mid-fold, then stages its own committed pointer.
+    // Retains the state seen during evaluation to check ordered staging.
     struct Recorder {
         key: Vec<u8>,
         tx: TxId,
-        trace: FoldTrace,
+        trace: ResolverTrace,
     }
 
     #[async_trait::async_trait]
@@ -1411,7 +1401,7 @@ mod tests {
                 )],
                 locks: staged_locks.clone(),
                 admission: StageAdmission::ExistingKeys,
-                outcome: FoldOutcome::Landed,
+                outcome: MemberOutcome::Landed,
             })
         }
 
@@ -1419,8 +1409,8 @@ mod tests {
             false
         }
 
-        fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
-            FoldOutcome::Conflict
+        fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
+            MemberOutcome::Conflict
         }
     }
 
@@ -1615,7 +1605,7 @@ mod tests {
         assert!(matches!(
             out,
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Conflict,
+                outcome: MemberOutcome::Conflict,
                 evidence: Some(CoordinationEvidence::Observed(_)),
                 ..
             })
@@ -1632,10 +1622,10 @@ mod tests {
         assert!(leaf.lookup(b"a").is_some());
     }
 
-    // A covered key still folds normally: the coverage re-check is transparent
+    // A covered key can still be locked: the coverage re-check is transparent
     // when the leaf covers the round's keys.
     #[tokio::test]
-    async fn covered_key_folds_normally_despite_a_high_key() {
+    async fn covered_key_is_locked_despite_a_high_key() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (coord, store, _timeline, _bg) = coord_over(backend.clone()).await;
 
@@ -1659,7 +1649,7 @@ mod tests {
         assert!(matches!(
             out,
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Locked { .. },
+                outcome: MemberOutcome::Locked { .. },
                 evidence: Some(CoordinationEvidence::Installed(_)),
                 ..
             })
@@ -1698,7 +1688,7 @@ mod tests {
         assert!(matches!(
             &out,
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Released { .. },
+                outcome: MemberOutcome::Released { .. },
                 evidence: Some(CoordinationEvidence::Observed(_)),
             })
         ));
@@ -1784,7 +1774,7 @@ mod tests {
     }
 
     // An entry left with no holder and no committed writer is indistinguishable
-    // from absent, so the CAS that folds the round drops it (ADR-029) while
+    // from absent, so the plan's CAS drops it (ADR-029) while
     // keeping live pointers and newly staged locks.
     #[tokio::test]
     async fn leaf_prunes_vestigial_entries_on_cas() {
@@ -1884,7 +1874,7 @@ mod tests {
     }
 
     // ADR-028: two transactions contending the same leaf merge into one round —
-    // a single shared load and a single CAS — folded oldest-first, with the
+    // a single shared load and a single CAS — planned oldest-first, with the
     // younger member observing the older's staged entry (threading).
     #[tokio::test(start_paused = true)]
     async fn same_leaf_submits_merge_into_one_round() {
@@ -1895,7 +1885,7 @@ mod tests {
         let (coord, _nodes, _timeline, _bg) = coord_over(recorder as Arc<dyn Backend>).await;
         log.lock().unwrap().clear();
 
-        let trace: FoldTrace = Arc::new(Mutex::new(Vec::new()));
+        let trace: ResolverTrace = Arc::new(Mutex::new(Vec::new()));
         let old = TxId::with_priority(1, b"old");
         let young = TxId::with_priority(2, b"young");
 
@@ -1938,14 +1928,14 @@ mod tests {
         assert!(matches!(
             driver.await.unwrap().unwrap(),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Landed,
+                outcome: MemberOutcome::Landed,
                 ..
             })
         ));
         assert!(matches!(
             joiner.await.unwrap().unwrap(),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Landed,
+                outcome: MemberOutcome::Landed,
                 ..
             })
         ));
@@ -1955,8 +1945,8 @@ mod tests {
         coord.close().await;
 
         let trace = trace.lock().unwrap();
-        assert_eq!(trace.len(), 2, "both members are folded once");
-        assert_eq!(trace[0].0, old, "the older member folds first");
+        assert_eq!(trace.len(), 2, "both resolvers are evaluated once");
+        assert_eq!(trace[0].0, old, "the older member is evaluated first");
         assert_eq!(trace[1].0, young);
         assert!(
             trace[1].1.contains(&b"a".to_vec()),
@@ -2007,7 +1997,7 @@ mod tests {
         assert!(matches!(
             driver.await.unwrap().unwrap(),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Landed,
+                outcome: MemberOutcome::Landed,
                 ..
             })
         ));
@@ -2015,12 +2005,12 @@ mod tests {
             matches!(
                 joiner.await.unwrap().unwrap(),
                 Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::Conflict,
+                    outcome: MemberOutcome::Conflict,
                     evidence: Some(CoordinationEvidence::Observed(_)),
                     ..
                 })
             ),
-            "the second claimant folds nothing and does not land"
+            "the second claimant stages nothing and does not land"
         );
         coord.close().await;
 
@@ -2080,7 +2070,7 @@ mod tests {
                 entries: vec![(self.key.clone(), e)],
                 locks: staged_locks.clone(),
                 admission: StageAdmission::ExistingKeys,
-                outcome: FoldOutcome::Landed,
+                outcome: MemberOutcome::Landed,
             })
         }
 
@@ -2088,21 +2078,21 @@ mod tests {
             false
         }
 
-        fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
+        fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome {
             if in_doubt {
-                return FoldOutcome::InDoubt("logless commit after an uncertain CAS".into());
+                return MemberOutcome::InDoubt("logless commit after an uncertain CAS".into());
             }
-            FoldOutcome::Moved
+            MemberOutcome::Moved
         }
 
-        fn excluded_outcome(&self, in_doubt: bool) -> FoldOutcome {
+        fn excluded_outcome(&self, in_doubt: bool) -> MemberOutcome {
             if in_doubt {
-                return FoldOutcome::InDoubt("logless commit after an uncertain CAS".into());
+                return MemberOutcome::InDoubt("logless commit after an uncertain CAS".into());
             }
             if self.replayable {
-                return FoldOutcome::Replay;
+                return MemberOutcome::Replay;
             }
-            FoldOutcome::Moved
+            MemberOutcome::Moved
         }
 
         fn leaf_scope_keys(&self) -> Vec<&[u8]> {
@@ -2158,7 +2148,7 @@ mod tests {
         ) -> Result<Step, TransError> {
             if self.already_landed {
                 return Ok(Step::Skip {
-                    outcome: FoldOutcome::Landed,
+                    outcome: MemberOutcome::Landed,
                 });
             }
             let entries = self
@@ -2176,7 +2166,7 @@ mod tests {
                 entries,
                 locks: staged_locks.clone(),
                 admission: StageAdmission::ExistingKeys,
-                outcome: FoldOutcome::Landed,
+                outcome: MemberOutcome::Landed,
             })
         }
 
@@ -2184,13 +2174,13 @@ mod tests {
             false
         }
 
-        fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
+        fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome {
             if in_doubt && self.logless {
-                FoldOutcome::InDoubt("multi-key logless probe is uncertain".into())
+                MemberOutcome::InDoubt("multi-key logless probe is uncertain".into())
             } else if self.logless {
-                FoldOutcome::Moved
+                MemberOutcome::Moved
             } else {
-                FoldOutcome::Reroute
+                MemberOutcome::Reroute
             }
         }
 
@@ -2251,7 +2241,7 @@ mod tests {
         assert!(matches!(
             driver.await.unwrap().unwrap(),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Landed,
+                outcome: MemberOutcome::Landed,
                 ..
             })
         ));
@@ -2259,7 +2249,7 @@ mod tests {
         let expected = matches!(
             &joined,
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Reroute,
+                outcome: MemberOutcome::Reroute,
                 evidence: Some(CoordinationEvidence::Observed(_)),
                 ..
             })
@@ -2323,7 +2313,7 @@ mod tests {
             assert!(matches!(
                 outcome,
                 Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::Landed,
+                    outcome: MemberOutcome::Landed,
                     ..
                 })
             ));
@@ -2384,7 +2374,7 @@ mod tests {
         assert!(matches!(
             driver.await.unwrap().unwrap(),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Landed,
+                outcome: MemberOutcome::Landed,
                 evidence: Some(CoordinationEvidence::Observed(_)),
                 ..
             })
@@ -2393,7 +2383,7 @@ mod tests {
         let expected = matches!(
             &joined,
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Reroute,
+                outcome: MemberOutcome::Reroute,
                 evidence: Some(CoordinationEvidence::Observed(_)),
                 ..
             })
@@ -2449,9 +2439,9 @@ mod tests {
         ) -> Result<Step, TransError> {
             let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true });
             let outcome = if in_doubt {
-                FoldOutcome::InDoubt("uncertain CAS attributed to skipped member".into())
+                MemberOutcome::InDoubt("uncertain CAS attributed to skipped member".into())
             } else {
-                FoldOutcome::Moved
+                MemberOutcome::Moved
             };
             Ok(Step::Skip { outcome })
         }
@@ -2460,11 +2450,11 @@ mod tests {
             false
         }
 
-        fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
+        fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome {
             if in_doubt {
-                FoldOutcome::InDoubt("uncertain CAS attributed to skipped member".into())
+                MemberOutcome::InDoubt("uncertain CAS attributed to skipped member".into())
             } else {
-                FoldOutcome::Moved
+                MemberOutcome::Moved
             }
         }
     }
@@ -2516,7 +2506,7 @@ mod tests {
             matches!(
                 driver.await.unwrap().unwrap(),
                 Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::Landed,
+                    outcome: MemberOutcome::Landed,
                     ..
                 })
             ),
@@ -2526,7 +2516,7 @@ mod tests {
             matches!(
                 joiner.await.unwrap().unwrap(),
                 Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::Moved,
+                    outcome: MemberOutcome::Moved,
                     evidence: Some(CoordinationEvidence::Observed(_)),
                     ..
                 })
@@ -2538,7 +2528,7 @@ mod tests {
 
     // ADR-053: a same-key claim is reported through `excluded_outcome`, not
     // `exhausted_outcome`. The distinction is load-bearing — the claim proves the
-    // excluded member folded nothing at all, while a spent CAS budget proves
+    // excluded member staged nothing at all, while a spent CAS budget proves
     // nothing about an earlier attempt — so a read-modify-write shaped member
     // learns a *replayable* loss where an exhausted round would only tell it the
     // entry moved.
@@ -2578,7 +2568,7 @@ mod tests {
         assert!(matches!(
             driver.await.unwrap().unwrap(),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Landed,
+                outcome: MemberOutcome::Landed,
                 ..
             })
         ));
@@ -2586,12 +2576,12 @@ mod tests {
             matches!(
                 joiner.await.unwrap().unwrap(),
                 Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::Replay,
+                    outcome: MemberOutcome::Replay,
                     evidence: Some(CoordinationEvidence::Observed(_)),
                     ..
                 })
             ),
-            "the excluded member folded nothing, so its loss is replayable"
+            "the excluded member staged nothing, so its loss is replayable"
         );
         coord.close().await;
     }
@@ -2639,7 +2629,7 @@ mod tests {
             matches!(
                 driver.await.unwrap().unwrap(),
                 Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::Landed,
+                    outcome: MemberOutcome::Landed,
                     ..
                 })
             ),
@@ -2649,7 +2639,7 @@ mod tests {
             matches!(
                 joiner.await.unwrap().unwrap(),
                 Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::Replay,
+                    outcome: MemberOutcome::Replay,
                     evidence: Some(CoordinationEvidence::Observed(_)),
                     ..
                 })
@@ -2664,7 +2654,7 @@ mod tests {
     // two operations in flight on the same leaf at once — GC releasing a
     // presumed-dead transaction's holds (ADR-029) while that transaction's own
     // acquire is still resolving on the same object (ADR-025). Both submissions
-    // carry their own outcome slot, but a fold round runs one resolver per id and
+    // carry their own outcome slot, but a coordinator round runs one resolver per id and
     // the dedup delivers to every merged submission; merging them would collapse
     // the two slots into one and leave the loser a delivered-but-empty slot. The
     // coordinator must instead serialize same-identity submissions into separate rounds
@@ -2709,14 +2699,14 @@ mod tests {
         assert!(matches!(
             acquire.await.unwrap().unwrap(),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Locked { .. },
+                outcome: MemberOutcome::Locked { .. },
                 ..
             })
         ));
         assert!(matches!(
             release.await.unwrap().unwrap(),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Released { .. },
+                outcome: MemberOutcome::Released { .. },
                 ..
             })
         ));
@@ -2801,7 +2791,7 @@ mod tests {
         assert!(matches!(
             overwrite.await.unwrap().unwrap(),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Locked { .. },
+                outcome: MemberOutcome::Locked { .. },
                 evidence: Some(CoordinationEvidence::Installed(_)),
                 ..
             })
@@ -2809,7 +2799,7 @@ mod tests {
         assert!(matches!(
             create.await.unwrap().unwrap(),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::LeafFull,
+                outcome: MemberOutcome::LeafFull,
                 evidence: Some(CoordinationEvidence::Observed(_)),
                 ..
             })
@@ -2869,7 +2859,7 @@ mod tests {
                     adds_key: false,
                     pressure_hint: true,
                 },
-                outcome: FoldOutcome::Landed,
+                outcome: MemberOutcome::Landed,
             })
         }
 
@@ -2877,8 +2867,8 @@ mod tests {
             true
         }
 
-        fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
-            FoldOutcome::Conflict
+        fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
+            MemberOutcome::Conflict
         }
 
         fn logless_publication_keys(&self) -> Vec<&[u8]> {
@@ -2931,7 +2921,7 @@ mod tests {
         assert!(matches!(
             outcome,
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Conflict,
+                outcome: MemberOutcome::Conflict,
                 evidence: Some(CoordinationEvidence::Observed(_)),
                 ..
             })
@@ -2988,7 +2978,7 @@ mod tests {
         assert!(matches!(
             outcome,
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Conflict,
+                outcome: MemberOutcome::Conflict,
                 evidence: Some(CoordinationEvidence::Observed(_)),
                 ..
             })
@@ -3003,7 +2993,7 @@ mod tests {
     struct CapacityAfterInDoubt {
         key: Vec<u8>,
         tx: TxId,
-        folds: std::sync::atomic::AtomicUsize,
+        evaluations: std::sync::atomic::AtomicUsize,
         recovers_non_landing: bool,
     }
 
@@ -3015,16 +3005,16 @@ mod tests {
             _staged: &BTreeMap<Vec<u8>, LeafEntry>,
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
-            let fold = self.folds.fetch_add(1, Ordering::SeqCst);
+            let evaluation = self.evaluations.fetch_add(1, Ordering::SeqCst);
             let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true });
             if in_doubt && !self.recovers_non_landing {
                 return Ok(Step::Skip {
-                    outcome: FoldOutcome::InDoubt(
+                    outcome: MemberOutcome::InDoubt(
                         "capacity changed after an unreconciled CAS".into(),
                     ),
                 });
             }
-            let value: Arc<[u8]> = if fold == 0 {
+            let value: Arc<[u8]> = if evaluation == 0 {
                 Arc::from(b"x".as_slice())
             } else {
                 Arc::from(vec![b'x'; 128])
@@ -3037,7 +3027,7 @@ mod tests {
                 entries: vec![(self.key.clone(), entry)],
                 locks: staged_locks.clone(),
                 admission: StageAdmission::ExistingKeys,
-                outcome: FoldOutcome::Landed,
+                outcome: MemberOutcome::Landed,
             })
         }
 
@@ -3045,11 +3035,11 @@ mod tests {
             false
         }
 
-        fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
+        fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome {
             if in_doubt {
-                FoldOutcome::InDoubt("capacity changed after in-doubt CAS".into())
+                MemberOutcome::InDoubt("capacity changed after in-doubt CAS".into())
             } else {
-                FoldOutcome::Moved
+                MemberOutcome::Moved
             }
         }
     }
@@ -3115,7 +3105,7 @@ mod tests {
                     Arc::new(CapacityAfterInDoubt {
                         key: b"k".to_vec(),
                         tx: driver_tx.clone(),
-                        folds: std::sync::atomic::AtomicUsize::new(0),
+                        evaluations: std::sync::atomic::AtomicUsize::new(0),
                         recovers_non_landing: false,
                     }),
                     Requirement::ANY,
@@ -3142,7 +3132,7 @@ mod tests {
         assert!(matches!(
             outcome,
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::InDoubt(_),
+                outcome: MemberOutcome::InDoubt(_),
                 evidence: Some(CoordinationEvidence::Observed(_)),
                 ..
             })
@@ -3150,7 +3140,7 @@ mod tests {
         assert!(matches!(
             skipped_outcome,
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Moved,
+                outcome: MemberOutcome::Moved,
                 evidence: Some(CoordinationEvidence::Observed(_)),
                 ..
             })
@@ -3213,7 +3203,7 @@ mod tests {
                 Arc::new(CapacityAfterInDoubt {
                     key: b"k".to_vec(),
                     tx: tx.clone(),
-                    folds: std::sync::atomic::AtomicUsize::new(0),
+                    evaluations: std::sync::atomic::AtomicUsize::new(0),
                     recovers_non_landing: true,
                 }),
                 Requirement::ANY,
@@ -3223,7 +3213,7 @@ mod tests {
         assert!(matches!(
             outcome,
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Conflict,
+                outcome: MemberOutcome::Conflict,
                 evidence: Some(CoordinationEvidence::Observed(_)),
                 ..
             })
@@ -3277,12 +3267,12 @@ mod tests {
     }
 
     // A commit-shaped resolver that stages once, then refuses to restage until
-    // its uncertain CAS can be reconciled. Records the later fold's cause so
+    // its uncertain CAS can be reconciled. Records the later evaluation's cause so
     // tests can pin the coordinator's sticky attribution.
     struct StickyCommitProbe {
         key: Vec<u8>,
         tx: TxId,
-        folds: std::sync::atomic::AtomicUsize,
+        evaluations: std::sync::atomic::AtomicUsize,
         seen_in_doubt: Arc<Mutex<Option<bool>>>,
     }
 
@@ -3294,7 +3284,7 @@ mod tests {
             _staged: &BTreeMap<Vec<u8>, LeafEntry>,
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
-            if self.folds.fetch_add(1, Ordering::SeqCst) == 0 {
+            if self.evaluations.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Ok(Step::Stage {
                     entries: vec![(
                         self.key.clone(),
@@ -3302,15 +3292,15 @@ mod tests {
                     )],
                     locks: staged_locks.clone(),
                     admission: StageAdmission::ExistingKeys,
-                    outcome: FoldOutcome::Landed,
+                    outcome: MemberOutcome::Landed,
                 });
             }
             let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true });
             *self.seen_in_doubt.lock().unwrap() = Some(in_doubt);
             let outcome = if in_doubt {
-                FoldOutcome::InDoubt("lost race after in-doubt CAS".into())
+                MemberOutcome::InDoubt("lost race after in-doubt CAS".into())
             } else {
-                FoldOutcome::Moved
+                MemberOutcome::Moved
             };
             Ok(Step::Skip { outcome })
         }
@@ -3319,11 +3309,11 @@ mod tests {
             false
         }
 
-        fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
+        fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome {
             if in_doubt {
-                FoldOutcome::InDoubt("round ended after in-doubt CAS".into())
+                MemberOutcome::InDoubt("round ended after in-doubt CAS".into())
             } else {
-                FoldOutcome::Moved
+                MemberOutcome::Moved
             }
         }
 
@@ -3380,7 +3370,7 @@ mod tests {
                     Arc::new(StickyCommitProbe {
                         key: b"k".to_vec(),
                         tx: driver_tx.clone(),
-                        folds: std::sync::atomic::AtomicUsize::new(0),
+                        evaluations: std::sync::atomic::AtomicUsize::new(0),
                         seen_in_doubt: driver_seen,
                     }),
                     Requirement::ANY,
@@ -3417,7 +3407,7 @@ mod tests {
             matches!(
                 out,
                 Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::InDoubt(_),
+                    outcome: MemberOutcome::InDoubt(_),
                     ..
                 })
             ),
@@ -3427,7 +3417,7 @@ mod tests {
         assert!(matches!(
             retrying_outcome,
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Landed,
+                outcome: MemberOutcome::Landed,
                 ..
             })
         ));
@@ -3456,7 +3446,7 @@ mod tests {
                 )],
                 locks: staged_locks.clone(),
                 admission: StageAdmission::ExistingKeys,
-                outcome: FoldOutcome::Landed,
+                outcome: MemberOutcome::Landed,
             })
         }
 
@@ -3464,11 +3454,11 @@ mod tests {
             false
         }
 
-        fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
+        fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome {
             if in_doubt {
-                FoldOutcome::InDoubt("round ended after in-doubt CAS".into())
+                MemberOutcome::InDoubt("round ended after in-doubt CAS".into())
             } else {
-                FoldOutcome::Moved
+                MemberOutcome::Moved
             }
         }
 
@@ -3532,7 +3522,7 @@ mod tests {
                     Arc::new(StickyCommitProbe {
                         key: b"uncertain".to_vec(),
                         tx: driver_tx.clone(),
-                        folds: std::sync::atomic::AtomicUsize::new(0),
+                        evaluations: std::sync::atomic::AtomicUsize::new(0),
                         seen_in_doubt: driver_seen,
                     }),
                     Requirement::ANY,
@@ -3566,7 +3556,7 @@ mod tests {
             matches!(
                 out,
                 Some(CoordinatedOutcome {
-                    outcome: FoldOutcome::InDoubt(_),
+                    outcome: MemberOutcome::InDoubt(_),
                     ..
                 })
             ),
@@ -3575,7 +3565,7 @@ mod tests {
         assert!(matches!(
             retrying_outcome,
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Moved,
+                outcome: MemberOutcome::Moved,
                 evidence: None,
                 ..
             })

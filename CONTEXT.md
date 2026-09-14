@@ -122,6 +122,20 @@ _Avoid_: Leaf group, owning leaf group, point-leaf plan
 A logical key in a parent index that bounds one child's range: keys at or above it route to that child. A child split publishes a new separator into its parent.
 _Avoid_: Index key, boundary key
 
+## Leaf coordination
+
+**Coordinator round**:
+One group of operations coordinated by one database instance for one leaf until the group completes. A round can require multiple mutation attempts.
+_Avoid_: Fold round, CAS (when referring to the whole round)
+
+**Round member**:
+One operation from one transaction identity in a coordinator round, with its own mutation decision and outcome. Its leaf changes are admitted together or not at all.
+_Avoid_: Fold member
+
+**Mutation plan**:
+The proposed state of one leaf and the round members' outcomes for one mutation attempt. A plan does not prove that a backend mutation took effect.
+_Avoid_: Fold, fold plan
+
 ## Topology changes
 
 **Structural intent**:

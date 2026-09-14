@@ -83,10 +83,11 @@ Only successful backend conditional create or compare-and-swap may construct
 original invocation point bound to that mutation. Checking the installed state
 later cannot renew the precondition proof.
 
-Reads, failed or indeterminate mutations, and unchanged folds cannot become
-receipts. Conversion to the installed observation remains explicit. Do not add
-`Deref`, `AsRef`, `From`, payload mapping, or raw-point extraction. Participation
-in a coordinator batch is a separate proof owned by that coordinator.
+Reads, failed or indeterminate mutations, and plans with no staged changes
+cannot become receipts. Conversion to the installed observation remains
+explicit. Do not add `Deref`, `AsRef`, `From`, payload mapping, or raw-point
+extraction. Participation in a coordinator batch is a separate proof owned by
+that coordinator.
 
 ## Review
 

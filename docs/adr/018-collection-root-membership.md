@@ -9,8 +9,8 @@ Two parts are superseded by [ADR-031](031-dynamic-range-sharding.md): the
 recorded fixed `shard_count` (sharding becomes dynamic and range-partitioned) and
 the **single coarse membership lock** (replaced by per-leaf/range membership
 coordination). The `_i` object and the OCC listing/validation *principle* carry
-over — ADR-031 makes `_i` itself the B-link tree's (fixed-path) root node, folding
-the collection metadata into it, and generalizes root-version validation to
+over — ADR-031 makes `_i` itself the B-link tree's (fixed-path) root node, including
+the collection metadata in it, and generalizes root-version validation to
 per-leaf version validation.
 
 [ADR-046](046-incarnation-addressed-collections.md) supersedes this ADR's

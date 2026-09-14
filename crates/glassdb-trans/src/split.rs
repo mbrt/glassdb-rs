@@ -30,7 +30,7 @@
 //!    optimization — correctness never depends on it landing.
 //!
 //! A leaf split, including a root-leaf split, acquires structure-write through
-//! the shared [`LeafCoordinator`], in the same folded CAS stream as data
+//! the shared [`LeafCoordinator`], in the same batched CAS stream as data
 //! mutations on that leaf. Interior indexes use direct structural CASes.
 //! The source shrink (or root rewrite) releases structure-write inline, so no
 //! unlocked post-split state is exposed before a separate release CAS.

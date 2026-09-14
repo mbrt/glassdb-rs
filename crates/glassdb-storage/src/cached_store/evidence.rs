@@ -74,7 +74,7 @@ impl<V> CasResult<V> {
 /// Proof of a successful conditional create or compare-and-swap.
 ///
 /// Only the storage mutation implementation may construct a receipt, after a
-/// definitive backend success. Reads, conflicts, unchanged folds, and in-doubt
+/// definitive backend success. Reads, conflicts, plans with no staged changes, and in-doubt
 /// results must not be converted into receipts. Batch-member participation is
 /// separate from this storage proof and belongs to the coordinator.
 ///

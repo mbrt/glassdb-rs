@@ -255,7 +255,7 @@ These are correctness constraints on the storage interface:
 | Transformation | Rule |
 | --- | --- |
 | Successful conditional create or CAS to `CasReceipt<V>` | Allowed only inside the storage mutation implementation, for that mutation. |
-| Read observation, unchanged fold, conflict, or in-doubt result to `CasReceipt<V>` | Forbidden. |
+| Read observation, plan with no staged changes, conflict, or in-doubt result to `CasReceipt<V>` | Forbidden. |
 | Receipt to installed observation | Allowed explicitly through `installed()` or `into_installed()`. The observation carries state evidence, without mutation or batch-participation proof. |
 | Implicit receipt conversion through `Deref`, `AsRef`, or `From` | Forbidden. Evidence changes must be explicit at the call site. |
 | Mapping a receipt's payload or changing its precondition, path, body, or revision | Forbidden. The receipt must describe the exact mutation. |
@@ -270,27 +270,27 @@ must retain the original installed state instead of reloading the peer's state.
 ## Coordinator mutation evidence
 
 The leaf coordinator distinguishes evidence of a successful CAS from an
-observation returned by a fold that staged nothing. `NodeStore::commit_leaf`
-preserves the storage receipt in `CasResult<Node>`, and an applied fold retains
-that `CasReceipt<Node>`. The coordinator does not reconstruct the receipt.
+observation retained by a plan with no staged changes. `NodeStore::commit_leaf`
+preserves the storage receipt in `CasResult<Node>`. After successful persistence,
+the coordinator retains that `CasReceipt<Node>`; it does not reconstruct it.
 
 The coordinator owns batch-member participation. A staged member may receive the
 receipt only from the CAS that carried its changes. A skipped member retains the
 loaded observation, even when another member's CAS succeeded. A storage receipt
 alone does not establish that a particular member participated in the mutation.
-An unchanged fold retains its original observation and must not complete a staged
-member. Existing freshness requirements still govern decisions made from reads.
-Exact-state shortcuts also require the validation barrier: installed evidence
-checks the receipt's original invocation point, while observed evidence checks
-the loaded state's currentness watermark.
+A plan with no staged changes retains its original observation and must not
+complete a staged member. Existing freshness requirements still govern decisions
+made from reads. Exact-state shortcuts also require the validation barrier:
+installed evidence checks the receipt's original invocation point, while
+observed evidence checks the loaded state's currentness watermark.
 
 A skipped member's loaded observation is not always sufficient to prove its
 outcome. A resolver can skip because an earlier member has already staged the
-required change. For example, a release can skip after an earlier acquire removed
-its terminal holder in the staged leaf. Such a result must wait for the fold's CAS
-to succeed. A conflict or in-doubt result must cause a re-fold before completion.
-The skipped member still receives the loaded observation, without a claim that
-it participated in the CAS.
+required change. For example, a release can skip after an earlier acquire
+removed its terminal holder in the staged leaf. Such a result must wait for the
+plan's CAS to succeed. A conflict or in-doubt result must cause a reload and a
+new mutation plan before completion. The skipped member still receives the
+loaded observation, without a claim that it participated in the CAS.
 
 ## Per-path coordination
 

@@ -7,38 +7,39 @@ Superseded by
 
 Refines the `ShardCoordinator` mechanism of
 [ADR-028](028-shard-mutation-coordinator.md) (a round may reuse a cached shard
-for its first fold attempt; the fold, CAS, and reload-recover loop are unchanged)
-and restores the single-load commit of
+for its first mutation attempt; mutation planning, CAS, and the reload-recover
+loop are unchanged) and restores the single-load commit of
 [ADR-027](027-single-rw-parallel-lock-publish.md) that ADR-028 split in two. It
 turns off the object-cache revalidation cost of
 [ADR-023](023-slimmed-backend-trait.md) on the reuse path and preserves the
 read-validation semantics of
-[ADR-024](024-hold-and-wait-conflict-resolution.md). It changes _how many times a
-transaction loads a shard_ and, for a superseded single-RW read, _which
+[ADR-024](024-hold-and-wait-conflict-resolution.md). It changes _how many times
+a transaction loads a shard_ and, for a superseded single-RW read, _which
 transparent-retry path it takes_ — never _what a committed transaction decides_
 (see Correctness).
 
 ## Context
 
 Every shard mutation is a load-modify-CAS of one coordination object through the
-coordinator (ADR-028): load once, fold the round's resolvers, CAS once, recover
-by reload. The object cache (ADR-023) serves a cached shard by revalidating it
-with a version-conditional `read_if_modified`, which is a **backend read even
-when the object is unchanged** (the backend answers "not modified" but the round
-trip — and the op-count it costs — still happen). So _every_ `load_shard` costs
-one backend read regardless of cache warmth: caching removes the body transfer,
-not the load op.
+coordinator (ADR-028): load once per attempt, build the round's mutation plan,
+CAS once, recover by reload. The object cache (ADR-023) serves a cached shard by
+revalidating it with a version-conditional `read_if_modified`, which is a
+**backend read even when the object is unchanged** (the backend answers "not
+modified" but the round trip — and the op-count it costs — still happen). So
+_every_ `load_shard` costs one backend read regardless of cache warmth: caching
+removes the body transfer, not the load op.
 
 Against that cost, the single read-write fast path loads the same shard more
 than once per transaction:
 
-1. **Commit eligibility → install.** The fast path pre-checks dynamic eligibility
-   (no live pending holder, not a create, read not superseded) by loading the
-   shard and resolving its holders. ADR-027 then reused that same load for its
-   bespoke lock CAS — one load per commit. ADR-028 routed the install through the
-   coordinator, which loads the shard _itself_ to fold. So the pre-check and the
-   fold each loaded the object: **two loads per single-RW commit**, one more than
-   ADR-027, the extra `read_if_modified` that regressed the `singleRMW` cost/tx.
+1. **Commit eligibility → install.** The fast path pre-checks dynamic
+   eligibility (no live pending holder, not a create, read not superseded) by
+   loading the shard and resolving its holders. ADR-027 then reused that same
+   load for its bespoke lock CAS — one load per commit. ADR-028 routed the
+   install through the coordinator, which loads the shard _itself_ to build a
+   mutation plan. So the pre-check and the mutation attempt each loaded the
+   object: **two loads per single-RW commit**, one more than ADR-027, the extra
+   `read_if_modified` that regressed the `singleRMW` cost/tx.
 
 2. **The transaction body's read → commit.** A read-modify-write first _reads_
    the key: the read resolves the key's effective writer
@@ -68,7 +69,8 @@ The single read-write fast path reads `AllowStale` for **both** loads it would
 otherwise duplicate:
 
 - its **commit-eligibility** resolve, and
-- its **commit-install** fold (the coordinator's first fold attempt).
+- its **commit-install** resolver evaluation (the coordinator's first mutation
+  attempt).
 
 So a shard the transaction already cached — from its body read, or from the
 eligibility check moments earlier — is reused with **no backend op**. A
@@ -93,34 +95,34 @@ can opt in.
 
 ## Correctness
 
-The claim is that `AllowStale` changes only _which bytes the first fold attempt
-folds over_, never the precondition logic or any commit decision — so it cannot
-cause a lost update, a double-apply, or a stale commit.
+The claim is that `AllowStale` changes only _which bytes the first mutation
+attempt uses to build its plan_, never the precondition logic or any commit
+decision — so it cannot cause a lost update, a double-apply, or a stale commit.
 
-- **A stale cached shard self-corrects.** A fold over a stale snapshot produces a
-  store whose `expected` version no longer matches the backend, so the CAS
-  misses; the round then reloads (`Latest`) and re-folds on fresh bytes — the
-  exact precondition-miss recovery ADR-028 already runs. The idempotent re-fold
-  contract (ADR-028 contract 3) holds identically whether the first attempt read
-  the cache or the backend.
+- **A stale cached shard self-corrects.** Planning from a stale snapshot
+  produces a store whose `expected` version no longer matches the backend, so
+  the CAS misses; the round then reloads (`Latest`) and rebuilds the plan from
+  fresh bytes — the exact precondition-miss recovery ADR-028 already runs. The
+  idempotent plan rebuild contract (ADR-028 contract 3) holds identically
+  whether the first attempt read the cache or the backend.
 - **Stale eligibility cannot commit, only re-run.** Between the read and the
   commit a concurrent writer may move the shard. With `AllowStale` the single-RW
   eligibility check may run on the cached (stale) snapshot and _pass_ a
   read-modify-write whose read was in fact superseded. It still cannot commit on
   outdated state: the version-conditional install CAS misses, the coordinator
-  reloads fresh, re-folds, and finds the read superseded, so the fast path renews
-  (`Wounded`). The lock CAS never landed, so no lock is held and the
-  speculatively-written committed object is in no shard's `locked_by` — it cannot
-  be help-forwarded and is an orphan GC reclaims (no lost update, no
-  double-apply). A `Wounded` renew is a **transparent re-run** at the user level:
-  the db retry loop treats it exactly like the full path's `Retry`, and the
-  re-run's read (`Latest`) refreshes the cache so it converges. The only
-  observable change is _which_ retry a superseded read takes: `Wounded` (renew,
-  no lock held) when the stale snapshot passed the check, vs. the full path's
-  in-place `Retry` (holding its locks, ADR-024) when the eligibility snapshot was
-  fresh — whether it was fresh depends only on cache warmth. The ADR-024 "retry
-  holding locks" guarantee is a full-path property, where a lock is actually held;
-  a superseded fast-path read holds none.
+  reloads fresh, evaluates the resolver again, and finds the read superseded, so
+  the fast path renews (`Wounded`). The lock CAS never landed, so no lock is
+  held and the speculatively-written committed object is in no shard's
+  `locked_by` — it cannot be help-forwarded and is an orphan GC reclaims (no
+  lost update, no double-apply). A `Wounded` renew is a **transparent re-run**
+  at the user level: the db retry loop treats it exactly like the full path's
+  `Retry`, and the re-run's read (`Latest`) refreshes the cache so it converges.
+  The only observable change is _which_ retry a superseded read takes: `Wounded`
+  (renew, no lock held) when the stale snapshot passed the check, vs. the full
+  path's in-place `Retry` (holding its locks, ADR-024) when the eligibility
+  snapshot was fresh — whether it was fresh depends only on cache warmth. The
+  ADR-024 "retry holding locks" guarantee is a full-path property, where a lock
+  is actually held; a superseded fast-path read holds none.
 - **No new CAS site, no new in-doubt case.** The coordinator's CAS sites, version
   conditions, and ADR-009 in-doubt recovery are untouched; `AllowStale` only
   chooses whether attempt zero revalidates the cache.
@@ -130,7 +132,7 @@ cause a lost update, a double-apply, or a stale commit.
 The backend op stream loses redundant `read_if_modified` ops but keeps the same
 CAS/store shape and ordering, so it stays deterministic under the simulation
 executor (ADR-008/013). A stale `AllowStale` snapshot that races a concurrent
-writer produces a deterministic extra fold + CAS miss + reload, exercised by the
+writer produces a deterministic extra plan + CAS miss + reload, exercised by the
 fuzzer. The retry flavour for a superseded single-RW read (`Wounded` vs `Retry`)
 is a function of cache warmth, which is deterministic per executor; both are
 transparent re-runs that converge, so neither the serializability / cycle oracles
@@ -151,7 +153,7 @@ passes against the leaner op shape (no regeneration was required).
   already populated — no retained shard set, no reader-to-commit plumbing.
   `AllowStale` is a _pure optimization_: a miss degrades to a normal load, never
   to incorrectness, so it needs no consistency guarantee of its own.
-- **The rare stale-reuse path does strictly more work** (a wasted fold + CAS miss
+- **The rare stale-reuse path does strictly more work** (a wasted plan + CAS miss
   - reload) than a cold load would, in exchange for removing a _guaranteed_
     backend read on the common path — the standard optimistic trade, and the same
     one ADR-028's reload-recover loop already makes.

@@ -21,10 +21,10 @@ change affects and verify that the existing evidence guarantees still hold.
 The recurring question to ask of the diff is: **does each responsibility live
 with its rightful owner?**
 
-- Check that the *mechanism* (generic engines: dedup, fold loops, CAS/retry)
-  stays free of *policy* (locking, wound-wait, commit, transaction identities). Policy
-  should live in the pluggable pieces owners install (e.g. resolvers), not baked
-  into the engine.
+- Check that the *mechanism* (generic engines: dedup, resolver evaluation loops,
+  CAS/retry) stays free of *policy* (locking, wound-wait, commit, transaction
+  identities). Policy should live in the pluggable pieces owners install (e.g.
+  resolvers), not baked into the engine.
 - Flag it when an engine names a domain concept (`LockType`, wound-wait,
   membership, `TxCommitStatus`): the concept has likely leaked in from a caller
   and should move out.

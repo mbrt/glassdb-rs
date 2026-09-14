@@ -140,7 +140,7 @@ work remain unchanged.
 ## 2026-08-12: fixed-topology coordinator retry attribution
 
 Status: investigation complete; no engine change retained. The coordinator's
-cross-Database cost is retry sleep after leaf-CAS loss, not its resolver fold,
+cross-Database cost is retry sleep after leaf-CAS loss, not its resolver evaluation,
 local owner queue, or synthetic backend rate limiter. Permanently deferring a
 committed background write-back after its first definitive CAS loss improves
 the mixed window but is rejected: the resulting holders create unbounded cold
@@ -152,7 +152,7 @@ Reference: `d7635058`. The benchmark seeded one tree per run and mode, reused
 that settled topology for each paired cell, alternated pair order, and opened
 fresh `Database` instances so coordinators and caches remained independent.
 Temporary probes split coordinator time into owner queueing, node load,
-resolver fold, mutation, and retry sleep; attributed failed rounds by resolver
+resolver evaluation, mutation, and retry sleep; attributed failed rounds by resolver
 kind; and measured actual waits inside the synthetic provider limiters. The
 probes, fixed-topology harness, and experimental policies were removed after
 the runs.
@@ -172,7 +172,7 @@ All 12 cells converged with zero failures and bounded drain. The following are
 aggregate worker times over each cell, not wall-clock transaction latency;
 ranges cover the three runs.
 
-| Mode / affinity | Failed CAS rounds | Load | Fold | Persist | Retry sleep | Retry share of worker time |
+| Mode / affinity | Failed CAS rounds | Load | Resolver evaluation | Persist | Retry sleep | Retry share of worker time |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | spread / 0% | `2,558–2,842` | `161–167 s` | `9.5–9.8 s` | `668–680 s` | `616–676 s` | `42–44%` |
 | spread / 100% | `0` | `102–112 s` | `6.1–6.7 s` | `473–524 s` | `0` | `0%` |
@@ -369,10 +369,10 @@ already backgrounded, its remaining foreground work is negligible, and neither
 cross-Database transaction-log read coalescing nor unbounded cross-leaf
 write-back parallelism moves throughput reliably. The remaining affinity gap is
 inside independent coordinators competing on the same leaf CAS, outside their
-resolver folds.
+resolver evaluations.
 
 Reference: `11d934ac`. Temporary process-wide counters attributed coordinator
-submission, resolver-fold, transaction-status resolution, write-back, retry
+submission, resolver evaluation, transaction-status resolution, write-back, retry
 release, collection-directory write-back, and collection finalization to the
 four mixed-workload shapes. A corrected overlap counter covered remote status
 reads across all `Database` instances. All probes and experimental switches
@@ -399,12 +399,13 @@ baseline.
 ### Shape and phase attribution
 
 The table contains three-run medians in model milliseconds. Submission and
-fold times are means within a cell and are not additive transaction latency:
-workers, coordinator members, and background cleanup overlap. `rwMany`
-write-back is the duration of one background pass; it submits once per touched
-leaf. Remote status rates use all four shapes as the transaction denominator.
+resolver evaluation times are means within a cell and are not additive
+transaction latency: workers, coordinator members, and background cleanup
+overlap. `rwMany` write-back is the duration of one background pass; it submits
+once per touched leaf. Remote status rates use all four shapes as the
+transaction denominator.
 
-| Mode / affinity | `rwSingle` direct submit / fold | `rwMany` acquire submit / fold | `rwMany` background write-back | Foreground post-commit | Remote status calls / body misses per tx | Same-TID remote overlap |
+| Mode / affinity | `rwSingle` direct submit / resolver evaluation | `rwMany` acquire submit / resolver evaluation | `rwMany` background write-back | Foreground post-commit | Remote status calls / body misses per tx | Same-TID remote overlap |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | hot / 0% | `801 / 1.36 ms` | `434 / 7.92 ms` | `270 ms` | `<0.015 ms` | `1.163 / 0.423` | `42.4%` |
 | hot / 100% | `124 / 0.018 ms` | `139 / 8.49 ms` | `176 ms` | `<0.015 ms` | `0.0126 / 0.0004` | negligible volume |
@@ -418,12 +419,12 @@ shutdown-drained `Background::spawn_waited` task; "move write-back off the
 foreground path" is therefore not an available optimization.
 
 Resolver work also does not explain submission time. At the hot endpoints the
-`rwMany` fold remains roughly `8 ms` while submission changes by `3.1x`;
-direct-commit fold work is almost zero while submission changes by `6.5x`.
-The missing time is after local admission and outside policy resolution:
-independent per-Database owners race the same object CAS, reload, and back off.
-This agrees with the earlier per-leaf miss probe and zero CAS retries at 100%
-affinity.
+`rwMany` resolver evaluation remains roughly `8 ms` while submission changes by
+`3.1x`; direct-commit resolver evaluation work is almost zero while submission
+changes by `6.5x`. The missing time is after local admission and outside policy
+resolution: independent per-Database owners race the same object CAS, reload,
+and back off. This agrees with the earlier per-leaf miss probe and zero CAS
+retries at 100% affinity.
 
 ### Rejected candidates
 
@@ -457,10 +458,10 @@ without failures or shutdown timeout.
 
 No status singleflight, cleanup suppression, unbounded write-back concurrency,
 or backoff change is justified. A follow-up should hold the settled tree fixed
-between paired variants and split the coordinator's non-fold time among local
-owner queueing, backend mutation/rate limiting, and retry sleep. Any proposed
-protocol fix should reduce required leaf-CAS work for independent clients,
-rather than rely on sharing process-local state.
+between paired variants and split the coordinator's time outside resolver
+evaluation among local owner queueing, backend mutation/rate limiting, and retry
+sleep. Any proposed protocol fix should reduce required leaf-CAS work for
+independent clients, rather than rely on sharing process-local state.
 
 ## 2026-08-11: ADR-050 resolved-handle routing
 
@@ -546,7 +547,7 @@ locks-to-validation is tiny except for a still-secondary `6.85 ms` spread/0%
 mean. Coordinator submission remains the differentiator: `3.3x` slower at the
 hot endpoint and `2.2x` slower at the spread endpoint, while coordinator load
 latency itself moves only from about `12–15 ms` to `12–14 ms`. The missing time
-therefore remains CAS ownership, fold scheduling, backoff, and any resolution
+therefore remains CAS ownership, member scheduling, backoff, and any resolution
 performed within those rounds.
 
 No redundant physical node read was found, so this investigation produces no
@@ -649,7 +650,7 @@ load/store add `6.4/34.3 ms`, versus `2.7/15.0 ms`. Resolution itself is only
 `20.3 ms/transaction` at 0%, versus `35.6 ms` at 100%.
 
 At 100% affinity, all traffic for one collection passes through one Database's
-cache and shard coordinator. It can fold local submissions into fewer CAS
+cache and shard coordinator. It can batch local submissions into fewer CAS
 rounds and already knows the status of its own transactions. At 0%, the same
 logical collection load is distributed across independent coordinators. They
 cannot merge across processes, issue competing node CASes, reload losers, and
@@ -670,10 +671,10 @@ shows why complete affinity is qualitatively different:
 | `100%` | `161.6` | `0.81` | `0.274` | `3.27` | `0` | `17.4%` |
 
 The 100% endpoint wins despite landing a smaller fraction of direct candidates.
-One coordinator folds almost twice as many members per round, needs about half
+One coordinator batches almost twice as many members per round, needs about half
 as many rounds per transaction, and never loses a leaf CAS to another
 Database. At every partial-affinity point, foreign writers preserve the CAS
-retry rate; extra local traffic increases fold width gradually but cannot
+retry rate; extra local traffic increases members per round gradually but cannot
 produce the endpoint's single-owner behavior.
 
 The spread endpoint rerun has noisier absolute throughput (`181.6` versus
@@ -681,7 +682,7 @@ The spread endpoint rerun has noisier absolute throughput (`181.6` versus
 isolates the other mechanism. Members/round barely moves from `1.06` to `1.13`,
 while CAS retries fall from `0.414` per transaction to zero and backend work
 falls from `5.14` to `4.21` operations/transaction. With keys distributed
-across many leaves there is little local folding opportunity; independent
+across many leaves there is little local batching opportunity; independent
 Databases instead collide on the same multi-key leaf even when their logical
 keys differ. v0.1.0's one-object-per-key representation did not have this
 cross-key CAS domain, although it paid much more backend work elsewhere.

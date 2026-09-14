@@ -45,8 +45,8 @@ use crate::access::{AccessSet, WriteOp};
 use crate::collection_coordination::{CollectionLocker, CollectionStateResolver};
 use crate::error::TransError;
 use crate::leaf_coord::{
-    CoordinatedOutcome, CoordinationEvidence, FoldOutcome, LeafCoordinator, LeafOperation,
-    LeafResolver, ResolveCtx, StageAdmission, Step,
+    CoordinatedOutcome, CoordinationEvidence, LeafCoordinator, LeafOperation, LeafResolver,
+    MemberOutcome, ResolveCtx, StageAdmission, Step,
 };
 use crate::monitor::Monitor;
 use crate::node_locking::NodeLockReconciler;
@@ -347,7 +347,7 @@ impl LeafResolver for AcquireOperation {
         let reconciler = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id);
         if let Some(holder) = reconciler.admit_non_structural(&mut locks).await? {
             return Ok(Step::Skip {
-                outcome: FoldOutcome::Wait(holder),
+                outcome: MemberOutcome::Wait(holder),
             });
         }
         let mut membership = self.membership;
@@ -369,7 +369,7 @@ impl LeafResolver for AcquireOperation {
                 // moment a key must wait, stage nothing and return Wait.
                 EntryResolution::Wait(holder) => {
                     return Ok(Step::Skip {
-                        outcome: FoldOutcome::Wait(holder),
+                        outcome: MemberOutcome::Wait(holder),
                     });
                 }
             }
@@ -381,12 +381,12 @@ impl LeafResolver for AcquireOperation {
                 .await?
             {
                 return Ok(Step::Skip {
-                    outcome: FoldOutcome::Wait(holder),
+                    outcome: MemberOutcome::Wait(holder),
                 });
             }
             membership = locks.membership().lock_type();
         }
-        let outcome = FoldOutcome::Locked {
+        let outcome = MemberOutcome::Locked {
             typ: entry_lock_type(&self.intents),
             membership,
         };
@@ -411,8 +411,8 @@ impl LeafResolver for AcquireOperation {
             .all(|i| matches!(i.desired, Desired::Read))
     }
 
-    fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
-        FoldOutcome::Conflict
+    fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
+        MemberOutcome::Conflict
     }
 
     fn leaf_scope_keys(&self) -> Vec<&[u8]> {
@@ -446,7 +446,7 @@ impl LeafOperation for AcquireOperation {
         };
         let CoordinatedOutcome { outcome, evidence } = coordinated;
         match outcome {
-            FoldOutcome::Locked { typ, membership } => {
+            MemberOutcome::Locked { typ, membership } => {
                 let held = HeldLeaf {
                     entry_lock: typ,
                     membership,
@@ -455,17 +455,17 @@ impl LeafOperation for AcquireOperation {
                     .map(|evidence| AcquireOutcome::Locked(LeafHoldReceipt { evidence, held }))
                     .ok_or_else(|| TransError::other("lock round returned no hold receipt"))
             }
-            FoldOutcome::Wait(holder) => Ok(AcquireOutcome::Wait(holder)),
-            FoldOutcome::LeafFull => Ok(AcquireOutcome::LeafFull),
+            MemberOutcome::Wait(holder) => Ok(AcquireOutcome::Wait(holder)),
+            MemberOutcome::LeafFull => Ok(AcquireOutcome::LeafFull),
             // A result from another operation kind is not proof that this lock
             // landed. The safe response is the ordinary release-and-relock path.
-            FoldOutcome::Conflict
-            | FoldOutcome::Released { .. }
-            | FoldOutcome::Reroute
-            | FoldOutcome::Landed
-            | FoldOutcome::Moved
-            | FoldOutcome::Replay
-            | FoldOutcome::InDoubt(_) => Ok(AcquireOutcome::Conflict),
+            MemberOutcome::Conflict
+            | MemberOutcome::Released { .. }
+            | MemberOutcome::Reroute
+            | MemberOutcome::Landed
+            | MemberOutcome::Moved
+            | MemberOutcome::Replay
+            | MemberOutcome::InDoubt(_) => Ok(AcquireOutcome::Conflict),
         }
     }
 }
@@ -512,20 +512,20 @@ impl LeafResolver for WriteBackOperation {
         {
             if !owns_entry && !owns_membership {
                 return Ok(Step::Skip {
-                    outcome: FoldOutcome::Released {
+                    outcome: MemberOutcome::Released {
                         superseded: Vec::new(),
                     },
                 });
             }
             return Ok(Step::Skip {
-                outcome: FoldOutcome::Wait(holder),
+                outcome: MemberOutcome::Wait(holder),
             });
         }
         let WritebackStaged {
             changes,
             superseded,
         } = writeback_changes(&self.id, &self.intents, staged);
-        let outcome = FoldOutcome::Released { superseded };
+        let outcome = MemberOutcome::Released { superseded };
         let locks_changed = locks.release_membership(&self.id);
         if changes.is_empty() && !locks_changed {
             Ok(Step::Skip { outcome })
@@ -543,15 +543,15 @@ impl LeafResolver for WriteBackOperation {
         true
     }
 
-    fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
+    fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
         // Exhaustion proves neither publication nor that gate acquisition
         // removed our holder. Re-descend and keep converging from current
         // routing state.
-        FoldOutcome::Reroute
+        MemberOutcome::Reroute
     }
 
-    fn reroute_outcome(&self, _in_doubt: bool) -> FoldOutcome {
-        FoldOutcome::Reroute
+    fn reroute_outcome(&self, _in_doubt: bool) -> MemberOutcome {
+        MemberOutcome::Reroute
     }
 
     fn leaf_scope_keys(&self) -> Vec<&[u8]> {
@@ -591,15 +591,15 @@ impl LeafOperation for WriteBackOperation {
     fn complete(&self, outcome: Option<CoordinatedOutcome>) -> Result<Self::Output, TransError> {
         match outcome {
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Released { superseded },
+                outcome: MemberOutcome::Released { superseded },
                 ..
             }) => Ok(WriteBackOutcome::Released(superseded)),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Reroute,
+                outcome: MemberOutcome::Reroute,
                 ..
             }) => Ok(WriteBackOutcome::Reroute),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Wait(_),
+                outcome: MemberOutcome::Wait(_),
                 ..
             }) => {
                 // The committed log makes later publication and cleanup
@@ -640,17 +640,17 @@ impl LeafResolver for ReleaseOperation {
         {
             if !owns_entry && !owns_membership {
                 return Ok(Step::Skip {
-                    outcome: FoldOutcome::Released {
+                    outcome: MemberOutcome::Released {
                         superseded: Vec::new(),
                     },
                 });
             }
             return Ok(Step::Skip {
-                outcome: FoldOutcome::Wait(holder),
+                outcome: MemberOutcome::Wait(holder),
             });
         }
         let changes = release_changes(&self.id, staged);
-        let outcome = FoldOutcome::Released {
+        let outcome = MemberOutcome::Released {
             superseded: Vec::new(),
         };
         let locks_changed = locks.release_membership(&self.id);
@@ -670,18 +670,18 @@ impl LeafResolver for ReleaseOperation {
         true
     }
 
-    fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
+    fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
         // Exhaustion proves nothing about the holds this transaction still has
         // in the leaf. Reporting a release the round never made would let the
         // caller retire a transaction object its holders still point at.
-        FoldOutcome::Conflict
+        MemberOutcome::Conflict
     }
 
-    fn reroute_outcome(&self, _in_doubt: bool) -> FoldOutcome {
+    fn reroute_outcome(&self, _in_doubt: bool) -> MemberOutcome {
         // The submitted object is no longer a leaf, so it carries none of this
         // transaction's holds — the proof a release needs. Retrying the same
         // path would only rediscover an object that will never be a leaf again.
-        FoldOutcome::Released {
+        MemberOutcome::Released {
             superseded: Vec::new(),
         }
     }
@@ -705,18 +705,18 @@ impl LeafOperation for ReleaseOperation {
     fn complete(&self, outcome: Option<CoordinatedOutcome>) -> Result<Self::Output, TransError> {
         match outcome {
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Released { .. },
+                outcome: MemberOutcome::Released { .. },
                 evidence,
             }) => Ok(ReleaseOutcome::Released(matches!(
                 evidence,
                 Some(CoordinationEvidence::Installed(_))
             ))),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Wait(holder),
+                outcome: MemberOutcome::Wait(holder),
                 ..
             }) => Ok(ReleaseOutcome::Wait(holder)),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Conflict,
+                outcome: MemberOutcome::Conflict,
                 ..
             }) => Ok(ReleaseOutcome::Contended),
             Some(_) => Err(TransError::other("release produced a non-cleanup outcome")),
@@ -780,8 +780,8 @@ async fn resolve_and_lock(
     // Resolve existing holders other than us via the shared resolver: a
     // committed exclusive holder is help-forwarded (its value becomes the
     // effective one), aborted/missing holders are dropped, and the live pending
-    // ones come back as conflicts to wound-wait. The monitor folds lease expiry
-    // and the unknown-tx grace period into `tx_status`, so a holder still seen
+    // ones come back as conflicts to wound-wait. The monitor accounts for lease expiry
+    // and the unknown-tx grace period in `tx_status`, so a holder still seen
     // as `Pending` here is genuinely live (ADR-021).
     let resolved = ctx
         .key_state
@@ -1549,11 +1549,11 @@ mod tests {
 
         assert!(matches!(
             resolver.exhausted_outcome(false),
-            FoldOutcome::Reroute
+            MemberOutcome::Reroute
         ));
         assert!(matches!(
             resolver.exhausted_outcome(true),
-            FoldOutcome::Reroute
+            MemberOutcome::Reroute
         ));
     }
 
@@ -3269,7 +3269,7 @@ mod tests {
     // a disjoint key (ADR-026): one CAS both publishes the committer's pointer and
     // installs the new acquirer's lock.
     #[tokio::test(start_paused = true)]
-    async fn write_back_folds_into_acquire_round() {
+    async fn write_back_joins_acquire_round() {
         let (locker, ctx, log, gate) = gated_locker_with(false).await;
         let ka = b"key-a".to_vec();
         let kb = same_leaf_sibling(&ka);
@@ -3304,7 +3304,7 @@ mod tests {
         assert_eq!(
             count_stores(&log, &leaf_path) - before,
             1,
-            "the write-back folds into the acquire's CAS round"
+            "the write-back joins the acquire's CAS round"
         );
         assert_eq!(
             entry_of(&ctx, &ka).await.unwrap().current.writer(),
@@ -3492,7 +3492,7 @@ mod tests {
     }
 
     // ADR-028: two writers on the *same* key now share one CAS round. The
-    // monotonic fold visits the older first — it stages its lock — and the
+    // member evaluation visits the older first — it stages its lock — and the
     // younger, observing that live staged holder it cannot wound, emits `Wait`
     // and blocks (hold-and-wait). One store serves the round; the younger is not
     // wounded, it simply waits its turn.
@@ -3521,7 +3521,7 @@ mod tests {
         });
 
         // Once both tasks are parked (driver in the gated load, the other queued),
-        // release the load so the round folds both members.
+        // release the load so the round evaluates both members.
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
 
@@ -3554,8 +3554,8 @@ mod tests {
         let _ = hy.await;
     }
 
-    // ADR-028 regression (monotonic fold): after the older releases its same-key
-    // lock, the waiting younger makes progress and acquires — the fold order
+    // ADR-028 regression (oldest-first planning): after the older releases its same-key
+    // lock, the waiting younger makes progress and acquires — the member order
     // guarantees liveness without either transaction being wounded.
     #[tokio::test(start_paused = true)]
     async fn same_key_younger_proceeds_after_older_releases() {
@@ -3611,15 +3611,15 @@ mod tests {
     }
 
     // ADR-028 regression (equal priority): two same-priority writers on one key
-    // never wound each other (that would livelock across renews). The monotonic
-    // fold's round-local byte tiebreak still picks one deterministic winner; the
-    // loser waits and, after the winner releases, proceeds. Both make progress.
+    // never wound each other (that would livelock across renews). The
+    // coordinator's round-local byte tiebreak picks one deterministic winner.
+    // The loser waits until the winner releases, then proceeds. Both make progress.
     #[tokio::test(start_paused = true)]
     async fn equal_priority_same_key_one_winner_no_livelock() {
         let (locker, ctx, log, gate) = gated_locker().await;
         let key = b"key";
         // Same priority (order 1), distinct prefixes: `aaaa` < `bbbb` by the
-        // fold's byte tiebreak, so `a` is the deterministic round winner.
+        // coordinator's byte tiebreak, so `a` is the deterministic round winner.
         let a = mk_tid(1, "aaaa");
         let b = mk_tid(1, "bbbb");
         assert!(
@@ -3681,8 +3681,8 @@ mod tests {
     }
 
     // ADR-028 regression (commute): a committed holder's write-back and another
-    // transaction's acquire of the *same* key fold into one CAS round with the
-    // same result regardless of wound-wait fold order — the write-back publishes
+    // transaction's acquire of the *same* key join one coordinator round with the
+    // same result regardless of wound-wait member order — the write-back publishes
     // the committed pointer and drops its hold, the acquirer ends holding the
     // lock over the help-forwarded value. Run both orderings to show it commutes.
     #[tokio::test(start_paused = true)]

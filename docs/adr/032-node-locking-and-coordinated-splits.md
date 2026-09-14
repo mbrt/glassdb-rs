@@ -207,7 +207,7 @@ so the invariant must cover the background and maintenance paths too, not only
 foreground overwrites/creates/deletes:
 
 - **Single read-write fast path** ([ADR-027](027-single-rw-parallel-lock-publish.md))
-  — a data mutation; it acquires **structure-R** folded into its existing lock CAS
+  — a data mutation; it acquires **structure-R** in its existing lock CAS
   (no extra round-trip). It takes no membership lock (it overwrites an existing
   key).
 - **Asynchronous write-back** ([ADR-020](020-commit-write-back-protocol.md)) — the

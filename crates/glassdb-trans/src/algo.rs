@@ -2177,7 +2177,7 @@ mod tests {
     // lock CAS then the write-back CAS that publishes the pointer — run
     // synchronously here because tests build the algo with no background
     // executor). Node-level
-    // locks fold into those writes rather than adding another CAS (ADR-032).
+    // locks are included in those writes rather than adding another CAS (ADR-032).
     #[derive(Debug, Default)]
     pub(super) struct WriteCounts {
         // Writes to a leaf coordination object (ADR-031): a standalone node
