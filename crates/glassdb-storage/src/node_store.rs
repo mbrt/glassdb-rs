@@ -356,13 +356,18 @@ impl NodeStore {
         }
     }
 
-    /// Compare-and-swaps an exact `_r` or `_n/<token>` node path.
+    /// Compare-and-swaps an exact `_r` or `_n/<token>` node path, reporting the
+    /// observation of the state it installed, or `None` on a lost CAS.
+    ///
+    /// Callers that go on to mutate the node need that observation rather than a
+    /// re-read: it is the only state that pairs the body they wrote with the
+    /// revision they wrote it at.
     pub async fn store_node_at(
         &self,
         path: &ObjectPath,
         node: &Node,
         expected: &LeafObservation,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<Option<LeafObservation>, StorageError> {
         validate_node_path(path)?;
         if expected.path() != path {
             return Err(StorageError::other("node observation path changed"));
@@ -372,8 +377,8 @@ impl NodeStore {
             .compare_and_swap(expected, Arc::new(node.clone()))
             .await
         {
-            Ok(CasResult::Committed(_)) => Ok(true),
-            Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(false),
+            Ok(CasResult::Committed(installed)) => Ok(Some(installed)),
+            Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(None),
             Err(error) => Err(error),
         }
     }
@@ -501,14 +506,16 @@ impl NodeStore {
         root: &Node,
         expected: &LeafObservation,
     ) -> Result<bool, StorageError> {
-        self.store_node_at(
-            &ObjectPath::TreeRoot {
-                collection: collection.clone(),
-            },
-            root,
-            expected,
-        )
-        .await
+        Ok(self
+            .store_node_at(
+                &ObjectPath::TreeRoot {
+                    collection: collection.clone(),
+                },
+                root,
+                expected,
+            )
+            .await?
+            .is_some())
     }
 
     /// Creates the fixed tree root if absent.

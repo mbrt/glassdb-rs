@@ -52,6 +52,9 @@ use crate::monitor::Monitor;
 use crate::node_locking::NodeLockReconciler;
 use crate::wound_wait::{Reclaim, try_reclaim};
 
+/// Rounds a release absorbs a contended leaf before returning it to its caller.
+const RELEASE_CONTENTION_ROUNDS: usize = 8;
+
 #[derive(Clone, Copy)]
 struct HeldLeaf {
     entry_lock: LockType,
@@ -667,6 +670,16 @@ impl LeafResolver for ReleaseOperation {
     }
 
     fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
+        // Exhaustion proves nothing about the holds this transaction still has
+        // in the leaf. Reporting a release the round never made would let the
+        // caller retire a transaction object its holders still point at.
+        FoldOutcome::Conflict
+    }
+
+    fn reroute_outcome(&self, _in_doubt: bool) -> FoldOutcome {
+        // The submitted object is no longer a leaf, so it carries none of this
+        // transaction's holds — the proof a release needs. Retrying the same
+        // path would only rediscover an object that will never be a leaf again.
         FoldOutcome::Released {
             superseded: Vec::new(),
         }
@@ -701,6 +714,10 @@ impl LeafOperation for ReleaseOperation {
                 outcome: FoldOutcome::Wait(holder),
                 ..
             }) => Ok(ReleaseOutcome::Wait(holder)),
+            Some(CoordinatedOutcome {
+                outcome: FoldOutcome::Conflict,
+                ..
+            }) => Ok(ReleaseOutcome::Contended),
             Some(_) => Err(TransError::other("release produced a non-cleanup outcome")),
             None => Err(TransError::other("coordinator shut down during release")),
         }
@@ -739,6 +756,8 @@ enum AcquireOutcome {
 enum ReleaseOutcome {
     Released(bool),
     Wait(TxId),
+    /// The round ended without proving the holds were dropped. Re-submit.
+    Contended,
 }
 
 /// Resolves the holders of an entry (help-forward committed, drop aborted,
@@ -1286,6 +1305,7 @@ impl KeyLocker {
             requirement,
         };
         let mut backoff = self.retry.backoff();
+        let mut contended = 0;
         loop {
             match self.coord.coordinate(operation.clone()).await? {
                 ReleaseOutcome::Released(changed) => return Ok(changed),
@@ -1294,6 +1314,16 @@ impl KeyLocker {
                     if let Woke::Finalized = self.wait_for_holder(&holder, delay).await? {
                         backoff = self.retry.backoff();
                     }
+                }
+                // A leaf this hot keeps its holder for now. Releases run in
+                // background sweeps that revisit the transaction, so returning
+                // lets the sweep move on instead of camping on one leaf.
+                ReleaseOutcome::Contended => {
+                    contended += 1;
+                    if contended == RELEASE_CONTENTION_ROUNDS {
+                        return Err(TransError::Retry);
+                    }
+                    rt::sleep(backoff.next_delay()).await;
                 }
             }
         }
@@ -1884,6 +1914,93 @@ mod tests {
             .unwrap();
         assert!(loaded.node().membership_lock().holders().is_empty());
         assert_eq!(loaded.node().membership_version(), 0);
+    }
+
+    // ADR-026: a release is complete only when the current node proves the
+    // holder is gone. A spent CAS budget proves nothing, so the release must
+    // keep converging — a caller that took exhaustion for a removal would
+    // retire a transaction object the leaf still points at.
+    #[tokio::test(start_paused = true)]
+    async fn a_release_that_spends_its_cas_budget_keeps_converging() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let (locker, ctx) = new_test_locker(backend.clone()).await;
+        let key = b"key";
+        seed_committed(&ctx, key, b"old").await;
+        let tx = mk_tid(1, "holder");
+        ctx.monitor.begin_tx(&tx);
+        lock_ok(&locker, &tx, &group_of(key, put_intent(key))).await;
+
+        // Deny exactly one round's worth of CAS attempts, so the round ends
+        // exhausted and the next one can land.
+        let budget = Arc::new(AtomicU64::new(crate::leaf_coord::CAS_RETRIES as u64));
+        let leaf_path = root_path().to_string();
+        backend.set_before({
+            let budget = budget.clone();
+            move |op| {
+                let deny = matches!(op, BackendOp::WriteIf { path, .. } if *path == leaf_path)
+                    && budget
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                            left.checked_sub(1)
+                        })
+                        .is_ok();
+                let future: HookFuture = Box::pin(async move {
+                    if deny {
+                        return Err(glassdb_backend::BackendError::Precondition);
+                    }
+                    Ok(())
+                });
+                future
+            }
+        });
+
+        assert!(
+            locker.keys().release_leaf(&tx, &root_path()).await.unwrap(),
+            "the release reports the removal it made, not the round that ended"
+        );
+        assert_eq!(
+            budget.load(Ordering::SeqCst),
+            0,
+            "the first round spent its whole CAS budget"
+        );
+        assert!(
+            !entry_of(&ctx, key).await.unwrap().is_locked_by(&tx),
+            "the released transaction holds nothing in the leaf"
+        );
+    }
+
+    // A leaf that never admits a CAS must return the release to its caller. The
+    // sweep that asked for it revisits the transaction later, where a release
+    // that reported success would leave the holder behind for good.
+    #[tokio::test(start_paused = true)]
+    async fn a_release_that_cannot_land_reports_no_release() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let (locker, ctx) = new_test_locker(backend.clone()).await;
+        let key = b"key";
+        seed_committed(&ctx, key, b"old").await;
+        let tx = mk_tid(1, "holder");
+        ctx.monitor.begin_tx(&tx);
+        lock_ok(&locker, &tx, &group_of(key, put_intent(key))).await;
+
+        let leaf_path = root_path().to_string();
+        backend.set_before(move |op| {
+            let deny = matches!(op, BackendOp::WriteIf { path, .. } if *path == leaf_path);
+            let future: HookFuture = Box::pin(async move {
+                if deny {
+                    return Err(glassdb_backend::BackendError::Precondition);
+                }
+                Ok(())
+            });
+            future
+        });
+
+        assert!(matches!(
+            locker.keys().release_leaf(&tx, &root_path()).await,
+            Err(TransError::Retry)
+        ));
+        assert!(
+            entry_of(&ctx, key).await.unwrap().is_locked_by(&tx),
+            "the holder the release could not remove is still recorded"
+        );
     }
 
     #[tokio::test]
