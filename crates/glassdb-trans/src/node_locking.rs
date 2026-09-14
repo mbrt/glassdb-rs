@@ -15,8 +15,7 @@ use glassdb_storage::{LeafEntry, LockType, NodeLocks, Requirement};
 use crate::error::TransError;
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{
-    CoordinatedOutcome, CoordinationEvidence, FoldOutcome, LeafOperation, LeafResolver, ResolveCtx,
-    StageAdmission, Step,
+    CoordinatedOutcome, FoldOutcome, LeafOperation, LeafResolver, ResolveCtx, StageAdmission, Step,
 };
 use crate::monitor::Monitor;
 use crate::wound_wait::{Reclaim, try_reclaim};
@@ -355,10 +354,15 @@ impl LeafOperation for StructuralGateOperation {
             return Ok(StructuralGateOutcome::Deferred);
         };
         let requirement = match evidence {
-            Some(CoordinationEvidence::Installed(observation)) => {
-                Requirement::AtLeast(observation.current_after())
-            }
-            Some(CoordinationEvidence::Observed(_)) | None => Requirement::Any,
+            // Both kinds carry the loaded state the gate was proven in, so the
+            // reload only has to reach that state. `Observed` needs the bound as
+            // much as `Installed` does: without it the reload can fall back to a
+            // persistent entry that predates a gate a peer installed, and the
+            // acquirer then abandons a gate it durably holds.
+            Some(evidence) => Requirement::AtLeast(evidence.observation().current_after()),
+            // An exhausted round yields `Conflict`, so a `Locked` outcome always
+            // carries evidence.
+            None => Requirement::Any,
         };
         Ok(StructuralGateOutcome::Acquired(requirement))
     }

@@ -8,8 +8,9 @@ use glassdb_concurr::{RetryConfig, rt};
 use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, StructuralIntentId, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
-    CollectionStore, LeafObservation, LockType, NodeStore, Observation, Requirement, StorageError,
-    StructuralIntent, StructuralIntentPhase, StructuralIntentStore, Timeline, TreeRouter,
+    CollectionStore, LeafObservation, LockType, Node, NodeStore, Observation, Requirement,
+    StorageError, StructuralIntent, StructuralIntentPhase, StructuralIntentStore, Timeline,
+    TreeRouter,
 };
 
 use crate::error::TransError;
@@ -669,9 +670,10 @@ impl StructuralRecovery {
     }
 
     async fn scan(&self) -> Result<RecoverySweep, StorageError> {
-        // Recovery has no transaction validation or preceding tree CAS. Capture
-        // one sweep epoch for intent discovery; each intent's own freshness
-        // then gates its source fencing and reachability.
+        // Recovery has no transaction validation or preceding tree CAS, so it
+        // allocates its own barrier. This one bounds intent discovery only.
+        // Classification needs a bound past the intent it reads, and this
+        // barrier precedes that read.
         let recovery_start = Requirement::AtLeast(self.timeline.now());
         let cursor = self.scan_cursor.lock().unwrap().clone();
         let page = match self
@@ -824,14 +826,36 @@ impl StructuralRecovery {
             return Ok(IntentRecoveryPhase::Delete);
         }
 
-        // Pin fencing and reachability to the intent's own freshness rather
-        // than the listing epoch. The Ready transition follows source-gate
-        // acquisition, so its watermark is at least as fresh as that gate.
-        let requirement = Requirement::AtLeast(observed.current_after());
+        if intent.source_version.is_empty() {
+            // A Ready transition records the revision its worker publishes
+            // from. Without it there is nothing to fence against, so the intent
+            // must not be classified at all.
+            return Err(TransError::other(
+                "Ready structural intent records no source version",
+            ));
+        }
+
+        // Allocate the bound here, where the Ready record is already in hand. A
+        // worker makes its gated source durable before it writes that record,
+        // so a barrier allocated now forces a backend check against a source
+        // the gate has already reached.
+        //
+        // The Ready observation's watermark is not such a barrier. A watermark
+        // is allocated before the read that fills its entry, so an entry filled
+        // concurrently can carry a watermark newer than the intent's and still
+        // hold source state from before the worker gated it. That reports a
+        // revision the worker never published from, which reads as a fence that
+        // never happened.
+        let requirement = Requirement::AtLeast(self.timeline.now());
         let collection = &intent.collection;
         let created_tokens = &intent.created_tokens;
         if !self
-            .fence_source_writer(collection, intent.source_token.as_ref(), requirement)
+            .fence_source_writer(
+                collection,
+                intent.source_token.as_ref(),
+                &intent.source_version,
+                requirement,
+            )
             .await?
         {
             return Err(TransError::Retry);
@@ -902,41 +926,68 @@ impl StructuralRecovery {
         Ok(IntentRecoveryPhase::Delete)
     }
 
-    /// Fences the source writer before classifying created-node reachability.
+    /// Fences the worker that recorded `source_version` before classifying
+    /// created-node reachability.
+    ///
+    /// That revision is the whole question. A worker publishes its split with
+    /// one CAS expecting it and never re-reads the source in between, so while
+    /// the source still carries it the publish can still land, and once it does
+    /// not the publish can never land again. The structural gate answers a
+    /// weaker question: it cannot tell this intent's worker from a later one
+    /// that gated the same source after this intent was abandoned.
     async fn fence_source_writer(
         &self,
         collection: &CollectionAddress,
         token: Option<&NodeToken>,
+        source_version: &str,
         requirement: Requirement,
     ) -> Result<bool, TransError> {
         for _ in 0..PARENT_RETRIES {
-            let node = match token {
-                Some(token) => match self.nodes.load_node(collection, token, requirement).await {
-                    Ok((node, _)) => node,
-                    Err(StorageError::NotFound) => return Ok(true),
-                    Err(error) => return Err(error.into()),
-                },
-                None => match self.nodes.load_root_node(collection, requirement).await? {
-                    Some((node, _)) => node,
-                    None => return Ok(true),
-                },
+            let Some((node, observed)) = self.load_source(collection, token, requirement).await?
+            else {
+                return Ok(true);
             };
-            if node.structural_gate().lock_type() != LockType::Write {
+            if !observed
+                .revision()
+                .is_some_and(|revision| revision.serialize() == source_version)
+            {
                 return Ok(true);
             }
-            let Some(holder) = node.structural_gate().holders().first() else {
-                return Ok(true);
-            };
+            // The worker recorded this revision while it held the gate, so a
+            // source still at it must still carry that gate.
+            let gate = node.structural_gate();
+            let holder = (gate.lock_type() == LockType::Write)
+                .then(|| gate.holders().first())
+                .flatten()
+                .ok_or_else(|| {
+                    TransError::other("split source is at its recorded revision without a gate")
+                })?;
             if self.mon.tx_status(holder).await? == TxCommitStatus::Pending {
                 return Ok(false);
             }
-            // A finalized holder can still have a shrink CAS in flight. This
-            // cleanup CAS either wins first and fences that shrink, or loses
-            // and the next iteration observes the landed right-link.
+            // A finalized holder can still have its publish CAS in flight. This
+            // cleanup CAS either wins first and fences that publish, or loses
+            // and the next iteration sees the source past `source_version`.
             self.structural_nodes
                 .release_structural_gate(collection, token, holder)
                 .await?;
         }
         Err(TransError::Retry)
+    }
+
+    async fn load_source(
+        &self,
+        collection: &CollectionAddress,
+        token: Option<&NodeToken>,
+        requirement: Requirement,
+    ) -> Result<Option<(Node, LeafObservation)>, TransError> {
+        match token {
+            Some(token) => match self.nodes.load_node(collection, token, requirement).await {
+                Ok(source) => Ok(Some(source)),
+                Err(StorageError::NotFound) => Ok(None),
+                Err(error) => Err(error.into()),
+            },
+            None => Ok(self.nodes.load_root_node(collection, requirement).await?),
+        }
     }
 }

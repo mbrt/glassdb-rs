@@ -2619,11 +2619,17 @@ mod tests {
         Node::leaf(LeafBody::from_entries(entries))
     }
 
+    /// A recorded source revision that no stored node carries, so recovery
+    /// reads the worker that recorded it as unable to publish.
+    fn superseded_source_version() -> String {
+        "superseded-source-version".to_string()
+    }
+
     fn nonroot_intent(source: &str, right: &str, split_key: &[u8]) -> StructuralIntent {
         StructuralIntent {
             collection: collection(),
             source_token: Some(test_token(source)),
-            source_version: String::new(),
+            source_version: superseded_source_version(),
             created_tokens: vec![test_token(right)],
             split_key: split_key.to_vec(),
             participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
