@@ -338,6 +338,23 @@ Cross-leaf acquisition strategy, transaction lifecycle, commit orchestration,
 GC selection, and structural writes after gate acquisition remain outside the
 coordinator.
 
+The coordinator keeps a successful leaf CAS separate from a fold that staged
+nothing. `NodeStore::commit_leaf` preserves the storage `CasReceipt<Node>` in
+its `CasResult<Node>::Applied` result. Applied means that this backend mutation
+definitively took effect. The generic `CasReceipt<V>` is constructed only by
+`CachedStore` after a definitive successful conditional create or CAS. It
+retains the exact installed observation, expected revision, and original
+invocation point. Exact-state validation requires a `CurrentnessBarrier` and
+checks that invocation point against it. A later read may advance the installed
+observation's watermark but cannot renew the receipt's proof of its
+precondition. The coordinator owns batch-member participation. Staged members
+receive the receipt; skipped members retain the loaded observation even when
+another member's CAS succeeds. Skipped outcomes can depend on earlier staged
+changes, so they also wait for the fold to succeed. An unchanged fold cannot
+complete a staged member. Neither result establishes a currentness barrier after
+the operation. The allowed and forbidden transformations are stated in the
+[cache guide](guides/caching.md#coordinator-mutation-evidence).
+
 | Component             | Layer            | Speaks                       | Owns                                                                                                                  | Must not know                       |
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
 | `glassdb` (`tx_impl`) | API / retry      | `Engine`, transaction body, `Error`, `BodyDecision` | metadata bootstrap, operation admission, transaction body, body replay, final attempt end, public handles/errors | stores, locks, nodes, tx logs, identity renewal, runtime wiring |
@@ -944,7 +961,7 @@ flowchart TD
   Backend["Backend — object storage"]
 
   Tx -->|"tx.read / tx.write"| Access
-  Access -->|"Any read / AtLeast currentness"| L1
+  Access -->|"ANY read / after(barrier) currentness"| L1
   L1 -->|"miss or insufficient evidence"| L2
   L2 -->|"miss or validation"| Backend
 ```
@@ -978,6 +995,15 @@ a replayable simulation model.
 
 ### Knowledge and causal evidence
 
+The evidence types have two owners in `glassdb-storage`: `timeline.rs` contains
+`Timeline`, `SequencePoint`, `CurrentnessBarrier`, and `Requirement`;
+`cached_store/evidence.rs` contains `Observation`, `Revision`, `CasReceipt`, and
+their supporting result and shared evidence types. Changes to these files
+require the [storage evidence review](guides/storage-consistency.md).
+
+Higher layers can retain, compare, and serialize revisions; they cannot
+construct or modify them.
+
 `CachedStore` (`glassdb-storage/src/cached_store.rs`) stores only usable
 knowledge for a path:
 
@@ -1003,21 +1029,58 @@ Callers express the minimum acceptable evidence as a `Requirement`:
 
 | Requirement | Cache state it accepts |
 | --- | --- |
-| `Any` | Any usable present or absent entry |
-| `AtLeast(t)` | Present or absent state proven current at or after `t` |
+| `ANY` | Any usable present or absent entry |
+| `within(timeline, age)` | Present or absent state whose evidence reaches an approximate age cutoff |
+| `after(barrier)` | Present or absent state whose evidence reaches the opaque `CurrentnessBarrier` |
+
+`Timeline::currentness_barrier()` captures an opaque `CurrentnessBarrier` after
+completed prerequisite work. Transaction validation captures one after the body
+and before key and predicate lock CASes, and uses it for point, scan,
+collection, and transaction-status dependencies. GC captures a status barrier,
+then a separate reference barrier after eligibility checks. Structural recovery
+captures a new barrier after observing a Ready intent. Separator publication
+carries its start barrier through routing and child-chain reconciliation.
+
+Decision interfaces that need an ordering bound require the barrier type. Shared
+read interfaces receive the explicit `Requirement::after(barrier)` conversion.
+`Requirement` has a private representation and only three public construction
+paths: `ANY`, `after`, and `within`. There is no raw sequence-point constructor.
+Barriers, requirements, and observations do not expose sequence points. No
+conversion from an observation, receipt, requirement, or raw point may construct
+a barrier. The capture points and forbidden transformations are stated in the
+[cache guide](guides/caching.md#currentness-barriers).
+
+The requirement's raw bound stays private to `timeline`. Observation watermarks
+remain restricted to the cached-store implementation, including against other
+modules in the storage crate. Batch currentness checks also belong there. They
+may reuse confirmed evidence for the same exact state; a requested bound cannot
+itself advance an observation. Typed node storage supplies observations and
+receives check outcomes without extracting or setting watermarks.
+
+Structural gate acquisition returns the exact observation from coordination,
+without reloading or extracting its watermark. Its next conditional mutation
+checks that observation's revision.
 
 An observation's `current_after` point is evidence that the observed state was
-current at that point. A persisted L2 body retains its original point. Opening
-the L2 returns the greatest discoverable point to `Database`, which starts the
-new timeline strictly after it and passes that timeline to `CachedStore`. Thus
-`Any` may use a persisted body immediately, while every bound allocated in the
-new session requires validation until the body's evidence advances.
-Finite-staleness cutoffs are clamped to that session boundary for the same
-reason. A point is never a claim about response time. A definitive backend
-operation contributes its invocation point, allocated immediately before
-dispatch. If the same backend state is observed again, its evidence watermark
-advances monotonically; a different state replaces the old discoverable
-knowledge.
+current at some instant at or after that point. A persisted L2 body retains its
+original point. Opening the L2 returns the greatest discoverable point to
+`Database`, which starts the new timeline strictly after it and passes that
+timeline to `CachedStore`. Thus `ANY` may use a persisted body immediately,
+while every bound allocated in the new session requires validation until the
+body's evidence advances. Finite-staleness cutoffs are clamped to that session
+boundary for the same reason. A point is never a claim about response time. A
+definitive backend operation contributes its invocation point, allocated
+immediately before dispatch. If the same backend state is observed again, its
+evidence watermark advances monotonically; a different state replaces the old
+discoverable knowledge.
+
+Successful conditional creates and compare-and-swaps return `CasReceipt<V>`,
+which records the precondition, original invocation point, and exact installed
+state. Typed stores can preserve this proof or explicitly retain only its
+observation with `into_installed()`. Receipts have no public constructor,
+implicit conversion, payload transformation, or sequence-point accessor. Their
+constraints are stated in the [cache
+guide](guides/caching.md#conditional-mutation-receipts).
 
 ### Per-path operation ordering
 
@@ -1048,9 +1111,9 @@ read; a read may join only when that flight's invocation point satisfies its
 requirement. A stricter reader queues and rechecks the cache after the current
 flight completes.
 
-An `Any` cache hit deliberately bypasses the lane. It may return older usable
+An `ANY` cache hit deliberately bypasses the lane. It may return older usable
 state while a same-path mutation is in flight, but never state already marked
-obsolete or uncertain. Code requiring a causal cut uses `AtLeast(t)` instead.
+obsolete or uncertain. Code requiring a currentness barrier uses `after(barrier)`.
 
 The protocol covers typed single-object reads and conditional mutations.
 Listing is not path-coordinated: each page receives its own invocation point,
@@ -1118,10 +1181,11 @@ The cache and coordinator rely on, and preserve, these properties:
    in-memory timeline.
 
 Transaction execution may use cached state freely before commit. Transaction
-validation captures one lower bound and propagates it through leaf and
-transaction-object dependencies. A post-bound lock CAS can satisfy that bound
-without another read. If a physical leaf changed, validation compares the
-observed logical writer or membership with the newer consistent state;
+validation captures one `CurrentnessBarrier` and propagates it through leaf and
+transaction-object dependencies. A lock CAS invoked after that barrier can
+satisfy it without another read. Rechecking the installed state later cannot
+change when the receipt's precondition was confirmed. If a physical leaf changed,
+validation compares the observed logical writer or membership with the newer consistent state;
 post-bound evidence can therefore save I/O without being mistaken for logical
 finality. `TLogger::get_at` and `TLogger::commit_status_at` may reuse cached
 committed and aborted objects indefinitely because their contents cannot change.

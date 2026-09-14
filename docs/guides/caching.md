@@ -88,7 +88,7 @@ Sequence points are normally meaningful only within one open database. They
 are not exchanged between clients or independent database openings. The
 persistent cache is the narrow exception: it persists points only so a new
 opening of the same database identity can start its timeline strictly after all
-recoverable cache evidence. Consequently, an old L2 body may satisfy `Any`, but
+recoverable cache evidence. Consequently, an old L2 body may satisfy `ANY`, but
 a requirement created in the new session forces validation before that body
 can satisfy it.
 
@@ -98,16 +98,17 @@ A read states the minimum evidence it needs with `Requirement`:
 
 | Requirement | Accepted cache state |
 | --- | --- |
-| `Any` | Any discoverable `Present` or `Absent` state, regardless of its watermark. |
-| `AtLeast(T)` | A discoverable state whose `current_after` watermark is at least `T`. |
+| `ANY` | Any discoverable `Present` or `Absent` state, regardless of its watermark. |
+| `within(timeline, age)` | A discoverable state whose evidence reaches the approximate age cutoff. |
+| `after(barrier)` | A discoverable state whose evidence reaches the opaque `CurrentnessBarrier`. |
 
-`Any` deliberately permits stale data. It is useful for optimistic transaction
+`ANY` deliberately permits stale data. It is useful for optimistic transaction
 execution and idempotent CAS loops, where a stale starting point can only fail
 validation or lose its precondition. A known-obsolete or uncertain state is no
-longer discoverable, so even `Any` cannot return it.
+longer discoverable, so even `ANY` cannot return it.
 
-`AtLeast(T)` first tries the cache. If the entry's evidence is too old,
-`CachedStore` checks the backend:
+`after(barrier)` and `within(...)` first try the cache. If the entry's evidence is
+too old, `CachedStore` checks the backend:
 
 - For `Present`, `read_if_modified` uses the retained revision. An unchanged
   response reuses the decoded body and advances its evidence. A changed
@@ -125,10 +126,79 @@ rechecks the cache after the earlier operation finishes.
 approximate cache policy. Transaction validation, mutation receipts, and
 recovery use exact sequence barriers without doing time arithmetic.
 
+## Currentness barriers
+
+`Timeline::currentness_barrier()` captures an opaque currentness barrier after
+prerequisite work completes and before operations used as dependent evidence.
+The capture point belongs to the policy that knows this ordering:
+
+| Policy | Required capture point |
+| --- | --- |
+| Transaction validation | After the body, before the key and predicate lock CASes used as validation evidence. |
+| GC eligibility | Before reading candidate status. |
+| GC reference checks | After eligibility checks finish; the earlier status barrier cannot replace this one. |
+| Structural recovery | After observing a Ready intent, before checking its source and reachability. The discovery barrier cannot replace this one. |
+| Separator publication | After observing the split, before routing and reading its child chain. Carry this barrier through reconciliation. |
+| Missing-object retries | After observing the missing object, before rechecking dependent state. |
+
+Transaction validation uses one barrier for every point read, scan, collection
+directory, and transaction-status dependency. Each new validation attempt
+captures a new barrier. Immutable committed and aborted status may still use
+existing terminal-state proof. That proof does not establish object presence
+after the barrier.
+
+Decision interfaces that need this ordering require `CurrentnessBarrier`.
+Shared read interfaces accept the explicit `Requirement::after(barrier)`
+conversion. `Requirement` has a private representation: only `ANY`, `after`, and
+`within` construct it publicly. The numeric lower bound stays private to
+`timeline`; a crate-visible getter also violates this rule.
+`within` is an approximate cache policy, not a substitute for a currentness
+barrier. `stricter` preserves the stronger bound without exposing either point.
+
+Do not add conversions from sequence points, observations, receipts, or
+requirements to `CurrentnessBarrier`. Do not add public sequence-point accessors,
+default values, implicit conversions, or serialization to barriers or
+requirements. Do not add raw-point or observation-based requirement constructors.
+Copying a barrier retains its original bound; it cannot open a new validation
+attempt. A barrier does not make older evidence current by association.
+
+`Observation::is_current_after(barrier)` and `Observation::satisfies(requirement)`
+check retained evidence without I/O or extracting a sequence point. Insufficient
+evidence requires a storage check under `Requirement::after(barrier)`. If a read
+starts before the barrier and finishes after it, the reply still carries the
+older invocation watermark. Completion time cannot upgrade that read.
+
+A requirement states what must be proved; it is not currentness evidence.
+Do not expose setters that advance an observation from a sequence point or
+requirement. Batch checks belong in the cached-store module, where reuse of a
+successful check can advance another observation only from confirmed evidence
+of the same exact state. A changed-state result cannot advance the old state's
+evidence. Other storage modules must use the check interface.
+
+An observation must not become a requirement for reading other objects. A
+structural gate acquisition instead returns its exact observation, and the next
+mutation checks that revision. Separator publication also carries its captured
+barrier to child reads; the parent's watermark does not replace it.
+
+Owner-driven key write-back uses `ANY`, including on rerouted leaves. It must
+use the same database instance that acquired the locks. The lock CAS installs
+its state and invalidates old persistent entries before completing; path
+coordination prevents older backend reads from replacing that state afterward. A
+cache miss reads after the lock CAS. Thus a later cached state without the
+holder means the holder has already been resolved. If the cached state still
+contains the holder, the write-back CAS checks its revision and a conflict
+invalidates the stale state. A split publishes committed holders and removes
+their locks before moving entries, so rerouting cannot overlook an inherited
+hold. No observation-to-barrier conversion or extra conditional read is needed.
+This is not a recovery interface for another instance's locks, and its result
+does not authorize deletion of the transaction object. GC checks references with
+its own barrier.
+
 ## Observations
 
-Every successful read or mutation returns an `Observation<V>` of one exact
-state. It contains:
+Every successful read or mutation establishes an `Observation<V>` of one exact
+state. Reads and deletes return that observation directly; conditional creates
+and compare-and-swaps return a receipt that retains it. An observation contains:
 
 - the physical path;
 - a shared decoded value, or absence;
@@ -157,10 +227,70 @@ existing watermark.
 4. The result is `Current`, with merged evidence, or `Changed` with an
    observation of the newly established state.
 
-Successful CAS also uses observations as receipts. Its precondition proves that
-the expected observation remained current until the CAS linearized, so the CAS
-advances that observation to its invocation point and returns a new observation
-of the installed state.
+Successful CAS confirms that the expected revision matched at the conditional
+transition. It does not prove that the expected state was current throughout the
+interval since its read: a content revision can recur after an intervening
+change. The CAS advances the expected observation's watermark to its invocation
+point and returns a receipt that retains the installed state.
+
+## Conditional mutation receipts
+
+`CachedStore` returns `Applied` only after a definitive successful conditional
+create or compare-and-swap.
+
+The receipt retains the installed observation, expected revision, and immutable
+invocation point, without the replaced body. For a conditional create, no
+expected revision means that the precondition was absence.
+`confirms_expected(observation, barrier)` checks both the path and state against
+the precondition and the original invocation point against the barrier. It does
+not prove continuous currentness since the read. The installed observation's
+body and revision describe the exact state written by the mutation.
+
+A later read may advance the installed observation's shared watermark. That read
+confirms the installed state only; it must not advance the receipt's invocation
+point or let the old precondition qualify for a newer validation barrier.
+
+These are correctness constraints on the storage interface:
+
+| Transformation | Rule |
+| --- | --- |
+| Successful conditional create or CAS to `CasReceipt<V>` | Allowed only inside the storage mutation implementation, for that mutation. |
+| Read observation, unchanged fold, conflict, or in-doubt result to `CasReceipt<V>` | Forbidden. |
+| Receipt to installed observation | Allowed explicitly through `installed()` or `into_installed()`. The observation carries state evidence, without mutation or batch-participation proof. |
+| Implicit receipt conversion through `Deref`, `AsRef`, or `From` | Forbidden. Evidence changes must be explicit at the call site. |
+| Mapping a receipt's payload or changing its precondition, path, body, or revision | Forbidden. The receipt must describe the exact mutation. |
+| Expected revision plus installed body to an observation | Forbidden. They identify different sides of the transition. |
+| Receipt to a sequence point or completion barrier | Forbidden. Its installed observation's watermark was allocated before the mutation. |
+
+A receipt proves that the conditional transition succeeded. It does not promise
+that the installed state is still current when the caller receives it. For
+example, a peer may replace the object before the CAS reply arrives. The receipt
+must retain the original installed state instead of reloading the peer's state.
+
+## Coordinator mutation evidence
+
+The leaf coordinator distinguishes evidence of a successful CAS from an
+observation returned by a fold that staged nothing. `NodeStore::commit_leaf`
+preserves the storage receipt in `CasResult<Node>`, and an applied fold retains
+that `CasReceipt<Node>`. The coordinator does not reconstruct the receipt.
+
+The coordinator owns batch-member participation. A staged member may receive the
+receipt only from the CAS that carried its changes. A skipped member retains the
+loaded observation, even when another member's CAS succeeded. A storage receipt
+alone does not establish that a particular member participated in the mutation.
+An unchanged fold retains its original observation and must not complete a staged
+member. Existing freshness requirements still govern decisions made from reads.
+Exact-state shortcuts also require the validation barrier: installed evidence
+checks the receipt's original invocation point, while observed evidence checks
+the loaded state's currentness watermark.
+
+A skipped member's loaded observation is not always sufficient to prove its
+outcome. A resolver can skip because an earlier member has already staged the
+required change. For example, a release can skip after an earlier acquire removed
+its terminal holder in the staged leaf. Such a result must wait for the fold's CAS
+to succeed. A conflict or in-doubt result must cause a re-fold before completion.
+The skipped member still receives the loaded observation, without a claim that
+it participated in the CAS.
 
 ## Per-path coordination
 
@@ -183,9 +313,9 @@ already established sufficient evidence. Reconciliation happens before lane
 release and before the completed operation becomes observable to its caller.
 Different paths retain full backend concurrency.
 
-An `Any` cache hit bypasses the lane and may return an older usable state while
-a mutation is in progress. This is part of `Any`'s contract. Code that needs a
-causal lower bound uses `AtLeast` or retains and validates an observation.
+An `ANY` cache hit bypasses the lane and may return an older usable state while
+a mutation is in progress. This is part of `ANY`'s contract. Code that needs a
+currentness barrier uses `after(barrier)` or retains and validates an observation.
 
 Mutation outcomes are reconciled conservatively while holding the lane:
 
@@ -256,10 +386,10 @@ order local publication; the backend remains the global authority.
 
 ### 4. Transactions validate speculative cache use
 
-`Any` is not itself a strong read. Transaction execution may use it because the
+`ANY` is not itself a strong read. Transaction execution may use it because the
 body is retryable and retains the physical observations on which it depended.
-After the body, validation captures one `validation_start` point and checks
-those dependencies against `AtLeast(validation_start)`. If a state changed, the
+After the body, validation captures one currentness barrier and checks
+those dependencies against `Requirement::after(barrier)`. If a state changed, the
 higher-level resolver compares its logical writer or membership evidence and
 the transaction retries when its result was invalidated.
 
@@ -281,9 +411,9 @@ execute cheaply from cache without treating an arbitrary cache hit as current.
 
 ## Boundaries of the guarantee
 
-- `Any` may return stale but still usable knowledge.
-- `AtLeast(T)` means the exact state was current sometime after `T`; it is not a
-  promise that the state remains current at return.
+- `ANY` may return stale but still usable knowledge.
+- `after(barrier)` means the exact state was current at some point at or after
+  the barrier; it does not promise that state remains current at return.
 - Sequence points are local causal evidence, not portable timestamps.
 - The generic cache does not infer object-specific facts. For example, the
   transaction-object store may cache finalized transactions indefinitely only
