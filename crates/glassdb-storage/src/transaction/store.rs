@@ -116,7 +116,7 @@ impl TLogger {
             id: l.id.clone(),
         };
         match self.logs.create(path, None, Arc::new(persisted)).await? {
-            CasResult::Committed(observed) => Ok(observed),
+            CasResult::Committed(receipt) => Ok(receipt.into_installed()),
             CasResult::Conflict => Err(StorageError::Precondition),
         }
     }
@@ -142,7 +142,7 @@ impl TLogger {
             .compare_and_swap(expected, Arc::new(persisted))
             .await?
         {
-            CasResult::Committed(observed) => Ok(observed),
+            CasResult::Committed(receipt) => Ok(receipt.into_installed()),
             CasResult::Conflict => Err(StorageError::Precondition),
         }
     }
@@ -424,7 +424,7 @@ mod tests {
             }
             assert_eq!(
                 logger
-                    .commit_status_at(&id, Requirement::Any)
+                    .commit_status_at(&id, Requirement::ANY)
                     .await
                     .unwrap()
                     .status,
@@ -471,7 +471,7 @@ mod tests {
         }
         assert_eq!(
             logger
-                .commit_status_at(&pending_id, Requirement::Any)
+                .commit_status_at(&pending_id, Requirement::ANY)
                 .await
                 .unwrap()
                 .status,
@@ -543,7 +543,7 @@ mod tests {
         };
         t.set(&log).await.unwrap();
 
-        let got = t.get_at(&id, Requirement::Any).await.unwrap();
+        let got = t.get_at(&id, Requirement::ANY).await.unwrap();
         let got = got.value().unwrap();
         assert_eq!(got.status, TxCommitStatus::Ok);
         assert_eq!(got.writes, log.writes);
@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(got.collection_changes, log.collection_changes);
         assert_eq!(got.prepared_collections, log.prepared_collections);
 
-        let status = t.commit_status_at(&id, Requirement::Any).await.unwrap();
+        let status = t.commit_status_at(&id, Requirement::ANY).await.unwrap();
         assert_eq!(status.status, TxCommitStatus::Ok);
     }
 
@@ -573,7 +573,7 @@ mod tests {
     async fn commit_status_unknown_when_absent() {
         let t = new_tlogger();
         let status = t
-            .commit_status_at(&TxId::from_bytes(vec![7]), Requirement::Any)
+            .commit_status_at(&TxId::from_bytes(vec![7]), Requirement::ANY)
             .await
             .unwrap();
         assert_eq!(status.status, TxCommitStatus::Unknown);
@@ -641,7 +641,7 @@ mod tests {
             let read_started = read_started.clone();
             async move {
                 read_started.notify_one();
-                logger.commit_status_at(&id, Requirement::Any).await
+                logger.commit_status_at(&id, Requirement::ANY).await
             }
         });
         read_started.notified().await;
@@ -678,7 +678,7 @@ mod tests {
         }];
         let stored_v = t.set(&log).await.unwrap();
 
-        let got = t.get_at(&id, Requirement::Any).await.unwrap();
+        let got = t.get_at(&id, Requirement::ANY).await.unwrap();
         let version = got.revision().cloned();
         let got = got.value().unwrap();
         assert_eq!(got.status, TxCommitStatus::Ok);
@@ -704,11 +704,11 @@ mod tests {
             );
             let id = TxId::from_bytes(vec![4, 3, 2, 4]);
             logger.set(&TxLog::new(id.clone(), status)).await.unwrap();
-            let observed = peer.get_at(&id, Requirement::Any).await.unwrap();
+            let observed = peer.get_at(&id, Requirement::ANY).await.unwrap();
             peer.delete(&observed).await.unwrap();
             operations.lock().unwrap().clear();
 
-            let bound = Requirement::AtLeast(timeline.now());
+            let bound = Requirement::after(timeline.currentness_barrier());
             let observed = logger.get_at(&id, bound).await.unwrap();
             assert_eq!(observed.value().unwrap().status, status);
             assert!(!bound.is_satisfied_by(observed.current_after()));
@@ -738,11 +738,11 @@ mod tests {
         operations.lock().unwrap().clear();
 
         logger
-            .get_at(&id, Requirement::AtLeast(timeline.now()))
+            .get_at(&id, Requirement::after(timeline.currentness_barrier()))
             .await
             .unwrap();
         logger
-            .get_at(&id, Requirement::AtLeast(timeline.now()))
+            .get_at(&id, Requirement::after(timeline.currentness_barrier()))
             .await
             .unwrap();
 
@@ -770,11 +770,11 @@ mod tests {
         operations.lock().unwrap().clear();
 
         logger
-            .get_at(&id, Requirement::AtLeast(timeline.now()))
+            .get_at(&id, Requirement::after(timeline.currentness_barrier()))
             .await
             .unwrap();
         logger
-            .get_at(&id, Requirement::AtLeast(timeline.now()))
+            .get_at(&id, Requirement::after(timeline.currentness_barrier()))
             .await
             .unwrap();
 

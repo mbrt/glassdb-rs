@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use glassdb_data::{CollectionAddress, LogicalKey, ObjectPath, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
-use glassdb_storage::{LeafEntry, LockType, NodeLocks, Requirement};
+use glassdb_storage::{LeafEntry, LeafObservation, LockType, NodeLocks, Requirement};
 
 use crate::error::TransError;
 use crate::key_state_resolver::KeyStateResolver;
@@ -258,8 +258,8 @@ pub(crate) struct StructuralGateOperation {
 
 /// Result of one coordinated structural-gate acquisition attempt.
 pub(crate) enum StructuralGateOutcome {
-    /// The gate landed; the requirement observes that CAS or a later state.
-    Acquired(Requirement),
+    /// The exact state in which this operation acquired the gate.
+    Acquired(LeafObservation),
     /// The gate did not land in this attempt.
     Deferred,
 }
@@ -338,7 +338,7 @@ impl LeafOperation for StructuralGateOperation {
     }
 
     fn first_requirement(&self) -> Requirement {
-        Requirement::Any
+        Requirement::ANY
     }
 
     fn complete(&self, outcome: Option<CoordinatedOutcome>) -> Result<Self::Output, TransError> {
@@ -353,18 +353,9 @@ impl LeafOperation for StructuralGateOperation {
         else {
             return Ok(StructuralGateOutcome::Deferred);
         };
-        let requirement = match evidence {
-            // Both kinds carry the loaded state the gate was proven in, so the
-            // reload only has to reach that state. `Observed` needs the bound as
-            // much as `Installed` does: without it the reload can fall back to a
-            // persistent entry that predates a gate a peer installed, and the
-            // acquirer then abandons a gate it durably holds.
-            Some(evidence) => Requirement::AtLeast(evidence.observation().current_after()),
-            // An exhausted round yields `Conflict`, so a `Locked` outcome always
-            // carries evidence.
-            None => Requirement::Any,
-        };
-        Ok(StructuralGateOutcome::Acquired(requirement))
+        let evidence =
+            evidence.ok_or_else(|| TransError::other("acquired gate has no evidence"))?;
+        Ok(StructuralGateOutcome::Acquired(evidence.into_observation()))
     }
 }
 

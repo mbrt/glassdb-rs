@@ -198,7 +198,7 @@ impl Reader {
                 // writer that is still unresolvable under fresh evidence is truly
                 // in-doubt: report absence so transaction validation retries
                 // rather than trusting an empty placeholder.
-                let fresh = Requirement::AtLeast(self.timeline.now());
+                let fresh = Requirement::after(self.timeline.currentness_barrier());
                 if !refreshed && requirement.stricter(fresh) != requirement {
                     requirement = fresh;
                     refreshed = true;
@@ -297,7 +297,7 @@ mod tests {
             assert_eq!(value.unwrap().value.as_ref(), b"old");
             let (_, root) = peer
                 .nodes
-                .load_root(&collection, Requirement::Any)
+                .load_root(&collection, Requirement::ANY)
                 .await
                 .unwrap();
             let updated = Node::leaf(LeafBody::from_entries([LeafEntry::new(b"key")
@@ -309,11 +309,11 @@ mod tests {
                 .store_root(&collection, &updated, &root)
                 .await
                 .unwrap();
-            let observed = peer.tlogger.get_at(&old, Requirement::Any).await.unwrap();
+            let observed = peer.tlogger.get_at(&old, Requirement::ANY).await.unwrap();
             peer.tlogger.delete(&observed).await.unwrap();
             local.tlogger.delete(&local_log).await.unwrap();
             assert!(matches!(
-                local.tlogger.get_at(&old, Requirement::Any).await,
+                local.tlogger.get_at(&old, Requirement::ANY).await,
                 Err(StorageError::NotFound)
             ));
             match operation {
@@ -337,7 +337,7 @@ mod tests {
                 }
                 2 => {
                     let states = resolver
-                        .effective_point_states(std::slice::from_ref(&key), None, Requirement::Any)
+                        .effective_point_states(std::slice::from_ref(&key), None, Requirement::ANY)
                         .await
                         .unwrap();
                     assert_eq!(states[0].writer, Some(TxId::from_bytes(vec![2])));
@@ -384,14 +384,17 @@ mod tests {
                     assert!(matches!(
                         locker
                             .keys()
-                            .lock_at(&writer, &accesses, false, Requirement::Any)
+                            .lock_at(&writer, &accesses, false, Requirement::ANY)
                             .await
                             .unwrap(),
                         LockOutcome::Locked(_)
                     ));
                     let (node, _) = peer
                         .nodes
-                        .load_root(&collection, Requirement::AtLeast(peer.timeline.now()))
+                        .load_root(
+                            &collection,
+                            Requirement::after(peer.timeline.currentness_barrier()),
+                        )
                         .await
                         .unwrap();
                     assert_eq!(

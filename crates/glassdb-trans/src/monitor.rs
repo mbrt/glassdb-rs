@@ -1519,7 +1519,7 @@ impl Monitor {
     /// preceding CAS or validation barrier to reuse, so the monitor must create
     /// the lower bound itself.
     fn current_requirement(&self) -> Requirement {
-        Requirement::AtLeast(self.inner.timeline.now())
+        Requirement::after(self.inner.timeline.currentness_barrier())
     }
 
     fn owned_status_evidence(&self, tid: &TxId) -> Result<Option<TxStatusEvidence>, TransError> {
@@ -2365,7 +2365,7 @@ mod tests {
 
         mon.begin_persisted_tx(&tx, recovery.clone()).await.unwrap();
 
-        let log = t.tl.get_at(&tx, Requirement::Any).await.unwrap();
+        let log = t.tl.get_at(&tx, Requirement::ANY).await.unwrap();
         let log = log.value().unwrap();
         assert_eq!(log.status, TxCommitStatus::Pending);
         assert_eq!(log.locks, recovery.locks);
@@ -2439,7 +2439,7 @@ mod tests {
         .await
         .unwrap();
 
-        let log = t.tl.get_at(&tx, Requirement::Any).await.unwrap();
+        let log = t.tl.get_at(&tx, Requirement::ANY).await.unwrap();
         let log = log.value().unwrap();
         assert_eq!(log.status, TxCommitStatus::Pending);
         assert_eq!(log.locks, vec![lock]);
@@ -2542,7 +2542,7 @@ mod tests {
             TxFinalStatus::Aborted
         );
 
-        let wounded = wounder_ctx.tl.get_at(&tx, Requirement::Any).await.unwrap();
+        let wounded = wounder_ctx.tl.get_at(&tx, Requirement::ANY).await.unwrap();
         assert!(matches!(
             wounder_ctx.tl.delete(&wounded).await,
             Err(StorageError::Precondition)
@@ -2578,7 +2578,7 @@ mod tests {
         assert_eq!(
             wounder_ctx
                 .tl
-                .commit_status_at(&tx, Requirement::Any)
+                .commit_status_at(&tx, Requirement::ANY)
                 .await
                 .unwrap()
                 .status,
@@ -2635,7 +2635,7 @@ mod tests {
                     return Ok(());
                 };
                 let committed = tl
-                    .get_at(&tx, Requirement::Any)
+                    .get_at(&tx, Requirement::ANY)
                     .await
                     .expect("the commit write landed before its ack was lost");
                 tl.delete(&committed)
@@ -2759,7 +2759,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let pending = racer_ctx.tl.get_at(&tx, Requirement::Any).await.unwrap();
+        let pending = racer_ctx.tl.get_at(&tx, Requirement::ANY).await.unwrap();
         let mut refreshed = pending.value().unwrap().as_ref().clone();
         refreshed.timestamp = Some(rt::system_now());
 
@@ -2872,7 +2872,7 @@ mod tests {
         );
         assert_eq!(
             ctx.tl
-                .commit_status_at(&tx, Requirement::Any)
+                .commit_status_at(&tx, Requirement::ANY)
                 .await
                 .unwrap()
                 .status,
@@ -2924,7 +2924,7 @@ mod tests {
         );
         assert_eq!(
             ctx.tl
-                .commit_status_at(&tx, Requirement::Any)
+                .commit_status_at(&tx, Requirement::ANY)
                 .await
                 .unwrap()
                 .status,
@@ -2950,7 +2950,7 @@ mod tests {
         assert!(!mon.is_tracked_local(&tx));
         assert_eq!(
             ctx.tl
-                .commit_status_at(&tx, Requirement::Any)
+                .commit_status_at(&tx, Requirement::ANY)
                 .await
                 .unwrap()
                 .status,
@@ -2974,7 +2974,7 @@ mod tests {
             Err(TransError::Storage(StorageError::Unavailable(_)))
         ));
         assert!(matches!(
-            ctx.tl.get_at(&tx, Requirement::Any).await,
+            ctx.tl.get_at(&tx, Requirement::ANY).await,
             Err(StorageError::NotFound)
         ));
     }
@@ -3053,7 +3053,7 @@ mod tests {
         assert_eq!(wound_writes.load(Ordering::SeqCst), 2);
         assert_eq!(failed_reads.load(Ordering::SeqCst), 1);
         let (_verify_mon, verify) = new_test_monitor(b);
-        let final_log = verify.tl.get_at(&tx, Requirement::Any).await.unwrap();
+        let final_log = verify.tl.get_at(&tx, Requirement::ANY).await.unwrap();
         assert_eq!(final_log.value().unwrap().locks, refreshed.locks);
     }
 
@@ -3187,7 +3187,7 @@ mod tests {
         let observed = mon
             .inner
             .tl
-            .commit_status_at(&tx, Requirement::Any)
+            .commit_status_at(&tx, Requirement::ANY)
             .await
             .unwrap()
             .observation;
@@ -3277,7 +3277,7 @@ mod tests {
         // Advance well past the pending timeout. Refresh keeps it alive.
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
-        let st = t.tl.commit_status_at(&tx, Requirement::Any).await.unwrap();
+        let st = t.tl.commit_status_at(&tx, Requirement::ANY).await.unwrap();
         assert_eq!(st.status, TxCommitStatus::Pending);
 
         // A separate monitor should still see it as pending (not expired).
@@ -3308,7 +3308,7 @@ mod tests {
         // pending object.
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
-        let tl = t.tl.get_at(&tx, Requirement::Any).await.unwrap();
+        let tl = t.tl.get_at(&tx, Requirement::ANY).await.unwrap();
         let tl = tl.value().unwrap();
         assert_eq!(tl.status, TxCommitStatus::Pending);
         assert_eq!(tl.locks, locks);
@@ -3400,7 +3400,7 @@ mod tests {
         assert_eq!(
             verify
                 .tl
-                .commit_status_at(&tx, Requirement::Any)
+                .commit_status_at(&tx, Requirement::ANY)
                 .await
                 .unwrap()
                 .status,
@@ -3437,7 +3437,7 @@ mod tests {
         assert_eq!(
             verify
                 .tl
-                .commit_status_at(&tx, Requirement::Any)
+                .commit_status_at(&tx, Requirement::ANY)
                 .await
                 .unwrap()
                 .status,

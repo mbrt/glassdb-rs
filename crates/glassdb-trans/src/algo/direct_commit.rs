@@ -172,7 +172,7 @@ impl DirectCommit {
             .collect::<Vec<_>>();
         let groups = self
             .router
-            .route_keys_with_requirements(keys, Requirement::Any, Requirement::Any)
+            .route_keys_with_requirements(keys, Requirement::ANY, Requirement::ANY)
             .await?;
         Ok(match groups.as_slice() {
             [group] => Some(group.path().clone()),
@@ -628,7 +628,7 @@ impl LeafOperation for DirectCommitOperation {
     }
 
     fn first_requirement(&self) -> Requirement {
-        Requirement::Any
+        Requirement::ANY
     }
 
     fn complete(&self, outcome: Option<CoordinatedOutcome>) -> Result<Self::Output, TransError> {

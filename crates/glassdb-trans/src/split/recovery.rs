@@ -8,9 +8,9 @@ use glassdb_concurr::{RetryConfig, rt};
 use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, StructuralIntentId, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
-    CollectionStore, LeafObservation, LockType, Node, NodeStore, Observation, Requirement,
-    StorageError, StructuralIntent, StructuralIntentPhase, StructuralIntentStore, Timeline,
-    TreeRouter,
+    CollectionStore, CurrentnessBarrier, LeafObservation, LockType, Node, NodeStore, Observation,
+    Requirement, StorageError, StructuralIntent, StructuralIntentPhase, StructuralIntentStore,
+    Timeline, TreeRouter,
 };
 
 use crate::error::TransError;
@@ -463,7 +463,7 @@ impl StructuralRecovery {
         let mut backoff = self.retry.backoff();
         loop {
             let (mut record, observed) =
-                match self.records.load_record(collection, Requirement::Any).await {
+                match self.records.load_record(collection, Requirement::ANY).await {
                     Ok(record) => record,
                     Err(StorageError::NotFound) => return Ok(()),
                     Err(error) => return Err(error.into()),
@@ -674,7 +674,7 @@ impl StructuralRecovery {
         // allocates its own currentness barrier. This one bounds intent
         // discovery only. Classification needs a bound past the intent it
         // reads, and this barrier precedes that read.
-        let recovery_start = Requirement::AtLeast(self.timeline.now());
+        let recovery_start = Requirement::after(self.timeline.currentness_barrier());
         let cursor = self.scan_cursor.lock().unwrap().clone();
         let page = match self
             .intent_store
@@ -795,7 +795,7 @@ impl StructuralRecovery {
                 .list_for_participant(
                     settlement.collection.db_root_component(),
                     &settlement.participant,
-                    Requirement::AtLeast(self.timeline.now()),
+                    Requirement::after(self.timeline.currentness_barrier()),
                 )
                 .await?;
             if intents.is_empty() {
@@ -846,7 +846,7 @@ impl StructuralRecovery {
         // hold source state from before the worker gated it. That reports a
         // revision the worker never published from, which reads as a fence that
         // never happened.
-        let requirement = Requirement::AtLeast(self.timeline.now());
+        let barrier = self.timeline.currentness_barrier();
         let collection = &intent.collection;
         let created_tokens = &intent.created_tokens;
         if !self
@@ -854,7 +854,7 @@ impl StructuralRecovery {
                 collection,
                 intent.source_token.as_ref(),
                 &intent.source_version,
-                requirement,
+                barrier,
             )
             .await?
         {
@@ -869,14 +869,19 @@ impl StructuralRecovery {
             }
             vec![
                 self.router
-                    .token_reachable_at_key(collection, &[], &created_tokens[0], requirement)
+                    .token_reachable_at_key(
+                        collection,
+                        &[],
+                        &created_tokens[0],
+                        Requirement::after(barrier),
+                    )
                     .await?,
                 self.router
                     .token_reachable_at_key(
                         collection,
                         &intent.split_key,
                         &created_tokens[1],
-                        requirement,
+                        Requirement::after(barrier),
                     )
                     .await?,
             ]
@@ -892,7 +897,7 @@ impl StructuralRecovery {
                         collection,
                         &intent.split_key,
                         &created_tokens[0],
-                        requirement,
+                        Requirement::after(barrier),
                     )
                     .await?,
             ]
@@ -913,7 +918,7 @@ impl StructuralRecovery {
                 if !reachable {
                     match self
                         .nodes
-                        .load_node_state(collection, token, requirement)
+                        .load_node_state(collection, token, Requirement::after(barrier))
                         .await
                     {
                         Ok(node) => self.nodes.delete_node(&node).await?,
@@ -940,11 +945,10 @@ impl StructuralRecovery {
         collection: &CollectionAddress,
         token: Option<&NodeToken>,
         source_version: &str,
-        requirement: Requirement,
+        barrier: CurrentnessBarrier,
     ) -> Result<bool, TransError> {
         for _ in 0..PARENT_RETRIES {
-            let Some((node, observed)) = self.load_source(collection, token, requirement).await?
-            else {
+            let Some((node, observed)) = self.load_source(collection, token, barrier).await? else {
                 return Ok(true);
             };
             if !observed
@@ -979,15 +983,22 @@ impl StructuralRecovery {
         &self,
         collection: &CollectionAddress,
         token: Option<&NodeToken>,
-        requirement: Requirement,
+        barrier: CurrentnessBarrier,
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
         match token {
-            Some(token) => match self.nodes.load_node(collection, token, requirement).await {
+            Some(token) => match self
+                .nodes
+                .load_node(collection, token, Requirement::after(barrier))
+                .await
+            {
                 Ok(source) => Ok(Some(source)),
                 Err(StorageError::NotFound) => Ok(None),
                 Err(error) => Err(error.into()),
             },
-            None => Ok(self.nodes.load_root_node(collection, requirement).await?),
+            None => Ok(self
+                .nodes
+                .load_root_node(collection, Requirement::after(barrier))
+                .await?),
         }
     }
 }

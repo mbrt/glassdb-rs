@@ -36,8 +36,8 @@ use glassdb_concurr::{
 };
 use glassdb_data::{ObjectPath, TxId};
 use glassdb_storage::{
-    LeafBody, LeafEdit, LeafEntry, LeafObservation, LockType, NodeLocks, NodeStore, Requirement,
-    SplitPolicy, StorageError,
+    CasReceipt, CasResult, CurrentnessBarrier, LeafBody, LeafEdit, LeafEntry, LeafObservation,
+    LockType, Node, NodeLocks, NodeStore, Requirement, SplitPolicy, StorageError,
 };
 
 use crate::error::TransError;
@@ -130,19 +130,36 @@ pub(crate) enum FoldOutcome {
     InDoubt(String),
 }
 
-/// The leaf observation that supports one coordinated outcome.
+/// The evidence that supports one coordinated outcome.
 pub(crate) enum CoordinationEvidence {
-    /// The member participated in the successful CAS that replaced this state.
-    Installed(LeafObservation),
-    /// The member's outcome was already true in this loaded state.
+    /// The member participated in the successful CAS that installed this state.
+    Installed(CasReceipt<Node>),
+    /// The loaded state retained by a member that staged no change. Its outcome
+    /// can also depend on another member's changes in the completed fold.
     Observed(LeafObservation),
 }
 
 impl CoordinationEvidence {
-    /// Returns the leaf observation that supports the outcome.
-    pub(crate) fn observation(&self) -> &LeafObservation {
+    /// Retains the exact observed state without the member's mutation proof.
+    pub(crate) fn into_observation(self) -> LeafObservation {
         match self {
-            Self::Installed(observation) | Self::Observed(observation) => observation,
+            Self::Installed(receipt) => receipt.into_installed(),
+            Self::Observed(observation) => observation,
+        }
+    }
+
+    /// Reports whether this round confirmed the retained leaf state at or after
+    /// the validation barrier.
+    pub(crate) fn validates(
+        &self,
+        observed: &LeafObservation,
+        barrier: CurrentnessBarrier,
+    ) -> bool {
+        match self {
+            Self::Installed(receipt) => receipt.confirms_expected(observed, barrier),
+            Self::Observed(current) => {
+                current.is_current_after(barrier) && current.same_state(observed)
+            }
         }
     }
 }
@@ -493,7 +510,8 @@ enum CapacityDecision {
 }
 
 enum PersistResult {
-    Landed,
+    Applied(CasReceipt<Node>),
+    Unchanged(LeafObservation),
     PreconditionMiss,
     InDoubt(BTreeSet<TxId>),
 }
@@ -719,7 +737,7 @@ impl CasWorker {
         plan: &mut FoldPlan,
     ) -> Result<PersistResult, TransError> {
         if !plan.is_dirty() {
-            return Ok(PersistResult::Landed);
+            return Ok(PersistResult::Unchanged(edit.observation().clone()));
         }
 
         // Drop entries a member left vestigial (no holder, no
@@ -739,11 +757,11 @@ impl CasWorker {
             // Hint the background splitter if this write left the leaf
             // over the soft cap (ADR-031); the splitter reloads and
             // re-checks, so a spurious hint only costs one load.
-            Ok(true) => {
+            Ok(CasResult::Committed(receipt)) => {
                 self.core.hinter.observe_leaf(path, &new_leaf);
-                Ok(PersistResult::Landed)
+                Ok(PersistResult::Applied(receipt))
             }
-            Ok(false) => Ok(PersistResult::PreconditionMiss),
+            Ok(CasResult::Conflict) => Ok(PersistResult::PreconditionMiss),
             Err(StorageError::Unavailable(_)) => {
                 Ok(PersistResult::InDoubt(plan.staged_ids().cloned().collect()))
             }
@@ -766,7 +784,7 @@ impl CasWorker {
         // already scheduled for this object one opportunity to join the round,
         // so batching does not depend on backend I/O creating the collection
         // window. A bounded load already opens that window at its backend await.
-        if first_requirement == Requirement::Any {
+        if first_requirement == Requirement::ANY {
             rt::yield_now().await;
         }
         let mut backoff = self.core.retry.backoff();
@@ -837,8 +855,9 @@ impl CasWorker {
 
             let loaded_observation = edit.observation().clone();
             let persist_result = self.persist(path, edit, &mut plan).await?;
-            match persist_result {
-                PersistResult::Landed => {}
+            let (loaded_observation, applied) = match persist_result {
+                PersistResult::Applied(receipt) => (loaded_observation, Some(receipt)),
+                PersistResult::Unchanged(observed) => (observed, None),
                 // This CAS definitely did not land, but an earlier in-doubt CAS
                 // might have, so leave the members it carried marked.
                 PersistResult::PreconditionMiss => {
@@ -852,7 +871,7 @@ impl CasWorker {
                     reloaded = true;
                     continue;
                 }
-            }
+            };
 
             // The CAS landed (or nothing needed staging): publish each member's
             // outcome into its slot before returning, so the deposit
@@ -865,7 +884,10 @@ impl CasWorker {
                         outcome: member.outcome,
                         evidence: Some(match member.participation {
                             Participation::Staged => {
-                                CoordinationEvidence::Installed(loaded_observation.clone())
+                                let receipt = applied.as_ref().ok_or_else(|| {
+                                    TransError::other("staged leaf member has no successful CAS")
+                                })?;
+                                CoordinationEvidence::Installed(receipt.clone())
                             }
                             Participation::Skipped => {
                                 CoordinationEvidence::Observed(loaded_observation.clone())
@@ -1203,16 +1225,16 @@ mod tests {
             )
             .await
             .unwrap();
-        let loaded = store.load_leaf(path, Requirement::Any).await.unwrap();
+        let loaded = store.load_leaf(path, Requirement::ANY).await.unwrap();
         let leaf = LeafBody::from_entries(entries);
         let mut edit = loaded.into_edit();
         edit.set_entries(leaf);
-        assert!(store.commit_leaf(edit).await.unwrap());
+        assert!(store.commit_leaf(edit).await.unwrap().committed());
     }
 
     async fn replace_leaf_node(store: &NodeStore, node: &Node) {
         let observed = store
-            .load_node_state(&collection(), &leaf_token(), Requirement::Any)
+            .load_node_state(&collection(), &leaf_token(), Requirement::ANY)
             .await
             .unwrap();
         assert!(
@@ -1244,7 +1266,7 @@ mod tests {
     // Loads the leaf's entries from a cold store, for asserting what landed.
     async fn cold_entries(store: &NodeStore, path: &ObjectPath) -> LeafBody {
         store
-            .load_leaf(path, Requirement::Any)
+            .load_leaf(path, Requirement::ANY)
             .await
             .unwrap()
             .entries()
@@ -1312,7 +1334,7 @@ mod tests {
         }
 
         fn first_requirement(&self) -> Requirement {
-            Requirement::Any
+            Requirement::ANY
         }
 
         fn complete(
@@ -1480,6 +1502,79 @@ mod tests {
         assert_eq!(e.lock_holders(), std::slice::from_ref(&tx));
     }
 
+    #[tokio::test]
+    async fn applied_evidence_keeps_its_installed_state_when_a_peer_writes_before_the_reply() {
+        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let backend = HookBackend::new(memory.clone());
+        let (coord, nodes, timeline, _bg) = coord_over(backend.clone()).await;
+        let barrier = timeline.currentness_barrier();
+        let expected = nodes
+            .load_leaf(&leaf(), Requirement::ANY)
+            .await
+            .unwrap()
+            .observation()
+            .clone();
+        backend.set_after(move |operation, outcome| {
+            let overwrite = matches!(operation, BackendOp::WriteIf { .. })
+                && operation.path() == leaf().to_string()
+                && outcome.is_success();
+            let peer = cold_store(memory.clone());
+            let future: HookFuture = Box::pin(async move {
+                if overwrite {
+                    let loaded = peer.load_leaf(&leaf(), Requirement::ANY).await.unwrap();
+                    let mut entries = loaded.entries().entries().cloned().collect::<Vec<_>>();
+                    entries.push(entry(
+                        b"peer",
+                        LockType::None,
+                        None,
+                        Some(&TxId::with_priority(2, b"peer")),
+                    ));
+                    let mut edit = loaded.into_edit();
+                    edit.set_entries(LeafBody::from_entries(entries));
+                    assert!(peer.commit_leaf(edit).await.unwrap().committed());
+                }
+                Ok(())
+            });
+            future
+        });
+
+        let tx = TxId::with_priority(1, b"t");
+        let outcome = coord
+            .submit_leaf(
+                &leaf(),
+                &tx,
+                Arc::new(StageLock {
+                    key: b"k".to_vec(),
+                    tx: tx.clone(),
+                    admission: StageAdmission::ExistingKeys,
+                }),
+                Requirement::ANY,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let evidence = outcome.evidence.unwrap();
+        assert!(matches!(&evidence, CoordinationEvidence::Installed(_)));
+        assert!(evidence.validates(&expected, barrier));
+        let CoordinationEvidence::Installed(receipt) = &evidence else {
+            panic!("staged member must retain its CAS receipt");
+        };
+        let installed = receipt.installed();
+        assert_ne!(installed.revision(), expected.revision());
+        let entries = installed.value().unwrap().as_leaf().unwrap();
+        assert_eq!(entries.lookup(b"k").unwrap().lock_holders(), &[tx]);
+        assert!(entries.lookup(b"peer").is_none());
+
+        let current = nodes
+            .load_leaf(&leaf(), Requirement::after(timeline.currentness_barrier()))
+            .await
+            .unwrap();
+        assert!(current.entries().lookup(b"peer").is_some());
+        assert!(!installed.same_state(current.observation()));
+        assert!(!evidence.validates(current.observation(), barrier));
+        coord.close().await;
+    }
+
     // A split can move a key to a right sibling after it was routed to this
     // leaf. The coordinator must notice the loaded leaf no longer covers the key
     // and re-route (deliver the member's re-route outcome) rather than strand a
@@ -1511,7 +1606,7 @@ mod tests {
                     tx: tx.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
             .unwrap();
@@ -1557,7 +1652,7 @@ mod tests {
                     tx: tx.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
             .unwrap();
@@ -1585,22 +1680,106 @@ mod tests {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let log = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
-        let (coord, _nodes, _timeline, _bg) = coord_over(backend).await;
+        let (coord, nodes, timeline, _bg) = coord_over(backend).await;
+        let barrier = timeline.currentness_barrier();
+        let expected = nodes
+            .load_leaf(&leaf(), Requirement::after(barrier))
+            .await
+            .unwrap()
+            .observation()
+            .clone();
         log.lock().unwrap().clear();
         let tx = TxId::with_priority(1, b"t");
 
         let out = coord
-            .submit_leaf(&leaf(), &tx, Arc::new(SkipRelease), Requirement::Any)
+            .submit_leaf(&leaf(), &tx, Arc::new(SkipRelease), Requirement::ANY)
             .await
             .unwrap();
         assert!(matches!(
-            out,
+            &out,
             Some(CoordinatedOutcome {
                 outcome: FoldOutcome::Released { .. },
                 evidence: Some(CoordinationEvidence::Observed(_)),
             })
         ));
+        let evidence = out.unwrap().evidence.unwrap();
+        let CoordinationEvidence::Observed(observation) = &evidence else {
+            panic!("skipped member must retain its read observation");
+        };
+        assert!(observation.same_state(&expected));
+        assert!(evidence.validates(&expected, barrier));
+        assert!(!evidence.validates(&expected, timeline.currentness_barrier()));
         assert_eq!(leaf_stores(&log), 0, "a skip stages nothing, so no CAS");
+        coord.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skipped_member_keeps_read_evidence_when_another_member_applies() {
+        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (backend, gate) = Gate::wrap(memory.clone());
+        let recorder = Arc::new(RecordingBackend::new(backend));
+        let log = recorder.log();
+        let (coord, _nodes, timeline, _bg) = coord_over(recorder).await;
+        let barrier = timeline.currentness_barrier();
+        let expected = cold_store(memory)
+            .load_leaf(&leaf(), Requirement::ANY)
+            .await
+            .unwrap()
+            .observation()
+            .clone();
+        log.lock().unwrap().clear();
+
+        gate.arm();
+        let first = coord.clone();
+        let staged = tokio::spawn(async move {
+            let tx = TxId::with_priority(1, b"stage");
+            first
+                .submit_leaf(
+                    &leaf(),
+                    &tx,
+                    Arc::new(StageLock {
+                        key: b"k".to_vec(),
+                        tx: tx.clone(),
+                        admission: StageAdmission::ExistingKeys,
+                    }),
+                    Requirement::ANY,
+                )
+                .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        let second = coord.clone();
+        let skipped = tokio::spawn(async move {
+            second
+                .submit_leaf(
+                    &leaf(),
+                    &TxId::with_priority(2, b"skip"),
+                    Arc::new(SkipRelease),
+                    Requirement::ANY,
+                )
+                .await
+        });
+        rt::sleep(Duration::from_secs(1)).await;
+        gate.release();
+
+        let applied = staged.await.unwrap().unwrap().unwrap().evidence.unwrap();
+        let observed = skipped.await.unwrap().unwrap().unwrap().evidence.unwrap();
+        assert!(matches!(&applied, CoordinationEvidence::Installed(_)));
+        assert!(matches!(&observed, CoordinationEvidence::Observed(_)));
+        assert!(applied.validates(&expected, barrier));
+        let applied = applied.into_observation();
+        let observed = observed.into_observation();
+        assert!(observed.same_state(&expected));
+        assert!(!applied.same_state(&observed));
+        assert!(
+            applied
+                .value()
+                .unwrap()
+                .as_leaf()
+                .unwrap()
+                .lookup(b"k")
+                .is_some()
+        );
+        assert_eq!(leaf_stores(&log), 1);
         coord.close().await;
     }
 
@@ -1632,7 +1811,7 @@ mod tests {
                     tx: tx.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
             .unwrap();
@@ -1670,14 +1849,14 @@ mod tests {
         .await;
         let (coord, nodes, timeline, _bg) = coord_over(backend.clone()).await;
         nodes
-            .load_leaf(&leaf_path(), Requirement::Any)
+            .load_leaf(&leaf_path(), Requirement::ANY)
             .await
             .unwrap();
 
         let tx = TxId::with_priority(2, b"t");
         log.lock().unwrap().clear();
         coord
-            .submit_leaf(&leaf(), &tx, Arc::new(SkipRelease), Requirement::Any)
+            .submit_leaf(&leaf(), &tx, Arc::new(SkipRelease), Requirement::ANY)
             .await
             .unwrap();
         assert_eq!(
@@ -1692,7 +1871,7 @@ mod tests {
                 &leaf(),
                 &tx,
                 Arc::new(SkipRelease),
-                Requirement::AtLeast(timeline.now()),
+                Requirement::after(timeline.currentness_barrier()),
             )
             .await
             .unwrap();
@@ -1733,7 +1912,7 @@ mod tests {
                     tx: t1.clone(),
                     trace: tr1,
                 }),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -1749,7 +1928,7 @@ mod tests {
                     tx: t2.clone(),
                     trace: tr2,
                 }),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -1807,7 +1986,7 @@ mod tests {
                 &leaf(),
                 &t1,
                 Arc::new(StageInline::logless(b"k", &t1, b"first")),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -1818,7 +1997,7 @@ mod tests {
                 &leaf(),
                 &t2,
                 Arc::new(StageInline::logless(b"k", &t2, b"second")),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -2051,7 +2230,7 @@ mod tests {
                 &leaf(),
                 &t1,
                 Arc::new(MultiPublisherProbe::direct(&[b"a", b"b"], &t1)),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -2062,7 +2241,7 @@ mod tests {
                 &leaf(),
                 &t2,
                 Arc::new(MultiPublisherProbe::publisher(&[b"b", b"c"], &t2)),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -2119,7 +2298,7 @@ mod tests {
                 &leaf(),
                 &t1,
                 Arc::new(MultiPublisherProbe::direct(&[b"a", b"b"], &t1)),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -2130,7 +2309,7 @@ mod tests {
                 &leaf(),
                 &t2,
                 Arc::new(MultiPublisherProbe::direct(&[b"c", b"d"], &t2)),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -2184,7 +2363,7 @@ mod tests {
                 &leaf(),
                 &t1,
                 Arc::new(MultiPublisherProbe::landed(&[b"a", b"b"], &t1)),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -2195,7 +2374,7 @@ mod tests {
                 &leaf(),
                 &t2,
                 Arc::new(MultiPublisherProbe::publisher(&[b"b", b"c"], &t2)),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -2315,7 +2494,7 @@ mod tests {
                 &leaf(),
                 &t1,
                 Arc::new(LoglessCommitProbe::new(b"k", &t1, b"first")),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -2326,7 +2505,7 @@ mod tests {
                 &leaf(),
                 &t2,
                 Arc::new(LoglessCommitProbe::new(b"k", &t2, b"second")),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -2378,7 +2557,7 @@ mod tests {
                 &leaf(),
                 &t1,
                 Arc::new(LoglessCommitProbe::replayable(b"k", &t1, b"first")),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -2389,7 +2568,7 @@ mod tests {
                 &leaf(),
                 &t2,
                 Arc::new(LoglessCommitProbe::replayable(b"k", &t2, b"second")),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -2438,7 +2617,7 @@ mod tests {
                 &leaf(),
                 &t1,
                 Arc::new(LoglessCommitProbe::replayable(b"k", &t1, b"first")),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -2449,7 +2628,7 @@ mod tests {
                 &leaf(),
                 &t2,
                 Arc::new(LoglessCommitProbe::replayable(b"k", &t2, b"second")),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -2510,7 +2689,7 @@ mod tests {
                     tx: t1.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -2518,7 +2697,7 @@ mod tests {
 
         let (c2, t2) = (coord.clone(), tx.clone());
         let release = tokio::spawn(async move {
-            c2.submit_leaf(&leaf(), &t2, Arc::new(SkipRelease), Requirement::Any)
+            c2.submit_leaf(&leaf(), &t2, Arc::new(SkipRelease), Requirement::ANY)
                 .await
         });
         rt::sleep(Duration::from_secs(1)).await;
@@ -2596,7 +2775,7 @@ mod tests {
                     tx: t1.clone(),
                     admission: StageAdmission::ExistingKeys,
                 }),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -2612,7 +2791,7 @@ mod tests {
                     tx: t2.clone(),
                     admission: StageAdmission::AddsKey,
                 }),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
         });
@@ -2745,7 +2924,7 @@ mod tests {
                 &leaf(),
                 &tx,
                 Arc::new(StageInline::logless(b"k", &tx, value)),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
             .unwrap();
@@ -2802,7 +2981,7 @@ mod tests {
                 &leaf(),
                 &tx,
                 Arc::new(StageInline::logless(b"k", &tx, value)),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
             .unwrap();
@@ -2939,7 +3118,7 @@ mod tests {
                         folds: std::sync::atomic::AtomicUsize::new(0),
                         recovers_non_landing: false,
                     }),
-                    Requirement::Any,
+                    Requirement::ANY,
                 )
                 .await
         });
@@ -2951,7 +3130,7 @@ mod tests {
                     &leaf(),
                     &joiner_tx,
                     Arc::new(SkipCauseProbe),
-                    Requirement::Any,
+                    Requirement::ANY,
                 )
                 .await
         });
@@ -3037,7 +3216,7 @@ mod tests {
                     folds: std::sync::atomic::AtomicUsize::new(0),
                     recovers_non_landing: true,
                 }),
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
             .unwrap();
@@ -3063,7 +3242,7 @@ mod tests {
 
         let tx = TxId::with_priority(1, b"t");
         let out = coord
-            .submit_leaf(&leaf(), &tx, Arc::new(SkipRelease), Requirement::Any)
+            .submit_leaf(&leaf(), &tx, Arc::new(SkipRelease), Requirement::ANY)
             .await
             .unwrap();
         assert!(
@@ -3204,7 +3383,7 @@ mod tests {
                         folds: std::sync::atomic::AtomicUsize::new(0),
                         seen_in_doubt: driver_seen,
                     }),
-                    Requirement::Any,
+                    Requirement::ANY,
                 )
                 .await
         });
@@ -3219,7 +3398,7 @@ mod tests {
                         key: b"peer".to_vec(),
                         tx: joiner_tx.clone(),
                     }),
-                    Requirement::Any,
+                    Requirement::ANY,
                 )
                 .await
         });
@@ -3356,7 +3535,7 @@ mod tests {
                         folds: std::sync::atomic::AtomicUsize::new(0),
                         seen_in_doubt: driver_seen,
                     }),
-                    Requirement::Any,
+                    Requirement::ANY,
                 )
                 .await
         });
@@ -3371,7 +3550,7 @@ mod tests {
                         key: b"retrying".to_vec(),
                         tx: joiner_tx.clone(),
                     }),
-                    Requirement::Any,
+                    Requirement::ANY,
                 )
                 .await
         });

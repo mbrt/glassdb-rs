@@ -18,9 +18,9 @@
 //! not revoke the historical fact that the observed state was current after its
 //! watermark.
 //!
-//! Reads take a [`Requirement`]: `Any` accepts any usable cached entry and reads
-//! the backend on a miss; `AtLeast(T)` accepts an entry only when its watermark
-//! is at least `T`, otherwise it checks through the backend. Actual same-path
+//! Reads take a [`Requirement`]: `ANY` accepts any usable cached entry and reads
+//! the backend on a miss; `after(barrier)` requires evidence that reaches a
+//! captured currentness barrier. Older evidence needs a backend check. Same-path
 //! backend calls are serialized, and the store allocates an invocation point
 //! immediately before dispatch. Reconciliation happens before the path lane is
 //! released and before the operation becomes ready.
@@ -33,7 +33,7 @@ use std::time::Duration;
 use crate::cache_stats::{CacheMetrics, CacheStats};
 use crate::disk_cache::PersistentCache;
 use crate::error::StorageError;
-use crate::timeline::{SequencePoint, Timeline};
+use crate::timeline::{CurrentnessBarrier, SequencePoint, Timeline};
 use glassdb_backend::{self as backend, Backend, BackendError};
 use glassdb_data::{ObjectPath, PathError};
 
@@ -165,55 +165,52 @@ impl Revision {
 }
 
 /// The freshness requirement a cached entry must satisfy before it is served.
+///
+/// Construct requirements explicitly with `ANY`, `after`, or `within`. Do not
+/// add constructors from observations, receipts, or raw sequence points, nor
+/// expose the stored bound. An invocation watermark cannot establish a barrier
+/// after completed work. Requirements cannot be converted back into barriers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Requirement {
-    /// Accept any usable cached entry without a backend check; read the
-    /// backend only on a miss.
-    Any,
-    /// Accept an entry only when its watermark is at least this time; otherwise
-    /// check through the backend.
-    AtLeast(SequencePoint),
-}
+pub struct Requirement(Option<SequencePoint>);
 
 impl Requirement {
-    /// Reports whether evidence confirmed current at `current_after` satisfies
-    /// this requirement.
-    pub fn is_satisfied_by(self, current_after: SequencePoint) -> bool {
-        match self {
-            Requirement::Any => true,
-            Requirement::AtLeast(bound) => current_after >= bound,
-        }
+    /// Accepts any usable cached entry without a backend check.
+    pub const ANY: Self = Self(None);
+
+    /// Requires evidence that reaches the captured currentness barrier.
+    pub fn after(barrier: CurrentnessBarrier) -> Self {
+        Self(Some(barrier.point()))
     }
 
     /// Returns the stronger of two requirements.
     pub fn stricter(self, other: Self) -> Self {
-        match (self, other) {
-            (Requirement::Any, requirement) | (requirement, Requirement::Any) => requirement,
-            (Requirement::AtLeast(left), Requirement::AtLeast(right)) => {
-                Requirement::AtLeast(left.max(right))
-            }
+        Self(self.0.max(other.0))
+    }
+
+    /// Accepts evidence within the approximate bounded-staleness cutoff.
+    pub fn within(timeline: &Timeline, max_staleness: Duration) -> Self {
+        if max_staleness == Duration::MAX {
+            Self::ANY
+        } else {
+            // This cutoff is a cache policy, not a barrier after completed work.
+            Self(Some(timeline.approximate_cutoff(max_staleness)))
         }
     }
 
-    /// Builds a requirement accepting evidence no older than `max_staleness`
-    /// on `timeline`.
-    pub fn within(timeline: &Timeline, max_staleness: Duration) -> Self {
-        if max_staleness == Duration::MAX {
-            Requirement::Any
-        } else {
-            // An explicit bounded-staleness read has no transaction validation
-            // barrier or mutation receipt to inherit, so its policy must sample
-            // the database timeline here.
-            Requirement::AtLeast(timeline.approximate_cutoff(max_staleness))
-        }
+    pub(crate) fn is_satisfied_by(self, current_after: SequencePoint) -> bool {
+        self.0.is_none_or(|bound| current_after >= bound)
+    }
+
+    pub(crate) fn minimum(self) -> Option<SequencePoint> {
+        self.0
     }
 }
 
 /// The outcome of a conditional mutation (create or compare-and-swap).
 #[derive(Debug)]
 pub enum CasResult<V> {
-    /// The mutation landed; the installed state's observation.
-    Committed(Observation<V>),
+    /// The mutation succeeded; the receipt retains its precondition and installed state.
+    Committed(CasReceipt<V>),
     /// The precondition failed: the starting revision or cached absence was
     /// obsolete. The exact starting entry has been invalidated.
     Conflict,
@@ -225,12 +222,60 @@ impl<V> CasResult<V> {
         matches!(self, CasResult::Committed(_))
     }
 
-    /// Returns the committed observation, or `None` on conflict.
-    pub fn into_observation(self) -> Option<Observation<V>> {
+    /// Returns the successful mutation's receipt, or `None` on conflict.
+    pub fn into_receipt(self) -> Option<CasReceipt<V>> {
         match self {
-            CasResult::Committed(o) => Some(o),
+            CasResult::Committed(receipt) => Some(receipt),
             CasResult::Conflict => None,
         }
+    }
+}
+
+/// Proof of a successful conditional create or compare-and-swap.
+///
+/// Only the storage mutation implementation may construct a receipt, after a
+/// definitive backend success. Reads, conflicts, unchanged folds, and in-doubt
+/// results must not be converted into receipts. Batch-member participation is
+/// separate from this storage proof and belongs to the coordinator.
+///
+/// The expected revision identifies the precondition; `None` means absence for
+/// a conditional create. It must not be paired with the installed body to make
+/// an observation. The installed observation retains the exact state written by
+/// this mutation, even if a peer replaces it before the reply arrives.
+/// Its invocation point is fixed: advancing the installed observation's
+/// watermark must never make the precondition qualify for a later barrier.
+///
+/// State evidence is available only through explicit accessors. Do not add
+/// `Deref`, `AsRef`, `From`, payload mapping, or methods that expose a sequence
+/// point. A receipt does not establish a currentness barrier after the mutation.
+#[derive(Debug, Clone)]
+pub struct CasReceipt<V> {
+    expected_revision: Option<Revision>,
+    installed: Observation<V>,
+    invoked: SequencePoint,
+}
+
+impl<V> CasReceipt<V> {
+    /// Returns the exact state installed by the successful mutation.
+    pub fn installed(&self) -> &Observation<V> {
+        &self.installed
+    }
+
+    /// Consumes the receipt and retains only its installed-state observation.
+    pub fn into_installed(self) -> Observation<V> {
+        self.installed
+    }
+
+    /// Reports whether this mutation confirmed the observation's state at or
+    /// after `barrier`. It does not prove continuous currentness since the read.
+    pub fn confirms_expected(
+        &self,
+        observed: &Observation<V>,
+        barrier: CurrentnessBarrier,
+    ) -> bool {
+        self.invoked >= barrier.point()
+            && self.installed.key == observed.key
+            && self.expected_revision == observed.revision
     }
 }
 
@@ -270,6 +315,11 @@ impl Evidence {
 /// mutation. It carries the decoded value (or absence), the [`Revision`], and a
 /// reference to shared currentness evidence. It remains inspectable after the
 /// state is evicted or invalidated as the current cache entry.
+///
+/// Keep the state, revision, path, and evidence together. Do not add public
+/// constructors, payload transformations, sequence-point accessors, or
+/// conversions to requirements or barriers. The invocation watermark cannot
+/// prove that another operation follows the completed observation.
 #[derive(Debug, Clone)]
 pub struct Observation<V> {
     key: ObjectKey,
@@ -305,14 +355,14 @@ impl<V> Observation<V> {
         self.revision.as_ref()
     }
 
-    /// The watermark after which the state was known to be current.
-    pub fn current_after(&self) -> SequencePoint {
-        self.evidence.get()
+    /// Reports whether this state has currentness evidence at or after `barrier`.
+    pub fn is_current_after(&self, barrier: CurrentnessBarrier) -> bool {
+        self.evidence.get() >= barrier.point()
     }
 
-    /// Advances this observation's currentness evidence without changing its state.
-    pub(crate) fn advance_current_after(&self, bound: SequencePoint) {
-        self.evidence.advance(bound);
+    /// Reports whether the retained evidence satisfies the freshness requirement.
+    pub fn satisfies(&self, requirement: Requirement) -> bool {
+        requirement.is_satisfied_by(self.evidence.get())
     }
 
     /// The parsed physical object path this observation refers to.
@@ -339,6 +389,15 @@ impl<V> Observation<V> {
             (Some(mine), Some(theirs)) => self.key == other.key && mine == theirs,
             _ => false,
         }
+    }
+
+    pub(crate) fn current_after(&self) -> SequencePoint {
+        self.evidence.get()
+    }
+
+    /// Advances this observation's currentness evidence without changing its state.
+    pub(crate) fn advance_current_after(&self, bound: SequencePoint) {
+        self.evidence.advance(bound);
     }
 }
 
@@ -441,7 +500,7 @@ impl CachedStore {
         &self,
         key: &ObjectKey,
     ) -> Result<Option<Observation<C::Value>>, StorageError> {
-        self.try_hit::<C>(key, Requirement::Any)
+        self.try_hit::<C>(key, Requirement::ANY)
     }
 
     /// Checks whether a previously returned observation is current under `req`.
@@ -509,14 +568,19 @@ impl CachedStore {
             self.knowledge
                 .install_mutation::<C>(key, value, size, Revision(version), invoked)
         })?;
-        Ok(committed.map_or(CasResult::Conflict, CasResult::Committed))
+        Ok(committed.map_or(CasResult::Conflict, |installed| {
+            CasResult::Committed(CasReceipt {
+                expected_revision: None,
+                installed,
+                invoked,
+            })
+        }))
     }
 
-    /// Compare-and-swaps the object from `expected` to `value`. On success the
-    /// expected observation is proven to have remained current right up to the
-    /// swap, so its watermark is advanced, and the new value is published; a
-    /// conflict invalidates the exact starting revision if still cached, while
-    /// an in-doubt outcome makes all path knowledge uncertain.
+    /// Conditionally replaces the exact state identified by `expected` with
+    /// `value`. Success confirms the expected revision at the transition and
+    /// returns a receipt of the installed state. It does not prove that
+    /// the expected state was current throughout the interval since its read.
     async fn cas<C: Codec>(
         &self,
         value: Arc<C::Value>,
@@ -551,13 +615,17 @@ impl CachedStore {
             Err(error) => MutationOutcome::failed(error),
         };
         let completed = round.finish(outcome, |version| match version {
-            Some(version) => CasResult::Committed(self.knowledge.install_mutation::<C>(
-                key,
-                value,
-                size,
-                Revision(version),
+            Some(version) => CasResult::Committed(CasReceipt {
+                expected_revision: Some(revision),
+                installed: self.knowledge.install_mutation::<C>(
+                    key,
+                    value,
+                    size,
+                    Revision(version),
+                    invoked,
+                ),
                 invoked,
-            )),
+            }),
             None => {
                 self.knowledge
                     .install_absent_observation::<C::Value>(key, invoked);
@@ -669,7 +737,7 @@ impl CachedStore {
                             .load::<C>(&self.knowledge, key, &state)
                             .await
                     {
-                        if req == Requirement::Any {
+                        if req == Requirement::ANY {
                             return Ok(self.knowledge.result_from_seed(persistent_seed, true));
                         }
                         seed = Some(persistent_seed);
@@ -1173,7 +1241,7 @@ mod tests {
                 let (first, _) =
                     simulated_persistent_store(&directory, erased.clone(), media.clone()).await;
                 let typed: TypedCachedStore<Bytes> = first.typed();
-                let loaded = typed.read("p", Requirement::Any).await.unwrap();
+                let loaded = typed.read("p", Requirement::ANY).await.unwrap();
                 let persisted = loaded.current_after();
                 drop(typed);
                 first.shutdown().await;
@@ -1183,7 +1251,7 @@ mod tests {
                     simulated_persistent_store(&directory, erased, media).await;
                 assert!(timeline.now() > persisted);
                 let typed: TypedCachedStore<Bytes> = reopened.typed();
-                let restored = typed.read("p", Requirement::Any).await.unwrap();
+                let restored = typed.read("p", Requirement::ANY).await.unwrap();
                 assert_eq!(restored.value().unwrap().as_slice(), b"one");
                 assert_eq!(restored.current_after(), persisted);
                 assert!(restored.cache_hit());
@@ -1208,7 +1276,7 @@ mod tests {
                 assert!(!store.persistent.is_enabled());
 
                 let typed: TypedCachedStore<Bytes> = store.typed();
-                let loaded = typed.read("p", Requirement::Any).await.unwrap();
+                let loaded = typed.read("p", Requirement::ANY).await.unwrap();
                 assert_eq!(loaded.value().unwrap().as_slice(), b"one");
                 drop(typed);
                 store.shutdown().await;
@@ -1257,7 +1325,7 @@ mod tests {
                     Some(persistent),
                 );
                 let typed: TypedCachedStore<Bytes> = store.typed();
-                let loaded = typed.read("p", Requirement::Any).await.unwrap();
+                let loaded = typed.read("p", Requirement::ANY).await.unwrap();
                 assert_eq!(loaded.value().unwrap().as_slice(), b"backend");
                 assert_eq!(store.body_reads(), 1);
                 assert_eq!(count(&log, "read"), 1);
@@ -1286,7 +1354,7 @@ mod tests {
         let (first, _) =
             simulated_persistent_store(&directory, erased.clone(), media.clone()).await;
         let first_typed: TypedCachedStore<Bytes> = first.typed();
-        first_typed.read("p", Requirement::Any).await.unwrap();
+        first_typed.read("p", Requirement::ANY).await.unwrap();
         drop(first_typed);
         first.shutdown().await;
         drop(first);
@@ -1298,7 +1366,7 @@ mod tests {
         let mut pause = media.pause_next_operation();
         let mut read = tokio::spawn({
             let typed = typed.clone();
-            async move { typed.read("p", Requirement::Any).await }
+            async move { typed.read("p", Requirement::ANY).await }
         });
         tokio::select! {
             () = pause.wait_until_entered() => {}
@@ -1330,8 +1398,9 @@ mod tests {
             .create(path, None, value)
             .await
             .unwrap()
-            .into_observation()
+            .into_receipt()
             .unwrap()
+            .into_installed()
     }
 
     async fn replace_value(
@@ -1343,8 +1412,9 @@ mod tests {
             .compare_and_swap(expected, value)
             .await
             .unwrap()
-            .into_observation()
+            .into_receipt()
             .unwrap()
+            .into_installed()
     }
 
     const OLD_VALUE: &[u8] = b"old";
@@ -1495,9 +1565,9 @@ mod tests {
                 .create("p", expected.as_ref(), v(PROPOSED_VALUE))
                 .await
             {
-                Ok(CasResult::Committed(observation)) => MutationResult {
+                Ok(CasResult::Committed(receipt)) => MutationResult {
                     kind: ExpectedMutationResult::Committed,
-                    observation: Some(observation),
+                    observation: Some(receipt.into_installed()),
                 },
                 Ok(CasResult::Conflict) => MutationResult {
                     kind: ExpectedMutationResult::Conflict,
@@ -1520,9 +1590,9 @@ mod tests {
                 )
                 .await
             {
-                Ok(CasResult::Committed(observation)) => MutationResult {
+                Ok(CasResult::Committed(receipt)) => MutationResult {
                     kind: ExpectedMutationResult::Committed,
-                    observation: Some(observation),
+                    observation: Some(receipt.into_installed()),
                 },
                 Ok(CasResult::Conflict) => MutationResult {
                     kind: ExpectedMutationResult::Conflict,
@@ -1576,7 +1646,7 @@ mod tests {
     ) -> PreparedMutation {
         let expected = match (kind, knowledge) {
             (MutationKind::Create, KnowledgeCase::Absent | KnowledgeCase::Stale) => {
-                store.read("p", Requirement::Any).await.unwrap()
+                store.read("p", Requirement::ANY).await.unwrap()
             }
             (_, KnowledgeCase::Matching)
             | (_, KnowledgeCase::Stale)
@@ -1617,8 +1687,8 @@ mod tests {
         }
 
         let known_winner = if matches!(knowledge, KnowledgeCase::KnownWinner) {
-            let bound = store.store.timeline.now();
-            Some(store.read("p", Requirement::AtLeast(bound)).await.unwrap())
+            let bound = store.store.timeline.currentness_barrier();
+            Some(store.read("p", Requirement::after(bound)).await.unwrap())
         } else {
             None
         };
@@ -1955,7 +2025,7 @@ mod tests {
             protocol.assert_operations(&[case.kind.operation()], case.name);
 
             protocol.clear_operations();
-            let next = store.read("p", Requirement::Any).await.unwrap();
+            let next = store.read("p", Requirement::ANY).await.unwrap();
             assert_observation(&next, case.next_value, case.next_cache_hit, case.name);
             let expected_operations: &[&str] = if case.next_cache_hit { &[] } else { &["read"] };
             protocol.assert_operations(expected_operations, case.name);
@@ -2021,12 +2091,12 @@ mod tests {
 
             let leader = tokio::spawn({
                 let store = store.clone();
-                async move { store.read("p", Requirement::Any).await }
+                async move { store.read("p", Requirement::ANY).await }
             });
             entered.notified().await;
             let waiter = tokio::spawn({
                 let store = store.clone();
-                async move { store.read("p", Requirement::Any).await }
+                async move { store.read("p", Requirement::ANY).await }
             });
             for _ in 0..64 {
                 tokio::task::yield_now().await;
@@ -2079,7 +2149,7 @@ mod tests {
 
             protocol.hook.clear_before();
             protocol.clear_operations();
-            let next = store.read("p", Requirement::Any).await.unwrap();
+            let next = store.read("p", Requirement::ANY).await.unwrap();
             let (next_value, next_hit) = match completion {
                 ReadCompletionCase::Present => (ExpectedValue::Old, true),
                 ReadCompletionCase::Absent => (ExpectedValue::Absent, true),
@@ -2134,12 +2204,12 @@ mod tests {
                     });
                     let leader = tokio::spawn({
                         let store = store.clone();
-                        async move { store.read("p", Requirement::Any).await }
+                        async move { store.read("p", Requirement::ANY).await }
                     });
                     entered.notified().await;
                     let waiter = tokio::spawn({
                         let store = store.clone();
-                        async move { store.read("p", Requirement::Any).await }
+                        async move { store.read("p", Requirement::ANY).await }
                     });
                     for _ in 0..64 {
                         tokio::task::yield_now().await;
@@ -2177,12 +2247,12 @@ mod tests {
                     });
                     let leader = tokio::spawn({
                         let store = store.clone();
-                        async move { store.read("p", Requirement::Any).await }
+                        async move { store.read("p", Requirement::ANY).await }
                     });
                     entered.notified().await;
                     let waiter = tokio::spawn({
                         let store = store.clone();
-                        async move { store.read("p", Requirement::Any).await }
+                        async move { store.read("p", Requirement::ANY).await }
                     });
                     for _ in 0..64 {
                         tokio::task::yield_now().await;
@@ -2199,7 +2269,7 @@ mod tests {
 
             protocol.hook.clear_before();
             protocol.clear_operations();
-            let next = store.read("p", Requirement::Any).await.unwrap();
+            let next = store.read("p", Requirement::ANY).await.unwrap();
             assert_observation(&next, ExpectedValue::Old, true, &context);
             protocol.assert_operations(&[], &context);
         }
@@ -2253,10 +2323,10 @@ mod tests {
                 }
             });
 
-            let bound = store.store.timeline.now();
+            let bound = store.store.timeline.currentness_barrier();
             let validating = tokio::spawn({
                 let store = store.clone();
-                async move { store.read("p", Requirement::AtLeast(bound)).await }
+                async move { store.read("p", Requirement::after(bound)).await }
             });
             entered.notified().await;
             protocol.clear_operations();
@@ -2282,7 +2352,7 @@ mod tests {
             protocol.assert_operations(&[], &context);
 
             protocol.clear_operations();
-            let next = store.read("p", Requirement::Any).await.unwrap();
+            let next = store.read("p", Requirement::ANY).await.unwrap();
             assert_observation(&next, expected_value, true, &context);
             protocol.assert_operations(&[], &context);
         }
@@ -2474,7 +2544,7 @@ mod tests {
 
             let (first, _) = persistent_store(&directory, protocol.backend.clone()).await;
             let first_typed: TypedCachedStore<Bytes> = first.typed();
-            let persisted = first_typed.read("p", Requirement::Any).await.unwrap();
+            let persisted = first_typed.read("p", Requirement::ANY).await.unwrap();
             assert_observation(&persisted, ExpectedValue::Old, false, case.name);
             drop(first_typed);
             first.shutdown().await;
@@ -2486,7 +2556,7 @@ mod tests {
             let expected = if matches!(case.kind, MutationKind::Create) {
                 None
             } else {
-                let restored = second_typed.read("p", Requirement::Any).await.unwrap();
+                let restored = second_typed.read("p", Requirement::ANY).await.unwrap();
                 assert_observation(&restored, ExpectedValue::Old, true, case.name);
                 protocol.assert_operations(&[], case.name);
                 Some(restored)
@@ -2612,7 +2682,7 @@ mod tests {
             protocol.clear_operations();
             let (third, _) = persistent_store(&directory, protocol.backend.clone()).await;
             let third_typed: TypedCachedStore<Bytes> = third.typed();
-            let next = third_typed.read("p", Requirement::Any).await.unwrap();
+            let next = third_typed.read("p", Requirement::ANY).await.unwrap();
             let preserved = matches!(case.completion, CompletionCase::DefinitiveBeforeApply);
             assert_observation(&next, case.next_value, preserved, case.name);
             let expected_operations: &[&str] = if preserved { &[] } else { &["read"] };
@@ -2623,42 +2693,40 @@ mod tests {
     }
 
     // Model invariant: an `Any` hit is served from cache with no backend op,
-    // while `AtLeast(now())` on an older entry checks and advances (never
+    // while `after(barrier)` on an older entry checks and advances (never
     // regresses) its watermark.
     #[tokio::test]
-    async fn any_hit_is_local_and_at_least_checks_current_and_advances() {
+    async fn any_hit_is_local_and_barrier_checks_current_and_advances() {
         let (s, log) = store_rec();
         create_value(&s, "p", v(b"a")).await;
 
-        let o1 = s.read("p", Requirement::Any).await.unwrap();
+        let o1 = s.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(o1.value().unwrap().as_slice(), b"a");
         assert_eq!(count(&log, "read"), 0);
         assert_eq!(count(&log, "read_if_modified"), 0);
 
-        let t = s.store.timeline.now();
-        let o2 = s.read("p", Requirement::AtLeast(t)).await.unwrap();
+        let t = s.store.timeline.currentness_barrier();
+        let o2 = s.read("p", Requirement::after(t)).await.unwrap();
         assert_eq!(count(&log, "read_if_modified"), 1, "stale entry is checked");
-        assert!(o2.current_after() >= t, "watermark advanced to the bound");
+        assert!(o2.is_current_after(t), "watermark advanced to the bound");
         assert!(o2.current_after() >= o1.current_after(), "never regresses");
     }
 
-    // Model invariant: `AtLeast(T)` accepts an entry whose watermark already
-    // reaches `T` with no backend op.
+    // Model invariant: `after(barrier)` accepts an entry whose watermark already
+    // reaches the barrier with no backend op.
     #[tokio::test]
-    async fn at_least_served_locally_when_watermark_sufficient() {
+    async fn barrier_served_locally_when_evidence_sufficient() {
         let (s, log) = store_rec();
         create_value(&s, "p", v(b"a")).await;
-        let o = s
-            .read("p", Requirement::AtLeast(s.store.timeline.now()))
-            .await
-            .unwrap();
-        let w = o.current_after();
+        let barrier = s.store.timeline.currentness_barrier();
+        let o = s.read("p", Requirement::after(barrier)).await.unwrap();
+        assert!(o.is_current_after(barrier));
         clear(&log);
 
-        let o2 = s.read("p", Requirement::AtLeast(w)).await.unwrap();
+        let o2 = s.read("p", Requirement::after(barrier)).await.unwrap();
         assert_eq!(count(&log, "read"), 0);
         assert_eq!(count(&log, "read_if_modified"), 0);
-        assert!(o2.current_after() >= w);
+        assert!(o2.is_current_after(barrier));
     }
 
     // Model invariant: `Any` never returns an entry a conflict invalidated. A
@@ -2677,8 +2745,9 @@ mod tests {
             .create("p", None, v(b"a"))
             .await
             .unwrap()
-            .into_observation()
-            .unwrap();
+            .into_receipt()
+            .unwrap()
+            .into_installed();
         // A peer overwrites the object; s1's cache is unaware.
         replace_value(&s2, &obs, v(b"b")).await;
 
@@ -2686,7 +2755,7 @@ mod tests {
         assert!(!r.committed(), "the stale CAS conflicts");
         clear(&log);
 
-        let got = s1.read("p", Requirement::Any).await.unwrap();
+        let got = s1.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(
             got.value().unwrap().as_slice(),
             b"b",
@@ -2711,8 +2780,8 @@ mod tests {
         let b = bytes_store(backend);
 
         create_value(&a, "p", v(b"x")).await;
-        let obs_a = a.read("p", Requirement::Any).await.unwrap();
-        let obs_b = b.read("p", Requirement::Any).await.unwrap();
+        let obs_a = a.read("p", Requirement::ANY).await.unwrap();
+        let obs_b = b.read("p", Requirement::ANY).await.unwrap();
 
         assert_eq!(
             obs_a.revision(),
@@ -2738,13 +2807,14 @@ mod tests {
         let s1 = bytes_store(backend.clone());
         let s2 = bytes_store(backend);
 
+        let barrier = s1.store.timeline.currentness_barrier();
         let obs = s1
             .create("p", None, v(b"a"))
             .await
             .unwrap()
-            .into_observation()
-            .unwrap();
-        let w = obs.current_after();
+            .into_receipt()
+            .unwrap()
+            .into_installed();
 
         replace_value(&s2, &obs, v(b"b")).await;
         s1.compare_and_swap(&obs, v(b"c")).await.unwrap(); // conflict -> uncertain
@@ -2753,7 +2823,7 @@ mod tests {
 
         clear(&log);
         assert!(matches!(
-            s1.check_current(&obs, Requirement::AtLeast(w))
+            s1.check_current(&obs, Requirement::after(barrier))
                 .await
                 .unwrap(),
             ObservationCheck::Current
@@ -2762,18 +2832,14 @@ mod tests {
         assert_eq!(count(&log, "read_if_modified"), 0);
 
         // A stricter bound checks again and observes the winner.
-        let t = s1.store.timeline.now();
-        match s1
-            .check_current(&obs, Requirement::AtLeast(t))
-            .await
-            .unwrap()
-        {
+        let t = s1.store.timeline.currentness_barrier();
+        match s1.check_current(&obs, Requirement::after(t)).await.unwrap() {
             ObservationCheck::Changed(cur) => assert_eq!(cur.value().unwrap().as_slice(), b"b"),
             ObservationCheck::Current => panic!("a stricter bound must observe the changed state"),
         }
 
         // A brand-new read cannot rediscover the obsolete value.
-        let got = s1.read("p", Requirement::Any).await.unwrap();
+        let got = s1.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(got.value().unwrap().as_slice(), b"b");
     }
 
@@ -2788,13 +2854,13 @@ mod tests {
 
         let observed = create_value(&local, "p", v(b"a")).await;
         replace_value(&peer, &observed, v(b"b")).await;
-        let bound = local.store.timeline.now();
-        let current = local.read("p", Requirement::AtLeast(bound)).await.unwrap();
+        let bound = local.store.timeline.currentness_barrier();
+        let current = local.read("p", Requirement::after(bound)).await.unwrap();
         assert_eq!(current.value().unwrap().as_slice(), b"b");
 
         clear(&log);
         match local
-            .check_current(&observed, Requirement::AtLeast(bound))
+            .check_current(&observed, Requirement::after(bound))
             .await
             .unwrap()
         {
@@ -2815,16 +2881,21 @@ mod tests {
             .create("p", None, v(b"a"))
             .await
             .unwrap()
-            .into_observation()
-            .unwrap();
+            .into_receipt()
+            .unwrap()
+            .into_installed();
 
         let before = s.store.timeline.now();
-        let nb = s
+        let barrier = s.store.timeline.currentness_barrier();
+        let receipt = s
             .compare_and_swap(&obs, v(b"b"))
             .await
             .unwrap()
-            .into_observation()
+            .into_receipt()
             .unwrap();
+        assert!(receipt.confirms_expected(&obs, barrier));
+        assert!(!receipt.confirms_expected(receipt.installed(), barrier));
+        let nb = receipt.into_installed();
         assert!(
             obs.current_after() >= before,
             "expected observation advanced past the CAS start"
@@ -2832,8 +2903,90 @@ mod tests {
         assert!(nb.current_after() >= before);
         assert_eq!(nb.value().unwrap().as_slice(), b"b");
 
-        let got = s.read("p", Requirement::Any).await.unwrap();
+        let got = s.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(got.value().unwrap().as_slice(), b"b");
+    }
+
+    #[tokio::test]
+    async fn checking_installed_state_does_not_renew_a_cas_receipt() {
+        let (store, log) = store_rec();
+        let expected = create_value(&store, "p", v(b"old")).await;
+        let first_barrier = store.store.timeline.currentness_barrier();
+        let receipt = store
+            .compare_and_swap(&expected, v(b"installed"))
+            .await
+            .unwrap()
+            .into_receipt()
+            .unwrap();
+        assert!(receipt.confirms_expected(&expected, first_barrier));
+
+        let next_barrier = store.store.timeline.currentness_barrier();
+        assert!(!receipt.installed().is_current_after(next_barrier));
+        clear(&log);
+        let check = store
+            .check_current(receipt.installed(), Requirement::after(next_barrier))
+            .await
+            .unwrap();
+        assert!(matches!(check, ObservationCheck::Current));
+        assert_eq!(count(&log, "read_if_modified"), 1);
+        assert!(receipt.installed().is_current_after(next_barrier));
+        assert!(!receipt.confirms_expected(&expected, next_barrier));
+        assert!(receipt.confirms_expected(&expected, first_barrier));
+    }
+
+    #[tokio::test]
+    async fn read_started_before_barrier_cannot_satisfy_it_by_completing_later() {
+        let memory = Arc::new(MemoryBackend::new());
+        let initial = memory
+            .write_if_not_exists("p", b"old".to_vec())
+            .await
+            .unwrap();
+        let hook = HookBackend::new(memory.clone());
+        let store = bytes_store(hook.clone());
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        hook.set_after({
+            let entered = entered.clone();
+            let release = release.clone();
+            move |operation, outcome| {
+                if !matches!(operation, BackendOp::Read { path } if *path == "p")
+                    || !outcome.is_success()
+                {
+                    return ready(Ok(()));
+                }
+                let entered = entered.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(())
+                })
+            }
+        });
+
+        let earlier = store.store.timeline.currentness_barrier();
+        let pending = tokio::spawn({
+            let store = store.clone();
+            async move { store.read("p", Requirement::ANY).await }
+        });
+        entered.notified().await;
+        let barrier = store.store.timeline.currentness_barrier();
+        memory
+            .write_if("p", b"new".to_vec(), &initial)
+            .await
+            .unwrap();
+        release.notify_one();
+
+        let old = pending.await.unwrap().unwrap();
+        assert_eq!(old.value().unwrap().as_slice(), b"old");
+        assert!(!old.is_current_after(barrier));
+        let requirement = Requirement::after(barrier).stricter(Requirement::after(earlier));
+        let check = store.check_current(&old, requirement).await.unwrap();
+        let ObservationCheck::Changed(current) = check else {
+            panic!("validation must reject the delayed old state");
+        };
+        assert_eq!(current.value().unwrap().as_slice(), b"new");
+        assert!(current.is_current_after(barrier));
     }
 
     // A reload can create independent evidence for the same revision. A
@@ -2845,7 +2998,7 @@ mod tests {
         let expected = create_value(&store, "p", v(b"a")).await;
 
         store.store.knowledge.invalidate("p");
-        let reloaded = store.read("p", Requirement::Any).await.unwrap();
+        let reloaded = store.read("p", Requirement::ANY).await.unwrap();
         assert!(expected.same_state(&reloaded));
         assert!(!Arc::ptr_eq(&expected.evidence.0, &reloaded.evidence.0));
 
@@ -2869,8 +3022,9 @@ mod tests {
             .create("p", None, v(b"a"))
             .await
             .unwrap()
-            .into_observation()
-            .unwrap();
+            .into_receipt()
+            .unwrap()
+            .into_installed();
         replace_value(&s2, &obs, v(b"b")).await;
 
         let before = s1.store.timeline.now();
@@ -2880,7 +3034,7 @@ mod tests {
             obs.current_after() < before,
             "conflict must not advance the observation"
         );
-        let got = s1.read("p", Requirement::Any).await.unwrap();
+        let got = s1.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(
             got.value().unwrap().as_slice(),
             b"b",
@@ -2901,8 +3055,9 @@ mod tests {
             .create("p", None, v(b"a"))
             .await
             .unwrap()
-            .into_observation()
-            .unwrap();
+            .into_receipt()
+            .unwrap()
+            .into_installed();
         let before = s.store.timeline.now();
 
         // The write lands but its acknowledgement is lost.
@@ -2925,7 +3080,7 @@ mod tests {
         );
         // The path became uncertain, so Any re-reads and finds the write
         // that actually landed.
-        let got = s.read("p", Requirement::Any).await.unwrap();
+        let got = s.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(got.value().unwrap().as_slice(), b"b");
     }
 
@@ -2937,7 +3092,7 @@ mod tests {
         let s = bytes_store(backend);
 
         // Cache a confirmed absence first.
-        assert!(!s.read("p", Requirement::Any).await.unwrap().exists());
+        assert!(!s.read("p", Requirement::ANY).await.unwrap().exists());
 
         hook.set_before(|op| {
             ready(if matches!(op, BackendOp::WriteIfNotExists { .. }) {
@@ -2952,7 +3107,7 @@ mod tests {
         ));
         hook.clear_before();
 
-        let got = s.read("p", Requirement::Any).await.unwrap();
+        let got = s.read("p", Requirement::ANY).await.unwrap();
         assert!(!got.exists(), "a failed create must not publish its value");
     }
 
@@ -2966,17 +3121,23 @@ mod tests {
         let local = bytes_store(backend.clone());
         let peer = bytes_store(backend);
 
-        let absent = local.read("p", Requirement::Any).await.unwrap();
+        let absent = local.read("p", Requirement::ANY).await.unwrap();
+        let other_absent = local.read("q", Requirement::ANY).await.unwrap();
         let present = create_value(&peer, "p", v(b"temporary")).await;
         peer.delete(&present).await.unwrap();
         clear(&log);
 
-        let created = local
+        let barrier = local.store.timeline.currentness_barrier();
+        let receipt = local
             .create("p", Some(&absent), v(b"final"))
             .await
             .unwrap()
-            .into_observation()
+            .into_receipt()
             .unwrap();
+        assert!(receipt.confirms_expected(&absent, barrier));
+        assert!(!receipt.confirms_expected(&other_absent, barrier));
+        assert!(!receipt.confirms_expected(&present, barrier));
+        let created = receipt.into_installed();
         assert_eq!(created.value().unwrap().as_slice(), b"final");
         assert_eq!(count(&log, "write_if_not_exists"), 1);
     }
@@ -2989,6 +3150,8 @@ mod tests {
         let backend: Arc<dyn Backend> = content.clone();
         let store = bytes_store(backend);
         let expected = create_value(&store, "p", v(b"a")).await;
+        let other_path = create_value(&store, "q", v(b"a")).await;
+        assert_eq!(expected.revision(), other_path.revision());
         content
             .delete_if("p", expected.revision().unwrap().version())
             .await
@@ -2998,7 +3161,17 @@ mod tests {
             .await
             .unwrap();
 
-        let replacement = replace_value(&store, &expected, v(b"b")).await;
+        let barrier = store.store.timeline.currentness_barrier();
+        let receipt = store
+            .compare_and_swap(&expected, v(b"b"))
+            .await
+            .unwrap()
+            .into_receipt()
+            .unwrap();
+        assert!(receipt.confirms_expected(&expected, barrier));
+        assert!(!receipt.confirms_expected(&other_path, barrier));
+        assert!(!receipt.confirms_expected(receipt.installed(), barrier));
+        let replacement = receipt.into_installed();
         assert_eq!(replacement.value().unwrap().as_slice(), b"b");
     }
 
@@ -3009,16 +3182,16 @@ mod tests {
         let (s, log) = store_rec();
         create_value(&s, "p", v(b"a")).await;
 
-        let t1 = s.store.timeline.now();
+        let t1 = s.store.timeline.currentness_barrier();
         let w1 = s
-            .read("p", Requirement::AtLeast(t1))
+            .read("p", Requirement::after(t1))
             .await
             .unwrap()
             .current_after();
-        assert!(w1 >= t1);
-        let t2 = s.store.timeline.now();
+        assert!(w1 >= t1.point());
+        let t2 = s.store.timeline.currentness_barrier();
         let w2 = s
-            .read("p", Requirement::AtLeast(t2))
+            .read("p", Requirement::after(t2))
             .await
             .unwrap()
             .current_after();
@@ -3032,20 +3205,20 @@ mod tests {
     #[tokio::test]
     async fn absence_is_cached_and_transitions() {
         let (s, log) = store_rec();
-        assert!(!s.read("m", Requirement::Any).await.unwrap().exists());
+        assert!(!s.read("m", Requirement::ANY).await.unwrap().exists());
         assert_eq!(count(&log, "read"), 1);
         clear(&log);
-        assert!(!s.read("m", Requirement::Any).await.unwrap().exists());
+        assert!(!s.read("m", Requirement::ANY).await.unwrap().exists());
         assert_eq!(count(&log, "read"), 0, "absence is cached");
 
         let present = create_value(&s, "m", v(b"x")).await;
-        let got = s.read("m", Requirement::Any).await.unwrap();
+        let got = s.read("m", Requirement::ANY).await.unwrap();
         assert_eq!(got.value().unwrap().as_slice(), b"x");
 
         let deleted = s.delete(&present).await.unwrap();
         assert!(deleted.is_absent());
         clear(&log);
-        assert!(!s.read("m", Requirement::Any).await.unwrap().exists());
+        assert!(!s.read("m", Requirement::ANY).await.unwrap().exists());
         assert_eq!(count(&log, "read"), 0, "delete leaves cached absence");
     }
 
@@ -3065,7 +3238,7 @@ mod tests {
         assert!(expected.current_after() >= before);
         assert_eq!(count(&log, "delete_if"), 1);
         clear(&log);
-        assert!(s.read("p", Requirement::Any).await.unwrap().is_absent());
+        assert!(s.read("p", Requirement::ANY).await.unwrap().is_absent());
         assert!(log.lock().unwrap().is_empty());
     }
 
@@ -3082,7 +3255,7 @@ mod tests {
         let peer = bytes_store(backend);
 
         let expected = create_value(&local, "p", v(b"a")).await;
-        let peer_observation = peer.read("p", Requirement::Any).await.unwrap();
+        let peer_observation = peer.read("p", Requirement::ANY).await.unwrap();
         peer.delete(&peer_observation).await.unwrap();
         let before = local.store.timeline.now();
         clear(&log);
@@ -3094,7 +3267,7 @@ mod tests {
         assert!(expected.current_after() < before);
         assert_eq!(count(&log, "delete_if"), 1);
         clear(&log);
-        assert!(local.read("p", Requirement::Any).await.unwrap().is_absent());
+        assert!(local.read("p", Requirement::ANY).await.unwrap().is_absent());
         assert!(log.lock().unwrap().is_empty());
     }
 
@@ -3146,8 +3319,8 @@ mod tests {
         release.notify_one();
 
         assert!(deleting.await.unwrap().unwrap().is_absent());
-        let bound = store.store.timeline.now();
-        let current = store.read("p", Requirement::AtLeast(bound)).await.unwrap();
+        let bound = store.store.timeline.currentness_barrier();
+        let current = store.read("p", Requirement::after(bound)).await.unwrap();
         assert!(current.exists());
         assert_eq!(current.value().unwrap().as_slice(), b"a");
     }
@@ -3165,7 +3338,7 @@ mod tests {
         let peer = bytes_store(backend);
 
         let expected = create_value(&local, "p", v(b"a")).await;
-        let peer_observation = peer.read("p", Requirement::Any).await.unwrap();
+        let peer_observation = peer.read("p", Requirement::ANY).await.unwrap();
         replace_value(&peer, &peer_observation, v(b"b")).await;
         let before = local.store.timeline.now();
 
@@ -3176,7 +3349,7 @@ mod tests {
         assert!(expected.current_after() < before);
         clear(&log);
 
-        let current = local.read("p", Requirement::Any).await.unwrap();
+        let current = local.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(current.value().unwrap().as_slice(), b"b");
         assert_eq!(count(&log, "read"), 1);
     }
@@ -3213,7 +3386,7 @@ mod tests {
 
         assert!(expected.current_after() < before);
         clear(&log);
-        assert!(store.read("p", Requirement::Any).await.unwrap().is_absent());
+        assert!(store.read("p", Requirement::ANY).await.unwrap().is_absent());
         assert_eq!(count(&log, "read"), 1);
     }
 
@@ -3247,7 +3420,7 @@ mod tests {
 
         assert!(expected.current_after() < before);
         clear(&log);
-        let current = store.read("p", Requirement::Any).await.unwrap();
+        let current = store.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(current.value().unwrap().as_slice(), b"a");
         assert!(current.cache_hit());
         assert!(log.lock().unwrap().is_empty());
@@ -3256,7 +3429,7 @@ mod tests {
     #[tokio::test]
     async fn delete_rejects_an_absence_observation_without_backend_io() {
         let (store, log) = store_rec();
-        let absent = store.read("p", Requirement::Any).await.unwrap();
+        let absent = store.read("p", Requirement::ANY).await.unwrap();
         clear(&log);
 
         assert!(matches!(
@@ -3279,7 +3452,7 @@ mod tests {
         let ints = store.typed::<Ints>();
         create_value(&bytes, "p", v(b"abcd")).await;
         assert!(matches!(
-            ints.read("p", Requirement::Any).await,
+            ints.read("p", Requirement::ANY).await,
             Err(StorageError::Other { .. })
         ));
     }
@@ -3324,7 +3497,7 @@ mod tests {
         }
         let reading = tokio::spawn({
             let s = s.clone();
-            async move { s.read("p", Requirement::Any).await }
+            async move { s.read("p", Requirement::ANY).await }
         });
         for _ in 0..64 {
             tokio::task::yield_now().await;
@@ -3376,14 +3549,14 @@ mod tests {
 
         let r1 = tokio::spawn({
             let s = s.clone();
-            async move { s.read("p", Requirement::Any).await }
+            async move { s.read("p", Requirement::ANY).await }
         });
         while entered.load(Ordering::SeqCst) < 1 {
             tokio::task::yield_now().await;
         }
         let r2 = tokio::spawn({
             let s = s.clone();
-            async move { s.read("p", Requirement::Any).await }
+            async move { s.read("p", Requirement::ANY).await }
         });
         // Give r2 a chance to (not) start its own read; it should join r1.
         for _ in 0..64 {
@@ -3431,14 +3604,14 @@ mod tests {
 
         let p = tokio::spawn({
             let store = store.clone();
-            async move { store.read("p", Requirement::Any).await }
+            async move { store.read("p", Requirement::ANY).await }
         });
         while !entered.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }
         let q = tokio::spawn({
             let store = store.clone();
-            async move { store.read("q", Requirement::Any).await }
+            async move { store.read("q", Requirement::ANY).await }
         });
         for _ in 0..64 {
             if q.is_finished() {
@@ -3490,7 +3663,7 @@ mod tests {
         while !entered.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }
-        let old = store.read("p", Requirement::Any).await.unwrap();
+        let old = store.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(old.value().unwrap().as_slice(), b"a");
         assert!(old.cache_hit());
 
@@ -3499,7 +3672,7 @@ mod tests {
         assert_eq!(new.value().unwrap().as_slice(), b"b");
         assert_eq!(
             store
-                .read("p", Requirement::Any)
+                .read("p", Requirement::ANY)
                 .await
                 .unwrap()
                 .value()
@@ -3547,7 +3720,7 @@ mod tests {
         let _ = replacing.await;
         hook.clear_after();
 
-        let current = store.read("p", Requirement::Any).await.unwrap();
+        let current = store.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(current.value().unwrap().as_slice(), b"b");
         assert!(!current.cache_hit());
         assert_eq!(count(&log, "write_if"), 1);
@@ -3589,7 +3762,7 @@ mod tests {
         });
         let reading = tokio::spawn({
             let store = store.clone();
-            async move { store.read("p", Requirement::Any).await }
+            async move { store.read("p", Requirement::ANY).await }
         });
         while !entered.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
@@ -3609,7 +3782,7 @@ mod tests {
 
         assert_eq!(count(&log, "write_if"), 0);
         clear(&log);
-        let current = store.read("p", Requirement::Any).await.unwrap();
+        let current = store.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(current.value().unwrap().as_slice(), b"a");
         assert!(current.cache_hit());
         assert!(log.lock().unwrap().is_empty());
@@ -3650,20 +3823,20 @@ mod tests {
             }
         });
 
-        // Reader A checks at AtLeast(now()); its op start is tA.
+        // Reader A checks after a captured barrier; its op start is tA.
         let a = tokio::spawn({
             let s = s.clone();
-            let t = s.store.timeline.now();
-            async move { s.read("p", Requirement::AtLeast(t)).await }
+            let t = s.store.timeline.currentness_barrier();
+            async move { s.read("p", Requirement::after(t)).await }
         });
         while entered.load(Ordering::SeqCst) < 1 {
             tokio::task::yield_now().await;
         }
         // A stricter bound than A's start: it cannot join A's in-flight op.
-        let strict = s.store.timeline.now();
+        let strict = s.store.timeline.currentness_barrier();
         let b = tokio::spawn({
             let s = s.clone();
-            async move { s.read("p", Requirement::AtLeast(strict)).await }
+            async move { s.read("p", Requirement::after(strict)).await }
         });
         for _ in 0..64 {
             tokio::task::yield_now().await;
@@ -3705,10 +3878,10 @@ mod tests {
         let earlier = SequencePoint::from_raw(1);
         let later = SequencePoint::from_raw(2);
 
-        assert!(Requirement::Any.is_satisfied_by(earlier));
-        assert!(Requirement::AtLeast(earlier).is_satisfied_by(earlier));
-        assert!(Requirement::AtLeast(earlier).is_satisfied_by(later));
-        assert!(!Requirement::AtLeast(later).is_satisfied_by(earlier));
+        assert!(Requirement::ANY.is_satisfied_by(earlier));
+        assert!(Requirement(Some(earlier)).is_satisfied_by(earlier));
+        assert!(Requirement(Some(earlier)).is_satisfied_by(later));
+        assert!(!Requirement(Some(later)).is_satisfied_by(earlier));
     }
 
     #[test]
@@ -3726,11 +3899,11 @@ mod tests {
 
         assert_eq!(
             Requirement::within(&timeline, Duration::from_secs(3)),
-            Requirement::AtLeast(SequencePoint::from_raw(7_000_000_000))
+            Requirement(Some(SequencePoint::from_raw(7_000_000_000)))
         );
         assert_eq!(
             Requirement::within(&timeline, Duration::MAX),
-            Requirement::Any
+            Requirement::ANY
         );
     }
 
@@ -3767,7 +3940,7 @@ mod tests {
             CachedStore::new(hooked, 1 << 20, timeline.clone(), None).typed();
         let read_store = store.clone();
         let read =
-            tokio::spawn(async move { read_store.read("p", Requirement::Any).await.unwrap() });
+            tokio::spawn(async move { read_store.read("p", Requirement::ANY).await.unwrap() });
         entered.notified().await;
 
         clock.set(Duration::from_secs(100));
@@ -3808,10 +3981,10 @@ mod tests {
             CachedStore::new(hooked, 1 << 20, Timeline::new(), None).typed();
         let leader = tokio::spawn({
             let store = store.clone();
-            async move { store.read("p", Requirement::Any).await }
+            async move { store.read("p", Requirement::ANY).await }
         });
         entered.notified().await;
-        let waiter = tokio::spawn(async move { store.read("p", Requirement::Any).await });
+        let waiter = tokio::spawn(async move { store.read("p", Requirement::ANY).await });
         tokio::task::yield_now().await;
         leader.abort();
 
@@ -3837,26 +4010,26 @@ mod tests {
 
         let (first, _) = persistent_store(&directory, erased.clone()).await;
         let first_typed: TypedCachedStore<Bytes> = first.typed();
-        let loaded = first_typed.read("p", Requirement::Any).await.unwrap();
+        let loaded = first_typed.read("p", Requirement::ANY).await.unwrap();
         let persisted = loaded.current_after();
         drop(first_typed);
         first.shutdown().await;
         drop(first);
 
         let (reopened, timeline) = persistent_store(&directory, erased).await;
-        let bound = timeline.now();
-        assert!(bound > persisted);
+        let bound = timeline.currentness_barrier();
+        assert!(bound.point() > persisted);
 
         let typed: TypedCachedStore<Bytes> = reopened.typed();
-        let restored = typed.read("p", Requirement::Any).await.unwrap();
+        let restored = typed.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(restored.value().unwrap().as_slice(), b"one");
         assert_eq!(restored.current_after(), persisted);
         assert!(restored.cache_hit());
         assert_eq!(reopened.body_reads(), 0);
 
         clear(&log);
-        let verified = typed.read("p", Requirement::AtLeast(bound)).await.unwrap();
-        assert!(verified.current_after() >= bound);
+        let verified = typed.read("p", Requirement::after(bound)).await.unwrap();
+        assert!(verified.is_current_after(bound));
         assert_eq!(reopened.body_reads(), 0);
         assert_eq!(
             count(&log, "read_if_modified"),
@@ -3882,7 +4055,7 @@ mod tests {
 
         let (first, _) = persistent_store(&directory, erased.clone()).await;
         let first_typed: TypedCachedStore<Bytes> = first.typed();
-        let old = first_typed.read("p", Requirement::Any).await.unwrap();
+        let old = first_typed.read("p", Requirement::ANY).await.unwrap();
         let changed = first_typed.compare_and_swap(&old, v(b"two")).await.unwrap();
         assert!(changed.committed());
         drop(first_typed);
@@ -3891,7 +4064,7 @@ mod tests {
 
         let (reopened, _) = persistent_store(&directory, erased).await;
         let typed: TypedCachedStore<Bytes> = reopened.typed();
-        let loaded = typed.read("p", Requirement::Any).await.unwrap();
+        let loaded = typed.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(loaded.value().unwrap().as_slice(), b"two");
         assert!(loaded.current_after() > SequencePoint::default());
         assert_eq!(reopened.body_reads(), 1);

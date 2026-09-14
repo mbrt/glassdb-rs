@@ -512,7 +512,7 @@ mod tests {
             None,
         );
         let observation = NodeStore::new(store, std::num::NonZeroUsize::MIN)
-            .load_root_state(key.collection(), Requirement::Any)
+            .load_root_state(key.collection(), Requirement::ANY)
             .await
             .unwrap();
         ReadAccess::new(key, ReadEvidence::new(last_writer, observation))

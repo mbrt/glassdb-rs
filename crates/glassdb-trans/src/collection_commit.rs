@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use glassdb_data::{CollectionAddress, CollectionId, TxId};
 use glassdb_storage::transaction::{TxCollectionChange, TxCollectionOp, TxLock};
-use glassdb_storage::{Requirement, SplitPolicy};
+use glassdb_storage::{CurrentnessBarrier, SplitPolicy};
 
 use crate::collection_catalog::CollectionCatalog;
 use crate::collections::{CatalogAccesses, CollectionLifecycle, CollectionOp};
@@ -228,14 +228,14 @@ impl CollectionCommit {
         &self,
         id: Option<&TxId>,
         attempt: &CollectionAttempt,
-        requirement: Requirement,
+        barrier: CurrentnessBarrier,
     ) -> Result<bool, TransError> {
         self.catalog
             .validate(
                 id,
                 &attempt.accesses.reads,
                 &attempt.accesses.changes,
-                requirement,
+                barrier,
                 &self.split_policy,
             )
             .await

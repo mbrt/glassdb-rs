@@ -103,7 +103,7 @@ impl<T> PendingPath<T> {
         self.items
             .iter()
             .map(|item| route_requirement(item.stage, interior, leaf))
-            .fold(Requirement::Any, Requirement::stricter)
+            .fold(Requirement::ANY, Requirement::stricter)
     }
 }
 
@@ -284,7 +284,7 @@ impl<T> BatchRouting<T> {
             return None;
         }
         let required = route_requirement(item.stage, self.interior, self.leaf);
-        if !required.is_satisfied_by(observation.current_after()) {
+        if !observation.satisfies(required) {
             self.enqueue(path.clone(), item);
             return None;
         }
@@ -331,9 +331,7 @@ impl<T> BatchRouting<T> {
                 self.enqueue(target, item);
                 None
             }
-            NodeBody::Leaf(_) if self.leaf.is_satisfied_by(observation.current_after()) => {
-                Some(item)
-            }
+            NodeBody::Leaf(_) if observation.satisfies(self.leaf) => Some(item),
             NodeBody::Leaf(_) => {
                 item.stage = RouteStage::Leaf;
                 self.enqueue(path.clone(), item);
@@ -1056,8 +1054,8 @@ mod tests {
         }
     }
 
-    fn assert_current_after(locator: &RoutedLeaf, bound: crate::SequencePoint) {
-        assert!(locator.observation.current_after() >= bound);
+    fn assert_current_after(locator: &RoutedLeaf, bound: crate::CurrentnessBarrier) {
+        assert!(locator.observation.is_current_after(bound));
     }
 
     fn live(key: &[u8]) -> LeafEntry {
@@ -1233,7 +1231,7 @@ mod tests {
         s.create_root(&collection(), &root).await.unwrap();
 
         let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
-        let requirement = Requirement::AtLeast(s.timeline.now());
+        let requirement = Requirement::after(s.timeline.currentness_barrier());
         let loc = router
             .route_key(&collection(), b"only", requirement)
             .await
@@ -1256,19 +1254,26 @@ mod tests {
         let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
         assert!(matches!(
             router
-                .route_key(&collection(), b"k", Requirement::AtLeast(s.timeline.now()))
+                .route_key(
+                    &collection(),
+                    b"k",
+                    Requirement::after(s.timeline.currentness_barrier())
+                )
                 .await,
             Err(StorageError::NotFound)
         ));
         // Structural traversal can still model absence as no reachable leaves.
         assert!(
             router
-                .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+                .leaves(
+                    &collection(),
+                    Requirement::after(s.timeline.currentness_barrier())
+                )
                 .await
                 .unwrap()
                 .is_empty()
         );
-        let requirement = Requirement::AtLeast(s.timeline.now());
+        let requirement = Requirement::after(s.timeline.currentness_barrier());
         assert!(
             !router
                 .token_reachable_at_key(&collection(), b"k", &token(9), requirement)
@@ -1298,7 +1303,11 @@ mod tests {
             (b"zebra", node_path(1)),
         ] {
             let loc = router
-                .route_key(&collection(), key, Requirement::AtLeast(s.timeline.now()))
+                .route_key(
+                    &collection(),
+                    key,
+                    Requirement::after(s.timeline.currentness_barrier()),
+                )
                 .await
                 .unwrap();
             assert_eq!(loc.path, want_leaf, "wrong leaf for key {key:?}");
@@ -1314,7 +1323,7 @@ mod tests {
         let cold = store_over(backend.clone());
         let router = TreeRouter::new(cold.nodes.clone(), std::num::NonZeroUsize::MIN);
         let loc = router
-            .route_key(&collection(), b"pear", Requirement::Any)
+            .route_key(&collection(), b"pear", Requirement::ANY)
             .await
             .unwrap();
         assert_eq!(loc.path, node_path(1));
@@ -1331,7 +1340,7 @@ mod tests {
 
         assert!(
             router
-                .route_key(&collection(), b"pear", Requirement::Any)
+                .route_key(&collection(), b"pear", Requirement::ANY)
                 .await
                 .unwrap()
                 .cache_hit
@@ -1340,12 +1349,12 @@ mod tests {
 
         let terminal_warm = store_over(backend);
         terminal_warm
-            .load_node_state(&collection(), &token(1), Requirement::Any)
+            .load_node_state(&collection(), &token(1), Requirement::ANY)
             .await
             .unwrap();
         take_reads(&log);
         let loc = TreeRouter::new(terminal_warm.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .route_key(&collection(), b"pear", Requirement::Any)
+            .route_key(&collection(), b"pear", Requirement::ANY)
             .await
             .unwrap();
         assert!(!loc.cache_hit, "a warm leaf cannot hide cold prefix reads");
@@ -1364,18 +1373,18 @@ mod tests {
         let s = store_over(backend.clone());
         let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
         router
-            .route_key(&collection(), b"pear", Requirement::Any)
+            .route_key(&collection(), b"pear", Requirement::ANY)
             .await
             .unwrap();
         take_reads(&log);
 
-        let bound = s.timeline.now();
+        let bound = s.timeline.currentness_barrier();
         let loc = router
             .route_key_with_requirements(
                 &collection(),
                 b"pear",
-                Requirement::Any,
-                Requirement::AtLeast(bound),
+                Requirement::ANY,
+                Requirement::after(bound),
             )
             .await
             .unwrap();
@@ -1387,18 +1396,18 @@ mod tests {
         let mixed = store_over(backend);
         for byte in [0, 1] {
             mixed
-                .load_node_state(&collection(), &token(byte), Requirement::Any)
+                .load_node_state(&collection(), &token(byte), Requirement::ANY)
                 .await
                 .unwrap();
         }
         take_reads(&log);
-        let bound = mixed.timeline.now();
+        let bound = mixed.timeline.currentness_barrier();
         let loc = TreeRouter::new(mixed.nodes.clone(), std::num::NonZeroUsize::MIN)
             .route_key_with_requirements(
                 &collection(),
                 b"pear",
-                Requirement::Any,
-                Requirement::AtLeast(bound),
+                Requirement::ANY,
+                Requirement::after(bound),
             )
             .await
             .unwrap();
@@ -1420,21 +1429,21 @@ mod tests {
         take_reads(&log);
 
         let s = store_over(backend);
-        s.load_node_state(&collection(), &token(1), Requirement::Any)
+        s.load_node_state(&collection(), &token(1), Requirement::ANY)
             .await
             .unwrap();
         take_reads(&log);
 
         let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
         let first = router
-            .first_leaf_at(&collection(), b"apple", Requirement::Any)
+            .first_leaf_at(&collection(), b"apple", Requirement::ANY)
             .await
             .unwrap()
             .unwrap();
         assert!(!first.cache_hit);
         take_reads(&log);
         let middle = router
-            .next_leaf(&collection(), &first, Requirement::Any)
+            .next_leaf(&collection(), &first, Requirement::ANY)
             .await
             .unwrap()
             .unwrap();
@@ -1454,7 +1463,7 @@ mod tests {
 
         let bounded = store_over(backend.clone());
         let leaves = TreeRouter::new(bounded.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .leaves_through(&collection(), b"apple", Some(b"mango"), Requirement::Any)
+            .leaves_through(&collection(), b"apple", Some(b"mango"), Requirement::ANY)
             .await
             .unwrap();
         assert_eq!(
@@ -1474,12 +1483,12 @@ mod tests {
 
         let terminal_warm = store_over(backend);
         terminal_warm
-            .load_node_state(&collection(), &token(4), Requirement::Any)
+            .load_node_state(&collection(), &token(4), Requirement::ANY)
             .await
             .unwrap();
         take_reads(&log);
         let leaves = TreeRouter::new(terminal_warm.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .leaves(&collection(), Requirement::Any)
+            .leaves(&collection(), Requirement::ANY)
             .await
             .unwrap();
         assert_eq!(
@@ -1509,7 +1518,7 @@ mod tests {
         let s = store_over(backend);
         let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
         let loc = router
-            .route_key(&collection(), b"pear", Requirement::Any)
+            .route_key(&collection(), b"pear", Requirement::ANY)
             .await
             .unwrap();
         assert_eq!(loc.path, node_path(1));
@@ -1526,12 +1535,12 @@ mod tests {
 
         assert!(
             router
-                .token_reachable_at_key(&collection(), b"pear", &token(3), Requirement::Any)
+                .token_reachable_at_key(&collection(), b"pear", &token(3), Requirement::ANY)
                 .await
                 .unwrap()
         );
         let parent = router
-            .parent_index_for(&collection(), b"pear", Requirement::Any)
+            .parent_index_for(&collection(), b"pear", Requirement::ANY)
             .await
             .unwrap()
             .unwrap();
@@ -1557,7 +1566,7 @@ mod tests {
             .unwrap();
         let router = TreeRouter::new(reader.nodes.clone(), std::num::NonZeroUsize::MIN);
         router
-            .route_key(&collection(), b"pear", Requirement::Any)
+            .route_key(&collection(), b"pear", Requirement::ANY)
             .await
             .unwrap();
 
@@ -1580,7 +1589,10 @@ mod tests {
             .await
             .unwrap();
         let (_, observation) = writer
-            .load_root(&collection(), Requirement::AtLeast(writer.timeline.now()))
+            .load_root(
+                &collection(),
+                Requirement::after(writer.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert!(
@@ -1598,13 +1610,13 @@ mod tests {
         );
         take_reads(&log);
 
-        let bound = reader.timeline.now();
+        let bound = reader.timeline.currentness_barrier();
         let loc = router
             .route_key_with_requirements(
                 &collection(),
                 b"pear",
-                Requirement::Any,
-                Requirement::AtLeast(bound),
+                Requirement::ANY,
+                Requirement::after(bound),
             )
             .await
             .unwrap();
@@ -1629,7 +1641,7 @@ mod tests {
         let s = store_over(backend);
         assert!(
             !TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-                .token_reachable_at_key(&collection(), b"pear", &token(0), Requirement::Any)
+                .token_reachable_at_key(&collection(), b"pear", &token(0), Requirement::ANY)
                 .await
                 .unwrap()
         );
@@ -1653,13 +1665,13 @@ mod tests {
         let router = TreeRouter::new(dangling.nodes.clone(), std::num::NonZeroUsize::MIN);
         assert!(
             !router
-                .token_reachable_at_key(&collection(), b"pear", &token(8), Requirement::Any)
+                .token_reachable_at_key(&collection(), b"pear", &token(8), Requirement::ANY)
                 .await
                 .unwrap()
         );
         assert!(matches!(
             router
-                .parent_index_for(&collection(), b"pear", Requirement::Any)
+                .parent_index_for(&collection(), b"pear", Requirement::ANY)
                 .await,
             Err(StorageError::NotFound)
         ));
@@ -1684,8 +1696,8 @@ mod tests {
                         'a',
                     ),
                 ],
-                Requirement::AtLeast(s.timeline.now()),
-                Requirement::AtLeast(s.timeline.now()),
+                Requirement::after(s.timeline.currentness_barrier()),
+                Requirement::after(s.timeline.currentness_barrier()),
             )
             .await
             .unwrap();
@@ -1824,7 +1836,7 @@ mod tests {
                 .into_iter()
                 .map(|collection| (LogicalKey::new(collection, b"k"), ()));
             let (groups, widths) = read_widths(
-                router.route_keys_with_requirements(items, Requirement::Any, Requirement::Any),
+                router.route_keys_with_requirements(items, Requirement::ANY, Requirement::ANY),
                 &gate,
             )
             .await;
@@ -1845,7 +1857,7 @@ mod tests {
             .into_iter()
             .map(|key| (LogicalKey::new(collection(), key), ()));
         let (groups, widths) = read_widths(
-            router.route_keys_with_requirements(items, Requirement::Any, Requirement::Any),
+            router.route_keys_with_requirements(items, Requirement::ANY, Requirement::ANY),
             &gate,
         )
         .await;
@@ -1877,8 +1889,8 @@ mod tests {
                     (LogicalKey::new(collection(), b"mango"), 2),
                     (LogicalKey::new(collection(), b"cat"), 3),
                 ],
-                Requirement::Any,
-                Requirement::Any,
+                Requirement::ANY,
+                Requirement::ANY,
             )
             .await
             .unwrap();
@@ -1923,8 +1935,8 @@ mod tests {
                     (LogicalKey::new(collection(), b"pear"), 0),
                     (LogicalKey::new(collection(), b"zebra"), 1),
                 ],
-                Requirement::Any,
-                Requirement::Any,
+                Requirement::ANY,
+                Requirement::ANY,
             )
             .await
             .unwrap();
@@ -1956,8 +1968,8 @@ mod tests {
         let groups = TreeRouter::new(cold.nodes.clone(), NonZeroUsize::new(16).unwrap())
             .route_keys_with_requirements(
                 [(LogicalKey::new(collection(), b"pear"), ())],
-                Requirement::Any,
-                Requirement::Any,
+                Requirement::ANY,
+                Requirement::ANY,
             )
             .await
             .unwrap();
@@ -1975,7 +1987,7 @@ mod tests {
         let router = TreeRouter::new(s.nodes.clone(), NonZeroUsize::new(2).unwrap());
         let root = CollectionAddress::root("db");
         let child = CollectionAddress::new("db", CollectionId::from_slice(&[1; 16]).unwrap());
-        let requirement = Requirement::AtLeast(s.timeline.now());
+        let requirement = Requirement::after(s.timeline.currentness_barrier());
 
         let root_error = router
             .route_keys_with_requirements(
@@ -2007,7 +2019,7 @@ mod tests {
         let s = store();
         seed_stale_leaf_parent(&s).await;
         let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
-        let requirement = Requirement::AtLeast(s.timeline.now());
+        let requirement = Requirement::after(s.timeline.currentness_barrier());
 
         // Routing steps right off L0, which no longer covers "pear".
         let routed = router
@@ -2068,8 +2080,8 @@ mod tests {
                         (LogicalKey::new(collection(), b"pear"), ()),
                         (LogicalKey::new(collection(), b"zebra"), ()),
                     ],
-                    Requirement::Any,
-                    Requirement::Any,
+                    Requirement::ANY,
+                    Requirement::ANY,
                 )
                 .await;
             let error = result
@@ -2127,8 +2139,8 @@ mod tests {
                     (LogicalKey::new(collection(), b"pear"), ()),
                     (LogicalKey::new(collection(), b"zebra"), ()),
                 ],
-                Requirement::Any,
-                Requirement::Any,
+                Requirement::ANY,
+                Requirement::ANY,
             )
             .await
             .unwrap();
@@ -2156,7 +2168,7 @@ mod tests {
             .route_key(
                 &collection(),
                 b"zebra",
-                Requirement::AtLeast(s.timeline.now()),
+                Requirement::after(s.timeline.currentness_barrier()),
             )
             .await
             .expect_err("a cycle must not route");

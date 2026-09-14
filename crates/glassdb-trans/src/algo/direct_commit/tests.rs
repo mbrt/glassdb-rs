@@ -30,7 +30,7 @@ async fn fold_step(
     let ctx = ResolveCtx {
         key_state: &key_state,
         tmon: &tctx.tmon,
-        requirement: Requirement::Any,
+        requirement: Requirement::ANY,
         cause,
     };
     resolver.resolve(&ctx, staged, locks).await.unwrap()
@@ -84,7 +84,10 @@ fn put_resolver(
 
 async fn membership_version(tctx: &Tctx) -> u64 {
     tctx.nodes
-        .load_leaf(&test_root_path(), Requirement::AtLeast(tctx.timeline.now()))
+        .load_leaf(
+            &test_root_path(),
+            Requirement::after(tctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap()
         .locks()
@@ -308,7 +311,7 @@ async fn direct_commit_merges_with_disjoint_acquire() {
     let (ca, cb) = (tm.clone(), tctx.locker.clone());
     let data_b = AccessSet::new(Vec::new(), vec![wa(&kbp, b"vb2")], Vec::new());
     let tb = txb.clone();
-    let lock_requirement = Requirement::AtLeast(tctx.timeline.now());
+    let lock_requirement = Requirement::after(tctx.timeline.currentness_barrier());
     let acquire = tokio::spawn(async move {
         cb.keys()
             .lock_at(&tb, &data_b, false, lock_requirement)
@@ -402,7 +405,7 @@ async fn direct_commit_batched_in_doubt_recovers() {
     });
     let data_b = AccessSet::new(Vec::new(), vec![wa(&kbp, b"vb2")], Vec::new());
     let tb = txb.clone();
-    let lock_requirement = Requirement::AtLeast(tctx.timeline.now());
+    let lock_requirement = Requirement::after(tctx.timeline.currentness_barrier());
     let acquire = tokio::spawn(async move {
         cb.keys()
             .lock_at(&tb, &data_b, false, lock_requirement)
@@ -481,7 +484,7 @@ async fn an_overwrite_over_the_inline_budget_takes_the_locked_path() {
     assert!(e.lock_holders().is_empty());
     let status = tctx
         .tlogger
-        .commit_status_at(&tid, Requirement::Any)
+        .commit_status_at(&tid, Requirement::ANY)
         .await
         .unwrap();
     assert_eq!(status.status, TxCommitStatus::Ok);
@@ -500,7 +503,7 @@ async fn single_rw_observing_a_gate_uses_the_full_locked_path() {
     tctx.tmon.begin_tx(&gate);
     let (mut root, version) = tctx
         .nodes
-        .load_root(&test_collection(), Requirement::Any)
+        .load_root(&test_collection(), Requirement::ANY)
         .await
         .unwrap();
     root.set_structural_gate(gate.clone());
@@ -632,7 +635,10 @@ async fn a_committed_holder_keeps_the_next_writer_on_the_direct_path() {
     // the committed H1 while the pointer lags at its predecessor H0.
     let loaded = tctx
         .nodes
-        .load_leaf(&leaf_path, Requirement::AtLeast(tctx.timeline.now()))
+        .load_leaf(
+            &leaf_path,
+            Requirement::after(tctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     let windowed = LeafBody::from_entries(loaded.entries().entries().cloned().map(|mut e| {
@@ -644,7 +650,7 @@ async fn a_committed_holder_keeps_the_next_writer_on_the_direct_path() {
     }));
     let mut edit = loaded.into_edit();
     edit.set_entries(windowed);
-    assert!(tctx.nodes.commit_leaf(edit).await.unwrap());
+    assert!(tctx.nodes.commit_leaf(edit).await.unwrap().committed());
 
     // The window is observably at the committed holder H1 (v2), not the
     // lagging pointer H0: the shared resolver already help-forwards it.
@@ -735,7 +741,10 @@ async fn direct_commit_replaces_a_committed_holder() {
     // H1 while the current state lags at its predecessor H0.
     let loaded = tctx
         .nodes
-        .load_leaf(&leaf_path, Requirement::AtLeast(tctx.timeline.now()))
+        .load_leaf(
+            &leaf_path,
+            Requirement::after(tctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     let windowed = LeafBody::from_entries(loaded.entries().entries().cloned().map(|mut e| {
@@ -747,7 +756,7 @@ async fn direct_commit_replaces_a_committed_holder() {
     }));
     let mut edit = loaded.into_edit();
     edit.set_entries(windowed);
-    assert!(tctx.nodes.commit_leaf(edit).await.unwrap());
+    assert!(tctx.nodes.commit_leaf(edit).await.unwrap().committed());
 
     let mut h = begin_accesses(
         &tm,
@@ -1301,7 +1310,7 @@ async fn direct_commit_superseded_read_replays_in_place() {
     tm.end(&mut h).await.unwrap();
     let status = tctx
         .tlogger
-        .commit_status_at(h.id(), Requirement::Any)
+        .commit_status_at(h.id(), Requirement::ANY)
         .await
         .unwrap();
     assert_eq!(
@@ -1373,7 +1382,7 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
     tctx.tmon.begin_tx(&driver);
     let locker = tctx.locker.clone();
     let data_b = AccessSet::new(Vec::new(), vec![wa(&kbp, b"vb2")], Vec::new());
-    let requirement = Requirement::AtLeast(tctx.timeline.now());
+    let requirement = Requirement::after(tctx.timeline.currentness_barrier());
     let acquire = tokio::spawn(async move {
         locker
             .keys()
@@ -1429,7 +1438,7 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
     tm.end(&mut replayed).await.unwrap();
     let status = tctx
         .tlogger
-        .commit_status_at(replayed.id(), Requirement::Any)
+        .commit_status_at(replayed.id(), Requirement::ANY)
         .await
         .unwrap();
     assert_eq!(
@@ -1802,7 +1811,10 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     );
     let root = tctx
         .nodes
-        .load_leaf(&test_root_path(), Requirement::AtLeast(tctx.timeline.now()))
+        .load_leaf(
+            &test_root_path(),
+            Requirement::after(tctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     assert!(
@@ -1845,7 +1857,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     );
     let (_, observed_l0) = peer
         .nodes
-        .load_node(&test_collection(), &l0, Requirement::Any)
+        .load_node(&test_collection(), &l0, Requirement::ANY)
         .await
         .unwrap();
     let bounded_l0 = seeded_l0()
@@ -1873,7 +1885,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     );
     let (_, observed_l1) = peer
         .nodes
-        .load_node(&test_collection(), &l1, Requirement::Any)
+        .load_node(&test_collection(), &l1, Requirement::ANY)
         .await
         .unwrap();
     let bounded_l1 = Node::leaf(LeafBody::new())

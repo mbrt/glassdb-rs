@@ -32,6 +32,34 @@ impl SequencePoint {
     }
 }
 
+/// A database-local bound separating completed work from subsequent operations.
+///
+/// Capture it after prerequisite work completes and before the operations used
+/// as dependent currentness evidence. All dependencies must reach that barrier.
+/// Use it only with the database instance that captured it. It does not order
+/// the contents returned by overlapping operations.
+///
+/// A transaction's validation barrier is captured after its body and before
+/// the key and predicate lock CASes used as validation evidence.
+///
+/// Only the timeline may construct a barrier. Do not add constructors from
+/// sequence points, observations, receipts, or freshness requirements, nor
+/// a default value, public sequence-point accessors, implicit conversions, or
+/// serialization.
+/// Such conversions would let an operation's invocation watermark stand in for
+/// a barrier captured after completed work. The explicit conversion to
+/// `Requirement::after` retains the opaque barrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CurrentnessBarrier {
+    point: SequencePoint,
+}
+
+impl CurrentnessBarrier {
+    pub(crate) fn point(self) -> SequencePoint {
+        self.point
+    }
+}
+
 pub(crate) trait TimeSource: Send + Sync {
     fn elapsed(&self) -> Duration;
 }
@@ -70,9 +98,19 @@ impl Timeline {
         Self::from_source(Arc::new(RuntimeSource::new()), None)
     }
 
-    /// Allocates a barrier satisfied by every operation invoked afterward and
-    /// not by any operation that definitively completed beforehand.
-    pub fn now(&self) -> SequencePoint {
+    /// Captures a currentness barrier after completed prerequisite work.
+    pub fn currentness_barrier(&self) -> CurrentnessBarrier {
+        CurrentnessBarrier { point: self.now() }
+    }
+
+    /// Creates a timeline whose first allocation follows the last recovered
+    /// sequence point, or starts a fresh timeline when it is `None`.
+    pub fn starting_after(previous: Option<SequencePoint>) -> Self {
+        Self::from_source(Arc::new(RuntimeSource::new()), previous)
+    }
+
+    /// Allocates the next local sequence point.
+    pub(crate) fn now(&self) -> SequencePoint {
         let elapsed = self
             .0
             .base
@@ -89,12 +127,6 @@ impl Timeline {
                 Err(actual) => current = actual,
             }
         }
-    }
-
-    /// Creates a timeline whose first allocation follows the last recovered
-    /// sequence point, or starts a fresh timeline when it is `None`.
-    pub fn starting_after(previous: Option<SequencePoint>) -> Self {
-        Self::from_source(Arc::new(RuntimeSource::new()), previous)
     }
 
     #[cfg(test)]

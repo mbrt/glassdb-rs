@@ -171,7 +171,10 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
                             GcOutcome::Retained
                         );
                         records
-                            .load_record(&prepared, Requirement::AtLeast(timeline.now()))
+                            .load_record(
+                                &prepared,
+                                Requirement::after(timeline.currentness_barrier()),
+                            )
                             .await
                             .unwrap();
                         assert_eq!(
@@ -193,7 +196,7 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
         assert_eq!(
             owner
                 .tlogger
-                .commit_status_at(&old_id, Requirement::Any)
+                .commit_status_at(&old_id, Requirement::ANY)
                 .await
                 .unwrap()
                 .status,
@@ -310,7 +313,10 @@ async fn store_entry(ctx: &Ctx, _key: &[u8], entry: LeafEntry) {
     let path = root_path();
     let loaded = ctx
         .nodes
-        .load_leaf(&path, Requirement::AtLeast(ctx.timeline.now()))
+        .load_leaf(
+            &path,
+            Requirement::after(ctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     let mut entries: BTreeMap<Vec<u8>, LeafEntry> = loaded
@@ -323,13 +329,16 @@ async fn store_entry(ctx: &Ctx, _key: &[u8], entry: LeafEntry) {
     let leaf = LeafBody::from_entries(entries.into_values());
     let mut edit = loaded.into_edit();
     edit.set_entries(leaf);
-    assert!(ctx.nodes.commit_leaf(edit).await.unwrap());
+    assert!(ctx.nodes.commit_leaf(edit).await.unwrap().committed());
 }
 
 async fn lookup_entry(ctx: &Ctx, key: &[u8]) -> Option<LeafEntry> {
     let loaded = ctx
         .nodes
-        .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
+        .load_leaf(
+            &root_path(),
+            Requirement::after(ctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     loaded.entries().lookup(key).cloned()
@@ -369,18 +378,18 @@ fn locked_entry(key: &[u8], holder: &TxId) -> LeafEntry {
 
 async fn is_gone(tl: &TLogger, id: &TxId) -> bool {
     matches!(
-        tl.get_at(id, Requirement::Any).await,
+        tl.get_at(id, Requirement::ANY).await,
         Err(StorageError::NotFound)
     )
 }
 
 async fn check_candidate(gc: &Gc, tid: &TxId) -> Result<GcOutcome, TransError> {
     let status = gc
-        .filter_candidate(tid, Requirement::AtLeast(gc.timeline.now()))
+        .filter_candidate(tid, gc.timeline.currentness_barrier())
         .await?;
-    let requirement = Requirement::AtLeast(gc.timeline.now());
+    let barrier = gc.timeline.currentness_barrier();
     match status {
-        GcEligibility::Ready(observation) => gc.try_reclaim(tid, &observation, requirement).await,
+        GcEligibility::Ready(observation) => gc.try_reclaim(tid, &observation, barrier).await,
         GcEligibility::Deferred(delay) => Ok(GcOutcome::Deferred(delay)),
         GcEligibility::Retained => Ok(GcOutcome::Retained),
     }
@@ -496,7 +505,7 @@ async fn committed_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
 
     assert!(is_gone(&ctx.tl, &id).await);
     assert!(matches!(
-        ctx.nodes.load_root(&prepared, Requirement::Any).await,
+        ctx.nodes.load_root(&prepared, Requirement::ANY).await,
         Err(StorageError::NotFound)
     ));
 }
@@ -527,11 +536,11 @@ async fn aborted_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
 
     assert!(is_gone(&ctx.tl, &id).await);
     assert!(matches!(
-        ctx.nodes.load_root(&prepared, Requirement::Any).await,
+        ctx.nodes.load_root(&prepared, Requirement::ANY).await,
         Err(StorageError::NotFound)
     ));
     assert!(matches!(
-        ctx.records.load_record(&prepared, Requirement::Any).await,
+        ctx.records.load_record(&prepared, Requirement::ANY).await,
         Err(StorageError::NotFound)
     ));
 }
@@ -590,7 +599,7 @@ async fn collection_cleanup_conflict_keeps_the_recovery_manifest() {
     );
     assert!(
         ctx.records
-            .load_record(&prepared, Requirement::Any)
+            .load_record(&prepared, Requirement::ANY)
             .await
             .is_ok()
     );
@@ -600,7 +609,7 @@ async fn collection_cleanup_conflict_keeps_the_recovery_manifest() {
     check_hints_and_scan_page(&ctx).await;
     assert!(is_gone(&ctx.tl, &id).await);
     assert!(matches!(
-        ctx.nodes.load_root(&prepared, Requirement::Any).await,
+        ctx.nodes.load_root(&prepared, Requirement::ANY).await,
         Err(StorageError::NotFound)
     ));
 }
@@ -617,7 +626,10 @@ async fn committed_drop_is_recovered_while_the_log_stores_a_live_value() {
     store_entry(&ctx, b"k", writer_entry(b"k", &id)).await;
     let (mut parent_record, parent_observed) = ctx
         .records
-        .load_record(&collection(), Requirement::AtLeast(ctx.timeline.now()))
+        .load_record(
+            &collection(),
+            Requirement::after(ctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     assert!(
@@ -674,13 +686,16 @@ async fn committed_drop_is_recovered_while_the_log_stores_a_live_value() {
     );
     let (parent_record, _) = ctx
         .records
-        .load_record(&collection(), Requirement::AtLeast(ctx.timeline.now()))
+        .load_record(
+            &collection(),
+            Requirement::after(ctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     assert_eq!(parent_record.child(b"child"), None);
     assert!(!parent_record.directory_lock().contains(&id));
     assert!(matches!(
-        ctx.nodes.load_root(&child, Requirement::Any).await,
+        ctx.nodes.load_root(&child, Requirement::ANY).await,
         Err(StorageError::NotFound)
     ));
 }
@@ -729,7 +744,7 @@ async fn committed_still_referenced_is_kept() {
 
     check_hints_and_scan_page(&ctx).await;
 
-    let log = ctx.tl.get_at(&t, Requirement::Any).await.unwrap();
+    let log = ctx.tl.get_at(&t, Requirement::ANY).await.unwrap();
     let log = log.value().unwrap();
     assert_eq!(log.status, TxCommitStatus::Ok);
 }
@@ -767,21 +782,24 @@ async fn committed_membership_lock_is_released_before_deletion() {
     store_entry(&ctx, b"k", writer_entry(b"k", &tx(2))).await;
     let loaded = ctx
         .nodes
-        .load_leaf(&root_path(), Requirement::Any)
+        .load_leaf(&root_path(), Requirement::ANY)
         .await
         .unwrap();
     let mut locks = loaded.locks().clone();
     locks.set_membership_writer(id.clone());
     let mut edit = loaded.into_edit();
     edit.set_locks(locks);
-    assert!(ctx.nodes.commit_leaf(edit).await.unwrap());
+    assert!(ctx.nodes.commit_leaf(edit).await.unwrap().committed());
 
     check_hints_and_scan_page(&ctx).await;
 
     assert!(is_gone(&ctx.tl, &id).await);
     let loaded = ctx
         .nodes
-        .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
+        .load_leaf(
+            &root_path(),
+            Requirement::after(ctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     assert!(loaded.node().membership_lock().holders().is_empty());
@@ -839,7 +857,7 @@ async fn pending_and_wounded_candidates_only_read_their_logs() {
         assert_eq!(diagnostics.ready, 0);
         assert_eq!(diagnostics.deferred, 0);
         assert_eq!(diagnostics.in_flight, 0);
-        let got = ctx.tl.get_at(&id, Requirement::Any).await.unwrap();
+        let got = ctx.tl.get_at(&id, Requirement::ANY).await.unwrap();
         assert_eq!(got.value().unwrap().status, status);
         assert_eq!(
             lookup_entry(&ctx, b"k").await.unwrap().lock_holders(),
@@ -884,7 +902,7 @@ async fn lock_acquisition_resolves_a_wound_that_gc_leaves_alone() {
             &contender,
             &accesses,
             false,
-            Requirement::AtLeast(ctx.timeline.now()),
+            Requirement::after(ctx.timeline.currentness_barrier()),
         )
         .await
         .unwrap();
@@ -893,7 +911,7 @@ async fn lock_acquisition_resolves_a_wound_that_gc_leaves_alone() {
     assert!(!entry.is_locked_by(&wounded));
     assert!(entry.is_locked_by(&contender));
     check_hints_and_scan_page(&ctx).await;
-    let got = ctx.tl.get_at(&wounded, Requirement::Any).await.unwrap();
+    let got = ctx.tl.get_at(&wounded, Requirement::ANY).await.unwrap();
     assert_eq!(got.value().unwrap().status, TxCommitStatus::Wounded);
 }
 
@@ -974,12 +992,15 @@ async fn gc_release_merges_into_live_acquire_round() {
     let leaf = LeafBody::from_entries([locked_entry(&ka, &dead), writer_entry(&kb, &seed)]);
     let loaded = ctx
         .nodes
-        .load_leaf(&leaf_path, Requirement::AtLeast(ctx.timeline.now()))
+        .load_leaf(
+            &leaf_path,
+            Requirement::after(ctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     let mut edit = loaded.into_edit();
     edit.set_entries(leaf);
-    assert!(ctx.nodes.commit_leaf(edit).await.unwrap());
+    assert!(ctx.nodes.commit_leaf(edit).await.unwrap().committed());
 
     let mut dead_log = TxLog::new(dead.clone(), TxCommitStatus::Aborted);
     dead_log.timestamp = Some(base() - PAST_HORIZON);
@@ -1008,7 +1029,7 @@ async fn gc_release_merges_into_live_acquire_round() {
         Vec::new(),
     );
     let live2 = live.clone();
-    let lock_requirement = Requirement::AtLeast(ctx.timeline.now());
+    let lock_requirement = Requirement::after(ctx.timeline.currentness_barrier());
     let acquire = tokio::spawn(async move {
         locker
             .keys()
@@ -1133,7 +1154,7 @@ async fn cached_candidate_converges_after_a_peer_deletes_it() {
         CachedStore::new(backend, 1 << 20, Timeline::new(), None),
         DbRoot::try_from("db").unwrap(),
     );
-    let observed = peer.get_at(&id, Requirement::Any).await.unwrap();
+    let observed = peer.get_at(&id, Requirement::ANY).await.unwrap();
     peer.delete(&observed).await.unwrap();
     operations.lock().unwrap().clear();
 
@@ -1337,7 +1358,10 @@ async fn reference_checks_follow_candidate_filtering() {
     // Cache absence after the status bound, before the peer's commit. A
     // reference check using that first bound would wrongly accept this leaf.
     ctx.nodes
-        .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
+        .load_leaf(
+            &root_path(),
+            Requirement::after(ctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     let peer = AssemblyFixture::new(
@@ -1347,17 +1371,17 @@ async fn reference_checks_follow_candidate_filtering() {
     );
     let mut edit = peer
         .nodes
-        .load_leaf(&root_path(), Requirement::Any)
+        .load_leaf(&root_path(), Requirement::ANY)
         .await
         .unwrap()
         .into_edit();
     edit.set_entries(LeafBody::from_entries([locked_entry(b"k", &id)]));
-    assert!(peer.nodes.commit_leaf(edit).await.unwrap());
+    assert!(peer.nodes.commit_leaf(edit).await.unwrap().committed());
     log.status = TxCommitStatus::Ok;
     // Native paused time does not advance wall time. The old timestamp stands
     // for a filter delayed until after this commit's safety horizon.
     log.timestamp = Some(base() - PAST_HORIZON);
-    let pending = peer.tlogger.get_at(&id, Requirement::Any).await.unwrap();
+    let pending = peer.tlogger.get_at(&id, Requirement::ANY).await.unwrap();
     peer.tlogger.set_if(&log, &pending).await.unwrap();
     resume.notify_one();
     for _ in 0..64 {

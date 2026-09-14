@@ -55,20 +55,23 @@ async fn settlement_cancels_a_prepared_split_before_node_creation() {
     assert!(matches!(attempt.state, SplitAttemptResult::RetryCleanly));
     sp.finalize_split(&worker).await;
     assert!(
-        s.list_nodes(COLL, Requirement::AtLeast(s.timeline.now()))
+        s.list_nodes(COLL, Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .is_empty(),
         "a cancelled Preparing intent cannot create its reserved nodes"
     );
     let (root, _) = s
-        .load_root(COLL, Requirement::AtLeast(s.timeline.now()))
+        .load_root(COLL, Requirement::after(s.timeline.currentness_barrier()))
         .await
         .unwrap();
     assert!(root.as_leaf().is_some());
     let (record, _) = s
         .records
-        .load_record(&collection(), Requirement::AtLeast(s.timeline.now()))
+        .load_record(
+            &collection(),
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     assert_eq!(record.topology_participants().count(), 0);
@@ -204,7 +207,7 @@ async fn structural_split_failure_transition_table() {
         );
 
         let logs = s
-            .list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+            .list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap();
         if retains_ready {
@@ -220,7 +223,10 @@ async fn structural_split_failure_transition_table() {
 
         let (record, _) = s
             .records
-            .load_record(&collection(), Requirement::AtLeast(s.timeline.now()))
+            .load_record(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -258,7 +264,11 @@ async fn startup_structural_recovery_reclaims_an_orphan_after_restart() {
     for _ in 0..20 {
         if matches!(
             second
-                .load_node(COLL, "R", Requirement::AtLeast(second.timeline.now()))
+                .load_node(
+                    COLL,
+                    "R",
+                    Requirement::after(second.timeline.currentness_barrier())
+                )
                 .await,
             Err(StorageError::NotFound)
         ) {
@@ -269,19 +279,30 @@ async fn startup_structural_recovery_reclaims_an_orphan_after_restart() {
 
     assert!(matches!(
         second
-            .load_node(COLL, "R", Requirement::AtLeast(second.timeline.now()))
+            .load_node(
+                COLL,
+                "R",
+                Requirement::after(second.timeline.currentness_barrier())
+            )
             .await,
         Err(StorageError::NotFound)
     ));
     assert!(
         second
-            .load_node(COLL, "L", Requirement::AtLeast(second.timeline.now()))
+            .load_node(
+                COLL,
+                "L",
+                Requirement::after(second.timeline.currentness_barrier())
+            )
             .await
             .is_ok()
     );
     assert!(
         second
-            .list_structural_intents("db", Requirement::AtLeast(second.timeline.now()))
+            .list_structural_intents(
+                "db",
+                Requirement::after(second.timeline.currentness_barrier())
+            )
             .await
             .unwrap()
             .is_empty()
@@ -310,12 +331,16 @@ async fn structural_recovery_defers_while_the_source_writer_is_live() {
 
     assert!(!sp.recover_structural_intents().await.unwrap());
     assert!(
-        s.load_node(COLL, "R", Requirement::AtLeast(s.timeline.now()))
-            .await
-            .is_ok()
+        s.load_node(
+            COLL,
+            "R",
+            Requirement::after(s.timeline.currentness_barrier())
+        )
+        .await
+        .is_ok()
     );
     assert_eq!(
-        s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+        s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .len(),
@@ -325,12 +350,16 @@ async fn structural_recovery_defers_while_the_source_writer_is_live() {
     sp.mon.abort_owned_tx(&id).await.unwrap();
     assert!(sp.recover_structural_intents().await.unwrap());
     assert!(matches!(
-        s.load_node(COLL, "R", Requirement::AtLeast(s.timeline.now()))
-            .await,
+        s.load_node(
+            COLL,
+            "R",
+            Requirement::after(s.timeline.currentness_barrier())
+        )
+        .await,
         Err(StorageError::NotFound)
     ));
     assert!(
-        s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+        s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .is_empty()
@@ -365,14 +394,22 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
 
     // Recovery reads L first, caching the pre-gate snapshot (no gate). A weak
     // freshness bound would later be satisfied by exactly this stale entry.
-    s.load_node(COLL, "L", Requirement::AtLeast(s.timeline.now()))
-        .await
-        .unwrap();
+    s.load_node(
+        COLL,
+        "L",
+        Requirement::after(s.timeline.currentness_barrier()),
+    )
+    .await
+    .unwrap();
 
     // The in-flight split (peer, sharing the backend): take the source gate
     // and create the sibling. `s`'s cache is unaware of both writes.
     let (mut gated, version) = peer
-        .load_node(COLL, "L", Requirement::AtLeast(peer.timeline.now()))
+        .load_node(
+            COLL,
+            "L",
+            Requirement::after(peer.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     gated.set_structural_gate(id.clone());
@@ -396,13 +433,17 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
         "recovery must defer to the live split rather than reclaim its child"
     );
     assert!(
-        s.load_node(COLL, "R", Requirement::AtLeast(s.timeline.now()))
-            .await
-            .is_ok(),
+        s.load_node(
+            COLL,
+            "R",
+            Requirement::after(s.timeline.currentness_barrier())
+        )
+        .await
+        .is_ok(),
         "the live split's child must survive recovery"
     );
     assert_eq!(
-        s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+        s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .len(),
@@ -432,7 +473,11 @@ async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
 
     // The abandoned worker loses the source to a later split of the same node.
     let (mut source, version) = s
-        .load_node(COLL, "L", Requirement::AtLeast(s.timeline.now()))
+        .load_node(
+            COLL,
+            "L",
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     source.remove_structural_gate(&abandoned);
@@ -455,12 +500,16 @@ async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
         "a later split's gate must not shield an abandoned intent from recovery"
     );
     assert!(matches!(
-        s.load_node(COLL, "R", Requirement::AtLeast(s.timeline.now()))
-            .await,
+        s.load_node(
+            COLL,
+            "R",
+            Requirement::after(s.timeline.currentness_barrier())
+        )
+        .await,
         Err(StorageError::NotFound)
     ));
     assert!(
-        s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+        s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .is_empty()
@@ -525,18 +574,24 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
     // The sweep is paused inside the read that discovers the intent, so that
     // read's watermark is already allocated while the root is still ungated.
     gate.wait_until_entered().await;
-    s.load_root(COLL, Requirement::AtLeast(s.timeline.now()))
+    s.load_root(COLL, Requirement::after(s.timeline.currentness_barrier()))
         .await
         .unwrap();
 
     let (mut root, version) = peer
-        .load_root(COLL, Requirement::AtLeast(peer.timeline.now()))
+        .load_root(
+            COLL,
+            Requirement::after(peer.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     root.set_structural_gate(worker.clone());
     assert!(peer.store_root(COLL, &root, &version).await.unwrap());
     let (_, gated) = peer
-        .load_root_node(COLL, Requirement::AtLeast(peer.timeline.now()))
+        .load_root_node(
+            COLL,
+            Requirement::after(peer.timeline.currentness_barrier()),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -568,14 +623,18 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
     );
     for token in ["L", "R"] {
         assert!(
-            s.load_node(COLL, token, Requirement::AtLeast(s.timeline.now()))
-                .await
-                .is_ok(),
+            s.load_node(
+                COLL,
+                token,
+                Requirement::after(s.timeline.currentness_barrier())
+            )
+            .await
+            .is_ok(),
             "the live root split's child {token} must survive recovery"
         );
     }
     assert_eq!(
-        s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+        s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .len(),
@@ -628,7 +687,7 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
     assert!(sp.recover_structural_intents().await.unwrap());
 
     let (root_node, _) = s
-        .load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
+        .load_root_node(COLL, Requirement::after(s.timeline.currentness_barrier()))
         .await
         .unwrap()
         .unwrap();
@@ -639,7 +698,10 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
     let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
     assert_eq!(
         router
-            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+            .leaves(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier())
+            )
             .await
             .unwrap()
             .len(),
@@ -648,13 +710,17 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
     );
     for key in [b"a".as_slice(), b"m", b"t"] {
         let leaf = router
-            .route_key(&collection(), key, Requirement::AtLeast(s.timeline.now()))
+            .route_key(
+                &collection(),
+                key,
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert!(leaf.node().unwrap().as_leaf().unwrap().exists(key));
     }
     assert!(
-        s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+        s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .is_empty()
@@ -665,7 +731,11 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
 /// in its Ready intent.
 async fn gated_revision(store: &TestStore, token: &str) -> String {
     let (_, observed) = store
-        .load_node(COLL, token, Requirement::AtLeast(store.timeline.now()))
+        .load_node(
+            COLL,
+            token,
+            Requirement::after(store.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     observed.revision().unwrap().serialize().to_string()
@@ -742,7 +812,11 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
     original.set_structural_gate(id.clone());
     s.store_node(COLL, "L", &original, None).await.unwrap();
     let (mut shrunk, source_version) = s
-        .load_node(COLL, "L", Requirement::AtLeast(s.timeline.now()))
+        .load_node(
+            COLL,
+            "L",
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     let (right, split_key) = shrunk.split("R").unwrap();
@@ -783,12 +857,16 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
     assert!(recovering.await.unwrap());
 
     assert!(
-        s.load_node(COLL, "R", Requirement::AtLeast(s.timeline.now()))
-            .await
-            .is_ok()
+        s.load_node(
+            COLL,
+            "R",
+            Requirement::after(s.timeline.currentness_barrier())
+        )
+        .await
+        .is_ok()
     );
     let (root_node, _) = s
-        .load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
+        .load_root_node(COLL, Requirement::after(s.timeline.currentness_barrier()))
         .await
         .unwrap()
         .unwrap();
@@ -887,12 +965,16 @@ async fn sweep_defers_one_failed_parent_split_and_continues() {
     ));
 
     assert!(matches!(
-        s.load_node(COLL, "U", Requirement::AtLeast(s.timeline.now()))
-            .await,
+        s.load_node(
+            COLL,
+            "U",
+            Requirement::after(s.timeline.currentness_barrier())
+        )
+        .await,
         Err(StorageError::NotFound)
     ));
     assert_eq!(
-        s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+        s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .len(),

@@ -75,7 +75,7 @@ impl CollectionLifecycle {
                 .await?
             {
                 self.records
-                    .load_record(&change.collection, Requirement::Any)
+                    .load_record(&change.collection, Requirement::ANY)
                     .await
                     .map_err(TransError::from)?;
             }
@@ -85,7 +85,7 @@ impl CollectionLifecycle {
                 .await?
             {
                 self.nodes
-                    .load_root(&change.collection, Requirement::Any)
+                    .load_root(&change.collection, Requirement::ANY)
                     .await
                     .map_err(TransError::from)?;
             }
@@ -105,7 +105,7 @@ impl CollectionLifecycle {
             .map(|change| &change.collection)
         {
             self.freeze_topology(collection, id).await?;
-            let nodes = self.nodes.list_nodes(collection, Requirement::Any).await?;
+            let nodes = self.nodes.list_nodes(collection, Requirement::ANY).await?;
             for (token, _) in nodes {
                 self.fence_node(collection, &token, id).await?;
             }
@@ -126,7 +126,7 @@ impl CollectionLifecycle {
             loop {
                 let page = self
                     .nodes
-                    .scan_nodes(collection, cursor.as_ref(), Requirement::Any)
+                    .scan_nodes(collection, cursor.as_ref(), Requirement::ANY)
                     .await?;
                 for (token, _) in page.nodes {
                     changed |= self.clear_node_fence(collection, &token, id).await?;
@@ -152,7 +152,7 @@ impl CollectionLifecycle {
             loop {
                 let page = self
                     .nodes
-                    .scan_nodes(collection, cursor.as_ref(), Requirement::Any)
+                    .scan_nodes(collection, cursor.as_ref(), Requirement::ANY)
                     .await?;
                 for (_, observed) in page.nodes {
                     self.nodes.delete_node(&observed).await?;
@@ -165,7 +165,7 @@ impl CollectionLifecycle {
             }
             let observed = self
                 .nodes
-                .load_root_state(collection, Requirement::Any)
+                .load_root_state(collection, Requirement::ANY)
                 .await?;
             if observed.exists() {
                 self.nodes.delete_root(&observed).await?;
@@ -173,7 +173,7 @@ impl CollectionLifecycle {
             }
             let observed = self
                 .records
-                .load_record_state(collection, Requirement::Any)
+                .load_record_state(collection, Requirement::ANY)
                 .await?;
             if observed.exists() {
                 self.records.delete_record(&observed).await?;
@@ -192,7 +192,7 @@ impl CollectionLifecycle {
         loop {
             let (mut record, observed) = self
                 .records
-                .load_record(collection, Requirement::Any)
+                .load_record(collection, Requirement::ANY)
                 .await?;
             if record.topology_freeze() != Some(id)
                 && let Some(holder) = record.topology_freeze().cloned()
@@ -242,7 +242,7 @@ impl CollectionLifecycle {
         loop {
             let (mut node, observed) = match self
                 .nodes
-                .load_node(collection, token, Requirement::Any)
+                .load_node(collection, token, Requirement::ANY)
                 .await
             {
                 Ok(node) => node,
@@ -283,7 +283,7 @@ impl CollectionLifecycle {
     ) -> Result<(), TransError> {
         let mut backoff = self.retry.backoff();
         loop {
-            let (mut root, observed) = self.nodes.load_root(collection, Requirement::Any).await?;
+            let (mut root, observed) = self.nodes.load_root(collection, Requirement::ANY).await?;
             if root.collection_delete_intent() == Some(id) {
                 return Ok(());
             }
@@ -353,7 +353,7 @@ impl CollectionLifecycle {
         loop {
             let (mut node, observed) = self
                 .nodes
-                .load_node(collection, token, Requirement::Any)
+                .load_node(collection, token, Requirement::ANY)
                 .await?;
             if !node.remove_collection_delete_intent(id) {
                 return Ok(false);
@@ -376,7 +376,7 @@ impl CollectionLifecycle {
         let mut changed = false;
         loop {
             let (mut root, observed) =
-                match self.nodes.load_root(collection, Requirement::Any).await {
+                match self.nodes.load_root(collection, Requirement::ANY).await {
                     Ok(root) => root,
                     Err(StorageError::NotFound) => return Ok(changed),
                     Err(error) => return Err(error.into()),
@@ -391,7 +391,7 @@ impl CollectionLifecycle {
         }
         loop {
             let (mut record, observed) =
-                match self.records.load_record(collection, Requirement::Any).await {
+                match self.records.load_record(collection, Requirement::ANY).await {
                     Ok(record) => record,
                     Err(StorageError::NotFound) => return Ok(changed),
                     Err(error) => return Err(error.into()),
@@ -572,7 +572,7 @@ mod tests {
         );
         let (mut shrunk, source_version) = primary
             .nodes
-            .load_node(&collection(), &node_token(SOURCE_TOKEN), Requirement::Any)
+            .load_node(&collection(), &node_token(SOURCE_TOKEN), Requirement::ANY)
             .await
             .unwrap();
         let (right, _) = shrunk.split(RIGHT_TOKEN).unwrap();
@@ -642,7 +642,7 @@ mod tests {
         let verifier = store(backend);
         let (final_source, _) = verifier
             .nodes
-            .load_node(&collection(), &node_token(SOURCE_TOKEN), Requirement::Any)
+            .load_node(&collection(), &node_token(SOURCE_TOKEN), Requirement::ANY)
             .await
             .unwrap();
         assert_eq!(final_source.collection_delete_intent(), Some(&drop_id));

@@ -206,7 +206,7 @@ impl NodeStore {
                     .find(|(prior, _)| observation.same_state(prior))
                 {
                     if matches!(result, Ok(LeafObservationCheck::Current))
-                        && let Requirement::AtLeast(bound) = requirement
+                        && let Some(bound) = requirement.minimum()
                     {
                         observation.advance_current_after(bound);
                     }
@@ -377,7 +377,7 @@ impl NodeStore {
             .compare_and_swap(expected, Arc::new(node.clone()))
             .await
         {
-            Ok(CasResult::Committed(installed)) => Ok(Some(installed)),
+            Ok(CasResult::Committed(receipt)) => Ok(Some(receipt.into_installed())),
             Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(None),
             Err(error) => Err(error),
         }
@@ -469,17 +469,16 @@ impl NodeStore {
         }
     }
 
-    /// Compare-and-swaps an observation-bound leaf edit.
-    pub async fn commit_leaf(&self, edit: LeafEdit) -> Result<bool, StorageError> {
+    /// Compare-and-swaps a leaf edit, retaining proof of the successful mutation.
+    pub async fn commit_leaf(&self, edit: LeafEdit) -> Result<CasResult<Node>, StorageError> {
         let LeafEdit { observation, node } = edit;
         let result = self
             .nodes
             .compare_and_swap(&observation, Arc::new(node))
-            .await
-            .map(|result| result.committed());
+            .await;
         match result {
             Ok(committed) => Ok(committed),
-            Err(StorageError::NotFound) => Ok(false),
+            Err(StorageError::NotFound) => Ok(CasResult::Conflict),
             Err(error) => Err(error),
         }
     }
@@ -549,7 +548,7 @@ impl NodeStore {
             .create(path, None, Arc::new(root.clone()))
             .await?
         {
-            CasResult::Committed(observed) => Ok(Some(observed)),
+            CasResult::Committed(receipt) => Ok(Some(receipt.into_installed())),
             CasResult::Conflict => Ok(None),
         }
     }
@@ -638,7 +637,10 @@ mod tests {
 
         let reader = store_over(backend);
         let first = reader
-            .load_leaf(&path, Requirement::AtLeast(reader.timeline.now()))
+            .load_leaf(
+                &path,
+                Requirement::after(reader.timeline.currentness_barrier()),
+            )
             .await
             .unwrap()
             .observation()
@@ -647,7 +649,10 @@ mod tests {
         assert_eq!(count(&log, "read_if_modified"), 0);
 
         let second = reader
-            .load_leaf(&path, Requirement::AtLeast(reader.timeline.now()))
+            .load_leaf(
+                &path,
+                Requirement::after(reader.timeline.currentness_barrier()),
+            )
             .await
             .unwrap()
             .observation()
@@ -671,12 +676,15 @@ mod tests {
 
         let reader = store_over(backend);
         reader
-            .load_leaf(&path, Requirement::AtLeast(reader.timeline.now()))
+            .load_leaf(
+                &path,
+                Requirement::after(reader.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(count(&log, "read"), 1);
 
-        reader.load_leaf(&path, Requirement::Any).await.unwrap();
+        reader.load_leaf(&path, Requirement::ANY).await.unwrap();
         assert_eq!(count(&log, "read"), 1, "cached Any must not read");
         assert_eq!(
             count(&log, "read_if_modified"),
@@ -685,7 +693,7 @@ mod tests {
         );
 
         assert!(matches!(
-            reader.load_leaf(&node_path(2), Requirement::Any).await,
+            reader.load_leaf(&node_path(2), Requirement::ANY).await,
             Err(StorageError::NotFound)
         ));
         assert_eq!(count(&log, "read"), 2, "uncached Any falls through");
@@ -700,23 +708,20 @@ mod tests {
 
         let first_store = store_over(backend.clone());
         let first = first_store
-            .load_node_state(&collection(), &token(7), Requirement::Any)
+            .load_node_state(&collection(), &token(7), Requirement::ANY)
             .await
             .unwrap();
         let second_store = store_over(backend);
         let second = second_store
-            .load_node_state(&collection(), &token(7), Requirement::Any)
+            .load_node_state(&collection(), &token(7), Requirement::ANY)
             .await
             .unwrap();
         log.lock().unwrap().clear();
 
         assert!(first.same_state(&second));
-        let bound = first_store.timeline.now();
+        let bound = first_store.timeline.currentness_barrier();
         let checks = first_store
-            .check_leaves_current(
-                &[first.clone(), second.clone()],
-                Requirement::AtLeast(bound),
-            )
+            .check_leaves_current(&[first.clone(), second.clone()], Requirement::after(bound))
             .await;
 
         assert!(
@@ -724,8 +729,8 @@ mod tests {
                 .iter()
                 .all(|check| matches!(check, Ok(LeafObservationCheck::Current)))
         );
-        assert!(first.current_after() >= bound);
-        assert!(second.current_after() >= bound);
+        assert!(first.is_current_after(bound));
+        assert!(second.is_current_after(bound));
         assert_eq!(count(&log, "read_if_modified"), 1);
     }
 
@@ -748,18 +753,21 @@ mod tests {
             NonZeroUsize::new(16).unwrap(),
         );
         let first = first_store
-            .load_node_at_state(&node_path(8), Requirement::Any)
+            .load_node_at_state(&node_path(8), Requirement::ANY)
             .await
             .unwrap();
         let second = second_store
-            .load_node_at_state(&node_path(8), Requirement::Any)
+            .load_node_at_state(&node_path(8), Requirement::ANY)
             .await
             .unwrap();
         assert!(!first.same_state(&second));
 
         log.lock().unwrap().clear();
         let checks = validator
-            .check_leaves_current(&[first, second], Requirement::AtLeast(timeline.now()))
+            .check_leaves_current(
+                &[first, second],
+                Requirement::after(timeline.currentness_barrier()),
+            )
             .await;
 
         assert!(
@@ -785,13 +793,29 @@ mod tests {
                 .unwrap()
         );
 
-        let loaded = store.load_leaf(&path, Requirement::Any).await.unwrap();
+        let loaded = store.load_leaf(&path, Requirement::ANY).await.unwrap();
         let previous_revision = loaded.observation().revision().cloned();
         let mut edit = loaded.into_edit();
         edit.set_entries(LeafBody::from_entries([LeafEntry::new(b"new".as_slice())]));
-        assert!(store.commit_leaf(edit).await.unwrap());
+        let installed = store
+            .commit_leaf(edit)
+            .await
+            .unwrap()
+            .into_receipt()
+            .unwrap()
+            .into_installed();
 
-        let committed = store.load_leaf(&path, Requirement::Any).await.unwrap();
+        let committed = store.load_leaf(&path, Requirement::ANY).await.unwrap();
+        assert!(installed.same_state(committed.observation()));
+        assert!(
+            installed
+                .value()
+                .unwrap()
+                .as_leaf()
+                .unwrap()
+                .lookup(b"new")
+                .is_some()
+        );
         assert!(committed.entries().lookup(b"new").is_some());
         assert_ne!(
             committed.observation().revision(),
@@ -813,7 +837,7 @@ mod tests {
                 .unwrap()
         );
 
-        let loaded = store.load_leaf(&path, Requirement::Any).await.unwrap();
+        let loaded = store.load_leaf(&path, Requirement::ANY).await.unwrap();
         let entries = LeafBody::from_entries([LeafEntry::new(b"key".as_slice())]);
         let mut locks = NodeLocks::default();
         let holder = TxId::from_bytes(b"holder".to_vec());
@@ -823,9 +847,9 @@ mod tests {
         assert_eq!(edit.path(), &path);
         edit.set_entries(entries.clone());
         edit.set_locks(locks.clone());
-        assert!(store.commit_leaf(edit).await.unwrap());
+        assert!(store.commit_leaf(edit).await.unwrap().committed());
 
-        let committed = store.load_leaf(&path, Requirement::Any).await.unwrap();
+        let committed = store.load_leaf(&path, Requirement::ANY).await.unwrap();
         assert_eq!(committed.entries(), &entries);
         assert_eq!(committed.locks(), &locks);
         assert_eq!(committed.node().high_key(), Some(b"m".as_slice()));
@@ -848,7 +872,7 @@ mod tests {
         }
 
         let mut edit = store
-            .load_leaf(&left_path, Requirement::Any)
+            .load_leaf(&left_path, Requirement::ANY)
             .await
             .unwrap()
             .into_edit();
@@ -856,11 +880,11 @@ mod tests {
             b"left-key".as_slice(),
         )]));
         assert_eq!(edit.path(), &left_path);
-        assert!(store.commit_leaf(edit).await.unwrap());
+        assert!(store.commit_leaf(edit).await.unwrap().committed());
 
-        let left = store.load_leaf(&left_path, Requirement::Any).await.unwrap();
+        let left = store.load_leaf(&left_path, Requirement::ANY).await.unwrap();
         let right = store
-            .load_leaf(&right_path, Requirement::Any)
+            .load_leaf(&right_path, Requirement::ANY)
             .await
             .unwrap();
         assert!(left.entries().lookup(b"left-key").is_some());
@@ -879,12 +903,12 @@ mod tests {
         );
 
         let mut winner = store
-            .load_leaf(&path, Requirement::Any)
+            .load_leaf(&path, Requirement::ANY)
             .await
             .unwrap()
             .into_edit();
         let mut stale = store
-            .load_leaf(&path, Requirement::Any)
+            .load_leaf(&path, Requirement::ANY)
             .await
             .unwrap()
             .into_edit();
@@ -895,10 +919,10 @@ mod tests {
             b"stale".as_slice(),
         )]));
 
-        assert!(store.commit_leaf(winner).await.unwrap());
-        assert!(!store.commit_leaf(stale).await.unwrap());
+        assert!(store.commit_leaf(winner).await.unwrap().committed());
+        assert!(!store.commit_leaf(stale).await.unwrap().committed());
 
-        let committed = store.load_leaf(&path, Requirement::Any).await.unwrap();
+        let committed = store.load_leaf(&path, Requirement::ANY).await.unwrap();
         assert!(committed.entries().lookup(b"winner").is_some());
         assert!(committed.entries().lookup(b"stale").is_none());
     }
@@ -921,7 +945,7 @@ mod tests {
         }
 
         let listed = store
-            .list_nodes(&collection(), Requirement::Any)
+            .list_nodes(&collection(), Requirement::ANY)
             .await
             .unwrap();
 

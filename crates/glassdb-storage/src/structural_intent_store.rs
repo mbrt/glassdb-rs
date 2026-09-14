@@ -75,7 +75,7 @@ impl StructuralIntentStore {
             .create(path, None, Arc::new(intent.clone()))
             .await
         {
-            Ok(CasResult::Committed(observed)) => Ok(observed),
+            Ok(CasResult::Committed(receipt)) => Ok(receipt.into_installed()),
             Ok(CasResult::Conflict) => Err(StorageError::Precondition),
             Err(e) => Err(e),
         }
@@ -92,7 +92,7 @@ impl StructuralIntentStore {
             .compare_and_swap(expected, Arc::new(intent.clone()))
             .await
         {
-            Ok(CasResult::Committed(observed)) => Ok(Some(observed)),
+            Ok(CasResult::Committed(receipt)) => Ok(Some(receipt.into_installed())),
             Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(None),
             Err(error) => Err(error),
         }
@@ -299,7 +299,7 @@ mod tests {
         store.delete(&updated).await.unwrap();
         assert!(
             store
-                .list(&db_root(), Requirement::Any)
+                .list(&db_root(), Requirement::ANY)
                 .await
                 .unwrap()
                 .is_empty()
@@ -321,7 +321,10 @@ mod tests {
         }
 
         let intents = store
-            .list(&db_root(), Requirement::AtLeast(store.timeline.now()))
+            .list(
+                &db_root(),
+                Requirement::after(store.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(intents.len(), STRUCTURAL_LIST_PAGE_SIZE + 1);
@@ -347,7 +350,7 @@ mod tests {
             .list_for_participant(
                 &db_root(),
                 &first,
-                Requirement::AtLeast(store.timeline.now()),
+                Requirement::after(store.timeline.currentness_barrier()),
             )
             .await
             .unwrap();

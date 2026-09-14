@@ -72,7 +72,7 @@ async fn separate_instances_find_orphans_without_local_hints() {
     }
     for id in ids {
         assert!(matches!(
-            logger(backend.clone()).get_at(&id, Requirement::Any).await,
+            logger(backend.clone()).get_at(&id, Requirement::ANY).await,
             Err(StorageError::NotFound)
         ));
     }
@@ -151,7 +151,7 @@ async fn list_failures_do_not_look_like_an_idle_database() {
     }
     assert!(matches!(
         logger(backend.clone())
-            .get_at(&ids[0], Requirement::Any)
+            .get_at(&ids[0], Requirement::ANY)
             .await,
         Err(StorageError::NotFound)
     ));
