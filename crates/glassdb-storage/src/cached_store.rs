@@ -7,10 +7,10 @@
 //! decoded type, so reading it back through a different typed store is an
 //! internal error.
 //!
-//! Requirement is a local currentness watermark, not a durable guarantee. Each
-//! cache entry is `Present` (a decoded value, its [`Revision`], and a
+//! A freshness requirement states local currentness, not a durable guarantee.
+//! Each cache entry is `Present` (a decoded value, its [`Revision`], and a
 //! current-after [`SequencePoint`]), `Absent` (a current-after watermark,
-//! no revision), or uncertain (no entry: no usable discoverable knowledge).
+//! no revision), or uncertain (no entry: no usable discoverable knowledge). Each
 //! successful read returns an [`Observation`]
 //! that references monotonic currentness evidence shared with the current cache
 //! entry; the observation stays usable even after that entry is evicted or

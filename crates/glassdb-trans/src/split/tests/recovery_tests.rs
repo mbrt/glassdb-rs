@@ -467,9 +467,9 @@ async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
     );
 }
 
-/// Regression: recovery must classify a Ready intent under a barrier it
-/// allocates after observing that intent, not under the watermark the
-/// observation carries.
+/// Regression: recovery must classify a Ready intent under a currentness
+/// barrier it allocates after observing that intent, not under the watermark
+/// the observation carries.
 ///
 /// A cache entry's watermark is allocated *before* the backend read that fills
 /// it, so an entry read concurrently with a split can carry a watermark newer

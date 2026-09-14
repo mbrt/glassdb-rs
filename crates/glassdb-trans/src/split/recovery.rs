@@ -671,9 +671,9 @@ impl StructuralRecovery {
 
     async fn scan(&self) -> Result<RecoverySweep, StorageError> {
         // Recovery has no transaction validation or preceding tree CAS, so it
-        // allocates its own barrier. This one bounds intent discovery only.
-        // Classification needs a bound past the intent it reads, and this
-        // barrier precedes that read.
+        // allocates its own currentness barrier. This one bounds intent
+        // discovery only. Classification needs a bound past the intent it
+        // reads, and this barrier precedes that read.
         let recovery_start = Requirement::AtLeast(self.timeline.now());
         let cursor = self.scan_cursor.lock().unwrap().clone();
         let page = match self
@@ -837,8 +837,8 @@ impl StructuralRecovery {
 
         // Allocate the bound here, where the Ready record is already in hand. A
         // worker makes its gated source durable before it writes that record,
-        // so a barrier allocated now forces a backend check against a source
-        // the gate has already reached.
+        // so a currentness barrier allocated now forces a backend check against
+        // a source the gate has already reached.
         //
         // The Ready observation's watermark is not such a barrier. A watermark
         // is allocated before the read that fills its entry, so an entry filled
