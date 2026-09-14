@@ -25,7 +25,9 @@
 //! immediately before dispatch. Reconciliation happens before the path lane is
 //! released and before the operation becomes ready.
 
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -35,6 +37,7 @@ use crate::disk_cache::PersistentCache;
 use crate::error::StorageError;
 use crate::timeline::{CurrentnessBarrier, SequencePoint, Timeline};
 use glassdb_backend::{self as backend, Backend, BackendError};
+use glassdb_concurr::map_all_bounded;
 use glassdb_data::{ObjectPath, PathError};
 
 mod knowledge;
@@ -170,6 +173,8 @@ impl Revision {
 /// add constructors from observations, receipts, or raw sequence points, nor
 /// expose the stored bound. An invocation watermark cannot establish a barrier
 /// after completed work. Requirements cannot be converted back into barriers.
+/// This also applies to crate-visible accessors: a requirement states the
+/// evidence needed, but cannot supply evidence to advance an observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Requirement(Option<SequencePoint>);
 
@@ -197,12 +202,8 @@ impl Requirement {
         }
     }
 
-    pub(crate) fn is_satisfied_by(self, current_after: SequencePoint) -> bool {
+    fn is_satisfied_by(self, current_after: SequencePoint) -> bool {
         self.0.is_none_or(|bound| current_after >= bound)
-    }
-
-    pub(crate) fn minimum(self) -> Option<SequencePoint> {
-        self.0
     }
 }
 
@@ -320,6 +321,8 @@ impl Evidence {
 /// constructors, payload transformations, sequence-point accessors, or
 /// conversions to requirements or barriers. The invocation watermark cannot
 /// prove that another operation follows the completed observation.
+/// Only this module may read or advance raw evidence. Other storage modules
+/// must use the currentness-check interface.
 #[derive(Debug, Clone)]
 pub struct Observation<V> {
     key: ObjectKey,
@@ -391,13 +394,8 @@ impl<V> Observation<V> {
         }
     }
 
-    pub(crate) fn current_after(&self) -> SequencePoint {
+    fn current_after(&self) -> SequencePoint {
         self.evidence.get()
-    }
-
-    /// Advances this observation's currentness evidence without changing its state.
-    pub(crate) fn advance_current_after(&self, bound: SequencePoint) {
-        self.evidence.advance(bound);
     }
 }
 
@@ -937,6 +935,68 @@ impl<C: Codec> TypedCachedStore<C> {
     ) -> Result<ObservationCheck<C::Value>, StorageError> {
         Self::check_path(&observed.key)?;
         self.store.check_current::<C>(observed, requirement).await
+    }
+
+    /// Checks retained observations against `requirement` with bounded work on
+    /// distinct paths, reusing checks of the same exact state.
+    pub(crate) async fn check_many_current(
+        &self,
+        observations: &[Observation<C::Value>],
+        requirement: Requirement,
+        parallelism: NonZeroUsize,
+    ) -> Vec<Result<ObservationCheck<C::Value>, StorageError>>
+    where
+        C::Value: Clone,
+    {
+        let mut by_path = BTreeMap::<ObjectPath, Vec<usize>>::new();
+        for (index, observation) in observations.iter().enumerate() {
+            by_path
+                .entry(observation.path().clone())
+                .or_default()
+                .push(index);
+        }
+        let mut groups = by_path.into_values().collect::<Vec<_>>();
+        groups.sort_by_key(|group| group[0]);
+
+        let path_results = map_all_bounded(groups, parallelism, |group| async move {
+            let mut checked =
+                Vec::<(usize, Result<ObservationCheck<C::Value>, StorageError>)>::new();
+            let mut results = Vec::with_capacity(group.len());
+            for index in group {
+                let observation = &observations[index];
+                if let Some((prior, result)) = checked
+                    .iter()
+                    .find(|(prior, _)| observation.same_state(&observations[*prior]))
+                {
+                    if matches!(result, Ok(ObservationCheck::Current)) {
+                        // Equal states can share confirmed evidence. The
+                        // requested bound is not itself evidence.
+                        observation
+                            .evidence
+                            .advance(observations[*prior].current_after());
+                    }
+                    results.push((index, result.clone()));
+                    continue;
+                }
+
+                let result = self.check_current(observation, requirement).await;
+                results.push((index, result.clone()));
+                checked.push((index, result));
+            }
+            results
+        })
+        .await;
+
+        let mut results = std::iter::repeat_with(|| None)
+            .take(observations.len())
+            .collect::<Vec<_>>();
+        for (index, result) in path_results.into_iter().flatten() {
+            results[index] = Some(result);
+        }
+        results
+            .into_iter()
+            .map(|result| result.expect("every observation is checked"))
+            .collect()
     }
 
     /// Creates a decoded object if it is absent.

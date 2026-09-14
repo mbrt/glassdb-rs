@@ -5,12 +5,10 @@
 //! or exact-revision deletion (ADR-023/ADR-031/ADR-042), all through the decoded
 //! [`CachedStore`].
 
-use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use glassdb_backend as backend;
-use glassdb_concurr::map_all_bounded;
 use glassdb_data::{CollectionAddress, NodeToken, ObjectPath};
 
 use crate::cached_store::{
@@ -186,52 +184,9 @@ impl NodeStore {
         observations: &[LeafObservation],
         requirement: Requirement,
     ) -> Vec<Result<LeafObservationCheck, StorageError>> {
-        let mut by_path = BTreeMap::<ObjectPath, Vec<(usize, LeafObservation)>>::new();
-        for (index, observation) in observations.iter().enumerate() {
-            by_path
-                .entry(observation.path().clone())
-                .or_default()
-                .push((index, observation.clone()));
-        }
-        let mut groups = by_path.into_values().collect::<Vec<_>>();
-        groups.sort_by_key(|group| group[0].0);
-
-        let path_results = map_all_bounded(groups, self.parallelism, |group| async move {
-            let mut checked =
-                Vec::<(LeafObservation, Result<LeafObservationCheck, StorageError>)>::new();
-            let mut results = Vec::with_capacity(group.len());
-            for (index, observation) in group {
-                if let Some((_, result)) = checked
-                    .iter()
-                    .find(|(prior, _)| observation.same_state(prior))
-                {
-                    if matches!(result, Ok(LeafObservationCheck::Current))
-                        && let Some(bound) = requirement.minimum()
-                    {
-                        observation.advance_current_after(bound);
-                    }
-                    results.push((index, result.clone()));
-                    continue;
-                }
-
-                let result = self.check_leaf_current(&observation, requirement).await;
-                results.push((index, result.clone()));
-                checked.push((observation, result));
-            }
-            results
-        })
-        .await;
-
-        let mut results = std::iter::repeat_with(|| None)
-            .take(observations.len())
-            .collect::<Vec<_>>();
-        for (index, result) in path_results.into_iter().flatten() {
-            results[index] = Some(result);
-        }
-        results
-            .into_iter()
-            .map(|result| result.expect("every leaf observation is checked"))
-            .collect()
+        self.nodes
+            .check_many_current(observations, requirement, self.parallelism)
+            .await
     }
 
     /// Loads the fixed B-link tree root under `prefix`.
@@ -706,20 +661,30 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(recorder);
         seed_empty_leaf(&backend, &token(7)).await;
 
-        let first_store = store_over(backend.clone());
+        let timeline = Timeline::new();
+        // Separate caches model retained observations before and after
+        // eviction, without mixing database-local timelines.
+        let first_store = NodeStore::new(
+            CachedStore::new(backend.clone(), 1 << 20, timeline.clone(), None),
+            NonZeroUsize::MIN,
+        );
+        let second_store = NodeStore::new(
+            CachedStore::new(backend, 1 << 20, timeline.clone(), None),
+            NonZeroUsize::MIN,
+        );
         let first = first_store
             .load_node_state(&collection(), &token(7), Requirement::ANY)
             .await
             .unwrap();
-        let second_store = store_over(backend);
         let second = second_store
             .load_node_state(&collection(), &token(7), Requirement::ANY)
             .await
             .unwrap();
+        assert_eq!(count(&log, "read"), 2);
         log.lock().unwrap().clear();
 
         assert!(first.same_state(&second));
-        let bound = first_store.timeline.currentness_barrier();
+        let bound = timeline.currentness_barrier();
         let checks = first_store
             .check_leaves_current(&[first.clone(), second.clone()], Requirement::after(bound))
             .await;
@@ -732,6 +697,46 @@ mod tests {
         assert!(first.is_current_after(bound));
         assert!(second.is_current_after(bound));
         assert_eq!(count(&log, "read_if_modified"), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_currentness_does_not_advance_a_changed_revision() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        seed_empty_leaf(&backend, &token(7)).await;
+        let reader = store_over(backend.clone());
+        let old = reader
+            .load_node_state(&collection(), &token(7), Requirement::ANY)
+            .await
+            .unwrap();
+
+        let peer = store_over(backend);
+        let mut edit = peer
+            .load_leaf(&node_path(7), Requirement::ANY)
+            .await
+            .unwrap()
+            .into_edit();
+        edit.set_entries(LeafBody::from_entries([LeafEntry::new(b"new".as_slice())]));
+        assert!(peer.commit_leaf(edit).await.unwrap().committed());
+
+        let requirement = Requirement::after(reader.timeline.currentness_barrier());
+        let current = reader
+            .load_node_state(&collection(), &token(7), requirement)
+            .await
+            .unwrap();
+        assert!(!old.satisfies(requirement));
+
+        let checks = reader
+            .check_leaves_current(&[current.clone(), old.clone(), old.clone()], requirement)
+            .await;
+        assert!(matches!(checks[0], Ok(LeafObservationCheck::Current)));
+        for result in &checks[1..] {
+            let Ok(LeafObservationCheck::Changed(changed)) = result else {
+                panic!("the old revision must be reported as changed");
+            };
+            assert!(changed.same_state(&current));
+            assert!(changed.satisfies(requirement));
+        }
+        assert!(!old.satisfies(requirement));
     }
 
     #[tokio::test]

@@ -711,7 +711,7 @@ mod tests {
             let bound = Requirement::after(timeline.currentness_barrier());
             let observed = logger.get_at(&id, bound).await.unwrap();
             assert_eq!(observed.value().unwrap().status, status);
-            assert!(!bound.is_satisfied_by(observed.current_after()));
+            assert!(!observed.satisfies(bound));
             assert_eq!(
                 logger.commit_status_at(&id, bound).await.unwrap().status,
                 status,
