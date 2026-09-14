@@ -336,7 +336,7 @@ impl CollectionStore {
             .compare_and_swap(expected, Arc::new(record.clone()))
             .await
         {
-            Ok(CasResult::Committed(_)) => Ok(true),
+            Ok(CasResult::Applied(_)) => Ok(true),
             Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(false),
             Err(error) => Err(error),
         }
@@ -368,7 +368,7 @@ impl CollectionStore {
             .create(path, None, Arc::new(record.clone()))
             .await?
         {
-            CasResult::Committed(receipt) => Ok(Some(receipt.into_installed())),
+            CasResult::Applied(receipt) => Ok(Some(receipt.into_installed())),
             CasResult::Conflict => Ok(None),
         }
     }

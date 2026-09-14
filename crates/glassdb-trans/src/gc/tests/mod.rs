@@ -329,7 +329,7 @@ async fn store_entry(ctx: &Ctx, _key: &[u8], entry: LeafEntry) {
     let leaf = LeafBody::from_entries(entries.into_values());
     let mut edit = loaded.into_edit();
     edit.set_entries(leaf);
-    assert!(ctx.nodes.commit_leaf(edit).await.unwrap().committed());
+    assert!(ctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 }
 
 async fn lookup_entry(ctx: &Ctx, key: &[u8]) -> Option<LeafEntry> {
@@ -789,7 +789,7 @@ async fn committed_membership_lock_is_released_before_deletion() {
     locks.set_membership_writer(id.clone());
     let mut edit = loaded.into_edit();
     edit.set_locks(locks);
-    assert!(ctx.nodes.commit_leaf(edit).await.unwrap().committed());
+    assert!(ctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 
     check_hints_and_scan_page(&ctx).await;
 
@@ -1000,7 +1000,7 @@ async fn gc_release_merges_into_live_acquire_round() {
         .unwrap();
     let mut edit = loaded.into_edit();
     edit.set_entries(leaf);
-    assert!(ctx.nodes.commit_leaf(edit).await.unwrap().committed());
+    assert!(ctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 
     let mut dead_log = TxLog::new(dead.clone(), TxCommitStatus::Aborted);
     dead_log.timestamp = Some(base() - PAST_HORIZON);
@@ -1376,7 +1376,7 @@ async fn reference_checks_follow_candidate_filtering() {
         .unwrap()
         .into_edit();
     edit.set_entries(LeafBody::from_entries([locked_entry(b"k", &id)]));
-    assert!(peer.nodes.commit_leaf(edit).await.unwrap().committed());
+    assert!(peer.nodes.commit_leaf(edit).await.unwrap().is_applied());
     log.status = TxCommitStatus::Ok;
     // Native paused time does not advance wall time. The old timestamp stands
     // for a filter delayed until after this commit's safety horizon.

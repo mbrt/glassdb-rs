@@ -75,7 +75,7 @@ impl StructuralIntentStore {
             .create(path, None, Arc::new(intent.clone()))
             .await
         {
-            Ok(CasResult::Committed(receipt)) => Ok(receipt.into_installed()),
+            Ok(CasResult::Applied(receipt)) => Ok(receipt.into_installed()),
             Ok(CasResult::Conflict) => Err(StorageError::Precondition),
             Err(e) => Err(e),
         }
@@ -92,7 +92,7 @@ impl StructuralIntentStore {
             .compare_and_swap(expected, Arc::new(intent.clone()))
             .await
         {
-            Ok(CasResult::Committed(receipt)) => Ok(Some(receipt.into_installed())),
+            Ok(CasResult::Applied(receipt)) => Ok(Some(receipt.into_installed())),
             Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(None),
             Err(error) => Err(error),
         }

@@ -116,7 +116,7 @@ impl TLogger {
             id: l.id.clone(),
         };
         match self.logs.create(path, None, Arc::new(persisted)).await? {
-            CasResult::Committed(receipt) => Ok(receipt.into_installed()),
+            CasResult::Applied(receipt) => Ok(receipt.into_installed()),
             CasResult::Conflict => Err(StorageError::Precondition),
         }
     }
@@ -142,7 +142,7 @@ impl TLogger {
             .compare_and_swap(expected, Arc::new(persisted))
             .await?
         {
-            CasResult::Committed(receipt) => Ok(receipt.into_installed()),
+            CasResult::Applied(receipt) => Ok(receipt.into_installed()),
             CasResult::Conflict => Err(StorageError::Precondition),
         }
     }

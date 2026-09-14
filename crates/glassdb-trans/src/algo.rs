@@ -1935,7 +1935,7 @@ mod tests {
             .unwrap();
         let mut edit = loaded.into_edit();
         edit.set_entries(LeafBody::from_entries([unsafe_entry]));
-        assert!(tctx.nodes.commit_leaf(edit).await.unwrap().committed());
+        assert!(tctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 
         let key = logical_key(&second);
         let mut handle = begin_accesses(
@@ -2327,7 +2327,7 @@ mod tests {
             .with_current(CurrentState::Tombstone {
                 writer: TxId::with_priority(1, b"representation"),
             })]));
-        assert!(tctx.nodes.commit_leaf(edit).await.unwrap().committed());
+        assert!(tctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
         assert!(
             tm.validate(&accesses, ValidationContext::Optimistic, barrier)
                 .await
@@ -2347,7 +2347,7 @@ mod tests {
         locks.advance_membership_version();
         locks.advance_membership_version();
         edit.set_locks(locks);
-        assert!(tctx.nodes.commit_leaf(edit).await.unwrap().committed());
+        assert!(tctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
         assert!(
             !tm.validate(&accesses, ValidationContext::Optimistic, barrier)
                 .await
@@ -2371,7 +2371,7 @@ mod tests {
             .with_current(CurrentState::Tombstone {
                 writer: writer.clone(),
             })]));
-        assert!(tctx.nodes.commit_leaf(edit).await.unwrap().committed());
+        assert!(tctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 
         let read = do_read(&tctx, &key).await;
         assert!(read.validates(Some(&writer), 0));
@@ -2398,7 +2398,7 @@ mod tests {
             .unwrap();
         let mut edit = loaded.into_edit();
         edit.set_entries(LeafBody::new());
-        assert!(external.commit_leaf(edit).await.unwrap().committed());
+        assert!(external.commit_leaf(edit).await.unwrap().is_applied());
 
         assert!(
             !tm.validate(&accesses, ValidationContext::Optimistic, barrier)
@@ -2647,7 +2647,7 @@ mod tests {
         };
         let mut edit = loaded.into_edit();
         edit.set_entries(LeafBody::from_entries(entries.into_values()));
-        assert!(external.commit_leaf(edit).await.unwrap().committed());
+        assert!(external.commit_leaf(edit).await.unwrap().is_applied());
 
         // A local disjoint lock observes that external version and publishes a
         // still newer state after our barrier. The original physical revision
@@ -2816,7 +2816,7 @@ mod tests {
         let leaf = LeafBody::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
         edit.set_entries(leaf);
-        assert!(tctx.nodes.commit_leaf(edit).await.unwrap().committed());
+        assert!(tctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
     }
 
     // Builds a read-only listing transaction's [`AccessSet`] from a fresh scan of the

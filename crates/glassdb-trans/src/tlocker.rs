@@ -2550,7 +2550,7 @@ mod tests {
         let new_leaf = LeafBody::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
         edit.set_entries(new_leaf);
-        assert!(ctx.nodes.commit_leaf(edit).await.unwrap().committed());
+        assert!(ctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
     }
 
     // --- ADR-025: cross-transaction lock-acquisition deduplication ----------

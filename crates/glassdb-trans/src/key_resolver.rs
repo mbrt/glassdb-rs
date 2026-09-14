@@ -631,7 +631,7 @@ mod tests {
         let new_leaf = LeafBody::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
         edit.set_entries(new_leaf);
-        assert!(store.commit_leaf(edit).await.unwrap().committed());
+        assert!(store.commit_leaf(edit).await.unwrap().is_applied());
     }
 
     // Installs an inline committed value for `key` directly in the leaf (no lock
@@ -683,7 +683,7 @@ mod tests {
         let new_leaf = LeafBody::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
         edit.set_entries(new_leaf);
-        assert!(store.commit_leaf(edit).await.unwrap().committed());
+        assert!(store.commit_leaf(edit).await.unwrap().is_applied());
     }
 
     // Commits `writer`'s value for `key` through the monitor (a tombstone when
@@ -726,7 +726,7 @@ mod tests {
         let new_leaf = LeafBody::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
         edit.set_entries(new_leaf);
-        assert!(store.commit_leaf(edit).await.unwrap().committed());
+        assert!(store.commit_leaf(edit).await.unwrap().is_applied());
     }
 
     fn count_tx_reads(log: &OpLog) -> usize {

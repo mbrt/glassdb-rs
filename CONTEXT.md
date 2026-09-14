@@ -80,6 +80,10 @@ _Avoid_: Synchronous cleanup
 
 ## Currentness
 
+**Applied mutation**:
+A conditional backend mutation known to have taken effect on one stored object. This does not establish that the installed state is still current.
+_Avoid_: Committed mutation
+
 **Sequence point**:
 A point on one database-local timeline, which orders currentness evidence within one open database. It is neither wall time nor comparable across database instances.
 _Avoid_: Timestamp, epoch, logical clock

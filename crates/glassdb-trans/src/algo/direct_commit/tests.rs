@@ -650,7 +650,7 @@ async fn a_committed_holder_keeps_the_next_writer_on_the_direct_path() {
     }));
     let mut edit = loaded.into_edit();
     edit.set_entries(windowed);
-    assert!(tctx.nodes.commit_leaf(edit).await.unwrap().committed());
+    assert!(tctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 
     // The window is observably at the committed holder H1 (v2), not the
     // lagging pointer H0: the shared resolver already help-forwards it.
@@ -756,7 +756,7 @@ async fn direct_commit_replaces_a_committed_holder() {
     }));
     let mut edit = loaded.into_edit();
     edit.set_entries(windowed);
-    assert!(tctx.nodes.commit_leaf(edit).await.unwrap().committed());
+    assert!(tctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 
     let mut h = begin_accesses(
         &tm,

@@ -305,7 +305,7 @@ impl NodeStore {
             None => self.nodes.create(path, None, Arc::new(node.clone())).await,
         };
         match res {
-            Ok(CasResult::Committed(_)) => Ok(true),
+            Ok(CasResult::Applied(_)) => Ok(true),
             Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(false),
             Err(error) => Err(error),
         }
@@ -332,7 +332,7 @@ impl NodeStore {
             .compare_and_swap(expected, Arc::new(node.clone()))
             .await
         {
-            Ok(CasResult::Committed(receipt)) => Ok(Some(receipt.into_installed())),
+            Ok(CasResult::Applied(receipt)) => Ok(Some(receipt.into_installed())),
             Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(None),
             Err(error) => Err(error),
         }
@@ -432,7 +432,7 @@ impl NodeStore {
             .compare_and_swap(&observation, Arc::new(node))
             .await;
         match result {
-            Ok(committed) => Ok(committed),
+            Ok(result) => Ok(result),
             Err(StorageError::NotFound) => Ok(CasResult::Conflict),
             Err(error) => Err(error),
         }
@@ -482,7 +482,7 @@ impl NodeStore {
             collection: collection.clone(),
         };
         match self.nodes.create(path, None, Arc::new(root.clone())).await {
-            Ok(CasResult::Committed(_)) => Ok(true),
+            Ok(CasResult::Applied(_)) => Ok(true),
             Ok(CasResult::Conflict) => Ok(false),
             Err(error) => Err(error),
         }
@@ -503,7 +503,7 @@ impl NodeStore {
             .create(path, None, Arc::new(root.clone()))
             .await?
         {
-            CasResult::Committed(receipt) => Ok(Some(receipt.into_installed())),
+            CasResult::Applied(receipt) => Ok(Some(receipt.into_installed())),
             CasResult::Conflict => Ok(None),
         }
     }
@@ -716,7 +716,7 @@ mod tests {
             .unwrap()
             .into_edit();
         edit.set_entries(LeafBody::from_entries([LeafEntry::new(b"new".as_slice())]));
-        assert!(peer.commit_leaf(edit).await.unwrap().committed());
+        assert!(peer.commit_leaf(edit).await.unwrap().is_applied());
 
         let requirement = Requirement::after(reader.timeline.currentness_barrier());
         let current = reader
@@ -852,7 +852,7 @@ mod tests {
         assert_eq!(edit.path(), &path);
         edit.set_entries(entries.clone());
         edit.set_locks(locks.clone());
-        assert!(store.commit_leaf(edit).await.unwrap().committed());
+        assert!(store.commit_leaf(edit).await.unwrap().is_applied());
 
         let committed = store.load_leaf(&path, Requirement::ANY).await.unwrap();
         assert_eq!(committed.entries(), &entries);
@@ -885,7 +885,7 @@ mod tests {
             b"left-key".as_slice(),
         )]));
         assert_eq!(edit.path(), &left_path);
-        assert!(store.commit_leaf(edit).await.unwrap().committed());
+        assert!(store.commit_leaf(edit).await.unwrap().is_applied());
 
         let left = store.load_leaf(&left_path, Requirement::ANY).await.unwrap();
         let right = store
@@ -924,8 +924,8 @@ mod tests {
             b"stale".as_slice(),
         )]));
 
-        assert!(store.commit_leaf(winner).await.unwrap().committed());
-        assert!(!store.commit_leaf(stale).await.unwrap().committed());
+        assert!(store.commit_leaf(winner).await.unwrap().is_applied());
+        assert!(!store.commit_leaf(stale).await.unwrap().is_applied());
 
         let committed = store.load_leaf(&path, Requirement::ANY).await.unwrap();
         assert!(committed.entries().lookup(b"winner").is_some());

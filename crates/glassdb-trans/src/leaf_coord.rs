@@ -757,7 +757,7 @@ impl CasWorker {
             // Hint the background splitter if this write left the leaf
             // over the soft cap (ADR-031); the splitter reloads and
             // re-checks, so a spurious hint only costs one load.
-            Ok(CasResult::Committed(receipt)) => {
+            Ok(CasResult::Applied(receipt)) => {
                 self.core.hinter.observe_leaf(path, &new_leaf);
                 Ok(PersistResult::Applied(receipt))
             }
@@ -1229,7 +1229,7 @@ mod tests {
         let leaf = LeafBody::from_entries(entries);
         let mut edit = loaded.into_edit();
         edit.set_entries(leaf);
-        assert!(store.commit_leaf(edit).await.unwrap().committed());
+        assert!(store.commit_leaf(edit).await.unwrap().is_applied());
     }
 
     async fn replace_leaf_node(store: &NodeStore, node: &Node) {
@@ -1531,7 +1531,7 @@ mod tests {
                     ));
                     let mut edit = loaded.into_edit();
                     edit.set_entries(LeafBody::from_entries(entries));
-                    assert!(peer.commit_leaf(edit).await.unwrap().committed());
+                    assert!(peer.commit_leaf(edit).await.unwrap().is_applied());
                 }
                 Ok(())
             });

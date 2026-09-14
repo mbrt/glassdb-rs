@@ -30,20 +30,24 @@ use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use crate::cache_stats::{CacheMetrics, CacheStats};
 use crate::disk_cache::PersistentCache;
 use crate::error::StorageError;
-use crate::timeline::{CurrentnessBarrier, SequencePoint, Timeline};
+pub use crate::timeline::Requirement;
+use crate::timeline::{SequencePoint, Timeline};
 use glassdb_backend::{self as backend, Backend, BackendError};
 use glassdb_concurr::map_all_bounded;
 use glassdb_data::{ObjectPath, PathError};
 
+mod evidence;
 mod knowledge;
 mod mutation;
 mod path_lane;
 mod persistent_bridge;
+
+use evidence::Evidence;
+pub use evidence::{CasReceipt, CasResult, Observation, ObservationCheck, Revision};
 
 use knowledge::{FetchResult, Knowledge, PresentSeed};
 use mutation::{MutationOutcome, MutationRound};
@@ -146,257 +150,6 @@ pub(crate) trait Codec: Send + Sync + 'static {
 
     /// Describes this physical object type in diagnostics.
     fn name() -> &'static str;
-}
-
-/// The cached store's opaque content-CAS token, wrapping the backend version.
-///
-/// Higher layers may retain, compare, and pass a revision (and, where recovery
-/// requires it, serialize the underlying backend version), but do not interpret
-/// or manufacture one.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct Revision(backend::Version);
-
-impl Revision {
-    fn version(&self) -> &backend::Version {
-        &self.0
-    }
-
-    /// Returns the provider token for durable recovery metadata.
-    pub fn serialize(&self) -> &str {
-        &self.0.token
-    }
-}
-
-/// The freshness requirement a cached entry must satisfy before it is served.
-///
-/// Construct requirements explicitly with `ANY`, `after`, or `within`. Do not
-/// add constructors from observations, receipts, or raw sequence points, nor
-/// expose the stored bound. An invocation watermark cannot establish a barrier
-/// after completed work. Requirements cannot be converted back into barriers.
-/// This also applies to crate-visible accessors: a requirement states the
-/// evidence needed, but cannot supply evidence to advance an observation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Requirement(Option<SequencePoint>);
-
-impl Requirement {
-    /// Accepts any usable cached entry without a backend check.
-    pub const ANY: Self = Self(None);
-
-    /// Requires evidence that reaches the captured currentness barrier.
-    pub fn after(barrier: CurrentnessBarrier) -> Self {
-        Self(Some(barrier.point()))
-    }
-
-    /// Returns the stronger of two requirements.
-    pub fn stricter(self, other: Self) -> Self {
-        Self(self.0.max(other.0))
-    }
-
-    /// Accepts evidence within the approximate bounded-staleness cutoff.
-    pub fn within(timeline: &Timeline, max_staleness: Duration) -> Self {
-        if max_staleness == Duration::MAX {
-            Self::ANY
-        } else {
-            // This cutoff is a cache policy, not a barrier after completed work.
-            Self(Some(timeline.approximate_cutoff(max_staleness)))
-        }
-    }
-
-    fn is_satisfied_by(self, current_after: SequencePoint) -> bool {
-        self.0.is_none_or(|bound| current_after >= bound)
-    }
-}
-
-/// The outcome of a conditional mutation (create or compare-and-swap).
-#[derive(Debug)]
-pub enum CasResult<V> {
-    /// The mutation succeeded; the receipt retains its precondition and installed state.
-    Committed(CasReceipt<V>),
-    /// The precondition failed: the starting revision or cached absence was
-    /// obsolete. The exact starting entry has been invalidated.
-    Conflict,
-}
-
-impl<V> CasResult<V> {
-    /// Reports whether the mutation committed.
-    pub fn committed(&self) -> bool {
-        matches!(self, CasResult::Committed(_))
-    }
-
-    /// Returns the successful mutation's receipt, or `None` on conflict.
-    pub fn into_receipt(self) -> Option<CasReceipt<V>> {
-        match self {
-            CasResult::Committed(receipt) => Some(receipt),
-            CasResult::Conflict => None,
-        }
-    }
-}
-
-/// Proof of a successful conditional create or compare-and-swap.
-///
-/// Only the storage mutation implementation may construct a receipt, after a
-/// definitive backend success. Reads, conflicts, unchanged folds, and in-doubt
-/// results must not be converted into receipts. Batch-member participation is
-/// separate from this storage proof and belongs to the coordinator.
-///
-/// The expected revision identifies the precondition; `None` means absence for
-/// a conditional create. It must not be paired with the installed body to make
-/// an observation. The installed observation retains the exact state written by
-/// this mutation, even if a peer replaces it before the reply arrives.
-/// Its invocation point is fixed: advancing the installed observation's
-/// watermark must never make the precondition qualify for a later barrier.
-///
-/// State evidence is available only through explicit accessors. Do not add
-/// `Deref`, `AsRef`, `From`, payload mapping, or methods that expose a sequence
-/// point. A receipt does not establish a currentness barrier after the mutation.
-#[derive(Debug, Clone)]
-pub struct CasReceipt<V> {
-    expected_revision: Option<Revision>,
-    installed: Observation<V>,
-    invoked: SequencePoint,
-}
-
-impl<V> CasReceipt<V> {
-    /// Returns the exact state installed by the successful mutation.
-    pub fn installed(&self) -> &Observation<V> {
-        &self.installed
-    }
-
-    /// Consumes the receipt and retains only its installed-state observation.
-    pub fn into_installed(self) -> Observation<V> {
-        self.installed
-    }
-
-    /// Reports whether this mutation confirmed the observation's state at or
-    /// after `barrier`. It does not prove continuous currentness since the read.
-    pub fn confirms_expected(
-        &self,
-        observed: &Observation<V>,
-        barrier: CurrentnessBarrier,
-    ) -> bool {
-        self.invoked >= barrier.point()
-            && self.installed.key == observed.key
-            && self.expected_revision == observed.revision
-    }
-}
-
-/// The outcome of checking whether a retained observation is still current.
-#[derive(Debug, Clone)]
-pub enum ObservationCheck<V> {
-    /// The observed state is still current after the required bound; its
-    /// watermark has been advanced if a backend round-trip confirmed it.
-    Current,
-    /// The state changed; here is the current observation.
-    Changed(Observation<V>),
-}
-
-/// A shared, monotonically-advanceable currentness watermark. Observations of one
-/// state and that state's current cache entry hold clones of the same cell, so
-/// checking advances the evidence every holder sees. An `Arc` held by a caller
-/// outlives eviction of the corresponding cache entry.
-#[derive(Debug, Clone)]
-struct Evidence(Arc<AtomicU64>);
-
-impl Evidence {
-    fn new(t: SequencePoint) -> Self {
-        Evidence(Arc::new(AtomicU64::new(t.raw())))
-    }
-
-    fn get(&self) -> SequencePoint {
-        SequencePoint::from_raw(self.0.load(Ordering::SeqCst))
-    }
-
-    /// Advances the watermark to at least `t`, never regressing it.
-    fn advance(&self, t: SequencePoint) {
-        self.0.fetch_max(t.raw(), Ordering::SeqCst);
-    }
-}
-
-/// An exact observed state of one object, returned by a successful read or
-/// mutation. It carries the decoded value (or absence), the [`Revision`], and a
-/// reference to shared currentness evidence. It remains inspectable after the
-/// state is evicted or invalidated as the current cache entry.
-///
-/// Keep the state, revision, path, and evidence together. Do not add public
-/// constructors, payload transformations, sequence-point accessors, or
-/// conversions to requirements or barriers. The invocation watermark cannot
-/// prove that another operation follows the completed observation.
-/// Only this module may read or advance raw evidence. Other storage modules
-/// must use the currentness-check interface.
-#[derive(Debug, Clone)]
-pub struct Observation<V> {
-    key: ObjectKey,
-    value: Option<Arc<V>>,
-    revision: Option<Revision>,
-    evidence: Evidence,
-    cache_hit: bool,
-}
-
-impl<V> Observation<V> {
-    /// The decoded value, or `None` for an observed absence.
-    pub fn value(&self) -> Option<&Arc<V>> {
-        self.value.as_ref()
-    }
-
-    /// Consumes the observation, yielding the decoded value (or `None`).
-    pub fn into_value(self) -> Option<Arc<V>> {
-        self.value
-    }
-
-    /// Reports whether the observed state has a value (is not an absence).
-    pub fn exists(&self) -> bool {
-        self.value.is_some()
-    }
-
-    /// Reports whether the observed state is absent.
-    pub fn is_absent(&self) -> bool {
-        self.value.is_none()
-    }
-
-    /// The observed revision, or `None` for an absence.
-    pub fn revision(&self) -> Option<&Revision> {
-        self.revision.as_ref()
-    }
-
-    /// Reports whether this state has currentness evidence at or after `barrier`.
-    pub fn is_current_after(&self, barrier: CurrentnessBarrier) -> bool {
-        self.evidence.get() >= barrier.point()
-    }
-
-    /// Reports whether the retained evidence satisfies the freshness requirement.
-    pub fn satisfies(&self, requirement: Requirement) -> bool {
-        requirement.is_satisfied_by(self.evidence.get())
-    }
-
-    /// The parsed physical object path this observation refers to.
-    pub fn path(&self) -> &ObjectPath {
-        self.key.object_path()
-    }
-
-    /// Reports whether the observation reused a cached decoded body.
-    pub fn cache_hit(&self) -> bool {
-        self.cache_hit
-    }
-
-    /// Reports whether two observations refer to the same exact state.
-    ///
-    /// Observations of one state normally share the same evidence cell, so
-    /// pointer identity is the fast path. But a cache eviction and reload mint a
-    /// fresh evidence cell for the very same committed version, so two
-    /// observations of the same path and revision are still the same state.
-    pub fn same_state(&self, other: &Self) -> bool {
-        if Arc::ptr_eq(&self.evidence.0, &other.evidence.0) {
-            return true;
-        }
-        match (&self.revision, &other.revision) {
-            (Some(mine), Some(theirs)) => self.key == other.key && mine == theirs,
-            _ => false,
-        }
-    }
-
-    fn current_after(&self) -> SequencePoint {
-        self.evidence.get()
-    }
 }
 
 /// The decoded object cache over a [`Backend`] (ADR-036). Reads and mutations of
@@ -562,12 +315,17 @@ impl CachedStore {
             Err(BackendError::Precondition) => MutationOutcome::conflict(),
             Err(error) => MutationOutcome::failed(error),
         };
-        let committed = round.finish(outcome, |version| {
-            self.knowledge
-                .install_mutation::<C>(key, value, size, Revision(version), invoked)
+        let applied = round.finish(outcome, |version| {
+            self.knowledge.install_mutation::<C>(
+                key,
+                value,
+                size,
+                Revision::from_backend(version),
+                invoked,
+            )
         })?;
-        Ok(committed.map_or(CasResult::Conflict, |installed| {
-            CasResult::Committed(CasReceipt {
+        Ok(applied.map_or(CasResult::Conflict, |installed| {
+            CasResult::Applied(CasReceipt {
                 expected_revision: None,
                 installed,
                 invoked,
@@ -613,13 +371,13 @@ impl CachedStore {
             Err(error) => MutationOutcome::failed(error),
         };
         let completed = round.finish(outcome, |version| match version {
-            Some(version) => CasResult::Committed(CasReceipt {
+            Some(version) => CasResult::Applied(CasReceipt {
                 expected_revision: Some(revision),
                 installed: self.knowledge.install_mutation::<C>(
                     key,
                     value,
                     size,
-                    Revision(version),
+                    Revision::from_backend(version),
                     invoked,
                 ),
                 invoked,
@@ -812,7 +570,7 @@ impl CachedStore {
         };
         let size = C::size(&decoded);
         let value = Arc::new(decoded);
-        let revision = Revision(version);
+        let revision = Revision::from_backend(version);
         let change = self.persistent.begin_change(state);
         let fetched = self.knowledge.install_fetched::<C>(
             key.as_str(),
@@ -1053,6 +811,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::time::Duration;
 
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
@@ -1600,7 +1359,7 @@ mod tests {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum ExpectedMutationResult {
-        Committed,
+        Applied,
         Conflict,
         Deleted,
         Precondition,
@@ -1625,8 +1384,8 @@ mod tests {
                 .create("p", expected.as_ref(), v(PROPOSED_VALUE))
                 .await
             {
-                Ok(CasResult::Committed(receipt)) => MutationResult {
-                    kind: ExpectedMutationResult::Committed,
+                Ok(CasResult::Applied(receipt)) => MutationResult {
+                    kind: ExpectedMutationResult::Applied,
                     observation: Some(receipt.into_installed()),
                 },
                 Ok(CasResult::Conflict) => MutationResult {
@@ -1650,8 +1409,8 @@ mod tests {
                 )
                 .await
             {
-                Ok(CasResult::Committed(receipt)) => MutationResult {
-                    kind: ExpectedMutationResult::Committed,
+                Ok(CasResult::Applied(receipt)) => MutationResult {
+                    kind: ExpectedMutationResult::Applied,
                     observation: Some(receipt.into_installed()),
                 },
                 Ok(CasResult::Conflict) => MutationResult {
@@ -1778,11 +1537,11 @@ mod tests {
 
     const MUTATION_CASES: &[MutationCase] = &[
         MutationCase {
-            name: "create commits from known absence",
+            name: "create applies from known absence",
             kind: MutationKind::Create,
             knowledge: KnowledgeCase::Absent,
             completion: CompletionCase::Natural,
-            result: ExpectedMutationResult::Committed,
+            result: ExpectedMutationResult::Applied,
             advance_expected: true,
             next_value: ExpectedValue::Proposed,
             next_cache_hit: true,
@@ -1828,11 +1587,11 @@ mod tests {
             next_cache_hit: false,
         },
         MutationCase {
-            name: "CAS commits from matching revision",
+            name: "CAS applies from matching revision",
             kind: MutationKind::Cas,
             knowledge: KnowledgeCase::Matching,
             completion: CompletionCase::Natural,
-            result: ExpectedMutationResult::Committed,
+            result: ExpectedMutationResult::Applied,
             advance_expected: true,
             next_value: ExpectedValue::Proposed,
             next_cache_hit: true,
@@ -1898,7 +1657,7 @@ mod tests {
             next_cache_hit: false,
         },
         MutationCase {
-            name: "delete commits from matching revision",
+            name: "delete applies from matching revision",
             kind: MutationKind::Delete,
             knowledge: KnowledgeCase::Matching,
             completion: CompletionCase::Natural,
@@ -2437,11 +2196,11 @@ mod tests {
 
     const L2_MUTATION_CASES: &[L2MutationCase] = &[
         L2MutationCase {
-            name: "L2 create commits after persisted state became missing",
+            name: "L2 create applies after persisted state became missing",
             kind: MutationKind::Create,
             remote: L2RemoteCase::Missing,
             completion: CompletionCase::Natural,
-            result: ExpectedMutationResult::Committed,
+            result: ExpectedMutationResult::Applied,
             advance_expected: false,
             next_value: ExpectedValue::Proposed,
         },
@@ -2482,11 +2241,11 @@ mod tests {
             next_value: ExpectedValue::Proposed,
         },
         L2MutationCase {
-            name: "L2 CAS commits from persisted revision",
+            name: "L2 CAS applies from persisted revision",
             kind: MutationKind::Cas,
             remote: L2RemoteCase::Matching,
             completion: CompletionCase::Natural,
-            result: ExpectedMutationResult::Committed,
+            result: ExpectedMutationResult::Applied,
             advance_expected: true,
             next_value: ExpectedValue::Proposed,
         },
@@ -2536,7 +2295,7 @@ mod tests {
             next_value: ExpectedValue::Proposed,
         },
         L2MutationCase {
-            name: "L2 delete commits from persisted revision",
+            name: "L2 delete applies from persisted revision",
             kind: MutationKind::Delete,
             remote: L2RemoteCase::Matching,
             completion: CompletionCase::Natural,
@@ -2812,7 +2571,7 @@ mod tests {
         replace_value(&s2, &obs, v(b"b")).await;
 
         let r = s1.compare_and_swap(&obs, v(b"c")).await.unwrap();
-        assert!(!r.committed(), "the stale CAS conflicts");
+        assert!(!r.is_applied(), "the stale CAS conflicts");
         clear(&log);
 
         let got = s1.read("p", Requirement::ANY).await.unwrap();
@@ -3060,7 +2819,7 @@ mod tests {
         store.store.knowledge.invalidate("p");
         let reloaded = store.read("p", Requirement::ANY).await.unwrap();
         assert!(expected.same_state(&reloaded));
-        assert!(!Arc::ptr_eq(&expected.evidence.0, &reloaded.evidence.0));
+        assert!(!expected.evidence.is_shared_with(&reloaded.evidence));
 
         let before = store.store.timeline.now();
         replace_value(&store, &expected, v(b"b")).await;
@@ -3089,7 +2848,7 @@ mod tests {
 
         let before = s1.store.timeline.now();
         let r = s1.compare_and_swap(&obs, v(b"c")).await.unwrap();
-        assert!(!r.committed());
+        assert!(!r.is_applied());
         assert!(
             obs.current_after() < before,
             "conflict must not advance the observation"
@@ -3248,7 +3007,7 @@ mod tests {
             .await
             .unwrap()
             .current_after();
-        assert!(w1 >= t1.point());
+        assert!(t1.is_reached_by(w1));
         let t2 = s.store.timeline.currentness_barrier();
         let w2 = s
             .read("p", Requirement::after(t2))
@@ -3933,40 +3692,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn requirement_satisfaction_follows_currentness_evidence() {
-        let earlier = SequencePoint::from_raw(1);
-        let later = SequencePoint::from_raw(2);
-
-        assert!(Requirement::ANY.is_satisfied_by(earlier));
-        assert!(Requirement(Some(earlier)).is_satisfied_by(earlier));
-        assert!(Requirement(Some(earlier)).is_satisfied_by(later));
-        assert!(!Requirement(Some(later)).is_satisfied_by(earlier));
-    }
-
-    #[test]
-    fn duration_requirement_uses_the_timeline() {
-        let clock = Arc::new(TestClock::default());
-        clock.set(Duration::from_secs(10));
-        let timeline = Timeline::with_source(clock);
-        let _store: TypedCachedStore<Bytes> = CachedStore::new(
-            Arc::new(MemoryBackend::new()),
-            1 << 20,
-            timeline.clone(),
-            None,
-        )
-        .typed();
-
-        assert_eq!(
-            Requirement::within(&timeline, Duration::from_secs(3)),
-            Requirement(Some(SequencePoint::from_raw(7_000_000_000)))
-        );
-        assert_eq!(
-            Requirement::within(&timeline, Duration::MAX),
-            Requirement::ANY
-        );
-    }
-
     #[tokio::test]
     async fn response_time_does_not_overstate_freshness() {
         let inner = Arc::new(MemoryBackend::new());
@@ -4078,7 +3803,7 @@ mod tests {
 
         let (reopened, timeline) = persistent_store(&directory, erased).await;
         let bound = timeline.currentness_barrier();
-        assert!(bound.point() > persisted);
+        assert!(!bound.is_reached_by(persisted));
 
         let typed: TypedCachedStore<Bytes> = reopened.typed();
         let restored = typed.read("p", Requirement::ANY).await.unwrap();
@@ -4117,7 +3842,7 @@ mod tests {
         let first_typed: TypedCachedStore<Bytes> = first.typed();
         let old = first_typed.read("p", Requirement::ANY).await.unwrap();
         let changed = first_typed.compare_and_swap(&old, v(b"two")).await.unwrap();
-        assert!(changed.committed());
+        assert!(changed.is_applied());
         drop(first_typed);
         first.shutdown().await;
         drop(first);
