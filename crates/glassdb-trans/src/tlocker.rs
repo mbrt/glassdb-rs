@@ -489,7 +489,6 @@ struct WriteBackOperation {
     id: TxId,
     path: ObjectPath,
     intents: Arc<Vec<KeyIntent>>,
-    requirement: Requirement,
 }
 
 #[async_trait]
@@ -583,7 +582,10 @@ impl LeafOperation for WriteBackOperation {
     }
 
     fn first_requirement(&self) -> Requirement {
-        self.requirement
+        // Locking used this cache, so it cannot serve a state from before the
+        // installed hold. A split resolves committed holders before moving
+        // entries. Any remaining write is protected by its revision CAS.
+        Requirement::ANY
     }
 
     fn complete(&self, outcome: Option<CoordinatedOutcome>) -> Result<Self::Output, TransError> {
@@ -1048,23 +1050,20 @@ impl KeyLocker {
     /// Cancellation can leave a partial pass, but the committed log remains
     /// authoritative and every landed CAS is safe to repeat.
     ///
-    /// The barrier must be captured after locking completes. It also bounds
-    /// reads of other leaves if a split requires rerouting.
+    /// `locked` must come from this locker's database instance. Locking and
+    /// write-back share cache knowledge; this is not a recovery interface for
+    /// another instance's locks.
+    ///
     /// Returns displaced external transaction-object references as GC candidates.
     /// Inline values and tombstones can have logless writers; GC scans discover
     /// any transaction objects behind those states.
-    pub(crate) async fn write_back(
-        &self,
-        id: &TxId,
-        locked: &LockedTx,
-        barrier: CurrentnessBarrier,
-    ) -> Vec<TxId> {
+    pub(crate) async fn write_back(&self, id: &TxId, locked: &LockedTx) -> Vec<TxId> {
         // A cancelled partial pass may lose these hints; GC's paged scan is
         // complete without them.
         let mut operations = Vec::with_capacity(locked.groups.len());
         for group in locked.groups.values() {
             operations.push(async move {
-                self.write_back_routed(id, &group.path, Arc::new(group.intents.clone()), barrier)
+                self.write_back_routed(id, &group.path, Arc::new(group.intents.clone()))
                     .await
             });
         }
@@ -1210,16 +1209,11 @@ impl KeyLocker {
         id: &TxId,
         path: &ObjectPath,
         intents: Arc<Vec<KeyIntent>>,
-        barrier: CurrentnessBarrier,
     ) -> Vec<TxId> {
-        let requirement = Requirement::after(barrier);
         let mut pending = VecDeque::from([(path.clone(), intents)]);
         let mut superseded = Vec::new();
         while let Some((path, intents)) = pending.pop_front() {
-            let outcome = match self
-                .write_back_leaf(id, &path, intents.clone(), requirement)
-                .await
-            {
+            let outcome = match self.write_back_leaf(id, &path, intents.clone()).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     tracing::warn!(
@@ -1240,9 +1234,11 @@ impl KeyLocker {
                         .cloned()
                         .map(|intent| (intent.key.clone(), intent))
                         .collect();
+                    // Splits publish committed holders before moving entries,
+                    // so a rerouted leaf has no inherited hold to overlook.
                     let groups = match self
                         .router
-                        .route_keys_with_requirements(items, Requirement::ANY, requirement)
+                        .route_keys_with_requirements(items, Requirement::ANY, Requirement::ANY)
                         .await
                     {
                         Ok(groups) => groups,
@@ -1282,13 +1278,11 @@ impl KeyLocker {
         id: &TxId,
         path: &ObjectPath,
         intents: Arc<Vec<KeyIntent>>,
-        requirement: Requirement,
     ) -> Result<WriteBackOutcome, TransError> {
         let operation = WriteBackOperation {
             id: id.clone(),
             path: path.clone(),
             intents,
-            requirement,
         };
         self.coord.coordinate(operation).await
     }
@@ -1551,7 +1545,6 @@ mod tests {
             id: mk_tid(1, "writer"),
             path: root_path(),
             intents: Arc::new(vec![put_intent(b"key")]),
-            requirement: Requirement::ANY,
         };
 
         assert!(matches!(
@@ -2169,10 +2162,7 @@ mod tests {
             prev_writer: TxId::default(),
         }];
         ctx.monitor.commit_tx(tl).await.unwrap();
-        locker
-            .keys()
-            .write_back(&old, &old_locked, ctx.timeline.currentness_barrier())
-            .await;
+        locker.keys().write_back(&old, &old_locked).await;
 
         let outcome = waiting.await.unwrap().unwrap();
         assert!(
@@ -2197,10 +2187,7 @@ mod tests {
         let receipts = lock_ok(&locker, &tx, &groups).await;
         let locked = LockedTx::from_receipts(groups, receipts).unwrap();
         // First writer of a fresh key overwrites no pointer: no GC hint.
-        let superseded = locker
-            .keys()
-            .write_back(&tx, &locked, ctx.timeline.currentness_barrier())
-            .await;
+        let superseded = locker.keys().write_back(&tx, &locked).await;
         assert!(superseded.is_empty());
 
         let e = entry_of(&ctx, key).await.unwrap();
@@ -2218,6 +2205,52 @@ mod tests {
         assert!(loaded.node().structural_gate().holders().is_empty());
         assert!(loaded.node().membership_lock().holders().is_empty());
         assert_eq!(loaded.node().membership_version(), 2);
+    }
+
+    #[tokio::test]
+    async fn warm_write_back_needs_only_its_cas_and_replay_needs_no_io() {
+        let backend = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
+        let log = backend.log();
+        let (locker, ctx) = new_test_locker(backend).await;
+        let key = b"key";
+        let writer = mk_tid(1, "writer");
+        let locked = lock_commit(&locker, &ctx, &writer, key).await;
+
+        // The small test cache can evict the leaf while committing the log.
+        // Warm it before measuring the ordinary cached write-back path.
+        let held = ctx
+            .nodes
+            .load_leaf(&root_path(), Requirement::ANY)
+            .await
+            .unwrap();
+        assert!(held.entries().lookup(key).unwrap().is_locked_by(&writer));
+        log.lock().unwrap().clear();
+
+        assert!(locker.keys().write_back(&writer, &locked).await.is_empty());
+        let leaf_path = root_path().to_string();
+        let operations: Vec<_> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|operation| operation.path == leaf_path)
+            .map(|operation| operation.op)
+            .collect();
+        assert_eq!(
+            operations,
+            ["write_if"],
+            "write-back must reuse the cached hold"
+        );
+
+        log.lock().unwrap().clear();
+        assert!(locker.keys().write_back(&writer, &locked).await.is_empty());
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a completed write-back needs no I/O"
+        );
+
+        let published = entry_of(&ctx, key).await.unwrap();
+        assert_eq!(published.current, CurrentState::External { writer });
+        assert!(published.lock_holders().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -2244,9 +2277,7 @@ mod tests {
 
         let superseded = tokio::time::timeout(
             Duration::from_secs(1),
-            locker
-                .keys()
-                .write_back(&writer, &locked, ctx.timeline.currentness_barrier()),
+            locker.keys().write_back(&writer, &locked),
         )
         .await
         .expect("post-commit write-back waited on a structural gate");
@@ -2276,13 +2307,7 @@ mod tests {
         // First committer publishes the pointer for `key`; it supersedes nothing.
         let old = mk_tid(1, "old");
         let lt_old = lock_commit(&locker, &ctx, &old, key).await;
-        assert!(
-            locker
-                .keys()
-                .write_back(&old, &lt_old, ctx.timeline.currentness_barrier())
-                .await
-                .is_empty()
-        );
+        assert!(locker.keys().write_back(&old, &lt_old).await.is_empty());
         assert_eq!(
             entry_of(&ctx, key).await.unwrap().current.writer(),
             Some(&old)
@@ -2292,13 +2317,7 @@ mod tests {
         // pointer it replaced.
         let new = mk_tid(2, "new");
         let lt_new = lock_commit(&locker, &ctx, &new, key).await;
-        assert_eq!(
-            locker
-                .keys()
-                .write_back(&new, &lt_new, ctx.timeline.currentness_barrier())
-                .await,
-            vec![old]
-        );
+        assert_eq!(locker.keys().write_back(&new, &lt_new).await, vec![old]);
         assert_eq!(
             entry_of(&ctx, key).await.unwrap().current.writer(),
             Some(&new)
@@ -2408,12 +2427,7 @@ mod tests {
             let group = group_of(key, put_intent(key)).remove(&root_path()).unwrap();
             let hints = locker
                 .keys()
-                .write_back_routed(
-                    &writer,
-                    &group.path,
-                    Arc::new(group.intents),
-                    ctx.timeline.currentness_barrier(),
-                )
+                .write_back_routed(&writer, &group.path, Arc::new(group.intents))
                 .await;
             assert!(hints.is_empty());
             assert_eq!(
@@ -2443,12 +2457,7 @@ mod tests {
         let group = group_of(key, put_intent(key)).remove(&root_path()).unwrap();
         locker
             .keys()
-            .write_back_routed(
-                &tx,
-                &group.path,
-                Arc::new(group.intents),
-                ctx.timeline.currentness_barrier(),
-            )
+            .write_back_routed(&tx, &group.path, Arc::new(group.intents))
             .await;
 
         let entry = entry_of(&ctx, key).await.unwrap();
@@ -3029,13 +3038,8 @@ mod tests {
         ctx.monitor.commit_tx(log).await.unwrap();
 
         gate.arm();
-        let (superseded, widths) = operation_widths(
-            locker
-                .keys()
-                .write_back(&tx, &locked, ctx.timeline.currentness_barrier()),
-            &gate,
-        )
-        .await;
+        let (superseded, widths) =
+            operation_widths(locker.keys().write_back(&tx, &locked), &gate).await;
 
         assert!(superseded.is_empty());
         assert_eq!(widths, vec![2, 2, 1]);
@@ -3218,23 +3222,6 @@ mod tests {
         locked
     }
 
-    // These coordinator-fold tests deliberately drive cleanup with `Any` so a
-    // gated backend load keeps the round open long enough for peers to merge.
-    // Production write-back instead requires a barrier captured after locking.
-    async fn write_back_any(locker: &Locker, id: &TxId, locked: &LockedTx) {
-        for group in locked.groups.values() {
-            let _ = locker
-                .keys()
-                .write_back_leaf(
-                    id,
-                    &group.path,
-                    Arc::new(group.intents.clone()),
-                    Requirement::ANY,
-                )
-                .await;
-        }
-    }
-
     // Two committed transactions writing *disjoint* keys of one leaf write back
     // concurrently. Write-backs never lock-conflict, so they merge into a single
     // CAS round (ADR-026) that publishes both pointers and drops both holds.
@@ -3258,8 +3245,8 @@ mod tests {
         gate.arm();
         let (l1, l2) = (locker.clone(), locker.clone());
         let (t1, t2) = (tx1.clone(), tx2.clone());
-        let h1 = tokio::spawn(async move { write_back_any(&l1, &t1, &lt1).await });
-        let h2 = tokio::spawn(async move { write_back_any(&l2, &t2, &lt2).await });
+        let h1 = tokio::spawn(async move { l1.keys().write_back(&t1, &lt1).await });
+        let h2 = tokio::spawn(async move { l2.keys().write_back(&t2, &lt2).await });
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
         h1.await.unwrap();
@@ -3300,7 +3287,7 @@ mod tests {
         let (t1, t2) = (tx1.clone(), tx2.clone());
         // The write-back is the driver (parks in the gated load); the acquire
         // queues and is absorbed once the load returns.
-        let hw = tokio::spawn(async move { write_back_any(&l1, &t1, &lt1).await });
+        let hw = tokio::spawn(async move { l1.keys().write_back(&t1, &lt1).await });
         let ha = tokio::spawn(async move {
             l2.keys()
                 .lock_leaves_at(&t2, &g2, false, Requirement::ANY)
@@ -3350,11 +3337,10 @@ mod tests {
         let write_locker = locker.clone();
         let write_id = writer.clone();
         let write_locked = locked.clone();
-        let barrier = ctx.timeline.currentness_barrier();
         let write_back = tokio::spawn(async move {
             write_locker
                 .keys()
-                .write_back(&write_id, &write_locked, barrier)
+                .write_back(&write_id, &write_locked)
                 .await
         });
         rt::sleep(Duration::from_millis(50)).await;
@@ -3396,10 +3382,7 @@ mod tests {
             std::slice::from_ref(&acquirer)
         );
 
-        locker
-            .keys()
-            .write_back(&writer, &locked, ctx.timeline.currentness_barrier())
-            .await;
+        locker.keys().write_back(&writer, &locked).await;
         let written = entry_of(&ctx, &written_key).await.unwrap();
         assert!(written.lock_holders().is_empty());
         assert_eq!(written.current.writer(), Some(&writer));
@@ -3440,11 +3423,10 @@ mod tests {
         let task_locker = locker.clone();
         let task_writer = writer.clone();
         let task_locked = locked.clone();
-        let barrier = ctx.timeline.currentness_barrier();
         let write_back = tokio::spawn(async move {
             task_locker
                 .keys()
-                .write_back(&task_writer, &task_locked, barrier)
+                .write_back(&task_writer, &task_locked)
                 .await
         });
         landed.notified().await;
@@ -3456,10 +3438,7 @@ mod tests {
         assert!(entry.lock_holders().is_empty());
         assert_eq!(entry.current.writer(), Some(&writer));
 
-        locker
-            .keys()
-            .write_back(&writer, &locked, ctx.timeline.currentness_barrier())
-            .await;
+        locker.keys().write_back(&writer, &locked).await;
         let entry = entry_of(&ctx, key).await.unwrap();
         assert!(entry.lock_holders().is_empty());
         assert_eq!(entry.current.writer(), Some(&writer));
@@ -3724,7 +3703,7 @@ mod tests {
             gate.arm();
             let (lw, la) = (locker.clone(), locker.clone());
             let (cw, ca) = (committer.clone(), acquirer.clone());
-            let hw = tokio::spawn(async move { write_back_any(&lw, &cw, &lt).await });
+            let hw = tokio::spawn(async move { lw.keys().write_back(&cw, &lt).await });
             let ha = tokio::spawn(async move {
                 la.keys()
                     .lock_leaves_at(&ca, &g, false, Requirement::ANY)

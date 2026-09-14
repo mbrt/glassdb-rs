@@ -3709,7 +3709,9 @@ mod tests {
     async fn split_help_forwards_a_committed_entry_holder_before_moving_its_entry() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let s = store_with_backend(backend.clone());
-        let other = store_with_backend(backend);
+        let recorder = Arc::new(RecordingBackend::new(backend));
+        let operations = recorder.log();
+        let other = store_with_backend(recorder);
         let bg = Arc::new(Background::new());
         let (sp, _) = splitter_and_monitor(&s, &bg, tiny());
         let holder = TxId::with_priority(1, b"committed");
@@ -3785,6 +3787,12 @@ mod tests {
         log.locks = locked.locked_paths();
         other_mon.commit_tx(log).await.unwrap();
 
+        let held = other
+            .nodes
+            .load_leaf(&node_path("L"), Requirement::ANY)
+            .await
+            .unwrap();
+        assert!(held.entries().lookup(b"d").unwrap().is_locked_by(&holder));
         sp.split_path(&node_path("L")).await.unwrap();
 
         let leaf = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
@@ -3815,10 +3823,31 @@ mod tests {
 
         // A different instance still targeting the pre-split source must
         // re-descend and converge without recreating the removed holder.
-        other_locker
-            .keys()
-            .write_back(&holder, &locked, other.timeline.currentness_barrier())
-            .await;
+        operations.lock().unwrap().clear();
+        other_locker.keys().write_back(&holder, &locked).await;
+        {
+            let operations = operations.lock().unwrap();
+            let source = node_path("L").to_string();
+            assert_eq!(
+                operations
+                    .iter()
+                    .find(|operation| operation.path == source)
+                    .unwrap()
+                    .op,
+                "write_if",
+                "the cached hold goes directly to CAS, whose conflict exposes the split"
+            );
+            let writes: Vec<_> = operations
+                .iter()
+                .filter(|operation| operation.op == "write_if")
+                .map(|operation| operation.path.as_str())
+                .collect();
+            assert_eq!(
+                writes,
+                [source.as_str()],
+                "the split already published the moved entry"
+            );
+        }
         let current = TreeRouter::new(other.nodes.clone(), std::num::NonZeroUsize::MIN)
             .route_key(&collection(), b"d", Requirement::ANY)
             .await

@@ -862,8 +862,6 @@ impl Algo {
     /// (unit tests, or after shutdown dropped it) it releases inline so locks are
     /// not left to lazy reclaim.
     async fn write_back(&self, id: &TxId, locked: LockedTx) {
-        // A no-change write-back must not use state from before our locks.
-        let barrier = self.timeline.currentness_barrier();
         match self.background.as_ref().and_then(|w| w.upgrade()) {
             Some(bg) => {
                 let locker = self.locker.clone();
@@ -872,12 +870,12 @@ impl Algo {
                 // Cancelling a dedup driver may need to spawn a successor for
                 // merged callers, so shutdown drains this finite pass.
                 bg.spawn_waited(async move {
-                    let superseded = locker.keys().write_back(&id, &locked, barrier).await;
+                    let superseded = locker.keys().write_back(&id, &locked).await;
                     cleanup_hints.schedule_all(superseded);
                 });
             }
             None => {
-                let superseded = self.locker.keys().write_back(id, &locked, barrier).await;
+                let superseded = self.locker.keys().write_back(id, &locked).await;
                 self.cleanup_hints.schedule_all(superseded);
             }
         }
