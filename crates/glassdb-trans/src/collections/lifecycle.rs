@@ -254,7 +254,6 @@ impl CollectionLifecycle {
             }
             if let Some(holder) = node.collection_delete_intent().cloned() {
                 self.resolve_delete_holder(&holder, id).await?;
-                continue;
             }
             if let Some(holder) = self.pending_node_holder(&node, id).await? {
                 self.resolve_pending_holder(&holder, id).await?;
@@ -289,7 +288,6 @@ impl CollectionLifecycle {
             }
             if let Some(holder) = root.collection_delete_intent().cloned() {
                 self.resolve_delete_holder(&holder, id).await?;
-                continue;
             }
             if let Some(holder) = self.pending_node_holder(&root, id).await? {
                 self.resolve_pending_holder(&holder, id).await?;
@@ -337,6 +335,7 @@ impl CollectionLifecycle {
         Ok(())
     }
 
+    /// Establishes that a foreign delete intent can be replaced.
     async fn resolve_delete_holder(&self, holder: &TxId, id: &TxId) -> Result<(), TransError> {
         match resolve_tx_conflict(&self.monitor, id, holder).await? {
             TxFinalStatus::Committed => Err(TransError::StaleCollection),
@@ -409,19 +408,21 @@ impl CollectionLifecycle {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture};
-    use glassdb_backend::{Backend, memory::MemoryBackend};
+    use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
+    use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
     use glassdb_concurr::Background;
-    use glassdb_data::{DbRoot, NodeToken, ObjectPath};
-    use glassdb_storage::transaction::TLogger;
-    use glassdb_storage::{CachedStore, CurrentState, LeafBody, LeafEntry, Timeline};
+    use glassdb_data::{CollectionId, DbRoot, NodeToken, ObjectPath};
+    use glassdb_storage::transaction::{TLogger, TxCollectionChange, TxCollectionOp, TxLog};
+    use glassdb_storage::{CachedStore, CurrentState, IndexNode, LeafBody, LeafEntry, Timeline};
     use tokio::sync::Notify;
 
     use super::*;
+    use crate::engine::{AssemblyFixture, EngineConfig};
+    use crate::monitor::TxRecoveryManifest;
 
     const COLLECTION: &str = "db/_c/0000000000000000000000";
     const SOURCE_TOKEN: &str = "0000000000000000000000";
@@ -525,6 +526,272 @@ mod tests {
         LeafEntry::new(key).with_current(CurrentState::External {
             writer: TxId::from_bytes(vec![9]),
         })
+    }
+
+    fn lifecycle(fixture: &AssemblyFixture) -> CollectionLifecycle {
+        CollectionLifecycle::new(
+            fixture.records.clone(),
+            fixture.nodes.clone(),
+            fixture.monitor.clone(),
+            RetryConfig::default(),
+            Arc::new(UnexpectedTopologySettler),
+        )
+    }
+
+    async fn refence_terminal_drop(status: TxCommitStatus, with_child: bool, cleanup_races: bool) {
+        let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let recorder = RecordingBackend::new(hooks.clone());
+        let operations = recorder.log();
+        let backend: Arc<dyn Backend> = Arc::new(recorder);
+        let owner = AssemblyFixture::new(
+            hooks.clone(),
+            DbRoot::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let peer = AssemblyFixture::new(
+            backend.clone(),
+            DbRoot::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let owner_lifecycle = lifecycle(&owner);
+        let peer_lifecycle = lifecycle(&peer);
+        let collection = CollectionAddress::new("db", CollectionId::from_slice(&[17; 16]).unwrap());
+        let mut change = CollectionChange {
+            parent: CollectionAddress::root("db"),
+            name: b"child".to_vec(),
+            collection: collection.clone(),
+            expected: None,
+            op: CollectionOp::Create,
+        };
+        owner_lifecycle
+            .prepare_collections(std::slice::from_ref(&change))
+            .await
+            .unwrap();
+        let mut parent = CollectionRecord::new();
+        parent
+            .add_child(change.name.clone(), collection.id())
+            .unwrap();
+        assert!(
+            owner
+                .records
+                .create_record(&change.parent, &parent)
+                .await
+                .unwrap()
+        );
+        assert!(
+            owner
+                .nodes
+                .create_root(&change.parent, &Node::leaf(LeafBody::new()))
+                .await
+                .unwrap()
+        );
+        let mut paths = vec![ObjectPath::TreeRoot {
+            collection: collection.clone(),
+        }];
+        if with_child {
+            let token = node_token(SOURCE_TOKEN);
+            assert!(
+                owner
+                    .nodes
+                    .store_node(&collection, &token, &Node::leaf(LeafBody::new()), None)
+                    .await
+                    .unwrap()
+            );
+            let (_, observed) = owner
+                .nodes
+                .load_root(&collection, Requirement::ANY)
+                .await
+                .unwrap();
+            let root = Node::index(IndexNode::from_children([(
+                Vec::new(),
+                SOURCE_TOKEN.to_owned(),
+            )]));
+            assert!(
+                owner
+                    .nodes
+                    .store_root(&collection, &root, &observed)
+                    .await
+                    .unwrap()
+            );
+            paths.push(ObjectPath::Node {
+                collection: collection.clone(),
+                token,
+            });
+        }
+        change.expected = Some(collection.id());
+        change.op = CollectionOp::Drop;
+        let first = TxId::from_bytes(vec![1]);
+        let second = TxId::from_bytes(vec![2]);
+        let manifest = TxRecoveryManifest {
+            collection_changes: vec![TxCollectionChange {
+                parent: change.parent.clone(),
+                name: change.name.clone(),
+                collection: collection.clone(),
+                op: TxCollectionOp::Drop,
+            }],
+            ..Default::default()
+        };
+        owner
+            .monitor
+            .begin_persisted_tx(&first, manifest.clone())
+            .await
+            .unwrap();
+        owner_lifecycle
+            .fence_drops(&first, std::slice::from_ref(&change))
+            .await
+            .unwrap();
+        match status {
+            TxCommitStatus::Wounded => {
+                assert_eq!(
+                    peer.monitor.preempt_tx(&first).await.unwrap(),
+                    TxFinalStatus::Aborted
+                );
+            }
+            TxCommitStatus::Ok => {
+                let mut log = TxLog::new(first.clone(), TxCommitStatus::Ok);
+                log.collection_changes = manifest.collection_changes.clone();
+                owner.monitor.commit_tx(log).await.unwrap();
+            }
+            _ => panic!("the first drop must be terminal"),
+        }
+        peer.monitor
+            .begin_persisted_tx(&second, manifest)
+            .await
+            .unwrap();
+
+        // Wounded and acknowledged-aborted holders take the same abort-side
+        // branch. Start wounded so repeated status reads can bound a broken
+        // loop; cached immutable Aborted status could otherwise hide it.
+        let status_path = ObjectPath::Transaction {
+            db_root: DbRoot::try_from("db").unwrap(),
+            id: first.clone(),
+        }
+        .to_string();
+        let status_reads = AtomicUsize::new(0);
+        let cleanup_armed = AtomicBool::new(cleanup_races);
+        let contested_path = paths.last().unwrap().to_string();
+        hooks.set_before({
+            let owner_lifecycle = owner_lifecycle.clone();
+            let owner_monitor = owner.monitor.clone();
+            let collection = collection.clone();
+            let first = first.clone();
+            let contested_path = contested_path.clone();
+            move |op| {
+                let status_read = matches!(
+                    op,
+                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                ) && op.path() == status_path;
+                let repeated = status_read && status_reads.fetch_add(1, Ordering::SeqCst) >= 7;
+                let cleanup = matches!(op, BackendOp::WriteIf { .. })
+                    && op.path() == contested_path
+                    && cleanup_armed.swap(false, Ordering::SeqCst);
+                let owner_lifecycle = owner_lifecycle.clone();
+                let owner_monitor = owner_monitor.clone();
+                let collection = collection.clone();
+                let first = first.clone();
+                Box::pin(async move {
+                    if repeated {
+                        return Err(BackendError::other(
+                            "delete-intent resolution made no progress",
+                        ));
+                    }
+                    if cleanup {
+                        // Acknowledged owner cleanup wins after the new drop
+                        // selected its revision, so replacement must retry.
+                        owner_monitor
+                            .abort_owned_tx(&first)
+                            .await
+                            .map_err(|error| {
+                                BackendError::with_source("acknowledging the prior drop", error)
+                            })?;
+                        owner_lifecycle
+                            .clear_aborted_drops(&first, &[collection])
+                            .await
+                            .map_err(|error| {
+                                BackendError::with_source("clearing the prior drop", error)
+                            })?;
+                    }
+                    Ok(())
+                })
+            }
+        });
+        operations.lock().unwrap().clear();
+        let result = peer_lifecycle
+            .fence_drops(&second, std::slice::from_ref(&change))
+            .await;
+        hooks.clear_before();
+        let recorded = std::mem::take(&mut *operations.lock().unwrap());
+        let expected = if status == TxCommitStatus::Ok {
+            assert!(matches!(result, Err(TransError::StaleCollection)));
+            &first
+        } else {
+            result.unwrap();
+            &second
+        };
+        for path in &paths {
+            let path = path.to_string();
+            let calls: Vec<_> = recorded
+                .iter()
+                .filter(|op| op.path == path)
+                .map(|op| op.op)
+                .collect();
+            let expected_calls: &[&str] = if status == TxCommitStatus::Ok {
+                &[]
+            } else if cleanup_races && path == contested_path {
+                &["read", "write_if", "read", "write_if"]
+            } else {
+                &["read", "write_if"]
+            };
+            assert_eq!(calls, expected_calls, "unexpected node I/O for {path}");
+        }
+        if status != TxCommitStatus::Ok {
+            peer_lifecycle
+                .fence_drops(&second, std::slice::from_ref(&change))
+                .await
+                .unwrap();
+            let replay = std::mem::take(&mut *operations.lock().unwrap());
+            assert!(
+                replay
+                    .iter()
+                    .all(|op| paths.iter().all(|path| op.path != path.to_string()))
+            );
+        }
+        let verifier = store(backend);
+        for path in paths {
+            let observed = verifier
+                .nodes
+                .load_node_at_state(&path, Requirement::ANY)
+                .await
+                .unwrap();
+            assert_eq!(
+                observed.value().unwrap().collection_delete_intent(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn drop_replaces_a_wounded_root_intent() {
+        refence_terminal_drop(TxCommitStatus::Wounded, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn drop_replaces_wounded_node_intents() {
+        refence_terminal_drop(TxCommitStatus::Wounded, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn drop_retries_if_aborted_owner_clears_the_intent() {
+        for with_child in [false, true] {
+            refence_terminal_drop(TxCommitStatus::Wounded, with_child, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn drop_preserves_committed_intents() {
+        for with_child in [false, true] {
+            refence_terminal_drop(TxCommitStatus::Ok, with_child, false).await;
+        }
     }
 
     async fn run_fence_shrink_race(fence_waits: bool) {

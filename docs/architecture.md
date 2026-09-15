@@ -245,6 +245,13 @@ remains registered in the collection record until its structural intent is
 completed or recovered. A freeze can therefore settle every pre-existing
 participant before node enumeration.
 
+A later drop replaces an aborted or wounded owner's delete intent in the same
+revision-checked CAS that installs its own fence. Resolving the old owner's
+status does not clear the stored intent, so rereading alone cannot make progress.
+Other pending holders must still be resolved before that CAS; a committed
+foreign drop rejects the new drop. This replacement needs no extra read barrier
+or separate clearing mutation.
+
 Normal point operations inspect only the terminal node they already access:
 an aborted intent is removable, a pending intent participates in wound-wait,
 and a committed intent reports a stale collection handle. Physical
