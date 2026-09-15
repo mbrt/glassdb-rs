@@ -765,7 +765,10 @@ impl Algo {
                 .validate(Some(&tx.id), &tx.collections, barrier)
                 .await?
         {
-            self.locker.collections().release(&tx.id, &locks).await?;
+            self.locker
+                .collections()
+                .release(&tx.id, &locks, Requirement::ANY)
+                .await?;
             return Err(TransError::Retry);
         }
 
@@ -848,7 +851,10 @@ impl Algo {
         {
             return Ok(AttemptOutcome::Complete);
         }
-        self.locker.collections().release(&tx.id, &locks).await?;
+        self.locker
+            .collections()
+            .release(&tx.id, &locks, Requirement::ANY)
+            .await?;
         Err(TransError::Retry)
     }
 

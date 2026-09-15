@@ -1008,7 +1008,7 @@ impl Locker {
         requirement: Requirement,
     ) -> Result<bool, TransError> {
         let keys_released = self.keys.release(id, locks, requirement).await?;
-        let coll_released = self.collections.release(id, locks).await?;
+        let coll_released = self.collections.release(id, locks, requirement).await?;
         Ok(keys_released || coll_released)
     }
 
@@ -2888,7 +2888,10 @@ mod tests {
                     if write_back {
                         locker.collections().write_back(&id, &changes, &locks).await
                     } else {
-                        locker.collections().release(&id, &locks).await
+                        locker
+                            .collections()
+                            .release(&id, &locks, Requirement::ANY)
+                            .await
                     }
                 },
                 &gate,

@@ -121,11 +121,19 @@ impl CollectionLocker {
     }
 
     /// Releases every recorded directory lock held by `id`.
-    pub(crate) async fn release(&self, id: &TxId, locks: &[TxLock]) -> Result<bool, TransError> {
+    ///
+    /// A present record with no holder must satisfy `requirement`. Owner
+    /// cleanup can use `ANY` because it shares cache knowledge with acquisition.
+    pub(crate) async fn release(
+        &self,
+        id: &TxId,
+        locks: &[TxLock],
+        requirement: Requirement,
+    ) -> Result<bool, TransError> {
         let results = map_all_bounded(
             Self::locked_collections(locks),
             self.parallelism,
-            |parent| async move { self.release_directory(&parent, id).await },
+            |parent| async move { self.release_directory(&parent, id, requirement).await },
         )
         .await;
         results
@@ -229,16 +237,28 @@ impl CollectionLocker {
         &self,
         parent: &CollectionAddress,
         id: &TxId,
+        requirement: Requirement,
     ) -> Result<bool, TransError> {
+        let mut read_requirement = Requirement::ANY;
         loop {
             let (mut record, observed) =
-                match self.records.load_record(parent, Requirement::ANY).await {
+                match self.records.load_record(parent, read_requirement).await {
                     Ok(record) => record,
+                    // Other instances access published collections after record creation.
+                    // Local preparation and cleanup share a cache. GC waits for commit
+                    // or acknowledged abort before inspecting prepared resources, so
+                    // cached absence cannot hide a later record creation here.
                     Err(StorageError::NotFound) => return Ok(false),
                     Err(error) => return Err(error.into()),
                 };
             if !record.remove_directory_holder(id) {
-                return Ok(false);
+                if observed.satisfies(requirement) {
+                    return Ok(false);
+                }
+                // A present cached record can predate the holder. Use the
+                // caller's bound only when no CAS proves that removal is done.
+                read_requirement = requirement;
+                continue;
             }
             if self.records.store_record(&record, &observed).await? {
                 return Ok(true);

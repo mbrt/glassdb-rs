@@ -977,6 +977,198 @@ async fn membership_only_gc_reuses_a_cached_holder_for_its_cas() {
     }
 }
 
+#[derive(Clone, Copy)]
+enum DirectoryCleanup {
+    StaleNoHolder,
+    CachedHolder,
+    ReadFailure,
+    OwnerReleased,
+    CommittedReleased,
+}
+
+async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
+    use crate::collection_coordination::CollectionLocker;
+    use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
+
+    let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let recorded = RecordingBackend::new(hooks.clone());
+    let operations = recorded.log();
+    let backend: Arc<dyn Backend> = Arc::new(recorded);
+    // GC caches the record before the independent owner acquires its holder.
+    let ctx = new_ctx_with(backend.clone()).await;
+    let owner = AssemblyFixture::new(
+        backend,
+        DbRoot::try_from("db").unwrap(),
+        &EngineConfig::default(),
+    );
+    let locker = CollectionLocker::new(
+        CollectionStateResolver::new(
+            owner.records.clone(),
+            owner.tlogger.clone(),
+            owner.timeline.clone(),
+            owner.monitor.clone(),
+            RetryConfig::default(),
+        ),
+        std::num::NonZeroUsize::MIN,
+    );
+    let id = tx(83);
+    let locks = vec![TxLock::Directory {
+        collection: collection(),
+        typ,
+    }];
+    owner
+        .monitor
+        .begin_persisted_tx(
+            &id,
+            TxRecoveryManifest {
+                locks: locks.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let operation = owner.monitor.begin_owner_operation(&id).unwrap();
+    locker.acquire(&collection(), &id, typ).await.unwrap();
+    operation.complete();
+    if matches!(case, DirectoryCleanup::CommittedReleased) {
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+        log.locks = locks.clone();
+        owner.monitor.commit_tx(log).await.unwrap();
+    } else {
+        assert_eq!(
+            owner.monitor.abort_owned_tx(&id).await.unwrap(),
+            OwnerAbortOutcome::Acknowledged
+        );
+    }
+    if matches!(case, DirectoryCleanup::CachedHolder) {
+        ctx.records
+            .load_record(
+                &collection(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+    }
+    let path = ObjectPath::CollectionRecord {
+        collection: collection(),
+    }
+    .to_string();
+    if matches!(
+        case,
+        DirectoryCleanup::OwnerReleased | DirectoryCleanup::CommittedReleased
+    ) {
+        operations.lock().unwrap().clear();
+        assert!(locker.release(&id, &locks, Requirement::ANY).await.unwrap());
+        let recorded = std::mem::take(&mut *operations.lock().unwrap());
+        let calls: Vec<_> = recorded
+            .iter()
+            .filter(|op| op.path == path)
+            .map(|op| op.op)
+            .collect();
+        assert_eq!(calls, ["write_if"]);
+        assert!(!locker.release(&id, &locks, Requirement::ANY).await.unwrap());
+        assert!(operations.lock().unwrap().is_empty());
+    }
+    // Enter reclamation after eligibility. Waiting out retention cannot
+    // change either instance's cached record.
+    let observed = ctx
+        .tl
+        .get_at(&id, Requirement::after(ctx.timeline.currentness_barrier()))
+        .await
+        .unwrap();
+    let barrier = ctx.timeline.currentness_barrier();
+    if matches!(case, DirectoryCleanup::ReadFailure) {
+        hooks.set_before({
+            let path = path.clone();
+            move |op| {
+                let fail = op.path() == path
+                    && matches!(
+                        op,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    );
+                Box::pin(async move {
+                    if fail {
+                        Err(BackendError::other("directory check failed"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+        assert!(ctx.gc.try_reclaim(&id, &observed, barrier).await.is_err());
+        assert!(!is_gone(&ctx.tl, &id).await);
+        hooks.clear_before();
+    }
+    operations.lock().unwrap().clear();
+    assert_eq!(
+        ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
+        GcOutcome::Reclaimed
+    );
+    assert!(is_gone(&ctx.tl, &id).await);
+    let recorded = std::mem::take(&mut *operations.lock().unwrap());
+    let (record, _) = owner
+        .records
+        .load_record(
+            &collection(),
+            Requirement::after(owner.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !record.directory_lock().contains(&id),
+        "GC deleted the transaction log while its directory holder remained"
+    );
+    let calls: Vec<_> = recorded
+        .iter()
+        .filter(|op| op.path == path)
+        .map(|op| op.op)
+        .collect();
+    let expected: &[&str] = match case {
+        DirectoryCleanup::StaleNoHolder | DirectoryCleanup::ReadFailure => {
+            &["read_if_modified", "write_if"]
+        }
+        DirectoryCleanup::CachedHolder => &["write_if"],
+        DirectoryCleanup::OwnerReleased | DirectoryCleanup::CommittedReleased => {
+            &["read_if_modified"]
+        }
+    };
+    assert_eq!(calls, expected);
+}
+
+#[tokio::test]
+async fn aborted_directory_reader_gc_refreshes_a_cached_no_holder() {
+    reclaim_directory(LockType::Read, DirectoryCleanup::StaleNoHolder).await;
+}
+
+#[tokio::test]
+async fn aborted_directory_writer_gc_refreshes_a_cached_no_holder() {
+    reclaim_directory(LockType::Write, DirectoryCleanup::StaleNoHolder).await;
+}
+
+#[tokio::test]
+async fn directory_gc_reuses_a_cached_holder_for_its_cas() {
+    for typ in [LockType::Read, LockType::Write] {
+        reclaim_directory(typ, DirectoryCleanup::CachedHolder).await;
+    }
+}
+
+#[tokio::test]
+async fn aborted_directory_gc_keeps_the_log_if_the_record_check_fails() {
+    reclaim_directory(LockType::Read, DirectoryCleanup::ReadFailure).await;
+}
+
+#[tokio::test]
+async fn directory_gc_checks_owner_cleanup_once() {
+    for typ in [LockType::Read, LockType::Write] {
+        for case in [
+            DirectoryCleanup::OwnerReleased,
+            DirectoryCleanup::CommittedReleased,
+        ] {
+            reclaim_directory(typ, case).await;
+        }
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn pending_and_wounded_candidates_only_read_their_logs() {
     for (status, age) in [TxCommitStatus::Pending, TxCommitStatus::Wounded]
