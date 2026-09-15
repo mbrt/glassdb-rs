@@ -528,7 +528,7 @@ impl Gc {
             .collect::<Vec<_>>();
         reclaimed.changed |= self
             .collection_lifecycle
-            .clear_aborted_drops(tid, &drops)
+            .clear_aborted_drops(tid, &drops, Requirement::after(barrier))
             .await?;
         reclaimed.changed |= self
             .collection_lifecycle

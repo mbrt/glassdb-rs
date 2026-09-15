@@ -114,11 +114,17 @@ impl CollectionLifecycle {
         Ok(())
     }
 
-    /// Clears delete preparation from a discarded body execution.
+    /// Clears delete preparation that a transaction no longer needs.
+    ///
+    /// The transaction must have stopped fencing these collections. A present
+    /// state without its intent or freeze must satisfy `requirement`. Owner
+    /// cleanup can use `ANY` because it shares the fencing cache; recovery
+    /// needs a bound captured after the owner's acknowledgement.
     pub(crate) async fn clear_aborted_drops(
         &self,
         id: &TxId,
         collections: &[CollectionAddress],
+        requirement: Requirement,
     ) -> Result<bool, TransError> {
         let mut changed = false;
         for collection in collections {
@@ -129,14 +135,16 @@ impl CollectionLifecycle {
                     .scan_nodes(collection, cursor.as_ref(), Requirement::ANY)
                     .await?;
                 for (token, _) in page.nodes {
-                    changed |= self.clear_node_fence(collection, &token, id).await?;
+                    changed |= self
+                        .clear_node_fence(collection, &token, id, requirement)
+                        .await?;
                 }
                 match page.next {
                     Some(next) => cursor = Some(next),
                     None => break,
                 }
             }
-            changed |= self.clear_root_fence(collection, id).await?;
+            changed |= self.clear_root_fence(collection, id, requirement).await?;
         }
         Ok(changed)
     }
@@ -348,14 +356,22 @@ impl CollectionLifecycle {
         collection: &CollectionAddress,
         token: &NodeToken,
         id: &TxId,
+        requirement: Requirement,
     ) -> Result<bool, TransError> {
+        let mut read_requirement = Requirement::ANY;
         loop {
             let (mut node, observed) = self
                 .nodes
-                .load_node(collection, token, Requirement::ANY)
+                .load_node(collection, token, read_requirement)
                 .await?;
             if !node.remove_collection_delete_intent(id) {
-                return Ok(false);
+                if observed.satisfies(requirement) {
+                    return Ok(false);
+                }
+                // Enumeration can reuse a body from before the fence. Require
+                // the caller's bound only when no removal CAS proves completion.
+                read_requirement = requirement;
+                continue;
             }
             if self
                 .nodes
@@ -371,32 +387,45 @@ impl CollectionLifecycle {
         &self,
         collection: &CollectionAddress,
         id: &TxId,
+        requirement: Requirement,
     ) -> Result<bool, TransError> {
         let mut changed = false;
+        let mut read_requirement = Requirement::ANY;
         loop {
             let (mut root, observed) =
-                match self.nodes.load_root(collection, Requirement::ANY).await {
+                match self.nodes.load_root(collection, read_requirement).await {
                     Ok(root) => root,
                     Err(StorageError::NotFound) => return Ok(changed),
                     Err(error) => return Err(error.into()),
                 };
             if !root.remove_collection_delete_intent(id) {
-                break;
+                if observed.satisfies(requirement) {
+                    break;
+                }
+                read_requirement = requirement;
+                continue;
             }
             if self.nodes.store_root(collection, &root, &observed).await? {
                 changed = true;
                 break;
             }
         }
+        // The record needs its own completion evidence, but a cached freeze
+        // still permits a removal CAS without a preceding currentness check.
+        let mut read_requirement = Requirement::ANY;
         loop {
             let (mut record, observed) =
-                match self.records.load_record(collection, Requirement::ANY).await {
+                match self.records.load_record(collection, read_requirement).await {
                     Ok(record) => record,
                     Err(StorageError::NotFound) => return Ok(changed),
                     Err(error) => return Err(error.into()),
                 };
             if !record.remove_topology_freeze(id) {
-                return Ok(changed);
+                if observed.satisfies(requirement) {
+                    return Ok(changed);
+                }
+                read_requirement = requirement;
+                continue;
             }
             if self.records.store_record(&record, &observed).await? {
                 return Ok(true);
@@ -705,7 +734,7 @@ mod tests {
                                 BackendError::with_source("acknowledging the prior drop", error)
                             })?;
                         owner_lifecycle
-                            .clear_aborted_drops(&first, &[collection])
+                            .clear_aborted_drops(&first, &[collection], Requirement::ANY)
                             .await
                             .map_err(|error| {
                                 BackendError::with_source("clearing the prior drop", error)

@@ -1411,6 +1411,357 @@ async fn topology_gc_keeps_the_log_and_participant_until_intents_settle() {
     }
 }
 
+#[derive(Clone, Copy)]
+enum DropCleanup {
+    StaleFences,
+    CachedFences,
+    CachedFreeze,
+    OwnerCleared,
+    ReadFailure,
+}
+
+async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropCleanup) {
+    use crate::collection_coordination::CollectionLocker;
+    use crate::collections::{CollectionChange, CollectionOp};
+    use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
+    use glassdb_data::NodeToken;
+    use glassdb_storage::IndexNode;
+
+    let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let recorded = RecordingBackend::new(hooks.clone());
+    let operations = recorded.log();
+    let backend: Arc<dyn Backend> = Arc::new(recorded);
+    let ctx = new_ctx_with(backend.clone()).await;
+    let owner = AssemblyFixture::new(
+        backend,
+        DbRoot::try_from("db").unwrap(),
+        &EngineConfig::default(),
+    );
+    let lifecycle = CollectionLifecycle::new(
+        owner.records.clone(),
+        owner.nodes.clone(),
+        owner.monitor.clone(),
+        RetryConfig::default(),
+        Arc::new(UnexpectedTopologySettler),
+    );
+    let locker = CollectionLocker::new(
+        CollectionStateResolver::new(
+            owner.records.clone(),
+            owner.tlogger.clone(),
+            owner.timeline.clone(),
+            owner.monitor.clone(),
+            RetryConfig::default(),
+        ),
+        std::num::NonZeroUsize::MIN,
+    );
+    let target = CollectionAddress::new("db", CollectionId::from_slice(&[37; 16]).unwrap());
+    let mut change = CollectionChange {
+        parent: collection(),
+        name: b"child".to_vec(),
+        collection: target.clone(),
+        expected: None,
+        op: CollectionOp::Create,
+    };
+    lifecycle
+        .prepare_collections(std::slice::from_ref(&change))
+        .await
+        .unwrap();
+    let mut node_paths = vec![ObjectPath::TreeRoot {
+        collection: target.clone(),
+    }];
+    if with_child {
+        let token = NodeToken::from_bytes([38; 16]);
+        assert!(
+            owner
+                .nodes
+                .store_node(&target, &token, &Node::leaf(LeafBody::new()), None)
+                .await
+                .unwrap()
+        );
+        let (_, observed) = owner
+            .nodes
+            .load_root(&target, Requirement::ANY)
+            .await
+            .unwrap();
+        let root = Node::index(IndexNode::from_children([(Vec::new(), token.to_string())]));
+        assert!(
+            owner
+                .nodes
+                .store_root(&target, &root, &observed)
+                .await
+                .unwrap()
+        );
+        node_paths.push(ObjectPath::Node {
+            collection: target.clone(),
+            token,
+        });
+    }
+    let (mut parent, observed) = owner
+        .records
+        .load_record(&collection(), Requirement::ANY)
+        .await
+        .unwrap();
+    parent.add_child(change.name.clone(), target.id()).unwrap();
+    assert!(
+        owner
+            .records
+            .store_record(&parent, &observed)
+            .await
+            .unwrap()
+    );
+    let record_path = ObjectPath::CollectionRecord {
+        collection: target.clone(),
+    }
+    .to_string();
+    for path in &node_paths {
+        ctx.nodes
+            .load_node_at_state(path, Requirement::ANY)
+            .await
+            .unwrap();
+    }
+    ctx.records
+        .load_record(&target, Requirement::ANY)
+        .await
+        .unwrap();
+
+    change.op = CollectionOp::Drop;
+    change.expected = Some(target.id());
+    let id = tx(87);
+    let locks = vec![
+        TxLock::Directory {
+            collection: collection(),
+            typ: LockType::Write,
+        },
+        TxLock::Directory {
+            collection: target.clone(),
+            typ: LockType::Read,
+        },
+    ];
+    owner
+        .monitor
+        .begin_persisted_tx(
+            &id,
+            TxRecoveryManifest {
+                locks: if durable_locks {
+                    locks.clone()
+                } else {
+                    Vec::new()
+                },
+                collection_changes: vec![TxCollectionChange {
+                    parent: collection(),
+                    name: change.name.clone(),
+                    collection: target.clone(),
+                    op: TxCollectionOp::Drop,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let operation = owner.monitor.begin_owner_operation(&id).unwrap();
+    locker
+        .acquire(&collection(), &id, LockType::Write)
+        .await
+        .unwrap();
+    locker.acquire(&target, &id, LockType::Read).await.unwrap();
+    owner.monitor.record_tx_locks(&id, locks.clone());
+    lifecycle
+        .fence_drops(&id, std::slice::from_ref(&change))
+        .await
+        .unwrap();
+    operation.complete();
+    // Paused time keeps the refresher from copying the local lock list. An
+    // acknowledged abort can retain the earlier durable drop-only manifest.
+    assert_eq!(
+        owner.monitor.abort_owned_tx(&id).await.unwrap(),
+        OwnerAbortOutcome::Acknowledged
+    );
+    let observed = ctx
+        .tl
+        .get_at(&id, Requirement::after(ctx.timeline.currentness_barrier()))
+        .await
+        .unwrap();
+    assert_eq!(
+        observed.value().unwrap().locks,
+        if durable_locks { locks } else { Vec::new() }
+    );
+    if matches!(case, DropCleanup::CachedFences) {
+        let requirement = Requirement::after(ctx.timeline.currentness_barrier());
+        for path in &node_paths {
+            ctx.nodes
+                .load_node_at_state(path, requirement)
+                .await
+                .unwrap();
+        }
+    }
+    if matches!(case, DropCleanup::CachedFences | DropCleanup::CachedFreeze) {
+        ctx.records
+            .load_record(
+                &target,
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+    }
+    if matches!(case, DropCleanup::OwnerCleared) {
+        operations.lock().unwrap().clear();
+        assert!(
+            lifecycle
+                .clear_aborted_drops(&id, std::slice::from_ref(&target), Requirement::ANY)
+                .await
+                .unwrap()
+        );
+        let recorded = std::mem::take(&mut *operations.lock().unwrap());
+        for path in node_paths
+            .iter()
+            .map(ToString::to_string)
+            .chain([record_path.clone()])
+        {
+            let calls: Vec<_> = recorded
+                .iter()
+                .filter(|op| op.path == path)
+                .map(|op| op.op)
+                .collect();
+            assert_eq!(calls, ["write_if"], "owner cleanup for {path}");
+        }
+        assert!(
+            !lifecycle
+                .clear_aborted_drops(&id, std::slice::from_ref(&target), Requirement::ANY)
+                .await
+                .unwrap()
+        );
+        assert!(operations.lock().unwrap().iter().all(|op| op.op == "list"));
+    }
+    let barrier = ctx.timeline.currentness_barrier();
+    if matches!(case, DropCleanup::ReadFailure) {
+        hooks.set_before({
+            let path = node_paths.last().unwrap().to_string();
+            move |op| {
+                let fail = op.path() == path
+                    && matches!(
+                        op,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    );
+                Box::pin(async move {
+                    if fail {
+                        Err(BackendError::other("drop fence check failed"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+        assert!(ctx.gc.try_reclaim(&id, &observed, barrier).await.is_err());
+        assert!(!is_gone(&ctx.tl, &id).await);
+        hooks.clear_before();
+    }
+    // Enter reclamation after eligibility. Retention cannot refresh any of
+    // these pre-fence cache entries.
+    operations.lock().unwrap().clear();
+    assert_eq!(
+        ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
+        GcOutcome::Reclaimed
+    );
+    assert!(is_gone(&ctx.tl, &id).await);
+    let recorded = std::mem::take(&mut *operations.lock().unwrap());
+    let mut remaining = Vec::new();
+    let verification = Requirement::after(owner.timeline.currentness_barrier());
+    for path in &node_paths {
+        let node = owner
+            .nodes
+            .load_node_at_state(path, verification)
+            .await
+            .unwrap();
+        if node.value().unwrap().collection_delete_intent() == Some(&id) {
+            remaining.push(path.to_string());
+        }
+    }
+    let (record, _) = owner
+        .records
+        .load_record(&target, verification)
+        .await
+        .unwrap();
+    if record.topology_freeze() == Some(&id) {
+        remaining.push(record_path.clone());
+    }
+    assert!(
+        remaining.is_empty(),
+        "GC deleted the log with drop fences still present: {remaining:?}"
+    );
+    let node_expected: &[&str] = match case {
+        DropCleanup::CachedFences => &["write_if"],
+        DropCleanup::OwnerCleared => &["read_if_modified"],
+        DropCleanup::StaleFences | DropCleanup::CachedFreeze | DropCleanup::ReadFailure => {
+            &["read_if_modified", "write_if"]
+        }
+    };
+    for path in node_paths.iter().map(ToString::to_string) {
+        let calls: Vec<_> = recorded
+            .iter()
+            .filter(|op| op.path == path)
+            .map(|op| op.op)
+            .collect();
+        assert_eq!(calls, node_expected, "GC node cleanup for {path}");
+    }
+    let record_calls: Vec<_> = recorded
+        .iter()
+        .filter(|op| op.path == record_path)
+        .map(|op| op.op)
+        .collect();
+    let record_expected: &[&str] = if durable_locks {
+        &["read_if_modified", "write_if", "write_if"]
+    } else if matches!(case, DropCleanup::CachedFreeze) {
+        &["write_if"]
+    } else {
+        node_expected
+    };
+    assert_eq!(record_calls, record_expected);
+    operations.lock().unwrap().clear();
+    assert!(
+        !ctx.gc
+            .collection_lifecycle
+            .clear_aborted_drops(&id, &[target], Requirement::after(barrier))
+            .await
+            .unwrap()
+    );
+    assert!(operations.lock().unwrap().iter().all(|op| op.op == "list"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborted_drop_gc_clears_cached_root_fence_and_freeze() {
+    reclaim_aborted_drop(false, false, DropCleanup::StaleFences).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborted_drop_gc_clears_cached_index_and_child_fences() {
+    reclaim_aborted_drop(true, false, DropCleanup::StaleFences).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborted_drop_gc_reuses_directory_release_evidence() {
+    reclaim_aborted_drop(true, true, DropCleanup::StaleFences).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborted_drop_gc_reuses_cached_fences_for_its_cas() {
+    reclaim_aborted_drop(true, false, DropCleanup::CachedFences).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborted_drop_gc_checks_stale_nodes_without_rechecking_a_cached_freeze() {
+    reclaim_aborted_drop(true, false, DropCleanup::CachedFreeze).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborted_drop_owner_cleanup_needs_no_extra_reads() {
+    reclaim_aborted_drop(true, false, DropCleanup::OwnerCleared).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborted_drop_gc_keeps_the_log_if_a_fence_check_fails() {
+    reclaim_aborted_drop(true, false, DropCleanup::ReadFailure).await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn pending_and_wounded_candidates_only_read_their_logs() {
     for (status, age) in [TxCommitStatus::Pending, TxCommitStatus::Wounded]

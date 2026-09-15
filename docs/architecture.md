@@ -252,6 +252,17 @@ Other pending holders must still be resolved before that CAS; a committed
 foreign drop rejects the new drop. This replacement needs no extra read barrier
 or separate clearing mutation.
 
+Aborted-drop cleanup also starts each node and collection-record read with
+`ANY`. A removal CAS proves that the transaction's delete intent or topology
+freeze is clear. A present state without that effect must instead meet the
+completion requirement. Owner cleanup shares the fencing cache and uses `ANY`;
+GC passes its existing bound captured after eligibility. Root, standalone-node,
+and collection-record completion require separate evidence. Earlier directory
+release can already supply the record evidence, but an aborted log can record
+a drop before its directory lock list is persisted. Cleanup must therefore
+check the freeze even when the log records no directory locks. It adds no
+barrier and checks currentness only when a no-op lacks sufficient evidence.
+
 Normal point operations inspect only the terminal node they already access:
 an aborted intent is removable, a pending intent participates in wound-wait,
 and a committed intent reports a stale collection handle. Physical
