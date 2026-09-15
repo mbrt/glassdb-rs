@@ -23,6 +23,10 @@ use crate::wound_wait::{Reclaim, resolve_tx_conflict, try_reclaim};
 pub trait TopologySettler: Send + Sync {
     /// Finishes and releases `id`'s structural work on `collection`. Returns
     /// [`TransError::Retry`] while `id` is not yet final.
+    ///
+    /// The caller must share the cache that admitted `id` or installed a
+    /// topology freeze with `id` still present. This permits completion from
+    /// local record evidence after another operation removes the participant.
     async fn settle_topology_participant(
         &self,
         collection: &CollectionAddress,
@@ -75,7 +79,7 @@ impl CollectionLifecycle {
                 .await?
             {
                 self.records
-                    .load_record(&change.collection, Requirement::Any)
+                    .load_record(&change.collection, Requirement::ANY)
                     .await
                     .map_err(TransError::from)?;
             }
@@ -85,7 +89,7 @@ impl CollectionLifecycle {
                 .await?
             {
                 self.nodes
-                    .load_root(&change.collection, Requirement::Any)
+                    .load_root(&change.collection, Requirement::ANY)
                     .await
                     .map_err(TransError::from)?;
             }
@@ -105,7 +109,7 @@ impl CollectionLifecycle {
             .map(|change| &change.collection)
         {
             self.freeze_topology(collection, id).await?;
-            let nodes = self.nodes.list_nodes(collection, Requirement::Any).await?;
+            let nodes = self.nodes.list_nodes(collection, Requirement::ANY).await?;
             for (token, _) in nodes {
                 self.fence_node(collection, &token, id).await?;
             }
@@ -114,11 +118,17 @@ impl CollectionLifecycle {
         Ok(())
     }
 
-    /// Clears delete preparation from a discarded body execution.
+    /// Clears delete preparation that a transaction no longer needs.
+    ///
+    /// The transaction must have stopped fencing these collections. A present
+    /// state without its intent or freeze must satisfy `requirement`. Owner
+    /// cleanup can use `ANY` because it shares the fencing cache; recovery
+    /// needs a bound captured after the owner's acknowledgement.
     pub(crate) async fn clear_aborted_drops(
         &self,
         id: &TxId,
         collections: &[CollectionAddress],
+        requirement: Requirement,
     ) -> Result<bool, TransError> {
         let mut changed = false;
         for collection in collections {
@@ -126,17 +136,19 @@ impl CollectionLifecycle {
             loop {
                 let page = self
                     .nodes
-                    .scan_nodes(collection, cursor.as_ref(), Requirement::Any)
+                    .scan_nodes(collection, cursor.as_ref(), Requirement::ANY)
                     .await?;
                 for (token, _) in page.nodes {
-                    changed |= self.clear_node_fence(collection, &token, id).await?;
+                    changed |= self
+                        .clear_node_fence(collection, &token, id, requirement)
+                        .await?;
                 }
                 match page.next {
                     Some(next) => cursor = Some(next),
                     None => break,
                 }
             }
-            changed |= self.clear_root_fence(collection, id).await?;
+            changed |= self.clear_root_fence(collection, id, requirement).await?;
         }
         Ok(changed)
     }
@@ -152,7 +164,7 @@ impl CollectionLifecycle {
             loop {
                 let page = self
                     .nodes
-                    .scan_nodes(collection, cursor.as_ref(), Requirement::Any)
+                    .scan_nodes(collection, cursor.as_ref(), Requirement::ANY)
                     .await?;
                 for (_, observed) in page.nodes {
                     self.nodes.delete_node(&observed).await?;
@@ -165,7 +177,7 @@ impl CollectionLifecycle {
             }
             let observed = self
                 .nodes
-                .load_root_state(collection, Requirement::Any)
+                .load_root_state(collection, Requirement::ANY)
                 .await?;
             if observed.exists() {
                 self.nodes.delete_root(&observed).await?;
@@ -173,7 +185,7 @@ impl CollectionLifecycle {
             }
             let observed = self
                 .records
-                .load_record_state(collection, Requirement::Any)
+                .load_record_state(collection, Requirement::ANY)
                 .await?;
             if observed.exists() {
                 self.records.delete_record(&observed).await?;
@@ -192,7 +204,7 @@ impl CollectionLifecycle {
         loop {
             let (mut record, observed) = self
                 .records
-                .load_record(collection, Requirement::Any)
+                .load_record(collection, Requirement::ANY)
                 .await?;
             if record.topology_freeze() != Some(id)
                 && let Some(holder) = record.topology_freeze().cloned()
@@ -242,7 +254,7 @@ impl CollectionLifecycle {
         loop {
             let (mut node, observed) = match self
                 .nodes
-                .load_node(collection, token, Requirement::Any)
+                .load_node(collection, token, Requirement::ANY)
                 .await
             {
                 Ok(node) => node,
@@ -254,7 +266,6 @@ impl CollectionLifecycle {
             }
             if let Some(holder) = node.collection_delete_intent().cloned() {
                 self.resolve_delete_holder(&holder, id).await?;
-                continue;
             }
             if let Some(holder) = self.pending_node_holder(&node, id).await? {
                 self.resolve_pending_holder(&holder, id).await?;
@@ -283,13 +294,12 @@ impl CollectionLifecycle {
     ) -> Result<(), TransError> {
         let mut backoff = self.retry.backoff();
         loop {
-            let (mut root, observed) = self.nodes.load_root(collection, Requirement::Any).await?;
+            let (mut root, observed) = self.nodes.load_root(collection, Requirement::ANY).await?;
             if root.collection_delete_intent() == Some(id) {
                 return Ok(());
             }
             if let Some(holder) = root.collection_delete_intent().cloned() {
                 self.resolve_delete_holder(&holder, id).await?;
-                continue;
             }
             if let Some(holder) = self.pending_node_holder(&root, id).await? {
                 self.resolve_pending_holder(&holder, id).await?;
@@ -337,6 +347,7 @@ impl CollectionLifecycle {
         Ok(())
     }
 
+    /// Establishes that a foreign delete intent can be replaced.
     async fn resolve_delete_holder(&self, holder: &TxId, id: &TxId) -> Result<(), TransError> {
         match resolve_tx_conflict(&self.monitor, id, holder).await? {
             TxFinalStatus::Committed => Err(TransError::StaleCollection),
@@ -349,14 +360,22 @@ impl CollectionLifecycle {
         collection: &CollectionAddress,
         token: &NodeToken,
         id: &TxId,
+        requirement: Requirement,
     ) -> Result<bool, TransError> {
+        let mut read_requirement = Requirement::ANY;
         loop {
             let (mut node, observed) = self
                 .nodes
-                .load_node(collection, token, Requirement::Any)
+                .load_node(collection, token, read_requirement)
                 .await?;
             if !node.remove_collection_delete_intent(id) {
-                return Ok(false);
+                if observed.satisfies(requirement) {
+                    return Ok(false);
+                }
+                // Enumeration can reuse a body from before the fence. Require
+                // the caller's bound only when no removal CAS proves completion.
+                read_requirement = requirement;
+                continue;
             }
             if self
                 .nodes
@@ -372,32 +391,45 @@ impl CollectionLifecycle {
         &self,
         collection: &CollectionAddress,
         id: &TxId,
+        requirement: Requirement,
     ) -> Result<bool, TransError> {
         let mut changed = false;
+        let mut read_requirement = Requirement::ANY;
         loop {
             let (mut root, observed) =
-                match self.nodes.load_root(collection, Requirement::Any).await {
+                match self.nodes.load_root(collection, read_requirement).await {
                     Ok(root) => root,
                     Err(StorageError::NotFound) => return Ok(changed),
                     Err(error) => return Err(error.into()),
                 };
             if !root.remove_collection_delete_intent(id) {
-                break;
+                if observed.satisfies(requirement) {
+                    break;
+                }
+                read_requirement = requirement;
+                continue;
             }
             if self.nodes.store_root(collection, &root, &observed).await? {
                 changed = true;
                 break;
             }
         }
+        // The record needs its own completion evidence, but a cached freeze
+        // still permits a removal CAS without a preceding currentness check.
+        let mut read_requirement = Requirement::ANY;
         loop {
             let (mut record, observed) =
-                match self.records.load_record(collection, Requirement::Any).await {
+                match self.records.load_record(collection, read_requirement).await {
                     Ok(record) => record,
                     Err(StorageError::NotFound) => return Ok(changed),
                     Err(error) => return Err(error.into()),
                 };
             if !record.remove_topology_freeze(id) {
-                return Ok(changed);
+                if observed.satisfies(requirement) {
+                    return Ok(changed);
+                }
+                read_requirement = requirement;
+                continue;
             }
             if self.records.store_record(&record, &observed).await? {
                 return Ok(true);
@@ -409,19 +441,21 @@ impl CollectionLifecycle {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture};
-    use glassdb_backend::{Backend, memory::MemoryBackend};
+    use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
+    use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
     use glassdb_concurr::Background;
-    use glassdb_data::{DbRoot, NodeToken, ObjectPath};
-    use glassdb_storage::transaction::TLogger;
-    use glassdb_storage::{CachedStore, CurrentState, LeafBody, LeafEntry, Timeline};
+    use glassdb_data::{CollectionId, DbRoot, NodeToken, ObjectPath};
+    use glassdb_storage::transaction::{TLogger, TxCollectionChange, TxCollectionOp, TxLog};
+    use glassdb_storage::{CachedStore, CurrentState, IndexNode, LeafBody, LeafEntry, Timeline};
     use tokio::sync::Notify;
 
     use super::*;
+    use crate::engine::{AssemblyFixture, EngineConfig};
+    use crate::monitor::TxRecoveryManifest;
 
     const COLLECTION: &str = "db/_c/0000000000000000000000";
     const SOURCE_TOKEN: &str = "0000000000000000000000";
@@ -527,6 +561,272 @@ mod tests {
         })
     }
 
+    fn lifecycle(fixture: &AssemblyFixture) -> CollectionLifecycle {
+        CollectionLifecycle::new(
+            fixture.records.clone(),
+            fixture.nodes.clone(),
+            fixture.monitor.clone(),
+            RetryConfig::default(),
+            Arc::new(UnexpectedTopologySettler),
+        )
+    }
+
+    async fn refence_terminal_drop(status: TxCommitStatus, with_child: bool, cleanup_races: bool) {
+        let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let recorder = RecordingBackend::new(hooks.clone());
+        let operations = recorder.log();
+        let backend: Arc<dyn Backend> = Arc::new(recorder);
+        let owner = AssemblyFixture::new(
+            hooks.clone(),
+            DbRoot::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let peer = AssemblyFixture::new(
+            backend.clone(),
+            DbRoot::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let owner_lifecycle = lifecycle(&owner);
+        let peer_lifecycle = lifecycle(&peer);
+        let collection = CollectionAddress::new("db", CollectionId::from_slice(&[17; 16]).unwrap());
+        let mut change = CollectionChange {
+            parent: CollectionAddress::root("db"),
+            name: b"child".to_vec(),
+            collection: collection.clone(),
+            expected: None,
+            op: CollectionOp::Create,
+        };
+        owner_lifecycle
+            .prepare_collections(std::slice::from_ref(&change))
+            .await
+            .unwrap();
+        let mut parent = CollectionRecord::new();
+        parent
+            .add_child(change.name.clone(), collection.id())
+            .unwrap();
+        assert!(
+            owner
+                .records
+                .create_record(&change.parent, &parent)
+                .await
+                .unwrap()
+        );
+        assert!(
+            owner
+                .nodes
+                .create_root(&change.parent, &Node::leaf(LeafBody::new()))
+                .await
+                .unwrap()
+        );
+        let mut paths = vec![ObjectPath::TreeRoot {
+            collection: collection.clone(),
+        }];
+        if with_child {
+            let token = node_token(SOURCE_TOKEN);
+            assert!(
+                owner
+                    .nodes
+                    .store_node(&collection, &token, &Node::leaf(LeafBody::new()), None)
+                    .await
+                    .unwrap()
+            );
+            let (_, observed) = owner
+                .nodes
+                .load_root(&collection, Requirement::ANY)
+                .await
+                .unwrap();
+            let root = Node::index(IndexNode::from_children([(
+                Vec::new(),
+                SOURCE_TOKEN.to_owned(),
+            )]));
+            assert!(
+                owner
+                    .nodes
+                    .store_root(&collection, &root, &observed)
+                    .await
+                    .unwrap()
+            );
+            paths.push(ObjectPath::Node {
+                collection: collection.clone(),
+                token,
+            });
+        }
+        change.expected = Some(collection.id());
+        change.op = CollectionOp::Drop;
+        let first = TxId::from_bytes(vec![1]);
+        let second = TxId::from_bytes(vec![2]);
+        let manifest = TxRecoveryManifest {
+            collection_changes: vec![TxCollectionChange {
+                parent: change.parent.clone(),
+                name: change.name.clone(),
+                collection: collection.clone(),
+                op: TxCollectionOp::Drop,
+            }],
+            ..Default::default()
+        };
+        owner
+            .monitor
+            .begin_persisted_tx(&first, manifest.clone())
+            .await
+            .unwrap();
+        owner_lifecycle
+            .fence_drops(&first, std::slice::from_ref(&change))
+            .await
+            .unwrap();
+        match status {
+            TxCommitStatus::Wounded => {
+                assert_eq!(
+                    peer.monitor.preempt_tx(&first).await.unwrap(),
+                    TxFinalStatus::Aborted
+                );
+            }
+            TxCommitStatus::Ok => {
+                let mut log = TxLog::new(first.clone(), TxCommitStatus::Ok);
+                log.collection_changes = manifest.collection_changes.clone();
+                owner.monitor.commit_tx(log).await.unwrap();
+            }
+            _ => panic!("the first drop must be terminal"),
+        }
+        peer.monitor
+            .begin_persisted_tx(&second, manifest)
+            .await
+            .unwrap();
+
+        // Wounded and acknowledged-aborted holders take the same abort-side
+        // branch. Start wounded so repeated status reads can bound a broken
+        // loop; cached immutable Aborted status could otherwise hide it.
+        let status_path = ObjectPath::Transaction {
+            db_root: DbRoot::try_from("db").unwrap(),
+            id: first.clone(),
+        }
+        .to_string();
+        let status_reads = AtomicUsize::new(0);
+        let cleanup_armed = AtomicBool::new(cleanup_races);
+        let contested_path = paths.last().unwrap().to_string();
+        hooks.set_before({
+            let owner_lifecycle = owner_lifecycle.clone();
+            let owner_monitor = owner.monitor.clone();
+            let collection = collection.clone();
+            let first = first.clone();
+            let contested_path = contested_path.clone();
+            move |op| {
+                let status_read = matches!(
+                    op,
+                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                ) && op.path() == status_path;
+                let repeated = status_read && status_reads.fetch_add(1, Ordering::SeqCst) >= 7;
+                let cleanup = matches!(op, BackendOp::WriteIf { .. })
+                    && op.path() == contested_path
+                    && cleanup_armed.swap(false, Ordering::SeqCst);
+                let owner_lifecycle = owner_lifecycle.clone();
+                let owner_monitor = owner_monitor.clone();
+                let collection = collection.clone();
+                let first = first.clone();
+                Box::pin(async move {
+                    if repeated {
+                        return Err(BackendError::other(
+                            "delete-intent resolution made no progress",
+                        ));
+                    }
+                    if cleanup {
+                        // Acknowledged owner cleanup wins after the new drop
+                        // selected its revision, so replacement must retry.
+                        owner_monitor
+                            .abort_owned_tx(&first)
+                            .await
+                            .map_err(|error| {
+                                BackendError::with_source("acknowledging the prior drop", error)
+                            })?;
+                        owner_lifecycle
+                            .clear_aborted_drops(&first, &[collection], Requirement::ANY)
+                            .await
+                            .map_err(|error| {
+                                BackendError::with_source("clearing the prior drop", error)
+                            })?;
+                    }
+                    Ok(())
+                })
+            }
+        });
+        operations.lock().unwrap().clear();
+        let result = peer_lifecycle
+            .fence_drops(&second, std::slice::from_ref(&change))
+            .await;
+        hooks.clear_before();
+        let recorded = std::mem::take(&mut *operations.lock().unwrap());
+        let expected = if status == TxCommitStatus::Ok {
+            assert!(matches!(result, Err(TransError::StaleCollection)));
+            &first
+        } else {
+            result.unwrap();
+            &second
+        };
+        for path in &paths {
+            let path = path.to_string();
+            let calls: Vec<_> = recorded
+                .iter()
+                .filter(|op| op.path == path)
+                .map(|op| op.op)
+                .collect();
+            let expected_calls: &[&str] = if status == TxCommitStatus::Ok {
+                &[]
+            } else if cleanup_races && path == contested_path {
+                &["read", "write_if", "read", "write_if"]
+            } else {
+                &["read", "write_if"]
+            };
+            assert_eq!(calls, expected_calls, "unexpected node I/O for {path}");
+        }
+        if status != TxCommitStatus::Ok {
+            peer_lifecycle
+                .fence_drops(&second, std::slice::from_ref(&change))
+                .await
+                .unwrap();
+            let replay = std::mem::take(&mut *operations.lock().unwrap());
+            assert!(
+                replay
+                    .iter()
+                    .all(|op| paths.iter().all(|path| op.path != path.to_string()))
+            );
+        }
+        let verifier = store(backend);
+        for path in paths {
+            let observed = verifier
+                .nodes
+                .load_node_at_state(&path, Requirement::ANY)
+                .await
+                .unwrap();
+            assert_eq!(
+                observed.value().unwrap().collection_delete_intent(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn drop_replaces_a_wounded_root_intent() {
+        refence_terminal_drop(TxCommitStatus::Wounded, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn drop_replaces_wounded_node_intents() {
+        refence_terminal_drop(TxCommitStatus::Wounded, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn drop_retries_if_aborted_owner_clears_the_intent() {
+        for with_child in [false, true] {
+            refence_terminal_drop(TxCommitStatus::Wounded, with_child, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn drop_preserves_committed_intents() {
+        for with_child in [false, true] {
+            refence_terminal_drop(TxCommitStatus::Ok, with_child, false).await;
+        }
+    }
+
     async fn run_fence_shrink_race(fence_waits: bool) {
         let (backend, gate) = FirstSourceWriteGate::wrap(Arc::new(MemoryBackend::new()));
         let backend: Arc<dyn Backend> = backend;
@@ -572,7 +872,7 @@ mod tests {
         );
         let (mut shrunk, source_version) = primary
             .nodes
-            .load_node(&collection(), &node_token(SOURCE_TOKEN), Requirement::Any)
+            .load_node(&collection(), &node_token(SOURCE_TOKEN), Requirement::ANY)
             .await
             .unwrap();
         let (right, _) = shrunk.split(RIGHT_TOKEN).unwrap();
@@ -642,7 +942,7 @@ mod tests {
         let verifier = store(backend);
         let (final_source, _) = verifier
             .nodes
-            .load_node(&collection(), &node_token(SOURCE_TOKEN), Requirement::Any)
+            .load_node(&collection(), &node_token(SOURCE_TOKEN), Requirement::ANY)
             .await
             .unwrap();
         assert_eq!(final_source.collection_delete_intent(), Some(&drop_id));

@@ -121,11 +121,19 @@ impl CollectionLocker {
     }
 
     /// Releases every recorded directory lock held by `id`.
-    pub(crate) async fn release(&self, id: &TxId, locks: &[TxLock]) -> Result<bool, TransError> {
+    ///
+    /// A present record with no holder must satisfy `requirement`. Owner
+    /// cleanup can use `ANY` because it shares cache knowledge with acquisition.
+    pub(crate) async fn release(
+        &self,
+        id: &TxId,
+        locks: &[TxLock],
+        requirement: Requirement,
+    ) -> Result<bool, TransError> {
         let results = map_all_bounded(
             Self::locked_collections(locks),
             self.parallelism,
-            |parent| async move { self.release_directory(&parent, id).await },
+            |parent| async move { self.release_directory(&parent, id, requirement).await },
         )
         .await;
         results
@@ -157,21 +165,34 @@ impl CollectionLocker {
             .try_fold(false, |referenced, result| Ok(referenced | result?))
     }
 
-    /// Removes a settled structural operation from collection topology.
+    /// Removes a settled participant from collection topology.
+    ///
+    /// The caller must establish that its structural intents have settled.
+    /// A present record without the participant must satisfy `requirement`.
     pub(crate) async fn release_topology_participant(
         &self,
         collection: &CollectionAddress,
         id: &TxId,
+        requirement: Requirement,
     ) -> Result<bool, TransError> {
+        let mut read_requirement = Requirement::ANY;
         loop {
             let (mut record, observed) =
-                match self.records.load_record(collection, Requirement::Any).await {
+                match self.records.load_record(collection, read_requirement).await {
                     Ok(record) => record,
+                    // Publication, shared preparation cache, and GC eligibility
+                    // exclude a pre-creation cached absence for recorded collections.
                     Err(StorageError::NotFound) => return Ok(false),
                     Err(error) => return Err(error.into()),
                 };
             if !record.remove_topology_participant(id) {
-                return Ok(false);
+                if observed.satisfies(requirement) {
+                    return Ok(false);
+                }
+                // Intent settlement does not refresh the collection record.
+                // Require the caller's bound only when no removal CAS applies.
+                read_requirement = requirement;
+                continue;
             }
             if self.records.store_record(&record, &observed).await? {
                 return Ok(true);
@@ -189,7 +210,7 @@ impl CollectionLocker {
         loop {
             let (mut record, observed) = self
                 .state
-                .resolve_observed(parent, Some(id), Requirement::Any)
+                .resolve_observed(parent, Some(id), Requirement::ANY)
                 .await?;
             let lock = record.directory_lock();
             let already_held = lock.contains(id)
@@ -229,16 +250,28 @@ impl CollectionLocker {
         &self,
         parent: &CollectionAddress,
         id: &TxId,
+        requirement: Requirement,
     ) -> Result<bool, TransError> {
+        let mut read_requirement = Requirement::ANY;
         loop {
             let (mut record, observed) =
-                match self.records.load_record(parent, Requirement::Any).await {
+                match self.records.load_record(parent, read_requirement).await {
                     Ok(record) => record,
+                    // Other instances access published collections after record creation.
+                    // Local preparation and cleanup share a cache. GC waits for commit
+                    // or acknowledged abort before inspecting prepared resources, so
+                    // cached absence cannot hide a later record creation here.
                     Err(StorageError::NotFound) => return Ok(false),
                     Err(error) => return Err(error.into()),
                 };
             if !record.remove_directory_holder(id) {
-                return Ok(false);
+                if observed.satisfies(requirement) {
+                    return Ok(false);
+                }
+                // A present cached record can predate the holder. Use the
+                // caller's bound only when no CAS proves that removal is done.
+                read_requirement = requirement;
+                continue;
             }
             if self.records.store_record(&record, &observed).await? {
                 return Ok(true);
@@ -335,7 +368,7 @@ impl CollectionStateResolver {
                         Err(TransError::Storage(StorageError::NotFound)) => {
                             // GC can reclaim a log after another instance removes
                             // its directory holder. A cached record must reload.
-                            requirement = Requirement::AtLeast(self.timeline.now());
+                            requirement = Requirement::after(self.timeline.currentness_barrier());
                             rt::sleep(backoff.next_delay()).await;
                         }
                         Err(error) => return Err(error),
@@ -360,7 +393,7 @@ impl CollectionStateResolver {
         let mut backoff = self.retry.backoff();
         loop {
             let (mut record, observed) =
-                match self.records.load_record(parent, Requirement::Any).await {
+                match self.records.load_record(parent, Requirement::ANY).await {
                     Ok(record) => record,
                     Err(StorageError::NotFound) => return Ok(false),
                     Err(error) => return Err(error.into()),
@@ -415,7 +448,7 @@ impl CollectionStateResolver {
     ) -> Result<(), TransError> {
         let observed = self
             .transactions
-            .get_at(id, Requirement::Any)
+            .get_at(id, Requirement::ANY)
             .await
             .map_err(|error| {
                 TransError::Storage(error.context(format!("loading committed transaction {id}")))
@@ -512,7 +545,7 @@ mod tests {
         locker.acquire(&parent, &id, LockType::Write).await.unwrap();
 
         let (record, _) = records
-            .load_record(&parent, Requirement::Any)
+            .load_record(&parent, Requirement::ANY)
             .await
             .unwrap();
         assert_eq!(record.directory_lock().lock_type(), LockType::Write);
@@ -552,18 +585,18 @@ mod tests {
         local.records.create_record(&parent, &record).await.unwrap();
         let (mut record, observed) = peer
             .records
-            .load_record(&parent, Requirement::Any)
+            .load_record(&parent, Requirement::ANY)
             .await
             .unwrap();
         record.remove_directory_holder(&old);
         let child = CollectionId::from_slice(&[1; 16]).unwrap();
         record.add_child(b"child".to_vec(), child).unwrap();
         peer.records.store_record(&record, &observed).await.unwrap();
-        let observed = peer.tlogger.get_at(&old, Requirement::Any).await.unwrap();
+        let observed = peer.tlogger.get_at(&old, Requirement::ANY).await.unwrap();
         peer.tlogger.delete(&observed).await.unwrap();
         local.tlogger.delete(&local_log).await.unwrap();
         assert!(matches!(
-            local.tlogger.get_at(&old, Requirement::Any).await,
+            local.tlogger.get_at(&old, Requirement::ANY).await,
             Err(StorageError::NotFound)
         ));
         let resolver = CollectionStateResolver::new(
@@ -574,7 +607,7 @@ mod tests {
             RetryConfig::default(),
         );
         let resolved = resolver
-            .resolve(&parent, None, Requirement::Any)
+            .resolve(&parent, None, Requirement::ANY)
             .await
             .unwrap();
         assert_eq!(resolved.child(b"child"), Some(child));

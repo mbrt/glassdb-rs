@@ -401,7 +401,7 @@ fn run_loop<T>(
             );
         }
 
-        // 1. Fold woken tasks into the (sorted) ready set.
+        // 1. Merge woken tasks into the (sorted) ready set.
         let woken = handle.wake.take();
         {
             let mut inner = handle.inner.borrow_mut();

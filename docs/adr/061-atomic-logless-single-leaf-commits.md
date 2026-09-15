@@ -13,8 +13,8 @@ Refines [ADR-053](053-replay-definitive-logless-rmw-losses.md)'s replay and
 locked-fallback policy for whole multi-key members, and
 [ADR-056](056-demand-driven-inline-pressure-splits.md)'s pressure policy by
 declining multi-key direct commits without requesting a split. It extends
-[ADR-028](028-shard-mutation-coordinator.md)'s member-atomic fold with
-multi-entry logless publication.
+[ADR-028](028-shard-mutation-coordinator.md)'s atomic staging of each complete
+member with multi-entry logless publication.
 
 [ADR-062](062-splitter-driven-tombstone-reclamation.md) defines the lifetime of
 the tombstones published here and the absence evidence needed once they can be
@@ -28,7 +28,7 @@ write-back because the leaf contains both the validated predecessor and the new
 authoritative value.
 
 The same argument applies to a larger transaction when its complete dependency
-set and complete result share one leaf. The coordinator already folds one
+set and complete result share one leaf. The coordinator already stages one
 member's keys atomically, and the backend CAS already makes one leaf the
 linearization unit. Sending these transactions through the logged protocol adds
 preparation, a transaction object, locks, and write-back without adding an
@@ -85,11 +85,11 @@ An actual absent-to-present or present-to-absent transition advances the leaf's
 membership generation in that same CAS. It may proceed only while the
 structural gate and collection-deletion fence are absent and no live or unknown
 membership holder conflicts. Finalized entry or membership holders may be
-reconciled as part of the fold; direct commit never waits for, wounds, or
+reconciled during resolver evaluation; direct commit never waits for, wounds, or
 otherwise changes a live holder before its commit CAS.
 
-Independent direct transactions may share one coordinator CAS. The fold gives
-them a deterministic serial order, but each transaction remains a separate
+Independent direct transactions may share one coordinator CAS. Mutation planning
+gives them a deterministic serial order, but each transaction remains a separate
 commit member with its own output markers and outcome.
 
 ### Keep admission failure detached from splitting

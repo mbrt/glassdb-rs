@@ -8,9 +8,9 @@ use glassdb_concurr::{RetryConfig, rt};
 use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, StructuralIntentId, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
-    CollectionStore, LeafObservation, LockType, Node, NodeStore, Observation, Requirement,
-    StorageError, StructuralIntent, StructuralIntentPhase, StructuralIntentStore, Timeline,
-    TreeRouter,
+    CollectionStore, CurrentnessBarrier, LeafObservation, LockType, Node, NodeStore, Observation,
+    Requirement, StorageError, StructuralIntent, StructuralIntentPhase, StructuralIntentStore,
+    Timeline, TreeRouter,
 };
 
 use crate::error::TransError;
@@ -150,6 +150,12 @@ struct ParticipantSettlement {
     participant: TxId,
     status_checked: bool,
     intents: VecDeque<Observation<StructuralIntent>>,
+}
+
+#[derive(Clone, Copy)]
+enum SettlementMode {
+    Background,
+    Explicit,
 }
 
 enum ParticipantSettlementStep {
@@ -421,6 +427,9 @@ impl StructuralRecovery {
     }
 
     /// Starts explicit settlement of one finalized topology participant.
+    ///
+    /// The caller must share the cache that admitted the participant or
+    /// installed a topology freeze with the participant still present.
     pub(super) fn begin_participant_settlement(
         &self,
         collection: &CollectionAddress,
@@ -455,21 +464,35 @@ impl StructuralRecovery {
     }
 
     /// Removes one participant after all of its structural intents settle.
+    ///
+    /// A present record without the participant must satisfy `requirement`.
+    /// Local admission or topology-freeze evidence permits `ANY`.
     pub(super) async fn leave_topology(
         &self,
         collection: &CollectionAddress,
         id: &TxId,
+        requirement: Requirement,
     ) -> Result<(), TransError> {
         let mut backoff = self.retry.backoff();
+        let mut read_requirement = Requirement::ANY;
         loop {
             let (mut record, observed) =
-                match self.records.load_record(collection, Requirement::Any).await {
+                match self.records.load_record(collection, read_requirement).await {
                     Ok(record) => record,
+                    // Published collections already have their record. Local
+                    // preparation shares this cache, and deleted identities are
+                    // not reused, so an absence cannot hide later admission.
                     Err(StorageError::NotFound) => return Ok(()),
                     Err(error) => return Err(error.into()),
                 };
             if !record.remove_topology_participant(id) {
-                return Ok(());
+                if observed.satisfies(requirement) {
+                    return Ok(());
+                }
+                // Intent cleanup does not refresh the collection record. Only
+                // a no-op without sufficient evidence needs a bounded reload.
+                read_requirement = requirement;
+                continue;
             }
             if self.records.store_record(&record, &observed).await? {
                 return Ok(());
@@ -568,7 +591,10 @@ impl StructuralRecovery {
         debug_assert!(parent_result.is_none());
 
         if let Some(settlement) = sweep.settlement.as_mut() {
-            match self.advance_participant(settlement).await {
+            match self
+                .advance_participant(settlement, SettlementMode::Background)
+                .await
+            {
                 Ok(ParticipantSettlementStep::Completed) => {
                     sweep.settlement = None;
                     sweep.participant = None;
@@ -654,7 +680,10 @@ impl StructuralRecovery {
                 continue;
             }
 
-            match self.advance_participant(&mut action.settlement).await? {
+            match self
+                .advance_participant(&mut action.settlement, SettlementMode::Explicit)
+                .await?
+            {
                 ParticipantSettlementStep::Completed => {
                     action.completed = true;
                     return Ok(RecoveryStep::Completed {
@@ -674,7 +703,7 @@ impl StructuralRecovery {
         // allocates its own currentness barrier. This one bounds intent
         // discovery only. Classification needs a bound past the intent it
         // reads, and this barrier precedes that read.
-        let recovery_start = Requirement::AtLeast(self.timeline.now());
+        let recovery_start = Requirement::after(self.timeline.currentness_barrier());
         let cursor = self.scan_cursor.lock().unwrap().clone();
         let page = match self
             .intent_store
@@ -764,6 +793,7 @@ impl StructuralRecovery {
     async fn advance_participant(
         &self,
         settlement: &mut ParticipantSettlement,
+        mode: SettlementMode,
     ) -> Result<ParticipantSettlementStep, TransError> {
         if !settlement.status_checked {
             if !self
@@ -790,16 +820,24 @@ impl StructuralRecovery {
                 return Ok(ParticipantSettlementStep::Recover(observed));
             }
 
+            let requirement = Requirement::after(self.timeline.currentness_barrier());
             let intents = self
                 .intent_store
                 .list_for_participant(
                     settlement.collection.db_root_component(),
                     &settlement.participant,
-                    Requirement::AtLeast(self.timeline.now()),
+                    requirement,
                 )
                 .await?;
             if intents.is_empty() {
-                self.leave_topology(&settlement.collection, &settlement.participant)
+                // The listing bound follows final status and completed intent
+                // recovery. Explicit settlement already has local record
+                // evidence from admission or its topology freeze.
+                let departure = match mode {
+                    SettlementMode::Background => requirement,
+                    SettlementMode::Explicit => Requirement::ANY,
+                };
+                self.leave_topology(&settlement.collection, &settlement.participant, departure)
                     .await?;
                 return Ok(ParticipantSettlementStep::Completed);
             }
@@ -846,7 +884,7 @@ impl StructuralRecovery {
         // hold source state from before the worker gated it. That reports a
         // revision the worker never published from, which reads as a fence that
         // never happened.
-        let requirement = Requirement::AtLeast(self.timeline.now());
+        let barrier = self.timeline.currentness_barrier();
         let collection = &intent.collection;
         let created_tokens = &intent.created_tokens;
         if !self
@@ -854,7 +892,7 @@ impl StructuralRecovery {
                 collection,
                 intent.source_token.as_ref(),
                 &intent.source_version,
-                requirement,
+                barrier,
             )
             .await?
         {
@@ -869,14 +907,19 @@ impl StructuralRecovery {
             }
             vec![
                 self.router
-                    .token_reachable_at_key(collection, &[], &created_tokens[0], requirement)
+                    .token_reachable_at_key(
+                        collection,
+                        &[],
+                        &created_tokens[0],
+                        Requirement::after(barrier),
+                    )
                     .await?,
                 self.router
                     .token_reachable_at_key(
                         collection,
                         &intent.split_key,
                         &created_tokens[1],
-                        requirement,
+                        Requirement::after(barrier),
                     )
                     .await?,
             ]
@@ -892,7 +935,7 @@ impl StructuralRecovery {
                         collection,
                         &intent.split_key,
                         &created_tokens[0],
-                        requirement,
+                        Requirement::after(barrier),
                     )
                     .await?,
             ]
@@ -913,7 +956,7 @@ impl StructuralRecovery {
                 if !reachable {
                     match self
                         .nodes
-                        .load_node_state(collection, token, requirement)
+                        .load_node_state(collection, token, Requirement::after(barrier))
                         .await
                     {
                         Ok(node) => self.nodes.delete_node(&node).await?,
@@ -940,11 +983,10 @@ impl StructuralRecovery {
         collection: &CollectionAddress,
         token: Option<&NodeToken>,
         source_version: &str,
-        requirement: Requirement,
+        barrier: CurrentnessBarrier,
     ) -> Result<bool, TransError> {
         for _ in 0..PARENT_RETRIES {
-            let Some((node, observed)) = self.load_source(collection, token, requirement).await?
-            else {
+            let Some((node, observed)) = self.load_source(collection, token, barrier).await? else {
                 return Ok(true);
             };
             if !observed
@@ -979,15 +1021,22 @@ impl StructuralRecovery {
         &self,
         collection: &CollectionAddress,
         token: Option<&NodeToken>,
-        requirement: Requirement,
+        barrier: CurrentnessBarrier,
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
         match token {
-            Some(token) => match self.nodes.load_node(collection, token, requirement).await {
+            Some(token) => match self
+                .nodes
+                .load_node(collection, token, Requirement::after(barrier))
+                .await
+            {
                 Ok(source) => Ok(Some(source)),
                 Err(StorageError::NotFound) => Ok(None),
                 Err(error) => Err(error.into()),
             },
-            None => Ok(self.nodes.load_root_node(collection, requirement).await?),
+            None => Ok(self
+                .nodes
+                .load_root_node(collection, Requirement::after(barrier))
+                .await?),
         }
     }
 }

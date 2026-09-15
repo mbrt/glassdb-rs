@@ -61,7 +61,7 @@ import seaborn as sns
 
 # Backend-op columns that sum into total round-trips, in case a `stats.csv` from
 # an older run predates the explicit `backend-ops` total column. Engine versions
-# categorize ops differently (e.g. v1's tag/metadata ops vs v2 folding all
+# categorize ops differently (e.g. v1's tag/metadata ops vs v2 combining all
 # coordination into object reads/writes), so summing every class is what makes
 # the efficiency number comparable across versions.
 OP_COLS = ["obj-write", "obj-read", "obj-list", "meta-write", "meta-read"]
@@ -243,7 +243,7 @@ def _geomean(s: pd.Series) -> float:
 
 
 # Fallback only: for mixbench JSON that predates sequential sampling (no
-# per-shape `converged` flag), a folded cell below this many committed
+# per-shape `converged` flag), an aggregated cell below this many committed
 # transactions is too small to trust and its ratio is flagged `[low-sample]`.
 # Current mixed runs to a target CI instead, flagging `[unconverged]` when the
 # time cap is hit first, so this floor is not consulted for fresh results.
@@ -567,7 +567,7 @@ def diagnostic_batch_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
 def diagnostic_role_totals(
     table: pd.DataFrame, metrics: list[str]
 ) -> pd.DataFrame:
-    """Fold selected backend metrics by physical object role."""
+    """Aggregate selected backend metrics by physical object role."""
     selected = table[
         table["component"].str.startswith("backend.")
         & table["metric"].isin(metrics)
@@ -591,7 +591,7 @@ def inline_pressure_table(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
     def select(df: pd.DataFrame) -> pd.DataFrame:
         d = with_run_identity(df, ["phase"])
         # The first version of this scenario reported shutdown separately.
-        # Current artifacts fold it into total, so ignore it when comparing
+        # Current artifacts include it in the total, so ignore it when comparing
         # across the schema boundary.
         d = d[d["phase"] != "shutdown"].copy()
         logical_tx = d["logical-tx"].where(d["logical-tx"] > 0)
@@ -788,10 +788,10 @@ def mixed_shape_table(a: Any, b: Any) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _folded_converged(grp: pd.DataFrame) -> pd.Series | None:
+def _paired_converged(grp: pd.DataFrame) -> pd.Series | None:
     """A cell's combined convergence (both sides reached `--target-ci`) for a
-    folded group of mixed rows, or `None` when the JSON predates sequential
-    sampling (so the digest falls back to the sample-count floor). A missing
+    group of paired mixed-workload rows, or `None` when the JSON predates
+    sequential sampling (so the digest falls back to the sample-count floor). A missing
     per-side flag is treated as converged so legacy-vs-new mixes never spuriously
     report `[unconverged]`."""
     a, b = grp["converged_a"], grp["converged_b"]
@@ -861,7 +861,7 @@ def summarize(
 
     `lower_is_better` adds a direction-aware verdict. `converged` (per-cell
     booleans from mixed sequential sampling) flags `[unconverged]` when any
-    folded cell hit its time cap before reaching the target confidence interval,
+    aggregated cell hit its time cap before reaching the target confidence interval,
     so its throughput is only indicative. When `converged` is absent, `samples`
     (per-cell committed-transaction counts) is the fallback reliability signal,
     flagging `[low-sample]` below [`LOW_SAMPLE_FLOOR`]. `noisy` marks metrics that
@@ -1445,11 +1445,11 @@ def main() -> int:
                 "retries-ratio",
             ]
             print_table(f"Mixed workload per-shape ({lb}/{la})", tbl[cols])
-            # Throughput ratio per shape (geomean folds mode/affinity cells).
+            # Throughput ratio per shape (geomean aggregates mode/affinity cells).
             # The mixed scenario runs each cell until its throughput
             # CI meets --target-ci, so a converged tps ratio is significant; a cell
             # that hit the time cap first is flagged [unconverged] (see
-            # `_folded_converged`).
+            # `_paired_converged`).
             for shape, grp in tbl.groupby("shape"):
                 summaries.append(
                     summarize(
@@ -1457,7 +1457,7 @@ def main() -> int:
                         grp["tps-ratio"],
                         lower_is_better=False,
                         samples=grp["committed_b"],
-                        converged=_folded_converged(grp),
+                        converged=_paired_converged(grp),
                     )
                 )
             # Retain per-shape op summaries for legacy per-shape topology JSON.
@@ -1469,7 +1469,7 @@ def main() -> int:
                         grp["ops-ratio"],
                         lower_is_better=True,
                         samples=grp["committed_b"],
-                        converged=_folded_converged(grp),
+                        converged=_paired_converged(grp),
                     )
                 )
             for mode, grp in ops.groupby("mode"):
@@ -1478,7 +1478,7 @@ def main() -> int:
                         f"mix-retries/tx[{mode}]",
                         grp["retries-ratio"],
                         lower_is_better=True,
-                        converged=_folded_converged(grp),
+                        converged=_paired_converged(grp),
                     )
                 )
         agg = mixed_aggregate_table(a_mx, b_mx)

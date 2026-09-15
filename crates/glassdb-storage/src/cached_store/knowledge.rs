@@ -37,7 +37,9 @@ impl Weighable for CacheEntry {
         // absent entry costs a small fixed bookkeeping amount.
         const OVERHEAD: usize = std::mem::size_of::<CacheEntry>();
         match &self.state {
-            EntryState::Present { size, revision, .. } => size + revision.0.token.len() + OVERHEAD,
+            EntryState::Present { size, revision, .. } => {
+                size + revision.serialize().len() + OVERHEAD
+            }
             EntryState::Absent { .. } => OVERHEAD,
         }
     }
@@ -93,11 +95,11 @@ impl ExpectedEvidence {
         let already_captured = self
             .observation
             .as_ref()
-            .is_some_and(|observation| Arc::ptr_eq(&observation.0, &cached.0))
+            .is_some_and(|observation| observation.is_shared_with(&cached))
             || self
                 .cached
                 .as_ref()
-                .is_some_and(|current| Arc::ptr_eq(&current.0, &cached.0));
+                .is_some_and(|current| current.is_shared_with(&cached));
         if already_captured {
             return;
         }

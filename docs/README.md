@@ -29,6 +29,8 @@ proposal is retired or work develops on another branch.
 
 - [`guides/caching.md`](guides/caching.md) describes reusable currentness
   evidence in `CachedStore`.
+- [`guides/storage-consistency.md`](guides/storage-consistency.md) gives the
+  correctness rules for timeline and observation types.
 - [`guides/releasing.md`](guides/releasing.md) describes the release process.
 - [`guides/reviewing-changes.md`](guides/reviewing-changes.md) defines the review
   focus for ownership, policy, mechanism, and intended behavior.

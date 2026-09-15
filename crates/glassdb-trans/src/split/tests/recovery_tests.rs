@@ -1,5 +1,221 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+enum ParticipantCleanup {
+    StaleRecord,
+    CachedParticipant,
+    OwnerDeparted,
+    ReadFailure,
+}
+
+async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
+    let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let recorder = RecordingBackend::new(hooks.clone());
+    let operations = recorder.log();
+    let backend: Arc<dyn Backend> = Arc::new(recorder);
+    let local = store_with_backend(backend.clone());
+    let peer = store_with_backend(backend.clone());
+    local
+        .create_root(COLL, &leaf_node(&[b"a", b"b", b"c", b"d"], None, None))
+        .await
+        .unwrap();
+    let local_bg = Arc::new(Background::new());
+    let peer_bg = Arc::new(Background::new());
+    let recovering = splitter(&local, &local_bg, tiny());
+    let owner = splitter(&peer, &peer_bg, tiny());
+    let participant = if committed {
+        // The split has completed its tree change, but failed intent deletion
+        // leaves both the Ready intent and participant for background recovery.
+        hooks.set_before({
+            let prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+            move |op| {
+                let fail =
+                    matches!(op, BackendOp::DeleteIf { path, .. } if path.starts_with(&prefix));
+                Box::pin(async move {
+                    if fail {
+                        Err(glassdb_backend::BackendError::other(
+                            "intent cleanup failed",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+        assert!(owner.split_path(&root_path()).await.is_err());
+        hooks.clear_before();
+        let intents = peer
+            .list_structural_intents("db", Requirement::ANY)
+            .await
+            .unwrap();
+        assert_eq!(intents.len(), 1);
+        let intent = intents[0].1.value().unwrap();
+        assert_eq!(intent.phase, StructuralIntentPhase::Ready);
+        let id = intent.participant_id.clone();
+        assert_eq!(owner.mon.tx_status(&id).await.unwrap(), TxCommitStatus::Ok);
+        id
+    } else {
+        let id = TxId::with_priority(1, b"peer-participant");
+        owner.begin_topology_tx(&collection(), &id).await.unwrap();
+        owner
+            .recovery
+            .prepare_intent(&collection(), None, &id)
+            .await
+            .unwrap();
+        owner.join_topology(&collection(), &id).await.unwrap();
+        assert_eq!(
+            owner.mon.abort_owned_tx(&id).await.unwrap(),
+            crate::monitor::OwnerAbortOutcome::Acknowledged
+        );
+        id
+    };
+    let record_path = ObjectPath::CollectionRecord {
+        collection: collection(),
+    }
+    .to_string();
+    if matches!(case, ParticipantCleanup::CachedParticipant) {
+        local
+            .records
+            .load_record(
+                &collection(),
+                Requirement::after(local.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+    }
+    if matches!(case, ParticipantCleanup::OwnerDeparted) {
+        // A peer can complete departure after this sweep deletes the intent
+        // and before it checks the collection record.
+        hooks.set_before({
+            let owner = owner.clone();
+            let participant = participant.clone();
+            let prefix =
+                ObjectPath::participant_structural_intents_prefix(&db_root("db"), &participant);
+            move |op| {
+                let depart = matches!(op, BackendOp::List { .. }) && op.path() == prefix;
+                let owner = owner.clone();
+                let participant = participant.clone();
+                Box::pin(async move {
+                    if depart {
+                        owner
+                            .leave_topology(&collection(), &participant)
+                            .await
+                            .map_err(|error| {
+                                glassdb_backend::BackendError::with_source("owner departure", error)
+                            })?;
+                    }
+                    Ok(())
+                })
+            }
+        });
+    }
+    if matches!(case, ParticipantCleanup::ReadFailure) {
+        hooks.set_before({
+            let path = record_path.clone();
+            move |op| {
+                let fail = op.path() == path
+                    && matches!(
+                        op,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    );
+                Box::pin(async move {
+                    if fail {
+                        Err(glassdb_backend::BackendError::other(
+                            "participant check failed",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+    }
+    operations.lock().unwrap().clear();
+    let result = recovering.recover_structural_intents().await;
+    let recorded = std::mem::take(&mut *operations.lock().unwrap());
+    hooks.clear_before();
+    let verifier = store_with_backend(backend);
+    assert!(
+        verifier
+            .list_structural_intents("db", Requirement::ANY)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let (record, _) = verifier
+        .records
+        .load_record(&collection(), Requirement::ANY)
+        .await
+        .unwrap();
+    if matches!(case, ParticipantCleanup::ReadFailure) {
+        assert!(
+            result.is_err(),
+            "a failed departure check cannot report a completed sweep"
+        );
+        assert!(record.topology_participants().any(|id| id == &participant));
+        // The transaction object remains available to GC even though intent
+        // discovery can no longer find this participant on its next sweep.
+        let log = verifier
+            .foundation
+            .tlogger
+            .get_at(&participant, Requirement::ANY)
+            .await
+            .unwrap();
+        assert!(log.value().unwrap().locks.iter().any(|lock| {
+            matches!(lock, TxLock::Topology { collection: target } if target == &collection())
+        }));
+        return;
+    }
+    assert!(result.unwrap());
+    assert!(
+        !record.topology_participants().any(|id| id == &participant),
+        "structural recovery deleted the intent but left its participant admitted"
+    );
+    let record_calls: Vec<_> = recorded
+        .iter()
+        .filter(|op| op.path == record_path)
+        .map(|op| op.op)
+        .collect();
+    let expected: &[&str] = match case {
+        ParticipantCleanup::StaleRecord => &["read_if_modified", "write_if"],
+        ParticipantCleanup::CachedParticipant => &["write_if"],
+        ParticipantCleanup::OwnerDeparted => &["write_if", "read_if_modified"],
+        ParticipantCleanup::ReadFailure => unreachable!(),
+    };
+    assert_eq!(record_calls, expected);
+    operations.lock().unwrap().clear();
+    assert!(!recovering.recover_structural_intents().await.unwrap());
+    assert!(operations.lock().unwrap().iter().all(|op| op.op == "list"));
+}
+
+#[tokio::test]
+async fn background_recovery_removes_participants_from_stale_records() {
+    for committed in [false, true] {
+        recover_peer_participant(committed, ParticipantCleanup::StaleRecord).await;
+    }
+}
+
+#[tokio::test]
+async fn background_recovery_removes_cached_participants_without_a_read() {
+    for committed in [false, true] {
+        recover_peer_participant(committed, ParticipantCleanup::CachedParticipant).await;
+    }
+}
+
+#[tokio::test]
+async fn background_recovery_checks_departure_after_another_instance_removes_the_participant() {
+    for committed in [false, true] {
+        recover_peer_participant(committed, ParticipantCleanup::OwnerDeparted).await;
+    }
+}
+
+#[tokio::test]
+async fn background_recovery_reports_failed_departure_checks() {
+    for committed in [false, true] {
+        recover_peer_participant(committed, ParticipantCleanup::ReadFailure).await;
+    }
+}
+
 #[tokio::test]
 async fn settlement_cancels_a_prepared_split_before_node_creation() {
     let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
@@ -44,6 +260,29 @@ async fn settlement_cancels_a_prepared_split_before_node_creation() {
         listings.iter().all(|path| path == &expected_listing),
         "settlement must list only the participant-owned intent prefix"
     );
+    let record_path = ObjectPath::CollectionRecord {
+        collection: collection(),
+    }
+    .to_string();
+    let record_calls: Vec<_> = operations
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|op| op.path == record_path)
+        .map(|op| op.op)
+        .collect();
+    assert_eq!(record_calls, ["write_if"]);
+    operations.lock().unwrap().clear();
+    sp.settle_topology_participant(&collection(), &participant)
+        .await
+        .unwrap();
+    assert!(
+        operations
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|op| op.path != record_path)
+    );
 
     let worker = TxId::with_priority(2, b"worker");
     sp.mon.begin_tx(&worker);
@@ -55,20 +294,23 @@ async fn settlement_cancels_a_prepared_split_before_node_creation() {
     assert!(matches!(attempt.state, SplitAttemptResult::RetryCleanly));
     sp.finalize_split(&worker).await;
     assert!(
-        s.list_nodes(COLL, Requirement::AtLeast(s.timeline.now()))
+        s.list_nodes(COLL, Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .is_empty(),
         "a cancelled Preparing intent cannot create its reserved nodes"
     );
     let (root, _) = s
-        .load_root(COLL, Requirement::AtLeast(s.timeline.now()))
+        .load_root(COLL, Requirement::after(s.timeline.currentness_barrier()))
         .await
         .unwrap();
     assert!(root.as_leaf().is_some());
     let (record, _) = s
         .records
-        .load_record(&collection(), Requirement::AtLeast(s.timeline.now()))
+        .load_record(
+            &collection(),
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     assert_eq!(record.topology_participants().count(), 0);
@@ -204,7 +446,7 @@ async fn structural_split_failure_transition_table() {
         );
 
         let logs = s
-            .list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+            .list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap();
         if retains_ready {
@@ -220,7 +462,10 @@ async fn structural_split_failure_transition_table() {
 
         let (record, _) = s
             .records
-            .load_record(&collection(), Requirement::AtLeast(s.timeline.now()))
+            .load_record(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -258,7 +503,11 @@ async fn startup_structural_recovery_reclaims_an_orphan_after_restart() {
     for _ in 0..20 {
         if matches!(
             second
-                .load_node(COLL, "R", Requirement::AtLeast(second.timeline.now()))
+                .load_node(
+                    COLL,
+                    "R",
+                    Requirement::after(second.timeline.currentness_barrier())
+                )
                 .await,
             Err(StorageError::NotFound)
         ) {
@@ -269,19 +518,30 @@ async fn startup_structural_recovery_reclaims_an_orphan_after_restart() {
 
     assert!(matches!(
         second
-            .load_node(COLL, "R", Requirement::AtLeast(second.timeline.now()))
+            .load_node(
+                COLL,
+                "R",
+                Requirement::after(second.timeline.currentness_barrier())
+            )
             .await,
         Err(StorageError::NotFound)
     ));
     assert!(
         second
-            .load_node(COLL, "L", Requirement::AtLeast(second.timeline.now()))
+            .load_node(
+                COLL,
+                "L",
+                Requirement::after(second.timeline.currentness_barrier())
+            )
             .await
             .is_ok()
     );
     assert!(
         second
-            .list_structural_intents("db", Requirement::AtLeast(second.timeline.now()))
+            .list_structural_intents(
+                "db",
+                Requirement::after(second.timeline.currentness_barrier())
+            )
             .await
             .unwrap()
             .is_empty()
@@ -310,12 +570,16 @@ async fn structural_recovery_defers_while_the_source_writer_is_live() {
 
     assert!(!sp.recover_structural_intents().await.unwrap());
     assert!(
-        s.load_node(COLL, "R", Requirement::AtLeast(s.timeline.now()))
-            .await
-            .is_ok()
+        s.load_node(
+            COLL,
+            "R",
+            Requirement::after(s.timeline.currentness_barrier())
+        )
+        .await
+        .is_ok()
     );
     assert_eq!(
-        s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+        s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .len(),
@@ -325,12 +589,16 @@ async fn structural_recovery_defers_while_the_source_writer_is_live() {
     sp.mon.abort_owned_tx(&id).await.unwrap();
     assert!(sp.recover_structural_intents().await.unwrap());
     assert!(matches!(
-        s.load_node(COLL, "R", Requirement::AtLeast(s.timeline.now()))
-            .await,
+        s.load_node(
+            COLL,
+            "R",
+            Requirement::after(s.timeline.currentness_barrier())
+        )
+        .await,
         Err(StorageError::NotFound)
     ));
     assert!(
-        s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+        s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .is_empty()
@@ -365,14 +633,22 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
 
     // Recovery reads L first, caching the pre-gate snapshot (no gate). A weak
     // freshness bound would later be satisfied by exactly this stale entry.
-    s.load_node(COLL, "L", Requirement::AtLeast(s.timeline.now()))
-        .await
-        .unwrap();
+    s.load_node(
+        COLL,
+        "L",
+        Requirement::after(s.timeline.currentness_barrier()),
+    )
+    .await
+    .unwrap();
 
     // The in-flight split (peer, sharing the backend): take the source gate
     // and create the sibling. `s`'s cache is unaware of both writes.
     let (mut gated, version) = peer
-        .load_node(COLL, "L", Requirement::AtLeast(peer.timeline.now()))
+        .load_node(
+            COLL,
+            "L",
+            Requirement::after(peer.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     gated.set_structural_gate(id.clone());
@@ -396,13 +672,17 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
         "recovery must defer to the live split rather than reclaim its child"
     );
     assert!(
-        s.load_node(COLL, "R", Requirement::AtLeast(s.timeline.now()))
-            .await
-            .is_ok(),
+        s.load_node(
+            COLL,
+            "R",
+            Requirement::after(s.timeline.currentness_barrier())
+        )
+        .await
+        .is_ok(),
         "the live split's child must survive recovery"
     );
     assert_eq!(
-        s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+        s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .len(),
@@ -432,7 +712,11 @@ async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
 
     // The abandoned worker loses the source to a later split of the same node.
     let (mut source, version) = s
-        .load_node(COLL, "L", Requirement::AtLeast(s.timeline.now()))
+        .load_node(
+            COLL,
+            "L",
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     source.remove_structural_gate(&abandoned);
@@ -455,12 +739,16 @@ async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
         "a later split's gate must not shield an abandoned intent from recovery"
     );
     assert!(matches!(
-        s.load_node(COLL, "R", Requirement::AtLeast(s.timeline.now()))
-            .await,
+        s.load_node(
+            COLL,
+            "R",
+            Requirement::after(s.timeline.currentness_barrier())
+        )
+        .await,
         Err(StorageError::NotFound)
     ));
     assert!(
-        s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+        s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .is_empty()
@@ -525,18 +813,24 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
     // The sweep is paused inside the read that discovers the intent, so that
     // read's watermark is already allocated while the root is still ungated.
     gate.wait_until_entered().await;
-    s.load_root(COLL, Requirement::AtLeast(s.timeline.now()))
+    s.load_root(COLL, Requirement::after(s.timeline.currentness_barrier()))
         .await
         .unwrap();
 
     let (mut root, version) = peer
-        .load_root(COLL, Requirement::AtLeast(peer.timeline.now()))
+        .load_root(
+            COLL,
+            Requirement::after(peer.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     root.set_structural_gate(worker.clone());
     assert!(peer.store_root(COLL, &root, &version).await.unwrap());
     let (_, gated) = peer
-        .load_root_node(COLL, Requirement::AtLeast(peer.timeline.now()))
+        .load_root_node(
+            COLL,
+            Requirement::after(peer.timeline.currentness_barrier()),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -568,14 +862,18 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
     );
     for token in ["L", "R"] {
         assert!(
-            s.load_node(COLL, token, Requirement::AtLeast(s.timeline.now()))
-                .await
-                .is_ok(),
+            s.load_node(
+                COLL,
+                token,
+                Requirement::after(s.timeline.currentness_barrier())
+            )
+            .await
+            .is_ok(),
             "the live root split's child {token} must survive recovery"
         );
     }
     assert_eq!(
-        s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+        s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .len(),
@@ -628,7 +926,7 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
     assert!(sp.recover_structural_intents().await.unwrap());
 
     let (root_node, _) = s
-        .load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
+        .load_root_node(COLL, Requirement::after(s.timeline.currentness_barrier()))
         .await
         .unwrap()
         .unwrap();
@@ -639,7 +937,10 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
     let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
     assert_eq!(
         router
-            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+            .leaves(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier())
+            )
             .await
             .unwrap()
             .len(),
@@ -648,13 +949,17 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
     );
     for key in [b"a".as_slice(), b"m", b"t"] {
         let leaf = router
-            .route_key(&collection(), key, Requirement::AtLeast(s.timeline.now()))
+            .route_key(
+                &collection(),
+                key,
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert!(leaf.node().unwrap().as_leaf().unwrap().exists(key));
     }
     assert!(
-        s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+        s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .is_empty()
@@ -665,7 +970,11 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
 /// in its Ready intent.
 async fn gated_revision(store: &TestStore, token: &str) -> String {
     let (_, observed) = store
-        .load_node(COLL, token, Requirement::AtLeast(store.timeline.now()))
+        .load_node(
+            COLL,
+            token,
+            Requirement::after(store.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     observed.revision().unwrap().serialize().to_string()
@@ -742,7 +1051,11 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
     original.set_structural_gate(id.clone());
     s.store_node(COLL, "L", &original, None).await.unwrap();
     let (mut shrunk, source_version) = s
-        .load_node(COLL, "L", Requirement::AtLeast(s.timeline.now()))
+        .load_node(
+            COLL,
+            "L",
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     let (right, split_key) = shrunk.split("R").unwrap();
@@ -783,12 +1096,16 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
     assert!(recovering.await.unwrap());
 
     assert!(
-        s.load_node(COLL, "R", Requirement::AtLeast(s.timeline.now()))
-            .await
-            .is_ok()
+        s.load_node(
+            COLL,
+            "R",
+            Requirement::after(s.timeline.currentness_barrier())
+        )
+        .await
+        .is_ok()
     );
     let (root_node, _) = s
-        .load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
+        .load_root_node(COLL, Requirement::after(s.timeline.currentness_barrier()))
         .await
         .unwrap()
         .unwrap();
@@ -887,12 +1204,16 @@ async fn sweep_defers_one_failed_parent_split_and_continues() {
     ));
 
     assert!(matches!(
-        s.load_node(COLL, "U", Requirement::AtLeast(s.timeline.now()))
-            .await,
+        s.load_node(
+            COLL,
+            "U",
+            Requirement::after(s.timeline.currentness_barrier())
+        )
+        .await,
         Err(StorageError::NotFound)
     ));
     assert_eq!(
-        s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+        s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .len(),

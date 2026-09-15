@@ -30,7 +30,7 @@
 //!    optimization — correctness never depends on it landing.
 //!
 //! A leaf split, including a root-leaf split, acquires structure-write through
-//! the shared [`LeafCoordinator`], in the same folded CAS stream as data
+//! the shared [`LeafCoordinator`], in the same batched CAS stream as data
 //! mutations on that leaf. Interior indexes use direct structural CASes.
 //! The source shrink (or root rewrite) releases structure-write inline, so no
 //! unlocked post-split state is exposed before a separate release CAS.
@@ -57,8 +57,9 @@ use glassdb_concurr::{Background, RetryConfig, ScanCadence, rt};
 use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxLog};
 use glassdb_storage::{
-    CollectionStore, IndexNode, InlinePolicy, LeafBody, LeafEntry, LeafObservation, LockType, Node,
-    NodeStore, Requirement, SplitPolicy, StorageError, StructuralIntentStore, Timeline, TreeRouter,
+    CollectionStore, CurrentnessBarrier, IndexNode, InlinePolicy, LeafBody, LeafEntry,
+    LeafObservation, LockType, Node, NodeStore, Requirement, SplitPolicy, StorageError,
+    StructuralIntentStore, Timeline, TreeRouter,
 };
 use tokio::sync::Notify;
 
@@ -185,7 +186,7 @@ impl StructuralNodeAccess {
                 collection: collection.clone(),
             },
         };
-        let (node, _) = match self.nodes.load_node_at(&path, Requirement::Any).await {
+        let (node, _) = match self.nodes.load_node_at(&path, Requirement::ANY).await {
             Ok(loaded) => loaded,
             Err(StorageError::NotFound) if token.is_none() => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -206,10 +207,16 @@ impl StructuralNodeAccess {
             .coord
             .coordinate(StructuralGateOperation::new(id.clone(), path.clone()))
             .await?;
-        let StructuralGateOutcome::Acquired(requirement) = outcome else {
+        let StructuralGateOutcome::Acquired(observation) = outcome else {
             return Ok(None);
         };
-        let (node, observation) = self.nodes.load_node_at(path, requirement).await?;
+        // Keep the state paired with the gate proof even if a peer changes the
+        // node before this caller resumes. The next mutation checks its revision.
+        let node = observation
+            .value()
+            .ok_or(StorageError::NotFound)?
+            .as_ref()
+            .clone();
         if node.structural_gate().lock_type() == LockType::Write
             && node.structural_gate().contains(id)
         {
@@ -229,10 +236,10 @@ impl StructuralNodeAccess {
             let (mut node, observation) = match token {
                 Some(token) => {
                     self.nodes
-                        .load_node(collection, token, Requirement::Any)
+                        .load_node(collection, token, Requirement::ANY)
                         .await?
                 }
-                None => match self.nodes.load_root(collection, Requirement::Any).await {
+                None => match self.nodes.load_root(collection, Requirement::ANY).await {
                     Ok((root, observation)) => (root, observation),
                     Err(StorageError::NotFound) => return Ok(None),
                     Err(error) => return Err(error.into()),
@@ -253,7 +260,7 @@ impl StructuralNodeAccess {
                 .collect();
             let reconciler = NodeLockReconciler::new(&self.key_state, &self.mon, id);
             let entries = match reconciler
-                .quiesce_entries(collection, &entries, Requirement::Any)
+                .quiesce_entries(collection, &entries, Requirement::ANY)
                 .await?
             {
                 QuiescedEntries::Ready(entries) => entries,
@@ -292,12 +299,12 @@ impl StructuralNodeAccess {
             let (mut node, observation) = match token {
                 Some(token) => {
                     self.nodes
-                        .load_node(collection, token, Requirement::Any)
+                        .load_node(collection, token, Requirement::ANY)
                         .await?
                 }
                 None => {
                     let (root, observation) =
-                        self.nodes.load_root(collection, Requirement::Any).await?;
+                        self.nodes.load_root(collection, Requirement::ANY).await?;
                     (root, observation)
                 }
             };
@@ -355,7 +362,7 @@ impl StructuralNodeAccess {
 }
 struct SeparatorPublication {
     separator: PendingSeparator,
-    start: Requirement,
+    start: CurrentnessBarrier,
     retries_remaining: usize,
 }
 
@@ -429,7 +436,7 @@ impl SeparatorPublisher {
                 split_key: split_key.to_vec(),
                 new_token: new_token.clone(),
             },
-            start: Requirement::AtLeast(self.timeline.now()),
+            start: self.timeline.currentness_barrier(),
             retries_remaining: PARENT_RETRIES,
         }
     }
@@ -448,7 +455,7 @@ impl SeparatorPublisher {
                 .parent_index_for(
                     &separator.collection,
                     &separator.split_key,
-                    publication.start,
+                    Requirement::after(publication.start),
                 )
                 .await?
             else {
@@ -473,6 +480,7 @@ impl SeparatorPublisher {
                     &locked_parent,
                     &locked_version,
                     &lock_id,
+                    publication.start,
                 )
                 .await;
             let released = self
@@ -506,6 +514,7 @@ impl SeparatorPublisher {
         parent: &Node,
         version: &LeafObservation,
         lock_id: &TxId,
+        barrier: CurrentnessBarrier,
     ) -> Result<Option<SeparatorPublicationOutcome>, TransError> {
         let Some(index) = parent.as_index() else {
             return Ok(Some(SeparatorPublicationOutcome::Published));
@@ -514,12 +523,7 @@ impl SeparatorPublisher {
             return Ok(Some(SeparatorPublicationOutcome::Published));
         }
         let missing = self
-            .missing_separators(
-                &separator.collection,
-                parent,
-                &separator.split_key,
-                Requirement::AtLeast(version.current_after()),
-            )
+            .missing_separators(&separator.collection, parent, &separator.split_key, barrier)
             .await?;
         if missing.is_empty() {
             return Ok(Some(SeparatorPublicationOutcome::Published));
@@ -579,8 +583,11 @@ impl SeparatorPublisher {
         collection: &CollectionAddress,
         parent: &Node,
         split_key: &[u8],
-        requirement: Requirement,
+        barrier: CurrentnessBarrier,
     ) -> Result<Vec<MissingSeparator>, TransError> {
+        // The split was observed before publication began. A parent's watermark
+        // cannot establish that the child reads follow that completed work.
+        let requirement = Requirement::after(barrier);
         let Some(index) = parent.as_index() else {
             return Ok(Vec::new());
         };
@@ -1447,7 +1454,11 @@ impl Splitter {
         let collection = split_collection(observed_path)?;
         let located = match self
             .router
-            .route_key(collection, key, Requirement::AtLeast(self.timeline.now()))
+            .route_key(
+                collection,
+                key,
+                Requirement::after(self.timeline.currentness_barrier()),
+            )
             .await
         {
             Ok(located) => located,
@@ -2006,7 +2017,7 @@ impl Splitter {
         let mut backoff = self.retry.backoff();
         loop {
             let (mut record, observed) =
-                match self.records.load_record(collection, Requirement::Any).await {
+                match self.records.load_record(collection, Requirement::ANY).await {
                     Ok(record) => record,
                     Err(StorageError::NotFound) => return Err(TransError::StaleCollection),
                     Err(error) => return Err(error.into()),
@@ -2042,12 +2053,15 @@ impl Splitter {
         }
     }
 
+    /// Removes a participant admitted by this database instance.
     async fn leave_topology(
         &self,
         collection: &CollectionAddress,
         id: &TxId,
     ) -> Result<(), TransError> {
-        self.recovery.leave_topology(collection, id).await
+        self.recovery
+            .leave_topology(collection, id, Requirement::ANY)
+            .await
     }
 
     /// Performs the write-ahead, child creation, and root rewrite.
@@ -2703,7 +2717,7 @@ mod tests {
         sp.run_once().await;
 
         let (root, _) = s
-            .load_root(COLL, Requirement::AtLeast(s.timeline.now()))
+            .load_root(COLL, Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap();
         let leaf = root.as_leaf().expect("compaction avoided height growth");
@@ -2711,7 +2725,7 @@ mod tests {
         assert!(leaf.lookup(b"a").unwrap().exists());
         assert_eq!(root.membership_version(), 2);
         assert!(
-            s.list_nodes(COLL, Requirement::AtLeast(s.timeline.now()))
+            s.list_nodes(COLL, Requirement::after(s.timeline.currentness_barrier()))
                 .await
                 .unwrap()
                 .is_empty()
@@ -2777,7 +2791,7 @@ mod tests {
             .await
             .unwrap();
         let (root, _) = s
-            .load_root(COLL, Requirement::AtLeast(s.timeline.now()))
+            .load_root(COLL, Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap();
         assert!(root.structural_gate().holders().is_empty());
@@ -2834,7 +2848,7 @@ mod tests {
         );
         assert!(cleanup_hints.pending().is_empty());
         let (root, _) = s
-            .load_root(COLL, Requirement::AtLeast(s.timeline.now()))
+            .load_root(COLL, Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap();
         assert_eq!(root.as_leaf().unwrap().len(), 3);
@@ -2870,7 +2884,10 @@ mod tests {
         sp.run_once().await;
 
         let leaves = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+            .leaves(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(leaves.len(), 2);
@@ -2920,7 +2937,10 @@ mod tests {
         let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
         assert_eq!(
             router
-                .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+                .leaves(
+                    &collection(),
+                    Requirement::after(s.timeline.currentness_barrier())
+                )
                 .await
                 .unwrap()
                 .len(),
@@ -2929,7 +2949,11 @@ mod tests {
         );
         for key in keys {
             let loc = router
-                .route_key(&collection(), key, Requirement::AtLeast(s.timeline.now()))
+                .route_key(
+                    &collection(),
+                    key,
+                    Requirement::after(s.timeline.currentness_barrier()),
+                )
                 .await
                 .unwrap();
             let entry = loc.node().unwrap().as_leaf().unwrap().lookup(key).cloned();
@@ -2956,7 +2980,7 @@ mod tests {
 
         // The root is now an index (height grew from 1 to 2).
         let (node, _) = s
-            .load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
+            .load_root_node(COLL, Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .unwrap();
@@ -2964,7 +2988,10 @@ mod tests {
 
         let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
         let leaves = router
-            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+            .leaves(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(leaves.len(), 2, "one leaf became two");
@@ -2988,7 +3015,11 @@ mod tests {
         // Every key remains reachable by descent, in order.
         for k in [b"a".as_slice(), b"b", b"c", b"d"] {
             let loc = router
-                .route_key(&collection(), k, Requirement::AtLeast(s.timeline.now()))
+                .route_key(
+                    &collection(),
+                    k,
+                    Requirement::after(s.timeline.currentness_barrier()),
+                )
                 .await
                 .unwrap();
             assert!(
@@ -2997,7 +3028,7 @@ mod tests {
             );
         }
         assert!(
-            s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+            s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
                 .await
                 .unwrap()
                 .is_empty()
@@ -3044,14 +3075,17 @@ mod tests {
 
         let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
         let leaves = router
-            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+            .leaves(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(leaves.len(), 2, "leaf L split into two");
         // The parent index now routes the moved keys directly to the sibling, not
         // via a right-link walk: its child for the split key differs from L.
         let (root_node, _) = s
-            .load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
+            .load_root_node(COLL, Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .unwrap();
@@ -3059,7 +3093,11 @@ mod tests {
         assert_eq!(index.len(), 2, "parent gained the separator");
         for k in [b"a".as_slice(), b"b", b"c", b"d"] {
             let loc = router
-                .route_key(&collection(), k, Requirement::AtLeast(s.timeline.now()))
+                .route_key(
+                    &collection(),
+                    k,
+                    Requirement::after(s.timeline.currentness_barrier()),
+                )
                 .await
                 .unwrap();
             assert!(
@@ -3068,7 +3106,7 @@ mod tests {
             );
         }
         assert!(
-            s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+            s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
                 .await
                 .unwrap()
                 .is_empty()
@@ -3113,7 +3151,7 @@ mod tests {
             .unwrap();
 
         let (root, _) = s
-            .load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
+            .load_root_node(COLL, Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .unwrap();
@@ -3126,7 +3164,11 @@ mod tests {
         assert_eq!(child_tokens.len(), 2, "the root grew by one level");
         for token in child_tokens {
             let (child, _) = s
-                .load_node(COLL, &token, Requirement::AtLeast(s.timeline.now()))
+                .load_node(
+                    COLL,
+                    &token,
+                    Requirement::after(s.timeline.currentness_barrier()),
+                )
                 .await
                 .unwrap();
             assert!(child.as_index().is_some(), "root children are indexes");
@@ -3135,7 +3177,10 @@ mod tests {
         let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
         assert_eq!(
             router
-                .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+                .leaves(
+                    &collection(),
+                    Requirement::after(s.timeline.currentness_barrier())
+                )
                 .await
                 .unwrap()
                 .len(),
@@ -3144,7 +3189,11 @@ mod tests {
         );
         for key in [b"a".as_slice(), b"m", b"n", b"o"] {
             let leaf = router
-                .route_key(&collection(), key, Requirement::AtLeast(s.timeline.now()))
+                .route_key(
+                    &collection(),
+                    key,
+                    Requirement::after(s.timeline.currentness_barrier()),
+                )
                 .await
                 .unwrap();
             assert!(leaf.node().unwrap().as_leaf().unwrap().exists(key));
@@ -3191,7 +3240,7 @@ mod tests {
             .unwrap();
 
         let (node, _) = s
-            .load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
+            .load_root_node(COLL, Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .unwrap();
@@ -3204,7 +3253,11 @@ mod tests {
         let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
         for k in [b"a".as_slice(), b"m", b"t"] {
             let loc = router
-                .route_key(&collection(), k, Requirement::AtLeast(s.timeline.now()))
+                .route_key(
+                    &collection(),
+                    k,
+                    Requirement::after(s.timeline.currentness_barrier()),
+                )
                 .await
                 .unwrap();
             assert!(
@@ -3228,7 +3281,10 @@ mod tests {
 
         sp.split_path(&root_path()).await.unwrap();
         let after_first = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+            .leaves(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         // Re-run: each resulting leaf holds two keys, which is at (not over) the
@@ -3239,7 +3295,10 @@ mod tests {
         sp.split_path(&root_path()).await.unwrap();
 
         let after_second = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+            .leaves(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3248,7 +3307,7 @@ mod tests {
             "a settled tree does not keep splitting"
         );
         assert!(
-            s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+            s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
                 .await
                 .unwrap()
                 .is_empty(),
@@ -3256,7 +3315,10 @@ mod tests {
         );
         let (record, _) = s
             .records
-            .load_record(&collection(), Requirement::AtLeast(s.timeline.now()))
+            .load_record(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(record.topology_participants().count(), 0);
@@ -3292,7 +3354,10 @@ mod tests {
         sp.run_once().await;
 
         let leaves = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+            .leaves(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(leaves.len(), 2, "the fed candidate was split");
@@ -3335,7 +3400,10 @@ mod tests {
 
         let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
         let leaves = router
-            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+            .leaves(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(leaves.len(), 5);
@@ -3344,7 +3412,11 @@ mod tests {
         }));
         for key in keys {
             let located = router
-                .route_key(&collection(), key, Requirement::AtLeast(s.timeline.now()))
+                .route_key(
+                    &collection(),
+                    key,
+                    Requirement::after(s.timeline.currentness_barrier()),
+                )
                 .await
                 .unwrap();
             assert!(located.node().unwrap().as_leaf().unwrap().exists(key));
@@ -3378,7 +3450,10 @@ mod tests {
         let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
         assert_eq!(
             router
-                .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+                .leaves(
+                    &collection(),
+                    Requirement::after(s.timeline.currentness_barrier())
+                )
                 .await
                 .unwrap()
                 .len(),
@@ -3400,7 +3475,11 @@ mod tests {
         );
 
         let target = router
-            .route_key(&collection(), b"h", Requirement::AtLeast(s.timeline.now()))
+            .route_key(
+                &collection(),
+                b"h",
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         let reason = SplitReason::InlinePressure {
@@ -3424,7 +3503,10 @@ mod tests {
 
         assert_eq!(
             router
-                .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+                .leaves(
+                    &collection(),
+                    Requirement::after(s.timeline.currentness_barrier())
+                )
                 .await
                 .unwrap()
                 .len(),
@@ -3445,7 +3527,11 @@ mod tests {
             }
         );
         let target = router
-            .route_key(&collection(), b"h", Requirement::AtLeast(s.timeline.now()))
+            .route_key(
+                &collection(),
+                b"h",
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -3500,7 +3586,7 @@ mod tests {
             "a key that disappeared does not reshape the tree"
         );
         assert!(
-            s.load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
+            s.load_root_node(COLL, Requirement::after(s.timeline.currentness_barrier()))
                 .await
                 .unwrap()
                 .unwrap()
@@ -3539,7 +3625,7 @@ mod tests {
             }
         );
         assert!(
-            s.load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
+            s.load_root_node(COLL, Requirement::after(s.timeline.currentness_barrier()))
                 .await
                 .unwrap()
                 .unwrap()
@@ -3550,7 +3636,7 @@ mod tests {
         );
 
         let (mut root, observation) = s
-            .load_root(COLL, Requirement::AtLeast(s.timeline.now()))
+            .load_root(COLL, Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap();
         root.remove_membership_holder(&holder);
@@ -3567,7 +3653,7 @@ mod tests {
             }
         );
         assert!(
-            s.load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
+            s.load_root_node(COLL, Requirement::after(s.timeline.currentness_barrier()))
                 .await
                 .unwrap()
                 .unwrap()
@@ -3603,7 +3689,10 @@ mod tests {
             TxCommitStatus::Wounded
         );
         let leaves = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+            .leaves(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(leaves.len(), 2);
@@ -3623,7 +3712,9 @@ mod tests {
     async fn split_help_forwards_a_committed_entry_holder_before_moving_its_entry() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let s = store_with_backend(backend.clone());
-        let other = store_with_backend(backend);
+        let recorder = Arc::new(RecordingBackend::new(backend));
+        let operations = recorder.log();
+        let other = store_with_backend(recorder);
         let bg = Arc::new(Background::new());
         let (sp, _) = splitter_and_monitor(&s, &bg, tiny());
         let holder = TxId::with_priority(1, b"committed");
@@ -3689,7 +3780,7 @@ mod tests {
                 &holder,
                 &accesses,
                 false,
-                Requirement::AtLeast(other.timeline.now()),
+                Requirement::after(other.timeline.currentness_barrier()),
             )
             .await
             .unwrap()
@@ -3699,10 +3790,20 @@ mod tests {
         log.locks = locked.locked_paths();
         other_mon.commit_tx(log).await.unwrap();
 
+        let held = other
+            .nodes
+            .load_leaf(&node_path("L"), Requirement::ANY)
+            .await
+            .unwrap();
+        assert!(held.entries().lookup(b"d").unwrap().is_locked_by(&holder));
         sp.split_path(&node_path("L")).await.unwrap();
 
         let leaf = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .route_key(&collection(), b"d", Requirement::AtLeast(s.timeline.now()))
+            .route_key(
+                &collection(),
+                b"d",
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert!(leaf.node().unwrap().structural_gate().holders().is_empty());
@@ -3725,9 +3826,33 @@ mod tests {
 
         // A different instance still targeting the pre-split source must
         // re-descend and converge without recreating the removed holder.
+        operations.lock().unwrap().clear();
         other_locker.keys().write_back(&holder, &locked).await;
+        {
+            let operations = operations.lock().unwrap();
+            let source = node_path("L").to_string();
+            assert_eq!(
+                operations
+                    .iter()
+                    .find(|operation| operation.path == source)
+                    .unwrap()
+                    .op,
+                "write_if",
+                "the cached hold goes directly to CAS, whose conflict exposes the split"
+            );
+            let writes: Vec<_> = operations
+                .iter()
+                .filter(|operation| operation.op == "write_if")
+                .map(|operation| operation.path.as_str())
+                .collect();
+            assert_eq!(
+                writes,
+                [source.as_str()],
+                "the split already published the moved entry"
+            );
+        }
         let current = TreeRouter::new(other.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .route_key(&collection(), b"d", Requirement::Any)
+            .route_key(&collection(), b"d", Requirement::ANY)
             .await
             .unwrap();
         let current = current
@@ -3766,7 +3891,10 @@ mod tests {
         sp.run_once().await;
         assert_eq!(
             TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-                .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+                .leaves(
+                    &collection(),
+                    Requirement::after(s.timeline.currentness_barrier())
+                )
                 .await
                 .unwrap()
                 .len(),
@@ -3777,7 +3905,10 @@ mod tests {
         sp.run_once().await;
         assert_eq!(
             TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-                .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+                .leaves(
+                    &collection(),
+                    Requirement::after(s.timeline.currentness_barrier())
+                )
                 .await
                 .unwrap()
                 .len(),
@@ -3817,7 +3948,10 @@ mod tests {
         // The only cap crossed is the byte cap, so a split here proves the byte
         // cap now has a producer.
         let leaves = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+            .leaves(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(leaves.len(), 2, "byte-cap overflow triggered a split");
@@ -3873,7 +4007,7 @@ mod tests {
         // The existing `g -> M` edge is retained, and the parent learns both
         // the previously missing `m -> S` edge and S's new `n` edge.
         let (root_node, _) = s
-            .load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
+            .load_root_node(COLL, Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .unwrap();
@@ -3893,7 +4027,11 @@ mod tests {
         let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
         for k in [b"a".as_slice(), b"b", b"g", b"h", b"m", b"n", b"o"] {
             let loc = router
-                .route_key(&collection(), k, Requirement::AtLeast(s.timeline.now()))
+                .route_key(
+                    &collection(),
+                    k,
+                    Requirement::after(s.timeline.currentness_barrier()),
+                )
                 .await
                 .unwrap();
             assert!(
@@ -3929,7 +4067,7 @@ mod tests {
             Err(TransError::Retry)
         ));
         let (blocked_root, _) = s
-            .load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
+            .load_root_node(COLL, Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .unwrap();
@@ -3944,7 +4082,10 @@ mod tests {
         );
         let (blocked_coordination, _) = s
             .records
-            .load_record(&collection(), Requirement::AtLeast(s.timeline.now()))
+            .load_record(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3954,7 +4095,10 @@ mod tests {
         );
         assert_eq!(
             TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-                .leaves(&collection(), Requirement::AtLeast(s.timeline.now()))
+                .leaves(
+                    &collection(),
+                    Requirement::after(s.timeline.currentness_barrier())
+                )
                 .await
                 .unwrap()
                 .len(),
@@ -3966,7 +4110,7 @@ mod tests {
         blocker.block(false);
         sp.run_once().await;
         let (healed_root, _) = s
-            .load_root_node(COLL, Requirement::AtLeast(s.timeline.now()))
+            .load_root_node(COLL, Requirement::after(s.timeline.currentness_barrier()))
             .await
             .unwrap()
             .unwrap();
@@ -3977,14 +4121,17 @@ mod tests {
         );
         assert!(sp.recover_structural_intents().await.unwrap());
         assert!(
-            s.list_structural_intents("db", Requirement::AtLeast(s.timeline.now()))
+            s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
                 .await
                 .unwrap()
                 .is_empty()
         );
         let (recovered_coordination, _) = s
             .records
-            .load_record(&collection(), Requirement::AtLeast(s.timeline.now()))
+            .load_record(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(recovered_coordination.topology_participants().count(), 0);
@@ -4069,6 +4216,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn separator_publication_rechecks_a_child_read_started_before_the_split() {
+        let memory = Arc::new(MemoryBackend::new());
+        let peer = store_with_backend(memory.clone());
+        peer.store_node(
+            COLL,
+            "L0",
+            &leaf_node(&[b"apple", b"mango"], None, None),
+            None,
+        )
+        .await
+        .unwrap();
+        let parent = Node::index(IndexNode::from_children([(
+            Vec::new(),
+            test_token("L0").to_string(),
+        )]));
+        peer.create_root(COLL, &parent).await.unwrap();
+
+        let hook = HookBackend::new(memory);
+        let local = store_with_backend(hook.clone());
+        let bg = Arc::new(Background::new());
+        let publisher = publisher(&local, &bg).await;
+        let (_, parent_observation) = local.load_root(COLL, Requirement::ANY).await.unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        hook.set_after({
+            let path = node_path("L0").to_string();
+            let entered = entered.clone();
+            let release = release.clone();
+            move |operation, outcome| {
+                let park = matches!(operation, BackendOp::Read { path: read } if *read == path)
+                    && outcome.is_success();
+                let entered = entered.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    if park {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    Ok(())
+                })
+            }
+        });
+        let pending = tokio::spawn({
+            let nodes = local.nodes.clone();
+            async move {
+                nodes
+                    .load_node(&collection(), &test_token("L0"), Requirement::ANY)
+                    .await
+            }
+        });
+        entered.notified().await;
+
+        // The child read started after the parent read, but still returns the
+        // state from before this split. Their invocation order cannot prove
+        // that separator reconciliation has seen the split.
+        let (_, source) = peer.load_node(COLL, "L0", Requirement::ANY).await.unwrap();
+        peer.store_node(COLL, "L1", &leaf_node(&[b"mango"], None, None), None)
+            .await
+            .unwrap();
+        peer.store_node(
+            COLL,
+            "L0",
+            &leaf_node(&[b"apple"], Some(b"m"), Some("L1")),
+            Some(&source),
+        )
+        .await
+        .unwrap();
+        let mut publication = publisher.begin_publication(&collection(), b"m", &test_token("L1"));
+        hook.clear_after();
+        release.notify_one();
+        let (old_child, old_observation) = pending.await.unwrap().unwrap();
+        assert!(old_child.right_sibling().is_none());
+        assert!(!old_observation.is_current_after(publication.start));
+        assert!(!parent_observation.is_current_after(publication.start));
+
+        assert!(matches!(
+            publisher.publish(&mut publication).await.unwrap(),
+            SeparatorPublicationOutcome::Published
+        ));
+        let (published, _) = local
+            .load_root(
+                COLL,
+                Requirement::after(local.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            published.as_index().unwrap().child_for(b"m"),
+            Some(test_token("L1").as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn missing_separators_reports_every_unindexed_edge_in_chain_order() {
         let s = store();
         let bg = Arc::new(Background::new());
@@ -4077,7 +4317,12 @@ mod tests {
         assert_eq!(
             publisher(&s, &bg)
                 .await
-                .missing_separators(&collection(), &parent, b"t", Requirement::Any)
+                .missing_separators(
+                    &collection(),
+                    &parent,
+                    b"t",
+                    s.timeline.currentness_barrier()
+                )
                 .await
                 .unwrap(),
             [
@@ -4102,7 +4347,12 @@ mod tests {
         assert_eq!(
             publisher(&s, &bg)
                 .await
-                .missing_separators(&collection(), &parent, b"m", Requirement::Any)
+                .missing_separators(
+                    &collection(),
+                    &parent,
+                    b"m",
+                    s.timeline.currentness_barrier()
+                )
                 .await
                 .unwrap(),
             [MissingSeparator {
@@ -4124,7 +4374,12 @@ mod tests {
         for split_key in [b"m".as_slice(), b"t".as_slice()] {
             assert!(
                 publisher
-                    .missing_separators(&collection(), &parent, split_key, Requirement::Any)
+                    .missing_separators(
+                        &collection(),
+                        &parent,
+                        split_key,
+                        s.timeline.currentness_barrier()
+                    )
                     .await
                     .unwrap()
                     .is_empty(),
@@ -4163,7 +4418,12 @@ mod tests {
 
         let error = publisher(&s, &bg)
             .await
-            .missing_separators(&collection(), &parent, b"t", Requirement::Any)
+            .missing_separators(
+                &collection(),
+                &parent,
+                b"t",
+                s.timeline.currentness_barrier(),
+            )
             .await
             .expect_err("a cycle must not reconcile");
         assert!(

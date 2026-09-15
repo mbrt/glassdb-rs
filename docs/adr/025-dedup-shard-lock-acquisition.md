@@ -7,9 +7,9 @@ Accepted
 The deduplication **mechanism** described here is generalized by
 [ADR-028](028-shard-mutation-coordinator.md) into a standalone
 `ShardCoordinator` shared by both the `Locker` and the commit algorithm, and
-this ADR's same-key merge **predicate** is dissolved there in favour of a
-monotonic in-fold resolution (both contenders join one round; the loser waits).
-The batching decision itself is unchanged.
+this ADR's same-key merge **predicate** is dissolved there in favour of
+oldest-first resolver evaluation during mutation planning (both contenders join
+one round; the loser waits). The batching decision itself is unchanged.
 
 [ADR-065](065-renewed-transaction-identity-on-serial-fallback.md) supersedes
 this ADR's assumption that receipt-based release always clears a late cancelled

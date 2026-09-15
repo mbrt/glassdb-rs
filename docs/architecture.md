@@ -140,8 +140,9 @@ outside it.
 Every leaf/root entry mutation — lock acquire, direct same-leaf publication,
 write-back, release, and GC reclamation — and every leaf structural-gate
 acquisition flows through **one leaf coordinator**. It loads the
-object once, folds the round's operations in wound-wait order, and CASes once
-(ADR-028/029). The coordinator is a transaction-aware shared mutation engine:
+object once per attempt, builds a mutation plan in wound-wait order, and
+persists staged changes with one CAS (ADR-028/029). The coordinator is a
+transaction-aware shared mutation engine:
 it owns identity, ordering, admission, and recovery across the heterogeneous
 round, while `Algo`, the `Locker`, and the `Splitter` supply each operation's
 target, resolver policy, and typed result as a `LeafOperation`. The operation
@@ -179,7 +180,7 @@ flowchart TD
     Hints["GcHints<br/>bounded nonblocking reports<br/>wake · de-duplicate"]
     Splitter["Splitter<br/>split scheduling · planning · node writes<br/>recursive parent split execution"]
     Recovery["StructuralRecovery<br/>structural-intent lifecycle<br/>classification · fencing · resumption · settlement"]
-    Coord["LeafCoordinator — fold engine<br/>identity · order · admission<br/>one load · one fold · one CAS<br/>per-member in-doubt recovery"]
+    Coord["LeafCoordinator — mutation engine<br/>identity · order · admission<br/>load · plan · CAS per attempt<br/>per-member in-doubt recovery"]
     Gc["Gc<br/>candidate retries · bounded parallel checks<br/>adaptive scans · reverse liveness checks<br/>reclamation · local diagnostics"]
 
     Engine -->|"owns · transaction-attempt lifecycle"| Algo
@@ -243,6 +244,24 @@ Each structural split records a transaction-log topology backreference and
 remains registered in the collection record until its structural intent is
 completed or recovered. A freeze can therefore settle every pre-existing
 participant before node enumeration.
+
+A later drop replaces an aborted or wounded owner's delete intent in the same
+revision-checked CAS that installs its own fence. Resolving the old owner's
+status does not clear the stored intent, so rereading alone cannot make progress.
+Other pending holders must still be resolved before that CAS; a committed
+foreign drop rejects the new drop. This replacement needs no extra read barrier
+or separate clearing mutation.
+
+Aborted-drop cleanup also starts each node and collection-record read with
+`ANY`. A removal CAS proves that the transaction's delete intent or topology
+freeze is clear. A present state without that effect must instead meet the
+completion requirement. Owner cleanup shares the fencing cache and uses `ANY`;
+GC passes its existing bound captured after eligibility. Root, standalone-node,
+and collection-record completion require separate evidence. Earlier directory
+release can already supply the record evidence, but an aborted log can record
+a drop before its directory lock list is persisted. Cleanup must therefore
+check the freeze even when the log records no directory locks. It adds no
+barrier and checks currentness only when a no-op lacks sufficient evidence.
 
 Normal point operations inspect only the terminal node they already access:
 an aborted intent is removable, a pending intent participates in wound-wait,
@@ -314,6 +333,16 @@ allocates once it holds the Ready record, because a cache entry's watermark is
 allocated before the read that fills it and therefore cannot order a read after
 the gate.
 
+Participant departure starts with `ANY`; a removal CAS proves completion.
+For background settlement, a present record without the participant must meet
+the existing final intent-listing requirement. That bound follows final-status
+observation and completed intent recovery. An insufficient no-op triggers a
+bounded record reload without allocating another barrier. Owner departure
+shares admission's cache and keeps `ANY`. Explicit settlement also keeps `ANY`:
+its caller must share the cache that admitted the participant or installed a
+topology freeze with it present. This includes repeated settlement after a local
+removal CAS. Intent cleanup alone does not supply this record evidence.
+
 The background loop reads at most one 128-object page of the independent `_s/`
 namespace per sweep and retains its cursor. Successful reclamation shortens its
 delay; live intents and no-ops lengthen it, up to ten minutes. A pending cursor
@@ -326,9 +355,10 @@ leaf structural-gate acquisition flows through a single transaction-aware
 `LeafCoordinator`. It owns the protocol shared by a heterogeneous round:
 single-flight batching, transaction identity, oldest-first wound-wait order,
 routing and capacity admission, whole-member exclusion for overlapping
-logless output claims, one CAS, per-member uncertainty attribution, and
-reload-and-re-fold recovery. Installed resolvers own the operation-specific
-mutation decisions. Each policy owner packages its resolver, target, first-load
+logless output claims, one CAS per attempt, per-member uncertainty attribution,
+and recovery by reloading and rebuilding the mutation plan. Installed resolvers
+own the operation-specific mutation decisions. Each policy owner packages its
+resolver, target, freshness
 requirement, and typed result in a `LeafOperation`: `Locker` supplies acquire /
 write-back / release, `DirectCommit` supplies direct commit, `Splitter` supplies
 leaf structural-gate acquisition, and `Gc` reclaims through the `Locker`'s
@@ -337,6 +367,32 @@ operation-specific results.
 Cross-leaf acquisition strategy, transaction lifecycle, commit orchestration,
 GC selection, and structural writes after gate acquisition remain outside the
 coordinator.
+
+The coordinator keeps a successful leaf CAS separate from a mutation plan with
+no staged changes. `NodeStore::commit_leaf` preserves the storage
+`CasReceipt<Node>` in its `CasResult<Node>::Applied` result. Applied means that
+this backend mutation definitively took effect. The generic `CasReceipt<V>` is
+constructed only by `CachedStore` after a definitive successful conditional
+create or CAS. It retains the exact installed observation, expected revision,
+and original invocation point. Exact-state validation requires a
+`CurrentnessBarrier` and checks that invocation point against it. A later read
+may advance the installed observation's watermark but cannot renew the receipt's
+proof of its precondition. The coordinator owns batch-member participation.
+Staged members receive the receipt; skipped members retain the loaded
+observation even when another member's CAS succeeds. Skipped outcomes can depend
+on earlier staged changes, so they also wait for the plan's CAS to succeed. A
+plan with no staged changes cannot complete a staged member. Neither result
+establishes a currentness barrier after the operation. The allowed and forbidden
+transformations are stated in the [cache
+guide](guides/caching.md#coordinator-mutation-evidence).
+
+Each attempt keeps the merged members and their requirement together, including
+members that join during the leaf load and bounds requested on earlier retries.
+Resolvers use that bound for dependent object reads. The loaded leaf can still
+precede it: a dirty plan obtains its leaf evidence from the CAS, while a plan
+with no changes checks the exact loaded state before delivery. An unchanged
+state needs no repeated resolution; a changed state requires a new plan. No
+extra barrier or preliminary read is added to the successful CAS path.
 
 | Component             | Layer            | Speaks                       | Owns                                                                                                                  | Must not know                       |
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
@@ -351,7 +407,7 @@ coordinator.
 | `Locker::collections` | collection-lock **policy** | collection addresses, `TxId`, records | directory/topology lock acquisition, recovery write-back and release | key routing, B-link topology, catalog semantics |
 | `CollectionStateResolver` | collection-state mechanism | collection addresses, records, `TxId` | resolved record loads, foreign-holder reconciliation, committed directory write-back assistance | key routing, B-link topology, catalog semantics |
 | `CollectionCatalog`   | collection semantics | directory reads, binding changes, resolved records | logical snapshots, read-your-writes validation, capacity/precondition checks | locking policy, CAS, wound-wait |
-| `LeafCoordinator`    | shared mutation engine | typed `LeafOperation`s | one round per object: single-flight, oldest-first fold, routing/capacity admission, overlapping logless-member exclusion, single CAS, per-member uncertainty, reload-recover, vestigial-entry pruning | operation-specific results, cross-leaf strategy, transaction lifecycle, commit orchestration, GC selection |
+| `LeafCoordinator`    | shared mutation engine | typed `LeafOperation`s | one round per object: single-flight, oldest-first mutation planning, routing/capacity admission, overlapping logless-member exclusion, one CAS per attempt, per-member uncertainty, reload-recover, vestigial-entry pruning | operation-specific results, cross-leaf strategy, transaction lifecycle, commit orchestration, GC selection |
 | `Splitter`            | structural mechanism | split candidates, opaque structural-intent witnesses and recovery actions | scheduling, topology registration/finalization, source preparation and compaction, split planning, node writes, foreground separator publication, recursive parent split execution | durable intent phases, recovery classification, participant settlement |
 | `StructuralRecovery`  | durable recovery mechanism | opaque intent witnesses and resumable parent-split requests | structural-intent creation and phase change, clean deletion, discovery, fencing, reachability classification, orphan cleanup, recovery resumption, participant settlement | split candidates and reasons, tombstone compaction, node split planning, recursive split execution |
 | `KeyResolver`         | key/range resolution | logical keys, ranges, `TreeRouter` | routing, scan composition, and input-aligned logical point validation | commit / lock policy, collection-record coordination |
@@ -359,6 +415,42 @@ coordinator.
 | `Reader`              | read mechanism   | logical keys, resolved writers | value materialization | commit / lock policy                |
 | `Monitor`             | tx lifecycle     | `TxId`, tx logs              | status, wound/abort, lease refresh, waits                                                                             | leaves                              |
 | `Gc`                  | GC scheduling and reclamation | `GcHints`, transaction and resource observations | bounded queues and checks, deferred retries, adaptive scans with retained cursors, reverse liveness checks, safety horizons, pinned wounds, reclamation through coordinator-backed release, statistics | commit policy, structural recovery |
+
+### Leaf coordination terms
+
+The [glossary](../CONTEXT.md#leaf-coordination) defines **coordinator round**,
+**round member**, and **mutation plan**. Use the following terms for the work
+within a round:
+
+| Work | Term | Meaning |
+| --- | --- | --- |
+| Combine compatible submissions for one leaf | Batch submissions | Form or extend a coordinator round. This does not evaluate the operations or prove that they can all stage changes. |
+| Obtain one member's decision | Evaluate a resolver | Call `LeafResolver::resolve` against the current staged entries and node locks. It proposes all of that member's changes or none. |
+| Build one attempt's proposed leaf state | Build a mutation plan | Check routing and publication claims, evaluate admitted resolvers in priority order, and admit their proposed changes within the leaf's capacity limits. Later resolvers see earlier admitted changes. |
+| Store the proposed changes | Persist a mutation plan | Remove vestigial entries and issue one conditional leaf mutation if any member staged changes. A plan with no staged changes retains the loaded observation without a CAS. |
+| Recover after contention or an uncertain result | Reload and rebuild the mutation plan | Load another leaf observation and repeat planning, while retaining each member's unresolved uncertainty. A stale transaction dependency can also require this retry. |
+
+`CasWorker::plan_mutation` builds a `MutationPlan`. Each `PlannedMember` records
+its `MemberOutcome` and whether its changes were staged. These names separate
+planning from persistence: an outcome proposed with staged changes is delivered
+only after the CAS succeeds. `CoordinatedOutcome` carries the delivered member
+outcome and any storage evidence. A skipped member can depend on earlier staged
+changes and must also wait for the plan's CAS.
+
+Priority order means oldest wound-wait priority first, with transaction-identity
+bytes as a deterministic tie-break within the round. A later member cannot
+wound an earlier member. The tie-break does not change persistent wound-wait
+priority. Each member's changes pass admission together or not at all; a later
+publisher cannot replace an earlier logless member's protected output markers.
+Resolver evaluation can consult transaction state and perform protocol work,
+such as wounding a holder. Building a leaf mutation plan is therefore not a
+pure computation, but it does not itself persist the proposed leaf state.
+
+Earlier revisions used **fold** for several of these steps. Code, guides, and
+ADRs now use the specific terms above. Rust's `Iterator::fold` and `try_fold`,
+and the profiler's folded-stack format, retain their standard names. Benchmark
+reports use **aggregation** for combining measurements and **members per round**
+for the number of operations batched by the coordinator.
 
 ### The lock boundary
 
@@ -944,7 +1036,7 @@ flowchart TD
   Backend["Backend — object storage"]
 
   Tx -->|"tx.read / tx.write"| Access
-  Access -->|"Any read / AtLeast currentness"| L1
+  Access -->|"ANY read / after(barrier) currentness"| L1
   L1 -->|"miss or insufficient evidence"| L2
   L2 -->|"miss or validation"| Backend
 ```
@@ -978,6 +1070,15 @@ a replayable simulation model.
 
 ### Knowledge and causal evidence
 
+The evidence types have two owners in `glassdb-storage`: `timeline.rs` contains
+`Timeline`, `SequencePoint`, `CurrentnessBarrier`, and `Requirement`;
+`cached_store/evidence.rs` contains `Observation`, `Revision`, `CasReceipt`, and
+their supporting result and shared evidence types. Changes to these files
+require the [storage evidence review](guides/storage-consistency.md).
+
+Higher layers can retain, compare, and serialize revisions; they cannot
+construct or modify them.
+
 `CachedStore` (`glassdb-storage/src/cached_store.rs`) stores only usable
 knowledge for a path:
 
@@ -1003,21 +1104,58 @@ Callers express the minimum acceptable evidence as a `Requirement`:
 
 | Requirement | Cache state it accepts |
 | --- | --- |
-| `Any` | Any usable present or absent entry |
-| `AtLeast(t)` | Present or absent state proven current at or after `t` |
+| `ANY` | Any usable present or absent entry |
+| `within(timeline, age)` | Present or absent state whose evidence reaches an approximate age cutoff |
+| `after(barrier)` | Present or absent state whose evidence reaches the opaque `CurrentnessBarrier` |
+
+`Timeline::currentness_barrier()` captures an opaque `CurrentnessBarrier` after
+completed prerequisite work. Transaction validation captures one after the body
+and before key and predicate lock CASes, and uses it for point, scan,
+collection, and transaction-status dependencies. GC captures a status barrier,
+then a separate reference barrier after eligibility checks. Structural recovery
+captures a new barrier after observing a Ready intent. Separator publication
+carries its start barrier through routing and child-chain reconciliation.
+
+Decision interfaces that need an ordering bound require the barrier type. Shared
+read interfaces receive the explicit `Requirement::after(barrier)` conversion.
+`Requirement` has a private representation and only three public construction
+paths: `ANY`, `after`, and `within`. There is no raw sequence-point constructor.
+Barriers, requirements, and observations do not expose sequence points. No
+conversion from an observation, receipt, requirement, or raw point may construct
+a barrier. The capture points and forbidden transformations are stated in the
+[cache guide](guides/caching.md#currentness-barriers).
+
+The requirement's raw bound stays private to `timeline`. Observation watermarks
+remain restricted to the cached-store implementation, including against other
+modules in the storage crate. Batch currentness checks also belong there. They
+may reuse confirmed evidence for the same exact state; a requested bound cannot
+itself advance an observation. Typed node storage supplies observations and
+receives check outcomes without extracting or setting watermarks.
+
+Structural gate acquisition returns the exact observation from coordination,
+without reloading or extracting its watermark. Its next conditional mutation
+checks that observation's revision.
 
 An observation's `current_after` point is evidence that the observed state was
-current at that point. A persisted L2 body retains its original point. Opening
-the L2 returns the greatest discoverable point to `Database`, which starts the
-new timeline strictly after it and passes that timeline to `CachedStore`. Thus
-`Any` may use a persisted body immediately, while every bound allocated in the
-new session requires validation until the body's evidence advances.
-Finite-staleness cutoffs are clamped to that session boundary for the same
-reason. A point is never a claim about response time. A definitive backend
-operation contributes its invocation point, allocated immediately before
-dispatch. If the same backend state is observed again, its evidence watermark
-advances monotonically; a different state replaces the old discoverable
-knowledge.
+current at some instant at or after that point. A persisted L2 body retains its
+original point. Opening the L2 returns the greatest discoverable point to
+`Database`, which starts the new timeline strictly after it and passes that
+timeline to `CachedStore`. Thus `ANY` may use a persisted body immediately,
+while every bound allocated in the new session requires validation until the
+body's evidence advances. Finite-staleness cutoffs are clamped to that session
+boundary for the same reason. A point is never a claim about response time. A
+definitive backend operation contributes its invocation point, allocated
+immediately before dispatch. If the same backend state is observed again, its
+evidence watermark advances monotonically; a different state replaces the old
+discoverable knowledge.
+
+Successful conditional creates and compare-and-swaps return `CasReceipt<V>`,
+which records the precondition, original invocation point, and exact installed
+state. Typed stores can preserve this proof or explicitly retain only its
+observation with `into_installed()`. Receipts have no public constructor,
+implicit conversion, payload transformation, or sequence-point accessor. Their
+constraints are stated in the [cache
+guide](guides/caching.md#conditional-mutation-receipts).
 
 ### Per-path operation ordering
 
@@ -1048,9 +1186,9 @@ read; a read may join only when that flight's invocation point satisfies its
 requirement. A stricter reader queues and rechecks the cache after the current
 flight completes.
 
-An `Any` cache hit deliberately bypasses the lane. It may return older usable
+An `ANY` cache hit deliberately bypasses the lane. It may return older usable
 state while a same-path mutation is in flight, but never state already marked
-obsolete or uncertain. Code requiring a causal cut uses `AtLeast(t)` instead.
+obsolete or uncertain. Code requiring a currentness barrier uses `after(barrier)`.
 
 The protocol covers typed single-object reads and conditional mutations.
 Listing is not path-coordinated: each page receives its own invocation point,
@@ -1118,10 +1256,11 @@ The cache and coordinator rely on, and preserve, these properties:
    in-memory timeline.
 
 Transaction execution may use cached state freely before commit. Transaction
-validation captures one lower bound and propagates it through leaf and
-transaction-object dependencies. A post-bound lock CAS can satisfy that bound
-without another read. If a physical leaf changed, validation compares the
-observed logical writer or membership with the newer consistent state;
+validation captures one `CurrentnessBarrier` and propagates it through leaf and
+transaction-object dependencies. A lock CAS invoked after that barrier can
+satisfy it without another read. Rechecking the installed state later cannot
+change when the receipt's precondition was confirmed. If a physical leaf changed,
+validation compares the observed logical writer or membership with the newer consistent state;
 post-bound evidence can therefore save I/O without being mistaken for logical
 finality. `TLogger::get_at` and `TLogger::commit_status_at` may reuse cached
 committed and aborted objects indefinitely because their contents cannot change.
@@ -1260,18 +1399,33 @@ recovery share the `ScanCadence` interval controller from `glassdb-concurr`.
   horizon: a candidate other than `Wounded` is kept within the horizon, because
   the non-atomic reverse check can race a lock a live transaction has taken but
   not yet published (ADR-024's lazy object materialization). A dead `Pending`
-  object is changed to `Wounded` so
-  its death remains durable across an unbounded owner suspension. GC may
-  immediately and repeatedly reclaim effects described by that record, but
-  cannot delete the marker. The owner changes it to `Aborted` after proving
-  retirement; ordinary finite
-  retention and deletion apply only after that acknowledgement (ADR-059).
+  object is changed to `Wounded` so its death remains durable across an
+  unbounded owner suspension. GC may immediately and repeatedly reclaim effects
+  described by that record, but cannot delete the marker. The owner changes it
+  to `Aborted` after proving retirement; ordinary finite retention and deletion
+  apply only after that acknowledgement (ADR-059).
 - **Reclamation through the coordinator.** GC releases a dead transaction's locks
   not with its own CAS but by calling the `Locker`'s per-object unlock methods,
-  so the release batches through the same leaf coordinator as live
-  traffic (ADR-029); the entry left behind is pruned as a fold property when it
-  becomes vestigial (no holder and an absent current state). It retains the candidate
-  log observation and conditionally deletes only that exact revision. Collection
+  so the release batches through the same leaf coordinator as live traffic
+  (ADR-029); the coordinator prunes the entry before persistence when it becomes
+  vestigial (no holder and an absent current state). Leaf release starts with
+  `ANY`: an applied CAS proves completion without an extra read. A no-op must
+  carry an observation that meets GC's existing candidate-check bound; otherwise
+  release retries with that requirement. This also covers membership holds with
+  no recorded entry key whose routing could refresh the leaf. An index proves
+  that the old leaf's holds are gone because it cannot become a leaf again.
+  Directory release also starts with `ANY` and checks a present no-holder
+  observation against the same bound before it reports completion. Owner cleanup
+  shares acquisition's cache knowledge and can keep `ANY`; committed GC already
+  supplies bounded evidence through its directory reference check. Topology
+  participant release uses the same rule after GC lists no remaining structural
+  intents. The collection record needs its own completion evidence; listing
+  intents does not refresh that record. Missing records need no extra check:
+  other instances access published collections after record creation, local
+  preparation and cleanup share a cache, and GC inspects prepared resources only
+  after commit or acknowledged abort. These caller guarantees exclude a cached
+  absence that could hide later record creation. GC retains the candidate log
+  observation and conditionally deletes only that exact revision. Collection
   reclamation processes one 128-node page at a time and deletes the root and
   collection record only after all standalone nodes have been processed.
 - **Progress measurement.** Candidate reads may reuse immutable final contents.

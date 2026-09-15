@@ -1,15 +1,30 @@
 # Reviewing changes
 
-What to look for when reviewing a change (or refactor) in this project. The
-recurring question to ask of the diff is: **does each responsibility live with
-its rightful owner?**
+What to look for when reviewing a change (or refactor) in this project.
+## Evidence type review
+
+Changes to `crates/glassdb-storage/src/timeline.rs` and
+`crates/glassdb-storage/src/cached_store/evidence.rs` require stricter review
+against the [storage evidence rules](storage-consistency.md). This includes
+visibility, exports, conversions, tests, and moves. Identify which rules each
+change affects and verify that the existing evidence guarantees still hold.
+
+## Protocol
+
+- For decisions based on reads, check [the barrier rules](caching.md#currentness-barriers).
+- For conditional mutation or evidence changes, check the allowed and forbidden
+  transformations in [the cache guide](caching.md#conditional-mutation-receipts)
+  and the [coordinator rules](caching.md#coordinator-mutation-evidence).
 
 ## Mechanism vs. policy
 
-- Check that the *mechanism* (generic engines: dedup, fold loops, CAS/retry)
-  stays free of *policy* (locking, wound-wait, commit, transaction identities). Policy
-  should live in the pluggable pieces owners install (e.g. resolvers), not baked
-  into the engine.
+The recurring question to ask of the diff is: **does each responsibility live
+with its rightful owner?**
+
+- Check that the *mechanism* (generic engines: dedup, resolver evaluation loops,
+  CAS/retry) stays free of *policy* (locking, wound-wait, commit, transaction
+  identities). Policy should live in the pluggable pieces owners install (e.g.
+  resolvers), not baked into the engine.
 - Flag it when an engine names a domain concept (`LockType`, wound-wait,
   membership, `TxCommitStatus`): the concept has likely leaked in from a caller
   and should move out.

@@ -16,7 +16,7 @@ use crate::error::TransError;
 use crate::gc::GcHints;
 use crate::key_state_resolver::HolderResolution;
 use crate::leaf_coord::{
-    CoordinatedOutcome, FoldOutcome, LeafCoordinator, LeafOperation, LeafResolver, ReloadCause,
+    CoordinatedOutcome, LeafCoordinator, LeafOperation, LeafResolver, MemberOutcome, ReloadCause,
     ResolveCtx, StageAdmission, Step,
 };
 use crate::split::SplitHintSink;
@@ -172,7 +172,7 @@ impl DirectCommit {
             .collect::<Vec<_>>();
         let groups = self
             .router
-            .route_keys_with_requirements(keys, Requirement::Any, Requirement::Any)
+            .route_keys_with_requirements(keys, Requirement::ANY, Requirement::ANY)
             .await?;
         Ok(match groups.as_slice() {
             [group] => Some(group.path().clone()),
@@ -222,7 +222,7 @@ struct DirectCommitOperation {
     /// option distinguishes "not staged" from a staged create over absence.
     staged_over: Mutex<Option<BTreeMap<Vec<u8>, CurrentState>>>,
     /// Once any exact output marker is observed, the leaf CAS atomically proves
-    /// the whole member landed even if a later fold or CAS replaces it.
+    /// the whole member landed even if a later planned change or CAS replaces it.
     landed_proven: AtomicBool,
 }
 
@@ -259,7 +259,7 @@ impl DirectCommitOperation {
         predecessors.into_iter().collect()
     }
 
-    /// Resolves all dependencies against one running fold state.
+    /// Resolves all dependencies against one staged leaf state.
     async fn resolve_keys(
         &self,
         ctx: &ResolveCtx<'_>,
@@ -343,7 +343,7 @@ impl DirectCommitOperation {
             .await?
         {
             return Ok(Step::Skip {
-                outcome: FoldOutcome::Moved,
+                outcome: MemberOutcome::Moved,
             });
         }
 
@@ -351,7 +351,7 @@ impl DirectCommitOperation {
         // while the same live holder remains would otherwise spin.
         if resolutions.iter().any(|state| !state.pending.is_empty()) {
             return Ok(Step::Skip {
-                outcome: FoldOutcome::Moved,
+                outcome: MemberOutcome::Moved,
             });
         }
         if self
@@ -370,9 +370,9 @@ impl DirectCommitOperation {
             // replaying the same absence read could never converge. The locked
             // path makes the cleanup durable before validating the read.
             let outcome = if locks.membership_version() != staged_locks.membership_version() {
-                FoldOutcome::Moved
+                MemberOutcome::Moved
             } else {
-                FoldOutcome::Replay
+                MemberOutcome::Replay
             };
             return Ok(Step::Skip { outcome });
         }
@@ -402,7 +402,7 @@ impl DirectCommitOperation {
         if !admitted {
             self.observe_pressure();
             return Ok(Step::Skip {
-                outcome: FoldOutcome::Moved,
+                outcome: MemberOutcome::Moved,
             });
         }
 
@@ -445,7 +445,7 @@ impl DirectCommitOperation {
                 adds_key,
                 pressure_hint: self.member.keys.len() == 1,
             },
-            outcome: FoldOutcome::Landed,
+            outcome: MemberOutcome::Landed,
         })
     }
 
@@ -526,9 +526,9 @@ impl DirectCommitOperation {
         self.landed_proven.store(true, Ordering::Release);
     }
 
-    fn known_or(&self, in_doubt: bool, otherwise: FoldOutcome) -> FoldOutcome {
+    fn known_or(&self, in_doubt: bool, otherwise: MemberOutcome) -> MemberOutcome {
         if self.proven_landed() {
-            FoldOutcome::Landed
+            MemberOutcome::Landed
         } else if in_doubt {
             self.ambiguous_outcome()
         } else {
@@ -536,18 +536,18 @@ impl DirectCommitOperation {
         }
     }
 
-    fn ambiguous_outcome(&self) -> FoldOutcome {
-        FoldOutcome::InDoubt(format!(
+    fn ambiguous_outcome(&self) -> MemberOutcome {
+        MemberOutcome::InDoubt(format!(
             "direct commit for {} could not be resolved after an uncertain CAS",
             self.id
         ))
     }
 
-    fn definitive_loss(&self) -> FoldOutcome {
+    fn definitive_loss(&self) -> MemberOutcome {
         if self.member.has_reads {
-            FoldOutcome::Replay
+            MemberOutcome::Replay
         } else {
-            FoldOutcome::Moved
+            MemberOutcome::Moved
         }
     }
 }
@@ -569,7 +569,7 @@ impl LeafResolver for DirectCommitOperation {
         if self.proven_landed() || self.has_marker(staged) {
             self.remember_landed();
             return Ok(Step::Skip {
-                outcome: FoldOutcome::Landed,
+                outcome: MemberOutcome::Landed,
             });
         }
 
@@ -588,15 +588,15 @@ impl LeafResolver for DirectCommitOperation {
         false
     }
 
-    fn exhausted_outcome(&self, in_doubt: bool) -> FoldOutcome {
-        self.known_or(in_doubt, FoldOutcome::Moved)
+    fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome {
+        self.known_or(in_doubt, MemberOutcome::Moved)
     }
 
-    fn reroute_outcome(&self, in_doubt: bool) -> FoldOutcome {
-        self.known_or(in_doubt, FoldOutcome::Reroute)
+    fn reroute_outcome(&self, in_doubt: bool) -> MemberOutcome {
+        self.known_or(in_doubt, MemberOutcome::Reroute)
     }
 
-    fn excluded_outcome(&self, in_doubt: bool) -> FoldOutcome {
+    fn excluded_outcome(&self, in_doubt: bool) -> MemberOutcome {
         self.known_or(in_doubt, self.definitive_loss())
     }
 
@@ -627,30 +627,30 @@ impl LeafOperation for DirectCommitOperation {
         &self.id
     }
 
-    fn first_requirement(&self) -> Requirement {
-        Requirement::Any
+    fn requirement(&self) -> Requirement {
+        Requirement::ANY
     }
 
     fn complete(&self, outcome: Option<CoordinatedOutcome>) -> Result<Self::Output, TransError> {
         match outcome {
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Landed,
+                outcome: MemberOutcome::Landed,
                 ..
             }) => Ok(DirectMutationOutcome::Landed(self.predecessors())),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::InDoubt(message),
+                outcome: MemberOutcome::InDoubt(message),
                 ..
             }) => Ok(DirectMutationOutcome::InDoubt(message)),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Replay,
+                outcome: MemberOutcome::Replay,
                 ..
             }) => Ok(DirectMutationOutcome::Replay),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Reroute,
+                outcome: MemberOutcome::Reroute,
                 ..
             }) => Ok(DirectMutationOutcome::Reroute),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Moved | FoldOutcome::Conflict | FoldOutcome::LeafFull,
+                outcome: MemberOutcome::Moved | MemberOutcome::Conflict | MemberOutcome::LeafFull,
                 ..
             })
             | None => Ok(DirectMutationOutcome::Locked),

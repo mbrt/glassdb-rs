@@ -637,7 +637,7 @@ async fn verify_permanent_collection(
     foundation: &AssemblyFoundation,
 ) -> Result<(), StorageError> {
     let collection = CollectionAddress::from_db_root(db_root.clone(), CollectionId::root());
-    let requirement = Requirement::AtLeast(foundation.timeline.now());
+    let requirement = Requirement::after(foundation.timeline.currentness_barrier());
     match foundation
         .records
         .load_record(&collection, requirement)

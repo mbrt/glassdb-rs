@@ -10,7 +10,7 @@ use super::super::tests::{
 use super::super::*;
 use super::*;
 use crate::key_state_resolver::KeyStateResolver;
-use crate::leaf_coord::{FoldOutcome, LeafResolver, ReloadCause, ResolveCtx, Step};
+use crate::leaf_coord::{LeafResolver, MemberOutcome, ReloadCause, ResolveCtx, Step};
 use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend};
 use glassdb_backend::{Backend, memory::MemoryBackend};
 use glassdb_data::{CollectionAddress, CollectionId, NodeToken};
@@ -18,8 +18,8 @@ use glassdb_storage::{
     CollectionRecord, CurrentState, IndexNode, LeafBody, LeafEntry, Node, NodeLocks,
 };
 
-/// Runs one resolver fold and retains its complete classification.
-async fn fold_step(
+/// Evaluates one resolver and retains its proposed decision.
+async fn resolve_step(
     resolver: &dyn LeafResolver,
     tctx: &Tctx,
     cause: ReloadCause,
@@ -30,24 +30,21 @@ async fn fold_step(
     let ctx = ResolveCtx {
         key_state: &key_state,
         tmon: &tctx.tmon,
-        requirement: Requirement::Any,
+        requirement: Requirement::ANY,
         cause,
     };
     resolver.resolve(&ctx, staged, locks).await.unwrap()
 }
 
-/// Runs one fold of `resolver` over the leaf state a coordinator round would
-/// hand it, and reports the outcome it classifies. Lets a test drive the
-/// `cause` and node-lock combinations that a live interleaving can only
-/// produce by luck.
-async fn fold(
+/// Classifies a direct-commit outcome for a chosen leaf state and reload cause.
+async fn resolve_outcome(
     resolver: &dyn LeafResolver,
     tctx: &Tctx,
     cause: ReloadCause,
     staged: &BTreeMap<Vec<u8>, LeafEntry>,
     locks: &NodeLocks,
-) -> FoldOutcome {
-    match fold_step(resolver, tctx, cause, staged, locks).await {
+) -> MemberOutcome {
+    match resolve_step(resolver, tctx, cause, staged, locks).await {
         Step::Skip { outcome } | Step::Stage { outcome, .. } => outcome,
     }
 }
@@ -84,7 +81,10 @@ fn put_resolver(
 
 async fn membership_version(tctx: &Tctx) -> u64 {
     tctx.nodes
-        .load_leaf(&test_root_path(), Requirement::AtLeast(tctx.timeline.now()))
+        .load_leaf(
+            &test_root_path(),
+            Requirement::after(tctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap()
         .locks()
@@ -98,7 +98,7 @@ async fn membership_version(tctx: &Tctx) -> u64 {
 // unsupported shape rather than a certified stale read, which is why the
 // locked path takes over instead of replaying the body (ADR-053). It resolves
 // as `Wounded` or `Retry` depending on whether the snapshot survived to the
-// commit fold; both converge on a fresh read.
+// commit resolver evaluation; both converge on a fresh read.
 #[tokio::test]
 async fn single_rw_stale_read_renews_and_converges() {
     let (tm, tctx) = new_algo().await;
@@ -268,7 +268,7 @@ fn leaf_stores(log: &OpLog, path: &str) -> usize {
         .count()
 }
 
-// ADR-028: the logless direct commit is folded by the same leaf coordinator
+// ADR-028: the logless direct commit is coordinated by the same leaf coordinator
 // as ordinary lock acquisition, so a direct commit and a disjoint-key
 // acquire contending one leaf batch into a single CAS round instead of
 // racing two separate loads+CASes. The commit publishes its value and the
@@ -308,7 +308,7 @@ async fn direct_commit_merges_with_disjoint_acquire() {
     let (ca, cb) = (tm.clone(), tctx.locker.clone());
     let data_b = AccessSet::new(Vec::new(), vec![wa(&kbp, b"vb2")], Vec::new());
     let tb = txb.clone();
-    let lock_requirement = Requirement::AtLeast(tctx.timeline.now());
+    let lock_requirement = Requirement::after(tctx.timeline.currentness_barrier());
     let acquire = tokio::spawn(async move {
         cb.keys()
             .lock_at(&tb, &data_b, false, lock_requirement)
@@ -362,7 +362,7 @@ async fn direct_commit_merges_with_disjoint_acquire() {
 
 // ADR-028 regression (batched in-doubt): a direct commit co-batched with a
 // disjoint-key acquire whose shared CAS comes back in-doubt (`Unavailable`)
-// recovers idempotently — the engine reloads and re-folds, the commit finds
+// recovers idempotently — the engine reloads and rebuilds the mutation plan, the commit finds
 // its own marker already published (`Landed`), and the acquire re-installs
 // its own lock (`Locked`) without double-applying. No error is surfaced.
 #[tokio::test(start_paused = true)]
@@ -402,7 +402,7 @@ async fn direct_commit_batched_in_doubt_recovers() {
     });
     let data_b = AccessSet::new(Vec::new(), vec![wa(&kbp, b"vb2")], Vec::new());
     let tb = txb.clone();
-    let lock_requirement = Requirement::AtLeast(tctx.timeline.now());
+    let lock_requirement = Requirement::after(tctx.timeline.currentness_barrier());
     let acquire = tokio::spawn(async move {
         cb.keys()
             .lock_at(&tb, &data_b, false, lock_requirement)
@@ -412,7 +412,7 @@ async fn direct_commit_batched_in_doubt_recovers() {
     rt::sleep(Duration::from_secs(1)).await;
     gate.release();
 
-    // The in-doubt CAS actually landed, so the re-fold sees both members
+    // The in-doubt CAS actually landed, so the next resolver evaluation sees both members
     // applied: the commit classifies itself Landed, the acquire re-locks.
     let (_ha, committed) = commit.await.unwrap();
     let acquire = acquire.await.unwrap().unwrap();
@@ -481,7 +481,7 @@ async fn an_overwrite_over_the_inline_budget_takes_the_locked_path() {
     assert!(e.lock_holders().is_empty());
     let status = tctx
         .tlogger
-        .commit_status_at(&tid, Requirement::Any)
+        .commit_status_at(&tid, Requirement::ANY)
         .await
         .unwrap();
     assert_eq!(status.status, TxCommitStatus::Ok);
@@ -500,7 +500,7 @@ async fn single_rw_observing_a_gate_uses_the_full_locked_path() {
     tctx.tmon.begin_tx(&gate);
     let (mut root, version) = tctx
         .nodes
-        .load_root(&test_collection(), Requirement::Any)
+        .load_root(&test_collection(), Requirement::ANY)
         .await
         .unwrap();
     root.set_structural_gate(gate.clone());
@@ -541,7 +541,7 @@ async fn single_rw_observing_a_gate_uses_the_full_locked_path() {
 }
 
 // ADR-030: a warm single read-write commit reuses the leaf the read cached
-// for both its eligibility check and its lock-install fold (`Any`), so
+// for both its eligibility check and its lock-install attempt (`Any`), so
 // it issues no backend leaf read for either. The successful install CAS
 // supplies the write-back's lower bound too, so write-back also reuses the
 // installed cached state. A revalidating eligibility, install, or write-back
@@ -632,7 +632,10 @@ async fn a_committed_holder_keeps_the_next_writer_on_the_direct_path() {
     // the committed H1 while the pointer lags at its predecessor H0.
     let loaded = tctx
         .nodes
-        .load_leaf(&leaf_path, Requirement::AtLeast(tctx.timeline.now()))
+        .load_leaf(
+            &leaf_path,
+            Requirement::after(tctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     let windowed = LeafBody::from_entries(loaded.entries().entries().cloned().map(|mut e| {
@@ -644,7 +647,7 @@ async fn a_committed_holder_keeps_the_next_writer_on_the_direct_path() {
     }));
     let mut edit = loaded.into_edit();
     edit.set_entries(windowed);
-    assert!(tctx.nodes.commit_leaf(edit).await.unwrap());
+    assert!(tctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 
     // The window is observably at the committed holder H1 (v2), not the
     // lagging pointer H0: the shared resolver already help-forwards it.
@@ -735,7 +738,10 @@ async fn direct_commit_replaces_a_committed_holder() {
     // H1 while the current state lags at its predecessor H0.
     let loaded = tctx
         .nodes
-        .load_leaf(&leaf_path, Requirement::AtLeast(tctx.timeline.now()))
+        .load_leaf(
+            &leaf_path,
+            Requirement::after(tctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     let windowed = LeafBody::from_entries(loaded.entries().entries().cloned().map(|mut e| {
@@ -747,7 +753,7 @@ async fn direct_commit_replaces_a_committed_holder() {
     }));
     let mut edit = loaded.into_edit();
     edit.set_entries(windowed);
-    assert!(tctx.nodes.commit_leaf(edit).await.unwrap());
+    assert!(tctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 
     let mut h = begin_accesses(
         &tm,
@@ -775,7 +781,7 @@ async fn direct_commit_replaces_a_committed_holder() {
     assert_eq!(&*value.value, b"v3");
 }
 
-// ADR-051 regression: every reason a fold declines to publish the commit
+// ADR-051 regression: every reason a resolver declines to publish the commit
 // marker must be classified against the round's in-doubt evidence, not just
 // the lost-race one. A structural gate or a collection-delete fence that
 // appears *after* an uncertain CAS is no proof that the CAS did not land, so
@@ -804,13 +810,13 @@ async fn direct_commit_blocked_after_uncertain_cas_stays_in_doubt() {
 
     for (what, locks) in [("a structural gate", &gated), ("a delete fence", &fenced)] {
         // Nothing was written yet, so the logged path may take over.
-        let outcome = fold(&resolver, &tctx, ReloadCause::Fresh, &staged, locks).await;
+        let outcome = resolve_outcome(&resolver, &tctx, ReloadCause::Fresh, &staged, locks).await;
         assert!(
-            matches!(outcome, FoldOutcome::Moved),
-            "{what} on a fresh fold proves nothing was written, got {outcome:?}"
+            matches!(outcome, MemberOutcome::Moved),
+            "{what} on a first evaluation proves nothing was written, got {outcome:?}"
         );
 
-        let outcome = fold(
+        let outcome = resolve_outcome(
             &resolver,
             &tctx,
             ReloadCause::Reloaded { in_doubt: true },
@@ -819,7 +825,7 @@ async fn direct_commit_blocked_after_uncertain_cas_stays_in_doubt() {
         )
         .await;
         assert!(
-            matches!(outcome, FoldOutcome::InDoubt(_)),
+            matches!(outcome, MemberOutcome::InDoubt(_)),
             "{what} cannot disprove a landed uncertain CAS, got {outcome:?}"
         );
     }
@@ -840,8 +846,9 @@ async fn direct_membership_change_neither_waits_for_nor_wounds_a_live_holder() {
     let mut locks = NodeLocks::default();
     locks.set_membership_writer(holder.clone());
 
-    let outcome = fold(&direct, &tctx, ReloadCause::Fresh, &BTreeMap::new(), &locks).await;
-    assert!(matches!(outcome, FoldOutcome::Moved));
+    let outcome =
+        resolve_outcome(&direct, &tctx, ReloadCause::Fresh, &BTreeMap::new(), &locks).await;
+    assert!(matches!(outcome, MemberOutcome::Moved));
     assert_eq!(
         tctx.tmon.tx_status(&holder).await.unwrap(),
         TxCommitStatus::Pending,
@@ -863,15 +870,15 @@ async fn direct_commit_replays_an_absence_read_from_an_older_generation() {
     locks.advance_membership_version();
 
     assert!(matches!(
-        fold_step(&direct, &tctx, ReloadCause::Fresh, &BTreeMap::new(), &locks,).await,
+        resolve_step(&direct, &tctx, ReloadCause::Fresh, &BTreeMap::new(), &locks,).await,
         Step::Skip {
-            outcome: FoldOutcome::Replay
+            outcome: MemberOutcome::Replay
         }
     ));
 }
 
 // ADR-051 regression (fuzz `history` crash-3ddc66ba): a blind put is
-// last-writer-wins on a fresh fold, but after its own uncertain CAS the entry
+// last-writer-wins on a first evaluation, but after its own uncertain CAS the entry
 // may already hold a commit that read the very value that CAS published.
 // Republishing then rolls the key back behind a commit whose writer was told it
 // succeeded, losing that update. Only an entry still naming the writer the
@@ -893,12 +900,12 @@ async fn a_blind_put_after_an_uncertain_cas_never_republishes_over_a_newer_write
     );
     let staged = BTreeMap::from([(b"k".to_vec(), seed)]);
 
-    // The fresh fold publishes over the seeded writer; its CAS is the one that
+    // The first evaluation proposes publication over the seeded writer. Its CAS
     // comes back uncertain.
     assert!(matches!(
-        fold_step(&blind, &tctx, ReloadCause::Fresh, &staged, &locks).await,
+        resolve_step(&blind, &tctx, ReloadCause::Fresh, &staged, &locks).await,
         Step::Stage {
-            outcome: FoldOutcome::Landed,
+            outcome: MemberOutcome::Landed,
             ..
         }
     ));
@@ -906,7 +913,7 @@ async fn a_blind_put_after_an_uncertain_cas_never_republishes_over_a_newer_write
     // The entry still names that writer, so the uncertain CAS provably did not
     // land and the publication is retried rather than surfaced as in-doubt.
     assert!(matches!(
-        fold_step(
+        resolve_step(
             &blind,
             &tctx,
             ReloadCause::Reloaded { in_doubt: true },
@@ -915,7 +922,7 @@ async fn a_blind_put_after_an_uncertain_cas_never_republishes_over_a_newer_write
         )
         .await,
         Step::Stage {
-            outcome: FoldOutcome::Landed,
+            outcome: MemberOutcome::Landed,
             ..
         }
     ));
@@ -927,7 +934,7 @@ async fn a_blind_put_after_an_uncertain_cas_never_republishes_over_a_newer_write
             value: Arc::from(b"v3".as_slice()),
         }),
     )]);
-    let outcome = fold(
+    let outcome = resolve_outcome(
         &blind,
         &tctx,
         ReloadCause::Reloaded { in_doubt: true },
@@ -936,7 +943,7 @@ async fn a_blind_put_after_an_uncertain_cas_never_republishes_over_a_newer_write
     )
     .await;
     assert!(
-        matches!(outcome, FoldOutcome::InDoubt(_)),
+        matches!(outcome, MemberOutcome::InDoubt(_)),
         "a newer writer cannot disprove a landed uncertain CAS, got {outcome:?}"
     );
 }
@@ -973,7 +980,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
         ),
     ]);
     assert!(matches!(
-        fold_step(
+        resolve_step(
             &resolver,
             &tctx,
             ReloadCause::Fresh,
@@ -998,7 +1005,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
         ),
     ]);
     assert!(matches!(
-        fold_step(
+        resolve_step(
             &resolver,
             &tctx,
             ReloadCause::Reloaded { in_doubt: true },
@@ -1007,7 +1014,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
         )
         .await,
         Step::Skip {
-            outcome: FoldOutcome::Landed
+            outcome: MemberOutcome::Landed
         }
     ));
     assert!(resolver.proven_landed());
@@ -1032,7 +1039,7 @@ async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
     );
     let empty = BTreeMap::new();
     assert!(matches!(
-        fold_step(
+        resolve_step(
             &resolver,
             &tctx,
             ReloadCause::Fresh,
@@ -1043,7 +1050,7 @@ async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
         Step::Stage { .. }
     ));
     assert!(matches!(
-        fold_step(
+        resolve_step(
             &resolver,
             &tctx,
             ReloadCause::Reloaded { in_doubt: true },
@@ -1052,7 +1059,7 @@ async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
         )
         .await,
         Step::Skip {
-            outcome: FoldOutcome::InDoubt(_)
+            outcome: MemberOutcome::InDoubt(_)
         }
     ));
 }
@@ -1082,7 +1089,7 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
         }),
     )]);
     assert!(matches!(
-        fold_step(
+        resolve_step(
             &resolver,
             &tctx,
             ReloadCause::Fresh,
@@ -1093,7 +1100,7 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
         Step::Stage { .. }
     ));
     assert!(matches!(
-        fold_step(
+        resolve_step(
             &resolver,
             &tctx,
             ReloadCause::Reloaded { in_doubt: true },
@@ -1102,14 +1109,14 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
         )
         .await,
         Step::Stage {
-            outcome: FoldOutcome::Landed,
+            outcome: MemberOutcome::Landed,
             ..
         }
     ));
 }
 
 // ADR-053: only a *superseded read* certifies the body-replay case, and an
-// uncertain CAS still outranks it. Every other way a fold declines is either
+// uncertain CAS still outranks it. Every other way a resolver declines is either
 // state the direct path cannot arbitrate or evidence that proves nothing, so
 // it reports `Moved` and the locked protocol takes over. Classifying too
 // broadly would spin the body forever against a holder or a closed budget.
@@ -1137,12 +1144,12 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     // definitive, so the body is reevaluated against the winner.
     let stale = direct(Some(TxId::with_priority(1, b"stale")));
     let staged = BTreeMap::from([(b"k".to_vec(), seed.clone())]);
-    let outcome = fold(&stale, &tctx, ReloadCause::Fresh, &staged, &locks).await;
+    let outcome = resolve_outcome(&stale, &tctx, ReloadCause::Fresh, &staged, &locks).await;
     assert!(
-        matches!(outcome, FoldOutcome::Replay),
+        matches!(outcome, MemberOutcome::Replay),
         "a superseded read staged nothing and can be reevaluated, got {outcome:?}"
     );
-    let outcome = fold(
+    let outcome = resolve_outcome(
         &stale,
         &tctx,
         ReloadCause::Reloaded { in_doubt: true },
@@ -1151,7 +1158,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     )
     .await;
     assert!(
-        matches!(outcome, FoldOutcome::InDoubt(_)),
+        matches!(outcome, MemberOutcome::InDoubt(_)),
         "an uncertain CAS is never downgraded to a replay, got {outcome:?}"
     );
 
@@ -1161,7 +1168,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     tctx.tmon.begin_tx(&holder);
     let mut held = seed.clone();
     held.replace_write_lock(holder);
-    let outcome = fold(
+    let outcome = resolve_outcome(
         &direct(Some(current.clone())),
         &tctx,
         ReloadCause::Fresh,
@@ -1170,7 +1177,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     )
     .await;
     assert!(
-        matches!(outcome, FoldOutcome::Moved),
+        matches!(outcome, MemberOutcome::Moved),
         "a live holder needs the locked protocol, not a replay, got {outcome:?}"
     );
 
@@ -1180,7 +1187,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     let buried = seed.clone().with_current(CurrentState::Tombstone {
         writer: deleter.clone(),
     });
-    let outcome = fold(
+    let outcome = resolve_outcome(
         &direct(Some(deleter)),
         &tctx,
         ReloadCause::Fresh,
@@ -1189,7 +1196,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     )
     .await;
     assert!(
-        matches!(outcome, FoldOutcome::Landed),
+        matches!(outcome, MemberOutcome::Landed),
         "a put over a tombstone is a direct create, got {outcome:?}"
     );
 
@@ -1213,14 +1220,14 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
         ),
     ]);
     assert!(matches!(
-        fold_step(&budgeted, &tctx, ReloadCause::Fresh, &crowded, &locks).await,
+        resolve_step(&budgeted, &tctx, ReloadCause::Fresh, &crowded, &locks).await,
         Step::Skip {
-            outcome: FoldOutcome::Moved
+            outcome: MemberOutcome::Moved
         }
     ));
     assert_eq!(split_hints.pending_inline_pressure(), 1);
     assert!(matches!(
-        fold_step(
+        resolve_step(
             &budgeted,
             &tctx,
             ReloadCause::Reloaded { in_doubt: true },
@@ -1229,7 +1236,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
         )
         .await,
         Step::Skip {
-            outcome: FoldOutcome::InDoubt(_)
+            outcome: MemberOutcome::InDoubt(_)
         }
     ));
     assert_eq!(
@@ -1244,9 +1251,9 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
         max_leaf_bytes: 1,
     };
     assert!(matches!(
-        fold_step(&impossible, &tctx, ReloadCause::Fresh, &crowded, &locks).await,
+        resolve_step(&impossible, &tctx, ReloadCause::Fresh, &crowded, &locks).await,
         Step::Skip {
-            outcome: FoldOutcome::Moved
+            outcome: MemberOutcome::Moved
         }
     ));
     assert_eq!(
@@ -1256,21 +1263,21 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     );
 
     // The round-level classifications: a same-key claim proves this member
-    // folded nothing, while a spent CAS budget proves nothing about an
+    // staged nothing, while a spent CAS budget proves nothing about an
     // earlier attempt of the same round. And a blind overwrite has no
     // read-dependent computation to reevaluate.
     let rmw = direct(Some(current));
-    assert!(matches!(rmw.excluded_outcome(false), FoldOutcome::Replay));
+    assert!(matches!(rmw.excluded_outcome(false), MemberOutcome::Replay));
     assert!(matches!(
         rmw.excluded_outcome(true),
-        FoldOutcome::InDoubt(_)
+        MemberOutcome::InDoubt(_)
     ));
     assert!(
-        matches!(rmw.exhausted_outcome(false), FoldOutcome::Moved),
+        matches!(rmw.exhausted_outcome(false), MemberOutcome::Moved),
         "an exhausted budget does not certify a replay"
     );
     assert!(
-        matches!(direct(None).excluded_outcome(false), FoldOutcome::Moved),
+        matches!(direct(None).excluded_outcome(false), MemberOutcome::Moved),
         "a blind overwrite takes the locked protocol instead of replaying"
     );
 }
@@ -1301,7 +1308,7 @@ async fn direct_commit_superseded_read_replays_in_place() {
     tm.end(&mut h).await.unwrap();
     let status = tctx
         .tlogger
-        .commit_status_at(h.id(), Requirement::Any)
+        .commit_status_at(h.id(), Requirement::ANY)
         .await
         .unwrap();
     assert_eq!(
@@ -1366,14 +1373,14 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
 
     // A disjoint-key acquire drives the round and parks in the gated load, so
     // both direct commits queue into one still-open batch. Their own first
-    // fold attempt is cache-served (`Any`, ADR-030), so without a driver they
+    // mutation attempt is cache-served (`Any`, ADR-030), so without a driver they
     // would each win a solo round and never contend.
     gate.arm();
     let driver = TxId::with_priority(1, b"driver");
     tctx.tmon.begin_tx(&driver);
     let locker = tctx.locker.clone();
     let data_b = AccessSet::new(Vec::new(), vec![wa(&kbp, b"vb2")], Vec::new());
-    let requirement = Requirement::AtLeast(tctx.timeline.now());
+    let requirement = Requirement::after(tctx.timeline.currentness_barrier());
     let acquire = tokio::spawn(async move {
         locker
             .keys()
@@ -1429,7 +1436,7 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
     tm.end(&mut replayed).await.unwrap();
     let status = tctx
         .tlogger
-        .commit_status_at(replayed.id(), Requirement::Any)
+        .commit_status_at(replayed.id(), Requirement::ANY)
         .await
         .unwrap();
     assert_eq!(
@@ -1678,7 +1685,7 @@ async fn cross_key_aggregate_rejection_does_not_hint() {
     )]);
 
     assert!(matches!(
-        fold_step(
+        resolve_step(
             &resolver,
             &tctx,
             ReloadCause::Fresh,
@@ -1687,7 +1694,7 @@ async fn cross_key_aggregate_rejection_does_not_hint() {
         )
         .await,
         Step::Skip {
-            outcome: FoldOutcome::Moved
+            outcome: MemberOutcome::Moved
         }
     ));
     assert_eq!(tm.direct_commit.split_hints.pending_inline_pressure(), 0);
@@ -1802,7 +1809,10 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     );
     let root = tctx
         .nodes
-        .load_leaf(&test_root_path(), Requirement::AtLeast(tctx.timeline.now()))
+        .load_leaf(
+            &test_root_path(),
+            Requirement::after(tctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     assert!(
@@ -1820,8 +1830,8 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     // CAS is paused, as a splitter on another process could.
     let (_peer, peer) = new_algo_from_backend(mem.clone()).await;
 
-    // Park the candidate's L0 CAS after it has grouped and folded there. Moving
-    // z to L1 now deterministically makes that first CAS stale.
+    // Park the candidate's L0 CAS after it has grouped its keys and planned the
+    // mutation there. Moving z to L1 now makes that first CAS stale.
     gate.arm();
     let direct = tm.direct_commit.clone();
     let direct_id = TxId::with_priority(3, b"direct");
@@ -1845,7 +1855,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     );
     let (_, observed_l0) = peer
         .nodes
-        .load_node(&test_collection(), &l0, Requirement::Any)
+        .load_node(&test_collection(), &l0, Requirement::ANY)
         .await
         .unwrap();
     let bounded_l0 = seeded_l0()
@@ -1873,7 +1883,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     );
     let (_, observed_l1) = peer
         .nodes
-        .load_node(&test_collection(), &l1, Requirement::Any)
+        .load_node(&test_collection(), &l1, Requirement::ANY)
         .await
         .unwrap();
     let bounded_l1 = Node::leaf(LeafBody::new())
@@ -2006,9 +2016,9 @@ async fn an_absence_read_uses_locked_cleanup_for_a_finalized_membership_writer()
         Some(ReadPredicate::new(None, Some(locks.membership_version())));
     assert!(
         matches!(
-            fold_step(&direct, &tctx, ReloadCause::Fresh, &BTreeMap::new(), &locks).await,
+            resolve_step(&direct, &tctx, ReloadCause::Fresh, &BTreeMap::new(), &locks).await,
             Step::Skip {
-                outcome: FoldOutcome::Moved
+                outcome: MemberOutcome::Moved
             }
         ),
         "the locked path must persist cleanup; replay alone sees the same generation"

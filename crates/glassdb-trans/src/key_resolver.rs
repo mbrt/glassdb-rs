@@ -93,7 +93,7 @@ impl KeyResolver {
             overlay,
             own_lock_holder,
             cap,
-            Requirement::Any,
+            Requirement::ANY,
         )
         .await
     }
@@ -323,7 +323,7 @@ impl KeyResolver {
                     .collect::<Vec<_>>();
                 let groups = self
                     .router
-                    .route_keys_with_requirements(items, Requirement::Any, requirement)
+                    .route_keys_with_requirements(items, Requirement::ANY, requirement)
                     .await?;
 
                 let group_results = map_all_bounded(groups, self.parallelism, |group| async move {
@@ -417,7 +417,7 @@ impl KeyResolver {
     /// An absent key resolves to no writer.
     ///
     /// `requirement` is forwarded to the descent: same-leaf direct commit passes
-    /// [`Requirement::Any`] so its eligibility check reuses a leaf already
+    /// [`Requirement::ANY`] so its eligibility check reuses a leaf already
     /// cached by the transaction, without a revalidation round-trip; a stale
     /// copy is caught by the publication's version-conditional CAS (ADR-030).
     pub(crate) async fn resolve_key(
@@ -458,7 +458,7 @@ impl KeyResolver {
         // is not revalidated on every commit.
         let loc = self
             .router
-            .route_key_with_requirements(key.collection(), key.key(), Requirement::Any, requirement)
+            .route_key_with_requirements(key.collection(), key.key(), Requirement::ANY, requirement)
             .await
             .map_err(|error| error.classify_collection_absence(key.collection()))?;
         if let Some(node) = loc.node() {
@@ -593,7 +593,7 @@ mod tests {
 
     async fn effective_writer(resolver: &KeyResolver, key: &LogicalKey) -> Option<TxId> {
         resolver
-            .resolve_key(key, Requirement::Any)
+            .resolve_key(key, Requirement::ANY)
             .await
             .unwrap()
             .0
@@ -606,7 +606,10 @@ mod tests {
     async fn seed_writer(store: &TestStore, key: &[u8], writer: &TxId, deleted: bool) {
         let path = root_path();
         let loaded = store
-            .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
+            .load_leaf(
+                &path,
+                Requirement::after(store.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         let mut entries: BTreeMap<Vec<u8>, LeafEntry> = loaded
@@ -628,7 +631,7 @@ mod tests {
         let new_leaf = LeafBody::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
         edit.set_entries(new_leaf);
-        assert!(store.commit_leaf(edit).await.unwrap());
+        assert!(store.commit_leaf(edit).await.unwrap().is_applied());
     }
 
     // Installs an inline committed value for `key` directly in the leaf (no lock
@@ -649,7 +652,10 @@ mod tests {
     // current value the entry already records.
     async fn seed_hold(store: &TestStore, key: &[u8], holder: &TxId) {
         let existing = store
-            .load_leaf(&root_path(), Requirement::AtLeast(store.timeline.now()))
+            .load_leaf(
+                &root_path(),
+                Requirement::after(store.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         let mut entry = existing.entries().lookup(key).cloned().unwrap();
@@ -661,7 +667,10 @@ mod tests {
     async fn seed_entry(store: &TestStore, key: &[u8], entry: LeafEntry) {
         let path = root_path();
         let loaded = store
-            .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
+            .load_leaf(
+                &path,
+                Requirement::after(store.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         let mut entries: BTreeMap<Vec<u8>, LeafEntry> = loaded
@@ -674,7 +683,7 @@ mod tests {
         let new_leaf = LeafBody::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
         edit.set_entries(new_leaf);
-        assert!(store.commit_leaf(edit).await.unwrap());
+        assert!(store.commit_leaf(edit).await.unwrap().is_applied());
     }
 
     // Commits `writer`'s value for `key` through the monitor (a tombstone when
@@ -699,7 +708,10 @@ mod tests {
     async fn seed_locked(store: &TestStore, key: &[u8], holder: &TxId) {
         let path = root_path();
         let loaded = store
-            .load_leaf(&path, Requirement::AtLeast(store.timeline.now()))
+            .load_leaf(
+                &path,
+                Requirement::after(store.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         let mut entries: BTreeMap<Vec<u8>, LeafEntry> = loaded
@@ -714,7 +726,7 @@ mod tests {
         let new_leaf = LeafBody::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
         edit.set_entries(new_leaf);
-        assert!(store.commit_leaf(edit).await.unwrap());
+        assert!(store.commit_leaf(edit).await.unwrap().is_applied());
     }
 
     fn count_tx_reads(log: &OpLog) -> usize {
@@ -745,7 +757,7 @@ mod tests {
         let range = ScanRange::all();
 
         assert!(matches!(
-            resolver.resolve_key(&key, Requirement::Any).await,
+            resolver.resolve_key(&key, Requirement::ANY).await,
             Err(TransError::Storage(StorageError::StaleCollection))
         ));
         assert!(matches!(
@@ -756,13 +768,17 @@ mod tests {
         ));
         assert!(matches!(
             resolver
-                .scan_coverage(&collection, &range, None, None, Requirement::Any)
+                .scan_coverage(&collection, &range, None, None, Requirement::ANY)
                 .await,
             Err(StorageError::StaleCollection)
         ));
         assert!(matches!(
             resolver
-                .effective_point_states(&[key], None, Requirement::AtLeast(timeline.now()),)
+                .effective_point_states(
+                    &[key],
+                    None,
+                    Requirement::after(timeline.currentness_barrier()),
+                )
                 .await,
             Err(StorageError::StaleCollection)
         ));
@@ -796,7 +812,7 @@ mod tests {
             .effective_point_states(
                 &[pa.clone(), pb.clone(), pc.clone()],
                 None,
-                Requirement::AtLeast(timeline.now()),
+                Requirement::after(timeline.currentness_barrier()),
             )
             .await
             .unwrap();
@@ -820,7 +836,7 @@ mod tests {
         let (resolver, monitor, timeline, _background) = resolver_over(backend).await;
         commit_value(&monitor, key, &holder, false).await;
         let key = logical_key(key);
-        let requirement = Requirement::AtLeast(timeline.now());
+        let requirement = Requirement::after(timeline.currentness_barrier());
 
         let foreign = resolver
             .effective_point_states(std::slice::from_ref(&key), None, requirement)
@@ -856,14 +872,14 @@ mod tests {
 
         // Warm the resolver's own cache with one cold load.
         resolver
-            .resolve_key(&key_path, Requirement::Any)
+            .resolve_key(&key_path, Requirement::ANY)
             .await
             .unwrap();
         log.lock().unwrap().clear();
 
         // `Any` serves the cached leaf: no backend read at all.
         let (resolved, _) = resolver
-            .resolve_key(&key_path, Requirement::Any)
+            .resolve_key(&key_path, Requirement::ANY)
             .await
             .unwrap();
         assert_eq!(resolved.writer, Some(writer.clone()), "still resolves");
@@ -876,7 +892,10 @@ mod tests {
         // A current bound revalidates the cached leaf with one conditional read.
         log.lock().unwrap().clear();
         resolver
-            .resolve_key(&key_path, Requirement::AtLeast(timeline.now()))
+            .resolve_key(
+                &key_path,
+                Requirement::after(timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(

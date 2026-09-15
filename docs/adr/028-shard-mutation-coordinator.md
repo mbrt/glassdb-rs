@@ -1,4 +1,4 @@
-# ADR-028: Unified shard-mutation coordinator (installed resolvers, monotonic fold)
+# ADR-028: Unified shard-mutation coordinator (installed resolvers, ordered mutation planning)
 
 ## Status
 
@@ -6,20 +6,20 @@ Accepted (implemented).
 
 The current responsibility boundary is described in
 [`architecture.md`](../architecture.md#component-responsibilities): the
-implemented coordinator is a transaction-aware shared fold engine, not a
+implemented coordinator is a transaction-aware shared mutation engine, not a
 policy-ignorant mechanism. The single-coordinator invariant and resolver
 correctness contracts are unchanged.
 
 The one documented exception to the invariant below — GC's out-of-band
 mark-sweep CAS — is closed by
 [ADR-029](029-gc-through-shard-coordinator.md), which routes GC's lock
-reclamation through this coordinator and makes vestigial-entry pruning a fold
-property, so the invariant holds with no exceptions.
+reclamation through this coordinator and makes vestigial-entry pruning a coordinator
+guarantee, so the invariant holds with no exceptions.
 
 Routing the single read-write install through the coordinator made it load the
 shard a second time (the fast path's eligibility pre-check already loaded it).
 [ADR-030](030-seed-shard-loads.md) restores the single-load commit by letting a
-round reuse the shard the transaction already cached for its first fold attempt.
+round reuse the shard the transaction already cached for its first mutation attempt.
 
 [ADR-051](051-inline-latest-values.md) extends the installed policy with a
 commit-critical direct inline publish. The coordinator invariant remains;
@@ -87,8 +87,8 @@ bypasses and a boundary that does not correspond to the two concerns.
 Introduce a **ShardCoordinator**: a single per-object *mechanism* over which
 callers *install resolvers* that encode policy. Every shard/root entry mutation —
 acquire, commit-install, write-back, release — flows through one coordinator
-instance and is resolved by folding the installed resolvers over the loaded
-object.
+instance and is resolved by evaluating the installed resolvers against the staged
+object state to build a mutation plan.
 
 ### The invariant
 
@@ -100,23 +100,26 @@ acquire, write-back, and release for a shard all land in one single-flight
 keyspace, so they are serialized and batched instead of competing on the object's
 version.
 
-### Mechanism: single-flight, monotonic fold, CAS retry
+### Mechanism: single-flight, ordered mutation planning, CAS retry
 
 The coordinator, keyed on the object path, drives one round as:
 
 1. **Single-flight.** At most one round runs per object; concurrent submissions
    join the in-flight round or wait for the next one. (This is the existing
    `Dedup` primitive, unchanged.)
-2. **Load once.** Read the object a single time for the whole round.
-3. **Fold.** Apply the round's installed resolvers, in a **policy-defined order**,
-   over a running staged entry map, *threading the entry*: resolver N observes the
-   entries as staged by resolvers 1..N.
-4. **Commit the round.** One CAS. A precondition miss or in-doubt
-   ([ADR-009](009-in-doubt-conditional-writes.md)) reloads and re-folds within a
-   bounded budget. Deposit each member's outcome, then deliver.
+2. **Load once per attempt.** Read the object once for all members in the attempt.
+3. **Build a mutation plan.** Evaluate the round's installed resolvers, in a
+   **policy-defined order**, over a running staged entry map, *threading the
+   entry*: resolver N observes the entries as staged by resolvers 1..N.
+4. **Persist the mutation plan.** One CAS for the staged changes. A precondition
+   miss or in-doubt
+   ([ADR-009](009-in-doubt-conditional-writes.md)) reloads and rebuilds the
+   mutation plan within a bounded budget. Deposit each member's outcome, then
+   deliver.
 
 The mechanism is **ignorant of locks, transaction ids, wound-wait, and commit**.
-It folds opaque resolvers, threads entries, CASes, and retries. Nothing more.
+It evaluates opaque resolvers, passes staged entries to later members, CASes,
+and retries. Nothing more.
 
 ### Policy: installed resolvers
 
@@ -134,41 +137,45 @@ the `Monitor` for wound-wait decisions and help-forwarding — and it emits its 
 `Landed`, `Moved`, `InDoubt`, `Released`).
 
 Conflict admission — ADR-025's merge predicate — **dissolves**. Every operation
-joins the round; conflicts resolve *in the fold*: the loser's resolver observes
-the winner's staged lock and returns `Wait`. "Merge" becomes "both resolvers
-stage"; "queue behind a conflict" becomes "the loser stages nothing and
-re-submits." Reorderability survives only as a scheduling hint (a read-only or
-release request may join any round rather than block behind an unrelated writer).
+joins the round; conflicts resolve *during mutation planning*: the loser's
+resolver observes the winner's staged lock and returns `Wait`. "Merge" becomes
+"both resolvers stage"; "queue behind a conflict" becomes "the loser stages
+nothing and re-submits." Reorderability survives only as a scheduling hint (a
+read-only or release request may join any round rather than block behind an
+unrelated writer).
 
 ### Contracts
 
 These are the load-bearing guarantees the split rests on. They are the ADR's real
 content; the rest is relocation of proven code.
 
-1. **Monotonic fold order (policy-supplied).** The fold visits members in
-   wound-wait order — **oldest-first** — so that once a member has staged or been
-   decided, no later resolver can invalidate it. Folding out of order would let an
-   older resolver need to *wound* an already-staged younger member and rewrite its
-   already-emitted outcome — backtracking the fold. Wound-wait supplies this order
-   for free: nobody younger may wound the older who staged first. The equal-priority
+1. **Member evaluation order (policy-supplied).** Mutation planning visits
+   members in wound-wait order — **oldest-first** — so that once a member has
+   staged or been decided, no later resolver can invalidate it. Evaluating
+   members out of order would let an older resolver need to *wound* an
+   already-staged younger member and rewrite its already-emitted outcome —
+   backtracking through the mutation plan. Wound-wait supplies this order for
+   free: nobody younger may wound the older who staged first. The equal-priority
    tiebreak used for ordering is **round-local only** and must let one contender
    make progress each round; it is never a *persistent* winner (a persistent
-   prefix tiebreak flips under `renew` and livelocks — the `should_wound` rule of
-   ADR-024).
+   prefix tiebreak flips under `renew` and livelocks — the `should_wound` rule
+   of ADR-024).
 
-2. **Member atomicity (member-major fold).** A resolver resolves its whole key set
-   atomically: it stages **all** of its keys or **none** (it returns `Wait`/`Moved`
-   without staging). Sequencing across conflicting members emerges because a later
-   member observes an earlier member's staged entries — with no key-major
-   transpose and no per-member rollback. This preserves the multi-key
-   lock-acquisition atomicity the current member-wise resolution already has.
+2. **Member atomicity (complete-member evaluation and admission).** A resolver
+   resolves its whole key set atomically: it stages **all** of its keys or
+   **none** (it returns `Wait`/`Moved` without staging). Sequencing across
+   conflicting members emerges because a later member observes an earlier
+   member's staged entries — with no key-major transpose and no per-member
+   rollback. This preserves the multi-key lock-acquisition atomicity the current
+   member-wise resolution already has.
 
 3. **Idempotent, cancel-safe resolvers.** The engine drops and re-drives rounds
-   (the `Dedup` cancel contract) and re-folds on every reload, so a resolver
-   re-run whose effect is already present must be a no-op: re-installing one's own
-   lock is idempotent, and a write-back publishes only its own monotonic pointer.
-   This is precisely what makes precondition/in-doubt recovery *free* — the same
-   resolver runs on the first attempt and on every reload.
+   (the `Dedup` cancel contract) and rebuilds the mutation plan on every reload,
+   so a resolver re-run whose effect is already present must be a no-op:
+   re-installing one's own lock is idempotent, and a write-back publishes only
+   its own monotonic pointer. This is precisely what makes precondition/in-doubt
+   recovery *free* — the same resolver runs on the first attempt and on every
+   reload.
 
 4. **Per-member outcome side-channel.** `Dedup` fans out one shared result, but
    members have heterogeneous outcomes. Each member's outcome is deposited into its
@@ -190,10 +197,10 @@ content; the rest is relocation of proven code.
 
 ### Where responsibilities land
 
-- **ShardCoordinator** (mechanism + fold): owns the `Dedup`, the shard store, the
-  shared `Resolver`, the `Monitor` handle, the retry budget, the diagnostic
-  snapshot, and shutdown. It exposes submit-and-await entry points per operation
-  kind and knows nothing of transaction strategy.
+- **ShardCoordinator** (mechanism + mutation planning): owns the `Dedup`, the
+  shard store, the shared `Resolver`, the `Monitor` handle, the retry budget,
+  the diagnostic snapshot, and shutdown. It exposes submit-and-await entry
+  points per operation kind and knows nothing of transaction strategy.
 - **Locker** (policy): grouping keys by shard, the parallel-vs-serial strategy
   *across* shards, the hold-and-wait loop (`Wait` → poll the holder → re-submit),
   the collection-root membership step, and per-transaction lock bookkeeping and
@@ -207,20 +214,21 @@ content; the rest is relocation of proven code.
 ### Correctness
 
 - **Serializability is preserved.** The set of decisions — wound-wait priority,
-  help-forwarding a committed holder, hold-and-wait, membership locking, in-doubt
-  recovery — is identical; only their location moves into resolvers. One round is a
-  **deterministic linearization** of that round's mutations to one object, made
-  atomic by the single CAS. Because the fold is monotonic (contract 1) and members
-  are atomic (contract 2), the linearization is exactly a valid interleaving of the
-  same operations the un-batched path would have applied across separate CASes.
+  help-forwarding a committed holder, hold-and-wait, membership locking,
+  in-doubt recovery — is identical; only their location moves into resolvers.
+  One round is a **deterministic linearization** of that round's mutations to
+  one object, made atomic by the single CAS. Because member order prevents
+  backtracking (contract 1) and members are atomic (contract 2), the
+  linearization is exactly a valid interleaving of the same operations the
+  un-batched path would have applied across separate CASes.
 - **The within-shard equal-priority livelock is removed.** Single-flight plus a
-  deterministic per-round fold winner means there is no racing CAS on a shard: one
-  contender stages and makes progress each round, then releases, so equals no
-  longer need the serial fallback *for a single object*. The serial fallback of
-  ADR-024 is **retained** for **cross-shard** deadlock — the fold serializes one
-  object, it says nothing about lock ordering *across* objects, so `Algo`'s
-  deadlock timeout and serial re-acquire still bound a wait-for cycle spanning
-  shards.
+  deterministic first member in each mutation plan means there is no racing CAS
+  on a shard: one contender stages and makes progress each round, then releases,
+  so equals no longer need the serial fallback *for a single object*. The serial
+  fallback of ADR-024 is **retained** for **cross-shard** deadlock — mutation
+  planning serializes one object, it says nothing about lock ordering *across*
+  objects, so `Algo`'s deadlock timeout and serial re-acquire still bound a
+  wait-for cycle spanning shards.
 - **ADR-027's fast-path correctness is preserved.** CommitInstall participates in
   wound-wait (it holds a lock during the pre-commit window), records the same
   back-references for GC ([ADR-022](022-garbage-collection-mark-sweep.md)),
@@ -233,13 +241,14 @@ content; the rest is relocation of proven code.
 
 ### Determinism (DST)
 
-The backend op stream changes **shape** — fewer rounds, priority-ordered folds,
-and the fast-path install now interleaved with other shard operations rather than
-a standalone CAS — but stays deterministic under the simulation executor via the
-`Clock` / `Background` seam ([ADR-008](008-deterministic-simulation-fuzzer.md) /
+The backend op stream changes **shape** — fewer rounds, priority-ordered
+mutation plans, and the fast-path install now interleaved with other shard
+operations rather than a standalone CAS — but stays deterministic under the
+simulation executor via the `Clock` / `Background` seam
+([ADR-008](008-deterministic-simulation-fuzzer.md) /
 [ADR-013](013-deterministic-scheduling-test-coverage.md)). The run-to-run
-op-stream self-check and the serializability / cycle oracles remain the safety net,
-and the minimized fuzz corpus is regenerated against the new shape.
+op-stream self-check and the serializability / cycle oracles remain the safety
+net, and the minimized fuzz corpus is regenerated against the new shape.
 
 ## Consequences
 
@@ -247,20 +256,20 @@ and the minimized fuzz corpus is regenerated against the new shape.
   write-backs, and releases on its shard, extending ADR-025/026's win to the last
   path that bypassed it. The invariant "all shard-entry mutations flow through one
   coordinator" becomes a checkable property rather than an aspiration.
-- **Policy and mechanism separate cleanly.** The engine folds opaque resolvers;
-  all lock/transaction semantics live in resolvers. Two pieces of machinery
-  disappear as *special cases* of the fold: ADR-025's merge predicate (subsumed by
-  fold order) and ADR-027's bespoke reclassify loop (subsumed by the resolver's
-  reload branch).
+- **Policy and mechanism separate cleanly.** The engine evaluates opaque
+  resolvers; all lock/transaction semantics live in resolvers. Two pieces of
+  machinery disappear as *special cases* of mutation planning: ADR-025's merge
+  predicate (subsumed by member order) and ADR-027's bespoke reclassify loop
+  (subsumed by the resolver's reload branch).
 - The **cost** is that resolvers are asynchronous and consult the `Monitor`
-  mid-round, so the `Dedup` cancel-safety contract propagates outward into policy,
-  and implementers must uphold three contracts the un-split code enforced
-  implicitly: the monotonic fold order, member-major atomic staging, and
-  idempotent re-fold. These are the places a defect would corrupt state (a
-  double-applied or lost commit), so they warrant deterministic regression tests
-  ahead of enabling conflicting-member batching.
+  mid-round, so the `Dedup` cancel-safety contract propagates outward into
+  policy, and implementers must uphold three contracts the un-split code
+  enforced implicitly: the member evaluation order, atomic staging of each
+  complete member, and idempotent mutation-plan rebuilds. These are the places a
+  defect would corrupt state (a double-applied or lost commit), so they warrant
+  deterministic regression tests ahead of enabling conflicting-member batching.
 - The within-shard serial fallback trigger may be **retired**; the cross-shard one
   is kept. The concurrency behaviour is otherwise identical to ADR-024.
-- The one structural addition beyond ADR-025's side channel is the **policy-supplied
-  fold comparator**. Everything else is relocation and generalization of code that
-  ADR-025/026/027 already run under the fuzzer.
+- The one structural addition beyond ADR-025's side channel is the
+  **policy-supplied member-priority comparator**. Everything else is relocation
+  and generalization of code that ADR-025/026/027 already run under the fuzzer.

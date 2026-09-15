@@ -29,7 +29,8 @@ use futures::{
 use glassdb_concurr::{Background, ScanCadence, map_all_bounded, rt};
 use glassdb_data::{LogicalKey, TxId};
 use glassdb_storage::{
-    NodeStore, Observation, Requirement, StorageError, StructuralIntentStore, Timeline, TreeRouter,
+    CurrentnessBarrier, NodeStore, Observation, Requirement, StorageError, StructuralIntentStore,
+    Timeline, TreeRouter,
     transaction::{TLogger, TxCollectionOp, TxCommitStatus, TxLock, TxLog, TxRecordState},
 };
 use tokio::sync::Notify;
@@ -343,9 +344,9 @@ impl Gc {
         limit: NonZeroUsize,
     ) -> Vec<(TxId, Result<GcOutcome, TransError>)> {
         let gc = &self;
-        let status_requirement = Requirement::AtLeast(self.timeline.now());
+        let status_barrier = self.timeline.currentness_barrier();
         let filtered = map_all_bounded(tids, limit, |tid| async move {
-            let result = gc.filter_candidate(&tid, status_requirement).await;
+            let result = gc.filter_candidate(&tid, status_barrier).await;
             (tid, result)
         })
         .await;
@@ -369,11 +370,11 @@ impl Gc {
         // Eligibility must precede the reference bound. Yield so concurrent
         // writers can publish observations that satisfy it; otherwise GC adds
         // backend reads for leaves those writers are already refreshing.
-        let requirement = Requirement::AtLeast(self.timeline.now());
+        let barrier = self.timeline.currentness_barrier();
         rt::yield_now().await;
         results.extend(
             map_all_bounded(ready, limit, |(tid, observation)| async move {
-                let result = gc.try_reclaim(&tid, &observation, requirement).await;
+                let result = gc.try_reclaim(&tid, &observation, barrier).await;
                 (tid, result)
             })
             .await,
@@ -385,12 +386,15 @@ impl Gc {
     async fn filter_candidate(
         &self,
         tid: &TxId,
-        requirement: Requirement,
+        barrier: CurrentnessBarrier,
     ) -> Result<GcEligibility, TransError> {
         // GC needs exact durable evidence for reclamation. A status cached
         // without its log cannot authorize deletion, and absence must not
         // create a wound marker merely because a scan or hint named an ID.
-        let status = self.tl.commit_status_at(tid, requirement).await?;
+        let status = self
+            .tl
+            .commit_status_at(tid, Requirement::after(barrier))
+            .await?;
         match TxRecordState::try_from_observation(&status.observation)? {
             TxRecordState::Missing | TxRecordState::Pending | TxRecordState::Wounded => {
                 return Ok(GcEligibility::Retained);
@@ -413,17 +417,14 @@ impl Gc {
         &self,
         tid: &TxId,
         observed: &Observation<TxLog>,
-        requirement: Requirement,
+        barrier: CurrentnessBarrier,
     ) -> Result<GcOutcome, TransError> {
         let log = observed
             .value()
             .ok_or_else(|| StorageError::other("GC candidate has no transaction log"))?;
         match log.status {
-            TxCommitStatus::Ok => {
-                self.reclaim_committed(tid, log, observed, requirement)
-                    .await
-            }
-            TxCommitStatus::Aborted => self.reclaim_aborted(tid, log, observed, requirement).await,
+            TxCommitStatus::Ok => self.reclaim_committed(tid, log, observed, barrier).await,
+            TxCommitStatus::Aborted => self.reclaim_aborted(tid, log, observed, barrier).await,
             TxCommitStatus::Pending | TxCommitStatus::Unknown | TxCommitStatus::Wounded => {
                 Ok(GcOutcome::Retained)
             }
@@ -440,7 +441,7 @@ impl Gc {
         tid: &TxId,
         log: &TxLog,
         observation: &Observation<TxLog>,
-        requirement: Requirement,
+        barrier: CurrentnessBarrier,
     ) -> Result<GcOutcome, TransError> {
         // Collection effects are independent of the transaction object's value
         // reachability. A crash after the commit point must not leave a dropped
@@ -471,7 +472,7 @@ impl Gc {
             .collect::<Vec<_>>();
         changed |= self.collection_lifecycle.reclaim(&dropped).await?;
         changed |= self.collection_lifecycle.reclaim(&unused_prepared).await?;
-        if self.still_referenced(tid, log, requirement).await? {
+        if self.still_referenced(tid, log, barrier).await? {
             return Ok(GcOutcome::from_progress(changed));
         }
         // The liveness check already ruled out every recorded entry lock.
@@ -482,7 +483,7 @@ impl Gc {
             .filter(|lock| !matches!(lock, TxLock::Entry { .. }))
             .cloned()
             .collect();
-        let released = self.release_locks(tid, &remaining, requirement).await?;
+        let released = self.release_locks(tid, &remaining, barrier).await?;
         changed |= released.changed;
         if !released.complete {
             return Ok(GcOutcome::from_progress(changed));
@@ -499,9 +500,9 @@ impl Gc {
         tid: &TxId,
         log: &TxLog,
         observation: &Observation<TxLog>,
-        requirement: Requirement,
+        barrier: CurrentnessBarrier,
     ) -> Result<GcOutcome, TransError> {
-        let reclaimed = self.cleanup_aborted_effects(tid, log, requirement).await?;
+        let reclaimed = self.cleanup_aborted_effects(tid, log, barrier).await?;
         if !reclaimed.complete {
             return Ok(GcOutcome::from_progress(reclaimed.changed));
         }
@@ -513,9 +514,9 @@ impl Gc {
         &self,
         tid: &TxId,
         log: &TxLog,
-        requirement: Requirement,
+        barrier: CurrentnessBarrier,
     ) -> Result<Reclamation, TransError> {
-        let mut reclaimed = self.release_locks(tid, &log.locks, requirement).await?;
+        let mut reclaimed = self.release_locks(tid, &log.locks, barrier).await?;
         if !reclaimed.complete {
             return Ok(reclaimed);
         }
@@ -527,7 +528,7 @@ impl Gc {
             .collect::<Vec<_>>();
         reclaimed.changed |= self
             .collection_lifecycle
-            .clear_aborted_drops(tid, &drops)
+            .clear_aborted_drops(tid, &drops, Requirement::after(barrier))
             .await?;
         reclaimed.changed |= self
             .collection_lifecycle
@@ -551,7 +552,7 @@ impl Gc {
         &self,
         tid: &TxId,
         log: &TxLog,
-        requirement: Requirement,
+        barrier: CurrentnessBarrier,
     ) -> Result<bool, TransError> {
         let mut items: Vec<(LogicalKey, CheckKind)> = log
             .writes
@@ -574,7 +575,11 @@ impl Gc {
         for items in by_collection.into_values() {
             let groups = match self
                 .router
-                .route_keys_with_requirements(items, requirement, requirement)
+                .route_keys_with_requirements(
+                    items,
+                    Requirement::after(barrier),
+                    Requirement::after(barrier),
+                )
                 .await
             {
                 Ok(groups) => groups,
@@ -605,7 +610,7 @@ impl Gc {
         if self
             .locker
             .collections()
-            .is_referenced(tid, &log.locks, requirement)
+            .is_referenced(tid, &log.locks, Requirement::after(barrier))
             .await?
         {
             return Ok(true);
@@ -618,9 +623,12 @@ impl Gc {
         &self,
         tid: &TxId,
         locks: &[TxLock],
-        requirement: Requirement,
+        barrier: CurrentnessBarrier,
     ) -> Result<Reclamation, TransError> {
-        let mut changed = self.locker.release(tid, locks, requirement).await?;
+        let mut changed = self
+            .locker
+            .release(tid, locks, Requirement::after(barrier))
+            .await?;
         let topology: BTreeSet<_> = locks
             .iter()
             .filter_map(|lock| match lock {
@@ -631,7 +639,11 @@ impl Gc {
         for collection in topology {
             let records = self
                 .structural_intents
-                .list_for_participant(collection.db_root_component(), tid, requirement)
+                .list_for_participant(
+                    collection.db_root_component(),
+                    tid,
+                    Requirement::after(barrier),
+                )
                 .await?;
             if !records.is_empty() {
                 return Ok(Reclamation {
@@ -642,7 +654,7 @@ impl Gc {
             changed |= self
                 .locker
                 .collections()
-                .release_topology_participant(collection, tid)
+                .release_topology_participant(collection, tid, Requirement::after(barrier))
                 .await?;
         }
         Ok(Reclamation {

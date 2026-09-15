@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use glassdb_data::{CollectionAddress, TxId};
-use glassdb_storage::{CollectionRecord, Requirement, SplitPolicy};
+use glassdb_storage::{CollectionRecord, CurrentnessBarrier, Requirement, SplitPolicy};
 
 use crate::collection_coordination::CollectionStateResolver;
 use crate::collections::{
@@ -28,7 +28,7 @@ impl CollectionCatalog {
         &self,
         parent: &CollectionAddress,
     ) -> Result<DirectorySnapshot, TransError> {
-        let record = self.state.resolve(parent, None, Requirement::Any).await?;
+        let record = self.state.resolve(parent, None, Requirement::ANY).await?;
         Ok(DirectorySnapshot {
             children: record
                 .children()
@@ -44,7 +44,7 @@ impl CollectionCatalog {
         id: Option<&TxId>,
         reads: &[DirectoryRead],
         changes: &[CollectionChange],
-        requirement: Requirement,
+        barrier: CurrentnessBarrier,
         split_policy: &SplitPolicy,
     ) -> Result<bool, TransError> {
         let mut records = BTreeMap::<CollectionAddress, CollectionRecord>::new();
@@ -54,7 +54,10 @@ impl CollectionCatalog {
             .chain(changes.iter().map(|change| &change.parent))
         {
             if !records.contains_key(parent) {
-                let record = self.state.resolve(parent, id, requirement).await?;
+                let record = self
+                    .state
+                    .resolve(parent, id, Requirement::after(barrier))
+                    .await?;
                 records.insert(parent.clone(), record);
             }
         }
@@ -181,7 +184,7 @@ mod tests {
 
         assert_eq!(snapshot.children, vec![(b"child".to_vec(), child.id())]);
         let (record, _) = records
-            .load_record(&parent, Requirement::Any)
+            .load_record(&parent, Requirement::ANY)
             .await
             .unwrap();
         assert!(!record.directory_lock().contains(&id));

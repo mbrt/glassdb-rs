@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use glassdb_data::{CollectionAddress, CollectionId, TxId};
 use glassdb_storage::transaction::{TxCollectionChange, TxCollectionOp, TxLock};
-use glassdb_storage::{Requirement, SplitPolicy};
+use glassdb_storage::{CurrentnessBarrier, Requirement, SplitPolicy};
 
 use crate::collection_catalog::CollectionCatalog;
 use crate::collections::{CatalogAccesses, CollectionLifecycle, CollectionOp};
@@ -183,7 +183,9 @@ impl CollectionCommit {
             .difference(&active_drops)
             .cloned()
             .collect::<Vec<_>>();
-        self.lifecycle.clear_aborted_drops(id, &discarded).await?;
+        self.lifecycle
+            .clear_aborted_drops(id, &discarded, Requirement::ANY)
+            .await?;
         attempt
             .fenced_drops
             .retain(|drop| active_drops.contains(drop));
@@ -228,14 +230,14 @@ impl CollectionCommit {
         &self,
         id: Option<&TxId>,
         attempt: &CollectionAttempt,
-        requirement: Requirement,
+        barrier: CurrentnessBarrier,
     ) -> Result<bool, TransError> {
         self.catalog
             .validate(
                 id,
                 &attempt.accesses.reads,
                 &attempt.accesses.changes,
-                requirement,
+                barrier,
                 &self.split_policy,
             )
             .await
@@ -283,7 +285,9 @@ impl CollectionCommit {
         attempt: &CollectionAttempt,
     ) -> Result<(), TransError> {
         let drops = attempt.fenced_drops.iter().cloned().collect::<Vec<_>>();
-        self.lifecycle.clear_aborted_drops(id, &drops).await?;
+        self.lifecycle
+            .clear_aborted_drops(id, &drops, Requirement::ANY)
+            .await?;
         let prepared = attempt.prepared.iter().cloned().collect::<Vec<_>>();
         self.lifecycle.reclaim(&prepared).await.map(|_| ())
     }

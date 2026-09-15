@@ -35,7 +35,7 @@ if ! cargo flamegraph --version >/dev/null 2>&1; then
 fi
 
 # cargo-flamegraph runs the target under perf and renders an SVG. It leaves the
-# raw perf.data in the repo root, which we fold into a greppable text file when
+# raw perf.data in the repo root, which we collapse into a searchable folded-stack file when
 # the collapse tool is available.
 if ! cargo flamegraph --profile profiling "${cargo_sel[@]}" \
 	--output "$svg" -- "${run_args[@]}"; then

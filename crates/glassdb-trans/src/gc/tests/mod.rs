@@ -171,7 +171,10 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
                             GcOutcome::Retained
                         );
                         records
-                            .load_record(&prepared, Requirement::AtLeast(timeline.now()))
+                            .load_record(
+                                &prepared,
+                                Requirement::after(timeline.currentness_barrier()),
+                            )
                             .await
                             .unwrap();
                         assert_eq!(
@@ -193,7 +196,7 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
         assert_eq!(
             owner
                 .tlogger
-                .commit_status_at(&old_id, Requirement::Any)
+                .commit_status_at(&old_id, Requirement::ANY)
                 .await
                 .unwrap()
                 .status,
@@ -310,7 +313,10 @@ async fn store_entry(ctx: &Ctx, _key: &[u8], entry: LeafEntry) {
     let path = root_path();
     let loaded = ctx
         .nodes
-        .load_leaf(&path, Requirement::AtLeast(ctx.timeline.now()))
+        .load_leaf(
+            &path,
+            Requirement::after(ctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     let mut entries: BTreeMap<Vec<u8>, LeafEntry> = loaded
@@ -323,13 +329,16 @@ async fn store_entry(ctx: &Ctx, _key: &[u8], entry: LeafEntry) {
     let leaf = LeafBody::from_entries(entries.into_values());
     let mut edit = loaded.into_edit();
     edit.set_entries(leaf);
-    assert!(ctx.nodes.commit_leaf(edit).await.unwrap());
+    assert!(ctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 }
 
 async fn lookup_entry(ctx: &Ctx, key: &[u8]) -> Option<LeafEntry> {
     let loaded = ctx
         .nodes
-        .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
+        .load_leaf(
+            &root_path(),
+            Requirement::after(ctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     loaded.entries().lookup(key).cloned()
@@ -369,18 +378,18 @@ fn locked_entry(key: &[u8], holder: &TxId) -> LeafEntry {
 
 async fn is_gone(tl: &TLogger, id: &TxId) -> bool {
     matches!(
-        tl.get_at(id, Requirement::Any).await,
+        tl.get_at(id, Requirement::ANY).await,
         Err(StorageError::NotFound)
     )
 }
 
 async fn check_candidate(gc: &Gc, tid: &TxId) -> Result<GcOutcome, TransError> {
     let status = gc
-        .filter_candidate(tid, Requirement::AtLeast(gc.timeline.now()))
+        .filter_candidate(tid, gc.timeline.currentness_barrier())
         .await?;
-    let requirement = Requirement::AtLeast(gc.timeline.now());
+    let barrier = gc.timeline.currentness_barrier();
     match status {
-        GcEligibility::Ready(observation) => gc.try_reclaim(tid, &observation, requirement).await,
+        GcEligibility::Ready(observation) => gc.try_reclaim(tid, &observation, barrier).await,
         GcEligibility::Deferred(delay) => Ok(GcOutcome::Deferred(delay)),
         GcEligibility::Retained => Ok(GcOutcome::Retained),
     }
@@ -496,7 +505,7 @@ async fn committed_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
 
     assert!(is_gone(&ctx.tl, &id).await);
     assert!(matches!(
-        ctx.nodes.load_root(&prepared, Requirement::Any).await,
+        ctx.nodes.load_root(&prepared, Requirement::ANY).await,
         Err(StorageError::NotFound)
     ));
 }
@@ -527,11 +536,11 @@ async fn aborted_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
 
     assert!(is_gone(&ctx.tl, &id).await);
     assert!(matches!(
-        ctx.nodes.load_root(&prepared, Requirement::Any).await,
+        ctx.nodes.load_root(&prepared, Requirement::ANY).await,
         Err(StorageError::NotFound)
     ));
     assert!(matches!(
-        ctx.records.load_record(&prepared, Requirement::Any).await,
+        ctx.records.load_record(&prepared, Requirement::ANY).await,
         Err(StorageError::NotFound)
     ));
 }
@@ -590,7 +599,7 @@ async fn collection_cleanup_conflict_keeps_the_recovery_manifest() {
     );
     assert!(
         ctx.records
-            .load_record(&prepared, Requirement::Any)
+            .load_record(&prepared, Requirement::ANY)
             .await
             .is_ok()
     );
@@ -600,7 +609,7 @@ async fn collection_cleanup_conflict_keeps_the_recovery_manifest() {
     check_hints_and_scan_page(&ctx).await;
     assert!(is_gone(&ctx.tl, &id).await);
     assert!(matches!(
-        ctx.nodes.load_root(&prepared, Requirement::Any).await,
+        ctx.nodes.load_root(&prepared, Requirement::ANY).await,
         Err(StorageError::NotFound)
     ));
 }
@@ -617,7 +626,10 @@ async fn committed_drop_is_recovered_while_the_log_stores_a_live_value() {
     store_entry(&ctx, b"k", writer_entry(b"k", &id)).await;
     let (mut parent_record, parent_observed) = ctx
         .records
-        .load_record(&collection(), Requirement::AtLeast(ctx.timeline.now()))
+        .load_record(
+            &collection(),
+            Requirement::after(ctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     assert!(
@@ -674,13 +686,16 @@ async fn committed_drop_is_recovered_while_the_log_stores_a_live_value() {
     );
     let (parent_record, _) = ctx
         .records
-        .load_record(&collection(), Requirement::AtLeast(ctx.timeline.now()))
+        .load_record(
+            &collection(),
+            Requirement::after(ctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     assert_eq!(parent_record.child(b"child"), None);
     assert!(!parent_record.directory_lock().contains(&id));
     assert!(matches!(
-        ctx.nodes.load_root(&child, Requirement::Any).await,
+        ctx.nodes.load_root(&child, Requirement::ANY).await,
         Err(StorageError::NotFound)
     ));
 }
@@ -729,7 +744,7 @@ async fn committed_still_referenced_is_kept() {
 
     check_hints_and_scan_page(&ctx).await;
 
-    let log = ctx.tl.get_at(&t, Requirement::Any).await.unwrap();
+    let log = ctx.tl.get_at(&t, Requirement::ANY).await.unwrap();
     let log = log.value().unwrap();
     assert_eq!(log.status, TxCommitStatus::Ok);
 }
@@ -767,25 +782,984 @@ async fn committed_membership_lock_is_released_before_deletion() {
     store_entry(&ctx, b"k", writer_entry(b"k", &tx(2))).await;
     let loaded = ctx
         .nodes
-        .load_leaf(&root_path(), Requirement::Any)
+        .load_leaf(&root_path(), Requirement::ANY)
         .await
         .unwrap();
     let mut locks = loaded.locks().clone();
     locks.set_membership_writer(id.clone());
     let mut edit = loaded.into_edit();
     edit.set_locks(locks);
-    assert!(ctx.nodes.commit_leaf(edit).await.unwrap());
+    assert!(ctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 
     check_hints_and_scan_page(&ctx).await;
 
     assert!(is_gone(&ctx.tl, &id).await);
     let loaded = ctx
         .nodes
-        .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
+        .load_leaf(
+            &root_path(),
+            Requirement::after(ctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     assert!(loaded.node().membership_lock().holders().is_empty());
     assert_eq!(ctx.coord.stats_and_reset().submissions, 1);
+}
+
+async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
+    use crate::access::{AccessSet, ScanRange};
+    use crate::key_resolver::KeyResolver;
+    use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
+
+    let backend = Arc::new(MemoryBackend::new());
+    let recorded = RecordingBackend::new(backend.clone());
+    let operations = recorded.log();
+    // Creating the root leaves GC with a cached leaf without any holders.
+    let ctx = new_ctx_with(Arc::new(recorded)).await;
+    let owner = AssemblyFixture::new(
+        backend,
+        DbRoot::try_from("db").unwrap(),
+        &EngineConfig::default(),
+    );
+    let coord = LeafCoordinator::with_hinter(
+        owner.nodes.clone(),
+        KeyStateResolver::new(owner.monitor.clone()),
+        owner.monitor.clone(),
+        RetryConfig::default(),
+        glassdb_storage::SplitPolicy::default(),
+        Arc::new(NoSplitHints),
+    );
+    let router = TreeRouter::new(owner.nodes.clone(), std::num::NonZeroUsize::MIN);
+    let locker = Locker::new(
+        coord,
+        router.clone(),
+        CollectionStateResolver::new(
+            owner.records.clone(),
+            owner.tlogger.clone(),
+            owner.timeline.clone(),
+            owner.monitor.clone(),
+            RetryConfig::default(),
+        ),
+        owner.monitor.clone(),
+        RetryConfig::default(),
+        std::num::NonZeroUsize::MIN,
+    );
+    let id = tx(81);
+    let locks = vec![TxLock::Membership {
+        leaf: glassdb_data::LeafRef::root(collection()),
+        typ: LockType::Read,
+    }];
+    owner
+        .monitor
+        .begin_persisted_tx(
+            &id,
+            TxRecoveryManifest {
+                locks: locks.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let operation = owner.monitor.begin_owner_operation(&id).unwrap();
+    let resolver = KeyResolver::new(
+        router,
+        KeyStateResolver::new(owner.monitor.clone()),
+        std::num::NonZeroUsize::MIN,
+    );
+    let page = resolver
+        .scan_keys(&collection(), &ScanRange::all(), &[], Some(&id), None)
+        .await
+        .unwrap();
+    let accesses = AccessSet::new(
+        Vec::new(),
+        Vec::new(),
+        vec![page.into_access(collection(), ScanRange::all(), Vec::new())],
+    );
+    let LockOutcome::Locked(locked) = locker
+        .keys()
+        .lock_at(
+            &id,
+            &accesses,
+            true,
+            Requirement::after(owner.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("the empty scan must acquire its membership reader");
+    };
+    assert_eq!(locked.locked_paths(), locks);
+    operation.complete();
+    if cached_holder {
+        ctx.nodes
+            .load_leaf(
+                &root_path(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+    }
+    if committed {
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+        log.locks = locks.clone();
+        owner.monitor.commit_tx(log).await.unwrap();
+    } else {
+        assert_eq!(
+            owner.monitor.abort_owned_tx(&id).await.unwrap(),
+            OwnerAbortOutcome::Acknowledged
+        );
+    }
+
+    // Exercise reclamation after eligibility. Passing the retention horizon
+    // cannot repair either instance's cached leaf.
+    let observed = ctx
+        .tl
+        .get_at(&id, Requirement::after(ctx.timeline.currentness_barrier()))
+        .await
+        .unwrap();
+    let barrier = ctx.timeline.currentness_barrier();
+    operations.lock().unwrap().clear();
+    assert_eq!(
+        ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
+        GcOutcome::Reclaimed
+    );
+    assert!(is_gone(&ctx.tl, &id).await);
+    let recorded = std::mem::take(&mut *operations.lock().unwrap());
+    ctx.coord.stats_and_reset();
+    assert!(
+        !ctx.locker
+            .release(&id, &locks, Requirement::after(barrier))
+            .await
+            .unwrap()
+    );
+    assert_eq!(ctx.coord.stats_and_reset().submissions, 1);
+    assert!(operations.lock().unwrap().is_empty());
+    let leaf = owner
+        .nodes
+        .load_leaf(
+            &root_path(),
+            Requirement::after(owner.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !leaf.node().membership_lock().contains(&id),
+        "GC deleted the transaction log while its membership reader remained"
+    );
+    let path = root_path().to_string();
+    let calls: Vec<_> = recorded
+        .iter()
+        .filter(|op| op.path == path)
+        .map(|op| op.op)
+        .collect();
+    let expected = if cached_holder {
+        vec!["write_if"]
+    } else {
+        vec!["read_if_modified", "write_if"]
+    };
+    assert_eq!(calls, expected);
+}
+
+#[tokio::test]
+async fn committed_membership_only_gc_refreshes_a_cached_no_holder() {
+    reclaim_membership_only(true, false).await;
+}
+
+#[tokio::test]
+async fn aborted_membership_only_gc_refreshes_a_cached_no_holder() {
+    reclaim_membership_only(false, false).await;
+}
+
+#[tokio::test]
+async fn membership_only_gc_reuses_a_cached_holder_for_its_cas() {
+    for committed in [false, true] {
+        reclaim_membership_only(committed, true).await;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DirectoryCleanup {
+    StaleNoHolder,
+    CachedHolder,
+    ReadFailure,
+    OwnerReleased,
+    CommittedReleased,
+}
+
+async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
+    use crate::collection_coordination::CollectionLocker;
+    use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
+
+    let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let recorded = RecordingBackend::new(hooks.clone());
+    let operations = recorded.log();
+    let backend: Arc<dyn Backend> = Arc::new(recorded);
+    // GC caches the record before the independent owner acquires its holder.
+    let ctx = new_ctx_with(backend.clone()).await;
+    let owner = AssemblyFixture::new(
+        backend,
+        DbRoot::try_from("db").unwrap(),
+        &EngineConfig::default(),
+    );
+    let locker = CollectionLocker::new(
+        CollectionStateResolver::new(
+            owner.records.clone(),
+            owner.tlogger.clone(),
+            owner.timeline.clone(),
+            owner.monitor.clone(),
+            RetryConfig::default(),
+        ),
+        std::num::NonZeroUsize::MIN,
+    );
+    let id = tx(83);
+    let locks = vec![TxLock::Directory {
+        collection: collection(),
+        typ,
+    }];
+    owner
+        .monitor
+        .begin_persisted_tx(
+            &id,
+            TxRecoveryManifest {
+                locks: locks.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let operation = owner.monitor.begin_owner_operation(&id).unwrap();
+    locker.acquire(&collection(), &id, typ).await.unwrap();
+    operation.complete();
+    if matches!(case, DirectoryCleanup::CommittedReleased) {
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+        log.locks = locks.clone();
+        owner.monitor.commit_tx(log).await.unwrap();
+    } else {
+        assert_eq!(
+            owner.monitor.abort_owned_tx(&id).await.unwrap(),
+            OwnerAbortOutcome::Acknowledged
+        );
+    }
+    if matches!(case, DirectoryCleanup::CachedHolder) {
+        ctx.records
+            .load_record(
+                &collection(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+    }
+    let path = ObjectPath::CollectionRecord {
+        collection: collection(),
+    }
+    .to_string();
+    if matches!(
+        case,
+        DirectoryCleanup::OwnerReleased | DirectoryCleanup::CommittedReleased
+    ) {
+        operations.lock().unwrap().clear();
+        assert!(locker.release(&id, &locks, Requirement::ANY).await.unwrap());
+        let recorded = std::mem::take(&mut *operations.lock().unwrap());
+        let calls: Vec<_> = recorded
+            .iter()
+            .filter(|op| op.path == path)
+            .map(|op| op.op)
+            .collect();
+        assert_eq!(calls, ["write_if"]);
+        assert!(!locker.release(&id, &locks, Requirement::ANY).await.unwrap());
+        assert!(operations.lock().unwrap().is_empty());
+    }
+    // Enter reclamation after eligibility. Waiting out retention cannot
+    // change either instance's cached record.
+    let observed = ctx
+        .tl
+        .get_at(&id, Requirement::after(ctx.timeline.currentness_barrier()))
+        .await
+        .unwrap();
+    let barrier = ctx.timeline.currentness_barrier();
+    if matches!(case, DirectoryCleanup::ReadFailure) {
+        hooks.set_before({
+            let path = path.clone();
+            move |op| {
+                let fail = op.path() == path
+                    && matches!(
+                        op,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    );
+                Box::pin(async move {
+                    if fail {
+                        Err(BackendError::other("directory check failed"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+        assert!(ctx.gc.try_reclaim(&id, &observed, barrier).await.is_err());
+        assert!(!is_gone(&ctx.tl, &id).await);
+        hooks.clear_before();
+    }
+    operations.lock().unwrap().clear();
+    assert_eq!(
+        ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
+        GcOutcome::Reclaimed
+    );
+    assert!(is_gone(&ctx.tl, &id).await);
+    let recorded = std::mem::take(&mut *operations.lock().unwrap());
+    let (record, _) = owner
+        .records
+        .load_record(
+            &collection(),
+            Requirement::after(owner.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !record.directory_lock().contains(&id),
+        "GC deleted the transaction log while its directory holder remained"
+    );
+    let calls: Vec<_> = recorded
+        .iter()
+        .filter(|op| op.path == path)
+        .map(|op| op.op)
+        .collect();
+    let expected: &[&str] = match case {
+        DirectoryCleanup::StaleNoHolder | DirectoryCleanup::ReadFailure => {
+            &["read_if_modified", "write_if"]
+        }
+        DirectoryCleanup::CachedHolder => &["write_if"],
+        DirectoryCleanup::OwnerReleased | DirectoryCleanup::CommittedReleased => {
+            &["read_if_modified"]
+        }
+    };
+    assert_eq!(calls, expected);
+}
+
+#[tokio::test]
+async fn aborted_directory_reader_gc_refreshes_a_cached_no_holder() {
+    reclaim_directory(LockType::Read, DirectoryCleanup::StaleNoHolder).await;
+}
+
+#[tokio::test]
+async fn aborted_directory_writer_gc_refreshes_a_cached_no_holder() {
+    reclaim_directory(LockType::Write, DirectoryCleanup::StaleNoHolder).await;
+}
+
+#[tokio::test]
+async fn directory_gc_reuses_a_cached_holder_for_its_cas() {
+    for typ in [LockType::Read, LockType::Write] {
+        reclaim_directory(typ, DirectoryCleanup::CachedHolder).await;
+    }
+}
+
+#[tokio::test]
+async fn aborted_directory_gc_keeps_the_log_if_the_record_check_fails() {
+    reclaim_directory(LockType::Read, DirectoryCleanup::ReadFailure).await;
+}
+
+#[tokio::test]
+async fn directory_gc_checks_owner_cleanup_once() {
+    for typ in [LockType::Read, LockType::Write] {
+        for case in [
+            DirectoryCleanup::OwnerReleased,
+            DirectoryCleanup::CommittedReleased,
+        ] {
+            reclaim_directory(typ, case).await;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TopologyCleanup {
+    StaleNoParticipant,
+    CachedParticipant,
+    ReadFailure,
+    IntentRemaining,
+}
+
+async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
+    use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
+    use glassdb_data::{NodeToken, StructuralIntentId};
+    use glassdb_storage::{StructuralIntent, StructuralIntentPhase};
+
+    let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let recorded = RecordingBackend::new(hooks.clone());
+    let operations = recorded.log();
+    let backend: Arc<dyn Backend> = Arc::new(recorded);
+    // GC caches the collection before the independent owner joins topology.
+    let ctx = new_ctx_with(backend.clone()).await;
+    let owner = AssemblyFixture::new(
+        backend,
+        DbRoot::try_from("db").unwrap(),
+        &EngineConfig::default(),
+    );
+    let id = tx(85);
+    let locks = vec![TxLock::Topology {
+        collection: collection(),
+    }];
+    owner
+        .monitor
+        .begin_persisted_tx(
+            &id,
+            TxRecoveryManifest {
+                locks: locks.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let operation = owner.monitor.begin_owner_operation(&id).unwrap();
+    let left = NodeToken::from_bytes([85; 16]);
+    let right = NodeToken::from_bytes([86; 16]);
+    let prepared = owner
+        .structural_intents
+        .write(
+            collection().db_root_component(),
+            &StructuralIntentId::from(&right),
+            &StructuralIntent {
+                collection: collection(),
+                source_token: None,
+                source_version: String::new(),
+                created_tokens: vec![left, right],
+                split_key: Vec::new(),
+                participant_id: id.clone(),
+                phase: StructuralIntentPhase::Preparing,
+            },
+        )
+        .await
+        .unwrap();
+    let (mut record, observed) = owner
+        .records
+        .load_record(&collection(), Requirement::ANY)
+        .await
+        .unwrap();
+    assert!(record.add_topology_participant(id.clone()));
+    assert!(
+        owner
+            .records
+            .store_record(&record, &observed)
+            .await
+            .unwrap()
+    );
+    let path = ObjectPath::CollectionRecord {
+        collection: collection(),
+    }
+    .to_string();
+    if !matches!(case, TopologyCleanup::IntentRemaining) {
+        // A canceled Preparing intent has not created any nodes. Departure
+        // can then fail before finalization, leaving only the participant.
+        owner.structural_intents.delete(&prepared).await.unwrap();
+        let (mut record, observed) = owner
+            .records
+            .load_record(&collection(), Requirement::ANY)
+            .await
+            .unwrap();
+        assert!(record.remove_topology_participant(&id));
+        hooks.set_before({
+            let path = path.clone();
+            move |op| {
+                let fail = op.path() == path && matches!(op, BackendOp::WriteIf { .. });
+                Box::pin(async move {
+                    if fail {
+                        Err(BackendError::other("participant departure failed"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+        assert!(
+            owner
+                .records
+                .store_record(&record, &observed)
+                .await
+                .is_err()
+        );
+        hooks.clear_before();
+    }
+    operation.complete();
+    if committed {
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+        log.locks = locks;
+        owner.monitor.commit_tx(log).await.unwrap();
+    } else {
+        assert_eq!(
+            owner.monitor.abort_owned_tx(&id).await.unwrap(),
+            OwnerAbortOutcome::Acknowledged
+        );
+    }
+    if matches!(case, TopologyCleanup::CachedParticipant) {
+        ctx.records
+            .load_record(
+                &collection(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+    }
+    // Enter reclamation after eligibility. Retention cannot refresh the
+    // collection record cached before participant registration.
+    let observed = ctx
+        .tl
+        .get_at(&id, Requirement::after(ctx.timeline.currentness_barrier()))
+        .await
+        .unwrap();
+    let barrier = ctx.timeline.currentness_barrier();
+    if matches!(case, TopologyCleanup::IntentRemaining) {
+        operations.lock().unwrap().clear();
+        assert_eq!(
+            ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
+            GcOutcome::Retained
+        );
+        assert!(!is_gone(&ctx.tl, &id).await);
+        assert!(operations.lock().unwrap().iter().all(|op| op.path != path));
+        owner.structural_intents.delete(&prepared).await.unwrap();
+    }
+    if matches!(case, TopologyCleanup::ReadFailure) {
+        hooks.set_before({
+            let path = path.clone();
+            move |op| {
+                let fail = op.path() == path
+                    && matches!(
+                        op,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    );
+                Box::pin(async move {
+                    if fail {
+                        Err(BackendError::other("participant check failed"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+        assert!(ctx.gc.try_reclaim(&id, &observed, barrier).await.is_err());
+        assert!(!is_gone(&ctx.tl, &id).await);
+        hooks.clear_before();
+    }
+    operations.lock().unwrap().clear();
+    assert_eq!(
+        ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
+        GcOutcome::Reclaimed
+    );
+    assert!(is_gone(&ctx.tl, &id).await);
+    let recorded = std::mem::take(&mut *operations.lock().unwrap());
+    let (record, _) = owner
+        .records
+        .load_record(
+            &collection(),
+            Requirement::after(owner.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        record
+            .topology_participants()
+            .all(|participant| participant != &id),
+        "GC deleted the transaction log while its topology participant remained"
+    );
+    let calls: Vec<_> = recorded
+        .iter()
+        .filter(|op| op.path == path)
+        .map(|op| op.op)
+        .collect();
+    let expected: &[&str] = if matches!(case, TopologyCleanup::CachedParticipant) {
+        &["write_if"]
+    } else {
+        &["read_if_modified", "write_if"]
+    };
+    assert_eq!(calls, expected);
+    operations.lock().unwrap().clear();
+    assert!(
+        !ctx.locker
+            .collections()
+            .release_topology_participant(&collection(), &id, Requirement::after(barrier))
+            .await
+            .unwrap()
+    );
+    assert!(operations.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn committed_topology_gc_refreshes_a_cached_no_participant() {
+    reclaim_topology(true, TopologyCleanup::StaleNoParticipant).await;
+}
+
+#[tokio::test]
+async fn aborted_topology_gc_refreshes_a_cached_no_participant() {
+    reclaim_topology(false, TopologyCleanup::StaleNoParticipant).await;
+}
+
+#[tokio::test]
+async fn topology_gc_reuses_a_cached_participant_for_its_cas() {
+    for committed in [false, true] {
+        reclaim_topology(committed, TopologyCleanup::CachedParticipant).await;
+    }
+}
+
+#[tokio::test]
+async fn topology_gc_keeps_the_log_if_the_record_check_fails() {
+    for committed in [false, true] {
+        reclaim_topology(committed, TopologyCleanup::ReadFailure).await;
+    }
+}
+
+#[tokio::test]
+async fn topology_gc_keeps_the_log_and_participant_until_intents_settle() {
+    for committed in [false, true] {
+        reclaim_topology(committed, TopologyCleanup::IntentRemaining).await;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DropCleanup {
+    StaleFences,
+    CachedFences,
+    CachedFreeze,
+    OwnerCleared,
+    ReadFailure,
+}
+
+async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropCleanup) {
+    use crate::collection_coordination::CollectionLocker;
+    use crate::collections::{CollectionChange, CollectionOp};
+    use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
+    use glassdb_data::NodeToken;
+    use glassdb_storage::IndexNode;
+
+    let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let recorded = RecordingBackend::new(hooks.clone());
+    let operations = recorded.log();
+    let backend: Arc<dyn Backend> = Arc::new(recorded);
+    let ctx = new_ctx_with(backend.clone()).await;
+    let owner = AssemblyFixture::new(
+        backend,
+        DbRoot::try_from("db").unwrap(),
+        &EngineConfig::default(),
+    );
+    let lifecycle = CollectionLifecycle::new(
+        owner.records.clone(),
+        owner.nodes.clone(),
+        owner.monitor.clone(),
+        RetryConfig::default(),
+        Arc::new(UnexpectedTopologySettler),
+    );
+    let locker = CollectionLocker::new(
+        CollectionStateResolver::new(
+            owner.records.clone(),
+            owner.tlogger.clone(),
+            owner.timeline.clone(),
+            owner.monitor.clone(),
+            RetryConfig::default(),
+        ),
+        std::num::NonZeroUsize::MIN,
+    );
+    let target = CollectionAddress::new("db", CollectionId::from_slice(&[37; 16]).unwrap());
+    let mut change = CollectionChange {
+        parent: collection(),
+        name: b"child".to_vec(),
+        collection: target.clone(),
+        expected: None,
+        op: CollectionOp::Create,
+    };
+    lifecycle
+        .prepare_collections(std::slice::from_ref(&change))
+        .await
+        .unwrap();
+    let mut node_paths = vec![ObjectPath::TreeRoot {
+        collection: target.clone(),
+    }];
+    if with_child {
+        let token = NodeToken::from_bytes([38; 16]);
+        assert!(
+            owner
+                .nodes
+                .store_node(&target, &token, &Node::leaf(LeafBody::new()), None)
+                .await
+                .unwrap()
+        );
+        let (_, observed) = owner
+            .nodes
+            .load_root(&target, Requirement::ANY)
+            .await
+            .unwrap();
+        let root = Node::index(IndexNode::from_children([(Vec::new(), token.to_string())]));
+        assert!(
+            owner
+                .nodes
+                .store_root(&target, &root, &observed)
+                .await
+                .unwrap()
+        );
+        node_paths.push(ObjectPath::Node {
+            collection: target.clone(),
+            token,
+        });
+    }
+    let (mut parent, observed) = owner
+        .records
+        .load_record(&collection(), Requirement::ANY)
+        .await
+        .unwrap();
+    parent.add_child(change.name.clone(), target.id()).unwrap();
+    assert!(
+        owner
+            .records
+            .store_record(&parent, &observed)
+            .await
+            .unwrap()
+    );
+    let record_path = ObjectPath::CollectionRecord {
+        collection: target.clone(),
+    }
+    .to_string();
+    for path in &node_paths {
+        ctx.nodes
+            .load_node_at_state(path, Requirement::ANY)
+            .await
+            .unwrap();
+    }
+    ctx.records
+        .load_record(&target, Requirement::ANY)
+        .await
+        .unwrap();
+
+    change.op = CollectionOp::Drop;
+    change.expected = Some(target.id());
+    let id = tx(87);
+    let locks = vec![
+        TxLock::Directory {
+            collection: collection(),
+            typ: LockType::Write,
+        },
+        TxLock::Directory {
+            collection: target.clone(),
+            typ: LockType::Read,
+        },
+    ];
+    owner
+        .monitor
+        .begin_persisted_tx(
+            &id,
+            TxRecoveryManifest {
+                locks: if durable_locks {
+                    locks.clone()
+                } else {
+                    Vec::new()
+                },
+                collection_changes: vec![TxCollectionChange {
+                    parent: collection(),
+                    name: change.name.clone(),
+                    collection: target.clone(),
+                    op: TxCollectionOp::Drop,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let operation = owner.monitor.begin_owner_operation(&id).unwrap();
+    locker
+        .acquire(&collection(), &id, LockType::Write)
+        .await
+        .unwrap();
+    locker.acquire(&target, &id, LockType::Read).await.unwrap();
+    owner.monitor.record_tx_locks(&id, locks.clone());
+    lifecycle
+        .fence_drops(&id, std::slice::from_ref(&change))
+        .await
+        .unwrap();
+    operation.complete();
+    // Paused time keeps the refresher from copying the local lock list. An
+    // acknowledged abort can retain the earlier durable drop-only manifest.
+    assert_eq!(
+        owner.monitor.abort_owned_tx(&id).await.unwrap(),
+        OwnerAbortOutcome::Acknowledged
+    );
+    let observed = ctx
+        .tl
+        .get_at(&id, Requirement::after(ctx.timeline.currentness_barrier()))
+        .await
+        .unwrap();
+    assert_eq!(
+        observed.value().unwrap().locks,
+        if durable_locks { locks } else { Vec::new() }
+    );
+    if matches!(case, DropCleanup::CachedFences) {
+        let requirement = Requirement::after(ctx.timeline.currentness_barrier());
+        for path in &node_paths {
+            ctx.nodes
+                .load_node_at_state(path, requirement)
+                .await
+                .unwrap();
+        }
+    }
+    if matches!(case, DropCleanup::CachedFences | DropCleanup::CachedFreeze) {
+        ctx.records
+            .load_record(
+                &target,
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+    }
+    if matches!(case, DropCleanup::OwnerCleared) {
+        operations.lock().unwrap().clear();
+        assert!(
+            lifecycle
+                .clear_aborted_drops(&id, std::slice::from_ref(&target), Requirement::ANY)
+                .await
+                .unwrap()
+        );
+        let recorded = std::mem::take(&mut *operations.lock().unwrap());
+        for path in node_paths
+            .iter()
+            .map(ToString::to_string)
+            .chain([record_path.clone()])
+        {
+            let calls: Vec<_> = recorded
+                .iter()
+                .filter(|op| op.path == path)
+                .map(|op| op.op)
+                .collect();
+            assert_eq!(calls, ["write_if"], "owner cleanup for {path}");
+        }
+        assert!(
+            !lifecycle
+                .clear_aborted_drops(&id, std::slice::from_ref(&target), Requirement::ANY)
+                .await
+                .unwrap()
+        );
+        assert!(operations.lock().unwrap().iter().all(|op| op.op == "list"));
+    }
+    let barrier = ctx.timeline.currentness_barrier();
+    if matches!(case, DropCleanup::ReadFailure) {
+        hooks.set_before({
+            let path = node_paths.last().unwrap().to_string();
+            move |op| {
+                let fail = op.path() == path
+                    && matches!(
+                        op,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    );
+                Box::pin(async move {
+                    if fail {
+                        Err(BackendError::other("drop fence check failed"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+        assert!(ctx.gc.try_reclaim(&id, &observed, barrier).await.is_err());
+        assert!(!is_gone(&ctx.tl, &id).await);
+        hooks.clear_before();
+    }
+    // Enter reclamation after eligibility. Retention cannot refresh any of
+    // these pre-fence cache entries.
+    operations.lock().unwrap().clear();
+    assert_eq!(
+        ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
+        GcOutcome::Reclaimed
+    );
+    assert!(is_gone(&ctx.tl, &id).await);
+    let recorded = std::mem::take(&mut *operations.lock().unwrap());
+    let mut remaining = Vec::new();
+    let verification = Requirement::after(owner.timeline.currentness_barrier());
+    for path in &node_paths {
+        let node = owner
+            .nodes
+            .load_node_at_state(path, verification)
+            .await
+            .unwrap();
+        if node.value().unwrap().collection_delete_intent() == Some(&id) {
+            remaining.push(path.to_string());
+        }
+    }
+    let (record, _) = owner
+        .records
+        .load_record(&target, verification)
+        .await
+        .unwrap();
+    if record.topology_freeze() == Some(&id) {
+        remaining.push(record_path.clone());
+    }
+    assert!(
+        remaining.is_empty(),
+        "GC deleted the log with drop fences still present: {remaining:?}"
+    );
+    let node_expected: &[&str] = match case {
+        DropCleanup::CachedFences => &["write_if"],
+        DropCleanup::OwnerCleared => &["read_if_modified"],
+        DropCleanup::StaleFences | DropCleanup::CachedFreeze | DropCleanup::ReadFailure => {
+            &["read_if_modified", "write_if"]
+        }
+    };
+    for path in node_paths.iter().map(ToString::to_string) {
+        let calls: Vec<_> = recorded
+            .iter()
+            .filter(|op| op.path == path)
+            .map(|op| op.op)
+            .collect();
+        assert_eq!(calls, node_expected, "GC node cleanup for {path}");
+    }
+    let record_calls: Vec<_> = recorded
+        .iter()
+        .filter(|op| op.path == record_path)
+        .map(|op| op.op)
+        .collect();
+    let record_expected: &[&str] = if durable_locks {
+        &["read_if_modified", "write_if", "write_if"]
+    } else if matches!(case, DropCleanup::CachedFreeze) {
+        &["write_if"]
+    } else {
+        node_expected
+    };
+    assert_eq!(record_calls, record_expected);
+    operations.lock().unwrap().clear();
+    assert!(
+        !ctx.gc
+            .collection_lifecycle
+            .clear_aborted_drops(&id, &[target], Requirement::after(barrier))
+            .await
+            .unwrap()
+    );
+    assert!(operations.lock().unwrap().iter().all(|op| op.op == "list"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborted_drop_gc_clears_cached_root_fence_and_freeze() {
+    reclaim_aborted_drop(false, false, DropCleanup::StaleFences).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborted_drop_gc_clears_cached_index_and_child_fences() {
+    reclaim_aborted_drop(true, false, DropCleanup::StaleFences).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborted_drop_gc_reuses_directory_release_evidence() {
+    reclaim_aborted_drop(true, true, DropCleanup::StaleFences).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborted_drop_gc_reuses_cached_fences_for_its_cas() {
+    reclaim_aborted_drop(true, false, DropCleanup::CachedFences).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborted_drop_gc_checks_stale_nodes_without_rechecking_a_cached_freeze() {
+    reclaim_aborted_drop(true, false, DropCleanup::CachedFreeze).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborted_drop_owner_cleanup_needs_no_extra_reads() {
+    reclaim_aborted_drop(true, false, DropCleanup::OwnerCleared).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborted_drop_gc_keeps_the_log_if_a_fence_check_fails() {
+    reclaim_aborted_drop(true, false, DropCleanup::ReadFailure).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -839,7 +1813,7 @@ async fn pending_and_wounded_candidates_only_read_their_logs() {
         assert_eq!(diagnostics.ready, 0);
         assert_eq!(diagnostics.deferred, 0);
         assert_eq!(diagnostics.in_flight, 0);
-        let got = ctx.tl.get_at(&id, Requirement::Any).await.unwrap();
+        let got = ctx.tl.get_at(&id, Requirement::ANY).await.unwrap();
         assert_eq!(got.value().unwrap().status, status);
         assert_eq!(
             lookup_entry(&ctx, b"k").await.unwrap().lock_holders(),
@@ -884,7 +1858,7 @@ async fn lock_acquisition_resolves_a_wound_that_gc_leaves_alone() {
             &contender,
             &accesses,
             false,
-            Requirement::AtLeast(ctx.timeline.now()),
+            Requirement::after(ctx.timeline.currentness_barrier()),
         )
         .await
         .unwrap();
@@ -893,7 +1867,7 @@ async fn lock_acquisition_resolves_a_wound_that_gc_leaves_alone() {
     assert!(!entry.is_locked_by(&wounded));
     assert!(entry.is_locked_by(&contender));
     check_hints_and_scan_page(&ctx).await;
-    let got = ctx.tl.get_at(&wounded, Requirement::Any).await.unwrap();
+    let got = ctx.tl.get_at(&wounded, Requirement::ANY).await.unwrap();
     assert_eq!(got.value().unwrap().status, TxCommitStatus::Wounded);
 }
 
@@ -974,12 +1948,15 @@ async fn gc_release_merges_into_live_acquire_round() {
     let leaf = LeafBody::from_entries([locked_entry(&ka, &dead), writer_entry(&kb, &seed)]);
     let loaded = ctx
         .nodes
-        .load_leaf(&leaf_path, Requirement::AtLeast(ctx.timeline.now()))
+        .load_leaf(
+            &leaf_path,
+            Requirement::after(ctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     let mut edit = loaded.into_edit();
     edit.set_entries(leaf);
-    assert!(ctx.nodes.commit_leaf(edit).await.unwrap());
+    assert!(ctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 
     let mut dead_log = TxLog::new(dead.clone(), TxCommitStatus::Aborted);
     dead_log.timestamp = Some(base() - PAST_HORIZON);
@@ -1008,7 +1985,7 @@ async fn gc_release_merges_into_live_acquire_round() {
         Vec::new(),
     );
     let live2 = live.clone();
-    let lock_requirement = Requirement::AtLeast(ctx.timeline.now());
+    let lock_requirement = Requirement::after(ctx.timeline.currentness_barrier());
     let acquire = tokio::spawn(async move {
         locker
             .keys()
@@ -1133,7 +2110,7 @@ async fn cached_candidate_converges_after_a_peer_deletes_it() {
         CachedStore::new(backend, 1 << 20, Timeline::new(), None),
         DbRoot::try_from("db").unwrap(),
     );
-    let observed = peer.get_at(&id, Requirement::Any).await.unwrap();
+    let observed = peer.get_at(&id, Requirement::ANY).await.unwrap();
     peer.delete(&observed).await.unwrap();
     operations.lock().unwrap().clear();
 
@@ -1337,7 +2314,10 @@ async fn reference_checks_follow_candidate_filtering() {
     // Cache absence after the status bound, before the peer's commit. A
     // reference check using that first bound would wrongly accept this leaf.
     ctx.nodes
-        .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
+        .load_leaf(
+            &root_path(),
+            Requirement::after(ctx.timeline.currentness_barrier()),
+        )
         .await
         .unwrap();
     let peer = AssemblyFixture::new(
@@ -1347,17 +2327,17 @@ async fn reference_checks_follow_candidate_filtering() {
     );
     let mut edit = peer
         .nodes
-        .load_leaf(&root_path(), Requirement::Any)
+        .load_leaf(&root_path(), Requirement::ANY)
         .await
         .unwrap()
         .into_edit();
     edit.set_entries(LeafBody::from_entries([locked_entry(b"k", &id)]));
-    assert!(peer.nodes.commit_leaf(edit).await.unwrap());
+    assert!(peer.nodes.commit_leaf(edit).await.unwrap().is_applied());
     log.status = TxCommitStatus::Ok;
     // Native paused time does not advance wall time. The old timestamp stands
     // for a filter delayed until after this commit's safety horizon.
     log.timestamp = Some(base() - PAST_HORIZON);
-    let pending = peer.tlogger.get_at(&id, Requirement::Any).await.unwrap();
+    let pending = peer.tlogger.get_at(&id, Requirement::ANY).await.unwrap();
     peer.tlogger.set_if(&log, &pending).await.unwrap();
     resume.notify_one();
     for _ in 0..64 {

@@ -336,7 +336,7 @@ impl CollectionStore {
             .compare_and_swap(expected, Arc::new(record.clone()))
             .await
         {
-            Ok(CasResult::Committed(_)) => Ok(true),
+            Ok(CasResult::Applied(_)) => Ok(true),
             Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(false),
             Err(error) => Err(error),
         }
@@ -368,7 +368,7 @@ impl CollectionStore {
             .create(path, None, Arc::new(record.clone()))
             .await?
         {
-            CasResult::Committed(observed) => Ok(Some(observed)),
+            CasResult::Applied(receipt) => Ok(Some(receipt.into_installed())),
             CasResult::Conflict => Ok(None),
         }
     }
@@ -581,11 +581,17 @@ mod tests {
         );
 
         let (mut record, record_before) = records
-            .load_record(&collection, Requirement::AtLeast(timeline.now()))
+            .load_record(
+                &collection,
+                Requirement::after(timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         let (mut root, root_before) = nodes
-            .load_root(&collection, Requirement::AtLeast(timeline.now()))
+            .load_root(
+                &collection,
+                Requirement::after(timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
 
@@ -593,11 +599,17 @@ mod tests {
         assert!(record.add_child(b"child".to_vec(), child).unwrap());
         assert!(records.store_record(&record, &record_before).await.unwrap());
         let (_, record_after) = records
-            .load_record(&collection, Requirement::AtLeast(timeline.now()))
+            .load_record(
+                &collection,
+                Requirement::after(timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         let (_, root_after_record_write) = nodes
-            .load_root(&collection, Requirement::AtLeast(timeline.now()))
+            .load_root(
+                &collection,
+                Requirement::after(timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_ne!(record_before.revision(), record_after.revision());
@@ -615,7 +627,10 @@ mod tests {
                 .unwrap()
         );
         let (_, record_after_root_write) = records
-            .load_record(&collection, Requirement::AtLeast(timeline.now()))
+            .load_record(
+                &collection,
+                Requirement::after(timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(

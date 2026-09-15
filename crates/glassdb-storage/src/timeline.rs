@@ -5,6 +5,9 @@
 //! decoded object cache and every higher-level component that captures
 //! currentness barriers. A persistent cache may order a new timeline after
 //! evidence from the previous open.
+//!
+//! Changes to this module require the review in
+//! `docs/guides/storage-consistency.md` (E1, E2).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,6 +32,76 @@ impl SequencePoint {
 
     pub(crate) fn raw(self) -> u64 {
         self.0
+    }
+}
+
+/// A database-local bound separating completed work from subsequent operations.
+///
+/// Capture it after prerequisite work completes and before the operations used
+/// as dependent currentness evidence. All dependencies must reach that barrier.
+/// Use it only with the database instance that captured it. It does not order
+/// the contents returned by overlapping operations.
+///
+/// A transaction's validation barrier is captured after its body and before
+/// the key and predicate lock CASes used as validation evidence.
+///
+/// Only the timeline may construct a barrier. Do not add constructors from
+/// sequence points, observations, receipts, or freshness requirements, nor
+/// a default value, public sequence-point accessors, implicit conversions, or
+/// serialization.
+/// Its point remains private even from other storage modules; those
+/// modules can test evidence without extracting the bound.
+/// Such conversions would let an operation's invocation watermark stand in for
+/// a barrier captured after completed work. The explicit conversion to
+/// `Requirement::after` retains the opaque barrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CurrentnessBarrier {
+    point: SequencePoint,
+}
+
+impl CurrentnessBarrier {
+    pub(crate) fn is_reached_by(self, point: SequencePoint) -> bool {
+        point >= self.point
+    }
+}
+
+/// The freshness requirement a cached entry must satisfy before it is served.
+///
+/// Construct requirements explicitly with `ANY`, `after`, or `within`. Do not
+/// add constructors from observations, receipts, or raw sequence points, nor
+/// expose the stored bound. An invocation watermark cannot establish a barrier
+/// after completed work. Requirements cannot be converted back into barriers.
+/// This also applies to crate-visible accessors: a requirement states the
+/// evidence needed, but cannot supply evidence to advance an observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Requirement(Option<SequencePoint>);
+
+impl Requirement {
+    /// Accepts any usable cached entry without a backend check.
+    pub const ANY: Self = Self(None);
+
+    /// Requires evidence that reaches the captured currentness barrier.
+    pub fn after(barrier: CurrentnessBarrier) -> Self {
+        Self(Some(barrier.point))
+    }
+
+    /// Returns the stronger of two requirements.
+    pub fn stricter(self, other: Self) -> Self {
+        Self(self.0.max(other.0))
+    }
+
+    /// Accepts evidence within the approximate bounded-staleness cutoff.
+    pub fn within(timeline: &Timeline, max_staleness: Duration) -> Self {
+        if max_staleness == Duration::MAX {
+            Self::ANY
+        } else {
+            // This cutoff is a cache policy, not a barrier after completed work.
+            Self(Some(timeline.approximate_cutoff(max_staleness)))
+        }
+    }
+
+    pub(crate) fn is_satisfied_by(self, current_after: SequencePoint) -> bool {
+        self.0.is_none_or(|bound| current_after >= bound)
     }
 }
 
@@ -70,9 +143,19 @@ impl Timeline {
         Self::from_source(Arc::new(RuntimeSource::new()), None)
     }
 
-    /// Allocates a barrier satisfied by every operation invoked afterward and
-    /// not by any operation that definitively completed beforehand.
-    pub fn now(&self) -> SequencePoint {
+    /// Captures a currentness barrier after completed prerequisite work.
+    pub fn currentness_barrier(&self) -> CurrentnessBarrier {
+        CurrentnessBarrier { point: self.now() }
+    }
+
+    /// Creates a timeline whose first allocation follows the last recovered
+    /// sequence point, or starts a fresh timeline when it is `None`.
+    pub fn starting_after(previous: Option<SequencePoint>) -> Self {
+        Self::from_source(Arc::new(RuntimeSource::new()), previous)
+    }
+
+    /// Allocates the next local sequence point.
+    pub(crate) fn now(&self) -> SequencePoint {
         let elapsed = self
             .0
             .base
@@ -91,12 +174,6 @@ impl Timeline {
         }
     }
 
-    /// Creates a timeline whose first allocation follows the last recovered
-    /// sequence point, or starts a fresh timeline when it is `None`.
-    pub fn starting_after(previous: Option<SequencePoint>) -> Self {
-        Self::from_source(Arc::new(RuntimeSource::new()), previous)
-    }
-
     #[cfg(test)]
     pub(crate) fn with_source(source: Arc<dyn TimeSource>) -> Self {
         Self::from_source(source, None)
@@ -104,7 +181,7 @@ impl Timeline {
 
     /// Derives the approximate sequence cutoff used only by bounded-staleness
     /// reads.
-    pub(crate) fn approximate_cutoff(&self, max_staleness: Duration) -> SequencePoint {
+    fn approximate_cutoff(&self, max_staleness: Duration) -> SequencePoint {
         SequencePoint(
             self.now()
                 .raw()
@@ -199,6 +276,30 @@ mod tests {
         assert_eq!(
             timeline.approximate_cutoff(Duration::from_secs(60)),
             SequencePoint::from_raw(20_000_000_001)
+        );
+    }
+
+    #[test]
+    fn requirement_satisfaction_follows_currentness_evidence() {
+        let earlier = SequencePoint::from_raw(1);
+        let later = SequencePoint::from_raw(2);
+
+        assert!(Requirement::ANY.is_satisfied_by(earlier));
+        assert!(Requirement(Some(earlier)).is_satisfied_by(earlier));
+        assert!(Requirement(Some(earlier)).is_satisfied_by(later));
+        assert!(!Requirement(Some(later)).is_satisfied_by(earlier));
+    }
+
+    #[test]
+    fn duration_requirement_uses_the_timeline() {
+        let timeline = Timeline::with_source(Arc::new(FixedSource(Duration::from_secs(10))));
+        assert_eq!(
+            Requirement::within(&timeline, Duration::from_secs(3)),
+            Requirement(Some(SequencePoint::from_raw(7_000_000_000)))
+        );
+        assert_eq!(
+            Requirement::within(&timeline, Duration::MAX),
+            Requirement::ANY
         );
     }
 }

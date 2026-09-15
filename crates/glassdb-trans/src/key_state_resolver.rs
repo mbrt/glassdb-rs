@@ -542,7 +542,7 @@ mod tests {
         let (state, _background) = harness.resolver();
         harness.clear_operations();
         let writer = state
-            .resolve_effective(key, Some(entry), None, Requirement::Any)
+            .resolve_effective(key, Some(entry), None, Requirement::ANY)
             .await
             .unwrap()
             .into_writer();
@@ -554,7 +554,7 @@ mod tests {
 
         harness.clear_operations();
         let writer = state
-            .resolve_effective(key, Some(entry), None, Requirement::Any)
+            .resolve_effective(key, Some(entry), None, Requirement::ANY)
             .await
             .unwrap()
             .into_writer();
@@ -566,7 +566,7 @@ mod tests {
         let (state, _background) = harness.resolver();
         harness.clear_operations();
         let holders = state
-            .resolve_holders(key, Some(entry), None, Requirement::Any)
+            .resolve_holders(key, Some(entry), None, Requirement::ANY)
             .await
             .unwrap();
         assert_eq!(holders, expected.holders, "{context}: holders");
@@ -581,7 +581,7 @@ mod tests {
         harness.clear_operations();
         assert_eq!(
             state
-                .resolve_effective(key, Some(entry), None, Requirement::Any)
+                .resolve_effective(key, Some(entry), None, Requirement::ANY)
                 .await
                 .unwrap()
                 .exists(),
@@ -772,7 +772,7 @@ mod tests {
             let (state, _background) = harness.resolver();
             harness.clear_operations();
             let holders = state
-                .resolve_holders(&key, Some(&entry), Some(&holder), Requirement::Any)
+                .resolve_holders(&key, Some(&entry), Some(&holder), Requirement::ANY)
                 .await
                 .unwrap();
             assert_eq!(
@@ -794,7 +794,7 @@ mod tests {
             harness.clear_operations();
             assert!(
                 state
-                    .resolve_effective(&key, Some(&entry), Some(&holder), Requirement::Any)
+                    .resolve_effective(&key, Some(&entry), Some(&holder), Requirement::ANY)
                     .await
                     .unwrap()
                     .exists(),
@@ -833,7 +833,7 @@ mod tests {
 
         let state = KeyStateResolver::new(monitor.clone());
         let pending = state
-            .resolve_holders(&key, Some(&entry), None, Requirement::Any)
+            .resolve_holders(&key, Some(&entry), None, Requirement::ANY)
             .await
             .unwrap();
         assert_eq!(pending.writer, Some(predecessor));
@@ -847,7 +847,7 @@ mod tests {
         );
 
         let committed = state
-            .resolve_holders(&key, Some(&entry), None, Requirement::Any)
+            .resolve_holders(&key, Some(&entry), None, Requirement::ANY)
             .await
             .unwrap();
         assert_eq!(committed.writer, Some(holder));

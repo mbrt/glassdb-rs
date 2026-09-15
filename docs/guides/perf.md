@@ -1018,7 +1018,7 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - `autoresearch-*` is **deterministic** (single-client backend ops/tx,
   lower is better) — the most trustworthy signal; `mix-*` and
   `deadlock-*` are **[noisy]** (contention-bound, short windows) and
-  `[low-sample]` marks a folded cell below the trust floor
+  `[low-sample]` marks an aggregated cell below the trust floor
 
 ### rw9010/balanced
 

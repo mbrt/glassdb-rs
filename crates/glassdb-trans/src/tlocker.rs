@@ -37,16 +37,16 @@ use glassdb_concurr::{RetryConfig, join_all_bounded, map_all_bounded, rt};
 use glassdb_data::{LeafRef, LogicalKey, ObjectPath, TxId};
 use glassdb_storage::transaction::TxLock;
 use glassdb_storage::{
-    CurrentState, EntryLockState, LeafEntry, LeafObservation, LockType, NodeLocks, Requirement,
-    StorageError, TreeRouter,
+    CurrentState, CurrentnessBarrier, EntryLockState, LeafEntry, LeafObservation, LockType,
+    NodeLocks, Requirement, StorageError, TreeRouter,
 };
 
 use crate::access::{AccessSet, WriteOp};
 use crate::collection_coordination::{CollectionLocker, CollectionStateResolver};
 use crate::error::TransError;
 use crate::leaf_coord::{
-    CoordinatedOutcome, CoordinationEvidence, FoldOutcome, LeafCoordinator, LeafOperation,
-    LeafResolver, ResolveCtx, StageAdmission, Step,
+    CoordinatedOutcome, CoordinationEvidence, LeafCoordinator, LeafOperation, LeafResolver,
+    MemberOutcome, ResolveCtx, StageAdmission, Step,
 };
 use crate::monitor::Monitor;
 use crate::node_locking::NodeLockReconciler;
@@ -123,11 +123,6 @@ struct LeafHoldReceipt {
 }
 
 impl LeafHoldReceipt {
-    /// Returns the leaf state that proves the hold.
-    fn observation(&self) -> &LeafObservation {
-        self.evidence.observation()
-    }
-
     /// Returns the aggregate lock strengths held on the leaf.
     fn held(&self) -> HeldLeaf {
         self.held
@@ -181,11 +176,15 @@ impl LockedTx {
     }
 
     /// Reports whether this transaction acquired its hold from the exact leaf
-    /// state that was observed earlier.
-    pub(crate) fn validated(&self, observed: &LeafObservation) -> bool {
+    /// state that was observed earlier, with evidence reaching `barrier`.
+    pub(crate) fn validated(
+        &self,
+        observed: &LeafObservation,
+        barrier: CurrentnessBarrier,
+    ) -> bool {
         self.groups
             .values()
-            .any(|group| group.receipt.observation().same_state(observed))
+            .any(|group| group.receipt.evidence.validates(observed, barrier))
     }
 
     /// The typed entry and leaf locks GC records on the transaction object for
@@ -252,7 +251,7 @@ async fn build_groups(
     // coordination CAS revalidates at the version, so neither the root `_r` nor
     // the terminal leaf needs a separate validation read.
     let grouped = router
-        .route_keys_with_requirements(items, Requirement::Any, Requirement::Any)
+        .route_keys_with_requirements(items, Requirement::ANY, Requirement::ANY)
         .await
         .map_err(|error| TransError::from(error).context("grouping keys by leaf"))?;
 
@@ -348,7 +347,7 @@ impl LeafResolver for AcquireOperation {
         let reconciler = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id);
         if let Some(holder) = reconciler.admit_non_structural(&mut locks).await? {
             return Ok(Step::Skip {
-                outcome: FoldOutcome::Wait(holder),
+                outcome: MemberOutcome::Wait(holder),
             });
         }
         let mut membership = self.membership;
@@ -370,7 +369,7 @@ impl LeafResolver for AcquireOperation {
                 // moment a key must wait, stage nothing and return Wait.
                 EntryResolution::Wait(holder) => {
                     return Ok(Step::Skip {
-                        outcome: FoldOutcome::Wait(holder),
+                        outcome: MemberOutcome::Wait(holder),
                     });
                 }
             }
@@ -382,12 +381,12 @@ impl LeafResolver for AcquireOperation {
                 .await?
             {
                 return Ok(Step::Skip {
-                    outcome: FoldOutcome::Wait(holder),
+                    outcome: MemberOutcome::Wait(holder),
                 });
             }
             membership = locks.membership().lock_type();
         }
-        let outcome = FoldOutcome::Locked {
+        let outcome = MemberOutcome::Locked {
             typ: entry_lock_type(&self.intents),
             membership,
         };
@@ -412,8 +411,8 @@ impl LeafResolver for AcquireOperation {
             .all(|i| matches!(i.desired, Desired::Read))
     }
 
-    fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
-        FoldOutcome::Conflict
+    fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
+        MemberOutcome::Conflict
     }
 
     fn leaf_scope_keys(&self) -> Vec<&[u8]> {
@@ -435,7 +434,7 @@ impl LeafOperation for AcquireOperation {
         &self.id
     }
 
-    fn first_requirement(&self) -> Requirement {
+    fn requirement(&self) -> Requirement {
         self.requirement
     }
 
@@ -447,7 +446,7 @@ impl LeafOperation for AcquireOperation {
         };
         let CoordinatedOutcome { outcome, evidence } = coordinated;
         match outcome {
-            FoldOutcome::Locked { typ, membership } => {
+            MemberOutcome::Locked { typ, membership } => {
                 let held = HeldLeaf {
                     entry_lock: typ,
                     membership,
@@ -456,17 +455,17 @@ impl LeafOperation for AcquireOperation {
                     .map(|evidence| AcquireOutcome::Locked(LeafHoldReceipt { evidence, held }))
                     .ok_or_else(|| TransError::other("lock round returned no hold receipt"))
             }
-            FoldOutcome::Wait(holder) => Ok(AcquireOutcome::Wait(holder)),
-            FoldOutcome::LeafFull => Ok(AcquireOutcome::LeafFull),
+            MemberOutcome::Wait(holder) => Ok(AcquireOutcome::Wait(holder)),
+            MemberOutcome::LeafFull => Ok(AcquireOutcome::LeafFull),
             // A result from another operation kind is not proof that this lock
             // landed. The safe response is the ordinary release-and-relock path.
-            FoldOutcome::Conflict
-            | FoldOutcome::Released { .. }
-            | FoldOutcome::Reroute
-            | FoldOutcome::Landed
-            | FoldOutcome::Moved
-            | FoldOutcome::Replay
-            | FoldOutcome::InDoubt(_) => Ok(AcquireOutcome::Conflict),
+            MemberOutcome::Conflict
+            | MemberOutcome::Released { .. }
+            | MemberOutcome::Reroute
+            | MemberOutcome::Landed
+            | MemberOutcome::Moved
+            | MemberOutcome::Replay
+            | MemberOutcome::InDoubt(_) => Ok(AcquireOutcome::Conflict),
         }
     }
 }
@@ -490,7 +489,6 @@ struct WriteBackOperation {
     id: TxId,
     path: ObjectPath,
     intents: Arc<Vec<KeyIntent>>,
-    requirement: Requirement,
 }
 
 #[async_trait]
@@ -514,20 +512,20 @@ impl LeafResolver for WriteBackOperation {
         {
             if !owns_entry && !owns_membership {
                 return Ok(Step::Skip {
-                    outcome: FoldOutcome::Released {
+                    outcome: MemberOutcome::Released {
                         superseded: Vec::new(),
                     },
                 });
             }
             return Ok(Step::Skip {
-                outcome: FoldOutcome::Wait(holder),
+                outcome: MemberOutcome::Wait(holder),
             });
         }
         let WritebackStaged {
             changes,
             superseded,
         } = writeback_changes(&self.id, &self.intents, staged);
-        let outcome = FoldOutcome::Released { superseded };
+        let outcome = MemberOutcome::Released { superseded };
         let locks_changed = locks.release_membership(&self.id);
         if changes.is_empty() && !locks_changed {
             Ok(Step::Skip { outcome })
@@ -545,15 +543,15 @@ impl LeafResolver for WriteBackOperation {
         true
     }
 
-    fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
+    fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
         // Exhaustion proves neither publication nor that gate acquisition
         // removed our holder. Re-descend and keep converging from current
         // routing state.
-        FoldOutcome::Reroute
+        MemberOutcome::Reroute
     }
 
-    fn reroute_outcome(&self, _in_doubt: bool) -> FoldOutcome {
-        FoldOutcome::Reroute
+    fn reroute_outcome(&self, _in_doubt: bool) -> MemberOutcome {
+        MemberOutcome::Reroute
     }
 
     fn leaf_scope_keys(&self) -> Vec<&[u8]> {
@@ -583,22 +581,25 @@ impl LeafOperation for WriteBackOperation {
         &self.id
     }
 
-    fn first_requirement(&self) -> Requirement {
-        self.requirement
+    fn requirement(&self) -> Requirement {
+        // Locking used this cache, so it cannot serve a state from before the
+        // installed hold. A split resolves committed holders before moving
+        // entries. Any remaining write is protected by its revision CAS.
+        Requirement::ANY
     }
 
     fn complete(&self, outcome: Option<CoordinatedOutcome>) -> Result<Self::Output, TransError> {
         match outcome {
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Released { superseded },
+                outcome: MemberOutcome::Released { superseded },
                 ..
             }) => Ok(WriteBackOutcome::Released(superseded)),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Reroute,
+                outcome: MemberOutcome::Reroute,
                 ..
             }) => Ok(WriteBackOutcome::Reroute),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Wait(_),
+                outcome: MemberOutcome::Wait(_),
                 ..
             }) => {
                 // The committed log makes later publication and cleanup
@@ -639,17 +640,17 @@ impl LeafResolver for ReleaseOperation {
         {
             if !owns_entry && !owns_membership {
                 return Ok(Step::Skip {
-                    outcome: FoldOutcome::Released {
+                    outcome: MemberOutcome::Released {
                         superseded: Vec::new(),
                     },
                 });
             }
             return Ok(Step::Skip {
-                outcome: FoldOutcome::Wait(holder),
+                outcome: MemberOutcome::Wait(holder),
             });
         }
         let changes = release_changes(&self.id, staged);
-        let outcome = FoldOutcome::Released {
+        let outcome = MemberOutcome::Released {
             superseded: Vec::new(),
         };
         let locks_changed = locks.release_membership(&self.id);
@@ -669,18 +670,18 @@ impl LeafResolver for ReleaseOperation {
         true
     }
 
-    fn exhausted_outcome(&self, _in_doubt: bool) -> FoldOutcome {
+    fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
         // Exhaustion proves nothing about the holds this transaction still has
         // in the leaf. Reporting a release the round never made would let the
         // caller retire a transaction object its holders still point at.
-        FoldOutcome::Conflict
+        MemberOutcome::Conflict
     }
 
-    fn reroute_outcome(&self, _in_doubt: bool) -> FoldOutcome {
+    fn reroute_outcome(&self, _in_doubt: bool) -> MemberOutcome {
         // The submitted object is no longer a leaf, so it carries none of this
         // transaction's holds — the proof a release needs. Retrying the same
         // path would only rediscover an object that will never be a leaf again.
-        FoldOutcome::Released {
+        MemberOutcome::Released {
             superseded: Vec::new(),
         }
     }
@@ -697,25 +698,30 @@ impl LeafOperation for ReleaseOperation {
         &self.id
     }
 
-    fn first_requirement(&self) -> Requirement {
+    fn requirement(&self) -> Requirement {
         self.requirement
     }
 
     fn complete(&self, outcome: Option<CoordinatedOutcome>) -> Result<Self::Output, TransError> {
         match outcome {
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Released { .. },
+                outcome: MemberOutcome::Released { .. },
                 evidence,
-            }) => Ok(ReleaseOutcome::Released(matches!(
-                evidence,
-                Some(CoordinationEvidence::Installed(_))
-            ))),
+            }) => Ok(match evidence {
+                Some(CoordinationEvidence::Installed(_)) => ReleaseOutcome::Released(true),
+                Some(CoordinationEvidence::Observed(observed)) => {
+                    ReleaseOutcome::Observed(observed)
+                }
+                // Only index rerouting releases without leaf evidence. A node
+                // cannot become a leaf again, so none of its holds can return.
+                None => ReleaseOutcome::Released(false),
+            }),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Wait(holder),
+                outcome: MemberOutcome::Wait(holder),
                 ..
             }) => Ok(ReleaseOutcome::Wait(holder)),
             Some(CoordinatedOutcome {
-                outcome: FoldOutcome::Conflict,
+                outcome: MemberOutcome::Conflict,
                 ..
             }) => Ok(ReleaseOutcome::Contended),
             Some(_) => Err(TransError::other("release produced a non-cleanup outcome")),
@@ -755,6 +761,7 @@ enum AcquireOutcome {
 
 enum ReleaseOutcome {
     Released(bool),
+    Observed(LeafObservation),
     Wait(TxId),
     /// The round ended without proving the holds were dropped. Re-submit.
     Contended,
@@ -779,8 +786,8 @@ async fn resolve_and_lock(
     // Resolve existing holders other than us via the shared resolver: a
     // committed exclusive holder is help-forwarded (its value becomes the
     // effective one), aborted/missing holders are dropped, and the live pending
-    // ones come back as conflicts to wound-wait. The monitor folds lease expiry
-    // and the unknown-tx grace period into `tx_status`, so a holder still seen
+    // ones come back as conflicts to wound-wait. The monitor accounts for lease expiry
+    // and the unknown-tx grace period in `tx_status`, so a holder still seen
     // as `Pending` here is genuinely live (ADR-021).
     let resolved = ctx
         .key_state
@@ -1001,7 +1008,7 @@ impl Locker {
         requirement: Requirement,
     ) -> Result<bool, TransError> {
         let keys_released = self.keys.release(id, locks, requirement).await?;
-        let coll_released = self.collections.release(id, locks).await?;
+        let coll_released = self.collections.release(id, locks, requirement).await?;
         Ok(keys_released || coll_released)
     }
 
@@ -1049,6 +1056,10 @@ impl KeyLocker {
     /// Cancellation can leave a partial pass, but the committed log remains
     /// authoritative and every landed CAS is safe to repeat.
     ///
+    /// `locked` must come from this locker's database instance. Locking and
+    /// write-back share cache knowledge; this is not a recovery interface for
+    /// another instance's locks.
+    ///
     /// Returns displaced external transaction-object references as GC candidates.
     /// Inline values and tombstones can have logless writers; GC scans discover
     /// any transaction objects behind those states.
@@ -1058,15 +1069,8 @@ impl KeyLocker {
         let mut operations = Vec::with_capacity(locked.groups.len());
         for group in locked.groups.values() {
             operations.push(async move {
-                // The hold receipt is the write-back's freshness barrier.
-                let requirement = Requirement::AtLeast(group.receipt.observation().current_after());
-                self.write_back_routed(
-                    id,
-                    &group.path,
-                    Arc::new(group.intents.clone()),
-                    requirement,
-                )
-                .await
+                self.write_back_routed(id, &group.path, Arc::new(group.intents.clone()))
+                    .await
             });
         }
         let results = join_all_bounded(operations, self.parallelism).await;
@@ -1077,14 +1081,55 @@ impl KeyLocker {
     }
 
     /// Releases `id` from one exact leaf path.
+    ///
+    /// Read-based completion must satisfy `requirement`. `ANY` is sufficient
+    /// when the caller shares the cache knowledge from acquiring these holds.
     pub(crate) async fn release_leaf(
         &self,
         id: &TxId,
         path: &ObjectPath,
+        requirement: Requirement,
     ) -> Result<bool, TransError> {
-        // A release stages no decision that can become unsafe from a stale
-        // seed; its CAS arbitrates with any newer leaf and retries on conflict.
-        self.release_leaf_at(id, path, Requirement::Any).await
+        let mut operation = ReleaseOperation {
+            id: id.clone(),
+            path: path.clone(),
+            requirement: Requirement::ANY,
+        };
+        let mut backoff = self.retry.backoff();
+        let mut contended = 0;
+        loop {
+            match self.coord.coordinate(operation.clone()).await? {
+                ReleaseOutcome::Released(changed) => return Ok(changed),
+                ReleaseOutcome::Observed(observed) => {
+                    if observed.satisfies(requirement) {
+                        return Ok(false);
+                    }
+                    // A cached no-holder state can predate a recovered hold.
+                    // Reuse the caller's bound only if no CAS or observation
+                    // already proves completion. Check each returned observation
+                    // because a round can absorb this member after its load.
+                    if operation.requirement != requirement {
+                        operation.requirement = requirement;
+                        continue;
+                    }
+                }
+                ReleaseOutcome::Wait(holder) => {
+                    let delay = backoff.next_delay();
+                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await? {
+                        backoff = self.retry.backoff();
+                    }
+                    continue;
+                }
+                ReleaseOutcome::Contended => {}
+            }
+            // Failed CASes or repeatedly insufficient observations cannot
+            // establish completion. Keep the log for a later cleanup attempt.
+            contended += 1;
+            if contended == RELEASE_CONTENTION_ROUNDS {
+                return Err(TransError::Retry);
+            }
+            rt::sleep(backoff.next_delay()).await;
+        }
     }
 
     /// Releases recorded entry and membership locks without changing committed values.
@@ -1124,7 +1169,7 @@ impl KeyLocker {
             }
         }
         let results = map_all_bounded(leaf_paths, self.parallelism, |path| async move {
-            self.release_leaf(id, &path).await
+            self.release_leaf(id, &path, requirement).await
         })
         .await;
         let mut changed = false;
@@ -1211,15 +1256,11 @@ impl KeyLocker {
         id: &TxId,
         path: &ObjectPath,
         intents: Arc<Vec<KeyIntent>>,
-        requirement: Requirement,
     ) -> Vec<TxId> {
         let mut pending = VecDeque::from([(path.clone(), intents)]);
         let mut superseded = Vec::new();
         while let Some((path, intents)) = pending.pop_front() {
-            let outcome = match self
-                .write_back_leaf(id, &path, intents.clone(), requirement)
-                .await
-            {
+            let outcome = match self.write_back_leaf(id, &path, intents.clone()).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     tracing::warn!(
@@ -1240,9 +1281,11 @@ impl KeyLocker {
                         .cloned()
                         .map(|intent| (intent.key.clone(), intent))
                         .collect();
+                    // Splits publish committed holders before moving entries,
+                    // so a rerouted leaf has no inherited hold to overlook.
                     let groups = match self
                         .router
-                        .route_keys_with_requirements(items, Requirement::Any, requirement)
+                        .route_keys_with_requirements(items, Requirement::ANY, Requirement::ANY)
                         .await
                     {
                         Ok(groups) => groups,
@@ -1282,51 +1325,13 @@ impl KeyLocker {
         id: &TxId,
         path: &ObjectPath,
         intents: Arc<Vec<KeyIntent>>,
-        requirement: Requirement,
     ) -> Result<WriteBackOutcome, TransError> {
         let operation = WriteBackOperation {
             id: id.clone(),
             path: path.clone(),
             intents,
-            requirement,
         };
         self.coord.coordinate(operation).await
-    }
-
-    async fn release_leaf_at(
-        &self,
-        id: &TxId,
-        path: &ObjectPath,
-        requirement: Requirement,
-    ) -> Result<bool, TransError> {
-        let operation = ReleaseOperation {
-            id: id.clone(),
-            path: path.clone(),
-            requirement,
-        };
-        let mut backoff = self.retry.backoff();
-        let mut contended = 0;
-        loop {
-            match self.coord.coordinate(operation.clone()).await? {
-                ReleaseOutcome::Released(changed) => return Ok(changed),
-                ReleaseOutcome::Wait(holder) => {
-                    let delay = backoff.next_delay();
-                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await? {
-                        backoff = self.retry.backoff();
-                    }
-                }
-                // A leaf this hot keeps its holder for now. Releases run in
-                // background sweeps that revisit the transaction, so returning
-                // lets the sweep move on instead of camping on one leaf.
-                ReleaseOutcome::Contended => {
-                    contended += 1;
-                    if contended == RELEASE_CONTENTION_ROUNDS {
-                        return Err(TransError::Retry);
-                    }
-                    rt::sleep(backoff.next_delay()).await;
-                }
-            }
-        }
     }
 
     /// Installs this transaction's locks on every key it touches in one leaf,
@@ -1551,16 +1556,15 @@ mod tests {
             id: mk_tid(1, "writer"),
             path: root_path(),
             intents: Arc::new(vec![put_intent(b"key")]),
-            requirement: Requirement::Any,
         };
 
         assert!(matches!(
             resolver.exhausted_outcome(false),
-            FoldOutcome::Reroute
+            MemberOutcome::Reroute
         ));
         assert!(matches!(
             resolver.exhausted_outcome(true),
-            FoldOutcome::Reroute
+            MemberOutcome::Reroute
         ));
     }
 
@@ -1590,7 +1594,10 @@ mod tests {
     async fn entry_of(ctx: &TlCtx, key: &[u8]) -> Option<LeafEntry> {
         let loaded = ctx
             .nodes
-            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
+            .load_leaf(
+                &root_path(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         loaded.entries().lookup(key).cloned()
@@ -1599,7 +1606,10 @@ mod tests {
     async fn replace_root(ctx: &TlCtx, root: &Node) {
         let (_, observed) = ctx
             .nodes
-            .load_root(&collection(), Requirement::AtLeast(ctx.timeline.now()))
+            .load_root(
+                &collection(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert!(
@@ -1616,7 +1626,7 @@ mod tests {
         id: &TxId,
         groups: &BTreeMap<ObjectPath, RoutedLockGroup>,
     ) -> BTreeMap<ObjectPath, LeafHoldReceipt> {
-        lock_ok_at(locker, id, groups, Requirement::Any).await
+        lock_ok_at(locker, id, groups, Requirement::ANY).await
     }
 
     // Acquires leaf locks against an explicit pre-lock requirement.
@@ -1655,7 +1665,10 @@ mod tests {
         assert_eq!(e.lock_holders(), std::slice::from_ref(&tx));
         let loaded = ctx
             .nodes
-            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
+            .load_leaf(
+                &root_path(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
@@ -1716,8 +1729,8 @@ mod tests {
         ctx.monitor.begin_tx(&tx);
         let groups = group_of_intents(vec![put_intent(b"apple")]);
 
-        let installed_at = ctx.timeline.now();
-        let installed = lock_ok_at(&locker, &tx, &groups, Requirement::AtLeast(installed_at)).await;
+        let installed_at = ctx.timeline.currentness_barrier();
+        let installed = lock_ok_at(&locker, &tx, &groups, Requirement::after(installed_at)).await;
         let receipt = &installed[&root_path()];
         assert!(matches!(
             receipt,
@@ -1726,10 +1739,13 @@ mod tests {
                 ..
             }
         ));
-        assert!(receipt.observation().current_after() >= installed_at);
+        let CoordinationEvidence::Installed(receipt) = &receipt.evidence else {
+            panic!("first acquisition must install its locks");
+        };
+        assert!(receipt.installed().is_current_after(installed_at));
 
-        let observed_at = ctx.timeline.now();
-        let observed = lock_ok_at(&locker, &tx, &groups, Requirement::AtLeast(observed_at)).await;
+        let observed_at = ctx.timeline.currentness_barrier();
+        let observed = lock_ok_at(&locker, &tx, &groups, Requirement::after(observed_at)).await;
         let receipt = &observed[&root_path()];
         assert!(matches!(
             receipt,
@@ -1738,7 +1754,10 @@ mod tests {
                 ..
             }
         ));
-        assert!(receipt.observation().current_after() >= observed_at);
+        let CoordinationEvidence::Observed(observation) = &receipt.evidence else {
+            panic!("repeated acquisition must retain its read observation");
+        };
+        assert!(observation.is_current_after(observed_at));
     }
 
     #[tokio::test]
@@ -1792,7 +1811,7 @@ mod tests {
                     &waiting_tx,
                     &group_of(b"target", put_intent(b"target")),
                     false,
-                    Requirement::Any,
+                    Requirement::ANY,
                 )
                 .await
         });
@@ -1812,7 +1831,10 @@ mod tests {
         ));
         let loaded = ctx
             .nodes
-            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
+            .load_leaf(
+                &root_path(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
@@ -1850,7 +1872,7 @@ mod tests {
                 &tx,
                 &group_of(b"z", put_intent(b"z")),
                 false,
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
             .unwrap();
@@ -1858,7 +1880,10 @@ mod tests {
         assert!(entry_of(&ctx, b"z").await.is_none());
         let loaded = ctx
             .nodes
-            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
+            .load_leaf(
+                &root_path(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
@@ -1876,7 +1901,10 @@ mod tests {
         lock_ok(&locker, &tx, &group_of(key, put_intent(key))).await;
         let loaded = ctx
             .nodes
-            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
+            .load_leaf(
+                &root_path(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
@@ -1899,17 +1927,27 @@ mod tests {
         let path = root_path();
         let loaded = ctx
             .nodes
-            .load_leaf(&path, Requirement::AtLeast(ctx.timeline.now()))
+            .load_leaf(
+                &path,
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(loaded.node().membership_lock().lock_type(), LockType::Read);
         assert!(loaded.node().membership_lock().contains(&tx));
         assert_eq!(loaded.node().membership_version(), 0);
 
-        locker.keys().release_leaf(&tx, &path).await.unwrap();
+        locker
+            .keys()
+            .release_leaf(&tx, &path, Requirement::ANY)
+            .await
+            .unwrap();
         let loaded = ctx
             .nodes
-            .load_leaf(&path, Requirement::AtLeast(ctx.timeline.now()))
+            .load_leaf(
+                &path,
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert!(loaded.node().membership_lock().holders().is_empty());
@@ -1954,7 +1992,11 @@ mod tests {
         });
 
         assert!(
-            locker.keys().release_leaf(&tx, &root_path()).await.unwrap(),
+            locker
+                .keys()
+                .release_leaf(&tx, &root_path(), Requirement::ANY)
+                .await
+                .unwrap(),
             "the release reports the removal it made, not the round that ended"
         );
         assert_eq!(
@@ -1994,7 +2036,10 @@ mod tests {
         });
 
         assert!(matches!(
-            locker.keys().release_leaf(&tx, &root_path()).await,
+            locker
+                .keys()
+                .release_leaf(&tx, &root_path(), Requirement::ANY)
+                .await,
             Err(TransError::Retry)
         ));
         assert!(
@@ -2071,7 +2116,7 @@ mod tests {
         let waiting = tokio::spawn(async move {
             locker2
                 .keys()
-                .lock_leaves_at(&young2, &groups, false, Requirement::Any)
+                .lock_leaves_at(&young2, &groups, false, Requirement::ANY)
                 .await
         });
 
@@ -2120,7 +2165,7 @@ mod tests {
         let waiting = tokio::spawn(async move {
             locker2
                 .keys()
-                .lock_leaves_at(&young2, &groups, false, Requirement::Any)
+                .lock_leaves_at(&young2, &groups, false, Requirement::ANY)
                 .await
         });
 
@@ -2173,12 +2218,61 @@ mod tests {
         assert_eq!(e.current, CurrentState::External { writer: tx });
         let loaded = ctx
             .nodes
-            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
+            .load_leaf(
+                &root_path(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
         assert!(loaded.node().membership_lock().holders().is_empty());
         assert_eq!(loaded.node().membership_version(), 2);
+    }
+
+    #[tokio::test]
+    async fn warm_write_back_needs_only_its_cas_and_replay_needs_no_io() {
+        let backend = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
+        let log = backend.log();
+        let (locker, ctx) = new_test_locker(backend).await;
+        let key = b"key";
+        let writer = mk_tid(1, "writer");
+        let locked = lock_commit(&locker, &ctx, &writer, key).await;
+
+        // The small test cache can evict the leaf while committing the log.
+        // Warm it before measuring the ordinary cached write-back path.
+        let held = ctx
+            .nodes
+            .load_leaf(&root_path(), Requirement::ANY)
+            .await
+            .unwrap();
+        assert!(held.entries().lookup(key).unwrap().is_locked_by(&writer));
+        log.lock().unwrap().clear();
+
+        assert!(locker.keys().write_back(&writer, &locked).await.is_empty());
+        let leaf_path = root_path().to_string();
+        let operations: Vec<_> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|operation| operation.path == leaf_path)
+            .map(|operation| operation.op)
+            .collect();
+        assert_eq!(
+            operations,
+            ["write_if"],
+            "write-back must reuse the cached hold"
+        );
+
+        log.lock().unwrap().clear();
+        assert!(locker.keys().write_back(&writer, &locked).await.is_empty());
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a completed write-back needs no I/O"
+        );
+
+        let published = entry_of(&ctx, key).await.unwrap();
+        assert_eq!(published.current, CurrentState::External { writer });
+        assert!(published.lock_holders().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -2193,7 +2287,10 @@ mod tests {
         ctx.monitor.begin_tx(&gate);
         let loaded = ctx
             .nodes
-            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
+            .load_leaf(
+                &root_path(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         let mut node = loaded.node().clone();
@@ -2210,7 +2307,10 @@ mod tests {
 
         let loaded = ctx
             .nodes
-            .load_leaf(&root_path(), Requirement::AtLeast(ctx.timeline.now()))
+            .load_leaf(
+                &root_path(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         assert_eq!(loaded.node().structural_gate().holders(), &[gate]);
@@ -2349,12 +2449,7 @@ mod tests {
             let group = group_of(key, put_intent(key)).remove(&root_path()).unwrap();
             let hints = locker
                 .keys()
-                .write_back_routed(
-                    &writer,
-                    &group.path,
-                    Arc::new(group.intents),
-                    Requirement::Any,
-                )
+                .write_back_routed(&writer, &group.path, Arc::new(group.intents))
                 .await;
             assert!(hints.is_empty());
             assert_eq!(
@@ -2384,7 +2479,7 @@ mod tests {
         let group = group_of(key, put_intent(key)).remove(&root_path()).unwrap();
         locker
             .keys()
-            .write_back_routed(&tx, &group.path, Arc::new(group.intents), Requirement::Any)
+            .write_back_routed(&tx, &group.path, Arc::new(group.intents))
             .await;
 
         let entry = entry_of(&ctx, key).await.unwrap();
@@ -2432,7 +2527,7 @@ mod tests {
                 &reader,
                 &group_of(key, read_intent(key)),
                 false,
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await
             .unwrap();
@@ -2467,7 +2562,10 @@ mod tests {
         let path = root_path();
         let loaded = ctx
             .nodes
-            .load_leaf(&path, Requirement::AtLeast(ctx.timeline.now()))
+            .load_leaf(
+                &path,
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
             .await
             .unwrap();
         let mut entries: BTreeMap<Vec<u8>, LeafEntry> = loaded
@@ -2483,7 +2581,7 @@ mod tests {
         let new_leaf = LeafBody::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
         edit.set_entries(new_leaf);
-        assert!(ctx.nodes.commit_leaf(edit).await.unwrap());
+        assert!(ctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
     }
 
     // --- ADR-025: cross-transaction lock-acquisition deduplication ----------
@@ -2790,7 +2888,10 @@ mod tests {
                     if write_back {
                         locker.collections().write_back(&id, &changes, &locks).await
                     } else {
-                        locker.collections().release(&id, &locks).await
+                        locker
+                            .collections()
+                            .release(&id, &locks, Requirement::ANY)
+                            .await
                     }
                 },
                 &gate,
@@ -2802,7 +2903,10 @@ mod tests {
                 let (record, _) = ctx
                     ._foundation
                     .records
-                    .load_record(&change.parent, Requirement::AtLeast(ctx.timeline.now()))
+                    .load_record(
+                        &change.parent,
+                        Requirement::after(ctx.timeline.currentness_barrier()),
+                    )
                     .await
                     .unwrap();
                 assert!(!record.directory_lock().contains(&id));
@@ -2831,7 +2935,7 @@ mod tests {
             locker.collections().is_referenced(
                 &id,
                 &locks,
-                Requirement::AtLeast(ctx.timeline.now()),
+                Requirement::after(ctx.timeline.currentness_barrier()),
             ),
             &gate,
         )
@@ -2867,7 +2971,11 @@ mod tests {
         });
         let result = locker
             .collections()
-            .is_referenced(&id, &locks, Requirement::AtLeast(ctx.timeline.now()))
+            .is_referenced(
+                &id,
+                &locks,
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
             .await;
         assert!(matches!(
             result,
@@ -2886,7 +2994,7 @@ mod tests {
         let (outcome, widths) = operation_widths(
             locker
                 .keys()
-                .lock_leaves_at(&tx, &groups, false, Requirement::Any),
+                .lock_leaves_at(&tx, &groups, false, Requirement::ANY),
             &gate,
         )
         .await;
@@ -2909,7 +3017,11 @@ mod tests {
 
         gate.arm();
         let (changed, widths) = operation_widths(
-            locker.release(&tx, &locks, Requirement::AtLeast(ctx.timeline.now())),
+            locker.release(
+                &tx,
+                &locks,
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            ),
             &gate,
         )
         .await;
@@ -2919,7 +3031,7 @@ mod tests {
         for path in &paths {
             let leaf = ctx
                 .nodes
-                .load_leaf(path, Requirement::AtLeast(ctx.timeline.now()))
+                .load_leaf(path, Requirement::after(ctx.timeline.currentness_barrier()))
                 .await
                 .unwrap();
             assert!(leaf.entries().lookup(b"key").is_none());
@@ -2985,12 +3097,12 @@ mod tests {
         let g2 = group_of(key, read_intent(key));
         let h1 = tokio::spawn(async move {
             l1.keys()
-                .lock_leaves_at(&t1, &g1, false, Requirement::Any)
+                .lock_leaves_at(&t1, &g1, false, Requirement::ANY)
                 .await
         });
         let h2 = tokio::spawn(async move {
             l2.keys()
-                .lock_leaves_at(&t2, &g2, false, Requirement::Any)
+                .lock_leaves_at(&t2, &g2, false, Requirement::ANY)
                 .await
         });
 
@@ -3045,12 +3157,12 @@ mod tests {
         let g2 = group_of(&kb, put_intent(&kb));
         let h1 = tokio::spawn(async move {
             l1.keys()
-                .lock_leaves_at(&t1, &g1, false, Requirement::Any)
+                .lock_leaves_at(&t1, &g1, false, Requirement::ANY)
                 .await
         });
         let h2 = tokio::spawn(async move {
             l2.keys()
-                .lock_leaves_at(&t2, &g2, false, Requirement::Any)
+                .lock_leaves_at(&t2, &g2, false, Requirement::ANY)
                 .await
         });
 
@@ -3099,7 +3211,7 @@ mod tests {
         let waiting = tokio::spawn(async move {
             waiting_locker
                 .keys()
-                .lock_leaves_at(&waiting_id, &waiting_group, false, Requirement::Any)
+                .lock_leaves_at(&waiting_id, &waiting_group, false, Requirement::ANY)
                 .await
         });
         rt::sleep(Duration::from_millis(50)).await;
@@ -3135,23 +3247,6 @@ mod tests {
         locked
     }
 
-    // These coordinator-fold tests deliberately drive cleanup with `Any` so a
-    // gated backend load keeps the round open long enough for peers to merge.
-    // Production write-back instead uses each retained acquisition receipt.
-    async fn write_back_any(locker: &Locker, id: &TxId, locked: &LockedTx) {
-        for group in locked.groups.values() {
-            locker
-                .keys()
-                .write_back_routed(
-                    id,
-                    &group.path,
-                    Arc::new(group.intents.clone()),
-                    Requirement::Any,
-                )
-                .await;
-        }
-    }
-
     // Two committed transactions writing *disjoint* keys of one leaf write back
     // concurrently. Write-backs never lock-conflict, so they merge into a single
     // CAS round (ADR-026) that publishes both pointers and drops both holds.
@@ -3175,8 +3270,8 @@ mod tests {
         gate.arm();
         let (l1, l2) = (locker.clone(), locker.clone());
         let (t1, t2) = (tx1.clone(), tx2.clone());
-        let h1 = tokio::spawn(async move { write_back_any(&l1, &t1, &lt1).await });
-        let h2 = tokio::spawn(async move { write_back_any(&l2, &t2, &lt2).await });
+        let h1 = tokio::spawn(async move { l1.keys().write_back(&t1, &lt1).await });
+        let h2 = tokio::spawn(async move { l2.keys().write_back(&t2, &lt2).await });
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
         h1.await.unwrap();
@@ -3199,7 +3294,7 @@ mod tests {
     // a disjoint key (ADR-026): one CAS both publishes the committer's pointer and
     // installs the new acquirer's lock.
     #[tokio::test(start_paused = true)]
-    async fn write_back_folds_into_acquire_round() {
+    async fn write_back_joins_acquire_round() {
         let (locker, ctx, log, gate) = gated_locker_with(false).await;
         let ka = b"key-a".to_vec();
         let kb = same_leaf_sibling(&ka);
@@ -3217,10 +3312,10 @@ mod tests {
         let (t1, t2) = (tx1.clone(), tx2.clone());
         // The write-back is the driver (parks in the gated load); the acquire
         // queues and is absorbed once the load returns.
-        let hw = tokio::spawn(async move { write_back_any(&l1, &t1, &lt1).await });
+        let hw = tokio::spawn(async move { l1.keys().write_back(&t1, &lt1).await });
         let ha = tokio::spawn(async move {
             l2.keys()
-                .lock_leaves_at(&t2, &g2, false, Requirement::Any)
+                .lock_leaves_at(&t2, &g2, false, Requirement::ANY)
                 .await
         });
         rt::sleep(Duration::from_millis(50)).await;
@@ -3234,7 +3329,7 @@ mod tests {
         assert_eq!(
             count_stores(&log, &leaf_path) - before,
             1,
-            "the write-back folds into the acquire's CAS round"
+            "the write-back joins the acquire's CAS round"
         );
         assert_eq!(
             entry_of(&ctx, &ka).await.unwrap().current.writer(),
@@ -3284,7 +3379,7 @@ mod tests {
         let acquire = tokio::spawn(async move {
             acquire_locker
                 .keys()
-                .lock_leaves_at(&acquire_id, &acquire_group, false, Requirement::Any)
+                .lock_leaves_at(&acquire_id, &acquire_group, false, Requirement::ANY)
                 .await
         });
         rt::sleep(Duration::from_millis(50)).await;
@@ -3398,8 +3493,14 @@ mod tests {
         let (t1, t2) = (tx1.clone(), tx2.clone());
         let path1 = root_path();
         let path2 = root_path();
-        let h1 = tokio::spawn(async move { l1.keys().release_leaf(&t1, &path1).await });
-        let h2 = tokio::spawn(async move { l2.keys().release_leaf(&t2, &path2).await });
+        let h1 =
+            tokio::spawn(
+                async move { l1.keys().release_leaf(&t1, &path1, Requirement::ANY).await },
+            );
+        let h2 =
+            tokio::spawn(
+                async move { l2.keys().release_leaf(&t2, &path2, Requirement::ANY).await },
+            );
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
         h1.await.unwrap().unwrap();
@@ -3422,7 +3523,7 @@ mod tests {
     }
 
     // ADR-028: two writers on the *same* key now share one CAS round. The
-    // monotonic fold visits the older first — it stages its lock — and the
+    // member evaluation visits the older first — it stages its lock — and the
     // younger, observing that live staged holder it cannot wound, emits `Wait`
     // and blocks (hold-and-wait). One store serves the round; the younger is not
     // wounded, it simply waits its turn.
@@ -3441,17 +3542,17 @@ mod tests {
         let gy = group_of(key, put_intent(key));
         let ho = tokio::spawn(async move {
             lo.keys()
-                .lock_leaves_at(&to, &go, false, Requirement::Any)
+                .lock_leaves_at(&to, &go, false, Requirement::ANY)
                 .await
         });
         let hy = tokio::spawn(async move {
             ly.keys()
-                .lock_leaves_at(&ty, &gy, false, Requirement::Any)
+                .lock_leaves_at(&ty, &gy, false, Requirement::ANY)
                 .await
         });
 
         // Once both tasks are parked (driver in the gated load, the other queued),
-        // release the load so the round folds both members.
+        // release the load so the round evaluates both members.
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
 
@@ -3484,8 +3585,8 @@ mod tests {
         let _ = hy.await;
     }
 
-    // ADR-028 regression (monotonic fold): after the older releases its same-key
-    // lock, the waiting younger makes progress and acquires — the fold order
+    // ADR-028 regression (oldest-first planning): after the older releases its same-key
+    // lock, the waiting younger makes progress and acquires — the member order
     // guarantees liveness without either transaction being wounded.
     #[tokio::test(start_paused = true)]
     async fn same_key_younger_proceeds_after_older_releases() {
@@ -3502,12 +3603,12 @@ mod tests {
         let gy = group_of(key, put_intent(key));
         let ho = tokio::spawn(async move {
             lo.keys()
-                .lock_leaves_at(&to, &go, false, Requirement::Any)
+                .lock_leaves_at(&to, &go, false, Requirement::ANY)
                 .await
         });
         let hy = tokio::spawn(async move {
             ly.keys()
-                .lock_leaves_at(&ty, &gy, false, Requirement::Any)
+                .lock_leaves_at(&ty, &gy, false, Requirement::ANY)
                 .await
         });
 
@@ -3521,7 +3622,7 @@ mod tests {
         // The older releases; the younger's hold-and-wait loop then re-acquires.
         locker
             .keys()
-            .release_leaf(&old, &root_path())
+            .release_leaf(&old, &root_path(), Requirement::ANY)
             .await
             .unwrap();
         assert!(matches!(
@@ -3541,15 +3642,15 @@ mod tests {
     }
 
     // ADR-028 regression (equal priority): two same-priority writers on one key
-    // never wound each other (that would livelock across renews). The monotonic
-    // fold's round-local byte tiebreak still picks one deterministic winner; the
-    // loser waits and, after the winner releases, proceeds. Both make progress.
+    // never wound each other (that would livelock across renews). The
+    // coordinator's round-local byte tiebreak picks one deterministic winner.
+    // The loser waits until the winner releases, then proceeds. Both make progress.
     #[tokio::test(start_paused = true)]
     async fn equal_priority_same_key_one_winner_no_livelock() {
         let (locker, ctx, log, gate) = gated_locker().await;
         let key = b"key";
         // Same priority (order 1), distinct prefixes: `aaaa` < `bbbb` by the
-        // fold's byte tiebreak, so `a` is the deterministic round winner.
+        // coordinator's byte tiebreak, so `a` is the deterministic round winner.
         let a = mk_tid(1, "aaaa");
         let b = mk_tid(1, "bbbb");
         assert!(
@@ -3565,12 +3666,12 @@ mod tests {
         let gb = group_of(key, put_intent(key));
         let ha = tokio::spawn(async move {
             la.keys()
-                .lock_leaves_at(&ta, &ga, false, Requirement::Any)
+                .lock_leaves_at(&ta, &ga, false, Requirement::ANY)
                 .await
         });
         let hb = tokio::spawn(async move {
             lb.keys()
-                .lock_leaves_at(&tb, &gb, false, Requirement::Any)
+                .lock_leaves_at(&tb, &gb, false, Requirement::ANY)
                 .await
         });
 
@@ -3594,7 +3695,11 @@ mod tests {
         );
 
         // After the winner releases, the loser proceeds: progress, no livelock.
-        locker.keys().release_leaf(&a, &root_path()).await.unwrap();
+        locker
+            .keys()
+            .release_leaf(&a, &root_path(), Requirement::ANY)
+            .await
+            .unwrap();
         assert!(matches!(
             hb.await.unwrap().unwrap(),
             LeafSetOutcome::Locked(_)
@@ -3611,8 +3716,8 @@ mod tests {
     }
 
     // ADR-028 regression (commute): a committed holder's write-back and another
-    // transaction's acquire of the *same* key fold into one CAS round with the
-    // same result regardless of wound-wait fold order — the write-back publishes
+    // transaction's acquire of the *same* key join one coordinator round with the
+    // same result regardless of wound-wait member order — the write-back publishes
     // the committed pointer and drops its hold, the acquirer ends holding the
     // lock over the help-forwarded value. Run both orderings to show it commutes.
     #[tokio::test(start_paused = true)]
@@ -3633,10 +3738,10 @@ mod tests {
             gate.arm();
             let (lw, la) = (locker.clone(), locker.clone());
             let (cw, ca) = (committer.clone(), acquirer.clone());
-            let hw = tokio::spawn(async move { write_back_any(&lw, &cw, &lt).await });
+            let hw = tokio::spawn(async move { lw.keys().write_back(&cw, &lt).await });
             let ha = tokio::spawn(async move {
                 la.keys()
-                    .lock_leaves_at(&ca, &g, false, Requirement::Any)
+                    .lock_leaves_at(&ca, &g, false, Requirement::ANY)
                     .await
             });
             rt::sleep(Duration::from_millis(50)).await;
@@ -3691,7 +3796,7 @@ mod tests {
                 &tx,
                 &group_of(b"key2", put_intent(b"key2")),
                 false,
-                Requirement::Any,
+                Requirement::ANY,
             )
             .await;
         assert!(err.is_err(), "locking after close is cancelled");
@@ -3717,7 +3822,7 @@ mod tests {
         let g = group_of(key, put_intent(key));
         let waiting = tokio::spawn(async move {
             l.keys()
-                .lock_leaves_at(&y, &g, false, Requirement::Any)
+                .lock_leaves_at(&y, &g, false, Requirement::ANY)
                 .await
         });
         rt::sleep(Duration::from_millis(50)).await;
@@ -3727,7 +3832,7 @@ mod tests {
 
         locker
             .keys()
-            .release_leaf(&old, &root_path())
+            .release_leaf(&old, &root_path(), Requirement::ANY)
             .await
             .unwrap();
         let other = mk_tid(3, "other");

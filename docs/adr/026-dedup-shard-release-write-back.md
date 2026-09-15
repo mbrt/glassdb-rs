@@ -41,7 +41,7 @@ non-create round.
 
 Extend the ADR-025 `Dedup` to also carry **release / write-back** members on the
 shard request (and the analogous release beneath `release_root`), keyed on the
-same object path, so a release or write-back folds into any round for that
+same object path, so a release or write-back joins any round for that
 object:
 
 - A release-only request is **reorderable** (`can_reorder == true`) — the v2

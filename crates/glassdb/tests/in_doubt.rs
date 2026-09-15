@@ -21,10 +21,10 @@
 //!   prove that state either way — surfaced as [`Error::InDoubt`] rather than
 //!   risking a double-apply on a renewed re-run. A *fast follow-on writer* that
 //!   moves the entry first is the reachable case and is covered below; anything
-//!   else that blocks the re-fold from proving it (a structural gate or a
-//!   collection-delete fence arriving in the same window) is classified the same
-//!   way, pinned by unit tests next to the resolvers because no interleaving
-//!   reproduces it reliably.
+//!   else that prevents resolver evaluation after a reload from proving it
+//!   (a structural gate or a collection-delete fence arriving in the same window)
+//!   is classified the same way, pinned by unit tests next to the resolvers
+//!   because no interleaving reproduces it reliably.
 //! - The logged path's commit point (the `_t/` flip) and its leaf lock CAS
 //!   (a node `_n/` or the root `_r`) are recovered in place the same way (they
 //!   are idempotent under their own preconditions). A value the inline budgets
