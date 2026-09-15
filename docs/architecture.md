@@ -1388,15 +1388,17 @@ recovery share the `ScanCadence` interval controller from `glassdb-concurr`.
   Directory release also starts with `ANY` and checks a present no-holder
   observation against the same bound before it reports completion. Owner cleanup
   shares acquisition's cache knowledge and can keep `ANY`; committed GC already
-  supplies bounded evidence through its directory reference check. Missing
-  records need no extra check: other instances access published collections
-  after record creation, local preparation and cleanup share a cache, and GC
-  inspects prepared resources only after commit or acknowledged abort. These
-  caller guarantees exclude a cached absence that could hide later record
-  creation. GC retains the candidate log observation and conditionally deletes
-  only that exact revision. Collection reclamation processes one 128-node page
-  at a time and deletes the root and collection record only after all standalone
-  nodes have been processed.
+  supplies bounded evidence through its directory reference check. Topology
+  participant release uses the same rule after GC lists no remaining structural
+  intents. The collection record needs its own completion evidence; listing
+  intents does not refresh that record. Missing records need no extra check:
+  other instances access published collections after record creation, local
+  preparation and cleanup share a cache, and GC inspects prepared resources only
+  after commit or acknowledged abort. These caller guarantees exclude a cached
+  absence that could hide later record creation. GC retains the candidate log
+  observation and conditionally deletes only that exact revision. Collection
+  reclamation processes one 128-node page at a time and deletes the root and
+  collection record only after all standalone nodes have been processed.
 - **Progress measurement.** Candidate reads may reuse immutable final contents.
   GC checks mutable references at the candidate-check bound and deletes the exact
   transaction revision. Successful resource changes and transaction deletion

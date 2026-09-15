@@ -1169,6 +1169,248 @@ async fn directory_gc_checks_owner_cleanup_once() {
     }
 }
 
+#[derive(Clone, Copy)]
+enum TopologyCleanup {
+    StaleNoParticipant,
+    CachedParticipant,
+    ReadFailure,
+    IntentRemaining,
+}
+
+async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
+    use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
+    use glassdb_data::{NodeToken, StructuralIntentId};
+    use glassdb_storage::{StructuralIntent, StructuralIntentPhase};
+
+    let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let recorded = RecordingBackend::new(hooks.clone());
+    let operations = recorded.log();
+    let backend: Arc<dyn Backend> = Arc::new(recorded);
+    // GC caches the collection before the independent owner joins topology.
+    let ctx = new_ctx_with(backend.clone()).await;
+    let owner = AssemblyFixture::new(
+        backend,
+        DbRoot::try_from("db").unwrap(),
+        &EngineConfig::default(),
+    );
+    let id = tx(85);
+    let locks = vec![TxLock::Topology {
+        collection: collection(),
+    }];
+    owner
+        .monitor
+        .begin_persisted_tx(
+            &id,
+            TxRecoveryManifest {
+                locks: locks.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let operation = owner.monitor.begin_owner_operation(&id).unwrap();
+    let left = NodeToken::from_bytes([85; 16]);
+    let right = NodeToken::from_bytes([86; 16]);
+    let prepared = owner
+        .structural_intents
+        .write(
+            collection().db_root_component(),
+            &StructuralIntentId::from(&right),
+            &StructuralIntent {
+                collection: collection(),
+                source_token: None,
+                source_version: String::new(),
+                created_tokens: vec![left, right],
+                split_key: Vec::new(),
+                participant_id: id.clone(),
+                phase: StructuralIntentPhase::Preparing,
+            },
+        )
+        .await
+        .unwrap();
+    let (mut record, observed) = owner
+        .records
+        .load_record(&collection(), Requirement::ANY)
+        .await
+        .unwrap();
+    assert!(record.add_topology_participant(id.clone()));
+    assert!(
+        owner
+            .records
+            .store_record(&record, &observed)
+            .await
+            .unwrap()
+    );
+    let path = ObjectPath::CollectionRecord {
+        collection: collection(),
+    }
+    .to_string();
+    if !matches!(case, TopologyCleanup::IntentRemaining) {
+        // A canceled Preparing intent has not created any nodes. Departure
+        // can then fail before finalization, leaving only the participant.
+        owner.structural_intents.delete(&prepared).await.unwrap();
+        let (mut record, observed) = owner
+            .records
+            .load_record(&collection(), Requirement::ANY)
+            .await
+            .unwrap();
+        assert!(record.remove_topology_participant(&id));
+        hooks.set_before({
+            let path = path.clone();
+            move |op| {
+                let fail = op.path() == path && matches!(op, BackendOp::WriteIf { .. });
+                Box::pin(async move {
+                    if fail {
+                        Err(BackendError::other("participant departure failed"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+        assert!(
+            owner
+                .records
+                .store_record(&record, &observed)
+                .await
+                .is_err()
+        );
+        hooks.clear_before();
+    }
+    operation.complete();
+    if committed {
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+        log.locks = locks;
+        owner.monitor.commit_tx(log).await.unwrap();
+    } else {
+        assert_eq!(
+            owner.monitor.abort_owned_tx(&id).await.unwrap(),
+            OwnerAbortOutcome::Acknowledged
+        );
+    }
+    if matches!(case, TopologyCleanup::CachedParticipant) {
+        ctx.records
+            .load_record(
+                &collection(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+    }
+    // Enter reclamation after eligibility. Retention cannot refresh the
+    // collection record cached before participant registration.
+    let observed = ctx
+        .tl
+        .get_at(&id, Requirement::after(ctx.timeline.currentness_barrier()))
+        .await
+        .unwrap();
+    let barrier = ctx.timeline.currentness_barrier();
+    if matches!(case, TopologyCleanup::IntentRemaining) {
+        operations.lock().unwrap().clear();
+        assert_eq!(
+            ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
+            GcOutcome::Retained
+        );
+        assert!(!is_gone(&ctx.tl, &id).await);
+        assert!(operations.lock().unwrap().iter().all(|op| op.path != path));
+        owner.structural_intents.delete(&prepared).await.unwrap();
+    }
+    if matches!(case, TopologyCleanup::ReadFailure) {
+        hooks.set_before({
+            let path = path.clone();
+            move |op| {
+                let fail = op.path() == path
+                    && matches!(
+                        op,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    );
+                Box::pin(async move {
+                    if fail {
+                        Err(BackendError::other("participant check failed"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+        assert!(ctx.gc.try_reclaim(&id, &observed, barrier).await.is_err());
+        assert!(!is_gone(&ctx.tl, &id).await);
+        hooks.clear_before();
+    }
+    operations.lock().unwrap().clear();
+    assert_eq!(
+        ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
+        GcOutcome::Reclaimed
+    );
+    assert!(is_gone(&ctx.tl, &id).await);
+    let recorded = std::mem::take(&mut *operations.lock().unwrap());
+    let (record, _) = owner
+        .records
+        .load_record(
+            &collection(),
+            Requirement::after(owner.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        record
+            .topology_participants()
+            .all(|participant| participant != &id),
+        "GC deleted the transaction log while its topology participant remained"
+    );
+    let calls: Vec<_> = recorded
+        .iter()
+        .filter(|op| op.path == path)
+        .map(|op| op.op)
+        .collect();
+    let expected: &[&str] = if matches!(case, TopologyCleanup::CachedParticipant) {
+        &["write_if"]
+    } else {
+        &["read_if_modified", "write_if"]
+    };
+    assert_eq!(calls, expected);
+    operations.lock().unwrap().clear();
+    assert!(
+        !ctx.locker
+            .collections()
+            .release_topology_participant(&collection(), &id, Requirement::after(barrier))
+            .await
+            .unwrap()
+    );
+    assert!(operations.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn committed_topology_gc_refreshes_a_cached_no_participant() {
+    reclaim_topology(true, TopologyCleanup::StaleNoParticipant).await;
+}
+
+#[tokio::test]
+async fn aborted_topology_gc_refreshes_a_cached_no_participant() {
+    reclaim_topology(false, TopologyCleanup::StaleNoParticipant).await;
+}
+
+#[tokio::test]
+async fn topology_gc_reuses_a_cached_participant_for_its_cas() {
+    for committed in [false, true] {
+        reclaim_topology(committed, TopologyCleanup::CachedParticipant).await;
+    }
+}
+
+#[tokio::test]
+async fn topology_gc_keeps_the_log_if_the_record_check_fails() {
+    for committed in [false, true] {
+        reclaim_topology(committed, TopologyCleanup::ReadFailure).await;
+    }
+}
+
+#[tokio::test]
+async fn topology_gc_keeps_the_log_and_participant_until_intents_settle() {
+    for committed in [false, true] {
+        reclaim_topology(committed, TopologyCleanup::IntentRemaining).await;
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn pending_and_wounded_candidates_only_read_their_logs() {
     for (status, age) in [TxCommitStatus::Pending, TxCommitStatus::Wounded]

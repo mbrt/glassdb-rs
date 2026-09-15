@@ -654,7 +654,7 @@ impl Gc {
             changed |= self
                 .locker
                 .collections()
-                .release_topology_participant(collection, tid)
+                .release_topology_participant(collection, tid, Requirement::after(barrier))
                 .await?;
         }
         Ok(Reclamation {

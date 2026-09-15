@@ -165,21 +165,34 @@ impl CollectionLocker {
             .try_fold(false, |referenced, result| Ok(referenced | result?))
     }
 
-    /// Removes a settled structural operation from collection topology.
+    /// Removes a settled participant from collection topology.
+    ///
+    /// The caller must establish that its structural intents have settled.
+    /// A present record without the participant must satisfy `requirement`.
     pub(crate) async fn release_topology_participant(
         &self,
         collection: &CollectionAddress,
         id: &TxId,
+        requirement: Requirement,
     ) -> Result<bool, TransError> {
+        let mut read_requirement = Requirement::ANY;
         loop {
             let (mut record, observed) =
-                match self.records.load_record(collection, Requirement::ANY).await {
+                match self.records.load_record(collection, read_requirement).await {
                     Ok(record) => record,
+                    // Publication, shared preparation cache, and GC eligibility
+                    // exclude a pre-creation cached absence for recorded collections.
                     Err(StorageError::NotFound) => return Ok(false),
                     Err(error) => return Err(error.into()),
                 };
             if !record.remove_topology_participant(id) {
-                return Ok(false);
+                if observed.satisfies(requirement) {
+                    return Ok(false);
+                }
+                // Intent settlement does not refresh the collection record.
+                // Require the caller's bound only when no removal CAS applies.
+                read_requirement = requirement;
+                continue;
             }
             if self.records.store_record(&record, &observed).await? {
                 return Ok(true);
