@@ -806,6 +806,177 @@ async fn committed_membership_lock_is_released_before_deletion() {
     assert_eq!(ctx.coord.stats_and_reset().submissions, 1);
 }
 
+async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
+    use crate::access::{AccessSet, ScanRange};
+    use crate::key_resolver::KeyResolver;
+    use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
+
+    let backend = Arc::new(MemoryBackend::new());
+    let recorded = RecordingBackend::new(backend.clone());
+    let operations = recorded.log();
+    // Creating the root leaves GC with a cached leaf without any holders.
+    let ctx = new_ctx_with(Arc::new(recorded)).await;
+    let owner = AssemblyFixture::new(
+        backend,
+        DbRoot::try_from("db").unwrap(),
+        &EngineConfig::default(),
+    );
+    let coord = LeafCoordinator::with_hinter(
+        owner.nodes.clone(),
+        KeyStateResolver::new(owner.monitor.clone()),
+        owner.monitor.clone(),
+        RetryConfig::default(),
+        glassdb_storage::SplitPolicy::default(),
+        Arc::new(NoSplitHints),
+    );
+    let router = TreeRouter::new(owner.nodes.clone(), std::num::NonZeroUsize::MIN);
+    let locker = Locker::new(
+        coord,
+        router.clone(),
+        CollectionStateResolver::new(
+            owner.records.clone(),
+            owner.tlogger.clone(),
+            owner.timeline.clone(),
+            owner.monitor.clone(),
+            RetryConfig::default(),
+        ),
+        owner.monitor.clone(),
+        RetryConfig::default(),
+        std::num::NonZeroUsize::MIN,
+    );
+    let id = tx(81);
+    let locks = vec![TxLock::Membership {
+        leaf: glassdb_data::LeafRef::root(collection()),
+        typ: LockType::Read,
+    }];
+    owner
+        .monitor
+        .begin_persisted_tx(
+            &id,
+            TxRecoveryManifest {
+                locks: locks.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let operation = owner.monitor.begin_owner_operation(&id).unwrap();
+    let resolver = KeyResolver::new(
+        router,
+        KeyStateResolver::new(owner.monitor.clone()),
+        std::num::NonZeroUsize::MIN,
+    );
+    let page = resolver
+        .scan_keys(&collection(), &ScanRange::all(), &[], Some(&id), None)
+        .await
+        .unwrap();
+    let accesses = AccessSet::new(
+        Vec::new(),
+        Vec::new(),
+        vec![page.into_access(collection(), ScanRange::all(), Vec::new())],
+    );
+    let LockOutcome::Locked(locked) = locker
+        .keys()
+        .lock_at(
+            &id,
+            &accesses,
+            true,
+            Requirement::after(owner.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("the empty scan must acquire its membership reader");
+    };
+    assert_eq!(locked.locked_paths(), locks);
+    operation.complete();
+    if cached_holder {
+        ctx.nodes
+            .load_leaf(
+                &root_path(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+    }
+    if committed {
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+        log.locks = locks.clone();
+        owner.monitor.commit_tx(log).await.unwrap();
+    } else {
+        assert_eq!(
+            owner.monitor.abort_owned_tx(&id).await.unwrap(),
+            OwnerAbortOutcome::Acknowledged
+        );
+    }
+
+    // Exercise reclamation after eligibility. Passing the retention horizon
+    // cannot repair either instance's cached leaf.
+    let observed = ctx
+        .tl
+        .get_at(&id, Requirement::after(ctx.timeline.currentness_barrier()))
+        .await
+        .unwrap();
+    let barrier = ctx.timeline.currentness_barrier();
+    operations.lock().unwrap().clear();
+    assert_eq!(
+        ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
+        GcOutcome::Reclaimed
+    );
+    assert!(is_gone(&ctx.tl, &id).await);
+    let recorded = std::mem::take(&mut *operations.lock().unwrap());
+    ctx.coord.stats_and_reset();
+    assert!(
+        !ctx.locker
+            .release(&id, &locks, Requirement::after(barrier))
+            .await
+            .unwrap()
+    );
+    assert_eq!(ctx.coord.stats_and_reset().submissions, 1);
+    assert!(operations.lock().unwrap().is_empty());
+    let leaf = owner
+        .nodes
+        .load_leaf(
+            &root_path(),
+            Requirement::after(owner.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !leaf.node().membership_lock().contains(&id),
+        "GC deleted the transaction log while its membership reader remained"
+    );
+    let path = root_path().to_string();
+    let calls: Vec<_> = recorded
+        .iter()
+        .filter(|op| op.path == path)
+        .map(|op| op.op)
+        .collect();
+    let expected = if cached_holder {
+        vec!["write_if"]
+    } else {
+        vec!["read_if_modified", "write_if"]
+    };
+    assert_eq!(calls, expected);
+}
+
+#[tokio::test]
+async fn committed_membership_only_gc_refreshes_a_cached_no_holder() {
+    reclaim_membership_only(true, false).await;
+}
+
+#[tokio::test]
+async fn aborted_membership_only_gc_refreshes_a_cached_no_holder() {
+    reclaim_membership_only(false, false).await;
+}
+
+#[tokio::test]
+async fn membership_only_gc_reuses_a_cached_holder_for_its_cas() {
+    for committed in [false, true] {
+        reclaim_membership_only(committed, true).await;
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn pending_and_wounded_candidates_only_read_their_logs() {
     for (status, age) in [TxCommitStatus::Pending, TxCommitStatus::Wounded]

@@ -2593,12 +2593,12 @@ mod tests {
 
         tctx.locker
             .keys()
-            .release_leaf(&current, &test_root_path())
+            .release_leaf(&current, &test_root_path(), Requirement::ANY)
             .await
             .unwrap();
         tctx.locker
             .keys()
-            .release_leaf(&other, &test_root_path())
+            .release_leaf(&other, &test_root_path(), Requirement::ANY)
             .await
             .unwrap();
     }
@@ -2691,7 +2691,7 @@ mod tests {
 
         tctx.locker
             .keys()
-            .release_leaf(&other, &test_root_path())
+            .release_leaf(&other, &test_root_path(), Requirement::ANY)
             .await
             .unwrap();
         drop(other_locked);

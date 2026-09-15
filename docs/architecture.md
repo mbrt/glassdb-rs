@@ -1370,20 +1370,25 @@ recovery share the `ScanCadence` interval controller from `glassdb-concurr`.
   horizon: a candidate other than `Wounded` is kept within the horizon, because
   the non-atomic reverse check can race a lock a live transaction has taken but
   not yet published (ADR-024's lazy object materialization). A dead `Pending`
-  object is changed to `Wounded` so
-  its death remains durable across an unbounded owner suspension. GC may
-  immediately and repeatedly reclaim effects described by that record, but
-  cannot delete the marker. The owner changes it to `Aborted` after proving
-  retirement; ordinary finite
-  retention and deletion apply only after that acknowledgement (ADR-059).
+  object is changed to `Wounded` so its death remains durable across an
+  unbounded owner suspension. GC may immediately and repeatedly reclaim effects
+  described by that record, but cannot delete the marker. The owner changes it
+  to `Aborted` after proving retirement; ordinary finite retention and deletion
+  apply only after that acknowledgement (ADR-059).
 - **Reclamation through the coordinator.** GC releases a dead transaction's locks
   not with its own CAS but by calling the `Locker`'s per-object unlock methods,
-  so the release batches through the same leaf coordinator as live
-  traffic (ADR-029); the coordinator prunes the entry before persistence when it
-  becomes vestigial (no holder and an absent current state). It retains the candidate
-  log observation and conditionally deletes only that exact revision. Collection
-  reclamation processes one 128-node page at a time and deletes the root and
-  collection record only after all standalone nodes have been processed.
+  so the release batches through the same leaf coordinator as live traffic
+  (ADR-029); the coordinator prunes the entry before persistence when it becomes
+  vestigial (no holder and an absent current state). Leaf release starts with
+  `ANY`: an applied CAS proves completion without an extra read. A no-op must
+  carry an observation that meets GC's existing candidate-check bound; otherwise
+  release retries with that requirement. This also covers membership holds with
+  no recorded entry key whose routing could refresh the leaf. An index proves
+  that the old leaf's holds are gone because it cannot become a leaf again. GC
+  retains the candidate log observation and conditionally deletes only that
+  exact revision. Collection reclamation processes one 128-node page at a time
+  and deletes the root and collection record only after all standalone nodes
+  have been processed.
 - **Progress measurement.** Candidate reads may reuse immutable final contents.
   GC checks mutable references at the candidate-check bound and deletes the exact
   transaction revision. Successful resource changes and transaction deletion

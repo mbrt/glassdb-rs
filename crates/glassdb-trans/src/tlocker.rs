@@ -707,10 +707,15 @@ impl LeafOperation for ReleaseOperation {
             Some(CoordinatedOutcome {
                 outcome: MemberOutcome::Released { .. },
                 evidence,
-            }) => Ok(ReleaseOutcome::Released(matches!(
-                evidence,
-                Some(CoordinationEvidence::Installed(_))
-            ))),
+            }) => Ok(match evidence {
+                Some(CoordinationEvidence::Installed(_)) => ReleaseOutcome::Released(true),
+                Some(CoordinationEvidence::Observed(observed)) => {
+                    ReleaseOutcome::Observed(observed)
+                }
+                // Only index rerouting releases without leaf evidence. A node
+                // cannot become a leaf again, so none of its holds can return.
+                None => ReleaseOutcome::Released(false),
+            }),
             Some(CoordinatedOutcome {
                 outcome: MemberOutcome::Wait(holder),
                 ..
@@ -756,6 +761,7 @@ enum AcquireOutcome {
 
 enum ReleaseOutcome {
     Released(bool),
+    Observed(LeafObservation),
     Wait(TxId),
     /// The round ended without proving the holds were dropped. Re-submit.
     Contended,
@@ -1075,14 +1081,55 @@ impl KeyLocker {
     }
 
     /// Releases `id` from one exact leaf path.
+    ///
+    /// Read-based completion must satisfy `requirement`. `ANY` is sufficient
+    /// when the caller shares the cache knowledge from acquiring these holds.
     pub(crate) async fn release_leaf(
         &self,
         id: &TxId,
         path: &ObjectPath,
+        requirement: Requirement,
     ) -> Result<bool, TransError> {
-        // A release stages no decision that can become unsafe from a stale
-        // seed; its CAS arbitrates with any newer leaf and retries on conflict.
-        self.release_leaf_at(id, path, Requirement::ANY).await
+        let mut operation = ReleaseOperation {
+            id: id.clone(),
+            path: path.clone(),
+            requirement: Requirement::ANY,
+        };
+        let mut backoff = self.retry.backoff();
+        let mut contended = 0;
+        loop {
+            match self.coord.coordinate(operation.clone()).await? {
+                ReleaseOutcome::Released(changed) => return Ok(changed),
+                ReleaseOutcome::Observed(observed) => {
+                    if observed.satisfies(requirement) {
+                        return Ok(false);
+                    }
+                    // A cached no-holder state can predate a recovered hold.
+                    // Reuse the caller's bound only if no CAS or observation
+                    // already proves completion. Check each returned observation
+                    // because a round can absorb this member after its load.
+                    if operation.requirement != requirement {
+                        operation.requirement = requirement;
+                        continue;
+                    }
+                }
+                ReleaseOutcome::Wait(holder) => {
+                    let delay = backoff.next_delay();
+                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await? {
+                        backoff = self.retry.backoff();
+                    }
+                    continue;
+                }
+                ReleaseOutcome::Contended => {}
+            }
+            // Failed CASes or repeatedly insufficient observations cannot
+            // establish completion. Keep the log for a later cleanup attempt.
+            contended += 1;
+            if contended == RELEASE_CONTENTION_ROUNDS {
+                return Err(TransError::Retry);
+            }
+            rt::sleep(backoff.next_delay()).await;
+        }
     }
 
     /// Releases recorded entry and membership locks without changing committed values.
@@ -1122,7 +1169,7 @@ impl KeyLocker {
             }
         }
         let results = map_all_bounded(leaf_paths, self.parallelism, |path| async move {
-            self.release_leaf(id, &path).await
+            self.release_leaf(id, &path, requirement).await
         })
         .await;
         let mut changed = false;
@@ -1285,42 +1332,6 @@ impl KeyLocker {
             intents,
         };
         self.coord.coordinate(operation).await
-    }
-
-    async fn release_leaf_at(
-        &self,
-        id: &TxId,
-        path: &ObjectPath,
-        requirement: Requirement,
-    ) -> Result<bool, TransError> {
-        let operation = ReleaseOperation {
-            id: id.clone(),
-            path: path.clone(),
-            requirement,
-        };
-        let mut backoff = self.retry.backoff();
-        let mut contended = 0;
-        loop {
-            match self.coord.coordinate(operation.clone()).await? {
-                ReleaseOutcome::Released(changed) => return Ok(changed),
-                ReleaseOutcome::Wait(holder) => {
-                    let delay = backoff.next_delay();
-                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await? {
-                        backoff = self.retry.backoff();
-                    }
-                }
-                // A leaf this hot keeps its holder for now. Releases run in
-                // background sweeps that revisit the transaction, so returning
-                // lets the sweep move on instead of camping on one leaf.
-                ReleaseOutcome::Contended => {
-                    contended += 1;
-                    if contended == RELEASE_CONTENTION_ROUNDS {
-                        return Err(TransError::Retry);
-                    }
-                    rt::sleep(backoff.next_delay()).await;
-                }
-            }
-        }
     }
 
     /// Installs this transaction's locks on every key it touches in one leaf,
@@ -1926,7 +1937,11 @@ mod tests {
         assert!(loaded.node().membership_lock().contains(&tx));
         assert_eq!(loaded.node().membership_version(), 0);
 
-        locker.keys().release_leaf(&tx, &path).await.unwrap();
+        locker
+            .keys()
+            .release_leaf(&tx, &path, Requirement::ANY)
+            .await
+            .unwrap();
         let loaded = ctx
             .nodes
             .load_leaf(
@@ -1977,7 +1992,11 @@ mod tests {
         });
 
         assert!(
-            locker.keys().release_leaf(&tx, &root_path()).await.unwrap(),
+            locker
+                .keys()
+                .release_leaf(&tx, &root_path(), Requirement::ANY)
+                .await
+                .unwrap(),
             "the release reports the removal it made, not the round that ended"
         );
         assert_eq!(
@@ -2017,7 +2036,10 @@ mod tests {
         });
 
         assert!(matches!(
-            locker.keys().release_leaf(&tx, &root_path()).await,
+            locker
+                .keys()
+                .release_leaf(&tx, &root_path(), Requirement::ANY)
+                .await,
             Err(TransError::Retry)
         ));
         assert!(
@@ -3468,8 +3490,14 @@ mod tests {
         let (t1, t2) = (tx1.clone(), tx2.clone());
         let path1 = root_path();
         let path2 = root_path();
-        let h1 = tokio::spawn(async move { l1.keys().release_leaf(&t1, &path1).await });
-        let h2 = tokio::spawn(async move { l2.keys().release_leaf(&t2, &path2).await });
+        let h1 =
+            tokio::spawn(
+                async move { l1.keys().release_leaf(&t1, &path1, Requirement::ANY).await },
+            );
+        let h2 =
+            tokio::spawn(
+                async move { l2.keys().release_leaf(&t2, &path2, Requirement::ANY).await },
+            );
         rt::sleep(Duration::from_millis(50)).await;
         gate.release();
         h1.await.unwrap().unwrap();
@@ -3591,7 +3619,7 @@ mod tests {
         // The older releases; the younger's hold-and-wait loop then re-acquires.
         locker
             .keys()
-            .release_leaf(&old, &root_path())
+            .release_leaf(&old, &root_path(), Requirement::ANY)
             .await
             .unwrap();
         assert!(matches!(
@@ -3664,7 +3692,11 @@ mod tests {
         );
 
         // After the winner releases, the loser proceeds: progress, no livelock.
-        locker.keys().release_leaf(&a, &root_path()).await.unwrap();
+        locker
+            .keys()
+            .release_leaf(&a, &root_path(), Requirement::ANY)
+            .await
+            .unwrap();
         assert!(matches!(
             hb.await.unwrap().unwrap(),
             LeafSetOutcome::Locked(_)
@@ -3797,7 +3829,7 @@ mod tests {
 
         locker
             .keys()
-            .release_leaf(&old, &root_path())
+            .release_leaf(&old, &root_path(), Requirement::ANY)
             .await
             .unwrap();
         let other = mk_tid(3, "other");
