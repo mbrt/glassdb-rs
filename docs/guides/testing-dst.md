@@ -55,21 +55,31 @@ Simulation tests ouside such a module compile but do not run through `make test`
 sim. The normal test suite enforces these rules with
 [`simulation_test_policy.rs`](../../crates/glassdb/tests/simulation_test_policy.rs).
 
+Database fuzz workloads check consistency through public state and transaction
+histories. Maintenance scenarios are useful when they can change those results:
+for example, deleting a transaction body still required by a current key writer
+must be detected. Leaked logs and incomplete physical cleanup alone are outside
+that scope. Inline values and tombstones can have valid logless writers, so a
+writer identity without a log is not by itself a consistency failure. Bounded
+execution guards still prevent a faulty run from stopping the test campaign.
+
 ## The four approaches in one paragraph each
 
 - **Current — in-repo `DetExecutor` (ADR-011).** A single-threaded executor with
-  a pluggable `Scheduler` controls task **poll order at await points**.
+  a pluggable `Scheduler` controls task **poll order when tasks suspend**.
   `exec::{block_on_with, TapeScheduler, PctScheduler}` configures each run;
   `rt::{spawn, sleep, Instant, timeout}` provides services inside it, and the
   entropy facade selects the run's seeded stream. `tokio::sync`,
   `tokio::select!`, and `tokio_util::CancellationToken` are reused as-is. Time
   is virtual, entropy is a seeded RNG, and tokio's own `select!` branch RNG is
-  seeded via `RngSeed`.
-  Two schedulers provide a **schedule-tape** (libFuzzer bytes choose the next
-  task) and **PCT** (randomized priorities + change points). `FaultBackend`
-  consumes an independent backend-fault tape. ADR-048 adds a third,
-  media-fault stream and a byte-level `SimMedia` for the optional disk cache.
-  Active only under `--cfg sim`; production is plain `tokio` plus `FileMedia`.
+  seeded via `RngSeed`. Two schedulers provide a **schedule-tape** (libFuzzer
+  bytes choose the next task) and **PCT** (randomized priorities + change
+  points). `FaultBackend` consumes an independent backend-fault tape for request
+  delays, failures, and reply delays. A delayed reply retains the result
+  selected by the backend, including unchanged and absent read results, while
+  other operations proceed. ADR-048 adds a third media-fault stream and a
+  byte-level `SimMedia` for the optional disk cache. Active only under `--cfg
+  sim`; production is plain `tokio` plus `FileMedia`.
 
 - **madsim.** A "magical deterministic simulator" that **re-implements** the
   tokio runtime, timer, `tokio::sync`, _and_ a full simulated network stack with
@@ -99,9 +109,10 @@ disk cache adds disposable local persistence but no new coordination
 authority. Those facts drive the comparison:
 
 - The meaningful fault boundary is **one client's transport to the store**, which
-  is exactly the `Backend` trait. The current `FaultBackend` injects delay,
-  dropped-request, lost-ack, and sustained per-client outages right there — and,
-  being plain middleware, it even runs under ordinary `#[tokio::test]`.
+  is exactly the `Backend` trait. The current `FaultBackend` injects request and
+  reply delays, dropped-request, lost-ack, and sustained per-client outages
+  right there — and, being plain middleware, it even runs under ordinary
+  `#[tokio::test]`.
 - A **simulated network is largely wasted** here. turmoil/mad-turmoil's core
   value (a network between hosts) has nothing to bite on; you'd be simulating the
   HTTP/socket layer to object storage purely as overhead. madsim had the same
