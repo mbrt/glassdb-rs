@@ -38,7 +38,8 @@ use glassdb_concurr::{
 use glassdb_data::{ObjectPath, TxId};
 use glassdb_storage::{
     CasReceipt, CasResult, CurrentnessBarrier, LeafBody, LeafEdit, LeafEntry, LeafObservation,
-    LockType, Node, NodeLocks, NodeStore, Requirement, SplitPolicy, StorageError,
+    LeafObservationCheck, LockType, Node, NodeLocks, NodeStore, Requirement, SplitPolicy,
+    StorageError,
 };
 
 use crate::error::TransError;
@@ -240,6 +241,8 @@ impl Step {
 pub(crate) struct ResolveCtx<'a> {
     pub(crate) key_state: &'a KeyStateResolver,
     pub(crate) tmon: &'a Monitor,
+    /// The combined bound for dependent reads and eventual leaf evidence. The
+    /// loaded and staged entries do not necessarily satisfy it yet.
     pub(crate) requirement: Requirement,
     pub(crate) cause: ReloadCause,
 }
@@ -258,10 +261,16 @@ pub(crate) trait LeafResolver: Send + Sync {
     /// Resolves this member against entries and node locks as currently staged
     /// this round. Resolvers cannot mutate node topology.
     ///
+    /// Use `ctx.requirement` for dependent object reads. The leaf state can
+    /// predate that bound; the coordinator confirms it by CAS or a currentness
+    /// check before delivery. A changed state discards the plan and repeats
+    /// resolution. Retained facts must remain valid when a plan is discarded.
+    ///
     /// When `ctx.cause` carries unresolved uncertainty, returning `InDoubt`
     /// preserves it. Any other decision certifies that the resolver reconciled
     /// the earlier CAS; in particular, a new stage must already be safe to
-    /// apply zero or one additional time.
+    /// apply zero or one additional time. That reconciliation must remain valid
+    /// even if this plan is discarded or its CAS conflicts.
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
@@ -329,7 +338,7 @@ pub(crate) trait LeafResolver: Send + Sync {
 
 /// One complete operation submitted to the shared leaf-mutation engine.
 ///
-/// The operation owns its target, transaction identity, first-load requirement,
+/// The operation owns its target, transaction identity, freshness requirement,
 /// resolver policy, and typed result. The coordinator runs the shared mutation
 /// mechanism and returns the raw round result to the operation for translation.
 pub(crate) trait LeafOperation: LeafResolver {
@@ -342,8 +351,9 @@ pub(crate) trait LeafOperation: LeafResolver {
     /// Returns the transaction identity used to order this operation.
     fn id(&self) -> &TxId;
 
-    /// Returns the cache requirement for the first mutation attempt.
-    fn first_requirement(&self) -> Requirement;
+    /// Returns the bound for dependent reads and completed leaf evidence.
+    /// This requirement is retained across joined attempts and retries.
+    fn requirement(&self) -> Requirement;
 
     /// Translates the shared round result into this operation's result.
     fn complete(&self, outcome: Option<CoordinatedOutcome>) -> Result<Self::Output, TransError>;
@@ -365,16 +375,16 @@ struct LeafMember {
 /// The leaf is identified by its object `path` — the collection root `_r` for a
 /// small collection's single leaf, else a standalone node `_n`, resolved by
 /// descent. `members` maps each contending transaction to its installed
-/// resolver and outcome slot. `first_requirement` is the cache requirement for the
-/// round's first mutation attempt: `Any` lets a lone round reuse a leaf the
-/// submitter just cached (the logless direct commit) without a
-/// revalidation round-trip. A failed mutation invalidates that exact seed, so
-/// retries use `Any` to consume the winner or newer shared knowledge.
+/// resolver and outcome slot. `requirement` combines the members' bounds for
+/// dependent reads and completed leaf evidence. `ANY` lets a round reuse a leaf
+/// the submitter just cached without a currentness check. Failed mutations
+/// invalidate their seed; retries retain the requirement and use the winner or
+/// newer shared knowledge only when it meets that bound.
 #[derive(Clone)]
 struct CasReq {
     path: ObjectPath,
     members: BTreeMap<TxId, LeafMember>,
-    first_requirement: Requirement,
+    requirement: Requirement,
 }
 
 impl MergeRequest for CasReq {
@@ -405,7 +415,7 @@ impl MergeRequest for CasReq {
         Some(CasReq {
             path: self.path.clone(),
             members,
-            first_requirement: self.first_requirement.stricter(other.first_requirement),
+            requirement: self.requirement.stricter(other.requirement),
         })
     }
 
@@ -729,9 +739,25 @@ impl CasWorker {
         path: &ObjectPath,
         mut edit: LeafEdit,
         plan: &mut MutationPlan,
+        requirement: Requirement,
     ) -> Result<PersistResult, TransError> {
         if !plan.is_dirty() {
-            return Ok(PersistResult::Unchanged(edit.observation().clone()));
+            // A late member can require evidence newer than the loaded leaf.
+            // A dirty plan gets that evidence from its CAS; a clean plan needs
+            // an exact-state check before its decisions can be delivered.
+            return Ok(
+                match self
+                    .core
+                    .nodes
+                    .check_leaf_current(edit.observation(), requirement)
+                    .await?
+                {
+                    LeafObservationCheck::Current => {
+                        PersistResult::Unchanged(edit.observation().clone())
+                    }
+                    LeafObservationCheck::Changed(_) => PersistResult::PreconditionMiss,
+                },
+            );
         }
 
         // Drop entries a member left vestigial (no holder, no
@@ -771,12 +797,12 @@ impl CasWorker {
         path: &ObjectPath,
         batch: &BatchHandle<CasReq, TransError>,
     ) -> Result<(), TransError> {
-        let first_requirement = batch.merged().first_requirement;
+        let mut requirement = batch.merged().requirement;
         // A cache-served `Any` load may complete without yielding. Give peers
         // already scheduled for this object one opportunity to join the round,
         // so batching does not depend on backend I/O creating the collection
         // window. A bounded load already opens that window at its backend await.
-        if first_requirement == Requirement::ANY {
+        if requirement == Requirement::ANY {
             rt::yield_now().await;
         }
         let mut backoff = self.core.retry.backoff();
@@ -796,14 +822,8 @@ impl CasWorker {
         // the batch afterwards — definitively did not land, and inheriting the
         // batch's ambiguity would strand it in-doubt over a write it never made.
         let mut in_doubt: BTreeSet<TxId> = BTreeSet::new();
-        // The first mutation attempt may reuse a cached leaf the submitter just
-        // loaded (a direct same-leaf member; `Any` serves it without a
-        // revalidation round-trip, ADR-030). A failed or in-doubt CAS
-        // invalidates the exact seed observation, so later attempts can also use
-        // `Any`: they either read the winner or reuse newer knowledge another
-        // operation already published. A stale cached leaf only costs a CAS
-        // miss and a reload, never correctness.
-        let mut requirement = first_requirement;
+        // Retain both submitted and resolver-requested bounds across retries.
+        // ANY seeds need no preliminary check when a CAS confirms their state.
         for attempt in 0..CAS_RETRIES {
             if attempt > 0 {
                 rt::sleep(backoff.next_delay()).await;
@@ -829,9 +849,12 @@ impl CasWorker {
             // Read the merged set *after* obtaining the leaf so this round
             // absorbs every member that queued while the load I/O was in flight
             // (ADR-025) — the window that turns N contenders' loads+CASes into
-            // one. A cache-served first attempt still builds a plan for all current
-            // members from the cached leaf; the CAS arbitrates if that leaf was stale.
-            let members = leaf_members(batch);
+            // one. Keep these members with their combined requirement: their
+            // dependent reads need that bound even when the leaf CAS can confirm
+            // an older seed without a preliminary check.
+            let merged = batch.merged();
+            requirement = requirement.stricter(merged.requirement);
+            let members = merged.members;
             let mut plan = match self
                 .plan_mutation(path, &edit, &members, requirement, reloaded, &mut in_doubt)
                 .await
@@ -846,12 +869,12 @@ impl CasWorker {
             };
 
             let loaded_observation = edit.observation().clone();
-            let persist_result = self.persist(path, edit, &mut plan).await?;
+            let persist_result = self.persist(path, edit, &mut plan, requirement).await?;
             let (loaded_observation, applied) = match persist_result {
                 PersistResult::Applied(receipt) => (loaded_observation, Some(receipt)),
                 PersistResult::Unchanged(observed) => (observed, None),
-                // This CAS definitely did not land, but an earlier in-doubt CAS
-                // might have, so leave the members it carried marked.
+                // The CAS did not land, or the clean plan's loaded state
+                // changed. Neither resolves an earlier uncertain mutation.
                 PersistResult::PreconditionMiss => {
                     reloaded = true;
                     continue;
@@ -978,15 +1001,10 @@ impl LeafCoordinator {
         O: LeafOperation + 'static,
     {
         let operation = Arc::new(operation);
-        let first_requirement = operation.first_requirement();
+        let requirement = operation.requirement();
         let resolver: Arc<dyn LeafResolver> = operation.clone();
         let outcome = self
-            .submit_leaf(
-                operation.path(),
-                operation.id(),
-                resolver,
-                first_requirement,
-            )
+            .submit_leaf(operation.path(), operation.id(), resolver, requirement)
             .await?;
         operation.complete(outcome)
     }
@@ -998,12 +1016,12 @@ impl LeafCoordinator {
     /// into the slot. Returns `Ok(None)` if the coordinator was shut down before
     /// the round ran, so the operation can preserve its best-effort behavior.
     ///
-    /// `first_requirement` chooses the cache requirement for the round's first mutation
-    /// attempt: a direct submitter that just read this leaf while evaluating its
-    /// complete point member passes `Any` so the round reuses the cached copy
-    /// instead of revalidating it (ADR-030); skip-capable
-    /// resolvers pass their phase's captured lower bound because their outcome
-    /// may not be followed by a CAS.
+    /// `requirement` bounds dependent reads and completed leaf evidence across
+    /// attempts. A direct submitter can pass `ANY` to reuse its cached leaf
+    /// (ADR-030). Members merged during a load can raise the bound: a successful
+    /// CAS confirms the loaded state, while a plan with no changes checks it
+    /// explicitly. A changed state requires a new plan, not just newer evidence
+    /// attached to the old outcome.
     ///
     /// `path` is the leaf's object path — the collection root `_r` for a small
     /// collection's single leaf, else a standalone node `_n` resolved by descent
@@ -1013,7 +1031,7 @@ impl LeafCoordinator {
         path: &ObjectPath,
         id: &TxId,
         resolver: Arc<dyn LeafResolver>,
-        first_requirement: Requirement,
+        requirement: Requirement,
     ) -> Result<Option<CoordinatedOutcome>, TransError> {
         let slot: OutcomeSlot = Arc::new(Mutex::new(None));
         let mut members = BTreeMap::new();
@@ -1027,7 +1045,7 @@ impl LeafCoordinator {
         let req = CasReq {
             path: path.clone(),
             members,
-            first_requirement,
+            requirement,
         };
         let key = path.to_string();
         match self.inner.dedup.run(&key, req).await {
@@ -1323,7 +1341,7 @@ mod tests {
             &self.tx
         }
 
-        fn first_requirement(&self) -> Requirement {
+        fn requirement(&self) -> Requirement {
             Requirement::ANY
         }
 
@@ -1412,6 +1430,561 @@ mod tests {
         fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
             MemberOutcome::Conflict
         }
+    }
+
+    // A resolver whose outcome exposes the state used for its decision.
+    struct RequirementProbe {
+        tx: TxId,
+        stage_until_present: bool,
+        dependency: Option<(NodeStore, ObjectPath)>,
+        requirements: Arc<Mutex<Vec<Requirement>>>,
+    }
+
+    #[async_trait]
+    impl LeafResolver for RequirementProbe {
+        async fn resolve(
+            &self,
+            ctx: &ResolveCtx<'_>,
+            staged: &BTreeMap<Vec<u8>, LeafEntry>,
+            locks: &NodeLocks,
+        ) -> Result<Step, TransError> {
+            self.requirements.lock().unwrap().push(ctx.requirement);
+            if self.stage_until_present && !staged.contains_key(b"driver".as_slice()) {
+                return StageLock {
+                    tx: self.tx.clone(),
+                    key: b"driver".to_vec(),
+                    admission: StageAdmission::ExistingKeys,
+                }
+                .resolve(ctx, staged, locks)
+                .await;
+            }
+            let has_peer = match &self.dependency {
+                Some((nodes, path)) => nodes
+                    .load_leaf(path, ctx.requirement)
+                    .await?
+                    .entries()
+                    .lookup(b"peer")
+                    .is_some(),
+                None => staged.contains_key(b"peer".as_slice()),
+            };
+            Ok(Step::Skip {
+                outcome: if has_peer {
+                    MemberOutcome::Wait(TxId::with_priority(3, b"peer"))
+                } else {
+                    MemberOutcome::Released {
+                        superseded: Vec::new(),
+                    }
+                },
+            })
+        }
+
+        fn reorderable(&self) -> bool {
+            true
+        }
+
+        fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
+            MemberOutcome::Conflict
+        }
+    }
+
+    fn park_read_reply(
+        backend: &HookBackend,
+        path: ObjectPath,
+        read_number: usize,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        backend.set_after({
+            let entered = entered.clone();
+            let release = release.clone();
+            move |op, _| {
+                let park = matches!(
+                    op,
+                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                ) && op.path() == path.to_string()
+                    && reads.fetch_add(1, Ordering::SeqCst) + 1 == read_number;
+                let entered = entered.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    if park {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    Ok(())
+                })
+            }
+        });
+        (entered, release)
+    }
+
+    async fn wait_for_joiner(coord: &LeafCoordinator) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if coord.dedup_snapshot().iter().any(|snapshot| {
+                    snapshot.batch_count + snapshot.pending_count + snapshot.queue_count == 2
+                }) {
+                    return;
+                }
+                rt::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[derive(Clone, Copy)]
+    enum JoinedLeafChange {
+        Unchanged,
+        Entry,
+        Index,
+    }
+
+    async fn joined_no_change_plan(retry: bool, change: JoinedLeafChange) {
+        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let hooks = HookBackend::new(memory.clone());
+        let recorder = RecordingBackend::new(hooks.clone());
+        let operations = recorder.log();
+        let (coord, _nodes, timeline, _bg) = coord_over_fast(Arc::new(recorder)).await;
+        let driver_id = TxId::with_priority(1, b"driver");
+        if retry {
+            hooks.set_before({
+                let memory = memory.clone();
+                let driver_id = driver_id.clone();
+                let first = std::sync::atomic::AtomicBool::new(true);
+                move |op| {
+                    let conflict = matches!(op, BackendOp::WriteIf { .. })
+                        && op.path() == leaf().to_string()
+                        && first.swap(false, Ordering::SeqCst);
+                    let peer = cold_store(memory.clone());
+                    let driver_id = driver_id.clone();
+                    Box::pin(async move {
+                        if conflict {
+                            store_leaf_entries(
+                                &peer,
+                                &leaf(),
+                                vec![entry(b"driver", LockType::Write, Some(&driver_id), None)],
+                            )
+                            .await;
+                        }
+                        Ok(())
+                    })
+                }
+            });
+        }
+        let (entered, release) = park_read_reply(&hooks, leaf(), if retry { 2 } else { 1 });
+        operations.lock().unwrap().clear();
+        let driver = tokio::spawn({
+            let coord = coord.clone();
+            async move {
+                coord
+                    .submit_leaf(
+                        &leaf(),
+                        &driver_id,
+                        Arc::new(RequirementProbe {
+                            tx: driver_id.clone(),
+                            stage_until_present: retry,
+                            dependency: None,
+                            requirements: Arc::default(),
+                        }),
+                        Requirement::ANY,
+                    )
+                    .await
+            }
+        });
+        entered.notified().await;
+        let peer = cold_store(memory);
+        if matches!(change, JoinedLeafChange::Entry) {
+            let loaded = peer.load_leaf(&leaf(), Requirement::ANY).await.unwrap();
+            let mut entries = loaded.entries().entries().cloned().collect::<Vec<_>>();
+            entries.push(entry(
+                b"peer",
+                LockType::Write,
+                Some(&TxId::with_priority(3, b"peer")),
+                None,
+            ));
+            let mut edit = loaded.into_edit();
+            edit.set_entries(LeafBody::from_entries(entries));
+            assert!(peer.commit_leaf(edit).await.unwrap().is_applied());
+        }
+        if matches!(change, JoinedLeafChange::Index) {
+            let child = NodeToken::from_bytes([2; 16]);
+            assert!(
+                peer.store_node(&collection(), &child, &Node::leaf(LeafBody::new()), None)
+                    .await
+                    .unwrap()
+            );
+            replace_leaf_node(
+                &peer,
+                &Node::index(glassdb_storage::IndexNode::from_children([(
+                    Vec::new(),
+                    child.to_string(),
+                )])),
+            )
+            .await;
+        }
+        let barrier = timeline.currentness_barrier();
+        let requirement = Requirement::after(barrier);
+        let requirements = Arc::new(Mutex::new(Vec::new()));
+        let joiner = tokio::spawn({
+            let coord = coord.clone();
+            let requirements = requirements.clone();
+            async move {
+                let tx = TxId::with_priority(2, b"joiner");
+                coord
+                    .submit_leaf(
+                        &leaf(),
+                        &tx,
+                        Arc::new(RequirementProbe {
+                            tx: tx.clone(),
+                            stage_until_present: false,
+                            dependency: None,
+                            requirements,
+                        }),
+                        requirement,
+                    )
+                    .await
+            }
+        });
+        wait_for_joiner(&coord).await;
+        release.notify_one();
+        driver.await.unwrap().unwrap();
+        let outcome = joiner.await.unwrap().unwrap().unwrap();
+        if matches!(change, JoinedLeafChange::Index) {
+            assert!(matches!(outcome.outcome, MemberOutcome::Conflict));
+            assert!(
+                outcome.evidence.is_none(),
+                "an index reroute must not carry leaf evidence"
+            );
+            assert_eq!(*requirements.lock().unwrap(), [requirement]);
+            assert_eq!(leaf_reads(&operations), 2);
+            assert_eq!(leaf_stores(&operations), 0);
+            coord.close().await;
+            return;
+        }
+        let observed = outcome.evidence.unwrap().into_observation();
+        assert!(
+            observed.is_current_after(barrier),
+            "the joined member received insufficient leaf evidence"
+        );
+        if matches!(change, JoinedLeafChange::Entry) {
+            assert!(
+                matches!(outcome.outcome, MemberOutcome::Wait(ref id) if id == &TxId::with_priority(3, b"peer")),
+                "the old no-change plan must be rebuilt after the leaf changes"
+            );
+        } else {
+            assert!(matches!(outcome.outcome, MemberOutcome::Released { .. }));
+        }
+        assert_eq!(
+            *requirements.lock().unwrap(),
+            vec![
+                requirement;
+                if matches!(change, JoinedLeafChange::Entry) {
+                    2
+                } else {
+                    1
+                }
+            ]
+        );
+        assert_eq!(leaf_reads(&operations), if retry { 3 } else { 2 });
+        assert_eq!(leaf_stores(&operations), usize::from(retry));
+        assert_eq!(coord.stats_and_reset().rounds, 1);
+        coord.close().await;
+    }
+
+    #[tokio::test]
+    async fn late_joiner_rechecks_a_changed_leaf_before_no_change_completion() {
+        joined_no_change_plan(false, JoinedLeafChange::Entry).await;
+    }
+
+    #[tokio::test]
+    async fn late_joiner_checks_an_unchanged_leaf_without_repeating_resolution() {
+        joined_no_change_plan(false, JoinedLeafChange::Unchanged).await;
+    }
+
+    #[tokio::test]
+    async fn late_joiner_keeps_its_requirement_after_a_cas_retry() {
+        joined_no_change_plan(true, JoinedLeafChange::Entry).await;
+    }
+
+    #[tokio::test]
+    async fn late_joiner_reroutes_when_the_no_change_check_finds_an_index() {
+        joined_no_change_plan(false, JoinedLeafChange::Index).await;
+    }
+
+    struct ValidateOnce {
+        timeline: Timeline,
+        requested: Mutex<Option<Requirement>>,
+    }
+
+    #[async_trait]
+    impl LeafResolver for ValidateOnce {
+        async fn resolve(
+            &self,
+            ctx: &ResolveCtx<'_>,
+            staged: &BTreeMap<Vec<u8>, LeafEntry>,
+            locks: &NodeLocks,
+        ) -> Result<Step, TransError> {
+            {
+                let mut requested = self.requested.lock().unwrap();
+                if requested.is_none() {
+                    let requirement = Requirement::after(self.timeline.currentness_barrier());
+                    *requested = Some(requirement);
+                    return Err(TransError::ValidateRetry(requirement));
+                }
+            }
+            SkipRelease.resolve(ctx, staged, locks).await
+        }
+
+        fn reorderable(&self) -> bool {
+            true
+        }
+
+        fn exhausted_outcome(&self, _: bool) -> MemberOutcome {
+            MemberOutcome::Conflict
+        }
+    }
+
+    #[tokio::test]
+    async fn an_any_joiner_preserves_a_resolvers_retry_requirement() {
+        let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let recorder = RecordingBackend::new(hooks.clone());
+        let operations = recorder.log();
+        let (coord, _, timeline, _bg) = coord_over_fast(Arc::new(recorder)).await;
+        let resolver = Arc::new(ValidateOnce {
+            timeline,
+            requested: Mutex::new(None),
+        });
+        let (entered, release) = park_read_reply(&hooks, leaf(), 2);
+        operations.lock().unwrap().clear();
+        let driver = tokio::spawn({
+            let coord = coord.clone();
+            let resolver = resolver.clone();
+            async move {
+                coord
+                    .submit_leaf(
+                        &leaf(),
+                        &TxId::with_priority(1, b"driver"),
+                        resolver,
+                        Requirement::ANY,
+                    )
+                    .await
+            }
+        });
+        entered.notified().await;
+        let requirement = resolver.requested.lock().unwrap().unwrap();
+        let requirements = Arc::new(Mutex::new(Vec::new()));
+        let joiner = tokio::spawn({
+            let coord = coord.clone();
+            let requirements = requirements.clone();
+            async move {
+                let tx = TxId::with_priority(2, b"joiner");
+                coord
+                    .submit_leaf(
+                        &leaf(),
+                        &tx,
+                        Arc::new(RequirementProbe {
+                            tx: tx.clone(),
+                            stage_until_present: false,
+                            dependency: None,
+                            requirements,
+                        }),
+                        Requirement::ANY,
+                    )
+                    .await
+            }
+        });
+        wait_for_joiner(&coord).await;
+        release.notify_one();
+        driver.await.unwrap().unwrap();
+        let outcome = joiner.await.unwrap().unwrap().unwrap();
+        assert!(
+            outcome
+                .evidence
+                .unwrap()
+                .into_observation()
+                .satisfies(requirement)
+        );
+        assert_eq!(*requirements.lock().unwrap(), [requirement]);
+        assert_eq!(leaf_reads(&operations), 2);
+        assert_eq!(leaf_stores(&operations), 0);
+        assert_eq!(coord.stats_and_reset().rounds, 1);
+        coord.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_missing_leaf_load_does_not_absorb_a_late_bounded_member() {
+        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let hooks = HookBackend::new(memory.clone());
+        let (coord, _, timeline, _bg) = coord_over(hooks.clone()).await;
+        let token = NodeToken::from_bytes([7; 16]);
+        let path = ObjectPath::Node {
+            collection: collection(),
+            token: token.clone(),
+        };
+        let (entered, release) = park_read_reply(&hooks, path.clone(), 1);
+        let driver = tokio::spawn({
+            let coord = coord.clone();
+            let path = path.clone();
+            async move {
+                coord
+                    .submit_leaf(
+                        &path,
+                        &TxId::with_priority(1, b"driver"),
+                        Arc::new(SkipRelease),
+                        Requirement::ANY,
+                    )
+                    .await
+            }
+        });
+        entered.notified().await;
+        assert!(
+            cold_store(memory)
+                .store_node(&collection(), &token, &Node::leaf(LeafBody::new()), None)
+                .await
+                .unwrap()
+        );
+        let barrier = timeline.currentness_barrier();
+        let requirements = Arc::new(Mutex::new(Vec::new()));
+        let joiner = tokio::spawn({
+            let coord = coord.clone();
+            let requirements = requirements.clone();
+            async move {
+                let tx = TxId::with_priority(2, b"joiner");
+                coord
+                    .submit_leaf(
+                        &path,
+                        &tx,
+                        Arc::new(RequirementProbe {
+                            tx: tx.clone(),
+                            stage_until_present: false,
+                            dependency: None,
+                            requirements,
+                        }),
+                        Requirement::after(barrier),
+                    )
+                    .await
+            }
+        });
+        wait_for_joiner(&coord).await;
+        release.notify_one();
+        assert!(matches!(
+            driver.await.unwrap(),
+            Err(TransError::Storage(StorageError::NotFound))
+        ));
+        let outcome = joiner.await.unwrap().unwrap().unwrap();
+        assert!(
+            outcome
+                .evidence
+                .unwrap()
+                .into_observation()
+                .is_current_after(barrier)
+        );
+        assert_eq!(*requirements.lock().unwrap(), [Requirement::after(barrier)]);
+        assert_eq!(coord.stats_and_reset().rounds, 2);
+        coord.close().await;
+    }
+
+    #[tokio::test]
+    async fn joined_requirement_bounds_dependencies_while_cas_supplies_leaf_evidence() {
+        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let hooks = HookBackend::new(memory.clone());
+        let recorder = RecordingBackend::new(hooks.clone());
+        let operations = recorder.log();
+        let (coord, nodes, timeline, _bg) = coord_over(Arc::new(recorder)).await;
+        let token = NodeToken::from_bytes([1; 16]);
+        let dependency = ObjectPath::Node {
+            collection: collection(),
+            token: token.clone(),
+        };
+        assert!(
+            nodes
+                .store_node(&collection(), &token, &Node::leaf(LeafBody::new()), None)
+                .await
+                .unwrap()
+        );
+        let (entered, release) = park_read_reply(&hooks, leaf(), 1);
+        operations.lock().unwrap().clear();
+        let driver = tokio::spawn({
+            let coord = coord.clone();
+            async move {
+                let tx = TxId::with_priority(1, b"driver");
+                coord
+                    .submit_leaf(
+                        &leaf(),
+                        &tx,
+                        Arc::new(StageLock {
+                            key: b"driver".to_vec(),
+                            tx: tx.clone(),
+                            admission: StageAdmission::ExistingKeys,
+                        }),
+                        Requirement::ANY,
+                    )
+                    .await
+            }
+        });
+        entered.notified().await;
+        let peer = cold_store(memory);
+        let mut edit = peer
+            .load_leaf(&dependency, Requirement::ANY)
+            .await
+            .unwrap()
+            .into_edit();
+        edit.set_entries(LeafBody::from_entries([entry(
+            b"peer",
+            LockType::Write,
+            Some(&TxId::with_priority(3, b"peer")),
+            None,
+        )]));
+        assert!(peer.commit_leaf(edit).await.unwrap().is_applied());
+        let barrier = timeline.currentness_barrier();
+        let requirements = Arc::new(Mutex::new(Vec::new()));
+        let joiner = tokio::spawn({
+            let coord = coord.clone();
+            let requirements = requirements.clone();
+            let dependency = dependency.clone();
+            async move {
+                let tx = TxId::with_priority(2, b"joiner");
+                coord
+                    .submit_leaf(
+                        &leaf(),
+                        &tx,
+                        Arc::new(RequirementProbe {
+                            tx: tx.clone(),
+                            stage_until_present: false,
+                            dependency: Some((nodes, dependency)),
+                            requirements,
+                        }),
+                        Requirement::after(barrier),
+                    )
+                    .await
+            }
+        });
+        wait_for_joiner(&coord).await;
+        release.notify_one();
+        let driver = driver.await.unwrap().unwrap().unwrap();
+        let joiner = joiner.await.unwrap().unwrap().unwrap();
+        assert!(
+            matches!(joiner.outcome, MemberOutcome::Wait(ref id) if id == &TxId::with_priority(3, b"peer")),
+            "a leaf CAS cannot repair a dependent read that ignored the joined requirement"
+        );
+        let expected = joiner.evidence.unwrap().into_observation();
+        assert!(expected.is_current_after(barrier));
+        assert!(driver.evidence.unwrap().validates(&expected, barrier));
+        assert_eq!(*requirements.lock().unwrap(), [Requirement::after(barrier)]);
+        let calls = |path: &ObjectPath| {
+            operations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|op| op.path == path.to_string())
+                .map(|op| op.op)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(calls(&leaf()), ["read", "write_if"]);
+        assert_eq!(calls(&dependency), ["read_if_modified"]);
+        assert_eq!(coord.stats_and_reset().rounds, 1);
+        coord.close().await;
     }
 
     // A hook that parks the next leaf read while armed, letting a second submitter merge.

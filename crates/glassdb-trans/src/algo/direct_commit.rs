@@ -627,7 +627,7 @@ impl LeafOperation for DirectCommitOperation {
         &self.id
     }
 
-    fn first_requirement(&self) -> Requirement {
+    fn requirement(&self) -> Requirement {
         Requirement::ANY
     }
 

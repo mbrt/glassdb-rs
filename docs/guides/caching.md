@@ -292,6 +292,22 @@ plan's CAS to succeed. A conflict or in-doubt result must cause a reload and a
 new mutation plan before completion. The skipped member still receives the
 loaded observation, without a claim that it participated in the CAS.
 
+Each attempt takes its members and their combined requirement from one merged
+request after the leaf load. Members that join during that load can strengthen
+the requirement. Resolver-requested bounds remain in force across retries.
+`ResolveCtx::requirement` applies to dependent object reads; it does not claim
+that the loaded or staged leaf already satisfies the bound.
+
+A dirty plan can use its CAS to confirm the loaded state after the combined
+bound, without a preliminary leaf read. A plan with no changes instead calls
+`check_leaf_current`: sufficient evidence costs no I/O, an unchanged backend
+state advances the original observation, and a changed state requires a reload
+and a new plan. Do not return an old decision with evidence for a different
+state. A leaf CAS cannot repair dependent reads made with a weaker requirement.
+Resolvers may retain only facts that remain valid when a plan is discarded;
+this also applies to reconciliation of an earlier uncertain CAS. An exact
+historical own marker can prove that a mutation landed; a staged proposal cannot.
+
 ## Per-path coordination
 
 `CachedStore` serializes actual backend point calls for the same physical path

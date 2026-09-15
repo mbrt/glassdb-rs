@@ -358,7 +358,7 @@ routing and capacity admission, whole-member exclusion for overlapping
 logless output claims, one CAS per attempt, per-member uncertainty attribution,
 and recovery by reloading and rebuilding the mutation plan. Installed resolvers
 own the operation-specific mutation decisions. Each policy owner packages its
-resolver, target, first-load
+resolver, target, freshness
 requirement, and typed result in a `LeafOperation`: `Locker` supplies acquire /
 write-back / release, `DirectCommit` supplies direct commit, `Splitter` supplies
 leaf structural-gate acquisition, and `Gc` reclaims through the `Locker`'s
@@ -385,6 +385,14 @@ plan with no staged changes cannot complete a staged member. Neither result
 establishes a currentness barrier after the operation. The allowed and forbidden
 transformations are stated in the [cache
 guide](guides/caching.md#coordinator-mutation-evidence).
+
+Each attempt keeps the merged members and their requirement together, including
+members that join during the leaf load and bounds requested on earlier retries.
+Resolvers use that bound for dependent object reads. The loaded leaf can still
+precede it: a dirty plan obtains its leaf evidence from the CAS, while a plan
+with no changes checks the exact loaded state before delivery. An unchanged
+state needs no repeated resolution; a changed state requires a new plan. No
+extra barrier or preliminary read is added to the successful CAS path.
 
 | Component             | Layer            | Speaks                       | Owns                                                                                                                  | Must not know                       |
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |

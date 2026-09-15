@@ -338,7 +338,7 @@ impl LeafOperation for StructuralGateOperation {
         &self.id
     }
 
-    fn first_requirement(&self) -> Requirement {
+    fn requirement(&self) -> Requirement {
         Requirement::ANY
     }
 

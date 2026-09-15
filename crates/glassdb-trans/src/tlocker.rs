@@ -434,7 +434,7 @@ impl LeafOperation for AcquireOperation {
         &self.id
     }
 
-    fn first_requirement(&self) -> Requirement {
+    fn requirement(&self) -> Requirement {
         self.requirement
     }
 
@@ -581,7 +581,7 @@ impl LeafOperation for WriteBackOperation {
         &self.id
     }
 
-    fn first_requirement(&self) -> Requirement {
+    fn requirement(&self) -> Requirement {
         // Locking used this cache, so it cannot serve a state from before the
         // installed hold. A split resolves committed holders before moving
         // entries. Any remaining write is protected by its revision CAS.
@@ -698,7 +698,7 @@ impl LeafOperation for ReleaseOperation {
         &self.id
     }
 
-    fn first_requirement(&self) -> Requirement {
+    fn requirement(&self) -> Requirement {
         self.requirement
     }
 
