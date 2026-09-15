@@ -824,6 +824,10 @@ impl Monitor {
         let transition = match self.owner_close_plan(tid) {
             OwnerClosePlan::Transition(transition) => transition,
             OwnerClosePlan::PreserveCommit => {
+                // The owner has stopped, but its commit outcome is unknown.
+                // Retaining local Pending state would keep waiters from using
+                // durable recovery after the refresher has stopped.
+                self.finish_local_tx(tid);
                 return Ok(OwnerAbortOutcome::CommitOutcomePreserved);
             }
             OwnerClosePlan::AlreadyFinished => return Ok(OwnerAbortOutcome::AlreadyFinished),

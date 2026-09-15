@@ -2,7 +2,7 @@
 //!
 //! The harness chooses modes, streams, seeds, and spawn order. This module owns
 //! the resulting faulty transports and executes crash, outage, join, and heal
-//! actions. Client cancellation hands control to `ClientRunner`, which owns the
+//! actions. Instance cancellation hands control to `ClientRunner`, which owns the
 //! corresponding restart lifecycle.
 
 use std::sync::Arc;
@@ -13,18 +13,18 @@ use glassdb_backend::middleware::{FaultBackend, FaultOptions};
 use glassdb_concurr::{Tape, rt};
 use tokio_util::sync::CancellationToken;
 
-/// Owns the fault-injecting transports and ordered client backend views.
+/// Owns the fault-injecting transports and ordered instance backend views.
 pub(super) struct FaultTransports {
     injected: Vec<Arc<FaultBackend>>,
-    client_backends: Vec<Arc<dyn Backend>>,
+    instance_backends: Vec<Arc<dyn Backend>>,
 }
 
 impl FaultTransports {
-    /// Gives each client a direct view of a faultless backbone.
-    pub(super) fn faultless(backbone: &Arc<dyn Backend>, clients: usize) -> Self {
+    /// Gives each instance a direct view of a faultless backbone.
+    pub(super) fn faultless(backbone: &Arc<dyn Backend>, instances: usize) -> Self {
         Self {
             injected: Vec::new(),
-            client_backends: (0..clients).map(|_| backbone.clone()).collect(),
+            instance_backends: (0..instances).map(|_| backbone.clone()).collect(),
         }
     }
 
@@ -36,22 +36,22 @@ impl FaultTransports {
     ) -> Self {
         let options = FaultOptions::from_intensity(intensity);
         let mut injected = Vec::with_capacity(schedules.len());
-        let mut client_backends = Vec::with_capacity(schedules.len());
+        let mut instance_backends = Vec::with_capacity(schedules.len());
         for (tape, seed) in schedules {
             let transport = FaultBackend::with_tape(backbone.clone(), tape, seed, options);
             transport.set_active(true);
             injected.push(transport.clone());
-            client_backends.push(transport as Arc<dyn Backend>);
+            instance_backends.push(transport as Arc<dyn Backend>);
         }
         Self {
             injected,
-            client_backends,
+            instance_backends,
         }
     }
 
-    /// Transfers client views while retaining injectors for outage and healing.
-    pub(super) fn take_client_backends(&mut self) -> Vec<Arc<dyn Backend>> {
-        std::mem::take(&mut self.client_backends)
+    /// Transfers instance views while retaining injectors for outage and healing.
+    pub(super) fn take_instance_backends(&mut self) -> Vec<Arc<dyn Backend>> {
+        std::mem::take(&mut self.instance_backends)
     }
 
     /// Disables every injector before final verification.
@@ -77,7 +77,7 @@ impl NemesisRunner {
         }
     }
 
-    /// Starts deterministic client-crash injection.
+    /// Starts deterministic instance-crash injection.
     pub(super) fn spawn_crash(&mut self, signals: &[CancellationToken], intensity: u8, tape: Tape) {
         debug_assert!(self.crash.is_none());
         self.crash = Some(rt::spawn(crash_nemesis(signals.to_vec(), intensity, tape)));
@@ -104,19 +104,19 @@ impl NemesisRunner {
     }
 }
 
-/// Cancels selected clients at deterministic virtual times. Their task owner
-/// performs the uncancellable restart without replaying an in-doubt operation.
+/// Cancels selected instances at deterministic virtual times. Each instance owner
+/// restarts once without replaying an in-doubt operation.
 async fn crash_nemesis(signals: Vec<CancellationToken>, intensity: u8, mut tape: Tape) {
     let crashes = (intensity as usize % 3).min(signals.len());
     for _ in 0..crashes {
         let gap = tape.below(40) + 1;
         rt::sleep(Duration::from_millis(gap)).await;
-        let client = tape.below(signals.len() as u64) as usize;
-        signals[client].cancel();
+        let instance = tape.below(signals.len() as u64) as usize;
+        signals[instance].cancel();
     }
 }
 
-/// Takes selected client transports down for sustained windows and heals them.
+/// Takes selected instance transports down for sustained windows and heals them.
 async fn outage_nemesis(transports: Vec<Arc<FaultBackend>>, intensity: u8, mut tape: Tape) {
     if transports.is_empty() {
         return;
@@ -124,12 +124,12 @@ async fn outage_nemesis(transports: Vec<Arc<FaultBackend>>, intensity: u8, mut t
     for _ in 0..outage_count(intensity) {
         let gap = tape.below(30) + 1;
         rt::sleep(Duration::from_millis(gap)).await;
-        let client = tape.below(transports.len() as u64) as usize;
-        transports[client].down();
+        let instance = tape.below(transports.len() as u64) as usize;
+        transports[instance].down();
         // The span keeps retries failing long enough to reach lease recovery.
         let span = tape.below(80) + 20;
         rt::sleep(Duration::from_millis(span)).await;
-        transports[client].heal();
+        transports[instance].heal();
     }
 }
 

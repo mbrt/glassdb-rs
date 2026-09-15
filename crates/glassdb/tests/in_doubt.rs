@@ -396,6 +396,76 @@ async fn single_rw_in_doubt_not_landed_retries_and_commits() {
     assert_eq!(got, 11, "the increment must be applied exactly once");
 }
 
+// Local ownership must end even when the commit result remains unknown, or a
+// later transaction waits forever on the stopped owner's in-memory Pending state.
+async fn local_write_after_uncertain_logged_commit(landed: bool) {
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let db = Database::builder("test", backend.clone())
+        .protocol_timing(glassdb::ProtocolTiming::simulation())
+        .open()
+        .await
+        .unwrap();
+    let coll = db.root_collection();
+    seed(&coll, b"key", 10).await;
+    settle_writebacks().await;
+
+    if landed {
+        backend.set_after(|operation, _| {
+            let unavailable = committed_log(operation)
+                || matches!(operation,
+                    BackendOp::Read { path } | BackendOp::ReadIfModified { path, .. }
+                        if path.contains("/_t/"));
+            Box::pin(async move {
+                if unavailable {
+                    Err(lost_ack("commit or status read"))
+                } else {
+                    Ok(())
+                }
+            })
+        });
+    } else {
+        // The refresher must not create Pending first: that would let commit
+        // recovery retry instead of reaching the missing-record ambiguity.
+        backend.set_before(|operation| {
+            let unavailable = matches!(operation,
+                BackendOp::WriteIf { path, .. } | BackendOp::WriteIfNotExists { path, .. }
+                    if path.contains("/_t/"));
+            Box::pin(async move {
+                if unavailable {
+                    Err(not_applied("transaction log write"))
+                } else {
+                    Ok(())
+                }
+            })
+        });
+    }
+    let result = increment_padded(&db, &coll, b"key").await;
+    assert!(matches!(result, Err(Error::InDoubt(_))), "{result:?}");
+    backend.clear_before();
+    backend.clear_after();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        increment_padded(&db.clone(), &coll, b"key"),
+    )
+    .await
+    .expect("local transaction remained pending after its owner returned")
+    .expect("the next local transaction must recover the previous outcome");
+    let value = coll.read(b"key").await.unwrap().unwrap();
+    assert_eq!(read_int(&value), if landed { 12 } else { 11 });
+    db.shutdown().await;
+}
+
+#[tokio::test]
+async fn local_write_recovers_after_a_commit_did_not_land() {
+    local_write_after_uncertain_logged_commit(false).await;
+}
+
+#[tokio::test]
+async fn local_write_recovers_after_an_unconfirmed_commit_landed() {
+    local_write_after_uncertain_logged_commit(true).await;
+}
+
 /// The logged path: when the *committed* transaction-log write —
 /// the commit point — lands but loses its ack, the engine must recover the
 /// outcome transparently instead of surfacing the uncertainty.

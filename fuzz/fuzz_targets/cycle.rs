@@ -6,9 +6,12 @@
 //! `concurrent-tx` target. The harness runs the decoded workload both without
 //! and with the persistent cache; the cached run uses only basic media delays
 //! and pre-effect failures. It lays down a ring (`key(i) -> (i + 1) % N`) and
-//! runs every client as its own task over a shared in-process backend on the
-//! in-repo deterministic executor ([`glassdb::exec`], `--cfg sim`); each client
-//! repeatedly rotates three consecutive ring edges. Because that rotation does
+//! runs four client tasks with up to six swaps each over a shared in-process
+//! backend on the deterministic executor ([`glassdb::exec`], `--cfg sim`).
+//! Adjacent pairs share a database instance, its caches and transport, and its
+//! crash/restart lifetime. Empty client programs are allowed. A separate instance
+//! can observe up to eight ring snapshots through a faultless transport.
+//! Each swap rotates three consecutive ring edges. Because that rotation does
 //! not commute, any isolation or atomicity break splits, shrinks, or grows the
 //! ring.
 //!
@@ -26,6 +29,6 @@
 use libfuzzer_sys::fuzz_target;
 
 // The decode-and-run logic lives in the generic `glassdb::sim::replay_input` so
-// the committed-corpus replay test (crates/glassdb/tests/fuzz_corpus.rs)
+// the committed-corpus replay test (crates/glassdb/tests/sim/sim_tests/fuzz_corpus.rs)
 // exercises the exact same path as the fuzzer.
 fuzz_target!(|data: &[u8]| glassdb::sim::replay_input::<glassdb::sim::CycleWorkload>(data));

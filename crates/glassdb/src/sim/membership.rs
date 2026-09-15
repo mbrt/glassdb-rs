@@ -9,7 +9,7 @@ use crate::{CollectionPath, Database, Error, KeyScan};
 
 use super::harness::{SimWorkload, open_det_db};
 use super::{
-    MAX_CLIENTS, MAX_OPS_PER_CLIENT, SimMedia, assert_valid_listing, key_name, tiny_split_policy,
+    CLIENT_COUNT, MAX_OPS_PER_CLIENT, SimMedia, assert_valid_listing, key_name, tiny_split_policy,
 };
 // ===========================================================================
 // Membership workload (ADR-031 dynamic range sharding).
@@ -62,21 +62,29 @@ pub enum MembOp {
 /// disjoint subset of `0..MEMBERSHIP_KEYS` (keys `k` with `k % nclients == i`),
 /// so every key is mutated by a single client and its op history is totally
 /// ordered. Clients run concurrently.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MembershipWorkload {
     /// Per-client op sequences.
     pub clients: Vec<Vec<MembOp>>,
 }
 
+impl Default for MembershipWorkload {
+    fn default() -> Self {
+        Self {
+            clients: vec![Vec::new(); CLIENT_COUNT],
+        }
+    }
+}
+
 impl<'a> Arbitrary<'a> for MembershipWorkload {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-        // At least two clients so there is something to interleave.
-        let nclients = 2 + (u.arbitrary::<u8>()? as usize % (MAX_CLIENTS - 1));
-        let mut clients = Vec::with_capacity(nclients);
-        for i in 0..nclients {
+        let mut clients = Vec::with_capacity(CLIENT_COUNT);
+        for i in 0..CLIENT_COUNT {
             // This client's disjoint slice of the key universe. Non-empty since
-            // MEMBERSHIP_KEYS >= MAX_CLIENTS >= nclients.
-            let my_keys: Vec<usize> = (0..MEMBERSHIP_KEYS).filter(|k| k % nclients == i).collect();
+            // MEMBERSHIP_KEYS >= CLIENT_COUNT.
+            let my_keys: Vec<usize> = (0..MEMBERSHIP_KEYS)
+                .filter(|k| k % CLIENT_COUNT == i)
+                .collect();
             let nops = u.arbitrary::<u8>()? as usize % (MAX_OPS_PER_CLIENT + 1);
             let mut ops = Vec::with_capacity(nops);
             for _ in 0..nops {

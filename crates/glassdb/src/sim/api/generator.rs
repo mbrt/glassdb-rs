@@ -2,18 +2,17 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 
-use super::super::{MAX_CLIENTS, MAX_OPS_PER_CLIENT};
+use super::super::{CLIENT_COUNT, MAX_OPS_PER_CLIENT};
 use super::{API_COLLECTION_SLOTS, API_KEYS, ApiAction, ApiTransaction, ApiWorkload};
 
 const MAX_ACTIONS_PER_TX: usize = 6;
 
 impl<'a> Arbitrary<'a> for ApiWorkload {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-        let nclients = 2 + (u.arbitrary::<u8>()? as usize % (MAX_CLIENTS - 1));
-        let mut clients = Vec::with_capacity(nclients);
-        for client in 0..nclients {
+        let mut clients = Vec::with_capacity(CLIENT_COUNT);
+        for client in 0..CLIENT_COUNT {
             let owned: Vec<usize> = (0..API_KEYS)
-                .filter(|key| key % nclients == client)
+                .filter(|key| key % CLIENT_COUNT == client)
                 .collect();
             let ntxs = u.arbitrary::<u8>()? as usize % (MAX_OPS_PER_CLIENT + 1);
             let mut txs = Vec::with_capacity(ntxs);

@@ -12,6 +12,11 @@
 //! persistent cache; the cached run uses only basic media delays and pre-effect
 //! failures.
 //!
+//! Four client tasks each run up to six transactions; empty programs are allowed.
+//! Adjacent pairs share a database instance, its caches and transport, and its
+//! crash/restart lifetime. Each logical client retains its own keys and
+//! collection names in the model.
+//!
 //! ```bash
 //! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run api-correctness <crash-file>
 //! ```

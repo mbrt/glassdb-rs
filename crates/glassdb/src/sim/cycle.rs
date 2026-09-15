@@ -11,7 +11,7 @@ use crate::{Collection, CollectionPath, Database, Error};
 
 use super::harness::SimWorkload;
 use super::{
-    MAX_CLIENTS, MAX_OPS_PER_CLIENT, SimMedia, key_name, read_int, try_read_int, write_int,
+    CLIENT_COUNT, MAX_OPS_PER_CLIENT, SimMedia, key_name, read_int, try_read_int, write_int,
 };
 // ===========================================================================
 // Cycle workload (ported from FoundationDB's `Cycle.cpp`).
@@ -39,7 +39,7 @@ const MIN_NODES: usize = 4;
 const MAX_NODES: usize = 12;
 /// Most snapshots the concurrent read-only observer takes during a run (keeps
 /// its work bounded at `MAX_SNAPSHOTS * node_count` reads).
-const MAX_SNAPSHOTS: usize = MAX_OPS_PER_CLIENT;
+const MAX_SNAPSHOTS: usize = 8;
 /// Collection the ring lives in.
 const CYCLE_COLLECTION: &[u8] = b"cycle";
 
@@ -63,7 +63,7 @@ impl Default for CycleWorkload {
     fn default() -> Self {
         CycleWorkload {
             node_count: MIN_NODES,
-            clients: Vec::new(),
+            clients: vec![Vec::new(); CLIENT_COUNT],
             snapshot_reads: 0,
         }
     }
@@ -72,10 +72,8 @@ impl Default for CycleWorkload {
 impl<'a> Arbitrary<'a> for CycleWorkload {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
         let node_count = MIN_NODES + (u.arbitrary::<u8>()? as usize % (MAX_NODES - MIN_NODES + 1));
-        // At least two clients so there is something to interleave.
-        let nclients = 2 + (u.arbitrary::<u8>()? as usize % (MAX_CLIENTS - 1));
-        let mut clients = Vec::with_capacity(nclients);
-        for _ in 0..nclients {
+        let mut clients = Vec::with_capacity(CLIENT_COUNT);
+        for _ in 0..CLIENT_COUNT {
             let nswaps = u.arbitrary::<u8>()? as usize % (MAX_OPS_PER_CLIENT + 1);
             let mut swaps = Vec::with_capacity(nswaps);
             for _ in 0..nswaps {

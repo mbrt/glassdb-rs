@@ -8,7 +8,8 @@
 //! Every operation can fault on **either side**, all preserving the harness
 //! invariant `acked <= final <= started`:
 //!
-//! - **delay**: a virtual latency before the operation (harmless to the bound);
+//! - **delay**: independent request and reply latencies. A delayed reply retains
+//!   the backend result while other operations can change storage;
 //! - **dropped request** (before landing): the request never reaches the store,
 //!   so the op fails without landing and the engine retries / leaves it in-doubt;
 //! - **lost ack** (after landing): the op *lands* at the store but the response
@@ -40,6 +41,9 @@ use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, V
 pub struct FaultOptions {
     /// Chance an operation is delayed before running.
     pub delay_prob: u8,
+    /// Chance a reply is delayed after the backend finishes, including unchanged
+    /// conditional reads and absent reads.
+    pub reply_delay_prob: u8,
     /// Chance the transport faults an operation (drops it on one side or the
     /// other).
     pub fault_prob: u8,
@@ -59,6 +63,7 @@ impl FaultOptions {
         let scale = |max: u8| ((max as u16 * intensity as u16) / 255) as u8;
         FaultOptions {
             delay_prob: scale(64),
+            reply_delay_prob: scale(64),
             fault_prob: scale(24),
             lost_ack_prob: 128,
             max_delay: Duration::from_millis(200),
@@ -144,10 +149,8 @@ impl FaultBackend {
         self.active.load(Ordering::SeqCst)
     }
 
-    /// Runs `op` through the faulty transport: an optional delay, then either the
-    /// real call, a dropped request (no landing), or a landed call whose ack is
-    /// lost. During an outage every op faults. The caller cancels by dropping
-    /// the surrounding future.
+    /// Models a call through the faulty transport, including delayed replies.
+    /// Cancellation abandons delivery without undoing an applied mutation.
     async fn transport<T, Fut>(&self, op: impl FnOnce() -> Fut) -> Result<T, BackendError>
     where
         Fut: std::future::Future<Output = Result<T, BackendError>>,
@@ -155,17 +158,11 @@ impl FaultBackend {
         if !self.is_active() {
             return op().await;
         }
-        // Draw delay and the fault decision from the tape in one shot, so tape
-        // consumption is grouped per operation. An outage forces a fault.
-        let (delay, fault) = {
+        // Select both delays and the fault before suspending so each call keeps
+        // its own transport decisions even when replies arrive out of order.
+        let (request_delay, fault, reply_delay) = {
             let mut t = self.tape.lock().unwrap();
-            let delay = if t.roll(self.opts.delay_prob) {
-                Some(Duration::from_nanos(
-                    t.below(self.opts.max_delay.as_nanos() as u64 + 1),
-                ))
-            } else {
-                None
-            };
+            let delay = self.roll_delay(&mut t, self.opts.delay_prob);
             let faulted = self.down.load(Ordering::SeqCst) || t.roll(self.opts.fault_prob);
             let fault = faulted.then(|| {
                 if t.roll(self.opts.lost_ack_prob) {
@@ -174,16 +171,19 @@ impl FaultBackend {
                     Fault::Dropped
                 }
             });
-            (delay, fault)
+            let reply_delay = self.roll_delay(&mut t, self.opts.reply_delay_prob);
+            (delay, fault, reply_delay)
         };
-        if let Some(d) = delay {
+        if let Some(d) = request_delay {
             rt::sleep(d).await;
         }
-        match fault {
+        let result = match fault {
             None => op().await,
-            Some(Fault::Dropped) => Err(BackendError::Unavailable(
-                "injected dropped request (lost before landing)".into(),
-            )),
+            Some(Fault::Dropped) => {
+                return Err(BackendError::Unavailable(
+                    "injected dropped request (lost before landing)".into(),
+                ));
+            }
             // The op reaches the store; only a *successful* landing is reported
             // as an in-doubt lost ack. A genuine error is returned as-is.
             Some(Fault::LostAck) => match op().await {
@@ -192,6 +192,22 @@ impl FaultBackend {
                 )),
                 Err(e) => Err(e),
             },
+        };
+        // Precondition and NotFound also carry read evidence. Retain the full
+        // result selected by the backend instead of reading again at delivery.
+        if let Some(d) = reply_delay {
+            rt::sleep(d).await;
+        }
+        result
+    }
+
+    fn roll_delay(&self, t: &mut Tape, prob: u8) -> Option<Duration> {
+        if t.roll(prob) {
+            Some(Duration::from_nanos(
+                t.below(self.opts.max_delay.as_nanos() as u64 + 1),
+            ))
+        } else {
+            None
         }
     }
 }
@@ -256,6 +272,7 @@ mod tests {
     fn fault_only_options() -> FaultOptions {
         FaultOptions {
             delay_prob: 0,
+            reply_delay_prob: 0,
             max_delay: Duration::ZERO,
             ..FaultOptions::from_intensity(255)
         }
@@ -300,6 +317,7 @@ mod tests {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let opts = FaultOptions {
             delay_prob: 255,
+            reply_delay_prob: 0,
             fault_prob: 0,
             lost_ack_prob: 0,
             max_delay: Duration::from_millis(10),
@@ -320,6 +338,7 @@ mod tests {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let opts = FaultOptions {
             delay_prob: 0,
+            reply_delay_prob: 0,
             fault_prob: 255,
             lost_ack_prob: 0,
             max_delay: Duration::from_millis(0),
@@ -344,6 +363,7 @@ mod tests {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let opts = FaultOptions {
             delay_prob: 0,
+            reply_delay_prob: 0,
             fault_prob: 255,
             lost_ack_prob: 255,
             max_delay: Duration::from_millis(0),
@@ -369,6 +389,7 @@ mod tests {
         let backend: Arc<dyn Backend> = mem.clone();
         let opts = FaultOptions {
             delay_prob: 0,
+            reply_delay_prob: 0,
             fault_prob: 255,
             lost_ack_prob: 255,
             max_delay: Duration::from_millis(0),
@@ -391,6 +412,7 @@ mod tests {
         // a dropped request so the empty store is never written.
         let opts = FaultOptions {
             delay_prob: 0,
+            reply_delay_prob: 0,
             fault_prob: 0,
             lost_ack_prob: 0,
             max_delay: Duration::from_millis(0),
