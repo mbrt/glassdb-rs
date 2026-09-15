@@ -152,6 +152,12 @@ struct ParticipantSettlement {
     intents: VecDeque<Observation<StructuralIntent>>,
 }
 
+#[derive(Clone, Copy)]
+enum SettlementMode {
+    Background,
+    Explicit,
+}
+
 enum ParticipantSettlementStep {
     Completed,
     Recover(Observation<StructuralIntent>),
@@ -421,6 +427,9 @@ impl StructuralRecovery {
     }
 
     /// Starts explicit settlement of one finalized topology participant.
+    ///
+    /// The caller must share the cache that admitted the participant or
+    /// installed a topology freeze with the participant still present.
     pub(super) fn begin_participant_settlement(
         &self,
         collection: &CollectionAddress,
@@ -455,21 +464,35 @@ impl StructuralRecovery {
     }
 
     /// Removes one participant after all of its structural intents settle.
+    ///
+    /// A present record without the participant must satisfy `requirement`.
+    /// Local admission or topology-freeze evidence permits `ANY`.
     pub(super) async fn leave_topology(
         &self,
         collection: &CollectionAddress,
         id: &TxId,
+        requirement: Requirement,
     ) -> Result<(), TransError> {
         let mut backoff = self.retry.backoff();
+        let mut read_requirement = Requirement::ANY;
         loop {
             let (mut record, observed) =
-                match self.records.load_record(collection, Requirement::ANY).await {
+                match self.records.load_record(collection, read_requirement).await {
                     Ok(record) => record,
+                    // Published collections already have their record. Local
+                    // preparation shares this cache, and deleted identities are
+                    // not reused, so an absence cannot hide later admission.
                     Err(StorageError::NotFound) => return Ok(()),
                     Err(error) => return Err(error.into()),
                 };
             if !record.remove_topology_participant(id) {
-                return Ok(());
+                if observed.satisfies(requirement) {
+                    return Ok(());
+                }
+                // Intent cleanup does not refresh the collection record. Only
+                // a no-op without sufficient evidence needs a bounded reload.
+                read_requirement = requirement;
+                continue;
             }
             if self.records.store_record(&record, &observed).await? {
                 return Ok(());
@@ -568,7 +591,10 @@ impl StructuralRecovery {
         debug_assert!(parent_result.is_none());
 
         if let Some(settlement) = sweep.settlement.as_mut() {
-            match self.advance_participant(settlement).await {
+            match self
+                .advance_participant(settlement, SettlementMode::Background)
+                .await
+            {
                 Ok(ParticipantSettlementStep::Completed) => {
                     sweep.settlement = None;
                     sweep.participant = None;
@@ -654,7 +680,10 @@ impl StructuralRecovery {
                 continue;
             }
 
-            match self.advance_participant(&mut action.settlement).await? {
+            match self
+                .advance_participant(&mut action.settlement, SettlementMode::Explicit)
+                .await?
+            {
                 ParticipantSettlementStep::Completed => {
                     action.completed = true;
                     return Ok(RecoveryStep::Completed {
@@ -764,6 +793,7 @@ impl StructuralRecovery {
     async fn advance_participant(
         &self,
         settlement: &mut ParticipantSettlement,
+        mode: SettlementMode,
     ) -> Result<ParticipantSettlementStep, TransError> {
         if !settlement.status_checked {
             if !self
@@ -790,16 +820,24 @@ impl StructuralRecovery {
                 return Ok(ParticipantSettlementStep::Recover(observed));
             }
 
+            let requirement = Requirement::after(self.timeline.currentness_barrier());
             let intents = self
                 .intent_store
                 .list_for_participant(
                     settlement.collection.db_root_component(),
                     &settlement.participant,
-                    Requirement::after(self.timeline.currentness_barrier()),
+                    requirement,
                 )
                 .await?;
             if intents.is_empty() {
-                self.leave_topology(&settlement.collection, &settlement.participant)
+                // The listing bound follows final status and completed intent
+                // recovery. Explicit settlement already has local record
+                // evidence from admission or its topology freeze.
+                let departure = match mode {
+                    SettlementMode::Background => requirement,
+                    SettlementMode::Explicit => Requirement::ANY,
+                };
+                self.leave_topology(&settlement.collection, &settlement.participant, departure)
                     .await?;
                 return Ok(ParticipantSettlementStep::Completed);
             }

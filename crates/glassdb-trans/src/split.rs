@@ -2053,12 +2053,15 @@ impl Splitter {
         }
     }
 
+    /// Removes a participant admitted by this database instance.
     async fn leave_topology(
         &self,
         collection: &CollectionAddress,
         id: &TxId,
     ) -> Result<(), TransError> {
-        self.recovery.leave_topology(collection, id).await
+        self.recovery
+            .leave_topology(collection, id, Requirement::ANY)
+            .await
     }
 
     /// Performs the write-ahead, child creation, and root rewrite.

@@ -333,6 +333,16 @@ allocates once it holds the Ready record, because a cache entry's watermark is
 allocated before the read that fills it and therefore cannot order a read after
 the gate.
 
+Participant departure starts with `ANY`; a removal CAS proves completion.
+For background settlement, a present record without the participant must meet
+the existing final intent-listing requirement. That bound follows final-status
+observation and completed intent recovery. An insufficient no-op triggers a
+bounded record reload without allocating another barrier. Owner departure
+shares admission's cache and keeps `ANY`. Explicit settlement also keeps `ANY`:
+its caller must share the cache that admitted the participant or installed a
+topology freeze with it present. This includes repeated settlement after a local
+removal CAS. Intent cleanup alone does not supply this record evidence.
+
 The background loop reads at most one 128-object page of the independent `_s/`
 namespace per sweep and retains its cursor. Successful reclamation shortens its
 delay; live intents and no-ops lengthen it, up to ten minutes. A pending cursor

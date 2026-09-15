@@ -23,6 +23,10 @@ use crate::wound_wait::{Reclaim, resolve_tx_conflict, try_reclaim};
 pub trait TopologySettler: Send + Sync {
     /// Finishes and releases `id`'s structural work on `collection`. Returns
     /// [`TransError::Retry`] while `id` is not yet final.
+    ///
+    /// The caller must share the cache that admitted `id` or installed a
+    /// topology freeze with `id` still present. This permits completion from
+    /// local record evidence after another operation removes the participant.
     async fn settle_topology_participant(
         &self,
         collection: &CollectionAddress,

@@ -1,5 +1,221 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+enum ParticipantCleanup {
+    StaleRecord,
+    CachedParticipant,
+    OwnerDeparted,
+    ReadFailure,
+}
+
+async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
+    let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let recorder = RecordingBackend::new(hooks.clone());
+    let operations = recorder.log();
+    let backend: Arc<dyn Backend> = Arc::new(recorder);
+    let local = store_with_backend(backend.clone());
+    let peer = store_with_backend(backend.clone());
+    local
+        .create_root(COLL, &leaf_node(&[b"a", b"b", b"c", b"d"], None, None))
+        .await
+        .unwrap();
+    let local_bg = Arc::new(Background::new());
+    let peer_bg = Arc::new(Background::new());
+    let recovering = splitter(&local, &local_bg, tiny());
+    let owner = splitter(&peer, &peer_bg, tiny());
+    let participant = if committed {
+        // The split has completed its tree change, but failed intent deletion
+        // leaves both the Ready intent and participant for background recovery.
+        hooks.set_before({
+            let prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+            move |op| {
+                let fail =
+                    matches!(op, BackendOp::DeleteIf { path, .. } if path.starts_with(&prefix));
+                Box::pin(async move {
+                    if fail {
+                        Err(glassdb_backend::BackendError::other(
+                            "intent cleanup failed",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+        assert!(owner.split_path(&root_path()).await.is_err());
+        hooks.clear_before();
+        let intents = peer
+            .list_structural_intents("db", Requirement::ANY)
+            .await
+            .unwrap();
+        assert_eq!(intents.len(), 1);
+        let intent = intents[0].1.value().unwrap();
+        assert_eq!(intent.phase, StructuralIntentPhase::Ready);
+        let id = intent.participant_id.clone();
+        assert_eq!(owner.mon.tx_status(&id).await.unwrap(), TxCommitStatus::Ok);
+        id
+    } else {
+        let id = TxId::with_priority(1, b"peer-participant");
+        owner.begin_topology_tx(&collection(), &id).await.unwrap();
+        owner
+            .recovery
+            .prepare_intent(&collection(), None, &id)
+            .await
+            .unwrap();
+        owner.join_topology(&collection(), &id).await.unwrap();
+        assert_eq!(
+            owner.mon.abort_owned_tx(&id).await.unwrap(),
+            crate::monitor::OwnerAbortOutcome::Acknowledged
+        );
+        id
+    };
+    let record_path = ObjectPath::CollectionRecord {
+        collection: collection(),
+    }
+    .to_string();
+    if matches!(case, ParticipantCleanup::CachedParticipant) {
+        local
+            .records
+            .load_record(
+                &collection(),
+                Requirement::after(local.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+    }
+    if matches!(case, ParticipantCleanup::OwnerDeparted) {
+        // A peer can complete departure after this sweep deletes the intent
+        // and before it checks the collection record.
+        hooks.set_before({
+            let owner = owner.clone();
+            let participant = participant.clone();
+            let prefix =
+                ObjectPath::participant_structural_intents_prefix(&db_root("db"), &participant);
+            move |op| {
+                let depart = matches!(op, BackendOp::List { .. }) && op.path() == prefix;
+                let owner = owner.clone();
+                let participant = participant.clone();
+                Box::pin(async move {
+                    if depart {
+                        owner
+                            .leave_topology(&collection(), &participant)
+                            .await
+                            .map_err(|error| {
+                                glassdb_backend::BackendError::with_source("owner departure", error)
+                            })?;
+                    }
+                    Ok(())
+                })
+            }
+        });
+    }
+    if matches!(case, ParticipantCleanup::ReadFailure) {
+        hooks.set_before({
+            let path = record_path.clone();
+            move |op| {
+                let fail = op.path() == path
+                    && matches!(
+                        op,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    );
+                Box::pin(async move {
+                    if fail {
+                        Err(glassdb_backend::BackendError::other(
+                            "participant check failed",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+    }
+    operations.lock().unwrap().clear();
+    let result = recovering.recover_structural_intents().await;
+    let recorded = std::mem::take(&mut *operations.lock().unwrap());
+    hooks.clear_before();
+    let verifier = store_with_backend(backend);
+    assert!(
+        verifier
+            .list_structural_intents("db", Requirement::ANY)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let (record, _) = verifier
+        .records
+        .load_record(&collection(), Requirement::ANY)
+        .await
+        .unwrap();
+    if matches!(case, ParticipantCleanup::ReadFailure) {
+        assert!(
+            result.is_err(),
+            "a failed departure check cannot report a completed sweep"
+        );
+        assert!(record.topology_participants().any(|id| id == &participant));
+        // The transaction object remains available to GC even though intent
+        // discovery can no longer find this participant on its next sweep.
+        let log = verifier
+            .foundation
+            .tlogger
+            .get_at(&participant, Requirement::ANY)
+            .await
+            .unwrap();
+        assert!(log.value().unwrap().locks.iter().any(|lock| {
+            matches!(lock, TxLock::Topology { collection: target } if target == &collection())
+        }));
+        return;
+    }
+    assert!(result.unwrap());
+    assert!(
+        !record.topology_participants().any(|id| id == &participant),
+        "structural recovery deleted the intent but left its participant admitted"
+    );
+    let record_calls: Vec<_> = recorded
+        .iter()
+        .filter(|op| op.path == record_path)
+        .map(|op| op.op)
+        .collect();
+    let expected: &[&str] = match case {
+        ParticipantCleanup::StaleRecord => &["read_if_modified", "write_if"],
+        ParticipantCleanup::CachedParticipant => &["write_if"],
+        ParticipantCleanup::OwnerDeparted => &["write_if", "read_if_modified"],
+        ParticipantCleanup::ReadFailure => unreachable!(),
+    };
+    assert_eq!(record_calls, expected);
+    operations.lock().unwrap().clear();
+    assert!(!recovering.recover_structural_intents().await.unwrap());
+    assert!(operations.lock().unwrap().iter().all(|op| op.op == "list"));
+}
+
+#[tokio::test]
+async fn background_recovery_removes_participants_from_stale_records() {
+    for committed in [false, true] {
+        recover_peer_participant(committed, ParticipantCleanup::StaleRecord).await;
+    }
+}
+
+#[tokio::test]
+async fn background_recovery_removes_cached_participants_without_a_read() {
+    for committed in [false, true] {
+        recover_peer_participant(committed, ParticipantCleanup::CachedParticipant).await;
+    }
+}
+
+#[tokio::test]
+async fn background_recovery_checks_departure_after_another_instance_removes_the_participant() {
+    for committed in [false, true] {
+        recover_peer_participant(committed, ParticipantCleanup::OwnerDeparted).await;
+    }
+}
+
+#[tokio::test]
+async fn background_recovery_reports_failed_departure_checks() {
+    for committed in [false, true] {
+        recover_peer_participant(committed, ParticipantCleanup::ReadFailure).await;
+    }
+}
+
 #[tokio::test]
 async fn settlement_cancels_a_prepared_split_before_node_creation() {
     let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
@@ -43,6 +259,29 @@ async fn settlement_cancels_a_prepared_split_before_node_creation() {
     assert!(
         listings.iter().all(|path| path == &expected_listing),
         "settlement must list only the participant-owned intent prefix"
+    );
+    let record_path = ObjectPath::CollectionRecord {
+        collection: collection(),
+    }
+    .to_string();
+    let record_calls: Vec<_> = operations
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|op| op.path == record_path)
+        .map(|op| op.op)
+        .collect();
+    assert_eq!(record_calls, ["write_if"]);
+    operations.lock().unwrap().clear();
+    sp.settle_topology_participant(&collection(), &participant)
+        .await
+        .unwrap();
+    assert!(
+        operations
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|op| op.path != record_path)
     );
 
     let worker = TxId::with_priority(2, b"worker");
