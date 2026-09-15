@@ -27,14 +27,14 @@ pub use self::scheduling::{
     replay_input,
 };
 use super::slow_backend;
-use super::{MAX_CLIENTS, MediaFaultProfile, SimMedia};
+use super::{CLIENT_COUNT, CLIENTS_PER_INSTANCE, MAX_INSTANCES, MediaFaultProfile, SimMedia};
 
 const DB_NAME: &str = "fuzz";
 const SLOW_MUTATION_SEED: u64 = 0x510A_7E00_5EED_BA5E;
 const CACHE_CAPACITY_BYTES: u64 = 2 * 1024 * 1024;
 const CACHE_MEDIA_SEED: u64 = 0xCA43_5EED_D15C_0048;
 
-/// Controls transport failures, client crashes, and slow backend mutations in
+/// Controls transport failures, instance crashes, and slow backend mutations in
 /// the deterministic simulation harness.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FaultConfig {
@@ -49,7 +49,7 @@ impl FaultConfig {
         Self::default()
     }
 
-    /// Enables transport failures and client crashes at the given intensity.
+    /// Enables transport failures and instance crashes at the given intensity.
     pub fn failures(intensity: u8) -> Self {
         FaultConfig {
             failures: true,
@@ -67,7 +67,7 @@ impl FaultConfig {
         }
     }
 
-    /// Enables transport failures, client crashes, and one slow mutation.
+    /// Enables transport failures, instance crashes, and one slow mutation.
     pub fn combined(intensity: u8) -> Self {
         FaultConfig {
             failures: true,
@@ -135,19 +135,19 @@ fn deinterleave<const N: usize>(tape: &[u8]) -> [Vec<u8>; N] {
 }
 
 const INIT_VERIFY_MEDIA_STREAM: usize = 0;
-const CLIENT_MEDIA_STREAM_BASE: usize = 1;
-const OBSERVER_MEDIA_STREAM: usize = CLIENT_MEDIA_STREAM_BASE + MAX_CLIENTS;
+const INSTANCE_MEDIA_STREAM_BASE: usize = 1;
+const OBSERVER_MEDIA_STREAM: usize = INSTANCE_MEDIA_STREAM_BASE + MAX_INSTANCES;
 const MEDIA_STREAMS: usize = OBSERVER_MEDIA_STREAM + 1;
 
 struct RunMedia {
     init_and_verify: SimMedia,
-    clients: Vec<SimMedia>,
+    instances: Vec<SimMedia>,
     observer: SimMedia,
 }
 
 impl RunMedia {
-    fn new(tape: Vec<u8>, seed: u64, client_count: usize) -> Self {
-        assert!(client_count <= MAX_CLIENTS);
+    fn new(tape: Vec<u8>, seed: u64, instance_count: usize) -> Self {
+        assert!(instance_count <= MAX_INSTANCES);
         let streams = deinterleave::<MEDIA_STREAMS>(&tape);
         let create = |stream: usize| {
             // Broad transaction workloads need ordinary latency and error
@@ -160,32 +160,31 @@ impl RunMedia {
             )
         };
         Self {
-            // Concurrent database handles need distinct exclusively opened
+            // Independent database instances need distinct exclusively opened
             // containers. Init and verification are sequential, so sharing
             // their medium also exercises clean reopen and timeline recovery.
             init_and_verify: create(INIT_VERIFY_MEDIA_STREAM),
-            clients: (0..client_count)
-                .map(|client| create(CLIENT_MEDIA_STREAM_BASE + client))
+            instances: (0..instance_count)
+                .map(|instance| create(INSTANCE_MEDIA_STREAM_BASE + instance))
                 .collect(),
             observer: create(OBSERVER_MEDIA_STREAM),
         }
     }
 }
 
-// Fault-tape stream layout: one stream for each nemesis, plus one per client
-// transport (so each client's faults are guided by its own disjoint bytes).
+// Fault-tape stream layout: one stream for each nemesis, plus one per instance
+// transport (so each instance has its own fault decisions).
 const CRASH_STREAM: usize = 0;
 const OUTAGE_STREAM: usize = 1;
-const CLIENT_STREAM_BASE: usize = 2;
-const FAULT_STREAMS: usize = CLIENT_STREAM_BASE + MAX_CLIENTS;
+const INSTANCE_STREAM_BASE: usize = 2;
+const FAULT_STREAMS: usize = INSTANCE_STREAM_BASE + MAX_INSTANCES;
 
-/// Distinct PRNG-fallback seed for client `i`'s transport, so an exhausted tape
-/// does not make every client fault in lockstep.
-fn client_seed(seed: u64, i: usize) -> u64 {
+/// Distinct PRNG-fallback seed for each instance transport.
+fn instance_seed(seed: u64, i: usize) -> u64 {
     seed ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1)
 }
 
-/// The shared faultless backbone every client reaches through its own
+/// The shared faultless backbone each database instance reaches through its
 /// transport: a `MemoryBackend` behind a `RecordingBackend` whose ordered op log
 /// powers the byte-for-byte determinism self-check. Init and verification use it
 /// directly (a perfect connection).
@@ -199,9 +198,8 @@ fn make_backbone() -> (Arc<dyn Backend>, OpLog) {
 
 /// Spawns the crash and outage nemeses when transport failures are enabled,
 /// each on its own fault-tape stream and a distinct fallback seed. The caller
-/// spawns the client tasks and optional observer first, so the fixed spawn order
-/// (clients, observer when enabled, crash, then outage) keeps task ids — and
-/// thus the schedule — deterministic.
+/// spawns the instance owners and optional observer first, so task creation
+/// remains deterministic for a given schedule.
 fn spawn_nemeses(
     faults: FaultConfig,
     seed: u64,
@@ -223,21 +221,21 @@ fn spawn_nemeses(
 // ===========================================================================
 // SimWorkload: the shared harness abstraction.
 //
-// Every deterministic-simulation workload (increment RMW, cycle, membership, API) is
-// the same run: seed a shared store, run each client's op sequence as its own
-// interleaved task over its own fault transport, run the crash/outage nemeses,
+// Every deterministic-simulation workload follows the same run: seed a shared
+// store, run each client's op sequence as its own task, sharing one database
+// instance and fault transport per pair, run the crash/outage nemeses,
 // then read the final committed state and assert an invariant. Only a few points
 // differ per workload — opening the database, the seed step, how one op runs, the
 // invariant, and an optional concurrent observer — so those are the trait
 // methods. Each workload owns its own collection(s) behind those methods, so the
 // harness works purely with `Database` handles. The run context owns the
-// backbone, media, model state, and per-client transports; `ClientRunner` owns
-// client crash/restart lifecycles, and `NemesisRunner` owns the nemesis tasks.
+// backbone, media, model state, and per-instance transports; `ClientRunner` owns
+// instance crash/restart lifecycles, and `NemesisRunner` owns the nemesis tasks.
 // ===========================================================================
 
 /// A deterministic-simulation workload the shared harness ([`run_generic`]) can
 /// drive. Implementors supply only what varies between workloads; the backbone,
-/// per-client transports, crash-and-restart client tasks, and fault nemeses are
+/// per-instance transports, client tasks, instance restarts, and fault nemeses are
 /// all provided by the harness.
 pub trait SimWorkload: Clone + Default + 'static {
     /// A single client operation, run in its own transaction.
@@ -257,7 +255,7 @@ pub trait SimWorkload: Clone + Default + 'static {
 
     /// Opens a database for this workload over `backend` and optional simulated
     /// cache media. The harness calls this for the seed/verify database and for
-    /// every client (and restart), so the workload — not the harness — chooses
+    /// every instance (and restart), so the workload — not the harness — chooses
     /// the split soft-cap policy. The default uses production caps; override to
     /// exercise B-link splits with few keys. Implementations must go through
     /// [`open_det_db`] to preserve the deterministic clock required for
@@ -287,19 +285,19 @@ pub trait SimWorkload: Clone + Default + 'static {
     ) -> impl Future<Output = Result<(), Error>>;
 
     /// Reads the final committed state and asserts the workload invariant.
-    /// Panics on any violation. `failures_enabled` selects the exact vs. relaxed
-    /// (in-doubt-tolerant) form of the invariant; slow-only runs remain exact.
+    /// Panics on any violation. `allow_in_doubt` selects the form of the invariant
+    /// that accepts interrupted operations, after faults or a foreground limit.
+    /// Otherwise every planned operation must complete.
     fn verify(
         &self,
         db: &Database,
         state: &Self::State,
-        failures_enabled: bool,
+        allow_in_doubt: bool,
     ) -> impl Future<Output = ()>;
 
     /// An optional concurrent read-only observer spawned alongside the clients
-    /// (e.g. the Cycle ring snapshotter). Spawned in a fixed order — after the
-    /// clients, before the nemeses — so task ids stay deterministic. Default:
-    /// none.
+    /// (e.g. the Cycle ring snapshotter). The harness spawns it after the instance
+    /// owners and before the nemeses. The default has no observer.
     fn spawn_observer(
         &self,
         _backbone: &Arc<dyn Backend>,
@@ -349,17 +347,18 @@ impl<W: SimWorkload> RunPlan<W> {
             media_tape,
         } = self;
 
-        // The fault tape guides each client's transport failures, crash timing,
+        // The fault tape guides each instance's transport failures, crash timing,
         // outage windows, and the independent one-shot slow mutation. With an empty
         // tape all decisions fall back to the seed (PCT/seed-breadth runs).
         let fault_streams = deinterleave::<FAULT_STREAMS>(&fault_tape);
 
-        // The store and a shared recorder form a faultless backbone; each client gets
+        // The store and a shared recorder form a faultless backbone; each instance gets
         // its own transport (`FaultBackend`) over it.
         let (backbone, log) = make_backbone();
         let client_ops: Vec<Vec<W::Op>> = workload.clients().to_vec();
-        let nclients = client_ops.len();
-        let run_media = media_tape.map(|tape| RunMedia::new(tape, seed, nclients));
+        assert!(client_ops.len() <= CLIENT_COUNT);
+        let ninstances = client_ops.len().div_ceil(CLIENTS_PER_INSTANCE);
+        let run_media = media_tape.map(|tape| RunMedia::new(tape, seed, ninstances));
 
         // Let the workload open and seed its collection(s), over the faultless
         // backbone so setup cannot fail spuriously.
@@ -377,7 +376,7 @@ impl<W: SimWorkload> RunPlan<W> {
 
         let state = Arc::new(workload.new_state());
 
-        // One transport per client over the shared backbone. Injectors are live
+        // One transport per instance over the shared backbone. Injectors are live
         // only while the clients run.
         let client_backbone: Arc<dyn Backend> = if faults.slow_mutations_enabled() {
             slow_backend::with_tape(
@@ -390,17 +389,17 @@ impl<W: SimWorkload> RunPlan<W> {
             backbone.clone()
         };
         let transports = if faults.failures_enabled() {
-            let schedules = (0..nclients)
-                .map(|client| {
+            let schedules = (0..ninstances)
+                .map(|instance| {
                     (
-                        fault_streams[CLIENT_STREAM_BASE + client % MAX_CLIENTS].clone(),
-                        client_seed(seed, client),
+                        fault_streams[INSTANCE_STREAM_BASE + instance].clone(),
+                        instance_seed(seed, instance),
                     )
                 })
                 .collect();
             FaultTransports::faulting(&client_backbone, faults.intensity, schedules)
         } else {
-            FaultTransports::faultless(&client_backbone, nclients)
+            FaultTransports::faultless(&client_backbone, ninstances)
         };
 
         RunContext {
@@ -438,20 +437,20 @@ impl<W: SimWorkload> RunContext<W> {
     fn start_clients(&mut self) -> ClientRunner {
         ClientRunner::spawn::<W>(
             std::mem::take(&mut self.client_ops),
-            self.transports.take_client_backends(),
+            self.transports.take_instance_backends(),
             self.run_media.as_ref(),
             &self.state,
             self.faults,
         )
     }
 
-    async fn teardown(self) -> OpLog {
+    async fn teardown(self, timed_out: bool) -> OpLog {
         // Heal every transport before verifying so recovery reads cannot themselves
         // fail.
         self.transports.final_heal();
 
         // The workload reads the final committed state (driving recovery of any
-        // crashed client's locks via lease expiry) and asserts its invariant.
+        // crashed instance's locks via lease expiry) and asserts its invariant.
         let verify_db = W::open_db(
             &self.backbone,
             self.run_media
@@ -461,7 +460,11 @@ impl<W: SimWorkload> RunContext<W> {
         .await
         .expect("open fresh verification db");
         self.workload
-            .verify(&verify_db, &self.state, self.faults.failures_enabled())
+            .verify(
+                &verify_db,
+                &self.state,
+                self.faults.failures_enabled() || timed_out,
+            )
             .await;
         verify_db.shutdown().await;
         drop(self.client_backbone);
@@ -486,8 +489,8 @@ async fn run_generic<W: SimWorkload>(
 
     // An optional concurrent observer, then the crash and outage nemeses, each on
     // its own slice of the fault tape (and a distinct fallback seed). The fixed
-    // spawn order (clients, observer, crash, outage) keeps task ids — and thus
-    // the schedule — deterministic.
+    // spawn order (instance owners, observer, crash, outage) keeps task creation
+    // deterministic for a given schedule.
     let observer = context.workload.spawn_observer(
         &context.backbone,
         &context.state,
@@ -504,13 +507,13 @@ async fn run_generic<W: SimWorkload>(
         &context.transports,
     );
 
-    clients.join().await;
+    let timed_out = clients.join().await;
     if let Some(h) = observer {
         h.await.expect("observer task failed");
     }
     nemeses.join().await;
 
-    context.teardown().await
+    context.teardown(timed_out).await
 }
 
 // ---------------------------------------------------------------------------
@@ -557,6 +560,98 @@ pub async fn run_and_record_with_faults<W: SimWorkload>(
 #[cfg(test)]
 mod sim_tests {
     use super::*;
+    use std::sync::Mutex;
+    use tokio::sync::Barrier;
+
+    #[derive(Clone, Default)]
+    struct SharedInstanceWorkload {
+        clients: Vec<Vec<usize>>,
+    }
+
+    struct SharedInstanceState {
+        starting: Barrier,
+        completed: Barrier,
+        snapshots: Mutex<Vec<(usize, crate::Stats)>>,
+    }
+
+    impl SimWorkload for SharedInstanceWorkload {
+        type Op = usize;
+        type State = SharedInstanceState;
+
+        fn clients(&self) -> &[Vec<Self::Op>] {
+            &self.clients
+        }
+
+        fn new_state(&self) -> Self::State {
+            SharedInstanceState {
+                starting: Barrier::new(4),
+                completed: Barrier::new(4),
+                snapshots: Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn seed(&self, _db: &Database) {}
+
+        async fn run_op(db: &Database, client: &usize, state: &Self::State) -> Result<(), Error> {
+            state.starting.wait().await;
+            let key = super::super::key_name(*client);
+            let key = &key;
+            db.tx(|tx| async move {
+                let root = tx.root_collection();
+                tx.write(&root, key, b"value")
+            })
+            .await?;
+            state.completed.wait().await;
+            state.snapshots.lock().unwrap().push((*client, db.stats()));
+            Ok(())
+        }
+
+        async fn verify(&self, db: &Database, state: &Self::State, _failures_enabled: bool) {
+            for client in 0..4 {
+                assert_eq!(
+                    db.root_collection()
+                        .read(&super::super::key_name(client))
+                        .await
+                        .unwrap(),
+                    Some(b"value".to_vec()),
+                );
+            }
+            let snapshots = state.snapshots.lock().unwrap();
+            assert_eq!(snapshots.len(), 4);
+            for (client, stats) in snapshots.iter() {
+                assert_eq!(
+                    stats.transactions.completed, 2,
+                    "client {client}: {stats:?}"
+                );
+                assert!(
+                    stats.coordinator.submissions > stats.coordinator.rounds,
+                    "client {client}: {stats:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_clients_share_each_database_and_coordinate_concurrent_writes() {
+        for media_tape in [None, Some(Vec::new())] {
+            glassdb_concurr::exec::block_on_with(
+                glassdb_concurr::exec::RandomScheduler::new(3),
+                3,
+                async move {
+                    run_generic(
+                        SharedInstanceWorkload {
+                            clients: (0..4).map(|id| vec![id]).collect(),
+                        },
+                        FaultConfig::none(),
+                        1,
+                        Vec::new(),
+                        media_tape,
+                    )
+                    .await;
+                },
+            );
+        }
+    }
 
     #[test]
     fn fault_config_decodes_four_modes_without_shifting_the_tail() {

@@ -17,13 +17,12 @@ use glassdb_concurr::rt;
 use crate::{Collection, CollectionPath, Database, Error, InlinePolicy, KeyScan, Transaction};
 
 use super::harness::{SimWorkload, open_det_db};
-use super::{SimMedia, key_name, tiny_split_policy};
+use super::{CLIENT_COUNT, SimMedia, key_name, tiny_split_policy};
 
 const HISTORY_COLLECTION: &[u8] = b"history";
 const HISTORY_KEY_COUNT: usize = 3;
 const HISTORY_REGISTER_COUNT: usize = 2;
-const MAX_HISTORY_CLIENTS: usize = 3;
-const MAX_HISTORY_TXS_PER_CLIENT: usize = 4;
+const MAX_HISTORY_TXS_PER_CLIENT: usize = 3;
 const CHECK_BRANCH_BUDGET: usize = 1_000_000;
 const APPLICATION_ERROR_MARKER: &str = "history-user-error";
 
@@ -600,7 +599,7 @@ pub struct HistoryWorkload {
 impl Default for HistoryWorkload {
     fn default() -> Self {
         Self {
-            clients: vec![Vec::new(), Vec::new()],
+            clients: vec![Vec::new(); CLIENT_COUNT],
         }
     }
 }
@@ -698,10 +697,9 @@ fn arbitrary_program(u: &mut Unstructured<'_>) -> arbitrary::Result<Vec<HistoryI
 
 impl<'a> Arbitrary<'a> for HistoryWorkload {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-        let clients = 2 + u.arbitrary::<u8>()? as usize % (MAX_HISTORY_CLIENTS - 1);
         let mut next_id = 0u64;
-        let mut programs = Vec::with_capacity(clients);
-        for client_id in 0..clients {
+        let mut programs = Vec::with_capacity(CLIENT_COUNT);
+        for client_id in 0..CLIENT_COUNT {
             let count = u.arbitrary::<u8>()? as usize % (MAX_HISTORY_TXS_PER_CLIENT + 1);
             let mut client = Vec::with_capacity(count);
             for _ in 0..count {
@@ -1706,10 +1704,7 @@ mod sim_tests {
 
     #[test]
     fn fuzz_program_decoder_reaches_bounded_scans() {
-        // This is the workload prefix after the eight-byte RNG seed in the
-        // committed history corpus. Keeping a scan here prevents the initial
-        // corpus from degenerating into point-only coverage.
-        let mut input = Unstructured::new(b"bBcbeeccaBcbha");
+        let mut input = Unstructured::new(&[1, 0, 0, 5, 2, 0, 4, 1, 0, 0, 0]);
         let workload = HistoryWorkload::arbitrary(&mut input).unwrap();
         assert!(matches!(
             workload.clients[0][0].instructions.as_slice(),

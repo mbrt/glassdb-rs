@@ -56,24 +56,24 @@ fn contended_history() -> HistoryWorkload {
                         },
                     ],
                 ),
-                transaction(
-                    2,
-                    0,
-                    vec![
-                        I::Delete { key: 2 },
-                        I::Scan {
-                            start: 0,
-                            end: 3,
-                            after: None,
-                            limit: 3,
-                        },
-                    ],
-                ),
             ],
+            vec![transaction(
+                2,
+                1,
+                vec![
+                    I::Delete { key: 2 },
+                    I::Scan {
+                        start: 0,
+                        end: 3,
+                        after: None,
+                        limit: 3,
+                    },
+                ],
+            )],
             vec![
                 transaction(
                     3,
-                    1,
+                    2,
                     vec![
                         I::Read {
                             key: 0,
@@ -87,7 +87,7 @@ fn contended_history() -> HistoryWorkload {
                 ),
                 transaction(
                     4,
-                    1,
+                    2,
                     vec![
                         I::Scan {
                             start: 0,
@@ -105,8 +105,12 @@ fn contended_history() -> HistoryWorkload {
                         },
                     ],
                 ),
-                transaction(5, 1, vec![I::WriteLiteral { key: 1, value: 7 }, I::Abort]),
             ],
+            vec![transaction(
+                5,
+                3,
+                vec![I::WriteLiteral { key: 1, value: 7 }, I::Abort],
+            )],
         ],
     }
 }

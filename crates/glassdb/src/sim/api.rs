@@ -18,7 +18,7 @@ mod oracle;
 pub use model::ApiAcct;
 
 use super::harness::{SimWorkload, open_det_db};
-use super::{SimMedia, tiny_split_policy};
+use super::{CLIENT_COUNT, SimMedia, tiny_split_policy};
 use executor::StepResult;
 // ===========================================================================
 // Transaction API workload (inspired by FoundationDB FuzzApiCorrectness).
@@ -88,7 +88,7 @@ pub struct ApiWorkload {
 impl Default for ApiWorkload {
     fn default() -> Self {
         ApiWorkload {
-            clients: vec![Vec::new(), Vec::new()],
+            clients: vec![Vec::new(); CLIENT_COUNT],
         }
     }
 }

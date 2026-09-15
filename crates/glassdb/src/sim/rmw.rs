@@ -11,7 +11,7 @@ use crate::{Collection, CollectionPath, Database, Error, InlinePolicy, SplitPoli
 
 use super::SimMedia;
 use super::harness::{SimWorkload, open_det_db};
-use super::{MAX_CLIENTS, MAX_OPS_PER_CLIENT, key_name, read_int, try_read_int, write_int};
+use super::{CLIENT_COUNT, MAX_OPS_PER_CLIENT, key_name, read_int, try_read_int, write_int};
 /// Number of distinct keys the workload operates on.
 pub const RMW_KEY_COUNT: usize = 4;
 /// Collection the increment workload operates on. Each workload owns its own
@@ -31,11 +31,20 @@ pub enum RmwOp {
 }
 
 /// A complete workload: one op sequence per client. Clients run concurrently.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RmwWorkload {
     /// Per-client op sequences.
     pub clients: Vec<Vec<RmwOp>>,
 }
+
+impl Default for RmwWorkload {
+    fn default() -> Self {
+        Self {
+            clients: vec![Vec::new(); CLIENT_COUNT],
+        }
+    }
+}
+
 impl<'a> Arbitrary<'a> for RmwOp {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
         let key = |u: &mut Unstructured<'a>| -> arbitrary::Result<usize> {
@@ -65,10 +74,8 @@ impl<'a> Arbitrary<'a> for RmwOp {
 
 impl<'a> Arbitrary<'a> for RmwWorkload {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-        // At least two clients so there is something to interleave.
-        let nclients = 2 + (u.arbitrary::<u8>()? as usize % (MAX_CLIENTS - 1));
-        let mut clients = Vec::with_capacity(nclients);
-        for _ in 0..nclients {
+        let mut clients = Vec::with_capacity(CLIENT_COUNT);
+        for _ in 0..CLIENT_COUNT {
             let nops = u.arbitrary::<u8>()? as usize % (MAX_OPS_PER_CLIENT + 1);
             let mut ops = Vec::with_capacity(nops);
             for _ in 0..nops {

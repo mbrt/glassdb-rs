@@ -55,6 +55,30 @@ Simulation tests ouside such a module compile but do not run through `make test`
 sim. The normal test suite enforces these rules with
 [`simulation_test_policy.rs`](../../crates/glassdb/tests/simulation_test_policy.rs).
 
+Each database fuzz input has four logical clients, with clients 0 and 1 sharing
+one database instance and clients 2 and 3 sharing another. The clients run as
+separate tasks and keep their own operation order and model identities. Each
+pair shares caches, a backend transport, and a crash/restart lifetime. A crash
+interrupts both streams; restart continues each stream after its last attempted
+operation. Completed or failed streams stay stopped. The optional cycle
+observer uses a separate database instance and a faultless transport.
+
+This fixed placement permits concurrent coordinator rounds in both instances.
+Generated streams can be empty so smaller cases remain easy to generate and
+minimize. Each client has at most six operations (24 in total); the exact-history
+target allows three transactions per client (12 in total) to bound checker cost.
+The cycle observer can still take eight snapshots. This layout does not cover
+three clients sharing one instance or three independent instances.
+
+Each instance limits its client operations to ten seconds of virtual time,
+starting after database open, on both the initial run and a restart. On expiry, it interrupts and joins both
+client tasks, drops the instance, and leaves unfinished operations in doubt.
+It does not restart after this limit. Final verification still runs through a
+fresh instance and checks completed and in-doubt operations. The limit does not
+apply to verification: a missing transaction body required by a current writer
+must still fail the run. This prevents a foreground progress failure from
+blocking the consistency checks.
+
 Database fuzz workloads check consistency through public state and transaction
 histories. Maintenance scenarios are useful when they can change those results:
 for example, deleting a transaction body still required by a current key writer
@@ -108,11 +132,10 @@ other; the shared, contended correctness boundary is the store. The optional
 disk cache adds disposable local persistence but no new coordination
 authority. Those facts drive the comparison:
 
-- The meaningful fault boundary is **one client's transport to the store**, which
-  is exactly the `Backend` trait. The current `FaultBackend` injects request and
-  reply delays, dropped-request, lost-ack, and sustained per-client outages
-  right there — and, being plain middleware, it even runs under ordinary
-  `#[tokio::test]`.
+- The meaningful fault boundary is **one database instance's transport to the
+  store**, which is exactly the `Backend` trait. The current `FaultBackend`
+  injects request and reply delays, dropped-request, lost-ack, and sustained
+  per-instance outages. This middleware also runs under ordinary `#[tokio::test]`.
 - A **simulated network is largely wasted** here. turmoil/mad-turmoil's core
   value (a network between hosts) has nothing to bite on; you'd be simulating the
   HTTP/socket layer to object storage purely as overhead. madsim had the same
@@ -241,7 +264,7 @@ This is the current approach's clearest win, and the reason it exists.
   string libFuzzer mutates locally — `tape[pos] % ready.len()` chooses the next
   task — so a byte flip is a single, local scheduling perturbation (a real
   gradient). A second **fault tape** extends the same gradient to the fault
-  schedule (which ops delay/drop/lose-ack, when clients crash, when outages open).
+  schedule (which ops delay/drop/lose-ack, when instances crash, when outages open).
   **PCT** complements it with a principled seed-breadth sweep that has a provable
   lower bound on catching depth-`d` bugs. All replay byte-for-byte.
 

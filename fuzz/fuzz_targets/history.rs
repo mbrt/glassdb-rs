@@ -6,6 +6,11 @@
 //! both cache modes. Programs include point and concurrent-group reads plus
 //! normalized bounded membership scans; long-lived snapshot reads are
 //! intentionally not generated.
+//!
+//! Four client tasks each run up to three transactions; empty programs are allowed.
+//! Adjacent pairs share a database instance, its caches and transport, and its
+//! crash/restart lifetime. The checker keeps the four logical client identities
+//! and their operation order distinct.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 

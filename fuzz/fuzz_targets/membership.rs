@@ -12,6 +12,10 @@
 //! cap, so a couple of live keys overflow a leaf and drive B-link leaf/root
 //! splits, right-link traversal, and cross-leaf sorted listing.
 //!
+//! Four client tasks each run up to six operations; empty programs are allowed.
+//! Adjacent pairs share a database instance, its caches and transport, and its
+//! crash/restart lifetime. Key ownership remains specific to each logical client.
+//!
 //! The generic harness ([`glassdb::sim::replay_input`]) asserts that every
 //! committed listing is strictly sorted and drawn from the key universe, and
 //! that the final key set matches the per-key membership accounting (exactly
@@ -28,6 +32,6 @@
 use libfuzzer_sys::fuzz_target;
 
 // The decode-and-run logic lives in the generic `glassdb::sim::replay_input` so
-// the committed-corpus replay test (crates/glassdb/tests/fuzz_corpus.rs)
+// the committed-corpus replay test (crates/glassdb/tests/sim/sim_tests/fuzz_corpus.rs)
 // exercises the exact same path as the fuzzer.
 fuzz_target!(|data: &[u8]| glassdb::sim::replay_input::<glassdb::sim::MembershipWorkload>(data));

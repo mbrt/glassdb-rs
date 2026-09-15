@@ -4,9 +4,11 @@
 //! [`FaultConfig`], and the remaining bytes, which are deinterleaved into
 //! *schedule*, *backend-fault*, and *cache-media* tapes. The harness runs every
 //! decoded workload both without and with the persistent cache; the cached run
-//! uses only basic media delays and pre-effect failures. Every client runs as
-//! its own task over
-//! a shared in-process backend on the in-repo deterministic executor
+//! uses only basic media delays and pre-effect failures. Four client tasks each
+//! run up to six operations. Adjacent pairs share a database instance, its caches
+//! and transport, and its crash/restart lifetime. Empty client programs are
+//! allowed. Both instances use a shared in-process backend on the deterministic
+//! executor
 //! ([`glassdb::exec`], `--cfg sim`); a [`TapeScheduler`] consumes the schedule
 //! tape to choose task interleavings, while the other tapes independently guide
 //! transport and media faults. All three dimensions are therefore part of the
@@ -28,6 +30,6 @@
 use libfuzzer_sys::fuzz_target;
 
 // The decode-and-run logic lives in the generic `glassdb::sim::replay_input` so
-// the committed-corpus replay test (crates/glassdb/tests/fuzz_corpus.rs)
+// the committed-corpus replay test (crates/glassdb/tests/sim/sim_tests/fuzz_corpus.rs)
 // exercises the exact same path as the fuzzer.
 fuzz_target!(|data: &[u8]| glassdb::sim::replay_input::<glassdb::sim::RmwWorkload>(data));

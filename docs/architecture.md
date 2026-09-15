@@ -97,6 +97,24 @@ deterministic runs, while `glassdb::rt` provides task, time, timeout, and
 dedicated-task services inside a run. Entropy selection remains in
 `glassdb-concurr::entropy`; see [testing-dst.md](guides/testing-dst.md).
 
+Database fuzz inputs generate four logical clients. Each client runs its
+operations in order, while adjacent pairs share one database instance through
+cloned handles: clients 0 and 1 share an instance, and clients 2 and 3 share
+another. Each instance owns its caches, backend transport, and crash/restart
+lifetime. This permits concurrent coordinator rounds in both instances over
+one shared backend. The optional cycle observer uses a separate instance and a
+faultless transport.
+
+Generated clients can have empty programs. Each has at most six operations,
+except the exact-history workload, which allows three transactions per client
+to bound checker cost. Each input runs without and with the persistent cache.
+Database fuzz checks target consistency through public state and transaction
+histories; retained protocol resources alone are not a failure. Deleting a
+transaction body that a current key writer still needs is in scope.
+An instance interrupts unfinished foreground work after ten seconds of virtual
+time. The run then verifies completed and in-doubt work through a fresh instance;
+the foreground limit does not bypass or limit those consistency checks.
+
 The cross-crate transaction boundary is deliberately narrower than the engine's
 internal module graph. `glassdb` talks to `glassdb-trans` through `Engine` and
 logical access/result types. `Engine` directly owns the runtime graph and its
@@ -1065,8 +1083,8 @@ Filesystem work does not run on Tokio's blocking pool. Cache lookups and
 write-behind work share one bounded cache-owned worker, so overload bypasses L2
 instead of creating an unbounded blocking-task backlog. Opening and shutdown
 are deadline-bounded and fail open; shutdown detaches a stuck worker after its
-deadline. The deterministic executor disables L2 until filesystem behavior has
-a replayable simulation model.
+deadline. The deterministic executor uses `SimMedia` for optional L2 instead of
+filesystem I/O.
 
 ### Knowledge and causal evidence
 
