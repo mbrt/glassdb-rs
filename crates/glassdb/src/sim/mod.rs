@@ -18,8 +18,9 @@
 //! - [`ApiWorkload`] checks transaction-local key operations, collection
 //!   lifecycle, nested paths, and aborts.
 //! - [`HistoryWorkload`] checks complete point/group-read, write, and
-//!   membership-scan histories against an implementation-independent sequential
-//!   specification.
+//!   membership-scan and shared collection histories against an
+//!   implementation-independent sequential specification. Its clients continue
+//!   after admissible public errors while retaining uncertain outcomes.
 
 mod api;
 mod cycle;
@@ -42,7 +43,7 @@ pub use harness::{
     PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS, pct_assert, pct_record, pct_sweep, record_input,
     replay_input,
 };
-pub use history::{HistoryInstruction, HistoryTransaction, HistoryWorkload};
+pub use history::{HistoryCollectionOp, HistoryInstruction, HistoryTransaction, HistoryWorkload};
 pub use membership::{MembOp, MembershipAcct, MembershipWorkload};
 pub use rmw::{RMW_KEY_COUNT, RmwAcct, RmwOp, RmwWorkload};
 

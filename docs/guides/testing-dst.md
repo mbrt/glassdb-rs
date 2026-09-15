@@ -60,7 +60,9 @@ one database instance and clients 2 and 3 sharing another. The clients run as
 separate tasks and keep their own operation order and model identities. Each
 pair shares caches, a backend transport, and a crash/restart lifetime. A crash
 interrupts both streams; restart continues each stream after its last attempted
-operation. Completed or failed streams stay stopped. The optional cycle
+operation. Completed streams stay stopped. The history workload continues after
+admissible public errors; other workloads stop a stream when an operation fails.
+The optional cycle
 observer uses a separate database instance and a faultless transport.
 
 This fixed placement permits concurrent coordinator rounds in both instances.
@@ -86,6 +88,19 @@ must be detected. Leaked logs and incomplete physical cleanup alone are outside
 that scope. Inline values and tombstones can have valid logless writers, so a
 writer identity without a log is not by itself a consistency failure. Bounded
 execution guards still prevent a faulty run from stopping the test campaign.
+
+The history target generates operations on two shared collection names, including
+creation, deletion, recreation, nested children, and collection values. It can
+couple a lifecycle operation with a key write in another collection or an explicit
+abort. Its model checks public results and full shared directory membership as
+well as values. It does not use transaction objects, locks, caches, or monitor
+state to classify errors or determine possible outcomes.
+
+After `Unavailable` or `InDoubt`, that client's next operation uses the same
+database instance unless a crash interrupts it. The failed operation remains
+consumed. An in-doubt operation may commit once or not at all; later public
+observations constrain that choice. The existing twelve-transaction limit and
+exact search budget also apply to shared collection histories.
 
 ## The four approaches in one paragraph each
 

@@ -202,9 +202,11 @@ impl<W: SimWorkload> InstanceTask<W> {
             // an operation that may already have changed storage.
             client.consumed.store(operation + 1, Ordering::SeqCst);
             if let Err(error) = W::run_op(db, op, state).await {
-                client.stopped.store(true, Ordering::SeqCst);
                 Self::assert_admissible_error(faults, "running client operation", error);
-                return;
+                if !W::CONTINUE_AFTER_ADMISSIBLE_ERROR {
+                    client.stopped.store(true, Ordering::SeqCst);
+                    return;
+                }
             }
         }
         client.stopped.store(true, Ordering::SeqCst);
@@ -222,12 +224,20 @@ impl<W: SimWorkload> InstanceTask<W> {
 mod sim_tests {
     use std::sync::Mutex;
 
+    use glassdb_backend::{
+        BackendError,
+        memory::MemoryBackend,
+        middleware::{BackendOp, HookBackend},
+    };
     use glassdb_concurr::exec;
     use tokio::sync::Notify;
 
     use super::super::RunPlan;
     use super::*;
     use crate::sim::key_name;
+    use crate::sim::{
+        HistoryCollectionOp as C, HistoryInstruction as I, HistoryTransaction, HistoryWorkload,
+    };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Step {
@@ -458,5 +468,291 @@ mod sim_tests {
             assert!(!calls.contains(&Step::Write(0)));
             context.teardown(false).await;
         });
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    enum PublicFailure {
+        #[default]
+        Read,
+        MutationReply(usize),
+    }
+
+    #[derive(Clone)]
+    struct RecoveryWorkload {
+        history: HistoryWorkload,
+        backend: Arc<HookBackend>,
+        failure: PublicFailure,
+    }
+
+    impl Default for RecoveryWorkload {
+        fn default() -> Self {
+            Self {
+                history: HistoryWorkload::default(),
+                backend: HookBackend::new(Arc::new(MemoryBackend::new())),
+                failure: PublicFailure::default(),
+            }
+        }
+    }
+
+    struct RecoveryState {
+        history: <HistoryWorkload as SimWorkload>::State,
+        backend: Arc<HookBackend>,
+        failure: PublicFailure,
+        outcomes: Mutex<Vec<(u64, Result<(), Error>)>>,
+        failed_operation_returned: CancellationToken,
+    }
+
+    impl RecoveryState {
+        fn inject_failure(&self) -> CancellationToken {
+            let cancelled = CancellationToken::new();
+            let deadline = cancelled.clone();
+            let backend = self.backend.clone();
+            // Some failed mutations are retried without returning to the
+            // caller. Bound the outage so those cases can also finish.
+            if matches!(self.failure, PublicFailure::MutationReply(_)) {
+                rt::spawn(async move {
+                    tokio::select! {
+                        _ = deadline.cancelled() => {},
+                        _ = rt::sleep(Duration::from_secs(1)) => {
+                            backend.clear_before();
+                            backend.clear_after();
+                        }
+                    }
+                });
+            }
+            match self.failure {
+                PublicFailure::Read => self.backend.set_before(|op| {
+                    let fail = matches!(
+                        op,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    );
+                    Box::pin(async move {
+                        if fail {
+                            Err(BackendError::Unavailable("read outage".into()))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                }),
+                PublicFailure::MutationReply(allowed) => {
+                    let failed = Arc::new(AtomicBool::new(false));
+                    let mutations = AtomicUsize::new(0);
+                    self.backend.set_before({
+                        let failed = failed.clone();
+                        move |_| {
+                            let fail = failed.load(Ordering::SeqCst);
+                            Box::pin(async move {
+                                if fail {
+                                    Err(BackendError::Unavailable("outage after lost reply".into()))
+                                } else {
+                                    Ok(())
+                                }
+                            })
+                        }
+                    });
+                    self.backend.set_after(move |op, _| {
+                        let mutation = matches!(
+                            op,
+                            BackendOp::WriteIf { .. }
+                                | BackendOp::WriteIfNotExists { .. }
+                                | BackendOp::DeleteIf { .. }
+                        );
+                        let fail = mutation && mutations.fetch_add(1, Ordering::SeqCst) >= allowed;
+                        if fail {
+                            failed.store(true, Ordering::SeqCst);
+                        }
+                        Box::pin(async move {
+                            if fail {
+                                Err(BackendError::Unavailable("lost mutation reply".into()))
+                            } else {
+                                Ok(())
+                            }
+                        })
+                    });
+                }
+            }
+            cancelled
+        }
+    }
+
+    impl SimWorkload for RecoveryWorkload {
+        type Op = HistoryTransaction;
+        type State = RecoveryState;
+
+        const CONTINUE_AFTER_ADMISSIBLE_ERROR: bool =
+            HistoryWorkload::CONTINUE_AFTER_ADMISSIBLE_ERROR;
+
+        fn clients(&self) -> &[Vec<Self::Op>] {
+            &self.history.clients
+        }
+
+        fn new_state(&self) -> Self::State {
+            RecoveryState {
+                history: self.history.new_state(),
+                backend: self.backend.clone(),
+                failure: self.failure,
+                outcomes: Mutex::new(Vec::new()),
+                failed_operation_returned: CancellationToken::new(),
+            }
+        }
+
+        async fn open_db(
+            backend: &Arc<dyn Backend>,
+            media: Option<SimMedia>,
+        ) -> Result<Database, Error> {
+            HistoryWorkload::open_db(backend, media).await
+        }
+
+        async fn seed(&self, db: &Database) {
+            self.history.seed(db).await;
+        }
+
+        async fn run_op(db: &Database, op: &Self::Op, state: &Self::State) -> Result<(), Error> {
+            if op.op_id == 3 {
+                state.failed_operation_returned.cancelled().await;
+            }
+            let healing = (op.op_id == 1).then(|| state.inject_failure());
+            let result = if op.op_id == 1 && matches!(state.failure, PublicFailure::Read) {
+                // A public point read exposes Unavailable without an uncertain
+                // mutation. It makes no change to the history's modeled state.
+                db.root_collection()
+                    .read_stale(b"unavailable-probe", Duration::ZERO)
+                    .await
+                    .map(|_| ())
+            } else {
+                HistoryWorkload::run_op(db, op, &state.history).await
+            };
+            if op.op_id == 0 {
+                // Let the preceding write-back finish before selecting a
+                // mutation reply from the next collection operation.
+                rt::sleep(Duration::from_millis(1)).await;
+            }
+            if let Some(healing) = healing {
+                healing.cancel();
+                state.backend.clear_before();
+                state.backend.clear_after();
+                state.failed_operation_returned.cancel();
+            }
+            state
+                .outcomes
+                .lock()
+                .unwrap()
+                .push((op.op_id, result.clone()));
+            result
+        }
+
+        async fn verify(&self, db: &Database, state: &Self::State, allow_in_doubt: bool) {
+            self.history
+                .verify(db, &state.history, allow_in_doubt)
+                .await;
+            let collection = db
+                .open_collection(&crate::CollectionPath::new(b"history-shared-0").unwrap())
+                .await
+                .unwrap();
+            assert_eq!(collection.read(b"value").await.unwrap(), Some(vec![3]));
+            let outcomes = state.outcomes.lock().unwrap();
+            assert_eq!(
+                outcomes.len(),
+                4,
+                "subsequent operations did not run: {outcomes:?}"
+            );
+            for (id, result) in outcomes.iter() {
+                match (id, state.failure) {
+                    (1, PublicFailure::Read) => {
+                        assert!(matches!(result, Err(Error::Unavailable(_))), "{result:?}")
+                    }
+                    (1, PublicFailure::MutationReply(_)) => {
+                        assert!(
+                            matches!(
+                                result,
+                                Ok(()) | Err(Error::InDoubt(_)) | Err(Error::Unavailable(_))
+                            ),
+                            "{result:?}"
+                        )
+                    }
+                    _ => assert!(result.is_ok(), "{id}: {result:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn history_continues_on_public_errors_with_shared_collection_names() {
+        for peer in [1, 2] {
+            for cached in [false, true] {
+                let mut in_doubt = false;
+                for failure in std::iter::once(PublicFailure::Read)
+                    .chain((0..8).map(PublicFailure::MutationReply))
+                {
+                    in_doubt |= exec::block_on(async move {
+                        let media_tape = cached.then(Vec::new);
+                        let mut workload = RecoveryWorkload {
+                            failure,
+                            ..Default::default()
+                        };
+                        workload.history.clients[0] = [C::Write(1), C::Drop, C::Write(3)]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(id, operation)| HistoryTransaction {
+                                op_id: id as u64,
+                                client_id: 0,
+                                instructions: vec![
+                                    I::Collection { slot: 0, operation },
+                                    I::WriteLiteral {
+                                        key: 0,
+                                        value: id as u8 + 1,
+                                    },
+                                ],
+                            })
+                            .collect();
+                        workload.history.clients[peer] = vec![HistoryTransaction {
+                            op_id: 3,
+                            client_id: peer,
+                            instructions: vec![I::Collection {
+                                slot: 0,
+                                operation: C::Read,
+                            }],
+                        }];
+                        let state = Arc::new(workload.new_state());
+                        let media = media_tape.map(|tape| RunMedia::new(tape, 0, 2));
+                        // Use the ordinary public backend interface for injection.
+                        // No transaction object, fence, cache, or monitor state
+                        // participates in error classification or verification.
+                        let seed_backend: Arc<dyn Backend> = workload.backend.clone();
+                        let seed = RecoveryWorkload::open_db(&seed_backend, None)
+                            .await
+                            .unwrap();
+                        workload.seed(&seed).await;
+                        seed.shutdown().await;
+                        let mut clients = ClientRunner::spawn::<RecoveryWorkload>(
+                            workload.history.clients.clone(),
+                            vec![seed_backend.clone(), seed_backend.clone()],
+                            media.as_ref(),
+                            &state,
+                            FaultConfig::failures(0),
+                        );
+                        assert!(
+                            !clients.join().await,
+                            "foreground limit reached: peer={peer}, failure={failure:?}, cached={}, public outcomes={:?}",
+                            media.is_some(),
+                            state.outcomes.lock().unwrap()
+                        );
+                        let verify = RecoveryWorkload::open_db(&seed_backend, None)
+                            .await
+                            .unwrap();
+                        workload.verify(&verify, &state, true).await;
+                        verify.shutdown().await;
+                        let outcomes = state.outcomes.lock().unwrap();
+                        outcomes.iter().any(|(id, result)| {
+                            *id == 1 && matches!(result, Err(Error::InDoubt(_)))
+                        })
+                    });
+                }
+                assert!(
+                    in_doubt,
+                    "no uncertain public outcome: peer={peer}, cached={cached}"
+                );
+            }
+        }
     }
 }

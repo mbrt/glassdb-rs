@@ -247,6 +247,10 @@ pub trait SimWorkload: Clone + Default + 'static {
     /// [`verify`]: SimWorkload::verify
     type State: 'static;
 
+    /// Whether the oracle supports later operations after an admissible public
+    /// error. The operation stays consumed and its recorded outcome is unchanged.
+    const CONTINUE_AFTER_ADMISSIBLE_ERROR: bool = false;
+
     /// This run's per-client op sequences. Clients run concurrently.
     fn clients(&self) -> &[Vec<Self::Op>];
 
@@ -277,7 +281,8 @@ pub trait SimWorkload: Clone + Default + 'static {
     fn seed(&self, db: &Database) -> impl Future<Output = ()>;
 
     /// Runs one op in its own transaction, updating `state`. Returns the op's
-    /// result so the client loop can stop (and leave it in-doubt) on failure.
+    /// public result so the client loop can apply its error policy. The workload
+    /// must record that result before returning, including any unknown outcome.
     fn run_op(
         db: &Database,
         op: &Self::Op,

@@ -1,9 +1,9 @@
 //! Exact strict-serializability checker for bounded transaction histories.
 //!
 //! This module models public point and concurrent-group reads, writes, deletes,
-//! and normalized key membership scans. It does not inspect transaction logs,
-//! cached objects, or other implementation state, so the oracle cannot
-//! accidentally reproduce the protocol it checks.
+//! normalized key membership scans, and shared collection lifecycle operations.
+//! It does not inspect transaction logs, cached objects, or other implementation
+//! state, so the oracle cannot accidentally reproduce the protocol it checks.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -19,6 +19,11 @@ use crate::{Collection, CollectionPath, Database, Error, InlinePolicy, KeyScan, 
 use super::harness::{SimWorkload, open_det_db};
 use super::{CLIENT_COUNT, SimMedia, key_name, tiny_split_policy};
 
+mod collections;
+
+pub use collections::HistoryCollectionOp;
+use collections::{Catalog, CollectionStep};
+
 const HISTORY_COLLECTION: &[u8] = b"history";
 const HISTORY_KEY_COUNT: usize = 3;
 const HISTORY_REGISTER_COUNT: usize = 2;
@@ -27,11 +32,19 @@ const CHECK_BRANCH_BUDGET: usize = 1_000_000;
 const APPLICATION_ERROR_MARKER: &str = "history-user-error";
 
 /// The checker-owned abstract database state.
-type AbstractState = BTreeMap<u8, u8>;
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct AbstractState {
+    keys: BTreeMap<u8, u8>,
+    collections: Catalog,
+}
 
 /// One resolved action from a transaction-body execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HistoryAction {
+    /// A shared collection operation and its public observations.
+    Collection(CollectionStep),
+    /// One transaction's complete shared collection catalog.
+    CatalogRead(Catalog),
     /// A point read and its returned value (`None` means absent).
     Read { key: u8, value: Option<u8> },
     /// Concurrent point-read observations from one transaction snapshot.
@@ -218,7 +231,9 @@ fn validate_trace(op_id: u64, trace: &BodyTrace) -> Result<(), CheckError> {
         match action {
             HistoryAction::Read { .. }
             | HistoryAction::ReadGroup { .. }
-            | HistoryAction::Scan { .. } => {}
+            | HistoryAction::Scan { .. }
+            | HistoryAction::Collection(_)
+            | HistoryAction::CatalogRead(_) => {}
             HistoryAction::Write { key, value } => {
                 derived.insert(*key, Some(*value));
             }
@@ -245,6 +260,7 @@ fn scanned_keys(
     limit: u8,
 ) -> Vec<u8> {
     let mut visible = state
+        .keys
         .keys()
         .copied()
         .map(|key| (key, true))
@@ -268,13 +284,19 @@ fn scanned_keys(
 
 fn apply_trace(state: &AbstractState, op: &LogicalOp<'_>) -> Result<AbstractState, String> {
     let mut overlay = BTreeMap::<u8, Option<u8>>::new();
+    let mut catalog = state.collections.clone();
     for action in &op.trace.ordered_actions {
         match action {
+            HistoryAction::Collection(step) => step.apply(&mut catalog)?,
+            HistoryAction::CatalogRead(observed) if *observed != catalog => {
+                return Err(format!("catalog read {observed:?}, expected {catalog:?}"));
+            }
+            HistoryAction::CatalogRead(_) => {}
             HistoryAction::Read { key, value } => {
                 let actual = overlay
                     .get(key)
                     .copied()
-                    .unwrap_or_else(|| state.get(key).copied());
+                    .unwrap_or_else(|| state.keys.get(key).copied());
                 if actual != *value {
                     return Err(format!(
                         "op {} read k{key} as {value:?}, candidate state gives {actual:?}",
@@ -287,7 +309,7 @@ fn apply_trace(state: &AbstractState, op: &LogicalOp<'_>) -> Result<AbstractStat
                     let actual = overlay
                         .get(key)
                         .copied()
-                        .unwrap_or_else(|| state.get(key).copied());
+                        .unwrap_or_else(|| state.keys.get(key).copied());
                     if actual != *value {
                         return Err(format!(
                             "op {} read group observed k{key} as {value:?}, candidate state gives \
@@ -324,13 +346,14 @@ fn apply_trace(state: &AbstractState, op: &LogicalOp<'_>) -> Result<AbstractStat
 
     let mut next = state.clone();
     if op.mutates {
+        next.collections = catalog;
         for (key, value) in &op.trace.final_mutations {
             match value {
                 Some(value) => {
-                    next.insert(*key, *value);
+                    next.keys.insert(*key, *value);
                 }
                 None => {
-                    next.remove(key);
+                    next.keys.remove(key);
                 }
             }
         }
@@ -544,6 +567,11 @@ fn check_history(
 /// One instruction in a generated public transaction program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryInstruction {
+    /// Operate on a collection name shared by all clients.
+    Collection {
+        slot: u8,
+        operation: HistoryCollectionOp,
+    },
     /// Read a point key into a local register.
     Read { key: u8, register: u8 },
     /// Read distinct keys concurrently into distinct local registers.
@@ -578,7 +606,7 @@ pub enum HistoryInstruction {
     Yield,
 }
 
-/// A bounded point/group-read/write/scan transaction run by one simulated client.
+/// A bounded key and collection transaction run by one simulated client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryTransaction {
     /// Stable ID assigned while decoding the workload.
@@ -615,7 +643,7 @@ fn arbitrary_register(u: &mut Unstructured<'_>) -> arbitrary::Result<u8> {
 fn arbitrary_program(u: &mut Unstructured<'_>) -> arbitrary::Result<Vec<HistoryInstruction>> {
     let key = arbitrary_key(u)?;
     let register = arbitrary_register(u)?;
-    let mut instructions = match u.arbitrary::<u8>()? % 8 {
+    let mut instructions = match u.arbitrary::<u8>()? % 10 {
         0 => vec![
             HistoryInstruction::Read { key, register },
             HistoryInstruction::WriteIncremented { key, register },
@@ -680,13 +708,38 @@ fn arbitrary_program(u: &mut Unstructured<'_>) -> arbitrary::Result<Vec<HistoryI
                 expected: Some(u.arbitrary()?),
             },
         ],
-        _ => vec![
+        7 => vec![
             HistoryInstruction::WriteLiteral {
                 key,
                 value: u.arbitrary()?,
             },
             HistoryInstruction::Abort,
         ],
+        _ => {
+            let slot = u.arbitrary::<u8>()? % collections::COLLECTION_SLOTS as u8;
+            let operation = match u.arbitrary::<u8>()? % 8 {
+                0 => HistoryCollectionOp::Create,
+                1 => HistoryCollectionOp::CreateIfAbsent,
+                2 => HistoryCollectionOp::Write(u.arbitrary()?),
+                3 => HistoryCollectionOp::Read,
+                4 => HistoryCollectionOp::Drop,
+                5 => HistoryCollectionOp::CreateNested,
+                6 => HistoryCollectionOp::WriteNested(u.arbitrary()?),
+                _ => HistoryCollectionOp::DropNested,
+            };
+            let mut program = vec![HistoryInstruction::Collection { slot, operation }];
+            // Couple lifecycle effects to a key in another collection so the
+            // history check can reject a partial commit across the two.
+            match u.arbitrary::<u8>()? % 3 {
+                0 => program.push(HistoryInstruction::WriteLiteral {
+                    key,
+                    value: u.arbitrary()?,
+                }),
+                1 => program.push(HistoryInstruction::Abort),
+                _ => {}
+            }
+            program
+        }
     };
     if u.arbitrary::<u8>()? % 3 == 0 {
         let at = u.arbitrary::<u8>()? as usize % (instructions.len() + 1);
@@ -830,12 +883,13 @@ impl HistoryRecorder {
     }
 
     fn add_final_read(&self, invocation: u64, notification: u64, final_state: &AbstractState) {
-        let actions = (0..HISTORY_KEY_COUNT as u8)
+        let mut actions: Vec<_> = (0..HISTORY_KEY_COUNT as u8)
             .map(|key| HistoryAction::Read {
                 key,
-                value: final_state.get(&key).copied(),
+                value: final_state.keys.get(&key).copied(),
             })
             .collect();
+        actions.push(HistoryAction::CatalogRead(final_state.collections.clone()));
         let mut inner = self.inner.lock().unwrap();
         let previous = inner.operations.insert(
             self.final_op_id,
@@ -922,6 +976,13 @@ async fn interpret_body(
 
     for instruction in &program.instructions {
         result = match instruction {
+            HistoryInstruction::Collection { slot, operation } => {
+                collections::execute(&tx, *slot, *operation)
+                    .await
+                    .map(|step| {
+                        actions.push(HistoryAction::Collection(step));
+                    })
+            }
             HistoryInstruction::Read { key, register } => {
                 match tx.read(collection, &key_name(*key as usize)).await {
                     Ok(value) => match byte_value(value, *key) {
@@ -1135,12 +1196,17 @@ async fn run_program(
 }
 
 fn initial_state() -> AbstractState {
-    (0..HISTORY_KEY_COUNT as u8).map(|key| (key, 0)).collect()
+    AbstractState {
+        keys: (0..HISTORY_KEY_COUNT as u8).map(|key| (key, 0)).collect(),
+        collections: Catalog::default(),
+    }
 }
 
 impl SimWorkload for HistoryWorkload {
     type Op = HistoryTransaction;
     type State = HistoryRecorder;
+
+    const CONTINUE_AFTER_ADMISSIBLE_ERROR: bool = true;
 
     fn clients(&self) -> &[Vec<Self::Op>] {
         &self.clients
@@ -1190,14 +1256,15 @@ impl SimWorkload for HistoryWorkload {
         let collection = &collection;
         let final_state = db
             .tx(|tx| async move {
-                let mut values = AbstractState::new();
+                let mut values = AbstractState::default();
                 for key in 0..HISTORY_KEY_COUNT as u8 {
                     let value =
                         byte_value(tx.read(collection, &key_name(key as usize)).await?, key)?;
                     if let Some(value) = value {
-                        values.insert(key, value);
+                        values.keys.insert(key, value);
                     }
                 }
+                values.collections = collections::inspect_catalog(&tx).await?;
                 Ok(values)
             })
             .await
@@ -1225,10 +1292,14 @@ impl SimWorkload for HistoryWorkload {
 
 #[cfg(test)]
 mod sim_tests {
+    use super::collections::{CollectionOutcome, CollectionState};
     use super::*;
 
     fn state(entries: &[(u8, u8)]) -> AbstractState {
-        entries.iter().copied().collect()
+        AbstractState {
+            keys: entries.iter().copied().collect(),
+            collections: Catalog::default(),
+        }
     }
 
     fn trace(actions: Vec<HistoryAction>, state: BodyState) -> BodyTrace {
@@ -1237,7 +1308,9 @@ mod sim_tests {
             match action {
                 HistoryAction::Read { .. }
                 | HistoryAction::ReadGroup { .. }
-                | HistoryAction::Scan { .. } => {}
+                | HistoryAction::Scan { .. }
+                | HistoryAction::Collection(_)
+                | HistoryAction::CatalogRead(_) => {}
                 HistoryAction::Write { key, value } => {
                     final_mutations.insert(*key, Some(*value));
                 }
@@ -1297,6 +1370,347 @@ mod sim_tests {
                 BodyState::CommitOutcome,
             ),
         )
+    }
+
+    fn collection_action(
+        operation: HistoryCollectionOp,
+        before: Option<CollectionState>,
+        after: Option<CollectionState>,
+        outcome: CollectionOutcome,
+    ) -> HistoryAction {
+        HistoryAction::Collection(CollectionStep {
+            slot: 0,
+            operation,
+            members_before: before.iter().map(|_| 0).collect(),
+            members_after: after.iter().map(|_| 0).collect(),
+            before,
+            after,
+            outcome,
+        })
+    }
+
+    #[test]
+    fn collection_and_key_changes_have_one_atomic_outcome() {
+        let initial = state(&[(0, 0)]);
+        let collection = Some(CollectionState {
+            value: Some(7),
+            child: None,
+        });
+        let mut committed = state(&[(0, 9)]);
+        committed.collections[0] = collection.clone();
+        for outcome in [HistoryOutcome::SnapshotTransparent, HistoryOutcome::InDoubt] {
+            let transaction = op(
+                0,
+                0,
+                Some(1),
+                outcome,
+                trace(
+                    vec![
+                        collection_action(
+                            HistoryCollectionOp::Write(7),
+                            None,
+                            collection.clone(),
+                            CollectionOutcome::Applied,
+                        ),
+                        HistoryAction::Write { key: 0, value: 9 },
+                    ],
+                    BodyState::CommitOutcome,
+                ),
+            );
+            let history = [transaction];
+            check_history(&initial, &history, &committed).unwrap();
+            assert_eq!(
+                check_history(&initial, &history, &initial).is_ok(),
+                outcome == HistoryOutcome::InDoubt
+            );
+            let mut only_collection = initial.clone();
+            only_collection.collections[0] = collection.clone();
+            assert!(check_history(&initial, &history, &only_collection).is_err());
+            assert!(check_history(&initial, &history, &state(&[(0, 9)])).is_err());
+        }
+    }
+
+    #[test]
+    fn competing_creates_must_agree_on_one_serial_order() {
+        let initial = AbstractState::default();
+        let collection = Some(CollectionState::default());
+        let mut final_state = initial.clone();
+        final_state.collections[0] = collection.clone();
+        let first = op(
+            0,
+            0,
+            Some(3),
+            HistoryOutcome::SnapshotTransparent,
+            trace(
+                vec![collection_action(
+                    HistoryCollectionOp::Create,
+                    None,
+                    collection.clone(),
+                    CollectionOutcome::Applied,
+                )],
+                BodyState::CommitOutcome,
+            ),
+        );
+        let mut second = op(
+            1,
+            1,
+            Some(2),
+            HistoryOutcome::SnapshotTransparent,
+            first.body_executions[0].clone(),
+        );
+        assert!(check_history(&initial, &[first.clone(), second.clone()], &final_state).is_err());
+        second.body_executions[0].ordered_actions = vec![collection_action(
+            HistoryCollectionOp::Create,
+            collection.clone(),
+            collection,
+            CollectionOutcome::AlreadyExists,
+        )];
+        check_history(&initial, &[first, second], &final_state).unwrap();
+    }
+
+    #[test]
+    fn collection_listing_cannot_omit_the_other_shared_slot() {
+        let mut initial = AbstractState::default();
+        initial.collections[1] = Some(CollectionState::default());
+        let mut read = op(
+            0,
+            0,
+            Some(1),
+            HistoryOutcome::SnapshotTransparent,
+            trace(
+                vec![collection_action(
+                    HistoryCollectionOp::Read,
+                    None,
+                    None,
+                    CollectionOutcome::Applied,
+                )],
+                BodyState::CommitOutcome,
+            ),
+        );
+        assert!(check_history(&initial, &[read.clone()], &initial).is_err());
+        let HistoryAction::Collection(step) = &mut read.body_executions[0].ordered_actions[0]
+        else {
+            unreachable!()
+        };
+        step.members_before = vec![1];
+        step.members_after = vec![1];
+        check_history(&initial, &[read], &initial).unwrap();
+    }
+
+    #[test]
+    fn recreation_does_not_restore_dropped_contents() {
+        let old = Some(CollectionState {
+            value: Some(4),
+            child: None,
+        });
+        let empty = Some(CollectionState::default());
+        let mut initial = AbstractState::default();
+        initial.collections[0] = old.clone();
+        let drop = op(
+            0,
+            0,
+            Some(1),
+            HistoryOutcome::SnapshotTransparent,
+            trace(
+                vec![collection_action(
+                    HistoryCollectionOp::Drop,
+                    old.clone(),
+                    None,
+                    CollectionOutcome::Applied,
+                )],
+                BodyState::CommitOutcome,
+            ),
+        );
+        let create = op(
+            1,
+            2,
+            Some(3),
+            HistoryOutcome::SnapshotTransparent,
+            trace(
+                vec![collection_action(
+                    HistoryCollectionOp::Create,
+                    None,
+                    empty.clone(),
+                    CollectionOutcome::Applied,
+                )],
+                BodyState::CommitOutcome,
+            ),
+        );
+        let mut final_state = AbstractState::default();
+        final_state.collections[0] = empty;
+        check_history(&initial, &[drop.clone(), create.clone()], &final_state).unwrap();
+        let read_old = op(
+            2,
+            4,
+            Some(5),
+            HistoryOutcome::SnapshotTransparent,
+            trace(
+                vec![collection_action(
+                    HistoryCollectionOp::Read,
+                    old.clone(),
+                    old,
+                    CollectionOutcome::Applied,
+                )],
+                BodyState::CommitOutcome,
+            ),
+        );
+        assert!(check_history(&initial, &[drop, create, read_old], &final_state).is_err());
+    }
+
+    #[test]
+    fn abandoned_collection_observations_are_not_validated_outcomes() {
+        let initial = AbstractState::default();
+        let wrong = Some(CollectionState {
+            value: Some(99),
+            child: None,
+        });
+        let mut transaction = op(
+            0,
+            0,
+            Some(1),
+            HistoryOutcome::SnapshotTransparent,
+            trace(
+                vec![collection_action(
+                    HistoryCollectionOp::Read,
+                    wrong.clone(),
+                    wrong,
+                    CollectionOutcome::Applied,
+                )],
+                BodyState::CommitOutcome,
+            ),
+        );
+        let mut final_body = trace(
+            vec![collection_action(
+                HistoryCollectionOp::Read,
+                None,
+                None,
+                CollectionOutcome::Applied,
+            )],
+            BodyState::CommitOutcome,
+        );
+        final_body.body_number = 1;
+        transaction.body_executions.push(final_body);
+        check_history(&initial, &[transaction], &initial).unwrap();
+    }
+
+    #[test]
+    fn uncertain_collection_commit_can_follow_a_later_public_operation() {
+        let initial = AbstractState::default();
+        let collection = Some(CollectionState::default());
+        let mut final_state = initial.clone();
+        final_state.collections[0] = collection.clone();
+        let create = op(
+            0,
+            0,
+            Some(1),
+            HistoryOutcome::InDoubt,
+            trace(
+                vec![collection_action(
+                    HistoryCollectionOp::Create,
+                    None,
+                    collection.clone(),
+                    CollectionOutcome::Applied,
+                )],
+                BodyState::CommitOutcome,
+            ),
+        );
+        let absent = op(
+            1,
+            2,
+            Some(3),
+            HistoryOutcome::SnapshotTransparent,
+            trace(
+                vec![collection_action(
+                    HistoryCollectionOp::Read,
+                    None,
+                    None,
+                    CollectionOutcome::Applied,
+                )],
+                BodyState::CommitOutcome,
+            ),
+        );
+        let present = op(
+            2,
+            4,
+            Some(5),
+            HistoryOutcome::SnapshotTransparent,
+            trace(
+                vec![collection_action(
+                    HistoryCollectionOp::Read,
+                    collection.clone(),
+                    collection,
+                    CollectionOutcome::Applied,
+                )],
+                BodyState::CommitOutcome,
+            ),
+        );
+        let mut history = [create, absent, present];
+        check_history(&initial, &history, &final_state).unwrap();
+        history[0].outcome = HistoryOutcome::DefiniteNoEffect;
+        assert!(check_history(&initial, &history, &final_state).is_err());
+    }
+
+    #[test]
+    fn a_nested_child_prevents_parent_drop_and_abort_preserves_both() {
+        let collection = Some(CollectionState {
+            value: Some(1),
+            child: Some(Some(2)),
+        });
+        let mut initial = AbstractState::default();
+        initial.collections[0] = collection.clone();
+        let mut drop = op(
+            0,
+            0,
+            Some(1),
+            HistoryOutcome::SnapshotTransparent,
+            trace(
+                vec![collection_action(
+                    HistoryCollectionOp::Drop,
+                    collection.clone(),
+                    collection.clone(),
+                    CollectionOutcome::NotEmpty,
+                )],
+                BodyState::CommitOutcome,
+            ),
+        );
+        check_history(&initial, &[drop.clone()], &initial).unwrap();
+        drop.body_executions[0].ordered_actions = vec![collection_action(
+            HistoryCollectionOp::Drop,
+            collection.clone(),
+            None,
+            CollectionOutcome::Applied,
+        )];
+        assert!(check_history(&initial, &[drop], &AbstractState::default()).is_err());
+
+        let empty_parent = Some(CollectionState {
+            value: Some(1),
+            child: None,
+        });
+        let aborted = op(
+            1,
+            0,
+            Some(1),
+            HistoryOutcome::SnapshotTransparent,
+            trace(
+                vec![
+                    collection_action(
+                        HistoryCollectionOp::DropNested,
+                        collection,
+                        empty_parent.clone(),
+                        CollectionOutcome::Applied,
+                    ),
+                    collection_action(
+                        HistoryCollectionOp::Drop,
+                        empty_parent,
+                        None,
+                        CollectionOutcome::Applied,
+                    ),
+                ],
+                BodyState::ExplicitAbort,
+            ),
+        );
+        check_history(&initial, std::slice::from_ref(&aborted), &initial).unwrap();
+        assert!(check_history(&initial, &[aborted], &AbstractState::default()).is_err());
     }
 
     fn brute_force_accepts(
@@ -1718,6 +2132,61 @@ mod sim_tests {
                 HistoryInstruction::Delete { key: 0 },
             ]
         ));
+    }
+
+    #[test]
+    fn generator_shares_collection_slots_across_all_clients() {
+        for (code, operation) in [
+            HistoryCollectionOp::Create,
+            HistoryCollectionOp::CreateIfAbsent,
+            HistoryCollectionOp::Write(55),
+            HistoryCollectionOp::Read,
+            HistoryCollectionOp::Drop,
+            HistoryCollectionOp::CreateNested,
+            HistoryCollectionOp::WriteNested(55),
+            HistoryCollectionOp::DropNested,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for slot in 0..collections::COLLECTION_SLOTS as u8 {
+                for abort in [false, true] {
+                    let mut data = Vec::new();
+                    for _ in 0..CLIENT_COUNT {
+                        data.extend([1, 0, 0, 8, slot, code as u8]);
+                        if matches!(
+                            operation,
+                            HistoryCollectionOp::Write(_) | HistoryCollectionOp::WriteNested(_)
+                        ) {
+                            data.push(55);
+                        }
+                        if abort {
+                            data.push(1);
+                        } else {
+                            data.extend([0, 77]);
+                        }
+                        data.push(1);
+                    }
+                    let workload =
+                        HistoryWorkload::arbitrary(&mut Unstructured::new(&data)).unwrap();
+                    for (client, programs) in workload.clients.iter().enumerate() {
+                        assert_eq!(programs.len(), 1);
+                        assert_eq!(programs[0].client_id, client);
+                        assert_eq!(
+                            programs[0].instructions,
+                            vec![
+                                HistoryInstruction::Collection { slot, operation },
+                                if abort {
+                                    HistoryInstruction::Abort
+                                } else {
+                                    HistoryInstruction::WriteLiteral { key: 0, value: 77 }
+                                },
+                            ]
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

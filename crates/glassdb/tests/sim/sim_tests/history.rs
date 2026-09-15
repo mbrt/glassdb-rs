@@ -4,8 +4,8 @@
 //! normalized bounded membership scans.
 use glassdb::exec::{TapeScheduler, block_on_with};
 use glassdb::sim::{
-    FaultConfig, HistoryInstruction as I, HistoryTransaction, HistoryWorkload, pct_sweep,
-    run_and_assert, run_and_assert_with_faults,
+    FaultConfig, HistoryCollectionOp as C, HistoryInstruction as I, HistoryTransaction,
+    HistoryWorkload, pct_sweep, run_and_assert, run_and_assert_with_faults,
 };
 
 use crate::sim_support::{assert_slow_mutation_modes, fault_tape, tape};
@@ -146,4 +146,51 @@ fn exact_history_holds_with_guided_faults() {
             run_and_assert_with_faults(workload, FaultConfig::failures(9), seed, faults_tape).await
         });
     }
+}
+
+fn shared_collection_history() -> HistoryWorkload {
+    let actions = [
+        [C::Write(10), C::Drop, C::Write(20)],
+        [C::Read, C::Create, C::Read],
+        [C::WriteNested(30), C::DropNested, C::Drop],
+        [C::CreateIfAbsent, C::CreateNested, C::Read],
+    ];
+    HistoryWorkload {
+        clients: actions
+            .into_iter()
+            .enumerate()
+            .map(|(client_id, actions)| {
+                actions
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, operation)| {
+                        transaction(
+                            (client_id * 3 + index) as u64,
+                            client_id,
+                            vec![
+                                I::Collection { slot: 0, operation },
+                                I::WriteLiteral {
+                                    key: client_id as u8 % 3,
+                                    value: (client_id * 3 + index) as u8,
+                                },
+                            ],
+                        )
+                    })
+                    .collect()
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn shared_collection_history_holds_under_contention_and_failures() {
+    let workload = shared_collection_history();
+    for faults in [FaultConfig::none(), FaultConfig::failures(7)] {
+        pct_sweep(&workload, faults, 0..8);
+    }
+}
+
+#[test]
+fn shared_collection_history_holds_with_slow_mutations() {
+    assert_slow_mutation_modes("shared collection history", &shared_collection_history());
 }
