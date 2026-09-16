@@ -513,21 +513,35 @@ for those bodies. Keep the bound after intervening recovery work.
 
 ### 8. Directory write-back retains removal proof per record
 
-Committed directory write-back returns only the collection addresses whose
-holder-removal CAS applied for that transaction identity. GC can exclude those
-directory locks from its later reference and release work. The committed
-identity cannot acquire the holders again, so cache eviction does not invalidate
-the proof. This saves record reads after eviction; a warm cache already serves
-those reads without backend calls.
+Committed directory write-back starts with `ANY` and returns only the collection
+addresses whose holder-removal CAS applied for that transaction identity. A
+present no-holder observation must satisfy the supplied completion requirement.
+Only insufficient no-holder evidence needs a stronger read; a holder found by
+that read is resolved in the same operation. Missing records use the collection
+identity and publication proof described above. Owner and helper write-back
+keep `ANY` because they share the necessary record and transaction knowledge.
 
-A cached no-holder or missing-record result is not an applied removal. Neither
-a conflict nor an uncertain mutation supplies removal proof. Never use an
-aggregate progress flag to skip all directories, or apply one transaction's
-removal proof to another identity. Directories without that proof keep GC's
-existing reference-check bound. Entry references, membership holds, and topology
-participants still need their own checks, including on the same collection.
-The proof does not establish that the full collection record is still current,
-advance an observation, or provide a requirement for another read.
+GC first attempts write-back with `ANY`. This preserves directory progress even
+when a live entry keeps the log. After collection reclamation and entry checks,
+GC completes the remaining directories under its existing post-eligibility
+reference bound. Only directories without an earlier applied removal enter
+that phase. Keep the bounded phase after the live-entry early return: moving
+it earlier would add directory reads on repeated checks of logs that still
+store live values.
+
+Successful bounded completion proves every submitted directory clear, including
+when its returned removal set is empty. That set reports applied mutations;
+it does not count bounded no-ops. A speculative `ANY` no-holder result is not
+equivalent to bounded completion. Neither a conflict nor an uncertain mutation
+supplies removal proof. Never use an aggregate progress flag to skip directories,
+or apply one transaction's proof to another identity.
+
+The committed identity cannot acquire those holders again, so cache eviction
+does not invalidate completion. GC needs no later directory reference or release
+reads. Entry references, membership holds, and topology participants still need
+their own checks, including on the same collection. The proof does not establish
+that the full collection record is still current, advance an observation, or
+provide a requirement for another read.
 
 ## Boundaries of the guarantee
 

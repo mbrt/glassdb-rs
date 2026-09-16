@@ -451,7 +451,7 @@ impl Gc {
         let removed_directories = self
             .locker
             .collections()
-            .recover_write_back(tid, &log.collection_changes, &log.locks)
+            .recover_write_back(tid, &log.collection_changes, &log.locks, Requirement::ANY)
             .await?;
         let mut changed = !removed_directories.is_empty();
         let dropped = log
@@ -481,7 +481,7 @@ impl Gc {
         // write-back proves removal even after cache eviction: this
         // committed identity cannot acquire those holders again. Keep every
         // other directory and all membership/topology obligations.
-        let remaining: Vec<_> = log
+        let mut remaining: Vec<_> = log
             .locks
             .iter()
             .filter(|lock| match lock {
@@ -491,14 +491,20 @@ impl Gc {
             })
             .cloned()
             .collect();
-        if self
+        changed |= !self
             .locker
             .collections()
-            .is_referenced(tid, &remaining, Requirement::after(barrier))
+            .recover_write_back(
+                tid,
+                &log.collection_changes,
+                &remaining,
+                Requirement::after(barrier),
+            )
             .await?
-        {
-            return Ok(GcOutcome::from_progress(changed));
-        }
+            .is_empty();
+        // Successful bounded completion proves every submitted directory clear,
+        // including no-ops. The returned progress set alone is not that proof.
+        remaining.retain(|lock| !matches!(lock, TxLock::Directory { .. }));
         let released = self.release_locks(tid, &remaining, barrier).await?;
         changed |= released.changed;
         if !released.complete {

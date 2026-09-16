@@ -792,7 +792,12 @@ impl Algo {
         if let Err(error) = self
             .locker
             .collections()
-            .write_back(&tx.id, &tx.collections.accesses().changes, &locks)
+            .write_back(
+                &tx.id,
+                &tx.collections.accesses().changes,
+                &locks,
+                Requirement::ANY,
+            )
             .await
         {
             tracing::debug!(%error, "collection-directory write-back deferred");

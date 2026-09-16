@@ -2053,20 +2053,25 @@ async fn committed_directory_removal_does_not_prove_other_records_clear() {
         if fail_check {
             assert!(result.is_err());
         } else {
-            assert_eq!(result.unwrap(), GcOutcome::Progress);
+            assert_eq!(result.unwrap(), GcOutcome::Reclaimed);
         }
-        assert!(!is_gone(&ctx.tl, &id).await);
+        assert_eq!(is_gone(&ctx.tl, &id).await, !fail_check);
         let recorded = std::mem::take(&mut *operations.lock().unwrap());
+        let expected: &[&str] = if fail_check {
+            &["read_if_modified"]
+        } else {
+            &["read_if_modified", "write_if"]
+        };
         assert_eq!(
             recorded
                 .iter()
                 .filter(|op| op.path == child_path)
                 .map(|op| op.op)
                 .collect::<Vec<_>>(),
-            ["read_if_modified"]
+            expected
         );
         hooks.clear_before();
-        for (collection, held) in [(collection(), false), (child, true)] {
+        for (collection, held) in [(collection(), false), (child, fail_check)] {
             let (record, _) = owner
                 .records
                 .load_record(
@@ -2077,6 +2082,266 @@ async fn committed_directory_removal_does_not_prove_other_records_clear() {
                 .unwrap();
             assert_eq!(record.directory_lock().contains(&id), held);
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DirectoryWriteBack {
+    Unreferenced,
+    LiveValue,
+    WriteFailure,
+    LostWriteReply,
+}
+
+async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) {
+    use crate::collection_coordination::CollectionLocker;
+    use crate::collections::{CollectionChange, CollectionOp};
+    use crate::monitor::TxRecoveryManifest;
+
+    let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let recorded = RecordingBackend::new(hooks.clone());
+    let operations = recorded.log();
+    let backend: Arc<dyn Backend> = Arc::new(recorded);
+    let ctx = new_ctx_with(backend.clone()).await;
+    let owner = AssemblyFixture::new(
+        backend,
+        DbRoot::try_from("db").unwrap(),
+        &EngineConfig::default(),
+    );
+    let locker = CollectionLocker::new(
+        CollectionStateResolver::new(
+            owner.records.clone(),
+            owner.tlogger.clone(),
+            owner.timeline.clone(),
+            owner.monitor.clone(),
+            RetryConfig::default(),
+        ),
+        std::num::NonZeroUsize::MIN,
+    );
+    let lifecycle = CollectionLifecycle::new(
+        owner.records.clone(),
+        owner.nodes.clone(),
+        owner.monitor.clone(),
+        RetryConfig::default(),
+        Arc::new(UnexpectedTopologySettler),
+    );
+    let id = tx(87);
+    let child = CollectionAddress::new("db", CollectionId::from_slice(&[87; 16]).unwrap());
+    let mut change = CollectionChange {
+        parent: collection(),
+        name: b"child".to_vec(),
+        collection: child.clone(),
+        expected: None,
+        op: CollectionOp::Create,
+    };
+    if op == TxCollectionOp::Drop {
+        lifecycle
+            .prepare_collections(std::slice::from_ref(&change))
+            .await
+            .unwrap();
+        let (mut record, observed) = ctx
+            .records
+            .load_record(&collection(), Requirement::ANY)
+            .await
+            .unwrap();
+        record.add_child(change.name.clone(), child.id()).unwrap();
+        assert!(ctx.records.store_record(&record, &observed).await.unwrap());
+        change.op = CollectionOp::Drop;
+        change.expected = Some(child.id());
+    }
+    // GC retains this no-holder parent while the owner acquires its writer.
+    let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+    log.locks = vec![TxLock::Directory {
+        collection: collection(),
+        typ: LockType::Write,
+    }];
+    log.collection_changes = vec![TxCollectionChange {
+        parent: collection(),
+        name: change.name.clone(),
+        collection: child.clone(),
+        op,
+    }];
+    if op == TxCollectionOp::Create {
+        log.prepared_collections = vec![child.clone()];
+    }
+    if matches!(case, DirectoryWriteBack::LiveValue) {
+        log.writes = committed(id.clone(), PAST_HORIZON, &[b"k"], &[]).writes;
+    }
+    owner
+        .monitor
+        .begin_persisted_tx(&id, TxRecoveryManifest::from_log(&log))
+        .await
+        .unwrap();
+    let operation = owner.monitor.begin_owner_operation(&id).unwrap();
+    lifecycle
+        .prepare_collections(std::slice::from_ref(&change))
+        .await
+        .unwrap();
+    lifecycle
+        .fence_drops(&id, std::slice::from_ref(&change))
+        .await
+        .unwrap();
+    locker
+        .acquire(&collection(), &id, LockType::Write)
+        .await
+        .unwrap();
+    operation.complete();
+    owner.monitor.commit_tx(log.clone()).await.unwrap();
+    if matches!(case, DirectoryWriteBack::LiveValue) {
+        locker
+            .write_back(
+                &id,
+                std::slice::from_ref(&change),
+                &log.locks,
+                Requirement::ANY,
+            )
+            .await
+            .unwrap();
+        store_entry(&ctx, b"k", writer_entry(b"k", &id)).await;
+    }
+    let path = ObjectPath::CollectionRecord {
+        collection: collection(),
+    }
+    .to_string();
+    let observed = ctx.tl.get_at(&id, Requirement::ANY).await.unwrap();
+    if matches!(
+        case,
+        DirectoryWriteBack::WriteFailure | DirectoryWriteBack::LostWriteReply
+    ) {
+        let fail_write = {
+            let path = path.clone();
+            move |operation: &BackendOp| -> HookFuture {
+                let fail =
+                    operation.path() == path && matches!(operation, BackendOp::WriteIf { .. });
+                Box::pin(async move {
+                    if fail {
+                        Err(BackendError::Unavailable(
+                            "directory write-back unavailable".into(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        };
+        let applied = matches!(case, DirectoryWriteBack::LostWriteReply);
+        if applied {
+            hooks.set_after(move |operation, outcome| {
+                if outcome.is_success() {
+                    fail_write(operation)
+                } else {
+                    Box::pin(async { Ok(()) })
+                }
+            });
+        } else {
+            hooks.set_before(fail_write);
+        }
+        assert!(
+            ctx.gc
+                .try_reclaim(&id, &observed, ctx.timeline.currentness_barrier())
+                .await
+                .is_err()
+        );
+        assert!(!is_gone(&ctx.tl, &id).await);
+        let (record, _) = owner
+            .records
+            .load_record(
+                &collection(),
+                Requirement::after(owner.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(record.directory_lock().contains(&id), !applied);
+        assert_eq!(
+            record.child(&change.name),
+            ((op == TxCollectionOp::Create) == applied).then_some(child.id())
+        );
+        hooks.clear_before();
+        hooks.clear_after();
+    }
+    operations.lock().unwrap().clear();
+    let outcome = ctx
+        .gc
+        .try_reclaim(&id, &observed, ctx.timeline.currentness_barrier())
+        .await
+        .unwrap();
+    let live_value = matches!(case, DirectoryWriteBack::LiveValue);
+    if live_value {
+        assert!(!is_gone(&ctx.tl, &id).await);
+        // Each GC pass captures a new bound. A live value must continue to
+        // bypass bounded directory completion after owner cleanup.
+        ctx.gc
+            .try_reclaim(&id, &observed, ctx.timeline.currentness_barrier())
+            .await
+            .unwrap();
+        assert!(!is_gone(&ctx.tl, &id).await);
+    } else {
+        assert_eq!(outcome, GcOutcome::Reclaimed);
+        assert!(is_gone(&ctx.tl, &id).await);
+    }
+    let recorded = std::mem::take(&mut *operations.lock().unwrap());
+    let calls: Vec<_> = recorded
+        .iter()
+        .filter(|op| op.path == path)
+        .map(|op| op.op)
+        .collect();
+    let expected: &[&str] = match case {
+        DirectoryWriteBack::Unreferenced => &["read_if_modified", "write_if"],
+        DirectoryWriteBack::LiveValue => &[],
+        DirectoryWriteBack::WriteFailure => &["read", "write_if"],
+        DirectoryWriteBack::LostWriteReply => &["read"],
+    };
+    assert_eq!(calls, expected);
+    let (record, _) = owner
+        .records
+        .load_record(
+            &collection(),
+            Requirement::after(owner.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    assert!(!record.directory_lock().contains(&id));
+    assert_eq!(
+        record.child(&change.name),
+        (op == TxCollectionOp::Create).then_some(child.id())
+    );
+    let root = ctx
+        .nodes
+        .load_root(
+            &child,
+            Requirement::after(ctx.timeline.currentness_barrier()),
+        )
+        .await;
+    if op == TxCollectionOp::Create {
+        assert!(root.is_ok());
+    } else {
+        assert!(matches!(root, Err(StorageError::NotFound)));
+    }
+}
+
+#[tokio::test]
+async fn committed_directory_changes_finish_in_one_gc_pass() {
+    for op in [TxCollectionOp::Create, TxCollectionOp::Drop] {
+        recover_directory_change(op, DirectoryWriteBack::Unreferenced).await;
+    }
+}
+
+#[tokio::test]
+async fn committed_directory_write_back_failure_keeps_the_log() {
+    for op in [TxCollectionOp::Create, TxCollectionOp::Drop] {
+        for case in [
+            DirectoryWriteBack::WriteFailure,
+            DirectoryWriteBack::LostWriteReply,
+        ] {
+            recover_directory_change(op, case).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn live_values_skip_bounded_directory_completion() {
+    for op in [TxCollectionOp::Create, TxCollectionOp::Drop] {
+        recover_directory_change(op, DirectoryWriteBack::LiveValue).await;
     }
 }
 

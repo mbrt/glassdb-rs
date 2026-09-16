@@ -2970,7 +2970,7 @@ mod tests {
                     if write_back {
                         locker
                             .collections()
-                            .write_back(&id, &changes, &locks)
+                            .write_back(&id, &changes, &locks, Requirement::ANY)
                             .await
                             .map(|removed| !removed.is_empty())
                     } else {
@@ -3005,7 +3005,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directory_reference_checks_obey_the_bound() {
+    async fn directory_write_back_completion_reads_obey_the_bound() {
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
         let gate = BatchGate::install(&backend, GateKind::Read);
         let (locker, ctx) = new_test_locker_with_parallelism(
@@ -3015,23 +3015,29 @@ mod tests {
         )
         .await;
         let id = mk_tid(1, "directory");
-        let (locks, _) = seed_directory_locks(&ctx, &id).await;
+        let (locks, changes) = seed_directory_locks(&ctx, &id).await;
+        locker
+            .collections()
+            .write_back(&id, &changes, &locks, Requirement::ANY)
+            .await
+            .unwrap();
         gate.arm();
-        let (referenced, widths) = operation_widths(
-            locker.collections().is_referenced(
+        let (removed, widths) = operation_widths(
+            locker.collections().write_back(
                 &id,
+                &changes,
                 &locks,
                 Requirement::after(ctx.timeline.currentness_barrier()),
             ),
             &gate,
         )
         .await;
-        assert!(referenced.unwrap());
+        assert!(removed.unwrap().is_empty());
         assert_eq!(widths, vec![2, 2, 1]);
     }
 
     #[tokio::test]
-    async fn directory_reference_read_failure_is_not_absence() {
+    async fn directory_write_back_read_failure_is_not_completion() {
         use glassdb_backend::BackendError;
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
         let (locker, ctx) = new_test_locker_with_parallelism(
@@ -3041,7 +3047,12 @@ mod tests {
         )
         .await;
         let id = mk_tid(1, "directory");
-        let (locks, _) = seed_directory_locks(&ctx, &id).await;
+        let (locks, changes) = seed_directory_locks(&ctx, &id).await;
+        locker
+            .collections()
+            .write_back(&id, &changes, &locks, Requirement::ANY)
+            .await
+            .unwrap();
         backend.set_before(|operation| {
             let fail = matches!(
                 operation,
@@ -3057,8 +3068,9 @@ mod tests {
         });
         let result = locker
             .collections()
-            .is_referenced(
+            .write_back(
                 &id,
+                &changes,
                 &locks,
                 Requirement::after(ctx.timeline.currentness_barrier()),
             )
