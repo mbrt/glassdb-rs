@@ -1140,6 +1140,11 @@ Callers express the minimum acceptable evidence as a `Requirement`:
 | `within(timeline, age)` | Present or absent state whose evidence reaches an approximate age cutoff |
 | `after(barrier)` | Present or absent state whose evidence reaches the opaque `CurrentnessBarrier` |
 
+An `ANY` decision needs a caller proof such as later validation, a conditional
+mutation, a stable fact, or shared local knowledge. A branch that skips the CAS
+needs its own proof. The [cache guide](guides/caching.md#decisions-from-any-reads)
+states these constraints, including the publication rules for cached absence.
+
 `Timeline::currentness_barrier()` captures an opaque `CurrentnessBarrier` after
 completed prerequisite work. Transaction validation captures one after the body
 and before key and predicate lock CASes, and uses it for point, scan,

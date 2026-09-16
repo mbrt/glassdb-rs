@@ -452,10 +452,10 @@ impl KeyResolver {
         key: &LogicalKey,
         requirement: Requirement,
     ) -> Result<RoutedLeaf, TransError> {
-        // Interior index nodes are served from cache (ADR-031 hot-path
-        // invariant); only the terminal leaf honors the caller's `requirement`
-        // (the fast path's `Any` reuse, else a current lower bound), so the root `_r`
-        // is not revalidated on every commit.
+        // Right links correct stale split routes; the terminal leaf meets the
+        // caller's requirement. Negative routes rely on nodes being created
+        // before their links, roots before bindings, and no identity reuse.
+        // The same proof applies to batched point routing above.
         let loc = self
             .router
             .route_key_with_requirements(key.collection(), key.key(), Requirement::ANY, requirement)

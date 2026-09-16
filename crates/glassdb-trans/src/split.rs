@@ -186,6 +186,8 @@ impl StructuralNodeAccess {
                 collection: collection.clone(),
             },
         };
+        // This read selects the acquisition path; missing roots defer work.
+        // Publication still requires the gated observation and a source CAS.
         let (node, _) = match self.nodes.load_node_at(&path, Requirement::ANY).await {
             Ok(loaded) => loaded,
             Err(StorageError::NotFound) if token.is_none() => return Ok(None),
@@ -289,6 +291,12 @@ impl StructuralNodeAccess {
         Ok(None)
     }
 
+    /// Releases a source gate whose acquisition or presence this cache knows.
+    ///
+    /// The caller must have acquired the gate locally or completed a bounded
+    /// read containing this holder through the same cache. The worker must not
+    /// acquire this source gate again. Thus an ANY no-holder result proves
+    /// removal, while a retained holder is removed by CAS.
     async fn release_structural_gate(
         &self,
         collection: &CollectionAddress,
@@ -2026,6 +2034,8 @@ impl Splitter {
                 .topology_participants()
                 .any(|participant| participant == id)
             {
+                // This is the same split's admission; its identity is not
+                // reused after departure. New admission requires the CAS below.
                 return Ok(());
             }
             if let Some(holder) = record.topology_freeze() {

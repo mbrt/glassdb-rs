@@ -39,6 +39,10 @@ impl<'a> NodeLockReconciler<'a> {
 
     /// Resolves every entry and removes holders this structural operation can
     /// reclaim before closing the node's structural gate.
+    ///
+    /// `Ready` is a candidate for CAS against the source observation, not proof
+    /// that the stored node is quiescent. With `ANY`, stale Pending or Unknown
+    /// status must lead to waiting or a durable wound; final decisions are stable.
     pub(crate) async fn quiesce_entries(
         &self,
         collection: &CollectionAddress,

@@ -126,6 +126,40 @@ rechecks the cache after the earlier operation finishes.
 approximate cache policy. Transaction validation, mutation receipts, and
 recovery use exact sequence barriers without doing time arithmetic.
 
+### Decisions from `ANY` reads
+
+An `ANY` read supplies a usable state, not permission to make every decision
+from it. State the proof beside a decision that accepts stale data, especially
+an early return, skipped mutation, or absent-object result:
+
+| Proof | Required constraint |
+| --- | --- |
+| Later validation | Retain the read or predicate dependency and validate it before accepting the body outcome. |
+| Conditional mutation | Check the observed revision when applying the change. This does not justify a branch that skips the CAS. |
+| Stable fact | Reuse only the fact that cannot change: for example, final committed contents or an exact publication marker for a transaction identity that is not reused. Historical contents do not prove current object presence. |
+| Shared local knowledge | Use the cache that completed acquisition or fencing, or previously returned that holder. A no-holder result also needs to exclude later acquisition by that identity. This proof does not transfer to another database instance. |
+| Publication and lifecycle | Establish why the caller cannot have cached absence before a later live publication. Nodes precede their published links, roots precede collection bindings, and retired identities are not reused. |
+
+Shared local knowledge includes L2. Per-path coordination prevents older replies
+from replacing established knowledge, and invalidation or replacement of older
+persistent entries prevents an L1 miss from restoring them. Without a usable
+entry in either cache, the backend read starts after the prerequisite work.
+
+Fresh identities alone do not prove permanent absence. A retried create can
+restore a deleted path. Structural recovery fences publication before treating
+reserved nodes as unreachable; a late create can then leave an orphan, as
+permitted by ADR-043. Do not use that exception to skip checks for a live
+reference or for completion of participant departure.
+
+Cached interior routing uses right links to correct stale split routes. The
+terminal leaf must meet the caller's requirement. If a root or child is absent,
+there is no terminal leaf to check: the caller still needs the publication and
+lifecycle proof for a negative route.
+
+If none of these proofs applies, use a requirement from the policy's existing
+barrier. Capture a new barrier only when the decision needs a later ordering
+point.
+
 ## Currentness barriers
 
 `Timeline::currentness_barrier()` captures an opaque currentness barrier after

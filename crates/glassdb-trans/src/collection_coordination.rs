@@ -205,6 +205,9 @@ impl CollectionLocker {
             let already_held = lock.contains(id)
                 && (desired == LockType::Read || lock.lock_type() == LockType::Write);
             if already_held {
+                // This active identity's releases update the same cache;
+                // foreign cleanup requires finalization. Retained ownership
+                // permits this return. Directory contents are validated later.
                 return Ok(());
             }
             let conflicts = match desired {
@@ -447,6 +450,9 @@ impl CollectionStateResolver {
         parent: &CollectionAddress,
         id: &TxId,
     ) -> Result<(), TransError> {
+        // Final-status resolution shares this store and has observed immutable
+        // committed contents. ANY cannot restore an older Pending body; it
+        // still does not prove that the transaction object remains present.
         let observed = self
             .transactions
             .get_at(id, Requirement::ANY)
@@ -464,6 +470,8 @@ impl CollectionStateResolver {
             )));
         }
         let changes = Self::recover_changes(&log.collection_changes);
+        // Resolution observed this holder through the same record cache. A
+        // later no-holder state proves removal; a retained holder seeds CAS.
         self.apply_committed_write_back(parent, id, &changes, Requirement::ANY)
             .await
             .map(|_| ())
