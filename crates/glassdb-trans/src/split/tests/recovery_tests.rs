@@ -903,6 +903,13 @@ async fn check_recovery_batch_reuses_source_reads(explicit: bool) {
         assert!(sp.recover_structural_intents().await.unwrap());
     }
     let recorded = std::mem::take(&mut *operations.lock().unwrap());
+    let intent_prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+    assert!(
+        recorded.iter().all(|op| {
+            !op.path.starts_with(&intent_prefix) || !matches!(op.op, "read" | "read_if_modified")
+        }),
+        "advancing discovery bounds must not recheck present cached intent bodies"
+    );
     for path in [node_path("L"), root_path()] {
         assert_eq!(
             recorded
@@ -967,7 +974,9 @@ async fn later_participant_discovery_checks_sources_after_its_own_ready_intents(
             memory.clone(),
             move |op| matches!(op, BackendOp::DeleteIf { path, .. } if path.starts_with(&prefix)),
         );
-        let s = store_with_backend(backend);
+        let recorder = Arc::new(RecordingBackend::new(backend));
+        let operations = recorder.log();
+        let s = store_with_backend(recorder);
         let peer = store_with_backend(memory.clone());
         s.store_node(
             COLL,
@@ -1001,6 +1010,7 @@ async fn later_participant_discovery_checks_sources_after_its_own_ready_intents(
         );
         sp.mon.abort_owned_tx(&participant).await.unwrap();
 
+        operations.lock().unwrap().clear();
         gate.arm();
         let recovering = {
             let sp = sp.clone();
@@ -1030,6 +1040,21 @@ async fn later_participant_discovery_checks_sources_after_its_own_ready_intents(
         gate.release();
         recovering.await.unwrap();
 
+        let prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+        let body_reads: Vec<_> = operations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| {
+                op.path.starts_with(&prefix) && matches!(op.op, "read" | "read_if_modified")
+            })
+            .map(|op| op.op)
+            .collect();
+        assert_eq!(
+            body_reads,
+            ["read"],
+            "rediscovery reads only the new intent body missing from this cache"
+        );
         let verifier = store_with_backend(memory);
         let router = TreeRouter::new(verifier.nodes.clone(), std::num::NonZeroUsize::MIN);
         for key in [b"a".as_slice(), b"b", b"m", b"n"] {

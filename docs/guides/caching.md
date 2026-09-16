@@ -507,6 +507,9 @@ batch's barrier, or substitute an intent's watermark or the discovery bound.
 Participant settlement still uses its final listing bound for departure; final
 transaction status alone does not close the intent namespace because recursive
 recovery can create more intents. Separator publication retains its own barrier.
+The per-listing bound rechecks only insufficient cached absence. Present intent
+bodies already use `ANY`, so retaining a bound across listings saves no reads
+for those bodies. Keep the bound after intervening recovery work.
 
 ## Boundaries of the guarantee
 

@@ -852,6 +852,9 @@ impl StructuralRecovery {
                 return Ok(ParticipantSettlementStep::Recover(recovery));
             }
 
+            // Present discovery bodies already use ANY. Advancing this bound
+            // rechecks insufficient absence after intervening recovery and
+            // also supplies the background departure proof below.
             let requirement = Requirement::after(self.timeline.currentness_barrier());
             let intents = self
                 .intent_store
