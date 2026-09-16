@@ -1010,7 +1010,7 @@ mod tests {
             .await
             .unwrap();
         assert!(out.value.is_none());
-        let (_, _, evidence) = out.into_parts();
+        let (_, evidence) = out.into_parts();
         assert!(evidence.validates(Some(&writer), 0));
         assert_eq!(
             count_tx_reads(&log),

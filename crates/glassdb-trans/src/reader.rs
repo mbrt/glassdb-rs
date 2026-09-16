@@ -38,30 +38,23 @@ pub struct ReadValue {
     pub version: Version,
 }
 
-/// The outcome of reading a key, including whether every physical object used
-/// to derive it was served locally. An absent value may still be a cache hit.
+/// The value of a logical key and its validation evidence.
 #[derive(Debug, Clone)]
 pub struct ReadOutcome {
     /// The resolved value, or `None` when the key is absent or deleted.
     pub value: Option<ReadValue>,
-    /// Whether every physical dependency was served locally.
-    pub cache_hit: bool,
     evidence: ReadEvidence,
 }
 
 impl ReadOutcome {
     /// Creates a read outcome carrying opaque validation evidence.
-    pub fn new(value: Option<ReadValue>, cache_hit: bool, evidence: ReadEvidence) -> Self {
-        Self {
-            value,
-            cache_hit,
-            evidence,
-        }
+    pub fn new(value: Option<ReadValue>, evidence: ReadEvidence) -> Self {
+        Self { value, evidence }
     }
 
-    /// Consumes the outcome into its value, cache status, and validation evidence.
-    pub fn into_parts(self) -> (Option<ReadValue>, bool, ReadEvidence) {
-        (self.value, self.cache_hit, self.evidence)
+    /// Consumes the outcome into its value and validation evidence.
+    pub fn into_parts(self) -> (Option<ReadValue>, ReadEvidence) {
+        (self.value, self.evidence)
     }
 }
 
@@ -143,15 +136,9 @@ impl Reader {
                 }
                 Err(error) => return Err(trans_to_storage(error)),
             };
-            let mut cache_hit = leaf.cache_hit;
-            cache_hit &= resolved.cache_hit;
             let leaf = leaf.observation;
             let Some(writer) = resolved.writer else {
-                return Ok(ReadOutcome::new(
-                    None,
-                    cache_hit,
-                    ReadEvidence::new(None, leaf),
-                ));
+                return Ok(ReadOutcome::new(None, ReadEvidence::new(None, leaf)));
             };
             let last_writer = Some(writer.clone());
             // An inline value or tombstone in the leaf is the writer's own
@@ -164,16 +151,11 @@ impl Reader {
                             value,
                             version: Version { writer },
                         }),
-                        cache_hit,
                         ReadEvidence::new(last_writer, leaf),
                     ));
                 }
                 ResolvedValue::Tombstone => {
-                    return Ok(ReadOutcome::new(
-                        None,
-                        cache_hit,
-                        ReadEvidence::new(last_writer, leaf),
-                    ));
+                    return Ok(ReadOutcome::new(None, ReadEvidence::new(last_writer, leaf)));
                 }
                 ResolvedValue::External | ResolvedValue::Unresolved => {}
             }
@@ -204,22 +186,13 @@ impl Reader {
                     refreshed = true;
                     continue;
                 }
-                return Ok(ReadOutcome::new(
-                    None,
-                    false,
-                    ReadEvidence::new(last_writer, leaf),
-                ));
+                return Ok(ReadOutcome::new(None, ReadEvidence::new(last_writer, leaf)));
             }
             if cv.value.not_written {
                 // The writer committed but wrote no value for this key: a genuine
                 // absence, independent of freshness.
-                return Ok(ReadOutcome::new(
-                    None,
-                    false,
-                    ReadEvidence::new(last_writer, leaf),
-                ));
+                return Ok(ReadOutcome::new(None, ReadEvidence::new(last_writer, leaf)));
             }
-            cache_hit &= cv.cache_hit;
             let version = Version { writer };
             let value = (!cv.value.deleted).then_some(ReadValue {
                 value: cv.value.value,
@@ -227,7 +200,6 @@ impl Reader {
             });
             return Ok(ReadOutcome::new(
                 value,
-                cache_hit,
                 ReadEvidence::new(last_writer, leaf),
             ));
         }
@@ -293,7 +265,7 @@ mod tests {
                 local.timeline.clone(),
                 RetryConfig::default(),
             );
-            let (value, _, _) = reader.read(&key, Duration::MAX).await.unwrap().into_parts();
+            let (value, _) = reader.read(&key, Duration::MAX).await.unwrap().into_parts();
             assert_eq!(value.unwrap().value.as_ref(), b"old");
             let (_, root) = peer
                 .nodes
@@ -318,8 +290,7 @@ mod tests {
             ));
             match operation {
                 0 => {
-                    let (value, _, _) =
-                        reader.read(&key, Duration::MAX).await.unwrap().into_parts();
+                    let (value, _) = reader.read(&key, Duration::MAX).await.unwrap().into_parts();
                     assert_eq!(value.unwrap().value.as_ref(), b"new");
                 }
                 1 => {

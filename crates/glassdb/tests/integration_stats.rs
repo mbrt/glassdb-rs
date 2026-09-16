@@ -156,22 +156,33 @@ async fn aggregate_inline_pressure_splits_for_a_later_direct_commit() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn stats_report_transactional_decoded_cache_hits() {
+async fn stats_report_cache_owner_activity() {
     let backend = mem();
-    let writer_db = init_db(backend.clone()).await;
-    let reader_db = init_db(backend).await;
+    let writer_db = Database::builder("example", backend.clone())
+        .inline_policy(InlinePolicy::none())
+        .open()
+        .await
+        .unwrap();
+    let reader_db = Database::builder("example", backend)
+        .inline_policy(InlinePolicy::none())
+        .open()
+        .await
+        .unwrap();
     let key = b"key";
     let value = b"value";
 
     let writer = create_top(&writer_db, b"cache-stats").await;
     let reader = open_top(&reader_db, b"cache-stats").await;
     writer.write(key, value).await.unwrap();
+    writer_db.shutdown().await;
+    let writer_stats = writer_db.stats();
 
     let before_cold = reader_db.stats();
     assert_eq!(reader.read(key).await.unwrap().unwrap(), value);
     let cold = reader_db.stats() - before_cold;
     assert_eq!(cold.transactions.reads, 1);
-    assert_eq!(cold.transactions.cache_hits, 0);
+    assert!(cold.cache.l1_misses > 0);
+    assert!(cold.monitor.final_status_misses > 0);
 
     let before_warm = reader_db.stats();
     let reader_ref = &reader;
@@ -193,7 +204,9 @@ async fn stats_report_transactional_decoded_cache_hits() {
         .unwrap();
     let warm = reader_db.stats() - before_warm;
     assert_eq!(warm.transactions.reads, 1);
-    assert_eq!(warm.transactions.cache_hits, 1);
+    assert!(warm.cache.l1_hits > 0);
+    assert!(warm.monitor.final_status_hits > 0);
+    assert_eq!(warm.monitor.final_status_misses, 0);
 
     let before_stale = reader_db.stats();
     assert_eq!(
@@ -206,14 +219,67 @@ async fn stats_report_transactional_decoded_cache_hits() {
     );
     let stale = reader_db.stats() - before_stale;
     assert_eq!(stale.transactions.reads, 0);
-    assert_eq!(stale.transactions.cache_hits, 0);
+    assert!(stale.cache.l1_hits > 0);
+    assert!(stale.monitor.final_status_hits > 0);
+    assert_eq!(stale.backend.obj_reads, 0);
 
     reader.delete(key).await.unwrap();
     let before_deleted = reader_db.stats();
     assert!(reader.read(key).await.unwrap().is_none());
     let deleted = reader_db.stats() - before_deleted;
     assert_eq!(deleted.transactions.reads, 1);
-    assert_eq!(deleted.transactions.cache_hits, 1);
+    assert!(deleted.cache.l1_hits > 0);
+
+    assert_eq!(writer_db.stats(), writer_stats);
+    reader_db.shutdown().await;
+    let final_stats = reader_db.stats();
+    assert_eq!(reader_db.clone().stats(), final_stats);
+    assert_eq!(reader_db.stats() - final_stats, glassdb::Stats::default());
+}
+
+#[tokio::test(start_paused = true)]
+async fn point_reads_preserve_local_values_absence_and_staged_changes() {
+    let db = init_db(mem()).await;
+    let collection = create_top(&db, b"point-accesses").await;
+    collection.write(b"present", b"old").await.unwrap();
+    let before = db.stats();
+    let collection_ref = &collection;
+
+    let values = db
+        .tx(|tx| async move {
+            let mut values = Vec::new();
+            for key in [b"present".as_slice(), b"missing"] {
+                values.push(tx.read(collection_ref, key).await?);
+                values.push(tx.read(collection_ref, key).await?);
+                tx.write(collection_ref, key, b"staged")?;
+                values.push(tx.read(collection_ref, key).await?);
+                tx.delete(collection_ref, key)?;
+                values.push(tx.read(collection_ref, key).await?);
+            }
+            Ok(values)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        values,
+        vec![
+            Some(b"old".to_vec()),
+            Some(b"old".to_vec()),
+            Some(b"staged".to_vec()),
+            None,
+            None,
+            None,
+            Some(b"staged".to_vec()),
+            None,
+        ]
+    );
+    let delta = db.stats() - before;
+    assert_eq!(delta.transactions.reads, 2);
+    assert_eq!(delta.transactions.writes, 2);
+    assert!(collection.read(b"present").await.unwrap().is_none());
+    assert!(collection.read(b"missing").await.unwrap().is_none());
+    db.shutdown().await;
 }
 // `Database::diagnostics` smoke test: a fresh Database has no coordinator
 // state, and the typed snapshot can be rendered after normal activity.

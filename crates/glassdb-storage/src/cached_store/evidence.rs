@@ -174,7 +174,6 @@ pub struct Observation<V> {
     pub(super) value: Option<Arc<V>>,
     pub(super) revision: Option<Revision>,
     pub(super) evidence: Evidence,
-    pub(super) cache_hit: bool,
 }
 
 impl<V> Observation<V> {
@@ -216,11 +215,6 @@ impl<V> Observation<V> {
     /// The parsed physical object path this observation refers to.
     pub fn path(&self) -> &ObjectPath {
         self.key.object_path()
-    }
-
-    /// Reports whether the observation reused a cached decoded body.
-    pub fn cache_hit(&self) -> bool {
-        self.cache_hit
     }
 
     /// Reports whether two observations refer to the same exact state.
