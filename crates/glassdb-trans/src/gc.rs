@@ -7,8 +7,9 @@
 //! GC skips missing, pending, and wounded logs (ADR-071). It filters
 //! committed and acknowledged aborted candidates by
 //! durable status and the safety horizon before capturing a fresh requirement
-//! for reference checks. Cached absence from before eligibility cannot authorize
-//! deletion. Wounded markers stay pinned until owner acknowledgement (ADR-059).
+//! for reference checks. Cached leaf contents from before eligibility cannot
+//! rule out a reference. Wounded markers stay pinned until owner acknowledgement
+//! (ADR-059).
 //!
 //! Lock reclamation uses the locker's coordinator-backed operations (ADR-029),
 //! so GC does not issue its own leaf mutations.
@@ -573,13 +574,16 @@ impl Gc {
                 .push((key, kind));
         }
         for items in by_collection.into_values() {
+            // Stale indexes remain usable routing hints: right links correct
+            // split placement, and the terminal leaf must meet the GC bound.
+            // Committed keys name collections created before commit; children
+            // are created before their links are published. Neither identity
+            // is reused, and published nodes remain until collection reclamation.
+            // Recovery fences the split source before probing unpublished nodes.
+            // Thus an old absence cannot hide a later live route.
             let groups = match self
                 .router
-                .route_keys_with_requirements(
-                    items,
-                    Requirement::after(barrier),
-                    Requirement::after(barrier),
-                )
+                .route_keys_with_requirements(items, Requirement::ANY, Requirement::after(barrier))
                 .await
             {
                 Ok(groups) => groups,

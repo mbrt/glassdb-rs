@@ -437,6 +437,26 @@ after the transaction; a write that invalidates the observed result is detected
 during validation. This is how the public strongly consistent read path can
 execute cheaply from cache without treating an arbitrary cache hit as current.
 
+### 5. GC separates routing from reference evidence
+
+GC captures its reference barrier after checking candidate eligibility. Its
+point-reference routes use `ANY` for interior nodes and `after(barrier)` for
+terminal leaves. Cached separators can lead to an older placement; right links
+and the bounded terminal read find the current leaf. A root cached as a leaf
+must also meet the terminal requirement, even if a peer has turned it into an
+index. GC must not decide that a writer or holder is absent from an unvalidated
+cached leaf.
+
+Missing routes rely on publication rules: a committed transaction's collections
+exist before commit, children exist before their links are published, and these
+identities are never reused. Published nodes remain present until collection
+reclamation. Recovery can inspect a reserved node before creation, but first
+fences the split's exact source revision. That worker can no longer publish the
+node. GC therefore cannot have a pre-creation cached absence for a later live
+route through normal access. Reclaimed collections can remain absent. This
+proof belongs to the GC caller; `ANY` alone does not make a negative routing
+result current.
+
 ## Boundaries of the guarantee
 
 - `ANY` may return stale but still usable knowledge.

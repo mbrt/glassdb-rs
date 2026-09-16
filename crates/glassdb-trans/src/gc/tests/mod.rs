@@ -8,16 +8,16 @@ use crate::monitor::Monitor;
 use crate::tlocker::LockOutcome;
 use async_trait::async_trait;
 use glassdb_backend as backend;
-use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
+use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend};
 use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
 use glassdb_concurr::RetryConfig;
-use glassdb_data::{CollectionAddress, CollectionId, DbRoot, LogicalKey, ObjectPath};
+use glassdb_data::{CollectionAddress, CollectionId, DbRoot, LogicalKey, NodeToken, ObjectPath};
 use glassdb_storage::transaction::{
     TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxLog, TxWrite,
 };
 use glassdb_storage::{
-    CollectionRecord, CollectionStore, CurrentState, LeafBody, LeafEntry, LockType, Node,
-    Requirement, Timeline, TreeRouter,
+    CollectionRecord, CollectionStore, CurrentState, IndexNode, LeafBody, LeafEntry, LockType,
+    Node, Requirement, Timeline, TreeRouter,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -760,6 +760,301 @@ async fn committed_still_referenced_is_kept() {
     let log = ctx.tl.get_at(&t, Requirement::ANY).await.unwrap();
     let log = log.value().unwrap();
     assert_eq!(log.status, TxCommitStatus::Ok);
+}
+
+async fn replace_root(nodes: &NodeStore, node: &Node) {
+    let (_, observed) = nodes
+        .load_root(&collection(), Requirement::ANY)
+        .await
+        .unwrap();
+    assert!(
+        nodes
+            .store_root(&collection(), node, &observed)
+            .await
+            .unwrap()
+    );
+}
+
+async fn replace_node(nodes: &NodeStore, token: &NodeToken, node: &Node) {
+    let observed = nodes
+        .load_node_state(&collection(), token, Requirement::ANY)
+        .await
+        .unwrap();
+    assert!(
+        nodes
+            .store_node(&collection(), token, node, Some(&observed))
+            .await
+            .unwrap()
+    );
+}
+
+fn node_path(token: &NodeToken) -> ObjectPath {
+    ObjectPath::Node {
+        collection: collection(),
+        token: token.clone(),
+    }
+}
+
+fn tree_reads(operations: &OpLog) -> Vec<(&'static str, String)> {
+    operations
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|op| {
+            matches!(op.op, "read" | "read_if_modified")
+                && matches!(
+                    ObjectPath::try_from(op.path.as_str()),
+                    Ok(ObjectPath::TreeRoot { .. } | ObjectPath::Node { .. })
+                )
+        })
+        .map(|op| (op.op, op.path.clone()))
+        .collect()
+}
+
+#[tokio::test]
+async fn reference_checks_refresh_leaves_without_refreshing_indexes() {
+    // Writer-only records use direct descent; the duplicate write/lock key
+    // exercises batched descent and must still require only one leaf read.
+    for holder in [false, true] {
+        let memory = Arc::new(MemoryBackend::new());
+        let recorder = Arc::new(RecordingBackend::new(memory.clone()));
+        let operations = recorder.log();
+        let ctx = new_ctx_with(recorder).await;
+        let leaf = NodeToken::from_bytes([1; 16]);
+        let index = NodeToken::from_bytes([2; 16]);
+        assert!(
+            ctx.nodes
+                .store_node(&collection(), &leaf, &Node::leaf(LeafBody::new()), None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            ctx.nodes
+                .store_node(
+                    &collection(),
+                    &index,
+                    &Node::index(IndexNode::from_children([(Vec::new(), leaf.to_string())])),
+                    None
+                )
+                .await
+                .unwrap()
+        );
+        replace_root(
+            &ctx.nodes,
+            &Node::index(IndexNode::from_children([(Vec::new(), index.to_string())])),
+        )
+        .await;
+
+        // The GC cache predates the reference. An independent instance
+        // publishes it, so skipping the terminal-leaf check would lose the log.
+        let peer = AssemblyFixture::new(
+            memory,
+            DbRoot::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let id = tx(1);
+        ctx.tl
+            .set(&committed(
+                id.clone(),
+                PAST_HORIZON,
+                &[b"key"],
+                if holder { &[b"key"] } else { &[] },
+            ))
+            .await
+            .unwrap();
+        let reference = if holder {
+            locked_entry(b"key", &id)
+        } else {
+            writer_entry(b"key", &id)
+        };
+        replace_node(
+            &peer.nodes,
+            &leaf,
+            &Node::leaf(LeafBody::from_entries([reference])),
+        )
+        .await;
+        operations.lock().unwrap().clear();
+
+        let outcomes = ctx
+            .gc
+            .clone()
+            .check_batch(vec![id.clone()], NonZeroUsize::MIN)
+            .await;
+        assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Retained);
+        assert!(!is_gone(&peer.tlogger, &id).await);
+        assert_eq!(
+            tree_reads(&operations),
+            [("read_if_modified", node_path(&leaf).to_string())]
+        );
+
+        // A later overwrite removes the last reference. GC must refresh the
+        // same leaf again before deleting the candidate's exact log revision.
+        let replacement = LeafEntry::new(b"key").with_current(CurrentState::Inline {
+            writer: tx(2),
+            value: Arc::from(b"new-value".as_slice()),
+        });
+        replace_node(
+            &peer.nodes,
+            &leaf,
+            &Node::leaf(LeafBody::from_entries([replacement])),
+        )
+        .await;
+        operations.lock().unwrap().clear();
+        let outcomes = ctx
+            .gc
+            .clone()
+            .check_batch(vec![id.clone()], NonZeroUsize::MIN)
+            .await;
+        assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Reclaimed);
+        assert!(is_gone(&ctx.tl, &id).await);
+        assert_eq!(
+            tree_reads(&operations),
+            [("read_if_modified", node_path(&leaf).to_string())]
+        );
+    }
+}
+
+#[tokio::test]
+async fn reference_checks_follow_a_split_behind_a_cached_parent() {
+    for publish_separator in [false, true] {
+        let memory = Arc::new(MemoryBackend::new());
+        let recorder = Arc::new(RecordingBackend::new(memory.clone()));
+        let operations = recorder.log();
+        let ctx = new_ctx_with(recorder).await;
+        let left = NodeToken::from_bytes([1; 16]);
+        let right = NodeToken::from_bytes([2; 16]);
+        assert!(
+            ctx.nodes
+                .store_node(&collection(), &left, &Node::leaf(LeafBody::new()), None)
+                .await
+                .unwrap()
+        );
+        replace_root(
+            &ctx.nodes,
+            &Node::index(IndexNode::from_children([(Vec::new(), left.to_string())])),
+        )
+        .await;
+        let id = tx(1);
+        ctx.tl
+            .set(&committed(id.clone(), PAST_HORIZON, &[b"pear"], &[b"pear"]))
+            .await
+            .unwrap();
+        let peer = AssemblyFixture::new(
+            memory,
+            DbRoot::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let body = LeafBody::from_entries([writer_entry(b"pear", &id)]);
+        replace_node(&peer.nodes, &left, &Node::leaf(body.clone())).await;
+
+        // Publish the new sibling before shrinking the source. The GC cache
+        // keeps the original parent and empty source across both split stages.
+        assert!(
+            peer.nodes
+                .store_node(&collection(), &right, &Node::leaf(body), None)
+                .await
+                .unwrap()
+        );
+        replace_node(
+            &peer.nodes,
+            &left,
+            &Node::leaf(LeafBody::new())
+                .with_high_key(Some(b"m".to_vec()))
+                .with_right_sibling(Some(right.to_string())),
+        )
+        .await;
+        if publish_separator {
+            replace_root(
+                &peer.nodes,
+                &Node::index(IndexNode::from_children([
+                    (Vec::new(), left.to_string()),
+                    (b"m".to_vec(), right.to_string()),
+                ])),
+            )
+            .await;
+        }
+        operations.lock().unwrap().clear();
+
+        let outcomes = ctx
+            .gc
+            .clone()
+            .check_batch(vec![id.clone()], NonZeroUsize::MIN)
+            .await;
+        assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Retained);
+        assert!(!is_gone(&peer.tlogger, &id).await);
+        assert_eq!(
+            tree_reads(&operations),
+            [
+                ("read_if_modified", node_path(&left).to_string()),
+                ("read", node_path(&right).to_string()),
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn reference_checks_refresh_a_cached_leaf_that_became_an_index() {
+    let memory = Arc::new(MemoryBackend::new());
+    let recorder = Arc::new(RecordingBackend::new(memory.clone()));
+    let operations = recorder.log();
+    let ctx = new_ctx_with(recorder).await;
+    let peer = AssemblyFixture::new(
+        memory,
+        DbRoot::try_from("db").unwrap(),
+        &EngineConfig::default(),
+    );
+    let id = tx(1);
+    ctx.tl
+        .set(&committed(id.clone(), PAST_HORIZON, &[b"pear"], &[]))
+        .await
+        .unwrap();
+    let left = NodeToken::from_bytes([1; 16]);
+    let right = NodeToken::from_bytes([2; 16]);
+    let body = LeafBody::from_entries([writer_entry(b"pear", &id)]);
+    replace_root(&peer.nodes, &Node::leaf(body.clone())).await;
+    assert!(
+        peer.nodes
+            .store_node(
+                &collection(),
+                &left,
+                &Node::leaf(LeafBody::new())
+                    .with_high_key(Some(b"m".to_vec()))
+                    .with_right_sibling(Some(right.to_string())),
+                None
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        peer.nodes
+            .store_node(&collection(), &right, &Node::leaf(body), None)
+            .await
+            .unwrap()
+    );
+    replace_root(
+        &peer.nodes,
+        &Node::index(IndexNode::from_children([
+            (Vec::new(), left.to_string()),
+            (b"m".to_vec(), right.to_string()),
+        ])),
+    )
+    .await;
+    operations.lock().unwrap().clear();
+
+    let outcomes = ctx
+        .gc
+        .clone()
+        .check_batch(vec![id.clone()], NonZeroUsize::MIN)
+        .await;
+    assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Retained);
+    assert!(!is_gone(&peer.tlogger, &id).await);
+    assert_eq!(
+        tree_reads(&operations),
+        [
+            ("read_if_modified", root_path().to_string()),
+            ("read", node_path(&right).to_string()),
+        ]
+    );
 }
 
 #[tokio::test(start_paused = true)]

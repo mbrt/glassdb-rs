@@ -1389,7 +1389,7 @@ candidate-driven **reverse mark-sweep** ([ADR-022](adr/022-garbage-collection-ma
 
 The `gc` module owns candidate reports, scheduling, scans, reclamation, and
 statistics. `Engine` constructs and starts one `Gc`. Its implementation keeps
-reclamation safety in `gc/reclaim.rs` and prefix traversal in `gc/scan.rs`;
+reclamation safety in `gc.rs` and prefix traversal in `gc/scan.rs`;
 queues and counters stay with the scheduler in `gc.rs`. GC and structural
 recovery share the `ScanCadence` interval controller from `glassdb-concurr`.
 
@@ -1398,6 +1398,14 @@ recovery share the `ScanCadence` interval controller from `glassdb-concurr`.
   candidate `_t/` object records its own back-references (its `locks ∪ writes`),
   so GC reads a batch of candidates and confirms each one dead by GET-ing only
   the handful of nodes/records it names — never a database-wide scan.
+  Point-reference routing uses `ANY` for interior nodes and the post-eligibility
+  requirement for terminal leaves. Cached indexes guide descent; right links
+  correct stale split placement. A cached leaf, including a root later split
+  into an index, must satisfy the terminal requirement before GC uses its
+  entries. Collection and node identities are not reused, creation precedes
+  commit or link publication, and published nodes remain until collection
+  reclamation. Recovery fences the split source before probing unpublished
+  nodes. These rules prevent cached absence from hiding a later live route.
 - **Candidate feed.** `Algo`, `DirectCommit`, and `Splitter` report GC
   candidates through `GcHints`. Reports use bounded in-memory work and never
   wait for queue space, backend requests, or GC completion. A busy queue drops
