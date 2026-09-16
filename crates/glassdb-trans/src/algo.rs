@@ -2266,6 +2266,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn logged_rw_commit_reuses_cached_leaf() {
+        let (tm, tctx, log) = new_recording_algo_big_cache().await;
+        let key = logical_key(b"key");
+        commit_writes(&tm, vec![wa(&key, b"initial")]).await;
+        let read = do_read(&tctx, &key).await;
+        // This value requires the logged protocol, including lock acquisition,
+        // post-lock validation, and write-back.
+        let value = vec![b'x'; InlinePolicy::default().max_value_bytes + 1];
+        let mut handle = begin_accesses(
+            &tm,
+            AccessSet::new(vec![read], vec![wa(&key, &value)], Vec::new()),
+        );
+
+        log.lock().unwrap().clear();
+        assert_eq!(
+            tm.commit(&mut handle).await.unwrap(),
+            BodyDecision::ReturnOutcome
+        );
+        tm.end(&mut handle).await.unwrap();
+        let writes = write_counts(&log);
+        assert_eq!(writes.leaf, 2);
+        assert_eq!(writes.tx, 1);
+        assert_eq!(leaf_reads(&log), (0, 0));
+        let (actual, _, _) = read_outcome(&tctx, &key).await.into_parts();
+        assert_eq!(actual.unwrap().value.as_ref(), value);
+    }
+
+    #[tokio::test]
     async fn readonly_validates() {
         let (tm, tctx) = new_algo().await;
         let keyp = logical_key(b"k");
@@ -3113,6 +3141,72 @@ mod tests {
         let mut stable = begin_accesses(&tm, accesses);
         tm.commit(&mut stable).await.unwrap();
         tm.end(&mut stable).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn locked_scan_uses_current_coverage_after_a_peer_split() {
+        for insert in [false, true] {
+            let (tm, tctx) =
+                new_algo_from_backend_with_cache(Arc::new(MemoryBackend::new()), 1 << 20).await;
+            commit_writes(
+                &tm,
+                vec![wa(&logical_key(b"a"), b"a0"), wa(&logical_key(b"m"), b"m0")],
+            )
+            .await;
+            let (accesses, keys) = scan_accesses_for_range(
+                &tctx,
+                ScanRange::all(),
+                vec![wa(&logical_key(b"a"), b"updated")],
+            )
+            .await;
+            assert_eq!(keys, [b"a".to_vec(), b"m".to_vec()]);
+
+            // The peer leaves this instance's cached root and the body's scan
+            // coverage unchanged. Acquisition must discover both new leaves.
+            let (peer, peer_ctx) = new_algo_from_backend(tctx.backend.clone()).await;
+            split_root_in_place(&peer_ctx).await;
+            if insert {
+                commit_writes(&peer, vec![wa(&logical_key(b"z"), b"new")]).await;
+            }
+
+            let mut handle = begin_accesses(&tm, accesses);
+            assert_eq!(
+                tm.commit(&mut handle).await.unwrap(),
+                if insert {
+                    BodyDecision::ReplayBody
+                } else {
+                    BodyDecision::ReturnOutcome
+                },
+                "logical scan validation must distinguish a split from a phantom"
+            );
+            if !insert {
+                let observed = tctx
+                    .tlogger
+                    .get_at(handle.id(), Requirement::ANY)
+                    .await
+                    .unwrap();
+                let log = observed.value().unwrap();
+                for token in [
+                    NodeToken::from_bytes([0; 16]),
+                    NodeToken::from_bytes([1; 16]),
+                ] {
+                    assert!(log.locks.contains(&TxLock::Membership {
+                        leaf: LeafRef::node(test_collection(), token),
+                        typ: LockType::Read,
+                    }));
+                }
+            }
+            tm.end(&mut handle).await.unwrap();
+            let (value, _, _) = read_outcome(&tctx, &logical_key(b"a")).await.into_parts();
+            assert_eq!(
+                value.unwrap().value.as_ref(),
+                if insert {
+                    b"a0".as_slice()
+                } else {
+                    b"updated".as_slice()
+                }
+            );
+        }
     }
 
     // ADR-032 boundary protection: on a multi-leaf tree a full scan covers every

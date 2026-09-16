@@ -376,10 +376,10 @@ struct LeafMember {
 /// small collection's single leaf, else a standalone node `_n`, resolved by
 /// descent. `members` maps each contending transaction to its installed
 /// resolver and outcome slot. `requirement` combines the members' bounds for
-/// dependent reads and completed leaf evidence. `ANY` lets a round reuse a leaf
-/// the submitter just cached without a currentness check. Failed mutations
-/// invalidate their seed; retries retain the requirement and use the winner or
-/// newer shared knowledge only when it meets that bound.
+/// dependent reads and completion checks. The first attempt can reuse any
+/// cached leaf as a CAS precondition. Failed mutations invalidate their seed;
+/// retries retain the requirement and use the winner or newer shared knowledge
+/// only when it meets that bound.
 #[derive(Clone)]
 struct CasReq {
     path: ObjectPath,
@@ -801,10 +801,9 @@ impl CasWorker {
         // A cache-served `Any` load may complete without yielding. Give peers
         // already scheduled for this object one opportunity to join the round,
         // so batching does not depend on backend I/O creating the collection
-        // window. A bounded load already opens that window at its backend await.
-        if requirement == Requirement::ANY {
-            rt::yield_now().await;
-        }
+        // window. The first load accepts any cached leaf, even for members
+        // that require bounded evidence before completion.
+        rt::yield_now().await;
         let mut backoff = self.core.retry.backoff();
         // Resolvers must distinguish the first attempt from recovery after a CAS
         // failure or a stale transaction dependency.
@@ -824,12 +823,23 @@ impl CasWorker {
         let mut in_doubt: BTreeSet<TxId> = BTreeSet::new();
         // Retain both submitted and resolver-requested bounds across retries.
         // ANY seeds need no preliminary check when a CAS confirms their state.
+        let mut load_requirement = Requirement::ANY;
         for attempt in 0..CAS_RETRIES {
             if attempt > 0 {
                 rt::sleep(backoff.next_delay()).await;
                 self.core.stats.n_retries.fetch_add(1, Ordering::Relaxed);
+                load_requirement = requirement;
             }
-            let edit = match self.core.nodes.load_leaf(path, requirement).await {
+            let loaded = self.core.nodes.load_leaf(path, load_requirement).await;
+            // Absence cannot supply a leaf CAS precondition or reach persist's
+            // no-change check. Preserve the submitted bound on this error path.
+            let loaded = match loaded {
+                Err(StorageError::NotFound) if load_requirement != requirement => {
+                    self.core.nodes.load_leaf(path, requirement).await
+                }
+                result => result,
+            };
+            let edit = match loaded {
                 Ok(loaded) => loaded.into_edit(),
                 // A root split can turn the routed root leaf into an index
                 // between grouping and this load. Deliver each resolver's
@@ -1017,11 +1027,11 @@ impl LeafCoordinator {
     /// the round ran, so the operation can preserve its best-effort behavior.
     ///
     /// `requirement` bounds dependent reads and completed leaf evidence across
-    /// attempts. A direct submitter can pass `ANY` to reuse its cached leaf
-    /// (ADR-030). Members merged during a load can raise the bound: a successful
-    /// CAS confirms the loaded state, while a plan with no changes checks it
-    /// explicitly. A changed state requires a new plan, not just newer evidence
-    /// attached to the old outcome.
+    /// attempts. The first attempt accepts any cached leaf as a CAS precondition
+    /// (ADR-030); retries load against the retained bound. Members merged during
+    /// a load can raise the bound: a successful CAS confirms the loaded state,
+    /// while a plan with no changes checks it explicitly. A changed state
+    /// requires a new plan, not just newer evidence attached to the old outcome.
     ///
     /// `path` is the leaf's object path — the collection root `_r` for a small
     /// collection's single leaf, else a standalone node `_n` resolved by descent
@@ -2276,56 +2286,40 @@ mod tests {
         coord.close().await;
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn skipped_member_keeps_read_evidence_when_another_member_applies() {
-        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let (backend, gate) = Gate::wrap(memory.clone());
-        let recorder = Arc::new(RecordingBackend::new(backend));
+        let recorder = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
         let log = recorder.log();
-        let (coord, _nodes, timeline, _bg) = coord_over(recorder).await;
-        let barrier = timeline.currentness_barrier();
-        let expected = cold_store(memory)
+        let (coord, nodes, timeline, _bg) = coord_over(recorder).await;
+        let expected = nodes
             .load_leaf(&leaf(), Requirement::ANY)
             .await
             .unwrap()
             .observation()
             .clone();
+        let barrier = timeline.currentness_barrier();
+        let requirement = Requirement::after(barrier);
         log.lock().unwrap().clear();
 
-        gate.arm();
-        let first = coord.clone();
-        let staged = tokio::spawn(async move {
-            let tx = TxId::with_priority(1, b"stage");
-            first
-                .submit_leaf(
-                    &leaf(),
-                    &tx,
-                    Arc::new(StageLock {
-                        key: b"k".to_vec(),
-                        tx: tx.clone(),
-                        admission: StageAdmission::ExistingKeys,
-                    }),
-                    Requirement::ANY,
-                )
-                .await
-        });
-        rt::sleep(Duration::from_secs(1)).await;
-        let second = coord.clone();
-        let skipped = tokio::spawn(async move {
-            second
-                .submit_leaf(
-                    &leaf(),
-                    &TxId::with_priority(2, b"skip"),
-                    Arc::new(SkipRelease),
-                    Requirement::ANY,
-                )
-                .await
-        });
-        rt::sleep(Duration::from_secs(1)).await;
-        gate.release();
+        let tx = TxId::with_priority(1, b"stage");
+        let skip = TxId::with_priority(2, b"skip");
+        let path = leaf();
+        let (staged, skipped) = tokio::join!(
+            coord.submit_leaf(
+                &path,
+                &tx,
+                Arc::new(StageLock {
+                    key: b"k".to_vec(),
+                    tx: tx.clone(),
+                    admission: StageAdmission::ExistingKeys,
+                }),
+                requirement,
+            ),
+            coord.submit_leaf(&path, &skip, Arc::new(SkipRelease), requirement),
+        );
 
-        let applied = staged.await.unwrap().unwrap().unwrap().evidence.unwrap();
-        let observed = skipped.await.unwrap().unwrap().unwrap().evidence.unwrap();
+        let applied = staged.unwrap().unwrap().evidence.unwrap();
+        let observed = skipped.unwrap().unwrap().evidence.unwrap();
         assert!(matches!(&applied, CoordinationEvidence::Installed(_)));
         assert!(matches!(&observed, CoordinationEvidence::Observed(_)));
         assert!(applied.validates(&expected, barrier));
@@ -2342,7 +2336,9 @@ mod tests {
                 .lookup(b"k")
                 .is_some()
         );
+        assert_eq!(leaf_reads(&log), 0);
         assert_eq!(leaf_stores(&log), 1);
+        assert_eq!(coord.stats_and_reset().rounds, 1);
         coord.close().await;
     }
 

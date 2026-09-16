@@ -81,7 +81,7 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
     use glassdb_backend::middleware::{BackendOp, HookBackend};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // Cover routing, key-lock CAS, and nested directory-lock CAS races.
+    // Cover the preparation reply, key-lock CAS, and nested directory-lock CAS.
     for phase in 0..3 {
         let backend = Arc::new(MemoryBackend::new());
         let peer = new_ctx_with(backend.clone()).await;
@@ -129,7 +129,7 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
         );
         let old_id = handle.id().clone();
         let triggered = Arc::new(AtomicBool::new(false));
-        hooked.set_before({
+        let pause_owner = {
             let triggered = triggered.clone();
             let old_id = old_id.clone();
             let path = if phase == 2 {
@@ -143,12 +143,9 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
             }
             .to_string();
             let owner_monitor = owner.monitor.clone();
-            move |operation| {
+            move |operation: &BackendOp<'_>| -> HookFuture {
                 let matches_kind = if phase == 0 {
-                    matches!(
-                        operation,
-                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
-                    )
+                    matches!(operation, BackendOp::WriteIfNotExists { .. })
                 } else {
                     matches!(operation, BackendOp::WriteIf { .. })
                 };
@@ -185,13 +182,29 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
                     Ok(())
                 })
             }
-        });
+        };
+        if phase == 0 {
+            // Preparation warms the root, so routing need not issue a read.
+            // Pause its successful create reply to wound the owner while the
+            // prepared collection exists but no key lock has been installed.
+            hooked.set_after(move |operation, outcome| {
+                if outcome.is_success() {
+                    pause_owner(operation)
+                } else {
+                    Box::pin(async { Ok(()) })
+                }
+            });
+        } else {
+            hooked.set_before(pause_owner);
+        }
 
+        let decision = engine.algo.commit(&mut handle).await.unwrap();
+        assert!(triggered.load(Ordering::SeqCst), "phase {phase} must run");
         assert_eq!(
-            engine.algo.commit(&mut handle).await.unwrap(),
-            BodyDecision::ReplayBody
+            decision,
+            BodyDecision::ReplayBody,
+            "phase {phase} must replay after the wound"
         );
-        assert!(triggered.load(Ordering::SeqCst));
         assert_ne!(handle.id(), &old_id);
         assert_eq!(
             owner

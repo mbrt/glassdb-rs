@@ -138,48 +138,26 @@ async fn single_rw_stale_read_renews_and_converges() {
     );
 }
 
-#[derive(Clone, Copy)]
-enum GateKind {
-    Read,
-    Write,
-}
-
-/// Controls a hook that gates the coordinator's next configured operation.
+/// Controls a hook that gates the coordinator's next conditional write.
 struct Gate {
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
     armed: std::sync::atomic::AtomicBool,
-    kind: GateKind,
 }
 
 impl Gate {
-    fn wrap(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
-        Self::wrap_kind(inner, GateKind::Read)
-    }
-
     fn wrap_writes(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
-        Self::wrap_kind(inner, GateKind::Write)
-    }
-
-    fn wrap_kind(inner: Arc<dyn Backend>, kind: GateKind) -> (Arc<HookBackend>, Arc<Self>) {
         let gate = Arc::new(Self {
             entered: Arc::new(tokio::sync::Notify::new()),
             release: Arc::new(tokio::sync::Notify::new()),
             armed: std::sync::atomic::AtomicBool::new(false),
-            kind,
         });
         let backend = HookBackend::new(inner);
         backend.set_before({
             let gate = gate.clone();
             move |op| {
                 use std::sync::atomic::Ordering::SeqCst;
-                let matches = match gate.kind {
-                    GateKind::Read => matches!(
-                        op,
-                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
-                    ),
-                    GateKind::Write => matches!(op, BackendOp::WriteIf { .. }),
-                };
+                let matches = matches!(op, BackendOp::WriteIf { .. });
                 let wait = matches && gate.armed.swap(false, SeqCst);
                 let entered = gate.entered.clone();
                 let release = gate.release.clone();
@@ -273,13 +251,9 @@ fn leaf_stores(log: &OpLog, path: &str) -> usize {
 // acquire contending one leaf batch into a single CAS round instead of
 // racing two separate loads+CASes. The commit publishes its value and the
 // acquire installs its lock in the one store.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn direct_commit_merges_with_disjoint_acquire() {
-    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let (backend, gate) = Gate::wrap(mem);
-    let rec = Arc::new(RecordingBackend::new(backend));
-    let log = rec.log();
-    let (tm, tctx) = new_algo_from_backend(rec).await;
+    let (tm, tctx, log) = new_recording_algo_big_cache().await;
 
     let ka = b"k".to_vec();
     let kb = same_leaf_sibling(&ka);
@@ -297,44 +271,24 @@ async fn direct_commit_merges_with_disjoint_acquire() {
 
     let leaf_path = test_root_path().to_string();
     log.lock().unwrap().clear();
-    gate.arm();
-
-    // The disjoint acquire is submitted first and becomes the dedup driver,
-    // parking in the gated current-bound load; the direct commit then joins
-    // that open batch. (Post-ADR-030 the commit's own first attempt is
-    // `Any` and would skip the load on a warm cache, so it merges via
-    // the driver's already-loading round rather than racing a solo, cache-
-    // served CAS — which is exactly the ADR-028 single-round behavior.)
-    let (ca, cb) = (tm.clone(), tctx.locker.clone());
+    // Both submissions can use the warm leaf. The coordinator must provide
+    // a join opportunity without depending on a backend read.
     let data_b = AccessSet::new(Vec::new(), vec![wa(&kbp, b"vb2")], Vec::new());
-    let tb = txb.clone();
     let lock_requirement = Requirement::after(tctx.timeline.currentness_barrier());
-    let acquire = tokio::spawn(async move {
-        cb.keys()
-            .lock_at(&tb, &data_b, false, lock_requirement)
-            .await
-    });
-
-    // Let the driver park in the gated load before the commit joins.
-    rt::sleep(Duration::from_secs(1)).await;
-
     let mut ha = begin_accesses(
         &tm,
         AccessSet::new(Vec::new(), vec![wa(&kap, b"v2")], Vec::new()),
     );
     let txa = ha.id().clone();
-    let commit = tokio::spawn(async move {
-        let result = ca.commit(&mut ha).await;
-        (ha, result)
-    });
-
-    // Once the commit has queued into the open batch, release the load.
-    rt::sleep(Duration::from_secs(1)).await;
-    gate.release();
-
-    let (_ha, committed) = commit.await.unwrap();
-    let acquire = acquire.await.unwrap().unwrap();
-    committed.expect("the direct commit must land");
+    let (acquire, committed) = tokio::join!(
+        tctx.locker
+            .keys()
+            .lock_at(&txb, &data_b, false, lock_requirement),
+        tm.commit(&mut ha),
+    );
+    let acquire = acquire.unwrap();
+    assert_eq!(committed.unwrap(), BodyDecision::ReturnOutcome);
+    assert_eq!(leaf_reads(&log), (0, 0));
     assert!(
         matches!(acquire, LockOutcome::Locked(_)),
         "the disjoint acquire must lock"
@@ -369,15 +323,16 @@ async fn direct_commit_merges_with_disjoint_acquire() {
 async fn direct_commit_batched_in_doubt_recovers() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let (backend, indoubt) = InDoubtCas::wrap(mem);
-    let (backend, gate) = Gate::wrap(backend);
-    let (tm, tctx) = new_algo_from_backend(backend).await;
+    let recorder = Arc::new(RecordingBackend::new(backend));
+    let log = recorder.log();
+    let (tm, tctx) = new_algo_from_backend(recorder).await;
 
     let ka = b"k".to_vec();
     let kb = same_leaf_sibling(&ka);
     let kap = logical_key(&ka);
     let kbp = logical_key(&kb);
 
-    // Seed keys A and B committed (un-gated, before arming): the commit has
+    // Seed keys A and B before arming the reply fault: the commit has
     // a predecessor and the acquire overwrites an existing B, so it takes no
     // membership root lock and the round stays a single leaf CAS.
     commit_writes(&tm, vec![wa(&kap, b"v1")]).await;
@@ -386,37 +341,28 @@ async fn direct_commit_batched_in_doubt_recovers() {
     let txb = TxId::with_priority(2_000_000_000, b"acquire");
     tctx.tmon.begin_tx(&txb);
 
-    // Arm the merge gate and the in-doubt first CAS together.
     indoubt.arm();
-    gate.arm();
-
-    let (ca, cb) = (tm.clone(), tctx.locker.clone());
+    log.lock().unwrap().clear();
     let mut ha = begin_accesses(
         &tm,
         AccessSet::new(Vec::new(), vec![wa(&kap, b"v2")], Vec::new()),
     );
     let txa = ha.id().clone();
-    let commit = tokio::spawn(async move {
-        let result = ca.commit(&mut ha).await;
-        (ha, result)
-    });
     let data_b = AccessSet::new(Vec::new(), vec![wa(&kbp, b"vb2")], Vec::new());
-    let tb = txb.clone();
-    let lock_requirement = Requirement::after(tctx.timeline.currentness_barrier());
-    let acquire = tokio::spawn(async move {
-        cb.keys()
-            .lock_at(&tb, &data_b, false, lock_requirement)
-            .await
-    });
+    let requirement = Requirement::after(tctx.timeline.currentness_barrier());
+    let (acquire, committed) = tokio::join!(
+        tctx.locker
+            .keys()
+            .lock_at(&txb, &data_b, false, requirement),
+        tm.commit(&mut ha),
+    );
 
-    rt::sleep(Duration::from_secs(1)).await;
-    gate.release();
-
-    // The in-doubt CAS actually landed, so the next resolver evaluation sees both members
-    // applied: the commit classifies itself Landed, the acquire re-locks.
-    let (_ha, committed) = commit.await.unwrap();
-    let acquire = acquire.await.unwrap().unwrap();
-    committed.expect("the commit recovers as landed, not in-doubt");
+    // One uncertain CAS must carry both members. Recovery must find the
+    // installed value and hold without applying another mutation.
+    let acquire = acquire.unwrap();
+    assert_eq!(committed.unwrap(), BodyDecision::ReturnOutcome);
+    assert_eq!(leaf_stores(&log, &test_root_path().to_string()), 1);
+    assert!(!indoubt.armed.load(std::sync::atomic::Ordering::SeqCst));
     assert!(
         matches!(acquire, LockOutcome::Locked(_)),
         "the co-batched acquire re-locks idempotently"
@@ -1347,11 +1293,9 @@ async fn direct_commit_superseded_read_replays_in_place() {
 // must reevaluate its body under the same id rather than publish a holder —
 // creating one would make every subsequent direct attempt on the key
 // ineligible, turning a local scheduling loss into a lasting logged phase.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn direct_commit_same_key_round_loser_replays_its_body() {
-    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    let (backend, gate) = Gate::wrap(mem);
-    let (tm, tctx) = new_algo_from_backend(backend).await;
+    let (tm, tctx, log) = new_recording_algo_big_cache().await;
 
     let ka = b"k".to_vec();
     let kb = same_leaf_sibling(&ka);
@@ -1371,43 +1315,22 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
     };
     let (mut h1, mut h2) = (rmw(ra1), rmw(ra2));
 
-    // A disjoint-key acquire drives the round and parks in the gated load, so
-    // both direct commits queue into one still-open batch. Their own first
-    // mutation attempt is cache-served (`Any`, ADR-030), so without a driver they
-    // would each win a solo round and never contend.
-    gate.arm();
+    // All three submissions use the warm leaf and join before planning.
     let driver = TxId::with_priority(1, b"driver");
     tctx.tmon.begin_tx(&driver);
-    let locker = tctx.locker.clone();
     let data_b = AccessSet::new(Vec::new(), vec![wa(&kbp, b"vb2")], Vec::new());
     let requirement = Requirement::after(tctx.timeline.currentness_barrier());
-    let acquire = tokio::spawn(async move {
-        locker
+    log.lock().unwrap().clear();
+    let (acquire, r1, r2) = tokio::join!(
+        tctx.locker
             .keys()
-            .lock_at(&driver, &data_b, false, requirement)
-            .await
-    });
-    rt::sleep(Duration::from_secs(1)).await;
-
-    let ta = tm.clone();
-    let first = tokio::spawn(async move {
-        let res = ta.commit(&mut h1).await;
-        (h1, res)
-    });
-    let tb = tm.clone();
-    let second = tokio::spawn(async move {
-        let res = tb.commit(&mut h2).await;
-        (h2, res)
-    });
-    rt::sleep(Duration::from_secs(1)).await;
-    gate.release();
-
-    assert!(matches!(
-        acquire.await.unwrap().unwrap(),
-        LockOutcome::Locked(_)
-    ));
-    let (h1, r1) = first.await.unwrap();
-    let (h2, r2) = second.await.unwrap();
+            .lock_at(&driver, &data_b, false, requirement),
+        tm.commit(&mut h1),
+        tm.commit(&mut h2),
+    );
+    assert!(matches!(acquire.unwrap(), LockOutcome::Locked(_)));
+    assert_eq!(leaf_stores(&log, &test_root_path().to_string()), 1);
+    assert!(entry(&tctx, &kb).await.unwrap().is_locked_by(&driver));
 
     // Which member wins the round's claim depends on id order; that exactly
     // one does is the property under test.

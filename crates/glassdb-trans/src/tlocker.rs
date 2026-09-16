@@ -332,6 +332,8 @@ struct AcquireOperation {
     path: ObjectPath,
     intents: Arc<Vec<KeyIntent>>,
     membership: LockType,
+    // Dependent reads and no-change completion still need this bound, even
+    // though the coordinator can use an older leaf as its CAS precondition.
     requirement: Requirement,
 }
 
@@ -1723,14 +1725,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_hold_receipt_meets_the_acquisition_requirement() {
-        let (locker, ctx) = init_tl_test().await;
+    async fn bounded_acquisition_checks_only_a_retained_hold() {
+        let recorder = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
+        let log = recorder.log();
+        let (locker, ctx) = new_test_locker(recorder).await;
         let tx = mk_tid(1, "tx");
         ctx.monitor.begin_tx(&tx);
         let groups = group_of_intents(vec![put_intent(b"apple")]);
+        let leaf_calls = || {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|op| op.path == root_path().to_string())
+                .map(|op| op.op)
+                .collect::<Vec<_>>()
+        };
 
         let installed_at = ctx.timeline.currentness_barrier();
+        log.lock().unwrap().clear();
         let installed = lock_ok_at(&locker, &tx, &groups, Requirement::after(installed_at)).await;
+        assert_eq!(leaf_calls(), ["write_if"]);
         let receipt = &installed[&root_path()];
         assert!(matches!(
             receipt,
@@ -1745,7 +1759,9 @@ mod tests {
         assert!(receipt.installed().is_current_after(installed_at));
 
         let observed_at = ctx.timeline.currentness_barrier();
+        log.lock().unwrap().clear();
         let observed = lock_ok_at(&locker, &tx, &groups, Requirement::after(observed_at)).await;
+        assert_eq!(leaf_calls(), ["read_if_modified"]);
         let receipt = &observed[&root_path()];
         assert!(matches!(
             receipt,
@@ -1758,6 +1774,66 @@ mod tests {
             panic!("repeated acquisition must retain its read observation");
         };
         assert!(observation.is_current_after(observed_at));
+    }
+
+    #[tokio::test]
+    async fn bounded_acquisition_retries_a_stale_cached_leaf() {
+        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let recorder = Arc::new(RecordingBackend::new(memory.clone()));
+        let log = recorder.log();
+        let (locker, ctx) = new_test_locker(recorder).await;
+        let peer = NodeStore::new(
+            glassdb_storage::CachedStore::new(memory, 1 << 20, Timeline::new(), None),
+            NonZeroUsize::MIN,
+        );
+        let current = glassdb_storage::CurrentState::Inline {
+            writer: mk_tid(1, "peer"),
+            value: Arc::from(b"peer-value".as_slice()),
+        };
+        let mut edit = peer
+            .load_leaf(&root_path(), Requirement::ANY)
+            .await
+            .unwrap()
+            .into_edit();
+        edit.set_entries(LeafBody::from_entries([
+            LeafEntry::new(b"apple").with_current(current.clone())
+        ]));
+        let mut locks = edit.locks().clone();
+        locks.advance_membership_version();
+        edit.set_locks(locks);
+        assert!(peer.commit_leaf(edit).await.unwrap().is_applied());
+
+        let tx = mk_tid(2, "tx");
+        ctx.monitor.begin_tx(&tx);
+        let barrier = ctx.timeline.currentness_barrier();
+        log.lock().unwrap().clear();
+        let receipts = lock_ok_at(
+            &locker,
+            &tx,
+            &group_of_intents(vec![put_intent(b"apple")]),
+            Requirement::after(barrier),
+        )
+        .await;
+
+        let calls = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| op.path == root_path().to_string())
+            .map(|op| op.op)
+            .collect::<Vec<_>>();
+        assert_eq!(calls, ["write_if", "read", "write_if"]);
+        let CoordinationEvidence::Installed(receipt) = &receipts[&root_path()].evidence else {
+            panic!("acquisition must install its locks after the conflict");
+        };
+        assert!(receipt.installed().is_current_after(barrier));
+        let node = receipt.installed().value().unwrap();
+        let entry = node.as_leaf().unwrap().lookup(b"apple").unwrap();
+        assert_eq!(entry.current, current);
+        assert_eq!(entry.lock_type(), LockType::Write);
+        assert_eq!(entry.lock_holders(), std::slice::from_ref(&tx));
+        assert_eq!(node.membership_version(), 1);
+        assert!(!node.membership_lock().contains(&tx));
     }
 
     #[tokio::test]

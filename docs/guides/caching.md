@@ -298,6 +298,12 @@ the requirement. Resolver-requested bounds remain in force across retries.
 `ResolveCtx::requirement` applies to dependent object reads; it does not claim
 that the loaded or staged leaf already satisfies the bound.
 
+The first leaf load uses `ANY` as a speculative CAS precondition, including for
+lock acquisition. This does not weaken the submitted requirement. Retries load
+against the retained combined bound, and a missing initial leaf is rechecked
+against the submitted bound before returning absence. A cached index can still
+cause rerouting because an index cannot become a leaf again.
+
 A dirty plan can use its CAS to confirm the loaded state after the combined
 bound, without a preliminary leaf read. A plan with no changes instead calls
 `check_leaf_current`: sufficient evidence costs no I/O, an unchanged backend
@@ -307,6 +313,12 @@ state. A leaf CAS cannot repair dependent reads made with a weaker requirement.
 Resolvers may retain only facts that remain valid when a plan is discarded;
 this also applies to reconciliation of an earlier uncertain CAS. An exact
 historical own marker can prove that a mutation landed; a staged proposal cannot.
+
+Acquisition still uses the validation barrier to find current scan coverage and
+to resolve transaction dependencies. Point and scan validation after locking
+retain that barrier. An older seed does not justify omitting a leaf from a scan
+or granting an exact-state shortcut: validation must use the actual observation
+or CAS receipt, and fall back to logical validation when it is insufficient.
 
 ## Per-path coordination
 

@@ -406,11 +406,16 @@ guide](guides/caching.md#coordinator-mutation-evidence).
 
 Each attempt keeps the merged members and their requirement together, including
 members that join during the leaf load and bounds requested on earlier retries.
-Resolvers use that bound for dependent object reads. The loaded leaf can still
-precede it: a dirty plan obtains its leaf evidence from the CAS, while a plan
-with no changes checks the exact loaded state before delivery. An unchanged
-state needs no repeated resolution; a changed state requires a new plan. No
-extra barrier or preliminary read is added to the successful CAS path.
+The first leaf load uses `ANY` as a speculative CAS precondition; retries use
+the retained combined bound. A missing initial leaf is rechecked against the
+submitted requirement before returning absence. Resolvers use the combined
+bound for dependent object reads. A dirty plan obtains its leaf evidence from
+the CAS, while a plan with no changes checks the exact loaded state before
+delivery. An unchanged state needs no repeated resolution; a changed state
+requires a new plan. Lock acquisition therefore needs no preliminary backend
+read of a cached leaf when its CAS succeeds. Current scan coverage and point/scan
+validation still use the transaction's validation barrier. No extra barrier is
+allocated for the speculative load.
 
 | Component             | Layer            | Speaks                       | Owns                                                                                                                  | Must not know                       |
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
