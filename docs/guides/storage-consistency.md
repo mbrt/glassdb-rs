@@ -22,19 +22,20 @@ point cannot order the contents returned by overlapping operations. Points
 from different database instances are not comparable.
 
 Raw allocation and representation helpers are storage implementation details.
-Their uses are backend invocation, shared evidence, and persistent-cache
+Their only uses are backend invocation, shared evidence, and persistent-cache
 encoding and decoding. They must not derive barriers or requirements from an
-observation. The permitted recovery handoff passes the opaque recovered point
-from `OpenedPersistentCache` to `Timeline::starting_after` for the same database
-identity. The new timeline and approximate staleness cutoffs must follow every
+observation. The one permitted recovery handoff passes the opaque recovered
+point from the opened persistent cache to the new timeline of the same database
+identity. That timeline and its approximate staleness cutoffs must follow every
 recoverable point.
 
 ## E2: Requirements and barriers are opaque
 
 Only `Timeline` constructs a currentness barrier. Capture it after prerequisite
-work and before dependent operations. `ANY`, `after`, and `within` construct
-requirements; `stricter` preserves the stronger requirement. `within` is an
-approximate cache policy, not proof that prerequisite work ended.
+work and before dependent operations. Requirements are constructed only as
+`ANY`, `after`, or `within`, and combining two requirements preserves the
+stronger one. `within` is an approximate cache policy, not proof that
+prerequisite work ended.
 
 Neither barriers nor requirements expose their point, including to other
 storage modules. Use predicates to check evidence. Do not add raw-point
@@ -44,26 +45,21 @@ states what must be proved and must never become evidence itself.
 
 ## E3: An observation retains one exact state
 
-Keep its path, decoded value or absence, revision, and evidence together.
-The internal fields and evidence operations in `cached_store/evidence.rs` are
-visible only to the parent `cached_store` module and its implementation
-children, through `pub(super)`. Do not widen them to `pub(crate)` or expose
-payload mapping, raw watermark accessors, setters, or constructors to typed
-stores. The parent scope preserves the cache implementation's existing access;
-it does not give other storage modules permission to manufacture observations.
+Keep its path, decoded value or absence, revision, and evidence together. The
+internal fields and evidence operations stay `pub(super)` to the cached-store
+module and its implementation children. Do not widen them to `pub(crate)`, and
+do not expose payload mapping, raw watermark accessors, setters, or constructors
+to typed stores. Preserving the
+cache implementation's existing access does not give other storage modules
+permission to manufacture observations.
 
-The atomic counter inside `Evidence` remains private to `evidence.rs`. Cache
-implementation code uses `get`, `advance`, and `is_shared_with`; it cannot
-store or swap the counter directly. Do not expose the atomic or its `Arc`, or
-move it into the parent module where its children could bypass `advance`.
-
-The backend version inside `Revision` also remains private to `evidence.rs`.
-The cache implementation uses `from_backend` for a token returned by the backend
-or restored with its exact persistent state, and `version` to borrow it for
-conditional backend operations. Neither operation supplies currentness evidence.
-Do not add public constructors, `Default`, conversion traits, or mutable access
-to the backend version. Higher layers may retain, compare, and serialize a
-revision, but cannot manufacture one.
+The shared evidence cell and the backend version inside a revision remain
+private to their module. The cache implementation advances evidence through the
+provided operations and borrows the backend version for conditional operations;
+neither can be stored, swapped, or replaced directly. Do not add public
+constructors, `Default`, conversion traits, or mutable access to the backend
+version. Higher layers may retain, compare, and serialize a revision, but cannot
+manufacture one.
 
 Advance evidence only from a definitive backend result or confirmed evidence
 for that exact state. Equal contents at different paths are not the same state.
@@ -74,14 +70,14 @@ an observation. A requirement alone cannot supply evidence for an update.
 
 ## E4: A CAS receipt proves one definitive mutation
 
-`CasResult::Applied` and `is_applied()` confirm that one conditional backend
-mutation took effect. They do not establish a transaction commit or promise that
-the installed state remains current when the reply arrives.
+An applied result confirms that one conditional backend mutation took effect. It
+does not establish a transaction commit or promise that the installed state
+remains current when the reply arrives.
 
-Only successful backend conditional create or compare-and-swap may construct
-`CasReceipt<V>`. Keep the expected revision, exact installed observation, and
-original invocation point bound to that mutation. Checking the installed state
-later cannot renew the precondition proof.
+Only a successful backend conditional create or compare-and-swap may construct a
+receipt. Keep the expected revision, exact installed observation, and original
+invocation point bound to that mutation. Checking the installed state later
+cannot renew the precondition proof.
 
 Reads, failed or indeterminate mutations, and plans with no staged changes
 cannot become receipts. Conversion to the installed observation remains

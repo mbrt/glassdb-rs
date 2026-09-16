@@ -25,18 +25,10 @@ hack/release.sh               # preview the bump + publish, changing nothing
 hack/release.sh --no-dry-run  # bump, publish to crates.io, tag, and open the GitHub release
 ```
 
-The script:
-
-1. checks the working tree is clean and on `main`, with the tooling and
-   credentials above present;
-2. runs the `make test` gate;
-3. bumps every published crate in lockstep with `release-plz update`, or to the
-   `--version` given;
-4. shows the diff and asks for confirmation;
-5. commits and pushes the version bump;
-6. publishes to crates.io with `cargo publish --workspace`;
-7. creates and pushes the single `vX.Y.Z` git tag;
-8. opens the GitHub release with `gh release create --generate-notes`.
+The script gates on a clean working tree on `main`, the tooling and credentials
+above, and the `make test` suite. It then bumps every published crate in
+lockstep, asks for confirmation, pushes the bump, publishes to crates.io, tags,
+and opens the GitHub release.
 
 The version bump is computed from the conventional-commit history, so commits
 that do not follow that convention only ever yield a patch bump. To force an

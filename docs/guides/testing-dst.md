@@ -48,59 +48,51 @@ names. This filter prevents ordinary unit tests from running under `--cfg sim`
 while the simulation lint still compiles their simulation branches.
 
 It's therefore required to place deterministic tests in a module named
-`sim_tests` (or using `tests/sim/main.rs`), and strart the source root with
+`sim_tests` (or using `tests/sim/main.rs`), and start the source root with
 `#![cfg(sim)]`.
 
 Simulation tests outside such a module compile but do not run through
 `make test-sim`. The ordinary test suite enforces these rules with
 [`simulation_test_policy.rs`](../../crates/glassdb/tests/simulation_test_policy.rs).
 
-Each database fuzz input has four logical clients, with clients 0 and 1 sharing
-one database instance and clients 2 and 3 sharing another. The clients run as
-separate tasks and keep their own operation order and model identities. Each
-pair shares caches, a backend transport, and a crash/restart lifetime. A crash
-interrupts both streams; restart continues each stream after its last attempted
-operation. Completed streams stay stopped. The history workload continues after
-admissible public errors; other workloads stop a stream when an operation fails.
-The optional cycle
-observer uses a separate database instance and a faultless transport.
+### Database fuzz workloads
 
-This fixed placement permits concurrent coordinator rounds in both instances.
-Generated streams can be empty so smaller cases remain easy to generate and
-minimize. Each client has at most six operations (24 in total); the exact-history
-target allows three transactions per client (12 in total) to bound checker cost.
-The cycle observer can still take eight snapshots. This layout does not cover
-three clients sharing one instance or three independent instances.
+Each database fuzz input drives several logical clients as separate tasks, each
+with its own operation order and model identity. Clients are paired onto shared
+database instances, so one input exercises both concurrent coordinator rounds
+inside an instance and independent instances over one backend. Each instance
+owns its caches, backend transport, and crash/restart lifetime: a crash
+interrupts the streams of that instance, and a restart continues each stream
+after its last attempted operation. The optional cycle observer uses a separate
+instance and a faultless transport. Generated streams can be empty, and
+per-client operation counts are bounded, so small cases stay easy to generate
+and minimize and the exact-history checker stays affordable. This fixed pairing
+does not cover three clients sharing one instance, or three independent
+instances.
 
-Each instance limits its client operations to ten seconds of virtual time,
-starting after database open, on both the initial run and a restart. On expiry, it interrupts and joins both
-client tasks, drops the instance, and leaves unfinished operations in doubt.
-It does not restart after this limit. Final verification still runs through a
-fresh instance and checks completed and in-doubt operations. The limit does not
-apply to verification: a missing transaction body required by a current writer
-must still fail the run. This prevents a foreground progress failure from
-blocking the consistency checks.
+Each instance also bounds its foreground client work in virtual time. On expiry
+it interrupts the client tasks and leaves unfinished operations in doubt. The
+bound never applies to verification: a fresh instance still checks completed and
+in-doubt operations, so a foreground progress failure cannot hide a consistency
+failure.
 
-Database fuzz workloads check consistency through public state and transaction
-histories. Maintenance scenarios are useful when they can change those results:
-for example, deleting a transaction body still required by a current key writer
-must be detected. Leaked logs and incomplete physical cleanup alone are outside
-that scope. Inline values and tombstones can have valid logless writers, so a
-writer identity without a log is not by itself a consistency failure. Bounded
-execution guards still prevent a faulty run from stopping the test campaign.
+These workloads check consistency through public state and transaction
+histories. Maintenance scenarios are in scope when they can change those
+results — deleting a transaction body still required by a current key writer
+must be detected — while leaked logs and incomplete physical cleanup alone are
+not. Inline values and tombstones can have valid logless writers, so a writer
+identity without a log is not by itself a consistency failure.
 
-The history target generates operations on two shared collection names, including
-creation, deletion, recreation, nested children, and collection values. It can
-couple a lifecycle operation with a key write in another collection or an explicit
+The history target additionally generates collection lifecycle operations
+(creation, deletion, recreation, nested children, collection values) on shared
+names, and can couple them with a key write in another collection or an explicit
 abort. Its model checks public results and full shared directory membership as
-well as values. It does not use transaction objects, locks, caches, or monitor
-state to classify errors or determine possible outcomes.
-
-After `Unavailable` or `InDoubt`, that client's next operation uses the same
-database instance unless a crash interrupts it. The failed operation remains
-consumed. An in-doubt operation may commit once or not at all; later public
-observations constrain that choice. The existing twelve-transaction limit and
-exact search budget also apply to shared collection histories.
+well as values. It classifies errors and possible outcomes only from public
+results, never from transaction objects, locks, caches, or monitor state. After
+an unavailable or in-doubt result, the client keeps using the same instance
+unless a crash interrupts it, and the failed operation stays consumed: an
+in-doubt operation may commit once or not at all, and later public observations
+constrain that choice.
 
 ## The four approaches in one paragraph each
 
