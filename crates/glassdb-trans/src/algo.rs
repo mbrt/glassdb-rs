@@ -1341,7 +1341,7 @@ mod tests {
 
     pub(super) async fn do_read(tctx: &Tctx, key: &LogicalKey) -> ReadAccess {
         let outcome = read_outcome(tctx, key).await;
-        let (_, _, evidence) = outcome.into_parts();
+        let (_, evidence) = outcome.into_parts();
         ReadAccess::new(key.clone(), evidence)
     }
 
@@ -2294,7 +2294,7 @@ mod tests {
         assert_eq!(writes.leaf, 2);
         assert_eq!(writes.tx, 1);
         assert_eq!(leaf_reads(&log), (0, 0));
-        let (actual, _, _) = read_outcome(&tctx, &key).await.into_parts();
+        let (actual, _) = read_outcome(&tctx, &key).await.into_parts();
         assert_eq!(actual.unwrap().value.as_ref(), value);
     }
 
@@ -2318,7 +2318,7 @@ mod tests {
         commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
 
         let outcome = read_outcome(&tctx, &keyp).await;
-        let (_, _, evidence) = outcome.into_parts();
+        let (_, evidence) = outcome.into_parts();
         let accesses = AccessSet::new(
             vec![ReadAccess::new(keyp.clone(), evidence)],
             Vec::new(),
@@ -3202,7 +3202,7 @@ mod tests {
                 }
             }
             tm.end(&mut handle).await.unwrap();
-            let (value, _, _) = read_outcome(&tctx, &logical_key(b"a")).await.into_parts();
+            let (value, _) = read_outcome(&tctx, &logical_key(b"a")).await.into_parts();
             assert_eq!(
                 value.unwrap().value.as_ref(),
                 if insert {

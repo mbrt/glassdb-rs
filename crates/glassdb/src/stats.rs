@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use glassdb_backend::BackendStats;
 use glassdb_storage::CacheStats;
-use glassdb_trans::{DirectCommitStats, GcStats, LeafCoordinatorStats, LockerStats, SplitterStats};
+use glassdb_trans::{
+    DirectCommitStats, GcStats, LeafCoordinatorStats, LockerStats, MonitorStats, SplitterStats,
+};
 
 /// Transaction activity for one snapshot or accumulated interval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -18,10 +20,6 @@ pub struct TransactionStats {
     pub elapsed: Duration,
     /// Number of reads.
     pub reads: u64,
-    /// Number of distinct transactional reads derived entirely from local objects.
-    /// Counted once per key per transaction attempt, including cached
-    /// not-found results.
-    pub cache_hits: u64,
     /// Number of writes.
     pub writes: u64,
     /// Number of retried transactions.
@@ -33,7 +31,6 @@ impl AddAssign for TransactionStats {
         self.completed += rhs.completed;
         self.elapsed += rhs.elapsed;
         self.reads += rhs.reads;
-        self.cache_hits += rhs.cache_hits;
         self.writes += rhs.writes;
         self.retries += rhs.retries;
     }
@@ -47,7 +44,6 @@ impl Sub for TransactionStats {
             completed: self.completed.saturating_sub(rhs.completed),
             elapsed: self.elapsed.saturating_sub(rhs.elapsed),
             reads: self.reads.saturating_sub(rhs.reads),
-            cache_hits: self.cache_hits.saturating_sub(rhs.cache_hits),
             writes: self.writes.saturating_sub(rhs.writes),
             retries: self.retries.saturating_sub(rhs.retries),
         }
@@ -66,6 +62,8 @@ pub struct Stats {
     pub backend: BackendStats,
     /// Decoded L1 and persistent encoded-body L2 cache activity.
     pub cache: CacheStats,
+    /// Transaction final-status cache activity.
+    pub monitor: MonitorStats,
     /// Distributed-locker activity.
     pub locker: LockerStats,
     /// Shared leaf-coordinator activity.
@@ -83,6 +81,7 @@ impl AddAssign for Stats {
         self.transactions += rhs.transactions;
         self.backend += rhs.backend;
         self.cache += rhs.cache;
+        self.monitor += rhs.monitor;
         self.locker += rhs.locker;
         self.coordinator += rhs.coordinator;
         self.direct_commit += rhs.direct_commit;
@@ -99,6 +98,7 @@ impl Sub for Stats {
             transactions: self.transactions - other.transactions,
             backend: self.backend - other.backend,
             cache: self.cache - other.cache,
+            monitor: self.monitor - other.monitor,
             locker: self.locker - other.locker,
             coordinator: self.coordinator - other.coordinator,
             direct_commit: self.direct_commit - other.direct_commit,
@@ -120,7 +120,6 @@ mod tests {
                 completed: 2,
                 elapsed: Duration::from_secs(3),
                 reads: 7,
-                cache_hits: 4,
                 writes: 5,
                 retries: 1,
             },
@@ -135,6 +134,10 @@ mod tests {
                 ..Default::default()
             },
             locker: LockerStats { calls: 6 },
+            monitor: MonitorStats {
+                final_status_hits: 3,
+                final_status_misses: 2,
+            },
             coordinator: LeafCoordinatorStats {
                 submissions: 10,
                 rounds: 8,
@@ -164,7 +167,6 @@ mod tests {
                 completed: 5,
                 elapsed: Duration::from_secs(8),
                 reads: 18,
-                cache_hits: 10,
                 writes: 9,
                 retries: 3,
             },
@@ -179,6 +181,10 @@ mod tests {
                 ..Default::default()
             },
             locker: LockerStats { calls: 10 },
+            monitor: MonitorStats {
+                final_status_hits: 8,
+                final_status_misses: 5,
+            },
             coordinator: LeafCoordinatorStats {
                 submissions: 14,
                 rounds: 10,
@@ -210,7 +216,6 @@ mod tests {
                     completed: 3,
                     elapsed: Duration::from_secs(5),
                     reads: 11,
-                    cache_hits: 6,
                     writes: 4,
                     retries: 2,
                 },
@@ -225,6 +230,10 @@ mod tests {
                     ..Default::default()
                 },
                 locker: LockerStats { calls: 4 },
+                monitor: MonitorStats {
+                    final_status_hits: 5,
+                    final_status_misses: 3
+                },
                 coordinator: LeafCoordinatorStats {
                     submissions: 4,
                     rounds: 2,

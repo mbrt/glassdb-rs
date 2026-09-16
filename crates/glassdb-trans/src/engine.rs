@@ -27,7 +27,7 @@ use crate::gc::{Gc, GcDiagnostics, GcHints, GcStats};
 use crate::key_resolver::{KeyResolver, ScanResult};
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{LeafCoordinator, LeafCoordinatorStats};
-use crate::monitor::{Monitor, ProtocolTiming};
+use crate::monitor::{Monitor, MonitorStats, ProtocolTiming};
 use crate::reader::{ReadOutcome, Reader};
 use crate::split::{Splitter, SplitterStats};
 use crate::tlocker::{Locker, LockerStats};
@@ -135,6 +135,8 @@ pub struct EngineStats {
     pub backend: BackendStats,
     /// Decoded and persistent cache activity.
     pub cache: CacheStats,
+    /// Transaction final-status cache activity.
+    pub monitor: MonitorStats,
     /// Distributed-locker activity.
     pub locker: LockerStats,
     /// Shared leaf-coordinator activity.
@@ -159,6 +161,7 @@ pub struct EngineDiagnostics {
 pub struct Engine {
     backend: Arc<StatsBackend>,
     objects: CachedStore,
+    monitor: Monitor,
     reader: Reader,
     resolver: KeyResolver,
     collection_catalog: CollectionCatalog,
@@ -281,6 +284,7 @@ impl Engine {
         EngineStats {
             backend: self.backend.stats_and_reset(),
             cache: self.objects.cache_stats_and_reset(),
+            monitor: self.monitor.stats_and_reset(),
             locker: self.locker.stats_and_reset(),
             coordinator: self.coord.stats_and_reset(),
             direct_commit: self.algo.direct_commit_stats_and_reset(),
@@ -576,7 +580,7 @@ impl DormantEngine {
             retry,
             locker.clone(),
             coord.clone(),
-            monitor,
+            monitor.clone(),
             collection_commit,
             cleanup_hints,
             managed_retirement.then_some(background_weak),
@@ -589,6 +593,7 @@ impl DormantEngine {
         let engine = Engine {
             backend,
             objects,
+            monitor,
             reader,
             resolver,
             collection_catalog,

@@ -16,7 +16,7 @@ pub(super) enum OverlayRead {
 #[derive(Default)]
 pub(super) struct AccessOverlay {
     staged: HashMap<LogicalKey, StagedValue>,
-    reads: HashMap<LogicalKey, ReadState>,
+    reads: HashMap<LogicalKey, ReadEvidence>,
     scans: Vec<ScanAccess>,
 }
 
@@ -26,26 +26,15 @@ impl AccessOverlay {
         if let Some(staged) = self.staged.get(key) {
             return OverlayRead::Known(staged.read());
         }
-        if matches!(self.reads.get(key), Some(ReadState::NotFound { .. })) {
+        if self.reads.contains_key(key) {
             return OverlayRead::Known(None);
         }
         OverlayRead::Unknown
     }
 
     /// Records an absent point read and its validation evidence.
-    pub(super) fn record_not_found(
-        &mut self,
-        key: LogicalKey,
-        cache_hit: bool,
-        evidence: ReadEvidence,
-    ) {
-        self.record_read(
-            key,
-            ReadState::NotFound {
-                cache_hit,
-                evidence,
-            },
-        );
+    pub(super) fn record_not_found(&mut self, key: LogicalKey, evidence: ReadEvidence) {
+        self.reads.insert(key, evidence);
     }
 
     /// Records a present point read and its validation evidence.
@@ -53,17 +42,10 @@ impl AccessOverlay {
         &mut self,
         key: LogicalKey,
         value: Arc<[u8]>,
-        cache_hit: bool,
         evidence: ReadEvidence,
     ) {
         self.staged.insert(key.clone(), StagedValue::Read(value));
-        self.record_read(
-            key,
-            ReadState::Found {
-                cache_hit,
-                evidence,
-            },
-        );
+        self.reads.insert(key, evidence);
     }
 
     /// Returns staged membership changes for a collection scan.
@@ -126,24 +108,10 @@ impl AccessOverlay {
             }
         }
         let mut reads = Vec::new();
-        for (key, state) in &self.reads {
-            reads.push(ReadAccess::new(key.clone(), state.evidence().clone()));
+        for (key, evidence) in &self.reads {
+            reads.push(ReadAccess::new(key.clone(), evidence.clone()));
         }
         AccessSet::new(reads, writes, self.scans.clone())
-    }
-
-    /// Returns the number of distinct point reads served from decoded cache state.
-    pub(super) fn cache_hits(&self) -> u64 {
-        self.reads.values().filter(|read| read.cache_hit()).count() as u64
-    }
-
-    fn record_read(&mut self, key: LogicalKey, mut state: ReadState) {
-        // Concurrent reads can both miss local state. Preserve a cache hit
-        // observed by either result while still counting the key only once.
-        if self.reads.get(&key).is_some_and(ReadState::cache_hit) {
-            state.set_cache_hit();
-        }
-        self.reads.insert(key, state);
     }
 }
 
@@ -158,41 +126,6 @@ impl StagedValue {
         match self {
             StagedValue::Read(value) | StagedValue::Put(value) => Some(value.to_vec()),
             StagedValue::Delete => None,
-        }
-    }
-}
-
-enum ReadState {
-    Found {
-        cache_hit: bool,
-        evidence: ReadEvidence,
-    },
-    NotFound {
-        cache_hit: bool,
-        evidence: ReadEvidence,
-    },
-}
-
-impl ReadState {
-    fn cache_hit(&self) -> bool {
-        match self {
-            ReadState::Found { cache_hit, .. } | ReadState::NotFound { cache_hit, .. } => {
-                *cache_hit
-            }
-        }
-    }
-
-    fn set_cache_hit(&mut self) {
-        match self {
-            ReadState::Found { cache_hit, .. } | ReadState::NotFound { cache_hit, .. } => {
-                *cache_hit = true;
-            }
-        }
-    }
-
-    fn evidence(&self) -> &ReadEvidence {
-        match self {
-            ReadState::Found { evidence, .. } | ReadState::NotFound { evidence, .. } => evidence,
         }
     }
 }

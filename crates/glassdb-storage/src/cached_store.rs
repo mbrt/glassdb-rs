@@ -29,7 +29,6 @@ use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cache_stats::{CacheMetrics, CacheStats};
 use crate::disk_cache::PersistentCache;
@@ -161,13 +160,6 @@ pub struct CachedStore {
     backend: Arc<dyn Backend>,
     knowledge: Knowledge,
     timeline: Timeline,
-    // Count of object bodies transferred from the backend (a fresh `read` or a
-    // conditional read that returned a changed body). A caller samples this
-    // before and after a logical read to tell whether the result reused cached
-    // bodies (an unchanged count, possibly after a cheap conditional check)
-    // or had to fetch a body — the signal behind the transaction-layer
-    // cache-hit stat.
-    body_reads: Arc<AtomicU64>,
     coordinator: PathCoordinator,
     metrics: Arc<CacheMetrics>,
     persistent: PersistentBridge,
@@ -193,19 +185,10 @@ impl CachedStore {
             backend,
             knowledge: Knowledge::new(max_size),
             timeline,
-            body_reads: Arc::new(AtomicU64::new(0)),
             coordinator: PathCoordinator::new(),
             metrics,
             persistent,
         }
-    }
-
-    /// The running count of object bodies this store has transferred from the
-    /// backend. Sampled around a logical read to detect a body-free read (the
-    /// count did not move): a hit reuses cached bodies, possibly after a cheap
-    /// conditional check that returned "not modified".
-    pub fn body_reads(&self) -> u64 {
-        self.body_reads.load(Ordering::SeqCst)
     }
 
     /// Returns cache activity since the previous sample.
@@ -480,10 +463,10 @@ impl CachedStore {
                     if let Some(observed) = fallback
                         && req.is_satisfied_by(observed.current_after())
                     {
-                        return Ok(self.knowledge.result_from_observation(observed, true));
+                        return Ok(self.knowledge.result_from_observation(observed));
                     }
                     if let Some(observed) = self.try_hit::<C>(key, req)? {
-                        return Ok(self.knowledge.result_from_observation(&observed, true));
+                        return Ok(self.knowledge.result_from_observation(&observed));
                     }
                     let state = permit.state().clone();
                     let mut seed = self.knowledge.present_seed::<C>(key, fallback)?;
@@ -494,7 +477,7 @@ impl CachedStore {
                             .await
                     {
                         if req == Requirement::ANY {
-                            return Ok(self.knowledge.result_from_seed(persistent_seed, true));
+                            return Ok(self.knowledge.result_from_seed(persistent_seed));
                         }
                         seed = Some(persistent_seed);
                     }
@@ -558,7 +541,6 @@ impl CachedStore {
         invoked: SequencePoint,
         state: &Arc<PathState>,
     ) -> Result<FetchResult, StorageError> {
-        self.body_reads.fetch_add(1, Ordering::SeqCst);
         let decoded = match C::decode(key.object_path(), &bytes) {
             Ok(decoded) => decoded,
             Err(error) => {
@@ -810,7 +792,7 @@ fn same_observed_state<V>(left: &Observation<V>, right: &Observation<V>) -> bool
 mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use glassdb_backend::Backend;
@@ -1056,7 +1038,9 @@ mod tests {
                     .write_if_not_exists("p", b"one".to_vec())
                     .await
                     .unwrap();
-                let erased: Arc<dyn Backend> = backend;
+                let recorded = Arc::new(RecordingBackend::new(backend));
+                let log = recorded.log();
+                let erased: Arc<dyn Backend> = recorded;
                 let (first, _) =
                     simulated_persistent_store(&directory, erased.clone(), media.clone()).await;
                 let typed: TypedCachedStore<Bytes> = first.typed();
@@ -1065,6 +1049,7 @@ mod tests {
                 drop(typed);
                 first.shutdown().await;
                 drop(first);
+                clear(&log);
 
                 let (reopened, timeline) =
                     simulated_persistent_store(&directory, erased, media).await;
@@ -1073,8 +1058,7 @@ mod tests {
                 let restored = typed.read("p", Requirement::ANY).await.unwrap();
                 assert_eq!(restored.value().unwrap().as_slice(), b"one");
                 assert_eq!(restored.current_after(), persisted);
-                assert!(restored.cache_hit());
-                assert_eq!(reopened.body_reads(), 0);
+                assert!(log.lock().unwrap().is_empty());
                 drop(typed);
                 reopened.shutdown().await;
             });
@@ -1146,7 +1130,6 @@ mod tests {
                 let typed: TypedCachedStore<Bytes> = store.typed();
                 let loaded = typed.read("p", Requirement::ANY).await.unwrap();
                 assert_eq!(loaded.value().unwrap().as_slice(), b"backend");
-                assert_eq!(store.body_reads(), 1);
                 assert_eq!(count(&log, "read"), 1);
                 assert_eq!(count(&log, "read_if_modified"), 0);
                 assert!(store.cache_stats_and_reset().l2_errors >= 1);
@@ -1196,7 +1179,6 @@ mod tests {
 
         let loaded = read.await.unwrap().unwrap();
         assert_eq!(loaded.value().unwrap().as_slice(), b"one");
-        assert_eq!(reopened.body_reads(), 1);
         assert_eq!(count(&log, "read"), 1);
         assert_eq!(count(&log, "read_if_modified"), 0);
         assert!(!reopened.persistent.is_enabled());
@@ -1300,18 +1282,12 @@ mod tests {
         }
     }
 
-    fn assert_observation(
-        observed: &Observation<Vec<u8>>,
-        expected: ExpectedValue,
-        cache_hit: bool,
-        context: &str,
-    ) {
+    fn assert_observation(observed: &Observation<Vec<u8>>, expected: ExpectedValue, context: &str) {
         assert_eq!(
             observed.value().map(|value| value.as_slice()),
             expected.bytes(),
             "{context}: value"
         );
-        assert_eq!(observed.cache_hit(), cache_hit, "{context}: cache hit");
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -1532,7 +1508,7 @@ mod tests {
         result: ExpectedMutationResult,
         advance_expected: bool,
         next_value: ExpectedValue,
-        next_cache_hit: bool,
+        next_read_operations: &'static [&'static str],
     }
 
     const MUTATION_CASES: &[MutationCase] = &[
@@ -1544,7 +1520,7 @@ mod tests {
             result: ExpectedMutationResult::Applied,
             advance_expected: true,
             next_value: ExpectedValue::Proposed,
-            next_cache_hit: true,
+            next_read_operations: &[],
         },
         MutationCase {
             name: "create conflicts with stale absence",
@@ -1554,7 +1530,7 @@ mod tests {
             result: ExpectedMutationResult::Conflict,
             advance_expected: false,
             next_value: ExpectedValue::Winner,
-            next_cache_hit: false,
+            next_read_operations: &["read"],
         },
         MutationCase {
             name: "create lost acknowledgement is uncertain",
@@ -1564,7 +1540,7 @@ mod tests {
             result: ExpectedMutationResult::Unavailable,
             advance_expected: false,
             next_value: ExpectedValue::Proposed,
-            next_cache_hit: false,
+            next_read_operations: &["read"],
         },
         MutationCase {
             name: "create definitive failure preserves absence",
@@ -1574,7 +1550,7 @@ mod tests {
             result: ExpectedMutationResult::Definitive,
             advance_expected: false,
             next_value: ExpectedValue::Absent,
-            next_cache_hit: true,
+            next_read_operations: &[],
         },
         MutationCase {
             name: "cancelled invoked create is uncertain",
@@ -1584,7 +1560,7 @@ mod tests {
             result: ExpectedMutationResult::Cancelled,
             advance_expected: false,
             next_value: ExpectedValue::Proposed,
-            next_cache_hit: false,
+            next_read_operations: &["read"],
         },
         MutationCase {
             name: "CAS applies from matching revision",
@@ -1594,7 +1570,7 @@ mod tests {
             result: ExpectedMutationResult::Applied,
             advance_expected: true,
             next_value: ExpectedValue::Proposed,
-            next_cache_hit: true,
+            next_read_operations: &[],
         },
         MutationCase {
             name: "CAS conflict invalidates stale revision",
@@ -1604,7 +1580,7 @@ mod tests {
             result: ExpectedMutationResult::Conflict,
             advance_expected: false,
             next_value: ExpectedValue::Winner,
-            next_cache_hit: false,
+            next_read_operations: &["read"],
         },
         MutationCase {
             name: "CAS conflict preserves known winner",
@@ -1614,7 +1590,7 @@ mod tests {
             result: ExpectedMutationResult::Conflict,
             advance_expected: false,
             next_value: ExpectedValue::Winner,
-            next_cache_hit: true,
+            next_read_operations: &[],
         },
         MutationCase {
             name: "CAS missing installs absence",
@@ -1624,7 +1600,7 @@ mod tests {
             result: ExpectedMutationResult::Conflict,
             advance_expected: false,
             next_value: ExpectedValue::Absent,
-            next_cache_hit: true,
+            next_read_operations: &[],
         },
         MutationCase {
             name: "CAS lost acknowledgement is uncertain",
@@ -1634,7 +1610,7 @@ mod tests {
             result: ExpectedMutationResult::Unavailable,
             advance_expected: false,
             next_value: ExpectedValue::Proposed,
-            next_cache_hit: false,
+            next_read_operations: &["read"],
         },
         MutationCase {
             name: "CAS definitive failure preserves expected revision",
@@ -1644,7 +1620,7 @@ mod tests {
             result: ExpectedMutationResult::Definitive,
             advance_expected: false,
             next_value: ExpectedValue::Old,
-            next_cache_hit: true,
+            next_read_operations: &[],
         },
         MutationCase {
             name: "cancelled invoked CAS is uncertain",
@@ -1654,7 +1630,7 @@ mod tests {
             result: ExpectedMutationResult::Cancelled,
             advance_expected: false,
             next_value: ExpectedValue::Proposed,
-            next_cache_hit: false,
+            next_read_operations: &["read"],
         },
         MutationCase {
             name: "delete applies from matching revision",
@@ -1664,7 +1640,7 @@ mod tests {
             result: ExpectedMutationResult::Deleted,
             advance_expected: true,
             next_value: ExpectedValue::Absent,
-            next_cache_hit: true,
+            next_read_operations: &[],
         },
         MutationCase {
             name: "delete conflict invalidates stale revision",
@@ -1674,7 +1650,7 @@ mod tests {
             result: ExpectedMutationResult::Precondition,
             advance_expected: false,
             next_value: ExpectedValue::Winner,
-            next_cache_hit: false,
+            next_read_operations: &["read"],
         },
         MutationCase {
             name: "delete conflict preserves known winner",
@@ -1684,7 +1660,7 @@ mod tests {
             result: ExpectedMutationResult::Precondition,
             advance_expected: false,
             next_value: ExpectedValue::Winner,
-            next_cache_hit: true,
+            next_read_operations: &[],
         },
         MutationCase {
             name: "delete missing converges on absence",
@@ -1694,7 +1670,7 @@ mod tests {
             result: ExpectedMutationResult::Deleted,
             advance_expected: false,
             next_value: ExpectedValue::Absent,
-            next_cache_hit: true,
+            next_read_operations: &[],
         },
         MutationCase {
             name: "delete lost acknowledgement is uncertain",
@@ -1704,7 +1680,7 @@ mod tests {
             result: ExpectedMutationResult::Unavailable,
             advance_expected: false,
             next_value: ExpectedValue::Absent,
-            next_cache_hit: false,
+            next_read_operations: &["read"],
         },
         MutationCase {
             name: "delete definitive failure preserves expected revision",
@@ -1714,7 +1690,7 @@ mod tests {
             result: ExpectedMutationResult::Definitive,
             advance_expected: false,
             next_value: ExpectedValue::Old,
-            next_cache_hit: true,
+            next_read_operations: &[],
         },
         MutationCase {
             name: "cancelled invoked delete is uncertain",
@@ -1724,7 +1700,7 @@ mod tests {
             result: ExpectedMutationResult::Cancelled,
             advance_expected: false,
             next_value: ExpectedValue::Absent,
-            next_cache_hit: false,
+            next_read_operations: &["read"],
         },
     ];
 
@@ -1834,7 +1810,7 @@ mod tests {
                 } else {
                     ExpectedValue::Proposed
                 };
-                assert_observation(observation, value, false, case.name);
+                assert_observation(observation, value, case.name);
                 assert!(
                     observation.current_after() >= barrier,
                     "{}: returned evidence",
@@ -1845,9 +1821,8 @@ mod tests {
 
             protocol.clear_operations();
             let next = store.read("p", Requirement::ANY).await.unwrap();
-            assert_observation(&next, case.next_value, case.next_cache_hit, case.name);
-            let expected_operations: &[&str] = if case.next_cache_hit { &[] } else { &["read"] };
-            protocol.assert_operations(expected_operations, case.name);
+            assert_observation(&next, case.next_value, case.name);
+            protocol.assert_operations(case.next_read_operations, case.name);
         }
     }
 
@@ -1933,8 +1908,8 @@ mod tests {
                     } else {
                         ExpectedValue::Absent
                     };
-                    assert_observation(&leader, value, false, &context);
-                    assert_observation(&waiter, value, false, &context);
+                    assert_observation(&leader, value, &context);
+                    assert_observation(&waiter, value, &context);
                     assert!(leader.same_state(&waiter), "{context}: shared state");
                     assert_eq!(
                         leader.current_after(),
@@ -1969,15 +1944,14 @@ mod tests {
             protocol.hook.clear_before();
             protocol.clear_operations();
             let next = store.read("p", Requirement::ANY).await.unwrap();
-            let (next_value, next_hit) = match completion {
-                ReadCompletionCase::Present => (ExpectedValue::Old, true),
-                ReadCompletionCase::Absent => (ExpectedValue::Absent, true),
+            let (next_value, expected_operations): (_, &[&str]) = match completion {
+                ReadCompletionCase::Present => (ExpectedValue::Old, &[]),
+                ReadCompletionCase::Absent => (ExpectedValue::Absent, &[]),
                 ReadCompletionCase::Unavailable | ReadCompletionCase::Definitive => {
-                    (ExpectedValue::Absent, false)
+                    (ExpectedValue::Absent, &["read"])
                 }
             };
-            assert_observation(&next, next_value, next_hit, &context);
-            let expected_operations: &[&str] = if next_hit { &[] } else { &["read"] };
+            assert_observation(&next, next_value, &context);
             protocol.assert_operations(expected_operations, &context);
         }
     }
@@ -2040,7 +2014,7 @@ mod tests {
                         .expect("waiter remained stuck behind its cancelled leader")
                         .unwrap()
                         .unwrap();
-                    assert_observation(&observed, ExpectedValue::Old, false, &context);
+                    assert_observation(&observed, ExpectedValue::Old, &context);
                     assert!(observed.current_after() >= barrier, "{context}: evidence");
                     protocol.assert_operations(&["read", "read"], &context);
                 }
@@ -2080,7 +2054,7 @@ mod tests {
                     assert!(waiter.await.unwrap_err().is_cancelled(), "{context}");
                     release.notify_one();
                     let observed = leader.await.unwrap().unwrap();
-                    assert_observation(&observed, ExpectedValue::Old, false, &context);
+                    assert_observation(&observed, ExpectedValue::Old, &context);
                     assert!(observed.current_after() >= barrier, "{context}: evidence");
                     protocol.assert_operations(&["read"], &context);
                 }
@@ -2089,7 +2063,7 @@ mod tests {
             protocol.hook.clear_before();
             protocol.clear_operations();
             let next = store.read("p", Requirement::ANY).await.unwrap();
-            assert_observation(&next, ExpectedValue::Old, true, &context);
+            assert_observation(&next, ExpectedValue::Old, &context);
             protocol.assert_operations(&[], &context);
         }
     }
@@ -2161,18 +2135,13 @@ mod tests {
             assert!(mutation.await.unwrap_err().is_cancelled(), "{context}");
             release.notify_one();
             let validated = validating.await.unwrap().unwrap();
-            assert_observation(
-                &validated,
-                expected_value,
-                !matches!(kind, MutationKind::Create),
-                &context,
-            );
+            assert_observation(&validated, expected_value, &context);
             protocol.hook.clear_after();
             protocol.assert_operations(&[], &context);
 
             protocol.clear_operations();
             let next = store.read("p", Requirement::ANY).await.unwrap();
-            assert_observation(&next, expected_value, true, &context);
+            assert_observation(&next, expected_value, &context);
             protocol.assert_operations(&[], &context);
         }
     }
@@ -2364,7 +2333,7 @@ mod tests {
             let (first, _) = persistent_store(&directory, protocol.backend.clone()).await;
             let first_typed: TypedCachedStore<Bytes> = first.typed();
             let persisted = first_typed.read("p", Requirement::ANY).await.unwrap();
-            assert_observation(&persisted, ExpectedValue::Old, false, case.name);
+            assert_observation(&persisted, ExpectedValue::Old, case.name);
             drop(first_typed);
             first.shutdown().await;
             drop(first);
@@ -2376,7 +2345,7 @@ mod tests {
                 None
             } else {
                 let restored = second_typed.read("p", Requirement::ANY).await.unwrap();
-                assert_observation(&restored, ExpectedValue::Old, true, case.name);
+                assert_observation(&restored, ExpectedValue::Old, case.name);
                 protocol.assert_operations(&[], case.name);
                 Some(restored)
             };
@@ -2485,7 +2454,7 @@ mod tests {
                 } else {
                     ExpectedValue::Proposed
                 };
-                assert_observation(observation, value, false, case.name);
+                assert_observation(observation, value, case.name);
                 assert!(
                     observation.current_after() >= barrier,
                     "{}: returned evidence",
@@ -2503,7 +2472,7 @@ mod tests {
             let third_typed: TypedCachedStore<Bytes> = third.typed();
             let next = third_typed.read("p", Requirement::ANY).await.unwrap();
             let preserved = matches!(case.completion, CompletionCase::DefinitiveBeforeApply);
-            assert_observation(&next, case.next_value, preserved, case.name);
+            assert_observation(&next, case.next_value, case.name);
             let expected_operations: &[&str] = if preserved { &[] } else { &["read"] };
             protocol.assert_operations(expected_operations, case.name);
             drop(third_typed);
@@ -2529,6 +2498,10 @@ mod tests {
         assert_eq!(count(&log, "read_if_modified"), 1, "stale entry is checked");
         assert!(o2.is_current_after(t), "watermark advanced to the bound");
         assert!(o2.current_after() >= o1.current_after(), "never regresses");
+        let stats = s.store.clone().cache_stats_and_reset();
+        assert_eq!((stats.l1_hits, stats.l1_misses), (1, 1));
+        assert!(s.peek("p").unwrap().is_some());
+        assert_eq!(s.store.cache_stats_and_reset(), CacheStats::default());
     }
 
     // Model invariant: `after(barrier)` accepts an entry whose watermark already
@@ -2585,6 +2558,8 @@ mod tests {
             1,
             "the invalidated entry forces a read"
         );
+        let stats = s1.store.cache_stats_and_reset();
+        assert_eq!((stats.l1_hits, stats.l1_misses), (0, 1));
     }
 
     // Regression: two observations of one committed revision are the same state
@@ -2656,6 +2631,7 @@ mod tests {
             ObservationCheck::Changed(cur) => assert_eq!(cur.value().unwrap().as_slice(), b"b"),
             ObservationCheck::Current => panic!("a stricter bound must observe the changed state"),
         }
+        assert_eq!(s1.store.cache_stats_and_reset(), CacheStats::default());
 
         // A brand-new read cannot rediscover the obsolete value.
         let got = s1.read("p", Requirement::ANY).await.unwrap();
@@ -3029,6 +3005,8 @@ mod tests {
         clear(&log);
         assert!(!s.read("m", Requirement::ANY).await.unwrap().exists());
         assert_eq!(count(&log, "read"), 0, "absence is cached");
+        let stats = s.store.cache_stats_and_reset();
+        assert_eq!((stats.l1_hits, stats.l1_misses), (1, 1));
 
         let present = create_value(&s, "m", v(b"x")).await;
         let got = s.read("m", Requirement::ANY).await.unwrap();
@@ -3241,7 +3219,6 @@ mod tests {
         clear(&log);
         let current = store.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(current.value().unwrap().as_slice(), b"a");
-        assert!(current.cache_hit());
         assert!(log.lock().unwrap().is_empty());
     }
 
@@ -3484,7 +3461,6 @@ mod tests {
         }
         let old = store.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(old.value().unwrap().as_slice(), b"a");
-        assert!(old.cache_hit());
 
         released.store(true, Ordering::SeqCst);
         let new = replacing.await.unwrap();
@@ -3541,7 +3517,6 @@ mod tests {
 
         let current = store.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(current.value().unwrap().as_slice(), b"b");
-        assert!(!current.cache_hit());
         assert_eq!(count(&log, "write_if"), 1);
         assert_eq!(count(&log, "read"), 1);
     }
@@ -3603,7 +3578,6 @@ mod tests {
         clear(&log);
         let current = store.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(current.value().unwrap().as_slice(), b"a");
-        assert!(current.cache_hit());
         assert!(log.lock().unwrap().is_empty());
     }
 
@@ -3800,6 +3774,7 @@ mod tests {
         drop(first_typed);
         first.shutdown().await;
         drop(first);
+        clear(&log);
 
         let (reopened, timeline) = persistent_store(&directory, erased).await;
         let bound = timeline.currentness_barrier();
@@ -3809,13 +3784,12 @@ mod tests {
         let restored = typed.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(restored.value().unwrap().as_slice(), b"one");
         assert_eq!(restored.current_after(), persisted);
-        assert!(restored.cache_hit());
-        assert_eq!(reopened.body_reads(), 0);
+        assert!(log.lock().unwrap().is_empty());
 
         clear(&log);
         let verified = typed.read("p", Requirement::after(bound)).await.unwrap();
         assert!(verified.is_current_after(bound));
-        assert_eq!(reopened.body_reads(), 0);
+        assert!(loaded.same_state(&verified));
         assert_eq!(
             count(&log, "read_if_modified"),
             1,
@@ -3836,7 +3810,9 @@ mod tests {
             .write_if_not_exists("p", b"one".to_vec())
             .await
             .unwrap();
-        let erased: Arc<dyn Backend> = backend.clone();
+        let recorded = Arc::new(RecordingBackend::new(backend));
+        let log = recorded.log();
+        let erased: Arc<dyn Backend> = recorded;
 
         let (first, _) = persistent_store(&directory, erased.clone()).await;
         let first_typed: TypedCachedStore<Bytes> = first.typed();
@@ -3846,13 +3822,15 @@ mod tests {
         drop(first_typed);
         first.shutdown().await;
         drop(first);
+        clear(&log);
 
         let (reopened, _) = persistent_store(&directory, erased).await;
         let typed: TypedCachedStore<Bytes> = reopened.typed();
         let loaded = typed.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(loaded.value().unwrap().as_slice(), b"two");
         assert!(loaded.current_after() > SequencePoint::default());
-        assert_eq!(reopened.body_reads(), 1);
+        assert_eq!(count(&log, "read"), 1);
+        assert_eq!(count(&log, "read_if_modified"), 0);
         let stats = reopened.cache_stats_and_reset();
         assert_eq!(stats.l2_hits, 0, "cache stats: {stats:?}");
         assert_eq!(stats.l2_misses, 1, "cache stats: {stats:?}");

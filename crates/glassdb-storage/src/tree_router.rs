@@ -40,8 +40,6 @@ const MAX_SELF_CORRECTING_HOPS: usize = 4096;
 pub struct RoutedLeaf {
     pub path: ObjectPath,
     pub observation: LeafObservation,
-    /// Whether every object read while routing to this leaf was served locally.
-    pub cache_hit: bool,
 }
 
 impl RoutedLeaf {
@@ -370,7 +368,6 @@ impl<T> BatchRouting<T> {
 struct Located {
     path: ObjectPath,
     observation: LeafObservation,
-    cache_hit: bool,
 }
 
 impl Located {
@@ -381,16 +378,10 @@ impl Located {
             .expect("Located is only constructed for present objects")
     }
 
-    fn after(mut self, prior_cache_hit: bool) -> Self {
-        self.cache_hit &= prior_cache_hit;
-        self
-    }
-
     fn into_locator(self) -> RoutedLeaf {
         RoutedLeaf {
             path: self.path,
             observation: self.observation,
-            cache_hit: self.cache_hit,
         }
     }
 }
@@ -432,12 +423,10 @@ impl<'a> DescentCursor<'a> {
                 return Ok(());
             };
             let token = node_token(token)?;
-            let cache_hit = self.current.cache_hit;
             self.current = self
                 .router
                 .load_child(self.collection, &token, self.requirement)
-                .await?
-                .after(cache_hit);
+                .await?;
         }
         Err(StorageError::other(
             "routing exceeded the right-link hop bound",
@@ -454,12 +443,10 @@ impl<'a> DescentCursor<'a> {
                     .ok_or_else(|| StorageError::other("descent reached an empty index node"))?,
             )?,
         };
-        let cache_hit = self.current.cache_hit;
         let child = self
             .router
             .load_child(self.collection, &token, self.requirement)
-            .await?
-            .after(cache_hit);
+            .await?;
         Ok(Some(std::mem::replace(&mut self.current, child)))
     }
 
@@ -490,11 +477,9 @@ impl<'a> DescentCursor<'a> {
         }
     }
 
-    /// Reloads the exact current path at a new requirement without losing the
-    /// hit state accumulated along the route.
+    /// Reloads the exact current path at a new freshness requirement.
     async fn reload_current(&mut self, requirement: Requirement) -> Result<(), StorageError> {
         let path = self.current.path.clone();
-        let cache_hit = self.current.cache_hit;
         let observation = self
             .router
             .nodes
@@ -503,12 +488,7 @@ impl<'a> DescentCursor<'a> {
         if observation.is_absent() {
             return Err(StorageError::other("tree node vanished during descent"));
         }
-        self.current = Located {
-            path,
-            cache_hit: observation.cache_hit(),
-            observation,
-        }
-        .after(cache_hit);
+        self.current = Located { path, observation };
         self.requirement = requirement;
         Ok(())
     }
@@ -589,7 +569,6 @@ impl<'a> LeafChain<'a> {
             self.router
                 .load_child(self.collection, &token, self.requirement)
                 .await?
-                .after(leaf.cache_hit)
                 .into_locator(),
         ))
     }
@@ -914,7 +893,6 @@ impl TreeRouter {
             path: ObjectPath::TreeRoot {
                 collection: collection.clone(),
             },
-            cache_hit: observation.cache_hit(),
             observation,
         };
         Ok(Some(DescentCursor::new(
@@ -952,7 +930,6 @@ impl TreeRouter {
                 collection: collection.clone(),
                 token: token.clone(),
             },
-            cache_hit: observation.cache_hit(),
             observation,
         })
     }
@@ -1320,7 +1297,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_leaf_right_hop_preserves_trace_and_cumulative_hits() {
+    async fn stale_leaf_right_hop_preserves_trace_and_reuses_cached_nodes() {
         let (backend, log) = recording_backend();
         seed_stale_leaf_parent(&store_over(backend.clone())).await;
         take_reads(&log);
@@ -1332,7 +1309,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loc.path, node_path(1));
-        assert!(!loc.cache_hit);
         assert!(loc.node().unwrap().as_leaf().unwrap().exists(b"pear"));
         assert_eq!(
             take_reads(&log),
@@ -1343,13 +1319,12 @@ mod tests {
             ]
         );
 
-        assert!(
-            router
-                .route_key(&collection(), b"pear", Requirement::ANY)
-                .await
-                .unwrap()
-                .cache_hit
-        );
+        let warm = router
+            .route_key(&collection(), b"pear", Requirement::ANY)
+            .await
+            .unwrap();
+        assert_eq!(warm.path, loc.path);
+        assert!(warm.node().unwrap().as_leaf().unwrap().exists(b"pear"));
         assert!(take_reads(&log).is_empty());
 
         let terminal_warm = store_over(backend);
@@ -1362,7 +1337,7 @@ mod tests {
             .route_key(&collection(), b"pear", Requirement::ANY)
             .await
             .unwrap();
-        assert!(!loc.cache_hit, "a warm leaf cannot hide cold prefix reads");
+        assert_eq!(loc.path, node_path(1));
         assert_eq!(
             take_reads(&log),
             [read("read", root_path()), read("read", node_path(0))]
@@ -1394,7 +1369,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loc.path, node_path(1));
-        assert!(loc.cache_hit);
         assert_current_after(&loc, bound);
         assert_eq!(take_reads(&log), [read("read_if_modified", node_path(1))]);
 
@@ -1416,7 +1390,6 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!loc.cache_hit, "a terminal hit cannot erase a root miss");
         assert_current_after(&loc, bound);
         assert_eq!(
             take_reads(&log),
@@ -1428,7 +1401,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn next_leaf_retains_a_prior_miss_when_the_sibling_is_warm() {
+    async fn next_leaf_reuses_a_warm_sibling() {
         let (backend, log) = recording_backend();
         seed_stale_leaf_parent(&store_over(backend.clone())).await;
         take_reads(&log);
@@ -1445,7 +1418,6 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(!first.cache_hit);
         take_reads(&log);
         let middle = router
             .next_leaf(&collection(), &first, Requirement::ANY)
@@ -1453,10 +1425,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(middle.path, node_path(1));
-        assert!(
-            !middle.cache_hit,
-            "the retained prefix miss must survive the warm sibling read"
-        );
         assert!(take_reads(&log).is_empty());
     }
 
@@ -1475,7 +1443,6 @@ mod tests {
             leaves.iter().map(|leaf| &leaf.path).collect::<Vec<_>>(),
             [&node_path(0), &node_path(1)]
         );
-        assert!(leaves.iter().all(|leaf| !leaf.cache_hit));
         assert_eq!(
             take_reads(&log),
             [
@@ -1500,10 +1467,6 @@ mod tests {
             leaves.iter().map(|leaf| &leaf.path).collect::<Vec<_>>(),
             [&node_path(0), &node_path(1), &node_path(4)]
         );
-        assert!(
-            leaves.iter().all(|leaf| !leaf.cache_hit),
-            "a warm terminal leaf cannot erase an earlier miss"
-        );
         assert_eq!(
             take_reads(&log),
             [
@@ -1527,7 +1490,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loc.path, node_path(1));
-        assert!(!loc.cache_hit);
         assert_eq!(
             take_reads(&log),
             [
@@ -1626,7 +1588,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loc.path, node_path(1));
-        assert!(!loc.cache_hit);
         assert_current_after(&loc, bound);
         assert!(loc.node().unwrap().as_leaf().unwrap().exists(b"pear"));
         assert_eq!(

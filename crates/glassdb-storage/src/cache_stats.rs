@@ -2,6 +2,12 @@ use std::ops::{AddAssign, Sub};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Cache activity for one snapshot or accumulated interval.
+///
+/// L1 counts the first lookup of each object read. A read that needs a lower
+/// tier counts as a miss even if a concurrent read or an unchanged conditional
+/// response later supplies the value. Cache probes and retained-observation
+/// checks do not count. L2 counts usable encoded records, including records
+/// that need a backend currentness check before use.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CacheStats {
     /// Decoded L1 reads served locally.

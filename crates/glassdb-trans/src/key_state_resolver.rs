@@ -45,7 +45,6 @@ impl ResolvedValue {
 pub(crate) struct WriterResolution {
     pub(crate) writer: Option<TxId>,
     pub(crate) value: ResolvedValue,
-    pub(crate) cache_hit: bool,
 }
 
 /// One coherent interpretation of an entry's foreign lock holders.
@@ -80,25 +79,12 @@ impl HolderResolution {
 }
 
 /// The effective committed state resolved from one loaded leaf entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct EffectiveResolution {
     writer: Option<TxId>,
     value: ResolvedValue,
     deleted: bool,
-    cache_hit: bool,
     pending: Vec<TxId>,
-}
-
-impl Default for EffectiveResolution {
-    fn default() -> Self {
-        Self {
-            writer: None,
-            value: ResolvedValue::Unresolved,
-            deleted: false,
-            cache_hit: true,
-            pending: Vec::new(),
-        }
-    }
 }
 
 impl EffectiveResolution {
@@ -107,7 +93,6 @@ impl EffectiveResolution {
         WriterResolution {
             writer: self.writer,
             value: self.value,
-            cache_hit: self.cache_hit,
         }
     }
 
@@ -259,7 +244,6 @@ impl KeyStateResolver {
             .monitor
             .committed_value_at(key, holder, requirement)
             .await?;
-        resolved.cache_hit &= committed.cache_hit;
         match committed.status {
             TxCommitStatus::Ok => {
                 if !committed.value.not_written {
@@ -558,9 +542,7 @@ mod tests {
             .await
             .unwrap()
             .into_writer();
-        let mut warm_writer = expected.writer.clone();
-        warm_writer.cache_hit = true;
-        assert_eq!(writer, warm_writer, "{context}: warm writer");
+        assert_eq!(writer, expected.writer, "{context}: warm writer");
         harness.assert_operations(0, &format!("{context}: warm writer"));
 
         let (state, _background) = harness.resolver();
@@ -637,7 +619,6 @@ mod tests {
                 } else {
                     current_case.value()
                 },
-                cache_hit: false,
             },
             holders: HolderResolution {
                 writer,
@@ -724,7 +705,6 @@ mod tests {
                 writer: WriterResolution {
                     writer: writer.clone(),
                     value: current_case.value(),
-                    cache_hit: true,
                 },
                 holders: HolderResolution {
                     writer,

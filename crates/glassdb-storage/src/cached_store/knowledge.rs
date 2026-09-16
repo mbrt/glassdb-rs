@@ -51,7 +51,6 @@ pub(super) struct FetchResult {
     value: Option<ErasedValue>,
     revision: Option<Revision>,
     evidence: Evidence,
-    cache_hit: bool,
 }
 
 /// Present knowledge retained for a version-conditional backend read.
@@ -212,7 +211,6 @@ impl Knowledge {
                     value: Some(value),
                     revision: Some(revision),
                     evidence,
-                    cache_hit: true,
                 }))
             }
             EntryState::Absent { evidence } => {
@@ -224,7 +222,6 @@ impl Knowledge {
                     value: None,
                     revision: None,
                     evidence,
-                    cache_hit: true,
                 }))
             }
         }
@@ -271,7 +268,6 @@ impl Knowledge {
     pub(super) fn result_from_observation<V: Send + Sync + 'static>(
         &self,
         observed: &Observation<V>,
-        cache_hit: bool,
     ) -> FetchResult {
         let value = observed
             .value
@@ -281,16 +277,14 @@ impl Knowledge {
             value,
             revision: observed.revision.clone(),
             evidence: observed.evidence.clone(),
-            cache_hit,
         }
     }
 
-    pub(super) fn result_from_seed(&self, seed: PresentSeed, cache_hit: bool) -> FetchResult {
+    pub(super) fn result_from_seed(&self, seed: PresentSeed) -> FetchResult {
         FetchResult {
             value: Some(seed.value),
             revision: Some(seed.revision),
             evidence: seed.evidence,
-            cache_hit,
         }
     }
 
@@ -338,7 +332,6 @@ impl Knowledge {
             value: Some(erased),
             revision: Some(revision),
             evidence,
-            cache_hit: false,
         }
     }
 
@@ -363,7 +356,6 @@ impl Knowledge {
             value: Some(value),
             revision: Some(revision),
             evidence,
-            cache_hit: false,
         }
     }
 
@@ -376,7 +368,6 @@ impl Knowledge {
             value: None,
             revision: None,
             evidence: self.install_absent(path, current_after),
-            cache_hit: false,
         }
     }
 
@@ -391,7 +382,6 @@ impl Knowledge {
             value: None,
             revision: None,
             evidence,
-            cache_hit: false,
         }
     }
 
@@ -413,7 +403,6 @@ impl Knowledge {
             value: Some(seed.value),
             revision: Some(seed.revision),
             evidence,
-            cache_hit: true,
         }
     }
 
@@ -431,7 +420,6 @@ impl Knowledge {
             value,
             revision: fetched.revision,
             evidence: fetched.evidence,
-            cache_hit: fetched.cache_hit,
         })
     }
 

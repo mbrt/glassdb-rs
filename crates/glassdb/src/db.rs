@@ -324,6 +324,7 @@ impl Database {
         let delta = Stats {
             backend: engine.backend,
             cache: engine.cache,
+            monitor: engine.monitor,
             locker: engine.locker,
             coordinator: engine.coordinator,
             direct_commit: engine.direct_commit,
@@ -495,9 +496,7 @@ impl DbInner {
 
             // Collect the accesses produced by the transaction body.
             let (accesses, catalog_accesses) = tx.collect_accesses();
-            let metrics = tx.metrics();
             stats.reads += accesses.read_count() as u64;
-            stats.cache_hits += metrics.cache_hits;
             stats.writes += accesses.write_count() as u64;
 
             if body_outcome.is_ok() {

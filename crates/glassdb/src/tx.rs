@@ -46,10 +46,6 @@ struct TransactionInner {
     catalog: CatalogOverlay,
 }
 
-pub(crate) struct TransactionMetrics {
-    pub(crate) cache_hits: u64,
-}
-
 impl Transaction {
     /// Reads the value for `key` within the transaction, returning `None` when
     /// the key is absent. Repeatable: a value read once is returned consistently,
@@ -78,18 +74,16 @@ impl Transaction {
 
         match self.db.engine.read(&key, std::time::Duration::MAX).await {
             Ok(outcome) => {
-                let (value, cache_hit, evidence) = outcome.into_parts();
+                let (value, evidence) = outcome.into_parts();
                 match value {
                     None => {
                         let mut inner = self.inner.lock().unwrap();
-                        inner.accesses.record_not_found(key, cache_hit, evidence);
+                        inner.accesses.record_not_found(key, evidence);
                         Ok(None)
                     }
                     Some(rv) => {
                         let mut inner = self.inner.lock().unwrap();
-                        inner
-                            .accesses
-                            .record_found(key, rv.value.clone(), cache_hit, evidence);
+                        inner.accesses.record_found(key, rv.value.clone(), evidence);
                         Ok(Some(rv.value.to_vec()))
                     }
                 }
@@ -333,13 +327,6 @@ impl Transaction {
     pub(crate) fn collect_accesses(&self) -> (AccessSet, CatalogAccesses) {
         let inner = self.inner.lock().unwrap();
         (inner.accesses.accesses(), inner.catalog.accesses())
-    }
-
-    pub(crate) fn metrics(&self) -> TransactionMetrics {
-        let inner = self.inner.lock().unwrap();
-        TransactionMetrics {
-            cache_hits: inner.accesses.cache_hits(),
-        }
     }
 
     async fn create_child(

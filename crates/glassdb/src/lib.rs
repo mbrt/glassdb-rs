@@ -65,8 +65,8 @@ pub use glassdb_storage::{
     SplitPolicyBuilder,
 };
 pub use glassdb_trans::{
-    DirectCommitStats, InlinePressureStats, LeafCoordinatorStats, LockerStats, ProtocolTiming,
-    SplitterStats,
+    DirectCommitStats, InlinePressureStats, LeafCoordinatorStats, LockerStats, MonitorStats,
+    ProtocolTiming, SplitterStats,
 };
 
 // Re-export the backend abstraction so callers can construct a Database without

@@ -34,7 +34,7 @@ pub use error::TransError;
 pub use gc::{GcDiagnostics, GcStats};
 pub use key_resolver::ScanResult;
 pub use leaf_coord::LeafCoordinatorStats;
-pub use monitor::ProtocolTiming;
+pub use monitor::{MonitorStats, ProtocolTiming};
 pub use reader::{ReadOutcome, ReadValue};
 pub use split::{InlinePressureStats, SplitterStats};
 pub use tlocker::LockerStats;

@@ -5,6 +5,7 @@
 //! transaction to finalize.
 
 use std::collections::{HashMap, hash_map::Entry};
+use std::ops::{AddAssign, Sub};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
@@ -21,6 +22,38 @@ use tokio::sync::oneshot;
 use crate::error::TransError;
 
 const FINAL_STATUS_CACHE_SIZE: usize = 16384;
+
+/// Final-status cache activity for one snapshot or accumulated interval.
+///
+/// Each final-status cache lookup counts once. Reads from local owner state
+/// bypass this cache and do not count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MonitorStats {
+    /// Final-status cache lookups that found a committed or aborted status.
+    pub final_status_hits: u64,
+    /// Final-status cache lookups that found no status.
+    pub final_status_misses: u64,
+}
+
+impl AddAssign for MonitorStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.final_status_hits += rhs.final_status_hits;
+        self.final_status_misses += rhs.final_status_misses;
+    }
+}
+
+impl Sub for MonitorStats {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self {
+            final_status_hits: self.final_status_hits.saturating_sub(rhs.final_status_hits),
+            final_status_misses: self
+                .final_status_misses
+                .saturating_sub(rhs.final_status_misses),
+        }
+    }
+}
 
 /// Timing parameters for transaction liveness and recovery.
 ///
@@ -402,6 +435,7 @@ impl FinalStatus {
 struct FinalStatusCache {
     capacity: usize,
     entries: LinkedHashMap<TxId, FinalStatus>,
+    stats: MonitorStats,
 }
 
 impl FinalStatusCache {
@@ -409,11 +443,18 @@ impl FinalStatusCache {
         Self {
             capacity,
             entries: LinkedHashMap::new(),
+            stats: MonitorStats::default(),
         }
     }
 
     fn get(&mut self, tid: &TxId) -> Option<FinalStatus> {
-        self.entries.to_back(tid).copied()
+        let status = self.entries.to_back(tid).copied();
+        if status.is_some() {
+            self.stats.final_status_hits += 1;
+        } else {
+            self.stats.final_status_misses += 1;
+        }
+        status
     }
 
     fn insert(&mut self, tid: TxId, status: FinalStatus) {
@@ -541,14 +582,12 @@ pub(crate) struct TValue {
 pub(crate) struct KeyCommitStatus {
     pub status: TxCommitStatus,
     pub value: TValue,
-    pub cache_hit: bool,
 }
 
 /// Transaction status together with the exact evidence used to resolve it.
 struct TxStatusEvidence {
     state: TxRecordState,
     observation: Option<Observation<TxLog>>,
-    cache_hit: bool,
 }
 
 impl TxStatusEvidence {
@@ -557,7 +596,6 @@ impl TxStatusEvidence {
             Some(record) => Ok(Self {
                 state: TxRecordState::try_from_status(Some(record.status))?,
                 observation: record.last_observation.clone(),
-                cache_hit: true,
             }),
             // An owner operation may precede entry into the logged protocol.
             // Like a freshly observed absent foreign record, it is not yet
@@ -565,18 +603,15 @@ impl TxStatusEvidence {
             None => Ok(Self {
                 state: TxRecordState::Missing,
                 observation: None,
-                cache_hit: true,
             }),
         }
     }
 
     fn observed(status: TxStatus) -> Result<Self, TransError> {
         let state = TxRecordState::try_from_observation(&status.observation)?;
-        let cache_hit = status.observation.cache_hit();
         Ok(Self {
             state,
             observation: Some(status.observation),
-            cache_hit,
         })
     }
 
@@ -584,7 +619,6 @@ impl TxStatusEvidence {
         Ok(Self {
             state: TxRecordState::try_from_status(Some(status))?,
             observation: None,
-            cache_hit: true,
         })
     }
 
@@ -623,6 +657,11 @@ impl Monitor {
                 shards: Sharded::new(|_| Mutex::new(State::default())),
             }),
         }
+    }
+
+    /// Returns final-status cache activity since the previous sample.
+    pub(crate) fn stats_and_reset(&self) -> MonitorStats {
+        std::mem::take(&mut self.inner.final_status.lock().unwrap().stats)
     }
 
     pub(crate) fn protocol_timing(&self) -> ProtocolTiming {
@@ -1436,13 +1475,10 @@ impl Monitor {
             return Ok(KeyCommitStatus {
                 status,
                 value: TValue::default(),
-                cache_hit: evidence.cache_hit,
             });
         }
 
-        let status_cache_hit = evidence.cache_hit;
         let tl = self.final_log(tid, status, evidence.observation).await?;
-        let cache_hit = status_cache_hit && tl.cache_hit();
         let tl = tl
             .value()
             .ok_or_else(|| TransError::other(format!("missing final log for {tid}")))?;
@@ -1455,7 +1491,6 @@ impl Monitor {
                         deleted: entry.deleted,
                         not_written: false,
                     },
-                    cache_hit,
                 });
             }
         }
@@ -1465,7 +1500,6 @@ impl Monitor {
                 not_written: true,
                 ..Default::default()
             },
-            cache_hit,
         })
     }
 
@@ -2347,6 +2381,84 @@ mod tests {
         assert!(cache.get(&third).is_some());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn stats_count_final_status_lookups_across_clones() {
+        let recorded = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
+        let operations = recorded.log();
+        let (writer, writer_ctx) = new_test_monitor(recorded.clone());
+        let (reader, _reader_ctx) = new_test_monitor(recorded);
+        let clone = reader.clone();
+
+        for (id, status) in [
+            (b"committed".as_slice(), TxCommitStatus::Ok),
+            (b"aborted", TxCommitStatus::Aborted),
+        ] {
+            let tid = TxId::from_bytes(id.to_vec());
+            writer_ctx
+                .tl
+                .set(&TxLog::new(tid.clone(), status))
+                .await
+                .unwrap();
+            assert_eq!(reader.tx_status(&tid).await.unwrap(), status);
+            assert_eq!(
+                clone.stats_and_reset(),
+                MonitorStats {
+                    final_status_hits: 0,
+                    final_status_misses: 1,
+                }
+            );
+
+            operations.lock().unwrap().clear();
+            assert_eq!(clone.tx_status(&tid).await.unwrap(), status);
+            assert_eq!(
+                reader.stats_and_reset(),
+                MonitorStats {
+                    final_status_hits: 1,
+                    final_status_misses: 0,
+                }
+            );
+            assert!(operations.lock().unwrap().is_empty());
+            assert_eq!(clone.stats_and_reset(), MonitorStats::default());
+        }
+        assert_eq!(writer.stats_and_reset(), MonitorStats::default());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stats_exclude_local_owner_state_and_do_not_cache_mutable_statuses() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (owner, owner_ctx) = new_test_monitor(backend.clone());
+        let (reader, _reader_ctx) = new_test_monitor(backend);
+        let tid = TxId::from_bytes(b"local".to_vec());
+        owner.begin_tx(&tid);
+        assert_eq!(
+            owner.tx_status(&tid).await.unwrap(),
+            TxCommitStatus::Pending
+        );
+        assert_eq!(owner.stats_and_reset(), MonitorStats::default());
+
+        for (id, status) in [
+            (b"pending".as_slice(), TxCommitStatus::Pending),
+            (b"wounded", TxCommitStatus::Wounded),
+        ] {
+            let tid = TxId::from_bytes(id.to_vec());
+            owner_ctx
+                .tl
+                .set(&TxLog::new(tid.clone(), status))
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                assert_eq!(reader.tx_status(&tid).await.unwrap(), status);
+            }
+            assert_eq!(
+                reader.stats_and_reset(),
+                MonitorStats {
+                    final_status_hits: 0,
+                    final_status_misses: 2,
+                }
+            );
+        }
+    }
+
     #[tokio::test]
     async fn begin_persisted_tx_durably_records_manifest() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -3094,7 +3206,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&*cs.value.value, b"val1");
-        assert!(cs.cache_hit);
 
         // A key the transaction didn't write.
         let key2 = logical_key(b"key2");
