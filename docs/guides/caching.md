@@ -137,7 +137,7 @@ The capture point belongs to the policy that knows this ordering:
 | Transaction validation | After the body, before the key and predicate lock CASes used as validation evidence. |
 | GC eligibility | Before reading candidate status. |
 | GC reference checks | After eligibility checks finish; the earlier status barrier cannot replace this one. |
-| Structural recovery | After observing a Ready intent, before checking its source and reachability. The discovery barrier cannot replace this one. |
+| Structural recovery | After observing all intents in a discovery batch, before checking their sources and reachability. Later discoveries need a new barrier. The discovery barrier cannot replace this one. |
 | Separator publication | After observing the split, before routing and reading its child chain. Carry this barrier through reconciliation. |
 | Missing-object retries | After observing the missing object, before rechecking dependent state. |
 
@@ -496,11 +496,17 @@ Cached Preparing can also defer peer help while its participant remains Pending.
 The live owner drives its own publication; finalization or lease recovery lets
 a later pass attempt revision-checked cleanup.
 
-Source fencing and reachability classification still capture a currentness
-barrier after observing Ready. Neither the intent's watermark nor the earlier
-discovery bound can replace it. Participant settlement still uses its final
-listing bound for departure; final transaction status alone does not close the
-intent namespace because recursive recovery can create more intents.
+Source fencing and reachability classification share one currentness barrier
+captured after the entire discovery batch is in hand. Each queued intent keeps
+that barrier through recovery. The immutable Ready bodies let checks of the
+same source or route reuse evidence within the batch. Later discovery, including
+participant rediscovery after recursive recovery, captures a new barrier after
+its own observations. Do not add or replace observations under an earlier
+batch's barrier, or substitute an intent's watermark or the discovery bound.
+
+Participant settlement still uses its final listing bound for departure; final
+transaction status alone does not close the intent namespace because recursive
+recovery can create more intents. Separator publication retains its own barrier.
 
 ## Boundaries of the guarantee
 

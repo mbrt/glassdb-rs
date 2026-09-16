@@ -817,6 +817,250 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
     );
 }
 
+// Stage a non-root split in durable order, leaving its publication to the test.
+async fn stage_recovery_split(
+    s: &TestStore,
+    participant: &TxId,
+    worker: &TxId,
+    sibling: &str,
+) -> (Node, LeafObservation) {
+    let mut intent = nonroot_intent("L", sibling, b"");
+    intent.participant_id = participant.clone();
+    intent.phase = StructuralIntentPhase::Preparing;
+    intent.source_version.clear();
+    let prepared = s.write_structural_intent(sibling, &intent).await.unwrap();
+    let (mut source, observed) = s.load_node(COLL, "L", Requirement::ANY).await.unwrap();
+    source.set_structural_gate(worker.clone());
+    assert!(
+        s.store_node(COLL, "L", &source, Some(&observed))
+            .await
+            .unwrap()
+    );
+    let (mut source, gated) = s.load_node(COLL, "L", Requirement::ANY).await.unwrap();
+    let (right, split_key) = source.split(sibling).unwrap();
+    source.remove_structural_gate(worker);
+    intent.source_version = gated.revision().unwrap().serialize().to_string();
+    intent.split_key = split_key;
+    intent.phase = StructuralIntentPhase::Ready;
+    assert!(
+        s.intent_store
+            .update(&prepared, &canonical_intent(&intent))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    s.store_node(COLL, sibling, &right, None).await.unwrap();
+    (source, gated)
+}
+
+async fn check_recovery_batch_reuses_source_reads(explicit: bool) {
+    let memory = Arc::new(MemoryBackend::new());
+    let recorder = Arc::new(RecordingBackend::new(memory.clone()));
+    let operations = recorder.log();
+    let s = store_with_backend(recorder);
+    s.store_node(
+        COLL,
+        "L",
+        &leaf_node(&[b"a", b"b", b"m", b"n"], None, None),
+        None,
+    )
+    .await
+    .unwrap();
+    s.create_root(
+        COLL,
+        &Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())])),
+    )
+    .await
+    .unwrap();
+    let bg = Arc::new(Background::new());
+    let sp = splitter(&s, &bg, tiny());
+    let participant = TxId::with_priority(1, b"batch-participant");
+    sp.begin_topology_tx(&collection(), &participant)
+        .await
+        .unwrap();
+    sp.join_topology(&collection(), &participant).await.unwrap();
+
+    // Two failed attempts leave different Ready intents for the same source.
+    // Releasing each gate prevents its recorded publication CAS from landing.
+    for sibling in ["R", "U"] {
+        let worker = TxId::with_priority(1, sibling.as_bytes());
+        stage_recovery_split(&s, &participant, &worker, sibling).await;
+        let (mut source, observed) = s.load_node(COLL, "L", Requirement::ANY).await.unwrap();
+        source.remove_structural_gate(&worker);
+        assert!(
+            s.store_node(COLL, "L", &source, Some(&observed))
+                .await
+                .unwrap()
+        );
+    }
+    sp.mon.abort_owned_tx(&participant).await.unwrap();
+    operations.lock().unwrap().clear();
+    if explicit {
+        sp.settle_topology_participant(&collection(), &participant)
+            .await
+            .unwrap();
+    } else {
+        assert!(sp.recover_structural_intents().await.unwrap());
+    }
+    let recorded = std::mem::take(&mut *operations.lock().unwrap());
+    for path in [node_path("L"), root_path()] {
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|op| {
+                    op.path == path.to_string() && matches!(op.op, "read" | "read_if_modified")
+                })
+                .count(),
+            1,
+            "one discovery batch needs only one currentness check of {path}"
+        );
+    }
+    let verifier = store_with_backend(memory);
+    for sibling in ["R", "U"] {
+        assert!(matches!(
+            verifier.load_node(COLL, sibling, Requirement::ANY).await,
+            Err(StorageError::NotFound)
+        ));
+    }
+    let (source, _) = verifier
+        .load_node(COLL, "L", Requirement::ANY)
+        .await
+        .unwrap();
+    let keys: Vec<_> = source
+        .as_leaf()
+        .unwrap()
+        .entries()
+        .map(|entry| entry.key.clone())
+        .collect();
+    assert_eq!(keys, [b"a", b"b", b"m", b"n"]);
+    assert!(
+        verifier
+            .discover_structural_intents("db", Requirement::ANY)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let (record, _) = verifier
+        .records
+        .load_record(&collection(), Requirement::ANY)
+        .await
+        .unwrap();
+    assert_eq!(record.topology_participants().count(), 0);
+}
+
+#[tokio::test]
+async fn recovery_sweep_reuses_source_reads_across_a_discovered_batch() {
+    check_recovery_batch_reuses_source_reads(false).await;
+}
+
+#[tokio::test]
+async fn participant_settlement_reuses_source_reads_across_a_discovered_batch() {
+    check_recovery_batch_reuses_source_reads(true).await;
+}
+
+#[tokio::test]
+async fn later_participant_discovery_checks_sources_after_its_own_ready_intents() {
+    for explicit in [false, true] {
+        let memory = Arc::new(MemoryBackend::new());
+        let prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+        let (backend, gate) = OpGate::wrap(
+            memory.clone(),
+            move |op| matches!(op, BackendOp::DeleteIf { path, .. } if path.starts_with(&prefix)),
+        );
+        let s = store_with_backend(backend);
+        let peer = store_with_backend(memory.clone());
+        s.store_node(
+            COLL,
+            "L",
+            &leaf_node(&[b"a", b"b", b"m", b"n"], None, None),
+            None,
+        )
+        .await
+        .unwrap();
+        s.create_root(
+            COLL,
+            &Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())])),
+        )
+        .await
+        .unwrap();
+        let bg = Arc::new(Background::new());
+        let sp = splitter(&s, &bg, tiny());
+        let participant = TxId::with_priority(1, b"later-discovery-participant");
+        sp.begin_topology_tx(&collection(), &participant)
+            .await
+            .unwrap();
+        sp.join_topology(&collection(), &participant).await.unwrap();
+        let first_worker = TxId::with_priority(1, b"first-worker");
+        stage_recovery_split(&s, &participant, &first_worker, "R").await;
+        let (mut source, observed) = s.load_node(COLL, "L", Requirement::ANY).await.unwrap();
+        source.remove_structural_gate(&first_worker);
+        assert!(
+            s.store_node(COLL, "L", &source, Some(&observed))
+                .await
+                .unwrap()
+        );
+        sp.mon.abort_owned_tx(&participant).await.unwrap();
+
+        gate.arm();
+        let recovering = {
+            let sp = sp.clone();
+            let participant = participant.clone();
+            tokio::spawn(async move {
+                if explicit {
+                    sp.settle_topology_participant(&collection(), &participant)
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(sp.recover_structural_intents().await.unwrap());
+                }
+            })
+        };
+        gate.wait_until_entered().await;
+        // Recovery has checked the unsplit source for the first batch. A peer
+        // can create more recovery work under this finalized participant, just
+        // as recursive parent recovery can. Its new sibling is now reachable.
+        let later_worker = TxId::with_priority(1, b"later-worker");
+        let (published, expected) =
+            stage_recovery_split(&peer, &participant, &later_worker, "U").await;
+        assert!(
+            peer.store_node(COLL, "L", &published, Some(&expected))
+                .await
+                .unwrap()
+        );
+        gate.release();
+        recovering.await.unwrap();
+
+        let verifier = store_with_backend(memory);
+        let router = TreeRouter::new(verifier.nodes.clone(), std::num::NonZeroUsize::MIN);
+        for key in [b"a".as_slice(), b"b", b"m", b"n"] {
+            let leaf = router
+                .route_key(&collection(), key, Requirement::ANY)
+                .await
+                .unwrap();
+            assert!(leaf.node().unwrap().as_leaf().unwrap().exists(key));
+        }
+        assert!(
+            verifier
+                .load_node(COLL, "U", Requirement::ANY)
+                .await
+                .is_ok()
+        );
+        assert!(
+            verifier
+                .discover_structural_intents("db", Requirement::ANY)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let (record, _) = verifier
+            .records
+            .load_record(&collection(), Requirement::ANY)
+            .await
+            .unwrap();
+        assert_eq!(record.topology_participants().count(), 0);
+    }
+}
+
 /// An intent must be fenced against the revision its own worker recorded, not
 /// against whatever holds the source gate now. A later split gating the same
 /// source cannot keep an abandoned intent's orphan alive, because the abandoned

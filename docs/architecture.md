@@ -352,10 +352,13 @@ transition recorded, not against the structural gate the source carries now. A
 worker publishes its split with one compare-and-swap expecting that revision and
 does not read the source again first, so the revision alone says whether the
 worker can still land, and a later split of the same source cannot shield an
-abandoned intent. Recovery bounds these reads by a currentness barrier it
-allocates once it holds the Ready record, because a cache entry's watermark is
-allocated before the read that fills it and therefore cannot order a read after
-the gate.
+abandoned intent. Recovery captures one classification barrier after each
+completed discovery batch and keeps it with that batch's intent recovery actions.
+Ready bodies are immutable, so source and reachability checks can reuse evidence
+within the batch. Later discoveries get a new barrier, including intents created
+by recursive recovery under a finalized participant. A cache entry's watermark
+is allocated before the read that fills it and therefore cannot order a read
+after the gate.
 
 Participant departure starts with `ANY`; a removal CAS proves completion.
 For background settlement, a present record without the participant must meet
@@ -1142,7 +1145,7 @@ completed prerequisite work. Transaction validation captures one after the body
 and before key and predicate lock CASes, and uses it for point, scan,
 collection, and transaction-status dependencies. GC captures a status barrier,
 then a separate reference barrier after eligibility checks. Structural recovery
-captures a new barrier after observing a Ready intent. Separator publication
+captures a new barrier after each completed intent discovery batch. Separator publication
 carries its start barrier through routing and child-chain reconciliation.
 
 Decision interfaces that need an ordering bound require the barrier type. Shared
