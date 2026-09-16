@@ -163,7 +163,7 @@ impl DirectCommit {
         }
     }
 
-    /// Returns the one leaf currently owning every dependency in `member`.
+    /// Selects one candidate leaf for all dependencies in `member`.
     async fn route_member(&self, member: &DirectMember) -> Result<Option<ObjectPath>, TransError> {
         let keys = member
             .keys
@@ -628,6 +628,9 @@ impl LeafOperation for DirectCommitOperation {
     }
 
     fn requirement(&self) -> Requirement {
+        // New publication requires CAS against the observed revision. An exact
+        // output marker for this non-reused identity instead proves an earlier
+        // publication; it does not need to prove that the output is still current.
         Requirement::ANY
     }
 

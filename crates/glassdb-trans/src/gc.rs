@@ -7,8 +7,9 @@
 //! GC skips missing, pending, and wounded logs (ADR-071). It filters
 //! committed and acknowledged aborted candidates by
 //! durable status and the safety horizon before capturing a fresh requirement
-//! for reference checks. Cached absence from before eligibility cannot authorize
-//! deletion. Wounded markers stay pinned until owner acknowledgement (ADR-059).
+//! for reference checks. Cached leaf contents from before eligibility cannot
+//! rule out a reference. Wounded markers stay pinned until owner acknowledgement
+//! (ADR-059).
 //!
 //! Lock reclamation uses the locker's coordinator-backed operations (ADR-029),
 //! so GC does not issue its own leaf mutations.
@@ -73,7 +74,7 @@ struct Reclamation {
 /// Which leaf-entry field a liveness check consults for a recorded key: a
 /// written key is referenced while it is the entry's `current_writer`; a locked
 /// key while it appears in `locked_by`. Rides along as the per-key payload of
-/// [`Gc::still_referenced`]'s batched leaf load.
+/// [`Gc::entries_referenced`]'s batched leaf load.
 enum CheckKind {
     Writer,
     Holder,
@@ -447,11 +448,12 @@ impl Gc {
         // reachability. A crash after the commit point must not leave a dropped
         // collection forever merely because this same log stores a live value
         // in another collection.
-        let mut changed = self
+        let removed_directories = self
             .locker
             .collections()
-            .recover_write_back(tid, &log.collection_changes, &log.locks)
+            .recover_write_back(tid, &log.collection_changes, &log.locks, Requirement::ANY)
             .await?;
+        let mut changed = !removed_directories.is_empty();
         let dropped = log
             .collection_changes
             .iter()
@@ -472,17 +474,37 @@ impl Gc {
             .collect::<Vec<_>>();
         changed |= self.collection_lifecycle.reclaim(&dropped).await?;
         changed |= self.collection_lifecycle.reclaim(&unused_prepared).await?;
-        if self.still_referenced(tid, log, barrier).await? {
+        if self.entries_referenced(tid, log, barrier).await? {
             return Ok(GcOutcome::from_progress(changed));
         }
-        // The liveness check already ruled out every recorded entry lock.
-        // Membership and topology effects still need their own cleanup.
-        let remaining: Vec<_> = log
+        // The original log's entry references are clear. Applied directory
+        // write-back proves removal even after cache eviction: this
+        // committed identity cannot acquire those holders again. Keep every
+        // other directory and all membership/topology obligations.
+        let mut remaining: Vec<_> = log
             .locks
             .iter()
-            .filter(|lock| !matches!(lock, TxLock::Entry { .. }))
+            .filter(|lock| match lock {
+                TxLock::Entry { .. } => false,
+                TxLock::Directory { collection, .. } => !removed_directories.contains(collection),
+                _ => true,
+            })
             .cloned()
             .collect();
+        changed |= !self
+            .locker
+            .collections()
+            .recover_write_back(
+                tid,
+                &log.collection_changes,
+                &remaining,
+                Requirement::after(barrier),
+            )
+            .await?
+            .is_empty();
+        // Successful bounded completion proves every submitted directory clear,
+        // including no-ops. The returned progress set alone is not that proof.
+        remaining.retain(|lock| !matches!(lock, TxLock::Directory { .. }));
         let released = self.release_locks(tid, &remaining, barrier).await?;
         changed |= released.changed;
         if !released.complete {
@@ -548,7 +570,7 @@ impl Gc {
     /// share a leaf, so a per-key load would re-read the same leaf several times
     /// per candidate. Each key carries the [`CheckKind`] that says which field
     /// to inspect.
-    async fn still_referenced(
+    async fn entries_referenced(
         &self,
         tid: &TxId,
         log: &TxLog,
@@ -573,13 +595,16 @@ impl Gc {
                 .push((key, kind));
         }
         for items in by_collection.into_values() {
+            // Stale indexes remain usable routing hints: right links correct
+            // split placement, and the terminal leaf must meet the GC bound.
+            // Committed keys name collections created before commit; children
+            // are created before their links are published. Neither identity
+            // is reused, and published nodes remain until collection reclamation.
+            // Recovery fences the split source before probing unpublished nodes.
+            // Thus an old absence cannot hide a later live route.
             let groups = match self
                 .router
-                .route_keys_with_requirements(
-                    items,
-                    Requirement::after(barrier),
-                    Requirement::after(barrier),
-                )
+                .route_keys_with_requirements(items, Requirement::ANY, Requirement::after(barrier))
                 .await
             {
                 Ok(groups) => groups,
@@ -607,14 +632,6 @@ impl Gc {
                 }
             }
         }
-        if self
-            .locker
-            .collections()
-            .is_referenced(tid, &log.locks, Requirement::after(barrier))
-            .await?
-        {
-            return Ok(true);
-        }
         Ok(false)
     }
 
@@ -639,7 +656,7 @@ impl Gc {
         for collection in topology {
             let records = self
                 .structural_intents
-                .list_for_participant(
+                .discover_for_participant(
                     collection.db_root_component(),
                     tid,
                     Requirement::after(barrier),

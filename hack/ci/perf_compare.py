@@ -183,6 +183,7 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
         "completedPairs": {name: 0 for name in (*CASES, "mixed")},
         "cases": CASES,
         "mixedArgs": MIXED_ARGS,
+        "diagnosticModel": perf_report.DIAGNOSTIC_MODEL,
         "processTimeoutSeconds": PROCESS_TIMEOUT,
         "base": base,
         "candidate": candidate or "working tree",
@@ -296,7 +297,10 @@ def measure(output: Path, manifest: dict) -> None:
                             log_name = f"criterion-{name}"
                         directory = run(side, repetition, log_name, command)
                         _, warnings = perf_report.read_measurement(
-                            directory, name, mixed_args=manifest["mixedArgs"]
+                            directory,
+                            name,
+                            mixed_args=manifest["mixedArgs"],
+                            diagnostic_model=manifest.get("diagnosticModel"),
                         )
                         if warnings:
                             raise perf_report.ReportError("; ".join(warnings))

@@ -126,6 +126,40 @@ rechecks the cache after the earlier operation finishes.
 approximate cache policy. Transaction validation, mutation receipts, and
 recovery use exact sequence barriers without doing time arithmetic.
 
+### Decisions from `ANY` reads
+
+An `ANY` read supplies a usable state, not permission to make every decision
+from it. State the proof beside a decision that accepts stale data, especially
+an early return, skipped mutation, or absent-object result:
+
+| Proof | Required constraint |
+| --- | --- |
+| Later validation | Retain the read or predicate dependency and validate it before accepting the body outcome. |
+| Conditional mutation | Check the observed revision when applying the change. This does not justify a branch that skips the CAS. |
+| Stable fact | Reuse only the fact that cannot change: for example, final committed contents or an exact publication marker for a transaction identity that is not reused. Historical contents do not prove current object presence. |
+| Shared local knowledge | Use the cache that completed acquisition or fencing, or previously returned that holder. A no-holder result also needs to exclude later acquisition by that identity. This proof does not transfer to another database instance. |
+| Publication and lifecycle | Establish why the caller cannot have cached absence before a later live publication. Nodes precede their published links, roots precede collection bindings, and retired identities are not reused. |
+
+Shared local knowledge includes L2. Per-path coordination prevents older replies
+from replacing established knowledge, and invalidation or replacement of older
+persistent entries prevents an L1 miss from restoring them. Without a usable
+entry in either cache, the backend read starts after the prerequisite work.
+
+Fresh identities alone do not prove permanent absence. A retried create can
+restore a deleted path. Structural recovery fences publication before treating
+reserved nodes as unreachable; a late create can then leave an orphan, as
+permitted by ADR-043. Do not use that exception to skip checks for a live
+reference or for completion of participant departure.
+
+Cached interior routing uses right links to correct stale split routes. The
+terminal leaf must meet the caller's requirement. If a root or child is absent,
+there is no terminal leaf to check: the caller still needs the publication and
+lifecycle proof for a negative route.
+
+If none of these proofs applies, use a requirement from the policy's existing
+barrier. Capture a new barrier only when the decision needs a later ordering
+point.
+
 ## Currentness barriers
 
 `Timeline::currentness_barrier()` captures an opaque currentness barrier after
@@ -137,7 +171,7 @@ The capture point belongs to the policy that knows this ordering:
 | Transaction validation | After the body, before the key and predicate lock CASes used as validation evidence. |
 | GC eligibility | Before reading candidate status. |
 | GC reference checks | After eligibility checks finish; the earlier status barrier cannot replace this one. |
-| Structural recovery | After observing a Ready intent, before checking its source and reachability. The discovery barrier cannot replace this one. |
+| Structural recovery | After observing all intents in a discovery batch, before checking their sources and reachability. Later discoveries need a new barrier. The discovery barrier cannot replace this one. |
 | Separator publication | After observing the split, before routing and reading its child chain. Carry this barrier through reconciliation. |
 | Missing-object retries | After observing the missing object, before rechecking dependent state. |
 
@@ -298,6 +332,12 @@ the requirement. Resolver-requested bounds remain in force across retries.
 `ResolveCtx::requirement` applies to dependent object reads; it does not claim
 that the loaded or staged leaf already satisfies the bound.
 
+The first leaf load uses `ANY` as a speculative CAS precondition, including for
+lock acquisition. This does not weaken the submitted requirement. Retries load
+against the retained combined bound, and a missing initial leaf is rechecked
+against the submitted bound before returning absence. A cached index can still
+cause rerouting because an index cannot become a leaf again.
+
 A dirty plan can use its CAS to confirm the loaded state after the combined
 bound, without a preliminary leaf read. A plan with no changes instead calls
 `check_leaf_current`: sufficient evidence costs no I/O, an unchanged backend
@@ -307,6 +347,12 @@ state. A leaf CAS cannot repair dependent reads made with a weaker requirement.
 Resolvers may retain only facts that remain valid when a plan is discarded;
 this also applies to reconciliation of an earlier uncertain CAS. An exact
 historical own marker can prove that a mutation landed; a staged proposal cannot.
+
+Acquisition still uses the validation barrier to find current scan coverage and
+to resolve transaction dependencies. Point and scan validation after locking
+retain that barrier. An older seed does not justify omitting a leaf from a scan
+or granting an exact-state shortcut: validation must use the actual observation
+or CAS receipt, and fall back to logical validation when it is insufficient.
 
 ## Per-path coordination
 
@@ -424,6 +470,112 @@ For read-only transactions, a concurrent write after validation can be ordered
 after the transaction; a write that invalidates the observed result is detected
 during validation. This is how the public strongly consistent read path can
 execute cheaply from cache without treating an arbitrary cache hit as current.
+
+### 5. GC separates routing from reference evidence
+
+GC captures its reference barrier after checking candidate eligibility. Its
+point-reference routes use `ANY` for interior nodes and `after(barrier)` for
+terminal leaves. Cached separators can lead to an older placement; right links
+and the bounded terminal read find the current leaf. A root cached as a leaf
+must also meet the terminal requirement, even if a peer has turned it into an
+index. GC must not decide that a writer or holder is absent from an unvalidated
+cached leaf.
+
+Missing routes rely on publication rules: a committed transaction's collections
+exist before commit, children exist before their links are published, and these
+identities are never reused. Published nodes remain present until collection
+reclamation. Recovery can inspect a reserved node before creation, but first
+fences the split's exact source revision. That worker can no longer publish the
+node. GC therefore cannot have a pre-creation cached absence for a later live
+route through normal access. Reclaimed collections can remain absent. This
+proof belongs to the GC caller; `ANY` alone does not make a negative routing
+result current.
+
+### 6. Entry release keeps its leaf completion proof
+
+Entry-release routes use `ANY` for interiors and the caller's requirement for
+terminal leaves. Right links correct stale split placement. Splits resolve
+holds before moving entries, so release need not follow a removed holder to
+another leaf. A root cached as a leaf still needs the terminal check if it has
+become an index.
+
+The release operation accepts an applied removal CAS or a no-holder observation
+that meets the caller's requirement. A recorded membership hold can name a leaf
+with no entry key to route. That leaf keeps its separate completion check;
+refreshing a different routed leaf supplies no evidence for it.
+
+Missing routes depend on the identity, publication, and recovery rules above.
+GC releases entry locks only after acknowledged abort. A manifest can name a
+prepared collection whose root was never created, but that transaction can no
+longer acquire locks there. The root's absence cannot hide a later hold from
+this transaction. Prepared collection reclamation remains a separate step.
+
+### 7. Structural intent discovery retains the original evidence
+
+`StructuralIntentStore::discover`, `discover_page`, and `discover_for_participant`
+accept present cached bodies as recovery candidates. All three use the same
+contract: `requirement` applies only to a listed body observed as absent.
+If that absence has insufficient evidence, discovery rechecks it under the
+supplied requirement; a read error cannot report an empty listing. Successive
+recovery passes keep their existing barriers so an old cached absence cannot
+hide a listed body indefinitely.
+
+Discovery does not advance a present observation's evidence. Structural intent
+identities are never reused, and their only phase change is Preparing to Ready.
+A stale Preparing observation cannot authorize deletion of Ready: deletion
+checks the exact revision. A conflict invalidates the obsolete cached revision
+and recovery requests retry. This can cost a failed deletion before the next
+discovery reads Ready. Ready contents stay fixed until deletion.
+Cached Preparing can also defer peer help while its participant remains Pending.
+The live owner drives its own publication; finalization or lease recovery lets
+a later pass attempt revision-checked cleanup.
+
+Source fencing and reachability classification share one currentness barrier
+captured after the entire discovery batch is in hand. Each queued intent keeps
+that barrier through recovery. The immutable Ready bodies let checks of the
+same source or route reuse evidence within the batch. Later discovery, including
+participant rediscovery after recursive recovery, captures a new barrier after
+its own observations. Do not add or replace observations under an earlier
+batch's barrier, or substitute an intent's watermark or the discovery bound.
+
+Participant settlement still uses its final listing bound for departure; final
+transaction status alone does not close the intent namespace because recursive
+recovery can create more intents. Separator publication retains its own barrier.
+The per-listing bound rechecks only insufficient cached absence. Present intent
+bodies already use `ANY`, so retaining a bound across listings saves no reads
+for those bodies. Keep the bound after intervening recovery work.
+
+### 8. Directory write-back retains removal proof per record
+
+Committed directory write-back starts with `ANY` and returns only the collection
+addresses whose holder-removal CAS applied for that transaction identity. A
+present no-holder observation must satisfy the supplied completion requirement.
+Only insufficient no-holder evidence needs a stronger read; a holder found by
+that read is resolved in the same operation. Missing records use the collection
+identity and publication proof described above. Owner and helper write-back
+keep `ANY` because they share the necessary record and transaction knowledge.
+
+GC first attempts write-back with `ANY`. This preserves directory progress even
+when a live entry keeps the log. After collection reclamation and entry checks,
+GC completes the remaining directories under its existing post-eligibility
+reference bound. Only directories without an earlier applied removal enter
+that phase. Keep the bounded phase after the live-entry early return: moving
+it earlier would add directory reads on repeated checks of logs that still
+store live values.
+
+Successful bounded completion proves every submitted directory clear, including
+when its returned removal set is empty. That set reports applied mutations;
+it does not count bounded no-ops. A speculative `ANY` no-holder result is not
+equivalent to bounded completion. Neither a conflict nor an uncertain mutation
+supplies removal proof. Never use an aggregate progress flag to skip directories,
+or apply one transaction's proof to another identity.
+
+The committed identity cannot acquire those holders again, so cache eviction
+does not invalidate completion. GC needs no later directory reference or release
+reads. Entry references, membership holds, and topology participants still need
+their own checks, including on the same collection. The proof does not establish
+that the full collection record is still current, advance an observation, or
+provide a requirement for another read.
 
 ## Boundaries of the guarantee
 

@@ -344,8 +344,10 @@ impl NodeStore {
         Ok(())
     }
 
-    /// Lists every standalone node under one incarnation-unique collection
+    /// Lists observed standalone nodes under one incarnation-unique collection
     /// prefix, including temporarily unreachable structural nodes.
+    ///
+    /// Uses the same body requirements and absence rules as [`Self::scan_nodes`].
     pub async fn list_nodes(
         &self,
         collection: &CollectionAddress,
@@ -366,6 +368,11 @@ impl NodeStore {
     }
 
     /// Reads one page of standalone nodes, including unreachable structural nodes.
+    ///
+    /// Listing names does not validate their bodies. Each body read, including
+    /// an absent result omitted from the page, uses `requirement`. With `ANY`,
+    /// cached absence can therefore omit a listed node. Callers must justify
+    /// that omission from publication and lifecycle rules. Pages are not a snapshot.
     pub async fn scan_nodes(
         &self,
         collection: &CollectionAddress,

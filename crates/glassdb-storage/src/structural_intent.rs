@@ -17,6 +17,10 @@ pub enum StructuralIntentPhase {
 }
 
 /// The structural state needed to resolve a crash-interrupted split.
+///
+/// An intent identity is never reused. Its only update is Preparing to Ready;
+/// a Ready body stays fixed until deletion. Recovery relies on these rules
+/// when it accepts a cached body as a discovery candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuralIntent {
     pub collection: CollectionAddress,

@@ -11,13 +11,18 @@ use futures::future::try_join_all;
 use glassdb::middleware::RecordingBackend;
 use glassdb::{Backend, Collection, Database, Error, InlinePolicy, Stats};
 use glassdb_backend::memory::MemoryBackend;
+use glassdb_backend::middleware::{DelayBackend, s3_delays};
 use glassdb_backend::{BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
 use glassdb_data::ObjectPath;
 use serde_json::{Value, json};
 
 const EXTERNAL_VALUE_BYTES: usize = 1025;
 
-const COST_ITERATIONS: usize = 30;
+const CHECK_ITERATIONS: usize = 30;
+// Faster clocks distort the read/write delay ratio and bring GC into these short runs.
+const MODEL_TIME_SPEEDUP: f64 = 5.0;
+// Most fixtures already warm caches; retain the sampling window with a shorter warmup.
+const WARMUP_MILLIS: u64 = 250;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Case {
@@ -233,13 +238,20 @@ struct Window {
 }
 
 impl Window {
-    fn record(&mut self, before: (Stats, [u64; 2], Instant), db: &Database, bytes: &BodyBytes) {
-        self.elapsed += before.2.elapsed();
+    fn record(
+        &mut self,
+        before: (Stats, [u64; 2], Instant),
+        db: &Database,
+        bytes: &BodyBytes,
+    ) -> Duration {
+        let elapsed = before.2.elapsed();
+        self.elapsed += elapsed;
         self.stats += db.stats() - before.0;
         let after = bytes.snapshot();
         for (index, value) in after.iter().enumerate() {
             self.bytes[index] += value - before.1[index];
         }
+        elapsed
     }
 
     fn json(&self, transactions: u64) -> Value {
@@ -257,41 +269,105 @@ impl Window {
     }
 }
 
-async fn measure_cost(case: Case) -> Value {
-    let bytes = Arc::new(BodyBytes::new(Arc::new(MemoryBackend::new())));
-    let mut fixture = Fixture::prepare(case, bytes.clone()).await;
-    let mut workload = Window::default();
-    let mut shutdown = Window::default();
-    for iteration in 0..COST_ITERATIONS {
-        if case == Case::FreshRead && iteration > 0 {
-            fixture.reopen(case).await;
+struct Measurement {
+    fixture: Fixture,
+    bytes: Arc<BodyBytes>,
+    workload: Window,
+    shutdown: Window,
+    transactions: u64,
+}
+
+impl Measurement {
+    async fn prepare(case: Case) -> Self {
+        let mut delays = s3_delays();
+        for latency in [
+            &mut delays.latency.meta_read,
+            &mut delays.latency.meta_write,
+            &mut delays.latency.obj_read,
+            &mut delays.latency.obj_write,
+            &mut delays.latency.list,
+        ] {
+            latency.std_dev = Duration::ZERO;
         }
-        let before = (fixture.db.stats(), bytes.snapshot(), Instant::now());
-        fixture.run(case).await.expect("cost workload");
-        workload.record(before, &fixture.db, &bytes);
-        if case == Case::FreshRead || iteration + 1 == COST_ITERATIONS {
-            let before = (fixture.db.stats(), bytes.snapshot(), Instant::now());
-            fixture.db.shutdown().await;
-            shutdown.record(before, &fixture.db, &bytes);
+        let backend = DelayBackend::new(Arc::new(MemoryBackend::new()), delays)
+            .expect("fixed S3 delay profile");
+        let bytes = Arc::new(BodyBytes::new(Arc::new(backend)));
+        Self {
+            fixture: Fixture::prepare(case, bytes.clone()).await,
+            bytes,
+            workload: Window::default(),
+            shutdown: Window::default(),
+            transactions: 0,
         }
     }
-    let n = COST_ITERATIONS as u64 * case.transactions();
-    assert_eq!(
-        workload.stats.transactions.completed, n,
-        "all measured transactions must complete"
-    );
-    let mut combined = Window {
-        stats: workload.stats,
-        bytes: workload.bytes,
-        elapsed: workload.elapsed,
-    };
-    combined.stats += shutdown.stats;
-    combined.bytes[0] += shutdown.bytes[0];
-    combined.bytes[1] += shutdown.bytes[1];
-    combined.elapsed += shutdown.elapsed;
-    json!({"name": case.name(), "transactions": n, "valueBytes": case.value_size(),
-        "setupSplits": fixture.setup_splits, "workload": workload.json(n),
-        "shutdown": shutdown.json(n), "combined": combined.json(n)})
+
+    async fn run(&mut self, case: Case, iterations: u64) -> Duration {
+        if case == Case::FreshRead {
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iterations {
+                if self.transactions > 0 {
+                    self.fixture.reopen(case).await;
+                }
+                let before = (
+                    self.fixture.db.stats(),
+                    self.bytes.snapshot(),
+                    Instant::now(),
+                );
+                self.fixture.run(case).await.expect("timed workload");
+                elapsed += self.workload.record(before, &self.fixture.db, &self.bytes);
+                self.transactions += 1;
+                self.close().await;
+            }
+            elapsed
+        } else {
+            // One counter snapshot per sample keeps cached-read timing overhead small.
+            let before = (
+                self.fixture.db.stats(),
+                self.bytes.snapshot(),
+                Instant::now(),
+            );
+            for _ in 0..iterations {
+                self.fixture.run(case).await.expect("timed workload");
+            }
+            let elapsed = self.workload.record(before, &self.fixture.db, &self.bytes);
+            self.transactions += iterations * case.transactions();
+            elapsed
+        }
+    }
+
+    async fn finish(mut self, case: Case) -> Value {
+        if case != Case::FreshRead {
+            self.close().await;
+        }
+        let n = self.transactions;
+        assert!(n > 0, "measurement must include transactions");
+        assert_eq!(
+            self.workload.stats.transactions.completed, n,
+            "all measured transactions must complete"
+        );
+        let mut combined = Window {
+            stats: self.workload.stats,
+            bytes: self.workload.bytes,
+            elapsed: self.workload.elapsed,
+        };
+        combined.stats += self.shutdown.stats;
+        combined.bytes[0] += self.shutdown.bytes[0];
+        combined.bytes[1] += self.shutdown.bytes[1];
+        combined.elapsed += self.shutdown.elapsed;
+        json!({"name": case.name(), "transactions": n, "valueBytes": case.value_size(),
+            "setupSplits": self.fixture.setup_splits, "workload": self.workload.json(n),
+            "shutdown": self.shutdown.json(n), "combined": combined.json(n)})
+    }
+
+    async fn close(&mut self) {
+        let before = (
+            self.fixture.db.stats(),
+            self.bytes.snapshot(),
+            Instant::now(),
+        );
+        self.fixture.db.shutdown().await;
+        self.shutdown.record(before, &self.fixture.db, &self.bytes);
+    }
 }
 
 async fn verify_inline_write_reads(case: Case) {
@@ -305,7 +381,7 @@ async fn verify_inline_write_reads(case: Case) {
     });
     let fixture = Fixture::prepare(case, Arc::new(MemoryBackend::new())).await;
     let before = fixture.db.stats();
-    for _ in 0..COST_ITERATIONS {
+    for _ in 0..CHECK_ITERATIONS {
         fixture
             .run(case)
             .await
@@ -314,7 +390,7 @@ async fn verify_inline_write_reads(case: Case) {
     let workload = fixture.db.stats() - before;
     assert_eq!(
         workload.transactions.completed,
-        COST_ITERATIONS as u64 * case.transactions()
+        CHECK_ITERATIONS as u64 * case.transactions()
     );
     assert_eq!(
         workload.backend.obj_reads, 0,
@@ -327,7 +403,7 @@ async fn verify_inline_write_reads(case: Case) {
 }
 
 fn benches(c: &mut Criterion) {
-    glassdb_concurr::rt::set_model_time_speedup(20.0)
+    glassdb_concurr::rt::set_model_time_speedup(MODEL_TIME_SPEEDUP)
         .expect("configure diagnostic model time before creating the runtime");
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -338,49 +414,38 @@ fn benches(c: &mut Criterion) {
     group
         .sample_size(20)
         .sampling_mode(SamplingMode::Flat)
-        .warm_up_time(Duration::from_millis(500))
+        .warm_up_time(Duration::from_millis(WARMUP_MILLIS))
         .measurement_time(Duration::from_secs(2))
         .noise_threshold(0.01);
     for case in CASES {
-        let mut fixture = None;
+        let mut measurement = None;
         group.throughput(Throughput::Elements(case.transactions()));
         group.bench_function(case.name(), |b| {
             // Unselected cases do no setup; selected cases keep one fixture across samples.
-            let fixture = fixture.get_or_insert_with(|| {
+            let measurement = measurement.get_or_insert_with(|| {
                 if case == Case::WarmExternalRead {
                     rt.block_on(verify_transaction_log_cache());
                 }
                 if matches!(case, Case::InlineRmw | Case::SharedLeafRmw) {
                     rt.block_on(verify_inline_write_reads(case));
                 }
-                costs.push(rt.block_on(measure_cost(case)));
-                rt.block_on(Fixture::prepare(case, Arc::new(MemoryBackend::new())))
+                rt.block_on(Measurement::prepare(case))
             });
-            b.iter_custom(|iterations| {
-                rt.block_on(async {
-                    let mut elapsed = Duration::ZERO;
-                    for _ in 0..iterations {
-                        if case == Case::FreshRead {
-                            fixture.db.shutdown().await;
-                            fixture.reopen(case).await;
-                        }
-                        let start = Instant::now();
-                        fixture.run(case).await.expect("timed workload");
-                        elapsed += start.elapsed();
-                    }
-                    elapsed
-                })
-            })
+            b.iter_custom(|iterations| rt.block_on(measurement.run(case, iterations)))
         });
-        if let Some(fixture) = fixture {
-            rt.block_on(fixture.db.shutdown());
+        if let Some(measurement) = measurement {
+            costs.push(rt.block_on(measurement.finish(case)));
         }
     }
     group.finish();
     if !costs.is_empty() {
         println!(
             "diagnostic-costs: {}",
-            json!({"schemaVersion": 1, "cases": costs})
+            json!({"schemaVersion": 2, "model": {
+                "backend": "memory", "latencyProfile": "s3", "latencyJitter": false,
+                "modelTimeSpeedup": MODEL_TIME_SPEEDUP, "warmupMs": WARMUP_MILLIS,
+                "costWindow": "benchmarkIterationsIncludingWarmup",
+            }, "cases": costs})
         );
     }
 }

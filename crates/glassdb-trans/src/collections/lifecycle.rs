@@ -73,6 +73,9 @@ impl CollectionLifecycle {
             .iter()
             .filter(|change| change.op == CollectionOp::Create)
         {
+            // These fresh identities belong to this active attempt. A create
+            // conflict invalidates obsolete local knowledge; success updates
+            // this cache. Both existence checks can therefore use ANY.
             if !self
                 .records
                 .create_record(&change.collection, &CollectionRecord::new())
@@ -109,6 +112,9 @@ impl CollectionLifecycle {
             .map(|change| &change.collection)
         {
             self.freeze_topology(collection, id).await?;
+            // Nodes precede their published links and retain their identities.
+            // Completed topology settlement fences abandoned publication;
+            // late creates can only leave unreachable orphans.
             let nodes = self.nodes.list_nodes(collection, Requirement::ANY).await?;
             for (token, _) in nodes {
                 self.fence_node(collection, &token, id).await?;
@@ -132,6 +138,8 @@ impl CollectionLifecycle {
     ) -> Result<bool, TransError> {
         let mut changed = false;
         for collection in collections {
+            // Enumeration uses the publication proof from fencing. Each
+            // present body's no-change result must meet requirement below.
             let mut cursor = None;
             loop {
                 let page = self
@@ -158,6 +166,10 @@ impl CollectionLifecycle {
         &self,
         collections: &[CollectionAddress],
     ) -> Result<bool, TransError> {
+        // Present bodies are conditional-delete seeds. Owner cleanup shares
+        // the preparation cache; GC waits for commit or acknowledged abort.
+        // Publication and identity rules exclude cached absence hiding a later
+        // live object, though an abandoned late create can leave an orphan.
         let mut changed = false;
         for collection in collections {
             let mut cursor = None;
@@ -228,6 +240,9 @@ impl CollectionLifecycle {
                 continue;
             }
             if record.topology_participants().next().is_none() {
+                // This cache includes our freeze CAS. While this identity can
+                // still commit, the freeze prevents admission and participants
+                // can only leave. The empty set needs no currentness check.
                 return Ok(());
             }
 
@@ -262,6 +277,8 @@ impl CollectionLifecycle {
                 Err(error) => return Err(error.into()),
             };
             if node.collection_delete_intent() == Some(id) {
+                // Local retry cleanup updates this same cache. Another owner
+                // can replace our intent only after we can no longer commit.
                 return Ok(());
             }
             if let Some(holder) = node.collection_delete_intent().cloned() {
@@ -296,6 +313,8 @@ impl CollectionLifecycle {
         loop {
             let (mut root, observed) = self.nodes.load_root(collection, Requirement::ANY).await?;
             if root.collection_delete_intent() == Some(id) {
+                // As for node intents, local cleanup shares this cache and
+                // foreign replacement requires that we can no longer commit.
                 return Ok(());
             }
             if let Some(holder) = root.collection_delete_intent().cloned() {

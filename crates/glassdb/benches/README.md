@@ -19,12 +19,24 @@ cargo bench -p glassdb --bench transactions
 ## Conditions
 
 All selected cases use the default engine policies and an in-memory backend
-without injected latency or persistent cache. Both targets use the same 20×
-model-clock setting: engine waits, expiry, and background schedules advance
-20 times faster, while CPU work does not. Criterion still reports wall time.
-Results compare revisions under this model, not production latency at 1×.
-Inputs and preparation are controlled; timings and task scheduling are not
-deterministic.
+wrapped in `DelayBackend`, with the `s3_delays()` profile and no persistent cache.
+Provider latencies have zero variance; the S3 throttling limits remain enabled.
+The profile uses 22 ms for object reads and LIST, and 55 ms for writes and DELETE,
+in model time. Both revisions use a 5× model clock, as does the mixed workload:
+backend delays, engine waits, expiry, and background schedules advance five times
+faster, while CPU work does not. Nominal wall delays are 4.4 ms and 11 ms;
+Tokio timer rounding and host scheduling can extend them.
+Criterion reports wall time. These results compare revisions under the model;
+they do not predict production latency at 1×. Fixed provider delays remove
+random latency variance, but do not make task scheduling deterministic.
+
+Local sweeps of 1×, 2×, 5×, 10×, 20× and 40× favored 5× for these short cases.
+Higher speeds increased the read-to-write delay ratio; 20× and 40× also brought
+reclamation past the default 45-model-second GC horizon into the timed runs.
+Except for fresh-client reads, fixtures warm caches before the warmup. A 250 ms
+warmup retained the measured PR effects while keeping the eight-case runtime close to the former
+undelayed harness. Clock and warmup changes require checking request counts,
+background work, measurement variance, and total process time together.
 
 | Case | Condition | Transactions per iteration |
 | --- | --- | ---: |
@@ -47,23 +59,25 @@ this is not an end-to-end database startup measurement.
 Criterion measures mean time per iteration. For the concurrent case, this is
 completion time for all three transactions, not individual transaction latency.
 Its samples cannot provide transaction p90; `perfbench` provides that metric.
-Each case uses a 500 ms warmup and 20 flat samples over two seconds.
+Each case requests a 250 ms warmup and 20 flat samples with a two-second
+measurement target.
 Current-thread Tokio creates a batching opportunity, not an exact batch-size
 guarantee. Coordinator submissions and rounds record the combining achieved.
 
 ## Backend costs
 
-The separate pass performs 30 iterations on its own prepared database. It
-does not instrument Criterion timing. Requests, successful read-body bytes,
+Costs come from the same fixture and iterations as the Criterion run, including
+warmup. Criterion does not expose the warmup/sample boundary to `iter_custom`,
+so costs describe the whole run, while the timing estimate uses sampled iterations.
+There is no separate short cost pass. Requests, successful read-body bytes,
 attempted write-body bytes, and coordinator counters are normalized by the
-number of completed transactions (90 for the concurrent case).
+number of completed transactions. Successful read and attempted write bodies
+are counted in the measured backend. Other counters are captured outside each
+sample's timer (each read's timer for fresh-client reads).
 The engine counts DELETE requests as writes; they add no write-body bytes.
-This short pass can finish before the GC safety horizon. The longer timed
-workload can include reclamation on the same runtime thread as writers, so
-unchanged cost rows do not establish unchanged GC work in the timing window.
 
 Workload, shutdown, and combined windows are separate. Fresh-client reads
-close their client after each measured read; other cases close after the pass.
+close their client after each measured read; other cases close after the benchmark.
 Setup calls are excluded; background work that overlaps a measured window is
 included, even if setup started it. Shutdown drains managed work but cancels GC
 and split loops, so combined cost is not full lifecycle or reclamation cost.
@@ -73,7 +87,9 @@ There is no combined score or automatic performance gate. Timing results
 depend on the host. Real-provider costs require separate measurements.
 Exact protocol guarantees belong in integration/simulation tests, not timing
 assertions. Fixture preparation, transaction completion, and zero backend reads
-for warmed inline writes are checked by the benchmark harness. `make test-bench`
+for warmed inline writes are checked by the benchmark harness. The inline-write
+and transaction-log cache checks use separate, undelayed memory backends.
+The inline-write check freezes model time to exclude GC deadlines. `make test-bench`
 runs all benchmark targets in test mode, including these checks.
 
 ## Comparison artifacts
@@ -83,6 +99,12 @@ declarations into the baseline snapshot. It records harness identity, compiler
 version, executable hashes, both resolved lockfile hashes, and workload settings. Each
 revision keeps its engine dependency graph; identical harnesses do not imply
 identical engine dependencies.
+New comparison manifests record the diagnostic delay model, warmup, and cost window.
+The report rejects diagnostic timing as well as costs when that metadata is
+missing or differs. Legacy comparison artifacts remain readable with their
+original manifest; they cannot enter a new delayed comparison. Comparisons with
+an explicit historical `--candidate` require a driver compatible with that
+candidate's harness. This driver expects the delayed harness for new comparisons.
 Criterion 0.8.2 is pinned in the benchmark dependencies. The report reads its
 private `estimates.json` format with validation; verify the reader when upgrading it.
 

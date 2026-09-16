@@ -341,15 +341,24 @@ that classifies phases, fences source writers, checks reachability, cleans
 unreachable nodes, and settles finalized topology participants. `Splitter`
 only executes a requested recursive parent split and supplies its result back to
 the action. It does not inspect durable phases or call `StructuralIntentStore`.
+Intent discovery reuses present cached bodies and applies its requirement only
+to listed bodies observed as absent. All intent enumeration uses this contract.
+A cached Preparing candidate can be deleted only at its exact revision;
+a conflict invalidates that cached state and requests retry.
+Ready contents are immutable until deletion. Neither cached presence nor the
+discovery bound supplies evidence about the source node.
 Recovery fences a source writer against the source revision the Ready
 transition recorded, not against the structural gate the source carries now. A
 worker publishes its split with one compare-and-swap expecting that revision and
 does not read the source again first, so the revision alone says whether the
 worker can still land, and a later split of the same source cannot shield an
-abandoned intent. Recovery bounds these reads by a currentness barrier it
-allocates once it holds the Ready record, because a cache entry's watermark is
-allocated before the read that fills it and therefore cannot order a read after
-the gate.
+abandoned intent. Recovery captures one classification barrier after each
+completed discovery batch and keeps it with that batch's intent recovery actions.
+Ready bodies are immutable, so source and reachability checks can reuse evidence
+within the batch. Later discoveries get a new barrier, including intents created
+by recursive recovery under a finalized participant. A cache entry's watermark
+is allocated before the read that fills it and therefore cannot order a read
+after the gate.
 
 Participant departure starts with `ANY`; a removal CAS proves completion.
 For background settlement, a present record without the participant must meet
@@ -406,11 +415,16 @@ guide](guides/caching.md#coordinator-mutation-evidence).
 
 Each attempt keeps the merged members and their requirement together, including
 members that join during the leaf load and bounds requested on earlier retries.
-Resolvers use that bound for dependent object reads. The loaded leaf can still
-precede it: a dirty plan obtains its leaf evidence from the CAS, while a plan
-with no changes checks the exact loaded state before delivery. An unchanged
-state needs no repeated resolution; a changed state requires a new plan. No
-extra barrier or preliminary read is added to the successful CAS path.
+The first leaf load uses `ANY` as a speculative CAS precondition; retries use
+the retained combined bound. A missing initial leaf is rechecked against the
+submitted requirement before returning absence. Resolvers use the combined
+bound for dependent object reads. A dirty plan obtains its leaf evidence from
+the CAS, while a plan with no changes checks the exact loaded state before
+delivery. An unchanged state needs no repeated resolution; a changed state
+requires a new plan. Lock acquisition therefore needs no preliminary backend
+read of a cached leaf when its CAS succeeds. Current scan coverage and point/scan
+validation still use the transaction's validation barrier. No extra barrier is
+allocated for the speculative load.
 
 | Component             | Layer            | Speaks                       | Owns                                                                                                                  | Must not know                       |
 | --------------------- | ---------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
@@ -629,6 +643,14 @@ the original sentinel-error matching semantics.
 The cloud backends are feature-gated (`s3`, `gcs`) so their heavy SDK
 dependencies are only pulled in when needed; each is tested against a pure-Rust
 in-process fake of its API.
+
+The PR diagnostic benchmarks wrap `MemoryBackend` in `DelayBackend` with fixed
+S3 mean latencies, provider throttling, and a 5× model clock. Backend waits and
+engine deadlines use the same clock. Cost counters cover the benchmark's own
+iterations, including a 250 ms warmup; shutdown has a separate window. The
+comparison manifest records the clock and warmup so the report can reject
+incompatible measurements.
+See [the diagnostic benchmark conditions](../crates/glassdb/benches/README.md).
 
 ## Transaction Algorithm
 
@@ -1126,12 +1148,17 @@ Callers express the minimum acceptable evidence as a `Requirement`:
 | `within(timeline, age)` | Present or absent state whose evidence reaches an approximate age cutoff |
 | `after(barrier)` | Present or absent state whose evidence reaches the opaque `CurrentnessBarrier` |
 
+An `ANY` decision needs a caller proof such as later validation, a conditional
+mutation, a stable fact, or shared local knowledge. A branch that skips the CAS
+needs its own proof. The [cache guide](guides/caching.md#decisions-from-any-reads)
+states these constraints, including the publication rules for cached absence.
+
 `Timeline::currentness_barrier()` captures an opaque `CurrentnessBarrier` after
 completed prerequisite work. Transaction validation captures one after the body
 and before key and predicate lock CASes, and uses it for point, scan,
 collection, and transaction-status dependencies. GC captures a status barrier,
 then a separate reference barrier after eligibility checks. Structural recovery
-captures a new barrier after observing a Ready intent. Separator publication
+captures a new barrier after each completed intent discovery batch. Separator publication
 carries its start barrier through routing and child-chain reconciliation.
 
 Decision interfaces that need an ordering bound require the barrier type. Shared
@@ -1384,7 +1411,7 @@ candidate-driven **reverse mark-sweep** ([ADR-022](adr/022-garbage-collection-ma
 
 The `gc` module owns candidate reports, scheduling, scans, reclamation, and
 statistics. `Engine` constructs and starts one `Gc`. Its implementation keeps
-reclamation safety in `gc/reclaim.rs` and prefix traversal in `gc/scan.rs`;
+reclamation safety in `gc.rs` and prefix traversal in `gc/scan.rs`;
 queues and counters stay with the scheduler in `gc.rs`. GC and structural
 recovery share the `ScanCadence` interval controller from `glassdb-concurr`.
 
@@ -1393,6 +1420,14 @@ recovery share the `ScanCadence` interval controller from `glassdb-concurr`.
   candidate `_t/` object records its own back-references (its `locks ∪ writes`),
   so GC reads a batch of candidates and confirms each one dead by GET-ing only
   the handful of nodes/records it names — never a database-wide scan.
+  Point-reference routing uses `ANY` for interior nodes and the post-eligibility
+  requirement for terminal leaves. Cached indexes guide descent; right links
+  correct stale split placement. A cached leaf, including a root later split
+  into an index, must satisfy the terminal requirement before GC uses its
+  entries. Collection and node identities are not reused, creation precedes
+  commit or link publication, and published nodes remain until collection
+  reclamation. Recovery fences the split source before probing unpublished
+  nodes. These rules prevent cached absence from hiding a later live route.
 - **Candidate feed.** `Algo`, `DirectCommit`, and `Splitter` report GC
   candidates through `GcHints`. Reports use bounded in-memory work and never
   wait for queue space, backend requests, or GC completion. A busy queue drops
@@ -1426,7 +1461,12 @@ recovery share the `ScanCadence` interval controller from `glassdb-concurr`.
   not with its own CAS but by calling the `Locker`'s per-object unlock methods,
   so the release batches through the same leaf coordinator as live traffic
   (ADR-029); the coordinator prunes the entry before persistence when it becomes
-  vestigial (no holder and an absent current state). Leaf release starts with
+  vestigial (no holder and an absent current state). Entry-release routing uses
+  `ANY` for interiors and the supplied requirement for terminal leaves. Right
+  links correct stale split placement; splits resolve holds before moving
+  entries. Missing routes use the identity and publication rules above; GC
+  releases entry locks only after acknowledged abort, so a missing prepared
+  root cannot later acquire those holds. Leaf release starts with
   `ANY`: an applied CAS proves completion without an extra read. A no-op must
   carry an observation that meets GC's existing candidate-check bound; otherwise
   release retries with that requirement. This also covers membership holds with
@@ -1434,8 +1474,18 @@ recovery share the `ScanCadence` interval controller from `glassdb-concurr`.
   that the old leaf's holds are gone because it cannot become a leaf again.
   Directory release also starts with `ANY` and checks a present no-holder
   observation against the same bound before it reports completion. Owner cleanup
-  shares acquisition's cache knowledge and can keep `ANY`; committed GC already
-  supplies bounded evidence through its directory reference check. Topology
+  shares acquisition's cache knowledge and can keep `ANY`. Committed GC first
+  attempts directory write-back with `ANY` and retains the addresses whose
+  holder-removal CAS applied. Collection reclamation and entry-reference checks
+  follow; live entries keep the log without bounded directory reads. Once entry
+  references are clear, write-back completes the remaining directories under
+  GC's existing post-eligibility reference bound. It still starts with `ANY`
+  and checks only insufficient no-holder observations. A holder found by that
+  check is resolved in the same pass. Successful bounded completion proves every
+  submitted directory clear, whether or not a CAS was needed. Applied removals
+  and completed directories need no later reference or release reads, even
+  after cache eviction: the committed identity cannot acquire those holders
+  again. Entry, membership, and topology obligations remain separate. Topology
   participant release uses the same rule after GC lists no remaining structural
   intents. The collection record needs its own completion evidence; listing
   intents does not refresh that record. Missing records need no extra check:

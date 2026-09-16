@@ -86,7 +86,7 @@ struct SweepAction {
     active: bool,
     failed: bool,
     completed: bool,
-    intents: VecDeque<(StructuralIntentId, Observation<StructuralIntent>)>,
+    intents: VecDeque<(StructuralIntentId, DiscoveredIntent)>,
     participants: VecDeque<(CollectionAddress, TxId)>,
     intent_id: Option<StructuralIntentId>,
     intent: Option<IntentRecovery>,
@@ -124,6 +124,15 @@ struct RecoverySweep {
     participants: BTreeSet<(CollectionAddress, TxId)>,
 }
 
+/// One candidate and its post-discovery classification bound.
+///
+/// Do not replace the observation while retaining its barrier. A later Ready
+/// observation needs a bound captured after its own discovery.
+struct DiscoveredIntent {
+    observed: Observation<StructuralIntent>,
+    barrier: CurrentnessBarrier,
+}
+
 /// Resumable recovery of one exact structural intent.
 struct IntentRecovery {
     observed: Observation<StructuralIntent>,
@@ -131,7 +140,7 @@ struct IntentRecovery {
 }
 
 enum IntentRecoveryPhase {
-    Classify,
+    Classify(CurrentnessBarrier),
     Publish {
         publication: SeparatorPublication,
         participant: TxId,
@@ -149,7 +158,7 @@ struct ParticipantSettlement {
     collection: CollectionAddress,
     participant: TxId,
     status_checked: bool,
-    intents: VecDeque<Observation<StructuralIntent>>,
+    intents: VecDeque<DiscoveredIntent>,
 }
 
 #[derive(Clone, Copy)]
@@ -160,7 +169,7 @@ enum SettlementMode {
 
 enum ParticipantSettlementStep {
     Completed,
-    Recover(Observation<StructuralIntent>),
+    Recover(DiscoveredIntent),
 }
 
 impl PreparedIntent {
@@ -521,7 +530,7 @@ impl StructuralRecovery {
         if !sweep.scanned {
             let discovered = self.scan().await?;
             sweep.scanned = true;
-            sweep.intents = discovered.intents.into();
+            sweep.intents = self.begin_intents(discovered.intents).collect();
             sweep.participants = discovered.participants.into_iter().collect();
         }
 
@@ -599,8 +608,8 @@ impl StructuralRecovery {
                     sweep.settlement = None;
                     sweep.participant = None;
                 }
-                Ok(ParticipantSettlementStep::Recover(observed)) => {
-                    sweep.intent = Some(Self::begin_intent(observed));
+                Ok(ParticipantSettlementStep::Recover(intent)) => {
+                    sweep.intent = Some(Self::begin_intent(intent));
                 }
                 Err(error) => {
                     let failure = SweepFailure {
@@ -616,9 +625,9 @@ impl StructuralRecovery {
             return Ok(None);
         }
 
-        if let Some((intent_id, observed)) = sweep.intents.pop_front() {
+        if let Some((intent_id, intent)) = sweep.intents.pop_front() {
             sweep.intent_id = Some(intent_id);
-            sweep.intent = Some(Self::begin_intent(observed));
+            sweep.intent = Some(Self::begin_intent(intent));
             return Ok(None);
         }
 
@@ -691,23 +700,22 @@ impl StructuralRecovery {
                         failed: false,
                     });
                 }
-                ParticipantSettlementStep::Recover(observed) => {
-                    action.intent = Some(Self::begin_intent(observed));
+                ParticipantSettlementStep::Recover(intent) => {
+                    action.intent = Some(Self::begin_intent(intent));
                 }
             }
         }
     }
 
     async fn scan(&self) -> Result<RecoverySweep, StorageError> {
-        // Recovery has no transaction validation or preceding tree CAS, so it
-        // allocates its own currentness barrier. This one bounds intent
-        // discovery only. Classification needs a bound past the intent it
-        // reads, and this barrier precedes that read.
+        // Only absent discovery bodies need this bound; present candidates
+        // use their exact revisions and phase rules. Ready classification
+        // still needs its own barrier after observing the intent.
         let recovery_start = Requirement::after(self.timeline.currentness_barrier());
         let cursor = self.scan_cursor.lock().unwrap().clone();
         let page = match self
             .intent_store
-            .scan_page(&self.db_root, cursor.as_ref(), recovery_start)
+            .discover_page(&self.db_root, cursor.as_ref(), recovery_start)
             .await
         {
             Ok(page) => page,
@@ -734,10 +742,26 @@ impl StructuralRecovery {
         Ok(self.mon.tx_status(id).await?.is_final())
     }
 
-    fn begin_intent(observed: Observation<StructuralIntent>) -> IntentRecovery {
+    fn begin_intents(
+        &self,
+        intents: Vec<(StructuralIntentId, Observation<StructuralIntent>)>,
+    ) -> impl Iterator<Item = (StructuralIntentId, DiscoveredIntent)> {
+        // Every Ready body is already in hand and stays fixed until deletion.
+        // One post-discovery barrier can therefore cover this entire batch.
+        // Later discoveries must pass through here again, including intents
+        // created by recursive recovery under an already-final participant.
+        // Neither the discovery bound nor an observation's watermark proves
+        // that a source read follows the gate recorded by a Ready intent.
+        let barrier = self.timeline.currentness_barrier();
+        intents
+            .into_iter()
+            .map(move |(id, observed)| (id, DiscoveredIntent { observed, barrier }))
+    }
+
+    fn begin_intent(intent: DiscoveredIntent) -> IntentRecovery {
         IntentRecovery {
-            observed,
-            phase: IntentRecoveryPhase::Classify,
+            observed: intent.observed,
+            phase: IntentRecoveryPhase::Classify(intent.barrier),
         }
     }
 
@@ -751,8 +775,8 @@ impl StructuralRecovery {
         }
         loop {
             match &mut recovery.phase {
-                IntentRecoveryPhase::Classify => {
-                    recovery.phase = self.classify_intent(&recovery.observed).await?;
+                IntentRecoveryPhase::Classify(barrier) => {
+                    recovery.phase = self.classify_intent(&recovery.observed, *barrier).await?;
                 }
                 IntentRecoveryPhase::Publish {
                     publication,
@@ -771,7 +795,15 @@ impl StructuralRecovery {
                     }
                 },
                 IntentRecoveryPhase::Delete => {
-                    self.intent_store.delete(&recovery.observed).await?;
+                    match self.intent_store.delete(&recovery.observed).await {
+                        Ok(()) => {}
+                        // Discovery can retain Preparing after a peer made it
+                        // Ready. The failed deletion invalidates that exact
+                        // cached revision; retry must discover and classify it
+                        // again instead of exposing a storage precondition.
+                        Err(StorageError::Precondition) => return Err(TransError::Retry),
+                        Err(error) => return Err(error.into()),
+                    }
                     return Ok(IntentRecoveryStep::Completed);
                 }
             }
@@ -808,8 +840,8 @@ impl StructuralRecovery {
         }
 
         loop {
-            if let Some(observed) = settlement.intents.pop_front() {
-                let intent = observed.value().ok_or_else(|| {
+            if let Some(recovery) = settlement.intents.pop_front() {
+                let intent = recovery.observed.value().ok_or_else(|| {
                     TransError::other("structural intent disappeared after listing")
                 })?;
                 if intent.collection != settlement.collection {
@@ -817,13 +849,16 @@ impl StructuralRecovery {
                         "topology participant owns intents for multiple collections",
                     ));
                 }
-                return Ok(ParticipantSettlementStep::Recover(observed));
+                return Ok(ParticipantSettlementStep::Recover(recovery));
             }
 
+            // Present discovery bodies already use ANY. Advancing this bound
+            // rechecks insufficient absence after intervening recovery and
+            // also supplies the background departure proof below.
             let requirement = Requirement::after(self.timeline.currentness_barrier());
             let intents = self
                 .intent_store
-                .list_for_participant(
+                .discover_for_participant(
                     settlement.collection.db_root_component(),
                     &settlement.participant,
                     requirement,
@@ -841,19 +876,25 @@ impl StructuralRecovery {
                     .await?;
                 return Ok(ParticipantSettlementStep::Completed);
             }
-            settlement.intents = intents.into_iter().map(|(_, observed)| observed).collect();
+            settlement.intents = self
+                .begin_intents(intents)
+                .map(|(_, intent)| intent)
+                .collect();
         }
     }
 
     async fn classify_intent(
         &self,
         observed: &Observation<StructuralIntent>,
+        barrier: CurrentnessBarrier,
     ) -> Result<IntentRecoveryPhase, TransError> {
         let intent = observed
             .value()
             .ok_or_else(|| TransError::other("structural intent disappeared after listing"))?
             .clone();
         if intent.phase == StructuralIntentPhase::Preparing {
+            // Cached Preparing can hide Ready while the participant is live;
+            // its owner drives publication without waiting for this sweep.
             if self.mon.tx_status(&intent.participant_id).await? == TxCommitStatus::Pending {
                 return Err(TransError::Retry);
             }
@@ -873,18 +914,9 @@ impl StructuralRecovery {
             ));
         }
 
-        // Allocate the bound here, where the Ready record is already in hand. A
-        // worker makes its gated source durable before it writes that record,
-        // so a currentness barrier allocated now forces a backend check against
-        // a source the gate has already reached.
-        //
-        // The Ready observation's watermark is not such a barrier. A watermark
-        // is allocated before the read that fills its entry, so an entry filled
-        // concurrently can carry a watermark newer than the intent's and still
-        // hold source state from before the worker gated it. That reports a
-        // revision the worker never published from, which reads as a fence that
-        // never happened.
-        let barrier = self.timeline.currentness_barrier();
+        // The batch barrier follows every Ready observation in this batch.
+        // Each worker made its gated source durable before writing Ready, so
+        // this bound excludes source evidence from before that gate.
         let collection = &intent.collection;
         let created_tokens = &intent.created_tokens;
         if !self

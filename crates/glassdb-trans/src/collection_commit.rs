@@ -183,6 +183,8 @@ impl CollectionCommit {
             .difference(&active_drops)
             .cloned()
             .collect::<Vec<_>>();
+        // Fencing has stopped. Cleanup shares the cache that installed this
+        // attempt's intents and freeze, so no-change results can use ANY.
         self.lifecycle
             .clear_aborted_drops(id, &discarded, Requirement::ANY)
             .await?;
@@ -285,6 +287,8 @@ impl CollectionCommit {
         attempt: &CollectionAttempt,
     ) -> Result<(), TransError> {
         let drops = attempt.fenced_drops.iter().cloned().collect::<Vec<_>>();
+        // Abort runs after fencing stops and shares its cache, as retry cleanup
+        // does. Recovered cleanup needs its separate acknowledgement bound.
         self.lifecycle
             .clear_aborted_drops(id, &drops, Requirement::ANY)
             .await?;

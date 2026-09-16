@@ -695,7 +695,11 @@ impl TreeRouter {
     /// requirement. A grown tree thus never checks the root `_r` on every key
     /// coordination; a current lower bound stays where a CAS depends on it.
     ///
-    /// When both freshnesses match this is exactly [`route_key`](Self::route_key).
+    /// The `leaf` requirement applies only after reaching a leaf. An absent
+    /// root or child can be reported under `interior`; callers using `ANY`
+    /// there must justify negative routes from publication and lifecycle rules.
+    ///
+    /// When both requirements match this is exactly [`route_key`](Self::route_key).
     pub async fn route_key_with_requirements(
         &self,
         collection: &CollectionAddress,
@@ -756,6 +760,7 @@ impl TreeRouter {
     ///
     /// The interior-vs-leaf requirement split of [`route_key_with_requirements`] lets the
     /// coordination hot path route keys without checking the root `_r`.
+    /// Its negative-route contract also applies here.
     /// Groups are keyed by leaf object path, so keys from different collections
     /// (distinct `_r`) never collide; input order is preserved within a group.
     /// Missing non-root collection trees are reported as

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report meaningful changes from Criterion, cost-pass, and perfbench artifacts."""
+"""Report meaningful changes from Criterion, backend-cost, and perfbench artifacts."""
 
 from __future__ import annotations
 
@@ -10,6 +10,15 @@ import statistics
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
+
+DIAGNOSTIC_MODEL = {
+    "backend": "memory",
+    "latencyProfile": "s3",
+    "latencyJitter": False,
+    "modelTimeSpeedup": 5,
+    "warmupMs": 250,
+    "costWindow": "benchmarkIterationsIncludingWarmup",
+}
 
 MIXED_SHAPES = ("rwSingle", "rwMany", "roSingle", "roMulti")
 MIXED_METRICS = (
@@ -109,6 +118,7 @@ def read_measurement(
     *,
     legacy_cases: set[str] | None = None,
     mixed_args: list[str] | tuple[str, ...] = (),
+    diagnostic_model: dict | None = None,
 ) -> tuple[dict, list[str]]:
     """Read and validate one benchmark process's artifacts."""
     metrics, warnings = {}, []
@@ -134,6 +144,7 @@ def read_measurement(
                 "criterion.log" if legacy_cases is not None else f"criterion-{name}.log"
             ),
             cost_cases=legacy_cases,
+            diagnostic_model=diagnostic_model,
         )
     return metrics, warnings
 
@@ -148,7 +159,18 @@ def load_diagnostics(
     *,
     cost_log="criterion.log",
     cost_cases=None,
+    diagnostic_model=None,
 ):
+    try:
+        costs = read_costs(directory / cost_log)
+        if costs["schemaVersion"] != (2 if diagnostic_model is not None else 1):
+            raise ReportError("unsupported cost schema for diagnostic model")
+        if diagnostic_model is not None and costs["model"] != diagnostic_model:
+            raise ReportError("diagnostic model differs from comparison settings")
+    except (ReportError, KeyError, TypeError) as error:
+        kind = "diagnostic model" if diagnostic_model is not None else "cost measurements"
+        warnings.append(f"{side}/{repetition}: invalid {kind} ({error})")
+        return
     for name in sorted(expected):
         try:
             # These private Criterion 0.8.2 artifacts must be checked on upgrades.
@@ -171,9 +193,6 @@ def load_diagnostics(
                 f"{side}/{repetition}/{name}: missing or invalid Criterion measurement ({error})"
             )
     try:
-        costs = read_costs(directory / cost_log)
-        if costs["schemaVersion"] != 1:
-            raise ReportError("unsupported cost schema")
         rows = {row["name"]: row for row in costs["cases"]}
         if (
             set(rows) != (expected if cost_cases is None else cost_cases)
@@ -446,6 +465,7 @@ def analyze_benchmark(root: Path, manifest: dict, name: str) -> BenchmarkResult:
                 name,
                 legacy_cases=None if adaptive else set(manifest["cases"]),
                 mixed_args=manifest.get("mixedArgs", ()),
+                diagnostic_model=manifest.get("diagnosticModel"),
             )
             result.warnings.extend(warnings)
             for key, sample in samples.items():
@@ -525,6 +545,13 @@ def render_report(root: Path, base_label: str, candidate_label: str) -> str:
         f"Base: `{escape(base_label)}`; candidate: `{escape(candidate_label)}`.",
         "",
     ]
+    if manifest.get("diagnosticModel") == DIAGNOSTIC_MODEL:
+        lines += [
+            "Diagnostics: memory backend with fixed S3 mean delays and throttling, "
+            "5× model time and 250 ms warmup. Times use wall time; costs cover benchmark iterations, "
+            "including warmup. Shutdown costs are separate.",
+            "",
+        ]
     if rows:
         lines += [
             "| Metric | Base median | Candidate median | Change | 95% simultaneous interval | Unit | Result |",

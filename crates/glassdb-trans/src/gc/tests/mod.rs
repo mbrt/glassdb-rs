@@ -8,16 +8,16 @@ use crate::monitor::Monitor;
 use crate::tlocker::LockOutcome;
 use async_trait::async_trait;
 use glassdb_backend as backend;
-use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
+use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend};
 use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
 use glassdb_concurr::RetryConfig;
-use glassdb_data::{CollectionAddress, CollectionId, DbRoot, LogicalKey, ObjectPath};
+use glassdb_data::{CollectionAddress, CollectionId, DbRoot, LogicalKey, NodeToken, ObjectPath};
 use glassdb_storage::transaction::{
     TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxLog, TxWrite,
 };
 use glassdb_storage::{
-    CollectionRecord, CollectionStore, CurrentState, LeafBody, LeafEntry, LockType, Node,
-    Requirement, Timeline, TreeRouter,
+    CollectionRecord, CollectionStore, CurrentState, IndexNode, LeafBody, LeafEntry, LockType,
+    Node, Requirement, Timeline, TreeRouter,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -81,7 +81,7 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
     use glassdb_backend::middleware::{BackendOp, HookBackend};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // Cover routing, key-lock CAS, and nested directory-lock CAS races.
+    // Cover the preparation reply, key-lock CAS, and nested directory-lock CAS.
     for phase in 0..3 {
         let backend = Arc::new(MemoryBackend::new());
         let peer = new_ctx_with(backend.clone()).await;
@@ -129,7 +129,7 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
         );
         let old_id = handle.id().clone();
         let triggered = Arc::new(AtomicBool::new(false));
-        hooked.set_before({
+        let pause_owner = {
             let triggered = triggered.clone();
             let old_id = old_id.clone();
             let path = if phase == 2 {
@@ -143,12 +143,9 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
             }
             .to_string();
             let owner_monitor = owner.monitor.clone();
-            move |operation| {
+            move |operation: &BackendOp<'_>| -> HookFuture {
                 let matches_kind = if phase == 0 {
-                    matches!(
-                        operation,
-                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
-                    )
+                    matches!(operation, BackendOp::WriteIfNotExists { .. })
                 } else {
                     matches!(operation, BackendOp::WriteIf { .. })
                 };
@@ -185,13 +182,29 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
                     Ok(())
                 })
             }
-        });
+        };
+        if phase == 0 {
+            // Preparation warms the root, so routing need not issue a read.
+            // Pause its successful create reply to wound the owner while the
+            // prepared collection exists but no key lock has been installed.
+            hooked.set_after(move |operation, outcome| {
+                if outcome.is_success() {
+                    pause_owner(operation)
+                } else {
+                    Box::pin(async { Ok(()) })
+                }
+            });
+        } else {
+            hooked.set_before(pause_owner);
+        }
 
+        let decision = engine.algo.commit(&mut handle).await.unwrap();
+        assert!(triggered.load(Ordering::SeqCst), "phase {phase} must run");
         assert_eq!(
-            engine.algo.commit(&mut handle).await.unwrap(),
-            BodyDecision::ReplayBody
+            decision,
+            BodyDecision::ReplayBody,
+            "phase {phase} must replay after the wound"
         );
-        assert!(triggered.load(Ordering::SeqCst));
         assert_ne!(handle.id(), &old_id);
         assert_eq!(
             owner
@@ -221,7 +234,11 @@ async fn new_ctx_with_interval(backend: Arc<dyn Backend>, pending_timeout: Durat
         pending_timeout,
         ProtocolTiming::default().max_clock_skew(),
     ));
-    let foundation = AssemblyFixture::new(backend, DbRoot::try_from("db").unwrap(), &config);
+    new_ctx_with_config(backend, &config).await
+}
+
+async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -> Ctx {
+    let foundation = AssemblyFixture::new(backend, DbRoot::try_from("db").unwrap(), config);
     let tl = foundation.tlogger.clone();
     let records = foundation.records.clone();
     let structural_intents = foundation.structural_intents.clone();
@@ -749,6 +766,301 @@ async fn committed_still_referenced_is_kept() {
     assert_eq!(log.status, TxCommitStatus::Ok);
 }
 
+async fn replace_root(nodes: &NodeStore, node: &Node) {
+    let (_, observed) = nodes
+        .load_root(&collection(), Requirement::ANY)
+        .await
+        .unwrap();
+    assert!(
+        nodes
+            .store_root(&collection(), node, &observed)
+            .await
+            .unwrap()
+    );
+}
+
+async fn replace_node(nodes: &NodeStore, token: &NodeToken, node: &Node) {
+    let observed = nodes
+        .load_node_state(&collection(), token, Requirement::ANY)
+        .await
+        .unwrap();
+    assert!(
+        nodes
+            .store_node(&collection(), token, node, Some(&observed))
+            .await
+            .unwrap()
+    );
+}
+
+fn node_path(token: &NodeToken) -> ObjectPath {
+    ObjectPath::Node {
+        collection: collection(),
+        token: token.clone(),
+    }
+}
+
+fn tree_reads(operations: &OpLog) -> Vec<(&'static str, String)> {
+    operations
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|op| {
+            matches!(op.op, "read" | "read_if_modified")
+                && matches!(
+                    ObjectPath::try_from(op.path.as_str()),
+                    Ok(ObjectPath::TreeRoot { .. } | ObjectPath::Node { .. })
+                )
+        })
+        .map(|op| (op.op, op.path.clone()))
+        .collect()
+}
+
+#[tokio::test]
+async fn reference_checks_refresh_leaves_without_refreshing_indexes() {
+    // Writer-only records use direct descent; the duplicate write/lock key
+    // exercises batched descent and must still require only one leaf read.
+    for holder in [false, true] {
+        let memory = Arc::new(MemoryBackend::new());
+        let recorder = Arc::new(RecordingBackend::new(memory.clone()));
+        let operations = recorder.log();
+        let ctx = new_ctx_with(recorder).await;
+        let leaf = NodeToken::from_bytes([1; 16]);
+        let index = NodeToken::from_bytes([2; 16]);
+        assert!(
+            ctx.nodes
+                .store_node(&collection(), &leaf, &Node::leaf(LeafBody::new()), None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            ctx.nodes
+                .store_node(
+                    &collection(),
+                    &index,
+                    &Node::index(IndexNode::from_children([(Vec::new(), leaf.to_string())])),
+                    None
+                )
+                .await
+                .unwrap()
+        );
+        replace_root(
+            &ctx.nodes,
+            &Node::index(IndexNode::from_children([(Vec::new(), index.to_string())])),
+        )
+        .await;
+
+        // The GC cache predates the reference. An independent instance
+        // publishes it, so skipping the terminal-leaf check would lose the log.
+        let peer = AssemblyFixture::new(
+            memory,
+            DbRoot::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let id = tx(1);
+        ctx.tl
+            .set(&committed(
+                id.clone(),
+                PAST_HORIZON,
+                &[b"key"],
+                if holder { &[b"key"] } else { &[] },
+            ))
+            .await
+            .unwrap();
+        let reference = if holder {
+            locked_entry(b"key", &id)
+        } else {
+            writer_entry(b"key", &id)
+        };
+        replace_node(
+            &peer.nodes,
+            &leaf,
+            &Node::leaf(LeafBody::from_entries([reference])),
+        )
+        .await;
+        operations.lock().unwrap().clear();
+
+        let outcomes = ctx
+            .gc
+            .clone()
+            .check_batch(vec![id.clone()], NonZeroUsize::MIN)
+            .await;
+        assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Retained);
+        assert!(!is_gone(&peer.tlogger, &id).await);
+        assert_eq!(
+            tree_reads(&operations),
+            [("read_if_modified", node_path(&leaf).to_string())]
+        );
+
+        // A later overwrite removes the last reference. GC must refresh the
+        // same leaf again before deleting the candidate's exact log revision.
+        let replacement = LeafEntry::new(b"key").with_current(CurrentState::Inline {
+            writer: tx(2),
+            value: Arc::from(b"new-value".as_slice()),
+        });
+        replace_node(
+            &peer.nodes,
+            &leaf,
+            &Node::leaf(LeafBody::from_entries([replacement])),
+        )
+        .await;
+        operations.lock().unwrap().clear();
+        let outcomes = ctx
+            .gc
+            .clone()
+            .check_batch(vec![id.clone()], NonZeroUsize::MIN)
+            .await;
+        assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Reclaimed);
+        assert!(is_gone(&ctx.tl, &id).await);
+        assert_eq!(
+            tree_reads(&operations),
+            [("read_if_modified", node_path(&leaf).to_string())]
+        );
+    }
+}
+
+#[tokio::test]
+async fn reference_checks_follow_a_split_behind_a_cached_parent() {
+    for publish_separator in [false, true] {
+        let memory = Arc::new(MemoryBackend::new());
+        let recorder = Arc::new(RecordingBackend::new(memory.clone()));
+        let operations = recorder.log();
+        let ctx = new_ctx_with(recorder).await;
+        let left = NodeToken::from_bytes([1; 16]);
+        let right = NodeToken::from_bytes([2; 16]);
+        assert!(
+            ctx.nodes
+                .store_node(&collection(), &left, &Node::leaf(LeafBody::new()), None)
+                .await
+                .unwrap()
+        );
+        replace_root(
+            &ctx.nodes,
+            &Node::index(IndexNode::from_children([(Vec::new(), left.to_string())])),
+        )
+        .await;
+        let id = tx(1);
+        ctx.tl
+            .set(&committed(id.clone(), PAST_HORIZON, &[b"pear"], &[b"pear"]))
+            .await
+            .unwrap();
+        let peer = AssemblyFixture::new(
+            memory,
+            DbRoot::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let body = LeafBody::from_entries([writer_entry(b"pear", &id)]);
+        replace_node(&peer.nodes, &left, &Node::leaf(body.clone())).await;
+
+        // Publish the new sibling before shrinking the source. The GC cache
+        // keeps the original parent and empty source across both split stages.
+        assert!(
+            peer.nodes
+                .store_node(&collection(), &right, &Node::leaf(body), None)
+                .await
+                .unwrap()
+        );
+        replace_node(
+            &peer.nodes,
+            &left,
+            &Node::leaf(LeafBody::new())
+                .with_high_key(Some(b"m".to_vec()))
+                .with_right_sibling(Some(right.to_string())),
+        )
+        .await;
+        if publish_separator {
+            replace_root(
+                &peer.nodes,
+                &Node::index(IndexNode::from_children([
+                    (Vec::new(), left.to_string()),
+                    (b"m".to_vec(), right.to_string()),
+                ])),
+            )
+            .await;
+        }
+        operations.lock().unwrap().clear();
+
+        let outcomes = ctx
+            .gc
+            .clone()
+            .check_batch(vec![id.clone()], NonZeroUsize::MIN)
+            .await;
+        assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Retained);
+        assert!(!is_gone(&peer.tlogger, &id).await);
+        assert_eq!(
+            tree_reads(&operations),
+            [
+                ("read_if_modified", node_path(&left).to_string()),
+                ("read", node_path(&right).to_string()),
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn reference_checks_refresh_a_cached_leaf_that_became_an_index() {
+    let memory = Arc::new(MemoryBackend::new());
+    let recorder = Arc::new(RecordingBackend::new(memory.clone()));
+    let operations = recorder.log();
+    let ctx = new_ctx_with(recorder).await;
+    let peer = AssemblyFixture::new(
+        memory,
+        DbRoot::try_from("db").unwrap(),
+        &EngineConfig::default(),
+    );
+    let id = tx(1);
+    ctx.tl
+        .set(&committed(id.clone(), PAST_HORIZON, &[b"pear"], &[]))
+        .await
+        .unwrap();
+    let left = NodeToken::from_bytes([1; 16]);
+    let right = NodeToken::from_bytes([2; 16]);
+    let body = LeafBody::from_entries([writer_entry(b"pear", &id)]);
+    replace_root(&peer.nodes, &Node::leaf(body.clone())).await;
+    assert!(
+        peer.nodes
+            .store_node(
+                &collection(),
+                &left,
+                &Node::leaf(LeafBody::new())
+                    .with_high_key(Some(b"m".to_vec()))
+                    .with_right_sibling(Some(right.to_string())),
+                None
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        peer.nodes
+            .store_node(&collection(), &right, &Node::leaf(body), None)
+            .await
+            .unwrap()
+    );
+    replace_root(
+        &peer.nodes,
+        &Node::index(IndexNode::from_children([
+            (Vec::new(), left.to_string()),
+            (b"m".to_vec(), right.to_string()),
+        ])),
+    )
+    .await;
+    operations.lock().unwrap().clear();
+
+    let outcomes = ctx
+        .gc
+        .clone()
+        .check_batch(vec![id.clone()], NonZeroUsize::MIN)
+        .await;
+    assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Retained);
+    assert!(!is_gone(&peer.tlogger, &id).await);
+    assert_eq!(
+        tree_reads(&operations),
+        [
+            ("read_if_modified", root_path().to_string()),
+            ("read", node_path(&right).to_string()),
+        ]
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn committed_entry_lock_keeps_the_log_and_lock() {
     let ctx = new_ctx().await;
@@ -767,6 +1079,346 @@ async fn committed_entry_lock_keeps_the_log_and_lock() {
         std::slice::from_ref(&id)
     );
     assert_eq!(ctx.coord.stats_and_reset().submissions, 0);
+}
+
+#[tokio::test]
+async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
+    use crate::access::{AccessSet, ScanRange, WriteAccess};
+    use crate::engine::engine_fixture;
+    use crate::key_resolver::KeyResolver;
+    use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
+    use glassdb_data::LeafRef;
+
+    // One key uses direct descent; two keys use batched descent. The scan also
+    // holds an empty leaf that entry routing cannot refresh.
+    for keys in [
+        &[b"apple".as_slice()][..],
+        &[b"apple".as_slice(), b"banana"],
+    ] {
+        let memory = Arc::new(MemoryBackend::new());
+        let hooks = HookBackend::new(memory.clone());
+        let recorder = Arc::new(RecordingBackend::new(hooks.clone()));
+        let operations = recorder.log();
+        let ctx = new_ctx_with(recorder).await;
+        let leaf = NodeToken::from_bytes([1; 16]);
+        let empty = NodeToken::from_bytes([2; 16]);
+        let index = NodeToken::from_bytes([3; 16]);
+        let current = CurrentState::Inline {
+            writer: tx(90),
+            value: Arc::from(b"old-value".as_slice()),
+        };
+        let body = LeafBody::from_entries(
+            keys.iter()
+                .map(|key| LeafEntry::new(*key).with_current(current.clone())),
+        );
+        for (token, node) in [
+            (&empty, Node::leaf(LeafBody::new())),
+            (
+                &leaf,
+                Node::leaf(body)
+                    .with_high_key(Some(b"m".to_vec()))
+                    .with_right_sibling(Some(empty.to_string())),
+            ),
+            (
+                &index,
+                Node::index(IndexNode::from_children([
+                    (Vec::new(), leaf.to_string()),
+                    (b"m".to_vec(), empty.to_string()),
+                ])),
+            ),
+        ] {
+            assert!(
+                ctx.nodes
+                    .store_node(&collection(), token, &node, None)
+                    .await
+                    .unwrap()
+            );
+        }
+        replace_root(
+            &ctx.nodes,
+            &Node::index(IndexNode::from_children([(Vec::new(), index.to_string())])),
+        )
+        .await;
+
+        let owner = AssemblyFixture::new(
+            memory,
+            DbRoot::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let engine = engine_fixture(
+            &owner,
+            DbRoot::try_from("db").unwrap(),
+            EngineConfig::default(),
+            false,
+        );
+        let id = tx(82);
+        let mut locks: Vec<_> = keys.iter().map(|key| write_lock(key)).collect();
+        for token in [&leaf, &empty] {
+            locks.push(TxLock::Membership {
+                leaf: LeafRef::node(collection(), token.clone()),
+                typ: LockType::Read,
+            });
+        }
+        owner
+            .monitor
+            .begin_persisted_tx(
+                &id,
+                TxRecoveryManifest {
+                    locks: locks.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let operation = owner.monitor.begin_owner_operation(&id).unwrap();
+        let resolver = KeyResolver::new(
+            TreeRouter::new(owner.nodes.clone(), NonZeroUsize::MIN),
+            KeyStateResolver::new(owner.monitor.clone()),
+            NonZeroUsize::MIN,
+        );
+        let page = resolver
+            .scan_keys(&collection(), &ScanRange::all(), &[], Some(&id), None)
+            .await
+            .unwrap();
+        let accesses = AccessSet::new(
+            Vec::new(),
+            keys.iter()
+                .map(|key| WriteAccess::put(key_path(key), Arc::from(b"discarded".as_slice())))
+                .collect(),
+            vec![page.into_access(collection(), ScanRange::all(), Vec::new())],
+        );
+        let LockOutcome::Locked(locked) = engine
+            .locker
+            .keys()
+            .lock_at(
+                &id,
+                &accesses,
+                true,
+                Requirement::after(owner.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("entry and scan locks must be acquired");
+        };
+        assert_eq!(locked.locked_paths(), locks);
+        operation.complete();
+        assert_eq!(
+            owner.monitor.abort_owned_tx(&id).await.unwrap(),
+            OwnerAbortOutcome::Acknowledged
+        );
+
+        // Enter reclamation after eligibility, retaining GC's pre-acquisition
+        // leaf cache. A failed terminal check must preserve the recovery log.
+        let observed = ctx.tl.get_at(&id, Requirement::ANY).await.unwrap();
+        let barrier = ctx.timeline.currentness_barrier();
+        hooks.set_before({
+            let path = node_path(&leaf).to_string();
+            move |op| {
+                let fail = op.path() == path
+                    && matches!(
+                        op,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    );
+                Box::pin(async move {
+                    if fail {
+                        Err(BackendError::other("terminal check failed"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+        assert!(ctx.gc.try_reclaim(&id, &observed, barrier).await.is_err());
+        assert!(!is_gone(&ctx.tl, &id).await);
+        hooks.clear_before();
+        // Use a new pass's bound: the failed attempt may have refreshed indexes.
+        let barrier = ctx.timeline.currentness_barrier();
+        operations.lock().unwrap().clear();
+        assert_eq!(
+            ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
+            GcOutcome::Reclaimed
+        );
+        assert!(is_gone(&ctx.tl, &id).await);
+        assert_eq!(
+            tree_reads(&operations),
+            [
+                ("read_if_modified", node_path(&leaf).to_string()),
+                ("read_if_modified", node_path(&empty).to_string()),
+            ]
+        );
+        assert_eq!(
+            operations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|op| op.op == "write_if")
+                .count(),
+            2
+        );
+
+        operations.lock().unwrap().clear();
+        assert!(
+            !ctx.locker
+                .release(&id, &locks, Requirement::after(barrier))
+                .await
+                .unwrap()
+        );
+        assert!(operations.lock().unwrap().is_empty());
+        for token in [&leaf, &empty] {
+            let loaded = owner
+                .nodes
+                .load_leaf(
+                    &node_path(token),
+                    Requirement::after(owner.timeline.currentness_barrier()),
+                )
+                .await
+                .unwrap();
+            assert!(loaded.node().membership_lock().holders().is_empty());
+            for entry in loaded.entries().entries() {
+                assert!(entry.lock_holders().is_empty());
+                assert_eq!(entry.current, current);
+            }
+            assert_eq!(
+                loaded.entries().entries().count(),
+                if token == &leaf { keys.len() } else { 0 }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn entry_release_follows_splits_without_refreshing_cached_indexes() {
+    use crate::engine::engine_fixture;
+
+    for (root_split, publish_separator) in [(false, false), (false, true), (true, true)] {
+        let memory = Arc::new(MemoryBackend::new());
+        let recorder = Arc::new(RecordingBackend::new(memory.clone()));
+        let operations = recorder.log();
+        let ctx = new_ctx_with(recorder).await;
+        let left = NodeToken::from_bytes([1; 16]);
+        let right = NodeToken::from_bytes([2; 16]);
+        let id = tx(82);
+        let current = CurrentState::Inline {
+            writer: tx(90),
+            value: Arc::from(b"old-value".as_slice()),
+        };
+        let held = Node::leaf(LeafBody::from_entries([
+            LeafEntry::new(b"apple").with_current(current.clone()),
+            locked_entry(b"pear", &id).with_current(current.clone()),
+        ]));
+        if root_split {
+            replace_root(&ctx.nodes, &held).await;
+        } else {
+            assert!(
+                ctx.nodes
+                    .store_node(&collection(), &left, &held, None)
+                    .await
+                    .unwrap()
+            );
+            replace_root(
+                &ctx.nodes,
+                &Node::index(IndexNode::from_children([(Vec::new(), left.to_string())])),
+            )
+            .await;
+        }
+        let owner = AssemblyFixture::new(
+            memory,
+            DbRoot::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let engine = engine_fixture(
+            &owner,
+            DbRoot::try_from("db").unwrap(),
+            EngineConfig::default(),
+            false,
+        );
+        let locks = vec![write_lock(b"pear")];
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Aborted);
+        log.locks = locks.clone();
+        owner.tlogger.set(&log).await.unwrap();
+        // A split resolves holds before moving entries. Keep the recovering
+        // instance's old held leaf while the peer removes the aborted hold.
+        assert!(
+            engine
+                .locker
+                .release(&id, &locks, Requirement::ANY)
+                .await
+                .unwrap()
+        );
+        let body = LeafBody::from_entries([LeafEntry::new(b"pear").with_current(current.clone())]);
+        assert!(
+            owner
+                .nodes
+                .store_node(&collection(), &right, &Node::leaf(body), None)
+                .await
+                .unwrap()
+        );
+        let left_node = Node::leaf(LeafBody::from_entries([
+            LeafEntry::new(b"apple").with_current(current.clone())
+        ]))
+        .with_high_key(Some(b"pear".to_vec()))
+        .with_right_sibling(Some(right.to_string()));
+        if root_split {
+            assert!(
+                owner
+                    .nodes
+                    .store_node(&collection(), &left, &left_node, None)
+                    .await
+                    .unwrap()
+            );
+        } else {
+            replace_node(&owner.nodes, &left, &left_node).await;
+        }
+        if publish_separator {
+            replace_root(
+                &owner.nodes,
+                &Node::index(IndexNode::from_children([
+                    (Vec::new(), left.to_string()),
+                    (b"pear".to_vec(), right.to_string()),
+                ])),
+            )
+            .await;
+        }
+        let barrier = ctx.timeline.currentness_barrier();
+        operations.lock().unwrap().clear();
+        assert!(
+            !ctx.locker
+                .release(&id, &locks, Requirement::after(barrier))
+                .await
+                .unwrap()
+        );
+        let source = if root_split {
+            root_path()
+        } else {
+            node_path(&left)
+        };
+        assert_eq!(
+            tree_reads(&operations),
+            [
+                ("read_if_modified", source.to_string()),
+                ("read", node_path(&right).to_string()),
+            ]
+        );
+        assert!(
+            operations
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|op| matches!(op.op, "read" | "read_if_modified"))
+        );
+        let right_leaf = owner
+            .nodes
+            .load_leaf(
+                &node_path(&right),
+                Requirement::after(owner.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        let entry = right_leaf.entries().lookup(b"pear").unwrap();
+        assert!(entry.lock_holders().is_empty());
+        assert_eq!(entry.current, current);
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -984,6 +1636,7 @@ enum DirectoryCleanup {
     ReadFailure,
     OwnerReleased,
     CommittedReleased,
+    CommittedHolder,
 }
 
 async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
@@ -1030,7 +1683,10 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
     let operation = owner.monitor.begin_owner_operation(&id).unwrap();
     locker.acquire(&collection(), &id, typ).await.unwrap();
     operation.complete();
-    if matches!(case, DirectoryCleanup::CommittedReleased) {
+    if matches!(
+        case,
+        DirectoryCleanup::CommittedReleased | DirectoryCleanup::CommittedHolder
+    ) {
         let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
         log.locks = locks.clone();
         owner.monitor.commit_tx(log).await.unwrap();
@@ -1040,7 +1696,10 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
             OwnerAbortOutcome::Acknowledged
         );
     }
-    if matches!(case, DirectoryCleanup::CachedHolder) {
+    if matches!(
+        case,
+        DirectoryCleanup::CachedHolder | DirectoryCleanup::CommittedHolder
+    ) {
         ctx.records
             .load_record(
                 &collection(),
@@ -1127,7 +1786,7 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
         DirectoryCleanup::StaleNoHolder | DirectoryCleanup::ReadFailure => {
             &["read_if_modified", "write_if"]
         }
-        DirectoryCleanup::CachedHolder => &["write_if"],
+        DirectoryCleanup::CachedHolder | DirectoryCleanup::CommittedHolder => &["write_if"],
         DirectoryCleanup::OwnerReleased | DirectoryCleanup::CommittedReleased => {
             &["read_if_modified"]
         }
@@ -1149,6 +1808,540 @@ async fn aborted_directory_writer_gc_refreshes_a_cached_no_holder() {
 async fn directory_gc_reuses_a_cached_holder_for_its_cas() {
     for typ in [LockType::Read, LockType::Write] {
         reclaim_directory(typ, DirectoryCleanup::CachedHolder).await;
+    }
+}
+
+#[tokio::test]
+async fn committed_directory_gc_reuses_removal_after_cache_eviction() {
+    use crate::monitor::TxRecoveryManifest;
+
+    let recorded = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+    let operations = recorded.log();
+    let mut config = EngineConfig::default();
+    config.set_cache_size(0);
+    let ctx = new_ctx_with_config(Arc::new(recorded), &config).await;
+    let id = tx(86);
+    let mut locks = Vec::new();
+    let mut parent = CollectionRecord::new();
+    // Each shard retains its last entry even with a zero-byte budget. More
+    // directories than shards guarantees eviction during write-back without
+    // selecting paths from the cache's hash or inspecting its entries.
+    for index in 0..=glassdb_concurr::shard::count() {
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+        let child = CollectionAddress::new("db", CollectionId::from_slice(&bytes).unwrap());
+        assert!(
+            ctx.records
+                .create_record(&child, &CollectionRecord::new())
+                .await
+                .unwrap()
+        );
+        assert!(
+            ctx.nodes
+                .create_root(&child, &Node::leaf(LeafBody::new()))
+                .await
+                .unwrap()
+        );
+        parent.add_child(bytes.to_vec(), child.id()).unwrap();
+        locks.push(TxLock::Directory {
+            collection: child,
+            typ: if index % 2 == 0 {
+                LockType::Read
+            } else {
+                LockType::Write
+            },
+        });
+    }
+    let (_, observed) = ctx
+        .records
+        .load_record(&collection(), Requirement::ANY)
+        .await
+        .unwrap();
+    assert!(ctx.records.store_record(&parent, &observed).await.unwrap());
+    ctx.mon
+        .begin_persisted_tx(
+            &id,
+            TxRecoveryManifest {
+                locks: locks.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let operation = ctx.mon.begin_owner_operation(&id).unwrap();
+    for lock in &locks {
+        let TxLock::Directory { collection, typ } = lock else {
+            unreachable!()
+        };
+        ctx.locker
+            .collections()
+            .acquire(collection, &id, *typ)
+            .await
+            .unwrap();
+    }
+    operation.complete();
+    let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+    log.locks = locks.clone();
+    ctx.mon.commit_tx(log).await.unwrap();
+    let observed = ctx.tl.get_at(&id, Requirement::ANY).await.unwrap();
+    let barrier = ctx.timeline.currentness_barrier();
+    operations.lock().unwrap().clear();
+    assert_eq!(
+        ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
+        GcOutcome::Reclaimed
+    );
+    assert!(is_gone(&ctx.tl, &id).await);
+    let recorded = std::mem::take(&mut *operations.lock().unwrap());
+    for lock in &locks {
+        let TxLock::Directory { collection, .. } = lock else {
+            unreachable!()
+        };
+        let path = ObjectPath::CollectionRecord {
+            collection: collection.clone(),
+        }
+        .to_string();
+        let calls = recorded
+            .iter()
+            .filter(|op| op.path == path)
+            .map(|op| op.op)
+            .collect::<Vec<_>>();
+        assert_eq!(calls.iter().filter(|op| **op == "write_if").count(), 1);
+        let after_removal = calls
+            .iter()
+            .skip_while(|op| **op != "write_if")
+            .skip(1)
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            after_removal.is_empty(),
+            "record read again after removal: {calls:?}"
+        );
+        let (record, _) = ctx
+            .records
+            .load_record(
+                collection,
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        assert!(!record.directory_lock().contains(&id));
+    }
+}
+
+#[tokio::test]
+async fn committed_directory_gc_needs_no_read_after_a_warm_removal() {
+    for typ in [LockType::Read, LockType::Write] {
+        reclaim_directory(typ, DirectoryCleanup::CommittedHolder).await;
+    }
+}
+
+#[tokio::test]
+async fn committed_directory_removal_does_not_prove_other_records_clear() {
+    use crate::collection_coordination::CollectionLocker;
+    use crate::monitor::TxRecoveryManifest;
+
+    for fail_check in [false, true] {
+        let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let recorded = RecordingBackend::new(hooks.clone());
+        let operations = recorded.log();
+        let backend: Arc<dyn Backend> = Arc::new(recorded);
+        let ctx = new_ctx_with(backend.clone()).await;
+        let child = CollectionAddress::new("db", CollectionId::from_slice(&[84; 16]).unwrap());
+        assert!(
+            ctx.records
+                .create_record(&child, &CollectionRecord::new())
+                .await
+                .unwrap()
+        );
+        assert!(
+            ctx.nodes
+                .create_root(&child, &Node::leaf(LeafBody::new()))
+                .await
+                .unwrap()
+        );
+        let (mut parent, observed) = ctx
+            .records
+            .load_record(&collection(), Requirement::ANY)
+            .await
+            .unwrap();
+        parent.add_child(b"child".to_vec(), child.id()).unwrap();
+        assert!(ctx.records.store_record(&parent, &observed).await.unwrap());
+        let owner = AssemblyFixture::new(
+            backend,
+            DbRoot::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let locker = CollectionLocker::new(
+            CollectionStateResolver::new(
+                owner.records.clone(),
+                owner.tlogger.clone(),
+                owner.timeline.clone(),
+                owner.monitor.clone(),
+                RetryConfig::default(),
+            ),
+            std::num::NonZeroUsize::MIN,
+        );
+        let id = tx(84);
+        let locks = vec![
+            TxLock::Directory {
+                collection: collection(),
+                typ: LockType::Read,
+            },
+            TxLock::Directory {
+                collection: child.clone(),
+                typ: LockType::Read,
+            },
+        ];
+        owner
+            .monitor
+            .begin_persisted_tx(
+                &id,
+                TxRecoveryManifest {
+                    locks: locks.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let operation = owner.monitor.begin_owner_operation(&id).unwrap();
+        for collection in [collection(), child.clone()] {
+            locker
+                .acquire(&collection, &id, LockType::Read)
+                .await
+                .unwrap();
+        }
+        operation.complete();
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+        log.locks = locks;
+        owner.monitor.commit_tx(log).await.unwrap();
+        // Only the parent's holder is visible to speculative write-back.
+        // The child's old no-holder record must still get the bounded check.
+        ctx.records
+            .load_record(
+                &collection(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        let observed = ctx.tl.get_at(&id, Requirement::ANY).await.unwrap();
+        let barrier = ctx.timeline.currentness_barrier();
+        let child_path = ObjectPath::CollectionRecord {
+            collection: child.clone(),
+        }
+        .to_string();
+        if fail_check {
+            hooks.set_before({
+                let child_path = child_path.clone();
+                move |op| {
+                    let fail = op.path() == child_path
+                        && matches!(
+                            op,
+                            BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                        );
+                    Box::pin(async move {
+                        if fail {
+                            Err(BackendError::other("directory check failed"))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                }
+            });
+        }
+        operations.lock().unwrap().clear();
+        let result = ctx.gc.try_reclaim(&id, &observed, barrier).await;
+        if fail_check {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(result.unwrap(), GcOutcome::Reclaimed);
+        }
+        assert_eq!(is_gone(&ctx.tl, &id).await, !fail_check);
+        let recorded = std::mem::take(&mut *operations.lock().unwrap());
+        let expected: &[&str] = if fail_check {
+            &["read_if_modified"]
+        } else {
+            &["read_if_modified", "write_if"]
+        };
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|op| op.path == child_path)
+                .map(|op| op.op)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        hooks.clear_before();
+        for (collection, held) in [(collection(), false), (child, fail_check)] {
+            let (record, _) = owner
+                .records
+                .load_record(
+                    &collection,
+                    Requirement::after(owner.timeline.currentness_barrier()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(record.directory_lock().contains(&id), held);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DirectoryWriteBack {
+    Unreferenced,
+    LiveValue,
+    WriteFailure,
+    LostWriteReply,
+}
+
+async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) {
+    use crate::collection_coordination::CollectionLocker;
+    use crate::collections::{CollectionChange, CollectionOp};
+    use crate::monitor::TxRecoveryManifest;
+
+    let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let recorded = RecordingBackend::new(hooks.clone());
+    let operations = recorded.log();
+    let backend: Arc<dyn Backend> = Arc::new(recorded);
+    let ctx = new_ctx_with(backend.clone()).await;
+    let owner = AssemblyFixture::new(
+        backend,
+        DbRoot::try_from("db").unwrap(),
+        &EngineConfig::default(),
+    );
+    let locker = CollectionLocker::new(
+        CollectionStateResolver::new(
+            owner.records.clone(),
+            owner.tlogger.clone(),
+            owner.timeline.clone(),
+            owner.monitor.clone(),
+            RetryConfig::default(),
+        ),
+        std::num::NonZeroUsize::MIN,
+    );
+    let lifecycle = CollectionLifecycle::new(
+        owner.records.clone(),
+        owner.nodes.clone(),
+        owner.monitor.clone(),
+        RetryConfig::default(),
+        Arc::new(UnexpectedTopologySettler),
+    );
+    let id = tx(87);
+    let child = CollectionAddress::new("db", CollectionId::from_slice(&[87; 16]).unwrap());
+    let mut change = CollectionChange {
+        parent: collection(),
+        name: b"child".to_vec(),
+        collection: child.clone(),
+        expected: None,
+        op: CollectionOp::Create,
+    };
+    if op == TxCollectionOp::Drop {
+        lifecycle
+            .prepare_collections(std::slice::from_ref(&change))
+            .await
+            .unwrap();
+        let (mut record, observed) = ctx
+            .records
+            .load_record(&collection(), Requirement::ANY)
+            .await
+            .unwrap();
+        record.add_child(change.name.clone(), child.id()).unwrap();
+        assert!(ctx.records.store_record(&record, &observed).await.unwrap());
+        change.op = CollectionOp::Drop;
+        change.expected = Some(child.id());
+    }
+    // GC retains this no-holder parent while the owner acquires its writer.
+    let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+    log.locks = vec![TxLock::Directory {
+        collection: collection(),
+        typ: LockType::Write,
+    }];
+    log.collection_changes = vec![TxCollectionChange {
+        parent: collection(),
+        name: change.name.clone(),
+        collection: child.clone(),
+        op,
+    }];
+    if op == TxCollectionOp::Create {
+        log.prepared_collections = vec![child.clone()];
+    }
+    if matches!(case, DirectoryWriteBack::LiveValue) {
+        log.writes = committed(id.clone(), PAST_HORIZON, &[b"k"], &[]).writes;
+    }
+    owner
+        .monitor
+        .begin_persisted_tx(&id, TxRecoveryManifest::from_log(&log))
+        .await
+        .unwrap();
+    let operation = owner.monitor.begin_owner_operation(&id).unwrap();
+    lifecycle
+        .prepare_collections(std::slice::from_ref(&change))
+        .await
+        .unwrap();
+    lifecycle
+        .fence_drops(&id, std::slice::from_ref(&change))
+        .await
+        .unwrap();
+    locker
+        .acquire(&collection(), &id, LockType::Write)
+        .await
+        .unwrap();
+    operation.complete();
+    owner.monitor.commit_tx(log.clone()).await.unwrap();
+    if matches!(case, DirectoryWriteBack::LiveValue) {
+        locker
+            .write_back(
+                &id,
+                std::slice::from_ref(&change),
+                &log.locks,
+                Requirement::ANY,
+            )
+            .await
+            .unwrap();
+        store_entry(&ctx, b"k", writer_entry(b"k", &id)).await;
+    }
+    let path = ObjectPath::CollectionRecord {
+        collection: collection(),
+    }
+    .to_string();
+    let observed = ctx.tl.get_at(&id, Requirement::ANY).await.unwrap();
+    if matches!(
+        case,
+        DirectoryWriteBack::WriteFailure | DirectoryWriteBack::LostWriteReply
+    ) {
+        let fail_write = {
+            let path = path.clone();
+            move |operation: &BackendOp| -> HookFuture {
+                let fail =
+                    operation.path() == path && matches!(operation, BackendOp::WriteIf { .. });
+                Box::pin(async move {
+                    if fail {
+                        Err(BackendError::Unavailable(
+                            "directory write-back unavailable".into(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        };
+        let applied = matches!(case, DirectoryWriteBack::LostWriteReply);
+        if applied {
+            hooks.set_after(move |operation, outcome| {
+                if outcome.is_success() {
+                    fail_write(operation)
+                } else {
+                    Box::pin(async { Ok(()) })
+                }
+            });
+        } else {
+            hooks.set_before(fail_write);
+        }
+        assert!(
+            ctx.gc
+                .try_reclaim(&id, &observed, ctx.timeline.currentness_barrier())
+                .await
+                .is_err()
+        );
+        assert!(!is_gone(&ctx.tl, &id).await);
+        let (record, _) = owner
+            .records
+            .load_record(
+                &collection(),
+                Requirement::after(owner.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(record.directory_lock().contains(&id), !applied);
+        assert_eq!(
+            record.child(&change.name),
+            ((op == TxCollectionOp::Create) == applied).then_some(child.id())
+        );
+        hooks.clear_before();
+        hooks.clear_after();
+    }
+    operations.lock().unwrap().clear();
+    let outcome = ctx
+        .gc
+        .try_reclaim(&id, &observed, ctx.timeline.currentness_barrier())
+        .await
+        .unwrap();
+    let live_value = matches!(case, DirectoryWriteBack::LiveValue);
+    if live_value {
+        assert!(!is_gone(&ctx.tl, &id).await);
+        // Each GC pass captures a new bound. A live value must continue to
+        // bypass bounded directory completion after owner cleanup.
+        ctx.gc
+            .try_reclaim(&id, &observed, ctx.timeline.currentness_barrier())
+            .await
+            .unwrap();
+        assert!(!is_gone(&ctx.tl, &id).await);
+    } else {
+        assert_eq!(outcome, GcOutcome::Reclaimed);
+        assert!(is_gone(&ctx.tl, &id).await);
+    }
+    let recorded = std::mem::take(&mut *operations.lock().unwrap());
+    let calls: Vec<_> = recorded
+        .iter()
+        .filter(|op| op.path == path)
+        .map(|op| op.op)
+        .collect();
+    let expected: &[&str] = match case {
+        DirectoryWriteBack::Unreferenced => &["read_if_modified", "write_if"],
+        DirectoryWriteBack::LiveValue => &[],
+        DirectoryWriteBack::WriteFailure => &["read", "write_if"],
+        DirectoryWriteBack::LostWriteReply => &["read"],
+    };
+    assert_eq!(calls, expected);
+    let (record, _) = owner
+        .records
+        .load_record(
+            &collection(),
+            Requirement::after(owner.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    assert!(!record.directory_lock().contains(&id));
+    assert_eq!(
+        record.child(&change.name),
+        (op == TxCollectionOp::Create).then_some(child.id())
+    );
+    let root = ctx
+        .nodes
+        .load_root(
+            &child,
+            Requirement::after(ctx.timeline.currentness_barrier()),
+        )
+        .await;
+    if op == TxCollectionOp::Create {
+        assert!(root.is_ok());
+    } else {
+        assert!(matches!(root, Err(StorageError::NotFound)));
+    }
+}
+
+#[tokio::test]
+async fn committed_directory_changes_finish_in_one_gc_pass() {
+    for op in [TxCollectionOp::Create, TxCollectionOp::Drop] {
+        recover_directory_change(op, DirectoryWriteBack::Unreferenced).await;
+    }
+}
+
+#[tokio::test]
+async fn committed_directory_write_back_failure_keeps_the_log() {
+    for op in [TxCollectionOp::Create, TxCollectionOp::Drop] {
+        for case in [
+            DirectoryWriteBack::WriteFailure,
+            DirectoryWriteBack::LostWriteReply,
+        ] {
+            recover_directory_change(op, case).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn live_values_skip_bounded_directory_completion() {
+    for op in [TxCollectionOp::Create, TxCollectionOp::Drop] {
+        recover_directory_change(op, DirectoryWriteBack::LiveValue).await;
     }
 }
 
@@ -1175,6 +2368,7 @@ enum TopologyCleanup {
     CachedParticipant,
     ReadFailure,
     IntentRemaining,
+    DirectoryRemoved,
 }
 
 async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
@@ -1194,9 +2388,15 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
         &EngineConfig::default(),
     );
     let id = tx(85);
-    let locks = vec![TxLock::Topology {
+    let mut locks = vec![TxLock::Topology {
         collection: collection(),
     }];
+    if matches!(case, TopologyCleanup::DirectoryRemoved) {
+        locks.push(TxLock::Directory {
+            collection: collection(),
+            typ: LockType::Read,
+        });
+    }
     owner
         .monitor
         .begin_persisted_tx(
@@ -1234,6 +2434,9 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
         .await
         .unwrap();
     assert!(record.add_topology_participant(id.clone()));
+    if matches!(case, TopologyCleanup::DirectoryRemoved) {
+        record.add_directory_reader(id.clone());
+    }
     assert!(
         owner
             .records
@@ -1288,7 +2491,10 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
             OwnerAbortOutcome::Acknowledged
         );
     }
-    if matches!(case, TopologyCleanup::CachedParticipant) {
+    if matches!(
+        case,
+        TopologyCleanup::CachedParticipant | TopologyCleanup::DirectoryRemoved
+    ) {
         ctx.records
             .load_record(
                 &collection(),
@@ -1358,15 +2564,16 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
             .all(|participant| participant != &id),
         "GC deleted the transaction log while its topology participant remained"
     );
+    assert!(!record.directory_lock().contains(&id));
     let calls: Vec<_> = recorded
         .iter()
         .filter(|op| op.path == path)
         .map(|op| op.op)
         .collect();
-    let expected: &[&str] = if matches!(case, TopologyCleanup::CachedParticipant) {
-        &["write_if"]
-    } else {
-        &["read_if_modified", "write_if"]
+    let expected: &[&str] = match case {
+        TopologyCleanup::CachedParticipant => &["write_if"],
+        TopologyCleanup::DirectoryRemoved => &["write_if", "write_if"],
+        _ => &["read_if_modified", "write_if"],
     };
     assert_eq!(calls, expected);
     operations.lock().unwrap().clear();
@@ -1378,6 +2585,11 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
             .unwrap()
     );
     assert!(operations.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn committed_directory_removal_keeps_topology_cleanup() {
+    reclaim_topology(true, TopologyCleanup::DirectoryRemoved).await;
 }
 
 #[tokio::test]

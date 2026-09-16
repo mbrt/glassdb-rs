@@ -629,6 +629,55 @@ class PerfReportTest(unittest.TestCase):
                 (self.root / "pr/03/criterion.log").write_text(contents)
                 self.assertIn("invalid cost measurements", self.report())
 
+    def test_diagnostic_models_must_match_before_timing_is_compared(self):
+        directory = self.root / "pr/01"
+        path = directory / "criterion.log"
+        costs = perf_report.read_costs(path)
+        costs.update(schemaVersion=2, model=perf_report.DIAGNOSTIC_MODEL.copy())
+        self.write(path, costs)
+        options = {
+            "legacy_cases": {"example"},
+            "diagnostic_model": perf_report.DIAGNOSTIC_MODEL,
+        }
+        metrics, warnings = perf_report.read_measurement(
+            directory, "example", **options
+        )
+        self.assertFalse(warnings)
+        self.assertIn("example: mean group time", metrics)
+        self.assertIn("example/workload: reads", metrics)
+        metrics, warnings = perf_report.read_measurement(
+            directory, "example", legacy_cases={"example"}
+        )
+        self.assertFalse(metrics)
+        self.assertIn("unsupported cost schema for diagnostic model", warnings[0])
+        for key, value in (
+            ("latencyProfile", "none"),
+            ("modelTimeSpeedup", 20),
+            ("warmupMs", 500),
+            ("latencyJitter", True),
+            ("costWindow", "separatePass"),
+        ):
+            with self.subTest(key=key):
+                costs["model"] = {**perf_report.DIAGNOSTIC_MODEL, key: value}
+                self.write(path, costs)
+                metrics, warnings = perf_report.read_measurement(
+                    directory, "example", **options
+                )
+                self.assertFalse(metrics)
+                self.assertIn("invalid diagnostic model", warnings[0])
+        for contents in (
+            "Benchmark failed before costs\n",
+            'diagnostic-costs: {"schemaVersion": 1, "cases": []}\n',
+            'diagnostic-costs: {"schemaVersion": 2, "cases": []}\n',
+        ):
+            with self.subTest(contents=contents):
+                path.write_text(contents)
+                metrics, warnings = perf_report.read_measurement(
+                    directory, "example", **options
+                )
+                self.assertFalse(metrics)
+                self.assertIn("invalid diagnostic model", warnings[0])
+
     def test_model_mismatch_is_not_compared(self):
         self.edit("mixed.json", lambda value: value.update(modelTimeSpeedup=1))
         self.assertIn("unsupported mixed schema or backend model", self.report())

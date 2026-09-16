@@ -28,6 +28,9 @@ impl CollectionCatalog {
         &self,
         parent: &CollectionAddress,
     ) -> Result<DirectorySnapshot, TransError> {
+        // Callers retain directory reads and mutation preconditions as semantic
+        // dependencies. Validation checks them after the body before accepting
+        // its outcome, so this snapshot can use cached contents.
         let record = self.state.resolve(parent, None, Requirement::ANY).await?;
         Ok(DirectorySnapshot {
             children: record

@@ -88,36 +88,49 @@ impl CollectionLocker {
     }
 
     /// Applies committed directory effects and releases their locks.
+    ///
+    /// Returns only directories whose holder-removal CAS applied for `id`.
+    /// A present no-holder observation must satisfy `requirement`. With `ANY`,
+    /// callers must share acquisition's cache knowledge or treat no-ops as
+    /// speculative. Neither no-holder nor missing-record completion reports
+    /// an applied removal.
     pub(crate) async fn write_back(
         &self,
         id: &TxId,
         changes: &[CollectionChange],
         locks: &[TxLock],
-    ) -> Result<bool, TransError> {
+        requirement: Requirement,
+    ) -> Result<BTreeSet<CollectionAddress>, TransError> {
         let results = map_all_bounded(
             Self::locked_collections(locks),
             self.parallelism,
             |parent| async move {
-                self.state
-                    .apply_committed_write_back(&parent, id, changes)
-                    .await
+                let removed = self
+                    .state
+                    .apply_committed_write_back(&parent, id, changes, requirement)
+                    .await?;
+                Ok(removed.then_some(parent))
             },
         )
         .await;
-        results
-            .into_iter()
-            .try_fold(false, |changed, result| Ok(changed | result?))
+        results.into_iter().filter_map(Result::transpose).collect()
     }
 
     /// Recovers committed directory effects from durable metadata.
+    ///
+    /// Returns the same per-directory removal proof as [`Self::write_back`].
+    /// With `Requirement::after` using a barrier captured after finalization,
+    /// success also proves every submitted directory complete, even if the
+    /// returned set is empty.
     pub(crate) async fn recover_write_back(
         &self,
         id: &TxId,
         changes: &[TxCollectionChange],
         locks: &[TxLock],
-    ) -> Result<bool, TransError> {
+        requirement: Requirement,
+    ) -> Result<BTreeSet<CollectionAddress>, TransError> {
         let changes = CollectionStateResolver::recover_changes(changes);
-        self.write_back(id, &changes, locks).await
+        self.write_back(id, &changes, locks, requirement).await
     }
 
     /// Releases every recorded directory lock held by `id`.
@@ -139,30 +152,6 @@ impl CollectionLocker {
         results
             .into_iter()
             .try_fold(false, |changed, result| Ok(changed | result?))
-    }
-
-    /// Reports whether any recorded directory still refers to `id`.
-    pub(crate) async fn is_referenced(
-        &self,
-        id: &TxId,
-        locks: &[TxLock],
-        requirement: Requirement,
-    ) -> Result<bool, TransError> {
-        let results = map_all_bounded(
-            Self::locked_collections(locks),
-            self.parallelism,
-            |parent| async move {
-                match self.records.load_record(&parent, requirement).await {
-                    Ok((record, _)) => Ok(record.directory_lock().contains(id)),
-                    Err(StorageError::NotFound) => Ok(false),
-                    Err(error) => Err(TransError::from(error)),
-                }
-            },
-        )
-        .await;
-        results
-            .into_iter()
-            .try_fold(false, |referenced, result| Ok(referenced | result?))
     }
 
     /// Removes a settled participant from collection topology.
@@ -216,6 +205,9 @@ impl CollectionLocker {
             let already_held = lock.contains(id)
                 && (desired == LockType::Read || lock.lock_type() == LockType::Write);
             if already_held {
+                // This active identity's releases update the same cache;
+                // foreign cleanup requires finalization. Retained ownership
+                // permits this return. Directory contents are validated later.
                 return Ok(());
             }
             let conflicts = match desired {
@@ -389,17 +381,29 @@ impl CollectionStateResolver {
         parent: &CollectionAddress,
         id: &TxId,
         changes: &[CollectionChange],
+        requirement: Requirement,
     ) -> Result<bool, TransError> {
         let mut backoff = self.retry.backoff();
+        let mut read_requirement = Requirement::ANY;
         loop {
             let (mut record, observed) =
-                match self.records.load_record(parent, Requirement::ANY).await {
+                match self.records.load_record(parent, read_requirement).await {
                     Ok(record) => record,
+                    // Published records predate access by other instances.
+                    // Preparation shares its owner's cache, and recovery runs
+                    // after commit. A cached absence cannot hide later creation
+                    // of a record this transaction can still hold.
                     Err(StorageError::NotFound) => return Ok(false),
                     Err(error) => return Err(error.into()),
                 };
             if !record.directory_lock().contains(id) {
-                return Ok(false);
+                if observed.satisfies(requirement) {
+                    return Ok(false);
+                }
+                // A stale no-holder record can predate acquisition. Reuse the
+                // completion bound and apply any holder found by this check.
+                read_requirement = requirement;
+                continue;
             }
             let mut changed = false;
             for change in changes.iter().filter(|change| &change.parent == parent) {
@@ -446,6 +450,9 @@ impl CollectionStateResolver {
         parent: &CollectionAddress,
         id: &TxId,
     ) -> Result<(), TransError> {
+        // Final-status resolution shares this store and has observed immutable
+        // committed contents. ANY cannot restore an older Pending body; it
+        // still does not prove that the transaction object remains present.
         let observed = self
             .transactions
             .get_at(id, Requirement::ANY)
@@ -463,7 +470,9 @@ impl CollectionStateResolver {
             )));
         }
         let changes = Self::recover_changes(&log.collection_changes);
-        self.apply_committed_write_back(parent, id, &changes)
+        // Resolution observed this holder through the same record cache. A
+        // later no-holder state proves removal; a retained holder seeds CAS.
+        self.apply_committed_write_back(parent, id, &changes, Requirement::ANY)
             .await
             .map(|_| ())
     }
