@@ -1461,8 +1461,13 @@ recovery share the `ScanCadence` interval controller from `glassdb-concurr`.
   that the old leaf's holds are gone because it cannot become a leaf again.
   Directory release also starts with `ANY` and checks a present no-holder
   observation against the same bound before it reports completion. Owner cleanup
-  shares acquisition's cache knowledge and can keep `ANY`; committed GC already
-  supplies bounded evidence through its directory reference check. Topology
+  shares acquisition's cache knowledge and can keep `ANY`. Committed GC retains
+  the addresses whose directory-holder removal CAS applied in the current
+  pass. Only those directory locks are excluded from later reference checks
+  and release, even if their cache entries are evicted. The committed identity
+  cannot acquire those holders again. A speculative no-holder or missing-record
+  result supplies no such proof; those directories keep the bounded reference
+  check. Entry, membership, and topology obligations remain separate. Topology
   participant release uses the same rule after GC lists no remaining structural
   intents. The collection record needs its own completion evidence; listing
   intents does not refresh that record. Missing records need no extra check:

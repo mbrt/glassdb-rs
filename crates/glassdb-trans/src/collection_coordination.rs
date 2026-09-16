@@ -88,34 +88,39 @@ impl CollectionLocker {
     }
 
     /// Applies committed directory effects and releases their locks.
+    ///
+    /// Returns only directories whose holder-removal CAS applied for `id`.
+    /// A speculative no-holder or missing-record result is not removal proof.
     pub(crate) async fn write_back(
         &self,
         id: &TxId,
         changes: &[CollectionChange],
         locks: &[TxLock],
-    ) -> Result<bool, TransError> {
+    ) -> Result<BTreeSet<CollectionAddress>, TransError> {
         let results = map_all_bounded(
             Self::locked_collections(locks),
             self.parallelism,
             |parent| async move {
-                self.state
+                let removed = self
+                    .state
                     .apply_committed_write_back(&parent, id, changes)
-                    .await
+                    .await?;
+                Ok(removed.then_some(parent))
             },
         )
         .await;
-        results
-            .into_iter()
-            .try_fold(false, |changed, result| Ok(changed | result?))
+        results.into_iter().filter_map(Result::transpose).collect()
     }
 
     /// Recovers committed directory effects from durable metadata.
+    ///
+    /// Returns the same per-directory removal proof as [`Self::write_back`].
     pub(crate) async fn recover_write_back(
         &self,
         id: &TxId,
         changes: &[TxCollectionChange],
         locks: &[TxLock],
-    ) -> Result<bool, TransError> {
+    ) -> Result<BTreeSet<CollectionAddress>, TransError> {
         let changes = CollectionStateResolver::recover_changes(changes);
         self.write_back(id, &changes, locks).await
     }

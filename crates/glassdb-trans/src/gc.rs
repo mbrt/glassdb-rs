@@ -74,7 +74,7 @@ struct Reclamation {
 /// Which leaf-entry field a liveness check consults for a recorded key: a
 /// written key is referenced while it is the entry's `current_writer`; a locked
 /// key while it appears in `locked_by`. Rides along as the per-key payload of
-/// [`Gc::still_referenced`]'s batched leaf load.
+/// [`Gc::entries_referenced`]'s batched leaf load.
 enum CheckKind {
     Writer,
     Holder,
@@ -448,11 +448,12 @@ impl Gc {
         // reachability. A crash after the commit point must not leave a dropped
         // collection forever merely because this same log stores a live value
         // in another collection.
-        let mut changed = self
+        let removed_directories = self
             .locker
             .collections()
             .recover_write_back(tid, &log.collection_changes, &log.locks)
             .await?;
+        let mut changed = !removed_directories.is_empty();
         let dropped = log
             .collection_changes
             .iter()
@@ -473,17 +474,31 @@ impl Gc {
             .collect::<Vec<_>>();
         changed |= self.collection_lifecycle.reclaim(&dropped).await?;
         changed |= self.collection_lifecycle.reclaim(&unused_prepared).await?;
-        if self.still_referenced(tid, log, barrier).await? {
+        if self.entries_referenced(tid, log, barrier).await? {
             return Ok(GcOutcome::from_progress(changed));
         }
-        // The liveness check already ruled out every recorded entry lock.
-        // Membership and topology effects still need their own cleanup.
+        // The original log's entry references are clear. Applied directory
+        // write-back proves removal even after cache eviction: this
+        // committed identity cannot acquire those holders again. Keep every
+        // other directory and all membership/topology obligations.
         let remaining: Vec<_> = log
             .locks
             .iter()
-            .filter(|lock| !matches!(lock, TxLock::Entry { .. }))
+            .filter(|lock| match lock {
+                TxLock::Entry { .. } => false,
+                TxLock::Directory { collection, .. } => !removed_directories.contains(collection),
+                _ => true,
+            })
             .cloned()
             .collect();
+        if self
+            .locker
+            .collections()
+            .is_referenced(tid, &remaining, Requirement::after(barrier))
+            .await?
+        {
+            return Ok(GcOutcome::from_progress(changed));
+        }
         let released = self.release_locks(tid, &remaining, barrier).await?;
         changed |= released.changed;
         if !released.complete {
@@ -549,7 +564,7 @@ impl Gc {
     /// share a leaf, so a per-key load would re-read the same leaf several times
     /// per candidate. Each key carries the [`CheckKind`] that says which field
     /// to inspect.
-    async fn still_referenced(
+    async fn entries_referenced(
         &self,
         tid: &TxId,
         log: &TxLog,
@@ -610,14 +625,6 @@ impl Gc {
                     }
                 }
             }
-        }
-        if self
-            .locker
-            .collections()
-            .is_referenced(tid, &log.locks, Requirement::after(barrier))
-            .await?
-        {
-            return Ok(true);
         }
         Ok(false)
     }

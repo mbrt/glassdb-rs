@@ -2968,7 +2968,11 @@ mod tests {
             let (changed, widths) = operation_widths(
                 async {
                     if write_back {
-                        locker.collections().write_back(&id, &changes, &locks).await
+                        locker
+                            .collections()
+                            .write_back(&id, &changes, &locks)
+                            .await
+                            .map(|removed| !removed.is_empty())
                     } else {
                         locker
                             .collections()

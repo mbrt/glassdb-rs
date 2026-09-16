@@ -511,6 +511,24 @@ The per-listing bound rechecks only insufficient cached absence. Present intent
 bodies already use `ANY`, so retaining a bound across listings saves no reads
 for those bodies. Keep the bound after intervening recovery work.
 
+### 8. Directory write-back retains removal proof per record
+
+Committed directory write-back returns only the collection addresses whose
+holder-removal CAS applied for that transaction identity. GC can exclude those
+directory locks from its later reference and release work. The committed
+identity cannot acquire the holders again, so cache eviction does not invalidate
+the proof. This saves record reads after eviction; a warm cache already serves
+those reads without backend calls.
+
+A cached no-holder or missing-record result is not an applied removal. Neither
+a conflict nor an uncertain mutation supplies removal proof. Never use an
+aggregate progress flag to skip all directories, or apply one transaction's
+removal proof to another identity. Directories without that proof keep GC's
+existing reference-check bound. Entry references, membership holds, and topology
+participants still need their own checks, including on the same collection.
+The proof does not establish that the full collection record is still current,
+advance an observation, or provide a requirement for another read.
+
 ## Boundaries of the guarantee
 
 - `ANY` may return stale but still usable knowledge.

@@ -234,7 +234,11 @@ async fn new_ctx_with_interval(backend: Arc<dyn Backend>, pending_timeout: Durat
         pending_timeout,
         ProtocolTiming::default().max_clock_skew(),
     ));
-    let foundation = AssemblyFixture::new(backend, DbRoot::try_from("db").unwrap(), &config);
+    new_ctx_with_config(backend, &config).await
+}
+
+async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -> Ctx {
+    let foundation = AssemblyFixture::new(backend, DbRoot::try_from("db").unwrap(), config);
     let tl = foundation.tlogger.clone();
     let records = foundation.records.clone();
     let structural_intents = foundation.structural_intents.clone();
@@ -1632,6 +1636,7 @@ enum DirectoryCleanup {
     ReadFailure,
     OwnerReleased,
     CommittedReleased,
+    CommittedHolder,
 }
 
 async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
@@ -1678,7 +1683,10 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
     let operation = owner.monitor.begin_owner_operation(&id).unwrap();
     locker.acquire(&collection(), &id, typ).await.unwrap();
     operation.complete();
-    if matches!(case, DirectoryCleanup::CommittedReleased) {
+    if matches!(
+        case,
+        DirectoryCleanup::CommittedReleased | DirectoryCleanup::CommittedHolder
+    ) {
         let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
         log.locks = locks.clone();
         owner.monitor.commit_tx(log).await.unwrap();
@@ -1688,7 +1696,10 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
             OwnerAbortOutcome::Acknowledged
         );
     }
-    if matches!(case, DirectoryCleanup::CachedHolder) {
+    if matches!(
+        case,
+        DirectoryCleanup::CachedHolder | DirectoryCleanup::CommittedHolder
+    ) {
         ctx.records
             .load_record(
                 &collection(),
@@ -1775,7 +1786,7 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
         DirectoryCleanup::StaleNoHolder | DirectoryCleanup::ReadFailure => {
             &["read_if_modified", "write_if"]
         }
-        DirectoryCleanup::CachedHolder => &["write_if"],
+        DirectoryCleanup::CachedHolder | DirectoryCleanup::CommittedHolder => &["write_if"],
         DirectoryCleanup::OwnerReleased | DirectoryCleanup::CommittedReleased => {
             &["read_if_modified"]
         }
@@ -1797,6 +1808,275 @@ async fn aborted_directory_writer_gc_refreshes_a_cached_no_holder() {
 async fn directory_gc_reuses_a_cached_holder_for_its_cas() {
     for typ in [LockType::Read, LockType::Write] {
         reclaim_directory(typ, DirectoryCleanup::CachedHolder).await;
+    }
+}
+
+#[tokio::test]
+async fn committed_directory_gc_reuses_removal_after_cache_eviction() {
+    use crate::monitor::TxRecoveryManifest;
+
+    let recorded = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+    let operations = recorded.log();
+    let mut config = EngineConfig::default();
+    config.set_cache_size(0);
+    let ctx = new_ctx_with_config(Arc::new(recorded), &config).await;
+    let id = tx(86);
+    let mut locks = Vec::new();
+    let mut parent = CollectionRecord::new();
+    // Each shard retains its last entry even with a zero-byte budget. More
+    // directories than shards guarantees eviction during write-back without
+    // selecting paths from the cache's hash or inspecting its entries.
+    for index in 0..=glassdb_concurr::shard::count() {
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+        let child = CollectionAddress::new("db", CollectionId::from_slice(&bytes).unwrap());
+        assert!(
+            ctx.records
+                .create_record(&child, &CollectionRecord::new())
+                .await
+                .unwrap()
+        );
+        assert!(
+            ctx.nodes
+                .create_root(&child, &Node::leaf(LeafBody::new()))
+                .await
+                .unwrap()
+        );
+        parent.add_child(bytes.to_vec(), child.id()).unwrap();
+        locks.push(TxLock::Directory {
+            collection: child,
+            typ: if index % 2 == 0 {
+                LockType::Read
+            } else {
+                LockType::Write
+            },
+        });
+    }
+    let (_, observed) = ctx
+        .records
+        .load_record(&collection(), Requirement::ANY)
+        .await
+        .unwrap();
+    assert!(ctx.records.store_record(&parent, &observed).await.unwrap());
+    ctx.mon
+        .begin_persisted_tx(
+            &id,
+            TxRecoveryManifest {
+                locks: locks.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let operation = ctx.mon.begin_owner_operation(&id).unwrap();
+    for lock in &locks {
+        let TxLock::Directory { collection, typ } = lock else {
+            unreachable!()
+        };
+        ctx.locker
+            .collections()
+            .acquire(collection, &id, *typ)
+            .await
+            .unwrap();
+    }
+    operation.complete();
+    let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+    log.locks = locks.clone();
+    ctx.mon.commit_tx(log).await.unwrap();
+    let observed = ctx.tl.get_at(&id, Requirement::ANY).await.unwrap();
+    let barrier = ctx.timeline.currentness_barrier();
+    operations.lock().unwrap().clear();
+    assert_eq!(
+        ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
+        GcOutcome::Reclaimed
+    );
+    assert!(is_gone(&ctx.tl, &id).await);
+    let recorded = std::mem::take(&mut *operations.lock().unwrap());
+    for lock in &locks {
+        let TxLock::Directory { collection, .. } = lock else {
+            unreachable!()
+        };
+        let path = ObjectPath::CollectionRecord {
+            collection: collection.clone(),
+        }
+        .to_string();
+        let calls = recorded
+            .iter()
+            .filter(|op| op.path == path)
+            .map(|op| op.op)
+            .collect::<Vec<_>>();
+        assert_eq!(calls.iter().filter(|op| **op == "write_if").count(), 1);
+        let after_removal = calls
+            .iter()
+            .skip_while(|op| **op != "write_if")
+            .skip(1)
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            after_removal.is_empty(),
+            "record read again after removal: {calls:?}"
+        );
+        let (record, _) = ctx
+            .records
+            .load_record(
+                collection,
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        assert!(!record.directory_lock().contains(&id));
+    }
+}
+
+#[tokio::test]
+async fn committed_directory_gc_needs_no_read_after_a_warm_removal() {
+    for typ in [LockType::Read, LockType::Write] {
+        reclaim_directory(typ, DirectoryCleanup::CommittedHolder).await;
+    }
+}
+
+#[tokio::test]
+async fn committed_directory_removal_does_not_prove_other_records_clear() {
+    use crate::collection_coordination::CollectionLocker;
+    use crate::monitor::TxRecoveryManifest;
+
+    for fail_check in [false, true] {
+        let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let recorded = RecordingBackend::new(hooks.clone());
+        let operations = recorded.log();
+        let backend: Arc<dyn Backend> = Arc::new(recorded);
+        let ctx = new_ctx_with(backend.clone()).await;
+        let child = CollectionAddress::new("db", CollectionId::from_slice(&[84; 16]).unwrap());
+        assert!(
+            ctx.records
+                .create_record(&child, &CollectionRecord::new())
+                .await
+                .unwrap()
+        );
+        assert!(
+            ctx.nodes
+                .create_root(&child, &Node::leaf(LeafBody::new()))
+                .await
+                .unwrap()
+        );
+        let (mut parent, observed) = ctx
+            .records
+            .load_record(&collection(), Requirement::ANY)
+            .await
+            .unwrap();
+        parent.add_child(b"child".to_vec(), child.id()).unwrap();
+        assert!(ctx.records.store_record(&parent, &observed).await.unwrap());
+        let owner = AssemblyFixture::new(
+            backend,
+            DbRoot::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let locker = CollectionLocker::new(
+            CollectionStateResolver::new(
+                owner.records.clone(),
+                owner.tlogger.clone(),
+                owner.timeline.clone(),
+                owner.monitor.clone(),
+                RetryConfig::default(),
+            ),
+            std::num::NonZeroUsize::MIN,
+        );
+        let id = tx(84);
+        let locks = vec![
+            TxLock::Directory {
+                collection: collection(),
+                typ: LockType::Read,
+            },
+            TxLock::Directory {
+                collection: child.clone(),
+                typ: LockType::Read,
+            },
+        ];
+        owner
+            .monitor
+            .begin_persisted_tx(
+                &id,
+                TxRecoveryManifest {
+                    locks: locks.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let operation = owner.monitor.begin_owner_operation(&id).unwrap();
+        for collection in [collection(), child.clone()] {
+            locker
+                .acquire(&collection, &id, LockType::Read)
+                .await
+                .unwrap();
+        }
+        operation.complete();
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+        log.locks = locks;
+        owner.monitor.commit_tx(log).await.unwrap();
+        // Only the parent's holder is visible to speculative write-back.
+        // The child's old no-holder record must still get the bounded check.
+        ctx.records
+            .load_record(
+                &collection(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        let observed = ctx.tl.get_at(&id, Requirement::ANY).await.unwrap();
+        let barrier = ctx.timeline.currentness_barrier();
+        let child_path = ObjectPath::CollectionRecord {
+            collection: child.clone(),
+        }
+        .to_string();
+        if fail_check {
+            hooks.set_before({
+                let child_path = child_path.clone();
+                move |op| {
+                    let fail = op.path() == child_path
+                        && matches!(
+                            op,
+                            BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                        );
+                    Box::pin(async move {
+                        if fail {
+                            Err(BackendError::other("directory check failed"))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                }
+            });
+        }
+        operations.lock().unwrap().clear();
+        let result = ctx.gc.try_reclaim(&id, &observed, barrier).await;
+        if fail_check {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(result.unwrap(), GcOutcome::Progress);
+        }
+        assert!(!is_gone(&ctx.tl, &id).await);
+        let recorded = std::mem::take(&mut *operations.lock().unwrap());
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|op| op.path == child_path)
+                .map(|op| op.op)
+                .collect::<Vec<_>>(),
+            ["read_if_modified"]
+        );
+        hooks.clear_before();
+        for (collection, held) in [(collection(), false), (child, true)] {
+            let (record, _) = owner
+                .records
+                .load_record(
+                    &collection,
+                    Requirement::after(owner.timeline.currentness_barrier()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(record.directory_lock().contains(&id), held);
+        }
     }
 }
 
@@ -1823,6 +2103,7 @@ enum TopologyCleanup {
     CachedParticipant,
     ReadFailure,
     IntentRemaining,
+    DirectoryRemoved,
 }
 
 async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
@@ -1842,9 +2123,15 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
         &EngineConfig::default(),
     );
     let id = tx(85);
-    let locks = vec![TxLock::Topology {
+    let mut locks = vec![TxLock::Topology {
         collection: collection(),
     }];
+    if matches!(case, TopologyCleanup::DirectoryRemoved) {
+        locks.push(TxLock::Directory {
+            collection: collection(),
+            typ: LockType::Read,
+        });
+    }
     owner
         .monitor
         .begin_persisted_tx(
@@ -1882,6 +2169,9 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
         .await
         .unwrap();
     assert!(record.add_topology_participant(id.clone()));
+    if matches!(case, TopologyCleanup::DirectoryRemoved) {
+        record.add_directory_reader(id.clone());
+    }
     assert!(
         owner
             .records
@@ -1936,7 +2226,10 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
             OwnerAbortOutcome::Acknowledged
         );
     }
-    if matches!(case, TopologyCleanup::CachedParticipant) {
+    if matches!(
+        case,
+        TopologyCleanup::CachedParticipant | TopologyCleanup::DirectoryRemoved
+    ) {
         ctx.records
             .load_record(
                 &collection(),
@@ -2006,15 +2299,16 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
             .all(|participant| participant != &id),
         "GC deleted the transaction log while its topology participant remained"
     );
+    assert!(!record.directory_lock().contains(&id));
     let calls: Vec<_> = recorded
         .iter()
         .filter(|op| op.path == path)
         .map(|op| op.op)
         .collect();
-    let expected: &[&str] = if matches!(case, TopologyCleanup::CachedParticipant) {
-        &["write_if"]
-    } else {
-        &["read_if_modified", "write_if"]
+    let expected: &[&str] = match case {
+        TopologyCleanup::CachedParticipant => &["write_if"],
+        TopologyCleanup::DirectoryRemoved => &["write_if", "write_if"],
+        _ => &["read_if_modified", "write_if"],
     };
     assert_eq!(calls, expected);
     operations.lock().unwrap().clear();
@@ -2026,6 +2320,11 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
             .unwrap()
     );
     assert!(operations.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn committed_directory_removal_keeps_topology_cleanup() {
+    reclaim_topology(true, TopologyCleanup::DirectoryRemoved).await;
 }
 
 #[tokio::test]
