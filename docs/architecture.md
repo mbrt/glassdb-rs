@@ -341,6 +341,12 @@ that classifies phases, fences source writers, checks reachability, cleans
 unreachable nodes, and settles finalized topology participants. `Splitter`
 only executes a requested recursive parent split and supplies its result back to
 the action. It does not inspect durable phases or call `StructuralIntentStore`.
+Intent discovery reuses present cached bodies and applies its requirement only
+to listed bodies observed as absent. All intent enumeration uses this contract.
+A cached Preparing candidate can be deleted only at its exact revision;
+a conflict invalidates that cached state and requests retry.
+Ready contents are immutable until deletion. Neither cached presence nor the
+discovery bound supplies evidence about the source node.
 Recovery fences a source writer against the source revision the Ready
 transition recorded, not against the structural gate the source carries now. A
 worker publishes its split with one compare-and-swap expecting that revision and

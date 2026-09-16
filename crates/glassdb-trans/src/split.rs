@@ -2472,13 +2472,15 @@ mod tests {
                 .await
         }
 
-        async fn list_structural_intents(
+        async fn discover_structural_intents(
             &self,
             root: &str,
             requirement: Requirement,
         ) -> Result<Vec<(StructuralIntentId, Observation<StructuralIntent>)>, StorageError>
         {
-            self.intent_store.list(&db_root(root), requirement).await
+            self.intent_store
+                .discover(&db_root(root), requirement)
+                .await
         }
     }
 
@@ -3028,10 +3030,13 @@ mod tests {
             );
         }
         assert!(
-            s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
-                .await
-                .unwrap()
-                .is_empty()
+            s.discover_structural_intents(
+                "db",
+                Requirement::after(s.timeline.currentness_barrier())
+            )
+            .await
+            .unwrap()
+            .is_empty()
         );
         let transaction_prefix = format!("{}/_t/", db_root("db"));
         assert_eq!(
@@ -3106,10 +3111,13 @@ mod tests {
             );
         }
         assert!(
-            s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
-                .await
-                .unwrap()
-                .is_empty()
+            s.discover_structural_intents(
+                "db",
+                Requirement::after(s.timeline.currentness_barrier())
+            )
+            .await
+            .unwrap()
+            .is_empty()
         );
     }
 
@@ -3307,10 +3315,13 @@ mod tests {
             "a settled tree does not keep splitting"
         );
         assert!(
-            s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
-                .await
-                .unwrap()
-                .is_empty(),
+            s.discover_structural_intents(
+                "db",
+                Requirement::after(s.timeline.currentness_barrier())
+            )
+            .await
+            .unwrap()
+            .is_empty(),
             "a no-op split cleans its Preparing intent"
         );
         let (record, _) = s
@@ -4121,10 +4132,13 @@ mod tests {
         );
         assert!(sp.recover_structural_intents().await.unwrap());
         assert!(
-            s.list_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
-                .await
-                .unwrap()
-                .is_empty()
+            s.discover_structural_intents(
+                "db",
+                Requirement::after(s.timeline.currentness_barrier())
+            )
+            .await
+            .unwrap()
+            .is_empty()
         );
         let (recovered_coordination, _) = s
             .records

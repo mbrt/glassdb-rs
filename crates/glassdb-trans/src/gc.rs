@@ -643,7 +643,7 @@ impl Gc {
         for collection in topology {
             let records = self
                 .structural_intents
-                .list_for_participant(
+                .discover_for_participant(
                     collection.db_root_component(),
                     tid,
                     Requirement::after(barrier),

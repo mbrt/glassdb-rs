@@ -476,6 +476,32 @@ prepared collection whose root was never created, but that transaction can no
 longer acquire locks there. The root's absence cannot hide a later hold from
 this transaction. Prepared collection reclamation remains a separate step.
 
+### 7. Structural intent discovery retains the original evidence
+
+`StructuralIntentStore::discover`, `discover_page`, and `discover_for_participant`
+accept present cached bodies as recovery candidates. All three use the same
+contract: `requirement` applies only to a listed body observed as absent.
+If that absence has insufficient evidence, discovery rechecks it under the
+supplied requirement; a read error cannot report an empty listing. Successive
+recovery passes keep their existing barriers so an old cached absence cannot
+hide a listed body indefinitely.
+
+Discovery does not advance a present observation's evidence. Structural intent
+identities are never reused, and their only phase change is Preparing to Ready.
+A stale Preparing observation cannot authorize deletion of Ready: deletion
+checks the exact revision. A conflict invalidates the obsolete cached revision
+and recovery requests retry. This can cost a failed deletion before the next
+discovery reads Ready. Ready contents stay fixed until deletion.
+Cached Preparing can also defer peer help while its participant remains Pending.
+The live owner drives its own publication; finalization or lease recovery lets
+a later pass attempt revision-checked cleanup.
+
+Source fencing and reachability classification still capture a currentness
+barrier after observing Ready. Neither the intent's watermark nor the earlier
+discovery bound can replace it. Participant settlement still uses its final
+listing bound for departure; final transaction status alone does not close the
+intent namespace because recursive recovery can create more intents.
+
 ## Boundaries of the guarantee
 
 - `ANY` may return stale but still usable knowledge.

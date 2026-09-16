@@ -699,15 +699,14 @@ impl StructuralRecovery {
     }
 
     async fn scan(&self) -> Result<RecoverySweep, StorageError> {
-        // Recovery has no transaction validation or preceding tree CAS, so it
-        // allocates its own currentness barrier. This one bounds intent
-        // discovery only. Classification needs a bound past the intent it
-        // reads, and this barrier precedes that read.
+        // Only absent discovery bodies need this bound; present candidates
+        // use their exact revisions and phase rules. Ready classification
+        // still needs its own barrier after observing the intent.
         let recovery_start = Requirement::after(self.timeline.currentness_barrier());
         let cursor = self.scan_cursor.lock().unwrap().clone();
         let page = match self
             .intent_store
-            .scan_page(&self.db_root, cursor.as_ref(), recovery_start)
+            .discover_page(&self.db_root, cursor.as_ref(), recovery_start)
             .await
         {
             Ok(page) => page,
@@ -771,7 +770,15 @@ impl StructuralRecovery {
                     }
                 },
                 IntentRecoveryPhase::Delete => {
-                    self.intent_store.delete(&recovery.observed).await?;
+                    match self.intent_store.delete(&recovery.observed).await {
+                        Ok(()) => {}
+                        // Discovery can retain Preparing after a peer made it
+                        // Ready. The failed deletion invalidates that exact
+                        // cached revision; retry must discover and classify it
+                        // again instead of exposing a storage precondition.
+                        Err(StorageError::Precondition) => return Err(TransError::Retry),
+                        Err(error) => return Err(error.into()),
+                    }
                     return Ok(IntentRecoveryStep::Completed);
                 }
             }
@@ -823,7 +830,7 @@ impl StructuralRecovery {
             let requirement = Requirement::after(self.timeline.currentness_barrier());
             let intents = self
                 .intent_store
-                .list_for_participant(
+                .discover_for_participant(
                     settlement.collection.db_root_component(),
                     &settlement.participant,
                     requirement,
@@ -854,6 +861,8 @@ impl StructuralRecovery {
             .ok_or_else(|| TransError::other("structural intent disappeared after listing"))?
             .clone();
         if intent.phase == StructuralIntentPhase::Preparing {
+            // Cached Preparing can hide Ready while the participant is live;
+            // its owner drives publication without waiting for this sweep.
             if self.mon.tx_status(&intent.participant_id).await? == TxCommitStatus::Pending {
                 return Err(TransError::Retry);
             }
