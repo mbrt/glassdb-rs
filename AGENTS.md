@@ -23,7 +23,8 @@
 
 ### Tests
 
-Always use `make test-all` to run tests. This runs format checks, linting, and the test suite
+Use `make test` to run format checks, linting, and ordinary and simulation tests.
+Also run `make test-bench` for changes to benchmarks or CI comparison tools.
 
 - Test interfaces and intended behavior instead of internals
 - Avoid tautological tests

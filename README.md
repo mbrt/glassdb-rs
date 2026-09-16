@@ -241,10 +241,13 @@ more delay after a conflict.
 
 ```bash
 cargo build --workspace
-make test     # fmt --check + clippy -D warnings + cargo test
-make test-sim # tests under the deterministic simulation executor (+ fuzz-corpus replay)
-make fuzz     # fuzz testing under DST. See Makefile for longer sweeps
+make test       # format checks, linting, ordinary tests, and simulation tests
+make test-bench # benchmark tests and Python CI comparison-tool tests
+make fuzz       # fuzz testing under DST. See Makefile for longer sweeps
 ```
+
+Performance CI runs `make test-bench` before building and measuring the
+comparison. Run it locally for changes to benchmarks or CI comparison tools.
 
 Updating `glassdb-proto` protos require the Protocol Buffers compiler
 (`protoc`).

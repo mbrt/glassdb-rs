@@ -37,8 +37,8 @@ rayon = "1.12.0"
 tempfile = "3.27.0"
 tokio = { version = "1", features = ["macros", "rt", "time", "test-util"] }
 
-# Criterion owns the cache benchmark entry point. `make test` runs it in
-# Criterion test mode through Cargo target discovery.
+# Criterion owns the cache benchmark entry point. `make test-bench` runs it in
+# Criterion test mode.
 [[bench]]
 name = "cache"
 harness = false

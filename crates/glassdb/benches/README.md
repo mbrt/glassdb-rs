@@ -73,7 +73,7 @@ There is no combined score or automatic performance gate. Timing results
 depend on the host. Real-provider costs require separate measurements.
 Exact protocol guarantees belong in integration/simulation tests, not timing
 assertions. Fixture preparation, transaction completion, and zero backend reads
-for warmed inline writes are checked by the benchmark harness. `make test-all`
+for warmed inline writes are checked by the benchmark harness. `make test-bench`
 runs all benchmark targets in test mode, including these checks.
 
 ## Comparison artifacts

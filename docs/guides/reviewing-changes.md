@@ -57,7 +57,8 @@ with its rightful owner?**
 
 - Spot tests that require widened visibility to reach internals; ask for using
   public APIs instead, without widening them only for testing.
-- Confirm `make test-all` passes (format, `clippy -D warnings`, tests).
+- Confirm `make test` passes (format, `clippy -D warnings`, ordinary and simulation tests).
+- For benchmark or CI comparison-tool changes, also confirm `make test-bench` passes.
 - Expect a deterministic regression test with any bug fix; it doubles as
   documentation.
 - Check that tests are behavioral and realistic: they should exercise intended

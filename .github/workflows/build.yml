@@ -28,12 +28,9 @@ jobs:
 
     - uses: Swatinem/rust-cache@v2
 
-    - name: Unit tests
+    - name: Database checks
+      timeout-minutes: 30
       run: make test
-
-    - name: Test sim
-      timeout-minutes: 15
-      run: make test-sim
 
   proto-codegen:
     runs-on: ubuntu-latest

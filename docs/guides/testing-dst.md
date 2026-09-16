@@ -51,8 +51,8 @@ It's therefore required to place deterministic tests in a module named
 `sim_tests` (or using `tests/sim/main.rs`), and strart the source root with
 `#![cfg(sim)]`.
 
-Simulation tests ouside such a module compile but do not run through `make test`
-sim. The normal test suite enforces these rules with
+Simulation tests outside such a module compile but do not run through
+`make test-sim`. The ordinary test suite enforces these rules with
 [`simulation_test_policy.rs`](../../crates/glassdb/tests/simulation_test_policy.rs).
 
 Each database fuzz input has four logical clients, with clients 0 and 1 sharing
