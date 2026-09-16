@@ -644,6 +644,14 @@ The cloud backends are feature-gated (`s3`, `gcs`) so their heavy SDK
 dependencies are only pulled in when needed; each is tested against a pure-Rust
 in-process fake of its API.
 
+The PR diagnostic benchmarks wrap `MemoryBackend` in `DelayBackend` with fixed
+S3 mean latencies, provider throttling, and a 5× model clock. Backend waits and
+engine deadlines use the same clock. Cost counters cover the benchmark's own
+iterations, including a 250 ms warmup; shutdown has a separate window. The
+comparison manifest records the clock and warmup so the report can reject
+incompatible measurements.
+See [the diagnostic benchmark conditions](../crates/glassdb/benches/README.md).
+
 ## Transaction Algorithm
 
 ### Isolation & Consistency

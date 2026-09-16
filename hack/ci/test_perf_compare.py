@@ -144,6 +144,26 @@ class MeasurementTest(unittest.TestCase):
             self.assertEqual(row[3], expected)
         self.assertEqual(os.sched_getaffinity(0), affinity)
 
+    def test_diagnostic_delay_model_is_checked_and_reported(self):
+        model = perf_compare.perf_report.DIAGNOSTIC_MODEL
+        self.configure(diagnosticModel=model)
+        manifest = self.manifest(cases=("a",))
+        manifest["diagnosticModel"] = model
+        perf_compare.measure(self.root, manifest)
+        self.assertFalse(manifest["warnings"])
+        self.assertIn("fixed S3 mean delays", (self.root / "report.md").read_text())
+
+    def test_legacy_diagnostic_cannot_enter_a_delayed_comparison(self):
+        manifest = self.manifest(cases=("a",))
+        manifest["diagnosticModel"] = perf_compare.perf_report.DIAGNOSTIC_MODEL
+        with self.assertRaisesRegex(
+            perf_compare.perf_report.ReportError, "invalid diagnostic model"
+        ):
+            perf_compare.measure(self.root, manifest)
+        self.assertEqual(manifest["completedPairs"]["a"], 0)
+        self.assertIn("invalid diagnostic model", " ".join(manifest["warnings"]))
+        self.assertNotIn("| a: mean group time |", (self.root / "report.md").read_text())
+
     def test_fixed_latency_measurements_use_the_requested_profile(self):
         manifest = self.manifest(cases=("a",))
         manifest["mixedArgs"] = ["--latency-jitter=false"]
@@ -328,6 +348,8 @@ else:
     row = {'name': case, 'transactions': 30,
         **{window: counters for window in ('workload', 'shutdown', 'combined')}}
     record = settings.get('costRecord', {'schemaVersion': 1, 'cases': [row]})
+    if 'diagnosticModel' in settings:
+        record.update(schemaVersion=2, model=settings['diagnosticModel'])
     if settings.get('badCostAt') == [repetition, case, side]:
         record = {}
     print('diagnostic-costs: ' + json.dumps(record))
