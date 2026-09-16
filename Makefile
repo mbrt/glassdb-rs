@@ -1,4 +1,4 @@
-.PHONY: test test-sim test-all lint format build clean fuzz fuzz-min bench bench-diagnostics flamegraph
+.PHONY: test test-unit test-sim test-bench lint format build clean fuzz fuzz-min bench bench-diagnostics flamegraph
 
 # Flags for every build under the in-repo deterministic simulation executor:
 # `--cfg sim` routes spawn/time/randomness through it, and `--cfg tokio_unstable`
@@ -12,13 +12,16 @@ clean:
 	cargo clean
 	cd fuzz && cargo clean
 
-test: lint
-	cargo test --workspace --all-targets
-	cargo test --workspace --doc
-	python3 -m unittest hack.ci.test_perf_report hack.ci.test_perf_compare
+# Run all database checks. Benchmark checks belong to performance CI.
+test: lint test-unit test-sim
 
-# Run both the normal and deterministic-simulation suites.
-test-all: test test-sim
+test-unit:
+	cargo test --workspace --exclude glassdb-bench-scale --all-features
+
+test-bench:
+	python3 -m unittest hack.ci.test_perf_report hack.ci.test_perf_compare
+	cargo test -p glassdb-bench-scale
+	cargo test --workspace --bench '*'
 
 lint:
 	cargo fmt --all -- --check

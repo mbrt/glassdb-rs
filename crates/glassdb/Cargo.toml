@@ -62,8 +62,8 @@ rayon = "1.12.0"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 syn = { version = "2", features = ["full", "visit"] }
 
-# Criterion owns benchmark entry points. `make test` discovers these targets
-# with `--all-targets` and runs them in Criterion test mode.
+# Criterion owns benchmark entry points. `make test-bench` runs these targets
+# in Criterion test mode.
 [[bench]]
 name = "transactions"
 harness = false

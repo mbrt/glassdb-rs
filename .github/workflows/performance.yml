@@ -36,8 +36,8 @@ jobs:
           . -> target/performance/main
           . -> target/performance/pr
 
-    - name: Test comparison tools
-      run: python3 -m unittest hack.ci.test_perf_report hack.ci.test_perf_compare
+    - name: Test benchmarks and comparison tools
+      run: make test-bench
 
     - name: Build the same candidate harness against both revisions
       env:

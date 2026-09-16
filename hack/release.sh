@@ -9,7 +9,7 @@
 #
 # Flow (with --no-dry-run):
 #   1. sanity checks (clean tree, on main, tooling + credentials present)
-#   2. `make test-all` gate
+#   2. `make test` gate
 #   3. `release-plz update` bumps every published crate in lockstep
 #      (or `--version X.Y.Z` rewrites the manifests to an exact version)
 #   4. review the diff and confirm
@@ -151,10 +151,10 @@ revert_tree() {
 # --- Test gate --------------------------------------------------------------
 
 if [ "$DRY_RUN" = true ]; then
-	echo "==> dry run: skipping 'make test-all'"
+	echo "==> dry run: skipping 'make test'"
 else
-	echo "==> running test suite (make test-all)"
-	make test-all
+	echo "==> running test suite (make test)"
+	make test
 fi
 
 # --- Version bump -----------------------------------------------------------

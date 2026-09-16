@@ -29,7 +29,7 @@ The script:
 
 1. checks the working tree is clean and on `main`, with the tooling and
    credentials above present;
-2. runs the `make test-all` gate;
+2. runs the `make test` gate;
 3. bumps every published crate in lockstep with `release-plz update`, or to the
    `--version` given;
 4. shows the diff and asks for confirmation;
