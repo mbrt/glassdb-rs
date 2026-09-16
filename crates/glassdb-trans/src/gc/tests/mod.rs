@@ -1077,6 +1077,346 @@ async fn committed_entry_lock_keeps_the_log_and_lock() {
     assert_eq!(ctx.coord.stats_and_reset().submissions, 0);
 }
 
+#[tokio::test]
+async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
+    use crate::access::{AccessSet, ScanRange, WriteAccess};
+    use crate::engine::engine_fixture;
+    use crate::key_resolver::KeyResolver;
+    use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
+    use glassdb_data::LeafRef;
+
+    // One key uses direct descent; two keys use batched descent. The scan also
+    // holds an empty leaf that entry routing cannot refresh.
+    for keys in [
+        &[b"apple".as_slice()][..],
+        &[b"apple".as_slice(), b"banana"],
+    ] {
+        let memory = Arc::new(MemoryBackend::new());
+        let hooks = HookBackend::new(memory.clone());
+        let recorder = Arc::new(RecordingBackend::new(hooks.clone()));
+        let operations = recorder.log();
+        let ctx = new_ctx_with(recorder).await;
+        let leaf = NodeToken::from_bytes([1; 16]);
+        let empty = NodeToken::from_bytes([2; 16]);
+        let index = NodeToken::from_bytes([3; 16]);
+        let current = CurrentState::Inline {
+            writer: tx(90),
+            value: Arc::from(b"old-value".as_slice()),
+        };
+        let body = LeafBody::from_entries(
+            keys.iter()
+                .map(|key| LeafEntry::new(*key).with_current(current.clone())),
+        );
+        for (token, node) in [
+            (&empty, Node::leaf(LeafBody::new())),
+            (
+                &leaf,
+                Node::leaf(body)
+                    .with_high_key(Some(b"m".to_vec()))
+                    .with_right_sibling(Some(empty.to_string())),
+            ),
+            (
+                &index,
+                Node::index(IndexNode::from_children([
+                    (Vec::new(), leaf.to_string()),
+                    (b"m".to_vec(), empty.to_string()),
+                ])),
+            ),
+        ] {
+            assert!(
+                ctx.nodes
+                    .store_node(&collection(), token, &node, None)
+                    .await
+                    .unwrap()
+            );
+        }
+        replace_root(
+            &ctx.nodes,
+            &Node::index(IndexNode::from_children([(Vec::new(), index.to_string())])),
+        )
+        .await;
+
+        let owner = AssemblyFixture::new(
+            memory,
+            DbRoot::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let engine = engine_fixture(
+            &owner,
+            DbRoot::try_from("db").unwrap(),
+            EngineConfig::default(),
+            false,
+        );
+        let id = tx(82);
+        let mut locks: Vec<_> = keys.iter().map(|key| write_lock(key)).collect();
+        for token in [&leaf, &empty] {
+            locks.push(TxLock::Membership {
+                leaf: LeafRef::node(collection(), token.clone()),
+                typ: LockType::Read,
+            });
+        }
+        owner
+            .monitor
+            .begin_persisted_tx(
+                &id,
+                TxRecoveryManifest {
+                    locks: locks.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let operation = owner.monitor.begin_owner_operation(&id).unwrap();
+        let resolver = KeyResolver::new(
+            TreeRouter::new(owner.nodes.clone(), NonZeroUsize::MIN),
+            KeyStateResolver::new(owner.monitor.clone()),
+            NonZeroUsize::MIN,
+        );
+        let page = resolver
+            .scan_keys(&collection(), &ScanRange::all(), &[], Some(&id), None)
+            .await
+            .unwrap();
+        let accesses = AccessSet::new(
+            Vec::new(),
+            keys.iter()
+                .map(|key| WriteAccess::put(key_path(key), Arc::from(b"discarded".as_slice())))
+                .collect(),
+            vec![page.into_access(collection(), ScanRange::all(), Vec::new())],
+        );
+        let LockOutcome::Locked(locked) = engine
+            .locker
+            .keys()
+            .lock_at(
+                &id,
+                &accesses,
+                true,
+                Requirement::after(owner.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("entry and scan locks must be acquired");
+        };
+        assert_eq!(locked.locked_paths(), locks);
+        operation.complete();
+        assert_eq!(
+            owner.monitor.abort_owned_tx(&id).await.unwrap(),
+            OwnerAbortOutcome::Acknowledged
+        );
+
+        // Enter reclamation after eligibility, retaining GC's pre-acquisition
+        // leaf cache. A failed terminal check must preserve the recovery log.
+        let observed = ctx.tl.get_at(&id, Requirement::ANY).await.unwrap();
+        let barrier = ctx.timeline.currentness_barrier();
+        hooks.set_before({
+            let path = node_path(&leaf).to_string();
+            move |op| {
+                let fail = op.path() == path
+                    && matches!(
+                        op,
+                        BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                    );
+                Box::pin(async move {
+                    if fail {
+                        Err(BackendError::other("terminal check failed"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+        assert!(ctx.gc.try_reclaim(&id, &observed, barrier).await.is_err());
+        assert!(!is_gone(&ctx.tl, &id).await);
+        hooks.clear_before();
+        // Use a new pass's bound: the failed attempt may have refreshed indexes.
+        let barrier = ctx.timeline.currentness_barrier();
+        operations.lock().unwrap().clear();
+        assert_eq!(
+            ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
+            GcOutcome::Reclaimed
+        );
+        assert!(is_gone(&ctx.tl, &id).await);
+        assert_eq!(
+            tree_reads(&operations),
+            [
+                ("read_if_modified", node_path(&leaf).to_string()),
+                ("read_if_modified", node_path(&empty).to_string()),
+            ]
+        );
+        assert_eq!(
+            operations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|op| op.op == "write_if")
+                .count(),
+            2
+        );
+
+        operations.lock().unwrap().clear();
+        assert!(
+            !ctx.locker
+                .release(&id, &locks, Requirement::after(barrier))
+                .await
+                .unwrap()
+        );
+        assert!(operations.lock().unwrap().is_empty());
+        for token in [&leaf, &empty] {
+            let loaded = owner
+                .nodes
+                .load_leaf(
+                    &node_path(token),
+                    Requirement::after(owner.timeline.currentness_barrier()),
+                )
+                .await
+                .unwrap();
+            assert!(loaded.node().membership_lock().holders().is_empty());
+            for entry in loaded.entries().entries() {
+                assert!(entry.lock_holders().is_empty());
+                assert_eq!(entry.current, current);
+            }
+            assert_eq!(
+                loaded.entries().entries().count(),
+                if token == &leaf { keys.len() } else { 0 }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn entry_release_follows_splits_without_refreshing_cached_indexes() {
+    use crate::engine::engine_fixture;
+
+    for (root_split, publish_separator) in [(false, false), (false, true), (true, true)] {
+        let memory = Arc::new(MemoryBackend::new());
+        let recorder = Arc::new(RecordingBackend::new(memory.clone()));
+        let operations = recorder.log();
+        let ctx = new_ctx_with(recorder).await;
+        let left = NodeToken::from_bytes([1; 16]);
+        let right = NodeToken::from_bytes([2; 16]);
+        let id = tx(82);
+        let current = CurrentState::Inline {
+            writer: tx(90),
+            value: Arc::from(b"old-value".as_slice()),
+        };
+        let held = Node::leaf(LeafBody::from_entries([
+            LeafEntry::new(b"apple").with_current(current.clone()),
+            locked_entry(b"pear", &id).with_current(current.clone()),
+        ]));
+        if root_split {
+            replace_root(&ctx.nodes, &held).await;
+        } else {
+            assert!(
+                ctx.nodes
+                    .store_node(&collection(), &left, &held, None)
+                    .await
+                    .unwrap()
+            );
+            replace_root(
+                &ctx.nodes,
+                &Node::index(IndexNode::from_children([(Vec::new(), left.to_string())])),
+            )
+            .await;
+        }
+        let owner = AssemblyFixture::new(
+            memory,
+            DbRoot::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let engine = engine_fixture(
+            &owner,
+            DbRoot::try_from("db").unwrap(),
+            EngineConfig::default(),
+            false,
+        );
+        let locks = vec![write_lock(b"pear")];
+        let mut log = TxLog::new(id.clone(), TxCommitStatus::Aborted);
+        log.locks = locks.clone();
+        owner.tlogger.set(&log).await.unwrap();
+        // A split resolves holds before moving entries. Keep the recovering
+        // instance's old held leaf while the peer removes the aborted hold.
+        assert!(
+            engine
+                .locker
+                .release(&id, &locks, Requirement::ANY)
+                .await
+                .unwrap()
+        );
+        let body = LeafBody::from_entries([LeafEntry::new(b"pear").with_current(current.clone())]);
+        assert!(
+            owner
+                .nodes
+                .store_node(&collection(), &right, &Node::leaf(body), None)
+                .await
+                .unwrap()
+        );
+        let left_node = Node::leaf(LeafBody::from_entries([
+            LeafEntry::new(b"apple").with_current(current.clone())
+        ]))
+        .with_high_key(Some(b"pear".to_vec()))
+        .with_right_sibling(Some(right.to_string()));
+        if root_split {
+            assert!(
+                owner
+                    .nodes
+                    .store_node(&collection(), &left, &left_node, None)
+                    .await
+                    .unwrap()
+            );
+        } else {
+            replace_node(&owner.nodes, &left, &left_node).await;
+        }
+        if publish_separator {
+            replace_root(
+                &owner.nodes,
+                &Node::index(IndexNode::from_children([
+                    (Vec::new(), left.to_string()),
+                    (b"pear".to_vec(), right.to_string()),
+                ])),
+            )
+            .await;
+        }
+        let barrier = ctx.timeline.currentness_barrier();
+        operations.lock().unwrap().clear();
+        assert!(
+            !ctx.locker
+                .release(&id, &locks, Requirement::after(barrier))
+                .await
+                .unwrap()
+        );
+        let source = if root_split {
+            root_path()
+        } else {
+            node_path(&left)
+        };
+        assert_eq!(
+            tree_reads(&operations),
+            [
+                ("read_if_modified", source.to_string()),
+                ("read", node_path(&right).to_string()),
+            ]
+        );
+        assert!(
+            operations
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|op| matches!(op.op, "read" | "read_if_modified"))
+        );
+        let right_leaf = owner
+            .nodes
+            .load_leaf(
+                &node_path(&right),
+                Requirement::after(owner.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        let entry = right_leaf.entries().lookup(b"pear").unwrap();
+        assert!(entry.lock_holders().is_empty());
+        assert_eq!(entry.current, current);
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn committed_membership_lock_is_released_before_deletion() {
     let ctx = new_ctx().await;

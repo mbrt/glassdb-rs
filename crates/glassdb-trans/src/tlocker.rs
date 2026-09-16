@@ -1158,9 +1158,15 @@ impl KeyLocker {
             }
         }
         for items in by_collection.into_values() {
+            // Cached indexes are routing hints. Right links and the bounded
+            // leaf read correct stale split placement; splits resolve holds
+            // before moving entries. Missing routes rely on the identity and
+            // publication rules in the cache guide. GC releases entries only
+            // after acknowledged abort, which excludes later lock acquisition
+            // under a missing prepared root.
             match self
                 .router
-                .route_keys_with_requirements(items, requirement, requirement)
+                .route_keys_with_requirements(items, Requirement::ANY, requirement)
                 .await
             {
                 Ok(groups) => {

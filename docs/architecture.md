@@ -1439,7 +1439,12 @@ recovery share the `ScanCadence` interval controller from `glassdb-concurr`.
   not with its own CAS but by calling the `Locker`'s per-object unlock methods,
   so the release batches through the same leaf coordinator as live traffic
   (ADR-029); the coordinator prunes the entry before persistence when it becomes
-  vestigial (no holder and an absent current state). Leaf release starts with
+  vestigial (no holder and an absent current state). Entry-release routing uses
+  `ANY` for interiors and the supplied requirement for terminal leaves. Right
+  links correct stale split placement; splits resolve holds before moving
+  entries. Missing routes use the identity and publication rules above; GC
+  releases entry locks only after acknowledged abort, so a missing prepared
+  root cannot later acquire those holds. Leaf release starts with
   `ANY`: an applied CAS proves completion without an extra read. A no-op must
   carry an observation that meets GC's existing candidate-check bound; otherwise
   release retries with that requirement. This also covers membership holds with

@@ -457,6 +457,25 @@ route through normal access. Reclaimed collections can remain absent. This
 proof belongs to the GC caller; `ANY` alone does not make a negative routing
 result current.
 
+### 6. Entry release keeps its leaf completion proof
+
+Entry-release routes use `ANY` for interiors and the caller's requirement for
+terminal leaves. Right links correct stale split placement. Splits resolve
+holds before moving entries, so release need not follow a removed holder to
+another leaf. A root cached as a leaf still needs the terminal check if it has
+become an index.
+
+The release operation accepts an applied removal CAS or a no-holder observation
+that meets the caller's requirement. A recorded membership hold can name a leaf
+with no entry key to route. That leaf keeps its separate completion check;
+refreshing a different routed leaf supplies no evidence for it.
+
+Missing routes depend on the identity, publication, and recovery rules above.
+GC releases entry locks only after acknowledged abort. A manifest can name a
+prepared collection whose root was never created, but that transaction can no
+longer acquire locks there. The root's absence cannot hide a later hold from
+this transaction. Prepared collection reclamation remains a separate step.
+
 ## Boundaries of the guarantee
 
 - `ANY` may return stale but still usable knowledge.
