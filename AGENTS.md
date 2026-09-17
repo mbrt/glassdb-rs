@@ -9,7 +9,7 @@
 
 - Always respect the design principles in `docs/principles.md`
 - Use the `glassdb-codebase-design` skill for designing functionality or refactoring.
-- Use and keep [docs/architecture.md](./docs/architecture.md) up to date with the current architecture and design decisions.
+- Use and keep [docs/architecture.md](./docs/architecture.md) up to date, but keep it minimal. Only add information that cannot be easily deduced from code (decisions, high-level algorithm, diagrams).
 - ADRs are frozen when accepted, except for their status and links to newer ADRs.
 
 ## Development
