@@ -757,6 +757,83 @@ async fn children_can_be_dropped_before_their_parent_in_one_transaction() {
 }
 
 #[tokio::test]
+async fn collection_drop_retries_transactional_lookup() {
+    // Cover directory validation, point validation, lock acquisition, and
+    // validation of an error outcome with the same deterministic drop.
+    for (read_key, write, abort) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (true, true, true),
+    ] {
+        let backend = Arc::new(MemoryBackend::new());
+        let db = Database::open("example", backend.clone()).await.unwrap();
+        let peer = Database::open("example", backend).await.unwrap();
+        db.create_collection("child").await.unwrap();
+        let old = peer.open_collection("child").await.unwrap();
+        let attempts = AtomicUsize::new(0);
+
+        let result = db
+            .tx(|tx| {
+                let old = &old;
+                let attempts = &attempts;
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    let root = tx.root_collection();
+                    let (child, created) = tx.create_collection_if_absent(&root, b"child").await?;
+                    if read_key {
+                        tx.read(&child, b"key").await?;
+                    }
+                    tx.iter_collections(&child).await?;
+                    if attempt == 0 {
+                        old.drop_collection().await?;
+                    }
+                    if write {
+                        let staged = tx.create_collection(&root, b"staged").await?;
+                        tx.iter_collections(&staged).await?;
+                        tx.write(&staged, b"marker", b"committed")?;
+                        tx.write(&root, b"marker", b"committed")?;
+                    }
+                    if abort {
+                        tx.abort()?;
+                    }
+                    Ok(created)
+                }
+            })
+            .await;
+
+        if abort {
+            assert!(matches!(result, Err(Error::Aborted)), "{result:?}");
+        } else {
+            assert!(result.unwrap(), "the retry must create a new collection");
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(db.collection_exists("child").await.unwrap(), !abort);
+        assert_eq!(
+            db.collection_exists("staged").await.unwrap(),
+            write && !abort
+        );
+        if write && !abort {
+            assert_eq!(
+                db.open_collection("staged")
+                    .await
+                    .unwrap()
+                    .read(b"marker")
+                    .await
+                    .unwrap(),
+                Some(b"committed".to_vec())
+            );
+        }
+        assert_eq!(
+            db.root_collection().read(b"marker").await.unwrap(),
+            (write && !abort).then(|| b"committed".to_vec())
+        );
+        db.shutdown().await;
+        peer.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn a_cached_handle_in_another_client_observes_the_drop_fence() {
     let backend = Arc::new(MemoryBackend::new());
     let first = Database::open("example", backend.clone()).await.unwrap();
@@ -783,6 +860,14 @@ async fn a_cached_handle_in_another_client_observes_the_drop_fence() {
         Err(Error::StaleCollection)
     ));
     assert!(matches!(old.iter_keys().await, Err(Error::StaleCollection)));
+    assert!(matches!(
+        old.write(b"k", b"new").await,
+        Err(Error::StaleCollection)
+    ));
+    assert!(matches!(
+        old.create_collection(b"nested").await,
+        Err(Error::StaleCollection)
+    ));
 }
 
 #[tokio::test]
