@@ -245,6 +245,18 @@ impl CollectionCommit {
             .await
     }
 
+    /// Validates durable directory observations without staged collection changes.
+    pub(crate) async fn validate_reads(
+        &self,
+        attempt: &CollectionAttempt,
+        barrier: CurrentnessBarrier,
+    ) -> Result<bool, TransError> {
+        let reads = attempt.accesses.clone().into_read_only();
+        self.catalog
+            .validate(None, &reads.reads, &[], barrier, &self.split_policy)
+            .await
+    }
+
     /// Installs deletion fences for every drop in the current body run.
     pub(crate) async fn fence(
         &self,

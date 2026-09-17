@@ -419,7 +419,7 @@ impl Algo {
                 Err(TransError::Retry) => {
                     return Ok(BodyDecision::ReplayBody);
                 }
-                Err(error) => return Err(error),
+                Err(error) => return self.retry_changed_catalog(tx, error).await,
             }
         }
     }
@@ -443,7 +443,7 @@ impl Algo {
                 Err(TransError::Retry) => {
                     return Ok(BodyDecision::ReplayBody);
                 }
-                Err(error) => return Err(error),
+                Err(error) => return self.retry_changed_catalog(tx, error).await,
             }
         }
     }
@@ -504,6 +504,34 @@ impl Algo {
             owner_operation.complete();
         }
         result
+    }
+
+    /// Retries a collection conflict when the body's directory observations changed.
+    async fn retry_changed_catalog(
+        &self,
+        tx: &mut Handle,
+        error: TransError,
+    ) -> Result<BodyDecision, TransError> {
+        if !matches!(
+            error,
+            TransError::StaleCollection | TransError::Storage(StorageError::StaleCollection)
+        ) {
+            return Err(error);
+        }
+        // Acquisition can stop before it records all held locks. Retire the
+        // identity before the recheck, so a foreign directory holder cannot
+        // wait for this attempt while the recheck waits for that holder.
+        self.end(tx).await?;
+        let barrier = self.timeline.currentness_barrier();
+        if self
+            .collection_commit
+            .validate_reads(&tx.collections, barrier)
+            .await?
+        {
+            return Err(error);
+        }
+        tx.renew();
+        Ok(BodyDecision::ReplayBody)
     }
 
     /// Resolves attempt failures caused by a wounded owner's reclaimed resources.

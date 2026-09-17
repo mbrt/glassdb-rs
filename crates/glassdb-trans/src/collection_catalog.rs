@@ -1,9 +1,11 @@
 //! Logical snapshots and validation for collection name-to-ID directories.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use glassdb_data::{CollectionAddress, TxId};
-use glassdb_storage::{CollectionRecord, CurrentnessBarrier, Requirement, SplitPolicy};
+use glassdb_storage::{
+    CollectionRecord, CurrentnessBarrier, Requirement, SplitPolicy, StorageError,
+};
 
 use crate::collection_coordination::CollectionStateResolver;
 use crate::collections::{
@@ -51,22 +53,39 @@ impl CollectionCatalog {
         split_policy: &SplitPolicy,
     ) -> Result<bool, TransError> {
         let mut records = BTreeMap::<CollectionAddress, CollectionRecord>::new();
+        let mut dropped = BTreeSet::new();
         for parent in reads
             .iter()
             .map(|read| &read.parent)
             .chain(changes.iter().map(|change| &change.parent))
         {
-            if !records.contains_key(parent) {
-                let record = self
+            if !records.contains_key(parent) && !dropped.contains(parent) {
+                let record = match self
                     .state
                     .resolve(parent, id, Requirement::after(barrier))
-                    .await?;
+                    .await
+                {
+                    Ok(record) => record,
+                    // A removed name can invalidate this body even if a later
+                    // directory read refers to the dropped collection. Check
+                    // the surviving directories before returning that error.
+                    Err(
+                        TransError::StaleCollection
+                        | TransError::Storage(StorageError::StaleCollection),
+                    ) => {
+                        dropped.insert(parent.clone());
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 records.insert(parent.clone(), record);
             }
         }
 
         for read in reads {
-            let record = &records[&read.parent];
+            let Some(record) = records.get(&read.parent) else {
+                continue;
+            };
             let valid = match &read.kind {
                 DirectoryReadKind::Entry { name, collection } => record.child(name) == *collection,
                 DirectoryReadKind::Listing { version } => record.directory_version() == *version,
@@ -76,9 +95,14 @@ impl CollectionCatalog {
             }
         }
         for change in changes {
-            if records[&change.parent].child(&change.name) != change.expected {
+            if let Some(record) = records.get(&change.parent)
+                && record.child(&change.name) != change.expected
+            {
                 return Ok(false);
             }
+        }
+        if !dropped.is_empty() {
+            return Err(TransError::StaleCollection);
         }
         for change in changes {
             let record = records
