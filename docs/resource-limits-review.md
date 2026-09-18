@@ -85,6 +85,10 @@ Item 12 is being split into small fixes. It remains incomplete.
 - Retry delays now stay within `retry_max_interval`, including the initial delay
   and jitter. The default is still 5 seconds. Jitter is sampled within that bound,
   and interval growth saturates instead of overflowing for very large durations.
+- Adaptive scan intervals now respect their maximum when the minimum is larger.
+  The shared schedule also handles zero and very large intervals without a panic.
+  Default intervals are unchanged. Other protocol-timing arithmetic still needs
+  validation for extreme configured durations.
 
 ## Prioritized fixes
 

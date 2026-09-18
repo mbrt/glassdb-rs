@@ -80,10 +80,10 @@ pub struct ScanCadence {
 }
 
 impl ScanCadence {
-    /// Starts a scan schedule at its minimum interval.
+    /// Starts a scan schedule at its minimum interval, capped by `maximum`.
     pub fn new(minimum: Duration, maximum: Duration) -> Self {
         Self {
-            minimum,
+            minimum: minimum.min(maximum),
             maximum,
             productive: 1.0,
         }
@@ -96,12 +96,16 @@ impl ScanCadence {
 
     /// Returns an interval with random variation within the configured bounds.
     pub fn delay(&self) -> Duration {
+        if self.minimum.is_zero() {
+            return Duration::ZERO;
+        }
         let seconds = self.minimum.as_secs_f64()
             / self
                 .productive
                 .powi(2)
                 .max(self.minimum.as_secs_f64() / self.maximum.as_secs_f64());
-        Duration::from_secs_f64(seconds * (0.9 + 0.2 * crate::entropy::uniform_unit()))
+        Duration::try_from_secs_f64(seconds * (0.9 + 0.2 * crate::entropy::uniform_unit()))
+            .unwrap_or(self.maximum)
             .clamp(self.minimum, self.maximum)
     }
 }
@@ -177,6 +181,31 @@ mod tests {
             assert!(backoff.next_delay() >= Duration::MAX / 2);
         }
     }
+
+    #[test]
+    fn scan_cadence_caps_the_minimum_interval() {
+        let maximum = Duration::from_secs(1);
+        let mut cadence = ScanCadence::new(Duration::from_secs(2), maximum);
+        assert_eq!(cadence.delay(), maximum);
+        cadence.observe(false);
+        assert_eq!(cadence.delay(), maximum);
+    }
+
+    #[test]
+    fn scan_cadence_accepts_zero_intervals() {
+        for (minimum, maximum) in [
+            (Duration::ZERO, Duration::from_secs(1)),
+            (Duration::ZERO, Duration::ZERO),
+            (Duration::from_secs(1), Duration::ZERO),
+        ] {
+            let mut cadence = ScanCadence::new(minimum, maximum);
+            assert_eq!(cadence.delay(), Duration::ZERO);
+            for _ in 0..2000 {
+                cadence.observe(false);
+            }
+            assert_eq!(cadence.delay(), Duration::ZERO);
+        }
+    }
 }
 
 #[cfg(all(test, sim))]
@@ -201,6 +230,25 @@ mod sim_tests {
                     delays.push(delay);
                 }
                 assert!(delays.windows(2).any(|pair| pair[0] != pair[1]));
+            }
+        });
+    }
+
+    #[test]
+    fn scan_intervals_stay_within_bounds() {
+        crate::exec::block_on_with(crate::exec::TapeScheduler::new(Vec::new()), 7, async {
+            for (minimum, maximum) in [
+                (Duration::from_millis(1), Duration::from_secs(1)),
+                (Duration::MAX / 2, Duration::MAX),
+                (Duration::MAX, Duration::MAX),
+            ] {
+                let mut cadence = ScanCadence::new(minimum, maximum);
+                for useful in [false, true] {
+                    for _ in 0..100 {
+                        cadence.observe(useful);
+                        assert!((minimum..=maximum).contains(&cadence.delay()));
+                    }
+                }
             }
         });
     }
