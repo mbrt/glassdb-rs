@@ -1379,7 +1379,20 @@ impl KeyLocker {
                 membership: group.membership,
                 requirement,
             };
-            match self.coord.coordinate(operation).await? {
+            // A leaf object is absent only when its collection incarnation was
+            // durably dropped: identities are never reused, so the handle this
+            // acquire addresses is stale rather than the object merely missing.
+            let coordinated = self
+                .coord
+                .coordinate(operation)
+                .await
+                .map_err(|error| match error {
+                    TransError::Storage(error) => TransError::Storage(
+                        error.classify_collection_absence(group.leaf.collection()),
+                    ),
+                    other => other,
+                });
+            match coordinated? {
                 AcquireOutcome::Locked(receipt) => return Ok(LeafOutcome::Locked(receipt)),
                 // Hold-and-wait (ADR-024): if the coordinated acquire reports
                 // [`AcquireOutcome::Wait`] — a key is held by a live holder this
@@ -3091,6 +3104,58 @@ mod tests {
         assert!(matches!(
             result,
             Err(TransError::Storage(StorageError::Unavailable(_)))
+        ));
+    }
+
+    // A collection incarnation is never reused, so a leaf the acquire cannot
+    // load means a peer dropped that collection. The acquire must report the
+    // handle as stale, which replays the body, instead of a bare absence that
+    // escapes to the caller as a missing object.
+    #[tokio::test]
+    async fn an_acquire_without_a_leaf_reports_a_dropped_collection_as_stale() {
+        let (locker, ctx) = init_tl_test().await;
+        let dropped = CollectionAddress::new(
+            "test",
+            CollectionId::from_slice(&[7; 16]).expect("fixed ID has the required width"),
+        );
+        ctx.nodes
+            .create_root(&dropped, &Node::leaf(LeafBody::new()))
+            .await
+            .unwrap();
+        let path = ObjectPath::TreeRoot {
+            collection: dropped.clone(),
+        };
+        let mut groups = BTreeMap::new();
+        groups.insert(
+            path.clone(),
+            RoutedLockGroup {
+                path,
+                leaf: LeafRef::root(dropped.clone()),
+                intents: vec![KeyIntent {
+                    raw_key: b"value".to_vec(),
+                    key: LogicalKey::new(dropped.clone(), b"value"),
+                    desired: Desired::Read,
+                }],
+                membership: LockType::None,
+            },
+        );
+        let tx = mk_tid(1, "reader");
+        ctx.monitor.begin_tx(&tx);
+
+        // Dropping the collection deletes its only leaf.
+        let root = ctx
+            .nodes
+            .load_root_state(&dropped, Requirement::ANY)
+            .await
+            .unwrap();
+        ctx.nodes.delete_root(&root).await.unwrap();
+
+        assert!(matches!(
+            locker
+                .keys()
+                .lock_leaves_at(&tx, &groups, false, Requirement::ANY)
+                .await,
+            Err(TransError::Storage(StorageError::StaleCollection))
         ));
     }
 
