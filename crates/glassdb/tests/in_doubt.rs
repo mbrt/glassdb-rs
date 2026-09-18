@@ -84,6 +84,87 @@ fn committed_log(op: &BackendOp<'_>) -> bool {
     )
 }
 
+#[tokio::test(start_paused = true)]
+async fn delayed_local_commit_acknowledgement_does_not_hide_committed_values() {
+    for publish_writer in [false, true] {
+        let memory = Arc::new(MemoryBackend::new());
+        let backend = HookBackend::new(memory.clone());
+        let owner = Database::builder("published", backend.clone())
+            .inline_policy(InlinePolicy::none())
+            .open()
+            .await
+            .unwrap();
+        let peer = Database::builder("published", memory)
+            .inline_policy(InlinePolicy::none())
+            .open()
+            .await
+            .unwrap();
+        let root = owner.root_collection();
+        root.write(b"key", b"old").await.unwrap();
+
+        let applied = Arc::new(tokio::sync::Notify::new());
+        let acknowledge = Arc::new(tokio::sync::Notify::new());
+        backend.set_after({
+            let applied = applied.clone();
+            let acknowledge = acknowledge.clone();
+            move |op, outcome| {
+                let delay = outcome.is_success() && committed_log(op);
+                let applied = applied.clone();
+                let acknowledge = acknowledge.clone();
+                Box::pin(async move {
+                    if delay {
+                        applied.notify_one();
+                        acknowledge.notified().await;
+                    }
+                    Ok(())
+                })
+            }
+        });
+        let writer = tokio::spawn({
+            let root = root.clone();
+            async move { root.write(b"key", b"committed").await }
+        });
+        applied.notified().await;
+        backend.clear_after();
+
+        // After the peer reads this commit, every later read must include it,
+        // whether the peer also publishes its writer in the leaf or not.
+        let seen = peer
+            .tx(|tx| async move {
+                let root = tx.root_collection();
+                let value = tx.read(&root, b"key").await?;
+                if publish_writer {
+                    tx.write(&root, b"other", b"peer")?;
+                }
+                Ok(value)
+            })
+            .await
+            .unwrap();
+        assert_eq!(seen, Some(b"committed".to_vec()));
+
+        let read = root.read(b"key");
+        tokio::pin!(read);
+        let value = tokio::select! {
+            value = &mut read => {
+                acknowledge.notify_one();
+                value
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                acknowledge.notify_one();
+                read.await
+            }
+        };
+        writer.await.unwrap().unwrap();
+        assert_eq!(
+            value.unwrap(),
+            Some(b"committed".to_vec()),
+            "publish_writer={publish_writer}"
+        );
+        owner.shutdown().await;
+        peer.shutdown().await;
+    }
+}
+
 fn fail_before(
     when: impl for<'a> Fn(&BackendOp<'a>) -> bool + Send + Sync + 'static,
     err: impl Fn() -> BackendError + Send + Sync + 'static,

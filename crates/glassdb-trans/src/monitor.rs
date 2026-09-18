@@ -1566,6 +1566,18 @@ impl Monitor {
             return Ok(None);
         };
         match &entry.role {
+            // A dispatched commit can take effect before its acknowledgement.
+            // Readers must check durable status while that outcome is pending,
+            // including when a peer has already published the writer in a leaf.
+            TxRuntimeRole::Owned(owned)
+                if owned.lifecycle.terminal_commit == TerminalCommit::Started
+                    && owned
+                        .record
+                        .as_ref()
+                        .is_none_or(|record| !record.status.is_final()) =>
+            {
+                Ok(None)
+            }
             TxRuntimeRole::Owned(owned) => TxStatusEvidence::local(owned.record.as_ref()).map(Some),
             TxRuntimeRole::Foreign(_) => Ok(None),
         }
