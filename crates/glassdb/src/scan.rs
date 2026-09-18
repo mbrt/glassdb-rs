@@ -2,7 +2,7 @@
 
 use glassdb_trans::ScanRange;
 
-use crate::Error;
+use crate::{Error, TransactionLimits};
 
 /// Describes one forward scan over a collection's raw key bytes.
 ///
@@ -64,7 +64,18 @@ impl<'a> KeyScan<'a> {
         self
     }
 
-    pub(crate) fn normalize(&self) -> Result<ScanRange, Error> {
+    pub(crate) fn normalize(&self, limits: &TransactionLimits) -> Result<ScanRange, Error> {
+        match self.bounds {
+            ScanBounds::Range { start, end } => {
+                limits.check_key(start)?;
+                limits.check_key(end)?;
+            }
+            ScanBounds::Prefix(prefix) => limits.check_key(prefix)?,
+            ScanBounds::All => {}
+        }
+        if let Some(after) = self.after {
+            limits.check_key(after)?;
+        }
         let (start, end) = match self.bounds {
             ScanBounds::Range { start, end } => (start, Some(end.to_vec())),
             ScanBounds::Prefix(prefix) => (prefix, prefix_end(prefix)),
@@ -171,11 +182,17 @@ mod tests {
 
     #[test]
     fn after_normalizes_against_the_inclusive_start() {
-        let before = KeyScan::range(b"b", b"z").after(b"a").normalize().unwrap();
+        let before = KeyScan::range(b"b", b"z")
+            .after(b"a")
+            .normalize(&TransactionLimits::default())
+            .unwrap();
         assert_eq!(before.start, b"b");
         assert!(!before.start_exclusive);
 
-        let within = KeyScan::range(b"b", b"z").after(b"m").normalize().unwrap();
+        let within = KeyScan::range(b"b", b"z")
+            .after(b"m")
+            .normalize(&TransactionLimits::default())
+            .unwrap();
         assert_eq!(within.start, b"m");
         assert!(within.start_exclusive);
     }

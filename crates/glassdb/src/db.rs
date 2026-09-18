@@ -18,6 +18,7 @@ use tokio::sync::Notify;
 use crate::collection::{Collection, CollectionPath};
 use crate::diagnostics::Diagnostics;
 use crate::error::Error;
+use crate::limits::TransactionLimits;
 use crate::stats::{Stats, TransactionStats};
 use crate::tx::Transaction;
 use crate::version::check_or_create_db_meta;
@@ -32,9 +33,16 @@ pub struct DatabaseBuilder {
     name: String,
     backend: Arc<dyn Backend>,
     engine_config: EngineConfig,
+    transaction_limits: TransactionLimits,
 }
 
 impl DatabaseBuilder {
+    /// Sets local limits on transaction inputs. See [`TransactionLimits`] for defaults.
+    pub fn transaction_limits(mut self, limits: TransactionLimits) -> Self {
+        self.transaction_limits = limits;
+        self
+    }
+
     /// Sets the number of bytes dedicated to caching objects and metadata.
     /// Setting this too small may impact performance, as more backend calls are
     /// necessary.
@@ -101,6 +109,7 @@ impl DatabaseBuilder {
             name,
             backend: b,
             engine_config,
+            transaction_limits,
         } = self;
 
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -118,6 +127,7 @@ impl DatabaseBuilder {
             name,
             database_id,
             engine,
+            transaction_limits,
             stats: Mutex::new(Stats::default()),
             operations: OperationLifecycle::new(),
         });
@@ -139,6 +149,7 @@ impl DatabaseBuilder {
             name: name.into(),
             backend,
             engine_config: EngineConfig::default(),
+            transaction_limits: TransactionLimits::default(),
         }
     }
 }
@@ -147,6 +158,7 @@ pub(crate) struct DbInner {
     pub(crate) name: String,
     pub(crate) database_id: DatabaseId,
     pub(crate) engine: Engine,
+    pub(crate) transaction_limits: TransactionLimits,
     stats: Mutex<Stats>,
     // Admission and drain cover every public asynchronous operation, including
     // the few APIs that do not run through a transaction.

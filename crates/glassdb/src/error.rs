@@ -56,6 +56,12 @@ pub enum Error {
     /// Invalid user input.
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// An operation would exceed a configured resource limit.
+    #[error("{resource} exceeds the configured limit of {limit}")]
+    LimitExceeded {
+        resource: &'static str,
+        limit: usize,
+    },
     /// An unexpected internal failure or invariant violation, with an optional
     /// underlying cause kept in the [`std::error::Error::source`] chain.
     #[error("{msg}")]
