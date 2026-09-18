@@ -12,7 +12,7 @@ use aws_sdk_s3::primitives::SdkBody;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::http::StatusCode;
 use glassdb_backend::middleware::ProviderLatencyProfile;
-use glassdb_backend::{Backend, BackendError, Version};
+use glassdb_backend::{Backend, BackendError, ListLimit, Version};
 use hyper::Method;
 
 use crate::fake_server::{FakeS3, FakeS3Options};
@@ -544,21 +544,22 @@ async fn explicit_fake_shutdown_releases_listener_and_thread() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn read_returns_value_and_version() {
+async fn backend_conformance() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
-    for (name, value) in [
-        ("non-empty", b"hello world".to_vec()),
-        ("empty", Vec::new()),
-        ("binary", vec![0x00, 0x01, 0x02, 0xff]),
-    ] {
-        let version = b.write_if_not_exists(name, value.clone()).await.unwrap();
-        assert!(!version.is_unset());
+    glassdb_backend::implementation::assert_backend_conformance(&b).await;
+}
 
-        let r = b.read(name).await.unwrap();
-        assert_eq!(r.contents, value, "case {name}");
-        assert_eq!(r.version, version, "case {name}");
-    }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_rejects_invalid_provider_cursor() {
+    let fake = FakeS3::start().await;
+    let b = backend(&fake);
+    let cursor = glassdb_backend::implementation::bind_list_cursor("prefix/", "invalid").unwrap();
+    let result = b.list("prefix/", Some(&cursor), ListLimit::MIN).await;
+    assert!(
+        matches!(result, Err(BackendError::InvalidCursor)),
+        "got {result:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -574,146 +575,6 @@ async fn identical_content_keeps_version() {
     // Distinct content yields a distinct version.
     let v3 = b.write_if("k", b"other".to_vec(), &v2).await.unwrap();
     assert_ne!(v1, v3);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn write_if_not_exists() {
-    let fake = FakeS3::start().await;
-    let b = backend(&fake);
-    b.write_if_not_exists("k", b"a".to_vec()).await.unwrap();
-    let err = b.write_if_not_exists("k", b"b".to_vec()).await.unwrap_err();
-    assert!(matches!(err, BackendError::Precondition));
-    let r = b.read("k").await.unwrap();
-    assert_eq!(r.contents, b"a");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn write_if_cas() {
-    let fake = FakeS3::start().await;
-    let b = backend(&fake);
-    let v0 = b.write_if_not_exists("k", b"a".to_vec()).await.unwrap();
-
-    let err = b
-        .write_if("k", b"b".to_vec(), &Version::new("\"stale\""))
-        .await
-        .unwrap_err();
-    assert!(matches!(err, BackendError::Precondition));
-
-    let v1 = b.write_if("k", b"b".to_vec(), &v0).await.unwrap();
-    assert_ne!(v0, v1);
-    let r = b.read("k").await.unwrap();
-    assert_eq!(r.contents, b"b");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn write_if_null_version_fails_precondition() {
-    let fake = FakeS3::start().await;
-    let b = backend(&fake);
-    let v0 = b.write_if_not_exists("k", b"a".to_vec()).await.unwrap();
-
-    // A null expected version has an empty token; it must fail rather than
-    // overwrite unconditionally.
-    let err = b
-        .write_if("k", b"b".to_vec(), &Version::default())
-        .await
-        .unwrap_err();
-    assert!(matches!(err, BackendError::Precondition));
-
-    let r = b.read("k").await.unwrap();
-    assert_eq!(r.contents, b"a");
-    assert_eq!(r.version, v0);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn read_if_modified() {
-    let fake = FakeS3::start().await;
-    let b = backend(&fake);
-    let v0 = b.write_if_not_exists("k", b"x".to_vec()).await.unwrap();
-
-    // The cached version still matches: revalidation reports Precondition (the
-    // 304 Not Modified path) instead of transferring the body.
-    let err = b.read_if_modified("k", &v0).await.unwrap_err();
-    assert!(matches!(err, BackendError::Precondition));
-
-    // A stale (different) version: the current object is returned in full.
-    let r = b
-        .read_if_modified("k", &Version::new("\"other\""))
-        .await
-        .unwrap();
-    assert_eq!(r.contents, b"x");
-    assert_eq!(r.version, v0);
-
-    // After a content change the cached version no longer matches, so the new
-    // value is returned.
-    let v1 = b.write_if("k", b"y".to_vec(), &v0).await.unwrap();
-    let r = b.read_if_modified("k", &v0).await.unwrap();
-    assert_eq!(r.contents, b"y");
-    assert_eq!(r.version, v1);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn read_if_modified_unset_version_reads() {
-    let fake = FakeS3::start().await;
-    let b = backend(&fake);
-    let v0 = b.write_if_not_exists("k", b"x".to_vec()).await.unwrap();
-
-    // An unset expected version has nothing to revalidate against, so it behaves
-    // like a plain read.
-    let r = b.read_if_modified("k", &Version::default()).await.unwrap();
-    assert_eq!(r.contents, b"x");
-    assert_eq!(r.version, v0);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_if_matching_etag() {
-    let fake = FakeS3::start().await;
-    let b = backend(&fake);
-    let version = b.write_if_not_exists("k", b"x".to_vec()).await.unwrap();
-    b.delete_if("k", &version).await.unwrap();
-    let err = b.read("k").await.unwrap_err();
-    assert!(matches!(err, BackendError::NotFound));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_if_missing_is_not_found() {
-    let fake = FakeS3::start().await;
-    let b = backend(&fake);
-
-    let error = b
-        .delete_if("missing", &Version::new("\"old\""))
-        .await
-        .unwrap_err();
-
-    assert!(matches!(error, BackendError::NotFound));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stale_delete_if_preserves_current_object() {
-    let fake = FakeS3::start().await;
-    let b = backend(&fake);
-    let old = b.write_if_not_exists("k", b"old".to_vec()).await.unwrap();
-    let current = b.write_if("k", b"current".to_vec(), &old).await.unwrap();
-
-    let err = b.delete_if("k", &old).await.unwrap_err();
-    assert!(matches!(err, BackendError::Precondition));
-    let read = b.read("k").await.unwrap();
-    assert_eq!(read.contents, b"current");
-    assert_eq!(read.version, current);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn read_not_found() {
-    let fake = FakeS3::start().await;
-    let b = backend(&fake);
-    let err = b.read("missing").await.unwrap_err();
-    assert!(matches!(err, BackendError::NotFound));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn list_is_recursive_and_paginated() {
-    let fake = FakeS3::start().await;
-    let b = backend(&fake);
-    glassdb_backend::implementation::assert_list_conformance(&b).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -836,15 +697,4 @@ async fn delete_if_lost_ack_is_in_doubt() {
     let err = b.delete_if("k", &version).await.unwrap_err();
     assert!(matches!(err, BackendError::Unavailable(_)));
     assert!(matches!(b.read("k").await, Err(BackendError::NotFound)));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn clean_conflict_still_precondition() {
-    // Guard against over-eagerly tainting: a genuine conflict with no lost ack
-    // must still be a retryable `Precondition`, not in-doubt.
-    let fake = FakeS3::start().await;
-    let b = backend(&fake);
-    b.write_if_not_exists("k", b"a".to_vec()).await.unwrap();
-    let err = b.write_if_not_exists("k", b"b".to_vec()).await.unwrap_err();
-    assert!(matches!(err, BackendError::Precondition), "got {err:?}");
 }
