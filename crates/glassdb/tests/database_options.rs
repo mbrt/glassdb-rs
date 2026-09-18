@@ -230,3 +230,60 @@ async fn inline_options_remain_local_to_each_client() {
     direct.shutdown().await;
     logged.shutdown().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn capacity_splits_do_not_depend_on_local_soft_thresholds() {
+    for soft_bytes in [384, usize::MAX] {
+        let policy = SplitPolicy::builder()
+            .node_max_bytes(512)
+            .split_headroom_bytes(128)
+            .leaf_max_entries(usize::MAX)
+            .node_soft_max_bytes(soft_bytes)
+            .index_max_children(usize::MAX)
+            .build()
+            .unwrap();
+        let db = Database::builder("capacity", MemoryBackend::new())
+            .split_policy(policy)
+            .inline_policy(InlinePolicy::none())
+            .open()
+            .await
+            .unwrap();
+        let root = db.root_collection();
+        for i in 0..32 {
+            let key = format!("{i:032}");
+            tokio::time::timeout(Duration::from_secs(5), root.write(key.as_bytes(), b"value"))
+                .await
+                .expect("capacity rejection must request a split below the soft threshold")
+                .unwrap();
+        }
+        for i in 0..32 {
+            let key = format!("{i:032}");
+            assert_eq!(
+                root.read(key.as_bytes()).await.unwrap(),
+                Some(b"value".to_vec())
+            );
+        }
+        assert!(db.stats().splitter.completed > 0);
+        db.shutdown().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn reopening_keeps_soft_split_thresholds_local() {
+    let backend = Arc::new(MemoryBackend::new());
+    let creator = Database::open("local", backend.clone()).await.unwrap();
+    creator.shutdown().await;
+    let reopened = Database::builder("local", backend)
+        .split_policy(SplitPolicy::builder().leaf_max_entries(1).build().unwrap())
+        .open()
+        .await
+        .unwrap();
+    let root = reopened.root_collection();
+    root.write(b"first", b"one").await.unwrap();
+    root.write(b"second", b"two").await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(reopened.stats().splitter.completed, 1);
+    assert_eq!(root.read(b"first").await.unwrap(), Some(b"one".to_vec()));
+    assert_eq!(root.read(b"second").await.unwrap(), Some(b"two".to_vec()));
+    reopened.shutdown().await;
+}

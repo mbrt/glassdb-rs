@@ -2,11 +2,11 @@
 
 ## Status
 
-Proposed — implementation in progress.
+Accepted — first pass implemented. Limits are recorded under Consequences.
 
 ## Context
 
-Each database instance currently supplies its own hard coordination limits and
+Before v4, each database instance supplies its own hard coordination limits and
 transaction timing. Smaller limits can prevent a client from modifying existing
 data. Different timing profiles disagree about lease expiry and the interval
 during which an ambiguous commit can recover before GC deletes its record.
@@ -41,6 +41,12 @@ clock-skew allowance.
 
 The existing split-policy type still contains both creation settings and local
 thresholds. A separate public creation-options interface is deferred.
+
+For this first pass, capacity hints request one split of a divisible node. The
+requesting operation retries admission. The hint does not retain that operation,
+so stale hints can cause extra splits. Indivisible nodes still have finite
+capacity. Limit validation checks the minimum key shape; it does not prove that
+all transient lock sets or split outputs fit a chosen configuration.
 
 ## Alternatives considered
 

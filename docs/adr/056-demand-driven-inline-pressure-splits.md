@@ -19,6 +19,10 @@ candidate's dependency set.
 actionable request by compacting quiescent tombstones before the final split
 decision. The pressure signal and one-split-per-request policy remain.
 
+[ADR-072](072-persisted-database-settings.md) refines the configuration agreement:
+hard coordination limits and transaction timing are stored in database metadata;
+inline budgets and soft split thresholds remain local to each client.
+
 ## Context
 
 ADR-051's aggregate inline budget bounds the value bytes rewritten with every

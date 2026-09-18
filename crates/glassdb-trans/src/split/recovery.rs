@@ -18,7 +18,7 @@ use crate::monitor::Monitor;
 
 use super::{
     PARENT_RETRIES, ParentSplitContinuation, SeparatorPublication, SeparatorPublicationOutcome,
-    SeparatorPublisher, StructuralNodeAccess,
+    SeparatorPublisher, SplitReason, StructuralNodeAccess,
 };
 
 /// Owns the durable structural-intent lifecycle and recovery policy.
@@ -108,8 +108,15 @@ enum ParentSplitState {
 
 /// Work that the split scheduler must perform before recovery can resume.
 pub(super) enum RecoveryStep {
-    Completed { active: bool, failed: bool },
-    SplitParent { path: ObjectPath, participant: TxId },
+    Completed {
+        active: bool,
+        failed: bool,
+    },
+    SplitParent {
+        path: ObjectPath,
+        participant: TxId,
+        reason: SplitReason,
+    },
 }
 
 struct SweepFailure {
@@ -150,7 +157,11 @@ enum IntentRecoveryPhase {
 
 enum IntentRecoveryStep {
     Completed,
-    SplitParent { path: ObjectPath, participant: TxId },
+    SplitParent {
+        path: ObjectPath,
+        participant: TxId,
+        reason: SplitReason,
+    },
 }
 
 /// Resumable settlement of one finalized topology participant.
@@ -576,9 +587,17 @@ impl StructuralRecovery {
                     }
                     return Ok(None);
                 }
-                Ok(IntentRecoveryStep::SplitParent { path, participant }) => {
+                Ok(IntentRecoveryStep::SplitParent {
+                    path,
+                    participant,
+                    reason,
+                }) => {
                     *parent_split = ParentSplitState::Awaiting;
-                    return Ok(Some(RecoveryStep::SplitParent { path, participant }));
+                    return Ok(Some(RecoveryStep::SplitParent {
+                        path,
+                        participant,
+                        reason,
+                    }));
                 }
                 Err(error) => {
                     let failure = SweepFailure {
@@ -681,9 +700,17 @@ impl StructuralRecovery {
                     IntentRecoveryStep::Completed => {
                         action.intent = None;
                     }
-                    IntentRecoveryStep::SplitParent { path, participant } => {
+                    IntentRecoveryStep::SplitParent {
+                        path,
+                        participant,
+                        reason,
+                    } => {
                         *parent_split = ParentSplitState::Awaiting;
-                        return Ok(RecoveryStep::SplitParent { path, participant });
+                        return Ok(RecoveryStep::SplitParent {
+                            path,
+                            participant,
+                            reason,
+                        });
                     }
                 }
                 continue;
@@ -791,7 +818,11 @@ impl StructuralRecovery {
                         if action.continuation == ParentSplitContinuation::CompletePublication {
                             recovery.phase = IntentRecoveryPhase::Delete;
                         }
-                        return Ok(IntentRecoveryStep::SplitParent { path, participant });
+                        return Ok(IntentRecoveryStep::SplitParent {
+                            path,
+                            participant,
+                            reason: action.reason,
+                        });
                     }
                 },
                 IntentRecoveryPhase::Delete => {

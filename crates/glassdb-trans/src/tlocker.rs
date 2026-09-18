@@ -1460,6 +1460,8 @@ mod tests {
 
     impl SplitHinter for NoSplitHints {
         fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {}
+
+        fn capacity_rejected(&self, _path: &ObjectPath) {}
     }
 
     struct TlCtx {

@@ -2,7 +2,7 @@
 
 Date: 2026-09-18
 
-Status: First-pass implementation in progress.
+Status: First-pass implementation complete; remaining limits are recorded below.
 
 ## Implementation status
 
@@ -19,7 +19,11 @@ Status: First-pass implementation in progress.
   invalid fields, concurrent creators, invalid proposals when reopening, and
   clients with different inline budgets. Regression tests, `make test`, and
   adversarial review passed.
-- Finding 4: pending.
+- Finding 4: capacity rejection now requests a split independently of local soft
+  thresholds. Parent separator publication and recovery preserve this split
+  reason. The reproduced insertion failure and a full parent below its soft
+  limits now pass regression tests, including interrupted parent publication.
+  Regression tests, `make test`, and adversarial review passed.
 
 The first pass retains the mixed `SplitPolicy` interface and does not provide
 migration or online changes to stored settings. Earlier development databases
@@ -28,14 +32,19 @@ must be recreated. The findings below describe the code before these fixes.
 Limit validation checks the minimum key shape. It does not certify that every
 key distribution or transient lock set fits a chosen limit.
 
+Capacity hints request one split of a divisible node, then the blocked operation
+retries admission. They do not retain the blocked operation, so stale hints can
+cause extra splits. An operation-aware benefit check is deferred. A node with
+fewer than two entries or children cannot split and retains its capacity limit.
+
 Persist transaction timing and hard coordination limits. Keep performance
 settings local to each database instance. Settings that are necessary for
 correctness must be persisted at creation and loaded when opening the database.
 
-Metadata currently stores only the version and database ID. Opening uses the
-caller's configuration unchanged. See
-[metadata bootstrap](../crates/glassdb/src/version.rs#L18) and
-[database open](../crates/glassdb/src/db.rs#L111).
+At the time of review, metadata stored only the version and database ID. Opening
+used the caller's configuration unchanged. See
+[metadata bootstrap](../crates/glassdb/src/version.rs) and
+[database open](../crates/glassdb/src/db.rs).
 
 ## Prioritized findings and proposed fixes
 
@@ -45,9 +54,9 @@ Move `SplitPolicy::node_max_bytes` and `split_headroom_bytes` into database
 metadata. These determine permitted key sizes, leaf mutations, and
 collection-directory capacity. They affect whether clients can operate on
 existing data. See
-[key validation](../crates/glassdb-trans/src/algo.rs#L678),
-[mutation admission](../crates/glassdb-trans/src/leaf_coord.rs#L707), and
-[directory limits](../crates/glassdb-trans/src/collection_catalog.rs#L134).
+[key validation](../crates/glassdb-trans/src/algo.rs),
+[mutation admission](../crates/glassdb-trans/src/leaf_coord.rs), and
+[directory limits](../crates/glassdb-trans/src/collection_catalog.rs).
 
 Two failures were reproduced after reopening with a smaller hard limit:
 
@@ -64,9 +73,9 @@ key, entry, and directory limits from that stored configuration.
 Persist both `ProtocolTiming::pending_timeout` and `max_clock_skew`. The timeout
 controls refresh frequency, peer expiry, and ambiguous commit recovery. GC uses
 the timeout plus skew allowance for final-record retention. See
-[timing](../crates/glassdb-trans/src/monitor.rs#L64),
-[recovery](../crates/glassdb-trans/src/monitor.rs#L1215), and
-[GC eligibility](../crates/glassdb-trans/src/gc.rs#L386).
+[timing](../crates/glassdb-trans/src/monitor.rs),
+[recovery](../crates/glassdb-trans/src/monitor.rs), and
+[GC eligibility](../crates/glassdb-trans/src/gc.rs).
 
 Different settings can cause premature wounds or remove an unreferenced final
 record during another client's recovery window. Current pinned wounds and
@@ -89,7 +98,7 @@ winning configuration before starting its engine. Opening must use stored
 values without applying local defaults over them.
 
 Gate this contract with a protocol version that older clients reject. Reject
-missing required settings rather than guessing historical values. The current
+missing required settings rather than guessing historical values. The reviewed
 v3 format is [documented as unshipped](adr/070-demand-driven-garbage-collection.md#transaction-paths-permit-broad-and-narrow-scans),
 so recreation is a simple transition.
 
@@ -98,8 +107,8 @@ so recreation is a simple transition.
 Capacity rejection currently requests an ordinary soft-cap split. The splitter
 can discard that request because the stored node remains below the soft
 threshold. See
-[split hints](../crates/glassdb-trans/src/split.rs#L1156) and
-[split checks](../crates/glassdb-trans/src/split.rs#L1501).
+[split hints](../crates/glassdb-trans/src/split.rs) and
+[split checks](../crates/glassdb-trans/src/split.rs).
 
 This failure was reproduced with one unchanged configuration, including a soft
 byte threshold equal to the content limit. Persisting that configuration would
@@ -121,12 +130,13 @@ options.
 | Soft split thresholds | Client, after finding 4 is fixed | Control when topology changes occur |
 | Cache sizes, persistent-cache directory and capacity | Client | Local resources |
 | Retry delays, leaf parallelism, GC scheduling and scan depth | Client | Local execution policy |
+| Active operation, transaction, and GC candidate limits | Client | Bound local work and resource use |
 | Explicit stale-read allowance | Read operation | Caller-selected read behavior |
 
 Fixed path layouts, encodings, and protocol rules should remain covered by the
 persisted protocol version. They do not need separate configuration fields.
 
-## Verification
+## Initial review verification
 
 Four focused tests ran outside the repository during this review. All passed
 their assertions, which reproduced the failures or checked the expected
