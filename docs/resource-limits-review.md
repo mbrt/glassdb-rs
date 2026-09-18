@@ -89,6 +89,9 @@ Item 12 is being split into small fixes. It remains incomplete.
   The shared schedule also handles zero and very large intervals without a panic.
   Default intervals are unchanged. Other protocol-timing arithmetic still needs
   validation for extreme configured durations.
+- Added `DatabaseBuilder::transaction_leaf_parallelism` for the existing limit.
+  It accepts a nonzero count and keeps the default of 16. The limit applies
+  separately to each bounded transaction phase.
 
 ## Prioritized fixes
 
@@ -290,9 +293,9 @@ Sources: [recording middleware](../crates/glassdb-backend/src/middleware/recordi
 [delay middleware](../crates/glassdb-backend/src/middleware/delay.rs#L336),
 [memory-backend LIST](../crates/glassdb-backend/src/memory.rs#L151).
 
-## Current limits and defaults
+## Limits and defaults at the initial review
 
-| Area | Current default or bound | Configuration and assessment |
+| Area | Initial default or bound | Configuration and assessment |
 | --- | --- | --- |
 | Decoded cache | **512 MiB per database instance** | Public setting; approximate accounting and oversized-entry exception |
 | Node sizing | **256** leaf entries; **256** index children; **256 KiB** soft size; **1 MiB** hard size; **64 KiB** reserved headroom | Public `SplitPolicy`; entry counts are split triggers, not hard caps |

@@ -2,6 +2,7 @@
 //! the transaction retry loop, collections, and stats.
 
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -55,6 +56,14 @@ impl DatabaseBuilder {
     /// Sets local transaction admission limits. See [`TransactionLimits`] for defaults.
     pub fn transaction_limits(mut self, limits: TransactionLimits) -> Self {
         self.transaction_limits = limits;
+        self
+    }
+
+    /// Sets the maximum parallel leaf operations per bounded transaction phase.
+    /// Defaults to 16. Concurrent phases each have their own capacity.
+    pub fn transaction_leaf_parallelism(mut self, parallelism: NonZeroUsize) -> Self {
+        self.engine_config
+            .set_transaction_leaf_parallelism(parallelism);
         self
     }
 
