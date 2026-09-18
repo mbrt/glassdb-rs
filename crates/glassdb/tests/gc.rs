@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -84,44 +85,53 @@ async fn separate_instances_find_orphans_without_local_hints() {
 
 #[tokio::test(start_paused = true)]
 async fn writers_complete_while_gc_is_saturated_and_stalled() {
-    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
-    let tl = logger(backend.clone());
-    old_objects(&tl, 100).await;
-    let db = Database::open("gc", backend.clone()).await.unwrap();
-    backend.set_before(|operation| {
-        let stall = matches!(operation, BackendOp::DeleteIf { path, .. } if path.contains("/_t/"));
-        Box::pin(async move {
-            if stall {
-                tokio::time::sleep(Duration::from_secs(70)).await;
-            }
-            Ok(())
-        })
-    });
-    step(0).await;
-    for _ in 0..8 {
-        step(4).await;
+    for configured_limit in [None, Some(1), Some(3), Some(12)] {
+        let limit = configured_limit.unwrap_or(8);
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let tl = logger(backend.clone());
+        old_objects(&tl, 100).await;
+        let mut builder = Database::builder("gc", backend.clone());
+        if let Some(limit) = configured_limit {
+            builder = builder.gc_parallelism(NonZeroUsize::new(limit).unwrap());
+        }
+        let db = builder.open().await.unwrap();
+        backend.set_before(|operation| {
+            let stall =
+                matches!(operation, BackendOp::DeleteIf { path, .. } if path.contains("/_t/"));
+            Box::pin(async move {
+                if stall {
+                    tokio::time::sleep(Duration::from_secs(70)).await;
+                }
+                Ok(())
+            })
+        });
+        step(0).await;
+        for _ in 0..8 {
+            step(4).await;
+        }
+        let gc = db.diagnostics().gc;
+        assert!(gc.in_flight > 0 && gc.in_flight <= limit as u64, "{gc:?}");
+        assert!(gc.ready > 0, "{gc:?}");
+        let collection = db.root_collection();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            db.tx(|tx| {
+                let collection = collection.clone();
+                async move { tx.write(&collection, b"writer", b"still runs") }
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // A healthy, long check must not restart when its total duration exceeds a lease.
+        step(65).await;
+        let stats = db.stats();
+        assert_eq!(stats.gc.failures, 0);
+        assert!(stats.gc.progress > 0);
+        assert_eq!(db.diagnostics().gc.in_flight, limit as u64);
+        backend.clear_before();
+        db.shutdown().await;
     }
-    let gc = db.diagnostics().gc;
-    assert!(gc.in_flight > 1 && gc.in_flight <= 8, "{gc:?}");
-    assert!(gc.ready > 0, "{gc:?}");
-    let collection = db.root_collection();
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        db.tx(|tx| {
-            let collection = collection.clone();
-            async move { tx.write(&collection, b"writer", b"still runs") }
-        }),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    // A healthy, long check must not restart when its total duration exceeds a lease.
-    step(65).await;
-    let stats = db.stats();
-    assert_eq!(stats.gc.failures, 0);
-    assert!(stats.gc.progress > 0);
-    backend.clear_before();
-    db.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]

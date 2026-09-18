@@ -23,7 +23,7 @@ use crate::collection_commit::{CollectionCommit, CollectionReservations};
 use crate::collection_coordination::CollectionStateResolver;
 use crate::collections::{CatalogAccesses, CollectionLifecycle, DirectorySnapshot};
 use crate::error::TransError;
-use crate::gc::{Gc, GcDiagnostics, GcHints, GcStats};
+use crate::gc::{DEFAULT_GC_PARALLELISM, Gc, GcDiagnostics, GcHints, GcStats};
 use crate::key_resolver::{KeyResolver, ScanResult};
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{LeafCoordinator, LeafCoordinatorStats};
@@ -55,6 +55,7 @@ pub struct EngineConfig {
     inline_policy: InlinePolicy,
     protocol_timing: ProtocolTiming,
     transaction_leaf_parallelism: NonZeroUsize,
+    gc_parallelism: NonZeroUsize,
 }
 
 impl EngineConfig {
@@ -111,6 +112,11 @@ impl EngineConfig {
     pub fn set_transaction_leaf_parallelism(&mut self, parallelism: NonZeroUsize) {
         self.transaction_leaf_parallelism = parallelism;
     }
+
+    /// Sets the maximum number of concurrent GC candidate checks.
+    pub fn set_gc_parallelism(&mut self, parallelism: NonZeroUsize) {
+        self.gc_parallelism = parallelism;
+    }
 }
 
 impl Default for EngineConfig {
@@ -125,6 +131,7 @@ impl Default for EngineConfig {
             inline_policy: InlinePolicy::default(),
             protocol_timing: ProtocolTiming::default(),
             transaction_leaf_parallelism: DEFAULT_TRANSACTION_LEAF_PARALLELISM,
+            gc_parallelism: DEFAULT_GC_PARALLELISM,
         }
     }
 }
@@ -516,6 +523,7 @@ impl DormantEngine {
             split_policy,
             inline_policy,
             transaction_leaf_parallelism,
+            gc_parallelism,
             ..
         } = config;
         let AssemblyFoundation {
@@ -590,6 +598,7 @@ impl DormantEngine {
             collection_lifecycle.clone(),
             monitor.protocol_timing(),
             cleanup_hints.clone(),
+            gc_parallelism,
         );
         let collection_commit = CollectionCommit::new(
             collection_catalog.clone(),

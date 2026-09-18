@@ -103,6 +103,9 @@ Item 12 is being split into small fixes. It remains incomplete.
 - Added `DatabaseBuilder::final_status_cache_entries` for the immutable
   transaction-status cache. The default remains 16,384 entries; zero disables
   this cache. The decoded-object cache and monitor runtime state are separate.
+- Added `DatabaseBuilder::gc_parallelism` for the maximum concurrent GC candidate
+  checks per database instance. It accepts a nonzero count and keeps the default
+  of 8. The scheduler still adjusts concurrency within that limit.
 
 ## Prioritized fixes
 

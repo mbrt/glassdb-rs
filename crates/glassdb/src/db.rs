@@ -67,6 +67,14 @@ impl DatabaseBuilder {
         self
     }
 
+    /// Limits concurrent GC candidate checks per database instance.
+    /// Defaults to 8. GC adjusts concurrency between one and this maximum.
+    /// Each candidate check can issue multiple backend operations.
+    pub fn gc_parallelism(mut self, parallelism: NonZeroUsize) -> Self {
+        self.engine_config.set_gc_parallelism(parallelism);
+        self
+    }
+
     /// Sets the number of bytes dedicated to caching objects and metadata.
     /// Setting this too small may impact performance, as more backend calls are
     /// necessary. Zero disables decoded object caching.

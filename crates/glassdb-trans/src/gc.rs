@@ -44,7 +44,7 @@ use scan::{GcScan, PAGE_SIZE};
 
 const HINT_CAPACITY: usize = 4096;
 const SCAN_CAPACITY: usize = 2 * PAGE_SIZE;
-const MAX_CHECKS: usize = 8;
+pub(crate) const DEFAULT_GC_PARALLELISM: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 const ADMISSION_BATCH: usize = 64;
 
 type Checks = BoxFuture<'static, Vec<(TxId, Result<GcOutcome, TransError>)>>;
@@ -273,6 +273,7 @@ pub(crate) struct Gc {
     timing: ProtocolTiming,
     timeline: Timeline,
     hints: GcHints,
+    max_checks: NonZeroUsize,
 }
 
 impl Gc {
@@ -287,6 +288,7 @@ impl Gc {
         collection_lifecycle: CollectionLifecycle,
         timing: ProtocolTiming,
         hints: GcHints,
+        max_checks: NonZeroUsize,
     ) -> Self {
         Self {
             tl,
@@ -297,6 +299,7 @@ impl Gc {
             timing,
             timeline,
             hints,
+            max_checks,
         }
     }
 
@@ -757,7 +760,7 @@ impl Scheduler {
             .map(|due| now.saturating_duration_since(due))
             .unwrap_or_default();
         if ready > self.concurrency || oldest >= self.retry_delay / 16 {
-            self.concurrency = (self.concurrency * 2).min(MAX_CHECKS);
+            self.concurrency = self.concurrency.saturating_mul(2).min(gc.max_checks.get());
         } else if ready == 0 && !self.checking {
             self.concurrency = 1;
         }

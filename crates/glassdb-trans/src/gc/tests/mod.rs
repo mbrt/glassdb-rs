@@ -297,6 +297,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
         ),
         mon.protocol_timing(),
         hints.clone(),
+        DEFAULT_GC_PARALLELISM,
     );
     Ctx {
         gc,
