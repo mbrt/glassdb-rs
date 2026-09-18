@@ -1071,6 +1071,15 @@ impl Algo {
         Ok(true)
     }
 
+    /// Reports whether every covered leaf is still in the exact state the scan
+    /// observed, which needs no re-resolution of the page.
+    ///
+    /// This is stronger than ADR-032's membership-version condition, so it also
+    /// covers what that version cannot: a split does not bump it, but a split
+    /// rewrites the leaf it shrinks, and new leaves enter a range only through
+    /// such a rewrite. Exact per-leaf state equality therefore leaves the
+    /// covered leaf set unchanged, and the set comparison stays in the logical
+    /// fallback.
     async fn validate_scan_observations(
         &self,
         accesses: &AccessSet,
@@ -3248,17 +3257,156 @@ mod tests {
         }
     }
 
+    // ADR-032 says a split is caught by the covered-leaf-set change, not by the
+    // membership version, which a split never bumps. The locked shortcut compares
+    // the exact observed leaf state instead of that version, and a split rewrites
+    // the leaf it shrinks. So a create in the leaf a split produced — a leaf no
+    // coverage entry names — still forces logical re-resolution of the page.
+    #[tokio::test]
+    async fn locked_scan_detects_a_create_in_a_leaf_a_peer_split_produced() {
+        use glassdb_storage::Node;
+        let (tm, tctx) = new_algo().await;
+        let (_, s1_token) = seed_two_leaf_tree(&tctx).await;
+        let s2_token = NodeToken::from_bytes([2; 16]);
+        let seed = TxId::with_priority(1, b"seed");
+
+        // The write makes commit validate the scan while holding its own locks.
+        let (accesses, keys) = scan_accesses_for_range(
+            &tctx,
+            ScanRange::all(),
+            vec![wa(&logical_key(b"a"), b"updated")],
+        )
+        .await;
+        assert_eq!(
+            keys,
+            vec![b"a".to_vec(), b"c".to_vec(), b"m".to_vec(), b"p".to_vec()]
+        );
+
+        // A peer splits the covered leaf S1(m,p) into S1(m | high "p") -> S2(p).
+        // S1 keeps its path, so it stays in this transaction's lock cover; only
+        // its state changes. The parent separator may lag (ADR-031), because the
+        // right-link carries the scan to S2 either way.
+        let entry = |key: &[u8]| {
+            LeafEntry::new(key).with_current(CurrentState::External {
+                writer: seed.clone(),
+            })
+        };
+        tctx.nodes
+            .store_node(
+                &test_collection(),
+                &s2_token,
+                &Node::leaf(LeafBody::from_entries([entry(b"p")])),
+                None,
+            )
+            .await
+            .unwrap();
+        let (_, s1_ver) = tctx
+            .nodes
+            .load_node(
+                &test_collection(),
+                &s1_token,
+                Requirement::after(tctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        tctx.nodes
+            .store_node(
+                &test_collection(),
+                &s1_token,
+                &Node::leaf(LeafBody::from_entries([entry(b"m")]))
+                    .with_high_key(Some(b"p".to_vec()))
+                    .with_right_sibling(Some(s2_token.to_string())),
+                Some(&s1_ver),
+            )
+            .await
+            .unwrap();
+
+        // A peer then creates `z` in S2. It bumps only S2's membership version,
+        // which no coverage entry of the earlier scan carries.
+        let (s2, s2_ver) = tctx
+            .nodes
+            .load_node(
+                &test_collection(),
+                &s2_token,
+                Requirement::after(tctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        let mut entries: Vec<LeafEntry> = s2.as_leaf().unwrap().entries().cloned().collect();
+        let creator = TxId::with_priority(2, b"phantom");
+        entries.push(LeafEntry::new(b"z").with_current(CurrentState::External {
+            writer: creator.clone(),
+        }));
+        let mut new_s2 = Node::leaf(LeafBody::from_entries(entries));
+        new_s2.set_membership_writer(creator.clone());
+        new_s2.remove_membership_holder(&creator);
+        tctx.nodes
+            .store_node(&test_collection(), &s2_token, &new_s2, Some(&s2_ver))
+            .await
+            .unwrap();
+
+        let mut handle = begin_accesses(&tm, accesses);
+        assert_eq!(
+            tm.commit(&mut handle).await.unwrap(),
+            BodyDecision::ReplayBody,
+            "a create in the split's new leaf is a phantom the scan must not miss"
+        );
+        tm.end(&mut handle).await.unwrap();
+    }
+
     // ADR-032 boundary protection: on a multi-leaf tree a full scan covers every
     // leaf including the endpoints, so a membership change in the final leaf
     // invalidates the scan.
     #[tokio::test]
     async fn scan_detects_boundary_membership_change() {
-        use glassdb_storage::{IndexNode, Node};
         let (tm, tctx) = new_algo().await;
+        let (_, s1_token) = seed_two_leaf_tree(&tctx).await;
+
+        let (accesses, keys) = scan_accesses(&tctx).await;
+        assert_eq!(
+            keys,
+            vec![b"a".to_vec(), b"c".to_vec(), b"m".to_vec(), b"p".to_vec()]
+        );
+
+        // Append a key past the current maximum: it lands in the last covered
+        // leaf S1, bumping its version.
+        let (s1, ver) = tctx
+            .nodes
+            .load_node(
+                &test_collection(),
+                &s1_token,
+                Requirement::after(tctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        let mut entries: Vec<LeafEntry> = s1.as_leaf().unwrap().entries().cloned().collect();
+        entries.push(LeafEntry::new(b"z").with_current(CurrentState::External {
+            writer: TxId::with_priority(2, b"boundary"),
+        }));
+        let mut new_s1 = Node::leaf(LeafBody::from_entries(entries));
+        let membership_writer = TxId::with_priority(2, b"membership");
+        new_s1.set_membership_writer(membership_writer.clone());
+        new_s1.remove_membership_holder(&membership_writer);
+        tctx.nodes
+            .store_node(&test_collection(), &s1_token, &new_s1, Some(&ver))
+            .await
+            .unwrap();
+
+        let mut stale = begin_accesses(&tm, accesses);
+        assert_eq!(
+            tm.commit(&mut stale).await.unwrap(),
+            BodyDecision::ReplayBody
+        );
+    }
+
+    // Replaces the test collection's root leaf with a two-level tree: an index
+    // root over S0(a,c | high "m") -> S1(m,p), chained by right-sibling.
+    // Returns both leaf tokens.
+    async fn seed_two_leaf_tree(tctx: &Tctx) -> (NodeToken, NodeToken) {
+        use glassdb_storage::{IndexNode, Node};
         let s0_token = NodeToken::from_bytes([0; 16]);
         let s1_token = NodeToken::from_bytes([1; 16]);
 
-        // Two-leaf tree: index root over S0(a,c | high "m") -> S1(m,p).
         let leaf = |ks: &[&[u8]], high: Option<&[u8]>, right: Option<&str>| {
             Node::leaf(LeafBody::from_entries(ks.iter().map(|k| {
                 LeafEntry::new(*k).with_current(CurrentState::External {
@@ -3302,42 +3450,7 @@ mod tests {
             .store_root(&test_collection(), &root, cur.observation())
             .await
             .unwrap();
-
-        let (accesses, keys) = scan_accesses(&tctx).await;
-        assert_eq!(
-            keys,
-            vec![b"a".to_vec(), b"c".to_vec(), b"m".to_vec(), b"p".to_vec()]
-        );
-
-        // Append a key past the current maximum: it lands in the last covered
-        // leaf S1, bumping its version.
-        let (s1, ver) = tctx
-            .nodes
-            .load_node(
-                &test_collection(),
-                &s1_token,
-                Requirement::after(tctx.timeline.currentness_barrier()),
-            )
-            .await
-            .unwrap();
-        let mut entries: Vec<LeafEntry> = s1.as_leaf().unwrap().entries().cloned().collect();
-        entries.push(LeafEntry::new(b"z").with_current(CurrentState::External {
-            writer: TxId::with_priority(2, b"boundary"),
-        }));
-        let mut new_s1 = Node::leaf(LeafBody::from_entries(entries));
-        let membership_writer = TxId::with_priority(2, b"membership");
-        new_s1.set_membership_writer(membership_writer.clone());
-        new_s1.remove_membership_holder(&membership_writer);
-        tctx.nodes
-            .store_node(&test_collection(), &s1_token, &new_s1, Some(&ver))
-            .await
-            .unwrap();
-
-        let mut stale = begin_accesses(&tm, accesses);
-        assert_eq!(
-            tm.commit(&mut stale).await.unwrap(),
-            BodyDecision::ReplayBody
-        );
+        (s0_token, s1_token)
     }
 
     // Rewrites the test collection's root `_r` (a single leaf holding `a`,`m`)
