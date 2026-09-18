@@ -86,6 +86,7 @@ impl DatabaseBuilder {
 
     /// Sets the upper bound on the per-retry delay for transient
     /// transaction-coordination and same-identity lock-acquisition operations.
+    /// This includes jitter and caps the initial interval. Defaults to 5 seconds.
     pub fn retry_max_interval(mut self, interval: Duration) -> Self {
         self.engine_config.set_retry_max_interval(interval);
         self

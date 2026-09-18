@@ -82,6 +82,9 @@ Item 12 is being split into small fixes. It remains incomplete.
 - Database names now use the existing database-root validator before backend I/O.
   The fixed format limit remains 1–255 ASCII letters or digits. Invalid names
   return `InvalidInput` instead of reaching a panic after a metadata read.
+- Retry delays now stay within `retry_max_interval`, including the initial delay
+  and jitter. The default is still 5 seconds. Jitter is sampled within that bound,
+  and interval growth saturates instead of overflowing for very large durations.
 
 ## Prioritized fixes
 
