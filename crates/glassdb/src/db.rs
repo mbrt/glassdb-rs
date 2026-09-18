@@ -75,6 +75,14 @@ impl DatabaseBuilder {
         self
     }
 
+    /// Limits cached final transaction statuses per database instance.
+    /// Defaults to 16,384 entries. Zero disables this cache.
+    /// This entry budget is separate from the decoded-object byte budget.
+    pub fn final_status_cache_entries(mut self, entries: usize) -> Self {
+        self.engine_config.set_final_status_cache_entries(entries);
+        self
+    }
+
     /// Enables the best-effort persistent encoded-body cache.
     ///
     /// The cache identity is derived automatically from the database name and

@@ -858,6 +858,7 @@ mod tests {
             Arc::downgrade(&background),
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
+            crate::monitor::DEFAULT_FINAL_STATUS_CACHE_ENTRIES,
         );
         let retry = RetryConfig {
             initial_interval: Duration::ZERO,
@@ -992,6 +993,7 @@ mod tests {
             Arc::downgrade(&background),
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
+            crate::monitor::DEFAULT_FINAL_STATUS_CACHE_ENTRIES,
         );
         let lifecycle = CollectionLifecycle::new(
             primary.records.clone(),

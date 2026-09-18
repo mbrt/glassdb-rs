@@ -27,7 +27,7 @@ use crate::gc::{Gc, GcDiagnostics, GcHints, GcStats};
 use crate::key_resolver::{KeyResolver, ScanResult};
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{LeafCoordinator, LeafCoordinatorStats};
-use crate::monitor::{Monitor, MonitorStats, ProtocolTiming};
+use crate::monitor::{DEFAULT_FINAL_STATUS_CACHE_ENTRIES, Monitor, MonitorStats, ProtocolTiming};
 use crate::reader::{ReadOutcome, Reader};
 use crate::split::{Splitter, SplitterStats};
 use crate::tlocker::{Locker, LockerStats};
@@ -47,6 +47,7 @@ struct PersistentCacheSetup {
 #[derive(Clone)]
 pub struct EngineConfig {
     cache_size: usize,
+    final_status_cache_entries: usize,
     persistent_cache: Option<PersistentCacheSetup>,
     retry: RetryConfig,
     read_unavailable_retries: usize,
@@ -60,6 +61,11 @@ impl EngineConfig {
     /// Sets the decoded-object cache capacity.
     pub fn set_cache_size(&mut self, bytes: usize) {
         self.cache_size = bytes;
+    }
+
+    /// Sets the number of final transaction statuses the monitor can cache.
+    pub fn set_final_status_cache_entries(&mut self, entries: usize) {
+        self.final_status_cache_entries = entries;
     }
 
     /// Enables the persistent encoded-body cache.
@@ -111,6 +117,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             cache_size: DEFAULT_CACHE_SIZE,
+            final_status_cache_entries: DEFAULT_FINAL_STATUS_CACHE_ENTRIES,
             persistent_cache: None,
             retry: RetryConfig::default(),
             read_unavailable_retries: DEFAULT_READ_UNAVAILABLE_RETRIES,
@@ -385,6 +392,7 @@ impl AssemblyFoundation {
             Arc::downgrade(&background),
             config.retry,
             config.protocol_timing,
+            config.final_status_cache_entries,
         );
         Self {
             backend,
@@ -452,6 +460,7 @@ impl AssemblyFixture {
             Arc::downgrade(background),
             retry,
             protocol_timing,
+            DEFAULT_FINAL_STATUS_CACHE_ENTRIES,
         )
     }
 }

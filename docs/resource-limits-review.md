@@ -100,6 +100,9 @@ Item 12 is being split into small fixes. It remains incomplete.
   retry budget. The default remains 5 retries (6 attempts); zero permits one
   attempt. Transactional and stale point reads each have their own budget.
   Backend retries and transaction-body retries remain separate.
+- Added `DatabaseBuilder::final_status_cache_entries` for the immutable
+  transaction-status cache. The default remains 16,384 entries; zero disables
+  this cache. The decoded-object cache and monitor runtime state are separate.
 
 ## Prioritized fixes
 

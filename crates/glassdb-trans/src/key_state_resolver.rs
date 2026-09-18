@@ -289,6 +289,7 @@ mod tests {
             Arc::downgrade(&background),
             RetryConfig::default(),
             ProtocolTiming::default(),
+            crate::monitor::DEFAULT_FINAL_STATUS_CACHE_ENTRIES,
         );
         (monitor, background)
     }

@@ -546,6 +546,7 @@ mod tests {
             Arc::downgrade(&bg),
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
+            crate::monitor::DEFAULT_FINAL_STATUS_CACHE_ENTRIES,
         );
         let nodes = NodeStore::new(objects, std::num::NonZeroUsize::MIN);
         nodes
