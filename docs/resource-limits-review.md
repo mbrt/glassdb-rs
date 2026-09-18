@@ -73,18 +73,15 @@ Item 6 is being split into small fixes. It remains incomplete.
 - More complete decoded-memory accounting and budgets for observations retained
   outside the cache remain unresolved.
 
-No scan or LIST limits have been added. The next decision is item 8's monitor
-lifetime handling. The monitor uses an empty waiter list to decide when to start
-a foreign-status poller. Removing cancelled registrations immediately therefore
-needs separate poller ownership, or a new waiter can start a second poller while
-the old one is still running. This goes beyond a local capacity check.
+No scan or LIST limits have been added. Monitor lifetime changes in item 8 are
+postponed at the user's request. Cancelled-waiter cleanup and monitor capacity
+limits need explicit waiter registration and poller ownership.
 
-Options:
+Item 12 is being split into small fixes. It remains incomplete.
 
-1. Postpone monitor lifetime changes and continue with isolated fixes, such as
-   database-name validation and retry-delay clamping in item 12.
-2. Design explicit waiter registrations and poller ownership before adding
-   monitor capacity limits.
+- Database names now use the existing database-root validator before backend I/O.
+  The fixed format limit remains 1–255 ASCII letters or digits. Invalid names
+  return `InvalidInput` instead of reaching a panic after a metadata read.
 
 ## Prioritized fixes
 

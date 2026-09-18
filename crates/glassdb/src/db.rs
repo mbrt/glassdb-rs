@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use glassdb_backend::Backend;
 use glassdb_concurr::rt;
-use glassdb_data::DatabaseId;
+use glassdb_data::{DatabaseId, DbRoot};
 use glassdb_storage::{InlinePolicy, PersistentCacheConfig, PersistentCacheMedia, SplitPolicy};
 use glassdb_trans::{
     AccessSet, BodyDecision, CatalogAccesses, Engine, EngineConfig, EngineTransaction,
@@ -119,6 +119,7 @@ impl DatabaseBuilder {
 
     /// Opens the database, validating the name and creating its metadata if
     /// needed.
+    /// Names must contain 1–255 ASCII letters or digits.
     pub async fn open(self) -> Result<Database, Error> {
         let DatabaseBuilder {
             name,
@@ -128,11 +129,7 @@ impl DatabaseBuilder {
             max_active_operations,
         } = self;
 
-        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
-            return Err(Error::InvalidInput(format!(
-                "name must be alphanumeric, got {name:?}"
-            )));
-        }
+        DbRoot::try_from(name.as_str()).map_err(|error| Error::InvalidInput(error.to_string()))?;
         let backend = Arc::new(glassdb_backend::StatsBackend::new(b));
         let database_id = check_or_create_db_meta(&backend, &name).await?;
         let engine = Engine::open(&name, database_id, backend, engine_config)
