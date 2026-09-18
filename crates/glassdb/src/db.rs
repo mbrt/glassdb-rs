@@ -519,7 +519,7 @@ impl DbInner {
                 {
                     Ok(BodyDecision::ReplayBody) => {}
                     Ok(BodyDecision::ReturnOutcome) => break body_outcome,
-                    Err(e) => break Err(Error::from_read_validation(e)),
+                    Err(e) => break Err(Error::from_read_trans(e)),
                 }
             }
             stats.retries += 1;

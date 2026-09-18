@@ -378,7 +378,12 @@ impl Transaction {
             }
         }
 
-        let snapshot = self.db.engine.collection_snapshot(parent).await?;
+        let snapshot = self
+            .db
+            .engine
+            .collection_snapshot(parent)
+            .await
+            .map_err(Error::from_read_trans)?;
         let mut inner = self.inner.lock().unwrap();
         inner.catalog.install_snapshot(parent.clone(), snapshot);
         Ok(())

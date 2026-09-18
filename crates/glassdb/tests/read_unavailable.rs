@@ -8,34 +8,55 @@
 //! a possibly-applied mutation, nor a generic [`Error::Internal`]).
 //!
 //! A normal in-memory backend never produces `Unavailable`, so a decorator
-//! injects it on reads of the coordination leaf objects (a node `/_n/` or the
-//! collection root `/_r`) a configurable number of times. In v2 a value read
-//! resolves a key by descending to its leaf (the lock table + MVCC index,
-//! ADR-031), so faulting the leaf read is the read-path outage under test. The
-//! key is seeded through a separate database over the same store so the reading
-//! database's cache is cold and the read actually reaches the (faulty) backend.
+//! injects it a configurable number of times on reads of one object kind. In v2
+//! a value read resolves a key by descending to its leaf (the lock table + MVCC
+//! index, ADR-031), so faulting the leaf read (a node `/_n/` or the collection
+//! root `/_r`) is the key read-path outage under test; faulting a collection
+//! record (`/_i`) is the directory read-path outage. The key is seeded through a
+//! separate database over the same store so the reading database's cache is cold
+//! and the read actually reaches the (faulty) backend.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
 use glassdb::backend::{Backend, BackendError};
 use glassdb::{CollectionPath, Database, Error};
 
-/// Controls a hook that injects `Unavailable` on coordination-leaf reads.
+/// The object kind whose reads a [`ReadFaults`] decorator faults.
+#[derive(Clone, Copy)]
+enum FaultTarget {
+    /// A coordination leaf: a node (`/_n/`) or the collection root (`/_r`).
+    Leaf,
+    /// A collection's lifecycle and directory record (`/_i`).
+    CollectionRecord,
+}
+
+impl FaultTarget {
+    fn matches(self, path: &str) -> bool {
+        match self {
+            Self::Leaf => path.contains("/_n/") || path.ends_with("/_r"),
+            Self::CollectionRecord => path.ends_with("/_i"),
+        }
+    }
+}
+
+/// Controls a hook that injects `Unavailable` on reads of one object kind.
 struct ReadFaults {
-    /// Remaining leaf reads to fault. `i64::MAX` models a sustained outage; a
-    /// small positive value models a transient blip.
+    target: FaultTarget,
+    /// Remaining targeted reads to fault. `i64::MAX` models a sustained outage;
+    /// a small positive value models a transient blip.
     fail_remaining: AtomicI64,
-    key_reads: AtomicUsize,
+    reads: AtomicUsize,
 }
 
 impl ReadFaults {
-    fn wrap(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
+    fn wrap(inner: Arc<dyn Backend>, target: FaultTarget) -> (Arc<HookBackend>, Arc<Self>) {
         let faults = Arc::new(Self {
+            target,
             fail_remaining: AtomicI64::new(0),
-            key_reads: AtomicUsize::new(0),
+            reads: AtomicUsize::new(0),
         });
         let backend = HookBackend::new(inner);
         backend.set_before({
@@ -54,27 +75,27 @@ impl ReadFaults {
         (backend, faults)
     }
 
-    /// Faults the next `n` key reads, then lets them through.
-    fn fail_next_key_reads(&self, n: i64) {
+    /// Faults the next `n` targeted reads, then lets them through.
+    fn fail_next_reads(&self, n: i64) {
         self.fail_remaining.store(n, Ordering::SeqCst);
     }
 
-    /// Faults every key read from now on (a sustained outage).
-    fn fail_key_reads_forever(&self) {
+    /// Faults every targeted read from now on (a sustained outage).
+    fn fail_reads_forever(&self) {
         self.fail_remaining.store(i64::MAX, Ordering::SeqCst);
     }
 
-    fn key_reads(&self) -> usize {
-        self.key_reads.load(Ordering::SeqCst)
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
     }
 
-    /// For a coordination leaf object, records the read and, if the fault budget
-    /// is not exhausted, consumes one unit and returns an injected `Unavailable`.
+    /// For a targeted object, records the read and, if the fault budget is not
+    /// exhausted, consumes one unit and returns an injected `Unavailable`.
     fn maybe_fault(&self, path: &str) -> Option<BackendError> {
-        if !(path.contains("/_n/") || path.ends_with("/_r")) {
+        if !self.target.matches(path) {
             return None;
         }
-        self.key_reads.fetch_add(1, Ordering::SeqCst);
+        self.reads.fetch_add(1, Ordering::SeqCst);
         loop {
             let cur = self.fail_remaining.load(Ordering::SeqCst);
             if cur <= 0 {
@@ -124,7 +145,7 @@ async fn transient_read_unavailability_is_retried_transparently() {
     seed_shared(mem.clone(), b"k", 10).await;
 
     // A second database with a cold cache reads through the faulty transport.
-    let (backend, faults) = ReadFaults::wrap(mem.clone());
+    let (backend, faults) = ReadFaults::wrap(mem.clone(), FaultTarget::Leaf);
     let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db
         .open_collection(&CollectionPath::new(b"c").unwrap())
@@ -132,7 +153,7 @@ async fn transient_read_unavailability_is_retried_transparently() {
         .unwrap();
 
     // Fault the first two key reads; the bounded retry rides over them.
-    faults.fail_next_key_reads(2);
+    faults.fail_next_reads(2);
 
     let calls = Arc::new(AtomicUsize::new(0));
     let coll = &coll;
@@ -152,9 +173,9 @@ async fn transient_read_unavailability_is_retried_transparently() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     // The two injected faults plus the successful read.
     assert!(
-        faults.key_reads() >= 3,
+        faults.reads() >= 3,
         "expected at least 3 key reads (2 faulted + 1 ok), got {}",
-        faults.key_reads()
+        faults.reads()
     );
 }
 
@@ -170,7 +191,7 @@ async fn error_outcome_does_not_escape_failed_validation() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     seed_shared(mem.clone(), b"k", 10).await;
 
-    let (backend, faults) = ReadFaults::wrap(mem.clone());
+    let (backend, faults) = ReadFaults::wrap(mem.clone(), FaultTarget::Leaf);
     let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db
         .open_collection(&CollectionPath::new(b"c").unwrap())
@@ -189,7 +210,7 @@ async fn error_outcome_does_not_escape_failed_validation() {
             async move {
                 bodies.fetch_add(1, Ordering::SeqCst);
                 let value = tx.read(coll, b"k").await?;
-                faults.fail_key_reads_forever();
+                faults.fail_reads_forever();
                 Err(Error::InvalidInput(format!(
                     "k is {:?}, which the body rejects",
                     value.map(|value| read_int(&value))
@@ -216,7 +237,7 @@ async fn explicit_abort_does_not_escape_failed_validation() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     seed_shared(mem.clone(), b"k", 10).await;
 
-    let (backend, faults) = ReadFaults::wrap(mem.clone());
+    let (backend, faults) = ReadFaults::wrap(mem.clone(), FaultTarget::Leaf);
     let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db
         .open_collection(&CollectionPath::new(b"c").unwrap())
@@ -232,7 +253,7 @@ async fn explicit_abort_does_not_escape_failed_validation() {
             async move {
                 bodies.fetch_add(1, Ordering::SeqCst);
                 tx.read(coll, b"k").await?;
-                faults.fail_key_reads_forever();
+                faults.fail_reads_forever();
                 tx.abort()
             }
         })
@@ -257,14 +278,14 @@ async fn sustained_read_unavailability_surfaces_unavailable() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     seed_shared(mem.clone(), b"k", 10).await;
 
-    let (backend, faults) = ReadFaults::wrap(mem.clone());
+    let (backend, faults) = ReadFaults::wrap(mem.clone(), FaultTarget::Leaf);
     let db = Database::open("example", backend.clone()).await.unwrap();
     let coll = db
         .open_collection(&CollectionPath::new(b"c").unwrap())
         .await
         .unwrap();
 
-    faults.fail_key_reads_forever();
+    faults.fail_reads_forever();
 
     let coll = &coll;
     let res = db.tx(|tx| async move { tx.read(coll, b"k").await }).await;
@@ -276,5 +297,61 @@ async fn sustained_read_unavailability_surfaces_unavailable() {
     assert!(
         !matches!(res, Err(Error::InDoubt(_)) | Err(Error::Internal { .. })),
         "read unavailability must not be classified as in-doubt or internal"
+    );
+}
+
+/// Resolving a collection name loads the parent's directory record. That load
+/// leaves the calling transaction's staged changes untouched, so an outage
+/// during it is the retry-safe `Error::Unavailable`, not `Error::InDoubt`.
+/// Reporting it as in-doubt claims the transaction may have committed when it
+/// never left its body (found by the `history` fuzz target, whose oracle
+/// rejects an in-doubt outcome that no commit outcome can explain).
+///
+/// The assertion is on the error the body itself observes. The error that
+/// escapes `tx` can come from the validation that follows an error outcome,
+/// which classifies its own failures separately.
+#[tokio::test(start_paused = true)]
+async fn directory_read_outage_is_unavailable_inside_the_body() {
+    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    seed_shared(mem.clone(), b"k", 10).await;
+    {
+        let db = Database::open("example", mem.clone()).await.unwrap();
+        let parent = db
+            .open_collection(&CollectionPath::new(b"c").unwrap())
+            .await
+            .unwrap();
+        parent.create_collection_if_absent(b"child").await.unwrap();
+    }
+
+    // A second database resolves the nested path through the faulty transport.
+    let (backend, faults) = ReadFaults::wrap(mem.clone(), FaultTarget::CollectionRecord);
+    let db = Database::open("example", backend).await.unwrap();
+
+    faults.fail_reads_forever();
+
+    let observed = Arc::new(Mutex::new(None));
+    let _ = db
+        .tx(|tx| {
+            let observed = observed.clone();
+            async move {
+                let result = async {
+                    let parent = tx.open_collection(&tx.root_collection(), b"c").await?;
+                    tx.open_collection(&parent, b"child").await
+                }
+                .await;
+                if let Err(error) = &result
+                    && let Ok(mut slot) = observed.lock()
+                {
+                    *slot = Some(error.clone());
+                }
+                result
+            }
+        })
+        .await;
+
+    let observed = observed.lock().unwrap().clone();
+    assert!(
+        matches!(observed, Some(Error::Unavailable(_))),
+        "a directory read outage must reach the body as Unavailable, got {observed:?}"
     );
 }

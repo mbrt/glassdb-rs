@@ -109,15 +109,19 @@ impl Error {
         }
     }
 
-    /// Maps a transaction-layer error raised while validating the reads behind a
-    /// transaction body's normal error outcome.
+    /// Maps a transaction-layer error raised by an operation that puts no
+    /// mutation of the caller's transaction in question: a collection directory
+    /// read from a transaction body, or the validation of the reads behind a
+    /// body's error outcome.
     ///
-    /// Such an attempt stages no write, so a sustained outage leaves no mutation
-    /// in question and keeps the retry-safe [`Error::Unavailable`] rather than
-    /// the conservative [`Error::InDoubt`] of [`From`].
-    pub(crate) fn from_read_validation(e: TransError) -> Self {
+    /// Neither leaves the caller's staged changes in doubt, so it applies the
+    /// same rule as [`Error::from_read`] to the storage error it carries. Such
+    /// an operation can still write while it helps a foreign transaction
+    /// identity reach its final status; that mutation belongs to the foreign
+    /// transaction.
+    pub(crate) fn from_read_trans(e: TransError) -> Self {
         match e {
-            TransError::Storage(StorageError::Unavailable(s)) => Error::Unavailable(s),
+            TransError::Storage(s) => Error::from_read(s),
             other => other.into(),
         }
     }

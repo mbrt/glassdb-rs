@@ -149,6 +149,18 @@ impl CoordinationEvidence {
         }
     }
 
+    /// The state this round left behind, when it can prove one.
+    ///
+    /// A skipped member staged nothing, so it retains the state the round
+    /// loaded. Another member's change can still have been published over it by
+    /// the same CAS, which is why only an installed receipt answers this.
+    pub(crate) fn installed(&self) -> Option<&LeafObservation> {
+        match self {
+            Self::Installed(receipt) => Some(receipt.installed()),
+            Self::Observed(_) => None,
+        }
+    }
+
     /// Reports whether this round confirmed the retained leaf state at or after
     /// the validation barrier.
     pub(crate) fn validates(
