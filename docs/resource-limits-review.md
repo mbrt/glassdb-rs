@@ -48,18 +48,20 @@ Item 3 is being split into small fixes. It remains incomplete.
 - A retained `Transaction` handle can start work after its enclosing call ends.
   Such work, and parallel work inside a transaction body, need separate bounds.
 
-The next decision is coordinator queue capacity. Lock acquisition, lock release,
-and write-back share the coordinator. A queue limit must preserve progress for
-recovery of already admitted work. This needs a capacity policy across transaction
-execution and recovery, so work stops here under the small-change constraint.
+Coordinator queue limits in item 3 and managed recovery budgets in item 4 are
+postponed at the user's request. Lock acquisition, lock release, and write-back
+share the coordinator. A later capacity policy must preserve recovery of already
+admitted work, including retirement handoff and foreign transaction identities.
+Independent small fixes continue.
 
-Options:
+Item 5 is being split into small fixes. It remains incomplete.
 
-1. Postpone coordinator queues and managed recovery budgets together, and continue
-   with independent small fixes.
-2. Design capacity reservations that remain owned through retirement handoff,
-   with capacity for recovery of foreign transaction identities. This needs
-   changes to the transaction lifecycle and background task management.
+- Enforced the existing ambiguous-commit recovery deadline during status reads
+  and retry delays. The configured pending timeout (15 seconds by default) is
+  measured from the commit write attempt. An expired budget starts no new status
+  read, and expiration returns `InDoubt` while preserving the uncertain outcome.
+- Total transaction and shutdown deadlines, backend request timeouts, and other
+  retry budgets remain unresolved.
 
 ## Prioritized fixes
 
