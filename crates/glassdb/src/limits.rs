@@ -1,8 +1,8 @@
-//! Configurable limits on transaction inputs.
+//! Configurable limits on transaction admission.
 
 use crate::Error;
 
-/// Limits applied by one database instance before it copies transaction inputs.
+/// Local admission limits applied by one database instance.
 ///
 /// These are local admission limits, not stored format limits. A zero byte limit
 /// permits only empty inputs. The node sizing policy can further restrict keys.
@@ -14,6 +14,11 @@ pub struct TransactionLimits {
     /// Maximum bytes in a value staged for writing. Defaults to 1 MiB.
     /// Existing stored values remain readable regardless of this limit.
     pub max_value_bytes: usize,
+    /// Maximum point accesses, scans, and collection operations per execution
+    /// of a transaction body. Defaults to 4,096. Repeated calls, including
+    /// failed or cancelled operations, count again. Each collection-path
+    /// segment counts as one operation. Zero rejects all these operations.
+    pub max_operations: usize,
 }
 
 impl TransactionLimits {
@@ -31,6 +36,7 @@ impl Default for TransactionLimits {
         Self {
             max_key_bytes: 4 * 1024,
             max_value_bytes: 1024 * 1024,
+            max_operations: 4096,
         }
     }
 }

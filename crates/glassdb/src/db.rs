@@ -37,7 +37,7 @@ pub struct DatabaseBuilder {
 }
 
 impl DatabaseBuilder {
-    /// Sets local limits on transaction inputs. See [`TransactionLimits`] for defaults.
+    /// Sets local transaction admission limits. See [`TransactionLimits`] for defaults.
     pub fn transaction_limits(mut self, limits: TransactionLimits) -> Self {
         self.transaction_limits = limits;
         self

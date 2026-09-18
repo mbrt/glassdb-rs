@@ -18,6 +18,7 @@ async fn oversized_inputs_are_rejected_before_backend_work() {
         .transaction_limits(TransactionLimits {
             max_key_bytes: 3,
             max_value_bytes: 5,
+            ..TransactionLimits::default()
         })
         .open()
         .await
@@ -80,6 +81,7 @@ async fn size_error_based_on_a_stale_read_retries_the_body() {
     let db = Database::builder("limits", MemoryBackend::new())
         .transaction_limits(TransactionLimits {
             max_value_bytes: 1,
+            max_operations: 2,
             ..TransactionLimits::default()
         })
         .open()
@@ -135,6 +137,7 @@ async fn zero_limits_allow_empty_inputs_and_existing_values_remain_readable() {
         .transaction_limits(TransactionLimits {
             max_key_bytes: 0,
             max_value_bytes: 0,
+            ..TransactionLimits::default()
         })
         .open()
         .await
@@ -150,4 +153,101 @@ async fn zero_limits_allow_empty_inputs_and_existing_values_remain_readable() {
     assert_eq!(c.read(b"").await.unwrap(), Some(Vec::new()));
     c.delete(b"").await.unwrap();
     assert_eq!(c.read(b"").await.unwrap(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_reads_share_the_operation_limit() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .transaction_limits(TransactionLimits {
+            max_operations: 1,
+            ..TransactionLimits::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let c = &db.root_collection();
+    let (first, second) = db
+        .tx(|tx| async move { Ok(futures::join!(tx.read(c, b"a"), tx.read(c, b"b"))) })
+        .await
+        .unwrap();
+    assert_eq!(first.unwrap(), None);
+    expect_limit(second, "transaction operations", 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn collection_operations_scans_and_repeated_accesses_share_one_limit() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .transaction_limits(TransactionLimits {
+            max_operations: 4,
+            ..TransactionLimits::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let c = &db.root_collection();
+    let rejected = db
+        .tx(|tx| async move {
+            tx.collection_exists(c, b"child").await?;
+            tx.scan_keys(c, KeyScan::all()).await?;
+            tx.write(c, b"k", b"v")?;
+            tx.read(c, b"k").await?;
+            Ok(tx.delete(c, b"k"))
+        })
+        .await
+        .unwrap();
+    expect_limit(rejected, "transaction operations", 4);
+    assert_eq!(c.read(b"k").await.unwrap().as_deref(), Some(&b"v"[..]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn zero_operations_rejects_access_before_backend_work() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .transaction_limits(TransactionLimits {
+            max_operations: 0,
+            ..TransactionLimits::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let c = db.root_collection();
+    let before = db.stats().backend;
+    expect_limit(c.read(b"k").await, "transaction operations", 0);
+    expect_limit(c.write(b"k", b"v").await, "transaction operations", 0);
+    expect_limit(
+        c.scan_keys(KeyScan::all()).await,
+        "transaction operations",
+        0,
+    );
+    expect_limit(
+        c.create_collection(b"child").await,
+        "transaction operations",
+        0,
+    );
+    assert_eq!(db.stats().backend, before);
+}
+
+#[tokio::test(start_paused = true)]
+async fn rejected_collection_handles_still_count_as_operations() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .transaction_limits(TransactionLimits {
+            max_operations: 1,
+            ..TransactionLimits::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let other = Database::open("other", MemoryBackend::new()).await.unwrap();
+    let foreign = &other.root_collection();
+    let c = &db.root_collection();
+    let rejected = db
+        .tx(|tx| async move {
+            glassdb::ensure_tx!(
+                matches!(tx.read(foreign, b"k").await, Err(Error::InvalidInput(_))),
+                Error::internal("foreign collection handle was accepted")
+            );
+            Ok(tx.read(c, b"k").await)
+        })
+        .await
+        .unwrap();
+    expect_limit(rejected, "transaction operations", 1);
 }

@@ -17,7 +17,10 @@ Item 1 is being split into small fixes. It remains incomplete.
 - Added `DatabaseBuilder::transaction_limits` with 4 KiB logical-key and 1 MiB
   written-value defaults. Input checks precede copies and point I/O; scan bounds
   and stale-read keys use the same key limit. Existing values remain readable.
-- Pending: point-access counts, staged-write bytes, and collection reservations.
+- Added a shared operation count per transaction-body execution, with a default
+  of 4,096. Point accesses, scans, and collection operations count toward the same
+  limit, including repeated calls. Admission occurs before copies or I/O.
+- Pending: staged-write bytes and collection reservations.
 - Full observation-memory and encoded-object budgets will be addressed with the
   related storage and scan work in items 2 and 7.
 

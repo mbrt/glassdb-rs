@@ -44,6 +44,7 @@ pub struct Transaction {
 struct TransactionInner {
     accesses: AccessOverlay,
     catalog: CatalogOverlay,
+    operations: usize,
 }
 
 impl Transaction {
@@ -54,7 +55,7 @@ impl Transaction {
     /// Takes `&self`, so multiple reads can be polled concurrently (e.g. with
     /// `futures::future::join_all`) to fetch keys in parallel.
     pub async fn read(&self, c: &Collection, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        self.validate_handle(c)?;
+        self.admit_operation(c)?;
         self.db.transaction_limits.check_key(key)?;
         let key = LogicalKey::new(c.address().clone(), key);
         // Brief lock to consult the per-transaction cache. The guard is dropped
@@ -101,7 +102,7 @@ impl Transaction {
     /// The scan participates in serializable validation and reflects writes and
     /// deletes staged before this call. Values remain separate tracked reads.
     pub async fn scan_keys(&self, c: &Collection, scan: KeyScan<'_>) -> Result<KeyPage, Error> {
-        self.validate_handle(c)?;
+        self.admit_operation(c)?;
         let range = scan.normalize(&self.db.transaction_limits)?;
         let limit = range.limit;
         let (overlay, created) = {
@@ -137,7 +138,7 @@ impl Transaction {
 
     /// Stages a write of `value` to `key`.
     pub fn write(&self, c: &Collection, key: &[u8], value: &[u8]) -> Result<(), Error> {
-        self.validate_handle(c)?;
+        self.admit_operation(c)?;
         self.db.transaction_limits.check_key(key)?;
         self.db.transaction_limits.check_value(value)?;
         if self.inner.lock().unwrap().catalog.is_dropped(c.address()) {
@@ -156,7 +157,7 @@ impl Transaction {
 
     /// Marks `key` for deletion within the transaction.
     pub fn delete(&self, c: &Collection, key: &[u8]) -> Result<(), Error> {
-        self.validate_handle(c)?;
+        self.admit_operation(c)?;
         self.db.transaction_limits.check_key(key)?;
         if self.inner.lock().unwrap().catalog.is_dropped(c.address()) {
             return Err(Error::InvalidInput(
@@ -254,7 +255,7 @@ impl Transaction {
     /// observation when its attempt completes. Each yielded handle remains
     /// bound to the listed incarnation.
     pub async fn iter_collections(&self, parent: &Collection) -> Result<CollectionIter, Error> {
-        self.validate_handle(parent)?;
+        self.admit_operation(parent)?;
         self.ensure_directory(parent.address()).await?;
         let current = {
             let mut inner = self.inner.lock().unwrap();
@@ -279,7 +280,7 @@ impl Transaction {
 
     /// Non-recursively drops the exact collection incarnation bound by `collection`.
     pub async fn drop_collection(&self, collection: &Collection) -> Result<(), Error> {
-        self.validate_handle(collection)?;
+        self.admit_operation(collection)?;
         if collection.address().id().is_root() {
             return Err(Error::InvalidInput(
                 "the permanent root collection cannot be dropped".into(),
@@ -314,6 +315,7 @@ impl Transaction {
             inner: Arc::new(Mutex::new(TransactionInner {
                 accesses: AccessOverlay::default(),
                 catalog: CatalogOverlay::new(reservations),
+                operations: 0,
             })),
         }
     }
@@ -339,8 +341,8 @@ impl Transaction {
         name: &[u8],
         mode: CreateMode,
     ) -> Result<(Collection, bool), Error> {
+        self.admit_operation(parent)?;
         validate_collection_name(name)?;
-        self.validate_handle(parent)?;
         self.ensure_directory(parent.address()).await?;
         let mut inner = self.inner.lock().unwrap();
         let (address, created) = inner.catalog.create_child(parent.address(), name, mode)?;
@@ -355,8 +357,8 @@ impl Transaction {
         parent: &Collection,
         name: &[u8],
     ) -> Result<Option<Collection>, Error> {
+        self.admit_operation(parent)?;
         validate_collection_name(name)?;
-        self.validate_handle(parent)?;
         self.ensure_directory(parent.address()).await?;
         let id = self
             .inner
@@ -393,7 +395,16 @@ impl Transaction {
         Ok(())
     }
 
-    fn validate_handle(&self, collection: &Collection) -> Result<(), Error> {
+    fn admit_operation(&self, collection: &Collection) -> Result<(), Error> {
+        let mut inner = self.inner.lock().unwrap();
+        let limit = self.db.transaction_limits.max_operations;
+        if inner.operations >= limit {
+            return Err(Error::LimitExceeded {
+                resource: "transaction operations",
+                limit,
+            });
+        }
+        inner.operations += 1;
         if collection.database_id() != self.db.database_id
             || collection.address().db_root() != self.db.name
         {
