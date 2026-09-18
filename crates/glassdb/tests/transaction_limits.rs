@@ -82,6 +82,7 @@ async fn size_error_based_on_a_stale_read_retries_the_body() {
         .transaction_limits(TransactionLimits {
             max_value_bytes: 1,
             max_operations: 2,
+            max_write_bytes: 2,
             ..TransactionLimits::default()
         })
         .open()
@@ -250,4 +251,102 @@ async fn rejected_collection_handles_still_count_as_operations() {
         .await
         .unwrap();
     expect_limit(rejected, "transaction operations", 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn write_byte_limit_counts_keys_and_values_and_preserves_admitted_writes() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .transaction_limits(TransactionLimits {
+            max_write_bytes: 7,
+            ..TransactionLimits::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let c = &db.root_collection();
+    let rejected = db
+        .tx(|tx| async move {
+            tx.write(c, b"a", b"abc")?;
+            tx.write(c, b"b", b"xy")?;
+            Ok(tx.write(c, b"c", b"z"))
+        })
+        .await
+        .unwrap();
+    expect_limit(rejected, "transaction write bytes", 7);
+    assert_eq!(c.read(b"a").await.unwrap().as_deref(), Some(&b"abc"[..]));
+    assert_eq!(c.read(b"b").await.unwrap().as_deref(), Some(&b"xy"[..]));
+    assert_eq!(c.read(b"c").await.unwrap(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn replacements_and_deletes_consume_the_write_byte_budget() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .transaction_limits(TransactionLimits {
+            max_write_bytes: 5,
+            ..TransactionLimits::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let c = &db.root_collection();
+    let rejected = db
+        .tx(|tx| async move {
+            tx.write(c, b"k", b"a")?;
+            tx.write(c, b"k", b"b")?;
+            tx.delete(c, b"k")?;
+            Ok(tx.write(c, b"k", b"c"))
+        })
+        .await
+        .unwrap();
+    expect_limit(rejected, "transaction write bytes", 5);
+    assert_eq!(c.read(b"k").await.unwrap(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_write_admission_does_not_consume_bytes() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .transaction_limits(TransactionLimits {
+            max_write_bytes: 3,
+            ..TransactionLimits::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let c = &db.root_collection();
+    db.tx(|tx| async move {
+        glassdb::ensure_tx!(
+            matches!(tx.write(c, b"k", b"abc"), Err(Error::LimitExceeded { .. })),
+            Error::internal("write byte limit was not enforced")
+        );
+        tx.write(c, b"k", b"ok")
+    })
+    .await
+    .unwrap();
+    assert_eq!(c.read(b"k").await.unwrap().as_deref(), Some(&b"ok"[..]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn write_byte_budget_is_reset_when_the_body_retries() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .transaction_limits(TransactionLimits {
+            max_write_bytes: 2,
+            ..TransactionLimits::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let c = &db.root_collection();
+    c.write(b"k", b"0").await.unwrap();
+    db.tx(|tx| async move {
+        let value = tx.read(c, b"k").await?.ok_or(Error::NotFound)?;
+        tx.write(c, b"k", b"2")?;
+        if value == b"0" {
+            c.write(b"k", b"1").await?;
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(c.read(b"k").await.unwrap().as_deref(), Some(&b"2"[..]));
+    assert!(db.stats().transactions.retries > 0);
 }

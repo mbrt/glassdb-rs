@@ -45,6 +45,7 @@ struct TransactionInner {
     accesses: AccessOverlay,
     catalog: CatalogOverlay,
     operations: usize,
+    write_bytes: usize,
 }
 
 impl Transaction {
@@ -141,17 +142,19 @@ impl Transaction {
         self.admit_operation(c)?;
         self.db.transaction_limits.check_key(key)?;
         self.db.transaction_limits.check_value(value)?;
-        if self.inner.lock().unwrap().catalog.is_dropped(c.address()) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.catalog.is_dropped(c.address()) {
             return Err(Error::InvalidInput(
                 "cannot write a collection after dropping it".into(),
             ));
         }
+        inner.admit_write(
+            key.len(),
+            value.len(),
+            self.db.transaction_limits.max_write_bytes,
+        )?;
         let key = LogicalKey::new(c.address().clone(), key);
-        self.inner
-            .lock()
-            .unwrap()
-            .accesses
-            .write(key, Arc::from(value));
+        inner.accesses.write(key, Arc::from(value));
         Ok(())
     }
 
@@ -159,13 +162,15 @@ impl Transaction {
     pub fn delete(&self, c: &Collection, key: &[u8]) -> Result<(), Error> {
         self.admit_operation(c)?;
         self.db.transaction_limits.check_key(key)?;
-        if self.inner.lock().unwrap().catalog.is_dropped(c.address()) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.catalog.is_dropped(c.address()) {
             return Err(Error::InvalidInput(
                 "cannot write a collection after dropping it".into(),
             ));
         }
+        inner.admit_write(key.len(), 0, self.db.transaction_limits.max_write_bytes)?;
         let key = LogicalKey::new(c.address().clone(), key);
-        self.inner.lock().unwrap().accesses.delete(key);
+        inner.accesses.delete(key);
         Ok(())
     }
 
@@ -316,6 +321,7 @@ impl Transaction {
                 accesses: AccessOverlay::default(),
                 catalog: CatalogOverlay::new(reservations),
                 operations: 0,
+                write_bytes: 0,
             })),
         }
     }
@@ -412,6 +418,27 @@ impl Transaction {
                 "collection handle belongs to a different database".into(),
             ));
         }
+        Ok(())
+    }
+}
+
+impl TransactionInner {
+    fn admit_write(
+        &mut self,
+        key_bytes: usize,
+        value_bytes: usize,
+        limit: usize,
+    ) -> Result<(), Error> {
+        let total = self
+            .write_bytes
+            .checked_add(key_bytes)
+            .and_then(|bytes| bytes.checked_add(value_bytes))
+            .filter(|&bytes| bytes <= limit)
+            .ok_or(Error::LimitExceeded {
+                resource: "transaction write bytes",
+                limit,
+            })?;
+        self.write_bytes = total;
         Ok(())
     }
 }

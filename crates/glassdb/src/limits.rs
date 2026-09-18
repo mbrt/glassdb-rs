@@ -19,6 +19,11 @@ pub struct TransactionLimits {
     /// failed or cancelled operations, count again. Each collection-path
     /// segment counts as one operation. Zero rejects all these operations.
     pub max_operations: usize,
+    /// Maximum total key and value bytes submitted by accepted writes and
+    /// deletes per transaction-body execution. Defaults to 64 MiB. Replacements
+    /// count again; deleting a key counts its bytes and does not refund earlier
+    /// writes. This does not include retained read or scan observations.
+    pub max_write_bytes: usize,
 }
 
 impl TransactionLimits {
@@ -37,6 +42,7 @@ impl Default for TransactionLimits {
             max_key_bytes: 4 * 1024,
             max_value_bytes: 1024 * 1024,
             max_operations: 4096,
+            max_write_bytes: 64 * 1024 * 1024,
         }
     }
 }

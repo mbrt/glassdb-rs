@@ -20,7 +20,10 @@ Item 1 is being split into small fixes. It remains incomplete.
 - Added a shared operation count per transaction-body execution, with a default
   of 4,096. Point accesses, scans, and collection operations count toward the same
   limit, including repeated calls. Admission occurs before copies or I/O.
-- Pending: staged-write bytes and collection reservations.
+- Added a cumulative write-input budget per transaction-body execution, with a
+  default of 64 MiB. Keys and values count before copying; replacements and
+  deletes consume budget without refunds. Read and scan observations are separate.
+- Pending: collection reservations.
 - Full observation-memory and encoded-object budgets will be addressed with the
   related storage and scan work in items 2 and 7.
 
