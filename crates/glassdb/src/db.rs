@@ -108,6 +108,7 @@ impl DatabaseBuilder {
     /// Sets local split thresholds and proposes hard limits for a new database.
     /// Existing databases load their hard limits from metadata, ignoring the
     /// proposed hard cap and reserved headroom. Soft thresholds remain local.
+    /// Creation fails if the hard limits cannot admit even an empty key.
     pub fn split_policy(mut self, policy: SplitPolicy) -> Self {
         self.split_policy = policy;
         self

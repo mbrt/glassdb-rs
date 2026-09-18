@@ -14,11 +14,19 @@ Status: First-pass implementation in progress.
   Recovery, refresh, and GC receive the stored profile. Invalid creation timing
   is rejected before storage initialization. Regression tests, `make test`,
   and adversarial review passed.
-- Findings 3–4: pending.
+- Finding 3: metadata bootstrap returns one validated identity and settings
+  record. Limits must admit at least the empty key. Tests cover missing and
+  invalid fields, concurrent creators, invalid proposals when reopening, and
+  clients with different inline budgets. Regression tests, `make test`, and
+  adversarial review passed.
+- Finding 4: pending.
 
 The first pass retains the mixed `SplitPolicy` interface and does not provide
 migration or online changes to stored settings. Earlier development databases
 must be recreated. The findings below describe the code before these fixes.
+
+Limit validation checks the minimum key shape. It does not certify that every
+key distribution or transient lock set fits a chosen limit.
 
 Persist transaction timing and hard coordination limits. Keep performance
 settings local to each database instance. Settings that are necessary for

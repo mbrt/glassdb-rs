@@ -26,14 +26,17 @@ pub(crate) struct DatabaseMetadata {
 impl DatabaseMetadata {
     /// Combines stored hard limits with local split thresholds.
     pub(crate) fn split_policy(&self, local: SplitPolicy) -> Result<SplitPolicy, Error> {
-        SplitPolicy::builder()
+        let policy = SplitPolicy::builder()
             .leaf_max_entries(local.leaf_max_entries())
             .node_soft_max_bytes(local.node_soft_max_bytes())
             .index_max_children(local.index_max_children())
             .node_max_bytes(self.node_max_bytes)
             .split_headroom_bytes(self.split_headroom_bytes)
             .build()
-            .map_err(|error| Error::with_source("invalid database coordination limits", error))
+            .map_err(|error| Error::with_source("invalid database coordination limits", error))?;
+        validate_limits(policy)
+            .map_err(|error| Error::with_source("invalid database coordination limits", error))?;
+        Ok(policy)
     }
 }
 
@@ -50,6 +53,7 @@ pub(crate) async fn check_or_create_db_meta(
         Err(Error::NotFound) => {}
         Err(e) => return Err(e),
     }
+    validate_limits(policy)?;
     validate_timing(timing)?;
     Engine::prepare_permanent_collection(b, name)
         .await
@@ -135,6 +139,15 @@ fn required_duration(value: Option<u64>, field: &str) -> Result<Duration, Error>
         .ok_or_else(|| Error::internal(format!("database metadata missing {field}")))
 }
 
+fn validate_limits(policy: SplitPolicy) -> Result<(), Error> {
+    if !policy.key_fits(b"") {
+        return Err(Error::InvalidInput(
+            "coordination limits cannot admit even an empty key".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_timing(timing: ProtocolTiming) -> Result<(), Error> {
     if timing.pending_timeout() < Duration::from_nanos(2) {
         return Err(Error::InvalidInput(
@@ -154,8 +167,11 @@ fn duration_nanos(duration: Duration) -> Result<u64, Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use glassdb_backend::memory::MemoryBackend;
+    use glassdb_backend::middleware::{BackendOp, HookBackend};
 
     #[tokio::test]
     async fn create_then_validate_round_trips_through_proto() {
@@ -165,7 +181,7 @@ mod tests {
             &b,
             "mydb",
             SplitPolicy::default(),
-            ProtocolTiming::default(),
+            ProtocolTiming::new(Duration::from_nanos(123_456_789), Duration::ZERO),
         )
         .await
         .unwrap();
@@ -289,6 +305,113 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, Error::Internal { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn invalid_metadata_stops_open_before_engine_initialization() {
+        type MetadataEdit = fn(&mut pb::DatabaseMetadata);
+        let cases: &[(&str, MetadataEdit)] = &[
+            ("missing hard cap", |m| m.node_max_bytes = None),
+            ("missing headroom", |m| m.split_headroom_bytes = None),
+            ("missing timeout", |m| m.pending_timeout_nanos = None),
+            ("missing skew", |m| m.max_clock_skew_nanos = None),
+            ("zero timeout", |m| m.pending_timeout_nanos = Some(0)),
+            ("zero refresh interval", |m| {
+                m.pending_timeout_nanos = Some(1)
+            }),
+            ("zero content budget", |m| {
+                m.split_headroom_bytes = m.node_max_bytes
+            }),
+            ("headroom above cap", |m| {
+                m.split_headroom_bytes = Some(1025)
+            }),
+            ("unusable cap", |m| {
+                m.node_max_bytes = Some(1);
+                m.split_headroom_bytes = Some(0);
+            }),
+            ("missing version", |m| m.version.clear()),
+            ("future version", |m| m.version = "future".into()),
+            ("missing ID", |m| m.database_id.clear()),
+        ];
+        for (name, edit) in cases {
+            let mut metadata = pb::DatabaseMetadata {
+                version: DB_VERSION.into(),
+                database_id: DatabaseId::new_random().as_bytes().to_vec(),
+                node_max_bytes: Some(1024),
+                split_headroom_bytes: Some(128),
+                pending_timeout_nanos: Some(250_000_000),
+                max_clock_skew_nanos: Some(0),
+            };
+            edit(&mut metadata);
+            let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+            backend
+                .write_if_not_exists("invalid/glassdb", metadata.encode_to_vec())
+                .await
+                .unwrap();
+            backend.set_before(|op| {
+                assert!(
+                    matches!(op, BackendOp::Read { path } if *path == "invalid/glassdb"),
+                    "invalid metadata must stop opening before any other access: {op:?}"
+                );
+                Box::pin(async { Ok(()) })
+            });
+            let result = crate::Database::open("invalid", backend).await;
+            assert!(matches!(result, Err(Error::Internal { .. })), "{name}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_creators_load_one_complete_metadata_record() {
+        let memory = Arc::new(MemoryBackend::new());
+        let loser_backend = HookBackend::new(memory.clone());
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        loser_backend.set_before({
+            let reached = reached.clone();
+            let release = release.clone();
+            move |op| {
+                let pause = matches!(op, BackendOp::WriteIfNotExists { path, .. }
+                    if *path == "race/glassdb");
+                let reached = reached.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    if pause {
+                        reached.notify_one();
+                        release.notified().await;
+                    }
+                    Ok(())
+                })
+            }
+        });
+        let loser = tokio::spawn(async move {
+            check_or_create_db_meta(
+                &loser_backend,
+                "race",
+                SplitPolicy::default(),
+                ProtocolTiming::default(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), reached.notified())
+            .await
+            .unwrap();
+        let policy = SplitPolicy::builder()
+            .node_max_bytes(512)
+            .split_headroom_bytes(128)
+            .build()
+            .unwrap();
+        let winner = check_or_create_db_meta(&memory, "race", policy, ProtocolTiming::simulation())
+            .await
+            .unwrap();
+        release.notify_one();
+        let loser = loser.await.unwrap().unwrap();
+        assert_eq!(
+            loser, winner,
+            "identity, limits, and timing must all come from the winner"
+        );
+        assert_eq!(winner.node_max_bytes, 512);
+        assert_eq!(winner.split_headroom_bytes, 128);
+        assert_eq!(winner.timing, ProtocolTiming::simulation());
     }
 
     // Golden vector: the metadata body must always encode to these exact bytes.

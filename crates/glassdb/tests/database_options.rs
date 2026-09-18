@@ -140,3 +140,93 @@ async fn invalid_creation_timing_does_not_initialize_storage() {
         assert!(objects.objects.is_empty());
     }
 }
+
+#[tokio::test]
+async fn unusable_creation_limits_do_not_initialize_storage() {
+    for (hard, headroom) in [(0, 0), (1, 0), (512, 512)] {
+        let policy = SplitPolicy::builder()
+            .node_max_bytes(hard)
+            .split_headroom_bytes(headroom)
+            .build()
+            .unwrap();
+        let backend = Arc::new(MemoryBackend::new());
+        let result = Database::builder("invalid", backend.clone())
+            .split_policy(policy)
+            .open()
+            .await;
+        assert!(matches!(result, Err(Error::InvalidInput(_))));
+        let objects = backend
+            .list("invalid/", None, ListLimit::new(100).unwrap())
+            .await
+            .unwrap();
+        assert!(objects.objects.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn opening_ignores_invalid_creation_proposals() {
+    let backend = Arc::new(MemoryBackend::new());
+    let creator = Database::open("existing", backend.clone()).await.unwrap();
+    creator
+        .root_collection()
+        .write(b"key", b"old")
+        .await
+        .unwrap();
+    creator.shutdown().await;
+
+    let reopened = Database::builder("existing", backend)
+        .split_policy(
+            SplitPolicy::builder()
+                .node_max_bytes(0)
+                .split_headroom_bytes(0)
+                .build()
+                .unwrap(),
+        )
+        .protocol_timing(ProtocolTiming::new(Duration::MAX, Duration::MAX))
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.root_collection().read(b"key").await.unwrap(),
+        Some(b"old".to_vec())
+    );
+    reopened
+        .root_collection()
+        .write(b"key", b"new")
+        .await
+        .unwrap();
+    reopened.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn inline_options_remain_local_to_each_client() {
+    let backend = Arc::new(MemoryBackend::new());
+    let direct = Database::open("local", backend.clone()).await.unwrap();
+    let logged = Database::builder("local", backend.clone())
+        .inline_policy(InlinePolicy::none())
+        .open()
+        .await
+        .unwrap();
+    direct
+        .root_collection()
+        .write(b"key", b"inline")
+        .await
+        .unwrap();
+    assert_eq!(
+        logged.root_collection().read(b"key").await.unwrap(),
+        Some(b"inline".to_vec())
+    );
+    assert_eq!(direct.stats().direct_commit.landed, 1);
+    logged
+        .root_collection()
+        .write(b"key", b"logged")
+        .await
+        .unwrap();
+    assert_eq!(
+        direct.root_collection().read(b"key").await.unwrap(),
+        Some(b"logged".to_vec())
+    );
+    assert_eq!(logged.stats().direct_commit.landed, 0);
+    direct.shutdown().await;
+    logged.shutdown().await;
+}
