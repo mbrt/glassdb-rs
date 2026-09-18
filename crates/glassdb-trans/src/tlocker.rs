@@ -176,15 +176,28 @@ impl LockedTx {
     }
 
     /// Reports whether this transaction acquired its hold from the exact leaf
-    /// state that was observed earlier, with evidence reaching `barrier`.
-    pub(crate) fn validated(
+    /// state that was observed earlier, with evidence reaching `barrier`, and
+    /// left that leaf with the membership version `membership_version`.
+    ///
+    /// One coordinated round publishes every member's staged change in a single
+    /// CAS (ADR-028), so matching the pre-CAS state alone would hide a peer's
+    /// create or delete that landed in the very same CAS. The installed state
+    /// is what ADR-032's membership-version condition must compare against.
+    pub(crate) fn certifies_membership(
         &self,
         observed: &LeafObservation,
+        membership_version: u64,
         barrier: CurrentnessBarrier,
     ) -> bool {
-        self.groups
-            .values()
-            .any(|group| group.receipt.evidence.validates(observed, barrier))
+        self.groups.get(observed.path()).is_some_and(|group| {
+            group.receipt.evidence.validates(observed, barrier)
+                && group
+                    .receipt
+                    .evidence
+                    .installed()
+                    .and_then(|installed| installed.value())
+                    .is_some_and(|node| node.membership_version() == membership_version)
+        })
     }
 
     /// The typed entry and leaf locks GC records on the transaction object for
@@ -3867,6 +3880,86 @@ mod tests {
                 "the committed value is published (order {wb_order}/{acq_order})"
             );
         }
+    }
+
+    // One coordinated round publishes every member's staged change in a single
+    // CAS (ADR-028), so a lock receipt proves only the state that round started
+    // from. A peer's create carried by that same CAS changes the leaf's
+    // membership, which ADR-032 condition (a) must still catch.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_create_in_one_round_cannot_certify_a_scan() {
+        let (locker, ctx, log, gate) = gated_locker_with(false).await;
+        let leaf_path = root_path().to_string();
+        let scanner = mk_tid(1, "scanner");
+        let peer = mk_tid(2, "peer");
+        ctx.monitor.begin_tx(&scanner);
+        ctx.monitor.begin_tx(&peer);
+
+        // The membership a scan of this leaf would have recorded.
+        let loaded = ctx
+            .nodes
+            .load_leaf(&root_path(), Requirement::ANY)
+            .await
+            .unwrap();
+        let observed = loaded.observation().clone();
+        let observed_membership = loaded.node().membership_version();
+        let barrier = ctx.timeline.currentness_barrier();
+
+        // The gated leaf load keeps the round open, so the peer's create and
+        // the scanner's own lock land in one CAS.
+        let before = count_stores(&log, &leaf_path);
+        gate.arm();
+        let peer_lock = tokio::spawn({
+            let (locker, peer) = (locker.clone(), peer.clone());
+            async move {
+                let mut groups = group_of(b"phantom", put_intent(b"phantom"));
+                for group in groups.values_mut() {
+                    group.membership = LockType::Write;
+                }
+                locker
+                    .keys()
+                    .lock_leaves_at(&peer, &groups, false, Requirement::ANY)
+                    .await
+            }
+        });
+        let scanner_lock = tokio::spawn({
+            let (locker, scanner) = (locker.clone(), scanner.clone());
+            async move {
+                let groups = group_of(b"read", read_intent(b"read"));
+                locker
+                    .keys()
+                    .lock_leaves_at(&scanner, &groups, false, Requirement::ANY)
+                    .await
+            }
+        });
+        rt::sleep(Duration::from_millis(50)).await;
+        gate.release();
+        assert!(matches!(
+            peer_lock.await.unwrap().unwrap(),
+            LeafSetOutcome::Locked(_)
+        ));
+        let LeafSetOutcome::Locked(receipts) = scanner_lock.await.unwrap().unwrap() else {
+            panic!("the scanner's read lock must be acquired");
+        };
+        assert_eq!(
+            count_stores(&log, &leaf_path) - before,
+            1,
+            "both transactions must share one leaf CAS"
+        );
+
+        let locked =
+            LockedTx::from_receipts(group_of(b"read", read_intent(b"read")), receipts).unwrap();
+        assert!(
+            locked
+                .groups
+                .values()
+                .any(|group| group.receipt.evidence.validates(&observed, barrier)),
+            "the shared CAS started from exactly the observed leaf state"
+        );
+        assert!(
+            !locked.certifies_membership(&observed, observed_membership, barrier),
+            "a create published by the same CAS leaves a membership the scan never saw"
+        );
     }
 
     // `close` cancels new submissions; the dedup snapshot tracks only live

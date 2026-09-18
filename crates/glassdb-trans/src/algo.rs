@@ -1009,7 +1009,8 @@ impl Algo {
     /// When locks are already held, scan resolution ignores this transaction's
     /// own holder ID so it is not mistaken for a concurrent membership change.
     /// Locked validation accepts an exact physical shortcut only from this
-    /// transaction's own successful lock CAS. When the leaf has moved, logical
+    /// transaction's own successful lock CAS, and only when that CAS left the
+    /// leaf with the membership the scan observed. When the leaf has moved, logical
     /// validation compares the observed writer or membership against current
     /// state satisfying the same pre-lock bound; evidence advanced by another
     /// operation can therefore avoid I/O without deciding logical validity.
@@ -1082,7 +1083,11 @@ impl Algo {
             .flat_map(|scan| scan.covered())
         {
             let unchanged = match lock_validation {
-                Some(locked) => locked.validated(&coverage.observation, barrier),
+                Some(locked) => locked.certifies_membership(
+                    &coverage.observation,
+                    coverage.membership_version,
+                    barrier,
+                ),
                 None => matches!(
                     self.nodes
                         .check_leaf_current(&coverage.observation, Requirement::after(barrier))
@@ -2607,6 +2612,7 @@ mod tests {
 
         let read = do_read(&tctx, &ka).await;
         let observed = read.observation().clone();
+        let observed_membership = observed.value().unwrap().membership_version();
         let barrier = tctx.timeline.currentness_barrier();
 
         // Another transaction's disjoint lock CAS validates the same pre-CAS
@@ -2629,7 +2635,7 @@ mod tests {
             LockOutcome::Locked(locked) => locked,
             _ => panic!("disjoint lock acquisition must succeed"),
         };
-        assert!(other_locked.validated(&observed, barrier));
+        assert!(other_locked.certifies_membership(&observed, observed_membership, barrier));
 
         // Our later lock CAS starts from the leaf containing `other`'s lock. It
         // cannot use `other`'s earlier receipt to certify our original read.
@@ -2651,7 +2657,7 @@ mod tests {
             LockOutcome::Locked(locked) => locked,
             _ => panic!("disjoint read lock acquisition must succeed"),
         };
-        assert!(!current_locked.validated(&observed, barrier));
+        assert!(!current_locked.certifies_membership(&observed, observed_membership, barrier));
         assert!(
             !tm.validate_read_observations(&current_data, barrier, Some(&current_locked),)
                 .await
