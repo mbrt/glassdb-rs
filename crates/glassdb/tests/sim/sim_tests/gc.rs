@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use glassdb::backend::{BackendError, ListLimit, memory::MemoryBackend};
 use glassdb::middleware::{BackendOp, HookBackend};
-use glassdb::{Backend, Database};
+use glassdb::{Backend, Database, GcLimits, InlinePolicy};
 use glassdb_concurr::{exec, rt};
 use glassdb_trans::ProtocolTiming;
 
@@ -141,5 +141,76 @@ fn a_hint_survives_the_safety_horizon_without_successful_gc_scans() {
             Err(BackendError::NotFound)
         ));
         db.shutdown().await;
+    });
+}
+
+#[test]
+fn gc_hint_limits_preserve_writes_and_scan_reclamation() {
+    exec::block_on(async {
+        let keys = [b"a", b"b", b"c", b"d", b"e"];
+        for (pending, retained) in [(0, 5), (5, 0), (2, 5), (5, 2), (2, 1)] {
+            let backend = Arc::new(MemoryBackend::new());
+            let writer = Database::builder("gc", backend.clone())
+                .inline_policy(InlinePolicy::none())
+                .open()
+                .await
+                .unwrap();
+            for key in keys {
+                writer.root_collection().write(key, b"old").await.unwrap();
+            }
+            writer.shutdown().await;
+            let listed = backend
+                .list("gc/_t/", None, ListLimit::new(1000).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(listed.objects.len(), keys.len());
+
+            let db = Database::builder("gc", backend.clone())
+                .gc_limits(GcLimits {
+                    max_pending_hints: pending,
+                    max_hint_candidates: retained,
+                })
+                .open()
+                .await
+                .unwrap();
+            let collection = db.root_collection();
+            db.tx(|tx| {
+                let collection = collection.clone();
+                async move {
+                    for key in keys {
+                        tx.write(&collection, key, b"new")?;
+                    }
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+            rt::sleep(Duration::from_millis(1)).await;
+
+            let admitted = pending.min(retained);
+            let backlog = db.diagnostics().gc;
+            assert_eq!(backlog.deferred, admitted as u64);
+            assert_eq!(backlog.ready, 0);
+            assert_eq!(backlog.in_flight, 0);
+            let stats = db.stats();
+            assert_eq!(stats.gc.dropped_candidates, (keys.len() - admitted) as u64);
+            assert_eq!(stats.gc.lists, 0);
+
+            rt::sleep(Duration::from_secs(120)).await;
+            assert!(db.stats().gc.lists > 0);
+            for path in listed.objects {
+                assert!(matches!(
+                    backend.read(&path).await,
+                    Err(BackendError::NotFound)
+                ));
+            }
+            for key in keys {
+                assert_eq!(
+                    collection.read(key).await.unwrap().as_deref(),
+                    Some(b"new".as_slice())
+                );
+            }
+            db.shutdown().await;
+        }
     });
 }

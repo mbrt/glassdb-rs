@@ -11,7 +11,7 @@ use glassdb_concurr::rt;
 use glassdb_data::{DatabaseId, DbRoot};
 use glassdb_storage::{InlinePolicy, PersistentCacheConfig, PersistentCacheMedia, SplitPolicy};
 use glassdb_trans::{
-    AccessSet, BodyDecision, CatalogAccesses, Engine, EngineConfig, EngineTransaction,
+    AccessSet, BodyDecision, CatalogAccesses, Engine, EngineConfig, EngineTransaction, GcLimits,
     ProtocolTiming, TransError,
 };
 use tokio::sync::Notify;
@@ -72,6 +72,13 @@ impl DatabaseBuilder {
     /// Each candidate check can issue multiple backend operations.
     pub fn gc_parallelism(mut self, parallelism: NonZeroUsize) -> Self {
         self.engine_config.set_gc_parallelism(parallelism);
+        self
+    }
+
+    /// Sets GC hint queue limits per database instance. See [`GcLimits`] for defaults.
+    /// Cloned database handles share the queues; separate opens have independent limits.
+    pub fn gc_limits(mut self, limits: GcLimits) -> Self {
+        self.engine_config.set_gc_limits(limits);
         self
     }
 

@@ -106,6 +106,13 @@ Item 12 is being split into small fixes. It remains incomplete.
 - Added `DatabaseBuilder::gc_parallelism` for the maximum concurrent GC candidate
   checks per database instance. It accepts a nonzero count and keeps the default
   of 8. The scheduler still adjusts concurrency within that limit.
+- Added `DatabaseBuilder::gc_limits` with shared `GcLimits` for pending hint
+  reports and retained candidates from hints. Each defaults to 4,096. The
+  retained count includes ready, deferred, and running checks. Full report
+  queues replace the oldest report; full candidate queues reject new candidates.
+  Zero disables retention at the corresponding stage. Dropped reports are
+  counted, writers do not wait for capacity, and GC scans retain their separate
+  budget. LIST handling is unchanged.
 
 ## Prioritized fixes
 

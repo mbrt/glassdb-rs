@@ -23,7 +23,7 @@ use crate::collection_commit::{CollectionCommit, CollectionReservations};
 use crate::collection_coordination::CollectionStateResolver;
 use crate::collections::{CatalogAccesses, CollectionLifecycle, DirectorySnapshot};
 use crate::error::TransError;
-use crate::gc::{DEFAULT_GC_PARALLELISM, Gc, GcDiagnostics, GcHints, GcStats};
+use crate::gc::{DEFAULT_GC_PARALLELISM, Gc, GcDiagnostics, GcHints, GcLimits, GcStats};
 use crate::key_resolver::{KeyResolver, ScanResult};
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{LeafCoordinator, LeafCoordinatorStats};
@@ -56,6 +56,7 @@ pub struct EngineConfig {
     protocol_timing: ProtocolTiming,
     transaction_leaf_parallelism: NonZeroUsize,
     gc_parallelism: NonZeroUsize,
+    gc_limits: GcLimits,
 }
 
 impl EngineConfig {
@@ -117,6 +118,11 @@ impl EngineConfig {
     pub fn set_gc_parallelism(&mut self, parallelism: NonZeroUsize) {
         self.gc_parallelism = parallelism;
     }
+
+    /// Sets the capacities of the GC hint queues.
+    pub fn set_gc_limits(&mut self, limits: GcLimits) {
+        self.gc_limits = limits;
+    }
 }
 
 impl Default for EngineConfig {
@@ -132,6 +138,7 @@ impl Default for EngineConfig {
             protocol_timing: ProtocolTiming::default(),
             transaction_leaf_parallelism: DEFAULT_TRANSACTION_LEAF_PARALLELISM,
             gc_parallelism: DEFAULT_GC_PARALLELISM,
+            gc_limits: GcLimits::default(),
         }
     }
 }
@@ -524,6 +531,7 @@ impl DormantEngine {
             inline_policy,
             transaction_leaf_parallelism,
             gc_parallelism,
+            gc_limits,
             ..
         } = config;
         let AssemblyFoundation {
@@ -559,7 +567,7 @@ impl DormantEngine {
             retry,
             read_unavailable_retries,
         );
-        let cleanup_hints = GcHints::default();
+        let cleanup_hints = GcHints::new(gc_limits);
         let (coord, splitter) = Splitter::with_coordinator(
             background_weak.clone(),
             records.clone(),
