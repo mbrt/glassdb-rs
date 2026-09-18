@@ -350,3 +350,150 @@ async fn write_byte_budget_is_reset_when_the_body_retries() {
     assert_eq!(c.read(b"k").await.unwrap().as_deref(), Some(&b"2"[..]));
     assert!(db.stats().transactions.retries > 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn collection_reservation_limit_preserves_admitted_changes() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .transaction_limits(TransactionLimits {
+            max_collection_reservations: 1,
+            ..TransactionLimits::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let c = &db.root_collection();
+    let rejected = db
+        .tx(|tx| async move {
+            let first = tx.create_collection(c, b"first").await?;
+            let (same, _) = tx.create_collection_if_absent(c, b"first").await?;
+            tx.write(&first, b"k", b"v")?;
+            let value = tx.read(&same, b"k").await?;
+            glassdb::ensure_tx!(
+                value.as_deref() == Some(&b"v"[..]),
+                Error::internal("repeated creation changed the collection identity")
+            );
+            Ok(tx.create_collection(c, b"second").await)
+        })
+        .await
+        .unwrap();
+    expect_limit(rejected, "collection reservations", 1);
+    assert!(c.collection_exists(b"first").await.unwrap());
+    assert!(!c.collection_exists(b"second").await.unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn staged_drops_do_not_refund_collection_reservations() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .transaction_limits(TransactionLimits {
+            max_collection_reservations: 1,
+            ..TransactionLimits::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let c = &db.root_collection();
+    let rejected = db
+        .tx(|tx| async move {
+            let first = tx.create_collection(c, b"first").await?;
+            tx.drop_collection(&first).await?;
+            tx.create_collection(c, b"second").await
+        })
+        .await;
+    expect_limit(rejected, "collection reservations", 1);
+    assert!(!c.collection_exists(b"first").await.unwrap());
+    assert!(!c.collection_exists(b"second").await.unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn body_retry_can_reuse_a_collection_reservation_at_capacity() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .transaction_limits(TransactionLimits {
+            max_collection_reservations: 1,
+            ..TransactionLimits::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let c = &db.root_collection();
+    c.write(b"guard", b"0").await.unwrap();
+    let child = db
+        .tx(|tx| async move {
+            let value = tx.read(c, b"guard").await?.ok_or(Error::NotFound)?;
+            let child = tx.create_collection(c, b"child").await?;
+            tx.write(&child, b"k", &value)?;
+            if value == b"0" {
+                c.write(b"guard", b"1").await?;
+            }
+            Ok(child)
+        })
+        .await
+        .unwrap();
+    assert_eq!(child.read(b"k").await.unwrap().as_deref(), Some(&b"1"[..]));
+    assert!(db.stats().transactions.retries > 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn body_retry_cannot_accumulate_new_collection_reservations() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .transaction_limits(TransactionLimits {
+            max_collection_reservations: 1,
+            ..TransactionLimits::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let c = &db.root_collection();
+    c.write(b"guard", b"0").await.unwrap();
+    let result = db
+        .tx(|tx| async move {
+            let value = tx.read(c, b"guard").await?.ok_or(Error::NotFound)?;
+            let name = if value == b"0" {
+                b"first".as_slice()
+            } else {
+                b"second".as_slice()
+            };
+            tx.create_collection(c, name).await?;
+            if value == b"0" {
+                c.write(b"guard", b"1").await?;
+            }
+            Ok(())
+        })
+        .await;
+    expect_limit(result, "collection reservations", 1);
+    assert!(!c.collection_exists(b"first").await.unwrap());
+    assert!(!c.collection_exists(b"second").await.unwrap());
+    assert!(db.stats().transactions.retries > 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn zero_collection_reservations_allows_existing_bindings() {
+    let backend = Arc::new(MemoryBackend::new());
+    let writer = Database::open("limits", backend.clone()).await.unwrap();
+    writer
+        .root_collection()
+        .create_collection(b"existing")
+        .await
+        .unwrap();
+    writer.shutdown().await;
+    let db = Database::builder("limits", backend)
+        .transaction_limits(TransactionLimits {
+            max_collection_reservations: 0,
+            ..TransactionLimits::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let c = db.root_collection();
+    c.create_collection_if_absent(b"existing").await.unwrap();
+    expect_limit(
+        c.create_collection(b"new").await,
+        "collection reservations",
+        0,
+    );
+    c.open_collection(b"existing")
+        .await
+        .unwrap()
+        .drop_collection()
+        .await
+        .unwrap();
+}

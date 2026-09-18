@@ -23,9 +23,28 @@ Item 1 is being split into small fixes. It remains incomplete.
 - Added a cumulative write-input budget per transaction-body execution, with a
   default of 64 MiB. Keys and values count before copying; replacements and
   deletes consume budget without refunds. Read and scan observations are separate.
-- Pending: collection reservations.
+- Added a limit of 1,024 new collection-ID reservations per transaction identity.
+  Existing reservations can be reused at capacity. Body retries and staged drops
+  do not release reservations; recovery retains ownership of prepared resources.
 - Full observation-memory and encoded-object budgets will be addressed with the
   related storage and scan work in items 2 and 7.
+
+Each completed part has a separate commit, deterministic regression tests, an
+adversarial review, and a passing `make test` run.
+
+The next decision is item 2's S3 response handling. S3 LIST responses are decoded
+inside the SDK before the adapter receives them. The SDK's
+`modify_before_deserialization` hook can wrap the response body with a byte limit,
+but this adds SDK-specific response handling. A limit failure after a conditional
+mutation must retain the possibility that the mutation applied.
+
+Options for item 2:
+
+1. Add bounded response handling through the S3 SDK hook and the GCS response
+   reader. This can cover LIST and metadata responses before decoding, but adds
+   more code and error-handling paths.
+2. Start with small fixes for direct object downloads. Keep the S3 LIST response
+   limit explicitly unresolved until the SDK integration is approved.
 
 ## Prioritized fixes
 

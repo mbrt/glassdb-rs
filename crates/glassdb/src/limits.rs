@@ -24,6 +24,10 @@ pub struct TransactionLimits {
     /// count again; deleting a key counts its bytes and does not refund earlier
     /// writes. This does not include retained read or scan observations.
     pub max_write_bytes: usize,
+    /// Maximum new collection bindings reserved by one transaction identity.
+    /// Defaults to 1,024. Reservations survive body retries and are not refunded
+    /// when a staged collection is dropped. Existing bindings remain usable.
+    pub max_collection_reservations: usize,
 }
 
 impl TransactionLimits {
@@ -43,6 +47,7 @@ impl Default for TransactionLimits {
             max_value_bytes: 1024 * 1024,
             max_operations: 4096,
             max_write_bytes: 64 * 1024 * 1024,
+            max_collection_reservations: 1024,
         }
     }
 }

@@ -351,7 +351,12 @@ impl Transaction {
         validate_collection_name(name)?;
         self.ensure_directory(parent.address()).await?;
         let mut inner = self.inner.lock().unwrap();
-        let (address, created) = inner.catalog.create_child(parent.address(), name, mode)?;
+        let (address, created) = inner.catalog.create_child(
+            parent.address(),
+            name,
+            mode,
+            self.db.transaction_limits.max_collection_reservations,
+        )?;
         Ok((
             Collection::new_child(address, parent.address().clone(), name, self.db.clone()),
             created,

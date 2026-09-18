@@ -31,13 +31,24 @@ type CollectionBinding = (CollectionAddress, Vec<u8>);
 
 impl CollectionReservations {
     /// Reserves the same collection ID for repeated creation of one binding.
-    pub fn reserve(&self, parent: &CollectionAddress, name: &[u8]) -> CollectionId {
-        *self
-            .ids
-            .lock()
-            .unwrap()
-            .entry((parent.clone(), name.to_vec()))
-            .or_insert_with(CollectionId::new_random)
+    /// Returns `None` when a new reservation would exceed `limit`.
+    pub fn reserve(
+        &self,
+        parent: &CollectionAddress,
+        name: &[u8],
+        limit: usize,
+    ) -> Option<CollectionId> {
+        let mut ids = self.ids.lock().unwrap();
+        let binding = (parent.clone(), name.to_vec());
+        if let Some(id) = ids.get(&binding) {
+            return Some(*id);
+        }
+        if ids.len() >= limit {
+            return None;
+        }
+        let id = CollectionId::new_random();
+        ids.insert(binding, id);
+        Some(id)
     }
 
     fn new() -> Self {
@@ -344,12 +355,21 @@ mod tests {
         attempt.fenced_drops.insert(address(2));
         let retired_reservations = attempt.reservations();
         let parent = CollectionAddress::root("db");
-        let old_id = retired_reservations.reserve(&parent, b"child");
+        let old_id = retired_reservations.reserve(&parent, b"child", 1).unwrap();
 
         attempt.renew();
 
-        assert_ne!(attempt.reservations().reserve(&parent, b"child"), old_id);
-        assert_eq!(retired_reservations.reserve(&parent, b"child"), old_id);
+        assert_ne!(
+            attempt
+                .reservations()
+                .reserve(&parent, b"child", 1)
+                .unwrap(),
+            old_id
+        );
+        assert_eq!(
+            retired_reservations.reserve(&parent, b"child", 1).unwrap(),
+            old_id
+        );
         assert_eq!(attempt.accesses.changes.len(), 1);
         assert_eq!(attempt.accesses.changes[0].collection, collection);
         assert!(attempt.prepared.is_empty());

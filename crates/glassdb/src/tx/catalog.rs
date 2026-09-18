@@ -113,6 +113,7 @@ impl CatalogOverlay {
         parent: &CollectionAddress,
         name: &[u8],
         mode: CreateMode,
+        reservation_limit: usize,
     ) -> Result<(CollectionAddress, bool), Error> {
         if self.dropped.contains(parent) {
             return Err(Error::StaleCollection);
@@ -144,7 +145,13 @@ impl CatalogOverlay {
                 "cannot recreate a collection binding after dropping it in one transaction".into(),
             ));
         }
-        let id = self.reservations.reserve(parent, name);
+        let id = self
+            .reservations
+            .reserve(parent, name, reservation_limit)
+            .ok_or(Error::LimitExceeded {
+                resource: "collection reservations",
+                limit: reservation_limit,
+            })?;
         let address = CollectionAddress::new(parent.db_root(), id);
         self.directories
             .get_mut(parent)
