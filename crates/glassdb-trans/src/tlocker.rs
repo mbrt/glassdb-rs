@@ -1487,7 +1487,7 @@ mod tests {
         parallelism: NonZeroUsize,
     ) -> (Locker, TlCtx) {
         let mut config = EngineConfig::default();
-        config.set_cache_size(1024);
+        config.set_cache_size(1 << 20);
         config.set_protocol_timing(ProtocolTiming::simulation());
         config.set_transaction_leaf_parallelism(parallelism);
         let foundation = AssemblyFixture::new(b, DbRoot::try_from("test").unwrap(), &config);
@@ -2346,8 +2346,7 @@ mod tests {
         let writer = mk_tid(1, "writer");
         let locked = lock_commit(&locker, &ctx, &writer, key).await;
 
-        // The small test cache can evict the leaf while committing the log.
-        // Warm it before measuring the ordinary cached write-back path.
+        // Warm the leaf before measuring the cached write-back path.
         let held = ctx
             .nodes
             .load_leaf(&root_path(), Requirement::ANY)

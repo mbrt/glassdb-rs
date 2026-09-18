@@ -2326,7 +2326,7 @@ mod tests {
         timing: ProtocolTiming,
     ) -> (Monitor, TestCtx) {
         let timeline = Timeline::new();
-        let objects = CachedStore::new(b, 1024, timeline.clone(), None);
+        let objects = CachedStore::new(b, 1 << 20, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), DbRoot::try_from("test").unwrap());
         let bg = Arc::new(Background::new());
         let mon = Monitor::with_config(

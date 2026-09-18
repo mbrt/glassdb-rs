@@ -761,7 +761,7 @@ mod tests {
             NonZeroUsize::MIN,
         );
         let validator = NodeStore::new(
-            CachedStore::new(backend, 0, timeline.clone(), None),
+            CachedStore::new(backend, 1 << 20, timeline.clone(), None),
             NonZeroUsize::new(16).unwrap(),
         );
         let first = first_store

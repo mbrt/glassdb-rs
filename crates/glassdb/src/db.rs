@@ -60,7 +60,7 @@ impl DatabaseBuilder {
 
     /// Sets the number of bytes dedicated to caching objects and metadata.
     /// Setting this too small may impact performance, as more backend calls are
-    /// necessary.
+    /// necessary. Zero disables decoded object caching.
     pub fn cache_size(mut self, bytes: usize) -> Self {
         self.engine_config.set_cache_size(bytes);
         self

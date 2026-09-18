@@ -63,6 +63,29 @@ Item 5 is being split into small fixes. It remains incomplete.
 - Total transaction and shutdown deadlines, backend request timeouts, and other
   retry budgets remain unresolved.
 
+Item 6 is being split into small fixes. It remains incomplete.
+
+- Cache entries larger than their partition's byte budget are no longer retained.
+  Oversized updates remove the old entry without evicting unrelated entries.
+  Update results and retained observations remain usable without cache admission.
+- `DatabaseBuilder::cache_size(0)` now disables decoded-cache retention.
+  The 512 MiB default and the division of capacity between partitions are unchanged.
+- More complete decoded-memory accounting and budgets for observations retained
+  outside the cache remain unresolved.
+
+No scan or LIST limits have been added. The next decision is item 8's monitor
+lifetime handling. The monitor uses an empty waiter list to decide when to start
+a foreign-status poller. Removing cancelled registrations immediately therefore
+needs separate poller ownership, or a new waiter can start a second poller while
+the old one is still running. This goes beyond a local capacity check.
+
+Options:
+
+1. Postpone monitor lifetime changes and continue with isolated fixes, such as
+   database-name validation and retry-delay clamping in item 12.
+2. Design explicit waiter registrations and poller ownership before adding
+   monitor capacity limits.
+
 ## Prioritized fixes
 
 The fixes below are in priority order:
