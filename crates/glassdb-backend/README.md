@@ -22,6 +22,26 @@ Applications normally depend on [`glassdb`](https://crates.io/crates/glassdb),
 which re-exports this crate as `glassdb::backend`. Depend on it directly only to
 implement a backend for another object store.
 
+## Backend conformance
+
+Use `implementation::assert_backend_conformance` in an async test with a fresh,
+empty, disposable backend:
+
+```rust
+use glassdb_backend::{implementation::assert_backend_conformance, memory::MemoryBackend};
+
+#[tokio::test]
+async fn backend_conformance() {
+    assert_backend_conformance(&MemoryBackend::new()).await;
+}
+```
+
+The suite checks contents and versions, conditional reads and mutations,
+competing mutations, and recursive paginated listing. It leaves fixtures under
+`__glassdb_backend_conformance__/` and `__glassdb_list_conformance__/`. Run it
+without external writers or injected faults. Keep provider-specific tests for
+transport failures, retries, and ambiguous mutation outcomes.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](https://github.com/mbrt/glassdb-rs/blob/main/LICENSE).

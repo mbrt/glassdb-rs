@@ -3,25 +3,27 @@
 
 mod support;
 
-use glassdb_backend::{Backend, BackendError, Version};
+use glassdb_backend::{Backend, BackendError, ListLimit};
 
 use self::support::FakeGcs;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn read_write_roundtrip() {
+async fn backend_conformance() {
     let fake = FakeGcs::start().await;
     let b = fake.backend();
-    for (name, value) in [
-        ("non-empty", b"hello world".to_vec()),
-        ("empty", Vec::new()),
-        ("binary", vec![0x00, 0x01, 0x02, 0xff]),
-    ] {
-        let version = b.write_if_not_exists(name, value.clone()).await.unwrap();
-        assert!(!version.is_unset());
+    glassdb_backend::implementation::assert_backend_conformance(&b).await;
+}
 
-        let r = b.read(name).await.unwrap();
-        assert_eq!(r.contents, value, "case {name}");
-        assert_eq!(r.version, version);
-    }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_rejects_invalid_provider_cursor() {
+    let fake = FakeGcs::start().await;
+    let b = fake.backend();
+    let cursor = glassdb_backend::implementation::bind_list_cursor("prefix/", "invalid").unwrap();
+    let result = b.list("prefix/", Some(&cursor), ListLimit::MIN).await;
+    assert!(
+        matches!(result, Err(BackendError::InvalidCursor)),
+        "got {result:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -31,115 +33,6 @@ async fn write_produces_fresh_version_each_time() {
     let v1 = b.write_if_not_exists("k", b"same".to_vec()).await.unwrap();
     let v2 = b.write_if("k", b"same".to_vec(), &v1).await.unwrap();
     assert_ne!(v1, v2);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn write_if_not_exists() {
-    let fake = FakeGcs::start().await;
-    let b = fake.backend();
-    b.write_if_not_exists("k", b"a".to_vec()).await.unwrap();
-    let err = b.write_if_not_exists("k", b"b".to_vec()).await.unwrap_err();
-    assert!(matches!(err, BackendError::Precondition));
-    let r = b.read("k").await.unwrap();
-    assert_eq!(r.contents, b"a");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn write_if_cas() {
-    let fake = FakeGcs::start().await;
-    let b = fake.backend();
-    let v0 = b.write_if_not_exists("k", b"a".to_vec()).await.unwrap();
-
-    let err = b
-        .write_if("k", b"b".to_vec(), &Version::new("999"))
-        .await
-        .unwrap_err();
-    assert!(matches!(err, BackendError::Precondition));
-
-    let v1 = b.write_if("k", b"b".to_vec(), &v0).await.unwrap();
-    assert_ne!(v0, v1);
-    let r = b.read("k").await.unwrap();
-    assert_eq!(r.contents, b"b");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn write_if_null_version_fails_precondition() {
-    let fake = FakeGcs::start().await;
-    let b = fake.backend();
-    let v0 = b.write_if_not_exists("k", b"a".to_vec()).await.unwrap();
-
-    let err = b
-        .write_if("k", b"b".to_vec(), &Version::default())
-        .await
-        .unwrap_err();
-    assert!(matches!(err, BackendError::Precondition));
-
-    let r = b.read("k").await.unwrap();
-    assert_eq!(r.contents, b"a");
-    assert_eq!(r.version, v0);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn read_if_modified() {
-    let fake = FakeGcs::start().await;
-    let b = fake.backend();
-    let v0 = b.write_if_not_exists("k", b"x".to_vec()).await.unwrap();
-
-    // Unchanged generation => precondition (not modified).
-    let err = b.read_if_modified("k", &v0).await.unwrap_err();
-    assert!(matches!(err, BackendError::Precondition));
-
-    // A stale version returns the current content and the fresh version.
-    let r = b.read_if_modified("k", &Version::new("1")).await.unwrap();
-    assert_eq!(r.contents, b"x");
-    assert_eq!(r.version, v0);
-
-    // After a content write the generation changes, so the old token no longer
-    // matches and the body is returned.
-    let v1 = b.write_if("k", b"y".to_vec(), &v0).await.unwrap();
-    assert_ne!(v0, v1);
-    let r = b.read_if_modified("k", &v0).await.unwrap();
-    assert_eq!(r.contents, b"y");
-    assert_eq!(r.version, v1);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_if_matching_generation() {
-    let fake = FakeGcs::start().await;
-    let b = fake.backend();
-    let version = b.write_if_not_exists("k", b"x".to_vec()).await.unwrap();
-    b.delete_if("k", &version).await.unwrap();
-    let err = b.read("k").await.unwrap_err();
-    assert!(matches!(err, BackendError::NotFound));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stale_delete_if_preserves_current_object() {
-    let fake = FakeGcs::start().await;
-    let b = fake.backend();
-    let old = b.write_if_not_exists("k", b"old".to_vec()).await.unwrap();
-    let current = b.write_if("k", b"current".to_vec(), &old).await.unwrap();
-
-    let err = b.delete_if("k", &old).await.unwrap_err();
-    assert!(matches!(err, BackendError::Precondition));
-    let read = b.read("k").await.unwrap();
-    assert_eq!(read.contents, b"current");
-    assert_eq!(read.version, current);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn read_not_found() {
-    let fake = FakeGcs::start().await;
-    let b = fake.backend();
-    let err = b.read("missing").await.unwrap_err();
-    assert!(matches!(err, BackendError::NotFound));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn list_is_recursive_and_paginated() {
-    let fake = FakeGcs::start().await;
-    let b = fake.backend();
-    glassdb_backend::implementation::assert_list_conformance(&b).await;
 }
 
 // In-doubt contract (ADR-009): a conditional write whose outcome is uncertain
@@ -196,16 +89,6 @@ async fn delete_if_lost_ack_is_in_doubt() {
     let err = b.delete_if("k", &version).await.unwrap_err();
     assert!(matches!(err, BackendError::Unavailable(_)));
     assert!(matches!(b.read("k").await, Err(BackendError::NotFound)));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn clean_conflict_still_precondition() {
-    // A genuine conflict with no lost ack must stay a retryable `Precondition`.
-    let fake = FakeGcs::start().await;
-    let b = fake.backend();
-    b.write_if_not_exists("k", b"a".to_vec()).await.unwrap();
-    let err = b.write_if_not_exists("k", b"b".to_vec()).await.unwrap_err();
-    assert!(matches!(err, BackendError::Precondition), "got {err:?}");
 }
 
 // Transient read unavailability: a read is idempotent, so a `5xx` (or transport

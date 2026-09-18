@@ -445,7 +445,9 @@ block for distributed coordination.
 
 The cloud backends are feature-gated so their heavy SDK dependencies are only
 pulled in when needed; each is tested against a pure-Rust in-process fake of its
-API. The PR diagnostic benchmarks wrap the in-memory backend with modeled
+API. Memory, GCS, and S3 share a backend conformance suite; provider-specific
+tests check transport faults and ambiguous mutation outcomes. The PR diagnostic
+benchmarks wrap the in-memory backend with modeled
 provider latency and throttling on a scaled clock; see
 [the diagnostic benchmark conditions](../crates/glassdb/benches/README.md).
 

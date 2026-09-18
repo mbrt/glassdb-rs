@@ -108,7 +108,10 @@ impl BackendError {
     }
 }
 
-/// An opaque CAS token identifying a generation of an object.
+/// An opaque CAS token identifying an object's content state.
+///
+/// Stored objects have nonempty tokens. At one path, different contents must
+/// have different tokens, but equivalent contents may retain the same token.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Version {
     pub token: Arc<str>,
@@ -188,6 +191,8 @@ pub trait Backend: Send + Sync {
     /// caller's cached copy at `expected` is still current). Maps to a native
     /// conditional GET (`If-None-Match` / `ifGenerationNotMatch`), so a hot,
     /// unchanged object revalidates without transferring its body.
+    /// An unset `expected` behaves like [`Backend::read`]. A missing object
+    /// returns [`BackendError::NotFound`].
     async fn read_if_modified(
         &self,
         path: &str,
@@ -196,6 +201,11 @@ pub trait Backend: Send + Sync {
 
     /// Conditionally writes if the object exists and its version matches
     /// `expected`, returning the new version.
+    ///
+    /// For a present object, a stale or unset version returns
+    /// [`BackendError::Precondition`]. A missing object returns
+    /// [`BackendError::NotFound`] or [`BackendError::Precondition`]; neither
+    /// outcome creates an object.
     async fn write_if(
         &self,
         path: &str,
@@ -204,7 +214,7 @@ pub trait Backend: Send + Sync {
     ) -> Result<Version, BackendError>;
 
     /// Creates the object only if it does not already exist, returning its
-    /// version.
+    /// version. An existing object returns [`BackendError::Precondition`].
     async fn write_if_not_exists(
         &self,
         path: &str,
@@ -213,9 +223,12 @@ pub trait Backend: Send + Sync {
 
     /// Deletes the object only if its version matches `expected`.
     ///
+    /// For a present object, a stale or unset version returns
+    /// [`BackendError::Precondition`].
     /// A missing object may be reported as [`BackendError::NotFound`] or as
-    /// success; both mean the path has converged on absence. An ambiguous
-    /// outcome is always [`BackendError::Unavailable`].
+    /// success; both mean the path has converged on absence. An unset version
+    /// may also return [`BackendError::Precondition`] for a missing object.
+    /// An ambiguous outcome is always [`BackendError::Unavailable`].
     async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError>;
 
     /// Lists one page of object paths recursively.
@@ -223,6 +236,9 @@ pub trait Backend: Send + Sync {
     /// Its prefix is empty or ends in `/`. Its cursor, when present, must have been
     /// returned by this backend for the same prefix. Result order is unspecified
     /// and only `ListPage::next == None` means traversal is complete.
+    /// Pages may contain fewer than `limit` objects, including none, even when
+    /// a next cursor is present. Without concurrent mutations, traversal must
+    /// return each matching path exactly once.
     async fn list(
         &self,
         prefix: &str,

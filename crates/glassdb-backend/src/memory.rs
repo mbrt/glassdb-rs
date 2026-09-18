@@ -199,82 +199,18 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn create_read_delete_if() {
-        let b = MemoryBackend::new();
-        assert!(matches!(b.read("a").await, Err(BackendError::NotFound)));
-        let v = b.write_if_not_exists("a", b"hello".to_vec()).await.unwrap();
-        assert_eq!(&*v.token, "1");
-        let r = b.read("a").await.unwrap();
-        assert_eq!(r.contents, b"hello");
-        b.delete_if("a", &v).await.unwrap();
-        assert!(matches!(
-            b.delete_if("a", &v).await,
-            Err(BackendError::NotFound)
-        ));
+    async fn backend_conformance() {
+        crate::implementation::assert_backend_conformance(&MemoryBackend::new()).await;
     }
 
     #[tokio::test]
-    async fn write_if_not_exists_and_conditions() {
+    async fn list_rejects_invalid_provider_cursor() {
         let b = MemoryBackend::new();
-        let v = b.write_if_not_exists("a", b"v".to_vec()).await.unwrap();
-        assert!(matches!(
-            b.write_if_not_exists("a", b"v2".to_vec()).await,
-            Err(BackendError::Precondition)
-        ));
-        // WriteIf with wrong version fails.
-        assert!(matches!(
-            b.write_if("a", b"v2".to_vec(), &Version::new("9")).await,
-            Err(BackendError::Precondition)
-        ));
-        let v2 = b.write_if("a", b"v2".to_vec(), &v).await.unwrap();
-        assert_ne!(v, v2);
-    }
-
-    #[tokio::test]
-    async fn read_if_modified_tracks_version() {
-        let b = MemoryBackend::new();
-        let v = b.write_if_not_exists("a", b"v".to_vec()).await.unwrap();
-
-        // Same version => precondition (not modified).
-        assert!(matches!(
-            b.read_if_modified("a", &v).await,
-            Err(BackendError::Precondition)
-        ));
-        // A stale version => returns the current content.
-        let r = b.read_if_modified("a", &Version::new("0")).await.unwrap();
-        assert_eq!(r.contents, b"v");
-
-        // After a content write the version changes, so the old token no longer
-        // matches and the body is returned.
-        let v2 = b.write_if("a", b"v2".to_vec(), &v).await.unwrap();
-        assert_ne!(v, v2);
-        let r = b.read_if_modified("a", &v).await.unwrap();
-        assert_eq!(r.contents, b"v2");
-        assert_eq!(r.version, v2);
-    }
-
-    #[tokio::test]
-    async fn list_is_recursive_and_paginated() {
-        let b = MemoryBackend::new();
-        crate::implementation::assert_list_conformance(&b).await;
-    }
-
-    #[tokio::test]
-    async fn stale_delete_cannot_remove_recreated_state() {
-        let b = MemoryBackend::new();
-        let old = b.write_if_not_exists("a", b"old".to_vec()).await.unwrap();
-        b.delete_if("a", &old).await.unwrap();
-        let current = b
-            .write_if_not_exists("a", b"current".to_vec())
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            b.delete_if("a", &old).await,
-            Err(BackendError::Precondition)
-        ));
-        let read = b.read("a").await.unwrap();
-        assert_eq!(read.contents, b"current");
-        assert_eq!(read.version, current);
+        let cursor = bind_list_cursor("prefix/", "invalid").unwrap();
+        let result = b.list("prefix/", Some(&cursor), ListLimit::MIN).await;
+        assert!(
+            matches!(result, Err(BackendError::InvalidCursor)),
+            "got {result:?}"
+        );
     }
 }
