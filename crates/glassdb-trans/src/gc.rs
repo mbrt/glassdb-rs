@@ -292,7 +292,7 @@ impl Gc {
             tl,
             structural_intents,
             collection_lifecycle,
-            router: TreeRouter::new(nodes, std::num::NonZeroUsize::MIN),
+            router: TreeRouter::new(nodes, timeline.clone(), std::num::NonZeroUsize::MIN),
             locker,
             timing,
             timeline,

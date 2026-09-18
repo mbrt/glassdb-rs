@@ -87,6 +87,9 @@ message Lock {
 message NodeLock {
     Lock.LockType lock_type = 1;
     repeated bytes locked_by = 2;
+    // Only a structural gate can be bound to a structural intent. Its owner
+    // becoming final does not release the gate.
+    string structural_intent = 3;
 }
 
 // A leaf body: the point-access coordination entries for one terminal node.
@@ -144,6 +147,8 @@ message Node {
         LeafBody leaf = 3;
         // An index node: separator keys mapping ranges to child nodes.
         IndexNode index = 4;
+        // A retired node identity that forwards all routing to this node.
+        string forward = 9;
     }
     NodeLock structure_lock = 5;
     NodeLock membership_lock = 6;
@@ -154,24 +159,46 @@ message Node {
     bytes collection_delete_intent = 8;
 }
 
-// A structural intent for one split. It lives at
-// `{db}/_s/<participant_id>/<intent_id>` until the created nodes are reachable
-// or reclaimed.
+// A structural intent for one split or merge. It lives at
+// `{db}/_s/<participant_id>/<intent_id>` until the change completes or is cancelled.
 message StructuralIntent {
+    string prefix = 1;
+    // The topology participant that owns this intent.
+    bytes participant_id = 2;
+    oneof operation {
+        SplitIntent split = 3;
+        MergeIntent merge = 4;
+    }
+}
+
+message SplitIntent {
     enum Phase {
         PREPARING = 0;
         READY = 1;
     }
 
-    string prefix = 1;
-    string source_token = 2;
-    string source_version = 3;
-    repeated string created_tokens = 4;
-    bytes split_key = 5;
-    bool is_root = 6;
-    // The topology participant that owns this intent.
-    bytes participant_id = 7;
-    Phase phase = 8;
+    // Empty for the collection root.
+    string source_token = 1;
+    string source_version = 2;
+    repeated string created_tokens = 3;
+    bytes split_key = 4;
+    Phase phase = 5;
+}
+
+// A merge retains the left source and redirects the right source to it.
+message MergeIntent {
+    enum Phase {
+        PREPARING = 0;
+        READY = 1;
+        APPLYING = 2;
+        ABORTING = 3;
+    }
+
+    string left_token = 1;
+    string left_version = 2;
+    string right_token = 3;
+    string right_version = 4;
+    Phase phase = 5;
 }
 
 // An index node body: an ordered list of separator entries. Routing selects the

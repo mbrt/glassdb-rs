@@ -1,6 +1,6 @@
 //! Lock-state representation shared across persisted coordination scopes.
 
-use glassdb_data::TxId;
+use glassdb_data::{StructuralIntentId, TxId};
 use glassdb_proto as pb;
 
 /// The type of lock held on a storage object.
@@ -303,6 +303,12 @@ impl SharedExclusiveLock {
     }
 
     pub(crate) fn from_pb(raw: Option<pb::NodeLock>) -> Result<Self, LockStateError> {
+        if raw
+            .as_ref()
+            .is_some_and(|lock| !lock.structural_intent.is_empty())
+        {
+            return Err(LockStateError::InvalidShape);
+        }
         let state = lock_state_from_pb(raw)?;
         if !matches!(
             state.lock_type(),
@@ -326,6 +332,7 @@ impl SharedExclusiveLock {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExclusiveGate {
     state: LockState,
+    intent: Option<StructuralIntentId>,
 }
 
 impl ExclusiveGate {
@@ -349,24 +356,74 @@ impl ExclusiveGate {
         self.state.contains(id)
     }
 
+    /// Returns the structural intent that must complete before this gate opens.
+    pub fn intent(&self) -> Option<&StructuralIntentId> {
+        self.intent.as_ref()
+    }
+
+    pub(crate) fn bind_intent(
+        &mut self,
+        owner: &TxId,
+        intent: StructuralIntentId,
+    ) -> Result<(), LockStateError> {
+        if owner.is_unset()
+            || self.state.lock_type() != LockType::Write
+            || !self.contains(owner)
+            || self
+                .intent
+                .as_ref()
+                .is_some_and(|current| current != &intent)
+        {
+            return Err(LockStateError::InvalidShape);
+        }
+        self.intent = Some(intent);
+        Ok(())
+    }
+
+    pub(crate) fn complete_intent(&mut self, owner: &TxId, intent: &StructuralIntentId) -> bool {
+        if !self.contains(owner) || self.intent.as_ref() != Some(intent) {
+            return false;
+        }
+        self.intent = None;
+        self.state.remove(owner)
+    }
+
     pub(crate) fn set_writer(&mut self, id: TxId) {
-        self.state.set_writer(id);
+        if self.intent.is_none() {
+            self.state.set_writer(id);
+        }
     }
 
     pub(crate) fn remove(&mut self, id: &TxId) -> bool {
-        self.state.remove(id)
+        self.intent.is_none() && self.state.remove(id)
     }
 
     pub(crate) fn to_pb(&self) -> pb::NodeLock {
-        lock_state_to_pb(&self.state)
+        let mut lock = lock_state_to_pb(&self.state);
+        lock.structural_intent = self
+            .intent
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        lock
     }
 
     pub(crate) fn from_pb(raw: Option<pb::NodeLock>) -> Result<Self, LockStateError> {
+        let intent = raw
+            .as_ref()
+            .filter(|lock| !lock.structural_intent.is_empty())
+            .map(|lock| StructuralIntentId::try_from(lock.structural_intent.as_str()))
+            .transpose()
+            .map_err(|_| LockStateError::InvalidShape)?;
         let state = lock_state_from_pb(raw)?;
-        if !matches!(state.lock_type(), LockType::None | LockType::Write) {
+        if !matches!(state.lock_type(), LockType::None | LockType::Write)
+            || (intent.is_some()
+                && (state.lock_type() != LockType::Write
+                    || state.holders().iter().any(TxId::is_unset)))
+        {
             return Err(LockStateError::InvalidShape);
         }
-        Ok(Self { state })
+        Ok(Self { state, intent })
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -374,7 +431,9 @@ impl ExclusiveGate {
     }
 
     pub(crate) fn clear(&mut self) {
-        self.state.clear();
+        if self.intent.is_none() {
+            self.state.clear();
+        }
     }
 }
 
@@ -419,5 +478,6 @@ fn lock_state_to_pb(state: &LockState) -> pb::NodeLock {
     pb::NodeLock {
         lock_type,
         locked_by,
+        structural_intent: String::new(),
     }
 }

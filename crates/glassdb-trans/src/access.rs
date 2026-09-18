@@ -505,10 +505,11 @@ mod tests {
     }
 
     async fn point_read(key: LogicalKey, last_writer: Option<TxId>) -> ReadAccess {
+        let timeline = Timeline::new();
         let store = CachedStore::new(
             Arc::new(MemoryBackend::new()),
             1024 * 1024,
-            Timeline::new(),
+            timeline.clone(),
             None,
         );
         let observation = NodeStore::new(store, std::num::NonZeroUsize::MIN)

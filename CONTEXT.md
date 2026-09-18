@@ -143,8 +143,12 @@ A durable claim for one planned topology change, owned by a topology participant
 _Avoid_: Structural log, structural record
 
 **Structural gate**:
-An exclusive, durably recorded claim on one node that admits changes to the node's shape. One transaction identity holds it at a time, and a release or a recovery fence must remove it before another shape change starts.
+An exclusive, durably recorded claim on one node that admits changes to the node's shape. A gate bound to a structural intent remains held until that intent's recovery releases it, even when its transaction owner is final.
 _Avoid_: Structure lock, structure-write lock
+
+**Redirect**:
+A retired node identity that refers routing to its successor. It retains no authority over key values.
+_Avoid_: Alias node, forwarding leaf
 
 ## Maintenance
 

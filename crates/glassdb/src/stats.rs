@@ -8,7 +8,8 @@ use std::time::Duration;
 use glassdb_backend::BackendStats;
 use glassdb_storage::CacheStats;
 use glassdb_trans::{
-    DirectCommitStats, GcStats, LeafCoordinatorStats, LockerStats, MonitorStats, SplitterStats,
+    DirectCommitStats, GcStats, LeafCoordinatorStats, LockerStats, MonitorStats,
+    TreeRebalancerStats,
 };
 
 /// Transaction activity for one snapshot or accumulated interval.
@@ -70,8 +71,9 @@ pub struct Stats {
     pub coordinator: LeafCoordinatorStats,
     /// Logless direct-commit coverage.
     pub direct_commit: DirectCommitStats,
-    /// Background tree-split activity.
-    pub splitter: SplitterStats,
+    /// Background tree rebalancing activity.
+    /// The field name is retained for source compatibility.
+    pub splitter: TreeRebalancerStats,
     /// Garbage collection activity.
     pub gc: GcStats,
 }
@@ -148,7 +150,10 @@ mod tests {
                 landed: 5,
             },
             gc: GcStats::default(),
-            splitter: SplitterStats {
+            splitter: TreeRebalancerStats {
+                merge_hints: 32,
+                merge_candidates: 1,
+                merges_completed: 0,
                 candidates: 3,
                 completed: 2,
                 deferred: 1,
@@ -195,7 +200,10 @@ mod tests {
                 landed: 8,
             },
             gc: GcStats::default(),
-            splitter: SplitterStats {
+            splitter: TreeRebalancerStats {
+                merge_hints: 64,
+                merge_candidates: 2,
+                merges_completed: 1,
                 candidates: 5,
                 completed: 3,
                 deferred: 1,
@@ -244,7 +252,10 @@ mod tests {
                     landed: 3,
                 },
                 gc: GcStats::default(),
-                splitter: SplitterStats {
+                splitter: TreeRebalancerStats {
+                    merge_hints: 32,
+                    merge_candidates: 1,
+                    merges_completed: 1,
                     candidates: 2,
                     completed: 1,
                     deferred: 0,

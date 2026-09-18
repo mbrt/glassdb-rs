@@ -21,7 +21,7 @@
 //! delivers each member's outcome (ADR-029). Each policy owner packages its
 //! mutation decision and typed result in a `LeafOperation`:
 //! [`Locker`](crate::tlocker::Locker) supplies acquire / write-back / release,
-//! direct commit supplies atomic logless publication, and the splitter supplies
+//! direct commit supplies atomic logless publication, and the tree rebalancer supplies
 //! leaf structural-gate acquisition. Cross-leaf strategy stays with the
 //! `Locker`, not in the engine.
 
@@ -45,6 +45,7 @@ use glassdb_storage::{
 use crate::error::TransError;
 use crate::key_state_resolver::KeyStateResolver;
 use crate::monitor::Monitor;
+use crate::node_locking::StructuralGateRetry;
 
 /// Maximum inner CAS retries on a single leaf/root before treating the
 /// operation as conflicted and restarting the transaction.
@@ -200,7 +201,7 @@ pub(crate) enum StageAdmission {
         /// Whether the publication creates at least one live user key and must
         /// therefore preserve the content headroom used by structural work.
         adds_key: bool,
-        /// Whether a rejected publication should notify the splitter. ADR-061
+        /// Whether a rejected publication should notify the tree rebalancer. ADR-061
         /// suppresses this for multi-key direct members because splitting can
         /// destroy their eligibility.
         pressure_hint: bool,
@@ -241,6 +242,7 @@ impl Step {
 pub(crate) struct ResolveCtx<'a> {
     pub(crate) key_state: &'a KeyStateResolver,
     pub(crate) tmon: &'a Monitor,
+    pub(crate) gate_retry: &'a StructuralGateRetry,
     /// The combined bound for dependent reads and eventual leaf evidence. The
     /// loaded and staged entries do not necessarily satisfy it yet.
     pub(crate) requirement: Requirement,
@@ -430,11 +432,11 @@ impl MergeRequest for CasReq {
 
 /// Sink for stored-leaf capacity observations, so a background growth policy
 /// can decide whether to split (ADR-031). The coordinator depends only on this
-/// seam — never on the splitter's queue or policy. The splitter supplies the
+/// seam — never on the tree rebalancer's queue or policy. The tree rebalancer supplies the
 /// implementation.
 pub trait SplitHinter: Send + Sync {
     /// Notes that `path`'s leaf was just stored holding `leaf`. Best-effort: a
-    /// spurious call only costs the splitter a reload and re-check, so the
+    /// spurious call only costs the tree rebalancer a reload and re-check, so the
     /// coordinator never blocks on it.
     fn observe_leaf(&self, path: &ObjectPath, leaf: &LeafBody);
 }
@@ -445,10 +447,11 @@ struct CoordCore {
     tmon: Monitor,
     nodes: NodeStore,
     key_state: KeyStateResolver,
+    gate_retry: StructuralGateRetry,
     retry: RetryConfig,
     stats: Stats,
     // Where stored over-cap leaves are reported: the background
-    // [`Splitter`](crate::split::Splitter)'s queue when one is wired.
+    // [`TreeRebalancer`](crate::tree_rebalancer::TreeRebalancer)'s queue when one is wired.
     hinter: Arc<dyn SplitHinter>,
     policy: SplitPolicy,
 }
@@ -560,6 +563,7 @@ impl CasWorker {
             let ctx = ResolveCtx {
                 key_state: &self.core.key_state,
                 tmon: &self.core.tmon,
+                gate_retry: &self.core.gate_retry,
                 requirement,
                 cause: if reloaded {
                     ReloadCause::Reloaded {
@@ -774,8 +778,8 @@ impl CasWorker {
         edit.set_entries(new_leaf.clone());
         edit.set_locks(plan.locks.clone());
         match self.core.nodes.commit_leaf(edit).await {
-            // Hint the background splitter if this write left the leaf
-            // over the soft cap (ADR-031); the splitter reloads and
+            // Hint the background tree rebalancer if this write left the leaf
+            // over the soft cap (ADR-031); the tree rebalancer reloads and
             // re-checks, so a spurious hint only costs one load.
             Ok(CasResult::Applied(receipt)) => {
                 self.core.hinter.observe_leaf(path, &new_leaf);
@@ -957,32 +961,6 @@ pub struct LeafCoordinator {
 }
 
 impl LeafCoordinator {
-    /// Creates a coordinator that reports capacity observations to `hinter` —
-    /// normally the background [`Splitter`](crate::split::Splitter)'s queue.
-    /// `policy` governs the coordinator's hard node-size limit.
-    pub fn with_hinter(
-        nodes: NodeStore,
-        key_state: KeyStateResolver,
-        tmon: Monitor,
-        retry: RetryConfig,
-        policy: SplitPolicy,
-        hinter: Arc<dyn SplitHinter>,
-    ) -> Self {
-        let core = Arc::new(CoordCore {
-            tmon,
-            nodes,
-            key_state,
-            retry,
-            stats: Stats::default(),
-            policy,
-            hinter,
-        });
-        let dedup = Dedup::new(CasWorker { core: core.clone() });
-        LeafCoordinator {
-            inner: Arc::new(CoordState { core, dedup }),
-        }
-    }
-
     /// Cancels in-flight coordination and awaits any spawned dedup owner tasks,
     /// so none leak when the database shuts down (ADR-025).
     pub async fn close(&self) {
@@ -1002,6 +980,34 @@ impl LeafCoordinator {
     /// Returns a per-object dedup coordination snapshot (ADR-025).
     pub fn dedup_snapshot(&self) -> Vec<DedupKeySnapshot> {
         self.inner.dedup.snapshot()
+    }
+
+    /// Creates a coordinator that reports capacity observations to `hinter` —
+    /// normally the background [`TreeRebalancer`](crate::tree_rebalancer::TreeRebalancer)'s queue.
+    /// `policy` governs the coordinator's hard node-size limit.
+    pub(crate) fn with_hinter(
+        nodes: NodeStore,
+        key_state: KeyStateResolver,
+        tmon: Monitor,
+        gate_retry: StructuralGateRetry,
+        retry: RetryConfig,
+        policy: SplitPolicy,
+        hinter: Arc<dyn SplitHinter>,
+    ) -> Self {
+        let core = Arc::new(CoordCore {
+            tmon,
+            nodes,
+            key_state,
+            gate_retry,
+            retry,
+            stats: Stats::default(),
+            policy,
+            hinter,
+        });
+        let dedup = Dedup::new(CasWorker { core: core.clone() });
+        LeafCoordinator {
+            inner: Arc::new(CoordState { core, dedup }),
+        }
     }
 
     /// Coordinates one complete operation and returns its operation-specific
@@ -1178,7 +1184,7 @@ mod tests {
     ) -> (LeafCoordinator, NodeStore, Timeline, Arc<Background>) {
         let seed_timeline = Timeline::new();
         let seed_store = NodeStore::new(
-            CachedStore::new(backend.clone(), 1 << 20, seed_timeline, None),
+            CachedStore::new(backend.clone(), 1 << 20, seed_timeline.clone(), None),
             std::num::NonZeroUsize::MIN,
         );
         let _ = seed_store
@@ -1199,8 +1205,15 @@ mod tests {
         let mon = foundation.monitor.clone();
         let nodes = foundation.nodes.clone();
         let key_state = KeyStateResolver::new(mon.clone());
-        let coord =
-            LeafCoordinator::with_hinter(nodes.clone(), key_state, mon, retry, policy, hinter);
+        let coord = LeafCoordinator::with_hinter(
+            nodes.clone(),
+            key_state,
+            mon,
+            crate::node_locking::StructuralGateRetry::new(timeline.clone(), Arc::default()),
+            retry,
+            policy,
+            hinter,
+        );
         (coord, nodes, timeline, bg)
     }
 
@@ -1209,9 +1222,184 @@ mod tests {
     fn cold_store(backend: Arc<dyn Backend>) -> NodeStore {
         let timeline = Timeline::new();
         NodeStore::new(
-            CachedStore::new(backend, 1 << 20, timeline, None),
+            CachedStore::new(backend, 1 << 20, timeline.clone(), None),
             std::num::NonZeroUsize::MIN,
         )
+    }
+
+    async fn coordinator_with_intent_gate(
+        backend: Arc<dyn Backend>,
+        recovery_wake: Arc<tokio::sync::Notify>,
+    ) -> (AssemblyFixture, LeafCoordinator) {
+        use glassdb_storage::transaction::{TxCommitStatus, TxLog};
+
+        let base = AssemblyFixture::new(
+            backend,
+            DbRoot::try_from(COLL).unwrap(),
+            &EngineConfig::default(),
+        );
+        let owner = TxId::with_priority(1, b"merge");
+        base.monitor.begin_tx(&owner);
+        base.monitor
+            .commit_tx(TxLog::new(owner.clone(), TxCommitStatus::Ok))
+            .await
+            .unwrap();
+        let mut node = Node::leaf(LeafBody::from_entries([LeafEntry::new(b"key")
+            .with_current(CurrentState::Inline {
+                writer: owner.clone(),
+                value: Arc::from(b"value".as_slice()),
+            })]));
+        node.set_structural_gate(owner.clone());
+        let mut locks = node.locks().clone();
+        locks
+            .bind_structural_intent(&owner, leaf_token().into())
+            .unwrap();
+        node.set_locks(locks);
+        assert!(
+            base.nodes
+                .store_node(&collection(), &leaf_token(), &node, None)
+                .await
+                .unwrap()
+        );
+        let coord = LeafCoordinator::with_hinter(
+            base.nodes.clone(),
+            KeyStateResolver::new(base.monitor.clone()),
+            base.monitor.clone(),
+            StructuralGateRetry::new(base.timeline.clone(), recovery_wake),
+            RetryConfig {
+                initial_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(1),
+            },
+            SplitPolicy::default(),
+            Arc::new(NoSplitHints),
+        );
+        (base, coord)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn structural_acquisition_refreshes_an_intent_gate_after_a_delayed_read() {
+        use crate::node_locking::{StructuralGateOperation, StructuralGateOutcome};
+        use glassdb_storage::{IndexNode, TreeRouter};
+
+        let memory = Arc::new(MemoryBackend::new());
+        let recorder = RecordingBackend::new(memory.clone());
+        let log = recorder.log();
+        let hooks = Arc::new(HookBackend::new(Arc::new(recorder)));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let (base, coord) = coordinator_with_intent_gate(hooks.clone(), wake.clone()).await;
+        base.nodes
+            .create_root(
+                &collection(),
+                &Node::index(IndexNode::from_children([(
+                    Vec::new(),
+                    leaf_token().to_string(),
+                )])),
+            )
+            .await
+            .unwrap();
+        let router = TreeRouter::new(
+            base.nodes.clone(),
+            base.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
+        let routed = tokio::time::timeout(
+            Duration::from_secs(1),
+            router.route_key(&collection(), b"key", Requirement::ANY),
+        )
+        .await
+        .expect("reads must not wait for an intent-owned gate")
+        .unwrap();
+        assert!(routed.node().unwrap().structural_gate().intent().is_some());
+        assert!(futures::poll!(Box::pin(wake.notified())).is_pending());
+        log.lock().unwrap().clear();
+
+        let (entered, release) = park_read_reply(&hooks, leaf(), 1);
+        let id = TxId::with_priority(2, b"next split");
+        let acquiring = coord.coordinate(StructuralGateOperation::new(id.clone(), leaf()));
+        tokio::pin!(acquiring);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                _ = &mut acquiring => panic!("the bound gate must defer acquisition"),
+                _ = entered.notified() => {}
+            }
+        })
+        .await
+        .expect("a bound gate must request a fresh read");
+        assert_eq!(leaf_stores(&log), 0);
+        tokio::time::timeout(Duration::from_secs(1), wake.notified())
+            .await
+            .expect("a blocked mutation must request recovery");
+
+        // The parked reply still contains the gate. Clearing it through another
+        // cache requires a new barrier after that reply completes.
+        let peer = cold_store(memory);
+        let loaded = tokio::time::timeout(
+            Duration::from_secs(1),
+            peer.load_leaf(&leaf(), Requirement::ANY),
+        )
+        .await
+        .expect("storage must return the gate without waiting")
+        .unwrap();
+        let mut edit = loaded.into_edit();
+        let gate = edit.locks().structural_gate();
+        let owner = gate.holder().unwrap().clone();
+        let intent = gate.intent().unwrap().clone();
+        let mut locks = edit.locks().clone();
+        assert!(locks.complete_structural_intent(&owner, &intent));
+        edit.set_locks(locks);
+        assert!(matches!(
+            peer.commit_leaf(edit).await.unwrap(),
+            CasResult::Applied(_)
+        ));
+        let after_release = base.timeline.currentness_barrier();
+        release.notify_one();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), acquiring)
+            .await
+            .expect("acquisition must observe the released gate")
+            .unwrap();
+        let StructuralGateOutcome::Acquired(observation) = outcome else {
+            panic!("acquisition must complete after recovery");
+        };
+        assert!(observation.is_current_after(after_release));
+        let node = observation.value().unwrap();
+        assert!(node.structural_gate().contains(&id));
+        assert!(node.structural_gate().intent().is_none());
+        assert_eq!(
+            node.as_leaf()
+                .unwrap()
+                .lookup(b"key")
+                .unwrap()
+                .current
+                .inline()
+                .unwrap()
+                .as_ref(),
+            b"value"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unfinished_intent_gate_uses_the_coordinators_retry_budget() {
+        use crate::node_locking::{StructuralGateOperation, StructuralGateOutcome};
+
+        let (base, coord) =
+            coordinator_with_intent_gate(Arc::new(MemoryBackend::new()), Arc::default()).await;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            coord.coordinate(StructuralGateOperation::new(
+                TxId::with_priority(2, b"next split"),
+                leaf(),
+            )),
+        )
+        .await
+        .expect("an unfinished intent must not block a coordinator round forever")
+        .unwrap();
+        assert!(matches!(outcome, StructuralGateOutcome::Deferred));
+        let stored = base
+            .nodes
+            .load_leaf(&leaf(), Requirement::ANY)
+            .await
+            .unwrap();
+        assert!(stored.locks().structural_gate().intent().is_some());
     }
 
     fn entry(key: &[u8], typ: LockType, holder: Option<&TxId>, writer: Option<&TxId>) -> LeafEntry {

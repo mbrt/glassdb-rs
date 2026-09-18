@@ -262,11 +262,12 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
         nodes.clone(),
         key_state,
         mon.clone(),
+        crate::node_locking::StructuralGateRetry::new(timeline.clone(), Arc::default()),
         RetryConfig::default(),
         glassdb_storage::SplitPolicy::default(),
         Arc::new(NoSplitHints),
     );
-    let router = TreeRouter::new(nodes.clone(), std::num::NonZeroUsize::MIN);
+    let router = TreeRouter::new(nodes.clone(), timeline.clone(), std::num::NonZeroUsize::MIN);
     let locker = Locker::new(
         coord.clone(),
         router,
@@ -1172,7 +1173,11 @@ async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
             .unwrap();
         let operation = owner.monitor.begin_owner_operation(&id).unwrap();
         let resolver = KeyResolver::new(
-            TreeRouter::new(owner.nodes.clone(), NonZeroUsize::MIN),
+            TreeRouter::new(
+                owner.nodes.clone(),
+                owner.timeline.clone(),
+                NonZeroUsize::MIN,
+            ),
             KeyStateResolver::new(owner.monitor.clone()),
             NonZeroUsize::MIN,
         );
@@ -1477,11 +1482,16 @@ async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
         owner.nodes.clone(),
         KeyStateResolver::new(owner.monitor.clone()),
         owner.monitor.clone(),
+        crate::node_locking::StructuralGateRetry::new(owner.timeline.clone(), Arc::default()),
         RetryConfig::default(),
         glassdb_storage::SplitPolicy::default(),
         Arc::new(NoSplitHints),
     );
-    let router = TreeRouter::new(owner.nodes.clone(), std::num::NonZeroUsize::MIN);
+    let router = TreeRouter::new(
+        owner.nodes.clone(),
+        owner.timeline.clone(),
+        std::num::NonZeroUsize::MIN,
+    );
     let locker = Locker::new(
         coord,
         router.clone(),
@@ -2374,7 +2384,7 @@ enum TopologyCleanup {
 async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
     use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
     use glassdb_data::{NodeToken, StructuralIntentId};
-    use glassdb_storage::{StructuralIntent, StructuralIntentPhase};
+    use glassdb_storage::{SplitIntent, SplitIntentPhase, StructuralIntent};
 
     let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
     let recorded = RecordingBackend::new(hooks.clone());
@@ -2416,15 +2426,15 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
         .write(
             collection().db_root_component(),
             &StructuralIntentId::from(&right),
-            &StructuralIntent {
+            &StructuralIntent::Split(SplitIntent {
                 collection: collection(),
                 source_token: None,
                 source_version: String::new(),
                 created_tokens: vec![left, right],
                 split_key: Vec::new(),
                 participant_id: id.clone(),
-                phase: StructuralIntentPhase::Preparing,
-            },
+                phase: SplitIntentPhase::Preparing,
+            }),
         )
         .await
         .unwrap();

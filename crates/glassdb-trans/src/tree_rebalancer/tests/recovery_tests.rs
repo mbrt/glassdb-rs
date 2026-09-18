@@ -21,8 +21,8 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
         .unwrap();
     let local_bg = Arc::new(Background::new());
     let peer_bg = Arc::new(Background::new());
-    let recovering = splitter(&local, &local_bg, tiny());
-    let owner = splitter(&peer, &peer_bg, tiny());
+    let recovering = tree_rebalancer(&local, &local_bg, tiny());
+    let owner = tree_rebalancer(&peer, &peer_bg, tiny());
     let participant = if committed {
         // The split has completed its tree change, but failed intent deletion
         // leaves both the Ready intent and participant for background recovery.
@@ -49,8 +49,10 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
             .await
             .unwrap();
         assert_eq!(intents.len(), 1);
-        let intent = intents[0].1.value().unwrap();
-        assert_eq!(intent.phase, StructuralIntentPhase::Ready);
+        let StructuralIntent::Split(intent) = intents[0].1.value().unwrap().as_ref() else {
+            panic!("expected a split intent");
+        };
+        assert_eq!(intent.phase, SplitIntentPhase::Ready);
         let id = intent.participant_id.clone();
         assert_eq!(owner.mon.tx_status(&id).await.unwrap(), TxCommitStatus::Ok);
         id
@@ -229,8 +231,8 @@ async fn recovery_retries_a_cached_preparing_intent_after_the_peer_publishes_rea
         .unwrap();
     let local_bg = Arc::new(Background::new());
     let peer_bg = Arc::new(Background::new());
-    let recovering = splitter(&local, &local_bg, tiny());
-    let owner = splitter(&peer, &peer_bg, tiny());
+    let recovering = tree_rebalancer(&local, &local_bg, tiny());
+    let owner = tree_rebalancer(&peer, &peer_bg, tiny());
     let prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
     // The recovering instance discovers Preparing before the owner advances
     // it. Failed owner cleanup then leaves the completed split for recovery.
@@ -249,10 +251,13 @@ async fn recovery_retries_a_cached_preparing_intent_after_the_peer_publishes_rea
                         .await
                         .unwrap();
                     assert_eq!(found.len(), 1);
-                    assert_eq!(
-                        found[0].1.value().unwrap().phase,
-                        StructuralIntentPhase::Preparing
-                    );
+                    assert!(matches!(
+                        found[0].1.value().unwrap().as_ref(),
+                        StructuralIntent::Split(SplitIntent {
+                            phase: SplitIntentPhase::Preparing,
+                            ..
+                        })
+                    ));
                 }
                 Ok(())
             })
@@ -295,10 +300,14 @@ async fn recovery_retries_a_cached_preparing_intent_after_the_peer_publishes_rea
             .unwrap()
             .is_empty()
     );
-    let leaves = TreeRouter::new(verifier.nodes.clone(), std::num::NonZeroUsize::MIN)
-        .leaves(&collection(), Requirement::ANY)
-        .await
-        .unwrap();
+    let leaves = TreeRouter::new(
+        verifier.nodes.clone(),
+        verifier.timeline.clone(),
+        std::num::NonZeroUsize::MIN,
+    )
+    .leaves(&collection(), Requirement::ANY)
+    .await
+    .unwrap();
     let keys: Vec<_> = leaves
         .iter()
         .flat_map(|leaf| {
@@ -331,7 +340,7 @@ async fn settlement_cancels_a_prepared_split_before_node_creation() {
     ));
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
-    let sp = splitter(&s, &bg, tiny());
+    let sp = tree_rebalancer(&s, &bg, tiny());
     let participant = TxId::with_priority(1, b"participant");
 
     sp.begin_topology_tx(&collection(), &participant)
@@ -457,7 +466,7 @@ async fn structural_split_failure_transition_table() {
         ));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
-        let sp = splitter(&s, &bg, tiny());
+        let sp = tree_rebalancer(&s, &bg, tiny());
 
         let root_path = root_path().to_string();
         let nodes_prefix = ObjectPath::nodes_prefix(&collection());
@@ -475,7 +484,13 @@ async fn structural_split_failure_transition_table() {
                         FailurePoint::ReadyPrecondition => {
                             path.starts_with(&structural_prefix)
                                 && StructuralIntent::decode(value).is_ok_and(|intent| {
-                                    intent.phase == StructuralIntentPhase::Ready
+                                    matches!(
+                                        intent,
+                                        StructuralIntent::Split(SplitIntent {
+                                            phase: SplitIntentPhase::Ready,
+                                            ..
+                                        })
+                                    )
                                 })
                         }
                         FailurePoint::RootRewrite => {
@@ -525,7 +540,7 @@ async fn structural_split_failure_transition_table() {
                         BackendOp::WriteIf { path, value, .. }
                             if path.starts_with(&structural_prefix)
                                 && StructuralIntent::decode(value).is_ok_and(|intent| {
-                                    intent.phase == StructuralIntentPhase::Ready
+                                    matches!(intent, StructuralIntent::Split(SplitIntent { phase: SplitIntentPhase::Ready, .. }))
                                 })
                     );
                 let result =
@@ -560,9 +575,14 @@ async fn structural_split_failure_transition_table() {
             .unwrap();
         if retains_ready {
             assert_eq!(logs.len(), 1, "case {point:?}");
-            assert_eq!(
-                logs[0].1.value().unwrap().phase,
-                StructuralIntentPhase::Ready,
+            assert!(
+                matches!(
+                    logs[0].1.value().unwrap().as_ref(),
+                    StructuralIntent::Split(SplitIntent {
+                        phase: SplitIntentPhase::Ready,
+                        ..
+                    })
+                ),
                 "case {point:?}"
             );
         } else {
@@ -607,8 +627,8 @@ async fn startup_structural_recovery_reclaims_an_orphan_after_restart() {
 
     let second = store_with_backend(backend);
     let bg = Arc::new(Background::new());
-    let splitter = splitter(&second, &bg, tiny());
-    splitter.start();
+    let tree_rebalancer = tree_rebalancer(&second, &bg, tiny());
+    tree_rebalancer.start();
     for _ in 0..20 {
         if matches!(
             second
@@ -661,7 +681,7 @@ async fn startup_structural_recovery_reclaims_an_orphan_after_restart() {
 async fn structural_recovery_defers_while_the_source_writer_is_live() {
     let s = store();
     let bg = Arc::new(Background::new());
-    let sp = splitter(&s, &bg, tiny());
+    let sp = tree_rebalancer(&s, &bg, tiny());
     let id = TxId::with_priority(1, b"live-split");
     sp.mon.begin_tx(&id);
 
@@ -730,7 +750,7 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
     let s = store_with_backend(recorder);
     let peer = store_with_backend(backend);
     let bg = Arc::new(Background::new());
-    let sp = splitter(&s, &bg, tiny());
+    let sp = tree_rebalancer(&s, &bg, tiny());
     let id = TxId::with_priority(1, b"inflight-split");
     sp.mon.begin_tx(&id);
 
@@ -826,7 +846,7 @@ async fn stage_recovery_split(
 ) -> (Node, LeafObservation) {
     let mut intent = nonroot_intent("L", sibling, b"");
     intent.participant_id = participant.clone();
-    intent.phase = StructuralIntentPhase::Preparing;
+    intent.phase = SplitIntentPhase::Preparing;
     intent.source_version.clear();
     let prepared = s.write_structural_intent(sibling, &intent).await.unwrap();
     let (mut source, observed) = s.load_node(COLL, "L", Requirement::ANY).await.unwrap();
@@ -841,10 +861,10 @@ async fn stage_recovery_split(
     source.remove_structural_gate(worker);
     intent.source_version = gated.revision().unwrap().serialize().to_string();
     intent.split_key = split_key;
-    intent.phase = StructuralIntentPhase::Ready;
+    intent.phase = SplitIntentPhase::Ready;
     assert!(
         s.intent_store
-            .update(&prepared, &canonical_intent(&intent))
+            .update(&prepared, &StructuralIntent::Split(intent.clone()))
             .await
             .unwrap()
             .is_some()
@@ -873,7 +893,7 @@ async fn check_recovery_batch_reuses_source_reads(explicit: bool) {
     .await
     .unwrap();
     let bg = Arc::new(Background::new());
-    let sp = splitter(&s, &bg, tiny());
+    let sp = tree_rebalancer(&s, &bg, tiny());
     let participant = TxId::with_priority(1, b"batch-participant");
     sp.begin_topology_tx(&collection(), &participant)
         .await
@@ -993,7 +1013,7 @@ async fn later_participant_discovery_checks_sources_after_its_own_ready_intents(
         .await
         .unwrap();
         let bg = Arc::new(Background::new());
-        let sp = splitter(&s, &bg, tiny());
+        let sp = tree_rebalancer(&s, &bg, tiny());
         let participant = TxId::with_priority(1, b"later-discovery-participant");
         sp.begin_topology_tx(&collection(), &participant)
             .await
@@ -1056,7 +1076,11 @@ async fn later_participant_discovery_checks_sources_after_its_own_ready_intents(
             "rediscovery reads only the new intent body missing from this cache"
         );
         let verifier = store_with_backend(memory);
-        let router = TreeRouter::new(verifier.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            verifier.nodes.clone(),
+            verifier.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
         for key in [b"a".as_slice(), b"b", b"m", b"n"] {
             let leaf = router
                 .route_key(&collection(), key, Requirement::ANY)
@@ -1094,7 +1118,7 @@ async fn later_participant_discovery_checks_sources_after_its_own_ready_intents(
 async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
     let s = store();
     let bg = Arc::new(Background::new());
-    let sp = splitter(&s, &bg, tiny());
+    let sp = tree_rebalancer(&s, &bg, tiny());
     let abandoned = TxId::with_priority(1, b"abandoned-split");
     let newcomer = TxId::with_priority(2, b"later-split");
     sp.mon.begin_tx(&newcomer);
@@ -1159,7 +1183,7 @@ async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
 /// than the intent's while holding source state from before the split gated it.
 /// Recovery once classified at the intent's own watermark, accepted exactly
 /// such an entry, read a revision the worker never published from, judged the
-/// live root split unapplied, and deleted both children - which the splitter
+/// live root split unapplied, and deleted both children - which the tree rebalancer
 /// then published a root index over, leaving the tree pointing at absent nodes.
 ///
 /// The peer owns the live split and follows the worker's durable order:
@@ -1176,11 +1200,11 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
     );
     let backend: Arc<dyn Backend> = backend;
     let s = store_with_backend(backend.clone());
-    // The live splitter models a separately opened database, so it owns a
+    // The live tree rebalancer models a separately opened database, so it owns a
     // distinct cache and timeline over the shared backend.
     let peer = store_with_backend(backend);
     let bg = Arc::new(Background::new());
-    let sp = splitter(&s, &bg, tiny());
+    let sp = tree_rebalancer(&s, &bg, tiny());
     let worker = TxId::with_priority(1, b"inflight-root-split");
     let participant = TxId::with_priority(1, b"root-split-participant");
     sp.mon.begin_tx(&worker);
@@ -1189,14 +1213,14 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
     peer.create_root(COLL, &leaf_node(&[b"a", b"b", b"m", b"n"], None, None))
         .await
         .unwrap();
-    let mut intent = StructuralIntent {
+    let mut intent = SplitIntent {
         collection: collection(),
         source_token: None,
         source_version: String::new(),
         created_tokens: vec![test_token("L"), test_token("R")],
         split_key: b"m".to_vec(),
         participant_id: participant.clone(),
-        phase: StructuralIntentPhase::Preparing,
+        phase: SplitIntentPhase::Preparing,
     };
     let prepared = peer.write_structural_intent("R", &intent).await.unwrap();
 
@@ -1230,10 +1254,10 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
         .unwrap()
         .unwrap();
     intent.source_version = gated.revision().unwrap().serialize().to_string();
-    intent.phase = StructuralIntentPhase::Ready;
+    intent.phase = SplitIntentPhase::Ready;
     assert!(
         peer.intent_store
-            .update(&prepared, &canonical_intent(&intent))
+            .update(&prepared, &StructuralIntent::Split(intent.clone()))
             .await
             .unwrap()
             .is_some()
@@ -1305,16 +1329,16 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
     ]));
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
-    let sp = splitter(&s, &bg, tiny());
+    let sp = tree_rebalancer(&s, &bg, tiny());
 
-    let intent = StructuralIntent {
+    let intent = SplitIntent {
         collection: collection(),
         source_token: Some(test_token("L")),
         source_version: superseded_source_version(),
         created_tokens: vec![test_token("R")],
         split_key: b"t".to_vec(),
         participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
-        phase: StructuralIntentPhase::Ready,
+        phase: SplitIntentPhase::Ready,
     };
     s.write_structural_intent("R", &intent).await.unwrap();
 
@@ -1329,7 +1353,11 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
         !root_node.over_soft_cap(&tiny()),
         "recovery completes the parent split requested by publication"
     );
-    let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+    let router = TreeRouter::new(
+        s.nodes.clone(),
+        s.timeline.clone(),
+        std::num::NonZeroUsize::MIN,
+    );
     assert_eq!(
         router
             .leaves(
@@ -1439,7 +1467,7 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
     // distinct database-local path coordinator over the shared backend.
     let peer = store_with_backend(backend);
     let bg = Arc::new(Background::new());
-    let sp = splitter(&s, &bg, tiny());
+    let sp = tree_rebalancer(&s, &bg, tiny());
     let id = TxId::with_priority(1, b"racing-split");
 
     let mut original = leaf_node(&[b"a", b"b", b"m", b"n"], None, None);
@@ -1459,14 +1487,14 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
     let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
     s.create_root(COLL, &root).await.unwrap();
 
-    let intent = StructuralIntent {
+    let intent = SplitIntent {
         collection: collection(),
         source_token: Some(test_token("L")),
         source_version: source_version.revision().unwrap().serialize().to_string(),
         created_tokens: vec![test_token("R")],
         split_key,
         participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
-        phase: StructuralIntentPhase::Ready,
+        phase: SplitIntentPhase::Ready,
     };
     s.write_structural_intent("R", &intent).await.unwrap();
     sp.mon.begin_tx(&id);
@@ -1512,7 +1540,7 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
 
 async fn recovery_that_needs_a_parent_split(
     participant: &TxId,
-) -> (TestStore, Arc<Background>, Splitter, StructuralIntent) {
+) -> (TestStore, Arc<Background>, TreeRebalancer, SplitIntent) {
     let s = store();
     s.store_node(
         COLL,
@@ -1543,15 +1571,15 @@ async fn recovery_that_needs_a_parent_split(
     .await
     .unwrap();
     let bg = Arc::new(Background::new());
-    let sp = splitter(&s, &bg, tiny());
-    let intent = StructuralIntent {
+    let sp = tree_rebalancer(&s, &bg, tiny());
+    let intent = SplitIntent {
         collection: collection(),
         source_token: Some(test_token("L")),
         source_version: superseded_source_version(),
         created_tokens: vec![test_token("R")],
         split_key: b"t".to_vec(),
         participant_id: participant.clone(),
-        phase: StructuralIntentPhase::Ready,
+        phase: SplitIntentPhase::Ready,
     };
     (s, bg, sp, intent)
 }
@@ -1574,7 +1602,7 @@ async fn sweep_defers_one_failed_parent_split_and_continues() {
         .write(
             &db_root("db"),
             &StructuralIntentId::from(intent_ids[0].clone()),
-            &request_record,
+            &StructuralIntent::Split(request_record),
         )
         .await
         .unwrap();
@@ -1582,7 +1610,7 @@ async fn sweep_defers_one_failed_parent_split_and_continues() {
         .write(
             &db_root("db"),
             &StructuralIntentId::from(intent_ids[1].clone()),
-            &orphan_intent,
+            &StructuralIntent::Split(orphan_intent),
         )
         .await
         .unwrap();
@@ -1628,7 +1656,7 @@ async fn explicit_settlement_returns_a_parent_split_error() {
         .write(
             &db_root("db"),
             &StructuralIntentId::from(test_token("request-intent")),
-            &intent,
+            &StructuralIntent::Split(intent),
         )
         .await
         .unwrap();

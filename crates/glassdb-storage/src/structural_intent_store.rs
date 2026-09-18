@@ -11,7 +11,7 @@ use crate::structural_intent::StructuralIntent;
 
 const STRUCTURAL_LIST_PAGE_SIZE: usize = 128;
 
-/// Reads and compare-and-swaps structural intents for split recovery.
+/// Reads and compare-and-swaps structural intents for topology recovery.
 #[derive(Clone)]
 pub struct StructuralIntentStore {
     structural_intents: crate::cached_store::TypedCachedStore<StructuralIntent>,
@@ -58,6 +58,15 @@ impl StructuralIntentStore {
         }
     }
 
+    /// Loads an exact structural intent, including absence.
+    pub async fn load(
+        &self,
+        path: &ObjectPath,
+        requirement: Requirement,
+    ) -> Result<Observation<StructuralIntent>, StorageError> {
+        self.structural_intents.read(path, requirement).await
+    }
+
     /// Creates a structural intent and returns its exact observation.
     pub async fn write(
         &self,
@@ -67,7 +76,7 @@ impl StructuralIntentStore {
     ) -> Result<Observation<StructuralIntent>, StorageError> {
         let path = ObjectPath::StructuralIntent {
             db_root: db_root.clone(),
-            participant: intent.participant_id.clone(),
+            participant: intent.participant_id().clone(),
             intent_id: intent_id.clone(),
         };
         match self
@@ -81,7 +90,7 @@ impl StructuralIntentStore {
         }
     }
 
-    /// Conditionally advances an exact split intent.
+    /// Conditionally advances an exact structural intent.
     pub async fn update(
         &self,
         expected: &Observation<StructuralIntent>,
@@ -220,7 +229,7 @@ fn validate_structural_intent_path(
             "structural intent has a non-structural path",
         ));
     };
-    if participant != &intent.participant_id {
+    if participant != intent.participant_id() {
         return Err(StorageError::other(
             "structural-intent path does not match its participant",
         ));
@@ -232,7 +241,7 @@ fn validate_structural_intent_path(
 mod tests {
     use super::*;
     use crate::Timeline;
-    use crate::structural_intent::StructuralIntentPhase;
+    use crate::structural_intent::{SplitIntent, SplitIntentPhase};
 
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
@@ -274,8 +283,8 @@ mod tests {
         StructuralIntentId::from(token(byte))
     }
 
-    fn intent(participant: &TxId, phase: StructuralIntentPhase) -> StructuralIntent {
-        StructuralIntent {
+    fn intent(participant: &TxId, phase: SplitIntentPhase) -> StructuralIntent {
+        StructuralIntent::Split(SplitIntent {
             collection: CollectionAddress::root("db"),
             source_token: Some(token(200)),
             source_version: "v1".to_string(),
@@ -283,7 +292,7 @@ mod tests {
             split_key: b"split".to_vec(),
             participant_id: participant.clone(),
             phase,
-        }
+        })
     }
 
     #[test]
@@ -295,7 +304,7 @@ mod tests {
         };
         let intent = intent(
             &TxId::from_bytes(b"body-participant".to_vec()),
-            StructuralIntentPhase::Preparing,
+            SplitIntentPhase::Preparing,
         );
 
         assert!(<StructuralIntent as Codec>::encode(&path, &intent).is_err());
@@ -305,13 +314,13 @@ mod tests {
     async fn structural_intent_lifecycle_rejects_a_stale_update_and_deletes() {
         let store = store_over(Arc::new(MemoryBackend::new()));
         let participant = TxId::from_bytes(b"participant".to_vec());
-        let preparing = intent(&participant, StructuralIntentPhase::Preparing);
+        let preparing = intent(&participant, SplitIntentPhase::Preparing);
         let created = store
             .write(&db_root(), &intent_id(1), &preparing)
             .await
             .unwrap();
 
-        let ready = intent(&participant, StructuralIntentPhase::Ready);
+        let ready = intent(&participant, SplitIntentPhase::Ready);
         let updated = store.update(&created, &ready).await.unwrap().unwrap();
         assert!(
             store.update(&created, &preparing).await.unwrap().is_none(),
@@ -333,9 +342,12 @@ mod tests {
         let store = store_over(Arc::new(MemoryBackend::new()));
         let participant = TxId::from_bytes(b"participant".to_vec());
         for i in 0..=STRUCTURAL_LIST_PAGE_SIZE {
-            let mut intent = intent(&participant, StructuralIntentPhase::Ready);
-            intent.created_tokens = vec![token(i as u8)];
-            intent.split_key = vec![i as u8];
+            let mut intent = intent(&participant, SplitIntentPhase::Ready);
+            let StructuralIntent::Split(split) = &mut intent else {
+                unreachable!()
+            };
+            split.created_tokens = vec![token(i as u8)];
+            split.split_key = vec![i as u8];
             store
                 .write(&db_root(), &intent_id(i as u8), &intent)
                 .await
@@ -362,7 +374,7 @@ mod tests {
                 .write(
                     &db_root(),
                     &intent_id(1),
-                    &intent(participant, StructuralIntentPhase::Preparing),
+                    &intent(participant, SplitIntentPhase::Preparing),
                 )
                 .await
                 .unwrap();
@@ -378,8 +390,8 @@ mod tests {
             .unwrap();
         assert_eq!(intents.len(), 1);
         assert_eq!(
-            intents[0].1.value().unwrap().participant_id,
-            first,
+            intents[0].1.value().unwrap().participant_id(),
+            &first,
             "a participant listing must not discover another participant's work"
         );
     }
@@ -414,10 +426,7 @@ mod tests {
     #[tokio::test]
     async fn discovery_reuses_present_bodies_without_advancing_evidence() {
         for discovery in [Discovery::All, Discovery::Page, Discovery::Participant] {
-            for phase in [
-                StructuralIntentPhase::Preparing,
-                StructuralIntentPhase::Ready,
-            ] {
+            for phase in [SplitIntentPhase::Preparing, SplitIntentPhase::Ready] {
                 let recorder = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
                 let operations = recorder.log();
                 let store = store_over(recorder);
@@ -467,7 +476,7 @@ mod tests {
                     .exists()
             );
             let peer = store_over(memory);
-            let body = intent(&participant, StructuralIntentPhase::Preparing);
+            let body = intent(&participant, SplitIntentPhase::Preparing);
             peer.write(&db_root(), &intent_id(1), &body).await.unwrap();
             let requirement = Requirement::after(timeline.currentness_barrier());
             hooks.set_before(|op| {
@@ -510,13 +519,13 @@ mod tests {
             let local = store_over(recorder);
             let peer = store_over(memory.clone());
             let participant = TxId::from_bytes(b"participant".to_vec());
-            let preparing = intent(&participant, StructuralIntentPhase::Preparing);
+            let preparing = intent(&participant, SplitIntentPhase::Preparing);
             local
                 .write(&db_root(), &intent_id(1), &preparing)
                 .await
                 .unwrap();
             let prior = peer.discover(&db_root(), Requirement::ANY).await.unwrap();
-            let ready = intent(&participant, StructuralIntentPhase::Ready);
+            let ready = intent(&participant, SplitIntentPhase::Ready);
             assert!(peer.update(&prior[0].1, &ready).await.unwrap().is_some());
 
             let requirement = Requirement::after(local.timeline.currentness_barrier());

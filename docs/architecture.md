@@ -87,7 +87,7 @@ deterministic run. That edge is absent from normal library builds.
 | `glassdb-backend`     | The `Backend` trait, in-memory backend, stats decorator, and middleware for testing and debugging                                 |
 | `glassdb-backend-s3`  | Amazon S3 backend, enabled by the `s3` feature                                                                                    |
 | `glassdb-backend-gcs` | Google Cloud Storage backend, enabled by the `gcs` feature                                                                        |
-| `glassdb-trans`       | Transaction engine: commit algorithm, collection lifecycle, locking, leaf coordination, reads, structural splitting, and GC       |
+| `glassdb-trans`       | Transaction engine: commit algorithm, collection lifecycle, locking, leaf coordination, reads, topology changes, and GC           |
 | `glassdb-storage`     | Typed object stores over a shared decoded cache with bounded-freshness evidence, B-link traversal, and transaction-log persistence |
 | `glassdb-data`        | Core types: transaction identity and order-preserving path encoding                                                               |
 | `glassdb-proto`       | Generated transaction-log protobuf messages                                                                                       |
@@ -108,7 +108,7 @@ reads, scans, and collection snapshots, delegates the transaction-attempt
 lifecycle to `Algo`, and collects statistics and diagnostics. The public crate
 keeps metadata bootstrap, operation admission, the transaction-body retry loop,
 public errors, and public handles. Concrete stores and the routing, locking,
-monitoring, splitting, and GC implementations are not exported across this
+monitoring, topology, and GC implementations are not exported across this
 boundary.
 
 ## Component Responsibilities
@@ -131,7 +131,7 @@ acquisition flows through **one leaf coordinator**. It loads the object once per
 attempt, builds a mutation plan in wound-wait order, and persists staged changes
 with one CAS (ADR-028/029). The coordinator is a transaction-aware shared
 mutation engine: it owns identity, ordering, admission, and recovery across a
-heterogeneous round, while `Algo`, the `Locker`, and the `Splitter` supply each
+heterogeneous round, while `Algo`, the `Locker`, and the `TreeRebalancer` supply each
 operation's target, resolver policy, and typed result. The operation types stay
 with their policy owners: the coordinator reads a member outcome only for
 admission, exclusion, and delivery, never for operation-specific policy.
@@ -165,8 +165,9 @@ flowchart TD
     Direct["DirectCommit<br/>logless same-leaf publication"]
     Monitor["Monitor<br/>transaction-log lifecycle<br/>wound · wait · refresh"]
     Hints["GcHints<br/>bounded nonblocking reports<br/>wake · de-duplicate"]
-    Splitter["Splitter<br/>split scheduling · planning · node writes<br/>recursive parent split execution"]
-    Recovery["StructuralRecovery<br/>structural-intent lifecycle<br/>classification · fencing · resumption · settlement"]
+    Topology["TopologyHints / MergeHints<br/>inline pressure · missed direct commits<br/>bounded counters and waiting intervals"]
+    TreeRebalancer["TreeRebalancer<br/>structural scheduling · preparation · node writes<br/>split execution · merge coordination"]
+    Recovery["StructuralRecovery / MergeProtocol<br/>structural-intent lifecycle<br/>fencing · publication · resumption · settlement"]
     Coord["LeafCoordinator — mutation engine<br/>identity · order · admission<br/>load · plan · CAS per attempt<br/>per-member in-doubt recovery"]
     Gc["Gc<br/>candidate retries · bounded parallel checks<br/>adaptive scans · reverse liveness checks<br/>reclamation · local diagnostics"]
 
@@ -175,7 +176,7 @@ flowchart TD
     Engine -->|"owns · reads · scans · snapshots"| Reader
     Engine -.->|"owns and wires"| Locker
     Engine -.->|"owns and wires"| Monitor
-    Engine -.->|"owns and wires"| Splitter
+    Engine -.->|"owns and wires"| TreeRebalancer
     Engine -.->|"owns and wires"| Coord
     Engine -.->|"owns and starts"| Gc
     Algo -->|"validate"| Reader
@@ -188,13 +189,15 @@ flowchart TD
     Algo -->|"direct candidate"| Direct
     Algo -->|"GC hints"| Hints
     Direct -->|"GC hints"| Hints
-    Splitter -->|"GC hints"| Hints
-    Splitter -->|"start · resume"| Recovery
-    Recovery -->|"parent split request"| Splitter
+    Direct -->|"inline pressure · two-leaf miss"| Topology
+    TreeRebalancer -->|"owns · drains"| Topology
+    TreeRebalancer -->|"GC hints"| Hints
+    TreeRebalancer -->|"start · resume"| Recovery
+    Recovery -->|"parent split request"| TreeRebalancer
     Hints -->|"candidates · wake"| Gc
     Locker -->|"acquire · write-back · release"| Coord
     Direct -->|"direct LeafOperation"| Coord
-    Splitter -->|"leaf structural-gate operation"| Coord
+    TreeRebalancer -->|"leaf structural-gate operation"| Coord
     Recovery -->|"source fencing · clean gate release"| Coord
     Gc -->|"reclaim through unlock"| Locker
   end
@@ -209,7 +212,7 @@ flowchart TD
   Reader -->|"typed reads"| Stores
   Monitor -->|"transaction logs"| Stores
   Coord -->|"data-node CAS"| Stores
-  Splitter -->|"post-gate node writes"| Stores
+  TreeRebalancer -->|"post-gate node writes"| Stores
   Recovery -->|"structural intents · recovery reads and cleanup"| Stores
   Gc -->|"paged scans · reverse checks"| Stores
   Stores --> Backend
@@ -225,9 +228,10 @@ projection, physical preparation, catalog validation, drop fencing, and physical
 cleanup. `Algo` composes those phases with collection and key locking around the
 same validation barrier and transaction-log status flip.
 
-A drop additionally freezes the target collection's split topology and installs
-the transaction identity as a delete intent on every root, index, and leaf
-object, so every pre-existing participant settles before node enumeration.
+A drop additionally freezes the target collection's topology and installs
+the transaction identity as a delete intent on every root, index, leaf, and
+redirect object. Every pre-existing participant settles before node enumeration,
+including a merge whose publication must finish after its owner has stopped.
 Normal point operations inspect only the terminal node they already access: an
 aborted intent is removable, a pending intent participates in wound-wait, and a
 committed intent reports a stale collection handle.
@@ -268,27 +272,123 @@ out of both the B-link `NodeStore` and the semantic catalog.
 
 Routing traversal is centralized in `TreeRouter`, but use of that mechanism is
 intentionally distributed. Key resolution, the key-lock view, GC, and the
-`Splitter` each own a cheap handle for their distinct read, lock, reclamation,
+`TreeRebalancer` each own a cheap handle for their distinct read, lock, reclamation,
 or structural workflow. A handle shares the same decoded object cache without
 gaining structural-intent capabilities or maintaining independent topology
 state. This does not invent a single semantic owner for those different routing
 responsibilities.
 
+Routing follows permanent redirects before it checks a node's high-key or
+right-sibling. Valid redirect chains have no fixed length limit. An apparent
+cycle through a mutable right link gets one fresh read of the redirect target;
+this handles a cached left leaf that still points to its retired right sibling.
+A cycle made only of permanent redirects is invalid. `TreeRouter` uses the
+database's shared `Timeline` to capture fresh currentness barriers for these
+retries.
+
+Reads may use leaves with intent-owned structural gates. Until the right leaf
+redirects, its entries and their copies in the retained left leaf are identical
+and cannot change. `NodeStore` returns observed gates without waiting or
+signaling recovery. Transaction-layer gate policy handles admission for both
+splits and merges. An intent-owned gate requests structural recovery and a
+fresh retry through the coordinator's existing bounded retry path. The
+recovery signal and timeline are explicit transaction-layer dependencies.
+The cache keeps its generic object and evidence rules; it does not interpret
+merge phases or transaction status. Structural sibling traversal
+stays at the same index level and normalizes at the predecessor's high-key.
+Scans retain the exclusive high-key of each observed leaf as their next lower
+bound, even if that leaf returned no keys. Following an old right link through
+a redirect can reach a merged range that includes earlier keys; the lower bound
+prevents duplicates and preserves staged deletes.
+
 `StructuralRecovery` owns each structural intent from its prepared write to
 clean deletion or durable recovery. It exposes opaque witnesses to split
-coordination, and one resumable action that classifies phases, fences source
-writers, checks reachability, cleans unreachable nodes, and settles finalized
-topology participants. `Splitter` only executes a requested recursive parent
-split and supplies its result back to the action; it does not inspect durable
-phases.
+coordination and dispatches merge intents to the private `MergeProtocol`.
+`StructuralIntent` has separate split and merge variants, each with its own
+fields and phases. Only split intents record a separator and created nodes.
+Merge intents record the two leaf identities and their exact source revisions;
+the retained left source supplies the existing high-key.
+Split recovery classifies phases, fences source writers, checks reachability,
+cleans unreachable nodes, and settles finalized topology participants.
+`TreeRebalancer` executes a requested recursive parent split and supplies its result
+back to recovery; it does not inspect durable phases.
 
-Recovery fences a source writer against the source revision that the intent's
+Split recovery fences a source writer against the source revision that the intent's
 Ready transition recorded, not against the structural gate the source carries
 now. A worker publishes its split with one compare-and-swap expecting that
 revision, so the revision alone says whether the worker can still land, and a
 later split of the same source cannot shield an abandoned intent. Structural
 recovery runs on its own background cadence over an independent namespace, and
 does not consume the transaction GC candidate queue.
+
+Merges retain the left of two adjacent standalone leaves
+([ADR-072](adr/072-leaf-merging-and-splitting.md#recoverable-merge-mechanism)).
+`TreeRebalancer` registers a fresh topology participant and acquires the right
+structural gate. It reads the left leaf without acquiring a gate, and skips busy
+left leaves. `MergeProtocol` owns the durable state transitions:
+
+| Intent phase | Required action |
+| --- | --- |
+| Preparing | Record both source identities before topology registration. Record the exact revisions of the clean ungated left leaf and the gated right leaf to enter Ready. |
+| Ready | Bind the right gate to the intent, then CAS the union and an intent-owned gate into the left leaf. Enter Applying if this copy succeeded. On conflict, permanently fence the recorded left revision before entering Aborting. |
+| Aborting | Release the right gate or fence its recorded revision against delayed gate promotion, then delete the intent. |
+| Applying | Convert the right leaf to a permanent redirect to the left, release the left gate, then delete the intent. |
+
+The merged leaf preserves every authoritative inline value and receives a
+membership generation greater than both sources. Generation overflow rejects
+the merge. An intent-owned gate survives ordinary cleanup and transaction
+finalization. The left gate proves that publication succeeded until the right
+redirect becomes durable. Left writes can continue until publication. A conflict
+cancels the optional merge; source writes never rebase onto later revisions.
+Cancellation checks for the publication gate first. Otherwise it advances the
+current left membership generation by CAS, preserving its contents and holders.
+A later structural gate or permanent redirect also fences the original ungated
+left revision. Ordinary gate acquisition advances the membership generation,
+which release preserves. Thus temporary lock changes and cleanup cannot restore
+the earlier bytes that a delayed union or gate acquisition expects, even when
+backend versions identify contents. The right leaf stays closed until this fence
+is durable. If publication wins the race, recovery completes the merge.
+Once publication succeeds, recovery must complete regardless of later
+performance policy or participant status. A completed intent cannot overwrite
+later left writes or splits.
+
+The retired right identity remains as a redirect until collection reclamation.
+It is also durable proof of attachment for stale split recovery. This version
+does not remove redirects or contract parent indexes.
+
+### Local merge hints
+
+`TreeRebalancer` owns bounded split and merge hints
+([ADR-072](adr/072-leaf-merging-and-splitting.md#merge-policy)). Existing size-based and
+inline-pressure median splits run first. Merge hints do not delay or veto them.
+`DirectCommit` reports an initial routing miss across exactly two standalone
+leaves in one collection, after its normal direct-shape and per-value checks.
+The report uses the existing routing observations and adds no backend requests
+or scans of leaf entries. A busy hint mutex drops the report.
+
+`MergeHints` keeps at most 128 pairs. Each record retains at most 32 distinct
+transaction identities and the largest output byte count. It requires 32 missed
+attempts and a 30-second wait from the first hint for a pair. Records expire after
+60 seconds. These are attempted opportunities, not committed-transaction cost
+measurements.
+
+Each maintenance turn removes and checks at most one mature pair. Current
+source reads must confirm adjacency and 25% spare entry and encoded-content
+capacity. Existing inline bytes plus the largest hinted output
+must also leave 25% spare inline capacity, without replacement credit. The
+tree rebalancer rechecks spare capacity against the source snapshots before
+passing the sources to `MergeProtocol`. Failed or rejected attempts need fresh
+evidence and another wait.
+
+All merge-policy state stays in memory. Nodes carry no policy metadata, and
+restarts require fresh hints and another wait. Waiting intervals do not coordinate
+decisions across instances. Later inline pressure can still split a merged leaf.
+The heuristic does not predict workload-wide savings or demand from other
+database instances.
+
+The existing maintenance stats report merge hints, evaluated candidates, and
+completed merges. Backend statistics, transaction lifetimes, readers,
+write-back, and GC have no merge-measurement hooks.
 
 ### Ownership summary
 
@@ -306,8 +406,10 @@ does not consume the transaction GC candidate queue.
 | `CollectionStateResolver` | collection-state mechanism | resolved record loads, foreign-holder reconciliation, committed directory write-back assistance | key routing, B-link topology, catalog semantics |
 | `CollectionCatalog`   | collection semantics | logical snapshots, read-your-writes validation, capacity and precondition checks | locking policy, CAS, wound-wait |
 | `LeafCoordinator`     | shared mutation engine | one round per object: batching, oldest-first mutation planning, routing and capacity admission, exclusion of overlapping logless members, one CAS per attempt, per-member uncertainty, reload-recover, vestigial-entry pruning | operation-specific results, cross-leaf strategy, transaction lifecycle, commit orchestration, GC selection |
-| `Splitter`            | structural mechanism | scheduling, topology registration and finalization, source preparation and compaction, split planning, node writes, separator publication | durable intent phases, recovery classification, participant settlement |
-| `StructuralRecovery`  | durable recovery mechanism | intent creation and phase change, clean deletion, discovery, fencing, reachability classification, orphan cleanup, participant settlement | split candidates and reasons, tombstone compaction, node split planning |
+| `MergeHints`          | merge heuristic | bounded missed-direct identities, output-size hints, local waits, spare-capacity checks | transaction completion, backend work, structural gates, publication, recovery |
+| `TreeRebalancer`            | structural coordination | scheduling, topology registration and finalization, source preparation and compaction, split planning, node writes, separator publication, merge coordination | durable intent phases, recovery classification |
+| `StructuralRecovery`  | durable recovery mechanism | intent creation and phase change, clean deletion, discovery, fencing, reachability classification, orphan cleanup, merge recovery dispatch, participant settlement | merge hints, tombstone compaction, node split planning |
+| `MergeProtocol`       | durable merge mechanism | exact source revisions, intent-owned gates, abort fences, retained-left publication, right redirects | demand observations, optional action selection, transaction bodies |
 | `KeyResolver`         | key/range resolution | routing, scan composition, and logical point validation | commit and lock policy, collection-record coordination |
 | `KeyStateResolver`    | loaded key-state mechanism | transaction-dependent interpretation of already-loaded key and node state | routing, scan composition, commit policy |
 | `Reader`              | read mechanism   | value materialization                                                                                                 | commit and lock policy             |
@@ -574,9 +676,12 @@ value is never demoted, because it may have no transaction object.
 
 An unmarked point absence records the routed leaf's membership generation. If
 the physical leaf changes, validation requires both continued absence and the
-same generation; a tombstone read instead records its exact writer. The splitter
-preserves this generation across topology changes and, under its structural
-gate, removes holder-free tombstones before its final split decision
+same generation; a tombstone read instead records its exact writer. Structural
+gate acquisition advances the generation. A split copies that generation into
+both outputs, while a merge sets it above both source generations. Gate
+acquisition can therefore cause conservative scan and absence validation retries.
+Under its structural gate, the tree rebalancer removes holder-free tombstones before
+its final split decision
 ([ADR-062](adr/062-splitter-driven-tombstone-reclamation.md)). If compaction
 removes the pressure, it persists the smaller leaf and cancels the split;
 otherwise the recoverable split partitions the compacted state.
@@ -590,7 +695,7 @@ batch through the leaf coordinator into one owner-driven CAS (ADR-025/026/028)
 rather than racing separate ones.
 
 A create that reaches the reserved leaf-content limit retries after releasing
-its partial locks, so the background splitter can make room. The capacity result
+its partial locks, so the background tree rebalancer can make room. The capacity result
 starts one bounded capacity-wait episode: leaf revisions, reroutes, and other
 full leaves do not reset it, because acquisition still lacks capacity. This
 keeps ordinary asynchronous splits retryable without turning an impossible
@@ -722,9 +827,11 @@ and the complete post-state to fit the aggregate and encoded leaf limits. There
 is no direct-specific key-count cap. Range scans, collection-catalog operations,
 cross-leaf point dependencies, structural or deletion fencing, and live or
 unknown holders use the regular [commit protocol](#commit-protocol). Direct
-commit never waits for or wounds a holder. A failed multi-key admission does not
-request a pressure split, because a split could destroy the member's one-leaf
-eligibility; the single-key pressure signal remains available.
+commit never waits for or wounds a holder. A single-key aggregate inline-pressure
+failure reports a split hint for authoritative revalidation. Multi-key pressure
+does not request a split because it could separate the dependencies. Separately,
+otherwise eligible attempts routed to exactly two standalone leaves can report
+a merge hint without extra backend reads.
 
 A non-landing direct attempt is classified as a whole
 ([ADR-053](adr/053-replay-definitive-logless-rmw-losses.md)). A read-dependent
@@ -1035,7 +1142,9 @@ presence — is authoritative for logical existence.
 For a small collection, `_r` is the only leaf. When it splits, `_r` becomes an
 index whose children are leaves over contiguous raw-key ranges. Each level has
 right-sibling links, so a traversal from cached index state can move right after
-a concurrent split and remain correct.
+a concurrent split and remain correct. A merge retains the left leaf and makes
+the right identity a permanent redirect to it. Cached index and sibling links
+can continue to name that redirect.
 
 ```mermaid
 flowchart LR
@@ -1067,6 +1176,10 @@ During validation, the algorithm detects concurrent modifications by comparing
 the observed writer against the current state; the backend version is the CAS
 token for the conditional write that takes the lock.
 
+Database format version 4 requires clients to preserve intent-owned structural
+gates and redirects. Earlier clients must reject this format before they read or
+rewrite coordination objects.
+
 ## Garbage Collection
 
 A transaction object is **live** exactly while some data node or collection
@@ -1084,12 +1197,13 @@ implements a candidate-driven **reverse mark-sweep**
   Instead each candidate transaction object records its own back-references, so
   GC reads a batch of candidates and confirms each one dead by GET-ing only the
   handful of nodes and records it names — never a database-wide scan. Cached
-  indexes guide descent and right links correct stale split placement, while
+  indexes guide descent, redirects follow retired identities, and right links
+  correct stale split placement, while
   terminal leaves must meet GC's post-eligibility freshness bound. Collection
   and node identities are not reused, creation precedes commit or link
   publication, and published nodes remain until collection reclamation, so
   cached absence cannot hide a later live route.
-- **Candidate feed.** `Algo`, `DirectCommit`, and `Splitter` report GC
+- **Candidate feed.** `Algo`, `DirectCommit`, and `TreeRebalancer` report GC
   candidates through `GcHints`. Reports use bounded in-memory work and never
   wait for queue space, backend requests, or GC completion; a busy or full queue
   drops a report and counts the loss. Hints wake GC without causing a LIST.
@@ -1117,7 +1231,8 @@ implements a candidate-driven **reverse mark-sweep**
   becomes vestigial. Entry references, membership holds, directory holders, and
   topology participants are separate obligations, each with its own completion
   evidence. GC deletes only the exact candidate revision it checked, and
-  reclaims a dropped collection one node page at a time, removing the root and
+  settles structural intents before reclaiming a dropped collection one node
+  page at a time, including permanent redirects. It removes the root and
   collection record last.
 - **Progress measurement.** Successful resource changes and transaction
   deletion count as useful work. Deletion progress is approximate: an

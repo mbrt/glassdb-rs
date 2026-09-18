@@ -42,8 +42,8 @@ use crate::gc::GcHints;
 use crate::key_resolver::KeyResolver;
 use crate::leaf_coord::LeafCoordinator;
 use crate::monitor::{Monitor, OwnerAbortOutcome};
-use crate::split::SplitHintSink;
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
+use crate::tree_rebalancer::TopologyHintSink;
 
 mod attempt;
 mod direct_commit;
@@ -352,13 +352,13 @@ impl Algo {
         resolver: KeyResolver,
         split_policy: SplitPolicy,
         inline_policy: InlinePolicy,
-        split_hints: SplitHintSink,
+        topology_hints: TopologyHintSink,
     ) -> Self {
         let direct_commit = DirectCommit::new(
             router,
             coord,
             inline_policy,
-            split_hints,
+            topology_hints,
             cleanup_hints.clone(),
         );
         let retirement = Arc::new(AttemptRetirement {
@@ -1376,7 +1376,11 @@ mod tests {
     pub(super) async fn read_outcome(tctx: &Tctx, key: &LogicalKey) -> crate::reader::ReadOutcome {
         let reader = Reader::new(
             KeyResolver::new(
-                TreeRouter::new(tctx.nodes.clone(), std::num::NonZeroUsize::MIN),
+                TreeRouter::new(
+                    tctx.nodes.clone(),
+                    tctx.timeline.clone(),
+                    std::num::NonZeroUsize::MIN,
+                ),
                 KeyStateResolver::new(tctx.tmon.clone()),
                 std::num::NonZeroUsize::MIN,
             ),
@@ -1913,7 +1917,7 @@ mod tests {
 
     // A database can contain an unsafe singleton written by an older client or
     // admitted under a former policy. If capacity remains unavailable while the
-    // splitter cannot relieve it, lock acquisition must report the bounded wait
+    // tree rebalancer cannot relieve it, lock acquisition must report the bounded wait
     // instead of retrying forever.
     #[tokio::test(start_paused = true)]
     async fn leaf_capacity_retry_episode_is_bounded() {
@@ -2893,7 +2897,11 @@ mod tests {
         writes: Vec<WriteAccess>,
     ) -> (AccessSet, Vec<Vec<u8>>) {
         let resolver = KeyResolver::new(
-            TreeRouter::new(tctx.nodes.clone(), std::num::NonZeroUsize::MIN),
+            TreeRouter::new(
+                tctx.nodes.clone(),
+                tctx.timeline.clone(),
+                std::num::NonZeroUsize::MIN,
+            ),
             KeyStateResolver::new(tctx.tmon.clone()),
             std::num::NonZeroUsize::MIN,
         );
@@ -2918,7 +2926,11 @@ mod tests {
 
         let range = ScanRange::all();
         let resolver = KeyResolver::new(
-            TreeRouter::new(tctx.nodes.clone(), std::num::NonZeroUsize::MIN),
+            TreeRouter::new(
+                tctx.nodes.clone(),
+                tctx.timeline.clone(),
+                std::num::NonZeroUsize::MIN,
+            ),
             KeyStateResolver::new(tctx.tmon.clone()),
             std::num::NonZeroUsize::MIN,
         );
@@ -3167,7 +3179,7 @@ mod tests {
         let (accesses, _keys) = scan_accesses(&tctx).await;
 
         // Grow the tree in place: rewrite `_r` from its single leaf into an index
-        // root pointing at two fresh leaves (the shape the background splitter
+        // root pointing at two fresh leaves (the shape the background tree rebalancer
         // produces), so the covered leaf set is no longer just `_r`.
         split_root_in_place(&tctx).await;
 

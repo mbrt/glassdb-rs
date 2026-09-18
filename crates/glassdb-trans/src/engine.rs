@@ -29,8 +29,8 @@ use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{LeafCoordinator, LeafCoordinatorStats};
 use crate::monitor::{Monitor, MonitorStats, ProtocolTiming};
 use crate::reader::{ReadOutcome, Reader};
-use crate::split::{Splitter, SplitterStats};
 use crate::tlocker::{Locker, LockerStats};
+use crate::tree_rebalancer::{TreeRebalancer, TreeRebalancerStats};
 
 /// Balances backend traffic and memory use for a default production client.
 const DEFAULT_CACHE_SIZE: usize = 512 * 1024 * 1024;
@@ -143,8 +143,8 @@ pub struct EngineStats {
     pub coordinator: LeafCoordinatorStats,
     /// Logless direct-commit coverage.
     pub direct_commit: DirectCommitStats,
-    /// Background tree-split activity.
-    pub splitter: SplitterStats,
+    /// Background tree rebalancing activity.
+    pub tree_rebalancer: TreeRebalancerStats,
     /// Garbage collection activity.
     pub gc: GcStats,
 }
@@ -168,7 +168,7 @@ pub struct Engine {
     algo: Algo,
     coord: LeafCoordinator,
     locker: Locker,
-    splitter: Splitter,
+    tree_rebalancer: TreeRebalancer,
     gc: Gc,
     // Subsystems hold weak references so this sole strong owner breaks task
     // capture cycles when the engine is dropped.
@@ -288,7 +288,7 @@ impl Engine {
             locker: self.locker.stats_and_reset(),
             coordinator: self.coord.stats_and_reset(),
             direct_commit: self.algo.direct_commit_stats_and_reset(),
-            splitter: self.splitter.stats_and_reset(),
+            tree_rebalancer: self.tree_rebalancer.stats_and_reset(),
             gc: self.gc.stats_and_reset(),
         }
     }
@@ -483,7 +483,7 @@ impl DormantEngine {
     /// Starts maintenance work and returns the live engine.
     fn start(self) -> Engine {
         self.engine.gc.start(&self.engine.background);
-        self.engine.splitter.start();
+        self.engine.tree_rebalancer.start();
         self.engine
     }
 
@@ -521,7 +521,11 @@ impl DormantEngine {
         );
         let collection_catalog = CollectionCatalog::new(collection_state.clone());
         let key_state = KeyStateResolver::new(monitor.clone());
-        let router = TreeRouter::new(nodes.clone(), transaction_leaf_parallelism);
+        let router = TreeRouter::new(
+            nodes.clone(),
+            timeline.clone(),
+            transaction_leaf_parallelism,
+        );
         let resolver = KeyResolver::new(
             router.clone(),
             key_state.clone(),
@@ -529,7 +533,7 @@ impl DormantEngine {
         );
         let reader = Reader::new(resolver.clone(), timeline.clone(), retry);
         let cleanup_hints = GcHints::default();
-        let (coord, splitter) = Splitter::with_coordinator(
+        let (coord, tree_rebalancer) = TreeRebalancer::with_coordinator(
             background_weak.clone(),
             records.clone(),
             nodes.clone(),
@@ -545,7 +549,11 @@ impl DormantEngine {
         );
         let locker = Locker::new(
             coord.clone(),
-            TreeRouter::new(nodes.clone(), transaction_leaf_parallelism),
+            TreeRouter::new(
+                nodes.clone(),
+                timeline.clone(),
+                transaction_leaf_parallelism,
+            ),
             collection_state,
             monitor.clone(),
             retry,
@@ -556,7 +564,7 @@ impl DormantEngine {
             nodes.clone(),
             monitor.clone(),
             retry,
-            Arc::new(splitter.clone()),
+            Arc::new(tree_rebalancer.clone()),
         );
         let gc = Gc::new(
             tlogger.clone(),
@@ -588,7 +596,7 @@ impl DormantEngine {
             resolver.clone(),
             split_policy,
             inline_policy,
-            splitter.hint_sink(),
+            tree_rebalancer.hint_sink(),
         );
         let engine = Engine {
             backend,
@@ -600,7 +608,7 @@ impl DormantEngine {
             algo,
             coord,
             locker,
-            splitter,
+            tree_rebalancer,
             gc,
             background,
         };
@@ -662,5 +670,357 @@ async fn verify_permanent_collection(
             "initialized database is missing its permanent tree root",
         )),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use glassdb_backend::memory::MemoryBackend;
+    use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture};
+    use glassdb_concurr::rt;
+    use glassdb_data::NodeToken;
+    use glassdb_storage::{CurrentState, IndexNode, LeafEntry};
+
+    use super::*;
+    use crate::access::{ReadAccess, WriteAccess};
+
+    struct Workload {
+        engine: Engine,
+        backend: Arc<StatsBackend>,
+        hooks: Arc<HookBackend>,
+        collection: CollectionAddress,
+        paths: Vec<ObjectPath>,
+    }
+
+    impl Workload {
+        async fn open(inline: InlinePolicy, leaves: &[&[(&[u8], usize)]]) -> Self {
+            let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
+            let backend = Arc::new(StatsBackend::new(hooks.clone()));
+            let collection = CollectionAddress::root("adaptation");
+            Engine::prepare_permanent_collection(backend.as_ref(), collection.db_root())
+                .await
+                .unwrap();
+            let tokens: Vec<_> = (0..leaves.len())
+                .map(|index| NodeToken::from_bytes([index as u8 + 1; 16]))
+                .collect();
+            let paths: Vec<_> = tokens
+                .iter()
+                .map(|token| ObjectPath::Node {
+                    collection: collection.clone(),
+                    token: token.clone(),
+                })
+                .collect();
+            for (index, entries) in leaves.iter().enumerate() {
+                let node = Node::leaf(LeafBody::from_entries(entries.iter().map(
+                    |(key, bytes)| {
+                        LeafEntry::new(key.to_vec()).with_current(CurrentState::Inline {
+                            writer: TxId::with_priority(1, b"seed"),
+                            value: Arc::from(vec![0; *bytes]),
+                        })
+                    },
+                )))
+                .with_high_key(leaves.get(index + 1).map(|entries| entries[0].0.to_vec()))
+                .with_right_sibling(tokens.get(index + 1).map(ToString::to_string));
+                backend
+                    .write_if_not_exists(&paths[index].to_string(), node.encode())
+                    .await
+                    .unwrap();
+            }
+            let root_path = ObjectPath::TreeRoot {
+                collection: collection.clone(),
+            }
+            .to_string();
+            let version = backend.read(&root_path).await.unwrap().version;
+            let root = Node::index(IndexNode::from_children(tokens.iter().enumerate().map(
+                |(index, token)| {
+                    let separator = if index == 0 {
+                        Vec::new()
+                    } else {
+                        leaves[index][0].0.to_vec()
+                    };
+                    (separator, token.to_string())
+                },
+            )));
+            backend
+                .write_if(&root_path, root.encode(), &version)
+                .await
+                .unwrap();
+            let mut config = EngineConfig::default();
+            config.set_inline_policy(inline);
+            let engine = Engine::open(
+                collection.db_root(),
+                DatabaseId::from_bytes([1; 16]),
+                backend.clone(),
+                config,
+            )
+            .await
+            .unwrap();
+            rt::sleep(Duration::from_millis(1)).await;
+            Self {
+                engine,
+                backend,
+                hooks,
+                collection,
+                paths,
+            }
+        }
+
+        async fn rmw(&self, keys: &[&[u8]], output_bytes: usize) -> Result<(), TransError> {
+            let mut tx = self
+                .engine
+                .begin_transaction(AccessSet::default(), CatalogAccesses::default());
+            loop {
+                let mut reads = Vec::new();
+                let mut writes = Vec::new();
+                for raw in keys {
+                    let key = LogicalKey::new(self.collection.clone(), raw);
+                    let (value, evidence) =
+                        self.engine.read(&key, Duration::MAX).await?.into_parts();
+                    let value = value.ok_or_else(|| TransError::other("workload key is absent"))?;
+                    let counter = decode_counter(&value.value)?;
+                    let mut next = vec![0; output_bytes];
+                    next[..8].copy_from_slice(&(counter + 1).to_le_bytes());
+                    reads.push(ReadAccess::new(key.clone(), evidence));
+                    writes.push(WriteAccess::put(key, Arc::from(next)));
+                }
+                self.engine.reset_transaction(
+                    &mut tx,
+                    AccessSet::new(reads, writes, Vec::new()),
+                    CatalogAccesses::default(),
+                );
+                if self.engine.commit(&mut tx).await? == BodyDecision::ReturnOutcome {
+                    break;
+                }
+            }
+            self.engine.end(&mut tx).await?;
+            // Let finite write-back and immediate GC hints finish so later
+            // request counts do not include cleanup from these commits.
+            rt::sleep(Duration::from_millis(1)).await;
+            Ok(())
+        }
+
+        async fn source(&self, index: usize) -> Node {
+            Node::decode(
+                &self
+                    .backend
+                    .read(&self.paths[index].to_string())
+                    .await
+                    .unwrap()
+                    .contents,
+            )
+            .unwrap()
+        }
+
+        async fn counter(&self, key: &[u8]) -> u64 {
+            let (value, _) = self
+                .engine
+                .read(
+                    &LogicalKey::new(self.collection.clone(), key),
+                    Duration::MAX,
+                )
+                .await
+                .unwrap()
+                .into_parts();
+            decode_counter(&value.unwrap().value).unwrap()
+        }
+    }
+
+    fn decode_counter(value: &[u8]) -> Result<u64, TransError> {
+        let bytes = value
+            .get(..8)
+            .ok_or_else(|| TransError::other("workload value has no counter"))?;
+        let bytes = bytes
+            .try_into()
+            .map_err(|_| TransError::other("invalid workload counter"))?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn requests(stats: BackendStats) -> u64 {
+        stats.obj_reads + stats.obj_writes + stats.obj_lists
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_missed_direct_commits_can_merge_and_restore_the_direct_path() {
+        let workload = Workload::open(
+            InlinePolicy::default(),
+            &[&[(b"a", 8), (b"b", 8)], &[(b"m", 8), (b"n", 8)]],
+        )
+        .await;
+        workload.engine.stats_and_reset();
+        for _ in 0..16 {
+            let (a, b) = tokio::join!(
+                workload.rmw(&[b"a", b"m"], 8),
+                workload.rmw(&[b"b", b"n"], 8)
+            );
+            a.unwrap();
+            b.unwrap();
+        }
+        let before = workload.engine.stats_and_reset();
+        assert_eq!(before.direct_commit.landed, 0);
+        assert_eq!(before.tree_rebalancer.merge_hints, 32);
+        assert_eq!(before.tree_rebalancer.merges_completed, 0);
+        rt::sleep(Duration::from_secs(31)).await;
+        rt::sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            workload
+                .engine
+                .stats_and_reset()
+                .tree_rebalancer
+                .merges_completed,
+            1
+        );
+        assert_eq!(workload.source(0).await.as_leaf().unwrap().len(), 4);
+        let right = workload.source(1).await;
+        let target = ObjectPath::Node {
+            collection: workload.collection.clone(),
+            token: NodeToken::try_from(right.forwarding_target().unwrap()).unwrap(),
+        };
+        assert_eq!(target, workload.paths[0]);
+        workload.engine.stats_and_reset();
+        for _ in 0..32 {
+            workload.rmw(&[b"a", b"m"], 8).await.unwrap();
+        }
+        let after = workload.engine.stats_and_reset();
+        assert_eq!(after.direct_commit.landed, 32);
+        assert_eq!(
+            requests(after.backend),
+            32,
+            "each warm commit still uses one request"
+        );
+        assert!(requests(before.backend) > requests(after.backend));
+        for (key, expected) in [(b"a", 48), (b"m", 48), (b"b", 16), (b"n", 16)] {
+            assert_eq!(workload.counter(key).await, expected);
+        }
+        workload.engine.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn left_direct_commit_can_win_before_merge_publication() {
+        let workload = Workload::open(InlinePolicy::default(), &[&[(b"a", 8)], &[(b"m", 8)]]).await;
+        for _ in 0..32 {
+            workload.rmw(&[b"a", b"m"], 8).await.unwrap();
+        }
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let publications = Arc::new(AtomicUsize::new(0));
+        workload.hooks.set_before({
+            let left = workload.paths[0].to_string();
+            let right = workload.paths[1].to_string();
+            let entered = entered.clone();
+            let resume = resume.clone();
+            let publications = publications.clone();
+            move |operation| {
+                let publication = matches!(operation,
+                    BackendOp::WriteIf { path, value, .. } if *path == left
+                        && Node::decode(value).is_ok_and(|node| node.structural_gate().intent().is_some())
+                );
+                if publication {
+                    publications.fetch_add(1, Ordering::SeqCst);
+                }
+                let pause = matches!(operation,
+                    BackendOp::WriteIf { path, value, .. } if *path == right
+                        && Node::decode(value).is_ok_and(|node| node.structural_gate().intent().is_some())
+                );
+                let entered = entered.clone();
+                let resume = resume.clone();
+                let future: HookFuture = Box::pin(async move {
+                    if pause {
+                        entered.notify_one();
+                        resume.notified().await;
+                    }
+                    Ok(())
+                });
+                future
+            }
+        });
+        rt::sleep(Duration::from_secs(31)).await;
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("hinted merge must reach publication");
+        assert!(
+            workload
+                .source(0)
+                .await
+                .structural_gate()
+                .holder()
+                .is_none()
+        );
+        assert!(
+            workload
+                .source(1)
+                .await
+                .structural_gate()
+                .holder()
+                .is_some()
+        );
+        assert_eq!(workload.counter(b"m").await, 32);
+        workload.engine.stats_and_reset();
+
+        tokio::time::timeout(Duration::from_secs(5), workload.rmw(&[b"a"], 8))
+            .await
+            .expect("left writes must not wait for merge publication")
+            .unwrap();
+        assert_eq!(workload.engine.stats_and_reset().direct_commit.landed, 1);
+        resume.notify_waiters();
+        rt::sleep(Duration::from_millis(1)).await;
+        assert_eq!(publications.load(Ordering::SeqCst), 1);
+        workload.hooks.clear_before();
+
+        for index in [0, 1] {
+            let node = workload.source(index).await;
+            assert_eq!(node.as_leaf().unwrap().len(), 1);
+            assert!(node.structural_gate().holder().is_none());
+        }
+        assert_eq!(workload.counter(b"a").await, 33);
+        assert_eq!(workload.counter(b"m").await, 32);
+        assert_eq!(
+            workload
+                .engine
+                .stats_and_reset()
+                .tree_rebalancer
+                .merges_completed,
+            0
+        );
+        workload.engine.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn merge_hints_leave_nonadjacent_or_inline_full_leaves_separate() {
+        for (inline, leaves, keys) in [
+            (
+                InlinePolicy::default(),
+                vec![vec![(b"a".as_slice(), 8)], vec![(b"m", 8)], vec![(b"z", 8)]],
+                [b"a".as_slice(), b"z".as_slice()],
+            ),
+            (
+                InlinePolicy {
+                    max_value_bytes: 100,
+                    max_leaf_bytes: 200,
+                },
+                vec![
+                    vec![(b"a".as_slice(), 8), (b"b", 80)],
+                    vec![(b"m", 8), (b"n", 80)],
+                ],
+                [b"a".as_slice(), b"m".as_slice()],
+            ),
+        ] {
+            let refs: Vec<_> = leaves.iter().map(Vec::as_slice).collect();
+            let workload = Workload::open(inline, &refs).await;
+            for _ in 0..32 {
+                workload.rmw(&keys, 8).await.unwrap();
+            }
+            rt::sleep(Duration::from_secs(31)).await;
+            rt::sleep(Duration::from_millis(1)).await;
+            let stats = workload.engine.stats_and_reset();
+            assert_eq!(stats.tree_rebalancer.merge_candidates, 1);
+            assert_eq!(stats.tree_rebalancer.merges_completed, 0);
+            assert!(workload.source(0).await.forwarding_target().is_none());
+            for key in keys {
+                assert_eq!(workload.counter(key).await, 32);
+            }
+            workload.engine.shutdown().await;
+        }
     }
 }

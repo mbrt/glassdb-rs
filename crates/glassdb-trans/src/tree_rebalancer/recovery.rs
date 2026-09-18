@@ -9,13 +9,14 @@ use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, StructuralI
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
     CollectionStore, CurrentnessBarrier, LeafObservation, LockType, Node, NodeStore, Observation,
-    Requirement, StorageError, StructuralIntent, StructuralIntentPhase, StructuralIntentStore,
-    Timeline, TreeRouter,
+    Requirement, SplitIntent, SplitIntentPhase, StorageError, StructuralIntent,
+    StructuralIntentStore, Timeline, TreeRouter,
 };
 
 use crate::error::TransError;
 use crate::monitor::Monitor;
 
+use super::merge::MergeProtocol;
 use super::{
     PARENT_RETRIES, ParentSplitContinuation, SeparatorPublication, SeparatorPublicationOutcome,
     SeparatorPublisher, StructuralNodeAccess,
@@ -31,16 +32,17 @@ pub(super) struct StructuralRecovery {
     mon: Monitor,
     structural_nodes: StructuralNodeAccess,
     publisher: SeparatorPublisher,
+    merges: MergeProtocol,
     timeline: Timeline,
     db_root: DbRoot,
     retry: RetryConfig,
     scan_cursor: Arc<Mutex<Option<glassdb_backend::ListCursor>>>,
 }
 
-/// Proves that one structural intent is still in its cancellable state.
+/// Proves that one split intent is still in its cancellable state.
 pub(super) struct PreparedIntent {
     observed: Observation<StructuralIntent>,
-    intent: StructuralIntent,
+    intent: SplitIntent,
 }
 
 /// Retains the exact cancellable observation after split coordination starts.
@@ -48,10 +50,10 @@ pub(super) struct PreparedIntentCleanup {
     observed: Observation<StructuralIntent>,
 }
 
-/// Proves that a structural intent may require durable recovery.
+/// Proves that a split intent may require durable recovery.
 pub(super) struct ReadyIntent {
     expected: Observation<StructuralIntent>,
-    intent: StructuralIntent,
+    intent: SplitIntent,
     observed: Option<Observation<StructuralIntent>>,
 }
 
@@ -207,16 +209,19 @@ impl PreparedIntent {
     fn from_observation(observed: Observation<StructuralIntent>) -> Result<Self, TransError> {
         let intent = observed
             .value()
+            .and_then(|intent| match intent.as_ref() {
+                StructuralIntent::Split(intent) => Some(intent),
+                StructuralIntent::Merge(_) => None,
+            })
             .filter(|intent| {
-                intent.phase == StructuralIntentPhase::Preparing
+                intent.phase == SplitIntentPhase::Preparing
                     && if intent.is_root() {
                         intent.created_tokens.len() == 2
                     } else {
                         intent.source_token.is_some() && intent.created_tokens.len() == 1
                     }
             })
-            .ok_or_else(|| TransError::other("invalid prepared structural intent"))?
-            .as_ref()
+            .ok_or_else(|| TransError::other("invalid prepared split intent"))?
             .clone();
         Ok(Self { observed, intent })
     }
@@ -225,7 +230,7 @@ impl PreparedIntent {
         let mut intent = self.intent;
         intent.source_version = source_version;
         intent.split_key = split_key;
-        intent.phase = StructuralIntentPhase::Ready;
+        intent.phase = SplitIntentPhase::Ready;
         ReadyIntent {
             expected: self.observed,
             intent,
@@ -243,7 +248,7 @@ impl ReadyIntent {
     fn confirm(&mut self, observed: Observation<StructuralIntent>) -> Result<(), TransError> {
         let matches = observed
             .value()
-            .is_some_and(|intent| intent.as_ref() == &self.intent);
+            .is_some_and(|intent| matches!(intent.as_ref(), StructuralIntent::Split(split) if split == &self.intent));
         if !matches {
             return Err(TransError::other(
                 "Ready transition returned an unexpected structural intent",
@@ -297,6 +302,7 @@ impl StructuralRecovery {
         timeline: Timeline,
         db_root: DbRoot,
         retry: RetryConfig,
+        merges: MergeProtocol,
     ) -> Self {
         Self {
             records,
@@ -306,6 +312,7 @@ impl StructuralRecovery {
             mon,
             structural_nodes,
             publisher,
+            merges,
             timeline,
             db_root,
             retry,
@@ -335,15 +342,15 @@ impl StructuralRecovery {
             .write(
                 collection.db_root_component(),
                 &intent_id,
-                &StructuralIntent {
+                &StructuralIntent::Split(SplitIntent {
                     collection: collection.clone(),
                     source_token: source_token.cloned(),
                     source_version: String::new(),
                     created_tokens,
                     split_key: Vec::new(),
                     participant_id: participant.clone(),
-                    phase: StructuralIntentPhase::Preparing,
-                },
+                    phase: SplitIntentPhase::Preparing,
+                }),
             )
             .await?;
         PreparedIntent::from_observation(observed)
@@ -370,7 +377,10 @@ impl StructuralRecovery {
         let mut ready = prepared.into_ready(source_version, split_key);
         match self
             .intent_store
-            .update(&ready.expected, &ready.intent)
+            .update(
+                &ready.expected,
+                &StructuralIntent::Split(ready.intent.clone()),
+            )
             .await
         {
             Ok(Some(observed)) => match ready.confirm(observed) {
@@ -548,7 +558,7 @@ impl StructuralRecovery {
                 }) => {
                     sweep.failed |= !matches!(error, TransError::Retry);
                     tracing::debug!(
-                        target: "glassdb::splitter",
+                        target: "glassdb::tree_rebalancer",
                         intent = ?intent,
                         participant = ?participant,
                         error = %error,
@@ -730,7 +740,7 @@ impl StructuralRecovery {
         let participants = intents
             .iter()
             .filter_map(|(_, observed)| observed.value())
-            .map(|intent| (intent.collection.clone(), intent.participant_id.clone()))
+            .map(|intent| (intent.collection().clone(), intent.participant_id().clone()))
             .collect();
         Ok(RecoverySweep {
             intents,
@@ -746,8 +756,9 @@ impl StructuralRecovery {
         &self,
         intents: Vec<(StructuralIntentId, Observation<StructuralIntent>)>,
     ) -> impl Iterator<Item = (StructuralIntentId, DiscoveredIntent)> {
-        // Every Ready body is already in hand and stays fixed until deletion.
-        // One post-discovery barrier can therefore cover this entire batch.
+        // A Ready split body stays fixed until deletion. One post-discovery
+        // barrier can therefore cover split classification in this batch.
+        // Merge recovery reloads its intent and captures its own later bounds.
         // Later discoveries must pass through here again, including intents
         // created by recursive recovery under an already-final participant.
         // Neither the discovery bound nor an observation's watermark proves
@@ -772,6 +783,14 @@ impl StructuralRecovery {
     ) -> Result<IntentRecoveryStep, TransError> {
         if let Some(result) = parent_result {
             result?;
+        }
+        if recovery
+            .observed
+            .value()
+            .is_some_and(|intent| matches!(intent.as_ref(), StructuralIntent::Merge(_)))
+        {
+            self.merges.recover(&recovery.observed).await?;
+            return Ok(IntentRecoveryStep::Completed);
         }
         loop {
             match &mut recovery.phase {
@@ -844,7 +863,7 @@ impl StructuralRecovery {
                 let intent = recovery.observed.value().ok_or_else(|| {
                     TransError::other("structural intent disappeared after listing")
                 })?;
-                if intent.collection != settlement.collection {
+                if intent.collection() != &settlement.collection {
                     return Err(TransError::other(
                         "topology participant owns intents for multiple collections",
                     ));
@@ -890,9 +909,11 @@ impl StructuralRecovery {
     ) -> Result<IntentRecoveryPhase, TransError> {
         let intent = observed
             .value()
-            .ok_or_else(|| TransError::other("structural intent disappeared after listing"))?
-            .clone();
-        if intent.phase == StructuralIntentPhase::Preparing {
+            .ok_or_else(|| TransError::other("structural intent disappeared after listing"))?;
+        let StructuralIntent::Split(intent) = intent.as_ref() else {
+            return Err(TransError::other("expected a split intent"));
+        };
+        if intent.phase == SplitIntentPhase::Preparing {
             // Cached Preparing can hide Ready while the participant is live;
             // its owner drives publication without waiting for this sweep.
             if self.mon.tx_status(&intent.participant_id).await? == TxCommitStatus::Pending {
@@ -991,7 +1012,22 @@ impl StructuralRecovery {
                         .load_node_state(collection, token, Requirement::after(barrier))
                         .await
                     {
-                        Ok(node) => self.nodes.delete_node(&node).await?,
+                        Ok(node) => {
+                            let body = node.value().ok_or(StorageError::NotFound)?;
+                            // A merge can retire this identity between the
+                            // reachability check and this load. Retirement is
+                            // permanent proof that the split attached it.
+                            if body.forwarding_target().is_some() {
+                                continue;
+                            }
+                            // The retained left leaf can cover this right
+                            // source before its redirect is durable. Wait for
+                            // the intent before classifying it as unattached.
+                            if body.structural_gate().intent().is_some() {
+                                return Err(TransError::Retry);
+                            }
+                            self.nodes.delete_node(&node).await?;
+                        }
                         Err(StorageError::NotFound) => {}
                         Err(error) => return Err(error.into()),
                     }

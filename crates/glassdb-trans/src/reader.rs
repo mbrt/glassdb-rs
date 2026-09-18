@@ -256,7 +256,11 @@ mod tests {
                 .await
                 .unwrap();
             let resolver = KeyResolver::new(
-                TreeRouter::new(local.nodes.clone(), NonZeroUsize::MIN),
+                TreeRouter::new(
+                    local.nodes.clone(),
+                    local.timeline.clone(),
+                    NonZeroUsize::MIN,
+                ),
                 KeyStateResolver::new(local.monitor.clone()),
                 NonZeroUsize::MIN,
             );
@@ -326,6 +330,10 @@ mod tests {
                         local.nodes.clone(),
                         KeyStateResolver::new(local.monitor.clone()),
                         local.monitor.clone(),
+                        crate::node_locking::StructuralGateRetry::new(
+                            local.timeline.clone(),
+                            Arc::default(),
+                        ),
                         RetryConfig::default(),
                         glassdb_storage::SplitPolicy::default(),
                         Arc::new(NoSplitHints),
@@ -339,7 +347,11 @@ mod tests {
                     );
                     let locker = Locker::new(
                         coord,
-                        TreeRouter::new(local.nodes.clone(), NonZeroUsize::MIN),
+                        TreeRouter::new(
+                            local.nodes.clone(),
+                            local.timeline.clone(),
+                            NonZeroUsize::MIN,
+                        ),
                         state,
                         local.monitor.clone(),
                         RetryConfig::default(),

@@ -4,6 +4,9 @@
 
 Accepted — implemented.
 
+[ADR-072](072-leaf-merging-and-splitting.md) retains this pressure policy.
+Missed direct attempts across two leaves can supply a background merge hint.
+
 Supersedes [ADR-051](051-inline-latest-values.md)'s initial direct-commit
 eligibility, which was limited to one `Put` of an existing key and reads of that
 same found key. ADR-051's authoritative inline representation and bounded

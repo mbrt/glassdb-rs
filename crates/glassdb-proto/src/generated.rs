@@ -207,6 +207,10 @@ pub struct NodeLock {
     pub lock_type: i32,
     #[prost(bytes = "vec", repeated, tag = "2")]
     pub locked_by: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    /// Only a structural gate can be bound to a structural intent. Its owner
+    /// becoming final does not release the gate.
+    #[prost(string, tag = "3")]
+    pub structural_intent: ::prost::alloc::string::String,
 }
 /// A leaf body: the point-access coordination entries for one terminal node.
 /// See ADR-017.
@@ -286,7 +290,7 @@ pub struct Node {
     /// fence.
     #[prost(bytes = "vec", tag = "8")]
     pub collection_delete_intent: ::prost::alloc::vec::Vec<u8>,
-    #[prost(oneof = "node::Body", tags = "3, 4")]
+    #[prost(oneof = "node::Body", tags = "3, 4, 9")]
     pub body: ::core::option::Option<node::Body>,
 }
 /// Nested message and enum types in `Node`.
@@ -299,33 +303,49 @@ pub mod node {
         /// An index node: separator keys mapping ranges to child nodes.
         #[prost(message, tag = "4")]
         Index(super::IndexNode),
+        /// A retired node identity that forwards all routing to this node.
+        #[prost(string, tag = "9")]
+        Forward(::prost::alloc::string::String),
     }
 }
-/// A structural intent for one split. It lives at
-/// `{db}/_s/<participant_id>/<intent_id>` until the created nodes are reachable
-/// or reclaimed.
+/// A structural intent for one split or merge. It lives at
+/// `{db}/_s/<participant_id>/<intent_id>` until the change completes or is cancelled.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StructuralIntent {
     #[prost(string, tag = "1")]
     pub prefix: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub source_token: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub source_version: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "4")]
-    pub created_tokens: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(bytes = "vec", tag = "5")]
-    pub split_key: ::prost::alloc::vec::Vec<u8>,
-    #[prost(bool, tag = "6")]
-    pub is_root: bool,
     /// The topology participant that owns this intent.
-    #[prost(bytes = "vec", tag = "7")]
+    #[prost(bytes = "vec", tag = "2")]
     pub participant_id: ::prost::alloc::vec::Vec<u8>,
-    #[prost(enumeration = "structural_intent::Phase", tag = "8")]
-    pub phase: i32,
+    #[prost(oneof = "structural_intent::Operation", tags = "3, 4")]
+    pub operation: ::core::option::Option<structural_intent::Operation>,
 }
 /// Nested message and enum types in `StructuralIntent`.
 pub mod structural_intent {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Operation {
+        #[prost(message, tag = "3")]
+        Split(super::SplitIntent),
+        #[prost(message, tag = "4")]
+        Merge(super::MergeIntent),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SplitIntent {
+    /// Empty for the collection root.
+    #[prost(string, tag = "1")]
+    pub source_token: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub source_version: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "3")]
+    pub created_tokens: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub split_key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(enumeration = "split_intent::Phase", tag = "5")]
+    pub phase: i32,
+}
+/// Nested message and enum types in `SplitIntent`.
+pub mod split_intent {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Phase {
@@ -348,6 +368,55 @@ pub mod structural_intent {
             match value {
                 "PREPARING" => Some(Self::Preparing),
                 "READY" => Some(Self::Ready),
+                _ => None,
+            }
+        }
+    }
+}
+/// A merge retains the left source and redirects the right source to it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MergeIntent {
+    #[prost(string, tag = "1")]
+    pub left_token: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub left_version: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub right_token: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub right_version: ::prost::alloc::string::String,
+    #[prost(enumeration = "merge_intent::Phase", tag = "5")]
+    pub phase: i32,
+}
+/// Nested message and enum types in `MergeIntent`.
+pub mod merge_intent {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum Phase {
+        Preparing = 0,
+        Ready = 1,
+        Applying = 2,
+        Aborting = 3,
+    }
+    impl Phase {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Preparing => "PREPARING",
+                Self::Ready => "READY",
+                Self::Applying => "APPLYING",
+                Self::Aborting => "ABORTING",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "PREPARING" => Some(Self::Preparing),
+                "READY" => Some(Self::Ready),
+                "APPLYING" => Some(Self::Applying),
+                "ABORTING" => Some(Self::Aborting),
                 _ => None,
             }
         }

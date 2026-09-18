@@ -19,7 +19,7 @@ use crate::leaf_coord::{
     CoordinatedOutcome, LeafCoordinator, LeafOperation, LeafResolver, MemberOutcome, ReloadCause,
     ResolveCtx, StageAdmission, Step,
 };
-use crate::split::SplitHintSink;
+use crate::tree_rebalancer::TopologyHintSink;
 
 /// Direct same-leaf commit coverage for one snapshot or accumulated interval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -60,7 +60,7 @@ pub(super) struct DirectCommit {
     router: TreeRouter,
     coord: LeafCoordinator,
     inline_policy: InlinePolicy,
-    split_hints: SplitHintSink,
+    topology_hints: TopologyHintSink,
     cleanup_hints: GcHints,
     counters: Arc<DirectCommitCounters>,
 }
@@ -71,14 +71,14 @@ impl DirectCommit {
         router: TreeRouter,
         coord: LeafCoordinator,
         inline_policy: InlinePolicy,
-        split_hints: SplitHintSink,
+        topology_hints: TopologyHintSink,
         cleanup_hints: GcHints,
     ) -> Self {
         DirectCommit {
             router,
             coord,
             inline_policy,
-            split_hints,
+            topology_hints,
             cleanup_hints,
             counters: Arc::new(DirectCommitCounters::default()),
         }
@@ -120,7 +120,7 @@ impl DirectCommit {
         {
             return Ok(DirectAttempt::Locked);
         }
-        let Some(mut leaf_path) = self.route_member(&member).await? else {
+        let Some(mut leaf_path) = self.route_member(&member, Some(id)).await? else {
             return Ok(DirectAttempt::Locked);
         };
         self.counters.candidates.fetch_add(1, Ordering::Relaxed);
@@ -135,7 +135,7 @@ impl DirectCommit {
                 leaf_path.clone(),
                 member.clone(),
                 self.inline_policy,
-                self.split_hints.clone(),
+                self.topology_hints.clone(),
             );
             let outcome = self.coord.coordinate(operation).await?;
             match outcome {
@@ -150,7 +150,7 @@ impl DirectCommit {
                 }
                 DirectMutationOutcome::Replay => return Ok(DirectAttempt::Replay),
                 DirectMutationOutcome::Reroute if !rerouted => {
-                    let Some(path) = self.route_member(&member).await? else {
+                    let Some(path) = self.route_member(&member, None).await? else {
                         return Ok(DirectAttempt::Locked);
                     };
                     leaf_path = path;
@@ -164,7 +164,11 @@ impl DirectCommit {
     }
 
     /// Selects one candidate leaf for all dependencies in `member`.
-    async fn route_member(&self, member: &DirectMember) -> Result<Option<ObjectPath>, TransError> {
+    async fn route_member(
+        &self,
+        member: &DirectMember,
+        hint_id: Option<&TxId>,
+    ) -> Result<Option<ObjectPath>, TransError> {
         let keys = member
             .keys
             .iter()
@@ -176,6 +180,25 @@ impl DirectCommit {
             .await?;
         Ok(match groups.as_slice() {
             [group] => Some(group.path().clone()),
+            [left, right] => {
+                if let (Some(id), Some(left_node), Some(right_node)) =
+                    (hint_id, left.node(), right.node())
+                {
+                    let output_bytes = member.output_keys().fold(0usize, |bytes, key| {
+                        bytes.saturating_add(match &key.write {
+                            Some(DirectWrite::Put(value)) => value.len(),
+                            _ => 0,
+                        })
+                    });
+                    self.topology_hints.observe_cross_leaf_miss(
+                        id,
+                        [left.path(), right.path()],
+                        [left_node, right_node],
+                        output_bytes,
+                    );
+                }
+                None
+            }
             _ => None,
         })
     }
@@ -217,7 +240,7 @@ struct DirectCommitOperation {
     leaf_path: ObjectPath,
     member: DirectMember,
     inline: InlinePolicy,
-    split_hints: SplitHintSink,
+    topology_hints: TopologyHintSink,
     /// Output states replaced by the last proposed publication. The outer
     /// option distinguishes "not staged" from a staged create over absence.
     staged_over: Mutex<Option<BTreeMap<Vec<u8>, CurrentState>>>,
@@ -232,14 +255,14 @@ impl DirectCommitOperation {
         leaf_path: ObjectPath,
         member: DirectMember,
         inline: InlinePolicy,
-        split_hints: SplitHintSink,
+        topology_hints: TopologyHintSink,
     ) -> Self {
         Self {
             id,
             leaf_path,
             member,
             inline,
-            split_hints,
+            topology_hints,
             staged_over: Mutex::new(None),
             landed_proven: AtomicBool::new(false),
         }
@@ -283,6 +306,7 @@ impl DirectCommitOperation {
         locks: &mut NodeLocks,
         changes_membership: bool,
     ) -> Result<bool, TransError> {
+        ctx.gate_retry.check(locks)?;
         // Pruning only the staged copy keeps this outside the lock lifecycle:
         // finalized metadata becomes durable iff the publication CAS lands.
         if let Some(holder) = locks.delete_intent().cloned() {
@@ -467,7 +491,7 @@ impl DirectCommitOperation {
         if !self.inline.admits_value(value_len) {
             return;
         }
-        self.split_hints
+        self.topology_hints
             .observe_inline_pressure(&self.leaf_path, &key.raw_key, value_len);
     }
 

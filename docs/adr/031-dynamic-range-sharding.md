@@ -4,6 +4,10 @@
 
 Accepted — implemented.
 
+[ADR-072](072-leaf-merging-and-splitting.md) adds merges from bounded
+local hints, with recoverable publication and permanent redirects. It retains
+this ADR's required splits.
+
 Supersedes the fixed-hash key→shard mapping and fixed shard count of
 [ADR-016](016-object-storage-native-layout.md) (the "fixed `C` shards" clause),
 [ADR-017](017-shard-object.md) (FNV-1a `key & (C-1)` mapping, the fixed `_s/<i>`

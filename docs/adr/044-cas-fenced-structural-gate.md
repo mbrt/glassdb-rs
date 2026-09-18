@@ -12,6 +12,10 @@ recovery, and hard-cap decisions remain unchanged.
 Also supersedes [ADR-033](033-transactional-key-iteration.md)'s requirement that
 an escalated scan hold structure-R; its membership-R predicate lock remains.
 
+[ADR-072](072-leaf-merging-and-splitting.md) adds intent-owned gates that survive
+owner finalization and advances the membership generation on ordinary gate
+acquisition to prevent content-version reuse after cleanup.
+
 ## Context
 
 ADR-032 gives splits priority over hot-node traffic by making every node

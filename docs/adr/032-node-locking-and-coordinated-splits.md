@@ -21,6 +21,10 @@ the commit CAS. The regular locked protocol is unchanged.
 [ADR-062](062-splitter-driven-tombstone-reclamation.md) additionally makes the
 membership version the validation generation for unmarked point absence.
 
+[ADR-072](072-leaf-merging-and-splitting.md) advances that generation when an
+ordinary structural gate is acquired, including for splits, so cleanup cannot
+restore a delayed acquisition's original content-CAS predicate.
+
 Supersedes the **"escalate to per-leaf read locks"** membership clause of
 [ADR-031](031-dynamic-range-sharding.md). It **refines** — does not replace —
 ADR-031's split: the source-shrink CAS stays the split's linearization point and

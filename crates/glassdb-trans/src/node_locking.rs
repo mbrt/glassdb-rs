@@ -2,15 +2,17 @@
 //!
 //! The leaf coordinator owns the shared transaction mutation protocol. This
 //! module owns the wound-wait transitions applied to membership locks and the
-//! full-node quiescing sequence required before a split closes the structural
-//! gate.
+//! full-node quiescing sequence required before a split or merge closes the
+//! structural gate. Intent-owned gates request recovery through ordinary retries.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use glassdb_data::{CollectionAddress, LogicalKey, ObjectPath, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
-use glassdb_storage::{LeafEntry, LeafObservation, LockType, NodeLocks, Requirement};
+use glassdb_storage::{LeafEntry, LeafObservation, LockType, NodeLocks, Requirement, Timeline};
+use tokio::sync::Notify;
 
 use crate::error::TransError;
 use crate::key_state_resolver::KeyStateResolver;
@@ -21,18 +23,55 @@ use crate::leaf_coord::{
 use crate::monitor::Monitor;
 use crate::wound_wait::{Reclaim, try_reclaim};
 
+/// Requests recovery and fresh resolution of intent-owned structural gates.
+#[derive(Clone)]
+pub(crate) struct StructuralGateRetry {
+    timeline: Timeline,
+    recovery_wake: Arc<Notify>,
+}
+
+impl StructuralGateRetry {
+    pub(crate) fn new(timeline: Timeline, recovery_wake: Arc<Notify>) -> Self {
+        Self {
+            timeline,
+            recovery_wake,
+        }
+    }
+
+    /// Defers a mutation until structural recovery releases the observed gate.
+    pub(crate) fn check(&self, locks: &NodeLocks) -> Result<(), TransError> {
+        if locks.structural_gate().intent().is_some() {
+            // Final owner status cannot release an intent-owned gate. Capture
+            // a new bound after each observation so cached gates cannot stall
+            // retries.
+            self.recovery_wake.notify_one();
+            return Err(TransError::ValidateRetry(Requirement::after(
+                self.timeline.currentness_barrier(),
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Wound-wait policy over one node's structural gate and membership lock.
 pub(crate) struct NodeLockReconciler<'a> {
     key_state: &'a KeyStateResolver,
     monitor: &'a Monitor,
+    gate_retry: &'a StructuralGateRetry,
     id: &'a TxId,
 }
 
 impl<'a> NodeLockReconciler<'a> {
-    pub(crate) fn new(key_state: &'a KeyStateResolver, monitor: &'a Monitor, id: &'a TxId) -> Self {
+    pub(crate) fn new(
+        key_state: &'a KeyStateResolver,
+        monitor: &'a Monitor,
+        gate_retry: &'a StructuralGateRetry,
+        id: &'a TxId,
+    ) -> Self {
         Self {
             key_state,
             monitor,
+            gate_retry,
             id,
         }
     }
@@ -93,6 +132,7 @@ impl<'a> NodeLockReconciler<'a> {
         &self,
         locks: &mut NodeLocks,
     ) -> Result<Option<TxId>, TransError> {
+        self.gate_retry.check(locks)?;
         if let Some(holder) = self.reconcile_delete_intent(locks).await? {
             return Ok(Some(holder));
         }
@@ -118,6 +158,7 @@ impl<'a> NodeLockReconciler<'a> {
         &self,
         locks: &mut NodeLocks,
     ) -> Result<Option<TxId>, TransError> {
+        self.gate_retry.check(locks)?;
         if let Some(holder) = self.reconcile_delete_intent(locks).await? {
             return Ok(Some(holder));
         }
@@ -289,7 +330,7 @@ impl LeafResolver for StructuralGateOperation {
             }
             _ => return Err(TransError::other("structural gate target is not a leaf")),
         };
-        let reconciler = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id);
+        let reconciler = NodeLockReconciler::new(ctx.key_state, ctx.tmon, ctx.gate_retry, &self.id);
         let entries = match reconciler
             .quiesce_entries(&collection, staged, ctx.requirement)
             .await?

@@ -9,6 +9,112 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-09-18: leaf-merge performance check
+
+Status: measured the uncommitted ADR-072 feature against `01e1bb44`. Sustained
+cross-leaf demand benefits, but the local heuristic can also increase backend
+work and reduce throughput. No engine or repository benchmark code changed
+during this investigation.
+
+### Method
+
+Release builds used the same compiler, lockfile, and benchmark sources. Each
+program ran alone with fixed CPU affinity. There were three alternating
+base/feature pairs for each S3 probe, all eight existing diagnostics, the
+existing S3/GCS inline-pressure benchmark, and the four-instance mixed workload.
+One additional GCS merge pair was exploratory.
+
+The focused probe seeded two equal leaves through public transactions, with a
+lower entry cap used only during setup. It then reopened with default policies.
+The normal pair contained 128 keys with 8-byte values. Two keys on opposite
+sides of the separator received 32 read-modify-write transactions, followed by
+a 35-model-second wait for the existing merge policy. No hint thresholds or
+engine waits changed. This measures an eligible pair, not how often a workload
+creates one.
+
+The table reports median paired changes. Backend requests and attempted write
+bytes include the first 32 transactions, the wait, topology work, later
+transactions, and managed shutdown. Setup and fresh-client verification are
+excluded. Throughput covers only the later transactions and excludes idle
+waits. Each comparison used the same number of logical transactions.
+
+### Focused S3 results
+
+| Demand after the wait | Total requests | Total write bytes | Later throughput |
+| --- | ---: | ---: | ---: |
+| 128 more transactions on the same pair | -53% | -25% | 2.63x |
+| Two independent instances, 64 single-key updates each | +33% | +63% | -55% |
+| No more mutations | +16% | +7% | N/A |
+| Same paired demand, but 256 entries prevent a merge | +0.1% | -3% | -0.5% |
+
+The sustained case merged two leaves into one and made all 128 later
+transactions direct commits. The merge interval added 23–24 requests. The
+average saving suggests a break-even of about eight later paired transactions.
+This is an estimate, not a measured break-even run.
+
+The independent instances updated different former leaf ranges concurrently.
+After the merge, their conditional writes competed on one leaf. All 128
+transactions still committed directly in both versions. During these updates,
+requests increased by 50% and write bytes by 108%. Thus, direct-commit coverage
+alone does not measure the cost of losing separate conditional-write targets.
+The throughput regression was consistent: feature/base ratios were
+0.434–0.487. Capacity rejection showed no clear change: total request ratios
+were 0.977–1.035.
+
+A further case used 1 KiB values and added inline demand after the paired
+transactions. Both versions completed four pressure splits. The pressure phase
+used 17% more requests after merging, although the full workload used 39%
+fewer because the earlier paired transactions benefited. Pressure-phase p50
+latency increased in two of three pairs: its median ratio was 1.833, with a
+0.782–1.848 range. The p90 ratio was 1.082, with a 1.076–1.488 range.
+
+In the sustained, independent-writer, and transient cases, a fresh read of an
+untouched key in the former right range needed four backend requests after a
+merge, versus three before. Its value representation was the same. The redirect
+adds a routing hop, and the retained leaf is larger.
+
+### Existing benchmarks and failed attempts
+
+All eight diagnostics kept identical request counts per transaction in each
+matched pair. Median latency changes ranged from -1.4% to +1.6%. Inline
+read-modify-write remained at one write and zero reads. The existing
+inline-pressure benchmark completed two splits and all 64 recovery mutations
+directly in every S3 and GCS run. Its median request ratio was 1.000 in both
+profiles; one GCS pair used 5.4% more requests.
+
+The mixed workload used four database instances, spread and hot modes, and
+ten-second windows. Median request ratios per transaction were 0.990 and 0.975,
+but individual pairs ranged from 0.960 to 1.081. Spread multi-key read-only
+throughput fell in every pair (ratios 0.896–0.960); the other throughput results
+also varied by shape. These short runs do not establish an overall benefit.
+The harness has no completed-merge counter, so it cannot attribute these
+changes to completed merges.
+
+The exploratory GCS pair evaluated five merge candidates and completed no
+merges. The first candidate matured during active foreground work. Total
+requests increased from 1,981 to 2,346, and later throughput was 15% lower.
+Structural-intent and topology writes show that failed attempts can add durable
+work without a direct-commit gain. One pair does not establish the size of this
+effect.
+
+### Limits and artifacts
+
+All focused probes checked topology, used bounded shutdown, and verified every
+value from a fresh database instance. The probe, runner, and interpretation
+received an adversarial review.
+
+These runs used in-memory storage with fixed S3/GCS delay models and retained
+throttling. They are not real-provider measurements or the full CI significance
+procedure. The delay model does not charge transfer time by byte count. Pure
+CPU overhead, repeated merge/split cycles, and future GC after shutdown remain
+unmeasured. The evidence supports the merge mechanism for sustained paired
+demand, but does not support an unconditional performance gain from the current
+heuristic.
+
+Temporary sources, executable hashes, commands, raw results, and a detailed
+report are in `/tmp/glassdb-merge-perf-20260918`. The tested source diff SHA-256
+is `7d428fe7b15bd47380c0afe02cc70658ec83dfe51f3c648b42791a1fce9564a8`.
+
 ## 2026-08-21: root-leaf structural-gate coordinator rationale
 
 Status: implemented through the typed coordinator interface. A deterministic
@@ -28,7 +134,7 @@ accepts a typed
 [`ShardOperation`](../../crates/glassdb-trans/src/shard_coord.rs).
 [`StructuralGateOperation`](../../crates/glassdb-trans/src/node_locking.rs) uses
 this interface for root and non-root leaf paths. Before this change,
-[`StructuralNodeAccess::acquire_structural_gate`](../../crates/glassdb-trans/src/split.rs)
+[`StructuralNodeAccess::acquire_structural_gate`](../../crates/glassdb-trans/src/tree_rebalancer.rs)
 selected the path from `Option<&NodeToken>`:
 
 - a non-root leaf uses the coordinator;

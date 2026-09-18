@@ -346,7 +346,7 @@ impl LeafResolver for AcquireOperation {
         staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
         let mut locks = staged_locks.clone();
-        let reconciler = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id);
+        let reconciler = NodeLockReconciler::new(ctx.key_state, ctx.tmon, ctx.gate_retry, &self.id);
         if let Some(holder) = reconciler.admit_non_structural(&mut locks).await? {
             return Ok(Step::Skip {
                 outcome: MemberOutcome::Wait(holder),
@@ -508,9 +508,10 @@ impl LeafResolver for WriteBackOperation {
         });
         let owns_membership = staged_locks.membership().contains(&self.id);
         let mut locks = staged_locks.clone();
-        if let Some(holder) = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id)
-            .admit_non_structural(&mut locks)
-            .await?
+        if let Some(holder) =
+            NodeLockReconciler::new(ctx.key_state, ctx.tmon, ctx.gate_retry, &self.id)
+                .admit_non_structural(&mut locks)
+                .await?
         {
             if !owns_entry && !owns_membership {
                 return Ok(Step::Skip {
@@ -636,9 +637,10 @@ impl LeafResolver for ReleaseOperation {
         let owns_entry = staged.values().any(|entry| entry.is_locked_by(&self.id));
         let owns_membership = staged_locks.membership().contains(&self.id);
         let mut locks = staged_locks.clone();
-        if let Some(holder) = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id)
-            .admit_non_structural(&mut locks)
-            .await?
+        if let Some(holder) =
+            NodeLockReconciler::new(ctx.key_state, ctx.tmon, ctx.gate_retry, &self.id)
+                .admit_non_structural(&mut locks)
+                .await?
         {
             if !owns_entry && !owns_membership {
                 return Ok(Step::Skip {
@@ -1483,11 +1485,12 @@ mod tests {
                 .unwrap()
         );
         let key_state = KeyStateResolver::new(mon.clone());
-        let router = TreeRouter::new(nodes.clone(), parallelism);
+        let router = TreeRouter::new(nodes.clone(), timeline.clone(), parallelism);
         let coord = LeafCoordinator::with_hinter(
             nodes.clone(),
             key_state,
             mon.clone(),
+            crate::node_locking::StructuralGateRetry::new(timeline.clone(), Arc::default()),
             RetryConfig::default(),
             policy,
             Arc::new(NoSplitHints),
@@ -1788,8 +1791,9 @@ mod tests {
         let recorder = Arc::new(RecordingBackend::new(memory.clone()));
         let log = recorder.log();
         let (locker, ctx) = new_test_locker(recorder).await;
+        let peer_timeline = Timeline::new();
         let peer = NodeStore::new(
-            glassdb_storage::CachedStore::new(memory, 1 << 20, Timeline::new(), None),
+            glassdb_storage::CachedStore::new(memory, 1 << 20, peer_timeline.clone(), None),
             NonZeroUsize::MIN,
         );
         let current = glassdb_storage::CurrentState::Inline {

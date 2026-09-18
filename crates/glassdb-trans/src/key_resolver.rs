@@ -147,6 +147,7 @@ impl KeyResolver {
                     .collect();
                 let mut keys = Vec::new();
                 let mut covered = Vec::new();
+                let mut lower = range.start.clone();
 
                 loop {
                     let coverage = self
@@ -160,6 +161,7 @@ impl KeyResolver {
                         .ok_or_else(|| StorageError::other("leaf scan reached a non-leaf node"))?;
                     let mut candidates: BTreeSet<Vec<u8>> = leaf
                         .entries()
+                        .filter(|entry| entry.key >= lower)
                         .filter(|entry| Self::in_scan_window(range, &entry.key, cap))
                         .map(|entry| entry.key.clone())
                         .collect();
@@ -223,6 +225,12 @@ impl KeyResolver {
                     else {
                         break;
                     };
+                    // A redirect can enter a merged leaf that also contains the
+                    // previous range. Advance by coverage, even for empty leaves.
+                    lower = node
+                        .high_key()
+                        .expect("a successor has a lower bound")
+                        .to_vec();
                     loc = next;
                 }
 
@@ -491,6 +499,197 @@ impl KeyResolver {
 
 #[cfg(test)]
 mod tests {
+    mod merges {
+        use super::*;
+
+        use glassdb_data::NodeToken;
+        use glassdb_storage::IndexNode;
+
+        fn token(byte: u8) -> NodeToken {
+            NodeToken::from_bytes([byte; 16])
+        }
+
+        fn path(byte: u8) -> ObjectPath {
+            ObjectPath::Node {
+                collection: collection(),
+                token: token(byte),
+            }
+        }
+
+        fn entries(keys: &[&[u8]]) -> LeafBody {
+            LeafBody::from_entries(keys.iter().map(|key| {
+                LeafEntry::new(*key).with_current(CurrentState::Inline {
+                    writer: TxId::from_bytes(b"committed".to_vec()),
+                    value: Arc::from(*key),
+                })
+            }))
+        }
+
+        async fn seed_tree(store: &NodeStore, left_keys: &[&[u8]]) {
+            let left = Node::leaf(entries(left_keys))
+                .with_high_key(Some(b"m".to_vec()))
+                .with_right_sibling(Some(token(2).to_string()));
+            let right = Node::leaf(entries(&[b"z"]));
+            for (id, node) in [(1, left), (2, right)] {
+                assert!(
+                    store
+                        .store_node(&collection(), &token(id), &node, None)
+                        .await
+                        .unwrap()
+                );
+            }
+            let (_, observed) = store
+                .load_root(&collection(), Requirement::ANY)
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .store_root(
+                        &collection(),
+                        &Node::index(IndexNode::from_children([
+                            (Vec::new(), token(1).to_string()),
+                            (b"m".to_vec(), token(2).to_string()),
+                        ])),
+                        &observed,
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+
+        async fn publish_merged_tree(store: &NodeStore) {
+            let left = store
+                .load_node_state(&collection(), &token(1), Requirement::ANY)
+                .await
+                .unwrap();
+            let right = store
+                .load_node_state(&collection(), &token(2), Requirement::ANY)
+                .await
+                .unwrap();
+            let mut merged = Node::leaf(LeafBody::from_entries(
+                [left.value().unwrap(), right.value().unwrap()]
+                    .into_iter()
+                    .flat_map(|node| node.as_leaf().unwrap().entries().cloned()),
+            ));
+            let mut locks = merged.locks().clone();
+            locks
+                .set_merged_membership_version(
+                    left.value().unwrap().membership_version(),
+                    right.value().unwrap().membership_version(),
+                )
+                .unwrap();
+            merged.set_locks(locks);
+            assert!(
+                store
+                    .store_node_at(left.path(), &merged, &left)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                store
+                    .store_node_at(right.path(), &Node::forward(token(1).to_string()), &right)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_scan_does_not_repeat_keys_or_undo_a_delete_after_a_merge() {
+            let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+            let store = store_over(backend.clone()).await;
+            seed_tree(&store, &[b"a", b"b"]).await;
+            let (resolver, _, _, _background) = resolver_over(backend).await;
+            let old_left = resolver
+                .router
+                .route_key(&collection(), b"a", Requirement::ANY)
+                .await
+                .unwrap();
+            assert_eq!(old_left.path, path(1));
+            publish_merged_tree(&store).await;
+
+            let range = ScanRange::all();
+            let overlay = vec![ScanMutation {
+                key: b"a".to_vec(),
+                present: false,
+            }];
+            let result = resolver
+                .scan_keys(&collection(), &range, &overlay, None, None)
+                .await
+                .unwrap();
+
+            assert_eq!(result.keys(), &[b"b".to_vec(), b"z".to_vec()]);
+            let access = result.into_access(collection(), range, overlay);
+            assert_eq!(access.covered().len(), 2);
+            assert_eq!(access.covered()[0].path.as_ref(), path(1).to_string());
+            assert_eq!(access.covered()[1].path.as_ref(), path(1).to_string());
+            assert_ne!(
+                access.covered()[0].observation.revision(),
+                access.covered()[1].observation.revision()
+            );
+            assert_eq!(
+                access.covered()[0].observation.revision(),
+                old_left.observation.revision()
+            );
+        }
+
+        #[tokio::test]
+        async fn an_empty_old_leaf_still_advances_the_scan_frontier() {
+            let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+            let store = store_over(backend.clone()).await;
+            seed_tree(&store, &[]).await;
+            let (resolver, _, _, _background) = resolver_over(backend).await;
+            let old_left = resolver
+                .router
+                .route_key(&collection(), b"a", Requirement::ANY)
+                .await
+                .unwrap();
+            assert!(old_left.node().unwrap().as_leaf().unwrap().is_empty());
+
+            // The scan can retain an empty leaf from before a new key and the merge.
+            // Its old coverage must still exclude that lower range on the next step.
+            let observed = store
+                .load_node_state(&collection(), &token(1), Requirement::ANY)
+                .await
+                .unwrap();
+            let mut inserted = observed.value().unwrap().as_ref().clone();
+            inserted.set_leaf(entries(&[b"a"])).unwrap();
+            let mut locks = inserted.locks().clone();
+            locks.advance_membership_version();
+            inserted.set_locks(locks);
+            assert!(
+                store
+                    .store_node_at(observed.path(), &inserted, &observed)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            publish_merged_tree(&store).await;
+
+            let range = ScanRange {
+                limit: Some(1),
+                ..ScanRange::all()
+            };
+            let overlay = vec![ScanMutation {
+                key: b"a".to_vec(),
+                present: false,
+            }];
+            let result = resolver
+                .scan_keys(&collection(), &range, &overlay, None, None)
+                .await
+                .unwrap();
+            assert_eq!(result.keys(), &[b"z".to_vec()]);
+            let access = result.into_access(collection(), range, overlay);
+            assert_eq!(access.frontier(), Some(b"z".as_slice()));
+            assert_eq!(access.covered().len(), 2);
+            assert_eq!(
+                access.covered()[0].observation.revision(),
+                old_left.observation.revision()
+            );
+        }
+    }
+
     use super::*;
 
     use std::collections::BTreeMap;
@@ -555,7 +754,7 @@ mod tests {
         let state = KeyStateResolver::new(mon.clone());
         (
             KeyResolver::new(
-                TreeRouter::new(nodes.clone(), std::num::NonZeroUsize::MIN),
+                TreeRouter::new(nodes.clone(), timeline.clone(), std::num::NonZeroUsize::MIN),
                 state,
                 std::num::NonZeroUsize::MIN,
             ),

@@ -2,9 +2,10 @@
 //! (ADR-031).
 //!
 //! A node is the unit of the dynamic, range-partitioned coordination directory.
-//! It is either a **leaf** — the per-key coordination entries of ADR-017 (a
-//! [`LeafBody`]) for a contiguous key range — or an **index**, an ordered map from
-//! separator keys to child-node tokens. Every node self-describes the range it
+//! It is a **leaf** — the per-key coordination entries of ADR-017 (a
+//! [`LeafBody`]) for a contiguous key range — an **index**, an ordered map from
+//! separator keys to child-node tokens, or a permanent redirect after a merge.
+//! Every live node self-describes the range it
 //! covers through a **high-key** (the exclusive upper bound; absent means
 //! +infinity) and a **right-sibling** pointer, the two fields that let a descent
 //! detect a concurrent split and self-correct by stepping right rather than
@@ -14,8 +15,8 @@
 //! the encoding is canonical (leaf entries and index separators sorted, holder
 //! sets sorted) and golden-anchored. This module is inert data plus encode/
 //! decode, pure lookups, and the in-memory split primitives ([`Node::split`]);
-//! descent lives in `directory.rs` and the background split protocol in the
-//! `glassdb-trans` `split` module.
+//! descent lives in `tree_router.rs` and topology maintenance in the
+//! `glassdb-trans` `tree_rebalancer` module.
 
 use std::collections::BTreeMap;
 use std::ops::Bound::{Included, Unbounded};
@@ -27,7 +28,7 @@ use crate::error::StorageError;
 use crate::leaf::{LeafBody, LeafEntry};
 use crate::lock::{ExclusiveGate, LockType, SharedExclusiveLock};
 use crate::wire_size::{length_delimited_field, nonempty_length_delimited_field};
-use glassdb_data::{NodeToken as ValidatedNodeToken, TxId};
+use glassdb_data::{NodeToken as ValidatedNodeToken, StructuralIntentId, TxId};
 
 const LEAF_ENTRIES_TAG: u32 = 1;
 const INDEX_ENTRIES_TAG: u32 = 1;
@@ -336,10 +337,20 @@ impl NodeLocks {
         self.membership_version
     }
 
-    /// Records one logical membership change without installing a holder.
-    ///
-    /// Logless commits have no prepare/release lock lifecycle, so their commit
-    /// CAS advances the scan-validation generation directly (ADR-061).
+    /// Gives a merged leaf a generation distinct from both sources.
+    pub fn set_merged_membership_version(
+        &mut self,
+        left: u64,
+        right: u64,
+    ) -> Result<(), StorageError> {
+        self.membership_version = left
+            .max(right)
+            .checked_add(1)
+            .ok_or_else(|| StorageError::other("merged membership generation overflows"))?;
+        Ok(())
+    }
+
+    /// Invalidates earlier scan and absence observations without installing a holder.
     pub fn advance_membership_version(&mut self) {
         self.membership_version = self.membership_version.wrapping_add(1);
     }
@@ -363,12 +374,37 @@ impl NodeLocks {
         true
     }
 
-    /// Closes the structural gate for one structural operation.
-    pub fn set_structural_gate(&mut self, id: TxId) {
-        self.structure.set_writer(id);
+    /// Keeps the structural gate closed until its intent completes.
+    pub fn bind_structural_intent(
+        &mut self,
+        owner: &TxId,
+        intent: StructuralIntentId,
+    ) -> Result<(), StorageError> {
+        self.structure
+            .bind_intent(owner, intent)
+            .map_err(|_| StorageError::other("structural intent does not own the gate"))
     }
 
-    /// Opens the structural gate when held by `id`.
+    /// Opens a structural gate only for its owning transaction and intent.
+    pub fn complete_structural_intent(
+        &mut self,
+        owner: &TxId,
+        intent: &StructuralIntentId,
+    ) -> bool {
+        self.structure.complete_intent(owner, intent)
+    }
+
+    /// Closes an ordinary structural gate without replacing an intent-owned gate.
+    pub fn set_structural_gate(&mut self, id: TxId) {
+        if self.structure.intent().is_some() || self.structure.holder() == Some(&id) {
+            return;
+        }
+        self.structure.set_writer(id);
+        // Gate cleanup must not restore an old content-based revision.
+        self.membership_version = self.membership_version.wrapping_add(1);
+    }
+
+    /// Opens an ordinary structural gate when held by `id`.
     pub fn remove_structural_gate(&mut self, id: &TxId) -> bool {
         self.structure.remove(id)
     }
@@ -415,14 +451,15 @@ impl NodeLocks {
     }
 }
 
-/// The body of a [`Node`]: either a leaf's per-key entries or an index's
-/// separators.
+/// The body of a [`Node`]: leaf entries, index separators, or a redirect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeBody {
     /// A leaf: the ADR-017 coordination entries for the node's key range.
     Leaf(LeafBody),
     /// An index: separator keys mapping ranges to child nodes.
     Index(IndexNode),
+    /// A permanent retired identity that routes through its replacement.
+    Forward(NodeToken),
 }
 
 /// A decoded B-link tree node: a body plus the high-key and right-sibling that
@@ -459,6 +496,16 @@ impl Node {
         }
     }
 
+    /// Creates a permanent redirect to a merge destination.
+    pub fn forward(target: NodeToken) -> Self {
+        Node {
+            high_key: None,
+            right_sibling: None,
+            body: NodeBody::Forward(target),
+            locks: NodeLocks::default(),
+        }
+    }
+
     /// Returns the node with the given exclusive upper range bound.
     #[must_use]
     pub fn with_high_key(mut self, high_key: Option<Vec<u8>>) -> Self {
@@ -487,6 +534,14 @@ impl Node {
     /// The node body.
     pub fn body(&self) -> &NodeBody {
         &self.body
+    }
+
+    /// Returns the replacement token of a retired node.
+    pub fn forwarding_target(&self) -> Option<&str> {
+        match &self.body {
+            NodeBody::Forward(target) => Some(target),
+            NodeBody::Leaf(_) | NodeBody::Index(_) => None,
+        }
     }
 
     /// Replaces the leaf body while preserving bounds and node coordination.
@@ -534,18 +589,17 @@ impl Node {
         &self.locks
     }
 
-    /// Returns the mutable node-level coordination state.
-    /// Replaces the node-level coordination state.
+    /// Replaces node coordination.
     pub fn set_locks(&mut self, locks: NodeLocks) {
         self.locks = locks;
     }
 
-    /// Closes the structural gate for one structural operation.
+    /// Closes an ordinary structural gate without replacing an intent-owned gate.
     pub fn set_structural_gate(&mut self, id: TxId) {
         self.locks.set_structural_gate(id);
     }
 
-    /// Opens the structural gate when held by `id`.
+    /// Opens an ordinary structural gate when held by `id`.
     pub fn remove_structural_gate(&mut self, id: &TxId) -> bool {
         self.locks.remove_structural_gate(id)
     }
@@ -615,19 +669,19 @@ impl Node {
         length_delimited_field(NODE_INDEX_TAG, index_len)
     }
 
-    /// The leaf body, or `None` if this is an index node.
+    /// The leaf body, or `None` for an index or redirect.
     pub fn as_leaf(&self) -> Option<&LeafBody> {
         match &self.body {
             NodeBody::Leaf(s) => Some(s),
-            NodeBody::Index(_) => None,
+            NodeBody::Index(_) | NodeBody::Forward(_) => None,
         }
     }
 
-    /// The index body, or `None` if this is a leaf node.
+    /// The index body, or `None` for a leaf or redirect.
     pub fn as_index(&self) -> Option<&IndexNode> {
         match &self.body {
             NodeBody::Index(i) => Some(i),
-            NodeBody::Leaf(_) => None,
+            NodeBody::Leaf(_) | NodeBody::Forward(_) => None,
         }
     }
 
@@ -657,6 +711,7 @@ impl Node {
                     && (index.len() > policy.index_max_children()
                         || self.content_encoded_len() > policy.node_soft_max_bytes())
             }
+            NodeBody::Forward(_) => false,
         }
     }
 
@@ -671,6 +726,9 @@ impl Node {
     /// sibling, then CAS the shrunk source — the linearization point) is the
     /// caller's multi-step protocol.
     pub fn split(&mut self, right_token: &str) -> Option<(Node, Vec<u8>)> {
+        if self.structural_gate().intent().is_some() {
+            return None;
+        }
         let (right_body, split_key) = match &mut self.body {
             NodeBody::Leaf(leaf) => {
                 if leaf.len() < 2 {
@@ -686,6 +744,7 @@ impl Node {
                 let (upper, separator) = index.split_off_median();
                 (NodeBody::Index(upper), separator)
             }
+            NodeBody::Forward(_) => return None,
         };
         // The right sibling takes over the upper range: the old high-key and the
         // old right-sibling link now bound and follow it.
@@ -724,7 +783,7 @@ impl Node {
         Node::from_pb(raw)
     }
 
-    /// Clears node locks before a split-created node becomes visible.
+    /// Clears transient holders while retaining durable node metadata.
     pub(crate) fn clear_node_locks(&mut self) {
         self.locks.clear_holders();
     }
@@ -733,6 +792,7 @@ impl Node {
         let body = match &self.body {
             NodeBody::Leaf(leaf) => pb::node::Body::Leaf(leaf.to_pb()),
             NodeBody::Index(index) => pb::node::Body::Index(index.to_pb()),
+            NodeBody::Forward(target) => pb::node::Body::Forward(target.clone()),
         };
         pb::Node {
             high_key: self.high_key.clone().unwrap_or_default(),
@@ -756,6 +816,12 @@ impl Node {
         let body = match raw.body {
             Some(pb::node::Body::Index(index)) => NodeBody::Index(IndexNode::from_pb(index)),
             Some(pb::node::Body::Leaf(leaf)) => NodeBody::Leaf(LeafBody::from_pb(leaf)?),
+            Some(pb::node::Body::Forward(target)) => {
+                ValidatedNodeToken::try_from(target.as_str()).map_err(|error| {
+                    StorageError::with_source("parsing node forwarding target", error)
+                })?;
+                NodeBody::Forward(target)
+            }
             None => NodeBody::Leaf(LeafBody::new()),
         };
         let structure = ExclusiveGate::from_pb(raw.structure_lock).map_err(|_| {
@@ -828,7 +894,190 @@ mod tests {
         let decoded = Node::decode(&node.encode()).unwrap();
         assert_eq!(decoded.structural_gate().holders(), &[gate]);
         assert_eq!(decoded.membership_lock().holders(), &[writer]);
-        assert_eq!(decoded.membership_version(), 1);
+        assert_eq!(decoded.membership_version(), 2);
+    }
+
+    fn intent_id(value: u8) -> StructuralIntentId {
+        ValidatedNodeToken::from_bytes([value; 16]).into()
+    }
+
+    #[test]
+    fn intent_bound_gate_preserves_authoritative_inline_values() {
+        let owner = TxId::from_bytes(vec![7]);
+        let intent = intent_id(1);
+        let current = CurrentState::Inline {
+            writer: TxId::from_bytes(vec![1]),
+            value: b"authoritative".as_slice().into(),
+        };
+        let mut node = Node::leaf(LeafBody::from_entries([
+            LeafEntry::new(b"key").with_current(current.clone())
+        ]));
+        let mut locks = node.locks().clone();
+        locks.set_structural_gate(owner.clone());
+        locks
+            .bind_structural_intent(&owner, intent.clone())
+            .unwrap();
+        node.set_locks(locks);
+        node.set_membership_writer(owner.clone());
+        let generation = node.membership_version();
+        node.clear_node_locks();
+        assert!(!node.remove_structural_gate(&owner));
+        node.set_structural_gate(TxId::from_bytes(vec![9]));
+
+        let mut decoded = Node::decode(&node.encode()).unwrap();
+        assert_eq!(decoded, node);
+        assert_eq!(decoded.structural_gate().holder(), Some(&owner));
+        assert_eq!(decoded.structural_gate().intent(), Some(&intent));
+        assert!(decoded.membership_lock().is_empty());
+        assert_eq!(decoded.membership_version(), generation);
+        assert_eq!(
+            decoded.as_leaf().unwrap().lookup(b"key").unwrap().current,
+            current
+        );
+
+        let mut locks = decoded.locks().clone();
+        assert!(locks.complete_structural_intent(&owner, &intent));
+        decoded.set_locks(locks);
+        assert!(decoded.structural_gate().is_empty());
+        assert!(decoded.structural_gate().intent().is_none());
+    }
+
+    #[test]
+    fn structural_intent_requires_its_gate_owner_and_exact_identity() {
+        let owner = TxId::from_bytes(vec![1]);
+        let other = TxId::from_bytes(vec![2]);
+        let intent = intent_id(1);
+        let mut locks = NodeLocks::default();
+        assert!(
+            locks
+                .bind_structural_intent(&owner, intent.clone())
+                .is_err()
+        );
+        locks.set_structural_gate(owner.clone());
+        assert!(
+            locks
+                .bind_structural_intent(&other, intent.clone())
+                .is_err()
+        );
+        locks
+            .bind_structural_intent(&owner, intent.clone())
+            .unwrap();
+        locks
+            .bind_structural_intent(&owner, intent.clone())
+            .unwrap();
+        assert!(locks.bind_structural_intent(&owner, intent_id(2)).is_err());
+        assert!(!locks.complete_structural_intent(&other, &intent));
+        assert!(!locks.complete_structural_intent(&owner, &intent_id(2)));
+        assert_eq!(locks.structural_gate().intent(), Some(&intent));
+        assert!(locks.complete_structural_intent(&owner, &intent));
+        locks.set_structural_gate(TxId::from_bytes(Vec::new()));
+        assert!(
+            locks
+                .bind_structural_intent(&TxId::from_bytes(Vec::new()), intent)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn decoding_rejects_invalid_structural_intent_bindings() {
+        for gate in [
+            pb::NodeLock {
+                structural_intent: intent_id(1).to_string(),
+                ..Default::default()
+            },
+            pb::NodeLock {
+                lock_type: pb::lock::LockType::Write as i32,
+                locked_by: vec![vec![1]],
+                structural_intent: "invalid/token".into(),
+            },
+            pb::NodeLock {
+                lock_type: pb::lock::LockType::Write as i32,
+                locked_by: vec![Vec::new()],
+                structural_intent: intent_id(1).to_string(),
+            },
+        ] {
+            let raw = pb::Node {
+                structure_lock: Some(gate),
+                ..Default::default()
+            };
+            assert!(Node::decode(&raw.encode_to_vec()).is_err());
+        }
+        let raw = pb::Node {
+            membership_lock: Some(pb::NodeLock {
+                lock_type: pb::lock::LockType::Write as i32,
+                locked_by: vec![vec![1]],
+                structural_intent: intent_id(1).to_string(),
+            }),
+            ..Default::default()
+        };
+        assert!(Node::decode(&raw.encode_to_vec()).is_err());
+    }
+
+    #[test]
+    fn forwarding_nodes_round_trip_and_reject_invalid_targets() {
+        let target = ValidatedNodeToken::from_bytes([1; 16]).to_string();
+        let mut node = Node::forward(target.clone());
+        assert_eq!(Node::decode(&node.encode()).unwrap(), node);
+        assert_eq!(node.forwarding_target(), Some(target.as_str()));
+        assert!(node.as_leaf().is_none());
+        assert!(node.as_index().is_none());
+        assert!(!node.over_soft_cap(&SplitPolicy::default()));
+        assert!(node.split("unused").is_none());
+        for target in ["", "invalid/token"] {
+            let raw = pb::Node {
+                body: Some(pb::node::Body::Forward(target.to_string())),
+                ..Default::default()
+            };
+            assert!(Node::decode(&raw.encode_to_vec()).is_err());
+        }
+    }
+
+    #[test]
+    fn golden_structural_intent_gate_encoding() {
+        let owner = TxId::from_bytes(vec![1]);
+        let mut node = Node::leaf(LeafBody::new());
+        let mut locks = node.locks().clone();
+        locks.set_structural_gate(owner.clone());
+        locks.bind_structural_intent(&owner, intent_id(0)).unwrap();
+        node.set_locks(locks);
+        let expected = [
+            b"\x1a\x00\x2a\x1d\x08\x03\x12\x01\x01\x1a\x16".as_slice(),
+            b"0000000000000000000000",
+            b"\x38\x01",
+        ]
+        .concat();
+        assert_eq!(node.encode(), expected);
+        assert_eq!(node.encoded_len(), expected.len());
+
+        let redirect = Node::forward(ValidatedNodeToken::from_bytes([0; 16]).to_string());
+        let expected = [b"\x4a\x16".as_slice(), b"0000000000000000000000"].concat();
+        assert_eq!(redirect.encode(), expected);
+    }
+
+    #[test]
+    fn split_cannot_change_a_leaf_with_an_intent_bound_gate() {
+        let owner = TxId::from_bytes(vec![1]);
+        let mut node = Node::leaf(LeafBody::from_entries([entry(b"a", 1), entry(b"b", 2)]));
+        let mut locks = node.locks().clone();
+        locks.set_structural_gate(owner.clone());
+        locks.bind_structural_intent(&owner, intent_id(1)).unwrap();
+        node.set_locks(locks);
+        let bound = node.clone();
+        assert!(node.split("unused").is_none());
+        assert_eq!(node, bound);
+    }
+
+    #[test]
+    fn merged_membership_generation_exceeds_both_sources_without_wrapping() {
+        let mut locks = NodeLocks::default();
+        locks.set_merged_membership_version(12, 3).unwrap();
+        assert_eq!(locks.membership_version(), 13);
+        locks.set_merged_membership_version(12, 20).unwrap();
+        assert_eq!(locks.membership_version(), 21);
+        assert!(locks.set_merged_membership_version(u64::MAX, 1).is_err());
+        assert_eq!(locks.membership_version(), 21);
+        assert!(locks.set_merged_membership_version(1, u64::MAX).is_err());
+        assert_eq!(locks.membership_version(), 21);
     }
 
     #[test]
@@ -837,14 +1086,17 @@ mod tests {
             pb::NodeLock {
                 lock_type: pb::lock::LockType::Read as i32,
                 locked_by: vec![vec![1]],
+                ..Default::default()
             },
             pb::NodeLock {
                 lock_type: pb::lock::LockType::Create as i32,
                 locked_by: vec![vec![1]],
+                ..Default::default()
             },
             pb::NodeLock {
                 lock_type: pb::lock::LockType::Write as i32,
                 locked_by: vec![vec![1], vec![2]],
+                ..Default::default()
             },
         ] {
             let raw = pb::Node {
@@ -861,6 +1113,7 @@ mod tests {
             membership_lock: Some(pb::NodeLock {
                 lock_type: pb::lock::LockType::Create as i32,
                 locked_by: vec![vec![1]],
+                ..Default::default()
             }),
             ..pb::Node::default()
         };
@@ -875,6 +1128,7 @@ mod tests {
             membership_lock: Some(pb::NodeLock {
                 lock_type: pb::lock::LockType::Read as i32,
                 locked_by: vec![vec![2], vec![1], vec![1]],
+                ..Default::default()
             }),
             ..pb::Node::default()
         };
@@ -908,6 +1162,30 @@ mod tests {
         node.locks.membership_version = u64::MAX;
         node.set_membership_writer(id);
         assert_eq!(node.membership_version(), 0);
+    }
+
+    #[test]
+    fn membership_version_tracks_new_structural_gate_holders() {
+        let owner = TxId::from_bytes(vec![1]);
+        let other = TxId::from_bytes(vec![2]);
+        let intent = intent_id(1);
+        let mut locks = NodeLocks::default();
+
+        locks.set_structural_gate(owner.clone());
+        assert_eq!(locks.membership_version(), 1);
+        locks.set_structural_gate(owner);
+        assert_eq!(locks.membership_version(), 1);
+        locks.set_structural_gate(other.clone());
+        assert_eq!(locks.membership_version(), 2);
+
+        locks
+            .bind_structural_intent(&other, intent.clone())
+            .unwrap();
+        locks.set_structural_gate(TxId::from_bytes(vec![3]));
+        assert_eq!(locks.structural_gate().holder(), Some(&other));
+        assert_eq!(locks.membership_version(), 2);
+        assert!(locks.complete_structural_intent(&other, &intent));
+        assert_eq!(locks.membership_version(), 2);
     }
 
     #[test]
@@ -1294,13 +1572,31 @@ mod tests {
     }
 
     #[test]
-    fn released_node_lock_is_omitted_from_encoding() {
-        let never_locked = Node::leaf(LeafBody::from_entries([entry(b"a", 1)]));
-        let mut released = never_locked.clone();
+    fn structural_gate_cleanup_cannot_restore_an_old_content_revision() {
+        let initial = Node::leaf(LeafBody::from_entries([entry(b"a", 1)]));
         let holder = TxId::from_bytes(vec![0x11]);
-        released.set_structural_gate(holder.clone());
+        let mut acquired = initial.clone();
+        acquired.set_structural_gate(holder.clone());
+        let mut released = acquired.clone();
         assert!(released.remove_structural_gate(&holder));
-        assert_eq!(released.encode(), never_locked.encode());
+        let mut cleared = acquired.clone();
+        cleared.clear_node_locks();
+
+        for mut cleaned in [released, cleared] {
+            assert!(cleaned.structural_gate().is_empty());
+            assert!(
+                pb::Node::decode(cleaned.encode().as_slice())
+                    .unwrap()
+                    .structure_lock
+                    .is_none()
+            );
+            assert_eq!(cleaned.membership_version(), 1);
+            assert_ne!(cleaned.encode(), initial.encode());
+
+            cleaned.set_structural_gate(holder.clone());
+            assert_eq!(cleaned.membership_version(), 2);
+            assert_ne!(cleaned.encode(), acquired.encode());
+        }
     }
 
     // Golden vector for the ADR-032 node-lock fields. Changing their tags,
@@ -1317,7 +1613,7 @@ mod tests {
             0x1a, 0x19, 0x0a, 0x17, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a,
             0x04, 0x01, 0x02, 0x03, 0x04, 0x22, 0x06, 0x0a, 0x02, 0xaa, 0xbb, 0x10, 0x01, 0x2a,
             0x05, 0x08, 0x03, 0x12, 0x01, 0x11, 0x32, 0x05, 0x08, 0x03, 0x12, 0x01, 0x22, 0x38,
-            0x01,
+            0x02,
         ];
         assert_eq!(node.encoded_len(), got.len());
         assert_eq!(got, want, "node-lock encoding drifted: {got:02x?}");

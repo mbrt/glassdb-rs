@@ -18,7 +18,7 @@ use crate::wound_wait::{Reclaim, resolve_tx_conflict, try_reclaim};
 
 /// Completes the structural recovery a finalized topology participant left
 /// behind, so a drop can freeze the topology without waiting for the background
-/// sweep. The [`Splitter`](crate::split::Splitter) supplies the implementation.
+/// sweep. The [`TreeRebalancer`](crate::tree_rebalancer::TreeRebalancer) supplies the implementation.
 #[async_trait]
 pub trait TopologySettler: Send + Sync {
     /// Finishes and releases `id`'s structural work on `collection`. Returns

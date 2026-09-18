@@ -443,12 +443,22 @@ mod tests {
     fn decoding_rejects_invalid_directory_lock_states() {
         for lock in [
             pb::NodeLock {
+                lock_type: pb::lock::LockType::Write as i32,
+                locked_by: vec![vec![1]],
+                structural_intent: glassdb_data::StructuralIntentId::from(
+                    glassdb_data::NodeToken::from_bytes([1; 16]),
+                )
+                .to_string(),
+            },
+            pb::NodeLock {
                 lock_type: pb::lock::LockType::Create as i32,
                 locked_by: vec![vec![1]],
+                ..Default::default()
             },
             pb::NodeLock {
                 lock_type: pb::lock::LockType::Read as i32,
                 locked_by: vec![vec![2], vec![1], vec![1]],
+                ..Default::default()
             },
         ] {
             let raw = pb::CollectionRecord {

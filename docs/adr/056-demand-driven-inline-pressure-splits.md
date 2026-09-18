@@ -4,6 +4,9 @@
 
 Accepted — implemented.
 
+[ADR-072](072-leaf-merging-and-splitting.md) retains this pressure policy
+and adds a separate merge heuristic.
+
 This extends [ADR-031](031-dynamic-range-sharding.md)'s background split policy
 and resolves the capacity follow-up left by
 [ADR-054](054-reserve-inline-publication-for-logless-commits.md). It does not

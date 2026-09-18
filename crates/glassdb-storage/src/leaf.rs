@@ -183,7 +183,7 @@ impl LeafEntry {
     }
 
     /// Reports whether an ordinary mutation left no coordination or committed
-    /// state to retain. Tombstones are excluded here because only the splitter's
+    /// state to retain. Tombstones are excluded here because only the tree rebalancer's
     /// generation-aware compaction may reclaim them (ADR-062).
     pub fn is_vestigial(&self) -> bool {
         self.lock_holders().is_empty() && matches!(self.current, CurrentState::Absent)

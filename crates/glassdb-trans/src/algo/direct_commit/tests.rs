@@ -27,9 +27,12 @@ async fn resolve_step(
     locks: &NodeLocks,
 ) -> Step {
     let key_state = KeyStateResolver::new(tctx.tmon.clone());
+    let gate_retry =
+        crate::node_locking::StructuralGateRetry::new(tctx.timeline.clone(), Arc::default());
     let ctx = ResolveCtx {
         key_state: &key_state,
         tmon: &tctx.tmon,
+        gate_retry: &gate_retry,
         requirement: Requirement::ANY,
         cause,
     };
@@ -75,7 +78,7 @@ fn put_resolver(
             has_reads,
         },
         InlinePolicy::default(),
-        tm.direct_commit.split_hints.clone(),
+        tm.direct_commit.topology_hints.clone(),
     )
 }
 
@@ -750,7 +753,7 @@ async fn direct_commit_blocked_after_uncertain_cas_stays_in_doubt() {
     let staged = BTreeMap::from([(b"k".to_vec(), seed)]);
 
     let mut gated = NodeLocks::default();
-    gated.set_structural_gate(TxId::with_priority(1, b"splitter"));
+    gated.set_structural_gate(TxId::with_priority(1, b"tree_rebalancer"));
     let mut fenced = NodeLocks::default();
     fenced.set_delete_intent(TxId::with_priority(1, b"dropper"));
 
@@ -775,6 +778,79 @@ async fn direct_commit_blocked_after_uncertain_cas_stays_in_doubt() {
             "{what} cannot disprove a landed uncertain CAS, got {outcome:?}"
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_intent_owned_gate_blocks_new_direct_publication_but_preserves_markers() {
+    let (tm, tctx) = new_algo().await;
+    let owner = TxId::with_priority(1, b"merge");
+    tctx.tmon.begin_tx(&owner);
+    tctx.tmon
+        .commit_tx(TxLog::new(owner.clone(), TxCommitStatus::Ok))
+        .await
+        .unwrap();
+    let mut locks = NodeLocks::default();
+    locks.set_structural_gate(owner.clone());
+    locks
+        .bind_structural_intent(
+            &owner,
+            glassdb_data::StructuralIntentId::from(glassdb_data::NodeToken::new_random()),
+        )
+        .unwrap();
+    let (mut root, observed) = tctx
+        .nodes
+        .load_root(&test_collection(), Requirement::ANY)
+        .await
+        .unwrap();
+    root.set_locks(locks);
+    assert!(
+        tctx.nodes
+            .store_root(&test_collection(), &root, &observed)
+            .await
+            .unwrap()
+    );
+    let writer = TxId::with_priority(2, b"writer");
+    let direct = put_resolver(&tm, writer.clone(), logical_key(b"k"), None, b"value");
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(600),
+        tm.direct_commit.coord.coordinate(direct),
+    )
+    .await
+    .expect("an unfinished intent must use bounded retries")
+    .unwrap();
+    assert!(matches!(outcome, DirectMutationOutcome::Locked));
+
+    let (mut root, observed) = tctx
+        .nodes
+        .load_root(&test_collection(), Requirement::ANY)
+        .await
+        .unwrap();
+    assert!(root.structural_gate().intent().is_some());
+    assert!(root.as_leaf().unwrap().lookup(b"k").is_none());
+    root.set_leaf(LeafBody::from_entries([LeafEntry::new(b"k").with_current(
+        CurrentState::Inline {
+            writer: writer.clone(),
+            value: Arc::from(b"value".as_slice()),
+        },
+    )]))
+    .unwrap();
+    assert!(
+        tctx.nodes
+            .store_root(&test_collection(), &root, &observed)
+            .await
+            .unwrap()
+    );
+    let direct = put_resolver(&tm, writer, logical_key(b"k"), None, b"value");
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tm.direct_commit.coord.coordinate(direct),
+        )
+        .await
+        .expect("an exact marker already proves publication")
+        .unwrap(),
+        DirectMutationOutcome::Landed(_)
+    ));
 }
 
 #[tokio::test]
@@ -911,7 +987,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
         test_root_path(),
         member,
         InlinePolicy::default(),
-        tm.direct_commit.split_hints.clone(),
+        tm.direct_commit.topology_hints.clone(),
     );
     let pa = TxId::with_priority(1, b"pa");
     let pb = TxId::with_priority(1, b"pb");
@@ -981,7 +1057,7 @@ async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
         test_root_path(),
         member,
         InlinePolicy::default(),
-        tm.direct_commit.split_hints.clone(),
+        tm.direct_commit.topology_hints.clone(),
     );
     let empty = BTreeMap::new();
     assert!(matches!(
@@ -1025,7 +1101,7 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
         test_root_path(),
         member,
         InlinePolicy::default(),
-        tm.direct_commit.split_hints.clone(),
+        tm.direct_commit.topology_hints.clone(),
     );
     let predecessor = TxId::with_priority(1, b"predecessor");
     let unchanged = BTreeMap::from([(
@@ -1074,7 +1150,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     let seed = entry(&tctx, b"k").await.unwrap();
     let current = seed.current.writer().cloned().unwrap();
     let locks = NodeLocks::default();
-    let split_hints = tm.direct_commit.split_hints.clone();
+    let topology_hints = tm.direct_commit.topology_hints.clone();
 
     let direct = |read_version: Option<TxId>| {
         put_resolver(
@@ -1171,7 +1247,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
             outcome: MemberOutcome::Moved
         }
     ));
-    assert_eq!(split_hints.pending_inline_pressure(), 1);
+    assert_eq!(topology_hints.pending_inline_pressure(), 1);
     assert!(matches!(
         resolve_step(
             &budgeted,
@@ -1186,7 +1262,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
         }
     ));
     assert_eq!(
-        split_hints.pending_inline_pressure(),
+        topology_hints.pending_inline_pressure(),
         1,
         "an unproved uncertain attempt returns before creating new pressure"
     );
@@ -1203,7 +1279,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
         }
     ));
     assert_eq!(
-        split_hints.pending_inline_pressure(),
+        topology_hints.pending_inline_pressure(),
         1,
         "a value no leaf can admit does not request a split"
     );
@@ -1552,7 +1628,7 @@ async fn multi_key_aggregate_rejection_is_atomic_and_does_not_hint() {
             landed: 0,
         }
     );
-    assert_eq!(tm.direct_commit.split_hints.pending_inline_pressure(), 0);
+    assert_eq!(tm.direct_commit.topology_hints.pending_inline_pressure(), 0);
     for key in &keys {
         assert_eq!(
             entry(&tctx, key.key()).await.unwrap().current,
@@ -1597,7 +1673,7 @@ async fn cross_key_aggregate_rejection_does_not_hint() {
             max_value_bytes: 8,
             max_leaf_bytes: 8,
         },
-        tm.direct_commit.split_hints.clone(),
+        tm.direct_commit.topology_hints.clone(),
     );
     let staged = BTreeMap::from([(
         source.key().to_vec(),
@@ -1620,7 +1696,7 @@ async fn cross_key_aggregate_rejection_does_not_hint() {
             outcome: MemberOutcome::Moved
         }
     ));
-    assert_eq!(tm.direct_commit.split_hints.pending_inline_pressure(), 0);
+    assert_eq!(tm.direct_commit.topology_hints.pending_inline_pressure(), 0);
 }
 
 // One member can mix every ADR-061 output shape. Membership generation advances
@@ -1750,7 +1826,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     );
 
     // This independent cache mutates topology while the main coordinator's
-    // CAS is paused, as a splitter on another process could.
+    // CAS is paused, as a tree rebalancer on another process could.
     let (_peer, peer) = new_algo_from_backend(mem.clone()).await;
 
     // Park the candidate's L0 CAS after it has grouped its keys and planned the

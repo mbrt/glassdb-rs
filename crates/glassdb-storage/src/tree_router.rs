@@ -12,7 +12,7 @@
 //! the decoded object store, so interior nodes stay cached and off the hot
 //! path) and never mutates the tree. Splitting and locking live above it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
 use futures::FutureExt;
@@ -20,6 +20,7 @@ use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
 use glassdb_data::{CollectionAddress, LogicalKey, NodeToken, ObjectPath};
 
+use crate::Timeline;
 use crate::cached_store::Requirement;
 use crate::error::StorageError;
 use crate::node::{Node, NodeBody};
@@ -76,6 +77,32 @@ struct RoutedItem<T> {
     payload: T,
     stage: RouteStage,
     right_hops: usize,
+    redirects: RedirectHistory,
+    // A repaired path can cross more merges, each with an older cached target.
+    refresh_path: bool,
+}
+
+#[derive(Default)]
+struct RedirectHistory {
+    visits: BTreeMap<ObjectPath, (usize, bool)>,
+}
+
+impl RedirectHistory {
+    /// Permits a refresh when right-link progress revisits a redirect.
+    fn revisit(&mut self, path: &ObjectPath, right_hops: usize) -> Result<bool, StorageError> {
+        let Some((previous_hops, refreshed)) = self.visits.get_mut(path) else {
+            self.visits.insert(path.clone(), (right_hops, false));
+            return Ok(false);
+        };
+        if right_hops > *previous_hops && !*refreshed {
+            // A merge can leave a cached left-to-right edge beside the new
+            // right-to-left redirect. A read after this redirect distinguishes
+            // that stale view from a persistent cycle.
+            *refreshed = true;
+            return Ok(true);
+        }
+        Err(StorageError::other("routing found a redirect cycle"))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -154,6 +181,8 @@ impl<T> BatchRouting<T> {
                     payload,
                     stage: RouteStage::Interior,
                     right_hops: 0,
+                    redirects: RedirectHistory::default(),
+                    refresh_path: false,
                 },
             );
         }
@@ -164,7 +193,7 @@ impl<T> BatchRouting<T> {
         !self.pending.is_empty() || !self.active.is_empty()
     }
 
-    fn admit(&mut self) -> Option<(ObjectPath, Requirement)> {
+    fn admit(&mut self, timeline: &Timeline) -> Option<(ObjectPath, Requirement)> {
         let path = self
             .pending
             .iter()
@@ -177,7 +206,10 @@ impl<T> BatchRouting<T> {
             .pending
             .remove(&path)
             .expect("an admitted path has pending items");
-        let requirement = batch.requirement(self.interior, self.leaf);
+        let mut requirement = batch.requirement(self.interior, self.leaf);
+        if batch.items.iter().any(|item| item.refresh_path) {
+            requirement = requirement.stricter(Requirement::after(timeline.currentness_barrier()));
+        }
         let previous = self.active.insert(path.clone(), batch);
         debug_assert!(previous.is_none(), "a path has at most one active load");
         Some((path, requirement))
@@ -287,6 +319,23 @@ impl<T> BatchRouting<T> {
             return None;
         }
 
+        if let Some(token) = node.forwarding_target() {
+            item.refresh_path |= match item.redirects.revisit(path, item.right_hops) {
+                Ok(refresh) => refresh,
+                Err(error) => {
+                    self.record_error(item.ordinal, path.clone(), error);
+                    return None;
+                }
+            };
+            match routed_node_path(&item, token) {
+                Ok(target) => {
+                    item.stage = RouteStage::Leaf;
+                    self.enqueue(target, item);
+                }
+                Err(error) => self.record_error(item.ordinal, path.clone(), error),
+            }
+            return None;
+        }
         if !node.covers(&item.raw_key) {
             let Some(token) = node.right_sibling() else {
                 return Some(item);
@@ -299,7 +348,7 @@ impl<T> BatchRouting<T> {
                 }
             };
             item.stage = match node.body() {
-                NodeBody::Leaf(_) => RouteStage::Leaf,
+                NodeBody::Leaf(_) | NodeBody::Forward(_) => RouteStage::Leaf,
                 NodeBody::Index(_) => RouteStage::Interior,
             };
             item.right_hops += 1;
@@ -308,6 +357,7 @@ impl<T> BatchRouting<T> {
         }
 
         match node.body() {
+            NodeBody::Forward(_) => unreachable!("redirect was followed above"),
             NodeBody::Index(index) => {
                 let Some(token) = index.child_for(&item.raw_key) else {
                     self.record_error(
@@ -415,28 +465,50 @@ impl<'a> DescentCursor<'a> {
 
     /// Moves right until the current node covers `key`.
     async fn normalize_at(&mut self, key: &[u8]) -> Result<(), StorageError> {
-        for _ in 0..MAX_SELF_CORRECTING_HOPS {
+        let mut redirects = RedirectHistory::default();
+        let mut right_hops = 0;
+        let mut refresh_path = false;
+        let mut requirement = self.requirement;
+        loop {
+            if let Some(target) = self.current.node().forwarding_target() {
+                refresh_path |= redirects.revisit(&self.current.path, right_hops)?;
+                if refresh_path {
+                    requirement = self.requirement.stricter(Requirement::after(
+                        self.router.timeline.currentness_barrier(),
+                    ));
+                }
+                let token = node_token(target)?;
+                self.current = self
+                    .router
+                    .load_child(self.collection, &token, requirement)
+                    .await?;
+                continue;
+            }
             if self.current.node().covers(key) {
                 return Ok(());
             }
             let Some(token) = self.current.node().right_sibling() else {
                 return Ok(());
             };
+            right_hops += 1;
+            if right_hops > MAX_SELF_CORRECTING_HOPS {
+                return Err(StorageError::other(
+                    "routing exceeded the right-link hop bound",
+                ));
+            }
             let token = node_token(token)?;
             self.current = self
                 .router
-                .load_child(self.collection, &token, self.requirement)
+                .load_child(self.collection, &token, requirement)
                 .await?;
         }
-        Err(StorageError::other(
-            "routing exceeded the right-link hop bound",
-        ))
     }
 
     /// Advances one index level and returns the normalized index it left.
     async fn advance_for(&mut self, key: &[u8]) -> Result<Option<Located>, StorageError> {
         let token = match self.current.node().body() {
             NodeBody::Leaf(_) => return Ok(None),
+            NodeBody::Forward(_) => return Err(StorageError::other("redirect was not normalized")),
             NodeBody::Index(index) => node_token(
                 index
                     .child_for(key)
@@ -565,9 +637,17 @@ impl<'a> LeafChain<'a> {
             return Ok(None);
         };
         let token = node_token(token)?;
+        let lower = leaf
+            .node()
+            .and_then(Node::high_key)
+            .ok_or_else(|| StorageError::other("a leaf with a right sibling has no high-key"))?;
+        let current = self
+            .router
+            .load_child(self.collection, &token, self.requirement)
+            .await?;
         Ok(Some(
-            self.router
-                .load_child(self.collection, &token, self.requirement)
+            DescentCursor::new(self.router, self.collection, self.requirement, current)
+                .descend_to_leaf(lower)
                 .await?
                 .into_locator(),
         ))
@@ -599,13 +679,20 @@ impl<'a> LeafChain<'a> {
 #[derive(Clone)]
 pub struct TreeRouter {
     nodes: NodeStore,
+    timeline: Timeline,
     parallelism: NonZeroUsize,
 }
 
 impl TreeRouter {
     /// Creates a router that reads nodes through `nodes`.
-    pub fn new(nodes: NodeStore, parallelism: NonZeroUsize) -> Self {
-        TreeRouter { nodes, parallelism }
+    ///
+    /// `timeline` must be shared with the decoded object cache.
+    pub fn new(nodes: NodeStore, timeline: Timeline, parallelism: NonZeroUsize) -> Self {
+        TreeRouter {
+            nodes,
+            timeline,
+            parallelism,
+        }
     }
 
     /// Routes `key` to a leaf by descending from the root `_r` and
@@ -648,6 +735,28 @@ impl TreeRouter {
         LeafChain::new(self, collection, requirement)
             .successor(leaf)
             .await
+    }
+
+    /// Follows one structural sibling edge without descending an index level.
+    pub async fn next_structural_node(
+        &self,
+        collection: &CollectionAddress,
+        current: &RoutedLeaf,
+        requirement: Requirement,
+    ) -> Result<Option<RoutedLeaf>, StorageError> {
+        let Some(token) = current.node().and_then(Node::right_sibling) else {
+            return Ok(None);
+        };
+        let lower = current
+            .node()
+            .and_then(Node::high_key)
+            .ok_or_else(|| StorageError::other("a sibling edge has no high-key"))?;
+        let next = self
+            .load_child(collection, &node_token(token)?, requirement)
+            .await?;
+        let mut cursor = DescentCursor::new(self, collection, requirement, next);
+        cursor.normalize_at(lower).await?;
+        Ok(Some(cursor.into_locator()))
     }
 
     /// Returns the routed leaves from `start` through the inclusive `end`.
@@ -791,7 +900,7 @@ impl TreeRouter {
 
         while routing.has_work() {
             while in_flight.len() < self.parallelism.get() {
-                let Some((path, requirement)) = routing.admit() else {
+                let Some((path, requirement)) = routing.admit(&self.timeline) else {
                     break;
                 };
                 let nodes = self.nodes.clone();
@@ -827,7 +936,7 @@ impl TreeRouter {
         let Some(cursor) = self.start_descent(collection, requirement).await? else {
             return Ok(false);
         };
-        match cursor
+        let reachable = match cursor
             .run_until(
                 key,
                 ReachTarget {
@@ -839,7 +948,19 @@ impl TreeRouter {
             )
             .await
         {
-            Ok(reachable) => Ok(reachable),
+            Ok(reachable) => reachable,
+            Err(StorageError::NotFound) => false,
+            Err(error) => return Err(error),
+        };
+        if reachable {
+            return Ok(true);
+        }
+        // A retired identity remains proof of attachment after its parent edge
+        // stops naming it. It must never be reclaimed as an unpublished split.
+        match self.nodes.load_node(collection, target, requirement).await {
+            Ok((node, _)) => {
+                Ok(node.forwarding_target().is_some() || node.structural_gate().intent().is_some())
+            }
             Err(StorageError::NotFound) => Ok(false),
             Err(error) => Err(error),
         }
@@ -863,21 +984,27 @@ impl TreeRouter {
         cursor.run_until(key, FindParent { parent: None }).await
     }
 
-    /// Returns the observed node named `token`, without descending to it.
+    /// Returns structural leaf metadata, following any retired identity.
     ///
-    /// Routing by key self-corrects rightward past a node a split has moved, so
-    /// a caller holding a child token from an index reads that exact child here.
+    /// These contents are not transaction read evidence.
     pub async fn leaf_at(
         &self,
         collection: &CollectionAddress,
         token: &NodeToken,
         requirement: Requirement,
     ) -> Result<RoutedLeaf, StorageError> {
-        let located = self.load_child(collection, token, requirement).await?;
-        if located.observation.is_absent() {
-            return Err(StorageError::NotFound);
+        let mut located = self.load_child(collection, token, requirement).await?;
+        let mut visited = BTreeSet::new();
+        loop {
+            let Some(target) = located.node().forwarding_target() else {
+                return Ok(located.into_locator());
+            };
+            if !visited.insert(located.path.clone()) {
+                return Err(StorageError::other("routing found a redirect cycle"));
+            }
+            let token = node_token(target)?;
+            located = self.load_child(collection, &token, requirement).await?;
         }
-        Ok(located.into_locator())
     }
 
     async fn start_descent<'a>(
@@ -921,17 +1048,15 @@ impl TreeRouter {
         token: &NodeToken,
         requirement: Requirement,
     ) -> Result<Located, StorageError> {
-        let observation = self
-            .nodes
-            .load_node_state(collection, token, requirement)
-            .await?;
-        Ok(Located {
-            path: ObjectPath::Node {
-                collection: collection.clone(),
-                token: token.clone(),
-            },
-            observation,
-        })
+        let path = ObjectPath::Node {
+            collection: collection.clone(),
+            token: token.clone(),
+        };
+        let observation = self.nodes.load_node_at_state(&path, requirement).await?;
+        if observation.is_absent() {
+            return Err(StorageError::NotFound);
+        }
+        Ok(Located { path, observation })
     }
 }
 
@@ -956,6 +1081,666 @@ fn routed_node_path<T>(item: &RoutedItem<T>, token: &str) -> Result<ObjectPath, 
 
 #[cfg(test)]
 mod tests {
+    mod merges {
+        use super::*;
+
+        use std::time::Duration;
+
+        use glassdb_data::{StructuralIntentId, TxId};
+
+        struct RetainedMerge {
+            reader: TestStore,
+            writer: TestStore,
+            old_left: RoutedLeaf,
+            requirement: Requirement,
+            log: OpLog,
+        }
+
+        impl RetainedMerge {
+            async fn new() -> Self {
+                let (backend, log) = recording_backend();
+                let writer = store_over(backend.clone());
+                let reader = store_over(backend);
+                store_leaf(&writer, 0, &[b"aardvark"], Some(b"apple"), Some(1)).await;
+                store_leaf(&writer, 1, &[b"apple", b"berry"], Some(b"m"), Some(2)).await;
+                store_leaf(&writer, 2, &[b"pear", b"zebra"], None, None).await;
+                assert!(
+                    writer
+                        .create_root(
+                            &collection(),
+                            &Node::index(IndexNode::from_children([
+                                (Vec::new(), token(0).to_string()),
+                                (b"apple".to_vec(), token(1).to_string()),
+                                (b"m".to_vec(), token(2).to_string()),
+                            ]))
+                        )
+                        .await
+                        .unwrap()
+                );
+                let requirement = Requirement::after(reader.timeline.currentness_barrier());
+                let router =
+                    TreeRouter::new(reader.nodes.clone(), reader.timeline.clone(), limit(2));
+                router
+                    .route_key(&collection(), b"aardvark", requirement)
+                    .await
+                    .unwrap();
+                let old_left = router
+                    .route_key(&collection(), b"apple", requirement)
+                    .await
+                    .unwrap();
+                let merged = leaf(&[b"apple", b"berry", b"pear", b"zebra"], None, None);
+                replace_node(&writer, 1, &merged).await;
+                replace_node(&writer, 2, &Node::forward(token(1).to_string())).await;
+                take_reads(&log);
+                Self {
+                    reader,
+                    writer,
+                    old_left,
+                    requirement,
+                    log,
+                }
+            }
+
+            fn router(&self) -> TreeRouter {
+                TreeRouter::new(
+                    self.reader.nodes.clone(),
+                    self.reader.timeline.clone(),
+                    limit(2),
+                )
+            }
+        }
+
+        async fn replace_node(store: &TestStore, id: u8, node: &Node) {
+            let old = store
+                .load_node_state(&collection(), &token(id), Requirement::ANY)
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .store_node(&collection(), &token(id), node, Some(&old))
+                    .await
+                    .unwrap()
+            );
+        }
+
+        #[tokio::test]
+        async fn stale_right_link_reloads_the_retained_left_once() {
+            let fixture = RetainedMerge::new().await;
+            let router = fixture.router();
+            let routed = router
+                .route_key(&collection(), b"pear", fixture.requirement)
+                .await
+                .unwrap();
+            assert_eq!(routed.path, node_path(1));
+            assert!(
+                routed
+                    .node()
+                    .unwrap()
+                    .as_leaf()
+                    .unwrap()
+                    .lookup(b"pear")
+                    .is_some()
+            );
+            let reads = take_reads(&fixture.log);
+            assert_eq!(
+                reads
+                    .iter()
+                    .filter(|(_, path)| path == &node_path(1).to_string())
+                    .count(),
+                1
+            );
+            assert_eq!(
+                router
+                    .route_key(&collection(), b"pear", fixture.requirement)
+                    .await
+                    .unwrap()
+                    .path,
+                node_path(1)
+            );
+            assert!(
+                take_reads(&fixture.log).is_empty(),
+                "a stable redirect must reuse the refreshed target"
+            );
+        }
+
+        #[tokio::test]
+        async fn batched_stale_routes_join_the_refreshed_retained_leaf() {
+            let fixture = RetainedMerge::new().await;
+            let groups = fixture
+                .router()
+                .route_keys_with_requirements(
+                    [
+                        (LogicalKey::new(collection(), b"apple"), 0),
+                        (LogicalKey::new(collection(), b"pear"), 1),
+                        (LogicalKey::new(collection(), b"berry"), 2),
+                    ],
+                    fixture.requirement,
+                    fixture.requirement,
+                )
+                .await
+                .unwrap();
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].path(), &node_path(1));
+            assert_eq!(
+                groups[0]
+                    .keys
+                    .iter()
+                    .map(|(_, ordinal)| *ordinal)
+                    .collect::<Vec<_>>(),
+                vec![0, 1, 2]
+            );
+            assert!(
+                groups[0]
+                    .node()
+                    .unwrap()
+                    .as_leaf()
+                    .unwrap()
+                    .lookup(b"pear")
+                    .is_some()
+            );
+        }
+
+        #[tokio::test]
+        async fn successors_can_revisit_an_expanded_leaf_without_losing_old_evidence() {
+            for structural in [false, true] {
+                let fixture = RetainedMerge::new().await;
+                let router = fixture.router();
+                let next = if structural {
+                    router
+                        .next_structural_node(&collection(), &fixture.old_left, fixture.requirement)
+                        .await
+                } else {
+                    router
+                        .next_leaf(&collection(), &fixture.old_left, fixture.requirement)
+                        .await
+                }
+                .unwrap()
+                .unwrap();
+                assert_eq!(next.path, fixture.old_left.path);
+                assert_eq!(
+                    fixture.old_left.node().unwrap().high_key(),
+                    Some(b"m".as_slice())
+                );
+                assert!(next.node().unwrap().high_key().is_none());
+                assert_ne!(
+                    next.observation.revision(),
+                    fixture.old_left.observation.revision()
+                );
+                assert!(
+                    router
+                        .next_leaf(&collection(), &next, fixture.requirement)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn retired_parent_edges_route_after_the_retained_leaf_splits_again() {
+            for split_below_old_boundary in [false, true] {
+                let fixture = RetainedMerge::new().await;
+                let (mut retained, observed) = fixture
+                    .writer
+                    .load_node(&collection(), &token(1), Requirement::ANY)
+                    .await
+                    .unwrap();
+                if split_below_old_boundary {
+                    retained
+                        .set_leaf(LeafBody::from_entries(
+                            [
+                                b"apple".as_slice(),
+                                b"apricot",
+                                b"avocado",
+                                b"banana",
+                                b"berry",
+                                b"blueberry",
+                                b"pear",
+                                b"zebra",
+                            ]
+                            .into_iter()
+                            .map(live),
+                        ))
+                        .unwrap();
+                }
+                let (right, separator) = retained.split(token(3).as_str()).unwrap();
+                assert_eq!(
+                    separator.as_slice() < b"m".as_slice(),
+                    split_below_old_boundary
+                );
+                assert!(
+                    fixture
+                        .writer
+                        .store_node(&collection(), &token(3), &right, None)
+                        .await
+                        .unwrap()
+                );
+                assert!(
+                    fixture
+                        .writer
+                        .store_node(&collection(), &token(1), &retained, Some(&observed))
+                        .await
+                        .unwrap()
+                );
+                let requirement = Requirement::after(fixture.reader.timeline.currentness_barrier());
+                let router = fixture.router();
+                for key in [b"apple".as_slice(), b"berry", b"pear", b"zebra"] {
+                    let routed = router
+                        .route_key_with_requirements(
+                            &collection(),
+                            key,
+                            Requirement::ANY,
+                            requirement,
+                        )
+                        .await
+                        .unwrap();
+                    assert!(
+                        routed
+                            .node()
+                            .unwrap()
+                            .as_leaf()
+                            .unwrap()
+                            .lookup(key)
+                            .is_some(),
+                        "{key:?}"
+                    );
+                    let expected = if key < separator.as_slice() {
+                        node_path(1)
+                    } else {
+                        node_path(3)
+                    };
+                    assert_eq!(routed.path, expected);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn repeated_merges_refresh_each_mutable_target_in_a_redirect_chain() {
+            for batched in [false, true] {
+                let fixture = RetainedMerge::new().await;
+                replace_node(
+                    &fixture.writer,
+                    0,
+                    &leaf(
+                        &[b"aardvark", b"apple", b"berry", b"pear", b"zebra"],
+                        None,
+                        None,
+                    ),
+                )
+                .await;
+                replace_node(&fixture.writer, 1, &Node::forward(token(0).to_string())).await;
+                let router = fixture.router();
+                if batched {
+                    let groups = router
+                        .route_keys_with_requirements(
+                            [
+                                (LogicalKey::new(collection(), b"pear"), ()),
+                                (LogicalKey::new(collection(), b"zebra"), ()),
+                            ],
+                            fixture.requirement,
+                            fixture.requirement,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(groups.len(), 1);
+                    assert_eq!(groups[0].path(), &node_path(0));
+                } else {
+                    assert_eq!(
+                        router
+                            .route_key(&collection(), b"pear", fixture.requirement)
+                            .await
+                            .unwrap()
+                            .path,
+                        node_path(0)
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn refresh_follows_redirects_past_a_retired_split_child() {
+            for batched in [false, true] {
+                let (backend, _) = recording_backend();
+                let writer = store_over(backend.clone());
+                let reader = store_over(backend);
+                store_leaf(
+                    &writer,
+                    1,
+                    &[b"apple", b"berry", b"kiwi"],
+                    Some(b"m"),
+                    Some(2),
+                )
+                .await;
+                store_leaf(&writer, 2, &[b"pear", b"zebra"], None, None).await;
+                assert!(
+                    writer
+                        .create_root(
+                            &collection(),
+                            &Node::index(IndexNode::from_children([
+                                (Vec::new(), token(1).to_string()),
+                                (b"m".to_vec(), token(2).to_string()),
+                            ]))
+                        )
+                        .await
+                        .unwrap()
+                );
+                let requirement = Requirement::after(reader.timeline.currentness_barrier());
+                let router =
+                    TreeRouter::new(reader.nodes.clone(), reader.timeline.clone(), limit(2));
+                router
+                    .route_key(&collection(), b"apple", requirement)
+                    .await
+                    .unwrap();
+
+                replace_node(
+                    &writer,
+                    1,
+                    &leaf(&[b"apple"], Some(b"berry"), Some(&token(3))),
+                )
+                .await;
+                store_leaf(&writer, 3, &[b"berry", b"kiwi"], Some(b"m"), Some(2)).await;
+                router
+                    .leaf_at(&collection(), &token(3), requirement)
+                    .await
+                    .unwrap();
+
+                replace_node(
+                    &writer,
+                    3,
+                    &leaf(&[b"berry", b"kiwi", b"pear", b"zebra"], None, None),
+                )
+                .await;
+                replace_node(&writer, 2, &Node::forward(token(3).to_string())).await;
+                replace_node(
+                    &writer,
+                    1,
+                    &leaf(
+                        &[b"apple", b"berry", b"kiwi", b"pear", b"zebra"],
+                        None,
+                        None,
+                    ),
+                )
+                .await;
+                replace_node(&writer, 3, &Node::forward(token(1).to_string())).await;
+
+                if batched {
+                    let groups = router
+                        .route_keys_with_requirements(
+                            [
+                                (LogicalKey::new(collection(), b"pear"), ()),
+                                (LogicalKey::new(collection(), b"zebra"), ()),
+                            ],
+                            requirement,
+                            requirement,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(groups.len(), 1);
+                    assert_eq!(groups[0].path(), &node_path(1));
+                } else {
+                    let routed = router
+                        .route_key(&collection(), b"pear", requirement)
+                        .await
+                        .unwrap();
+                    assert_eq!(routed.path, node_path(1));
+                    assert!(
+                        routed
+                            .node()
+                            .unwrap()
+                            .as_leaf()
+                            .unwrap()
+                            .lookup(b"pear")
+                            .is_some()
+                    );
+                }
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_persistent_right_link_and_redirect_cycle_still_fails() {
+            for batched in [false, true] {
+                let fixture = RetainedMerge::new().await;
+                replace_node(&fixture.writer, 1, fixture.old_left.node().unwrap()).await;
+                let error = tokio::time::timeout(Duration::from_secs(1), async {
+                    let router = fixture.router();
+                    if batched {
+                        router
+                            .route_keys_with_requirements(
+                                [
+                                    (LogicalKey::new(collection(), b"pear"), ()),
+                                    (LogicalKey::new(collection(), b"zebra"), ()),
+                                ],
+                                fixture.requirement,
+                                fixture.requirement,
+                            )
+                            .await
+                            .err()
+                            .unwrap()
+                    } else {
+                        router
+                            .route_key(&collection(), b"pear", fixture.requirement)
+                            .await
+                            .unwrap_err()
+                    }
+                })
+                .await
+                .expect("a fresh but cyclic tree must terminate");
+                assert!(error.to_string().contains("redirect cycle"), "{error}");
+            }
+        }
+
+        #[tokio::test]
+        async fn valid_redirect_chains_can_exceed_the_right_link_limit() {
+            let store = store();
+            let token_at = |index: usize| NodeToken::from_bytes((index as u128).to_le_bytes());
+            let redirects = MAX_SELF_CORRECTING_HOPS + 1;
+            for index in 0..=redirects {
+                let node = if index == redirects {
+                    leaf(&[b"apple", b"pear"], None, None)
+                } else {
+                    Node::forward(token_at(index + 1).to_string())
+                };
+                assert!(
+                    store
+                        .store_node(&collection(), &token_at(index), &node, None)
+                        .await
+                        .unwrap()
+                );
+            }
+            assert!(
+                store
+                    .create_root(
+                        &collection(),
+                        &Node::index(IndexNode::from_children([(
+                            Vec::new(),
+                            token_at(0).to_string(),
+                        )])),
+                    )
+                    .await
+                    .unwrap()
+            );
+            let router = TreeRouter::new(store.nodes.clone(), store.timeline.clone(), limit(2));
+            let expected = ObjectPath::Node {
+                collection: collection(),
+                token: token_at(redirects),
+            };
+
+            assert_eq!(
+                router
+                    .route_key(&collection(), b"pear", Requirement::ANY)
+                    .await
+                    .unwrap()
+                    .path,
+                expected
+            );
+            let groups = router
+                .route_keys_with_requirements(
+                    [
+                        (LogicalKey::new(collection(), b"apple"), ()),
+                        (LogicalKey::new(collection(), b"pear"), ()),
+                    ],
+                    Requirement::ANY,
+                    Requirement::ANY,
+                )
+                .await
+                .unwrap();
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].path(), &expected);
+            assert_eq!(groups[0].keys.len(), 2);
+            assert_eq!(
+                router
+                    .leaf_at(&collection(), &token_at(0), Requirement::ANY)
+                    .await
+                    .unwrap()
+                    .path,
+                expected
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn redirect_cycles_fail_all_routing_interfaces() {
+            let store = store();
+            for (source, target) in [(0, 1), (1, 0)] {
+                assert!(
+                    store
+                        .store_node(
+                            &collection(),
+                            &token(source),
+                            &Node::forward(token(target).to_string()),
+                            None,
+                        )
+                        .await
+                        .unwrap()
+                );
+            }
+            assert!(
+                store
+                    .create_root(
+                        &collection(),
+                        &Node::index(IndexNode::from_children([(
+                            Vec::new(),
+                            token(0).to_string(),
+                        )])),
+                    )
+                    .await
+                    .unwrap()
+            );
+            let router = TreeRouter::new(store.nodes.clone(), store.timeline.clone(), limit(2));
+            let results = tokio::time::timeout(Duration::from_secs(1), async {
+                let point = router
+                    .route_key(&collection(), b"apple", Requirement::ANY)
+                    .await
+                    .unwrap_err();
+                let grouped = router
+                    .route_keys_with_requirements(
+                        [
+                            (LogicalKey::new(collection(), b"apple"), ()),
+                            (LogicalKey::new(collection(), b"pear"), ()),
+                        ],
+                        Requirement::ANY,
+                        Requirement::ANY,
+                    )
+                    .await
+                    .err()
+                    .expect("a redirect cycle cannot route a key group");
+                let structural = router
+                    .leaf_at(&collection(), &token(0), Requirement::ANY)
+                    .await
+                    .unwrap_err();
+                [point, grouped, structural]
+            })
+            .await
+            .expect("cycle checks must terminate");
+            for error in results {
+                assert!(error.to_string().contains("redirect cycle"), "{error}");
+            }
+        }
+
+        #[tokio::test]
+        async fn structural_successor_stays_at_the_same_index_level() {
+            let store = store();
+            store_leaf(&store, 3, &[b"apple"], Some(b"m"), Some(4)).await;
+            store_leaf(&store, 4, &[b"pear"], None, None).await;
+            let left = Node::index(IndexNode::from_children([(
+                Vec::new(),
+                token(3).to_string(),
+            )]))
+            .with_high_key(Some(b"m".to_vec()))
+            .with_right_sibling(Some(token(2).to_string()));
+            let right = Node::index(IndexNode::from_children([(
+                b"m".to_vec(),
+                token(4).to_string(),
+            )]));
+            for (id, node) in [(1, left), (2, right)] {
+                assert!(
+                    store
+                        .store_node(&collection(), &token(id), &node, None)
+                        .await
+                        .unwrap()
+                );
+            }
+            let router = TreeRouter::new(store.nodes.clone(), store.timeline.clone(), limit(1));
+            let current = router
+                .leaf_at(&collection(), &token(1), Requirement::ANY)
+                .await
+                .unwrap();
+            let next = router
+                .next_structural_node(&collection(), &current, Requirement::ANY)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(next.path, node_path(2));
+            assert!(next.node().unwrap().as_index().is_some());
+            assert_eq!(
+                next.node().unwrap().as_index().unwrap().child_for(b"pear"),
+                Some(token(4).as_str())
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn structural_successor_can_inspect_an_intent_owned_gate() {
+            let store = store();
+            let owner = TxId::from_bytes(b"merge".to_vec());
+            let intent = StructuralIntentId::from(&token(4));
+            let mut gated = leaf(&[b"apple", b"pear"], None, None);
+            let mut locks = gated.locks().clone();
+            locks.set_structural_gate(owner.clone());
+            locks
+                .bind_structural_intent(&owner, intent.clone())
+                .unwrap();
+            gated.set_locks(locks);
+            store_leaf(&store, 1, &[b"apple"], Some(b"m"), Some(2)).await;
+            for (id, node) in [(2, Node::forward(token(3).to_string())), (3, gated)] {
+                assert!(
+                    store
+                        .store_node(&collection(), &token(id), &node, None)
+                        .await
+                        .unwrap()
+                );
+            }
+            let router = TreeRouter::new(store.nodes.clone(), store.timeline.clone(), limit(1));
+            let current = router
+                .leaf_at(&collection(), &token(1), Requirement::ANY)
+                .await
+                .unwrap();
+            let next = tokio::time::timeout(
+                Duration::from_secs(1),
+                router.next_structural_node(&collection(), &current, Requirement::ANY),
+            )
+            .await
+            .expect("structural recovery must not wait for merge publication")
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(next.path, node_path(3));
+            assert_eq!(
+                next.node().unwrap().structural_gate().intent(),
+                Some(&intent)
+            );
+        }
+    }
+
     use super::*;
 
     use std::future::Future;
@@ -1212,7 +1997,11 @@ mod tests {
         let root = Node::leaf(LeafBody::from_entries([live(b"only")]));
         s.create_root(&collection(), &root).await.unwrap();
 
-        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
         let requirement = Requirement::after(s.timeline.currentness_barrier());
         let loc = router
             .route_key(&collection(), b"only", requirement)
@@ -1233,7 +2022,11 @@ mod tests {
     #[tokio::test]
     async fn absent_collection_is_not_a_writable_empty_leaf() {
         let s = store();
-        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
         assert!(matches!(
             router
                 .route_key(
@@ -1275,7 +2068,11 @@ mod tests {
     async fn descends_index_to_correct_leaf() {
         let s = store();
         seed_two_level(&s).await;
-        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
 
         for (key, want_leaf) in [
             (b"apple".as_slice(), node_path(0)),
@@ -1303,7 +2100,11 @@ mod tests {
         take_reads(&log);
 
         let cold = store_over(backend.clone());
-        let router = TreeRouter::new(cold.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            cold.nodes.clone(),
+            cold.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
         let loc = router
             .route_key(&collection(), b"pear", Requirement::ANY)
             .await
@@ -1333,10 +2134,14 @@ mod tests {
             .await
             .unwrap();
         take_reads(&log);
-        let loc = TreeRouter::new(terminal_warm.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .route_key(&collection(), b"pear", Requirement::ANY)
-            .await
-            .unwrap();
+        let loc = TreeRouter::new(
+            terminal_warm.nodes.clone(),
+            terminal_warm.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        )
+        .route_key(&collection(), b"pear", Requirement::ANY)
+        .await
+        .unwrap();
         assert_eq!(loc.path, node_path(1));
         assert_eq!(
             take_reads(&log),
@@ -1351,7 +2156,11 @@ mod tests {
         take_reads(&log);
 
         let s = store_over(backend.clone());
-        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
         router
             .route_key(&collection(), b"pear", Requirement::ANY)
             .await
@@ -1381,15 +2190,19 @@ mod tests {
         }
         take_reads(&log);
         let bound = mixed.timeline.currentness_barrier();
-        let loc = TreeRouter::new(mixed.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .route_key_with_requirements(
-                &collection(),
-                b"pear",
-                Requirement::ANY,
-                Requirement::after(bound),
-            )
-            .await
-            .unwrap();
+        let loc = TreeRouter::new(
+            mixed.nodes.clone(),
+            mixed.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        )
+        .route_key_with_requirements(
+            &collection(),
+            b"pear",
+            Requirement::ANY,
+            Requirement::after(bound),
+        )
+        .await
+        .unwrap();
         assert_current_after(&loc, bound);
         assert_eq!(
             take_reads(&log),
@@ -1412,7 +2225,11 @@ mod tests {
             .unwrap();
         take_reads(&log);
 
-        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
         let first = router
             .first_leaf_at(&collection(), b"apple", Requirement::ANY)
             .await
@@ -1435,10 +2252,14 @@ mod tests {
         take_reads(&log);
 
         let bounded = store_over(backend.clone());
-        let leaves = TreeRouter::new(bounded.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .leaves_through(&collection(), b"apple", Some(b"mango"), Requirement::ANY)
-            .await
-            .unwrap();
+        let leaves = TreeRouter::new(
+            bounded.nodes.clone(),
+            bounded.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        )
+        .leaves_through(&collection(), b"apple", Some(b"mango"), Requirement::ANY)
+        .await
+        .unwrap();
         assert_eq!(
             leaves.iter().map(|leaf| &leaf.path).collect::<Vec<_>>(),
             [&node_path(0), &node_path(1)]
@@ -1459,10 +2280,14 @@ mod tests {
             .await
             .unwrap();
         take_reads(&log);
-        let leaves = TreeRouter::new(terminal_warm.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .leaves(&collection(), Requirement::ANY)
-            .await
-            .unwrap();
+        let leaves = TreeRouter::new(
+            terminal_warm.nodes.clone(),
+            terminal_warm.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        )
+        .leaves(&collection(), Requirement::ANY)
+        .await
+        .unwrap();
         assert_eq!(
             leaves.iter().map(|leaf| &leaf.path).collect::<Vec<_>>(),
             [&node_path(0), &node_path(1), &node_path(4)]
@@ -1484,7 +2309,11 @@ mod tests {
         take_reads(&log);
 
         let s = store_over(backend);
-        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
         let loc = router
             .route_key(&collection(), b"pear", Requirement::ANY)
             .await
@@ -1531,7 +2360,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let router = TreeRouter::new(reader.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            reader.nodes.clone(),
+            reader.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
         router
             .route_key(&collection(), b"pear", Requirement::ANY)
             .await
@@ -1600,21 +2433,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn topology_queries_ignore_off_path_nodes_and_classify_dangling_links() {
+    async fn topology_queries_check_one_retired_identity_and_classify_dangling_links() {
         let (backend, log) = recording_backend();
         seed_two_level(&store_over(backend.clone())).await;
         take_reads(&log);
         let s = store_over(backend);
         assert!(
-            !TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-                .token_reachable_at_key(&collection(), b"pear", &token(0), Requirement::ANY)
-                .await
-                .unwrap()
+            !TreeRouter::new(
+                s.nodes.clone(),
+                s.timeline.clone(),
+                std::num::NonZeroUsize::MIN
+            )
+            .token_reachable_at_key(&collection(), b"pear", &token(0), Requirement::ANY)
+            .await
+            .unwrap()
         );
         assert_eq!(
             take_reads(&log),
-            [read("read", root_path()), read("read", node_path(1))],
-            "reachability follows the key path and never reads the target directly"
+            [
+                read("read", root_path()),
+                read("read", node_path(1)),
+                read("read", node_path(0))
+            ],
+            "an off-path target gets one bounded check for a redirect or intent-owned gate"
         );
 
         let dangling = store();
@@ -1628,7 +2469,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let router = TreeRouter::new(dangling.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            dangling.nodes.clone(),
+            dangling.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
         assert!(
             !router
                 .token_reachable_at_key(&collection(), b"pear", &token(8), Requirement::ANY)
@@ -1647,7 +2492,11 @@ mod tests {
     async fn group_keys_by_leaf_routes_and_preserves_order() {
         let s = store();
         seed_two_level(&s).await;
-        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
 
         let groups = router
             .route_keys_with_requirements(
@@ -1797,7 +2646,7 @@ mod tests {
                 seed_distinct_leaf_collections(&store_over(backend.clone()).nodes, leaves).await;
             let gate = ReadGate::install(&backend);
             let cold = store_over(backend);
-            let router = TreeRouter::new(cold.nodes.clone(), limit(16));
+            let router = TreeRouter::new(cold.nodes.clone(), cold.timeline.clone(), limit(16));
             let items = collections
                 .into_iter()
                 .map(|collection| (LogicalKey::new(collection, b"k"), ()));
@@ -1818,7 +2667,7 @@ mod tests {
         seed_two_level(&store_over(backend.clone()).nodes).await;
         let gate = ReadGate::install(&backend);
         let cold = store_over(backend);
-        let router = TreeRouter::new(cold.nodes.clone(), limit(2));
+        let router = TreeRouter::new(cold.nodes.clone(), cold.timeline.clone(), limit(2));
         let items = [b"cat".as_slice(), b"mango", b"apple", b"pear"]
             .into_iter()
             .map(|key| (LogicalKey::new(collection(), key), ()));
@@ -1845,7 +2694,11 @@ mod tests {
         seed_two_level(&store_over(backend.clone())).await;
         take_reads(&log);
         let cold = store_over(backend);
-        let router = TreeRouter::new(cold.nodes.clone(), NonZeroUsize::new(16).unwrap());
+        let router = TreeRouter::new(
+            cold.nodes.clone(),
+            cold.timeline.clone(),
+            NonZeroUsize::new(16).unwrap(),
+        );
 
         let groups = router
             .route_keys_with_requirements(
@@ -1893,7 +2746,11 @@ mod tests {
         seed_converging_leaf_paths(&store_over(backend.clone())).await;
         take_reads(&log);
         let cold = store_over(backend);
-        let router = TreeRouter::new(cold.nodes.clone(), NonZeroUsize::new(2).unwrap());
+        let router = TreeRouter::new(
+            cold.nodes.clone(),
+            cold.timeline.clone(),
+            NonZeroUsize::new(2).unwrap(),
+        );
 
         let groups = router
             .route_keys_with_requirements(
@@ -1931,14 +2788,18 @@ mod tests {
         take_reads(&log);
         let cold = store_over(backend);
 
-        let groups = TreeRouter::new(cold.nodes.clone(), NonZeroUsize::new(16).unwrap())
-            .route_keys_with_requirements(
-                [(LogicalKey::new(collection(), b"pear"), ())],
-                Requirement::ANY,
-                Requirement::ANY,
-            )
-            .await
-            .unwrap();
+        let groups = TreeRouter::new(
+            cold.nodes.clone(),
+            cold.timeline.clone(),
+            NonZeroUsize::new(16).unwrap(),
+        )
+        .route_keys_with_requirements(
+            [(LogicalKey::new(collection(), b"pear"), ())],
+            Requirement::ANY,
+            Requirement::ANY,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(groups.len(), 1);
         assert_eq!(
@@ -1950,7 +2811,11 @@ mod tests {
     #[tokio::test]
     async fn grouped_routing_classifies_the_collection_that_failed() {
         let s = store();
-        let router = TreeRouter::new(s.nodes.clone(), NonZeroUsize::new(2).unwrap());
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            NonZeroUsize::new(2).unwrap(),
+        );
         let root = CollectionAddress::root("db");
         let child = CollectionAddress::new("db", CollectionId::from_slice(&[1; 16]).unwrap());
         let requirement = Requirement::after(s.timeline.currentness_barrier());
@@ -1984,7 +2849,11 @@ mod tests {
     async fn leaf_at_reads_the_named_child_without_self_correcting() {
         let s = store();
         seed_stale_leaf_parent(&s).await;
-        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
         let requirement = Requirement::after(s.timeline.currentness_barrier());
 
         // Routing steps right off L0, which no longer covers "pear".
@@ -2039,7 +2908,7 @@ mod tests {
             seed_right_link_cycle(&cyclic).await;
             cyclic
         }] {
-            let router = TreeRouter::new(s.nodes.clone(), limit(2));
+            let router = TreeRouter::new(s.nodes.clone(), s.timeline.clone(), limit(2));
             let result = router
                 .route_keys_with_requirements(
                     [
@@ -2098,7 +2967,7 @@ mod tests {
         .await
         .unwrap();
 
-        let router = TreeRouter::new(s.nodes.clone(), limit(2));
+        let router = TreeRouter::new(s.nodes.clone(), s.timeline.clone(), limit(2));
         let groups = router
             .route_keys_with_requirements(
                 [
@@ -2128,7 +2997,11 @@ mod tests {
     async fn a_right_link_cycle_fails_routing_instead_of_walking_forever() {
         let s = store();
         seed_right_link_cycle(&s).await;
-        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
 
         let routing = router
             .route_key(

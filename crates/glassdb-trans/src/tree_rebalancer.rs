@@ -1,11 +1,9 @@
-//! Background growth of the B-link coordination tree by leaf and node splits
-//! (ADR-031).
+//! Background rebalancing of the B-link coordination tree (ADRs 031, 072).
 //!
-//! Coordination objects are grow-only: a leaf that crosses its soft cap is
-//! halved so no single object becomes a scalability or contention bottleneck.
-//! Splitting runs off the hot path in a periodic background task, fed candidates
-//! from stored over-cap leaves and direct-commit inline admission misses —
-//! never a key-space enumeration.
+//! Size and inline-pressure hints require median splits. Repeated missed direct
+//! commits can justify merging two leaves with spare capacity. Rebalancing runs
+//! outside transaction commit and uses bounded hints without a tree scan.
+//! Merge publication and recovery are defined in the `merge` module.
 //!
 //! Every split is a sequence of independent, idempotent compare-and-swaps under
 //! a one-node structure-write lock. Before joining collection topology in
@@ -44,6 +42,8 @@
 //! rewritten into a two-entry index over them, growing the tree's height while
 //! leaving the independent collection record untouched.
 
+mod merge;
+mod merge_hints;
 mod recovery;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -71,23 +71,26 @@ use crate::leaf_coord::{LeafCoordinator, SplitHinter};
 use crate::monitor::{Monitor, TxRecoveryManifest};
 use crate::node_locking::{
     NodeLockReconciler, QuiescedEntries, StructuralGateOperation, StructuralGateOutcome,
+    StructuralGateRetry,
 };
 
+use merge::MergeProtocol;
+use merge_hints::{MergeCandidate, MergeHints};
 use recovery::{
     PreparedIntent, PreparedIntentCleanup, ReadyIntent, ReadyIntentCompletion,
     ReadyIntentTransition, RecoveryAction, RecoveryStep, StructuralRecovery,
 };
 
-/// How often the splitter drains its candidate queue. A split is a handful of
-/// CAS round-trips, so a tight cadence keeps overflowing leaves short-lived.
-const SPLIT_INTERVAL: Duration = Duration::from_secs(1);
+/// A short interval limits how long leaves remain over capacity while keeping
+/// rebalancing work outside transaction commits.
+const REBALANCE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Back off empty structural-intent listings independently of split candidates.
 const STRUCTURAL_RECOVERY_IDLE_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Upper bound on the buffered split-candidate queue. Candidates are only hints:
-/// the splitter reloads and re-checks each one, so dropping the oldest when full
-/// merely delays a split, never causes an unsafe one.
+/// the tree rebalancer reloads and re-checks each one, so dropping the oldest
+/// when full merely delays a split, never causes an unsafe one.
 const CANDIDATE_QUEUE_CAP: usize = 4096;
 
 /// Bounded attempts to insert a separator into a contended parent before
@@ -96,7 +99,7 @@ const PARENT_RETRIES: usize = 8;
 
 /// Safety bound on the leaf right-link hops walked while reconciling
 /// separators, so a malformed or concurrently-mutated chain can never spin the
-/// splitter. A well-formed chain up to a split key is far shorter than this.
+/// tree rebalancer. A well-formed chain up to a split key is far shorter than this.
 const MAX_RECONCILE_HOPS: usize = 4096;
 
 /// A right-link edge that a parent index does not name yet: the separator that
@@ -108,7 +111,7 @@ struct MissingSeparator {
 }
 
 /// A leaf separator a split could not publish into its parent index on the
-/// first try (a lost CAS): re-driven by a later [`Splitter`] sweep so the
+/// first try (a lost CAS): re-driven by a later [`TreeRebalancer`] sweep so the
 /// directory does not stay reliant on a right-link walk (ADR-031). Re-driving
 /// reconciles the whole chain, so `split_key -> new_token` names only the
 /// rightmost edge to publish.
@@ -126,7 +129,48 @@ struct StructuralNodeAccess {
     nodes: NodeStore,
     mon: Monitor,
     key_state: KeyStateResolver,
+    gate_retry: StructuralGateRetry,
     coord: LeafCoordinator,
+}
+
+/// Hands an interrupted topology owner to the monitor and durable recovery.
+struct StructuralOwner {
+    monitor: Monitor,
+    background: Weak<Background>,
+    wake: Arc<Notify>,
+    id: TxId,
+    cleanup: GcHints,
+    retry: RetryConfig,
+}
+
+impl Drop for StructuralOwner {
+    fn drop(&mut self) {
+        if !self.monitor.is_tracked_local(&self.id) {
+            return;
+        }
+        let Some(background) = self.background.upgrade() else {
+            return;
+        };
+        let monitor = self.monitor.clone();
+        let id = self.id.clone();
+        let wake = self.wake.clone();
+        let cleanup = self.cleanup.clone();
+        let mut backoff = self.retry.backoff();
+        background.spawn(async move {
+            loop {
+                if monitor.abort_owned_tx(&id).await.is_ok() {
+                    cleanup.schedule(id);
+                    wake.notify_one();
+                    break;
+                }
+                // A failed status read must not leave the stopped local owner
+                // Pending forever. Shutdown can cancel this task; another
+                // instance then uses the ordinary missing-owner recovery rules.
+                wake.notify_one();
+                rt::sleep(backoff.next_delay()).await;
+            }
+        });
+    }
 }
 
 impl StructuralNodeAccess {
@@ -134,12 +178,14 @@ impl StructuralNodeAccess {
         nodes: NodeStore,
         mon: Monitor,
         key_state: KeyStateResolver,
+        gate_retry: StructuralGateRetry,
         coord: LeafCoordinator,
     ) -> Self {
         Self {
             nodes,
             mon,
             key_state,
+            gate_retry,
             coord,
         }
     }
@@ -260,7 +306,8 @@ impl StructuralNodeAccess {
                 .cloned()
                 .map(|entry| (entry.key.clone(), entry))
                 .collect();
-            let reconciler = NodeLockReconciler::new(&self.key_state, &self.mon, id);
+            let reconciler =
+                NodeLockReconciler::new(&self.key_state, &self.mon, &self.gate_retry, id);
             let entries = match reconciler
                 .quiesce_entries(collection, &entries, Requirement::ANY)
                 .await?
@@ -350,7 +397,7 @@ impl StructuralNodeAccess {
             .await
         {
             tracing::debug!(
-                target: "glassdb::splitter",
+                target: "glassdb::tree_rebalancer",
                 error = %error,
                 "finalizing split transaction failed"
             );
@@ -628,7 +675,7 @@ impl SeparatorPublisher {
             }
             let Some(next) = self
                 .router
-                .next_leaf(collection, &current, requirement)
+                .next_structural_node(collection, &current, requirement)
                 .await?
             else {
                 return Ok(missing);
@@ -641,29 +688,41 @@ impl SeparatorPublisher {
     }
 }
 
-/// The feed of leaves that may need splitting (ADR-031), owned by the
-/// [`Splitter`]. The coordinator observes stored leaf size through
-/// [`SplitHinter`], while direct-commit admission reports inline pressure
-/// through [`SplitHintSink`]. The splitter drains and re-checks both causes.
-/// Cloneable so the producers and splitter share one queue and policy.
+/// Bounded demand for background splits and merges, owned by [`TreeRebalancer`].
+/// The coordinator reports stored leaf size through [`SplitHinter`]. Direct
+/// admission reports pressure and missed opportunities through [`TopologyHintSink`].
 #[derive(Clone)]
-pub(crate) struct SplitCandidates {
+pub(crate) struct TopologyHints {
     policy: SplitPolicy,
     inline: InlinePolicy,
     queue: Arc<Mutex<VecDeque<SplitCandidate>>>,
+    merges: MergeHints,
 }
 
-/// Lightweight producer handle for split hints decided outside the leaf
-/// coordinator. Opaque to its holders: they report pressure, never inspect or
-/// drive the splitter's queue.
+/// Reports inline pressure and missed direct commits for background maintenance.
 #[derive(Clone)]
-pub struct SplitHintSink {
-    candidates: SplitCandidates,
+pub struct TopologyHintSink {
+    candidates: TopologyHints,
 }
 
-impl SplitHintSink {
+impl TopologyHintSink {
+    /// Reports a possible direct commit lost to placement across two leaves.
+    pub(crate) fn observe_cross_leaf_miss(
+        &self,
+        id: &TxId,
+        paths: [&ObjectPath; 2],
+        nodes: [&Node; 2],
+        output_bytes: usize,
+    ) {
+        if output_bytes <= self.candidates.inline.max_leaf_bytes {
+            self.candidates
+                .merges
+                .observe(id, paths, nodes, output_bytes);
+        }
+    }
+
     /// Records recoverable aggregate inline pressure for authoritative
-    /// revalidation by the splitter.
+    /// revalidation by the tree rebalancer.
     pub(crate) fn observe_inline_pressure(&self, path: &ObjectPath, key: &[u8], value_len: usize) {
         if !self.candidates.inline.admits_value(value_len) {
             return;
@@ -829,7 +888,7 @@ enum StructuralSplitTopology<'a> {
 
 /// One root or non-root split with a single outer lifecycle.
 struct StructuralSplitAttempt<'a> {
-    splitter: &'a Splitter,
+    tree_rebalancer: &'a TreeRebalancer,
     collection: &'a CollectionAddress,
     target: StructuralSplitTarget<'a>,
     worker: TxId,
@@ -838,14 +897,14 @@ struct StructuralSplitAttempt<'a> {
 
 impl<'a> StructuralSplitAttempt<'a> {
     fn new(
-        splitter: &'a Splitter,
+        tree_rebalancer: &'a TreeRebalancer,
         collection: &'a CollectionAddress,
         target: StructuralSplitTarget<'a>,
         worker: TxId,
         reason: &'a SplitReason,
     ) -> Self {
         Self {
-            splitter,
+            tree_rebalancer,
             collection,
             target,
             worker,
@@ -857,7 +916,7 @@ impl<'a> StructuralSplitAttempt<'a> {
         let result = match topology {
             StructuralSplitTopology::Owned => {
                 match self
-                    .splitter
+                    .tree_rebalancer
                     .begin_topology_tx(self.collection, &self.worker)
                     .await
                 {
@@ -866,23 +925,23 @@ impl<'a> StructuralSplitAttempt<'a> {
                 }
             }
             StructuralSplitTopology::Joined(_) => {
-                self.splitter.mon.begin_tx(&self.worker);
+                self.tree_rebalancer.mon.begin_tx(&self.worker);
                 self.run_prepared(topology).await
             }
         };
 
         match topology {
             StructuralSplitTopology::Owned => {
-                self.splitter
+                self.tree_rebalancer
                     .finalize_topology_split(self.collection, &self.worker)
                     .await;
             }
             StructuralSplitTopology::Joined(_) => {
-                self.splitter.finalize_split(&self.worker).await;
+                self.tree_rebalancer.finalize_split(&self.worker).await;
             }
         }
         if result.is_err() {
-            self.splitter.recovery_wake.notify_one();
+            self.tree_rebalancer.recovery_wake.notify_one();
         }
         result
     }
@@ -893,7 +952,7 @@ impl<'a> StructuralSplitAttempt<'a> {
             StructuralSplitTopology::Joined(participant) => participant,
         };
         let prepared = self
-            .splitter
+            .tree_rebalancer
             .recovery
             .prepare_intent(self.collection, self.target.source_token(), participant)
             .await?;
@@ -901,7 +960,7 @@ impl<'a> StructuralSplitAttempt<'a> {
         let outcome = match topology {
             StructuralSplitTopology::Owned => {
                 match self
-                    .splitter
+                    .tree_rebalancer
                     .join_topology(self.collection, &self.worker)
                     .await
                 {
@@ -917,12 +976,12 @@ impl<'a> StructuralSplitAttempt<'a> {
     async fn coordinate(&self, prepared: PreparedIntent) -> SplitAttemptOutcome {
         match self.target {
             StructuralSplitTarget::Root => {
-                self.splitter
+                self.tree_rebalancer
                     .coordinate_root_split(self.collection, &self.worker, self.reason, prepared)
                     .await
             }
             StructuralSplitTarget::NonRoot(token) => {
-                self.splitter
+                self.tree_rebalancer
                     .coordinate_nonroot_split(
                         self.collection,
                         token,
@@ -945,17 +1004,22 @@ impl<'a> StructuralSplitAttempt<'a> {
         match state {
             SplitAttemptResult::Completed => match topology {
                 StructuralSplitTopology::Owned => result.and(
-                    self.splitter
+                    self.tree_rebalancer
                         .leave_topology(self.collection, &self.worker)
                         .await,
                 ),
                 StructuralSplitTopology::Joined(_) => result,
             },
             SplitAttemptResult::RetryCleanly => {
-                let cleanup = match self.splitter.recovery.discard_prepared(prepared).await {
+                let cleanup = match self
+                    .tree_rebalancer
+                    .recovery
+                    .discard_prepared(prepared)
+                    .await
+                {
                     Ok(()) => match topology {
                         StructuralSplitTopology::Owned => {
-                            self.splitter
+                            self.tree_rebalancer
                                 .leave_topology(self.collection, &self.worker)
                                 .await
                         }
@@ -981,15 +1045,17 @@ struct Stats {
     inline_pressure_completed: AtomicU64,
     inline_pressure_deferred: AtomicU64,
     inline_pressure_discarded: AtomicU64,
+    merge_candidates: AtomicU64,
+    merges_completed: AtomicU64,
 }
 
-/// Background split activity for one snapshot or accumulated interval.
+/// Tree rebalancing activity for one snapshot or accumulated interval.
 ///
 /// `completed` counts locally observed source/root linearizations. A split may
 /// also be `deferred` if a later publication or cleanup step needs another
 /// sweep, so the fields are not mutually exclusive outcomes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SplitterStats {
+pub struct TreeRebalancerStats {
     /// Deduplicated candidates processed for any split cause.
     pub candidates: u64,
     /// Locally observed source/root split linearizations for any cause.
@@ -1002,6 +1068,12 @@ pub struct SplitterStats {
     pub splits_avoided: u64,
     /// Activity attributable specifically to aggregate inline pressure.
     pub inline_pressure: InlinePressureStats,
+    /// Distinct missed-direct identities retained by the bounded merge hints.
+    pub merge_hints: u64,
+    /// Mature merge hints checked by background maintenance.
+    pub merge_candidates: u64,
+    /// Merges completed by this instance's background maintenance.
+    pub merges_completed: u64,
 }
 
 /// Split activity attributable to aggregate inline pressure.
@@ -1039,7 +1111,7 @@ impl Sub for InlinePressureStats {
     }
 }
 
-impl AddAssign for SplitterStats {
+impl AddAssign for TreeRebalancerStats {
     fn add_assign(&mut self, rhs: Self) {
         self.candidates += rhs.candidates;
         self.completed += rhs.completed;
@@ -1047,10 +1119,13 @@ impl AddAssign for SplitterStats {
         self.tombstones_reclaimed += rhs.tombstones_reclaimed;
         self.splits_avoided += rhs.splits_avoided;
         self.inline_pressure += rhs.inline_pressure;
+        self.merge_hints += rhs.merge_hints;
+        self.merge_candidates += rhs.merge_candidates;
+        self.merges_completed += rhs.merges_completed;
     }
 }
 
-impl Sub for SplitterStats {
+impl Sub for TreeRebalancerStats {
     type Output = Self;
 
     fn sub(self, rhs: Self) -> Self::Output {
@@ -1063,11 +1138,14 @@ impl Sub for SplitterStats {
                 .saturating_sub(rhs.tombstones_reclaimed),
             splits_avoided: self.splits_avoided.saturating_sub(rhs.splits_avoided),
             inline_pressure: self.inline_pressure - rhs.inline_pressure,
+            merge_hints: self.merge_hints.saturating_sub(rhs.merge_hints),
+            merge_candidates: self.merge_candidates.saturating_sub(rhs.merge_candidates),
+            merges_completed: self.merges_completed.saturating_sub(rhs.merges_completed),
         }
     }
 }
 
-impl SplitCandidates {
+impl TopologyHints {
     /// Creates an empty candidate feed with the supplied split policy.
     #[cfg(test)]
     fn with_policy(policy: SplitPolicy) -> Self {
@@ -1076,20 +1154,21 @@ impl SplitCandidates {
 
     /// Creates an empty candidate feed with co-wired split and inline policies.
     fn with_policies(policy: SplitPolicy, inline: InlinePolicy) -> Self {
-        SplitCandidates {
+        TopologyHints {
             policy,
             inline,
             queue: Arc::new(Mutex::new(VecDeque::new())),
+            merges: MergeHints::default(),
         }
     }
 
-    /// The soft-cap policy shared by the feed and the splitter.
+    /// The soft-cap policy shared by the feed and the tree rebalancer.
     pub(crate) fn policy(&self) -> &SplitPolicy {
         &self.policy
     }
 
-    fn hint_sink(&self) -> SplitHintSink {
-        SplitHintSink {
+    fn hint_sink(&self) -> TopologyHintSink {
+        TopologyHintSink {
             candidates: self.clone(),
         }
     }
@@ -1153,11 +1232,11 @@ impl SplitCandidate {
     }
 }
 
-impl SplitHinter for SplitCandidates {
+impl SplitHinter for TopologyHints {
     /// Records that `path`'s leaf, now holding `entries`, may be a split
     /// candidate: over either the entry-count or the encoded-byte soft cap. A
     /// node needs at least two entries to be divisible, so a single hot key is
-    /// never enqueued however large. The byte size is a hint the splitter
+    /// never enqueued however large. The byte size is a hint the tree rebalancer
     /// re-checks authoritatively against the full node (which adds a little
     /// framing), so this need not account for it. The oldest hint is dropped
     /// when the queue is full.
@@ -1176,27 +1255,26 @@ impl SplitHinter for SplitCandidates {
     }
 }
 
-/// Background executor that halves over-full B-link nodes (ADR-031). Holds no
-/// per-transaction state: every split is a pure structural compare-and-swap
-/// through the node and structural-intent stores, recovered idempotently like any
-/// in-doubt CAS.
+/// Maintains tree capacity and executes optional topology decisions.
+/// Structural intents retain interrupted splits and merges for recovery.
 #[derive(Clone)]
-pub struct Splitter {
+pub struct TreeRebalancer {
     // Weak so a clone captured in the spawned loop does not keep the executor
     // alive across shutdown; `Engine` is the single strong owner.
     bg: Weak<Background>,
     records: CollectionStore,
     nodes: NodeStore,
-    router: TreeRouter,
     mon: Monitor,
     structural_nodes: StructuralNodeAccess,
     timeline: Timeline,
-    // The candidate feed this splitter drains. The coordinator receives a
+    // The candidate feed this tree rebalancer drains. The coordinator receives a
     // clone for stored-leaf capacity; direct resolvers receive lightweight hint
     // sinks for inline-pressure observations.
-    candidates: SplitCandidates,
+    candidates: TopologyHints,
     publisher: SeparatorPublisher,
     recovery: StructuralRecovery,
+    router: TreeRouter,
+    merges: MergeProtocol,
     // Wakes the independent recovery loop when a local split leaves `_s` work.
     recovery_wake: Arc<Notify>,
     // Paces collection-record and node CAS retries. Transaction-status polling remains
@@ -1206,9 +1284,8 @@ pub struct Splitter {
     stats: Arc<Stats>,
 }
 
-impl Splitter {
-    /// Builds a splitter and coordinator that share one timeline and
-    /// split-candidate feed.
+impl TreeRebalancer {
+    /// Builds a tree rebalancer and its leaf coordinator.
     #[allow(clippy::too_many_arguments)]
     pub fn with_coordinator(
         bg: Weak<Background>,
@@ -1224,16 +1301,19 @@ impl Splitter {
         inline: InlinePolicy,
         cleanup_hints: GcHints,
     ) -> (LeafCoordinator, Self) {
-        let candidates = SplitCandidates::with_policies(policy, inline);
+        let candidates = TopologyHints::with_policies(policy, inline);
+        let recovery_wake = Arc::new(Notify::new());
+        let gate_retry = StructuralGateRetry::new(timeline.clone(), recovery_wake.clone());
         let coord = LeafCoordinator::with_hinter(
             nodes.clone(),
             key_state.clone(),
             mon.clone(),
+            gate_retry,
             retry,
             policy,
             Arc::new(candidates.clone()),
         );
-        let splitter = Splitter::with_candidates(
+        let tree_rebalancer = TreeRebalancer::with_candidates(
             bg,
             records,
             nodes,
@@ -1246,19 +1326,22 @@ impl Splitter {
             candidates,
             retry,
             cleanup_hints,
+            recovery_wake,
         );
-        (coord, splitter)
+        (coord, tree_rebalancer)
     }
 
-    /// Returns a producer handle for split hints decided outside the leaf
-    /// coordinator.
-    pub fn hint_sink(&self) -> SplitHintSink {
+    /// Returns a producer handle for topology hints.
+    pub fn hint_sink(&self) -> TopologyHintSink {
         self.candidates.hint_sink()
     }
 
-    /// Returns and resets background split activity counters.
-    pub fn stats_and_reset(&self) -> SplitterStats {
-        SplitterStats {
+    /// Returns and resets tree rebalancing activity counters.
+    pub fn stats_and_reset(&self) -> TreeRebalancerStats {
+        TreeRebalancerStats {
+            merge_hints: self.candidates.merges.observations_and_reset(),
+            merge_candidates: self.stats.merge_candidates.swap(0, Ordering::Relaxed),
+            merges_completed: self.stats.merges_completed.swap(0, Ordering::Relaxed),
             candidates: self.stats.candidates.swap(0, Ordering::Relaxed),
             completed: self.stats.completed.swap(0, Ordering::Relaxed),
             deferred: self.stats.deferred.swap(0, Ordering::Relaxed),
@@ -1285,71 +1368,16 @@ impl Splitter {
         }
     }
 
-    /// Creates a splitter over an explicitly co-wired coordinator and feed.
-    #[allow(clippy::too_many_arguments)]
-    fn with_candidates(
-        bg: Weak<Background>,
-        records: CollectionStore,
-        nodes: NodeStore,
-        intent_store: StructuralIntentStore,
-        timeline: Timeline,
-        mon: Monitor,
-        key_state: KeyStateResolver,
-        db_root: DbRoot,
-        coord: LeafCoordinator,
-        candidates: SplitCandidates,
-        retry: RetryConfig,
-        cleanup_hints: GcHints,
-    ) -> Self {
-        let router = TreeRouter::new(nodes.clone(), std::num::NonZeroUsize::MIN);
-        let structural_nodes =
-            StructuralNodeAccess::new(nodes.clone(), mon.clone(), key_state, coord);
-        let publisher = SeparatorPublisher::new(
-            structural_nodes.clone(),
-            router.clone(),
-            timeline.clone(),
-            *candidates.policy(),
-        );
-        let recovery = StructuralRecovery::new(
-            records.clone(),
-            nodes.clone(),
-            intent_store.clone(),
-            router.clone(),
-            mon.clone(),
-            structural_nodes.clone(),
-            publisher.clone(),
-            timeline.clone(),
-            db_root,
-            retry,
-        );
-        Splitter {
-            bg,
-            records,
-            nodes,
-            router,
-            mon,
-            structural_nodes,
-            timeline,
-            candidates,
-            publisher,
-            recovery,
-            recovery_wake: Arc::new(Notify::new()),
-            retry,
-            cleanup_hints,
-            stats: Arc::new(Stats::default()),
-        }
-    }
-
-    /// Starts independent split-candidate and structural-recovery loops.
+    /// Starts tree rebalancing and structural recovery.
     pub fn start(&self) {
         let Some(bg) = self.bg.upgrade() else {
             return;
         };
-        let splitter = self.clone();
+        let tree_rebalancer = self.clone();
         bg.spawn(async move {
             loop {
-                rt::sleep(SPLIT_INTERVAL).await;
-                splitter.run_once().await;
+                rt::sleep(REBALANCE_INTERVAL).await;
+                tree_rebalancer.run_once().await;
             }
         });
         let recovery = self.clone();
@@ -1376,9 +1404,151 @@ impl Splitter {
         });
     }
 
-    /// Runs one sweep: split every queued candidate. Best-effort — a transient
-    /// error on one candidate only defers its split to a later cycle, so it is
-    /// logged and the sweep continues.
+    /// Merges two adjacent standalone leaves through durable structural recovery.
+    async fn merge_leaves(
+        &self,
+        collection: &CollectionAddress,
+        left: &NodeToken,
+        right: &NodeToken,
+        candidate: Option<&MergeCandidate>,
+    ) -> Result<(), TransError> {
+        let participant = self.candidates.new_id();
+        let _owner = StructuralOwner {
+            monitor: self.mon.clone(),
+            background: self.bg.clone(),
+            wake: self.recovery_wake.clone(),
+            id: participant.clone(),
+            cleanup: self.cleanup_hints.clone(),
+            retry: self.retry,
+        };
+        let result = async {
+            self.begin_topology_tx(collection, &participant).await?;
+            let prepared = self
+                .merges
+                .prepare(collection, left, right, &participant)
+                .await?;
+            self.join_topology(collection, &participant).await?;
+            let (_, right_observation) = self
+                .acquire_structural_gate(collection, Some(right), &participant)
+                .await?
+                .ok_or(TransError::Retry)?;
+            let left_observation = self
+                .nodes
+                .load_node_state(
+                    collection,
+                    left,
+                    Requirement::after(self.timeline.currentness_barrier()),
+                )
+                .await?;
+            if let Some(candidate) = candidate {
+                let sources = [
+                    left_observation.value().ok_or(TransError::Retry)?.as_ref(),
+                    right_observation.value().unwrap().as_ref(),
+                ];
+                if !candidate.permits(sources, self.candidates.policy, self.candidates.inline) {
+                    return Err(TransError::Retry);
+                }
+            }
+            let ready = self
+                .merges
+                .ready(&prepared, &left_observation, &right_observation)
+                .await?
+                .ok_or(TransError::Retry)?;
+            self.merges.recover(&ready).await?;
+            let (source, _) = self
+                .nodes
+                .load_node(
+                    collection,
+                    right,
+                    Requirement::after(self.timeline.currentness_barrier()),
+                )
+                .await?;
+            if source.forwarding_target() != Some(left.as_str()) {
+                return Err(TransError::Retry);
+            }
+            self.leave_topology(collection, &participant).await
+        }
+        .await;
+        if result.is_err() {
+            // Intent-owned gates survive ordinary cleanup. Recovery must
+            // finish before the participant can leave collection topology.
+            let _ = self
+                .release_structural_gate(collection, Some(right), &participant)
+                .await;
+            self.recovery_wake.notify_one();
+        }
+        self.finalize_topology_split(collection, &participant).await;
+        self.cleanup_hints.schedule(participant);
+        result
+    }
+
+    /// Creates a tree rebalancer over an explicitly co-wired coordinator and feed.
+    #[allow(clippy::too_many_arguments)]
+    fn with_candidates(
+        bg: Weak<Background>,
+        records: CollectionStore,
+        nodes: NodeStore,
+        intent_store: StructuralIntentStore,
+        timeline: Timeline,
+        mon: Monitor,
+        key_state: KeyStateResolver,
+        db_root: DbRoot,
+        coord: LeafCoordinator,
+        candidates: TopologyHints,
+        retry: RetryConfig,
+        cleanup_hints: GcHints,
+        recovery_wake: Arc<Notify>,
+    ) -> Self {
+        let router = TreeRouter::new(nodes.clone(), timeline.clone(), std::num::NonZeroUsize::MIN);
+        let gate_retry = StructuralGateRetry::new(timeline.clone(), recovery_wake.clone());
+        let structural_nodes =
+            StructuralNodeAccess::new(nodes.clone(), mon.clone(), key_state, gate_retry, coord);
+        let publisher = SeparatorPublisher::new(
+            structural_nodes.clone(),
+            router.clone(),
+            timeline.clone(),
+            *candidates.policy(),
+        );
+        let merges = MergeProtocol::new(
+            nodes.clone(),
+            intent_store.clone(),
+            structural_nodes.clone(),
+            timeline.clone(),
+            *candidates.policy(),
+        );
+        let recovery = StructuralRecovery::new(
+            records.clone(),
+            nodes.clone(),
+            intent_store.clone(),
+            router.clone(),
+            mon.clone(),
+            structural_nodes.clone(),
+            publisher.clone(),
+            timeline.clone(),
+            db_root,
+            retry,
+            merges.clone(),
+        );
+        TreeRebalancer {
+            bg,
+            records,
+            nodes,
+            mon,
+            structural_nodes,
+            timeline,
+            candidates,
+            publisher,
+            recovery,
+            merges,
+            router,
+            recovery_wake,
+            retry,
+            cleanup_hints,
+            stats: Arc::new(Stats::default()),
+        }
+    }
+
+    /// Processes tree rebalancing work and retries deferred separator publication.
     async fn run_once(&self) {
         for candidate in self.candidates.drain() {
             self.stats.candidates.fetch_add(1, Ordering::Relaxed);
@@ -1390,7 +1560,7 @@ impl Splitter {
             }
             if let Err(e) = self.process_candidate(&candidate).await {
                 tracing::debug!(
-                    target: "glassdb::splitter",
+                    target: "glassdb::tree_rebalancer",
                     path = %candidate.path,
                     error = %e,
                     "split candidate deferred"
@@ -1420,12 +1590,67 @@ impl Splitter {
                 .await
             {
                 tracing::debug!(
-                    target: "glassdb::splitter",
+                    target: "glassdb::tree_rebalancer",
                     error = %e,
                     "separator publication deferred"
                 );
             }
         }
+        self.maintain_merges().await;
+    }
+
+    /// Checks at most one merge hint after all pending split work.
+    async fn maintain_merges(&self) {
+        let Some(candidate) = self.candidates.merges.take() else {
+            return;
+        };
+        self.stats.merge_candidates.fetch_add(1, Ordering::Relaxed);
+        match self.try_merge(&candidate).await {
+            Ok(true) => {
+                self.stats.merges_completed.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false) => {}
+            Err(error) => tracing::debug!(%error, "merge hint discarded"),
+        }
+    }
+
+    async fn try_merge(&self, candidate: &MergeCandidate) -> Result<bool, TransError> {
+        let requirement = Requirement::after(self.timeline.currentness_barrier());
+        let (a, b) = tokio::try_join!(
+            self.nodes.load_node_at(&candidate.paths[0], requirement),
+            self.nodes.load_node_at(&candidate.paths[1], requirement),
+        )?;
+        if !candidate.permits([&a.0, &b.0], self.candidates.policy, self.candidates.inline) {
+            return Ok(false);
+        }
+        let (left, right) = match (a.0.high_key(), b.0.high_key()) {
+            (Some(a), Some(b)) if a < b => (0, 1),
+            (Some(_), None) => (0, 1),
+            _ => (1, 0),
+        };
+        let (
+            ObjectPath::Node {
+                collection,
+                token: left_token,
+            },
+            ObjectPath::Node {
+                token: right_token, ..
+            },
+        ) = (&candidate.paths[left], &candidate.paths[right])
+        else {
+            return Ok(false);
+        };
+        let left_node = if left == 0 { &a.0 } else { &b.0 };
+        if !self
+            .merges
+            .sources_are_adjacent(collection, left_node, right_token)
+            .await?
+        {
+            return Ok(false);
+        }
+        self.merge_leaves(collection, left_token, right_token, Some(candidate))
+            .await?;
+        Ok(true)
     }
 
     /// Dispatches one candidate through its cause-specific validation path.
@@ -1699,8 +1924,8 @@ impl Splitter {
                 }
                 Ok(())
             }
-            SplitNeed::Reroute => Err(TransError::Retry),
             SplitNeed::Split => unreachable!("a required split must remain in coordination"),
+            SplitNeed::Reroute => Err(TransError::Retry),
         };
         self.cancel_preparing_split(collection, target, worker, result)
             .await
@@ -2152,7 +2377,7 @@ impl Splitter {
         });
         if let Err(e) = self.mon.commit_tx(log).await {
             tracing::debug!(
-                target: "glassdb::splitter",
+                target: "glassdb::tree_rebalancer",
                 error = %e,
                 "finalizing topology participant failed"
             );
@@ -2166,7 +2391,7 @@ impl Splitter {
             Ok(active) => Ok(active),
             Err(error) => {
                 tracing::debug!(
-                    target: "glassdb::splitter",
+                    target: "glassdb::tree_rebalancer",
                     error = %error,
                     "structural recovery action failed"
                 );
@@ -2234,7 +2459,7 @@ impl Splitter {
 }
 
 #[async_trait]
-impl TopologySettler for Splitter {
+impl TopologySettler for TreeRebalancer {
     /// Completes structural recovery before releasing one finalized topology participant.
     async fn settle_topology_participant(
         &self,
@@ -2286,7 +2511,8 @@ mod tests {
     use glassdb_storage::transaction::TxWrite;
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, CurrentState, LeafEntry, LockType,
-        Observation, StructuralIntent, StructuralIntentPhase,
+        MergeIntent, MergeIntentPhase, Observation, SplitIntent, SplitIntentPhase,
+        StructuralIntent,
     };
 
     const COLL: &str = "db/_c/0000000000000000000000";
@@ -2323,26 +2549,20 @@ mod tests {
     }
 
     fn canonical_node(node: &Node) -> Node {
-        let mut canonical = match (node.as_leaf(), node.as_index()) {
-            (Some(leaf), None) => Node::leaf(leaf.clone()),
-            (None, Some(index)) => Node::index(IndexNode::from_children(
-                index
-                    .children()
-                    .map(|(key, token)| (key.to_vec(), test_token(token).to_string())),
-            )),
-            _ => unreachable!("a node has exactly one body"),
+        let mut canonical = node.clone();
+        if let Some(index) = node.as_index() {
+            canonical
+                .set_index(IndexNode::from_children(
+                    index
+                        .children()
+                        .map(|(key, token)| (key.to_vec(), test_token(token).to_string())),
+                ))
+                .unwrap();
         }
-        .with_high_key(node.high_key().map(<[u8]>::to_vec))
-        .with_right_sibling(
+        canonical.with_right_sibling(
             node.right_sibling()
                 .map(|token| test_token(token).to_string()),
-        );
-        canonical.set_locks(node.locks().clone());
-        canonical
-    }
-
-    fn canonical_intent(intent: &StructuralIntent) -> StructuralIntent {
-        intent.clone()
+        )
     }
 
     fn root_path() -> ObjectPath {
@@ -2471,13 +2691,13 @@ mod tests {
         async fn write_structural_intent(
             &self,
             intent_id: &str,
-            intent: &StructuralIntent,
+            intent: &SplitIntent,
         ) -> Result<Observation<StructuralIntent>, StorageError> {
             self.intent_store
                 .write(
                     &db_root("db"),
                     &StructuralIntentId::from(test_token(intent_id)),
-                    &canonical_intent(intent),
+                    &StructuralIntent::Split(intent.clone()),
                 )
                 .await
         }
@@ -2496,6 +2716,90 @@ mod tests {
 
     fn store() -> TestStore {
         store_with_backend(Arc::new(MemoryBackend::new()))
+    }
+
+    #[tokio::test]
+    async fn merged_leaves_preserve_values_and_share_one_routing_target() {
+        let s = store();
+        let left = Node::leaf(LeafBody::from_entries([inline_live(b"a", b"left")]))
+            .with_high_key(Some(b"m".to_vec()))
+            .with_right_sibling(Some(test_token("R").to_string()));
+        let right = Node::leaf(LeafBody::from_entries([inline_live(b"m", b"right")]));
+        s.store_node(COLL, "L", &left, None).await.unwrap();
+        s.store_node(COLL, "R", &right, None).await.unwrap();
+        s.create_root(
+            COLL,
+            &Node::index(IndexNode::from_children([
+                (Vec::new(), "L".into()),
+                (b"m".to_vec(), "R".into()),
+            ])),
+        )
+        .await
+        .unwrap();
+        let bg = Arc::new(Background::new());
+        let sp = tree_rebalancer(&s, &bg, SplitPolicy::default());
+        sp.merge_leaves(&collection(), &test_token("L"), &test_token("R"), None)
+            .await
+            .unwrap();
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
+        let leaves = router
+            .leaves(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(leaves.len(), 1);
+        let node = leaves[0].node().unwrap();
+        let body = node.as_leaf().unwrap();
+        assert_eq!(
+            body.lookup(b"a")
+                .unwrap()
+                .current
+                .inline()
+                .unwrap()
+                .as_ref(),
+            b"left"
+        );
+        assert_eq!(
+            body.lookup(b"m")
+                .unwrap()
+                .current
+                .inline()
+                .unwrap()
+                .as_ref(),
+            b"right"
+        );
+        for key in [b"a".as_slice(), b"m"] {
+            assert_eq!(
+                router
+                    .route_key(&collection(), key, Requirement::ANY)
+                    .await
+                    .unwrap()
+                    .path,
+                leaves[0].path
+            );
+        }
+        assert!(
+            s.discover_structural_intents(
+                "db",
+                Requirement::after(s.timeline.currentness_barrier())
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        let record = s
+            .records
+            .load_record(&collection(), Requirement::ANY)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(record.topology_participants().count(), 0);
     }
 
     fn store_with_backend(backend: Arc<dyn Backend>) -> TestStore {
@@ -2543,58 +2847,64 @@ mod tests {
             .with_right_sibling(right.map(|token| test_token(token).to_string()))
     }
 
-    fn splitter(store: &TestStore, bg: &Arc<Background>, policy: SplitPolicy) -> Splitter {
-        splitter_with_candidates(store, bg, SplitCandidates::with_policy(policy))
-    }
-
-    fn splitter_with_candidates(
+    fn tree_rebalancer(
         store: &TestStore,
         bg: &Arc<Background>,
-        candidates: SplitCandidates,
-    ) -> Splitter {
-        splitter_with_candidates_and_hints(store, bg, candidates, GcHints::default())
+        policy: SplitPolicy,
+    ) -> TreeRebalancer {
+        tree_rebalancer_with_candidates(store, bg, TopologyHints::with_policy(policy))
     }
 
-    fn splitter_with_candidates_and_hints(
+    fn tree_rebalancer_with_candidates(
         store: &TestStore,
         bg: &Arc<Background>,
-        candidates: SplitCandidates,
+        candidates: TopologyHints,
+    ) -> TreeRebalancer {
+        tree_rebalancer_with_candidates_and_hints(store, bg, candidates, GcHints::default())
+    }
+
+    fn tree_rebalancer_with_candidates_and_hints(
+        store: &TestStore,
+        bg: &Arc<Background>,
+        candidates: TopologyHints,
         cleanup_hints: GcHints,
-    ) -> Splitter {
+    ) -> TreeRebalancer {
         let mon = store.foundation.monitor_for(
             bg,
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
-        splitter_with_monitor_and_hints(store, bg, mon, candidates, cleanup_hints)
+        tree_rebalancer_with_monitor_and_hints(store, bg, mon, candidates, cleanup_hints)
     }
 
-    fn splitter_with_monitor(
+    fn tree_rebalancer_with_monitor(
         store: &TestStore,
         bg: &Arc<Background>,
         mon: Monitor,
-        candidates: SplitCandidates,
-    ) -> Splitter {
-        splitter_with_monitor_and_hints(store, bg, mon, candidates, GcHints::default())
+        candidates: TopologyHints,
+    ) -> TreeRebalancer {
+        tree_rebalancer_with_monitor_and_hints(store, bg, mon, candidates, GcHints::default())
     }
 
-    fn splitter_with_monitor_and_hints(
+    fn tree_rebalancer_with_monitor_and_hints(
         store: &TestStore,
         bg: &Arc<Background>,
         mon: Monitor,
-        candidates: SplitCandidates,
+        candidates: TopologyHints,
         cleanup_hints: GcHints,
-    ) -> Splitter {
+    ) -> TreeRebalancer {
         let key_state = KeyStateResolver::new(mon.clone());
+        let recovery_wake = Arc::new(Notify::new());
         let coord = LeafCoordinator::with_hinter(
             store.nodes.clone(),
             key_state.clone(),
             mon.clone(),
+            StructuralGateRetry::new(store.timeline.clone(), recovery_wake.clone()),
             RetryConfig::default(),
             *candidates.policy(),
             Arc::new(candidates.clone()),
         );
-        Splitter::with_candidates(
+        TreeRebalancer::with_candidates(
             Arc::downgrade(bg),
             store.records.clone(),
             store.nodes.clone(),
@@ -2607,22 +2917,23 @@ mod tests {
             candidates,
             RetryConfig::default(),
             cleanup_hints,
+            recovery_wake,
         )
     }
 
-    fn splitter_and_monitor(
+    fn tree_rebalancer_and_monitor(
         store: &TestStore,
         bg: &Arc<Background>,
         policy: SplitPolicy,
-    ) -> (Splitter, Monitor) {
+    ) -> (TreeRebalancer, Monitor) {
         let mon = store.foundation.monitor_for(
             bg,
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
-        let candidates = SplitCandidates::with_policy(policy);
-        let splitter = splitter_with_monitor(store, bg, mon.clone(), candidates);
-        (splitter, mon)
+        let candidates = TopologyHints::with_policy(policy);
+        let tree_rebalancer = tree_rebalancer_with_monitor(store, bg, mon.clone(), candidates);
+        (tree_rebalancer, mon)
     }
 
     fn leaf_with_membership_reader(keys: &[&[u8]], holder: &TxId) -> Node {
@@ -2643,25 +2954,837 @@ mod tests {
         "superseded-source-version".to_string()
     }
 
-    fn nonroot_intent(source: &str, right: &str, split_key: &[u8]) -> StructuralIntent {
-        StructuralIntent {
+    fn nonroot_intent(source: &str, right: &str, split_key: &[u8]) -> SplitIntent {
+        SplitIntent {
             collection: collection(),
             source_token: Some(test_token(source)),
             source_version: superseded_source_version(),
             created_tokens: vec![test_token(right)],
             split_key: split_key.to_vec(),
             participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
-            phase: StructuralIntentPhase::Ready,
+            phase: SplitIntentPhase::Ready,
         }
     }
 
+    mod merge_lifecycle_tests {
+        use super::*;
+
+        use std::sync::atomic::AtomicUsize;
+
+        use glassdb_backend::{BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
+        use glassdb_data::CollectionId;
+
+        use crate::collections::{CollectionChange, CollectionLifecycle, CollectionOp};
+
+        // Equal bodies must reuse their revision, as they can with ETags. The
+        // default memory backend's unique generations would hide this race.
+        #[derive(Default)]
+        struct ContentVersionBackend {
+            inner: MemoryBackend,
+            mutations: tokio::sync::Mutex<()>,
+        }
+
+        impl ContentVersionBackend {
+            fn version(value: &[u8]) -> Version {
+                Version::new(format!("{value:?}"))
+            }
+        }
+
+        #[async_trait]
+        impl Backend for ContentVersionBackend {
+            async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
+                let mut reply = self.inner.read(path).await?;
+                reply.version = Self::version(&reply.contents);
+                Ok(reply)
+            }
+
+            async fn read_if_modified(
+                &self,
+                path: &str,
+                expected: &Version,
+            ) -> Result<ReadReply, BackendError> {
+                let reply = self.read(path).await?;
+                if &reply.version == expected {
+                    Err(BackendError::Precondition)
+                } else {
+                    Ok(reply)
+                }
+            }
+
+            async fn write_if(
+                &self,
+                path: &str,
+                value: Vec<u8>,
+                expected: &Version,
+            ) -> Result<Version, BackendError> {
+                let _guard = self.mutations.lock().await;
+                let current = self.inner.read(path).await?;
+                if &Self::version(&current.contents) != expected {
+                    return Err(BackendError::Precondition);
+                }
+                let version = Self::version(&value);
+                self.inner.write_if(path, value, &current.version).await?;
+                Ok(version)
+            }
+
+            async fn write_if_not_exists(
+                &self,
+                path: &str,
+                value: Vec<u8>,
+            ) -> Result<Version, BackendError> {
+                let _guard = self.mutations.lock().await;
+                let version = Self::version(&value);
+                self.inner.write_if_not_exists(path, value).await?;
+                Ok(version)
+            }
+
+            async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+                let _guard = self.mutations.lock().await;
+                let current = self.inner.read(path).await?;
+                if &Self::version(&current.contents) != expected {
+                    return Err(BackendError::Precondition);
+                }
+                self.inner.delete_if(path, &current.version).await
+            }
+
+            async fn list(
+                &self,
+                prefix: &str,
+                cursor: Option<&ListCursor>,
+                limit: ListLimit,
+            ) -> Result<ListPage, BackendError> {
+                self.inner.list(prefix, cursor, limit).await
+            }
+        }
+
+        struct DelayedWrite {
+            path: String,
+            value: Vec<u8>,
+            expected: Version,
+        }
+
+        async fn seed_merge_pair(store: &TestStore, collection: &CollectionAddress) {
+            let prefix = collection.physical_prefix();
+            let left = Node::leaf(LeafBody::from_entries([inline_live(b"a", b"left")]))
+                .with_high_key(Some(b"m".to_vec()))
+                .with_right_sibling(Some(test_token("R").to_string()));
+            let right = Node::leaf(LeafBody::from_entries([inline_live(b"m", b"right")]));
+            assert!(store.store_node(&prefix, "L", &left, None).await.unwrap());
+            assert!(store.store_node(&prefix, "R", &right, None).await.unwrap());
+            assert!(
+                store
+                    .create_root(
+                        &prefix,
+                        &Node::index(IndexNode::from_children([
+                            (Vec::new(), "L".to_string()),
+                            (b"m".to_vec(), "R".to_string()),
+                        ])),
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn busy_left_leaf_is_skipped_without_changing_its_holders() {
+            for blocker in ["entry", "membership", "structure", "deletion"] {
+                let store = store();
+                seed_merge_pair(&store, &collection()).await;
+                let background = Arc::new(Background::new());
+                let rebalancer = tree_rebalancer(&store, &background, SplitPolicy::default());
+                let holder = TxId::with_priority(1, b"busy left");
+                rebalancer.mon.begin_tx(&holder);
+                let (mut busy, left) = store.load_node(COLL, "L", Requirement::ANY).await.unwrap();
+                match blocker {
+                    "entry" => {
+                        let mut entry = busy.as_leaf().unwrap().lookup(b"a").unwrap().clone();
+                        entry.acquire_read_lock(holder.clone());
+                        busy.set_leaf(LeafBody::from_entries([entry])).unwrap();
+                    }
+                    "membership" => busy.add_membership_reader(holder.clone()),
+                    "structure" => busy.set_structural_gate(holder.clone()),
+                    "deletion" => busy.set_collection_delete_intent(holder.clone()),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    store
+                        .store_node(COLL, "L", &busy, Some(&left))
+                        .await
+                        .unwrap()
+                );
+
+                assert!(matches!(
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        rebalancer.merge_leaves(
+                            &collection(),
+                            &test_token("L"),
+                            &test_token("R"),
+                            None,
+                        ),
+                    )
+                    .await
+                    .expect("busy left leaves must not wait for their holders"),
+                    Err(TransError::Retry)
+                ));
+                let (current, _) = store
+                    .load_node(
+                        COLL,
+                        "L",
+                        Requirement::after(store.timeline.currentness_barrier()),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(current, busy, "{blocker}");
+                assert_eq!(
+                    rebalancer.mon.tx_status(&holder).await.unwrap(),
+                    TxCommitStatus::Pending
+                );
+                let (right, _) = store.load_node(COLL, "R", Requirement::ANY).await.unwrap();
+                assert!(right.structural_gate().holder().is_none());
+                assert_eq!(right.as_leaf().unwrap().len(), 1);
+                rebalancer.mon.abort_owned_tx(&holder).await.unwrap();
+                background.shutdown().await;
+            }
+        }
+
+        async fn cancelled_merge_settles(fail_first_retirement_read: bool) {
+            let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+            let store = store_with_backend(backend.clone());
+            seed_merge_pair(&store, &collection()).await;
+            let background = Arc::new(Background::new());
+            let tree_rebalancer = tree_rebalancer(&store, &background, SplitPolicy::default());
+            let entered = Arc::new(Notify::new());
+            backend.set_before({
+                let entered = entered.clone();
+                move |operation| {
+                    let pause = matches!(operation,
+                        BackendOp::WriteIf { path, value, .. }
+                            if path.contains("/_s/")
+                                && StructuralIntent::decode(value).is_ok_and(|intent| {
+                                    matches!(intent, StructuralIntent::Merge(MergeIntent { phase: MergeIntentPhase::Ready, .. }))
+                                })
+                    );
+                    let entered = entered.clone();
+                    let future: HookFuture = Box::pin(async move {
+                        if pause {
+                            entered.notify_one();
+                            std::future::pending::<()>().await;
+                        }
+                        Ok(())
+                    });
+                    future
+                }
+            });
+            let task = tokio::spawn({
+                let tree_rebalancer = tree_rebalancer.clone();
+                async move {
+                    tree_rebalancer
+                        .merge_leaves(&collection(), &test_token("L"), &test_token("R"), None)
+                        .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .expect("merge must reach its Ready CAS");
+
+            let intents = store
+                .discover_structural_intents(
+                    "db",
+                    Requirement::after(store.timeline.currentness_barrier()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(intents.len(), 1);
+            let StructuralIntent::Merge(intent) = intents[0].1.value().unwrap().as_ref() else {
+                panic!("expected a merge intent");
+            };
+            let participant = intent.participant_id.clone();
+            assert_eq!(intent.phase, MergeIntentPhase::Preparing);
+            assert!(tree_rebalancer.mon.is_tracked_local(&participant));
+            for token in ["L", "R"] {
+                let (node, _) = store
+                    .load_node(COLL, token, Requirement::ANY)
+                    .await
+                    .unwrap();
+                assert_eq!(node.structural_gate().contains(&participant), token == "R");
+                assert!(node.structural_gate().intent().is_none());
+            }
+
+            let retirement_reads = Arc::new(AtomicUsize::new(0));
+            let read_failed = Arc::new(Notify::new());
+            if fail_first_retirement_read {
+                let tx_path = ObjectPath::Transaction {
+                    db_root: db_root("db"),
+                    id: participant.clone(),
+                }
+                .to_string();
+                backend.set_before({
+                    let retirement_reads = retirement_reads.clone();
+                    let read_failed = read_failed.clone();
+                    move |operation| {
+                        let fail = matches!(operation,
+                            BackendOp::Read { path } | BackendOp::ReadIfModified { path, .. }
+                                if *path == tx_path
+                        ) && retirement_reads.fetch_add(1, Ordering::SeqCst) == 0;
+                        let read_failed = read_failed.clone();
+                        let future: HookFuture = Box::pin(async move {
+                            if fail {
+                                read_failed.notify_one();
+                                Err(BackendError::Unavailable(
+                                    "first retirement read failed".into(),
+                                ))
+                            } else {
+                                Ok(())
+                            }
+                        });
+                        future
+                    }
+                });
+            }
+
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            if fail_first_retirement_read {
+                tokio::time::timeout(Duration::from_secs(5), read_failed.notified())
+                    .await
+                    .expect("owner retirement must attempt its status read");
+                assert!(tree_rebalancer.mon.is_tracked_local(&participant));
+            }
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tree_rebalancer.mon.await_tx_final(&participant),
+                )
+                .await
+                .expect("a cancelled local owner must retire")
+                .unwrap(),
+                TxFinalStatus::Aborted
+            );
+            assert!(!tree_rebalancer.mon.is_tracked_local(&participant));
+            if fail_first_retirement_read {
+                assert!(retirement_reads.load(Ordering::SeqCst) >= 2);
+            }
+            backend.clear_before();
+
+            assert!(tree_rebalancer.recover_structural_intents().await.unwrap());
+            assert!(
+                store
+                    .discover_structural_intents(
+                        "db",
+                        Requirement::after(store.timeline.currentness_barrier()),
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let (record, _) = store
+                .records
+                .load_record(&collection(), Requirement::ANY)
+                .await
+                .unwrap();
+            assert_eq!(record.topology_participants().count(), 0);
+
+            // The same open instance must make progress after reclaiming the final
+            // owner's ordinary gates. Reopening would hide a leaked local Pending owner.
+            tree_rebalancer
+                .merge_leaves(&collection(), &test_token("L"), &test_token("R"), None)
+                .await
+                .unwrap();
+            let leaves = TreeRouter::new(
+                store.nodes.clone(),
+                store.timeline.clone(),
+                std::num::NonZeroUsize::MIN,
+            )
+            .leaves(
+                &collection(),
+                Requirement::after(store.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(leaves.len(), 1);
+            assert_eq!(leaves[0].node().unwrap().as_leaf().unwrap().len(), 2);
+            background.shutdown().await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn cancelling_before_ready_retires_and_settles_in_the_same_instance() {
+            cancelled_merge_settles(false).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn cancelled_owner_retries_a_failed_initial_retirement_read() {
+            cancelled_merge_settles(true).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn cancellation_fences_delayed_writes_with_content_revisions() {
+            for structural_gate in [false, true] {
+                let storage = Arc::new(ContentVersionBackend::default());
+                let backend = HookBackend::new(storage.clone());
+                let store = store_with_backend(backend.clone());
+                seed_merge_pair(&store, &collection()).await;
+                let background = Arc::new(Background::new());
+                let tree_rebalancer = tree_rebalancer(&store, &background, SplitPolicy::default());
+                let acquisition = Arc::new(Mutex::new(None::<DelayedWrite>));
+                let publication = Arc::new(Mutex::new(None::<DelayedWrite>));
+                backend.set_before({
+                    let acquisition = acquisition.clone();
+                    let publication = publication.clone();
+                    move |operation| {
+                        let mut delayed = false;
+                        if let BackendOp::WriteIf {
+                            path,
+                            value,
+                            expected,
+                        } = operation
+                            && let Ok(node) = Node::decode(value)
+                        {
+                            let target = if *path == node_path("L").to_string()
+                                && node.structural_gate().intent().is_some()
+                            {
+                                Some(&publication)
+                            } else if *path == node_path("R").to_string()
+                                && node.structural_gate().lock_type() == LockType::Write
+                                && node.structural_gate().intent().is_none()
+                            {
+                                Some(&acquisition)
+                            } else {
+                                None
+                            };
+                            if let Some(target) = target {
+                                let mut pending = target.lock().unwrap();
+                                if pending.is_none() {
+                                    *pending = Some(DelayedWrite {
+                                        path: (*path).to_string(),
+                                        value: value.to_vec(),
+                                        expected: (*expected).clone(),
+                                    });
+                                    delayed = true;
+                                }
+                            }
+                        }
+                        let future: HookFuture = Box::pin(async move {
+                            if delayed {
+                                Err(BackendError::Unavailable(
+                                    "request remains in flight".into(),
+                                ))
+                            } else {
+                                Ok(())
+                            }
+                        });
+                        future
+                    }
+                });
+                assert!(
+                    tree_rebalancer
+                        .merge_leaves(&collection(), &test_token("L"), &test_token("R"), None)
+                        .await
+                        .is_err()
+                );
+                backend.clear_before();
+                let acquisition = acquisition
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("gate acquisition was sent");
+                let publication = publication
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("the retried gate reached publication");
+
+                // A temporary reader could restore the original bytes on release;
+                // a later structural gate already fences that revision. Neither
+                // holder may be removed by cancellation.
+                let (mut locked, left) =
+                    store.load_node(COLL, "L", Requirement::ANY).await.unwrap();
+                assert!(locked.structural_gate().holder().is_none());
+                let reader = TxId::with_priority(3, b"concurrent reader");
+                if structural_gate {
+                    locked.set_structural_gate(reader.clone());
+                } else {
+                    let mut entry = locked.as_leaf().unwrap().lookup(b"a").unwrap().clone();
+                    entry.acquire_read_lock(reader.clone());
+                    locked.set_leaf(LeafBody::from_entries([entry])).unwrap();
+                }
+                assert!(
+                    store
+                        .store_node(COLL, "L", &locked, Some(&left))
+                        .await
+                        .unwrap()
+                );
+
+                assert!(tree_rebalancer.recover_structural_intents().await.unwrap());
+                assert!(
+                    store
+                        .discover_structural_intents(
+                            "db",
+                            Requirement::after(store.timeline.currentness_barrier()),
+                        )
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+
+                let (mut unlocked, left) = store
+                    .load_node(
+                        COLL,
+                        "L",
+                        Requirement::after(store.timeline.currentness_barrier()),
+                    )
+                    .await
+                    .unwrap();
+                if structural_gate {
+                    assert!(unlocked.remove_structural_gate(&reader));
+                } else {
+                    let mut entry = unlocked.as_leaf().unwrap().lookup(b"a").unwrap().clone();
+                    assert!(entry.release_lock(&reader));
+                    unlocked.set_leaf(LeafBody::from_entries([entry])).unwrap();
+                }
+                assert!(
+                    store
+                        .store_node(COLL, "L", &unlocked, Some(&left))
+                        .await
+                        .unwrap()
+                );
+
+                // Both requests can still execute after the intent was deleted
+                // and the temporary reader released its lock.
+                for (step, pending) in [
+                    ("gate acquisition", acquisition),
+                    ("left publication", publication),
+                ] {
+                    assert!(
+                        matches!(
+                            storage
+                                .write_if(&pending.path, pending.value, &pending.expected)
+                                .await,
+                            Err(BackendError::Precondition)
+                        ),
+                        "{step} was not fenced"
+                    );
+                }
+                for token in ["L", "R"] {
+                    let (node, _) = store
+                        .load_node(
+                            COLL,
+                            token,
+                            Requirement::after(store.timeline.currentness_barrier()),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(node.as_leaf().unwrap().len(), 1);
+                    assert_eq!(node.structural_gate().lock_type(), LockType::None);
+                }
+                tree_rebalancer
+                    .merge_leaves(&collection(), &test_token("L"), &test_token("R"), None)
+                    .await
+                    .unwrap();
+                background.shutdown().await;
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn drop_fencing_settles_applying_merge_before_node_enumeration() {
+            let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+            let store = store_with_backend(backend.clone());
+            let collection =
+                CollectionAddress::new("db", CollectionId::from_slice(&[19; 16]).unwrap());
+            seed_merge_pair(&store, &collection).await;
+            let background = Arc::new(Background::new());
+            let tree_rebalancer = tree_rebalancer(&store, &background, SplitPolicy::default());
+            backend.set_before(|operation| {
+                let fail = matches!(operation,
+                    BackendOp::WriteIf { path, value, .. } if path.contains("/_n/")
+                        && Node::decode(value).is_ok_and(|node| {
+                            node.structural_gate().intent().is_none()
+                                && node.as_leaf().is_some_and(|leaf| leaf.len() == 2)
+                        })
+                );
+                let future: HookFuture = Box::pin(async move {
+                    if fail {
+                        Err(BackendError::other("merge publication interrupted"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                future
+            });
+            assert!(
+                tree_rebalancer
+                    .merge_leaves(&collection, &test_token("L"), &test_token("R"), None)
+                    .await
+                    .is_err()
+            );
+            backend.clear_before();
+            let intents = store
+                .discover_structural_intents(
+                    "db",
+                    Requirement::after(store.timeline.currentness_barrier()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(intents.len(), 1);
+            let StructuralIntent::Merge(intent) = intents[0].1.value().unwrap().as_ref() else {
+                panic!("expected a merge intent");
+            };
+            assert_eq!(intent.phase, MergeIntentPhase::Applying);
+            let target = intent.left_token.clone();
+            let pending = store
+                .nodes
+                .load_node_state(&collection, &target, Requirement::ANY)
+                .await
+                .unwrap();
+            assert!(
+                pending
+                    .value()
+                    .unwrap()
+                    .structural_gate()
+                    .intent()
+                    .is_some()
+            );
+
+            let lifecycle = CollectionLifecycle::new(
+                store.records.clone(),
+                store.nodes.clone(),
+                tree_rebalancer.mon.clone(),
+                RetryConfig::default(),
+                Arc::new(tree_rebalancer.clone()),
+            );
+            let drop_id = TxId::with_priority(0, b"collection drop");
+            tree_rebalancer.mon.begin_tx(&drop_id);
+            let change = CollectionChange {
+                parent: super::collection(),
+                name: b"child".to_vec(),
+                collection: collection.clone(),
+                expected: Some(collection.id()),
+                op: CollectionOp::Drop,
+            };
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                lifecycle.fence_drops(&drop_id, &[change]),
+            )
+            .await
+            .expect("collection drop must settle the interrupted merge")
+            .unwrap();
+
+            let (record, _) = store
+                .records
+                .load_record(&collection, Requirement::ANY)
+                .await
+                .unwrap();
+            assert_eq!(record.topology_participants().count(), 0);
+            assert_eq!(record.topology_freeze(), Some(&drop_id));
+            assert!(
+                store
+                    .discover_structural_intents(
+                        "db",
+                        Requirement::after(store.timeline.currentness_barrier())
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let nodes = store
+                .nodes
+                .list_nodes(&collection, Requirement::ANY)
+                .await
+                .unwrap();
+            assert_eq!(nodes.len(), 2);
+            for (_, observed) in nodes {
+                let node = observed.value().unwrap();
+                assert_eq!(node.collection_delete_intent(), Some(&drop_id));
+                assert!(node.structural_gate().intent().is_none());
+            }
+            let (root, _) = store
+                .nodes
+                .load_root(&collection, Requirement::ANY)
+                .await
+                .unwrap();
+            assert_eq!(root.collection_delete_intent(), Some(&drop_id));
+            background.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn old_split_recovery_preserves_redirects_after_the_merged_leaf_splits() {
+            let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+            let store = store_with_backend(backend.clone());
+            let original_keys = [b"a".as_slice(), b"b", b"m", b"n"];
+            let original = Node::leaf(LeafBody::from_entries(
+                original_keys.iter().map(|key| inline_live(key, key)),
+            ));
+            assert!(store.store_node(COLL, "L", &original, None).await.unwrap());
+            assert!(
+                store
+                    .create_root(
+                        COLL,
+                        &Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())])),
+                    )
+                    .await
+                    .unwrap()
+            );
+            let background = Arc::new(Background::new());
+            let split_policy = SplitPolicy::builder()
+                .leaf_max_entries(2)
+                .node_soft_max_bytes(1 << 20)
+                .index_max_children(64)
+                .build()
+                .unwrap();
+            let splitting = tree_rebalancer(&store, &background, split_policy);
+            backend.set_before(|operation| {
+                let fail = matches!(operation,
+                    BackendOp::DeleteIf { path, .. } if path.contains("/_s/")
+                );
+                let future: HookFuture = Box::pin(async move {
+                    if fail {
+                        Err(BackendError::other("old split intent cleanup interrupted"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                future
+            });
+            assert!(splitting.split_path(&node_path("L")).await.is_err());
+            backend.clear_before();
+            let intents = store
+                .discover_structural_intents(
+                    "db",
+                    Requirement::after(store.timeline.currentness_barrier()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(intents.len(), 1);
+            let StructuralIntent::Split(old_split) = intents[0].1.value().unwrap().as_ref() else {
+                panic!("expected a split intent");
+            };
+            assert_eq!(old_split.phase, SplitIntentPhase::Ready);
+            assert_eq!(old_split.split_key, b"m");
+            let old_right = old_split.created_tokens[0].clone();
+
+            let merging = tree_rebalancer(&store, &background, SplitPolicy::default());
+            merging
+                .merge_leaves(&collection(), &test_token("L"), &old_right, None)
+                .await
+                .unwrap();
+            let retired = store
+                .nodes
+                .load_node_state(
+                    &collection(),
+                    &old_right,
+                    Requirement::after(store.timeline.currentness_barrier()),
+                )
+                .await
+                .unwrap();
+            let merged_token =
+                NodeToken::try_from(retired.value().unwrap().forwarding_target().unwrap()).unwrap();
+            let merged = store
+                .nodes
+                .load_node_state(&collection(), &merged_token, Requirement::ANY)
+                .await
+                .unwrap();
+            let added_keys = [b"ab".as_slice(), b"ac", b"ad", b"ae"];
+            let mut grown = merged.value().unwrap().as_ref().clone();
+            let entries = LeafBody::from_entries(
+                grown
+                    .as_leaf()
+                    .unwrap()
+                    .entries()
+                    .cloned()
+                    .chain(added_keys.iter().map(|key| inline_live(key, key))),
+            );
+            grown.set_leaf(entries).unwrap();
+            let mut locks = grown.locks().clone();
+            locks.advance_membership_version();
+            grown.set_locks(locks);
+            assert!(
+                store
+                    .nodes
+                    .store_node_at(merged.path(), &grown, &merged)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            splitting.split_path(merged.path()).await.unwrap();
+            let (lower, _) = store
+                .nodes
+                .load_node(
+                    &collection(),
+                    &merged_token,
+                    Requirement::after(store.timeline.currentness_barrier()),
+                )
+                .await
+                .unwrap();
+            assert!(lower.high_key().unwrap() < old_split.split_key.as_slice());
+
+            // At the old separator, keyed descent now skips the retired identity and
+            // the retained half of the merged leaf. The old split must still preserve
+            // that redirect, which other cached parent and sibling links can name.
+            assert!(splitting.recover_structural_intents().await.unwrap());
+            let retired_after_recovery = store
+                .nodes
+                .load_node_state(
+                    &collection(),
+                    &old_right,
+                    Requirement::after(store.timeline.currentness_barrier()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                retired_after_recovery.value().unwrap().forwarding_target(),
+                Some(merged_token.as_str())
+            );
+            let router = TreeRouter::new(
+                store.nodes.clone(),
+                store.timeline.clone(),
+                std::num::NonZeroUsize::MIN,
+            );
+            for key in original_keys.into_iter().chain(added_keys) {
+                let located = router
+                    .route_key(
+                        &collection(),
+                        key,
+                        Requirement::after(store.timeline.currentness_barrier()),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    located
+                        .node()
+                        .unwrap()
+                        .as_leaf()
+                        .unwrap()
+                        .lookup(key)
+                        .unwrap(),
+                    &inline_live(key, key)
+                );
+            }
+            assert!(
+                store
+                    .discover_structural_intents(
+                        "db",
+                        Requirement::after(store.timeline.currentness_barrier()),
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let (record, _) = store
+                .records
+                .load_record(&collection(), Requirement::ANY)
+                .await
+                .unwrap();
+            assert_eq!(record.topology_participants().count(), 0);
+            background.shutdown().await;
+        }
+    }
     mod recovery_tests;
 
     #[test]
     fn separator_queue_is_bounded_and_drops_the_oldest() {
         let s = store();
         let bg = Arc::new(Background::new());
-        let publisher = splitter(&s, &bg, tiny()).publisher;
+        let publisher = tree_rebalancer(&s, &bg, tiny()).publisher;
         for ordinal in 0..=CANDIDATE_QUEUE_CAP {
             publisher.defer(PendingSeparator {
                 collection: collection(),
@@ -2721,10 +3844,11 @@ mod tests {
         root.set_locks(locks);
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
-        let candidates = SplitCandidates::with_policy(tiny());
+        let candidates = TopologyHints::with_policy(tiny());
         candidates.observe_leaf(&root_path(), root.as_leaf().unwrap());
         let cleanup_hints = GcHints::default();
-        let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, cleanup_hints.clone());
+        let sp =
+            tree_rebalancer_with_candidates_and_hints(&s, &bg, candidates, cleanup_hints.clone());
 
         sp.run_once().await;
 
@@ -2735,7 +3859,7 @@ mod tests {
         let leaf = root.as_leaf().expect("compaction avoided height growth");
         assert_eq!(leaf.len(), 1);
         assert!(leaf.lookup(b"a").unwrap().exists());
-        assert_eq!(root.membership_version(), 2);
+        assert_eq!(root.membership_version(), 3);
         assert!(
             s.list_nodes(COLL, Requirement::after(s.timeline.currentness_barrier()))
                 .await
@@ -2744,11 +3868,11 @@ mod tests {
         );
         assert_eq!(
             sp.stats_and_reset(),
-            SplitterStats {
+            TreeRebalancerStats {
                 candidates: 1,
                 tombstones_reclaimed: 2,
                 splits_avoided: 1,
-                ..SplitterStats::default()
+                ..TreeRebalancerStats::default()
             }
         );
         assert_eq!(cleanup_hints.pending(), vec![first, second]);
@@ -2767,7 +3891,7 @@ mod tests {
         // classifies the node before structural-gate acquisition.
         let s = store_with_backend(recorder);
         let bg = Arc::new(Background::new());
-        let sp = splitter(&s, &bg, tiny());
+        let sp = tree_rebalancer(&s, &bg, tiny());
         operations.lock().unwrap().clear();
 
         let worker = TxId::with_priority(1, b"root-gate");
@@ -2842,20 +3966,21 @@ mod tests {
             }
         });
         let bg = Arc::new(Background::new());
-        let candidates = SplitCandidates::with_policy(tiny());
+        let candidates = TopologyHints::with_policy(tiny());
         candidates.observe_leaf(&root_path(), root.as_leaf().unwrap());
         let cleanup_hints = GcHints::default();
-        let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, cleanup_hints.clone());
+        let sp =
+            tree_rebalancer_with_candidates_and_hints(&s, &bg, candidates, cleanup_hints.clone());
 
         sp.run_once().await;
 
         assert!(failed.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(
             sp.stats_and_reset(),
-            SplitterStats {
+            TreeRebalancerStats {
                 candidates: 1,
                 deferred: 1,
-                ..SplitterStats::default()
+                ..TreeRebalancerStats::default()
             }
         );
         assert!(cleanup_hints.pending().is_empty());
@@ -2888,24 +4013,29 @@ mod tests {
         .await
         .unwrap();
         let bg = Arc::new(Background::new());
-        let candidates = SplitCandidates::with_policy(tiny());
+        let candidates = TopologyHints::with_policy(tiny());
         candidates.observe_leaf(&node_path("L"), source.as_leaf().unwrap());
         let cleanup_hints = GcHints::default();
-        let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, cleanup_hints.clone());
+        let sp =
+            tree_rebalancer_with_candidates_and_hints(&s, &bg, candidates, cleanup_hints.clone());
 
         sp.run_once().await;
 
-        let leaves = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .leaves(
-                &collection(),
-                Requirement::after(s.timeline.currentness_barrier()),
-            )
-            .await
-            .unwrap();
+        let leaves = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        )
+        .leaves(
+            &collection(),
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
         assert_eq!(leaves.len(), 2);
         assert!(leaves.iter().all(|leaf| {
             let node = leaf.node().unwrap();
-            node.membership_version() == 2
+            node.membership_version() == 3
                 && node
                     .as_leaf()
                     .unwrap()
@@ -2914,11 +4044,11 @@ mod tests {
         }));
         assert_eq!(
             sp.stats_and_reset(),
-            SplitterStats {
+            TreeRebalancerStats {
                 candidates: 1,
                 completed: 1,
                 tombstones_reclaimed: 1,
-                ..SplitterStats::default()
+                ..TreeRebalancerStats::default()
             }
         );
         assert_eq!(cleanup_hints.pending(), vec![writer]);
@@ -2941,12 +4071,16 @@ mod tests {
             .unwrap();
         let bg = Arc::new(Background::new());
 
-        splitter(&s, &bg, tiny())
+        tree_rebalancer(&s, &bg, tiny())
             .split_path(&root_path())
             .await
             .unwrap();
 
-        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
         assert_eq!(
             router
                 .leaves(
@@ -2985,7 +4119,7 @@ mod tests {
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
 
-        splitter(&s, &bg, tiny())
+        tree_rebalancer(&s, &bg, tiny())
             .split_path(&root_path())
             .await
             .unwrap();
@@ -2998,7 +4132,11 @@ mod tests {
             .unwrap();
         assert!(node.as_index().is_some(), "root became an index");
 
-        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
         let leaves = router
             .leaves(
                 &collection(),
@@ -3083,12 +4221,16 @@ mod tests {
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
 
-        splitter(&s, &bg, tiny())
+        tree_rebalancer(&s, &bg, tiny())
             .split_path(&node_path("L"))
             .await
             .unwrap();
 
-        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
         let leaves = router
             .leaves(
                 &collection(),
@@ -3163,7 +4305,7 @@ mod tests {
         .unwrap();
         let bg = Arc::new(Background::new());
 
-        splitter(&s, &bg, tiny())
+        tree_rebalancer(&s, &bg, tiny())
             .split_path(&node_path("L1"))
             .await
             .unwrap();
@@ -3192,7 +4334,11 @@ mod tests {
             assert!(child.as_index().is_some(), "root children are indexes");
         }
 
-        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
         assert_eq!(
             router
                 .leaves(
@@ -3252,7 +4398,7 @@ mod tests {
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
 
-        splitter(&s, &bg, tiny())
+        tree_rebalancer(&s, &bg, tiny())
             .split_path(&root_path())
             .await
             .unwrap();
@@ -3268,7 +4414,11 @@ mod tests {
             "root now has two index children"
         );
         // Every original leaf is still reached in order (now via one more hop).
-        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
         for k in [b"a".as_slice(), b"m", b"t"] {
             let loc = router
                 .route_key(
@@ -3286,7 +4436,7 @@ mod tests {
     }
 
     // Re-running a split on a node already back under the cap is a no-op: the
-    // splitter reloads, sees it is not over the cap, and leaves the tree alone.
+    // tree rebalancer reloads, sees it is not over the cap, and leaves the tree alone.
     #[tokio::test]
     async fn re_split_of_a_settled_node_is_a_noop() {
         let s = store();
@@ -3295,16 +4445,20 @@ mod tests {
         ));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
-        let sp = splitter(&s, &bg, tiny());
+        let sp = tree_rebalancer(&s, &bg, tiny());
 
         sp.split_path(&root_path()).await.unwrap();
-        let after_first = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .leaves(
-                &collection(),
-                Requirement::after(s.timeline.currentness_barrier()),
-            )
-            .await
-            .unwrap();
+        let after_first = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        )
+        .leaves(
+            &collection(),
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
         // Re-run: each resulting leaf holds two keys, which is at (not over) the
         // cap, so nothing changes.
         for leaf in &after_first {
@@ -3312,13 +4466,17 @@ mod tests {
         }
         sp.split_path(&root_path()).await.unwrap();
 
-        let after_second = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .leaves(
-                &collection(),
-                Requirement::after(s.timeline.currentness_barrier()),
-            )
-            .await
-            .unwrap();
+        let after_second = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        )
+        .leaves(
+            &collection(),
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             after_first.len(),
             after_second.len(),
@@ -3356,7 +4514,7 @@ mod tests {
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
 
-        let candidates = SplitCandidates::with_policy(tiny());
+        let candidates = TopologyHints::with_policy(tiny());
         // Under the cap: not enqueued.
         candidates.observe_leaf(
             &root_path(),
@@ -3371,27 +4529,31 @@ mod tests {
             &root_path(),
             &LeafBody::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
         );
-        let sp = splitter_with_candidates(&s, &bg, candidates);
+        let sp = tree_rebalancer_with_candidates(&s, &bg, candidates);
         sp.run_once().await;
 
-        let leaves = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .leaves(
-                &collection(),
-                Requirement::after(s.timeline.currentness_barrier()),
-            )
-            .await
-            .unwrap();
+        let leaves = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        )
+        .leaves(
+            &collection(),
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
         assert_eq!(leaves.len(), 2, "the fed candidate was split");
         assert_eq!(
             sp.stats_and_reset(),
-            SplitterStats {
+            TreeRebalancerStats {
                 candidates: 1,
                 completed: 1,
                 deferred: 0,
-                ..SplitterStats::default()
+                ..TreeRebalancerStats::default()
             }
         );
-        assert_eq!(sp.stats_and_reset(), SplitterStats::default());
+        assert_eq!(sp.stats_and_reset(), TreeRebalancerStats::default());
     }
 
     // One large mutation can overshoot the soft cap by enough that halving the
@@ -3410,16 +4572,20 @@ mod tests {
             .index_max_children(100)
             .build()
             .unwrap();
-        let candidates = SplitCandidates::with_policy(policy);
+        let candidates = TopologyHints::with_policy(policy);
         candidates.observe_leaf(&root_path(), root.as_leaf().unwrap());
-        let sp = splitter_with_candidates(&s, &bg, candidates);
+        let sp = tree_rebalancer_with_candidates(&s, &bg, candidates);
 
         // 9 -> 4+5 -> 2+2+2+3 -> 2+2+2+1+2.
         for _ in 0..3 {
             sp.run_once().await;
         }
 
-        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
         let leaves = router
             .leaves(
                 &collection(),
@@ -3459,8 +4625,8 @@ mod tests {
         ]));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
-        let candidates = SplitCandidates::with_policies(SplitPolicy::default(), pressure_inline());
-        let sp = splitter_with_candidates(&s, &bg, candidates.clone());
+        let candidates = TopologyHints::with_policies(SplitPolicy::default(), pressure_inline());
+        let sp = tree_rebalancer_with_candidates(&s, &bg, candidates.clone());
         let root_path = root_path();
 
         candidates
@@ -3468,7 +4634,11 @@ mod tests {
             .observe_inline_pressure(&root_path, b"h", 8);
         sp.run_once().await;
 
-        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
         assert_eq!(
             router
                 .leaves(
@@ -3483,7 +4653,7 @@ mod tests {
         );
         assert_eq!(
             sp.stats_and_reset(),
-            SplitterStats {
+            TreeRebalancerStats {
                 candidates: 1,
                 completed: 1,
                 inline_pressure: InlinePressureStats {
@@ -3491,7 +4661,7 @@ mod tests {
                     completed: 1,
                     ..InlinePressureStats::default()
                 },
-                ..SplitterStats::default()
+                ..TreeRebalancerStats::default()
             }
         );
 
@@ -3536,7 +4706,7 @@ mod tests {
         );
         assert_eq!(
             sp.stats_and_reset(),
-            SplitterStats {
+            TreeRebalancerStats {
                 candidates: 1,
                 completed: 1,
                 inline_pressure: InlinePressureStats {
@@ -3544,7 +4714,7 @@ mod tests {
                     completed: 1,
                     ..InlinePressureStats::default()
                 },
-                ..SplitterStats::default()
+                ..TreeRebalancerStats::default()
             }
         );
         let target = router
@@ -3567,8 +4737,8 @@ mod tests {
         let root = Node::leaf(LeafBody::from_entries([live(b"a"), live(b"b")]));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
-        let candidates = SplitCandidates::with_policies(SplitPolicy::default(), pressure_inline());
-        let sp = splitter_with_candidates(&s, &bg, candidates.clone());
+        let candidates = TopologyHints::with_policies(SplitPolicy::default(), pressure_inline());
+        let sp = tree_rebalancer_with_candidates(&s, &bg, candidates.clone());
         let root_path = root_path();
 
         candidates
@@ -3577,14 +4747,14 @@ mod tests {
         sp.run_once().await;
         assert_eq!(
             sp.stats_and_reset(),
-            SplitterStats {
+            TreeRebalancerStats {
                 candidates: 1,
                 inline_pressure: InlinePressureStats {
                     candidates: 1,
                     discarded: 1,
                     ..InlinePressureStats::default()
                 },
-                ..SplitterStats::default()
+                ..TreeRebalancerStats::default()
             },
             "a value that now fits does not reshape the tree"
         );
@@ -3595,14 +4765,14 @@ mod tests {
         sp.run_once().await;
         assert_eq!(
             sp.stats_and_reset(),
-            SplitterStats {
+            TreeRebalancerStats {
                 candidates: 1,
                 inline_pressure: InlinePressureStats {
                     candidates: 1,
                     discarded: 1,
                     ..InlinePressureStats::default()
                 },
-                ..SplitterStats::default()
+                ..TreeRebalancerStats::default()
             },
             "a key that disappeared does not reshape the tree"
         );
@@ -3628,21 +4798,21 @@ mod tests {
         let root = node;
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
-        let candidates = SplitCandidates::with_policy(tiny());
+        let candidates = TopologyHints::with_policy(tiny());
         candidates.observe_leaf(
             &root_path(),
             &LeafBody::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
         );
-        let sp = splitter_with_candidates(&s, &bg, candidates);
+        let sp = tree_rebalancer_with_candidates(&s, &bg, candidates);
 
         sp.run_once().await;
         assert_eq!(
             sp.stats_and_reset(),
-            SplitterStats {
+            TreeRebalancerStats {
                 candidates: 1,
                 completed: 0,
                 deferred: 1,
-                ..SplitterStats::default()
+                ..TreeRebalancerStats::default()
             }
         );
         assert!(
@@ -3666,11 +4836,11 @@ mod tests {
         sp.run_once().await;
         assert_eq!(
             sp.stats_and_reset(),
-            SplitterStats {
+            TreeRebalancerStats {
                 candidates: 1,
                 completed: 1,
                 deferred: 0,
-                ..SplitterStats::default()
+                ..TreeRebalancerStats::default()
             }
         );
         assert!(
@@ -3689,7 +4859,7 @@ mod tests {
     async fn split_wounds_a_younger_entry_holder_and_lands() {
         let s = store();
         let bg = Arc::new(Background::new());
-        let (sp, mon) = splitter_and_monitor(&s, &bg, tiny());
+        let (sp, mon) = tree_rebalancer_and_monitor(&s, &bg, tiny());
         let younger = TxId::new_at(rt::system_now() + Duration::from_secs(1));
         mon.begin_tx(&younger);
         s.store_node(
@@ -3709,13 +4879,17 @@ mod tests {
             mon.tx_status(&younger).await.unwrap(),
             TxCommitStatus::Wounded
         );
-        let leaves = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .leaves(
-                &collection(),
-                Requirement::after(s.timeline.currentness_barrier()),
-            )
-            .await
-            .unwrap();
+        let leaves = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        )
+        .leaves(
+            &collection(),
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
         assert_eq!(leaves.len(), 2);
         for leaf in leaves {
             let node = leaf.node().unwrap();
@@ -3737,7 +4911,7 @@ mod tests {
         let operations = recorder.log();
         let other = store_with_backend(recorder);
         let bg = Arc::new(Background::new());
-        let (sp, _) = splitter_and_monitor(&s, &bg, tiny());
+        let (sp, _) = tree_rebalancer_and_monitor(&s, &bg, tiny());
         let holder = TxId::with_priority(1, b"committed");
         let other_bg = Arc::new(Background::new());
         let other_transactions = other.foundation.tlogger.clone();
@@ -3751,13 +4925,18 @@ mod tests {
             other.nodes.clone(),
             other_key_state,
             other_mon.clone(),
+            crate::node_locking::StructuralGateRetry::new(other.timeline.clone(), Arc::default()),
             RetryConfig::default(),
             SplitPolicy::default(),
             Arc::new(NoSplitHints),
         );
         let other_locker = crate::tlocker::Locker::new(
             other_coord,
-            TreeRouter::new(other.nodes.clone(), std::num::NonZeroUsize::MIN),
+            TreeRouter::new(
+                other.nodes.clone(),
+                other.timeline.clone(),
+                std::num::NonZeroUsize::MIN,
+            ),
             crate::collection_coordination::CollectionStateResolver::new(
                 other.records.clone(),
                 other_transactions,
@@ -3819,14 +4998,18 @@ mod tests {
         assert!(held.entries().lookup(b"d").unwrap().is_locked_by(&holder));
         sp.split_path(&node_path("L")).await.unwrap();
 
-        let leaf = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .route_key(
-                &collection(),
-                b"d",
-                Requirement::after(s.timeline.currentness_barrier()),
-            )
-            .await
-            .unwrap();
+        let leaf = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        )
+        .route_key(
+            &collection(),
+            b"d",
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
         assert!(leaf.node().unwrap().structural_gate().holders().is_empty());
         let entry = leaf
             .node()
@@ -3872,10 +5055,14 @@ mod tests {
                 "the split already published the moved entry"
             );
         }
-        let current = TreeRouter::new(other.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .route_key(&collection(), b"d", Requirement::ANY)
-            .await
-            .unwrap();
+        let current = TreeRouter::new(
+            other.nodes.clone(),
+            other.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        )
+        .route_key(&collection(), b"d", Requirement::ANY)
+        .await
+        .unwrap();
         let current = current
             .node()
             .unwrap()
@@ -3891,7 +5078,7 @@ mod tests {
     async fn split_defers_to_an_older_membership_reader_then_lands() {
         let s = store();
         let bg = Arc::new(Background::new());
-        let (sp, mon) = splitter_and_monitor(&s, &bg, tiny());
+        let (sp, mon) = tree_rebalancer_and_monitor(&s, &bg, tiny());
         let older = TxId::new_at(rt::system_now() - Duration::from_secs(1));
         mon.begin_tx(&older);
         s.store_node(
@@ -3911,28 +5098,36 @@ mod tests {
         );
         sp.run_once().await;
         assert_eq!(
-            TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-                .leaves(
-                    &collection(),
-                    Requirement::after(s.timeline.currentness_barrier())
-                )
-                .await
-                .unwrap()
-                .len(),
+            TreeRouter::new(
+                s.nodes.clone(),
+                s.timeline.clone(),
+                std::num::NonZeroUsize::MIN
+            )
+            .leaves(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier())
+            )
+            .await
+            .unwrap()
+            .len(),
             1
         );
 
         mon.abort_owned_tx(&older).await.unwrap();
         sp.run_once().await;
         assert_eq!(
-            TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-                .leaves(
-                    &collection(),
-                    Requirement::after(s.timeline.currentness_barrier())
-                )
-                .await
-                .unwrap()
-                .len(),
+            TreeRouter::new(
+                s.nodes.clone(),
+                s.timeline.clone(),
+                std::num::NonZeroUsize::MIN
+            )
+            .leaves(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier())
+            )
+            .await
+            .unwrap()
+            .len(),
             2
         );
     }
@@ -3957,24 +5152,28 @@ mod tests {
             .index_max_children(1000)
             .build()
             .unwrap();
-        let candidates = SplitCandidates::with_policy(policy);
+        let candidates = TopologyHints::with_policy(policy);
         candidates.observe_leaf(
             &root_path(),
             &LeafBody::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
         );
 
-        let sp = splitter_with_candidates(&s, &bg, candidates);
+        let sp = tree_rebalancer_with_candidates(&s, &bg, candidates);
         sp.run_once().await;
 
         // The only cap crossed is the byte cap, so a split here proves the byte
         // cap now has a producer.
-        let leaves = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-            .leaves(
-                &collection(),
-                Requirement::after(s.timeline.currentness_barrier()),
-            )
-            .await
-            .unwrap();
+        let leaves = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        )
+        .leaves(
+            &collection(),
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
         assert_eq!(leaves.len(), 2, "byte-cap overflow triggered a split");
     }
 
@@ -4020,7 +5219,7 @@ mod tests {
             .index_max_children(100)
             .build()
             .unwrap();
-        splitter(&s, &bg, policy)
+        tree_rebalancer(&s, &bg, policy)
             .split_path(&node_path("S"))
             .await
             .unwrap();
@@ -4045,7 +5244,11 @@ mod tests {
         );
 
         // Every key is still reachable in order.
-        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let router = TreeRouter::new(
+            s.nodes.clone(),
+            s.timeline.clone(),
+            std::num::NonZeroUsize::MIN,
+        );
         for k in [b"a".as_slice(), b"b", b"g", b"h", b"m", b"n", b"o"] {
             let loc = router
                 .route_key(
@@ -4078,7 +5281,7 @@ mod tests {
         let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
-        let sp = splitter(&s, &bg, tiny());
+        let sp = tree_rebalancer(&s, &bg, tiny());
 
         // Block the parent `_r` CAS: the split lands (L shrinks, a sibling is
         // created) but the separator publication cannot, so it is re-queued.
@@ -4115,14 +5318,18 @@ mod tests {
             "the participant stays registered while structural recovery is pending"
         );
         assert_eq!(
-            TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-                .leaves(
-                    &collection(),
-                    Requirement::after(s.timeline.currentness_barrier())
-                )
-                .await
-                .unwrap()
-                .len(),
+            TreeRouter::new(
+                s.nodes.clone(),
+                s.timeline.clone(),
+                std::num::NonZeroUsize::MIN
+            )
+            .leaves(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier())
+            )
+            .await
+            .unwrap()
+            .len(),
             2,
             "the leaves still split; only the parent separator is missing"
         );
@@ -4236,7 +5443,7 @@ mod tests {
     }
 
     async fn publisher(s: &TestStore, bg: &Arc<Background>) -> SeparatorPublisher {
-        splitter(s, bg, SplitPolicy::default()).publisher
+        tree_rebalancer(s, bg, SplitPolicy::default()).publisher
     }
 
     #[tokio::test]
