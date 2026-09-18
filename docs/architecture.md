@@ -111,6 +111,13 @@ public errors, and public handles. Concrete stores and the routing, locking,
 monitoring, splitting, and GC implementations are not exported across this
 boundary.
 
+Admission of transaction calls and stale reads rejects excess work without
+queuing, before a transaction body or stale read starts. A call keeps its position
+across body retries and commit. Cancellation releases that position after the
+engine's retirement handoff; it does not reserve capacity for the resulting recovery work.
+Background recovery therefore needs a separate budget that preserves ownership
+of admitted protocol resources.
+
 ## Component Responsibilities
 
 Inside the transaction engine the division of labour separates transaction

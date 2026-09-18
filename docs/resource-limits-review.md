@@ -32,19 +32,34 @@ Item 1 is being split into small fixes. It remains incomplete.
 Each completed part has a separate commit, deterministic regression tests, an
 adversarial review, and a passing `make test` run.
 
-The next decision is item 2's S3 response handling. S3 LIST responses are decoded
-inside the SDK before the adapter receives them. The SDK's
-`modify_before_deserialization` hook can wrap the response body with a byte limit,
-but this adds SDK-specific response handling. A limit failure after a conditional
-mutation must retain the possibility that the mutation applied.
+Item 2 is postponed at the user's request. Backend implementations and LIST
+handling remain unchanged. Response limits need a later design that avoids
+assigning this responsibility separately to each backend implementation.
 
-Options for item 2:
+Item 3 is being split into small fixes. It remains incomplete.
 
-1. Add bounded response handling through the S3 SDK hook and the GCS response
-   reader. This can cover LIST and metadata responses before decoding, but adds
-   more code and error-handling paths.
-2. Start with small fixes for direct object downloads. Keep the S3 LIST response
-   limit explicitly unresolved until the SDK integration is approved.
+- Added `DatabaseBuilder::max_active_operations`, with a default of 256 concurrent
+  transaction calls and stale reads per database instance. Clones share capacity;
+  separate opens have independent limits. Transaction calls hold capacity across
+  body retries and commit. Admission rejects excess work immediately with
+  `LimitExceeded`, without creating a waiting queue.
+- Background work, coordinator queues and batches, and aggregate backend work
+  still need separate bounds.
+- A retained `Transaction` handle can start work after its enclosing call ends.
+  Such work, and parallel work inside a transaction body, need separate bounds.
+
+The next decision is coordinator queue capacity. Lock acquisition, lock release,
+and write-back share the coordinator. A queue limit must preserve progress for
+recovery of already admitted work. This needs a capacity policy across transaction
+execution and recovery, so work stops here under the small-change constraint.
+
+Options:
+
+1. Postpone coordinator queues and managed recovery budgets together, and continue
+   with independent small fixes.
+2. Design capacity reservations that remain owned through retirement handoff,
+   with capacity for recovery of foreign transaction identities. This needs
+   changes to the transaction lifecycle and background task management.
 
 ## Prioritized fixes
 
