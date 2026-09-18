@@ -18,6 +18,7 @@
 
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
@@ -286,10 +287,12 @@ async fn sustained_read_unavailability_surfaces_unavailable() {
         .unwrap();
 
     faults.fail_reads_forever();
+    let reads_before = faults.reads();
 
     let coll = &coll;
     let res = db.tx(|tx| async move { tx.read(coll, b"k").await }).await;
 
+    assert_eq!(faults.reads() - reads_before, 6);
     assert!(
         matches!(res, Err(Error::Unavailable(_))),
         "a sustained read outage must surface as Unavailable, got {res:?}"
@@ -298,6 +301,49 @@ async fn sustained_read_unavailability_surfaces_unavailable() {
         !matches!(res, Err(Error::InDoubt(_)) | Err(Error::Internal { .. })),
         "read unavailability must not be classified as in-doubt or internal"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn configured_read_retry_budget_applies_to_each_point_read() {
+    for retries in [0, 2, 7] {
+        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        seed_shared(memory.clone(), b"k", 10).await;
+        let (backend, faults) = ReadFaults::wrap(memory, FaultTarget::Leaf);
+        let db = Database::builder("example", backend)
+            .read_unavailable_retries(retries)
+            .retry_initial_interval(Duration::ZERO)
+            .retry_max_interval(Duration::ZERO)
+            .open()
+            .await
+            .unwrap();
+        let coll = db
+            .open_collection(&CollectionPath::new(b"c").unwrap())
+            .await
+            .unwrap();
+
+        faults.fail_reads_forever();
+        for stale in [false, true] {
+            let reads_before = faults.reads();
+            let result = if stale {
+                coll.read_stale(b"k", Duration::ZERO).await
+            } else {
+                coll.read(b"k").await
+            };
+            assert!(matches!(result, Err(Error::Unavailable(_))));
+            assert_eq!(faults.reads() - reads_before, retries + 1);
+        }
+
+        faults.fail_next_reads(retries as i64);
+        let reads_before = faults.reads();
+        let value = coll
+            .read_stale(b"k", Duration::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_int(&value), 10);
+        assert_eq!(faults.reads() - reads_before, retries + 1);
+        db.shutdown().await;
+    }
 }
 
 /// Resolving a collection name loads the parent's directory record. That load

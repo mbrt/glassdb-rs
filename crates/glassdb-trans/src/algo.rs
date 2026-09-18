@@ -1396,6 +1396,7 @@ mod tests {
             ),
             tctx.timeline.clone(),
             RetryConfig::default(),
+            0,
         );
         match reader.read(key, Duration::MAX).await {
             Ok(outcome) => outcome,

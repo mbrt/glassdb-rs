@@ -77,6 +77,10 @@ No scan or LIST limits have been added. Monitor lifetime changes in item 8 are
 postponed at the user's request. Cancelled-waiter cleanup and monitor capacity
 limits need explicit waiter registration and poller ownership.
 
+Item 9 is postponed at the user's request. Collection-record growth limits need
+a shared admission policy that leaves room for cleanup and permits shrinking
+existing oversized records.
+
 Item 12 is being split into small fixes. It remains incomplete.
 
 - Database names now use the existing database-root validator before backend I/O.
@@ -92,6 +96,10 @@ Item 12 is being split into small fixes. It remains incomplete.
 - Added `DatabaseBuilder::transaction_leaf_parallelism` for the existing limit.
   It accepts a nonzero count and keeps the default of 16. The limit applies
   separately to each bounded transaction phase.
+- Added `DatabaseBuilder::read_unavailable_retries` for the existing point-read
+  retry budget. The default remains 5 retries (6 attempts); zero permits one
+  attempt. Transactional and stale point reads each have their own budget.
+  Backend retries and transaction-body retries remain separate.
 
 ## Prioritized fixes
 
