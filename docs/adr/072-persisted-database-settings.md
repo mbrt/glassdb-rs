@@ -23,9 +23,10 @@ creation settings; opening an existing database ignores those proposed values.
 Soft split thresholds, inline budgets, and resource limits remain local to each
 database instance. A hard-cap split must not depend on soft thresholds.
 
-Require a new protocol version for each incompatible metadata change. Older
-clients must reject it. No automatic migration or online settings changes are
-provided; development databases must be recreated.
+Use protocol v4 for these settings. This version is not yet merged, so the hard
+limits and timing share one version change. Older clients must reject it. No
+automatic migration or online settings changes are provided; development
+databases must be recreated.
 
 This refines the configuration agreement in
 [ADR-056](056-demand-driven-inline-pressure-splits.md). The value-preservation

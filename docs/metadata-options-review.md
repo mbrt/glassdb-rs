@@ -10,7 +10,11 @@ Status: First-pass implementation in progress.
   engine. Existing builder setters are retained; their hard limits apply only
   when creating a database. Soft thresholds remain local. Regression tests,
   `make test`, and adversarial review passed.
-- Findings 2–4: pending.
+- Finding 2: both timing fields are stored in the same unmerged v4 metadata.
+  Recovery, refresh, and GC receive the stored profile. Invalid creation timing
+  is rejected before storage initialization. Regression tests, `make test`,
+  and adversarial review passed.
+- Findings 3–4: pending.
 
 The first pass retains the mixed `SplitPolicy` interface and does not provide
 migration or online changes to stored settings. Earlier development databases

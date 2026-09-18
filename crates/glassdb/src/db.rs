@@ -35,6 +35,7 @@ pub struct DatabaseBuilder {
     backend: Arc<dyn Backend>,
     engine_config: EngineConfig,
     split_policy: SplitPolicy,
+    protocol_timing: ProtocolTiming,
     transaction_limits: TransactionLimits,
 }
 
@@ -122,11 +123,14 @@ impl DatabaseBuilder {
         self
     }
 
-    /// Overrides transaction-liveness timing, including the pending lease and
-    /// cross-client clock-skew allowance. The configured skew must bound every
-    /// client using this database so a live transaction is never reclaimed.
+    /// Proposes transaction timing for a new database. Existing databases load
+    /// their timing from metadata and ignore this proposal. The clock-skew
+    /// allowance must bound every client using the database.
+    ///
+    /// Durations must fit in unsigned 64-bit nanoseconds, and the pending
+    /// timeout must be at least two nanoseconds so its refresh interval is nonzero.
     pub fn protocol_timing(mut self, timing: ProtocolTiming) -> Self {
-        self.engine_config.set_protocol_timing(timing);
+        self.protocol_timing = timing;
         self
     }
 
@@ -139,14 +143,17 @@ impl DatabaseBuilder {
             backend: b,
             mut engine_config,
             split_policy,
+            protocol_timing,
             transaction_limits,
         } = self;
 
         DbRoot::try_from(name.as_str()).map_err(|error| Error::InvalidInput(error.to_string()))?;
         let backend = Arc::new(glassdb_backend::StatsBackend::new(b));
-        let metadata = check_or_create_db_meta(&backend, &name, split_policy).await?;
+        let metadata =
+            check_or_create_db_meta(&backend, &name, split_policy, protocol_timing).await?;
         let database_id = metadata.id;
         engine_config.set_split_policy(metadata.split_policy(split_policy)?);
+        engine_config.set_protocol_timing(metadata.timing);
         let engine = Engine::open(&name, database_id, backend, engine_config)
             .await
             .map_err(Error::from_read)?;
@@ -178,6 +185,7 @@ impl DatabaseBuilder {
             backend,
             engine_config: EngineConfig::default(),
             split_policy: SplitPolicy::default(),
+            protocol_timing: ProtocolTiming::default(),
             transaction_limits: TransactionLimits::default(),
         }
     }

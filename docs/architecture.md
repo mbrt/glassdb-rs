@@ -111,10 +111,11 @@ public errors, and public handles. Concrete stores and the routing, locking,
 monitoring, splitting, and GC implementations are not exported across this
 boundary.
 
-Database metadata owns hard coordination limits. Creation writes them with the
-database ID; each open loads them before starting the engine. A concurrent
-creator uses the winning metadata. Soft split thresholds remain local to each
-database instance. Earlier formats require recreation; see
+Database metadata owns hard coordination limits and transaction timing. Creation
+writes them with the database ID; each open loads them before starting the engine.
+A concurrent creator uses the winning metadata. Recovery, refresh, and GC use
+the stored timing. Soft split thresholds remain local to each database instance.
+Earlier formats require recreation; see
 [ADR-072](adr/072-persisted-database-settings.md).
 
 The database instance does not cap concurrent transaction calls or stale reads.

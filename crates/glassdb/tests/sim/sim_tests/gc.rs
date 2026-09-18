@@ -8,6 +8,58 @@ use glassdb_concurr::{exec, rt};
 use glassdb_trans::ProtocolTiming;
 
 #[test]
+fn reopening_retains_the_stored_gc_safety_horizon() {
+    exec::block_on(async {
+        let backend = Arc::new(MemoryBackend::new());
+        let creator = Database::builder("timing", backend.clone())
+            .protocol_timing(ProtocolTiming::simulation())
+            .inline_policy(InlinePolicy::none())
+            .open()
+            .await
+            .unwrap();
+        creator
+            .root_collection()
+            .write(b"key", b"old")
+            .await
+            .unwrap();
+        creator.shutdown().await;
+        let listed = backend
+            .list("timing/_t/", None, ListLimit::new(100).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(listed.objects.len(), 1);
+        let old_path = &listed.objects[0];
+
+        let reopened = Database::builder("timing", backend.clone())
+            .protocol_timing(ProtocolTiming::new(
+                Duration::from_millis(50),
+                Duration::ZERO,
+            ))
+            .inline_policy(InlinePolicy::none())
+            .open()
+            .await
+            .unwrap();
+        reopened
+            .root_collection()
+            .write(b"key", b"new")
+            .await
+            .unwrap();
+        rt::sleep(Duration::from_millis(700)).await;
+        assert!(backend.read(old_path).await.is_ok());
+        rt::sleep(Duration::from_millis(100)).await;
+        assert!(matches!(
+            backend.read(old_path).await,
+            Err(BackendError::NotFound)
+        ));
+        assert_eq!(
+            reopened.root_collection().read(b"key").await.unwrap(),
+            Some(b"new".to_vec())
+        );
+        reopened.shutdown().await;
+    });
+}
+
+#[test]
 fn gc_preserves_wounded_preparations_and_the_replayed_collection() {
     use glassdb_data::{CollectionAddress, ObjectPath};
     use glassdb_storage::InlinePolicy;

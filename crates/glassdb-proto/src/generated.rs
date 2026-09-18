@@ -387,6 +387,11 @@ pub struct DatabaseMetadata {
     pub node_max_bytes: ::core::option::Option<u64>,
     #[prost(uint64, optional, tag = "4")]
     pub split_headroom_bytes: ::core::option::Option<u64>,
+    /// Shared transaction timing. Both fields are mandatory in v4.
+    #[prost(uint64, optional, tag = "5")]
+    pub pending_timeout_nanos: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "6")]
+    pub max_clock_skew_nanos: ::core::option::Option<u64>,
 }
 /// Collection metadata stored at `{prefix}/_i` (ADR-050). The B-link tree begins
 /// independently at `{prefix}/_r`; data-path operations do not read this record.

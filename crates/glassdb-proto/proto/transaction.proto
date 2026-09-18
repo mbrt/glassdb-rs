@@ -200,6 +200,9 @@ message DatabaseMetadata {
     // Hard coordination limits. Both fields are mandatory in v4.
     optional uint64 node_max_bytes = 3;
     optional uint64 split_headroom_bytes = 4;
+    // Shared transaction timing. Both fields are mandatory in v4.
+    optional uint64 pending_timeout_nanos = 5;
+    optional uint64 max_clock_skew_nanos = 6;
 }
 
 // Collection metadata stored at `{prefix}/_i` (ADR-050). The B-link tree begins
