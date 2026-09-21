@@ -101,16 +101,6 @@ impl DatabaseBuilder {
         self
     }
 
-    /// Sets the number of retries for an unavailable point read. Defaults to 5.
-    /// Zero makes one attempt and returns its result without retrying.
-    ///
-    /// Each point read, including a stale read, has its own budget. Backend
-    /// retries and transaction-body retries use their own policies.
-    pub fn read_unavailable_retries(mut self, retries: usize) -> Self {
-        self.engine_config.set_read_unavailable_retries(retries);
-        self
-    }
-
     /// Overrides the node sizing policy, including split triggers and hard cap.
     /// Every client of one database should use the same policy because splits
     /// durably reshape shared topology.

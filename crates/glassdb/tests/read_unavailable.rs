@@ -304,46 +304,43 @@ async fn sustained_read_unavailability_surfaces_unavailable() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn configured_read_retry_budget_applies_to_each_point_read() {
-    for retries in [0, 2, 7] {
-        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        seed_shared(memory.clone(), b"k", 10).await;
-        let (backend, faults) = ReadFaults::wrap(memory, FaultTarget::Leaf);
-        let db = Database::builder("example", backend)
-            .read_unavailable_retries(retries)
-            .retry_initial_interval(Duration::ZERO)
-            .retry_max_interval(Duration::ZERO)
-            .open()
-            .await
-            .unwrap();
-        let coll = db
-            .open_collection(&CollectionPath::new(b"c").unwrap())
-            .await
-            .unwrap();
+async fn read_retry_budget_applies_to_each_point_read() {
+    let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    seed_shared(memory.clone(), b"k", 10).await;
+    let (backend, faults) = ReadFaults::wrap(memory, FaultTarget::Leaf);
+    let db = Database::builder("example", backend)
+        .retry_initial_interval(Duration::ZERO)
+        .retry_max_interval(Duration::ZERO)
+        .open()
+        .await
+        .unwrap();
+    let coll = db
+        .open_collection(&CollectionPath::new(b"c").unwrap())
+        .await
+        .unwrap();
 
-        faults.fail_reads_forever();
-        for stale in [false, true] {
-            let reads_before = faults.reads();
-            let result = if stale {
-                coll.read_stale(b"k", Duration::ZERO).await
-            } else {
-                coll.read(b"k").await
-            };
-            assert!(matches!(result, Err(Error::Unavailable(_))));
-            assert_eq!(faults.reads() - reads_before, retries + 1);
-        }
-
-        faults.fail_next_reads(retries as i64);
+    faults.fail_reads_forever();
+    for stale in [false, true] {
         let reads_before = faults.reads();
-        let value = coll
-            .read_stale(b"k", Duration::ZERO)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(read_int(&value), 10);
-        assert_eq!(faults.reads() - reads_before, retries + 1);
-        db.shutdown().await;
+        let result = if stale {
+            coll.read_stale(b"k", Duration::ZERO).await
+        } else {
+            coll.read(b"k").await
+        };
+        assert!(matches!(result, Err(Error::Unavailable(_))));
+        assert_eq!(faults.reads() - reads_before, 6);
     }
+
+    faults.fail_next_reads(5);
+    let reads_before = faults.reads();
+    let value = coll
+        .read_stale(b"k", Duration::ZERO)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read_int(&value), 10);
+    assert_eq!(faults.reads() - reads_before, 6);
+    db.shutdown().await;
 }
 
 /// Resolving a collection name loads the parent's directory record. That load

@@ -20,6 +20,8 @@ use crate::error::trans_to_storage;
 use crate::key_resolver::KeyResolver;
 use crate::key_state_resolver::ResolvedValue;
 
+const READ_UNAVAILABLE_RETRIES: usize = 5;
+
 /// The result of reading a key: the raw value and its storage version. The
 /// version's writer is the *effective writer* the read resolved through, which
 /// is the optimistic-validation token the commit path checks.
@@ -57,22 +59,15 @@ pub struct Reader {
     resolver: KeyResolver,
     timeline: Timeline,
     retry: RetryConfig,
-    unavailable_retries: usize,
 }
 
 impl Reader {
-    /// Creates a point reader with a retry budget for transient failures.
-    pub fn new(
-        resolver: KeyResolver,
-        timeline: Timeline,
-        retry: RetryConfig,
-        unavailable_retries: usize,
-    ) -> Self {
+    /// Creates a point reader with retry backoff for transient failures.
+    pub fn new(resolver: KeyResolver, timeline: Timeline, retry: RetryConfig) -> Self {
         Reader {
             resolver,
             timeline,
             retry,
-            unavailable_retries,
         }
     }
 
@@ -80,7 +75,7 @@ impl Reader {
     /// `None` when the key is absent or deleted.
     ///
     /// A read is idempotent, so a transient in-doubt (`Unavailable`) outcome is
-    /// retried in place with exponential backoff up to the configured count.
+    /// retried in place with exponential backoff up to five times.
     /// A persistent outage surfaces the last `Unavailable` error for the caller
     /// to classify; the caller cancels by
     /// dropping the future at any `.await` (e.g. via `tokio::time::timeout`).
@@ -90,7 +85,7 @@ impl Reader {
         max_stale: Duration,
     ) -> Result<ReadOutcome, StorageError> {
         let mut backoff = self.retry.backoff();
-        for _ in 0..self.unavailable_retries {
+        for _ in 0..READ_UNAVAILABLE_RETRIES {
             match self.read_once(key, max_stale).await {
                 Err(StorageError::Unavailable(_)) => rt::sleep(backoff.next_delay()).await,
                 other => return other,
@@ -261,7 +256,6 @@ mod tests {
                 resolver.clone(),
                 local.timeline.clone(),
                 RetryConfig::default(),
-                0,
             );
             let (value, _) = reader.read(&key, Duration::MAX).await.unwrap().into_parts();
             assert_eq!(value.unwrap().value.as_ref(), b"old");

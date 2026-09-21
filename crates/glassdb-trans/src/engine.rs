@@ -35,7 +35,6 @@ use crate::tlocker::{Locker, LockerStats};
 /// Balances backend traffic and memory use for a default production client.
 const DEFAULT_CACHE_SIZE: usize = 512 * 1024 * 1024;
 const DEFAULT_TRANSACTION_LEAF_PARALLELISM: NonZeroUsize = NonZeroUsize::new(16).unwrap();
-const DEFAULT_READ_UNAVAILABLE_RETRIES: usize = 5;
 
 #[derive(Clone)]
 struct PersistentCacheSetup {
@@ -49,7 +48,6 @@ pub struct EngineConfig {
     cache_size: usize,
     persistent_cache: Option<PersistentCacheSetup>,
     retry: RetryConfig,
-    read_unavailable_retries: usize,
     split_policy: SplitPolicy,
     inline_policy: InlinePolicy,
     protocol_timing: ProtocolTiming,
@@ -81,11 +79,6 @@ impl EngineConfig {
     /// Sets the maximum coordination retry delay.
     pub fn set_retry_max_interval(&mut self, interval: Duration) {
         self.retry.max_interval = interval;
-    }
-
-    /// Sets the retry count for unavailable point reads.
-    pub fn set_read_unavailable_retries(&mut self, retries: usize) {
-        self.read_unavailable_retries = retries;
     }
 
     /// Sets the shared tree-splitting policy.
@@ -125,7 +118,6 @@ impl Default for EngineConfig {
             cache_size: DEFAULT_CACHE_SIZE,
             persistent_cache: None,
             retry: RetryConfig::default(),
-            read_unavailable_retries: DEFAULT_READ_UNAVAILABLE_RETRIES,
             split_policy: SplitPolicy::default(),
             inline_policy: InlinePolicy::default(),
             protocol_timing: ProtocolTiming::default(),
@@ -517,7 +509,6 @@ impl DormantEngine {
     ) -> Self {
         let EngineConfig {
             retry,
-            read_unavailable_retries,
             split_policy,
             inline_policy,
             transaction_leaf_parallelism,
@@ -552,12 +543,7 @@ impl DormantEngine {
             key_state.clone(),
             transaction_leaf_parallelism,
         );
-        let reader = Reader::new(
-            resolver.clone(),
-            timeline.clone(),
-            retry,
-            read_unavailable_retries,
-        );
+        let reader = Reader::new(resolver.clone(), timeline.clone(), retry);
         let cleanup_hints = GcHints::new(gc_limits);
         let (coord, splitter) = Splitter::with_coordinator(
             background_weak.clone(),
