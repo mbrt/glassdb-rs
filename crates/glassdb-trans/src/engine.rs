@@ -35,6 +35,7 @@ use crate::tlocker::{Locker, LockerStats};
 /// Balances backend traffic and memory use for a default production client.
 const DEFAULT_CACHE_SIZE: usize = 512 * 1024 * 1024;
 const DEFAULT_TRANSACTION_LEAF_PARALLELISM: NonZeroUsize = NonZeroUsize::new(16).unwrap();
+const DEFAULT_COLLECTION_RESERVATION_LIMIT: usize = 1024;
 
 #[derive(Clone)]
 struct PersistentCacheSetup {
@@ -52,6 +53,7 @@ pub struct EngineConfig {
     inline_policy: InlinePolicy,
     protocol_timing: ProtocolTiming,
     transaction_leaf_parallelism: NonZeroUsize,
+    collection_reservation_limit: usize,
     gc_parallelism: NonZeroUsize,
     gc_limits: GcLimits,
 }
@@ -101,6 +103,11 @@ impl EngineConfig {
         self.transaction_leaf_parallelism = parallelism;
     }
 
+    /// Sets the maximum new collection bindings reserved by one transaction identity.
+    pub fn set_collection_reservation_limit(&mut self, limit: usize) {
+        self.collection_reservation_limit = limit;
+    }
+
     /// Sets the maximum number of concurrent GC candidate checks.
     pub fn set_gc_parallelism(&mut self, parallelism: NonZeroUsize) {
         self.gc_parallelism = parallelism;
@@ -122,6 +129,7 @@ impl Default for EngineConfig {
             inline_policy: InlinePolicy::default(),
             protocol_timing: ProtocolTiming::default(),
             transaction_leaf_parallelism: DEFAULT_TRANSACTION_LEAF_PARALLELISM,
+            collection_reservation_limit: DEFAULT_COLLECTION_RESERVATION_LIMIT,
             gc_parallelism: DEFAULT_GC_PARALLELISM,
             gc_limits: GcLimits::default(),
         }
@@ -512,6 +520,7 @@ impl DormantEngine {
             split_policy,
             inline_policy,
             transaction_leaf_parallelism,
+            collection_reservation_limit,
             gc_parallelism,
             gc_limits,
             ..
@@ -604,6 +613,7 @@ impl DormantEngine {
             router,
             resolver.clone(),
             split_policy,
+            collection_reservation_limit,
             inline_policy,
             splitter.hint_sink(),
         );

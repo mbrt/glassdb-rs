@@ -113,7 +113,6 @@ impl CatalogOverlay {
         parent: &CollectionAddress,
         name: &[u8],
         mode: CreateMode,
-        reservation_limit: usize,
     ) -> Result<(CollectionAddress, bool), Error> {
         if self.dropped.contains(parent) {
             return Err(Error::StaleCollection);
@@ -147,10 +146,10 @@ impl CatalogOverlay {
         }
         let id = self
             .reservations
-            .reserve(parent, name, reservation_limit)
-            .ok_or(Error::LimitExceeded {
+            .reserve(parent, name)
+            .map_err(|error| Error::LimitExceeded {
                 resource: "collection reservations",
-                limit: reservation_limit,
+                limit: error.limit,
             })?;
         let address = CollectionAddress::new(parent.db_root(), id);
         self.directories

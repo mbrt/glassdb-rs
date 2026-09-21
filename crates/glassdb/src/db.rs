@@ -40,6 +40,8 @@ pub struct DatabaseBuilder {
 impl DatabaseBuilder {
     /// Sets local transaction admission limits. See [`TransactionLimits`] for defaults.
     pub fn transaction_limits(mut self, limits: TransactionLimits) -> Self {
+        self.engine_config
+            .set_collection_reservation_limit(limits.max_collection_reservations);
         self.transaction_limits = limits;
         self
     }
