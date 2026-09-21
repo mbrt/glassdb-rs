@@ -13,7 +13,7 @@ fn expect_limit<T>(result: Result<T, Error>, resource: &'static str, limit: usiz
 }
 
 #[tokio::test(start_paused = true)]
-async fn oversized_inputs_are_rejected_before_backend_work() {
+async fn oversized_write_inputs_are_rejected_before_backend_work() {
     let db = Database::builder("limits", MemoryBackend::new())
         .transaction_limits(TransactionLimits {
             max_key_bytes: 3,
@@ -28,21 +28,6 @@ async fn oversized_inputs_are_rejected_before_backend_work() {
 
     expect_limit(c.write(b"long", b"v").await, "logical key bytes", 3);
     expect_limit(c.write(b"key", b"longer").await, "value bytes", 5);
-    expect_limit(c.read(b"long").await, "logical key bytes", 3);
-    expect_limit(c.delete(b"long").await, "logical key bytes", 3);
-    expect_limit(
-        c.read_stale(b"long", Duration::ZERO).await,
-        "logical key bytes",
-        3,
-    );
-    for scan in [
-        KeyScan::prefix(b"long"),
-        KeyScan::range(b"long", b"z"),
-        KeyScan::range(b"a", b"long"),
-        KeyScan::all().after(b"long"),
-    ] {
-        expect_limit(c.scan_keys(scan).await, "logical key bytes", 3);
-    }
     assert_eq!(db.stats().backend, before);
 
     c.write(b"key", b"value").await.unwrap();
@@ -121,6 +106,98 @@ async fn defaults_bound_key_and_value_inputs() {
         "value bytes",
         1024 * 1024,
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn smaller_write_key_limits_allow_reads_and_deletes_of_existing_keys() {
+    for max_key_bytes in [TransactionLimits::default().max_key_bytes, 0] {
+        let backend = Arc::new(MemoryBackend::new());
+        let writer = Database::builder("limits", backend.clone())
+            .transaction_limits(TransactionLimits {
+                max_key_bytes: 8 * 1024,
+                ..TransactionLimits::default()
+            })
+            .open()
+            .await
+            .unwrap();
+        let key = vec![b'k'; 5 * 1024];
+        writer
+            .root_collection()
+            .write(&key, b"existing")
+            .await
+            .unwrap();
+        writer.shutdown().await;
+
+        let db = Database::builder("limits", backend)
+            .transaction_limits(TransactionLimits {
+                max_key_bytes,
+                ..TransactionLimits::default()
+            })
+            .open()
+            .await
+            .unwrap();
+        let c = db.root_collection();
+        assert_eq!(
+            c.read(&key).await.unwrap().as_deref(),
+            Some(b"existing".as_slice())
+        );
+        assert_eq!(
+            c.read_stale(&key, Duration::ZERO).await.unwrap().as_deref(),
+            Some(b"existing".as_slice())
+        );
+        expect_limit(
+            c.write(&key, b"replacement").await,
+            "logical key bytes",
+            max_key_bytes,
+        );
+        assert_eq!(
+            c.read(&key).await.unwrap().as_deref(),
+            Some(b"existing".as_slice())
+        );
+        c.delete(&key).await.unwrap();
+        assert_eq!(c.read(&key).await.unwrap(), None);
+        db.shutdown().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn smaller_write_key_limits_allow_scan_bounds_and_returned_cursors() {
+    let backend = Arc::new(MemoryBackend::new());
+    let writer = Database::builder("limits", backend.clone())
+        .transaction_limits(TransactionLimits {
+            max_key_bytes: 8 * 1024,
+            ..TransactionLimits::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let prefix = vec![b'k'; 5 * 1024];
+    let mut first_key = prefix.clone();
+    first_key.push(b'a');
+    let mut second_key = prefix.clone();
+    second_key.push(b'b');
+    for key in [&first_key, &second_key] {
+        writer.root_collection().write(key, b"value").await.unwrap();
+    }
+    writer.shutdown().await;
+
+    let db = Database::open("limits", backend).await.unwrap();
+    let c = db.root_collection();
+    let first = c.scan_keys(KeyScan::all().limit(1)).await.unwrap();
+    assert_eq!(first.keys(), std::slice::from_ref(&first_key));
+    let second = c
+        .scan_keys(KeyScan::all().after(first.next_after().unwrap()).limit(1))
+        .await
+        .unwrap();
+    assert_eq!(second.keys(), std::slice::from_ref(&second_key));
+    let range = c
+        .scan_keys(KeyScan::range(&first_key, &second_key))
+        .await
+        .unwrap();
+    assert_eq!(range.keys(), std::slice::from_ref(&first_key));
+    let prefixed = c.scan_keys(KeyScan::prefix(&prefix)).await.unwrap();
+    assert_eq!(prefixed.keys(), &[first_key, second_key]);
+    db.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]

@@ -57,7 +57,6 @@ impl Transaction {
     /// `futures::future::join_all`) to fetch keys in parallel.
     pub async fn read(&self, c: &Collection, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         self.admit_operation(c)?;
-        self.db.transaction_limits.check_key(key)?;
         let key = LogicalKey::new(c.address().clone(), key);
         // Brief lock to consult the per-transaction cache. The guard is dropped
         // before the backend read below so it is never held across `.await`.
@@ -104,7 +103,7 @@ impl Transaction {
     /// deletes staged before this call. Values remain separate tracked reads.
     pub async fn scan_keys(&self, c: &Collection, scan: KeyScan<'_>) -> Result<KeyPage, Error> {
         self.admit_operation(c)?;
-        let range = scan.normalize(&self.db.transaction_limits)?;
+        let range = scan.normalize()?;
         let limit = range.limit;
         let (overlay, created) = {
             let inner = self.inner.lock().unwrap();
@@ -140,7 +139,7 @@ impl Transaction {
     /// Stages a write of `value` to `key`.
     pub fn write(&self, c: &Collection, key: &[u8], value: &[u8]) -> Result<(), Error> {
         self.admit_operation(c)?;
-        self.db.transaction_limits.check_key(key)?;
+        self.db.transaction_limits.check_write_key(key)?;
         self.db.transaction_limits.check_value(value)?;
         let mut inner = self.inner.lock().unwrap();
         if inner.catalog.is_dropped(c.address()) {
@@ -161,7 +160,6 @@ impl Transaction {
     /// Marks `key` for deletion within the transaction.
     pub fn delete(&self, c: &Collection, key: &[u8]) -> Result<(), Error> {
         self.admit_operation(c)?;
-        self.db.transaction_limits.check_key(key)?;
         let mut inner = self.inner.lock().unwrap();
         if inner.catalog.is_dropped(c.address()) {
             return Err(Error::InvalidInput(

@@ -34,6 +34,8 @@ pub struct DatabaseBuilder {
     name: String,
     backend: Arc<dyn Backend>,
     engine_config: EngineConfig,
+    split_policy: SplitPolicy,
+    protocol_timing: ProtocolTiming,
     transaction_limits: TransactionLimits,
 }
 
@@ -103,29 +105,33 @@ impl DatabaseBuilder {
         self
     }
 
-    /// Overrides the node sizing policy, including split triggers and hard cap.
-    /// Every client of one database should use the same policy because splits
-    /// durably reshape shared topology.
+    /// Sets local split thresholds and proposes hard limits for a new database.
+    /// Existing databases load their hard limits from metadata, ignoring the
+    /// proposed hard cap and reserved headroom. Soft thresholds remain local.
+    /// Creation fails if the hard limits cannot admit even an empty key.
     pub fn split_policy(mut self, policy: SplitPolicy) -> Self {
-        self.engine_config.set_split_policy(policy);
+        self.split_policy = policy;
         self
     }
 
     /// Overrides the budgets for logless direct commits whose authoritative
     /// value is stored in the leaf (ADR-051, ADR-054). Values outside the
-    /// budgets take the regular logged protocol. Every client of one database
-    /// should use the same policy because aggregate-pressure misses can request
-    /// durable tree splits (ADR-056).
+    /// budgets take the regular logged protocol. Budgets are local to each
+    /// database instance. Aggregate pressure can request shared tree splits
+    /// (ADR-056).
     pub fn inline_policy(mut self, policy: InlinePolicy) -> Self {
         self.engine_config.set_inline_policy(policy);
         self
     }
 
-    /// Overrides transaction-liveness timing, including the pending lease and
-    /// cross-client clock-skew allowance. The configured skew must bound every
-    /// client using this database so a live transaction is never reclaimed.
+    /// Proposes transaction timing for a new database. Existing databases load
+    /// their timing from metadata and ignore this proposal. The clock-skew
+    /// allowance must bound every client using the database.
+    ///
+    /// Durations must fit in unsigned 64-bit nanoseconds, and the pending
+    /// timeout must be at least two nanoseconds so its refresh interval is nonzero.
     pub fn protocol_timing(mut self, timing: ProtocolTiming) -> Self {
-        self.engine_config.set_protocol_timing(timing);
+        self.protocol_timing = timing;
         self
     }
 
@@ -136,13 +142,19 @@ impl DatabaseBuilder {
         let DatabaseBuilder {
             name,
             backend: b,
-            engine_config,
+            mut engine_config,
+            split_policy,
+            protocol_timing,
             transaction_limits,
         } = self;
 
         DbRoot::try_from(name.as_str()).map_err(|error| Error::InvalidInput(error.to_string()))?;
         let backend = Arc::new(glassdb_backend::StatsBackend::new(b));
-        let database_id = check_or_create_db_meta(&backend, &name).await?;
+        let metadata =
+            check_or_create_db_meta(&backend, &name, split_policy, protocol_timing).await?;
+        let database_id = metadata.id;
+        engine_config.set_split_policy(metadata.split_policy(split_policy)?);
+        engine_config.set_protocol_timing(metadata.timing);
         let engine = Engine::open(&name, database_id, backend, engine_config)
             .await
             .map_err(Error::from_read)?;
@@ -173,6 +185,8 @@ impl DatabaseBuilder {
             name: name.into(),
             backend,
             engine_config: EngineConfig::default(),
+            split_policy: SplitPolicy::default(),
+            protocol_timing: ProtocolTiming::default(),
             transaction_limits: TransactionLimits::default(),
         }
     }

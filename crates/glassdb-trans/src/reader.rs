@@ -313,6 +313,8 @@ mod tests {
                     struct NoSplitHints;
                     impl SplitHinter for NoSplitHints {
                         fn observe_leaf(&self, _: &glassdb_data::ObjectPath, _: &LeafBody) {}
+
+                        fn capacity_rejected(&self, _path: &glassdb_data::ObjectPath) {}
                     }
                     let coord = LeafCoordinator::with_hinter(
                         local.nodes.clone(),

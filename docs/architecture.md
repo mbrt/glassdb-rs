@@ -111,6 +111,20 @@ public errors, and public handles. Concrete stores and the routing, locking,
 monitoring, splitting, and GC implementations are not exported across this
 boundary.
 
+Database metadata owns hard coordination limits and transaction timing. Creation
+writes them with the database ID; each open loads them before starting the engine.
+A concurrent creator uses the winning metadata. Recovery, refresh, and GC use
+the stored timing. Soft split thresholds remain local to each database instance.
+Capacity rejections request splits independently of those thresholds, including
+parent splits during separator publication and recovery. A capacity hint requests
+one split of a divisible node; the blocked operation then retries admission.
+Earlier formats require recreation; see
+[ADR-072](adr/072-persisted-database-settings.md).
+
+Client key-size limits apply to write admission, including overwrites. Reads,
+deletions, and scans ignore this local limit so clients can access keys created
+by another database instance.
+
 The database instance does not cap concurrent transaction calls or stale reads.
 It tracks active calls so shutdown can reject new calls and wait for existing
 calls to finish. The transaction engine drains background protocol work.

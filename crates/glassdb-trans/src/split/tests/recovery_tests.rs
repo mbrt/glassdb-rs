@@ -42,7 +42,12 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
                 })
             }
         });
-        assert!(owner.split_path(&root_path()).await.is_err());
+        assert!(
+            owner
+                .split_path(&root_path(), &SplitReason::SoftCap)
+                .await
+                .is_err()
+        );
         hooks.clear_before();
         let intents = peer
             .discover_structural_intents("db", Requirement::ANY)
@@ -273,7 +278,12 @@ async fn recovery_retries_a_cached_preparing_intent_after_the_peer_publishes_rea
             })
         }
     });
-    assert!(owner.split_path(&root_path()).await.is_err());
+    assert!(
+        owner
+            .split_path(&root_path(), &SplitReason::SoftCap)
+            .await
+            .is_err()
+    );
     hooks.clear_before();
     hooks.clear_after();
     operations.lock().unwrap().clear();
@@ -542,9 +552,12 @@ async fn structural_split_failure_transition_table() {
         });
 
         assert!(
-            sp.split_path(&ObjectPath::TreeRoot {
-                collection: collection(),
-            })
+            sp.split_path(
+                &ObjectPath::TreeRoot {
+                    collection: collection(),
+                },
+                &SplitReason::SoftCap
+            )
             .await
             .is_err(),
             "case {point:?}"

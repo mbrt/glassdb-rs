@@ -372,17 +372,26 @@ pub struct IndexEntry {
 }
 /// Database-level metadata, written once at `{name}/glassdb` when a database is
 /// first opened. Its presence marks the database as initialized; `version` gates
-/// on-disk format compatibility. A message (not a bare string) so new metadata
-/// fields can be added without breaking existing databases.
+/// protocol and on-disk format compatibility.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DatabaseMetadata {
-    /// On-disk format version identifier (e.g. "v2").
+    /// Protocol and on-disk format version identifier.
     #[prost(string, tag = "1")]
     pub version: ::prost::alloc::string::String,
     /// Persistent random ID for this logical database. Exactly 16 bytes and
     /// mandatory for the v2 format.
     #[prost(bytes = "vec", tag = "2")]
     pub database_id: ::prost::alloc::vec::Vec<u8>,
+    /// Hard coordination limits. Both fields are mandatory in v4.
+    #[prost(uint64, optional, tag = "3")]
+    pub node_max_bytes: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "4")]
+    pub split_headroom_bytes: ::core::option::Option<u64>,
+    /// Shared transaction timing. Both fields are mandatory in v4.
+    #[prost(uint64, optional, tag = "5")]
+    pub pending_timeout_nanos: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "6")]
+    pub max_clock_skew_nanos: ::core::option::Option<u64>,
 }
 /// Collection metadata stored at `{prefix}/_i` (ADR-050). The B-link tree begins
 /// independently at `{prefix}/_r`; data-path operations do not read this record.

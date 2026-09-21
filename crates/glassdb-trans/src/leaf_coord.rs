@@ -440,15 +440,17 @@ impl MergeRequest for CasReq {
     }
 }
 
-/// Sink for stored-leaf capacity observations, so a background growth policy
-/// can decide whether to split (ADR-031). The coordinator depends only on this
-/// seam — never on the splitter's queue or policy. The splitter supplies the
-/// implementation.
+/// Sink for stored-leaf observations and capacity rejections, so a background
+/// growth policy can decide whether to split (ADR-031). The coordinator depends
+/// only on this seam. The splitter supplies the implementation.
 pub trait SplitHinter: Send + Sync {
     /// Notes that `path`'s leaf was just stored holding `leaf`. Best-effort: a
     /// spurious call only costs the splitter a reload and re-check, so the
     /// coordinator never blocks on it.
     fn observe_leaf(&self, path: &ObjectPath, leaf: &LeafBody);
+
+    /// Requests capacity relief after a mutation cannot fit in `path`.
+    fn capacity_rejected(&self, path: &ObjectPath);
 }
 
 /// State shared by the [`LeafCoordinator`] and its dedup [`CasWorker`]: the
@@ -733,7 +735,7 @@ impl CasWorker {
         // Splitting cannot make an intrinsically oversized entry fit. The
         // direct publisher falls back to an external value instead.
         if pressure_hint && !inline_entry_full {
-            self.core.hinter.observe_leaf(path, &candidate_leaf);
+            self.core.hinter.capacity_rejected(path);
         }
         let outcome = if proposed.admission == StageAdmission::AddsKey {
             MemberOutcome::LeafFull
@@ -1131,6 +1133,8 @@ mod tests {
 
     impl SplitHinter for NoSplitHints {
         fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {}
+
+        fn capacity_rejected(&self, _path: &ObjectPath) {}
     }
 
     // Every coordination round in these tests targets one leaf object. A
@@ -2057,6 +2061,10 @@ mod tests {
     }
 
     impl SplitHinter for HintCounter {
+        fn capacity_rejected(&self, _path: &ObjectPath) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+
         fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {
             self.calls.fetch_add(1, Ordering::SeqCst);
         }

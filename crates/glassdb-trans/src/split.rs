@@ -4,7 +4,7 @@
 //! Coordination objects are grow-only: a leaf that crosses its soft cap is
 //! halved so no single object becomes a scalability or contention bottleneck.
 //! Splitting runs off the hot path in a periodic background task, fed candidates
-//! from stored over-cap leaves and direct-commit inline admission misses —
+//! from stored over-cap leaves, capacity rejections, and inline admission misses —
 //! never a key-space enumeration.
 //!
 //! Every split is a sequence of independent, idempotent compare-and-swaps under
@@ -381,6 +381,7 @@ enum SeparatorPublicationOutcome {
 
 struct ParentRequiresSplit {
     path: ObjectPath,
+    reason: SplitReason,
     continuation: ParentSplitContinuation,
 }
 
@@ -546,10 +547,11 @@ impl SeparatorPublisher {
         if updated.content_encoded_len() > content_limit
             || updated.encoded_len() > self.policy.node_max_bytes()
         {
-            if parent.over_soft_cap(&self.policy) {
+            if index.len() >= 2 {
                 return Ok(Some(SeparatorPublicationOutcome::ParentRequiresSplit(
                     ParentRequiresSplit {
                         path: parent_path.clone(),
+                        reason: SplitReason::Capacity,
                         continuation: ParentSplitContinuation::ResumePublication,
                     },
                 )));
@@ -572,6 +574,7 @@ impl SeparatorPublisher {
             return Ok(Some(SeparatorPublicationOutcome::ParentRequiresSplit(
                 ParentRequiresSplit {
                     path: parent_path.clone(),
+                    reason: SplitReason::SoftCap,
                     continuation: ParentSplitContinuation::CompletePublication,
                 },
             )));
@@ -700,6 +703,7 @@ struct SplitCandidate {
 #[derive(Clone)]
 enum SplitReason {
     SoftCap,
+    Capacity,
     InlinePressure { key: Vec<u8>, value_len: usize },
 }
 
@@ -708,6 +712,7 @@ impl SplitReason {
         match self {
             SplitReason::SoftCap => 0,
             SplitReason::InlinePressure { .. } => 1,
+            SplitReason::Capacity => 2,
         }
     }
 
@@ -1174,6 +1179,14 @@ impl SplitHinter for SplitCandidates {
             reason: SplitReason::SoftCap,
         });
     }
+
+    fn capacity_rejected(&self, path: &ObjectPath) {
+        self.push(SplitCandidate {
+            path: path.clone(),
+            priority: self.new_id(),
+            reason: SplitReason::Capacity,
+        });
+    }
 }
 
 /// Background executor that halves over-full B-link nodes (ADR-031). Holds no
@@ -1431,7 +1444,7 @@ impl Splitter {
     /// Dispatches one candidate through its cause-specific validation path.
     async fn process_candidate(&self, candidate: &SplitCandidate) -> Result<(), TransError> {
         match &candidate.reason {
-            SplitReason::SoftCap => {
+            SplitReason::SoftCap | SplitReason::Capacity => {
                 self.split_path_with_id(
                     &candidate.path,
                     candidate.priority.renew(),
@@ -1501,6 +1514,17 @@ impl Splitter {
     /// Classifies whether `node` still needs the split represented by `reason`.
     fn split_need(&self, node: &Node, reason: &SplitReason) -> SplitNeed {
         match reason {
+            SplitReason::Capacity => {
+                // The rejected operation is retried by its owner. A hint only
+                // asks for one split of a divisible node, even below soft caps.
+                if node.as_leaf().is_some_and(|leaf| leaf.len() >= 2)
+                    || node.as_index().is_some_and(|index| index.len() >= 2)
+                {
+                    SplitNeed::Split
+                } else {
+                    SplitNeed::NotActionable
+                }
+            }
             SplitReason::SoftCap => {
                 if node.over_soft_cap(self.candidates.policy()) {
                     SplitNeed::Split
@@ -1560,12 +1584,9 @@ impl Splitter {
         });
     }
 
-    /// Splits the leaf at object `path` if it is still over the soft cap: an
-    /// in-place root split when `path` is the collection root `_r`, else a
-    /// standalone node half-split.
-    async fn split_path(&self, path: &ObjectPath) -> Result<(), TransError> {
-        let reason = SplitReason::SoftCap;
-        self.split_path_with_id(path, self.candidates.new_id(), &reason)
+    /// Splits a node when the given reason is still actionable.
+    async fn split_path(&self, path: &ObjectPath, reason: &SplitReason) -> Result<(), TransError> {
+        self.split_path_with_id(path, self.candidates.new_id(), reason)
             .await
     }
 
@@ -1611,6 +1632,7 @@ impl Splitter {
         &self,
         path: &ObjectPath,
         topology_participant: &TxId,
+        reason: &SplitReason,
     ) -> Result<(), TransError> {
         let (collection, target) = match path {
             ObjectPath::TreeRoot { collection } => (collection, StructuralSplitTarget::Root),
@@ -1623,8 +1645,7 @@ impl Splitter {
         // finalized. A fresh structural identity prevents ordinary lock
         // helping from mistaking this in-flight recursive split for stale work.
         let worker = self.candidates.new_id();
-        let reason = SplitReason::SoftCap;
-        StructuralSplitAttempt::new(self, collection, target, worker, &reason)
+        StructuralSplitAttempt::new(self, collection, target, worker, reason)
             .run(StructuralSplitTopology::Joined(topology_participant))
             .await
     }
@@ -2186,8 +2207,13 @@ impl Splitter {
                         Ok(active)
                     };
                 }
-                RecoveryStep::SplitParent { path, participant } => {
-                    let result = Box::pin(self.split_path_joined(&path, &participant)).await;
+                RecoveryStep::SplitParent {
+                    path,
+                    participant,
+                    reason,
+                } => {
+                    let result =
+                        Box::pin(self.split_path_joined(&path, &participant, &reason)).await;
                     action.resume_parent_split(result);
                 }
             }
@@ -2221,8 +2247,11 @@ impl Splitter {
                 SeparatorPublicationOutcome::Published => return Ok(()),
                 SeparatorPublicationOutcome::ParentRequiresSplit(action) => {
                     match topology_participant {
-                        Some(id) => Box::pin(self.split_path_joined(&action.path, id)).await?,
-                        None => Box::pin(self.split_path(&action.path)).await?,
+                        Some(id) => {
+                            Box::pin(self.split_path_joined(&action.path, id, &action.reason))
+                                .await?
+                        }
+                        None => Box::pin(self.split_path(&action.path, &action.reason)).await?,
                     }
                     if action.continuation == ParentSplitContinuation::CompletePublication {
                         return Ok(());
@@ -2257,7 +2286,7 @@ fn split_into_children(
     let mut source = node.clone();
     let (right, split_key) = source
         .split(right_token)
-        .expect("root over the soft cap has at least two entries/children");
+        .expect("a split source has at least two entries/children");
     source.remove_structural_gate(structure_holder);
     (source, right, split_key)
 }
@@ -2295,6 +2324,8 @@ mod tests {
 
     impl SplitHinter for NoSplitHints {
         fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {}
+
+        fn capacity_rejected(&self, _path: &ObjectPath) {}
     }
 
     fn collection() -> CollectionAddress {
@@ -2942,7 +2973,7 @@ mod tests {
         let bg = Arc::new(Background::new());
 
         splitter(&s, &bg, tiny())
-            .split_path(&root_path())
+            .split_path(&root_path(), &SplitReason::SoftCap)
             .await
             .unwrap();
 
@@ -2986,7 +3017,7 @@ mod tests {
         let bg = Arc::new(Background::new());
 
         splitter(&s, &bg, tiny())
-            .split_path(&root_path())
+            .split_path(&root_path(), &SplitReason::SoftCap)
             .await
             .unwrap();
 
@@ -3084,7 +3115,7 @@ mod tests {
         let bg = Arc::new(Background::new());
 
         splitter(&s, &bg, tiny())
-            .split_path(&node_path("L"))
+            .split_path(&node_path("L"), &SplitReason::SoftCap)
             .await
             .unwrap();
 
@@ -3164,7 +3195,7 @@ mod tests {
         let bg = Arc::new(Background::new());
 
         splitter(&s, &bg, tiny())
-            .split_path(&node_path("L1"))
+            .split_path(&node_path("L1"), &SplitReason::SoftCap)
             .await
             .unwrap();
 
@@ -3253,7 +3284,7 @@ mod tests {
         let bg = Arc::new(Background::new());
 
         splitter(&s, &bg, tiny())
-            .split_path(&root_path())
+            .split_path(&root_path(), &SplitReason::SoftCap)
             .await
             .unwrap();
 
@@ -3285,6 +3316,133 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn separator_capacity_splits_parent_during_publication_and_recovery() {
+        for recover in [false, true] {
+            let s = store();
+            let children = [
+                (b"a".as_slice(), "L0"),
+                (b"b", "L1"),
+                (b"c", "L2"),
+                (b"d", "L3"),
+                (b"e", "L4"),
+                (b"f", "L5"),
+                (b"g", "L6"),
+                (b"h", "L7"),
+            ];
+            for (i, (key, token)) in children.iter().enumerate() {
+                let next = children.get(i + 1);
+                s.store_node(
+                    COLL,
+                    token,
+                    &leaf_node(
+                        &[key],
+                        next.map(|(key, _)| *key),
+                        next.map(|(_, token)| *token),
+                    ),
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            let mut index = IndexNode::from_children(children[..7].iter().enumerate().map(
+                |(i, (key, token))| {
+                    (
+                        if i == 0 { Vec::new() } else { key.to_vec() },
+                        test_token(token).to_string(),
+                    )
+                },
+            ));
+            let root = Node::index(index.clone());
+            s.create_root(COLL, &root).await.unwrap();
+            index.insert_child(b"h".to_vec(), test_token("L7").to_string());
+            let required_bytes = Node::index(index).content_encoded_len();
+            let policy = SplitPolicy::builder()
+                .node_max_bytes(required_bytes + 128 - 1)
+                .split_headroom_bytes(128)
+                .node_soft_max_bytes(usize::MAX)
+                .index_max_children(usize::MAX)
+                .build()
+                .unwrap();
+            assert!(policy.key_fits(b"h"));
+            assert!(!root.over_soft_cap(&policy));
+            let bg = Arc::new(Background::new());
+            let sp = splitter(&s, &bg, policy);
+
+            if recover {
+                // This is the durable state after a source shrink and before its
+                // separator publication. Recovery must retain the capacity cause.
+                let participant = TxId::with_priority(1, b"interrupted-split");
+                sp.begin_topology_tx(&collection(), &participant)
+                    .await
+                    .unwrap();
+                sp.join_topology(&collection(), &participant).await.unwrap();
+                s.write_structural_intent(
+                    "L7",
+                    &StructuralIntent {
+                        collection: collection(),
+                        source_token: Some(test_token("L6")),
+                        source_version: superseded_source_version(),
+                        created_tokens: vec![test_token("L7")],
+                        split_key: b"h".to_vec(),
+                        participant_id: participant.clone(),
+                        phase: StructuralIntentPhase::Ready,
+                    },
+                )
+                .await
+                .unwrap();
+                sp.mon.abort_owned_tx(&participant).await.unwrap();
+                assert!(sp.recover_structural_intents().await.unwrap());
+                assert!(
+                    s.discover_structural_intents(
+                        "db",
+                        Requirement::after(s.timeline.currentness_barrier())
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+                );
+            } else {
+                sp.publish_separators(&collection(), b"h", &test_token("L7"), None)
+                    .await
+                    .unwrap();
+            }
+
+            let (root, _) = s
+                .load_root(COLL, Requirement::after(s.timeline.currentness_barrier()))
+                .await
+                .unwrap();
+            let root_index = root.as_index().unwrap();
+            assert_eq!(root_index.len(), 2);
+            for (_, token) in root_index.children() {
+                let (child, _) = s
+                    .load_node(
+                        COLL,
+                        token,
+                        Requirement::after(s.timeline.currentness_barrier()),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    child.as_index().is_some(),
+                    "the parent split must grow the tree height"
+                );
+            }
+            let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+            for (key, _) in children {
+                let located = router
+                    .route_key(
+                        &collection(),
+                        key,
+                        Requirement::after(s.timeline.currentness_barrier()),
+                    )
+                    .await
+                    .unwrap();
+                assert!(located.node().unwrap().as_leaf().unwrap().exists(key));
+            }
+        }
+    }
+
     // Re-running a split on a node already back under the cap is a no-op: the
     // splitter reloads, sees it is not over the cap, and leaves the tree alone.
     #[tokio::test]
@@ -3297,7 +3455,9 @@ mod tests {
         let bg = Arc::new(Background::new());
         let sp = splitter(&s, &bg, tiny());
 
-        sp.split_path(&root_path()).await.unwrap();
+        sp.split_path(&root_path(), &SplitReason::SoftCap)
+            .await
+            .unwrap();
         let after_first = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
             .leaves(
                 &collection(),
@@ -3308,9 +3468,13 @@ mod tests {
         // Re-run: each resulting leaf holds two keys, which is at (not over) the
         // cap, so nothing changes.
         for leaf in &after_first {
-            sp.split_path(&leaf.path).await.unwrap();
+            sp.split_path(&leaf.path, &SplitReason::SoftCap)
+                .await
+                .unwrap();
         }
-        sp.split_path(&root_path()).await.unwrap();
+        sp.split_path(&root_path(), &SplitReason::SoftCap)
+            .await
+            .unwrap();
 
         let after_second = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
             .leaves(
@@ -3703,7 +3867,9 @@ mod tests {
         let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
         s.create_root(COLL, &root).await.unwrap();
 
-        sp.split_path(&node_path("L")).await.unwrap();
+        sp.split_path(&node_path("L"), &SplitReason::SoftCap)
+            .await
+            .unwrap();
 
         assert_eq!(
             mon.tx_status(&younger).await.unwrap(),
@@ -3817,7 +3983,9 @@ mod tests {
             .await
             .unwrap();
         assert!(held.entries().lookup(b"d").unwrap().is_locked_by(&holder));
-        sp.split_path(&node_path("L")).await.unwrap();
+        sp.split_path(&node_path("L"), &SplitReason::SoftCap)
+            .await
+            .unwrap();
 
         let leaf = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
             .route_key(
@@ -4021,7 +4189,7 @@ mod tests {
             .build()
             .unwrap();
         splitter(&s, &bg, policy)
-            .split_path(&node_path("S"))
+            .split_path(&node_path("S"), &SplitReason::SoftCap)
             .await
             .unwrap();
 
@@ -4084,7 +4252,7 @@ mod tests {
         // created) but the separator publication cannot, so it is re-queued.
         blocker.block(true);
         assert!(matches!(
-            sp.split_path(&node_path("L")).await,
+            sp.split_path(&node_path("L"), &SplitReason::SoftCap).await,
             Err(TransError::Retry)
         ));
         let (blocked_root, _) = s

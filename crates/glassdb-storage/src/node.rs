@@ -141,10 +141,10 @@ impl IndexNode {
     }
 }
 
-/// The soft caps that trigger a background split (ADR-031). A node over any of
-/// its caps is a split candidate. Injected rather than hard-coded so the split
-/// maintainer's thresholds are tunable and tests can drive splits with tiny
-/// nodes.
+/// Size admission limits and soft thresholds for coordination-node splits.
+///
+/// The hard cap and reserved headroom are shared database settings. Soft
+/// thresholds tune each client's background splitting (ADR-031, ADR-072).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SplitPolicy {
     /// Maximum leaf entries before it is a split candidate.
