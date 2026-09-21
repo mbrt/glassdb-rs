@@ -6,16 +6,16 @@ const INITIAL_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_INTERVAL: Duration = Duration::from_secs(5);
 const MULTIPLIER: f64 = 1.5;
 /// Fraction by which a backoff delay is randomized: a delay `d` becomes uniform
-/// in `[0.5*d, 1.5*d]`.
+/// in `[0.5*d, 1.5*d]`, with the upper end limited by the configured maximum.
 const JITTER_FACTOR: f64 = 0.5;
 
 /// Tunes the exponential backoff used to retry transient operations: the first
 /// delay, and the cap each delay grows toward.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryConfig {
-    /// Delay before the first retry; grows exponentially up to `max_interval`.
+    /// Base interval before the first retry, limited to `max_interval`.
     pub initial_interval: Duration,
-    /// Upper bound on the per-retry delay.
+    /// Upper bound on the per-retry delay, including jitter.
     pub max_interval: Duration,
 }
 
@@ -33,7 +33,7 @@ impl RetryConfig {
     /// retry loop gets its own [`Backoff`] so the interval resets per attempt.
     pub fn backoff(&self) -> Backoff {
         Backoff {
-            current: self.initial_interval,
+            current: self.initial_interval.min(self.max_interval),
             max: self.max_interval,
         }
     }
@@ -54,18 +54,22 @@ impl Backoff {
     /// always on: it spreads retries to avoid thundering-herd contention when
     /// many clients poll the same transaction.
     pub fn next_delay(&mut self) -> Duration {
-        let delay = jittered(self.current);
-        self.current = std::cmp::min(self.current.mul_f64(MULTIPLIER), self.max);
+        let delay = jittered(self.current, self.max);
+        self.current = Duration::try_from_secs_f64(self.current.as_secs_f64() * MULTIPLIER)
+            .unwrap_or(self.max)
+            .min(self.max);
         delay
     }
 }
 
-/// Perturbs `d` by +/-[`JITTER_FACTOR`], uniformly in `[0.5*d, 1.5*d]`.
-fn jittered(d: Duration) -> Duration {
+/// Perturbs `d` within its jitter band and the configured maximum.
+fn jittered(d: Duration, max: Duration) -> Duration {
     let base = d.as_secs_f64();
     let min = base * (1.0 - JITTER_FACTOR);
-    let span = base * (2.0 * JITTER_FACTOR);
-    Duration::from_secs_f64(min + crate::entropy::uniform_unit() * span)
+    let upper = (base * (1.0 + JITTER_FACTOR)).min(max.as_secs_f64());
+    Duration::try_from_secs_f64(min + crate::entropy::uniform_unit() * (upper - min))
+        .unwrap_or(max)
+        .min(max)
 }
 
 /// Adjusts scan intervals from recent progress within fixed bounds.
@@ -76,10 +80,10 @@ pub struct ScanCadence {
 }
 
 impl ScanCadence {
-    /// Starts a scan schedule at its minimum interval.
+    /// Starts a scan schedule at its minimum interval, capped by `maximum`.
     pub fn new(minimum: Duration, maximum: Duration) -> Self {
         Self {
-            minimum,
+            minimum: minimum.min(maximum),
             maximum,
             productive: 1.0,
         }
@@ -92,12 +96,16 @@ impl ScanCadence {
 
     /// Returns an interval with random variation within the configured bounds.
     pub fn delay(&self) -> Duration {
+        if self.minimum.is_zero() {
+            return Duration::ZERO;
+        }
         let seconds = self.minimum.as_secs_f64()
             / self
                 .productive
                 .powi(2)
                 .max(self.minimum.as_secs_f64() / self.maximum.as_secs_f64());
-        Duration::from_secs_f64(seconds * (0.9 + 0.2 * crate::entropy::uniform_unit()))
+        Duration::try_from_secs_f64(seconds * (0.9 + 0.2 * crate::entropy::uniform_unit()))
+            .unwrap_or(self.maximum)
             .clamp(self.minimum, self.maximum)
     }
 }
@@ -112,7 +120,7 @@ mod tests {
         let lo = base.mul_f64(1.0 - JITTER_FACTOR);
         let hi = base.mul_f64(1.0 + JITTER_FACTOR);
         for _ in 0..10_000 {
-            let d = jittered(base);
+            let d = jittered(base, Duration::MAX);
             assert!(d >= lo && d <= hi, "jittered {d:?} out of [{lo:?}, {hi:?}]");
         }
     }
@@ -120,10 +128,10 @@ mod tests {
     #[test]
     fn jitter_varies() {
         let base = Duration::from_millis(200);
-        let first = jittered(base);
+        let first = jittered(base, Duration::MAX);
         // Over many draws at least one differs from the first; a fixed output
         // would mean jitter is not actually applied.
-        assert!((0..1000).any(|_| jittered(base) != first));
+        assert!((0..1000).any(|_| jittered(base, Duration::MAX) != first));
     }
 
     #[test]
@@ -140,11 +148,108 @@ mod tests {
         for _ in 0..20 {
             let d = b.next_delay();
             let lo = base.mul_f64(1.0 - JITTER_FACTOR);
-            let hi = base.mul_f64(1.0 + JITTER_FACTOR);
+            let hi = base.mul_f64(1.0 + JITTER_FACTOR).min(cfg.max_interval);
             assert!(d >= lo && d <= hi, "delay {d:?} out of [{lo:?}, {hi:?}]");
             base = std::cmp::min(base.mul_f64(MULTIPLIER), cfg.max_interval);
         }
         // Once capped, the base no longer grows.
         assert_eq!(base, cfg.max_interval);
+    }
+
+    #[test]
+    fn backoff_caps_an_initial_interval_above_the_maximum() {
+        for max_interval in [Duration::ZERO, Duration::from_millis(1)] {
+            let mut backoff = RetryConfig {
+                initial_interval: Duration::from_secs(1),
+                max_interval,
+            }
+            .backoff();
+            for _ in 0..20 {
+                assert!(backoff.next_delay() <= max_interval);
+            }
+        }
+    }
+
+    #[test]
+    fn backoff_handles_the_largest_duration() {
+        let mut backoff = RetryConfig {
+            initial_interval: Duration::MAX,
+            max_interval: Duration::MAX,
+        }
+        .backoff();
+        for _ in 0..20 {
+            assert!(backoff.next_delay() >= Duration::MAX / 2);
+        }
+    }
+
+    #[test]
+    fn scan_cadence_caps_the_minimum_interval() {
+        let maximum = Duration::from_secs(1);
+        let mut cadence = ScanCadence::new(Duration::from_secs(2), maximum);
+        assert_eq!(cadence.delay(), maximum);
+        cadence.observe(false);
+        assert_eq!(cadence.delay(), maximum);
+    }
+
+    #[test]
+    fn scan_cadence_accepts_zero_intervals() {
+        for (minimum, maximum) in [
+            (Duration::ZERO, Duration::from_secs(1)),
+            (Duration::ZERO, Duration::ZERO),
+            (Duration::from_secs(1), Duration::ZERO),
+        ] {
+            let mut cadence = ScanCadence::new(minimum, maximum);
+            assert_eq!(cadence.delay(), Duration::ZERO);
+            for _ in 0..2000 {
+                cadence.observe(false);
+            }
+            assert_eq!(cadence.delay(), Duration::ZERO);
+        }
+    }
+}
+
+#[cfg(all(test, sim))]
+mod sim_tests {
+    use super::*;
+
+    #[test]
+    fn retry_delays_never_exceed_the_configured_maximum() {
+        crate::exec::block_on_with(crate::exec::TapeScheduler::new(Vec::new()), 7, async {
+            for config in [
+                RetryConfig::default(),
+                RetryConfig {
+                    initial_interval: Duration::from_millis(1),
+                    max_interval: Duration::from_millis(1),
+                },
+            ] {
+                let mut backoff = config.backoff();
+                let mut delays = Vec::new();
+                for _ in 0..100 {
+                    let delay = backoff.next_delay();
+                    assert!(delay <= config.max_interval);
+                    delays.push(delay);
+                }
+                assert!(delays.windows(2).any(|pair| pair[0] != pair[1]));
+            }
+        });
+    }
+
+    #[test]
+    fn scan_intervals_stay_within_bounds() {
+        crate::exec::block_on_with(crate::exec::TapeScheduler::new(Vec::new()), 7, async {
+            for (minimum, maximum) in [
+                (Duration::from_millis(1), Duration::from_secs(1)),
+                (Duration::MAX / 2, Duration::MAX),
+                (Duration::MAX, Duration::MAX),
+            ] {
+                let mut cadence = ScanCadence::new(minimum, maximum);
+                for useful in [false, true] {
+                    for _ in 0..100 {
+                        cadence.observe(useful);
+                        assert!((minimum..=maximum).contains(&cadence.delay()));
+                    }
+                }
+            }
+        });
     }
 }

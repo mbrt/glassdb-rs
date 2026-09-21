@@ -71,19 +71,6 @@ impl<V: Weighable + Clone> Inner<V> {
 
     fn remove_oldest(&mut self, mut overflowed: bool) {
         while overflowed || self.curr_size > self.max_size {
-            // Never evict the most-recently-used entry, even if it alone
-            // exceeds the shard budget. Otherwise a freshly written value
-            // (e.g. one larger than max_size/shards) would be dropped
-            // immediately, defeating the write and breaking callers that read
-            // back their own writes. Overshoot is bounded to one entry per
-            // shard.
-            if self.map.len() <= 1 {
-                if overflowed {
-                    let still_overflowed = self.recompute_weight();
-                    assert!(!still_overflowed, "one cache weight must fit in usize");
-                }
-                return;
-            }
             let Some((_, v)) = self.map.pop_front() else {
                 return;
             };
@@ -151,6 +138,11 @@ impl<V: Weighable + Clone> CacheShard<V> {
             }
             Some(newv) => {
                 let new_size = newv.size();
+                if inner.max_size == 0 || new_size > inner.max_size {
+                    // Keeping an old value here could hide a completed mutation.
+                    inner.delete_entry(key);
+                    return result;
+                }
                 let replacement = replace_weight(inner.curr_size, old_size, new_size);
                 inner.curr_size = replacement.size;
                 // `insert` appends at the back (most-recently-used) and, for an
@@ -181,7 +173,7 @@ pub struct Cache<V> {
 
 impl<V: Weighable + Clone> Cache<V> {
     /// Creates a cache with the given maximum size in bytes. The budget is split
-    /// evenly across shards to reduce lock contention.
+    /// evenly across shards to reduce lock contention. Zero disables retention.
     pub fn new(max_size: usize) -> Self {
         let per = max_size / shard::count();
         Cache {
@@ -194,14 +186,15 @@ impl<V: Weighable + Clone> Cache<V> {
         self.sh.for_key(key.as_bytes()).get(key)
     }
 
-    /// Stores `val` under `key`.
+    /// Stores `val` when it fits its shard's budget. Otherwise removes `key`.
     pub fn set(&self, key: &str, val: V) {
         self.sh.for_key(key.as_bytes()).set(key, val);
     }
 
     /// Updates the value under `key` while holding the lock. The closure
     /// receives the old value (or `None`) and returns the new value, or `None`
-    /// to remove the entry.
+    /// to remove the entry. A new value that exceeds its shard's budget also
+    /// removes the entry.
     pub fn update<F>(&self, key: &str, f: F)
     where
         F: FnOnce(Option<V>) -> Option<V>,
@@ -353,12 +346,44 @@ mod tests {
     }
 
     #[test]
-    fn never_evicts_sole_entry() {
-        // A single entry larger than the budget is kept (bounded overshoot).
+    fn rejects_an_entry_larger_than_the_budget() {
         let c = CacheShard::new(2);
         c.set("a", e("aaaa"));
-        assert_eq!(c.get("a"), Some(e("aaaa")));
-        assert_eq!(c.size(), 4);
+        assert_eq!(c.get("a"), None);
+        assert_eq!(c.size(), 0);
+    }
+
+    #[test]
+    fn oversized_entry_does_not_evict_other_keys() {
+        let c = CacheShard::new(3);
+        c.set("kept", e("fit"));
+        c.set("large", e("large"));
+        assert_eq!(c.get("kept"), Some(e("fit")));
+        assert_eq!(c.get("large"), None);
+        assert_eq!(c.size(), 3);
+    }
+
+    #[test]
+    fn oversized_update_removes_old_value_and_returns_its_result() {
+        let c = CacheShard::new(3);
+        c.set("a", e("old"));
+        let result = c.update_with_result("a", |_| (Some(e("large")), 42));
+        assert_eq!(result, 42);
+        assert_eq!(c.get("a"), None);
+        assert_eq!(c.size(), 0);
+        c.set("a", e("new"));
+        assert_eq!(c.get("a"), Some(e("new")));
+        assert_eq!(c.size(), 3);
+    }
+
+    #[test]
+    fn zero_budget_retains_no_entries_even_with_zero_weight() {
+        let c = Cache::new(0);
+        c.set("a", e(""));
+        c.update("b", |_| Some(e("value")));
+        assert_eq!(c.get("a"), None);
+        assert_eq!(c.get("b"), None);
+        assert_eq!(c.size(), 0);
     }
 
     #[test]

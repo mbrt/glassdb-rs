@@ -297,6 +297,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
         ),
         mon.protocol_timing(),
         hints.clone(),
+        DEFAULT_GC_PARALLELISM,
     );
     Ctx {
         gc,
@@ -3649,42 +3650,75 @@ async fn a_ready_hint_queue_does_not_starve_the_scan() {
 }
 
 #[test]
-fn candidate_capacity_is_preserved_across_deferrals_and_completion() {
-    let now = rt::Instant::now();
-    let counters = Counters::default();
-    let mut candidates = Candidates::default();
-    let ids: Vec<_> = (0u64..HINT_CAPACITY as u64)
-        .map(|i| TxId::from_bytes(i.to_be_bytes().to_vec()))
-        .collect();
-    for id in &ids {
-        candidates.admit(id.clone(), false, now, &counters);
+fn hint_producers_share_capacity_and_keep_the_latest_reports() {
+    for capacity in [0, 1, 3] {
+        let hints = GcHints::new(GcLimits {
+            max_pending_hints: capacity,
+            max_hint_candidates: 0,
+        });
+        let clone = hints.clone();
+        let ids: Vec<_> = (0..5).map(tx).collect();
+        hints.schedule_all(ids[..2].iter().cloned());
+        clone.schedule_all(ids[2..].iter().cloned());
+        let (reports, more) = hints.drain();
+        assert_eq!(reports, ids[ids.len() - capacity..]);
+        assert!(!more);
+        assert_eq!(
+            hints.counters.take().dropped_candidates,
+            (ids.len() - capacity) as u64
+        );
+        assert!(clone.drain().0.is_empty());
     }
-    let overflow = TxId::from_bytes(b"overflow".to_vec());
-    candidates.admit(overflow.clone(), false, now, &counters);
-    assert_eq!(counters.take().dropped_candidates, 1);
-    for _ in 0..HINT_CAPACITY {
-        let id = candidates.take_ready().unwrap();
-        let candidate = candidates.complete(&id);
-        candidates.defer(id, candidate, now + Duration::from_secs(1));
-    }
-    candidates.record_backlog(&counters);
-    assert_eq!(counters.diagnostics().deferred, HINT_CAPACITY as u64);
-    assert_eq!(counters.diagnostics().ready, 0);
-    candidates.admit(overflow.clone(), false, now, &counters);
-    assert_eq!(counters.take().dropped_candidates, 1);
+}
 
-    candidates.promote_due(now + Duration::from_secs(1));
-    candidates.record_backlog(&counters);
-    assert_eq!(counters.diagnostics().ready, ADMISSION_BATCH as u64);
-    assert_eq!(
-        counters.diagnostics().deferred,
-        (HINT_CAPACITY - ADMISSION_BATCH) as u64
-    );
-    let id = candidates.take_ready().unwrap();
-    candidates.complete(&id);
-    candidates.admit(overflow, false, now, &counters);
-    assert_eq!(counters.take().dropped_candidates, 0);
-    assert_eq!(candidates.oldest_ready(), Some(now));
+#[test]
+fn candidate_capacity_is_preserved_across_deferrals_and_completion() {
+    for capacity in [1, 3, HINT_CAPACITY] {
+        let now = rt::Instant::now();
+        let counters = Counters::default();
+        let mut candidates = Candidates::new(
+            Duration::ZERO,
+            GcLimits {
+                max_hint_candidates: capacity,
+                ..GcLimits::default()
+            },
+        );
+        let ids: Vec<_> = (0u64..capacity as u64)
+            .map(|i| TxId::from_bytes(i.to_be_bytes().to_vec()))
+            .collect();
+        for id in &ids {
+            candidates.admit(id.clone(), false, now, &counters);
+        }
+        let overflow = TxId::from_bytes(b"overflow".to_vec());
+        candidates.admit(overflow.clone(), false, now, &counters);
+        assert_eq!(counters.take().dropped_candidates, 1);
+        for _ in 0..capacity {
+            let id = candidates.take_ready().unwrap();
+            candidates.admit(overflow.clone(), false, now, &counters);
+            assert_eq!(counters.take().dropped_candidates, 1);
+            let candidate = candidates.complete(&id);
+            candidates.defer(id, candidate, now + Duration::from_secs(1));
+        }
+        candidates.record_backlog(&counters);
+        assert_eq!(counters.diagnostics().deferred, capacity as u64);
+        assert_eq!(counters.diagnostics().ready, 0);
+        candidates.admit(overflow.clone(), false, now, &counters);
+        assert_eq!(counters.take().dropped_candidates, 1);
+
+        candidates.promote_due(now + Duration::from_secs(1));
+        candidates.record_backlog(&counters);
+        let promoted = capacity.min(ADMISSION_BATCH);
+        assert_eq!(counters.diagnostics().ready, promoted as u64);
+        assert_eq!(
+            counters.diagnostics().deferred,
+            (capacity - promoted) as u64
+        );
+        let id = candidates.take_ready().unwrap();
+        candidates.complete(&id);
+        candidates.admit(overflow, false, now, &counters);
+        assert_eq!(counters.take().dropped_candidates, 0);
+        assert_eq!(candidates.oldest_ready(), Some(now));
+    }
 }
 
 #[test]
@@ -3779,7 +3813,7 @@ async fn only_a_hint_during_a_check_requests_a_delayed_follow_up() {
 fn scan_admission_does_not_advance_a_hint_deadline() {
     let now = rt::Instant::now();
     let delay = Duration::from_secs(45);
-    let mut candidates = Candidates::new(delay);
+    let mut candidates = Candidates::new(delay, GcLimits::default());
     let counters = Counters::default();
     let id = tx(21);
     candidates.admit(id.clone(), false, now, &counters);

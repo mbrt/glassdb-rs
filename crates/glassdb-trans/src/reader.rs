@@ -20,13 +20,6 @@ use crate::error::trans_to_storage;
 use crate::key_resolver::KeyResolver;
 use crate::key_state_resolver::ResolvedValue;
 
-/// Extra attempts made when a read fails with an in-doubt (`Unavailable`)
-/// outcome before the error is surfaced. Reads are idempotent (ADR-009), so
-/// re-reading is always safe; this recovers transient backend unavailability in
-/// place, mirroring the commit-side in-place retries. The cap keeps a sustained
-/// outage from looping forever — it surfaces as `Unavailable` for the caller to
-/// classify — while a caller `timeout` still bounds the total wait by dropping
-/// the future.
 const READ_UNAVAILABLE_RETRIES: usize = 5;
 
 /// The result of reading a key: the raw value and its storage version. The
@@ -69,8 +62,7 @@ pub struct Reader {
 }
 
 impl Reader {
-    /// Creates a reader that resolves and materializes values through
-    /// `resolver` using `retry` for transient read failures.
+    /// Creates a point reader with retry backoff for transient failures.
     pub fn new(resolver: KeyResolver, timeline: Timeline, retry: RetryConfig) -> Self {
         Reader {
             resolver,
@@ -83,9 +75,9 @@ impl Reader {
     /// `None` when the key is absent or deleted.
     ///
     /// A read is idempotent, so a transient in-doubt (`Unavailable`) outcome is
-    /// retried in place with exponential backoff up to
-    /// [`READ_UNAVAILABLE_RETRIES`] times. A persistent outage surfaces the last
-    /// `Unavailable` error for the caller to classify; the caller cancels by
+    /// retried in place with exponential backoff up to five times.
+    /// A persistent outage surfaces the last `Unavailable` error for the caller
+    /// to classify; the caller cancels by
     /// dropping the future at any `.await` (e.g. via `tokio::time::timeout`).
     pub async fn read(
         &self,

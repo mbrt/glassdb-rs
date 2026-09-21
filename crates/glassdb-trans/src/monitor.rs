@@ -1229,24 +1229,19 @@ impl Monitor {
     ) -> Result<TxStatus, TransError> {
         // The deadline starts with the write because time spent waiting for its
         // ambiguous response also consumes the record's retention horizon.
-        let deadline = attempt_started + self.inner.timing.pending_timeout();
-        loop {
-            match self
-                .inner
-                .tl
-                .commit_status_at(tid, self.current_requirement())
-                .await
-            {
-                Ok(status) => return Ok(status),
-                Err(StorageError::Unavailable(reason)) => {
-                    let remaining = deadline.saturating_duration_since(rt::Instant::now());
-                    if remaining.is_zero() {
-                        return Err(in_doubt(reason));
-                    }
-                    rt::sleep(backoff.next_delay().min(remaining)).await;
-                }
-                Err(error) => return Err(error.into()),
-            }
+        let remaining = self
+            .inner
+            .timing
+            .pending_timeout()
+            .saturating_sub(attempt_started.elapsed());
+        if remaining.is_zero() {
+            return Err(in_doubt("commit recovery deadline expired"));
+        }
+        tokio::select! {
+            // A status that arrives at the deadline is too late to decide the outcome.
+            biased;
+            _ = rt::sleep(remaining) => Err(in_doubt("commit recovery deadline expired")),
+            status = self.read_tx_status_retrying_unavailable(tid, backoff) => status,
         }
     }
 
@@ -2331,7 +2326,7 @@ mod tests {
         timing: ProtocolTiming,
     ) -> (Monitor, TestCtx) {
         let timeline = Timeline::new();
-        let objects = CachedStore::new(b, 1024, timeline.clone(), None);
+        let objects = CachedStore::new(b, 1 << 20, timeline.clone(), None);
         let tl = TLogger::new(objects.clone(), DbRoot::try_from("test").unwrap());
         let bg = Arc::new(Background::new());
         let mon = Monitor::with_config(

@@ -325,6 +325,7 @@ pub struct Algo {
     // coordination loops own independent schedules from the same engine policy.
     acquisition_retry: RetryConfig,
     split_policy: SplitPolicy,
+    collection_reservation_limit: usize,
     collection_commit: CollectionCommit,
     retirement: Arc<AttemptRetirement>,
     // Weak so a captured `Algo` clone inside a spawned retirement task does not
@@ -351,6 +352,7 @@ impl Algo {
         router: TreeRouter,
         resolver: KeyResolver,
         split_policy: SplitPolicy,
+        collection_reservation_limit: usize,
         inline_policy: InlinePolicy,
         split_hints: SplitHintSink,
     ) -> Self {
@@ -376,6 +378,7 @@ impl Algo {
             timeline,
             acquisition_retry,
             split_policy,
+            collection_reservation_limit,
             collection_commit,
             retirement,
             background,
@@ -393,7 +396,10 @@ impl Algo {
         let id = TxId::new_at(rt::system_now());
         Handle {
             accesses,
-            collections: CollectionAttempt::new(catalog_accesses),
+            collections: CollectionAttempt::new(
+                catalog_accesses,
+                self.collection_reservation_limit,
+            ),
             state: AttemptState::new(),
             retirement: AttemptRetirementGuard::new(self.retirement.clone(), id.clone()),
             id,

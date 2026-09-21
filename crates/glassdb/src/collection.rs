@@ -98,6 +98,7 @@ impl Collection {
         max_staleness: Duration,
     ) -> Result<Option<Vec<u8>>, Error> {
         let _guard = self.db.admit_operation()?;
+        self.db.transaction_limits.check_key(key)?;
         let key = LogicalKey::new(self.address.clone(), key);
         match self.db.engine.read(&key, max_staleness).await {
             Ok(outcome) => Ok(outcome.value.map(|rv| rv.value.to_vec())),

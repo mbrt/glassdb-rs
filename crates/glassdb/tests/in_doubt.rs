@@ -52,11 +52,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture, HookOutcome};
 use glassdb::backend::{Backend, BackendError};
-use glassdb::{Collection, CollectionPath, Database, Error, InlinePolicy, Transaction};
+use glassdb::{
+    Collection, CollectionPath, Database, Error, InlinePolicy, ProtocolTiming, Transaction,
+};
 use glassdb_storage::transaction::TxCommitStatus;
 
 type Before = Box<dyn for<'a> Fn(&BackendOp<'a>) -> Result<(), BackendError> + Send + Sync>;
@@ -607,6 +610,86 @@ async fn logged_commit_lost_ack_recovers_transparently() {
         1,
         "the in-doubt commit point must be resolved by reading, not re-issued",
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn logged_commit_recovery_deadline_bounds_status_reads() {
+    let horizon = Duration::from_secs(1);
+    for (ack_delay, status_delay) in [
+        (Duration::ZERO, None),
+        (horizon / 2, None),
+        (horizon, None),
+        (Duration::ZERO, Some(horizon)),
+    ] {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let db = Database::builder("deadline", backend.clone())
+            .inline_policy(InlinePolicy::none())
+            .protocol_timing(ProtocolTiming::new(horizon, Duration::from_secs(30)))
+            .open()
+            .await
+            .unwrap();
+        let coll = db.root_collection();
+        let commit_applied = Arc::new(AtomicBool::new(false));
+        let status_reads = Arc::new(AtomicUsize::new(0));
+        let release_reads = Arc::new(tokio::sync::Notify::new());
+        let commit_writes = arm_after(
+            &backend,
+            Box::new({
+                let commit_applied = commit_applied.clone();
+                let status_reads = status_reads.clone();
+                let release_reads = release_reads.clone();
+                move |operation, outcome| {
+                    let commit = outcome.is_success() && committed_log(operation);
+                    let status_read = commit_applied.load(Ordering::SeqCst)
+                        && matches!(operation,
+                        BackendOp::Read { path } | BackendOp::ReadIfModified { path, .. }
+                            if path.contains("/_t/"));
+                    let commit_applied = commit_applied.clone();
+                    let status_reads = status_reads.clone();
+                    let release_reads = release_reads.clone();
+                    Box::pin(async move {
+                        if commit {
+                            commit_applied.store(true, Ordering::SeqCst);
+                            if !ack_delay.is_zero() {
+                                tokio::time::sleep(ack_delay).await;
+                            }
+                            return Err(lost_ack("commit"));
+                        }
+                        if status_read {
+                            status_reads.fetch_add(1, Ordering::SeqCst);
+                            if let Some(delay) = status_delay {
+                                tokio::time::sleep(delay).await;
+                            } else {
+                                release_reads.notified().await;
+                            }
+                        }
+                        Ok(())
+                    })
+                }
+            }),
+        );
+
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(horizon * 2, coll.write(b"key", b"value"))
+            .await
+            .expect("a stalled status read exceeded the commit recovery deadline");
+        assert!(matches!(result, Err(Error::InDoubt(_))), "{result:?}");
+        assert_eq!(started.elapsed(), horizon, "ack_delay={ack_delay:?}");
+        assert_eq!(commit_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            status_reads.load(Ordering::SeqCst),
+            usize::from(ack_delay < horizon),
+            "an expired recovery budget must not start another read"
+        );
+
+        backend.clear_after();
+        release_reads.notify_waiters();
+        assert_eq!(
+            coll.read(b"key").await.unwrap().as_deref(),
+            Some(&b"value"[..])
+        );
+        db.shutdown().await;
+    }
 }
 
 /// Lock acquisition is a *pre-commit* operation: no durable user value has been

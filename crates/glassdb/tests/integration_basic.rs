@@ -499,10 +499,12 @@ async fn read_stale() {
 }
 #[tokio::test(start_paused = true)]
 async fn builder_custom_options() {
+    use std::num::NonZeroUsize;
     use std::time::Duration;
 
     let db = Database::builder("example", mem())
         .cache_size(8 * 1024 * 1024)
+        .transaction_leaf_parallelism(NonZeroUsize::new(2).unwrap())
         .retry_initial_interval(Duration::from_millis(10))
         .retry_max_interval(Duration::from_millis(100))
         .protocol_timing(ProtocolTiming::new(

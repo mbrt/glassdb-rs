@@ -25,6 +25,7 @@ mod db;
 pub mod diagnostics;
 mod error;
 mod iter;
+mod limits;
 mod scan;
 #[cfg(all(feature = "sim", sim))]
 pub mod sim;
@@ -37,6 +38,7 @@ pub use db::{Database, DatabaseBuilder};
 pub use diagnostics::Diagnostics;
 pub use error::Error;
 pub use iter::{CollectionEntry, CollectionIter, KeyIter};
+pub use limits::TransactionLimits;
 pub use scan::{KeyPage, KeyScan};
 pub use stats::{Stats, TransactionStats};
 pub use tx::Transaction;
@@ -65,8 +67,8 @@ pub use glassdb_storage::{
     SplitPolicyBuilder,
 };
 pub use glassdb_trans::{
-    DirectCommitStats, InlinePressureStats, LeafCoordinatorStats, LockerStats, MonitorStats,
-    ProtocolTiming, SplitterStats,
+    DirectCommitStats, GcLimits, InlinePressureStats, LeafCoordinatorStats, LockerStats,
+    MonitorStats, ProtocolTiming, SplitterStats,
 };
 
 // Re-export the backend abstraction so callers can construct a Database without

@@ -144,7 +144,13 @@ impl CatalogOverlay {
                 "cannot recreate a collection binding after dropping it in one transaction".into(),
             ));
         }
-        let id = self.reservations.reserve(parent, name);
+        let id = self
+            .reservations
+            .reserve(parent, name)
+            .map_err(|error| Error::LimitExceeded {
+                resource: "collection reservations",
+                limit: error.limit,
+            })?;
         let address = CollectionAddress::new(parent.db_root(), id);
         self.directories
             .get_mut(parent)

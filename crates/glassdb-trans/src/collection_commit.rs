@@ -25,24 +25,44 @@ pub(crate) struct CollectionAttempt {
 #[derive(Clone)]
 pub struct CollectionReservations {
     ids: Arc<Mutex<HashMap<CollectionBinding, CollectionId>>>,
+    limit: usize,
+}
+
+/// A new collection binding would exceed the transaction identity's reservation limit.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("collection reservation limit of {limit} exceeded")]
+pub struct CollectionReservationLimitExceeded {
+    /// Maximum new collection bindings reserved by one transaction identity.
+    pub limit: usize,
 }
 
 type CollectionBinding = (CollectionAddress, Vec<u8>);
 
 impl CollectionReservations {
     /// Reserves the same collection ID for repeated creation of one binding.
-    pub fn reserve(&self, parent: &CollectionAddress, name: &[u8]) -> CollectionId {
-        *self
-            .ids
-            .lock()
-            .unwrap()
-            .entry((parent.clone(), name.to_vec()))
-            .or_insert_with(CollectionId::new_random)
+    /// Returns an error when a new reservation would exceed the fixed limit.
+    pub fn reserve(
+        &self,
+        parent: &CollectionAddress,
+        name: &[u8],
+    ) -> Result<CollectionId, CollectionReservationLimitExceeded> {
+        let mut ids = self.ids.lock().unwrap();
+        let binding = (parent.clone(), name.to_vec());
+        if let Some(id) = ids.get(&binding) {
+            return Ok(*id);
+        }
+        if ids.len() >= self.limit {
+            return Err(CollectionReservationLimitExceeded { limit: self.limit });
+        }
+        let id = CollectionId::new_random();
+        ids.insert(binding, id);
+        Ok(id)
     }
 
-    fn new() -> Self {
+    fn new(limit: usize) -> Self {
         Self {
             ids: Arc::new(Mutex::new(HashMap::new())),
+            limit,
         }
     }
 }
@@ -58,11 +78,11 @@ pub(crate) struct CollectionCommit {
 }
 
 impl CollectionAttempt {
-    /// Starts collection tracking for one transaction identity.
-    pub(crate) fn new(accesses: CatalogAccesses) -> Self {
+    /// Starts collection tracking with a fixed reservation limit.
+    pub(crate) fn new(accesses: CatalogAccesses, reservation_limit: usize) -> Self {
         Self {
             accesses,
-            reservations: CollectionReservations::new(),
+            reservations: CollectionReservations::new(reservation_limit),
             prepared: BTreeSet::new(),
             fenced_drops: BTreeSet::new(),
         }
@@ -92,7 +112,7 @@ impl CollectionAttempt {
     /// Drops physical resources that belonged to the retired identity.
     pub(crate) fn renew(&mut self) {
         // Old body handles must never allocate from the replacement identity.
-        self.reservations = CollectionReservations::new();
+        self.reservations = CollectionReservations::new(self.reservations.limit);
         self.prepared.clear();
         self.fenced_drops.clear();
     }
@@ -336,20 +356,33 @@ mod tests {
     #[test]
     fn renewed_attempt_keeps_accesses_without_old_physical_resources() {
         let collection = address(1);
-        let mut attempt = CollectionAttempt::new(CatalogAccesses {
-            reads: Vec::new(),
-            changes: vec![create_change(collection.clone())],
-        });
+        let mut attempt = CollectionAttempt::new(
+            CatalogAccesses {
+                reads: Vec::new(),
+                changes: vec![create_change(collection.clone())],
+            },
+            1,
+        );
         attempt.prepared.insert(collection.clone());
         attempt.fenced_drops.insert(address(2));
         let retired_reservations = attempt.reservations();
         let parent = CollectionAddress::root("db");
-        let old_id = retired_reservations.reserve(&parent, b"child");
+        let old_id = retired_reservations.reserve(&parent, b"child").unwrap();
 
         attempt.renew();
 
-        assert_ne!(attempt.reservations().reserve(&parent, b"child"), old_id);
-        assert_eq!(retired_reservations.reserve(&parent, b"child"), old_id);
+        let reservations = attempt.reservations();
+        assert_ne!(reservations.reserve(&parent, b"child").unwrap(), old_id);
+        assert_eq!(
+            retired_reservations.reserve(&parent, b"child").unwrap(),
+            old_id
+        );
+        for reservations in [retired_reservations, reservations] {
+            assert_eq!(
+                reservations.reserve(&parent, b"other").unwrap_err().limit,
+                1
+            );
+        }
         assert_eq!(attempt.accesses.changes.len(), 1);
         assert_eq!(attempt.accesses.changes[0].collection, collection);
         assert!(attempt.prepared.is_empty());
@@ -360,10 +393,13 @@ mod tests {
     fn durable_projections_preserve_prepared_roots_from_prior_body_runs() {
         let earlier = address(1);
         let active = address(2);
-        let mut attempt = CollectionAttempt::new(CatalogAccesses {
-            reads: Vec::new(),
-            changes: vec![create_change(active.clone())],
-        });
+        let mut attempt = CollectionAttempt::new(
+            CatalogAccesses {
+                reads: Vec::new(),
+                changes: vec![create_change(active.clone())],
+            },
+            0,
+        );
         attempt.prepared.insert(earlier.clone());
 
         let retained_lock = TxLock::Topology {

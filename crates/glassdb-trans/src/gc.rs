@@ -44,8 +44,33 @@ use scan::{GcScan, PAGE_SIZE};
 
 const HINT_CAPACITY: usize = 4096;
 const SCAN_CAPACITY: usize = 2 * PAGE_SIZE;
-const MAX_CHECKS: usize = 8;
+pub(crate) const DEFAULT_GC_PARALLELISM: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 const ADMISSION_BATCH: usize = 64;
+
+/// GC hint queue limits for one database instance.
+///
+/// Excess hints are discarded without delaying writers. GC scans can still
+/// discover their transaction objects and use a separate candidate budget.
+#[derive(Debug, Clone, Copy)]
+pub struct GcLimits {
+    /// Maximum reports waiting for admission. Defaults to 4,096.
+    /// At capacity, a new report replaces the oldest. Zero drops every report.
+    pub max_pending_hints: usize,
+    /// Maximum retained candidates from hints, including ready, deferred, and
+    /// running checks. Defaults to 4,096. At capacity, new candidates are
+    /// discarded; existing candidates keep their place. Zero rejects all new
+    /// candidates from hints.
+    pub max_hint_candidates: usize,
+}
+
+impl Default for GcLimits {
+    fn default() -> Self {
+        Self {
+            max_pending_hints: HINT_CAPACITY,
+            max_hint_candidates: HINT_CAPACITY,
+        }
+    }
+}
 
 type Checks = BoxFuture<'static, Vec<(TxId, Result<GcOutcome, TransError>)>>;
 type Listing = BoxFuture<'static, (GcScan, Result<Option<Vec<TxId>>, StorageError>)>;
@@ -99,6 +124,7 @@ enum CandidateState {
 #[derive(Default)]
 struct Candidates {
     entries: BTreeMap<TxId, Candidate>,
+    limits: GcLimits,
     hint_delay: Duration,
     hints: CandidateQueue,
     scans: CandidateQueue,
@@ -113,9 +139,10 @@ struct CandidateQueue {
 }
 
 impl Candidates {
-    fn new(hint_delay: Duration) -> Self {
+    fn new(hint_delay: Duration, limits: GcLimits) -> Self {
         Self {
             hint_delay,
+            limits,
             ..Self::default()
         }
     }
@@ -141,12 +168,12 @@ impl Candidates {
             candidate.reported_again |= !from_scan && candidate.state == CandidateState::Running;
             return;
         }
-        let queue = self.queue_mut(from_scan);
         let capacity = if from_scan {
             SCAN_CAPACITY
         } else {
-            HINT_CAPACITY
+            self.limits.max_hint_candidates
         };
+        let queue = self.queue_mut(from_scan);
         if queue.count >= capacity {
             counters.dropped_candidates.fetch_add(1, Ordering::Relaxed);
             return;
@@ -273,6 +300,7 @@ pub(crate) struct Gc {
     timing: ProtocolTiming,
     timeline: Timeline,
     hints: GcHints,
+    max_checks: NonZeroUsize,
 }
 
 impl Gc {
@@ -287,6 +315,7 @@ impl Gc {
         collection_lifecycle: CollectionLifecycle,
         timing: ProtocolTiming,
         hints: GcHints,
+        max_checks: NonZeroUsize,
     ) -> Self {
         Self {
             tl,
@@ -297,6 +326,7 @@ impl Gc {
             timing,
             timeline,
             hints,
+            max_checks,
         }
     }
 
@@ -713,7 +743,7 @@ impl Scheduler {
         let retry_delay = gc.timing.pending_timeout();
         let counters = gc.hints.counters.clone();
         Self {
-            candidates: Candidates::new(retry_delay + gc.timing.max_clock_skew()),
+            candidates: Candidates::new(retry_delay + gc.timing.max_clock_skew(), gc.hints.limits),
             scanned: VecDeque::new(),
             checks: OptionFuture::default(),
             checking: false,
@@ -757,7 +787,7 @@ impl Scheduler {
             .map(|due| now.saturating_duration_since(due))
             .unwrap_or_default();
         if ready > self.concurrency || oldest >= self.retry_delay / 16 {
-            self.concurrency = (self.concurrency * 2).min(MAX_CHECKS);
+            self.concurrency = self.concurrency.saturating_mul(2).min(gc.max_checks.get());
         } else if ready == 0 && !self.checking {
             self.concurrency = 1;
         }
@@ -879,12 +909,21 @@ impl Scheduler {
 /// Reports GC candidates without waiting for GC or queue capacity.
 #[derive(Clone, Default)]
 pub(crate) struct GcHints {
+    limits: GcLimits,
     queue: Arc<Mutex<VecDeque<TxId>>>,
     wake: Arc<Notify>,
     counters: Arc<Counters>,
 }
 
 impl GcHints {
+    /// Creates a candidate feed with shared producer and admission limits.
+    pub(crate) fn new(limits: GcLimits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
     /// Reports one transaction object for a reverse liveness check.
     pub(crate) fn schedule(&self, tid: TxId) {
         self.schedule_all([tid]);
@@ -893,6 +932,12 @@ impl GcHints {
     /// Reports transaction objects for reverse liveness checks.
     pub(crate) fn schedule_all(&self, tids: impl IntoIterator<Item = TxId>) {
         for tid in tids {
+            if self.limits.max_pending_hints == 0 {
+                self.counters
+                    .dropped_candidates
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             // A busy consumer must not put a writer behind the GC queue lock.
             let Ok(mut queue) = self.queue.try_lock() else {
                 self.counters
@@ -900,7 +945,7 @@ impl GcHints {
                     .fetch_add(1, Ordering::Relaxed);
                 continue;
             };
-            if queue.len() == HINT_CAPACITY {
+            if queue.len() == self.limits.max_pending_hints {
                 queue.pop_front();
                 self.counters
                     .dropped_candidates

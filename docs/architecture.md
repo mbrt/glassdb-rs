@@ -111,6 +111,10 @@ public errors, and public handles. Concrete stores and the routing, locking,
 monitoring, splitting, and GC implementations are not exported across this
 boundary.
 
+The database instance does not cap concurrent transaction calls or stale reads.
+It tracks active calls so shutdown can reject new calls and wait for existing
+calls to finish. The transaction engine drains background protocol work.
+
 ## Component Responsibilities
 
 Inside the transaction engine the division of labour separates transaction
@@ -1103,6 +1107,9 @@ implements a candidate-driven **reverse mark-sweep**
   safety-horizon deferrals and failed checks with due times, and increases
   concurrent checks as ready work grows or ages. Candidate memory, admission,
   and concurrency are all bounded, and transient errors receive delayed retries.
+  Pending reports and retained candidates from hints have separate capacities;
+  deferred and running candidates still consume the retained capacity. GC scans
+  keep separate capacity so they can discover work after hints are discarded.
 - **Safety horizon and pinned wounds.** The lock lease acts as the sweep
   horizon: a candidate other than `Wounded` is kept within the horizon, because
   the non-atomic reverse check can race a lock a live transaction has taken but

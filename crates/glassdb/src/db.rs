@@ -2,15 +2,16 @@
 //! the transaction retry loop, collections, and stats.
 
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use glassdb_backend::Backend;
 use glassdb_concurr::rt;
-use glassdb_data::DatabaseId;
+use glassdb_data::{DatabaseId, DbRoot};
 use glassdb_storage::{InlinePolicy, PersistentCacheConfig, PersistentCacheMedia, SplitPolicy};
 use glassdb_trans::{
-    AccessSet, BodyDecision, CatalogAccesses, Engine, EngineConfig, EngineTransaction,
+    AccessSet, BodyDecision, CatalogAccesses, Engine, EngineConfig, EngineTransaction, GcLimits,
     ProtocolTiming, TransError,
 };
 use tokio::sync::Notify;
@@ -18,6 +19,7 @@ use tokio::sync::Notify;
 use crate::collection::{Collection, CollectionPath};
 use crate::diagnostics::Diagnostics;
 use crate::error::Error;
+use crate::limits::TransactionLimits;
 use crate::stats::{Stats, TransactionStats};
 use crate::tx::Transaction;
 use crate::version::check_or_create_db_meta;
@@ -32,12 +34,44 @@ pub struct DatabaseBuilder {
     name: String,
     backend: Arc<dyn Backend>,
     engine_config: EngineConfig,
+    transaction_limits: TransactionLimits,
 }
 
 impl DatabaseBuilder {
+    /// Sets local transaction admission limits. See [`TransactionLimits`] for defaults.
+    pub fn transaction_limits(mut self, limits: TransactionLimits) -> Self {
+        self.engine_config
+            .set_collection_reservation_limit(limits.max_collection_reservations);
+        self.transaction_limits = limits;
+        self
+    }
+
+    /// Sets the maximum parallel leaf operations per bounded transaction phase.
+    /// Defaults to 16. Concurrent phases each have their own capacity.
+    pub fn transaction_leaf_parallelism(mut self, parallelism: NonZeroUsize) -> Self {
+        self.engine_config
+            .set_transaction_leaf_parallelism(parallelism);
+        self
+    }
+
+    /// Limits concurrent GC candidate checks per database instance.
+    /// Defaults to 8. GC adjusts concurrency between one and this maximum.
+    /// Each candidate check can issue multiple backend operations.
+    pub fn gc_parallelism(mut self, parallelism: NonZeroUsize) -> Self {
+        self.engine_config.set_gc_parallelism(parallelism);
+        self
+    }
+
+    /// Sets GC hint queue limits per database instance. See [`GcLimits`] for defaults.
+    /// Cloned database handles share the queues; separate opens have independent limits.
+    pub fn gc_limits(mut self, limits: GcLimits) -> Self {
+        self.engine_config.set_gc_limits(limits);
+        self
+    }
+
     /// Sets the number of bytes dedicated to caching objects and metadata.
     /// Setting this too small may impact performance, as more backend calls are
-    /// necessary.
+    /// necessary. Zero disables decoded object caching.
     pub fn cache_size(mut self, bytes: usize) -> Self {
         self.engine_config.set_cache_size(bytes);
         self
@@ -63,6 +97,7 @@ impl DatabaseBuilder {
 
     /// Sets the upper bound on the per-retry delay for transient
     /// transaction-coordination and same-identity lock-acquisition operations.
+    /// This includes jitter and caps the initial interval. Defaults to 5 seconds.
     pub fn retry_max_interval(mut self, interval: Duration) -> Self {
         self.engine_config.set_retry_max_interval(interval);
         self
@@ -96,18 +131,16 @@ impl DatabaseBuilder {
 
     /// Opens the database, validating the name and creating its metadata if
     /// needed.
+    /// Names must contain 1–255 ASCII letters or digits.
     pub async fn open(self) -> Result<Database, Error> {
         let DatabaseBuilder {
             name,
             backend: b,
             engine_config,
+            transaction_limits,
         } = self;
 
-        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
-            return Err(Error::InvalidInput(format!(
-                "name must be alphanumeric, got {name:?}"
-            )));
-        }
+        DbRoot::try_from(name.as_str()).map_err(|error| Error::InvalidInput(error.to_string()))?;
         let backend = Arc::new(glassdb_backend::StatsBackend::new(b));
         let database_id = check_or_create_db_meta(&backend, &name).await?;
         let engine = Engine::open(&name, database_id, backend, engine_config)
@@ -118,6 +151,7 @@ impl DatabaseBuilder {
             name,
             database_id,
             engine,
+            transaction_limits,
             stats: Mutex::new(Stats::default()),
             operations: OperationLifecycle::new(),
         });
@@ -139,6 +173,7 @@ impl DatabaseBuilder {
             name: name.into(),
             backend,
             engine_config: EngineConfig::default(),
+            transaction_limits: TransactionLimits::default(),
         }
     }
 }
@@ -147,6 +182,7 @@ pub(crate) struct DbInner {
     pub(crate) name: String,
     pub(crate) database_id: DatabaseId,
     pub(crate) engine: Engine,
+    pub(crate) transaction_limits: TransactionLimits,
     stats: Mutex<Stats>,
     // Admission and drain cover every public asynchronous operation, including
     // the few APIs that do not run through a transaction.
@@ -448,8 +484,7 @@ impl Drop for OperationGuard<'_> {
 }
 
 impl DbInner {
-    /// Admits one public asynchronous operation or rejects it once shutdown has
-    /// begun.
+    /// Admits a transaction call or stale read while shutdown has not begun.
     pub(crate) fn admit_operation(&self) -> Result<OperationGuard<'_>, Error> {
         self.operations.admit()
     }
