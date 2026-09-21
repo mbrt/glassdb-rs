@@ -24,8 +24,6 @@ use crate::stats::{Stats, TransactionStats};
 use crate::tx::Transaction;
 use crate::version::check_or_create_db_meta;
 
-const DEFAULT_MAX_ACTIVE_OPERATIONS: usize = 256;
-
 /// Builds and opens a [`Database`], tweaking optional settings before opening.
 ///
 /// Start from [`Database::builder`], chain any setters, then call
@@ -37,22 +35,9 @@ pub struct DatabaseBuilder {
     backend: Arc<dyn Backend>,
     engine_config: EngineConfig,
     transaction_limits: TransactionLimits,
-    max_active_operations: usize,
 }
 
 impl DatabaseBuilder {
-    /// Limits concurrent transaction calls and stale reads per database instance.
-    /// Defaults to 256. At capacity, new operations return [`Error::LimitExceeded`]
-    /// without waiting or starting a transaction body. Zero rejects all such calls.
-    ///
-    /// Database clones share the limit; separate opens have independent limits.
-    /// A transaction call holds one position across its body retries and commit.
-    /// Background work and shutdown do not count.
-    pub fn max_active_operations(mut self, limit: usize) -> Self {
-        self.max_active_operations = limit;
-        self
-    }
-
     /// Sets local transaction admission limits. See [`TransactionLimits`] for defaults.
     pub fn transaction_limits(mut self, limits: TransactionLimits) -> Self {
         self.transaction_limits = limits;
@@ -169,7 +154,6 @@ impl DatabaseBuilder {
             backend: b,
             engine_config,
             transaction_limits,
-            max_active_operations,
         } = self;
 
         DbRoot::try_from(name.as_str()).map_err(|error| Error::InvalidInput(error.to_string()))?;
@@ -185,7 +169,7 @@ impl DatabaseBuilder {
             engine,
             transaction_limits,
             stats: Mutex::new(Stats::default()),
-            operations: OperationLifecycle::new(max_active_operations),
+            operations: OperationLifecycle::new(),
         });
         Ok(Database { inner })
     }
@@ -206,7 +190,6 @@ impl DatabaseBuilder {
             backend,
             engine_config: EngineConfig::default(),
             transaction_limits: TransactionLimits::default(),
-            max_active_operations: DEFAULT_MAX_ACTIVE_OPERATIONS,
         }
     }
 }
@@ -460,7 +443,6 @@ async fn create_path_in_transaction(
 struct OperationLifecycle {
     state: Mutex<OperationState>,
     drained: Notify,
-    limit: usize,
 }
 
 struct OperationState {
@@ -469,14 +451,13 @@ struct OperationState {
 }
 
 impl OperationLifecycle {
-    fn new(limit: usize) -> Self {
+    fn new() -> Self {
         Self {
             state: Mutex::new(OperationState {
                 shutting_down: false,
                 active: 0,
             }),
             drained: Notify::new(),
-            limit,
         }
     }
 
@@ -484,12 +465,6 @@ impl OperationLifecycle {
         let mut state = self.state.lock().unwrap();
         if state.shutting_down {
             return Err(Error::ShuttingDown);
-        }
-        if state.active >= self.limit {
-            return Err(Error::LimitExceeded {
-                resource: "active database operations",
-                limit: self.limit,
-            });
         }
         state.active += 1;
         Ok(OperationGuard { lifecycle: self })
@@ -525,8 +500,7 @@ impl Drop for OperationGuard<'_> {
 }
 
 impl DbInner {
-    /// Admits a transaction call or stale read within the instance's capacity
-    /// while shutdown has not begun.
+    /// Admits a transaction call or stale read while shutdown has not begun.
     pub(crate) fn admit_operation(&self) -> Result<OperationGuard<'_>, Error> {
         self.operations.admit()
     }
