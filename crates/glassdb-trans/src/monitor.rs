@@ -21,7 +21,7 @@ use tokio::sync::oneshot;
 
 use crate::error::TransError;
 
-pub(crate) const DEFAULT_FINAL_STATUS_CACHE_ENTRIES: usize = 16384;
+const FINAL_STATUS_CACHE_SIZE: usize = 16384;
 
 /// Final-status cache activity for one snapshot or accumulated interval.
 ///
@@ -636,7 +636,7 @@ impl TxStatusEvidence {
 }
 
 impl Monitor {
-    /// Creates a monitor with a final-status cache limit and liveness timing.
+    /// Creates a monitor with retry-backoff and transaction-liveness timing.
     /// The retry config tunes the backoff used when polling a peer
     /// transaction's commit status and when writing a transaction's final log.
     pub fn with_config(
@@ -645,13 +645,12 @@ impl Monitor {
         background: Weak<Background>,
         retry: RetryConfig,
         timing: ProtocolTiming,
-        final_status_cache_entries: usize,
     ) -> Self {
         Monitor {
             inner: Arc::new(Inner {
                 tl,
                 timeline,
-                final_status: Mutex::new(FinalStatusCache::new(final_status_cache_entries)),
+                final_status: Mutex::new(FinalStatusCache::new(FINAL_STATUS_CACHE_SIZE)),
                 background,
                 retry,
                 timing,
@@ -2336,7 +2335,6 @@ mod tests {
             Arc::downgrade(&bg),
             RetryConfig::default(),
             timing,
-            DEFAULT_FINAL_STATUS_CACHE_ENTRIES,
         );
         (mon, TestCtx { tl, _bg: bg })
     }

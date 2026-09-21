@@ -156,55 +156,6 @@ async fn aggregate_inline_pressure_splits_for_a_later_direct_commit() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn final_status_cache_entries_control_retention() {
-    for entries in [0, 1, 2] {
-        let backend = mem();
-        let writer_db = Database::builder("example", backend.clone())
-            .inline_policy(InlinePolicy::none())
-            .open()
-            .await
-            .unwrap();
-        for key in [b"a", b"b"] {
-            writer_db.root_collection().write(key, key).await.unwrap();
-        }
-        writer_db.shutdown().await;
-
-        let reader_db = Database::builder("example", backend)
-            .final_status_cache_entries(entries)
-            .open()
-            .await
-            .unwrap();
-        let reader = reader_db.root_collection();
-        for key in [b"a", b"b"] {
-            reader
-                .read_stale(key, std::time::Duration::MAX)
-                .await
-                .unwrap();
-        }
-
-        for (key, expect_miss) in [(b"b", entries == 0), (b"a", entries < 2)] {
-            let before = reader_db.stats();
-            assert_eq!(
-                reader
-                    .read_stale(key, std::time::Duration::MAX)
-                    .await
-                    .unwrap()
-                    .as_deref(),
-                Some(key.as_slice())
-            );
-            let stats = (reader_db.stats() - before).monitor;
-            assert_eq!(stats.final_status_misses > 0, expect_miss);
-            if entries == 0 {
-                assert_eq!(stats.final_status_hits, 0);
-            } else if !expect_miss {
-                assert!(stats.final_status_hits > 0);
-            }
-        }
-        reader_db.shutdown().await;
-    }
-}
-
-#[tokio::test(start_paused = true)]
 async fn stats_report_cache_owner_activity() {
     let backend = mem();
     let writer_db = Database::builder("example", backend.clone())
