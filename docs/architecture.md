@@ -121,6 +121,10 @@ one split of a divisible node; the blocked operation then retries admission.
 Earlier formats require recreation; see
 [ADR-072](adr/072-persisted-database-settings.md).
 
+Client key-size limits apply to write admission, including overwrites. Reads,
+deletions, and scans ignore this local limit so clients can access keys created
+by another database instance.
+
 The database instance does not cap concurrent transaction calls or stale reads.
 It tracks active calls so shutdown can reject new calls and wait for existing
 calls to finish. The transaction engine drains background protocol work.

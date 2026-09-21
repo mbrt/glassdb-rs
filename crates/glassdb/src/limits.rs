@@ -4,12 +4,13 @@ use crate::Error;
 
 /// Local admission limits applied by one database instance.
 ///
-/// These are local admission limits, not stored format limits. A zero byte limit
-/// permits only empty inputs. The node sizing policy can further restrict keys.
+/// Key and value byte limits apply to write requests. Zero permits only empty
+/// keys or values in those requests. The shared node sizing policy can further
+/// restrict keys.
 #[derive(Debug, Clone, Copy)]
 pub struct TransactionLimits {
-    /// Maximum logical-key bytes, including caller-supplied scan bounds.
-    /// Defaults to 4 KiB.
+    /// Maximum logical-key bytes in a write request, including overwrites.
+    /// Defaults to 4 KiB. Reads, deletions, and scans do not apply this limit.
     pub max_key_bytes: usize,
     /// Maximum bytes in a value staged for writing. Defaults to 1 MiB.
     /// Existing stored values remain readable regardless of this limit.
@@ -31,7 +32,7 @@ pub struct TransactionLimits {
 }
 
 impl TransactionLimits {
-    pub(crate) fn check_key(&self, key: &[u8]) -> Result<(), Error> {
+    pub(crate) fn check_write_key(&self, key: &[u8]) -> Result<(), Error> {
         check_limit("logical key bytes", key.len(), self.max_key_bytes)
     }
 
