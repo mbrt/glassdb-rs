@@ -478,9 +478,12 @@ struct CasWorker {
     core: Arc<CoordCore>,
 }
 
-/// Returns the merged request's members.
+/// Returns the merged request's members, or none when the round has stopped.
 fn leaf_members(batch: &BatchHandle<CasReq, TransError>) -> BTreeMap<TxId, LeafMember> {
-    batch.merged().members
+    batch
+        .merged()
+        .map(|merged| merged.members)
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -808,10 +811,11 @@ impl CasWorker {
     /// so other members can complete while that caller waits and re-submits.
     async fn run_leaf(
         &self,
-        path: &ObjectPath,
+        submitted: &CasReq,
         batch: &BatchHandle<CasReq, TransError>,
     ) -> Result<(), TransError> {
-        let mut requirement = batch.merged().requirement;
+        let path = &submitted.path;
+        let mut requirement = submitted.requirement;
         // A cache-served `Any` load may complete without yielding. Give peers
         // already scheduled for this object one opportunity to join the round,
         // so batching does not depend on backend I/O creating the collection
@@ -876,7 +880,14 @@ impl CasWorker {
             // one. Keep these members with their combined requirement: their
             // dependent reads need that bound even when the leaf CAS can confirm
             // an older seed without a preliminary check.
-            let merged = batch.merged();
+            // A round whose every caller has gone away must stop here: nothing
+            // consumes its outcomes, and planning again would publish state on
+            // behalf of abandoned transactions — including, after a precondition
+            // miss proved the first CAS did not land, a brand-new logless
+            // publication over a newer writer.
+            let Some(merged) = batch.merged() else {
+                return Ok(());
+            };
             requirement = requirement.stricter(merged.requirement);
             let members = merged.members;
             let mut plan = match self
@@ -958,7 +969,10 @@ impl Worker<CasReq, TransError> for CasWorker {
         _key: &str,
         batch: &BatchHandle<CasReq, TransError>,
     ) -> Result<(), TransError> {
-        self.run_leaf(&batch.merged().path, batch).await
+        let Some(submitted) = batch.merged() else {
+            return Ok(());
+        };
+        self.run_leaf(&submitted, batch).await
     }
 }
 

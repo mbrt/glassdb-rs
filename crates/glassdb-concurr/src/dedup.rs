@@ -56,6 +56,11 @@ pub trait MergeRequest: Clone + Send + Sync + 'static {
 /// therefore hold no invariants across `.await` points that require running
 /// an `Err`-arm to clean up; if there is per-iteration state to settle, do it
 /// synchronously before the next `.await`.
+///
+/// Dropping the future cannot abort a round that never reaches an `.await`, so
+/// abortion is also reported in band: [`BatchHandle::merged`] returns `None`
+/// once the round has no live caller left. A worker that performs externally
+/// visible effects must consult it before each one, not only at its start.
 #[async_trait]
 pub trait Worker<R, E>: Send + Sync
 where
@@ -110,9 +115,8 @@ struct KeyQueue<R, E> {
     reorderable: VecDeque<Member<R, E>>,
     /// FIFO submissions waiting their turn.
     fifo: VecDeque<Member<R, E>>,
-    /// The merged request for the current batch. Starting a round moves it into
-    /// that driver's handle as stale/close/liveness fallback; the next refresh
-    /// recomputes it from the still-owned batch.
+    /// The merged request for the current batch, recomputed by every refresh
+    /// from the still-owned batch.
     merged: Option<R>,
 }
 
@@ -272,12 +276,6 @@ where
 
     fn merged(&self) -> Option<&R> {
         self.merged.as_ref()
-    }
-
-    fn take_merged(&mut self) -> R {
-        self.merged
-            .take()
-            .expect("dedup: formed batch has no merged request")
     }
 
     fn batch_len(&self) -> usize {
@@ -478,7 +476,7 @@ where
         &mut self,
         driver_id: DriverId,
         closing: bool,
-    ) -> MachineStep<R, E, Option<(CancellationToken, R)>> {
+    ) -> MachineStep<R, E, Option<CancellationToken>> {
         let matches_ready = matches!(
             &self.phase,
             KeyPhase::Driven {
@@ -497,11 +495,10 @@ where
         }
 
         let signal = CancellationToken::new();
-        let fallback = self.queue.take_merged();
         if let KeyPhase::Driven { round, .. } = &mut self.phase {
             *round = RoundPhase::Running(signal.clone());
         }
-        step.value = Some((signal, fallback));
+        step.value = Some(signal);
         step
     }
 
@@ -516,9 +513,14 @@ where
 
         let mut step = MachineStep::keep(None);
         if !self.queue.refresh_batch(&mut step.effects.discarded) {
+            // No live caller remains. Report the abortion in band as well as
+            // through the signal: dropping the worker future only takes effect
+            // at its next `.await`, which a round can reach after it has
+            // already acted on a request whose members are all gone.
             step.effects.cancellation = Some(signal);
+        } else {
+            step.value = self.queue.merged().cloned();
         }
-        step.value = self.queue.merged().cloned();
         step
     }
 
@@ -714,7 +716,6 @@ pub struct BatchHandle<R, E> {
     shard: Arc<Shard<R, E>>,
     key: String,
     driver: DriverId,
-    fallback: Option<R>,
 }
 
 impl<R, E> BatchHandle<R, E>
@@ -722,12 +723,12 @@ where
     R: MergeRequest,
 {
     /// Returns the current merged request, absorbing any newly-arrived
-    /// compatible submissions. If every caller for the batch has gone away,
-    /// the round's [`CancellationToken`] is fired so the outer `select!` in
-    /// [`Inner::drive_one_round`] drops the worker future at its next
-    /// `.await`. The (now-stale) merged request is still returned so the
-    /// worker has something to inspect for the rest of its current poll.
-    pub fn merged(&self) -> R {
+    /// compatible submissions, or `None` once the round must stop: every caller
+    /// for the batch has gone away, or the round is no longer this driver's, so
+    /// nothing would consume its result. The round's [`CancellationToken`] also
+    /// fires, but that only drops the worker future at its next `.await`, so a
+    /// worker must stop on `None` before it acts again.
+    pub fn merged(&self) -> Option<R> {
         let (merged, effects) = {
             let mut map = self.shard.map.lock().unwrap();
             match map.get_mut(&self.key) {
@@ -739,12 +740,7 @@ where
             }
         };
         effects.apply();
-        merged.unwrap_or_else(|| {
-            self.fallback
-                .as_ref()
-                .expect("dedup: active batch has no round fallback")
-                .clone()
-        })
+        merged
     }
 
     /// Resolves when new work arrives for the key (or a waiter cancels). Intended
@@ -761,13 +757,6 @@ where
             }
         };
         notify.notified().await;
-    }
-
-    /// Retains the already-computed request when a stale, closed, or emptied
-    /// batch cannot produce a current merge. Replacing the prior round's value
-    /// happens after the shard unlocks.
-    fn install_fallback(&mut self, fallback: R) {
-        drop(self.fallback.replace(fallback));
     }
 }
 
@@ -1004,10 +993,9 @@ where
             self.commit_step(&mut map, shard, key, step)
         };
         effects.apply();
-        let Some((op_signal, fallback)) = started else {
+        let Some(op_signal) = started else {
             return DriverFlow::Exit;
         };
-        handle.install_fallback(fallback);
 
         // Drop-the-future cancellation. The worker is a plain cancel-safe
         // async fn (see `Worker` trait contract); whichever arm wins, the
@@ -1074,7 +1062,6 @@ where
             shard: shard.clone(),
             key: key.clone(),
             driver,
-            fallback: None,
         };
         while let DriverFlow::Continue =
             self.drive_one_round(shard, &key, driver, &mut handle).await
@@ -1101,7 +1088,6 @@ where
             shard: shard.clone(),
             key: key.to_owned(),
             driver,
-            fallback: None,
         };
         let _ = self.drive_one_round(shard, key, driver, &mut handle).await;
         guard.disarm();
@@ -1506,6 +1492,23 @@ mod tests {
         step.effects.apply();
     }
 
+    // Regression: a round that loses every caller must stop in band. Handing
+    // the worker the batch's former request let a round that reaches no
+    // `.await` keep acting on members that were already gone — in the leaf
+    // coordinator, publishing a new CAS for an abandoned transaction.
+    #[tokio::test]
+    async fn refresh_stops_a_round_that_lost_every_caller() {
+        let (seed, result) = test_member(mergeable(1));
+        let mut machine = KeyMachine::new(seed, DriverId(1));
+        machine.start_round(DriverId(1), false).effects.apply();
+        let refreshed = machine.refresh(DriverId(1));
+        assert_eq!(refreshed.value.map(|request| request.counter), Some(1));
+
+        drop(result);
+        let refreshed = machine.refresh(DriverId(1));
+        assert!(refreshed.value.is_none());
+    }
+
     #[tokio::test]
     async fn machine_effects_are_deferred() {
         let (seed, mut result) = test_member(mergeable(1));
@@ -1524,7 +1527,7 @@ mod tests {
         let (seed, result) = test_member(mergeable(1));
         let mut cancellation = KeyMachine::new(seed, DriverId(3));
         let started = cancellation.start_round(DriverId(3), false);
-        let signal = started.value.unwrap().0;
+        let signal = started.value.unwrap();
         started.effects.apply();
         drop(result);
         let refreshed = cancellation.refresh(DriverId(3));
@@ -1555,7 +1558,7 @@ mod tests {
         let (seed, mut result) = test_member(mergeable(1));
         let mut running = KeyMachine::new(seed, DriverId(6));
         let started = running.start_round(DriverId(6), false);
-        let signal = started.value.unwrap().0;
+        let signal = started.value.unwrap();
         started.effects.apply();
         let mut closed = running.close();
         assert_eq!(closed.action, MachineAction::Remove);
@@ -1710,7 +1713,7 @@ mod tests {
                 };
                 let signal = running.then(|| {
                     let started = machine.start_round(driver, false);
-                    let signal = started.value.unwrap().0;
+                    let signal = started.value.unwrap();
                     started.effects.apply();
                     signal
                 });
@@ -1831,7 +1834,11 @@ mod tests {
             {
                 p.forget();
             }
-            let r = batch.merged();
+            // `None` means the round lost every caller while this worker was
+            // gated: record nothing, since a stopped round must do no work.
+            let Some(r) = batch.merged() else {
+                return Ok(());
+            };
             self.done.lock().unwrap().push(r.counter);
             if self.fails { Err(()) } else { Ok(()) }
         }
@@ -1848,7 +1855,9 @@ mod tests {
     impl Worker<TestRequest, ()> for AccumWorker {
         async fn run(&self, _key: &str, batch: &BatchHandle<TestRequest, ()>) -> Result<(), ()> {
             loop {
-                let r = batch.merged();
+                let Some(r) = batch.merged() else {
+                    return Ok(());
+                };
                 if r.counter >= self.target {
                     self.res.lock().unwrap().push(r.counter);
                     return Ok(());
