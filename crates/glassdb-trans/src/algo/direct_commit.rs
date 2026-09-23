@@ -61,7 +61,7 @@ pub(super) struct DirectCommit {
     coord: LeafCoordinator,
     inline_policy: InlinePolicy,
     split_hints: SplitHintSink,
-    cleanup_hints: GcHints,
+    gc_hints: GcHints,
     counters: Arc<DirectCommitCounters>,
 }
 
@@ -72,14 +72,14 @@ impl DirectCommit {
         coord: LeafCoordinator,
         inline_policy: InlinePolicy,
         split_hints: SplitHintSink,
-        cleanup_hints: GcHints,
+        gc_hints: GcHints,
     ) -> Self {
         DirectCommit {
             router,
             coord,
             inline_policy,
             split_hints,
-            cleanup_hints,
+            gc_hints,
             counters: Arc::new(DirectCommitCounters::default()),
         }
     }
@@ -142,7 +142,7 @@ impl DirectCommit {
                 DirectMutationOutcome::Landed(predecessors) => {
                     self.counters.landed.fetch_add(1, Ordering::Relaxed);
                     state.commit();
-                    self.cleanup_hints.schedule_all(predecessors);
+                    self.gc_hints.schedule_all(predecessors);
                     return Ok(DirectOutcome::Committed);
                 }
                 DirectMutationOutcome::InDoubt(msg) => {
@@ -284,10 +284,11 @@ impl DirectCommitOperation {
         changes_membership: bool,
     ) -> Result<bool, TransError> {
         // Pruning only the staged copy keeps this outside the lock lifecycle:
-        // finalized metadata becomes durable iff the publication CAS lands.
+        // removals of holders with a final status become durable iff the
+        // publication CAS lands.
         if let Some(holder) = locks.drop_intent().cloned() {
             match ctx.tmon.tx_status(&holder).await? {
-                TxCommitStatus::Ok => return Err(TransError::StaleCollection),
+                TxCommitStatus::Committed => return Err(TransError::StaleCollection),
                 TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
                     locks.remove_drop_intent(&holder);
                 }
@@ -297,7 +298,7 @@ impl DirectCommitOperation {
 
         for holder in locks.structural_gate().holders().to_vec() {
             match ctx.tmon.tx_status(&holder).await? {
-                TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
+                TxCommitStatus::Committed | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
                     locks.remove_structural_gate(&holder);
                 }
                 TxCommitStatus::Pending | TxCommitStatus::Unknown => return Ok(true),
@@ -307,7 +308,9 @@ impl DirectCommitOperation {
         if changes_membership {
             for holder in locks.membership().holders().to_vec() {
                 match ctx.tmon.tx_status(&holder).await? {
-                    TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
+                    TxCommitStatus::Committed
+                    | TxCommitStatus::Aborted
+                    | TxCommitStatus::Wounded => {
                         locks.remove_membership_holder(&holder);
                     }
                     TxCommitStatus::Pending | TxCommitStatus::Unknown => return Ok(true),
@@ -365,7 +368,7 @@ impl DirectCommitOperation {
                 })
             })
         {
-            // Releasing a finalized membership writer advances the staged
+            // Releasing a membership writer with a final status advances the staged
             // generation. A skipped publication would discard that change, so
             // replaying the same absence read could never converge. The locked
             // path makes the cleanup durable before validating the read.

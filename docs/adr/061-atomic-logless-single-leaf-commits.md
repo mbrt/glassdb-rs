@@ -60,7 +60,7 @@ There is no direct-specific key-count limit. Leaf admission bounds durable
 output, while coordinator cost from a very large read set is measured and may
 justify a later policy limit.
 
-A clean topology change before an in-doubt CAS is rerouted. Direct commit is
+A clean structural change before an in-doubt CAS is rerouted. Direct commit is
 retried only if the complete dependency set still shares one leaf; otherwise
 the transaction uses the regular locked commit.
 
@@ -84,9 +84,9 @@ installs no lock, performs no preparatory mutation, and needs no write-back.
 An actual absent-to-present or present-to-absent transition advances the leaf's
 membership generation in that same CAS. It may proceed only while the
 structural gate and drop intent are absent and no live or unknown
-membership holder conflicts. Finalized key-lock or membership holders may be
-reconciled during resolver evaluation; direct commit never waits for, wounds, or
-otherwise changes a live holder before its commit CAS.
+membership holder conflicts. Key-lock or membership holders with a final status
+may be reconciled during resolver evaluation; direct commit never waits for,
+wounds, or otherwise changes a live holder before its commit CAS.
 
 Independent direct transactions may share one coordinator CAS. Mutation planning
 gives them a deterministic serial order, but each transaction remains a separate
@@ -97,7 +97,7 @@ commit member with its own output markers and outcome.
 A multi-key candidate that fails per-value, aggregate, or exact-size admission
 uses the locked commit without requesting an inline-pressure split. A split
 could divide the dependency set and permanently remove its direct eligibility;
-the failed transaction does not justify that irreversible topology change.
+the failed transaction does not justify that irreversible structural change.
 
 ADR-056's existing single-key pressure request remains, as do ordinary
 post-mutation soft-cap splits. A rejected multi-key transaction neither waits

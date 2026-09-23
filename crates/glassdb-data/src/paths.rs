@@ -378,7 +378,7 @@ pub enum ObjectPath {
     DatabaseMetadata { db_prefix: DbPrefix },
     /// A collection's lifecycle and directory record.
     CollectionRecord { collection: CollectionAddress },
-    /// A transaction record, deterministically sharded by its encoded ID.
+    /// A transaction record, prefix-partitioned by its encoded ID.
     Transaction { db_prefix: DbPrefix, id: TxId },
     /// The fixed root of a collection's B-link tree.
     TreeRoot { collection: CollectionAddress },
@@ -396,9 +396,9 @@ pub enum ObjectPath {
 }
 
 impl ObjectPath {
-    /// Returns the deterministic transaction-record shard containing `id`.
-    pub fn transaction_shard(id: &TxId) -> usize {
-        transaction::shard(id)
+    /// Returns the index of the transaction prefix that contains `id`.
+    pub fn transaction_prefix_index(id: &TxId) -> usize {
+        transaction::prefix_index(id)
     }
 
     /// Returns the listing prefix for all standalone nodes in `collection`.
@@ -406,9 +406,9 @@ impl ObjectPath {
         tree::nodes_prefix(&collection.physical_prefix())
     }
 
-    /// Returns the listing prefix for one deterministic transaction shard.
-    pub fn transaction_shard_prefix(db_prefix: &DbPrefix, shard: usize) -> String {
-        transaction::shard_prefix(db_prefix.as_str(), shard)
+    /// Returns the listing prefix of one transaction prefix index.
+    pub fn transaction_prefix(db_prefix: &DbPrefix, index: usize) -> String {
+        transaction::index_prefix(db_prefix.as_str(), index)
     }
 
     /// Returns a transaction listing prefix at one of the three supported depths.
@@ -782,11 +782,8 @@ mod tests {
             ObjectPath::nodes_prefix(&collection),
             format!("{collection_prefix}/_n/")
         );
-        assert_eq!(
-            ObjectPath::transaction_shard_prefix(&db_prefix, 16),
-            "db/_t/0/F/"
-        );
-        assert_eq!(ObjectPath::transaction_shard(&participant), 16);
+        assert_eq!(ObjectPath::transaction_prefix(&db_prefix, 16), "db/_t/0/F/");
+        assert_eq!(ObjectPath::transaction_prefix_index(&participant), 16);
         assert_eq!(ObjectPath::structural_intents_prefix(&db_prefix), "db/_s/");
         assert_eq!(
             ObjectPath::participant_structural_intents_prefix(&db_prefix, &participant),

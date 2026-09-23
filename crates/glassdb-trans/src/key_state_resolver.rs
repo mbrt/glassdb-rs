@@ -245,7 +245,7 @@ impl KeyStateResolver {
             .committed_value_at(key, holder, requirement)
             .await?;
         match committed.status {
-            TxCommitStatus::Ok => {
+            TxCommitStatus::Committed => {
                 if !committed.value.not_written {
                     resolved.writer = Some(holder.clone());
                     resolved.value = ResolvedValue::Unresolved;
@@ -460,7 +460,7 @@ mod tests {
         fn status(self) -> TxCommitStatus {
             match self {
                 Self::Pending => TxCommitStatus::Pending,
-                Self::CommittedLive | Self::CommittedDeleted => TxCommitStatus::Ok,
+                Self::CommittedLive | Self::CommittedDeleted => TxCommitStatus::Committed,
                 Self::Aborted => TxCommitStatus::Aborted,
                 Self::Wounded => TxCommitStatus::Wounded,
             }
@@ -681,7 +681,7 @@ mod tests {
             let wounded = TxId::with_priority(5, b"wounded");
             for (holder, status) in [
                 (&pending, TxCommitStatus::Pending),
-                (&committed, TxCommitStatus::Ok),
+                (&committed, TxCommitStatus::Committed),
                 (&aborted, TxCommitStatus::Aborted),
                 (&wounded, TxCommitStatus::Wounded),
             ] {
@@ -736,7 +736,7 @@ mod tests {
                     &holder,
                     lock_type,
                     if lock_type == LockType::Write {
-                        TxCommitStatus::Ok
+                        TxCommitStatus::Committed
                     } else {
                         TxCommitStatus::Pending
                     },
@@ -822,7 +822,7 @@ mod tests {
         monitor.commit_tx(committed).await.unwrap();
         assert_eq!(
             monitor.tx_status(&holder).await.unwrap(),
-            TxCommitStatus::Ok,
+            TxCommitStatus::Committed,
             "the holder committed before the second resolution"
         );
 

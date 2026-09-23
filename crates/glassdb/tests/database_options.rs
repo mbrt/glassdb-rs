@@ -96,7 +96,7 @@ async fn reopening_uses_the_stored_commit_recovery_timeout() {
                 | BackendOp::WriteIfNotExists { path, value }
                 if path.contains("/_t/")
                     && glassdb_storage::txrecord::status(value)
-                        .is_ok_and(|status| status == TxCommitStatus::Ok));
+                        .is_ok_and(|status| status == TxCommitStatus::Committed));
         let status_read = matches!(op,
             BackendOp::Read { path } | BackendOp::ReadIfModified { path, .. }
                 if path.contains("/_t/"));

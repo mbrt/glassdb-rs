@@ -2,13 +2,13 @@
 //! (ADR-019/035).
 //!
 //! Values live *only* in this record. While **pending** it is small (lease +
-//! lock intentions); a single CAS flips it to **committed**, attaching the full
-//! value map — the commit point. **Aborted** is the wound/self-abort terminal.
+//! recovery manifest); a single CAS flips it to **committed**, attaching the full
+//! value map — the commit point. **Aborted** is the wound/self-abort final status.
 //! Unlike v1, the status and timestamp are authoritative in the *body* (there
 //! are no tags), and the timestamp doubles as the lease while pending (ADR-021).
 //!
 //! The in-memory representation reuses [`TxRecord`] (id, status, timestamp, the
-//! value map as `writes`, and the lock intentions as `locks`); this module is
+//! value map as `writes`, and the recovery manifest as `locks`); this module is
 //! the public body facade over the canonical transaction-record codec.
 
 use crate::error::StorageError;
@@ -69,7 +69,7 @@ mod tests {
         TxRecord {
             id: TxId::from_bytes(vec![1, 2, 3, 4]),
             timestamp: Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
-            status: TxCommitStatus::Ok,
+            status: TxCommitStatus::Committed,
             writes: vec![TxWrite {
                 key: key(b"hello"),
                 value: Arc::from(&b"world"[..]),
@@ -86,7 +86,7 @@ mod tests {
     fn committed_round_trip() {
         let record = committed_record();
         let decoded = decode("db", &record.id, &encode(&record).unwrap()).unwrap();
-        assert_eq!(decoded.status, TxCommitStatus::Ok);
+        assert_eq!(decoded.status, TxCommitStatus::Committed);
         assert_eq!(decoded.writes, record.writes);
         assert_eq!(decoded.timestamp, record.timestamp);
     }

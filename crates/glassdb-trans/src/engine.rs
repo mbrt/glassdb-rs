@@ -558,7 +558,7 @@ impl DormantEngine {
             transaction_leaf_parallelism,
         );
         let reader = Reader::new(resolver.clone(), timeline.clone(), retry);
-        let cleanup_hints = GcHints::new(gc_limits);
+        let gc_hints = GcHints::new(gc_limits);
         let (coord, splitter) = Splitter::with_coordinator(
             background_weak.clone(),
             records.clone(),
@@ -571,7 +571,7 @@ impl DormantEngine {
             db_prefix,
             split_policy,
             inline_policy,
-            cleanup_hints.clone(),
+            gc_hints.clone(),
         );
         let locker = Locker::new(
             coord.clone(),
@@ -596,7 +596,7 @@ impl DormantEngine {
             locker.clone(),
             collection_lifecycle.clone(),
             monitor.protocol_timing(),
-            cleanup_hints.clone(),
+            gc_hints.clone(),
             gc_parallelism,
         );
         let collection_commit = CollectionCommit::new(
@@ -613,7 +613,7 @@ impl DormantEngine {
             coord.clone(),
             monitor.clone(),
             collection_commit,
-            cleanup_hints,
+            gc_hints,
             managed_retirement.then_some(background_weak),
             router,
             resolver.clone(),

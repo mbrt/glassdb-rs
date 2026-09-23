@@ -90,7 +90,7 @@ pub struct CollectionLocks {
     #[prost(enumeration = "lock::LockType", tag = "3")]
     pub directory_lock: i32,
     #[prost(bool, tag = "4")]
-    pub topology_freeze: bool,
+    pub topology_participant: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CollectionChange {

@@ -3,9 +3,9 @@
 ## Status
 
 Accepted — implemented (`glassdb::Transaction` collection APIs,
-transaction-record collection manifests, root directory coordination, topology
-freeze participation, per-node drop intents, and asynchronous recovery/GC).
-Topology participation and settlement are refined by
+collection changes in recovery manifests, root directory
+coordination, topology freeze participation, per-node drop intents, and
+asynchronous recovery/GC). Topology participation and settlement are refined by
 [ADR-049](049-participant-owned-topology-intents.md).
 [ADR-050](050-separate-collection-record-and-tree-root.md) separates the
 collection record at `_i` from the data-tree root at `_r`; this ADR's lifecycle
@@ -138,7 +138,7 @@ validation, so an ordinary point operation needs no additional root or path
 check:
 
 - a pending intent participates in normal wound-wait resolution;
-- an aborted intent may be helped away; and
+- an aborted intent may be cleared by later operations; and
 - a committed drop intent makes the node stale and yields
   `StaleCollection`.
 

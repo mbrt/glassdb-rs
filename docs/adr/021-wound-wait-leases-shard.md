@@ -25,8 +25,8 @@ unchanged.
 
 [ADR-059](059-pin-foreign-wounds-until-owner-retirement.md) supersedes the
 foreign abort transition and its finite-lifetime anti-resurrection argument.
-Foreign or otherwise unacknowledged retirement now writes a pinned `Wounded`
-status; a proven local retirement may write `Aborted` directly.
+Foreign or otherwise unacknowledged retirement now writes a pinned wound
+(`Wounded` status); a proven local retirement may write `Aborted` directly.
 The current conflict entry point is `Monitor::preempt_tx`; the accepted text
 below retains the implementation names used when this ADR was written.
 

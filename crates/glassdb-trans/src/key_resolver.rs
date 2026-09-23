@@ -600,7 +600,7 @@ mod tests {
             .writer
     }
 
-    // Installs a committed pointer for `key` directly in the collection's leaf
+    // Installs a committed current state for `key` directly in the collection's leaf
     // `_r` (no lock holders), so the entry resolves to `writer` regardless of
     // whether that writer recorded a live value or tombstone.
     async fn seed_writer(store: &TestStore, key: &[u8], writer: &TxId, deleted: bool) {
@@ -691,7 +691,7 @@ mod tests {
     async fn commit_value(mon: &Monitor, key: &[u8], writer: &TxId, deleted: bool) {
         use glassdb_storage::transaction::{TxRecord, TxWrite};
         mon.begin_tx(writer);
-        let mut record = TxRecord::new(writer.clone(), TxCommitStatus::Ok);
+        let mut record = TxRecord::new(writer.clone(), TxCommitStatus::Committed);
         record.writes = vec![TxWrite {
             key: logical_key(key),
             value: Arc::from(b"v".as_slice()),
@@ -702,9 +702,9 @@ mod tests {
     }
 
     // Installs a write-locked entry for `key` whose only holder is `holder` and
-    // whose `current_writer` pointer is not yet published — the help-forward
-    // case: the effective writer must be discovered from the committed holder,
-    // not the (stale, empty) pointer.
+    // whose current state is not yet published — the help-forward case: the
+    // effective writer must be discovered from the committed holder, not the
+    // (stale, absent) current state.
     async fn seed_locked(store: &TestStore, key: &[u8], holder: &TxId) {
         let path = root_path();
         let loaded = store
@@ -786,7 +786,7 @@ mod tests {
 
     // With split deferred every key lives in the collection's single leaf `_r`
     // (ADR-031), so a batch of keys resolves against that one leaf: a live
-    // pointer, a tombstone, and an absent key each resolve to the right writer.
+    // current state, a tombstone, and an absent key each resolve to the right writer.
     #[tokio::test]
     async fn effective_point_states_resolve_against_the_single_leaf() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -906,7 +906,7 @@ mod tests {
     }
 
     // The singular resolve mirrors the batched one for one key: live and
-    // tombstone pointers yield their writer, while an absent key yields none.
+    // tombstone current states yield their writer, while an absent key yields none.
     #[tokio::test]
     async fn effective_writer_resolves_single_key() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -932,7 +932,7 @@ mod tests {
     }
 
     // A committed exclusive holder that has not yet published its `current_writer`
-    // pointer is help-forwarded: writer identity is resolved independently of
+    // current state is help-forwarded: writer identity is resolved independently of
     // whether the committed value is live or a tombstone.
     #[tokio::test]
     async fn effective_writer_help_forwards_committed_holder() {

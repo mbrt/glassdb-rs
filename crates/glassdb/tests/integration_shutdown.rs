@@ -414,8 +414,8 @@ async fn cancelled_direct_commit_writes_no_aborted_record() {
 }
 
 /// When a `Database::tx` future is dropped after a lock CAS lands but before
-/// terminal commit dispatch, its internal guard pins the identity as wounded.
-/// Peers can then release its locks without waiting for the lock lease.
+/// commit write dispatch, its internal guard pins the identity as wounded.
+/// Peers can then release its locks without waiting for the lease.
 #[tokio::test(start_paused = true)]
 async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
     use std::time::Duration;
@@ -453,11 +453,11 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
     });
 
     // The lock is externally visible, but the owner has not observed the CAS
-    // completion and cannot have dispatched its terminal commit.
+    // completion and cannot have dispatched its commit write.
     lock_landed.await.unwrap();
 
     // Drop the future. The engine transaction's retirement guard starts a
-    // background task that writes the pinned Wounded marker to the tx record via
+    // background task that writes the pinned wound to the tx record via
     // the now-disarmed backend.
     stalled.abort();
     let _ = stalled.await;
@@ -519,7 +519,7 @@ async fn cancelled_single_rw_commit_unblocks_peer_promptly() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Park the lock CAS after it lands. Dropping the future here leaves exactly
-    // the holder-without-a-record state, before terminal commit dispatch.
+    // the holder-without-a-record state, before commit write dispatch.
     let (installed, release_lock) = pause.arm_leaf_write_gate();
     let stalled = tokio::spawn({
         let db = db.clone();
@@ -555,7 +555,7 @@ async fn cancelled_single_rw_commit_unblocks_peer_promptly() {
 }
 
 /// Clean shutdown waits for the async wound scheduled when a transaction is
-/// cancelled after publishing a holder but before terminal commit dispatch.
+/// cancelled after publishing a holder but before commit write dispatch.
 #[tokio::test(start_paused = true)]
 async fn shutdown_waits_for_cancelled_tx_retirement() {
     use std::time::Duration;

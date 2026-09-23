@@ -431,7 +431,7 @@ async fn an_overwrite_over_the_inline_budget_uses_a_locked_commit() {
         .commit_status_at(&tid, Requirement::ANY)
         .await
         .unwrap();
-    assert_eq!(status.status, TxCommitStatus::Ok);
+    assert_eq!(status.status, TxCommitStatus::Committed);
     let r = do_read(&tctx, &keyp).await;
     assert!(r.validates(Some(&tid), 0));
 }
@@ -473,7 +473,7 @@ async fn single_rw_observing_a_gate_uses_a_locked_commit() {
     assert!(!committing.is_finished());
 
     tctx.tmon
-        .commit_tx(TxRecord::new(gate, TxCommitStatus::Ok))
+        .commit_tx(TxRecord::new(gate, TxCommitStatus::Committed))
         .await
         .unwrap();
     let (mut handle, result) = committing.await.unwrap();
@@ -551,7 +551,7 @@ async fn a_blind_put_over_the_inline_budget_uses_a_locked_commit() {
 }
 
 // ADR-020 regression: locked commit leaves a write lock held by the
-// *committed* writer until its asynchronous write-back publishes the pointer
+// *committed* writer until its asynchronous write-back publishes the current state
 // and releases it. A single-key writer arriving in that window must treat the
 // committed holder as effectively unlocked — help-forwarding it as the
 // predecessor — and stay on direct commit, rather than bailing to
@@ -576,7 +576,7 @@ async fn a_committed_holder_keeps_the_next_writer_on_direct_commit() {
         .clone();
 
     // Recreate the commit window before write-back: the lock is still held by
-    // the committed H1 while the pointer lags at its predecessor H0.
+    // the committed H1 while the current state lags at its predecessor H0.
     let loaded = tctx
         .nodes
         .load_leaf(
@@ -597,7 +597,7 @@ async fn a_committed_holder_keeps_the_next_writer_on_direct_commit() {
     assert!(tctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 
     // The window is observably at the committed holder H1 (v2), not the
-    // lagging pointer H0: the shared resolver already help-forwards it.
+    // lagging current state H0: the shared resolver already help-forwards it.
     let r = do_read(&tctx, &keyp).await;
     assert!(r.validates(Some(&h1), 0));
 
@@ -1911,20 +1911,20 @@ async fn direct_publication_reports_external_predecessors_only() {
     assert!(matches!(external.current, CurrentState::External { .. }));
     let writer = external.current.writer().unwrap().clone();
     commit_writes(&tm, vec![wa(&key, b"inline")]).await;
-    assert_eq!(tm.cleanup_hints.pending(), vec![writer.clone()]);
+    assert_eq!(tm.gc_hints.pending(), vec![writer.clone()]);
     commit_writes(&tm, vec![wa(&key, b"next")]).await;
     commit_writes(&tm, vec![wdel(&key)]).await;
     commit_writes(&tm, vec![wa(&key, b"after-delete")]).await;
-    assert_eq!(tm.cleanup_hints.pending(), vec![writer]);
+    assert_eq!(tm.gc_hints.pending(), vec![writer]);
 }
 
 #[tokio::test]
-async fn an_absence_read_uses_locked_cleanup_for_a_finalized_membership_writer() {
+async fn an_absence_read_uses_locked_write_back_for_a_membership_writer_with_final_status() {
     let (tm, tctx) = new_algo().await;
     let holder = TxId::with_priority(1, b"membership-holder");
     tctx.tmon.begin_tx(&holder);
     tctx.tmon
-        .commit_tx(TxRecord::new(holder.clone(), TxCommitStatus::Ok))
+        .commit_tx(TxRecord::new(holder.clone(), TxCommitStatus::Committed))
         .await
         .unwrap();
     let mut locks = NodeLocks::default();

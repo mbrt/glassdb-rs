@@ -49,7 +49,7 @@ sweep in this path.
 The transaction owner performs the transition with the general engine interfaces
 that it already uses for a wound:
 
-1. End the old identity. This closes admission and makes the identity terminal
+1. End the old identity. This closes admission and makes the identity final
    on the abort side before any replacement can publish. A dropped or timed-out
    conditional write leaves an unresolved owner operation, so the existing end
    path pins the identity as wounded. A completed conflict episode can be
@@ -59,7 +59,7 @@ that it already uses for a wound:
 
 The renewed identity samples a new validation lower bound, acquires the
 collection directory locks again, and builds all physical lock state again. A
-late leaf write from the old identity names a terminal abort-side holder. The
+late leaf write from the old identity names a final abort-side holder. The
 renewed transaction and the existing recovery rules can remove it, and it can
 never look like the renewed transaction's own out-of-order lock.
 
@@ -95,7 +95,7 @@ under the same identity, because it is already inside the serial mechanism.
   locks resolves an abort-side holder, which it already knows how to do.
 - Retirement has one shape. Wound identity renewal, abnormal abandonment, and the serial
   transition all end the identity through the same path, so there is one place
-  where terminal status becomes durable.
+  where final status becomes durable.
 - The deadlock timeout stops being an internal control signal that `Algo`
   resolves alone. The transaction owner, which owns the handle and the retirement
   guard, decides the transition. This keeps identity replacement where identity

@@ -1,4 +1,4 @@
-# ADR-049: Participant-owned topology intents
+# ADR-049: Participant-owned structural intents
 
 ## Status
 
@@ -22,19 +22,19 @@ remove it while the split continued and later created a node.
 
 ## Decision
 
-- A topology participant is a durable pending transaction with a topology freeze
-  back-reference.
+- A topology participant is a durable pending transaction with a
+  topology-participant entry in its recovery manifest.
 - Before registering in the collection root, it writes a `Preparing` structural
   intent under `_s/<participant-id>/<intent-id>`. The intent reserves every node
   identity the operation could create.
 - After acquiring the affected node's structural gate, the operation
   conditionally advances the intent to `Ready`. Node creation is permitted only
   after that transition succeeds.
-- Recursive topology changes write another intent under the same participant
+- Recursive structural changes write another intent under the same participant
   before acquiring the next node gate. They retain at most one node gate at a
   time.
-- A freeze settles a finalized participant by repeatedly listing only that
-  participant's prefix. It cancels `Preparing` intents, recovers `Ready`
+- A freeze settles a participant with final status by repeatedly listing only
+  that participant's prefix. It cancels `Preparing` intents, recovers `Ready`
   intents, and removes the root participant only when the prefix is empty.
 - Split recovery proves reachability by descending for the recorded split key,
   following B-link right siblings as usual. It does not enumerate the

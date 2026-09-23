@@ -42,8 +42,8 @@ acquisition. The hold-and-wait and lease-refresh decisions remain unchanged.
 
 [ADR-059](059-pin-foreign-wounds-until-owner-retirement.md) supersedes the
 finite aborted-record fence used by the lazy materialization discussion below.
-A foreign wound of either a missing or pending record is now pinned as
-`Wounded` until the owner proves retirement and acknowledges `Aborted`.
+A foreign wound of either a missing or pending record is now a pinned wound
+(`Wounded`) until the owner proves retirement and acknowledges `Aborted`.
 
 ## Context
 
@@ -139,7 +139,7 @@ the MVP replaced with release-and-retry.
 ### Read-writer validation lives in `Algo`, after locking
 
 A v2 shard entry co-locates a key's **lock state** (`locked_by` / `lock_type`)
-and its **writer pointer** (`current_writer`) in one object, so the first cut
+and its **external value** (`current_writer`) in one object, so the first cut
 combined optimistic read validation with the shard CAS: the lock attempt compared
 the read's observed token against the resolved entry and bailed out with a
 `StaleRead` restart. That coupled the locker to optimistic-concurrency *policy*
@@ -242,7 +242,7 @@ it. The absolute check keeps the skew exactly as today.
 A transaction that holds any lock runs the background refresher
 (`start_refresh_tx` → `refresh_pending`, [ADR-021](021-wound-wait-leases-shard.md))
 for the duration of the hold. Its **first** write *creates* the pending record
-(status `pending`, lease `timestamp`, lock intentions, ADR-019) with
+(status `pending`, lease `timestamp`, recovery manifest, ADR-019) with
 create-if-absent semantics; thereafter it CAS-bumps the `timestamp` every
 `PENDING_TX_TIMEOUT/2` over the record's revision until the transaction commits or
 aborts. This is what stops a peer from reclaiming a *waiting* holder's locks as
@@ -263,8 +263,8 @@ almost never fires.)
 This wound-safety relies on the `aborted` record still being **present** when the
 refresher retries; GC must therefore not delete it out from under a stuck owner.
 [ADR-022](022-garbage-collection-mark-sweep.md) guarantees this by retaining an
-aborted record as a tombstone for a full safety lease *after the abort*, so the
-create-if-absent always finds it.
+aborted record as a tombstone for a full safety horizon *after the abort*, so
+the create-if-absent always finds it.
 
 ### A deadlock timeout bounds the wait and escalates to the serial order
 

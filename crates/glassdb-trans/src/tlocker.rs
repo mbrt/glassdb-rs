@@ -4,7 +4,7 @@
 //!
 //! A transaction groups its accessed keys by leaf and locks each leaf with a
 //! single read-modify-write CAS: resolve every touched key's holders
-//! (help-forward committed holders, drop abort-side terminal ones, wound-wait the live
+//! (help-forward committed holders, drop abort-side ones, wound-wait the live
 //! pending ones), install this transaction's locks, then CAS the leaf back.
 //! Create/delete additionally take the routed leaf's membership-write lock.
 //! Every node rewrite proves the exclusive structural gate absent in the state
@@ -92,7 +92,7 @@ enum Desired {
     Delete,
 }
 
-/// One key's lock intention within a leaf.
+/// One key's planned lock within a leaf.
 #[derive(Clone)]
 struct KeyIntent {
     /// Raw user key bytes (the leaf-entry key).
@@ -201,7 +201,7 @@ impl LockedTx {
     }
 
     /// The typed entry and leaf locks GC records on the transaction record for
-    /// its reverse liveness check and lock pruning (ADR-022).
+    /// its GC check and lock pruning (ADR-022).
     pub(crate) fn locked_paths(&self) -> Vec<TxLock> {
         let mut out = Vec::new();
         for group in self.groups.values() {
@@ -256,7 +256,7 @@ async fn build_groups(
             (key.clone(), (key, desired))
         })
         .collect();
-    // Route with interior nodes served from cache (ADR-031 hot-path invariant):
+    // Route with index nodes served from cache (ADR-031 hot-path invariant):
     // a stale index misroute self-corrects via right-links, and the leaf's own
     // coordination CAS revalidates at the revision, so neither the root `_r` nor
     // the terminal leaf needs a separate validation read.
@@ -335,7 +335,7 @@ fn leaf_ref(path: &ObjectPath) -> Result<LeafRef, TransError> {
 // --- LeafBody operations (the locking policy the Locker supplies, ADR-028) -----
 
 /// Acquires locks on its keys: resolve every key's holders (help-forward
-/// committed, drop abort-side terminal, wound-wait the live pending ones) and install this
+/// committed, drop abort-side, wound-wait the live pending ones) and install this
 /// transaction's lock (ADR-024).
 struct AcquireOperation {
     id: TxId,
@@ -614,12 +614,12 @@ impl LeafOperation for WriteBackOperation {
                 outcome: MemberOutcome::Wait(_),
                 ..
             }) => {
-                // The committed record makes later publication and cleanup
+                // The committed record makes later publication and write-back
                 // recoverable, so a live structural gate need not delay commit.
                 Ok(WriteBackOutcome::Deferred)
             }
             Some(_) => Err(TransError::other(
-                "write-back produced a non-cleanup outcome",
+                "write-back produced an unexpected coordinated outcome",
             )),
             None => Err(TransError::other("coordinator shut down during write-back")),
         }
@@ -736,7 +736,9 @@ impl LeafOperation for ReleaseOperation {
                 outcome: MemberOutcome::Conflict,
                 ..
             }) => Ok(ReleaseOutcome::Contended),
-            Some(_) => Err(TransError::other("release produced a non-cleanup outcome")),
+            Some(_) => Err(TransError::other(
+                "release produced an unexpected coordinated outcome",
+            )),
             None => Err(TransError::other("coordinator shut down during release")),
         }
     }
@@ -850,11 +852,11 @@ async fn resolve_and_lock(
     Ok(EntryResolution::Locked(e, changes_membership))
 }
 
-/// Stages `id`'s write-back on its `intents`: publish the committed pointer
+/// Stages `id`'s write-back on its `intents`: publish the committed current state
 /// (`current_writer` / tombstone) for each key it still holds and remove its hold
 /// (ADR-020). Returns one changed entry per affected key; keys `id` no longer
 /// holds are skipped, so re-running is a no-op (idempotent, ADR-009). Publishing
-/// only `id`'s own monotonic pointer, this never conflicts with another member.
+/// only `id`'s own monotonic current state, this never conflicts with another member.
 fn writeback_changes(
     id: &TxId,
     intents: &[KeyIntent],
@@ -878,8 +880,8 @@ fn writeback_changes(
                     superseded.push(prev.clone());
                 }
                 // Replaying a write-back must not demote an authoritative
-                // direct-commit value. A newly published value in the
-                // transaction record points to that record instead (ADR-054).
+                // direct-commit value. A value newly published in the
+                // transaction record becomes an external value instead (ADR-054).
                 if e.current.writer() != Some(id) {
                     e.current = if matches!(intent.desired, Desired::Delete) {
                         CurrentState::Tombstone { writer: id.clone() }
@@ -1059,12 +1061,12 @@ impl KeyLocker {
         )?))
     }
 
-    /// Publishes `current_writer` pointers / tombstones and releases this
+    /// Publishes current states and tombstones and releases this
     /// transaction's locks across the leaves it touched. Every CAS is
     /// idempotent; errors are best-effort (a failure leaves the locks to be
     /// reclaimed lazily by the next contender or lease expiry), so this never
     /// fails an already-committed transaction. A live structural holder defers
-    /// the affected leaf rather than making post-commit cleanup wait.
+    /// the affected leaf rather than making post-commit write-back wait.
     /// Cancellation can leave a partial pass, but the committed record remains
     /// authoritative and every landed CAS is safe to repeat.
     ///
@@ -1164,7 +1166,7 @@ impl KeyLocker {
                 TxLock::Membership { leaf, .. } => {
                     leaf_paths.insert(leaf.object_path());
                 }
-                TxLock::Directory { .. } | TxLock::TopologyFreeze { .. } => {}
+                TxLock::Directory { .. } | TxLock::TopologyParticipant { .. } => {}
             }
         }
         for items in by_collection.into_values() {
@@ -1928,7 +1930,7 @@ mod tests {
         ctx.monitor
             .commit_tx(glassdb_storage::transaction::TxRecord::new(
                 gate,
-                TxCommitStatus::Ok,
+                TxCommitStatus::Committed,
             ))
             .await
             .unwrap();
@@ -2282,8 +2284,8 @@ mod tests {
             "younger must wait for the older holder"
         );
 
-        // `old` commits its write, then publishes the pointer and releases.
-        let mut record = TxRecord::new(old.clone(), TxCommitStatus::Ok);
+        // `old` commits its write, then publishes the current state and releases.
+        let mut record = TxRecord::new(old.clone(), TxCommitStatus::Committed);
         record.writes = vec![TxWrite {
             key: logical_key(key),
             value: Arc::from(&b"v1"[..]),
@@ -2315,7 +2317,7 @@ mod tests {
         let groups = group_of(key, put_intent(key));
         let receipts = lock_ok(&locker, &tx, &groups).await;
         let locked = LockedTx::from_receipts(groups, receipts).unwrap();
-        // First writer of a fresh key overwrites no pointer: no GC hint.
+        // First writer of a fresh key overwrites no current state: no GC hint.
         let superseded = locker.keys().write_back(&tx, &locked).await;
         assert!(superseded.is_empty());
 
@@ -2432,7 +2434,7 @@ mod tests {
         let (locker, ctx) = init_tl_test().await;
         let key = b"key";
 
-        // First committer publishes the pointer for `key`; it supersedes nothing.
+        // First committer publishes the current state for `key`; it supersedes nothing.
         let old = mk_tid(1, "old");
         let lt_old = lock_commit(&locker, &ctx, &old, key).await;
         assert!(locker.keys().write_back(&old, &lt_old).await.is_empty());
@@ -2442,7 +2444,7 @@ mod tests {
         );
 
         // A second committer overwrites the same key; its write-back reports the
-        // pointer it replaced.
+        // current state it replaced.
         let new = mk_tid(2, "new");
         let lt_new = lock_commit(&locker, &ctx, &new, key).await;
         assert_eq!(locker.keys().write_back(&new, &lt_new).await, vec![old]);
@@ -2452,8 +2454,8 @@ mod tests {
         );
     }
 
-    // A later acquisition help-forwards committed holders as transaction-object
-    // pointers. Values in the transaction record are not copied into leaf entries
+    // A later acquisition help-forwards committed holders as external values.
+    // Values in the transaction record are not copied into leaf entries
     // (ADR-054).
     #[tokio::test]
     async fn committed_record_values_are_help_forwarded_as_external() {
@@ -2472,7 +2474,7 @@ mod tests {
             &group_of_intents(vec![put_intent(&first), put_intent(&second)]),
         )
         .await;
-        let mut record = TxRecord::new(writer.clone(), TxCommitStatus::Ok);
+        let mut record = TxRecord::new(writer.clone(), TxCommitStatus::Committed);
         record.writes = [(&first, b"aaaaa"), (&second, b"bbbbb")]
             .into_iter()
             .map(|(key, value)| TxWrite {
@@ -2568,7 +2570,7 @@ mod tests {
         }
     }
 
-    // A replayed cleanup for the same writer must likewise preserve an inline
+    // A replayed write-back for the same writer must likewise preserve an inline
     // value: it may be the only durable copy.
     #[tokio::test]
     async fn replayed_write_back_preserves_its_existing_inline_value() {
@@ -2596,7 +2598,7 @@ mod tests {
 
     // The node's hard cap is no licence to demote either: an acquisition whose
     // staged entry no longer fits is refused rather than republishing the value
-    // it carries forward as a pointer. That value may be the key's only copy —
+    // it carries forward as an external value. That value may be the key's only copy —
     // a direct-commit writer (ADR-051) has no transaction record to restore it from.
     #[tokio::test]
     async fn a_full_leaf_refuses_a_lock_rather_than_dropping_an_inline_value() {
@@ -2608,7 +2610,7 @@ mod tests {
             value: Arc::from(b"kept".as_slice()),
         };
         let seeded = LeafEntry::new(key).with_current(inlined.clone());
-        // A cap with room for the read lock over a pointer, but not over the
+        // A cap with room for the read lock over an external value, but not over the
         // inline bytes the entry actually carries: demoting the payload is the
         // only way this acquisition could fit.
         let mut demoted = LeafEntry::new(key).with_current(CurrentState::External { writer });
@@ -2656,7 +2658,7 @@ mod tests {
         use glassdb_storage::transaction::{TxRecord, TxWrite};
         let writer = mk_tid(0, "seed");
         ctx.monitor.begin_tx(&writer);
-        let mut record = TxRecord::new(writer.clone(), TxCommitStatus::Ok);
+        let mut record = TxRecord::new(writer.clone(), TxCommitStatus::Committed);
         record.writes = vec![TxWrite {
             key: logical_key(key),
             value: Arc::from(value),
@@ -2665,7 +2667,7 @@ mod tests {
         }];
         ctx.monitor.commit_tx(record).await.unwrap();
 
-        // Install the committed pointer directly in the collection's leaf `_r`.
+        // Install the committed current state directly in the collection's leaf `_r`.
         let path = root_path();
         let loaded = ctx
             .nodes
@@ -2982,7 +2984,7 @@ mod tests {
             let mut record = TxRecord::new(
                 id.clone(),
                 if write_back {
-                    TxCommitStatus::Ok
+                    TxCommitStatus::Committed
                 } else {
                     TxCommitStatus::Aborted
                 },
@@ -3233,7 +3235,7 @@ mod tests {
             .collect();
         let receipts = lock_ok(&locker, &tx, &groups).await;
         let locked = LockedTx::from_receipts(groups, receipts).unwrap();
-        let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Ok);
+        let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Committed);
         record.writes = writes;
         ctx.monitor.commit_tx(record).await.unwrap();
 
@@ -3411,7 +3413,7 @@ mod tests {
         let groups = group_of(key, put_intent(key));
         let receipts = lock_ok(locker, tx, &groups).await;
         let locked = LockedTx::from_receipts(groups, receipts).unwrap();
-        let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Ok);
+        let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Committed);
         record.writes = vec![TxWrite {
             key: logical_key(key),
             value: Arc::from(&b"v"[..]),
@@ -3424,7 +3426,7 @@ mod tests {
 
     // Two committed transactions writing *disjoint* keys of one leaf write back
     // concurrently. Write-backs never lock-conflict, so they merge into a single
-    // CAS round (ADR-026) that publishes both pointers and drops both holds.
+    // CAS round (ADR-026) that publishes both current states and drops both holds.
     #[tokio::test(start_paused = true)]
     async fn concurrent_write_backs_share_one_cas() {
         // Gate is deferred so the un-gated lock+commit setup runs first.
@@ -3466,7 +3468,7 @@ mod tests {
     }
 
     // A write-back reorders into a concurrent acquire round for the same leaf on
-    // a disjoint key (ADR-026): one CAS both publishes the committer's pointer and
+    // a disjoint key (ADR-026): one CAS both publishes the committer's current state and
     // installs the new acquirer's lock.
     #[tokio::test(start_paused = true)]
     async fn write_back_joins_acquire_round() {
@@ -3686,7 +3688,7 @@ mod tests {
             1,
             "two releases on one leaf share a single CAS"
         );
-        // Both locks are gone; the seeded committed pointers remain unchanged.
+        // Both locks are gone; the seeded committed current states remain unchanged.
         assert!(
             entry_of(&ctx, &ka).await.unwrap().lock_holders().is_empty(),
             "first lock released"
@@ -3893,7 +3895,7 @@ mod tests {
     // ADR-028 regression (commute): a committed holder's write-back and another
     // transaction's acquire of the *same* key join one coordinator round with the
     // same result regardless of wound-wait member order — the write-back publishes
-    // the committed pointer and drops its hold, the acquirer ends holding the
+    // the committed current state and drops its hold, the acquirer ends holding the
     // lock over the help-forwarded value. Run both orderings to show it commutes.
     #[tokio::test(start_paused = true)]
     async fn release_and_acquire_same_key_commute() {

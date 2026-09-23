@@ -7,18 +7,18 @@ engine)
 
 The flat `_t/<txid>` path is refined by
 [ADR-035](035-paginated-listing-and-sharded-transaction-logs.md) into a
-deterministically sharded transaction-record layout. The unified record and
+prefix-partitioned transaction-record layout. The unified record and
 lifecycle decided here are unchanged.
 
 [ADR-051](051-inline-latest-values.md) supersedes the value-placement clauses
 that make transaction records the only durable home for values and make
-write-back pointer-only. Transaction status, locked multi-key
+write-back publish only external values. Transaction status, locked multi-key
 atomicity, and the pending → committed → aborted lifecycle remain unchanged.
 
 ## Context
 
 [ADR-016](016-object-storage-native-layout.md) decided that values live **only**
-in transaction records and that a key's current writer is a *pointer*
+in transaction records and that a key's current state is an *external value*
 (`current_writer` txid) held in its shard ([ADR-017](017-shard-object.md)). This
 ADR fixes what that record *is*: its contents, why status and values stay in one
 record, and the pending → committed → aborted lifecycle with its commit point.
@@ -48,15 +48,15 @@ ADR-022.
 ### Values live only in the transaction record
 
 There are no per-key value objects. A key's writer identifies the value recorded in
-the transaction record of the txid that wrote it; the shard's `current_writer` is
-the pointer to it. A strong read is: shard → `current_writer` txid → GET that
+the transaction record of the txid that wrote it; the shard's `current_writer`
+refers to it. A strong read is: shard → `current_writer` txid → GET that
 transaction record → take the key's entry from its value map. Because a committed
 transaction record never changes, the materialized value is **immutable and
 cacheable indefinitely**, and keys co-written by one transaction share a single
 record (one GET).
 
 Consequently **write-back no longer copies values anywhere**: it only publishes
-the `current_writer` pointer and releases locks in the shard (ADR-020). The value
+the external value and releases locks in the shard (ADR-020). The value
 was already uploaded once, when the transaction committed.
 
 ### One unified record, not a split header + value blob
@@ -87,9 +87,9 @@ Status and timestamp therefore move from tags **into the body**; tags disappear
 
 - **Pending** (created with `write_if_not_exists` at first lock acquisition, so
   peers can resolve a shard `locked_by` entry to a live transaction): status
-  `pending`, the wound-wait timestamp, the **lock intentions** (the shards/keys
-  and lock types it is taking — the successor of v1's transaction-record
-  `locks`), and the lease/expiry state. It carries **no authoritative values**
+  `pending`, its priority, the **recovery manifest** (the shards/keys and lock
+  types it is taking — the successor of v1's transaction-record `locks`), and
+  the lease/expiry state. It carries **no authoritative values**
   yet. Its role is to
   let peers and recovery reason about an in-flight transaction (is it alive? what
   is it locking?).
@@ -107,9 +107,9 @@ there is never a "committed but values missing" window: any reader that observes
 `committed` can read every value the transaction wrote. Before the flip the
 transaction has no effect — shards merely reference its txid as a locker; its
 values are invisible. After it, write-back asynchronously and idempotently
-publishes `current_writer` pointers and releases locks (ADR-020). A reader or
-recoverer that finds a shard pointing at a txid consults its record: `committed`
-→ use the value; `pending` → not yet effective (wait/help/fall back to the prior
+publishes external values and releases locks (ADR-020). A reader or recoverer
+that finds a shard pointing at a txid consults its record: `committed` → use the
+value; `pending` → not yet effective (wait/help-forward/fall back to the prior
 writer, per ADR-020); `aborted` → ignore.
 
 The commit CAS is the single **in-doubt** point, and
@@ -124,11 +124,11 @@ txid (the v2 analog of v1's `set_final_log`). Exact retry sequencing is ADR-020.
 Reuse the `glassdb-proto` toolchain, evolving the existing `TransactionRecord`
 message, which already has the `status` enum (including `PENDING`), a
 `timestamp`, the per-collection `writes` (each a key suffix + value/`deleted` +
-`prev_tid`), and the lock intentions (`CollectionLocks`). v2 makes `status` and
-`timestamp` authoritative in the body (no tags), treats `writes` as the committed
-value map and the locks as the pending intentions, and adds the lease/expiry
-field defined by ADR-021. Encoding stays canonical and golden-anchored, like the
-shard and the path encodings.
+`prev_tid`), and the recovery manifest (`CollectionLocks`). v2 makes `status`
+and `timestamp` authoritative in the body (no tags), treats `writes` as the
+committed value map and the locks as the recovery manifest, and adds the
+lease/expiry field defined by ADR-021. Encoding stays canonical and
+golden-anchored, like the shard and the path encodings.
 
 ## Consequences
 
@@ -151,8 +151,9 @@ shard and the path encodings.
   direct single-RW writer) — **cannot arise**, because a value and its committed
   status are now the *same* record; any fast path must still produce a committed
   transaction record.
-- Write-back shrinks to publishing a pointer and releasing locks in the shard,
-  removing the value copy, the last-writer tag, and the S3 nonce (ADR-016/023).
+- Write-back shrinks to publishing an external value and releasing locks in the
+  shard, removing the value copy, the last-writer tag, and the S3 nonce
+  (ADR-016/023).
 - The encoding evolves `TransactionRecord`; new golden vectors are needed, and Go
   on-disk compatibility is already dropped (ADR-016).
 - This ADR is the record model only; it is behavior-complete only with the

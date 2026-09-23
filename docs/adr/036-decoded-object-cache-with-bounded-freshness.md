@@ -154,9 +154,9 @@ dependencies.
 
 Object-specific invariants may be stronger than generic freshness. In
 particular, a typed transaction-record store may serve a cached committed or
-aborted record indefinitely because terminal transaction records are immutable.
-Pending records still honor the caller's bound. The generic cache does not know
-transaction states or other dependency semantics.
+aborted record indefinitely because transaction records with final status are
+immutable. Pending records still honor the caller's bound. The generic cache
+does not know transaction states or other dependency semantics.
 
 ### OCC propagates one lower bound through its dependencies
 
@@ -180,12 +180,12 @@ leaf install CAS validates the observed writer while installing the lock. A CAS
 performed by an earlier transaction cannot certify freshness for a later
 transaction.
 
-Consequently, an otherwise idle read-only transaction whose key and finalized
-transaction record are cached still performs one conditional read per distinct
-terminal leaf during validation. The database cannot infer that other database
-instances did not write after the cached leaf was last validated. Removing that
-floor would require a stronger primitive such as a freshness lease,
-exclusive-client mode, or change stream.
+Consequently, an otherwise idle read-only transaction whose key and transaction
+record with final status are cached still performs one conditional read per
+distinct terminal leaf during validation. The database cannot infer that other
+database instances did not write after the cached leaf was last validated.
+Removing that floor would require a stronger primitive such as a freshness
+lease, exclusive-client mode, or change stream.
 
 ### Watermark ownership and propagation
 

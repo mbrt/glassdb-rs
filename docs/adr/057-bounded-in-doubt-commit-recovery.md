@@ -49,11 +49,11 @@ record:
 - Ordinary lost acknowledgements still recover transparently when the final
   status can be read.
 - Recovery of one unresolved attempt is bounded by the pending timeout.
-- GC retains its existing horizon and reference checks.
+- GC retains its existing horizon and GC checks.
 
 ## Alternatives considered
 
 - Retaining final records longer only moves the race unless retention is
   unbounded.
-- Re-creating an absent record can choose the wrong terminal outcome.
+- Re-creating an absent record can choose the wrong final outcome.
 - Treating absence as an abort can report failure for a durable commit.

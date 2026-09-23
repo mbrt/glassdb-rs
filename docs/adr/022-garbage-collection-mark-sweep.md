@@ -5,8 +5,8 @@
 Accepted — implemented.
 
 [ADR-071](071-gc-skips-pending-and-wounded-transactions.md) supersedes
-candidate-driven wounding and cleanup of wounded candidates: GC skips missing,
-pending, and wounded transaction records.
+candidate-driven wounding and reclamation of wounded candidates: GC skips
+missing, pending, and wounded transaction records.
 
 The lock-reclamation *mechanism* (the "stale-lock and empty-entry pruning" CAS)
 is refined by [ADR-029](029-gc-through-shard-coordinator.md): GC's release now
@@ -17,13 +17,13 @@ policy; ADR-059 later changes the abort-side retention part of that policy as
 noted below.
 
 [ADR-035](035-paginated-listing-and-sharded-transaction-logs.md) refines the
-flat `_t/` candidate walk into a paginated traversal over deterministic shards.
-The safety policy below remains unchanged.
+flat `_t/` candidate walk into a paginated traversal over deterministic
+transaction prefixes. The safety policy below remains unchanged.
 
 [ADR-051](051-inline-latest-values.md) refines the liveness graph:
 an inline writer ID may have no transaction record, while an existing ordinary
 transaction record remains live whenever current or locked state names it.
-Candidate-driven listing and reverse reference checks remain unchanged.
+Candidate-driven listing and GC checks remain unchanged.
 
 [ADR-062](062-splitter-driven-tombstone-reclamation.md) supersedes the rule
 that `current_writer` is never cleared, only for tombstones compacted by the
@@ -40,22 +40,22 @@ finite horizons changes, but their duration does not.
 
 [ADR-059](059-pin-foreign-wounds-until-owner-retirement.md) supersedes the
 pending-to-aborted and finite tombstone fence below. A collector changes dead
-`Pending` to pinned `Wounded`, may repeatedly reclaim described effects, and
-must not delete the marker. Ordinary finite retention starts only after the
-owner acknowledges `Wounded` as `Aborted`.
+`Pending` to a pinned wound (`Wounded`), may repeatedly reclaim described
+effects, and must not delete the marker. Ordinary finite retention starts only
+after the owner acknowledges `Wounded` as `Aborted`.
 
 [ADR-070](070-demand-driven-garbage-collection.md) refines candidate scheduling
-with cleanup driven by hints and due retries, bounded parallel work, and
+with GC driven by GC hints and due retries, bounded parallel work, and
 independent adaptive GC scans. That change is implemented.
 
 ## Context
 
 In v1 garbage collection is **time-based**
-([architecture.md](../architecture.md) "Garbage Collection"): a finalized
-transaction record is queued and deleted after a fixed delay, with a bounded queue.
-That is safe in v1 only because values live in *per-key value objects* — the
-transaction record is transient bookkeeping, so deleting it after the unlock/write-back loses
-nothing live.
+([architecture.md](../architecture.md) "Garbage Collection"): a transaction
+record with final status is queued and deleted after a fixed delay, with a
+bounded queue. That is safe in v1 only because values live in *per-key value
+objects* — the transaction record is transient bookkeeping, so deleting it after
+the unlock/write-back loses nothing live.
 
 v2 inverts the relationship. [ADR-019](019-unified-transaction-object.md) makes
 the committed transaction record (`{db}/_t/<txid>`) the **only** home for values:
@@ -67,17 +67,17 @@ record would therefore drop **live data**. GC must instead be a **reachability**
 problem ([ADR-016](016-object-storage-native-layout.md)): a transaction record is
 live exactly while some shard or root still references its txid.
 
-Several earlier ADRs deliberately left their cleanup debt to this one:
+Several earlier ADRs deliberately left their GC debt to this one:
 
-- **Orphaned transaction records** — every transaction leaves a finalized record
-  that becomes garbage once unreferenced: a committed record whose values are
-  later overwritten, and an aborted record from a wound or the serial-fallback
-  release ([ADR-020](020-commit-write-back-protocol.md),
+- **Orphaned transaction records** — every transaction leaves a record with
+  final status that becomes garbage once unreferenced: a committed record whose
+  values are later overwritten, and an aborted record from a wound or the
+  serial-fallback release ([ADR-020](020-commit-write-back-protocol.md),
   [ADR-024](024-hold-and-wait-conflict-resolution.md)). Under the MVP's
   release-and-retry this was a *storm* — a fresh `TxId::renew` record per body
   replay and the dominant source of garbage; with hold-and-wait
-  ([ADR-024](024-hold-and-wait-conflict-resolution.md)) the per-conflict renew is
-  gone, so the volume drops to overwrites, wounds, and the occasional serial
+  ([ADR-024](024-hold-and-wait-conflict-resolution.md)) the per-conflict renew
+  is gone, so the volume drops to overwrites, wounds, and the occasional serial
   fallback. The *mechanism* GC needs is identical either way.
 - **Uncontended dead locks** — [ADR-021](021-wound-wait-leases-shard.md)
   reclaims a conflicting lock *lazily*, only when contended. An abandoned lock
@@ -106,7 +106,7 @@ explicit liveness-counter object remain out of scope (see
 The roots of the live set are the **shards** and **collection roots**; the
 leaves are **transaction records**. A transaction record is referenced when:
 
-- a shard entry names its txid in `current_writer` (the MVCC pointer) or in
+- a shard entry names its txid in `current_writer` (the external value) or in
   `locked_by` (a held lock), per
   [`ShardEntry`](../../crates/glassdb-storage/src/shard.rs); or
 - a collection root names its txid in `membership_locked_by`.
@@ -126,7 +126,7 @@ all, and union the referenced txids — is `O(non-empty shards + roots)` per cyc
 the size of the **whole database**, paid every cycle even when almost nothing is
 garbage. For a large store that is infeasible.
 
-The transaction record already records **its own back-references**. A
+The transaction record already records **its own recovery manifest**. A
 [`TxRecord`](../../crates/glassdb-storage/src/transaction/model.rs) carries the full set of
 paths the transaction locked (`locks`) and wrote (`writes`), and every write
 records the `prev_writer` it superseded
@@ -136,11 +136,11 @@ objects**: each candidate names exactly the entries that can reference it, so
 confirming it is dead costs a GET of *those* entries only — never a database-wide
 scan.
 
-### The candidate-driven reverse check
+### The candidate-driven GC check
 
 One cycle:
 
-1. **Pick candidates.** Take a batch of txids — from the write-back hint (the
+1. **Pick candidates.** Take a batch of txids — from the GC hint (the
    `prev_writer` a fresh commit just superseded, i.e. exactly the txids that *just*
    lost a reference; see [Trigger](#trigger-cadence-and-candidates)) and/or a paged
    `list` of `{db}/_t/`. Only a *subset* of `_t/` is touched per cycle.
@@ -155,19 +155,20 @@ One cycle:
      commit→write-back gap); none → **delete**. A committed record is never pruned
      or force-aborted — its locks become `current_writer` through write-back, never
      through GC.
-   - **Aborted** (already finalized) — **release** its recorded `locked_by` entries
-     (idempotent CAS) promptly, but **delete** the record only once it is past the
-     horizon *measured from the abort* (it is a tombstone — see
-     [Aborted records are tombstones](#aborted-records-are-tombstones-until-a-lease-after-the-abort)).
+   - **Aborted** (already with final status) — **release** its recorded
+     `locked_by` entries (idempotent CAS) promptly, but **delete** the record
+     only once it is past the horizon *measured from the abort* (it is a
+     tombstone — see [Aborted records are
+     tombstones](#aborted-records-are-tombstones-until-a-lease-after-the-abort)).
    - **Pending but dead** — do **not** drop its locks or delete it in place; first
      **force-abort** it (next section), which either reveals it was alive (keep) or
      finalizes it into the aborted (tombstone) case.
 
 A candidate's reference set is **monotonically shrinking** while it is checked:
 `current_writer` only ever moves *forward* to newer transactions, and a candidate
-worth deleting is finalized or past its lease (its locks are only released, never
-taken). Once a key stops naming `txid` it never names it again, so a concurrent
-writer cannot invalidate the check.
+worth deleting has final status or is past its lease (its locks are only
+released, never taken). Once a key stops naming `txid` it never names it again,
+so a concurrent writer cannot invalidate the check.
 
 ### Reclaiming a dead pending transaction: abort, then release, then delete
 
@@ -184,7 +185,7 @@ the **same official sequence the engine uses for a contended expiry**
    committed or refreshed first, the CAS fails — the transaction was *not* dead, so
    GC leaves it untouched; if the CAS succeeds, the death is now **durable and
    final** and the owner's own commit will fail.
-2. **Release known locks.** Only now, with the status finalized, drop its recorded
+2. **Release known locks.** Only now, with final status, drop its recorded
    `locked_by` entries from their shards/root (idempotent CAS) — the aborted path.
 3. **Delete after the tombstone lease.** The abort stamps the record with a fresh
    `timestamp`; GC removes it only once it is past the horizon *from that abort*, not
@@ -196,7 +197,7 @@ aborted`), its locks are released only *after* its death is durable, and the
 record is removed last. A peer therefore always sees one of `pending`,
 `aborted`, or — after deletion — `missing` (resolved by the `handle_unknown_tx`
 grace), and never a lock that vanished out from under a live owner. Pruning and
-deletion thus only ever touch a **finalized** transaction.
+deletion thus only ever touch a transaction with **final status**.
 
 ### The safety horizon reuses the ADR-021 lease
 
@@ -213,7 +214,7 @@ reusing the `is_expired` seam and constants in
 the `Clock` abstraction so the horizon is deterministic under the DST executor
 (ADR-008/013).
 
-**Why an age horizon is necessary and sufficient.** The reverse check is
+**Why an age horizon is necessary and sufficient.** The reverse GC check is
 non-atomic — it reads the candidate, then its referencing entries — so it can race
 concurrent writes. The only dangerous error is *under*-approximating liveness
 (deleting a still-referenced transaction record); *over*-approximation (keeping garbage) is
@@ -223,11 +224,11 @@ harmless and reclaimed next cycle. The horizon precludes under-approximation:
   taken locks ([ADR-024](024-hold-and-wait-conflict-resolution.md)). When GC reads
   a recent pending candidate, the `locked_by` entries it records may not be durable
   yet (an in-doubt lock CAS, [ADR-009](009-in-doubt-conditional-writes.md)), so the
-  back-reference GETs can momentarily find none even though the transaction is live.
-  A live holder keeps its `timestamp` fresh through the refresher (ADR-024), so a
-  pending candidate *within* the horizon is kept; one whose lease has fallen past it
-  has stopped refreshing and is genuinely dead — however long it was legitimately
-  pending before that.
+  recovery-manifest GETs can momentarily find none even though the transaction
+  is live. A live holder keeps its `timestamp` fresh through the refresher
+  (ADR-024), so a pending candidate *within* the horizon is kept; one whose
+  lease has fallen past it has stopped refreshing and is genuinely dead —
+  however long it was legitimately pending before that.
 - A **committed** record never gains a *new* reference after its `timestamp`:
   commit converts its pre-acquired locks to `current_writer` on the same shards
   (write-back, ADR-020) and takes no further locks, so its reference set is
@@ -251,7 +252,7 @@ record is not** — the record is a *tombstone* that other parties may still con
 The database instance that owned the transaction may have been stuck (a long
 pause, a slow shard write) and, on waking, still issue **one more lock CAS**
 under that `txid`, or its refresher may still run. So GC keeps the aborted
-record until a full safety lease has elapsed **since the abort**:
+record until a full safety horizon has elapsed **since the abort**:
 
 ```
 deletable  ⟺  now > abort_timestamp + PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW
@@ -277,7 +278,7 @@ outliving the owner:
   observed the tombstone), so any residual stale lock degrades to the benign
   missing-object case below.
 
-### Why the recorded back-references are complete
+### Why the recorded recovery manifest is complete
 
 Checking only a candidate's recorded entries is equivalent to scanning every shard,
 *because an entry can name `txid` only if `txid` put it there*:
@@ -289,23 +290,24 @@ Checking only a candidate's recorded entries is equivalent to scanning every sha
 So `txid.locks ∪ txid.writes` is a **superset** of everything that can name `txid`,
 *provided the record faithfully records its full lock + write set*. A committed
 record always does (the commit writes the complete `TxRecord`); a self-abort does too.
-A **wound** must therefore preserve the victim's lock intentions when it flips
+A **wound** must therefore preserve the victim's recovery manifest when it flips
 `pending → aborted` (copy `locks` from the pending record it overwrites) so the
 aborted record stays self-describing.
 
 The record that cannot be complete is a wound of a victim that took locks but had
 **not yet materialized** its pending record: the wounder writes a minimal aborted
-record with no `locks` (it cannot know them). (More generally, a finalized record's
-recorded locks can lag the locks it actually took.) This never costs **value**
-safety, because only a **committed** record holds values and a committed record
-always records completely — so the reverse check never deletes a value-bearing
-record whose references it has not fully seen. A finalized **valueless** record with
-an incomplete record is still reclaimed past the horizon; any `locked_by` entry it
-failed to list degrades to a *missing-object* reference, which the engine's
-`handle_unknown_tx` grace reclaims exactly as it would a still-present aborted lock
-(ADR-024). The only cost is that such an uncontended stale lock, once contended,
-takes one grace window to reclaim instead of dropping on sight — bounded and rare,
-never a correctness loss, and **no forward scan required**.
+record with no `locks` (it cannot know them). (More generally, the recorded
+locks of a record with final status can lag the locks it actually took.) This
+never costs **value** safety, because only a **committed** record holds values
+and a committed record always records completely — so the GC check never deletes
+a value-bearing record whose references it has not fully seen. A **valueless**
+record with final status and an incomplete recovery manifest is still reclaimed
+past the horizon; any `locked_by` entry it failed to list degrades to a
+*missing-object* reference, which the engine's `handle_unknown_tx` grace
+reclaims exactly as it would a still-present aborted lock (ADR-024). The only
+cost is that such an uncontended stale lock, once contended, takes one grace
+window to reclaim instead of dropping on sight — bounded and rare, never a
+correctness loss, and **no forward scan required**.
 
 ### The commit→write-back gap is covered for free
 
@@ -317,24 +319,24 @@ committed record, not on write-back.
 
 ### Stale-lock and empty-entry pruning
 
-A **finalized** candidate that is itself a dead holder can still look referenced
-because its own `locked_by` entries were never cleared — an *uncontended* dead lock
-that lazy contention (ADR-021) never reached, so the record can never become
-collectable on its own. As part of releasing the candidate's locks GC prunes these:
-for each entry in its recorded `locks` whose shard/root still names `txid`, a single
-idempotent CAS (`write_if`, inheriting
-[ADR-009](009-in-doubt-conditional-writes.md) in-doubt parity) drops the `locked_by`
-holder, and removes an entry then left **vestigial** — no lock, no `current_writer`,
-not a live tombstone.
+A candidate with **final status** that is itself a dead holder can still look
+referenced because its own `locked_by` entries were never cleared — an
+*uncontended* dead lock that lazy contention (ADR-021) never reached, so the
+record can never become collectable on its own. As part of releasing the
+candidate's locks GC prunes these: for each entry in its recorded `locks` whose
+shard/root still names `txid`, a single idempotent CAS (`write_if`, inheriting
+[ADR-009](009-in-doubt-conditional-writes.md) in-doubt parity) drops the
+`locked_by` holder, and removes an entry then left **vestigial** — no lock, no
+`current_writer`, not a live tombstone.
 
-Pruning runs **only for a finalized candidate** — a dead *pending* one is
-force-aborted first (above), never pruned in place. It keeps shards tidy and lets
-the record be reclaimed without leaving a missing-object reference behind, and is the
-*proactive*, now **targeted**, analog of ADR-021's contention-driven clearing: GC
-visits only the shards the candidate itself recorded, never the whole shard space.
-(A record-less minimal abort has nothing to prune; it is still reclaimed past the
-horizon.) `current_writer` is **never** cleared (it is the live value pointer); it is
-replaced only by a newer writer's write-back.
+Pruning runs **only for a candidate with final status** — a dead *pending* one
+is force-aborted first (above), never pruned in place. It keeps shards tidy and
+lets the record be reclaimed without leaving a missing-object reference behind,
+and is the *proactive*, now **targeted**, analog of ADR-021's contention-driven
+clearing: GC visits only the shards the candidate itself recorded, never the
+whole shard space. (A record-less minimal abort has nothing to prune; it is
+still reclaimed past the horizon.) `current_writer` is **never** cleared (it is
+the live external value); it is replaced only by a newer writer's write-back.
 
 ### GC's invariant settles the missing-object case
 
@@ -347,16 +349,16 @@ GC's contract is twofold and load-bearing:
    record, measured **from the abort**, so the tombstone outlives any database
    instance that could still act under that `txid`.
 
-(1) follows from the reverse check plus completeness: a committed record always
-records its full back-references, so "its recorded entries no longer name it" means
-it is genuinely unreferenced before deletion. A **finalized valueless** record
-(aborted) carries nothing to lose, so GC may delete it once past the horizon even if
-an uncontended stale `locked_by` still names it — but, by (2), only past the horizon
-measured from the abort, so the tombstone outlives the owner (no resurrection under
-ADR-024, no prematurely-missing transaction record). A **pending** record is never deleted or
-pruned in place: a dead one is first **force-aborted** (above), so its death is
-durable before any lock moves — which is what keeps a slow-but-live owner from
-losing a lock under it.
+(1) follows from the GC check plus completeness: a committed record always
+records its full recovery manifest, so "its recorded entries no longer name it"
+means it is genuinely unreferenced before deletion. A **valueless** record with
+final status (aborted) carries nothing to lose, so GC may delete it once past
+the horizon even if an uncontended stale `locked_by` still names it — but, by
+(2), only past the horizon measured from the abort, so the tombstone outlives
+the owner (no resurrection under ADR-024, no prematurely-missing transaction
+record). A **pending** record is never deleted or pruned in place: a dead one is
+first **force-aborted** (above), so its death is durable before any lock moves —
+which is what keeps a slow-but-live owner from losing a lock under it.
 
 A `locked_by` entry that points at a **missing** `_t/` transaction record is therefore one of
 three benign cases: a live transaction in its lazy-creation window
@@ -388,7 +390,7 @@ The collector is a single loop on the
 `Clock` seam so cycles are deterministic under DST, batching its GETs and deletes.
 Candidates come from two sources:
 
-- **Write-back hint (primary).**
+- **GC hint (primary).**
   [`Gc::schedule_tx_cleanup`](../../crates/glassdb-trans/src/algo.rs) is
   **repurposed** from v1's "delete after a delay" queue (unsafe in v2 — a
   freshly-written-back record is *referenced* as `current_writer`) into a
@@ -402,8 +404,8 @@ Candidates come from two sources:
   is a `list` of one flat directory — never a database-wide shard scan — and is what
   makes the candidate set complete without any forward mark.
 
-The reverse check is authoritative, so a dropped or stale hint only delays a delete,
-never causes an unsafe one.
+The GC check is authoritative, so a dropped or stale GC hint only delays a
+delete, never causes an unsafe one.
 
 ### Deferred
 
@@ -413,28 +415,28 @@ never causes an unsafe one.
 - **Explicit liveness-counter object.** A per-object reference counter maintained
   by write-back / overwrite would make liveness `O(1)` per candidate — removing even
   the candidate's shard GETs — at the cost of a second source of truth to keep
-  consistent. The MVP uses the candidate-driven reverse check only; the counter is a
+  consistent. The MVP uses the candidate-driven GC check only; the counter is a
   later optimization.
 
 ## Consequences
 
-- The unbounded-growth limitation of ADR-016/019/020 is bounded: finalized
-  transaction records (overwritten commits, wound / serial-fallback aborts, and
-  any residual release-and-retry orphans), uncontended dead locks, and torn-down
-  subcollections are all reclaimed, so ADR-016–021 become operationally complete,
-  not just correct on the happy path.
+- The unbounded-growth limitation of ADR-016/019/020 is bounded: transaction
+  records with final status (overwritten commits, wound / serial-fallback
+  aborts, and any residual release-and-retry orphans), uncontended dead locks,
+  and torn-down subcollections are all reclaimed, so ADR-016–021 become
+  operationally complete, not just correct on the happy path.
 - GC's value-safety + horizon **invariant is load-bearing**: a committed record is
   deleted only once its complete record proves it unreferenced — which is what
-  retroactively justifies ADR-021's lazy (contention-only) reclaim — while finalized
-  valueless records are reclaimed past the horizon regardless, their residual stale
-  locks absorbed by the engine's `handle_unknown_tx` grace
-  ([ADR-024](024-hold-and-wait-conflict-resolution.md)). Pruning and deletion only
-  ever touch finalized transactions; a dead *pending* one is force-aborted
-  (`pending → aborted` CAS) before any lock moves, and an **aborted record is kept
-  as a tombstone a full safety lease past the abort** — so a stuck owner cannot be
-  resurrected by its own create-if-absent refresher (ADR-024) and never sees a lock
-  vanish out from under it. GC never endangers live data and needs no database-wide
-  scan.
+  retroactively justifies ADR-021's lazy (contention-only) reclaim — while
+  valueless records with final status are reclaimed past the horizon regardless,
+  their residual stale locks absorbed by the engine's `handle_unknown_tx` grace
+  ([ADR-024](024-hold-and-wait-conflict-resolution.md)). Pruning and deletion
+  only ever touch transactions with final status; a dead *pending* one is
+  force-aborted (`pending → aborted` CAS) before any lock moves, and an
+  **aborted record is kept as a tombstone a full safety horizon past the abort**
+  — so a stuck owner cannot be resurrected by its own create-if-absent refresher
+  (ADR-024) and never sees a lock vanish out from under it. GC never endangers
+  live data and needs no database-wide scan.
 - The cost is **proportional to garbage, not database size** — there is no
   database-wide scan at all: per cycle a GET of each candidate transaction record and of the
   handful of shards/root it records. The first passes are GET-heavy (cold shard

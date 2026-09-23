@@ -69,7 +69,7 @@ type Competitor = Box<dyn FnOnce() -> BoxFuture<()> + Send + Sync>;
 
 fn is_committed_tx_record(body: &[u8]) -> bool {
     glassdb_storage::txrecord::status(body)
-        .map(|status| status == TxCommitStatus::Ok)
+        .map(|status| status == TxCommitStatus::Committed)
         .unwrap_or(false)
 }
 
@@ -292,7 +292,7 @@ async fn increment(db: &Database, coll: &Collection, key: &'static [u8]) -> Resu
 
 /// The same read-modify-write with a value the inline budgets reject, so its
 /// commit uses a locked commit: a write lock, a committed record, then a
-/// write-back that publishes the pointer.
+/// write-back that publishes the current state.
 async fn increment_padded(
     db: &Database,
     coll: &Collection,
@@ -435,7 +435,7 @@ async fn single_rw_lost_ack_then_moved_surfaces_in_doubt() {
     let res = increment(&db, &coll, b"k").await;
     assert!(
         matches!(res, Err(Error::InDoubt(_))),
-        "a competing commit that moved the pointer after our lost-ack CAS is \
+        "a competing commit that changed the current state after our lost-ack CAS is \
          irreducibly in-doubt, got {res:?}"
     );
 

@@ -23,20 +23,22 @@ authoritative leaf inlining, leaving this the fallback for the remainder.
 ADR-020's single read-write fast path commits a lone overwrite of an existing
 key with **two sequential** writes: the committed transaction record
 (`_t/<txid>`), then a shard CAS that publishes `current_writer = txid`. The order
-is load-bearing: a bare `current_writer` pointer is trusted _directly_ by
-readers, so the transaction record it names must be discoverable **before** the pointer, or
-the [ADR-007](007-single-rw-cache-lost-update.md) lost-update anomaly recurs (a
-reader resolves the pointer, finds no transaction record, and poisons its cache). Two serial
-round-trips on the critical commit path.
+is load-bearing: a bare `current_writer` external value is trusted _directly_ by
+readers, so the transaction record it names must be discoverable **before** the
+external value, or the [ADR-007](007-single-rw-cache-lost-update.md) lost-update
+anomaly recurs (a reader resolves the external value, finds no transaction
+record, and poisons its cache). Two serial round-trips on the critical commit
+path.
 
 Two observations remove that constraint:
 
-1. The ordering is a property of the **pointer**, not of the shard write. A
-   `locked_by` write lock is _not_ believed on sight: every consumer interprets a
-   locked entry through the holder's status via the shared resolver
+1. The ordering is a property of the **external value**, not of the shard write.
+   A `locked_by` write lock is _not_ believed on sight: every consumer
+   interprets a locked entry through the holder's status via the shared resolver
    (`resolve_holders`), which falls back to the existing `current_writer` when
-   the holder's transaction record is missing or pending. So a lock write carries no
-   happens-before requirement against the transaction record write — the two can be parallel.
+   the holder's transaction record is missing or pending. So a lock write
+   carries no happens-before requirement against the transaction record write —
+   the two can be parallel.
 2. A lock held by an **already-committed** writer is not a conflict. The resolver
    help-forwards such a holder to its committed value (the effective writer),
    treating only *live pending* holders as blockers. So the window in which a
@@ -45,8 +47,9 @@ Two observations remove that constraint:
 
 ## Decision
 
-The fast path publishes a **write lock** instead of the pointer, issues its two
-writes **concurrently**, and converts the lock to the pointer asynchronously:
+The fast path publishes a **write lock** instead of the external value, issues
+its two writes **concurrently**, and converts the lock to the external value
+asynchronously:
 
 1. **Pre-check**: load the shard and resolve the entry's holders. A
    committed-but-not-yet-written-back holder is help-forwarded to the effective
@@ -55,9 +58,9 @@ writes **concurrently**, and converts the lock to the pointer asynchronously:
    transaction ineligible — nothing has been written, so it falls back to the
    locked commit under the same id.
 2. **Issue in parallel**:
-   - **W1** — write the committed transaction record (`set_final_log`, status
-     `Ok`), recording its held lock (`locks = [key: write]`) so GC's reverse
-     check can prune it ([ADR-022](022-garbage-collection-mark-sweep.md)).
+   - **W1** — write the committed transaction record (`set_final_log`, committed
+     status), recording its held lock (`locks = [key: write]`) so the GC check
+     can prune it ([ADR-022](022-garbage-collection-mark-sweep.md)).
    - **W2** — one shard CAS that installs `lock_type = Write`,
      `locked_by = [txid]` and **help-forwards the resolved predecessor into
      `current_writer`** (so taking over a committed holder never orphans it),
@@ -108,6 +111,6 @@ is an orphan (renew). This surfaces as `InDoubt` rather than risk a double-apply
   after commit leaves a lock behind a committed record that readers help-forward
   and the next writer or GC reclaims — the same lifecycle as the locked commit.
 - The backend op stream for a fast commit changes shape (a lock CAS plus a
-  deferred write-back CAS instead of a single pointer CAS) but stays deterministic
-  under the simulation executor, so the op-stream self-check and the
-  serializability / cycle oracles remain the safety net.
+  deferred write-back CAS instead of a single `current_writer` CAS) but stays
+  deterministic under the simulation executor, so the op-stream self-check and
+  the serializability / cycle oracles remain the safety net.

@@ -157,7 +157,7 @@ impl Reader {
                 }
                 Err(error) => return Err(trans_to_storage(error)),
             };
-            if cv.status != TxCommitStatus::Ok {
+            if cv.status != TxCommitStatus::Committed {
                 // The resolved writer's transaction record is not authoritatively
                 // committed. A staleness-tolerant resolution can name a writer
                 // whose committed record was already garbage-collected: it read a
@@ -222,7 +222,7 @@ mod tests {
             let collection = CollectionAddress::root("db");
             let key = LogicalKey::new(collection.clone(), b"key");
             let old = TxId::from_bytes(vec![1]);
-            let mut record = TxRecord::new(old.clone(), TxCommitStatus::Ok);
+            let mut record = TxRecord::new(old.clone(), TxCommitStatus::Committed);
             record.writes.push(TxWrite {
                 key: key.clone(),
                 value: Arc::from(&b"old"[..]),

@@ -7,8 +7,8 @@
 //! GC skips missing, pending, and wounded records (ADR-071). It filters
 //! committed and acknowledged aborted candidates by
 //! durable status and the safety horizon before capturing a fresh requirement
-//! for reference checks. Cached leaf contents from before eligibility cannot
-//! rule out a reference. Wounded markers stay pinned until owner acknowledgement
+//! for GC checks. Cached leaf contents from before eligibility cannot
+//! rule out a reference. Pinned wounds stay until owner acknowledgement
 //! (ADR-059).
 //!
 //! Lock reclamation uses the locker's coordinator-backed operations (ADR-029),
@@ -96,7 +96,7 @@ struct Reclamation {
     changed: bool,
 }
 
-/// Which leaf-entry field a liveness check consults for a recorded key: a
+/// Which leaf-entry field a GC check consults for a recorded key: a
 /// written key is referenced while it is the entry's `current_writer`; a locked
 /// key while it appears in `locked_by`. Rides along as the per-key payload of
 /// [`Gc::entries_referenced`]'s batched leaf load.
@@ -421,7 +421,7 @@ impl Gc {
     ) -> Result<GcEligibility, TransError> {
         // GC needs exact durable evidence for reclamation. A status cached
         // without its record cannot authorize deletion, and absence must not
-        // create a wound marker merely because a scan or hint named an ID.
+        // create a wound merely because a scan or hint named an ID.
         let status = self
             .tx_records
             .commit_status_at(tid, Requirement::after(barrier))
@@ -454,7 +454,9 @@ impl Gc {
             .value()
             .ok_or_else(|| StorageError::other("GC candidate has no transaction record"))?;
         match record.status {
-            TxCommitStatus::Ok => self.reclaim_committed(tid, record, observed, barrier).await,
+            TxCommitStatus::Committed => {
+                self.reclaim_committed(tid, record, observed, barrier).await
+            }
             TxCommitStatus::Aborted => self.reclaim_aborted(tid, record, observed, barrier).await,
             TxCommitStatus::Pending | TxCommitStatus::Unknown | TxCommitStatus::Wounded => {
                 Ok(GcOutcome::Retained)
@@ -550,7 +552,7 @@ impl Gc {
     }
 
     /// An acknowledged aborted candidate holds no value. Past its ordinary
-    /// cleanup horizon, release its recorded effects and delete it. The
+    /// safety horizon, release its recorded effects and delete it. The
     /// anti-resurrection proof is the owner's acknowledgement, not elapsed time.
     async fn reclaim_aborted(
         &self,
@@ -684,7 +686,7 @@ impl Gc {
         let topology: BTreeSet<_> = locks
             .iter()
             .filter_map(|lock| match lock {
-                TxLock::TopologyFreeze { collection } => Some(collection),
+                TxLock::TopologyParticipant { collection } => Some(collection),
                 _ => None,
             })
             .collect();
@@ -933,12 +935,12 @@ impl GcHints {
         }
     }
 
-    /// Reports one transaction record for a reverse liveness check.
+    /// Reports one transaction record for a GC check.
     pub(crate) fn schedule(&self, tid: TxId) {
         self.schedule_all([tid]);
     }
 
-    /// Reports transaction records for reverse liveness checks.
+    /// Reports transaction records for GC checks.
     pub(crate) fn schedule_all(&self, tids: impl IntoIterator<Item = TxId>) {
         for tid in tids {
             if self.limits.max_pending_hints == 0 {

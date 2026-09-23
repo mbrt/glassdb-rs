@@ -58,12 +58,12 @@ directory binding. A visible binding therefore implies that the collection
 record and tree root have both been prepared. Partial preparation remains
 undiscoverable and recoverable under the collection lifecycle protocol.
 
-Collection topology changes join and leave lifecycle coordination in `_i`, then
-mutate `_r` and `_n` through the ordinary node protocol. Collection drop freezes
-topology in `_i`, fences `_r` and all `_n` nodes, commits the parent-directory
-removal, and later reclaims the data nodes, `_r`, and `_i`. Thus collection
-directory locking and data-node locking have separate physical domains while
-remaining part of one transaction.
+Collection structural changes join and leave lifecycle coordination in `_i`,
+then mutate `_r` and `_n` through the ordinary node protocol. Collection drop
+freezes topology in `_i`, fences `_r` and all `_n` nodes, commits the
+parent-directory removal, and later reclaims the `_n` nodes, `_r`, and `_i`.
+Thus collection directory locking and node locking have separate physical
+domains while remaining part of one transaction.
 
 ## Consequences
 

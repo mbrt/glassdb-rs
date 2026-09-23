@@ -5,7 +5,7 @@
 //! share one leaf first tries ADR-061's direct commit. Other read-write
 //! transactions validate their reads and install locks with one read-modify-write
 //! CAS per touched leaf, flip their transaction record to committed, then publish
-//! `current_writer` pointers and release their locks. A read-only transaction
+//! current states and release their locks. A read-only transaction
 //! starts with optimistic validation. If validation fails, later body replays
 //! use locked validation on their point reads and scan predicates so sustained
 //! churn cannot make them replay the body forever.
@@ -80,7 +80,7 @@ const MAX_LEAF_FULL_WAIT: Duration = Duration::from_secs(30);
 
 struct IdentityRetirement {
     mon: Monitor,
-    cleanup_hints: GcHints,
+    gc_hints: GcHints,
     background: Option<Weak<Background>>,
 }
 
@@ -97,11 +97,11 @@ impl IdentityRetirement {
             return;
         };
         let mon = self.mon.clone();
-        let cleanup_hints = self.cleanup_hints.clone();
+        let gc_hints = self.gc_hints.clone();
         let tx_id = tx_id.clone();
         bg.spawn_waited(async move {
             if mon.abort_owned_tx(&tx_id).await.is_ok() {
-                cleanup_hints.schedule(tx_id);
+                gc_hints.schedule(tx_id);
             }
         });
     }
@@ -322,7 +322,7 @@ pub struct Algo {
     locker: Locker,
     direct_commit: DirectCommit,
     mon: Monitor,
-    cleanup_hints: GcHints,
+    gc_hints: GcHints,
     timeline: Timeline,
     // Factory for each transaction's same-identity acquisition schedule. Other
     // coordination loops own independent schedules from the same engine policy.
@@ -350,7 +350,7 @@ impl Algo {
         coord: LeafCoordinator,
         mon: Monitor,
         collection_commit: CollectionCommit,
-        cleanup_hints: GcHints,
+        gc_hints: GcHints,
         background: Option<Weak<Background>>,
         router: TreeRouter,
         resolver: KeyResolver,
@@ -359,16 +359,11 @@ impl Algo {
         inline_policy: InlinePolicy,
         split_hints: SplitHintSink,
     ) -> Self {
-        let direct_commit = DirectCommit::new(
-            router,
-            coord,
-            inline_policy,
-            split_hints,
-            cleanup_hints.clone(),
-        );
+        let direct_commit =
+            DirectCommit::new(router, coord, inline_policy, split_hints, gc_hints.clone());
         let retirement = Arc::new(IdentityRetirement {
             mon: mon.clone(),
-            cleanup_hints: cleanup_hints.clone(),
+            gc_hints: gc_hints.clone(),
             background: background.clone(),
         });
         Algo {
@@ -377,7 +372,7 @@ impl Algo {
             locker,
             direct_commit,
             mon,
-            cleanup_hints,
+            gc_hints,
             timeline,
             acquisition_retry,
             split_policy,
@@ -512,7 +507,7 @@ impl Algo {
         result
     }
 
-    /// Replays the body when a collection conflict follows changed directory observations.
+    /// Replays the body when a stale-collection error follows changed directory observations.
     async fn replay_changed_catalog(
         &self,
         tx: &mut Handle,
@@ -567,7 +562,7 @@ impl Algo {
         }
         match self.mon.abort_owned_tx(&tx.id).await? {
             OwnerAbortOutcome::Acknowledged => {
-                self.cleanup_hints.schedule(tx.id.clone());
+                self.gc_hints.schedule(tx.id.clone());
                 self.collection_commit.abort(&tx.id, &tx.collections).await
             }
             // A dropped or otherwise unresolved owner operation was pinned as
@@ -575,7 +570,7 @@ impl Algo {
             // cleanup; local rollback must not race an effect that may land
             // after this future returns.
             OwnerAbortOutcome::Pinned => {
-                self.cleanup_hints.schedule(tx.id.clone());
+                self.gc_hints.schedule(tx.id.clone());
                 Ok(())
             }
             // The commit point won before cleanup observed its result. Its
@@ -585,7 +580,7 @@ impl Algo {
                 tx.commit();
                 Ok(())
             }
-            // The terminal write was dispatched but its result is no longer
+            // The commit write was dispatched but its result is no longer
             // abortable. Preserve its resources exactly as for an observed
             // committed winner.
             OwnerAbortOutcome::CommitOutcomePreserved => {
@@ -774,8 +769,8 @@ impl Algo {
         };
 
         // Record the held lock set so both the committed record (below) and the
-        // refresher's pending record describe their own back-references, which
-        // is what lets GC prune this transaction's locks by reverse check
+        // refresher's pending record describe their own recovery manifest, which
+        // is what lets GC prune this transaction's locks by a GC check
         // (ADR-022). This tracks the latest acquire; a body replay that drops
         // keys may under-record, which only defers those stale locks to lazy
         // reclaim, never a correctness loss.
@@ -818,7 +813,7 @@ impl Algo {
             .await
         {
             if matches!(e, TransError::AlreadyFinalized) {
-                // An abort-side terminal status won between locking and commit.
+                // An abort-side final status won between locking and commit.
                 return Err(TransError::Wounded);
             }
             return Err(e.context(format!("committing writes for tx {}", tx.id)));
@@ -900,31 +895,31 @@ impl Algo {
         Err(TransError::Retry)
     }
 
-    /// Publishes the committed transaction's pointers and releases its locks.
+    /// Publishes the committed transaction's current states and releases its locks.
     /// Idempotent and best-effort: the transaction is already durably committed,
-    /// so a write-back failure only delays lazy lock cleanup, never the result.
+    /// so a write-back failure only delays lazy lock release, never the result.
     /// It is spawned in the background so commit returns immediately rather than
-    /// waiting for the pointer publishes and lock releases; a shutdown drains
+    /// waiting for the current-state publishes and lock releases; a shutdown drains
     /// the spawned task (`Background::spawn_waited`). A live holder defers that
-    /// cleanup rather than making the task wait. Without a background executor
+    /// write-back rather than making the task wait. Without a background executor
     /// (unit tests, or after shutdown dropped it) it releases inline so locks are
     /// not left to lazy reclaim.
     async fn write_back(&self, id: &TxId, locked: LockedTx) {
         match self.background.as_ref().and_then(|w| w.upgrade()) {
             Some(bg) => {
                 let locker = self.locker.clone();
-                let cleanup_hints = self.cleanup_hints.clone();
+                let gc_hints = self.gc_hints.clone();
                 let id = id.clone();
                 // Cancelling a dedup driver may need to spawn a successor for
                 // merged callers, so shutdown drains this finite pass.
                 bg.spawn_waited(async move {
                     let superseded = locker.keys().write_back(&id, &locked).await;
-                    cleanup_hints.schedule_all(superseded);
+                    gc_hints.schedule_all(superseded);
                 });
             }
             None => {
                 let superseded = self.locker.keys().write_back(id, &locked).await;
-                self.cleanup_hints.schedule_all(superseded);
+                self.gc_hints.schedule_all(superseded);
             }
         }
     }
@@ -1214,7 +1209,7 @@ impl Algo {
                     .mon
                     .tx_status_at(holder, Requirement::after(barrier))
                     .await?
-                    == TxCommitStatus::Ok
+                    == TxCommitStatus::Committed
                 {
                     return Ok(true);
                 }
@@ -1225,7 +1220,7 @@ impl Algo {
 
     /// Builds and writes the committed transaction record (the commit point).
     /// Records `locks` (the held lock set) alongside `writes` so the object
-    /// carries its full back-reference set for GC's reverse check (ADR-022).
+    /// carries its full recovery manifest for the GC check (ADR-022).
     async fn commit_writes(
         &self,
         accesses: &AccessSet,
@@ -1233,7 +1228,7 @@ impl Algo {
         locks: Vec<TxLock>,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Ok);
+        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
         for w in accesses.final_writes() {
             let (value, deleted): (Arc<[u8]>, bool) = match w.operation() {
                 WriteOp::Put(value) => (value.clone(), false),
@@ -1499,7 +1494,7 @@ mod tests {
         let mut peer_handle = begin_accesses(&peer, accesses);
         tokio::time::timeout(Duration::from_secs(1), peer.commit(&mut peer_handle))
             .await
-            .expect("protocol helping did not make progress")
+            .expect("protocol help-forward did not make progress")
             .unwrap();
         peer.end(&mut peer_handle).await.unwrap();
     }
@@ -1539,8 +1534,8 @@ mod tests {
     }
 
     // Regression (review 1.1 / ADR-022): the committed transaction record must
-    // record its full lock set, not just its writes, so GC's reverse liveness
-    // check and lock pruning operate on real records. A transaction that reads one
+    // record its full lock set, not just its writes, so the GC check
+    // and lock pruning operate on real records. A transaction that reads one
     // key and creates another records both key locks plus the leaf's structural
     // gate and membership scopes (ADR-032).
     #[tokio::test]
@@ -1659,7 +1654,7 @@ mod tests {
             },
         );
         let id = handle.id().clone();
-        let lock = TxLock::TopologyFreeze {
+        let lock = TxLock::TopologyParticipant {
             collection: test_collection(),
         };
         tm.mon
@@ -2017,7 +2012,7 @@ mod tests {
             tm.commit(&mut handle),
         )
         .await
-        .expect("the unchanged full leaf must produce a terminal result")
+        .expect("the unchanged full leaf must produce a final result")
         .unwrap_err();
         match error {
             TransError::Other { msg, .. } => {
@@ -2246,7 +2241,7 @@ mod tests {
     // CAS-write counts by object kind, the fingerprint of direct commit vs locked commit: a
     // Direct commit (ADR-051) issues one leaf write and no transaction record at
     // all; locked commit issues one transaction-record write and two leaf writes (the
-    // lock CAS then the write-back CAS that publishes the pointer — run
+    // lock CAS then the write-back CAS that publishes the current state — run
     // synchronously here because tests build the algo with no background
     // executor). Node-level
     // locks are included in those writes rather than adding another CAS (ADR-032).
@@ -2282,7 +2277,7 @@ mod tests {
     // substring checks would mistake its object create for a standalone-node
     // write and make commit-path counts depend on random transaction entropy.
     #[test]
-    fn write_counts_parses_transaction_shard_named_like_node() {
+    fn write_counts_parses_transaction_prefix_named_like_node() {
         let id = TxId::from_bytes(vec![0x97, 0x30]);
         let path = ObjectPath::Transaction {
             db_prefix: test_db_prefix(),
@@ -2541,7 +2536,7 @@ mod tests {
         // Finalize only the transaction record. The leaf still contains the
         // same pending lock, so leaf validation alone cannot detect that the
         // effective writer moved.
-        let mut record = TxRecord::new(holder.clone(), TxCommitStatus::Ok);
+        let mut record = TxRecord::new(holder.clone(), TxCommitStatus::Committed);
         record.locks = locked.locked_paths();
         record.writes.push(TxWrite {
             key: keyp,
@@ -2621,7 +2616,7 @@ mod tests {
         let kb = logical_key(b"b");
         commit_writes(&tm, vec![wa(&ka, b"a0"), wa(&kb, b"b0")]).await;
 
-        // `commit_writes` publishes pointers in a background task. This test is
+        // `commit_writes` publishes current states in a background task. This test is
         // about the next lock CAS's receipt, so first wait until that unrelated
         // setup CAS has left the shared leaf quiescent; otherwise it can change
         // the exact observation between `do_read` and the lock under test.
@@ -2890,7 +2885,7 @@ mod tests {
         assert!(entry(&tctx, b"k2").await.unwrap().exists());
     }
 
-    // Installs live committed pointers for `keys` directly in the collection's
+    // Installs live committed current states for `keys` directly in the collection's
     // root leaf `_r` (no lock holders or pending write-back), giving scan tests a
     // stable membership baseline.
     async fn seed_live_keys(tctx: &Tctx, keys: &[&[u8]]) {
@@ -3074,7 +3069,7 @@ mod tests {
 
         // Commit only the transaction record: membership_generation is unchanged
         // until write-back, so the dependency is what must reject validation.
-        let mut record = TxRecord::new(holder.clone(), TxCommitStatus::Ok);
+        let mut record = TxRecord::new(holder.clone(), TxCommitStatus::Committed);
         record.locks = locked.locked_paths();
         record.writes.push(TxWrite {
             key: key_path,

@@ -24,8 +24,9 @@ This is a protocol-incompatible change and establishes database protocol v3.
 
 A tombstone is currently permanent until a later write replaces it. The
 transaction-record collector never clears one: GC starts from transaction
-records and checks their recorded back-references, while a direct-commit tombstone
-has no transaction record or durable cleanup candidate at all.
+records and checks their recorded recovery-manifest entries, while a
+direct-commit tombstone has no transaction record or durable GC candidate at
+all.
 
 Repeated deletion of one key does not accumulate entries, but distinct deleted
 keys preserve the collection's historical key set in its leaves. Tombstones can
@@ -99,14 +100,14 @@ root-rewrite CAS remains the structural linearization point.
 There is no periodic tree sweep, durable tombstone queue, direct-commit
 compaction, or merge. A cold leaf that remains below every split threshold may
 retain tombstones forever. Active ranges that create split pressure can receive
-opportunistic cleanup; the tree itself remains at its historical high-water
+opportunistic reclamation; the tree itself remains at its historical high-water
 mark.
 
 ### Hand removed locked writers to ordinary GC
 
 After removal is durable, every removed writer ID is submitted as an ordinary
-transaction-record cleanup hint. GC applies its existing reverse reference
-check and safety horizon; another current value or holder still naming a locked
+transaction-record GC hint. GC applies its existing reverse GC
+check and safety horizon; another current state or holder still naming a locked
 transaction keeps it live. A direct-commit ID simply has no record to collect.
 
 The existing transaction-record collector does not scan leaves and does not
@@ -120,18 +121,18 @@ reclaim one immediately after it becomes quiescent, including while the database
 instance is recovering an unavailable direct CAS.
 
 An exact surviving marker still proves a whole ADR-061 transaction landed.
-When cleanup removes the last marker, recovery reports `InDoubt` unless other
-state independently proves the outcome. In particular, unmarked absence after
-an all-absent delete attempt cannot prove that its tombstone CAS failed to land.
-No marker belonging to a different transaction supplies that proof.
+When reclamation removes the last marker, recovery reports `InDoubt` unless
+other state independently proves the outcome. In particular, unmarked absence
+after an all-absent delete attempt cannot prove that its tombstone CAS failed to
+land. No marker belonging to a different transaction supplies that proof.
 
-This availability loss is explicit. Delaying cleanup by transaction ID would
+This availability loss is explicit. Delaying reclamation by transaction ID would
 not provide a publication-age guarantee because transaction IDs record
 transaction start, and adding durable age or provenance solely for recovery is
 rejected.
 
 Locked commit recovery remains based on the transaction record rather than the
-leaf tombstone. Once the tombstone reference is removed, ADR-022's reverse
+leaf tombstone. Once the tombstone reference is removed, ADR-022's GC
 check and ADR-057's recovery horizon govern reclamation of that record.
 
 ### Require database protocol v3
@@ -176,9 +177,9 @@ compaction and no longer requires a split afterward.
 
 ### Extend transaction-record GC to find tombstones
 
-Direct-commit tombstones have no transaction record or back-reference from which the
-current collector can discover them. A forward leaf scan would make GC cost
-proportional to database size rather than garbage.
+Direct-commit tombstones have no transaction record or recovery-manifest entry
+from which the current collector can discover them. A forward leaf scan would
+make GC cost proportional to database size rather than garbage.
 
 ### Enqueue every delete for background compaction
 

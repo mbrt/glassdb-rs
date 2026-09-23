@@ -35,7 +35,7 @@ pub(crate) async fn resolve_tx_conflict(
     holder: &TxId,
 ) -> Result<TxFinalStatus, TransError> {
     match monitor.tx_status(holder).await? {
-        TxCommitStatus::Ok => Ok(TxFinalStatus::Committed),
+        TxCommitStatus::Committed => Ok(TxFinalStatus::Committed),
         TxCommitStatus::Aborted | TxCommitStatus::Wounded => Ok(TxFinalStatus::Aborted),
         TxCommitStatus::Pending => {
             if matches!(

@@ -36,7 +36,7 @@ const CURRENT_TOMBSTONE_TAG: u32 = 4;
 /// where the value itself lives.
 ///
 /// `writer` is the optimistic-validation token the commit path compares. It
-/// identifies the writer, but it is not universally a pointer to a transaction
+/// identifies the writer, but it does not always refer to a transaction
 /// record: a direct commit publishes [`CurrentState::Inline`] without ever
 /// writing one.
 ///
@@ -225,7 +225,7 @@ fn current_state_field_len(current: &CurrentState) -> usize {
     length_delimited_field(ENTRY_CURRENT_TAG, current_len)
 }
 
-/// A decoded leaf: the coordination directory for the keys that map to it.
+/// A decoded leaf: the leaf entries for the keys that map to it.
 ///
 /// Entries are stored keyed by their raw key bytes, so iteration and encoding
 /// are in canonical key order.

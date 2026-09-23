@@ -881,7 +881,7 @@ current engine's cross-instance shard-CAS rounds, not the `readRepeat`
 classification or the retired rw9010 throughput number.
 
 The coordinator counters establish cross-instance leaf false sharing, but
-neither a global nor a demand-driven tree-shape change is supported. The
+neither a global nor a demand-driven structural change is supported. The
 global-cap screen trades lower contention for much more structural work and
 worse multi-key fan-out. The per-leaf probe finds no small hot subset: misses
 cover every active leaf, and the busiest quarter captures only `37–38%` of them.

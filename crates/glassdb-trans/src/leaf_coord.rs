@@ -331,7 +331,7 @@ pub(crate) trait LeafResolver: Send + Sync {
     /// The raw keys whose current committed state this member may replace.
     /// Once a direct-commit member reserves a key, any later publisher intersecting it
     /// is excluded as a whole. Lock-only and release-only mutations leave this
-    /// empty because they preserve current-state markers.
+    /// empty because they preserve current states.
     fn publication_keys(&self) -> Vec<&[u8]> {
         self.direct_publication_keys()
     }
@@ -2379,7 +2379,7 @@ mod tests {
 
     // An entry left with no holder and no committed writer is indistinguishable
     // from absent, so the plan's CAS drops it (ADR-029) while
-    // keeping live pointers and newly staged locks.
+    // keeping live current states and newly staged locks.
     #[tokio::test]
     async fn leaf_prunes_vestigial_entries_on_cas() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -2416,7 +2416,10 @@ mod tests {
             leaf.lookup(b"vestige").is_none(),
             "the vestigial entry is dropped by the CAS"
         );
-        assert!(leaf.lookup(b"live").is_some(), "the live pointer is kept");
+        assert!(
+            leaf.lookup(b"live").is_some(),
+            "the live current state is kept"
+        );
         assert!(
             leaf.lookup(b"lock").is_some(),
             "the newly staged lock is kept"
@@ -3480,7 +3483,7 @@ mod tests {
         }
     }
 
-    // A policy whose hard cap admits an external pointer for `key` but not the
+    // A policy whose hard cap admits an external value for `key` but not the
     // same entry carrying `value` inline.
     fn policy_rejecting_inline(key: &[u8], tx: &TxId, value: &[u8]) -> SplitPolicy {
         let external =

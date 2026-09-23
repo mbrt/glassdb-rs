@@ -56,7 +56,8 @@ async fn main() -> Result<(), glassdb::Error> {
     let v = users.read(b"alice").await?.expect("alice exists");
     assert_eq!(v, b"hello");
 
-    // Multi-key serializable transaction with automatic body replays on conflict.
+    // Multi-key serializable transaction with automatic body replays after an
+    // invalidated read.
     // `tx` is an owned handle.
     let users = &users;
     db.tx(|tx| async move {
@@ -234,7 +235,8 @@ rises when hitting S3 prefix write limits:
 
 ![](docs/img/tx-latency.png)
 
-The p50-p90 bands also show tail-latency growth. Body replays can add more delay after a conflict.
+The p50-p90 bands also show tail-latency growth. Body replays can add more delay
+after an invalidated read.
 
 ## Development
 

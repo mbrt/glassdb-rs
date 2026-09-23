@@ -151,7 +151,7 @@ locked commit already provides bounded semantic progress.
 
 ### Split repeatedly until the requested value fits
 
-One request could then cause several irreversible topology changes after its
+One request could then cause several irreversible structural changes after its
 mutation has already completed through fallback. Requiring another real
 failure before each additional split bounds structural amplification by
 continued demand.
@@ -159,15 +159,15 @@ continued demand.
 ### Choose a split point by inline bytes
 
 A pressure-aware separator could create headroom in fewer splits, but conflicts
-with entry-count balance and introduces another tree-shape policy. Retaining the
+with entry-count balance and introduces another topology policy. Retaining the
 median isolates this decision; load-aware splitting can be evaluated
 separately.
 
 ### Hint only the originally observed path
 
-This is smaller than a key-directed request, but concurrent topology changes can
-move the target before the background worker runs. Splitting the stale source
-may do nothing for the demand that justified it.
+This is smaller than a key-directed request, but concurrent structural changes
+can move the target before the background worker runs. Splitting the stale
+source may do nothing for the demand that justified it.
 
 ### Require repeated failures before the first split
 

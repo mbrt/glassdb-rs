@@ -413,7 +413,7 @@ mod tests {
         );
         handle.prepared.insert(earlier.clone());
 
-        let retained_lock = TxLock::TopologyFreeze {
+        let retained_lock = TxLock::TopologyParticipant {
             collection: CollectionAddress::root("db"),
         };
         let recovery = handle.pending_manifest(TxRecoveryManifest {

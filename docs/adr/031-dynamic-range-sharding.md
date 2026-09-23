@@ -62,9 +62,9 @@ coordinator, which all address shards by identity.
 
 ## Decision
 
-Replace hash sharding with an **order-preserving, range-partitioned
-coordination directory**: a **B-link tree** ([Lehman & Yao]) of objects per
-collection, mutated only by content CAS.
+Replace hash sharding with an **order-preserving, range-partitioned collection
+tree**: a **B-link tree** ([Lehman & Yao]) of objects per collection, mutated
+only by content CAS.
 
 ### Object model
 
@@ -78,7 +78,7 @@ collection, mutated only by content CAS.
   any root-level structural change _and_ on membership change, coupling the two;
   this is accepted deliberately to keep the object model minimal (see
   Consequences).
-- **Index node** (interior, including the root at height ≥ 2). An ordered list of
+- **Index node** (including the root at height ≥ 2). An ordered list of
   separator keys → child-node pointers, plus a **high-key** and a
   **right-sibling** pointer. Maps a key range to the child that owns it.
 - **Leaf shard** (including the root at height 1). Owns a contiguous key range and
@@ -111,7 +111,7 @@ A key's leaf is found by descending from the root object `_i` through index
 nodes. Every node **self-describes** the range it covers (its high-key), so the
 descent is **cached and self-correcting**:
 
-- Database instances cache interior nodes, including the root `_i` (revalidated
+- Database instances cache index nodes, including the root `_i` (revalidated
   by version like any coordination object, ADR-023). A hit descends from the
   cache with no central read.
 - If a lookup reaches a node whose high-key shows the key belongs further right —
@@ -188,10 +188,10 @@ coordination:
 
 Mechanisms are unchanged (ADR-021/022), now at leaf/index granularity. GC and
 crash recovery **re-resolve** a key's shard through the _current_ topology; a
-back-reference to a node that a split/merge has removed triggers a topology
-refresh rather than a lost reference. Index and leaf nodes holding locks are live
-references; orphaned split siblings (a crash before step 2) are unreferenced and
-reclaimable.
+recovery-manifest entry for a node that a split/merge has removed triggers a
+topology refresh rather than a lost reference. Index and leaf nodes holding
+locks are live references; orphaned split siblings (a crash before step 2) are
+unreferenced and reclaimable.
 
 ## Consequences
 
@@ -204,7 +204,7 @@ reclaimable.
 - **Finer membership concurrency**: create/delete serialize only within a leaf's
   range, not the whole collection.
 - **The hot path is preserved**: reads/overwrites of an existing key still touch
-  only the leaf; interior nodes including the root `_i` are cached and
+  only the leaf; index nodes including the root `_i` are cached and
   self-correcting via B-link right-links, so they stay off the hot path as the
   collection root did in ADR-018.
 - **Fewer objects, at the cost of coupling.** The collection metadata (existence,

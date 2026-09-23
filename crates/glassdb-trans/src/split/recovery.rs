@@ -164,7 +164,7 @@ enum IntentRecoveryStep {
     },
 }
 
-/// Resumable settlement of one finalized topology participant.
+/// Resumable settlement of one topology participant with a final status.
 struct ParticipantSettlement {
     collection: CollectionAddress,
     participant: TxId,
@@ -446,7 +446,7 @@ impl StructuralRecovery {
         }
     }
 
-    /// Starts explicit settlement of one finalized topology participant.
+    /// Starts explicit settlement of one topology participant with a final status.
     ///
     /// The caller must share the cache that admitted the participant or
     /// installed a topology freeze with the participant still present.
@@ -1070,7 +1070,7 @@ impl StructuralRecovery {
             if self.mon.tx_status(holder).await? == TxCommitStatus::Pending {
                 return Ok(false);
             }
-            // A finalized holder can still have its publish CAS in flight. This
+            // A holder with a final status can still have its publish CAS in flight. This
             // cleanup CAS either wins first and fences that publish, or loses
             // and the next iteration sees the source past `source_revision`.
             self.structural_nodes

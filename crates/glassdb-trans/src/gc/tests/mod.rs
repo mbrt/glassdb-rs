@@ -368,7 +368,7 @@ fn committed(id: TxId, offset: Duration, writes: &[&[u8]], locks: &[&[u8]]) -> T
     TxRecord {
         id,
         timestamp: Some(base() - offset),
-        status: TxCommitStatus::Ok,
+        status: TxCommitStatus::Committed,
         writes: writes
             .iter()
             .map(|k| TxWrite {
@@ -566,7 +566,7 @@ async fn aborted_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn collection_cleanup_conflict_keeps_the_recovery_manifest() {
+async fn rejected_collection_reclamation_keeps_the_recovery_manifest() {
     let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
     let ctx = new_ctx_with(backend.clone()).await;
     let id = tx(1);
@@ -615,7 +615,7 @@ async fn collection_cleanup_conflict_keeps_the_recovery_manifest() {
 
     assert!(
         !is_gone(&ctx.tx_records, &id).await,
-        "cleanup conflicts must retain the only durable orphan manifest"
+        "rejected reclamation CASes must retain the only durable orphan manifest"
     );
     assert!(
         ctx.records
@@ -729,7 +729,7 @@ async fn committed_references_in_a_reclaimed_collection_are_absent() {
         CollectionId::from_slice(&[9; 16]).expect("fixed ID has the required width"),
     );
     let key = LogicalKey::new(missing, b"k");
-    let mut record = TxRecord::new(id.clone(), TxCommitStatus::Ok);
+    let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
     record.timestamp = Some(base() - PAST_HORIZON);
     record.writes.push(TxWrite {
         key: key.clone(),
@@ -766,7 +766,7 @@ async fn committed_still_referenced_is_kept() {
 
     let record = ctx.tx_records.get_at(&t, Requirement::ANY).await.unwrap();
     let record = record.value().unwrap();
-    assert_eq!(record.status, TxCommitStatus::Ok);
+    assert_eq!(record.status, TxCommitStatus::Committed);
 }
 
 async fn replace_root(nodes: &NodeStore, node: &Node) {
@@ -1212,7 +1212,7 @@ async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
         );
 
         // Enter reclamation after eligibility, retaining GC's pre-acquisition
-        // leaf cache. A failed terminal check must preserve the recovery record.
+        // leaf cache. A failed GC check must preserve the recovery record.
         let observed = ctx.tx_records.get_at(&id, Requirement::ANY).await.unwrap();
         let barrier = ctx.timeline.currentness_barrier();
         hooks.set_before({
@@ -1225,7 +1225,7 @@ async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
                     );
                 Box::pin(async move {
                     if fail {
-                        Err(BackendError::other("terminal check failed"))
+                        Err(BackendError::other("GC check failed"))
                     } else {
                         Ok(())
                     }
@@ -1555,7 +1555,7 @@ async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
             .unwrap();
     }
     if committed {
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Ok);
+        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
         record.locks = locks.clone();
         owner.monitor.commit_tx(record).await.unwrap();
     } else {
@@ -1565,7 +1565,7 @@ async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
         );
     }
 
-    // Exercise reclamation after eligibility. Passing the retention horizon
+    // Exercise reclamation after eligibility. Passing the safety horizon
     // cannot repair either instance's cached leaf.
     let observed = ctx
         .tx_records
@@ -1690,7 +1690,7 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
         case,
         DirectoryCleanup::CommittedReleased | DirectoryCleanup::CommittedHolder
     ) {
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Ok);
+        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
         record.locks = locks.clone();
         owner.monitor.commit_tx(record).await.unwrap();
     } else {
@@ -1883,7 +1883,7 @@ async fn committed_directory_gc_reuses_removal_after_cache_eviction() {
             .unwrap();
     }
     operation.complete();
-    let mut record = TxRecord::new(id.clone(), TxCommitStatus::Ok);
+    let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
     record.locks = locks.clone();
     ctx.mon.commit_tx(record).await.unwrap();
     let observed = ctx.tx_records.get_at(&id, Requirement::ANY).await.unwrap();
@@ -2014,7 +2014,7 @@ async fn committed_directory_removal_does_not_prove_other_records_clear() {
                 .unwrap();
         }
         operation.complete();
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Ok);
+        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
         record.locks = locks;
         owner.monitor.commit_tx(record).await.unwrap();
         // Only the parent's holder is visible to speculative write-back.
@@ -2153,7 +2153,7 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
         change.expected = Some(child.id());
     }
     // GC retains this no-holder parent while the owner acquires its writer.
-    let mut record = TxRecord::new(id.clone(), TxCommitStatus::Ok);
+    let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
     record.locks = vec![TxLock::Directory {
         collection: collection(),
         typ: LockType::Write,
@@ -2272,7 +2272,7 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
     if live_value {
         assert!(!is_gone(&ctx.tx_records, &id).await);
         // Each GC pass captures a new bound. A live value must continue to
-        // bypass bounded directory completion after owner cleanup.
+        // bypass bounded directory completion after owner write-back.
         ctx.gc
             .try_reclaim(&id, &observed, ctx.timeline.currentness_barrier())
             .await
@@ -2354,7 +2354,7 @@ async fn aborted_directory_gc_keeps_the_record_if_the_record_check_fails() {
 }
 
 #[tokio::test]
-async fn directory_gc_checks_owner_cleanup_once() {
+async fn directory_gc_checks_owner_release_once() {
     for typ in [LockType::Read, LockType::Write] {
         for case in [
             DirectoryCleanup::OwnerReleased,
@@ -2391,7 +2391,7 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
         &EngineConfig::default(),
     );
     let id = tx(85);
-    let mut locks = vec![TxLock::TopologyFreeze {
+    let mut locks = vec![TxLock::TopologyParticipant {
         collection: collection(),
     }];
     if matches!(case, TopologyCleanup::DirectoryRemoved) {
@@ -2485,7 +2485,7 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
     }
     operation.complete();
     if committed {
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Ok);
+        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
         record.locks = locks;
         owner.monitor.commit_tx(record).await.unwrap();
     } else {
@@ -2591,7 +2591,7 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
 }
 
 #[tokio::test]
-async fn committed_directory_removal_keeps_topology_cleanup() {
+async fn committed_directory_removal_keeps_topology_reclamation() {
     reclaim_topology(true, TopologyCleanup::DirectoryRemoved).await;
 }
 
@@ -2837,7 +2837,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
                 .filter(|op| op.path == path)
                 .map(|op| op.op)
                 .collect();
-            assert_eq!(calls, ["write_if"], "owner cleanup for {path}");
+            assert_eq!(calls, ["write_if"], "owner release for {path}");
         }
         assert!(
             !lifecycle
@@ -2916,7 +2916,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
             .filter(|op| op.path == path)
             .map(|op| op.op)
             .collect();
-        assert_eq!(calls, node_expected, "GC node cleanup for {path}");
+        assert_eq!(calls, node_expected, "GC node reclamation for {path}");
     }
     let record_calls: Vec<_> = recorded
         .iter()
@@ -2968,7 +2968,7 @@ async fn aborted_drop_gc_checks_stale_nodes_without_rechecking_a_cached_freeze()
 }
 
 #[tokio::test(start_paused = true)]
-async fn aborted_drop_owner_cleanup_needs_no_extra_reads() {
+async fn aborted_drop_owner_release_needs_no_extra_reads() {
     reclaim_aborted_drop(true, false, DropCleanup::OwnerCleared).await;
 }
 
@@ -3090,7 +3090,7 @@ async fn lock_acquisition_resolves_a_wound_that_gc_leaves_alone() {
     assert_eq!(got.value().unwrap().status, TxCommitStatus::Wounded);
 }
 
-// An acknowledged aborted record still within its cleanup horizon keeps its
+// An acknowledged aborted record still within its safety horizon keeps its
 // locks and remains available to ordinary late observers.
 #[tokio::test(start_paused = true)]
 async fn recent_aborted_tombstone_is_kept() {
@@ -3131,7 +3131,7 @@ async fn expired_aborted_prunes_locks_and_is_deleted() {
 
 // A shared hint for a direct-commit writer has no record and is a harmless no-op.
 #[tokio::test(start_paused = true)]
-async fn direct_cleanup_hint_is_a_noop() {
+async fn direct_gc_hint_is_a_noop() {
     let ctx = new_ctx().await;
     let t = tx(9);
     ctx.hints.schedule(t.clone());
@@ -3430,7 +3430,7 @@ async fn young_final_candidates_complete_without_a_reference_pass() {
     let ids = vec![tx(1), tx(2)];
     for (id, status) in ids
         .iter()
-        .zip([TxCommitStatus::Ok, TxCommitStatus::Aborted])
+        .zip([TxCommitStatus::Committed, TxCommitStatus::Aborted])
     {
         let mut record = committed(id.clone(), Duration::ZERO, &[b"k"], &[b"k"]);
         record.status = status;
@@ -3532,7 +3532,7 @@ async fn reference_checks_follow_candidate_filtering() {
     entered.notified().await;
 
     // Cache absence after the status bound, before the peer's commit. A
-    // reference check using that first bound would wrongly accept this leaf.
+    // GC check using that first bound would wrongly accept this leaf.
     ctx.nodes
         .load_leaf(
             &root_path(),
@@ -3553,7 +3553,7 @@ async fn reference_checks_follow_candidate_filtering() {
         .into_edit();
     edit.set_entries(LeafBody::from_entries([locked_entry(b"k", &id)]));
     assert!(peer.nodes.commit_leaf(edit).await.unwrap().is_applied());
-    record.status = TxCommitStatus::Ok;
+    record.status = TxCommitStatus::Committed;
     // Native paused time does not advance wall time. The old timestamp stands
     // for a filter delayed until after this commit's safety horizon.
     record.timestamp = Some(base() - PAST_HORIZON);

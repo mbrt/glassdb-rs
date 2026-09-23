@@ -152,10 +152,10 @@ re-applying them is harmless.
 ### Garbage-collection interaction
 
 Transaction records are deleted asynchronously, well after the writes they describe
-are materialized, so a finalized record being garbage-collected never turns a
-genuine commit into a phantom rejected mutation during commit or recovery. The in-doubt
-outcome concerns the *acknowledgement* of a write, not the later absence of a
-record, so GC does not widen the in-doubt window.
+are materialized, so a record with final status being garbage-collected never
+turns a genuine commit into a phantom rejected mutation during commit or
+recovery. The in-doubt outcome concerns the *acknowledgement* of a write, not
+the later absence of a record, so GC does not widen the in-doubt window.
 
 ## Consequences
 

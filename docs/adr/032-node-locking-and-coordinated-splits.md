@@ -55,7 +55,7 @@ scans ([ADR-033](033-transactional-key-iteration.md)) are phantom-safe without
 conflicting with value writes.
 
 **One constraint bounds the split design.** Cross-object atomicity in this engine
-comes from per-key transaction pointers that readers resolve by status
+comes from per-key external values that readers resolve by status
 ([ADR-020](020-commit-write-back-protocol.md)); structural fields (high-key,
 right-sibling, separators, child pointers) have no such status-resolved pointer,
 and the transaction record holds only key writes. A split therefore **cannot** be
@@ -170,7 +170,7 @@ node's structure-W at a time** — never a child-to-parent chain:
 
 1. Acquire the **structure-W** lock on the node to split (wound-wait, ADR-002).
    This excludes concurrent splits/merges and escalated scans on that node and
-   lets the split wound/help competing mutations by priority.
+   lets the split wound/help-forward competing mutations by priority.
 2. Create the right sibling (`write_if_not_exists`), then **shrink the source in
    one CAS — the linearization point**, right-linking it to the sibling.
 3. **Release the source structure-W immediately.** The split is now linearized;
@@ -189,7 +189,7 @@ during recovery, several created-node tokens) still follow the global
 sorted-by-path order of ADR-020.
 
 **Non-root index splits** are the same three-step shape one level up: an over-full
-interior node is split under its own structure-W (steps 1–3), and its separator is
+index node is split under its own structure-W (steps 1–3), and its separator is
 inserted into *its* parent as a follow-on (step 4), which may itself overflow and
 recurse — each level acquired and released independently. Only the root cannot
 move; it splits in place, rewriting `_i` under `_i`'s structure-W.
@@ -260,7 +260,7 @@ by the source's object revision (unreliable: lock reclamation or another permitt
 rewrite bumps it without touching the link). Right-links are only ever *added*
 (merge is deferred), so reachability is monotonic and the search is well-defined:
 
-- **Leaf / interior split.** Search for the created sibling's token by descending
+- **Leaf / index split.** Search for the created sibling's token by descending
   from `_i` to the recorded separator key and following right-links across the
   covered range. **Reachable** (found via a parent separator or anywhere on the
   right-link chain) ⟹ the shrink CAS landed ⟹ **roll forward**: idempotently
@@ -282,8 +282,8 @@ idempotent, and deletion is gated on proven unreachability, replaying recovery i
 safe.
 
 While a record is live its created tokens count as **reachable** for the GC
-reverse-reference check ([ADR-022](022-garbage-collection-mark-sweep.md)), so GC
-never races a split; once the record is finalized, ordinary reachability
+GC check ([ADR-022](022-garbage-collection-mark-sweep.md)), so GC never races a
+split; once the record has final status, ordinary reachability
 (parent/right-link) governs. This structural record + forward/abort resolution
 replaces ADR-031's split-active registry and reachability sweep, and is the
 log-schema extension the current key-writes-only record needs.

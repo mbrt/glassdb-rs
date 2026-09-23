@@ -1,7 +1,7 @@
 //! The B-link tree node: in-memory view and canonical protobuf encoding
 //! (ADR-031).
 //!
-//! A node is the unit of the dynamic, range-partitioned coordination directory.
+//! A node is the unit of the dynamic, range-partitioned collection tree.
 //! It is either a **leaf** — the per-key coordination entries of ADR-017 (a
 //! [`LeafBody`]) for a contiguous key range — or an **index**, an ordered map from
 //! separator keys to child-node tokens. Every node self-describes the range it
@@ -40,7 +40,7 @@ const NODE_INDEX_TAG: u32 = 4;
 /// root has no token; it lives at the fixed `_r` path.
 pub type NodeToken = String;
 
-/// An index node body: the separator keys of an interior node, each mapping the
+/// An index node body: the separator keys of an index node, each mapping the
 /// inclusive lower bound of a key range to its routed child node.
 ///
 /// Separators are held sorted, so iteration and encoding are canonical and the

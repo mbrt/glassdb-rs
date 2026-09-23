@@ -463,9 +463,9 @@ impl CollectionStateResolver {
         let record = observed.value().ok_or_else(|| {
             TransError::other(format!("committed transaction record disappeared for {id}"))
         })?;
-        if record.status != TxCommitStatus::Ok {
+        if record.status != TxCommitStatus::Committed {
             return Err(TransError::other(format!(
-                "transaction {id} finalized as committed but its record has status {:?}",
+                "transaction {id} resolved as committed but its record has status {:?}",
                 record.status
             )));
         }
@@ -582,12 +582,12 @@ mod tests {
         let old = TxId::from_bytes(vec![1]);
         let local_record = local
             .tx_records
-            .set(&TxRecord::new(old.clone(), TxCommitStatus::Ok))
+            .set(&TxRecord::new(old.clone(), TxCommitStatus::Committed))
             .await
             .unwrap();
         assert_eq!(
             local.monitor.tx_status(&old).await.unwrap(),
-            TxCommitStatus::Ok
+            TxCommitStatus::Committed
         );
         let mut record = CollectionRecord::new();
         record.set_directory_writer(old.clone());

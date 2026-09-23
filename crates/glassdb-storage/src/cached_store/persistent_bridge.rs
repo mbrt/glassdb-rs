@@ -10,7 +10,9 @@ use super::knowledge::{Knowledge, PresentSeed};
 use super::path_lane::PathState;
 use super::{Codec, ObjectKey, Revision};
 use crate::cache_stats::CacheMetrics;
-use crate::disk_cache::{EncodedBody, FenceContext, FenceGuard, PathFence, PersistentCache};
+use crate::disk_cache::{
+    EncodedBody, PathChangeOwner, PathChanges, PendingChange, PersistentCache,
+};
 use crate::timeline::SequencePoint;
 
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -18,7 +20,7 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Per-path persistent-cache state owned by the path lane.
 #[derive(Default)]
 pub(super) struct PersistentPath {
-    fence: PathFence,
+    path_changes: PathChanges,
 }
 
 /// The optional persistent tier behind the cached-store boundary.
@@ -57,7 +59,7 @@ impl PersistentBridge {
         let Some(cache) = &self.cache else {
             return;
         };
-        cache.record_present_hit(path, PathLease::shared(state));
+        cache.record_present_hit(path, PathOwner::shared(state));
     }
 
     /// Restores and decodes one usable persistent candidate into L1 knowledge.
@@ -68,8 +70,8 @@ impl PersistentBridge {
         state: &Arc<PathState>,
     ) -> Option<PresentSeed> {
         let cache = self.cache.as_ref()?;
-        let lease = PathLease::shared(state);
-        if lease.fence().is_active() || !cache.is_enabled() {
+        let owner = PathOwner::shared(state);
+        if owner.path_changes().is_pending() || !cache.is_enabled() {
             return None;
         }
         let encoded = match rt::timeout(LOOKUP_TIMEOUT, cache.lookup(key.encoded().clone())).await {
@@ -79,17 +81,17 @@ impl PersistentBridge {
                 return None;
             }
         };
-        self.decode_candidate::<C>(knowledge, key, cache, lease, encoded)
+        self.decode_candidate::<C>(knowledge, key, cache, owner, encoded)
     }
 
     /// Starts a path-changing L2 transition before its corresponding L1 change.
     pub(super) fn begin_change(&self, state: &Arc<PathState>) -> PersistentChange {
         let active = self.cache.as_ref().and_then(|cache| {
             cache
-                .begin_fence(PathLease::shared(state))
-                .map(|fence| ActiveChange {
+                .begin_change(PathOwner::shared(state))
+                .map(|change| ActiveChange {
                     cache: cache.clone(),
-                    fence,
+                    change,
                 })
         });
         PersistentChange { active }
@@ -100,14 +102,14 @@ impl PersistentBridge {
         knowledge: &Knowledge,
         key: &ObjectKey,
         cache: &PersistentCache,
-        lease: Arc<PathLease>,
+        owner: Arc<PathOwner>,
         encoded: EncodedBody,
     ) -> Option<PresentSeed> {
         let token = match String::from_utf8(encoded.revision) {
             Ok(token) => token,
             Err(error) => {
                 tracing::warn!(path = %key.as_str(), %error, "discarding invalid persistent-cache revision");
-                cache.reject_corrupt_candidate(key.encoded().clone(), lease);
+                cache.reject_corrupt_candidate(key.encoded().clone(), owner);
                 return None;
             }
         };
@@ -115,7 +117,7 @@ impl PersistentBridge {
             Ok(decoded) => decoded,
             Err(error) => {
                 tracing::warn!(path = %key.as_str(), %error, "discarding undecodable persistent-cache body");
-                cache.reject_corrupt_candidate(key.encoded().clone(), lease);
+                cache.reject_corrupt_candidate(key.encoded().clone(), owner);
                 return None;
             }
         };
@@ -129,16 +131,16 @@ impl PersistentBridge {
             revision,
             encoded.current_after,
         );
-        cache.record_present_hit(key.encoded(), lease);
+        cache.record_present_hit(key.encoded(), owner);
         Some(seed)
     }
 }
 
-struct PathLease {
+struct PathOwner {
     state: Arc<PathState>,
 }
 
-impl PathLease {
+impl PathOwner {
     fn shared(state: &Arc<PathState>) -> Arc<Self> {
         Arc::new(Self {
             state: state.clone(),
@@ -146,25 +148,25 @@ impl PathLease {
     }
 }
 
-impl FenceContext for PathLease {
-    fn fence(&self) -> &PathFence {
-        &self.state.persistent().fence
+impl PathChangeOwner for PathOwner {
+    fn path_changes(&self) -> &PathChanges {
+        &self.state.persistent().path_changes
     }
 }
 
 struct ActiveChange {
     cache: PersistentCache,
-    fence: FenceGuard,
+    change: PendingChange,
 }
 
-/// An L2 fence established before a path-changing L1 transition.
+/// An L2 path change started before its path-changing L1 transition.
 #[must_use]
 pub(super) struct PersistentChange {
     active: Option<ActiveChange>,
 }
 
 impl PersistentChange {
-    /// Publishes a backend-read body under this path fence.
+    /// Publishes a backend-read body as the result of this path change.
     pub(super) fn replace(
         mut self,
         path: Arc<str>,
@@ -180,7 +182,7 @@ impl PersistentChange {
             revision.serialize().as_bytes().to_vec(),
             body,
             current_after,
-            active.fence,
+            active.change,
         );
     }
 
@@ -189,6 +191,6 @@ impl PersistentChange {
         let Some(active) = self.active.take() else {
             return;
         };
-        active.cache.invalidate(path, active.fence);
+        active.cache.invalidate(path, active.change);
     }
 }

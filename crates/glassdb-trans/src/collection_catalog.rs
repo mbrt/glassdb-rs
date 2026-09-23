@@ -25,7 +25,7 @@ impl CollectionCatalog {
         CollectionCatalog { state }
     }
 
-    /// Loads a direct-child directory after resolving finalized transactions.
+    /// Loads a direct-child directory after resolving transactions with a final status.
     pub(crate) async fn snapshot(
         &self,
         parent: &CollectionAddress,
@@ -196,7 +196,7 @@ mod tests {
         record.set_directory_writer(id.clone());
         assert!(records.create_record(&parent, &record).await.unwrap());
         monitor.begin_tx(&id);
-        let mut tx_record = TxRecord::new(id.clone(), TxCommitStatus::Ok);
+        let mut tx_record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
         tx_record.locks.push(TxLock::Directory {
             collection: parent.clone(),
             typ: LockType::Write,

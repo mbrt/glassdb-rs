@@ -164,7 +164,7 @@ impl Evidence {
 ///
 /// Keep the state, revision, path, and evidence together. Do not add public
 /// constructors, payload transformations, sequence-point accessors, or
-/// conversions to requirements or barriers. The invocation watermark cannot
+/// conversions to requirements or barriers. The invocation point cannot
 /// prove that another operation follows the completed observation.
 /// Raw evidence access is restricted to the parent `cached_store` implementation.
 /// Other storage modules must use the currentness-check interface.

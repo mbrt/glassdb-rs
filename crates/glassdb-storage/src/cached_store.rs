@@ -425,7 +425,7 @@ impl CachedStore {
         Ok(self.backend.list(prefix, cursor, limit).await?)
     }
 
-    /// Allocates a unique invocation watermark, ordered before the backend
+    /// Allocates a unique invocation point, ordered before the backend
     /// call it precedes.
     fn next_invocation(&self) -> SequencePoint {
         self.timeline.now()
@@ -810,7 +810,7 @@ mod tests {
 
     use super::*;
     #[cfg(sim)]
-    use crate::disk_cache::PathFence;
+    use crate::disk_cache::PathChanges;
     use crate::disk_cache::PersistentCacheConfig;
     use crate::disk_cache::sim_media::{MediaFaultProfile, SimMedia};
     use crate::timeline::TimeSource;
@@ -1111,15 +1111,15 @@ mod tests {
                 )
                 .await;
                 let persistent = opened.cache;
-                let guard = persistent
-                    .begin_fence(Arc::new(PathFence::default()))
+                let change = persistent
+                    .begin_change(Arc::new(PathChanges::default()))
                     .unwrap();
                 persistent.replace(
                     Arc::from("p"),
                     vec![0xff],
                     b"untrusted".to_vec(),
                     SequencePoint::from_raw(1),
-                    guard,
+                    change,
                 );
 
                 let erased: Arc<dyn Backend> = recorded;

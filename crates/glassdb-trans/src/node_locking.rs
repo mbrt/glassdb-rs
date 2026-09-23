@@ -86,7 +86,7 @@ impl<'a> NodeLockReconciler<'a> {
     /// Admits an ordinary node rewrite by proving the gate absent in the state
     /// that will be conditionally replaced.
     ///
-    /// A live gate has priority over new traffic. A finalized gate can be
+    /// A live gate has priority over new traffic. A gate whose holder has a final status can be
     /// removed by this same CAS: if its structural write was still in flight,
     /// only one of the two conditional writes can land.
     pub(crate) async fn admit_non_structural(
@@ -112,8 +112,8 @@ impl<'a> NodeLockReconciler<'a> {
     /// Closes the structural gate after quiescing membership holders.
     ///
     /// Returns the live holder to wait for, or leaves both node-lock scopes free
-    /// of finalized foreign holders with a structural gate installed for this
-    /// operation.
+    /// of foreign holders with a final status, with a structural gate installed
+    /// for this operation.
     pub(crate) async fn acquire_structural_gate(
         &self,
         locks: &mut NodeLocks,
@@ -136,7 +136,7 @@ impl<'a> NodeLockReconciler<'a> {
                     }
                 }
                 TxCommitStatus::Unknown => return Ok(Some(holder)),
-                TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
+                TxCommitStatus::Committed | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
             }
             locks.remove_structural_gate(&holder);
         }
@@ -155,7 +155,7 @@ impl<'a> NodeLockReconciler<'a> {
                     }
                 }
                 TxCommitStatus::Unknown => return Ok(Some(holder)),
-                TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
+                TxCommitStatus::Committed | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
             }
             locks.remove_membership_holder(&holder);
         }
@@ -174,7 +174,7 @@ impl<'a> NodeLockReconciler<'a> {
             return Ok(None);
         }
         match self.monitor.tx_status(&holder).await? {
-            TxCommitStatus::Ok => Err(TransError::StaleCollection),
+            TxCommitStatus::Committed => Err(TransError::StaleCollection),
             TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
                 locks.remove_drop_intent(&holder);
                 Ok(None)
@@ -222,7 +222,9 @@ impl<'a> NodeLockReconciler<'a> {
                         }
                     }
                     TxCommitStatus::Unknown => return Ok(Some(holder)),
-                    TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
+                    TxCommitStatus::Committed
+                    | TxCommitStatus::Aborted
+                    | TxCommitStatus::Wounded => {}
                 }
                 locks.remove_membership_holder(&holder);
             }
@@ -242,7 +244,7 @@ impl<'a> NodeLockReconciler<'a> {
         Ok(None)
     }
 
-    /// Removes finalized membership holders after their entry state was
+    /// Removes membership holders with a final status after their entry state was
     /// reconciled. Unknown holders remain live until the monitor classifies
     /// them through its missing-transaction grace period.
     async fn prune_finalized_membership(&self, locks: &mut NodeLocks) -> Result<(), TransError> {

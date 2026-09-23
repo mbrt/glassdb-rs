@@ -50,8 +50,8 @@ necessary even for a tiny value and can transfer unrelated values written by
 the same transaction.
 
 The single read-write fast path likewise creates a committed transaction record
-and installs a leaf lock in parallel, then asynchronously converts the lock to a
-writer pointer. A small overwrite already fits in the leaf CAS that validates
+and installs a leaf lock in parallel, then asynchronously converts the lock to
+an external value. A small overwrite already fits in the leaf CAS that validates
 its predecessor. Keeping its value there would make that CAS a self-contained
 commit and remove both the transaction-record write and write-back.
 
@@ -63,7 +63,7 @@ as a bounded optimization.
 
 ## Decision
 
-### Make current value state self-describing
+### Make current state self-describing
 
 Replace the independent `current_writer` and `deleted` fields with one tagged
 current state, separate from the entry's lock state:
@@ -76,8 +76,8 @@ Tombstone { writer }
 ```
 
 `writer` remains the value's optimistic-validation token. It identifies the
-transaction that wrote the value, but it is no longer universally a
-pointer to a transaction record.
+transaction that wrote the value, but it no longer always refers to a
+transaction record.
 
 An inline value is authoritative latest-value evidence. Its transaction record
 may exist because an ordinary committed transaction was written back, or may
@@ -184,7 +184,7 @@ not a new availability guarantee.
 A direct-commit writer ID may later appear as a predecessor or GC hint even though no
 transaction record exists. That absence is expected. Record listing remains the
 completeness mechanism for real transaction records, and the usual reverse
-reference check retains or reclaims them unchanged.
+GC check retains or reclaims them unchanged.
 
 ### Leave broader atomic leaf commits and snapshot history to follow-ups
 

@@ -188,7 +188,7 @@ flowchart TD
     Splitter["Splitter<br/>split scheduling · planning · node writes<br/>recursive parent split execution"]
     Recovery["StructuralRecovery<br/>structural-intent lifecycle<br/>classification · fencing · resumption · settlement"]
     Coord["LeafCoordinator — mutation engine<br/>identity · order · admission<br/>load · plan · CAS per attempt<br/>per-member in-doubt recovery"]
-    Gc["Gc<br/>candidate retries · bounded parallel checks<br/>adaptive scans · reverse liveness checks<br/>reclamation · local diagnostics"]
+    Gc["Gc<br/>candidate retries · bounded parallel checks<br/>adaptive scans · GC checks<br/>reclamation · local diagnostics"]
 
     Engine -->|"owns · transaction lifecycle"| Algo
     Engine -->|"immutable access set"| Accesses
@@ -228,10 +228,10 @@ flowchart TD
   API -->|"logical reads · scans · snapshots · AccessSet"| Engine
   Reader -->|"typed reads"| Stores
   Monitor -->|"transaction records"| Stores
-  Coord -->|"data-node CAS"| Stores
+  Coord -->|"node CAS"| Stores
   Splitter -->|"post-gate node writes"| Stores
   Recovery -->|"structural intents · recovery reads and cleanup"| Stores
-  Gc -->|"paged scans · reverse checks"| Stores
+  Gc -->|"paged scans · GC checks"| Stores
   Stores --> Backend
 ```
 
@@ -272,8 +272,8 @@ locking still start only when the commit protocol requires them.
 
 Lock ownership is centralized behind two views of `Locker`. The key view takes
 logical key accesses and owns node-lock acquisition, write-back, and release.
-The collection view takes collection addresses and coordinates directory and
-topology freezes in collection records.
+The collection view takes collection addresses, coordinates directory locks,
+and releases topology participants in collection records.
 
 `CollectionStateResolver` is the shared mechanism beneath collection semantics
 and locking. It loads collection records, reconciles foreign topology and
@@ -297,10 +297,10 @@ responsibilities.
 `StructuralRecovery` owns each structural intent from its prepared write to
 clean deletion or durable recovery. It exposes opaque witnesses to split
 coordination, and one resumable action that classifies phases, fences source
-writers, checks reachability, cleans unreachable nodes, and settles finalized
-topology participants. `Splitter` only executes a requested recursive parent
-split and supplies its result back to the action; it does not inspect durable
-phases.
+writers, checks reachability, cleans unreachable nodes, and settles topology
+participants with a final status. `Splitter` only executes a requested recursive
+parent split and supplies its result back to the action; it does not inspect
+durable phases.
 
 Recovery fences a source writer against the source revision that the intent's
 Ready transition recorded, not against the structural gate the source carries
@@ -320,9 +320,9 @@ does not consume the transaction GC candidate queue.
 | `Algo`                | commit **policy** | transaction identity and retirement, direct-vs-locked selection, lock→validate→commit→write-back orchestration, **post-lock read validation**, conflict policy, body-replay decision, GC candidate hints | transaction-body execution, leaf routing, CAS details, caching, collection lifecycle implementation, GC execution |
 | `DirectCommit`        | direct commit mechanism | one-leaf and physical eligibility, atomic inline/tombstone publication, transaction-local recovery classification | access normalization, transaction records, range and catalog validation, waiting or wounding holders |
 | `GcHints`             | GC candidate seam | bounded nonblocking candidate reports, observable hint loss, wakeups and de-duplication | GC execution, transaction policy, backend storage |
-| `CollectionCommit`    | collection-commit **policy** | same-identity collection replay state, durable manifest fields, collection-ID preparation, validation, drop-intent installation, post-commit and post-abort cleanup | key locking, key validation, the atomic commit decision |
+| `CollectionCommit`    | collection-commit **policy** | same-identity collection replay state, durable recovery-manifest fields, collection-ID preparation, validation, drop-intent installation, post-commit and post-abort cleanup | key locking, key validation, the atomic commit decision |
 | `Locker::keys`        | key-lock **policy** | key→leaf grouping, parallel and serial acquisition, hold-and-wait, acquire / write-back / release operations | access normalization, collection-directory semantics |
-| `Locker::collections` | collection-lock **policy** | directory and topology freeze acquisition, recovery write-back and release | key routing, B-link topology, catalog semantics |
+| `Locker::collections` | collection-lock **policy** | directory lock acquisition, topology participant release, recovery write-back and release | key routing, B-link topology, catalog semantics |
 | `CollectionStateResolver` | collection-state mechanism | resolved record loads, foreign-holder reconciliation, committed directory write-back assistance | key routing, B-link topology, catalog semantics |
 | `CollectionCatalog`   | collection semantics | logical snapshots, read-your-writes validation, capacity and precondition checks | locking policy, CAS, wound-wait |
 | `LeafCoordinator`     | shared mutation engine | one round per object: batching, oldest-first mutation planning, routing and capacity admission, exclusion of overlapping direct members, one CAS per attempt, per-member in-doubt state, reload-recover, vestigial-entry pruning | operation-specific results, cross-leaf strategy, transaction lifecycle, commit orchestration, GC selection |
@@ -332,7 +332,7 @@ does not consume the transaction GC candidate queue.
 | `KeyStateResolver`    | loaded key-state mechanism | transaction-dependent interpretation of already-loaded key and node state | routing, scan composition, commit policy |
 | `Reader`              | read mechanism   | value materialization                                                                                                 | commit and lock policy             |
 | `Monitor`             | tx lifecycle     | status, wound and abort, lease refresh, waits                                                                         | leaves                              |
-| `Gc`                  | GC scheduling and reclamation | bounded queues and checks, deferred retries, adaptive scans, reverse liveness checks, safety horizons, pinned wounds, reclamation through the coordinator, statistics | commit policy, structural recovery |
+| `Gc`                  | GC scheduling and reclamation | bounded queues and checks, deferred retries, adaptive scans, GC checks, safety horizons, pinned wounds, reclamation through the coordinator, statistics | commit policy, structural recovery |
 
 ### Leaf coordination terms
 
@@ -534,8 +534,8 @@ crucially, it does so with locks still held, so the second pass is guaranteed
 to succeed (at most one body replay).
 
 After **Commit**, the transaction record is the durable commit point. The async
-cleanup phase writes the new values back to keys, releases locks, and schedules
-the transaction record for garbage collection.
+write-back phase writes the new values back to keys, releases locks, and
+schedules the transaction record for garbage collection.
 
 Because `Database::tx` takes the body by value and the framework owns the
 body-replay loop, a conflict simply replays the body. Dropping the transaction
@@ -591,13 +591,13 @@ at all. Inlining is bounded by a configurable per-value and per-leaf byte
 budget. New inline states are reserved for direct commits, where the leaf is the
 value's only durable authority
 ([ADR-054](adr/054-reserve-inline-publication-for-logless-commits.md)). Locked
-write-back and help-forwarding publish an external pointer; an existing inline
+write-back and help-forwarding publish an external value; an existing inline
 value is never demoted, because it may have no transaction record.
 
 An unmarked point absence records the routed leaf's membership generation. If
 the physical leaf changes, validation requires both continued absence and the
 same generation; a tombstone read instead records its exact writer. The splitter
-preserves this generation across topology changes and, under its structural
+preserves this generation across structural changes and, under its structural
 gate, removes holder-free tombstones before its final split decision
 ([ADR-062](adr/062-splitter-driven-tombstone-reclamation.md)). If compaction
 removes the pressure, it persists the smaller leaf and cancels the split;
@@ -694,7 +694,7 @@ The validate-and-commit sequence:
 
 4. **Async write-back.** Publish the new current state for each modified key and
    release locks, with the same bounded parallelism over routed leaf groups. A
-   committed value is published as an external pointer to the transaction
+   committed value is published as an external value to the transaction
    record, and a delete as a tombstone
    ([ADR-054](adr/054-reserve-inline-publication-for-logless-commits.md)). This
    can happen asynchronously because the transaction record is the source of
@@ -763,10 +763,10 @@ unchanged predecessors prove non-landing only when at least one output could not
 have collapsed back to that predecessor through tombstone reclamation, so an
 all-unmarked-absence delete that remains in doubt can surface as an in-doubt
 error. Valid reads
-may retry direct, while a stale read replays the body. If pruning a finalized
-membership holder changes the temporary generation and read validation fails,
-the locked commit path makes that cleanup durable, because replaying against a
-generation change that was never stored would repeat the same failure.
+may retry direct, while a stale read replays the body. If pruning a membership
+holder with a final status changes the temporary generation and read validation
+fails, the locked commit path makes that pruning durable, because replaying
+against a generation change that was never stored would repeat the same failure.
 Cancellation before dispatch leaves no state, while cancellation after dispatch
 is crash-equivalent.
 
@@ -788,7 +788,7 @@ The guard is disarmed only after finalization succeeds. Cancellation or unwindin
 synchronously transfers an armed identity to engine-managed retirement, which
 forgets process-local lock ownership before control escapes and then settles or
 pins the durable identity in waited background work. Physical locks and prepared
-collection objects remain recoverable from the transaction manifest and are
+collection objects remain recoverable from the recovery manifest and are
 released lazily by helpers or garbage collection. Process abort skips local
 unwinding and uses the ordinary crash-recovery path.
 
@@ -800,7 +800,7 @@ an older, higher-priority transaction). When a transaction requests a lock that
 conflicts with current holders:
 
 - If the requester is **older** than a holder, it **wounds** it: the holder's
-  record becomes terminal before the requester takes the lock. A foreign or
+  record gets a final status before the requester takes the lock. A foreign or
   in-doubt wound writes a pinned `Wounded` status; a Database with proof that
   its local victim has retired writes `Aborted` directly.
 - If the requester is **younger**, it **waits** for the holder to finish.
@@ -827,7 +827,7 @@ If a database instance crashes mid-transaction (or its transaction future is
 dropped), other database instances can recover. The lifecycle monitor drives
 this:
 
-1. **Lock leases.** While holding locks, a transaction periodically refreshes
+1. **Leases.** While holding locks, a transaction periodically refreshes
    its transaction record with a new timestamp, at half the pending-transaction
    timeout. If the timestamp becomes stale, allowing for a bounded clock skew,
    competing transactions consider the lock expired.
@@ -835,7 +835,7 @@ this:
 2. **Transaction record as arbiter.** To take over an expired lock, a competing
    transaction conditionally changes the expired transaction's record to
    `Wounded`, including by create-if-absent when the lazy pending record never
-   appeared. This is terminal for the transaction but cannot be deleted by GC.
+   appeared. This is final for the transaction but cannot be deleted by GC.
    If the CAS loses to a refresh or commit, the competitor waits longer.
 
 3. **Owner acknowledgement.** A returning owner that proves no operation can
@@ -848,7 +848,7 @@ this:
    finalization keep the identity retirement guard armed. Its synchronous handoff removes
    process-local ownership from diagnostics and admits waited recovery before
    control leaves the owner. A cleanup failure is diagnostic only; durable
-   wounds, leases, helping, and GC retain recovery ownership.
+   wounds, leases, help-forward, and GC retain recovery ownership.
 
 ## Storage, Caching & Consistency
 
@@ -1015,7 +1015,7 @@ The cache and coordinator rely on, and preserve, these properties:
 Transaction execution may use cached state freely before commit, because
 validation rechecks every retained dependency at the validation barrier. Final
 transaction status is immutable, so committed and aborted records may be reused
-from cache indefinitely; `Wounded` is terminal for readers but still mutable to
+from cache indefinitely; `Wounded` is final for readers but still mutable to
 the owner, so it is revalidated instead. A cached committed status can outlive
 its cached transaction body: a missing committed body carries a new causal bound
 back to the module that owns the referring observation, which reloads at that
@@ -1094,7 +1094,7 @@ conditional write that takes the lock.
 
 ## Garbage Collection
 
-A transaction record is **live** exactly while some data node or collection
+A transaction record is **live** exactly while some node or collection
 record still references its identity (entry, membership, directory, or topology
 coordination), so garbage collection is a reachability problem rather than a
 timer. A direct commit
@@ -1104,16 +1104,16 @@ only existing records are candidates, and one is dead once nothing names it. GC
 implements a candidate-driven **reverse mark-sweep**
 ([ADR-022](adr/022-garbage-collection-mark-sweep.md)).
 
-- **Reverse liveness check.** A forward mark (list every leaf, union the
+- **Reverse GC check.** A forward mark (list every leaf, union the
   referenced transaction identities) would cost the whole database per cycle.
-  Instead each candidate transaction record records its own back-references, so
-  GC reads a batch of candidates and confirms each one dead by GET-ing only the
-  handful of nodes and records it names — never a database-wide scan. Cached
-  indexes guide descent and right links correct stale split placement, while
-  terminal leaves must meet GC's post-eligibility freshness bound. Collection
-  and node identities are not reused, creation precedes commit or link
-  publication, and published nodes remain until collection reclamation, so
-  cached absence cannot hide a later live route.
+  Instead each candidate transaction record records its own recovery-manifest
+  entries, so GC reads a batch of candidates and confirms each one dead by
+  GET-ing only the handful of nodes and records it names — never a database-wide
+  scan. Cached indexes guide descent and right links correct stale split
+  placement, while terminal leaves must meet GC's post-eligibility freshness
+  bound. Collection and node identities are not reused, creation precedes commit
+  or link publication, and published nodes remain until collection reclamation,
+  so cached absence cannot hide a later live route.
 - **Candidate feed.** `Algo`, `DirectCommit`, and `Splitter` report GC
   candidates through `GcHints`. Reports use bounded in-memory work and never
   wait for queue space, backend requests, or GC completion; a busy or full queue
@@ -1129,15 +1129,16 @@ implements a candidate-driven **reverse mark-sweep**
   Pending reports and retained candidates from hints have separate capacities;
   deferred and running candidates still consume the retained capacity. GC scans
   keep separate capacity so they can discover work after hints are discarded.
-- **Safety horizon and pinned wounds.** The lock lease acts as the sweep
-  horizon: a candidate other than `Wounded` is kept within the horizon, because
-  the non-atomic reverse check can race a lock a live transaction has taken but
-  not yet published (ADR-024's lazy object materialization). A dead `Pending`
-  object is changed to `Wounded` so its death remains durable across an unbounded
-  owner suspension. GC may immediately and repeatedly reclaim the effects that
-  record describes, but cannot delete the marker. The owner changes it to
-  `Aborted` after proving retirement; ordinary finite retention and deletion
-  apply only after that acknowledgement (ADR-059).
+- **Safety horizon and pinned wounds.** The lease plus the allowed clock skew
+  is the safety horizon: a candidate other than `Wounded` is kept within the
+  horizon, because the non-atomic reverse GC check can race a lock a live
+  transaction has taken but not yet published (ADR-024's lazy object
+  materialization). A dead `Pending` object is changed to `Wounded` so its death
+  remains durable across an unbounded owner suspension. GC may immediately and
+  repeatedly reclaim the effects that record describes, but cannot delete the
+  pinned wound. The owner changes it to `Aborted` after proving retirement;
+  ordinary finite retention and deletion apply only after that acknowledgement
+  (ADR-059).
 - **Reclamation through the coordinator.** GC releases a dead transaction's
   locks not with its own CAS but by calling the `Locker`'s per-object unlock
   methods, so the release batches through the same leaf coordinator as live

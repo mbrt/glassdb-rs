@@ -59,7 +59,7 @@ For a physical path, the discoverable cache state is one of:
 
 Absence is a real negative cache entry. Uncertainty is deliberately not an
 entry variant: there is nothing an ordinary lookup can accidentally return. A
-conflict, an in-doubt mutation, or an undecodable changed object can
+rejected mutation, an in-doubt mutation, or an undecodable changed object can
 remove discoverable knowledge without inventing a replacement.
 
 A revision wraps the backend's opaque content revision. Higher layers can
@@ -149,7 +149,7 @@ reserved nodes as unreachable; a late create can then leave an orphan, as
 permitted by ADR-043. Do not use that exception to skip checks for a live
 reference or for completion of participant departure.
 
-Cached interior routing uses right links to correct stale split routes. The
+Cached index-node routing uses right links to correct stale split routes. The
 terminal leaf must meet the caller's requirement. If a root or child is absent,
 there is no terminal leaf to check: the caller still needs the publication and
 lifecycle proof for a negative route.
@@ -168,7 +168,7 @@ that knows this ordering:
 | --- | --- |
 | Transaction validation | After the body, before the key and predicate lock CASes used as validation evidence. |
 | GC eligibility | Before reading candidate status. |
-| GC reference checks | After eligibility checks finish; the earlier status barrier cannot replace this one. |
+| GC checks | After eligibility checks finish; the earlier status barrier cannot replace this one. |
 | Structural recovery | After observing all intents in a discovery batch, before checking their sources and reachability. Later discoveries need a new barrier. |
 | Separator publication | After observing the split, before routing and reading its child chain. Carry this barrier through reconciliation. |
 | Missing-object retries | After observing the missing object, before rechecking dependent state. |
@@ -195,7 +195,7 @@ not add raw-point or observation-based requirement constructors.
 Retained evidence is checked with predicates, without I/O and without extracting
 a sequence point. Insufficient evidence requires a storage check under the
 barrier. If a read starts before the barrier and finishes after it, the reply
-still carries the older invocation watermark: completion time cannot upgrade
+still carries the older invocation point: completion time cannot upgrade
 that read.
 
 A requirement states what must be proved; it is not currentness evidence. Do
@@ -275,7 +275,7 @@ These are correctness constraints on the storage interface:
 | Transformation | Rule |
 | --- | --- |
 | Successful conditional create or CAS to a receipt | Allowed only inside the storage mutation implementation, for that mutation. |
-| Read observation, plan with no staged changes, conflict, or in-doubt result to a receipt | Forbidden. |
+| Read observation, plan with no staged changes, rejected CAS, or in-doubt result to a receipt | Forbidden. |
 | Receipt to installed observation | Allowed only through an explicit accessor. The observation carries state evidence, without mutation or batch-participation proof. |
 | Implicit receipt conversion through `Deref`, `AsRef`, or `From` | Forbidden. Evidence changes must be explicit at the call site. |
 | Mapping a receipt's payload or changing its precondition, path, body, or revision | Forbidden. The receipt must describe the exact mutation. |
@@ -307,9 +307,9 @@ The coordinator owns batch-member participation:
 A skipped member's loaded observation is not always sufficient to prove its
 outcome. A resolver can skip because an earlier member has already staged the
 required change; for example, a release can skip after an earlier acquire
-removed its terminal holder in the staged leaf. Such a result must wait for the
-plan's CAS to succeed. A conflict or in-doubt result must cause a reload and a
-new mutation plan before completion.
+removed its holder with a final status in the staged leaf. Such a result must
+wait for the plan's CAS to succeed. A rejected CAS or in-doubt result must cause
+a reload and a new mutation plan before completion.
 
 Existing freshness requirements still govern decisions made from reads.
 Exact-state shortcuts also require the validation barrier: installed evidence
@@ -374,7 +374,7 @@ currentness barrier uses `after(barrier)` or retains and validates an observatio
 Mutation outcomes are reconciled conservatively while holding the lane:
 
 - Success publishes the exact installed state before returning.
-- A clean precondition conflict invalidates only matching expected knowledge;
+- A clean rejected CAS invalidates only matching expected knowledge;
   it cannot erase a different state already known locally.
 - An unavailable result after dispatch makes the whole path in doubt, because
   the mutation may or may not have landed.
@@ -427,7 +427,7 @@ real-time edge rather than invocation or response order alone.
 ### 3. Reconciliation never guesses
 
 Same-state validation merges evidence with a maximum, while a different state
-replaces discoverable knowledge. A conflict removes only the exact state it
+replaces discoverable knowledge. A rejected CAS removes only the exact state it
 proved obsolete. An in-doubt or cancelled mutation removes usable
 knowledge instead of choosing between the old and proposed states. Thus the
 cache either exposes a state supported by a definitive operation or exposes no
@@ -466,10 +466,10 @@ Background policies read with `ANY` far more often than the transaction path,
 so each one owns the argument for why its negative or no-op result is safe.
 Three rules recur:
 
-- **Routing is not evidence.** Interior descent may use `ANY` and rely on right
-  links to correct stale placement, but the terminal leaf must meet the caller's
-  requirement. A root cached as a leaf still needs that check, because a peer may
-  have turned it into an index.
+- **Routing is not evidence.** Index-node descent may use `ANY` and rely on
+  right links to correct stale placement, but the terminal leaf must meet the
+  caller's requirement. A root cached as a leaf still needs that check, because
+  a peer may have turned it into an index.
 - **A missing route needs publication and lifecycle proof.** Children exist
   before their links are published, roots exist before collection bindings,
   identities are never reused, and published nodes remain until collection
@@ -502,8 +502,9 @@ rechecked under the supplied requirement, so a read error can never be reported
 as an empty listing. Structural intent identities are never reused and their
 only phase change is from preparing to ready. Ready contents are then immutable
 until deletion, so deletion is checked against the exact observed revision and a
-conflict invalidates the obsolete cached state. A stale preparing observation
-can defer peer help but can never authorize deletion of a ready intent.
+rejected CAS invalidates the obsolete cached state. A stale preparing
+observation can defer peer help but can never authorize deletion of a ready
+intent.
 
 Structural recovery captures one barrier after a complete discovery batch and
 keeps it with that batch. Do not substitute an intent's own watermark or the
@@ -519,8 +520,8 @@ create more intents.
   the barrier; it does not promise that state remains current at return.
 - Sequence points are local causal evidence, not portable timestamps.
 - The generic cache does not infer object-specific facts. For example, the
-  transaction-record store may cache finalized transactions indefinitely only
-  because that type separately guarantees immutability.
+  transaction-record store may cache transactions with a final status
+  indefinitely only because that type separately guarantees immutability.
 - Listing is an uncached pass-through. Each page is strongly observed as one
   backend request, but a multi-page listing is not a snapshot.
 - The persistent L2 preserves old bodies and evidence but introduces no

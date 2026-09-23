@@ -51,7 +51,7 @@ impl SequencePoint {
 /// serialization.
 /// Its point remains private even from other storage modules; those
 /// modules can test evidence without extracting the bound.
-/// Such conversions would let an operation's invocation watermark stand in for
+/// Such conversions would let an operation's invocation point stand in for
 /// a barrier captured after completed work. The explicit conversion to
 /// `Requirement::after` retains the opaque barrier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +69,7 @@ impl CurrentnessBarrier {
 ///
 /// Construct requirements explicitly with `ANY`, `after`, or `within`. Do not
 /// add constructors from observations, receipts, or raw sequence points, nor
-/// expose the stored bound. An invocation watermark cannot establish a barrier
+/// expose the stored bound. An invocation point cannot establish a barrier
 /// after completed work. Requirements cannot be converted back into barriers.
 /// This also applies to crate-visible accessors: a requirement states the
 /// evidence needed, but cannot supply evidence to advance an observation.

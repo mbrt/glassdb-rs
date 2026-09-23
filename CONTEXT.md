@@ -77,6 +77,9 @@ _Avoid_: Validation watermark, validation timestamp
 A durable protocol identity that holds one transaction's claims and owns its status and recovery resources.
 _Avoid_: Lock owner ID, transaction attempt
 
+**Priority**:
+The wound-wait rank of a transaction identity. An older identity has priority: it can wound a younger holder, and a younger requester waits for an older holder. Identities with equal priority are not ordered.
+
 **Identity renewal**:
 The replacement of a transaction identity with a new identity that keeps the same wound-wait priority. It does not by itself replay the transaction body or discard that body's access set and body outcome.
 _Avoid_: Replacement identity, restart
@@ -132,8 +135,34 @@ Protocol work that the owner of a transaction identity runs under that identity 
 The durable record of one transaction identity. It holds the identity's status, lease, and recovery manifest, and the committed values after commit.
 _Avoid_: Transaction log, transaction object, tx log, log object
 
+**Recovery manifest**:
+The part of a transaction record that lists the claims, collection changes, and prepared collections of its identity. Recovery and GC use it to find the identity's durable effects when the owner cannot.
+_Avoid_: Transaction manifest, lock intentions, back-references
+
+**Lease**:
+The time during which a pending transaction record shows that its owner is still active. The owner extends it by refreshing the record; after it expires, other transactions can wound the identity.
+_Avoid_: Lock lease, heartbeat
+
+**Final status**:
+A transaction status that decides whether the identity commits: committed, wounded, or aborted. A wounded status can still change to aborted, but no final status can change to committed.
+_Avoid_: Terminal status, finalized status
+
+**Current state**:
+The committed state of one logical key in its leaf entry: an inline value, an external value, or a tombstone, each with its writer; or absent, with no writer.
+_Avoid_: Pointer
+
+**Inline value**:
+A current state that holds the value bytes in the leaf entry. Readers return it without reading the writer's transaction record.
+
+**External value**:
+A current state whose value bytes are in the writer's transaction record.
+_Avoid_: External pointer, pointer
+
+**Tombstone**:
+A current state that records that its writer deleted the key.
+
 **Writer**:
-The transaction identity whose commit produced the current value of one logical key.
+The transaction identity whose commit produced the current state of one logical key.
 _Avoid_: Version, writer token, value version
 
 **Direct commit**:
@@ -151,6 +180,18 @@ _Avoid_: Read-only fast path
 **Locked validation**:
 Validation of an access set while the transaction holds its locks.
 
+**Invalidated read**:
+A read in an access set whose observed writer or observed key membership changed before validation. It causes a body replay.
+_Avoid_: Validation conflict, read conflict
+
+**Write-back**:
+The publication of a committed transaction's changes into the objects that it locked, together with the release of those locks.
+_Avoid_: Cleanup, commit cleanup
+
+**Help-forward**:
+A write-back that another transaction or GC does for a committed holder.
+_Avoid_: Helping
+
 ## Claims and locks
 
 **Claim**:
@@ -158,6 +199,9 @@ A durable mark on one stored object that names the transaction identity that hol
 
 **Holder**:
 The transaction identity that a claim names.
+
+**Conflict**:
+Concurrent access to the same data by two transactions, where at least one of them writes.
 
 **Lock**:
 A claim that a transaction takes on the data that it reads or writes. Wound-wait resolves conflicts between the holders of conflicting locks.
@@ -173,6 +217,12 @@ _Avoid_: Membership hold
 **Directory lock**:
 A lock on the child bindings in one collection record.
 
+**Wound**:
+The conditional change of a pending transaction record to wounded, usually by another transaction. After it, the identity can never commit.
+
+**Fence**:
+A durable change that stops earlier work from publishing more effects, even if that work is still running. A wound, for example, fences the owner of the wounded identity.
+
 ## Conditional mutations
 
 **Revision**:
@@ -182,6 +232,9 @@ _Avoid_: Version, backend version, CAS token, generation, ETag
 **Applied mutation**:
 A conditional backend mutation known to have taken effect on one stored object. This does not establish that the installed state is still current.
 _Avoid_: Committed mutation
+
+**Mutation receipt**:
+The proof of one applied mutation: its precondition, its invocation point, and an observation of the state that it installed. It does not prove that the precondition stayed current after the read.
 
 **Rejected mutation**:
 A conditional backend mutation that did not take effect because its precondition was false.
@@ -201,6 +254,13 @@ _Avoid_: Timestamp, epoch, logical clock
 A sequence point allocated to separate finished work from work not yet started: no operation that definitively completed before the allocation reaches it, and every operation invoked after it does.
 _Avoid_: Anchor, epoch, fresh read
 
+**Invocation point**:
+The sequence point allocated immediately before one backend operation starts. The operation takes effect at or after it.
+_Avoid_: Invocation watermark
+
+**Observation**:
+An exact observed state of one stored object, with a currentness watermark after which that state was known to be current. It does not prove that the state is current now.
+
 **Currentness watermark**:
 The sequence point an observation carries, after which its state was known to be current. It is allocated before the read or mutation that produced the observation, so it states nothing about the state after that operation.
 _Avoid_: Anchor, observation timestamp, read watermark
@@ -211,12 +271,24 @@ _Avoid_: Consistency level, staleness policy
 
 ## Point routing
 
+**Collection tree**:
+The range-partitioned B-link tree of nodes that holds the logical keys of one collection.
+_Avoid_: Coordination directory
+
+**Node**:
+One stored object of a collection tree: an index node or a leaf.
+_Avoid_: Data node
+
 **Tree root**:
-The node at the fixed path of one collection's tree, where every routing starts. It is separate from the collection record.
+The node at the fixed path of one collection tree, where every routing starts. It is separate from the collection record.
 _Avoid_: Root (alone), collection root
 
+**Index node**:
+A node that routes key ranges to child nodes through separators.
+_Avoid_: Interior node
+
 **Leaf**:
-A terminal physical node in one collection's range-partitioned tree. In one exact state, it owns a contiguous logical-key range and is the physical mutation unit for that range.
+A terminal node of a collection tree. In one exact state, it owns a contiguous logical-key range and is the physical mutation unit for that range.
 _Avoid_: Shard, leaf shard
 
 **Membership generation**:
@@ -224,11 +296,11 @@ A leaf counter that changes when a transaction changes, or can change, the set o
 _Avoid_: Membership version
 
 **Routing**:
-The resolution of a logical key or range endpoint to a leaf by descent through a collection's tree. Its result records observed placement; it does not reserve the key or keep that placement current.
+The resolution of a logical key or range endpoint to a leaf by descent through a collection tree. Its result records observed placement; it does not reserve the key or keep that placement current.
 _Avoid_: Shard calculation, ownership proof
 
 **Leaf observation**:
-An exact observed state of one leaf, with a currentness watermark after which that state was known to be current. It does not prove that the state is current now.
+An observation of one leaf.
 _Avoid_: Fresh leaf, leaf version, freshness observation
 
 **Routed leaf group**:
@@ -236,7 +308,7 @@ One leaf observation and the ordered logical keys associated with it by one rout
 _Avoid_: Leaf group, owning leaf group, point-leaf plan
 
 **Separator**:
-A logical key in a parent index that bounds one child's range: keys at or above it route to that child. A child split publishes a new separator into its parent.
+A logical key in a parent index node that bounds one child's range: keys at or above it route to that child. A child split publishes a new separator into its parent.
 _Avoid_: Index key, boundary key
 
 ## Leaf coordination
@@ -253,30 +325,61 @@ _Avoid_: Fold member
 The proposed state of one leaf and the round members' outcomes for one mutation attempt. A plan does not prove that a backend mutation took effect.
 _Avoid_: Fold, fold plan
 
-## Topology changes
+## Structural changes
+
+**Topology**:
+The nodes, separators, and links of one collection tree.
+_Avoid_: Tree shape
+
+**Structural change**:
+A change of the topology of one collection tree, such as a split.
+_Avoid_: Topology change
+
+**Topology participant**:
+A transaction identity that a collection record lists while it can make structural changes to the collection tree.
+_Avoid_: Topology lock
 
 **Structural intent**:
-The durable plan of one topology change, written by one topology participant. It stays until the change is completed or recovered.
-_Avoid_: Structural log, structural record
+The durable plan of one structural change, written by one topology participant. It stays until the change is completed or recovered.
+_Avoid_: Structural log, structural record, topology intent
 
 **Structural gate**:
-An exclusive claim on one node that admits changes to the node's shape. A release or a recovery fence must remove it before another shape change starts.
+An exclusive claim on one node that admits structural changes to that node. A release or a recovery fence must remove it before another structural change starts.
 _Avoid_: Structure lock, structure-write lock
 
 **Topology freeze**:
 A claim on a collection record, held by the transaction identity that prepares a drop of the collection. It admits no new topology participant, and the existing participants must complete or be recovered before the drop continues.
-_Avoid_: Topology lock
 
 ## Maintenance
 
+**GC hint**:
+A local report that a transaction identity can have GC work. It makes the identity a GC candidate without a GC scan.
+_Avoid_: Cleanup hint
+
 **GC candidate**:
-A transaction identity selected for a check of its remaining references and recovery resources. Selection does not prove that its transaction record can be deleted.
+A transaction identity selected for a GC check. Selection does not prove that its transaction record can be deleted.
 _Avoid_: Cleanup candidate
 
+**GC check**:
+The check of one GC candidate's recovery manifest and committed writes against the current stored objects. It decides which effects GC can reclaim and whether GC can delete the transaction record.
+_Avoid_: Reverse liveness check, reverse check, reference check
+
+**Safety horizon**:
+The time after the last refresh of a transaction record during which GC keeps the record and its effects, unless the record is wounded. It is the lease plus the allowed clock skew.
+_Avoid_: Cleanup horizon, sweep horizon, retention horizon, lease horizon, safety lease
+
+**Pinned wound**:
+A wounded transaction record that GC keeps until the owner proves retirement and changes it to aborted.
+_Avoid_: Pinned transaction marker, pinned wound marker
+
 **GC backlog**:
-Known GC work that is ready to run but has not completed. Retained live values, pinned transaction markers, and work awaiting its next permitted check do not by themselves constitute GC backlog.
+Known GC work that is ready to run but has not completed. Retained live values, pinned wounds, and work awaiting its next permitted check do not by themselves constitute GC backlog.
 _Avoid_: Cleanup backlog, transaction-object count, garbage count
 
 **GC scan**:
-A traversal of stored transaction records to find GC candidates independently of local hints. Scans of structural intents belong to structural recovery.
+A traversal of stored transaction records to find GC candidates independently of GC hints. Scans of structural intents belong to structural recovery.
 _Avoid_: Recovery scan (when referring to transaction-record GC)
+
+**Transaction prefix**:
+One of the fixed listing prefixes that partition the transaction records of one database by transaction identity.
+_Avoid_: Transaction shard

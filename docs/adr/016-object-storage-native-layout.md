@@ -53,8 +53,8 @@ Three object kinds (details in the follow-on ADRs):
   **lock table**, the **MVCC version index** (current-writer txid per key), and
   the **per-shard key directory** (which of its keys exist). It is the unit of
   CAS; reading or writing an *existing* key touches only its shard.
-- **Transaction record** — unified; small while pending (lease + lock
-  intentions), fat once committed (it then carries the transaction's written
+- **Transaction record** — unified; small while pending (lease + recovery
+  manifest), fat once committed (it then carries the transaction's written
   values). Values live *only* here; there are no per-key value objects.
 - **Collection root** — small; records collection existence, the (constant)
   shard count, and the **list of subcollections**. It is the
@@ -66,7 +66,7 @@ Three object kinds (details in the follow-on ADRs):
 Isolation remains **strict serializable**, enforced by the same S2PL +
 wound-wait protocol ([ADR-002](002-wound-wait-locking.md)) relocated to shard
 granularity. Commit is the CAS that flips the transaction record to committed;
-write-back is an async per-shard CAS that publishes current-writer pointers and
+write-back is an async per-shard CAS that publishes external values and
 releases locks together. The in-doubt reasoning of
 [ADR-009](009-in-doubt-conditional-writes.md) carries over to the new CAS sites.
 

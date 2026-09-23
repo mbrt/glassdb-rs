@@ -46,7 +46,7 @@ retirement of the transaction identity writes `Wounded`:
 - an observed `pending` object is changed to `Wounded` with CAS; and
 - the wound must be durable before any holder is released or reused.
 
-`Wounded` is terminal for transaction semantics. Readers, lock resolvers, and
+`Wounded` is final for transaction semantics. Readers, lock resolvers, and
 helpers treat it as an abort; a lease refresh or commit cannot replace it.
 Unlike `Aborted`, however, it is pinned. General GC may clear stale holders and
 reclaim resources whose cleanup remains durably described, but it may not
@@ -59,7 +59,7 @@ retirement proof writes `Wounded`.
 
 A Database that wounds one of its own locally tracked identities closes new
 owner work and checks the retirement proof atomically with that closure. If no
-owner operation is active or unresolved and no terminal commit has an in-doubt
+owner operation is active or unresolved and no commit write has an in-doubt
 outcome, it writes `Aborted` directly; `Wounded` must not appear as an
 intermediate state. If any of those facts is unknown, it durably writes
 `Wounded` immediately and leaves owner acknowledgement to the normal path.
@@ -94,7 +94,7 @@ cannot retroactively describe unknown resources.
 
 - The uncontended lazy transaction path gains no pending-object operation or
   latency wave before its first holder.
-- Foreign wounds gain a distinct terminal transition. Healthy owners normally
+- Foreign wounds gain a distinct final transition. Healthy owners normally
   acknowledge it promptly, after which existing finite GC applies.
 - A permanently dead owner, or one with an unresolved mutation, leaves a small
   `Wounded` object indefinitely. Repeated failures can therefore grow retained
@@ -103,7 +103,7 @@ cannot retroactively describe unknown resources.
 - Stale holders can be released while the marker remains, so a pinned wound
   does not have to keep user keys blocked.
 - `Wounded` and `Aborted` make the lifecycle proof visible in durable state:
-  terminal-but-unacknowledged is distinct from terminal-and-GC-eligible.
+  final-but-unacknowledged is distinct from final-and-GC-eligible.
 
 ## Future optimizations
 

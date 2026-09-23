@@ -43,7 +43,7 @@ message CollectionLocks {
     repeated KeyLock key_locks = 1;
     repeated MembershipLock membership_locks = 2;
     Lock.LockType directory_lock = 3;
-    bool topology_freeze = 4;
+    bool topology_participant = 4;
 }
 
 message CollectionChange {

@@ -11,7 +11,7 @@ const DEFAULT_MAX_LEAF_BYTES: usize = 16 * 1024;
 ///
 /// The budgets govern new authoritative inline values published by direct
 /// commits (ADR-051, ADR-054, ADR-061). A value that misses either takes the
-/// locked commit protocol and is eventually published as an external pointer.
+/// locked commit protocol and is eventually published as an external value.
 /// The budgets are a runtime tuning knob, never persisted, and values already
 /// inline are grandfathered — lowering a budget leaves them alone, because an
 /// inline value may be a key's only copy. The default admits values up to 1 KiB

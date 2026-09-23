@@ -44,7 +44,7 @@ mod tests {
                         lock_type: lock::LockType::Read as i32,
                     }],
                     directory_lock: 0,
-                    topology_freeze: false,
+                    topology_participant: false,
                 }),
             }],
             collection_changes: vec![],

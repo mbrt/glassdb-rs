@@ -12,7 +12,7 @@ use crate::lock::LockType;
 pub enum TxCommitStatus {
     #[default]
     Unknown,
-    Ok,
+    Committed,
     Aborted,
     Pending,
     Wounded,
@@ -23,13 +23,13 @@ impl TxCommitStatus {
     pub fn is_final(self) -> bool {
         matches!(
             self,
-            TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded
+            TxCommitStatus::Committed | TxCommitStatus::Aborted | TxCommitStatus::Wounded
         )
     }
 
     /// Reports whether the persisted status can no longer change.
     pub fn is_immutable(self) -> bool {
-        matches!(self, TxCommitStatus::Ok | TxCommitStatus::Aborted)
+        matches!(self, TxCommitStatus::Committed | TxCommitStatus::Aborted)
     }
 }
 
@@ -64,7 +64,7 @@ impl TxRecordState {
             None => Ok(TxRecordState::Missing),
             Some(TxCommitStatus::Pending) => Ok(TxRecordState::Pending),
             Some(TxCommitStatus::Wounded) => Ok(TxRecordState::Wounded),
-            Some(TxCommitStatus::Ok) => Ok(TxRecordState::Committed),
+            Some(TxCommitStatus::Committed) => Ok(TxRecordState::Committed),
             Some(TxCommitStatus::Aborted) => Ok(TxRecordState::Aborted),
             Some(TxCommitStatus::Unknown) => Err(StorageError::other(
                 "unknown is not a persisted transaction status",
@@ -157,7 +157,7 @@ pub struct TxWrite {
     pub prev_writer: TxId,
 }
 
-/// A transaction lock backreference.
+/// One recovery-manifest entry for a transaction lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxLock {
     Key {
@@ -172,19 +172,19 @@ pub enum TxLock {
         collection: CollectionAddress,
         typ: LockType,
     },
-    TopologyFreeze {
+    TopologyParticipant {
         collection: CollectionAddress,
     },
 }
 
 impl TxLock {
-    /// Returns the lock type recorded for this backreference.
+    /// Returns the lock type recorded for this recovery-manifest entry.
     pub fn typ(&self) -> LockType {
         match self {
             TxLock::Key { typ, .. }
             | TxLock::Membership { typ, .. }
             | TxLock::Directory { typ, .. } => *typ,
-            TxLock::TopologyFreeze { .. } => LockType::Write,
+            TxLock::TopologyParticipant { .. } => LockType::Write,
         }
     }
 }

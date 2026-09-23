@@ -19,9 +19,9 @@ notes below are retained for history but are **superseded by ADR-024**; see
 [Deadlock prevention](#deadlock-prevention-and-the-serial-fallback).
 
 The **single read-write fast path** decision below (two sequential writes: the
-committed record then a `current_writer` pointer CAS, no lock, no write-back) is
+committed record then a `current_writer` CAS, no lock, no write-back) is
 **superseded by [ADR-027](027-single-rw-parallel-lock-publish.md)**, which
-publishes a write lock instead of the pointer so the two writes issue in
+publishes a write lock instead of the external value so the two writes issue in
 parallel, followed by an asynchronous write-back. The rest of this ADR is
 unchanged.
 
@@ -47,7 +47,7 @@ write-back. The isolation level (strict serializable) and the wound-wait rule ar
 unchanged. What changes is the **granularity and the medium**: locks move from
 per-key object _tags_ (mutated with `set_tags_if`) to entries inside per-shard
 objects mutated with **content CAS** (`write_if`), and values are published as a
-`current_writer` pointer in the shard rather than written into a per-key object.
+external value in the shard rather than written into a per-key object.
 
 This is the ADR that makes ADR-017–019 behavior-complete. Lease/expiry mechanics
 are ADR-021; reclamation is ADR-022; the slimmed backend trait is ADR-023.
@@ -61,15 +61,16 @@ critical path); phase 5 is asynchronous and idempotent.
    `current_writer` it was read at) and a write set (each key with its value or a
    delete), via the read path. No coordination.
 2. **Prepare** — create the pending transaction record
-   (`write_if_not_exists` of `_t/<txid>`: lease + lock intentions, ADR-019), so
-   any lock the transaction takes is resolvable by peers to a live transaction.
+   (`write_if_not_exists` of `_t/<txid>`: lease + recovery manifest, ADR-019),
+   so any lock the transaction takes is resolvable by peers to a live
+   transaction.
 3. **Validate-and-lock** — per shard (and the collection root when needed), one
    read-modify-write CAS validates reads and installs locks together.
 4. **Commit** — one CAS flips the transaction record to `committed` with its
    value map. This is the commit point.
 5. **Write-back** — asynchronously, per shard, publish `current_writer`
-   pointers / tombstones and release locks; then schedule the transaction record
-   for GC once unreferenced.
+   external values / tombstones and release locks; then schedule the transaction
+   record for GC once unreferenced.
 
 ### Validate-and-lock: one read-modify-write CAS per shard
 
@@ -80,7 +81,7 @@ does a single GET + single CAS:
 2. For each of _its_ keys in that shard:
    - **Validate the read**: the entry's `current_writer` must equal the writer
      the transaction read; a key read as absent must still be absent or
-     tombstoned. A mismatch is a conflict (refresh the read and retry).
+     tombstoned. A mismatch is an invalidated read (refresh the read and retry).
    - **Apply wound-wait** against any conflicting holder of the entry's lock: if
      the transaction is older it **wounds** the holder (durably aborts that
      transaction's object, pending → aborted CAS) and takes the lock; if younger
@@ -138,8 +139,8 @@ wounded**: the commit is the point of no return.
 
 After commit, for each shard the transaction locked, a single CAS:
 
-- sets `current_writer = txid` for the keys it wrote (publishing the new MVCC
-  pointer), sets `deleted` for its deletes, and
+- sets `current_writer = txid` for the keys it wrote (publishing the new
+  external value), sets `deleted` for its deletes, and
 - releases the transaction's locks (drops it from `locked_by` / clears the entry
   lock).
 
@@ -164,8 +165,9 @@ on the single committed record, not on write-back**:
   still locked-by-the-committed-writer computes the same values for both. The
   transaction's effects appear atomically as of the commit CAS.
 
-This is the v1 invariant (commit = record finalized; unlock/write-back is async and
-readers resolve via the locker's status) carried to shard granularity.
+This is the v1 invariant (commit = record reaches final status;
+unlock/write-back is async and readers resolve via the locker's status) carried
+to shard granularity.
 
 ### Membership operations (create / delete / list)
 
@@ -281,10 +283,10 @@ Every CAS site inherits [ADR-009](009-in-doubt-conditional-writes.md): an
   either lands or observes the record already `committed` by this txid.
 - **Single read-write fast path**: the one place an irreducible in-doubt can still
   surface. v2 _narrows_ it relative to v1: because the value's committed
-  transaction record exists and the published pointer names the writer, the common
-  lost-ack case resolves by reading the shard back (`current_writer == txid` ⇒
-  committed). The residual ambiguity (a fast follow-on writer overwrote the
-  pointer) is surfaced as `InDoubt`, as before.
+  transaction record exists and the published external value names the writer,
+  the common lost-ack case resolves by reading the shard back (`current_writer
+  == txid` ⇒ committed). The residual ambiguity (a fast follow-on writer
+  overwrote the external value) is surfaced as `InDoubt`, as before.
 
 ### Fast paths
 
@@ -303,9 +305,9 @@ Every CAS site inherits [ADR-009](009-in-doubt-conditional-writes.md): an
   unreferenced and GC'd. This is the v2 form of v1's direct fast path, and unlike
   v1 it leaves a discoverable committed record (so the [ADR-007](007-single-rw-cache-lost-update.md)
   lost-update anomaly cannot recur). ADR-027 keeps the discoverable committed
-  record but publishes a **write lock** instead of the pointer, so the transaction record and
-  shard writes issue **in parallel**, and an asynchronous write-back converts the
-  lock to the pointer.
+  record but publishes a **write lock** instead of the external value, so the
+  transaction record and shard writes issue **in parallel**, and an asynchronous
+  write-back converts the lock to the external value.
 
 ## Consequences
 

@@ -75,7 +75,7 @@ is tombstoned. The **minimal** entry is:
 - `lock_type` — `none | read | write | create`.
 - `locked_by` — the set of txids holding the lock (more than one only for `read`).
 - `current_writer` — the txid of the transaction record holding the committed
-  value (the MVCC pointer); unset if the key has no committed value yet.
+  value (the external value); unset if the key has no committed value yet.
 - `deleted` — tombstone flag.
 
 Derived: a key **exists** iff it has an entry with `current_writer` set and

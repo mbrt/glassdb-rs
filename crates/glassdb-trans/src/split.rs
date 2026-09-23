@@ -346,7 +346,7 @@ impl StructuralNodeAccess {
     async fn finalize_split(&self, id: &TxId) {
         if let Err(error) = self
             .mon
-            .commit_tx(TxRecord::new(id.clone(), TxCommitStatus::Ok))
+            .commit_tx(TxRecord::new(id.clone(), TxCommitStatus::Committed))
             .await
         {
             tracing::debug!(
@@ -1215,7 +1215,7 @@ pub struct Splitter {
     // Paces collection-record and node CAS retries. Transaction-status polling remains
     // entirely owned by Monitor.
     retry: RetryConfig,
-    cleanup_hints: GcHints,
+    gc_hints: GcHints,
     stats: Arc<Stats>,
 }
 
@@ -1235,7 +1235,7 @@ impl Splitter {
         db_prefix: DbPrefix,
         policy: SplitPolicy,
         inline: InlinePolicy,
-        cleanup_hints: GcHints,
+        gc_hints: GcHints,
     ) -> (LeafCoordinator, Self) {
         let candidates = SplitCandidates::with_policies(policy, inline);
         let coord = LeafCoordinator::with_hinter(
@@ -1258,7 +1258,7 @@ impl Splitter {
             coord.clone(),
             candidates,
             retry,
-            cleanup_hints,
+            gc_hints,
         );
         (coord, splitter)
     }
@@ -1312,7 +1312,7 @@ impl Splitter {
         coord: LeafCoordinator,
         candidates: SplitCandidates,
         retry: RetryConfig,
-        cleanup_hints: GcHints,
+        gc_hints: GcHints,
     ) -> Self {
         let router = TreeRouter::new(nodes.clone(), std::num::NonZeroUsize::MIN);
         let structural_nodes =
@@ -1348,7 +1348,7 @@ impl Splitter {
             recovery,
             recovery_wake: Arc::new(Notify::new()),
             retry,
-            cleanup_hints,
+            gc_hints,
             stats: Arc::new(Stats::default()),
         }
     }
@@ -1618,7 +1618,7 @@ impl Splitter {
             .begin_persisted_tx(
                 id,
                 TxRecoveryManifest {
-                    locks: vec![TxLock::TopologyFreeze {
+                    locks: vec![TxLock::TopologyParticipant {
                         collection: collection.clone(),
                     }],
                     ..TxRecoveryManifest::default()
@@ -1641,9 +1641,9 @@ impl Splitter {
             }
             _ => return Err(TransError::other("split candidate is not a tree node")),
         };
-        // Recovery can publish separators after the topology participant has
-        // finalized. A fresh structural identity prevents ordinary lock
-        // helping from mistaking this in-flight recursive split for stale work.
+        // Recovery can publish separators after the topology participant has a
+        // final status. A fresh structural identity prevents help-forward from
+        // mistaking this in-flight recursive split for stale work.
         let worker = self.candidates.new_id();
         StructuralSplitAttempt::new(self, collection, target, worker, reason)
             .run(StructuralSplitTopology::Joined(topology_participant))
@@ -1738,7 +1738,7 @@ impl Splitter {
         if split_avoided {
             self.stats.splits_avoided.fetch_add(1, Ordering::Relaxed);
         }
-        self.cleanup_hints.schedule_all(writers.iter().cloned());
+        self.gc_hints.schedule_all(writers.iter().cloned());
     }
 
     /// Persists compaction and opens the gate in the same CAS when it made the
@@ -1934,7 +1934,7 @@ impl Splitter {
         })
     }
 
-    /// Publishes statistics, follow-up candidates, and cleanup hints after the
+    /// Publishes statistics, follow-up candidates, and GC hints after the
     /// source/root linearization is acknowledged.
     fn record_completed_split(
         &self,
@@ -2070,7 +2070,7 @@ impl Splitter {
                         rt::sleep(backoff.next_delay()).await;
                         continue;
                     }
-                    TxCommitStatus::Ok => Err(TransError::StaleCollection),
+                    TxCommitStatus::Committed => Err(TransError::StaleCollection),
                     TxCommitStatus::Pending | TxCommitStatus::Unknown => Err(TransError::Retry),
                 };
             }
@@ -2167,8 +2167,8 @@ impl Splitter {
     }
 
     async fn finalize_topology_split(&self, collection: &CollectionAddress, id: &TxId) {
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Ok);
-        record.locks.push(TxLock::TopologyFreeze {
+        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+        record.locks.push(TxLock::TopologyParticipant {
             collection: collection.clone(),
         });
         if let Err(e) = self.mon.commit_tx(record).await {
@@ -2264,7 +2264,7 @@ impl Splitter {
 
 #[async_trait]
 impl TopologySettler for Splitter {
-    /// Completes structural recovery before releasing one finalized topology participant.
+    /// Completes structural recovery before releasing one topology participant with a final status.
     async fn settle_topology_participant(
         &self,
         collection: &CollectionAddress,
@@ -2590,14 +2590,14 @@ mod tests {
         store: &TestStore,
         bg: &Arc<Background>,
         candidates: SplitCandidates,
-        cleanup_hints: GcHints,
+        gc_hints: GcHints,
     ) -> Splitter {
         let mon = store.foundation.monitor_for(
             bg,
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
-        splitter_with_monitor_and_hints(store, bg, mon, candidates, cleanup_hints)
+        splitter_with_monitor_and_hints(store, bg, mon, candidates, gc_hints)
     }
 
     fn splitter_with_monitor(
@@ -2614,7 +2614,7 @@ mod tests {
         bg: &Arc<Background>,
         mon: Monitor,
         candidates: SplitCandidates,
-        cleanup_hints: GcHints,
+        gc_hints: GcHints,
     ) -> Splitter {
         let key_state = KeyStateResolver::new(mon.clone());
         let coord = LeafCoordinator::with_hinter(
@@ -2637,7 +2637,7 @@ mod tests {
             coord,
             candidates,
             RetryConfig::default(),
-            cleanup_hints,
+            gc_hints,
         )
     }
 
@@ -2754,8 +2754,8 @@ mod tests {
         let bg = Arc::new(Background::new());
         let candidates = SplitCandidates::with_policy(tiny());
         candidates.observe_leaf(&root_path(), root.as_leaf().unwrap());
-        let cleanup_hints = GcHints::default();
-        let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, cleanup_hints.clone());
+        let gc_hints = GcHints::default();
+        let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, gc_hints.clone());
 
         sp.run_once().await;
 
@@ -2782,7 +2782,7 @@ mod tests {
                 ..SplitterStats::default()
             }
         );
-        assert_eq!(cleanup_hints.pending(), vec![first, second]);
+        assert_eq!(gc_hints.pending(), vec![first, second]);
     }
 
     #[tokio::test]
@@ -2875,8 +2875,8 @@ mod tests {
         let bg = Arc::new(Background::new());
         let candidates = SplitCandidates::with_policy(tiny());
         candidates.observe_leaf(&root_path(), root.as_leaf().unwrap());
-        let cleanup_hints = GcHints::default();
-        let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, cleanup_hints.clone());
+        let gc_hints = GcHints::default();
+        let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, gc_hints.clone());
 
         sp.run_once().await;
 
@@ -2889,7 +2889,7 @@ mod tests {
                 ..SplitterStats::default()
             }
         );
-        assert!(cleanup_hints.pending().is_empty());
+        assert!(gc_hints.pending().is_empty());
         let (root, _) = s
             .load_root(COLL, Requirement::after(s.timeline.currentness_barrier()))
             .await
@@ -2921,8 +2921,8 @@ mod tests {
         let bg = Arc::new(Background::new());
         let candidates = SplitCandidates::with_policy(tiny());
         candidates.observe_leaf(&node_path("L"), source.as_leaf().unwrap());
-        let cleanup_hints = GcHints::default();
-        let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, cleanup_hints.clone());
+        let gc_hints = GcHints::default();
+        let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, gc_hints.clone());
 
         sp.run_once().await;
 
@@ -2952,7 +2952,7 @@ mod tests {
                 ..SplitterStats::default()
             }
         );
-        assert_eq!(cleanup_hints.pending(), vec![writer]);
+        assert_eq!(gc_hints.pending(), vec![writer]);
     }
 
     // ADR-051: an inline value may be a key's only copy, so a split has to move
@@ -3936,7 +3936,7 @@ mod tests {
             std::num::NonZeroUsize::MIN,
         );
         other_mon.begin_tx(&holder);
-        let mut record = TxRecord::new(holder.clone(), TxCommitStatus::Ok);
+        let mut record = TxRecord::new(holder.clone(), TxCommitStatus::Committed);
         record.writes.push(TxWrite {
             key: LogicalKey::new(collection(), b"d"),
             value: Arc::from(b"new-d".as_slice()),

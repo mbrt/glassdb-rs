@@ -57,7 +57,10 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
         let intent = intents[0].1.value().unwrap();
         assert_eq!(intent.phase, StructuralIntentPhase::Ready);
         let id = intent.participant_id.clone();
-        assert_eq!(owner.mon.tx_status(&id).await.unwrap(), TxCommitStatus::Ok);
+        assert_eq!(
+            owner.mon.tx_status(&id).await.unwrap(),
+            TxCommitStatus::Committed
+        );
         id
     } else {
         let id = TxId::with_priority(1, b"peer-participant");
@@ -167,7 +170,10 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
             .await
             .unwrap();
         assert!(record.value().unwrap().locks.iter().any(|lock| {
-            matches!(lock, TxLock::TopologyFreeze { collection: target } if target == &collection())
+            matches!(
+                lock,
+                TxLock::TopologyParticipant { collection: target } if target == &collection()
+            )
         }));
         return;
     }
@@ -238,7 +244,7 @@ async fn recovery_retries_a_cached_preparing_intent_after_the_peer_publishes_rea
     let owner = splitter(&peer, &peer_bg, tiny());
     let prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
     // The recovering instance discovers Preparing before the owner advances
-    // it. Failed owner cleanup then leaves the completed split for recovery.
+    // it. Failed intent deletion then leaves the completed split for recovery.
     hooks.set_after({
         let local = local.clone();
         let prefix = prefix.clone();
@@ -1040,7 +1046,7 @@ async fn later_participant_discovery_checks_sources_after_its_own_ready_intents(
         };
         gate.wait_until_entered().await;
         // Recovery has checked the unsplit source for the first batch. A peer
-        // can create more recovery work under this finalized participant, just
+        // can create more recovery work under this participant with a final status, just
         // as recursive parent recovery can. Its new sibling is now reachable.
         let later_worker = TxId::with_priority(1, b"later-worker");
         let (published, expected) =

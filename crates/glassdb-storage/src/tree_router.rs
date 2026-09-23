@@ -9,7 +9,7 @@
 //! from the root.
 //!
 //! This layer is pure routing: it reads nodes through the [`NodeStore`] (hence
-//! the decoded object store, so interior nodes stay cached and off the hot
+//! the decoded object store, so index nodes stay cached and off the hot
 //! path) and never mutates the tree. Splitting and locking live above it.
 
 use std::collections::BTreeMap;

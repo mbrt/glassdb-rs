@@ -16,7 +16,7 @@ use crate::error::TransError;
 use crate::monitor::{Monitor, TxFinalStatus};
 use crate::wound_wait::{Reclaim, resolve_tx_conflict, try_reclaim};
 
-/// Completes the structural recovery a finalized topology participant left
+/// Completes the structural recovery a topology participant with a final status left
 /// behind, so a drop can freeze the topology without waiting for the background
 /// sweep. The [`Splitter`](crate::split::Splitter) supplies the implementation.
 #[async_trait]
@@ -592,7 +592,7 @@ mod tests {
         )
     }
 
-    async fn refence_terminal_drop(status: TxCommitStatus, with_child: bool, cleanup_races: bool) {
+    async fn refence_final_drop(status: TxCommitStatus, with_child: bool, cleanup_races: bool) {
         let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
         let recorder = RecordingBackend::new(hooks.clone());
         let operations = recorder.log();
@@ -701,12 +701,12 @@ mod tests {
                     TxFinalStatus::Aborted
                 );
             }
-            TxCommitStatus::Ok => {
-                let mut record = TxRecord::new(first.clone(), TxCommitStatus::Ok);
+            TxCommitStatus::Committed => {
+                let mut record = TxRecord::new(first.clone(), TxCommitStatus::Committed);
                 record.collection_changes = manifest.collection_changes.clone();
                 owner.monitor.commit_tx(record).await.unwrap();
             }
-            _ => panic!("the first drop must be terminal"),
+            _ => panic!("the first drop must have a final status"),
         }
         peer.monitor
             .begin_persisted_tx(&second, manifest)
@@ -750,7 +750,7 @@ mod tests {
                         ));
                     }
                     if cleanup {
-                        // Acknowledged owner cleanup wins after the new drop
+                        // Acknowledged owner release wins after the new drop
                         // selected its revision, so replacement must retry.
                         owner_monitor
                             .abort_owned_tx(&first)
@@ -775,7 +775,7 @@ mod tests {
             .await;
         hooks.clear_before();
         let recorded = std::mem::take(&mut *operations.lock().unwrap());
-        let expected = if status == TxCommitStatus::Ok {
+        let expected = if status == TxCommitStatus::Committed {
             assert!(matches!(result, Err(TransError::StaleCollection)));
             &first
         } else {
@@ -789,7 +789,7 @@ mod tests {
                 .filter(|op| op.path == path)
                 .map(|op| op.op)
                 .collect();
-            let expected_calls: &[&str] = if status == TxCommitStatus::Ok {
+            let expected_calls: &[&str] = if status == TxCommitStatus::Committed {
                 &[]
             } else if cleanup_races && path == contested_path {
                 &["read", "write_if", "read", "write_if"]
@@ -798,7 +798,7 @@ mod tests {
             };
             assert_eq!(calls, expected_calls, "unexpected node I/O for {path}");
         }
-        if status != TxCommitStatus::Ok {
+        if status != TxCommitStatus::Committed {
             peer_lifecycle
                 .install_drop_intents(&second, std::slice::from_ref(&change))
                 .await
@@ -823,25 +823,25 @@ mod tests {
 
     #[tokio::test]
     async fn drop_replaces_a_wounded_root_intent() {
-        refence_terminal_drop(TxCommitStatus::Wounded, false, false).await;
+        refence_final_drop(TxCommitStatus::Wounded, false, false).await;
     }
 
     #[tokio::test]
     async fn drop_replaces_wounded_node_intents() {
-        refence_terminal_drop(TxCommitStatus::Wounded, true, false).await;
+        refence_final_drop(TxCommitStatus::Wounded, true, false).await;
     }
 
     #[tokio::test]
     async fn drop_retries_if_aborted_owner_clears_the_intent() {
         for with_child in [false, true] {
-            refence_terminal_drop(TxCommitStatus::Wounded, with_child, true).await;
+            refence_final_drop(TxCommitStatus::Wounded, with_child, true).await;
         }
     }
 
     #[tokio::test]
     async fn drop_preserves_committed_intents() {
         for with_child in [false, true] {
-            refence_terminal_drop(TxCommitStatus::Ok, with_child, false).await;
+            refence_final_drop(TxCommitStatus::Committed, with_child, false).await;
         }
     }
 

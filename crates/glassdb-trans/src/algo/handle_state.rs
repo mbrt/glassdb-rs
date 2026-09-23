@@ -51,7 +51,7 @@ impl HandleState {
         }
     }
 
-    /// Marks the transaction terminal after its commit point has won.
+    /// Marks the transaction committed after its commit point has won.
     pub(super) fn commit(&mut self) {
         match self.phase {
             IdentityPhase::New | IdentityPhase::Engaged => {
@@ -91,8 +91,8 @@ impl HandleState {
     pub(super) fn renew(&mut self) {
         match self.phase {
             // The engine renewal boundary historically accepts any active
-            // opaque handle. Wound cleanup may also discover a concurrent
-            // terminal outcome before the driver consumes and renews the
+            // opaque handle. Wound handling may also discover a concurrent
+            // final status before the driver consumes and renews the
             // handle, so renewal must remain valid from every phase.
             IdentityPhase::New | IdentityPhase::Engaged | IdentityPhase::Committed => {
                 self.phase = IdentityPhase::New;

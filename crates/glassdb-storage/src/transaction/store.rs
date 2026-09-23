@@ -15,7 +15,7 @@ use crate::transaction::{
     TxCommitStatus, TxLifecycleRelation, TxRecord, TxRecordCodec, TxRecordState,
 };
 
-const TRANSACTION_SHARD_COUNT: usize = 64 * 64;
+const TRANSACTION_PREFIX_COUNT: usize = 64 * 64;
 
 /// The commit status of a transaction along with its timestamp and revision.
 #[derive(Debug, Clone)]
@@ -149,24 +149,25 @@ impl TxRecordStore {
         }
     }
 
-    /// Returns every physical transaction-record shard.
-    pub fn transaction_shards(&self) -> impl Iterator<Item = usize> {
-        0..TRANSACTION_SHARD_COUNT
+    /// Returns the index of every transaction prefix.
+    pub fn transaction_prefix_indexes(&self) -> impl Iterator<Item = usize> {
+        0..TRANSACTION_PREFIX_COUNT
     }
 
-    /// Returns the physical shard containing `id`.
-    pub fn transaction_shard(&self, id: &TxId) -> usize {
-        ObjectPath::transaction_shard(id)
+    /// Returns the index of the transaction prefix that contains `id`.
+    pub fn transaction_prefix_index(&self, id: &TxId) -> usize {
+        ObjectPath::transaction_prefix_index(id)
     }
 
-    /// Lists one page of transaction identities from `shard`.
+    /// Lists one page of transaction identities from the transaction prefix at
+    /// `index`.
     pub async fn list_transaction_ids(
         &self,
-        shard: usize,
+        index: usize,
         cursor: Option<&backend::ListCursor>,
         limit: backend::ListLimit,
     ) -> Result<TxListPage, StorageError> {
-        self.scan_transaction_ids(2, shard, cursor, limit).await
+        self.scan_transaction_ids(2, index, cursor, limit).await
     }
 
     /// Lists transaction identities at the requested prefix depth.
@@ -225,7 +226,7 @@ impl TxRecordStore {
 ///
 /// Immutable objects are cached indefinitely, so replacing one would invalidate
 /// knowledge held by every database instance that has observed it. `Wounded`
-/// is terminal for transaction semantics but remains mutable until its owner
+/// is a final status for transaction semantics but remains mutable until its owner
 /// acknowledges it as `Aborted`.
 fn validate_lifecycle_transition(
     current: Option<TxCommitStatus>,
@@ -335,7 +336,7 @@ mod tests {
 
         for (suffix, status) in [
             (1, TxCommitStatus::Pending),
-            (2, TxCommitStatus::Ok),
+            (2, TxCommitStatus::Committed),
             (3, TxCommitStatus::Aborted),
             (7, TxCommitStatus::Wounded),
         ] {
@@ -366,7 +367,10 @@ mod tests {
             .unwrap();
         assert_operations(&operations, &["write_if"]);
         let committed = logger
-            .set_if(&TxRecord::new(committed_id, TxCommitStatus::Ok), &refreshed)
+            .set_if(
+                &TxRecord::new(committed_id, TxCommitStatus::Committed),
+                &refreshed,
+            )
             .await
             .unwrap();
         assert_operations(&operations, &["write_if"]);
@@ -418,7 +422,7 @@ mod tests {
     async fn rejected_lifecycle_transitions_issue_no_backend_operations() {
         let (logger, operations) = new_recording_tx_record_store();
 
-        for (suffix, current) in [(1, TxCommitStatus::Ok), (2, TxCommitStatus::Aborted)] {
+        for (suffix, current) in [(1, TxCommitStatus::Committed), (2, TxCommitStatus::Aborted)] {
             let id = TxId::from_bytes(vec![10, suffix]);
             let observed = logger
                 .set(&TxRecord::new(id.clone(), current))
@@ -427,7 +431,7 @@ mod tests {
             assert_operations(&operations, &["write_if_not_exists"]);
             for next in [
                 TxCommitStatus::Pending,
-                TxCommitStatus::Ok,
+                TxCommitStatus::Committed,
                 TxCommitStatus::Aborted,
                 TxCommitStatus::Wounded,
             ] {
@@ -475,7 +479,7 @@ mod tests {
         assert_operations(&operations, &[]);
         for next in [
             TxCommitStatus::Pending,
-            TxCommitStatus::Ok,
+            TxCommitStatus::Committed,
             TxCommitStatus::Wounded,
         ] {
             assert!(matches!(
@@ -529,7 +533,7 @@ mod tests {
         let record = TxRecord {
             id: id.clone(),
             timestamp: Some(UNIX_EPOCH + Duration::from_millis(1_700_000_000_000)),
-            status: TxCommitStatus::Ok,
+            status: TxCommitStatus::Committed,
             writes: vec![TxWrite {
                 key: key.clone(),
                 value: Arc::from(&b"world"[..]),
@@ -549,7 +553,7 @@ mod tests {
                     collection: test_collection("db", 1),
                     typ: LockType::Write,
                 },
-                TxLock::TopologyFreeze {
+                TxLock::TopologyParticipant {
                     collection: test_collection("db", 1),
                 },
             ],
@@ -565,7 +569,7 @@ mod tests {
 
         let got = t.get_at(&id, Requirement::ANY).await.unwrap();
         let got = got.value().unwrap();
-        assert_eq!(got.status, TxCommitStatus::Ok);
+        assert_eq!(got.status, TxCommitStatus::Committed);
         assert_eq!(got.writes, record.writes);
         assert!(got.locks.contains(&TxLock::Membership {
             leaf: LeafRef::root(test_collection("db", 1)),
@@ -579,14 +583,14 @@ mod tests {
             collection: test_collection("db", 1),
             typ: LockType::Write,
         }));
-        assert!(got.locks.contains(&TxLock::TopologyFreeze {
+        assert!(got.locks.contains(&TxLock::TopologyParticipant {
             collection: test_collection("db", 1),
         }));
         assert_eq!(got.collection_changes, record.collection_changes);
         assert_eq!(got.prepared_collections, record.prepared_collections);
 
         let status = t.commit_status_at(&id, Requirement::ANY).await.unwrap();
-        assert_eq!(status.status, TxCommitStatus::Ok);
+        assert_eq!(status.status, TxCommitStatus::Committed);
     }
 
     #[tokio::test]
@@ -647,7 +651,7 @@ mod tests {
 
         let objects = CachedStore::new(backend, 1 << 20, Timeline::new(), None);
         let logger = TxRecordStore::new(objects, db_prefix());
-        let record = TxRecord::new(id.clone(), TxCommitStatus::Ok);
+        let record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
 
         let creating = tokio::spawn({
             let logger = logger.clone();
@@ -675,7 +679,7 @@ mod tests {
         release_create.notify_one();
         creating.await.unwrap().unwrap();
         let status = reading.await.unwrap().unwrap();
-        assert_eq!(status.status, TxCommitStatus::Ok);
+        assert_eq!(status.status, TxCommitStatus::Committed);
         assert_eq!(
             reads.load(Ordering::SeqCst),
             0,
@@ -688,7 +692,7 @@ mod tests {
         let t = new_tx_record_store();
         let id = TxId::from_bytes(vec![1, 2, 3, 4]);
         let key = LogicalKey::new(test_collection("db", 1), b"hello");
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Ok);
+        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
         record.timestamp = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
         record.writes = vec![TxWrite {
             key,
@@ -701,7 +705,7 @@ mod tests {
         let got = t.get_at(&id, Requirement::ANY).await.unwrap();
         let revision = got.revision().cloned();
         let got = got.value().unwrap();
-        assert_eq!(got.status, TxCommitStatus::Ok);
+        assert_eq!(got.status, TxCommitStatus::Committed);
         assert_eq!(got.writes, record.writes);
         assert_eq!(got.timestamp, record.timestamp);
         assert_eq!(revision.as_ref(), stored_v.revision());
@@ -709,7 +713,7 @@ mod tests {
 
     #[tokio::test]
     async fn final_contents_remain_cached_after_peer_deletion() {
-        for status in [TxCommitStatus::Ok, TxCommitStatus::Aborted] {
+        for status in [TxCommitStatus::Committed, TxCommitStatus::Aborted] {
             let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
             let operations = backend.log();
             let backend = Arc::new(backend);
@@ -811,7 +815,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_transaction_ids_pages_one_shard() {
+    async fn list_transaction_ids_pages_one_transaction_prefix() {
         let t = new_tx_record_store();
         let ids = [
             TxId::from_bytes(vec![1, 2]),
@@ -823,13 +827,19 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let shard = t.transaction_shard(&ids[0]);
-        assert!(ids.iter().all(|id| t.transaction_shard(id) == shard));
+        let prefix_index = t.transaction_prefix_index(&ids[0]);
+        assert!(
+            ids.iter()
+                .all(|id| t.transaction_prefix_index(id) == prefix_index)
+        );
         let limit = backend::ListLimit::new(2).unwrap();
-        let first = t.list_transaction_ids(shard, None, limit).await.unwrap();
+        let first = t
+            .list_transaction_ids(prefix_index, None, limit)
+            .await
+            .unwrap();
         assert_eq!(first.ids.len(), 2);
         let second = t
-            .list_transaction_ids(shard, first.next.as_ref(), limit)
+            .list_transaction_ids(prefix_index, first.next.as_ref(), limit)
             .await
             .unwrap();
         assert!(second.next.is_none());
@@ -855,8 +865,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let shard = t.transaction_shard(&ids[0]);
-        for (depth, index) in [(0, 0), (1, shard / 64), (2, shard)] {
+        let prefix_index = t.transaction_prefix_index(&ids[0]);
+        for (depth, index) in [(0, 0), (1, prefix_index / 64), (2, prefix_index)] {
             let mut cursor = None;
             let mut found = Vec::new();
             loop {
@@ -879,8 +889,8 @@ mod tests {
                 .iter()
                 .filter(|id| match depth {
                     0 => true,
-                    1 => t.transaction_shard(id) / 64 == index,
-                    _ => t.transaction_shard(id) == index,
+                    1 => t.transaction_prefix_index(id) / 64 == index,
+                    _ => t.transaction_prefix_index(id) == index,
                 })
                 .cloned()
                 .collect();

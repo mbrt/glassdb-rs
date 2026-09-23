@@ -145,7 +145,7 @@ impl Codec for TxRecordCodec {
                     TxLock::Membership { leaf, .. } => {
                         leaf.node_token().map_or(0, |token| token.as_str().len())
                     }
-                    TxLock::Directory { .. } | TxLock::TopologyFreeze { .. } => 0,
+                    TxLock::Directory { .. } | TxLock::TopologyParticipant { .. } => 0,
                 })
                 .sum::<usize>()
             + record
@@ -173,7 +173,7 @@ fn parse_record(bytes: &[u8]) -> Result<pb::TransactionRecord, StorageError> {
 
 fn encode_status(status: TxCommitStatus) -> Result<pb::transaction_record::Status, StorageError> {
     match status {
-        TxCommitStatus::Ok => Ok(pb::transaction_record::Status::Committed),
+        TxCommitStatus::Committed => Ok(pb::transaction_record::Status::Committed),
         TxCommitStatus::Aborted => Ok(pb::transaction_record::Status::Aborted),
         TxCommitStatus::Pending => Ok(pb::transaction_record::Status::Pending),
         TxCommitStatus::Wounded => Ok(pb::transaction_record::Status::Wounded),
@@ -183,7 +183,7 @@ fn encode_status(status: TxCommitStatus) -> Result<pb::transaction_record::Statu
 
 fn decode_status(status: pb::transaction_record::Status) -> Result<TxCommitStatus, StorageError> {
     match status {
-        pb::transaction_record::Status::Committed => Ok(TxCommitStatus::Ok),
+        pb::transaction_record::Status::Committed => Ok(TxCommitStatus::Committed),
         pb::transaction_record::Status::Aborted => Ok(TxCommitStatus::Aborted),
         pb::transaction_record::Status::Pending => Ok(TxCommitStatus::Pending),
         pb::transaction_record::Status::Wounded => Ok(TxCommitStatus::Wounded),
@@ -215,8 +215,8 @@ fn decode_collection_writes(
                     typ,
                 });
             }
-            if group_locks.topology_freeze {
-                locks.push(TxLock::TopologyFreeze {
+            if group_locks.topology_participant {
+                locks.push(TxLock::TopologyParticipant {
                     collection: collection.clone(),
                 });
             }
@@ -375,7 +375,9 @@ fn append_lock(
     let collection = match lock {
         TxLock::Key { key, .. } => key.collection(),
         TxLock::Membership { leaf, .. } => leaf.collection(),
-        TxLock::Directory { collection, .. } | TxLock::TopologyFreeze { collection } => collection,
+        TxLock::Directory { collection, .. } | TxLock::TopologyParticipant { collection } => {
+            collection
+        }
     };
     let group = collection_writes
         .entry(collection.clone())
@@ -404,8 +406,8 @@ fn append_lock(
         TxLock::Directory { typ, .. } => {
             locks.directory_lock = lock_type_to_proto(*typ) as i32;
         }
-        TxLock::TopologyFreeze { .. } => {
-            locks.topology_freeze = true;
+        TxLock::TopologyParticipant { .. } => {
+            locks.topology_participant = true;
         }
     }
 }
@@ -448,7 +450,7 @@ fn validate_database_membership(
         match lock {
             TxLock::Key { key, .. } => check(key.collection())?,
             TxLock::Membership { leaf, .. } => check(leaf.collection())?,
-            TxLock::Directory { collection, .. } | TxLock::TopologyFreeze { collection } => {
+            TxLock::Directory { collection, .. } | TxLock::TopologyParticipant { collection } => {
                 check(collection)?
             }
         }
@@ -540,7 +542,7 @@ mod tests {
                     collection: parent.clone(),
                     typ: LockType::Write,
                 },
-                TxLock::TopologyFreeze {
+                TxLock::TopologyParticipant {
                     collection: created.clone(),
                 },
             ],
@@ -595,7 +597,7 @@ mod tests {
     #[test]
     fn every_status_round_trips_through_full_and_status_only_decode() {
         for status in [
-            TxCommitStatus::Ok,
+            TxCommitStatus::Committed,
             TxCommitStatus::Aborted,
             TxCommitStatus::Pending,
             TxCommitStatus::Wounded,
@@ -651,7 +653,7 @@ mod tests {
         assert!(relocated.locks.iter().all(|lock| match lock {
             TxLock::Key { key, .. } => key.collection().db_prefix() == "moved",
             TxLock::Membership { leaf, .. } => leaf.collection().db_prefix() == "moved",
-            TxLock::Directory { collection, .. } | TxLock::TopologyFreeze { collection } => {
+            TxLock::Directory { collection, .. } | TxLock::TopologyParticipant { collection } => {
                 collection.db_prefix() == "moved"
             }
         }));
@@ -669,7 +671,7 @@ mod tests {
 
     #[test]
     fn one_transaction_cannot_span_database_roots() {
-        let mut record = record_with_status(TxCommitStatus::Ok);
+        let mut record = record_with_status(TxCommitStatus::Committed);
         record.writes = vec![
             TxWrite {
                 key: LogicalKey::new(collection("first", 1), b"a"),
@@ -710,7 +712,7 @@ mod tests {
 
         assert_eq!(
             TxRecordCodec::decode_status(&bytes).unwrap(),
-            TxCommitStatus::Ok
+            TxCommitStatus::Committed
         );
         assert!(TxRecordCodec::decode("db", &TxId::from_bytes(vec![1]), &bytes).is_err());
     }

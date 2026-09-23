@@ -35,7 +35,7 @@ waste LIST page capacity; fewer prefixes make individual traversals longer in
 large databases. A fixed count does not suit both cases.
 
 GC cost should follow useful work, with an allowance for GC scans. GC backlog
-must never make writers wait. Live values and pinned `Wounded` markers can
+must never make writers wait. Live values and pinned wounds can
 remain stored indefinitely; their presence alone is not GC backlog.
 
 ## Decision
@@ -170,7 +170,7 @@ the existing reclamation checks continue to determine deletion safety.
 Adjust the delay between scan turns from recent useful work per LIST. Resources
 reclaimed or recovery advanced permit faster scans; repeated unproductive
 results increase the delay. Smooth the observations and add random variation.
-Live objects, unchanged pinned markers, and successful no-ops are not positive
+Live objects, unchanged pinned wounds, and successful no-ops are not positive
 demand signals. Errors use separate retry handling and are not evidence of an
 idle database. Retain a finite maximum delay; never disable scans permanently.
 
@@ -249,6 +249,6 @@ application transactions. Object storage remains the only shared dependency.
   undiscovered indefinitely.
 - **Make writers pay cleanup debt or wait for queue space.** This violates
   writer independence. Unlimited GC concurrency also risks delaying writers.
-- **Require durable publication of every cleanup hint.** Surviving a failure
+- **Require durable publication of every GC hint.** Surviving a failure
   between mutation and publication would require a larger transaction-protocol
   change. Local hints plus scans keep that obligation off the commit path.
