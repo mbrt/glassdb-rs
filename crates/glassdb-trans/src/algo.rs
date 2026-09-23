@@ -700,7 +700,7 @@ impl Algo {
     ///
     /// [`Retry`]: TransError::Retry
     async fn commit_readonly(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
-        // Read-only commit has no mutation receipt; this barrier separates the
+        // Read-only commit has no CAS receipt; this barrier separates the
         // completed body from the physical observations that certify it.
         let barrier = self.timeline.currentness_barrier();
         if self

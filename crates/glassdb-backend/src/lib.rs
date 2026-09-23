@@ -1,7 +1,7 @@
 //! Object-storage backend abstraction (ADR-016, ADR-023, ADR-042).
 //!
 //! A [`Backend`] is a small, content-CAS-only contract over an object store:
-//! reads (plain and revision-conditional), conditional writes and deletion, and
+//! reads (plain and revision-conditional), CASes and conditional deletes, and
 //! list. Coordination state lives entirely in object **content**; there are no
 //! metadata tags. Every object carries an opaque [`Revision`] (the provider's
 //! ETag or generation), which is the only token used for conditional reads and

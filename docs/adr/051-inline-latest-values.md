@@ -215,8 +215,8 @@ they are not part of the initial path.
   status or an external value must be guided by the tagged current state or by a
   lock, not by the writer ID alone.
 - Direct commit retains ADR-009's user-visible in-doubt outcome and makes
-  post-dispatch cancellation potentially committed, as any abandoned direct
-  conditional write must be.
+  post-dispatch cancellation potentially committed, as any abandoned direct CAS
+  must be.
 - Thresholds and budgets require benchmarks that measure saved read operations
   against leaf size, CAS latency, split rate, and cache pressure.
 

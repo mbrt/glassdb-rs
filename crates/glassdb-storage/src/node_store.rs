@@ -1,7 +1,7 @@
 //! Typed persistence for B-link tree nodes.
 //!
 //! Tree roots (`_r`) and standalone nodes (`_n/<token>`) are the coordination
-//! units. Mutations use create-if-absent, revision-conditional compare-and-swap,
+//! units. Mutations use create-if-absent, revision-conditional replace,
 //! or exact-revision deletion (ADR-023/ADR-031/ADR-042), all through the decoded
 //! [`CachedStore`].
 
@@ -297,9 +297,7 @@ impl NodeStore {
         };
         let res = match expected {
             Some(observed) if observed.path() == &path => {
-                self.nodes
-                    .compare_and_swap(observed, Arc::new(node.clone()))
-                    .await
+                self.nodes.replace(observed, Arc::new(node.clone())).await
             }
             Some(_) => return Err(StorageError::other("node observation path changed")),
             None => self.nodes.create(path, None, Arc::new(node.clone())).await,
@@ -327,11 +325,7 @@ impl NodeStore {
         if expected.path() != path {
             return Err(StorageError::other("node observation path changed"));
         }
-        match self
-            .nodes
-            .compare_and_swap(expected, Arc::new(node.clone()))
-            .await
-        {
+        match self.nodes.replace(expected, Arc::new(node.clone())).await {
             Ok(CasResult::Applied(receipt)) => Ok(Some(receipt.into_installed())),
             Ok(CasResult::Rejected) | Err(StorageError::NotFound) => Ok(None),
             Err(error) => Err(error),
@@ -434,10 +428,7 @@ impl NodeStore {
     /// Compare-and-swaps a leaf edit, retaining proof of the successful mutation.
     pub async fn commit_leaf(&self, edit: LeafEdit) -> Result<CasResult<Node>, StorageError> {
         let LeafEdit { observation, node } = edit;
-        let result = self
-            .nodes
-            .compare_and_swap(&observation, Arc::new(node))
-            .await;
+        let result = self.nodes.replace(&observation, Arc::new(node)).await;
         match result {
             Ok(result) => Ok(result),
             Err(StorageError::NotFound) => Ok(CasResult::Rejected),

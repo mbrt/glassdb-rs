@@ -133,7 +133,7 @@ handled explicitly rather than assumed away.
 
 ### Victim restart
 
-A wounded transaction's record is durably set to `aborted` via a conditional write
+A wounded transaction's record is durably set to `aborted` via a CAS
 (`Monitor::wound_tx`), so both the local victim and any other database instance
 observe the abort. `Algo::commit` surfaces this as `TransError::Wounded`
 (checked at the top of each commit round and when the final record write fails,

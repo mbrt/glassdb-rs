@@ -333,7 +333,7 @@ impl CollectionStore {
     ) -> Result<bool, StorageError> {
         match self
             .records
-            .compare_and_swap(expected, Arc::new(record.clone()))
+            .replace(expected, Arc::new(record.clone()))
             .await
         {
             Ok(CasResult::Applied(_)) => Ok(true),

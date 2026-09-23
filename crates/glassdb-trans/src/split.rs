@@ -281,7 +281,7 @@ impl StructuralNodeAccess {
                 node.set_leaf(LeafBody::from_entries(entries.into_values()))?;
             }
             node.set_locks(locks);
-            // The CAS receipt is the gated state itself. A re-read reports
+            // The CAS receipt holds the gated state itself. A re-read reports
             // whatever revision this database knows of by then, which the caller
             // would then pair with the body it gated.
             if let Some(gated) = self.store_structural_node(&node, &observation).await? {
@@ -4329,7 +4329,7 @@ mod tests {
         assert_eq!(recovered_coordination.topology_participants().count(), 0);
     }
 
-    /// Controls a hook that rejects conditional writes to the tree root.
+    /// Controls a hook that rejects CASes of the tree root.
     struct RootWriteBlocker {
         blocked: std::sync::atomic::AtomicBool,
     }

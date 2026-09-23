@@ -20,7 +20,7 @@ acquire before sorted serial acquisition.
 In v1 the `Locker` wrapped every per-**key** lock/unlock request in
 `glassdb_concurr::Dedup`: concurrent requests for the same key **merged** (a
 shared-read batch, or a lock coalesced with an unlock) or **queued**, and a
-single per-key worker drove the conditional writes. N transactions read-locking
+single per-key worker drove the CASes. N transactions read-locking
 one key therefore cost **one** backend operation, not N — the deduplication win.
 
 The v2 engine ([ADR-017](017-shard-object.md), [ADR-020](020-commit-write-back-protocol.md))

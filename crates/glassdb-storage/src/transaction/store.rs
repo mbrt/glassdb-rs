@@ -133,17 +133,13 @@ impl TxRecordStore {
         expected: &Observation<TxRecord>,
     ) -> Result<Observation<TxRecord>, StorageError> {
         let current = expected.value().ok_or_else(|| {
-            StorageError::other("transaction record CAS requires a present value")
+            StorageError::other("transaction record replace requires a present value")
         })?;
         validate_lifecycle_transition(Some(current.status), Some(l.status))?;
         let ts = l.timestamp.unwrap_or_else(rt::system_now);
         let mut persisted = l.clone();
         persisted.timestamp = Some(ts);
-        match self
-            .records
-            .compare_and_swap(expected, Arc::new(persisted))
-            .await?
-        {
+        match self.records.replace(expected, Arc::new(persisted)).await? {
             CasResult::Applied(receipt) => Ok(receipt.into_installed()),
             CasResult::Rejected => Err(StorageError::Precondition),
         }

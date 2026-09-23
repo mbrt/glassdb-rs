@@ -23,7 +23,7 @@ pub(crate) struct LockedDirectories {
 }
 
 impl LockedDirectories {
-    /// Consumes the receipt into durable lock records.
+    /// Converts the acquired directory locks into durable lock records.
     pub(crate) fn into_durable_locks(self) -> Vec<TxLock> {
         self.locks
     }

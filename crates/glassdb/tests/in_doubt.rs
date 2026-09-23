@@ -1,11 +1,11 @@
 //! Regression tests for the in-doubt (unknown-outcome) commit contract.
 //!
 //! Object storage (S3/GCS) offers no at-most-once request id: if a conditional
-//! write's first attempt lands but its acknowledgement is lost, a retry — at any
-//! layer (the SDK, a proxy, the service) — observes a precondition failure that
-//! is indistinguishable from a genuine rejection. A backend reports such an
-//! in-doubt conditional write as [`BackendError::Unavailable`] rather than a
-//! confident `Precondition`.
+//! mutation's first attempt lands but its acknowledgement is lost, a retry — at
+//! any layer (the SDK, a proxy, the service) — observes a precondition failure
+//! that is indistinguishable from a genuine rejection. A backend reports such an
+//! in-doubt mutation as [`BackendError::Unavailable`] rather than a confident
+//! `Precondition`.
 //!
 //! In v2 every commit point is a CAS on a coordination object whose durable
 //! state disambiguates the outcome, so the engine recovers most in-doubt
@@ -37,16 +37,16 @@
 //! accept the uncertainty.
 //!
 //! These tests drive that contract deterministically with a [`HookBackend`],
-//! a small middleware that wraps every conditional write in a `before`/`after`
-//! pair (see [`Before`]/[`After`]): a `before` hook may short-circuit the op
-//! *without* applying it (a clean `Precondition`, or an `Unavailable` for a
-//! write that never landed), while an `after` hook sees the *landed* result and
-//! may transform it (turn an `Ok` into `Unavailable`, modelling a lost ack) and
-//! run async side effects. A normal in-memory backend never produces
-//! `Unavailable`, so the harness injects it. To exercise direct commit's one
-//! irreducible in-doubt an `after` hook can interpose a genuine competing
-//! transaction at the instant a lost-ack write lands, rather than forging any
-//! protocol state.
+//! a small middleware that wraps every conditional mutation in a
+//! `before`/`after` pair (see [`Before`]/[`After`]): a `before` hook may
+//! short-circuit the op *without* applying it (a clean `Precondition`, or an
+//! `Unavailable` for a write that never landed), while an `after` hook sees the
+//! *landed* result and may transform it (turn an `Ok` into `Unavailable`,
+//! modelling a lost ack) and run async side effects. A normal in-memory backend
+//! never produces `Unavailable`, so the harness injects it. To exercise direct
+//! commit's one irreducible in-doubt an `after` hook can interpose a genuine
+//! competing transaction at the instant a lost-ack write lands, rather than
+//! forging any protocol state.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -557,7 +557,7 @@ async fn local_write_recovers_after_an_unconfirmed_commit_landed() {
 /// It recovers by reading the record status back. The record is keyed by
 /// transaction identity, and only this database instance writes `committed` under it.
 /// Thus, a final `committed` status is its own landed write and resolves to a
-/// commit outcome. Reading instead of issuing the conditional write again
+/// commit outcome. Reading instead of issuing the CAS again
 /// keeps the commit point driven exactly once. Thus, no extra body execution
 /// widens the window in which GC could reclaim the very record the engine
 /// needs to read (ADR-057).
@@ -603,7 +603,7 @@ async fn locked_commit_lost_ack_recovers_transparently() {
     assert_eq!(read_int(&coll.read(b"b").await.unwrap().unwrap()), 1);
 
     // The commit point is driven exactly once — the lost-ack write itself.
-    // Anything above one would mean the engine re-issued the conditional write
+    // Anything above one would mean the engine re-issued the CAS
     // instead of recognizing its own landed record by reading the status back.
     assert_eq!(
         committed_record_writes.load(Ordering::SeqCst),

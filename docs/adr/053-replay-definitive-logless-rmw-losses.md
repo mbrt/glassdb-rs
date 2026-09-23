@@ -140,7 +140,7 @@ durable effects is sufficient to replay it.
 - The engine must classify non-landing reasons precisely. A classification that
   is too broad can livelock; one that is too narrow retains avoidable locked
   fallbacks.
-- Cross-database contention still relies on backend conditional writes for
+- Cross-database contention still relies on backend CASes for
   arbitration. This decision removes a local phase transition rather than
   introducing distributed serialization.
 - ADR-051's direct-commit in-doubt behavior and user-visible error contract do

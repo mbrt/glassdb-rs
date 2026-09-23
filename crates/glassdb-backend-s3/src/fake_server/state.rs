@@ -125,7 +125,7 @@ impl ObjectStore {
         // Like real S3, the ETag of a (non-multipart) object is derived from its
         // content: identical bytes yield an identical ETag, and any content
         // change yields a new one. This is what makes ADR-023's nonce removal
-        // safe — the body itself drives the CAS token.
+        // safe — the body itself drives the revision.
         let etag = content_etag(&request.body);
         objects.insert(
             request.key.to_string(),

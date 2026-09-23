@@ -53,7 +53,7 @@ For a physical path, the discoverable cache state is one of:
 
 | State | Meaning |
 | --- | --- |
-| Present | A decoded value, its opaque backend CAS revision, and evidence about when that state was current. |
+| Present | A decoded value, its opaque backend revision, and evidence about when that state was current. |
 | Absent | Definitive evidence that the object did not exist. |
 | No entry | No usable knowledge; the path is uncached or in doubt. |
 
@@ -121,7 +121,7 @@ rechecks the cache after the earlier operation finishes.
 
 The duration-based requirement derives a cutoff from an elapsed duration for
 stale reads. That duration-to-sequence conversion is intentionally an
-approximate cache policy. Transaction validation, mutation receipts, and
+approximate cache policy. Transaction validation, CAS receipts, and
 recovery use exact sequence barriers without doing time arithmetic.
 
 ### Decisions from `ANY` reads
@@ -223,8 +223,8 @@ its own barrier.
 ## Observations
 
 Every successful read or mutation establishes an observation of one exact
-state. Reads and deletes return that observation directly; conditional creates
-and compare-and-swaps return a receipt that retains it. An observation contains:
+state. Reads and deletes return that observation directly; CASes return a
+receipt that retains it. An observation contains:
 
 - the physical path;
 - a shared decoded value, or absence;
@@ -254,10 +254,10 @@ interval since its read: a content revision can recur after an intervening
 change. The CAS advances the expected observation's watermark to its invocation
 point and returns a receipt that retains the installed state.
 
-## Conditional mutation receipts
+## CAS receipts
 
 `CachedStore` reports a mutation as applied only after a definitive successful
-conditional create or compare-and-swap.
+CAS.
 
 The receipt retains the installed observation, expected revision, and immutable
 invocation point, without the replaced body. For a conditional create, no

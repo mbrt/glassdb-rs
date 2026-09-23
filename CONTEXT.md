@@ -166,7 +166,7 @@ The transaction identity whose commit produced the current state of one logical 
 _Avoid_: Version, writer token, value version
 
 **Direct commit**:
-A commit that validates and publishes all point accesses of one transaction with one conditional mutation of one leaf, without locks or a transaction record.
+A commit that validates and publishes all point accesses of one transaction with one CAS of one leaf, without locks or a transaction record.
 _Avoid_: Logless commit, same-leaf commit
 
 **Locked commit**:
@@ -229,19 +229,27 @@ A durable change that stops earlier work from publishing more effects, even if t
 The opaque token that identifies one content state of one stored object. It does not order states.
 _Avoid_: Version, backend version, CAS token, generation, ETag
 
+**Conditional mutation**:
+A backend change of one stored object that takes effect only if its precondition holds: a CAS or a conditional delete. A conditional delete also succeeds when the object is already absent, so it is not a CAS.
+
+**CAS**:
+A conditional mutation that creates or replaces one stored object only if its current state is the expected state: absence or an exact revision. An applied CAS shows that the expected state was current when the CAS took effect.
+_Avoid_: Conditional write
+
 **Applied mutation**:
-A conditional backend mutation known to have taken effect on one stored object. This does not establish that the installed state is still current.
+A conditional mutation known to have taken effect on one stored object. This does not establish that the installed state is still current.
 _Avoid_: Committed mutation
 
-**Mutation receipt**:
-The proof of one applied mutation: its precondition, its invocation point, and an observation of the state that it installed. It does not prove that the precondition stayed current after the read.
+**CAS receipt**:
+The evidence that one applied CAS returns. It shows that the expected state was current at or after the invocation point of the CAS, and it holds an observation of the installed state. It does not show that either state was current at another time.
+_Avoid_: Mutation receipt
 
 **Rejected mutation**:
-A conditional backend mutation that did not take effect because its precondition was false.
+A conditional mutation that did not take effect because its precondition was false.
 _Avoid_: Conflict, precondition failure
 
 **In-doubt mutation**:
-A conditional backend mutation whose result does not show whether it took effect.
+A conditional mutation whose result does not show whether it took effect.
 _Avoid_: Indeterminate, ambiguous, or uncertain mutation
 
 ## Currentness
@@ -259,7 +267,7 @@ The sequence point allocated immediately before one backend operation starts. Th
 _Avoid_: Invocation watermark
 
 **Observation**:
-An exact observed state of one stored object, with a currentness watermark after which that state was known to be current. It does not prove that the state is current now.
+The exact state of one stored object, or its absence, as a read returned it or an applied mutation installed it, with its currentness watermark. It does not prove that the state is current now.
 
 **Currentness watermark**:
 The sequence point an observation carries, after which its state was known to be current. It is allocated before the read or mutation that produced the observation, so it states nothing about the state after that operation.
@@ -314,7 +322,7 @@ _Avoid_: Index key, boundary key
 ## Leaf coordination
 
 **Coordinator round**:
-One group of operations coordinated by one database instance for one leaf until the group completes. A round can require multiple mutation attempts.
+One group of operations coordinated by one database instance for one leaf until the group completes. A round can require multiple CASes.
 _Avoid_: Fold round, CAS (when referring to the whole round)
 
 **Round member**:
@@ -322,7 +330,7 @@ One operation from one transaction identity in a coordinator round, with its own
 _Avoid_: Fold member
 
 **Mutation plan**:
-The proposed state of one leaf and the round members' outcomes for one mutation attempt. A plan does not prove that a backend mutation took effect.
+The proposed state of one leaf and the round members' outcomes, which at most one CAS publishes. A plan does not prove that its CAS took effect.
 _Avoid_: Fold, fold plan
 
 ## Structural changes

@@ -189,7 +189,7 @@ creation to affect the live tree or transaction state.
 ADR-036's `read_stale` remains an approximate cache policy only. It may use a
 monotonic elapsed-time sample to derive an explicitly approximate
 `SequencePoint` cutoff, but duration-to-sequence conversion is confined to that
-API. Causal validation, mutation receipts, and recovery never perform time
+API. Causal validation, CAS receipts, and recovery never perform time
 arithmetic. Snapshot reads are expected to supersede `read_stale` for real
 bounded-staleness guarantees.
 

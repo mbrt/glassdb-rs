@@ -15,8 +15,8 @@ under delay or cancellation: an old request can overwrite a state created by a
 later protocol step. Unconditional delete has the same problem when a path is
 deleted and subsequently reused.
 
-GlassDB already retains opaque object revisions for validation and conditional
-writes. S3 and GCS also support deleting the current object only when its
+GlassDB already retains opaque object revisions for validation and CASes. S3 and
+GCS also support deleting the current object only when its
 [ETag](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-deletes.html)
 or
 [generation](https://docs.cloud.google.com/storage/docs/request-preconditions)

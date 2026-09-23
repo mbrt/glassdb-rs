@@ -89,7 +89,7 @@ impl StructuralIntentStore {
     ) -> Result<Option<Observation<StructuralIntent>>, StorageError> {
         match self
             .structural_intents
-            .compare_and_swap(expected, Arc::new(intent.clone()))
+            .replace(expected, Arc::new(intent.clone()))
             .await
         {
             Ok(CasResult::Applied(receipt)) => Ok(Some(receipt.into_installed())),

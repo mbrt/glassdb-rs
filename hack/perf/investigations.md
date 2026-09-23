@@ -12,7 +12,7 @@ This file is evidence, not a record of accepted behavior:
 ## 2026-08-21: root-leaf structural-gate coordinator rationale
 
 Status: implemented through the typed coordinator interface. A deterministic
-regression proves one root read and one conditional write. No retained benchmark
+regression proves one root read and one CAS. No retained benchmark
 compares contention or latency between the two acquisition paths.
 
 ### Finding
@@ -67,7 +67,7 @@ The retained performance evidence does not justify the bypass:
 
 A coordinated root leaf reuses the root load that classifies the node. The
 regression records one coordinator submission and round, one physical root
-read, and one conditional write.
+read, and one CAS.
 
 ### Remaining performance guardrail
 

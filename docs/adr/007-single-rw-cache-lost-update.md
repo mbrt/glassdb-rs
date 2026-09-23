@@ -37,9 +37,9 @@ the *guessed* value bytes paired with the *real* writer ID.
 That produces a poisoned cache entry: value bytes from one writer, writer tag
 from a newer writer. A later single-RW commit on that key validates with
 `checkReadVersionUnlocked`, which trusts the entry because its writer tag matches
-the live `last-writer` — even though the value is stale. The conditional write
-then succeeds and clobbers the newer value: a lost update, and a strict
-serializability violation.
+the live `last-writer` — even though the value is stale. The CAS then succeeds
+and clobbers the newer value: a lost update, and a strict serializability
+violation.
 
 Wound-wait (ADR-002) did not introduce the bug but made it far more frequent: the
 extra aborts and restarts under contention multiply the number of times a

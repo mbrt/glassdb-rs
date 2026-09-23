@@ -78,8 +78,8 @@ for an older pending holder, wounds a younger one, help-forwards a committed
 holder, and removes an aborted holder. It does not install the gate while any
 holder can still perform a later rewrite of that node.
 
-Gate installation and ordinary node mutation use the same backend conditional
-write boundary. For a mutation `M` and gate installation `G` on one node:
+Gate installation and ordinary node mutation use the same backend CAS boundary.
+For a mutation `M` and gate installation `G` on one node:
 
 - if `M` lands first, `G` loses its precondition, reloads the node, and
   reconciles `M`'s holder; and
@@ -97,12 +97,12 @@ gated follow-on, and the shrink CAS remains the split's linearization point.
 
 ### Converge delayed write-back explicitly
 
-A write-back using a pre-gate observation cannot mutate a gated node: its
-conditional write either precedes gate installation or fails. After reloading,
-it may finish without another write only when routing and the current node state
-prove that its holder is gone, because successful gate acquisition has already
-resolved it. A holder that is still present must be resolved normally; it is
-not silently discarded.
+A write-back using a pre-gate observation cannot mutate a gated node: its CAS
+either precedes gate installation or fails. After reloading, it may finish
+without another write only when routing and the current node state prove that
+its holder is gone, because successful gate acquisition has already resolved it.
+A holder that is still present must be resolved normally; it is not silently
+discarded.
 
 This rule makes late write-back converge after help-forwarding while preventing
 a committed value from being lost merely because a gate appeared. It applies

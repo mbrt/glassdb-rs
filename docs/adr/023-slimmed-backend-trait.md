@@ -125,13 +125,13 @@ Writes return the new `Revision`; `read` / `read_if_modified` return contents pl
 The CAS sites of the v2 protocol — pending-object create
 (`write_if_not_exists`), the shard/root lock CAS, the commit-flip CAS, the
 write-back CAS (all `write_if`), and the wound/abort CAS — inherit
-[ADR-009](009-in-doubt-conditional-writes.md) verbatim: an in-doubt conditional
-write whose outcome cannot be confirmed is reported as `Unavailable`, never as a
-confident `Precondition`. The S3 backend's conditional-`PutObject` classification
-loop is unchanged; only its tag/nonce handling is removed. `read_if_modified` is
-an idempotent read, so a transient failure stays freely retryable (`Unavailable`)
+[ADR-009](009-in-doubt-conditional-writes.md) verbatim: an in-doubt CAS whose
+outcome cannot be confirmed is reported as `Unavailable`, never as a confident
+`Precondition`. The S3 backend's conditional-`PutObject` classification loop is
+unchanged; only its tag/nonce handling is removed. `read_if_modified` is an
+idempotent read, so a transient failure stays freely retryable (`Unavailable`)
 and is never in-doubt. The ADR-009 per-backend obligation table shrinks to its
-conditional-write rows.
+CAS rows.
 
 ### Per-backend simplification
 

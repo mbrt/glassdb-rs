@@ -451,7 +451,7 @@ mod tests {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let fb = FaultBackend::new(mem, 7, fault_only_options());
         fb.set_active(true);
-        // With max intensity, some conditional writes are faulted within a few
+        // With max intensity, some CASes are faulted within a few
         // dozen attempts.
         let mut faults = 0;
         for i in 0..200 {

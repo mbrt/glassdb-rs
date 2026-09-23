@@ -19,7 +19,7 @@ to minimize object kinds and let a small collection use that object directly as
 its only leaf. Transactional collection management has since added directory
 coordination and topology-lifecycle state to the same object.
 
-The two parts now have independent responsibilities but share a CAS revision
+The two parts now have independent responsibilities but share a revision
 and size limit. A key mutation in a root leaf conflicts with a collection
 metadata mutation, even though their logical fields are disjoint. The combined
 representation also requires storage, routing, coordination, splitting, and
@@ -67,7 +67,7 @@ domains while remaining part of one transaction.
 
 ## Consequences
 
-- Collection metadata and root-leaf data no longer share a CAS revision or
+- Collection metadata and root-leaf data no longer share a revision or
   object-size budget.
 - Every key-bearing leaf has one node representation and mutation path.
   Collection metadata does not need to be preserved while rewriting a leaf.

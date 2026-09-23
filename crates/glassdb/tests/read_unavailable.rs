@@ -1,7 +1,7 @@
 //! Regression tests for transient read unavailability.
 //!
-//! A read is side-effect-free, so unlike a conditional write it can always be
-//! retried safely (ADR-009). The engine therefore retries an in-doubt
+//! A read is side-effect-free, so unlike a conditional mutation it can always
+//! be retried safely (ADR-009). The engine therefore retries an in-doubt
 //! (`Unavailable`) read in place with backoff, recovering a transient backend
 //! outage transparently; a sustained outage surfaces as the dedicated
 //! [`Error::Unavailable`] (never the in-doubt [`Error::InDoubt`], which concerns

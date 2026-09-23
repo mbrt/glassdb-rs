@@ -14,7 +14,7 @@ use glassdb_data::ObjectPath;
 use super::ObjectKey;
 use crate::timeline::{CurrentnessBarrier, Requirement, SequencePoint};
 
-/// The cached store's opaque content-CAS token, wrapping the backend revision.
+/// The cached store's opaque content revision, wrapping the backend revision.
 ///
 /// Higher layers may retain, compare, and pass a revision (and, where recovery
 /// requires it, serialize the underlying backend revision), but do not interpret
@@ -44,7 +44,7 @@ impl Revision {
     }
 }
 
-/// The outcome of a conditional mutation (create or compare-and-swap).
+/// The outcome of a CAS (a conditional create or replace).
 #[derive(Debug)]
 pub enum CasResult<V> {
     /// The mutation definitively took effect; the receipt retains its precondition
@@ -71,7 +71,7 @@ impl<V> CasResult<V> {
     }
 }
 
-/// Proof of a successful conditional create or compare-and-swap.
+/// Proof of one applied CAS.
 ///
 /// Only the storage mutation implementation may construct a receipt, after a
 /// definitive backend success. Reads, rejections, plans with no staged changes, and in-doubt

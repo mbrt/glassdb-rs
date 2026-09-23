@@ -68,16 +68,16 @@ Changed-state and error results cannot advance an old state's evidence.
 Eviction removes discoverable knowledge, not the historical facts retained by
 an observation. A requirement alone cannot supply evidence for an update.
 
-## E4: A CAS receipt proves one definitive mutation
+## E4: A CAS receipt proves one applied CAS
 
-An applied result confirms that one conditional backend mutation took effect. It
-does not establish a transaction commit or promise that the installed state
-remains current when the reply arrives.
+An applied result confirms that one CAS took effect. It does not establish a
+transaction commit or promise that the installed state remains current when the
+reply arrives.
 
-Only a successful backend conditional create or compare-and-swap may construct a
-receipt. Keep the expected revision, exact installed observation, and original
-invocation point bound to that mutation. Checking the installed state later
-cannot renew the precondition proof.
+Only an applied backend CAS may construct a receipt. Keep the expected revision,
+exact installed observation, and original invocation point bound to that
+mutation. Checking the installed state later cannot renew the precondition
+proof.
 
 Reads, failed or in-doubt mutations, and plans with no staged changes
 cannot become receipts. Conversion to the installed observation remains

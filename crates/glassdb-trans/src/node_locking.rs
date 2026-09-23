@@ -88,7 +88,7 @@ impl<'a> NodeLockReconciler<'a> {
     ///
     /// A live gate has priority over new traffic. A gate whose holder has a final status can be
     /// removed by this same CAS: if its structural write was still in flight,
-    /// only one of the two conditional writes can land.
+    /// only one of the two CASes can land.
     pub(crate) async fn admit_non_structural(
         &self,
         locks: &mut NodeLocks,

@@ -1,4 +1,4 @@
-# ADR-009: In-doubt conditional-write outcomes (`BackendError::InDoubt`)
+# ADR-009: In-doubt conditional-mutation outcomes (`BackendError::InDoubt`)
 
 ## Status
 
@@ -14,25 +14,25 @@ commit path always recovers an in-doubt record write — is refined by
 
 ## Context
 
-GlassDB builds atomic commits out of object-store compare-and-swap (CAS):
-conditional writes (`write_if`, `write_if_not_exists`, `set_tags_if`,
-`delete_if`) are the only tool for idempotency, because object storage offers
-**no at-most-once request identity**. That creates a fundamental ambiguity:
+GlassDB builds atomic commits out of object-store conditional mutations
+(`write_if`, `write_if_not_exists`, `set_tags_if`, `delete_if`): they are the
+only tool for idempotency, because object storage offers **no at-most-once
+request identity**. That creates a fundamental ambiguity:
 
-> If a conditional write's first attempt *lands* but its acknowledgement is
+> If a conditional mutation's first attempt *lands* but its acknowledgement is
 > *lost*, any retry observes a precondition failure (S3 `412`/`409`, GCS
 > `conditionNotMet`) that is **indistinguishable from a rejected mutation**.
 
 The deterministic fuzzer (ADR-008) made this concrete. Once its `NetBackend`
 modelled real object storage faithfully — at-least-once delivery, no dedup — a
-single-key increment could be applied twice (`final > started`): a conditional
-write landed, its ack was dropped, the retry saw a `Precondition`, the engine
-treated it as a rejected mutation and re-applied. The direct single-RW fast path
-(ADR-007) is the sharpest case: it keeps no transaction record, so the outcome
-cannot be reconstructed, and a *transparent, exactly-once* retry is impossible.
+single-key increment could be applied twice (`final > started`): a CAS landed,
+its ack was dropped, the retry saw a `Precondition`, the engine treated it as a
+rejected mutation and re-applied. The direct single-RW fast path (ADR-007) is
+the sharpest case: it keeps no transaction record, so the outcome cannot be
+reconstructed, and a *transparent, exactly-once* retry is impossible.
 
 The danger is not hypothetical to the simulator only — it depends on whether a
-backend **retries conditional writes and how it reports the result**:
+backend **retries conditional mutations and how it reports the result**:
 
 - **Amazon S3** wraps every call in the SDK's adaptive retryer
   (`RetryConfig::adaptive()`). A conditional `PutObject` whose first attempt
@@ -67,18 +67,18 @@ recover it on its own**:
    helpers at every layer, and is deliberately **not** classified as
    `retry`/`wounded`/`precondition`.
 
-2. **Backends own conditional-write retries and must report an in-doubt
+2. **Backends own conditional-mutation retries and must report an in-doubt
    outcome as `Unavailable`, never as a confident `Precondition`.** Concretely,
    a backend returns `Unavailable` when (a) it observes a precondition failure on
-   a conditional write *after an attempt whose outcome was in doubt* (a lost or
-   possibly-applied earlier attempt), or (b) it exhausts its retry budget.
+   a conditional mutation *after an attempt whose outcome was in doubt* (a lost
+   or possibly-applied earlier attempt), or (b) it exhausts its retry budget.
    Reads and unconditional (idempotent) writes are unaffected and may be retried
    freely.
 
 3. **The locked commit path retries `Unavailable` internally.** A transaction
    record is keyed by its tx id; only the owning database instance writes
    `committed`, and third parties only write to it to wound (status `aborted`).
-   The conditional write (`write_if_not_exists` / `write_if`) is therefore
+   The CAS (`write_if_not_exists` / `write_if`) is therefore
    idempotent across retries: as long as the record is not yet final, any race
    (our own `refresh_pending` advancing the pending record, a wound, or our own
    previously landed attempt) is safe to resolve by re-reading.
@@ -94,7 +94,7 @@ recover it on its own**:
 4. **Pre-commit operations recover `Unavailable` in place.** An in-doubt
    outcome while acquiring a *lock* happens before the commit point: no
    user-visible value has been made durable yet, so re-reading the lock
-   metadata reveals whether the conditional write took, and re-applying it is
+   metadata reveals whether the conditional mutation took, and re-applying it is
    idempotent. The locker therefore retries the lock operation itself on
    `Unavailable` (`LockerWorker::run` reloads metadata and re-attempts,
    exactly as it already does for a stale `Precondition`), resolving the
@@ -107,9 +107,9 @@ recover it on its own**:
 5. **The single-RW fast path first re-issues the idempotent CAS, then surfaces
    only the irreducible in-doubt.** The fast path is direct: its value write is
    the commit point. On an `Unavailable` outcome the engine re-issues the *same*
-   conditional write unchanged (same expected revision, same value). That write
-   is idempotent under its own precondition — no re-read is needed, the
-   precondition is what enforces "only when nothing changed":
+   CAS unchanged (same expected revision, same value). That write is idempotent
+   under its own precondition — no re-read is needed, the precondition is what
+   enforces "only when nothing changed":
    - it **lands** (`Ok`) only when the object is still at the expected revision
      (no writer changed it, so our earlier attempt did not land either): the
      value is applied exactly once and the transaction commits. This recovers
@@ -134,12 +134,12 @@ instead of being retried into a double-apply.
 
 ### Per-backend obligations
 
-| Backend | Conditional-write retry | In-doubt outcome → |
-|---------|-------------------------|---------------------|
+| Backend | Conditional-mutation retry | In-doubt outcome → |
+|---------|----------------------------|---------------------|
 | Memory  | n/a (local, atomic)     | cannot occur |
-| `FaultBackend` (sim) | lost-ack injection | a landed conditional write reported as `Unavailable` (modelling a lost acknowledgement) |
+| `FaultBackend` (sim) | lost-ack injection | a landed conditional mutation reported as `Unavailable` (modelling a lost acknowledgement) |
 | S3 | SDK retryer **disabled** for conditional `PutObject`; backend owns the loop | in-doubt attempt (timeout/dispatch/`5xx`) then `412` → `Unavailable`; budget exhaustion → `Unavailable` |
-| GCS | none (single attempt) | transport error or `5xx` on a conditional request → `Unavailable`; a clean `412`/`409` is a rejected mutation (GCS applies conditional writes atomically and we never retry, so it did not take effect) → `Precondition` |
+| GCS | none (single attempt) | transport error or `5xx` on a conditional request → `Unavailable`; a clean `412`/`409` is a rejected mutation (GCS applies conditional mutations atomically and we never retry, so it did not take effect) → `Precondition` |
 
 For S3, the backend now distinguishes attempt outcomes itself instead of
 delegating to the SDK retryer (which hides intermediate attempts): a `409`
@@ -173,7 +173,7 @@ the later absence of a record, so GC does not widen the in-doubt window.
 ### Regression tests for the contract
 
 - `crates/glassdb/tests/in_doubt.rs` — database/engine level. The `FaultBackend`
-  middleware injects a lost ack on a landed conditional write and asserts: the
+  middleware injects a lost ack on a landed CAS and asserts: the
   single-RW path surfaces `Unavailable` without double-applying (the re-issued
   CAS hits a real precondition because the earlier attempt landed); an in-doubt
   outcome on a write that did *not* land is recovered transparently by re-issuing

@@ -18,7 +18,7 @@ pub enum BackendOp<'a> {
         path: &'a str,
         expected: &'a Revision,
     },
-    /// A compare-and-swap object write.
+    /// A conditional replace of an object.
     WriteIf {
         path: &'a str,
         value: &'a [u8],

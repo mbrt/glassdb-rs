@@ -51,9 +51,9 @@ that it already uses for a wound:
 
 1. End the old identity. This closes admission and makes the identity final
    on the abort side before any replacement can publish. A dropped or timed-out
-   conditional write leaves an unresolved owner operation, so the existing end
-   path pins the identity as wounded. A completed conflict episode can be
-   acknowledged as aborted. If end fails, no replacement identity is created.
+   CAS leaves an unresolved owner operation, so the existing end path pins the
+   identity as wounded. A completed conflict episode can be acknowledged as
+   aborted. If end fails, no replacement identity is created.
 2. Begin again from the ended identity, preserving wound-wait priority.
 3. Enter sorted serial acquisition directly under the renewed identity.
 

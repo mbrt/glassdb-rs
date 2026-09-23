@@ -320,7 +320,7 @@ impl CachedStore {
     /// `value`. Success confirms the expected revision at the transition and
     /// returns a receipt of the installed state. It does not prove that
     /// the expected state was current throughout the interval since its read.
-    async fn cas<C: Codec>(
+    async fn replace<C: Codec>(
         &self,
         value: Arc<C::Value>,
         expected: &Observation<C::Value>,
@@ -332,7 +332,7 @@ impl CachedStore {
         let expected_revision = expected
             .revision
             .clone()
-            .ok_or_else(|| StorageError::other("CAS requires a present observation"))?;
+            .ok_or_else(|| StorageError::other("replace requires a present observation"))?;
         let expected_state = self
             .knowledge
             .expected_present(expected_revision.clone(), expected);
@@ -761,16 +761,18 @@ impl<C: Codec> TypedCachedStore<C> {
     }
 
     /// Conditionally replaces the exact observed revision.
-    pub(crate) async fn compare_and_swap(
+    pub(crate) async fn replace(
         &self,
         expected: &Observation<C::Value>,
         value: Arc<C::Value>,
     ) -> Result<CasResult<C::Value>, StorageError> {
         Self::check_path(&expected.key)?;
         if expected.revision().is_none() {
-            return Err(StorageError::other("CAS requires a present observation"));
+            return Err(StorageError::other(
+                "replace requires a present observation",
+            ));
         }
-        self.store.cas::<C>(value, expected).await
+        self.store.replace::<C>(value, expected).await
     }
 
     /// Deletes an exact present observation and caches the resulting absence.
@@ -1212,7 +1214,7 @@ mod tests {
         value: Arc<Vec<u8>>,
     ) -> Observation<Vec<u8>> {
         store
-            .compare_and_swap(expected, value)
+            .replace(expected, value)
             .await
             .unwrap()
             .into_receipt()
@@ -1295,7 +1297,7 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum MutationKind {
         Create,
-        Cas,
+        Replace,
         Delete,
     }
 
@@ -1303,7 +1305,7 @@ mod tests {
         fn operation(self) -> &'static str {
             match self {
                 Self::Create => "write_if_not_exists",
-                Self::Cas => "write_if",
+                Self::Replace => "write_if",
                 Self::Delete => "delete_if",
             }
         }
@@ -1312,7 +1314,7 @@ mod tests {
             matches!(
                 (self, operation),
                 (Self::Create, BackendOp::WriteIfNotExists { .. })
-                    | (Self::Cas, BackendOp::WriteIf { .. })
+                    | (Self::Replace, BackendOp::WriteIf { .. })
                     | (Self::Delete, BackendOp::DeleteIf { .. })
             )
         }
@@ -1380,8 +1382,8 @@ mod tests {
                 },
                 Err(error) => panic!("unexpected create result: {error:?}"),
             },
-            MutationKind::Cas => match store
-                .compare_and_swap(
+            MutationKind::Replace => match store
+                .replace(
                     expected.as_ref().expect("CAS case needs an observation"),
                     v(PROPOSED_VALUE),
                 )
@@ -1566,7 +1568,7 @@ mod tests {
         },
         MutationCase {
             name: "CAS applies from matching revision",
-            kind: MutationKind::Cas,
+            kind: MutationKind::Replace,
             knowledge: KnowledgeCase::Matching,
             completion: CompletionCase::Natural,
             result: ExpectedMutationResult::Applied,
@@ -1576,7 +1578,7 @@ mod tests {
         },
         MutationCase {
             name: "CAS rejection invalidates stale revision",
-            kind: MutationKind::Cas,
+            kind: MutationKind::Replace,
             knowledge: KnowledgeCase::Stale,
             completion: CompletionCase::Natural,
             result: ExpectedMutationResult::Rejected,
@@ -1586,7 +1588,7 @@ mod tests {
         },
         MutationCase {
             name: "CAS rejection preserves known winner",
-            kind: MutationKind::Cas,
+            kind: MutationKind::Replace,
             knowledge: KnowledgeCase::KnownWinner,
             completion: CompletionCase::Natural,
             result: ExpectedMutationResult::Rejected,
@@ -1596,7 +1598,7 @@ mod tests {
         },
         MutationCase {
             name: "CAS missing installs absence",
-            kind: MutationKind::Cas,
+            kind: MutationKind::Replace,
             knowledge: KnowledgeCase::Missing,
             completion: CompletionCase::Natural,
             result: ExpectedMutationResult::Rejected,
@@ -1606,7 +1608,7 @@ mod tests {
         },
         MutationCase {
             name: "CAS lost acknowledgement is in doubt",
-            kind: MutationKind::Cas,
+            kind: MutationKind::Replace,
             knowledge: KnowledgeCase::Matching,
             completion: CompletionCase::UnavailableAfterApply,
             result: ExpectedMutationResult::Unavailable,
@@ -1616,7 +1618,7 @@ mod tests {
         },
         MutationCase {
             name: "CAS definitive failure preserves expected revision",
-            kind: MutationKind::Cas,
+            kind: MutationKind::Replace,
             knowledge: KnowledgeCase::Matching,
             completion: CompletionCase::DefinitiveBeforeApply,
             result: ExpectedMutationResult::Definitive,
@@ -1626,7 +1628,7 @@ mod tests {
         },
         MutationCase {
             name: "cancelled invoked CAS is in doubt",
-            kind: MutationKind::Cas,
+            kind: MutationKind::Replace,
             knowledge: KnowledgeCase::Matching,
             completion: CompletionCase::CancelledAfterApply,
             result: ExpectedMutationResult::Cancelled,
@@ -2074,7 +2076,7 @@ mod tests {
     async fn queued_mutation_cancellation_protocol_matrix() {
         for kind in [
             MutationKind::Create,
-            MutationKind::Cas,
+            MutationKind::Replace,
             MutationKind::Delete,
         ] {
             let context = format!("queued {kind:?} cancellation");
@@ -2101,7 +2103,7 @@ mod tests {
                         MutationKind::Create => {
                             matches!(operation, BackendOp::Read { path } if *path == "p")
                         }
-                        MutationKind::Cas | MutationKind::Delete => matches!(
+                        MutationKind::Replace | MutationKind::Delete => matches!(
                             operation,
                             BackendOp::ReadIfModified { path, .. } if *path == "p"
                         ),
@@ -2213,7 +2215,7 @@ mod tests {
         },
         L2MutationCase {
             name: "L2 CAS applies from persisted revision",
-            kind: MutationKind::Cas,
+            kind: MutationKind::Replace,
             remote: L2RemoteCase::Matching,
             completion: CompletionCase::Natural,
             result: ExpectedMutationResult::Applied,
@@ -2222,7 +2224,7 @@ mod tests {
         },
         L2MutationCase {
             name: "L2 CAS rejection invalidates persisted stale revision",
-            kind: MutationKind::Cas,
+            kind: MutationKind::Replace,
             remote: L2RemoteCase::Stale,
             completion: CompletionCase::Natural,
             result: ExpectedMutationResult::Rejected,
@@ -2231,7 +2233,7 @@ mod tests {
         },
         L2MutationCase {
             name: "L2 CAS missing invalidates persisted revision",
-            kind: MutationKind::Cas,
+            kind: MutationKind::Replace,
             remote: L2RemoteCase::Missing,
             completion: CompletionCase::Natural,
             result: ExpectedMutationResult::Rejected,
@@ -2240,7 +2242,7 @@ mod tests {
         },
         L2MutationCase {
             name: "L2 CAS lost acknowledgement invalidates persisted revision",
-            kind: MutationKind::Cas,
+            kind: MutationKind::Replace,
             remote: L2RemoteCase::Matching,
             completion: CompletionCase::UnavailableAfterApply,
             result: ExpectedMutationResult::Unavailable,
@@ -2249,7 +2251,7 @@ mod tests {
         },
         L2MutationCase {
             name: "L2 CAS definitive failure preserves persisted revision",
-            kind: MutationKind::Cas,
+            kind: MutationKind::Replace,
             remote: L2RemoteCase::Matching,
             completion: CompletionCase::DefinitiveBeforeApply,
             result: ExpectedMutationResult::Definitive,
@@ -2258,7 +2260,7 @@ mod tests {
         },
         L2MutationCase {
             name: "L2 cancelled CAS invalidates persisted revision",
-            kind: MutationKind::Cas,
+            kind: MutationKind::Replace,
             remote: L2RemoteCase::Matching,
             completion: CompletionCase::CancelledAfterApply,
             result: ExpectedMutationResult::Cancelled,
@@ -2545,7 +2547,7 @@ mod tests {
         // A peer overwrites the object; s1's cache is unaware.
         replace_value(&s2, &obs, v(b"b")).await;
 
-        let r = s1.compare_and_swap(&obs, v(b"c")).await.unwrap();
+        let r = s1.replace(&obs, v(b"c")).await.unwrap();
         assert!(!r.is_applied(), "the stale CAS was rejected");
         clear(&log);
 
@@ -2613,7 +2615,7 @@ mod tests {
             .into_installed();
 
         replace_value(&s2, &obs, v(b"b")).await;
-        s1.compare_and_swap(&obs, v(b"c")).await.unwrap(); // rejection -> in doubt
+        s1.replace(&obs, v(b"c")).await.unwrap(); // rejection -> in doubt
 
         assert_eq!(obs.value().unwrap().as_slice(), b"a", "still inspectable");
 
@@ -2685,7 +2687,7 @@ mod tests {
         let before = s.store.timeline.now();
         let barrier = s.store.timeline.currentness_barrier();
         let receipt = s
-            .compare_and_swap(&obs, v(b"b"))
+            .replace(&obs, v(b"b"))
             .await
             .unwrap()
             .into_receipt()
@@ -2710,7 +2712,7 @@ mod tests {
         let expected = create_value(&store, "p", v(b"old")).await;
         let first_barrier = store.store.timeline.currentness_barrier();
         let receipt = store
-            .compare_and_swap(&expected, v(b"installed"))
+            .replace(&expected, v(b"installed"))
             .await
             .unwrap()
             .into_receipt()
@@ -2825,7 +2827,7 @@ mod tests {
         replace_value(&s2, &obs, v(b"b")).await;
 
         let before = s1.store.timeline.now();
-        let r = s1.compare_and_swap(&obs, v(b"c")).await.unwrap();
+        let r = s1.replace(&obs, v(b"c")).await.unwrap();
         assert!(!r.is_applied());
         assert!(
             obs.current_after() < before,
@@ -2867,7 +2869,7 @@ mod tests {
                 },
             )
         });
-        let err = s.compare_and_swap(&obs, v(b"b")).await.unwrap_err();
+        let err = s.replace(&obs, v(b"b")).await.unwrap_err();
         assert!(matches!(err, StorageError::Unavailable(_)));
         hook.clear_after();
 
@@ -2960,7 +2962,7 @@ mod tests {
 
         let barrier = store.store.timeline.currentness_barrier();
         let receipt = store
-            .compare_and_swap(&expected, v(b"b"))
+            .replace(&expected, v(b"b"))
             .await
             .unwrap()
             .into_receipt()
@@ -3819,7 +3821,7 @@ mod tests {
         let (first, _) = persistent_store(&directory, erased.clone()).await;
         let first_typed: TypedCachedStore<Bytes> = first.typed();
         let old = first_typed.read("p", Requirement::ANY).await.unwrap();
-        let changed = first_typed.compare_and_swap(&old, v(b"two")).await.unwrap();
+        let changed = first_typed.replace(&old, v(b"two")).await.unwrap();
         assert!(changed.is_applied());
         drop(first_typed);
         first.shutdown().await;

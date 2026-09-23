@@ -167,7 +167,7 @@ fn run_write_same(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
         let mut count = 0u64;
         while !bench.is_finished() {
             // Vary the content so each overwrite is a genuine state change,
-            // including on providers whose CAS token is content-derived.
+            // including on providers whose revision is content-derived.
             let data = random_data(1024);
             bench
                 .measure_once(|| async {
@@ -187,7 +187,7 @@ fn run_write_fail_pre(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
         let data = random_data(1024);
         let p = format!("{TEST_ROOT}/write-same");
         replace_or_create(b.as_ref(), &p, data.clone()).await?;
-        // A clearly-bogus revision so the conditional write always fails its
+        // A clearly-bogus revision so the CAS always fails its
         // precondition; the error is ignored, the latency is what we measure.
         let expected = Revision::new("0/0");
         while !bench.is_finished() {

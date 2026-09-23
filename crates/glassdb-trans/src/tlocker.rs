@@ -117,26 +117,26 @@ struct RoutedLockGroup {
 }
 
 /// Proof that one transaction holds all its requested locks on one leaf.
-struct LeafHoldReceipt {
+struct LeafHoldProof {
     evidence: CoordinationEvidence,
     held: HeldLeaf,
 }
 
-impl LeafHoldReceipt {
+impl LeafHoldProof {
     /// Returns the aggregate lock strengths held on the leaf.
     fn held(&self) -> HeldLeaf {
         self.held
     }
 }
 
-/// One routed group paired with the receipt that proves its locks are held.
+/// One routed group paired with the proof that its locks are held.
 /// Keeping these together prevents successful lock acquisition from later
 /// reconstructing commit and validation evidence from diagnostic bookkeeping.
 struct HeldLockGroup {
     path: ObjectPath,
     leaf: LeafRef,
     intents: Vec<KeyIntent>,
-    receipt: LeafHoldReceipt,
+    proof: LeafHoldProof,
 }
 
 /// The locks acquired through [`Locker::keys`]. Opaque to the caller: it carries
@@ -147,15 +147,17 @@ pub(crate) struct LockedTx {
 }
 
 impl LockedTx {
-    /// Pairs every routed group with its hold receipt for that path.
-    fn from_receipts(
+    /// Pairs every routed group with its hold proof for that path.
+    fn from_proofs(
         groups: BTreeMap<ObjectPath, RoutedLockGroup>,
-        mut receipts: BTreeMap<ObjectPath, LeafHoldReceipt>,
+        mut proofs: BTreeMap<ObjectPath, LeafHoldProof>,
     ) -> Result<Self, TransError> {
         let mut locked = BTreeMap::new();
         for (path, group) in groups {
-            let receipt = receipts.remove(&path).ok_or_else(|| {
-                TransError::other(format!("lock acquisition returned no receipt for {path}"))
+            let proof = proofs.remove(&path).ok_or_else(|| {
+                TransError::other(format!(
+                    "lock acquisition returned no hold proof for {path}"
+                ))
             })?;
             locked.insert(
                 path,
@@ -163,13 +165,13 @@ impl LockedTx {
                     path: group.path,
                     leaf: group.leaf,
                     intents: group.intents,
-                    receipt,
+                    proof,
                 },
             );
         }
-        if !receipts.is_empty() {
+        if !proofs.is_empty() {
             return Err(TransError::other(
-                "lock acquisition returned a receipt for an unknown leaf",
+                "lock acquisition returned a hold proof for an unknown leaf",
             ));
         }
         Ok(Self { groups: locked })
@@ -190,9 +192,9 @@ impl LockedTx {
         barrier: CurrentnessBarrier,
     ) -> bool {
         self.groups.get(observed.path()).is_some_and(|group| {
-            group.receipt.evidence.validates(observed, barrier)
+            group.proof.evidence.validates(observed, barrier)
                 && group
-                    .receipt
+                    .proof
                     .evidence
                     .installed()
                     .and_then(|installed| installed.value())
@@ -205,17 +207,17 @@ impl LockedTx {
     pub(crate) fn locked_paths(&self) -> Vec<TxLock> {
         let mut out = Vec::new();
         for group in self.groups.values() {
-            debug_assert_eq!(group.receipt.held().key_lock, key_lock_type(&group.intents));
+            debug_assert_eq!(group.proof.held().key_lock, key_lock_type(&group.intents));
             for intent in &group.intents {
                 out.push(TxLock::Key {
                     key: intent.key.clone(),
                     typ: lock_type(intent.desired),
                 });
             }
-            if group.receipt.held().membership != LockType::None {
+            if group.proof.held().membership != LockType::None {
                 out.push(TxLock::Membership {
                     leaf: group.leaf.clone(),
-                    typ: group.receipt.held().membership,
+                    typ: group.proof.held().membership,
                 });
             }
         }
@@ -464,8 +466,8 @@ impl LeafOperation for AcquireOperation {
                     membership,
                 };
                 evidence
-                    .map(|evidence| AcquireOutcome::Locked(LeafHoldReceipt { evidence, held }))
-                    .ok_or_else(|| TransError::other("lock round returned no hold receipt"))
+                    .map(|evidence| AcquireOutcome::Locked(LeafHoldProof { evidence, held }))
+                    .ok_or_else(|| TransError::other("lock round returned no hold proof"))
             }
             MemberOutcome::Wait(holder) => Ok(AcquireOutcome::Wait(holder)),
             MemberOutcome::LeafFull => Ok(AcquireOutcome::LeafFull),
@@ -767,7 +769,7 @@ enum WriteBackOutcome {
 }
 
 enum AcquireOutcome {
-    Locked(LeafHoldReceipt),
+    Locked(LeafHoldProof),
     Wait(TxId),
     Conflict,
     LeafFull,
@@ -935,14 +937,14 @@ pub(crate) enum LockOutcome {
 
 /// Outcome of acquiring locks across all touched leaves.
 enum LeafSetOutcome {
-    Locked(BTreeMap<ObjectPath, LeafHoldReceipt>),
+    Locked(BTreeMap<ObjectPath, LeafHoldProof>),
     Conflict,
     LeafFull,
 }
 
 /// Outcome of acquiring locks on a single leaf (after any hold-and-wait).
 enum LeafOutcome {
-    Locked(LeafHoldReceipt),
+    Locked(LeafHoldProof),
     Conflict,
     LeafFull,
 }
@@ -1048,17 +1050,15 @@ impl KeyLocker {
         scan_requirement: Requirement,
     ) -> Result<LockOutcome, TransError> {
         let groups = build_groups(&self.router, accesses, scan_requirement).await?;
-        let receipts = match self
+        let proofs = match self
             .lock_leaves_at(id, &groups, serial, scan_requirement)
             .await?
         {
-            LeafSetOutcome::Locked(receipts) => receipts,
+            LeafSetOutcome::Locked(proofs) => proofs,
             LeafSetOutcome::Conflict => return Ok(LockOutcome::Conflict),
             LeafSetOutcome::LeafFull => return Ok(LockOutcome::LeafFull),
         };
-        Ok(LockOutcome::Locked(LockedTx::from_receipts(
-            groups, receipts,
-        )?))
+        Ok(LockOutcome::Locked(LockedTx::from_proofs(groups, proofs)?))
     }
 
     /// Publishes current states and tombstones and releases this
@@ -1238,14 +1238,14 @@ impl KeyLocker {
             self.tmon.start_refresh_tx(id);
         }
 
-        let mut receipts = BTreeMap::new();
+        let mut proofs = BTreeMap::new();
         if serial {
             // Ascending leaf-path order is the global lock order: the BTreeMap
             // already iterates sorted by leaf path.
             for group in groups.values() {
                 match self.lock_leaf(id, group, requirement).await? {
-                    LeafOutcome::Locked(receipt) => {
-                        receipts.insert(group.path.clone(), receipt);
+                    LeafOutcome::Locked(proof) => {
+                        proofs.insert(group.path.clone(), proof);
                     }
                     LeafOutcome::Conflict => return Ok(LeafSetOutcome::Conflict),
                     LeafOutcome::LeafFull => return Ok(LeafSetOutcome::LeafFull),
@@ -1259,15 +1259,15 @@ impl KeyLocker {
             let outcomes = join_all_bounded(operations, self.parallelism).await;
             for (group, outcome) in groups.values().zip(outcomes) {
                 match outcome? {
-                    LeafOutcome::Locked(receipt) => {
-                        receipts.insert(group.path.clone(), receipt);
+                    LeafOutcome::Locked(proof) => {
+                        proofs.insert(group.path.clone(), proof);
                     }
                     LeafOutcome::Conflict => return Ok(LeafSetOutcome::Conflict),
                     LeafOutcome::LeafFull => return Ok(LeafSetOutcome::LeafFull),
                 }
             }
         }
-        Ok(LeafSetOutcome::Locked(receipts))
+        Ok(LeafSetOutcome::Locked(proofs))
     }
 
     /// Publishes a group and re-descends when a split moved any of its keys.
@@ -1392,7 +1392,7 @@ impl KeyLocker {
                     other => other,
                 });
             match coordinated? {
-                AcquireOutcome::Locked(receipt) => return Ok(LeafOutcome::Locked(receipt)),
+                AcquireOutcome::Locked(proof) => return Ok(LeafOutcome::Locked(proof)),
                 // Hold-and-wait (ADR-024): if the coordinated acquire reports
                 // [`AcquireOutcome::Wait`] — a key is held by a live holder this
                 // transaction cannot wound — it **waits** for that holder to
@@ -1660,7 +1660,7 @@ mod tests {
         locker: &Locker,
         id: &TxId,
         groups: &BTreeMap<ObjectPath, RoutedLockGroup>,
-    ) -> BTreeMap<ObjectPath, LeafHoldReceipt> {
+    ) -> BTreeMap<ObjectPath, LeafHoldProof> {
         lock_ok_at(locker, id, groups, Requirement::ANY).await
     }
 
@@ -1670,14 +1670,14 @@ mod tests {
         id: &TxId,
         groups: &BTreeMap<ObjectPath, RoutedLockGroup>,
         requirement: Requirement,
-    ) -> BTreeMap<ObjectPath, LeafHoldReceipt> {
+    ) -> BTreeMap<ObjectPath, LeafHoldProof> {
         match locker
             .keys()
             .lock_leaves_at(id, groups, false, requirement)
             .await
             .unwrap()
         {
-            LeafSetOutcome::Locked(receipts) => receipts,
+            LeafSetOutcome::Locked(proofs) => proofs,
             LeafSetOutcome::Conflict => panic!("expected lock acquisition to succeed"),
             LeafSetOutcome::LeafFull => panic!("expected leaf to have capacity"),
         }
@@ -1723,10 +1723,10 @@ mod tests {
         let one_key = group_of_intents(vec![put_intent(b"apple")]);
 
         log.lock().unwrap().clear();
-        let receipts = lock_ok(&locker, &tx, &one_key).await;
+        let proofs = lock_ok(&locker, &tx, &one_key).await;
         assert!(matches!(
-            receipts[&root_path()],
-            LeafHoldReceipt {
+            proofs[&root_path()],
+            LeafHoldProof {
                 evidence: CoordinationEvidence::Installed(_),
                 ..
             }
@@ -1734,10 +1734,10 @@ mod tests {
         assert_eq!(count_stores(&log, &path), 1);
 
         log.lock().unwrap().clear();
-        let receipts = lock_ok(&locker, &tx, &one_key).await;
+        let proofs = lock_ok(&locker, &tx, &one_key).await;
         assert!(matches!(
-            receipts[&root_path()],
-            LeafHoldReceipt {
+            proofs[&root_path()],
+            LeafHoldProof {
                 evidence: CoordinationEvidence::Observed(_),
                 ..
             }
@@ -1746,10 +1746,10 @@ mod tests {
 
         let two_keys = group_of_intents(vec![put_intent(b"apple"), put_intent(b"mango")]);
         log.lock().unwrap().clear();
-        let receipts = lock_ok(&locker, &tx, &two_keys).await;
+        let proofs = lock_ok(&locker, &tx, &two_keys).await;
         assert!(matches!(
-            receipts[&root_path()],
-            LeafHoldReceipt {
+            proofs[&root_path()],
+            LeafHoldProof {
                 evidence: CoordinationEvidence::Installed(_),
                 ..
             }
@@ -1778,15 +1778,15 @@ mod tests {
         log.lock().unwrap().clear();
         let installed = lock_ok_at(&locker, &tx, &groups, Requirement::after(installed_at)).await;
         assert_eq!(leaf_calls(), ["write_if"]);
-        let receipt = &installed[&root_path()];
+        let proof = &installed[&root_path()];
         assert!(matches!(
-            receipt,
-            LeafHoldReceipt {
+            proof,
+            LeafHoldProof {
                 evidence: CoordinationEvidence::Installed(_),
                 ..
             }
         ));
-        let CoordinationEvidence::Installed(receipt) = &receipt.evidence else {
+        let CoordinationEvidence::Installed(receipt) = &proof.evidence else {
             panic!("first acquisition must install its locks");
         };
         assert!(receipt.installed().is_current_after(installed_at));
@@ -1795,15 +1795,15 @@ mod tests {
         log.lock().unwrap().clear();
         let observed = lock_ok_at(&locker, &tx, &groups, Requirement::after(observed_at)).await;
         assert_eq!(leaf_calls(), ["read_if_modified"]);
-        let receipt = &observed[&root_path()];
+        let proof = &observed[&root_path()];
         assert!(matches!(
-            receipt,
-            LeafHoldReceipt {
+            proof,
+            LeafHoldProof {
                 evidence: CoordinationEvidence::Observed(_),
                 ..
             }
         ));
-        let CoordinationEvidence::Observed(observation) = &receipt.evidence else {
+        let CoordinationEvidence::Observed(observation) = &proof.evidence else {
             panic!("repeated acquisition must retain its read observation");
         };
         assert!(observation.is_current_after(observed_at));
@@ -1840,7 +1840,7 @@ mod tests {
         ctx.monitor.begin_tx(&tx);
         let barrier = ctx.timeline.currentness_barrier();
         log.lock().unwrap().clear();
-        let receipts = lock_ok_at(
+        let proofs = lock_ok_at(
             &locker,
             &tx,
             &group_of_intents(vec![put_intent(b"apple")]),
@@ -1856,7 +1856,7 @@ mod tests {
             .map(|op| op.op)
             .collect::<Vec<_>>();
         assert_eq!(calls, ["write_if", "read", "write_if"]);
-        let CoordinationEvidence::Installed(receipt) = &receipts[&root_path()].evidence else {
+        let CoordinationEvidence::Installed(receipt) = &proofs[&root_path()].evidence else {
             panic!("acquisition must install its locks after the conflict");
         };
         assert!(receipt.installed().is_current_after(barrier));
@@ -2262,8 +2262,8 @@ mod tests {
         let old = mk_tid(1, "old");
         ctx.monitor.begin_tx(&old);
         let old_groups = group_of(key, put_intent(key));
-        let old_receipts = lock_ok(&locker, &old, &old_groups).await;
-        let old_locked = LockedTx::from_receipts(old_groups, old_receipts).unwrap();
+        let old_proofs = lock_ok(&locker, &old, &old_groups).await;
+        let old_locked = LockedTx::from_proofs(old_groups, old_proofs).unwrap();
 
         // Younger contender blocks waiting for `old`.
         let young = mk_tid(2, "young");
@@ -2315,8 +2315,8 @@ mod tests {
         ctx.monitor.begin_tx(&tx);
 
         let groups = group_of(key, put_intent(key));
-        let receipts = lock_ok(&locker, &tx, &groups).await;
-        let locked = LockedTx::from_receipts(groups, receipts).unwrap();
+        let proofs = lock_ok(&locker, &tx, &groups).await;
+        let locked = LockedTx::from_proofs(groups, proofs).unwrap();
         // First writer of a fresh key overwrites no current state: no GC hint.
         let superseded = locker.keys().write_back(&tx, &locked).await;
         assert!(superseded.is_empty());
@@ -2925,7 +2925,7 @@ mod tests {
         (locker, ctx, log, gate)
     }
 
-    /// Counts the CAS stores (create or conditional write) issued against `path`.
+    /// Counts the CASes issued against `path`.
     fn count_stores(log: &OpLog, path: &str) -> usize {
         log.lock()
             .unwrap()
@@ -3186,9 +3186,9 @@ mod tests {
         let groups = groups_on_distinct_leaves(&ctx, 5).await;
         let tx = mk_tid(1, "tx");
         ctx.monitor.begin_tx(&tx);
-        let receipts = lock_ok(&locker, &tx, &groups).await;
+        let proofs = lock_ok(&locker, &tx, &groups).await;
         let paths: Vec<_> = groups.keys().cloned().collect();
-        let locked = LockedTx::from_receipts(groups, receipts).unwrap();
+        let locked = LockedTx::from_proofs(groups, proofs).unwrap();
         ctx.monitor.preempt_tx(&tx).await.unwrap();
         let locks = locked.locked_paths();
 
@@ -3233,8 +3233,8 @@ mod tests {
                 prev_writer: TxId::default(),
             })
             .collect();
-        let receipts = lock_ok(&locker, &tx, &groups).await;
-        let locked = LockedTx::from_receipts(groups, receipts).unwrap();
+        let proofs = lock_ok(&locker, &tx, &groups).await;
+        let locked = LockedTx::from_proofs(groups, proofs).unwrap();
         let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Committed);
         record.writes = writes;
         ctx.monitor.commit_tx(record).await.unwrap();
@@ -3411,8 +3411,8 @@ mod tests {
         use glassdb_storage::transaction::{TxRecord, TxWrite};
         ctx.monitor.begin_tx(tx);
         let groups = group_of(key, put_intent(key));
-        let receipts = lock_ok(locker, tx, &groups).await;
-        let locked = LockedTx::from_receipts(groups, receipts).unwrap();
+        let proofs = lock_ok(locker, tx, &groups).await;
+        let locked = LockedTx::from_proofs(groups, proofs).unwrap();
         let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Committed);
         record.writes = vec![TxWrite {
             key: logical_key(key),
@@ -3949,9 +3949,9 @@ mod tests {
     }
 
     // One coordinated round publishes every member's staged change in a single
-    // CAS (ADR-028), so a lock receipt proves only the state that round started
-    // from. A peer's create carried by that same CAS changes the leaf's
-    // membership, which ADR-032 condition (a) must still catch.
+    // CAS (ADR-028), so the receipt of the lock CAS proves only the state that
+    // round started from. A peer's create carried by that same CAS changes the
+    // leaf's membership, which ADR-032 condition (a) must still catch.
     #[tokio::test(start_paused = true)]
     async fn a_peer_create_in_one_round_cannot_certify_a_scan() {
         let (locker, ctx, log, gate) = gated_locker_with(false).await;
@@ -4004,7 +4004,7 @@ mod tests {
             peer_lock.await.unwrap().unwrap(),
             LeafSetOutcome::Locked(_)
         ));
-        let LeafSetOutcome::Locked(receipts) = scanner_lock.await.unwrap().unwrap() else {
+        let LeafSetOutcome::Locked(proofs) = scanner_lock.await.unwrap().unwrap() else {
             panic!("the scanner's read lock must be acquired");
         };
         assert_eq!(
@@ -4014,12 +4014,12 @@ mod tests {
         );
 
         let locked =
-            LockedTx::from_receipts(group_of(b"read", read_intent(b"read")), receipts).unwrap();
+            LockedTx::from_proofs(group_of(b"read", read_intent(b"read")), proofs).unwrap();
         assert!(
             locked
                 .groups
                 .values()
-                .any(|group| group.receipt.evidence.validates(&observed, barrier)),
+                .any(|group| group.proof.evidence.validates(&observed, barrier)),
             "the shared CAS started from exactly the observed leaf state"
         );
         assert!(

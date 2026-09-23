@@ -13,7 +13,7 @@ change affects and verify that the existing evidence guarantees still hold.
 
 - For decisions based on reads, check [the barrier rules](caching.md#currentness-barriers).
 - For conditional mutation or evidence changes, check the allowed and forbidden
-  transformations in [the cache guide](caching.md#conditional-mutation-receipts)
+  transformations in [the cache guide](caching.md#cas-receipts)
   and the [coordinator rules](caching.md#coordinator-mutation-evidence).
 
 ## Mechanism vs. policy

@@ -96,7 +96,7 @@ remain useful after that state is evicted or invalidated as the current cache
 entry: invalidation changes what a new read may use, but does not revoke the
 historical fact that the observed state was current after its watermark.
 
-`Revision` is the cached-store-owned opaque content-CAS token. Higher layers may
+`Revision` is the cached-store-owned opaque content revision. Higher layers may
 retain, compare, pass, and where recovery requires it serialize a revision, but
 do not interpret or manufacture one.
 
@@ -218,7 +218,7 @@ A successful CAS advances the retained precondition observation to the CAS
 start watermark. That receipt is propagated to later phases: lock acquisition
 uses it as physical read-validation evidence, and write-back uses it instead of
 sampling time or revalidating the just-installed leaf. Structural code likewise
-uses a successful lock or mutation receipt for post-CAS reloads and related
+uses a successful lock or other CAS receipt for post-CAS reloads and related
 tree walks. A receipt must not be replaced with a later `now()`: the later time
 would claim freshness the CAS did not establish.
 

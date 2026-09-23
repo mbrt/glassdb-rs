@@ -139,7 +139,7 @@ async fn single_rw_stale_read_renews_and_converges() {
     );
 }
 
-/// Controls a hook that gates the coordinator's next conditional write.
+/// Controls a hook that gates the coordinator's next CAS.
 struct Gate {
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,

@@ -3241,7 +3241,7 @@ async fn gc_release_merges_into_live_acquire_round() {
     );
 }
 
-/// Counts the CAS stores (conditional write / create) issued against `path`.
+/// Counts the CASes issued against `path`.
 fn count_stores(op_log: &glassdb_backend::middleware::OpLog, path: &str) -> usize {
     op_log
         .lock()

@@ -1991,7 +1991,7 @@ impl Monitor {
                 Ok(observed) => {
                     self.record_durable_observation(&tid, &observed);
                 }
-                // The create lost (object already exists) or the CAS revision
+                // The create lost (object already exists) or the revision
                 // moved under us. Re-read: a final status is a wound (or a race
                 // we lost) — stop and let the owner observe it; a still-pending
                 // status means we adopt its revision and keep refreshing.
@@ -2873,7 +2873,7 @@ mod tests {
         );
     }
 
-    /// Whether `operation` is the conditional write that flips a transaction
+    /// Whether `operation` is the CAS that flips a transaction
     /// record to `committed`, which is the commit point a lost acknowledgement
     /// puts in doubt.
     fn is_commit_write(operation: &BackendOp<'_>) -> bool {

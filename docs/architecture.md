@@ -397,7 +397,7 @@ The `Backend` trait defines the contract with object storage. It is an
 Six methods form a conditional-only surface
 ([ADR-042](adr/042-conditional-only-backend-mutations.md), refining
 [ADR-023](adr/023-slimmed-backend-trait.md)): read, revision-conditional read,
-compare-and-swap write, create-if-absent write, conditional delete, and
+conditional replace, create-if-absent write, conditional delete, and
 paginated prefix listing. Each maps to a primitive that S3 and GCS provide
 natively. All coordination state lives in object *content*, and every mutation
 names either absence or an exact content revision — there are no tags,
@@ -435,7 +435,7 @@ maps to a native conditional GET on every backend and lets a hot, unchanged
 object check its currentness without a body transfer
 ([ADR-023](adr/023-slimmed-backend-trait.md)).
 
-**Conditional operations.** Conditional writes and deletes name an expected
+**Conditional operations.** CASes and conditional deletes name an expected
 revision (or "must not exist") and fail if that state is no longer current. A
 missing object during a conditional delete is successful convergence. Content
 compare-and-swap is the only coordination primitive — the fundamental building
@@ -894,7 +894,7 @@ deterministic executor substitutes a simulated medium for filesystem I/O.
 ### Knowledge and causal evidence
 
 `CachedStore` stores only usable knowledge for a path: a decoded present value
-with its opaque CAS revision and currentness evidence, or definitive absence.
+with its opaque revision and currentness evidence, or definitive absence.
 Uncertainty is represented by the absence of a cache entry, so no ordinary
 lookup can accidentally reuse it. An observation may retain an exact historical
 state and its evidence after the shared cache entry has been evicted or
@@ -930,14 +930,14 @@ The capture points and forbidden transformations are stated in the
 [cache guide](guides/caching.md#currentness-barriers), and the type rules in the
 [storage evidence rules](guides/storage-consistency.md).
 
-Successful conditional creates and compare-and-swaps return a **receipt** that
-records the precondition, original invocation point, and exact installed state.
-A receipt proves that one conditional transition took effect; it does not prove
-that the installed state is still current, and a later read cannot renew its
-precondition proof. The leaf coordinator adds batch-member participation on top:
-a staged member receives the receipt only from the CAS that carried its changes,
-while a skipped member retains the loaded observation. See the
-[cache guide](guides/caching.md#conditional-mutation-receipts) and the
+Applied CASes return a **CAS receipt** that records the precondition, original
+invocation point, and exact installed state. A receipt proves that one
+conditional transition took effect; it does not prove that the installed state
+is still current, and a later read cannot renew its precondition proof. The leaf
+coordinator adds batch-member participation on top: a staged member receives the
+receipt only from the CAS that carried its changes, while a skipped member
+retains the loaded observation. See the
+[cache guide](guides/caching.md#cas-receipts) and the
 [coordinator rules](guides/caching.md#coordinator-mutation-evidence).
 
 ### Per-path operation ordering
@@ -1090,7 +1090,7 @@ Writers and revisions are kept separate (ADR-023):
 
 During validation, the algorithm detects concurrent modifications by comparing
 the observed writer against the current state; the revision conditions the
-conditional write that takes the lock.
+CAS that takes the lock.
 
 ## Garbage Collection
 
