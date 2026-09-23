@@ -5,15 +5,21 @@ by project area.
 
 ## Database access
 
+**Backend**:
+The object store, such as S3, GCS, or memory, that holds the stored objects of one or more databases. GlassDB reads and lists stored objects by path, and changes them only with conditional mutations.
+
 **Database**:
-The durable collections and protocol state that one backend stores under one database prefix. Its database ID identifies it: if its metadata is deleted and created again, the result is a different database with the same name.
+The durable collections, transaction records, and other protocol state that one backend stores under one database prefix. Its database ID identifies it: a database that is deleted and created again with the same name is a different database.
+
+**Database ID**:
+The identity of one database, created with the database. GlassDB never reuses it.
 
 **Database prefix**:
 The top-level object-path component under which one database stores all its objects. It is the validated database name.
 _Avoid_: Database root, DB root
 
 **Database instance**:
-A local runtime created by one successful database open. Cloned handles share that instance; separate opens create separate instances, including within one process.
+A local runtime created by one successful database open. Cloned database handles share that instance; separate opens create separate instances, including within one process.
 _Avoid_: Client
 
 ## Data model
@@ -34,7 +40,7 @@ _Avoid_: Database root
 The entry in a parent collection that maps one child name to one collection ID.
 
 **Collection record**:
-The object that holds one collection's child bindings, directory lock, topology participants, and topology freeze. Data-path operations do not read it.
+The stored object that holds one collection's child bindings, directory lock, topology participants, and topology freeze. Reads and writes of logical keys do not read it.
 
 **Collection handle**:
 A value that names one collection by its collection ID. It stays bound to that collection and becomes stale when the collection is dropped.
@@ -44,7 +50,7 @@ The removal of one collection and its binding. A drop is not recursive: a collec
 _Avoid_: Delete (which applies to logical keys)
 
 **Drop intent**:
-A claim on one node of a collection, held by the transaction identity that drops the collection. After the holder commits, every later access through the node reports the collection handle as stale.
+A claim on one node of a collection tree, held by the transaction identity that drops the collection. After the holder commits, every later access through the node reports the collection handle as stale.
 _Avoid_: Delete intent, drop fence, deletion fence
 
 **Logical key**:
@@ -53,8 +59,11 @@ _Avoid_: Object key, object path
 
 ## Transaction execution
 
+**Transaction**:
+A unit of work that a caller runs with one transaction operation, which executes a transaction body. Its staged changes commit together or not at all. It can run under more than one transaction identity and execute its body more than once, but at most one of its identities commits.
+
 **Transaction body**:
-The caller-supplied computation that stages transaction changes and returns a body outcome when it completes. GlassDB may execute it more than once.
+The caller-supplied computation that reads data, records the changes to commit (its staged changes), and returns a body outcome when it completes. GlassDB may execute it more than once.
 _Avoid_: Callback, user closure
 
 **Body replay**:
@@ -70,18 +79,21 @@ The point reads, final key writes, and range scans from one execution of a trans
 _Avoid_: Data, transaction data
 
 **Validation barrier**:
-The currentness barrier that one transaction allocates after its body and before validation. Validation rechecks the access set at or after it, so transaction body reads can accept any watermark.
+The currentness barrier that one transaction allocates after its body and before validation. Validation rechecks the access set at or after it, so transaction body reads can accept any currentness watermark.
 _Avoid_: Validation watermark, validation timestamp
 
 **Transaction identity**:
 A durable protocol identity that holds one transaction's claims and owns its status and recovery resources.
 _Avoid_: Lock owner ID, transaction attempt
 
+**Transaction owner**:
+The transaction operation in one database instance that runs a transaction identity. It refreshes the identity's lease and runs its owner operations. Other database instances know the identity only through its transaction record.
+
 **Engaged identity**:
 A transaction identity that started a locked commit or locked validation. It can have durable effects, so it must reach a final status.
 
 **Priority**:
-The wound-wait rank of a transaction identity. An older identity has priority: it can wound a younger holder, and a younger requester waits for an older holder. Identities with equal priority are not ordered.
+The wound-wait rank of a transaction identity, set when its transaction starts. An identity of an older transaction has priority over an identity of a younger one. Identities with equal priority are not ordered.
 
 **Identity renewal**:
 The replacement of a transaction identity with a new identity that keeps the same wound-wait priority. It does not by itself replay the transaction body or discard that body's access set and body outcome.
@@ -116,21 +128,21 @@ A transaction interruption caused by dropping the transaction future before it r
 _Avoid_: Explicit abort
 
 **Snapshot-transparent**:
-A body outcome that cannot expose an inconsistent snapshot because its reads are validated before it escapes.
+A body outcome that cannot expose an inconsistent snapshot, because GlassDB validates its reads before the caller receives it.
 
 **Cancellation-safe**:
-A transaction is cancellation-safe when cancellation cannot cause a partial logical commit or leave durable protocol resources without a recovery owner. It does not guarantee rollback.
+A transaction is cancellation-safe when cancellation cannot cause a partial logical commit or leave a durable protocol resource for which neither its owner nor recovery is responsible. It does not guarantee rollback.
 
 **Protocol-clean retirement**:
-The state in which an interrupted transaction can no longer publish new effects and every remaining durable resource has a recovery owner. Physical reclamation may complete later.
+The state in which an interrupted transaction can no longer publish new effects, and recovery is responsible for every remaining durable resource. Physical reclamation may complete later.
 _Avoid_: Immediate cleanup, complete deletion
 
 **Retirement handoff**:
-The synchronous transfer of responsibility for an interrupted transaction to managed recovery work before control leaves its owner. Protocol-clean retirement may follow asynchronously.
+The synchronous transfer of responsibility for an interrupted transaction from its owner to recovery, before control leaves the owner. Protocol-clean retirement may follow asynchronously.
 _Avoid_: Synchronous cleanup
 
 **Owner operation**:
-Protocol work that the owner of a transaction identity runs under that identity and that can still publish effects. Each commit pass is one owner operation. While one is active or unresolved, retirement cannot prove that the identity can publish nothing more.
+Protocol work that the transaction owner runs under one transaction identity and that can still publish effects. Each commit pass is one owner operation. While one is active or unresolved, the identity can still publish effects, so it cannot reach protocol-clean retirement.
 
 ## Commit
 
@@ -139,12 +151,15 @@ The durable record of one transaction identity. It holds the identity's status, 
 _Avoid_: Transaction log, transaction object, tx log, log object
 
 **Recovery manifest**:
-The part of a transaction record that lists the claims, collection changes, and prepared collections of its identity. Recovery and GC use it to find the identity's durable effects when the owner cannot.
+The part of a transaction record that lists the claims of its identity, the collections that it creates or drops, and the new collections whose stored objects it created before commit. Recovery and GC use it to find the identity's durable effects when the owner cannot.
 _Avoid_: Transaction manifest, lock intentions, back-references
 
 **Lease**:
 The time during which a pending transaction record shows that its owner is still active. The owner extends it by refreshing the record; after it expires, other transactions can wound the identity.
 _Avoid_: Lock lease, heartbeat
+
+**Transaction status**:
+The state of one transaction identity in its transaction record: pending, committed, wounded, or aborted. Only a pending identity can still commit.
 
 **Final status**:
 A transaction status that decides whether the identity commits: committed, wounded, or aborted. A wounded status can still change to aborted, but no final status can change to committed.
@@ -176,6 +191,9 @@ _Avoid_: Logless commit, same-leaf commit
 A commit that locks the access set, validates its reads, and then makes the transaction record committed.
 _Avoid_: Logged protocol, regular commit protocol, locked path
 
+**Validation**:
+The check that every point read in an access set still observes the same writer, and that every read of an absent key and every range scan still observes the same membership generation. GlassDB validates the reads before it commits or returns a body outcome.
+
 **Optimistic validation**:
 Validation of an access set before the transaction holds any lock.
 _Avoid_: Read-only fast path
@@ -184,7 +202,7 @@ _Avoid_: Read-only fast path
 Validation of an access set while the transaction holds its locks.
 
 **Invalidated read**:
-A read in an access set whose observed writer or observed key membership changed before validation. It causes a body replay.
+A read in an access set whose observed writer or observed membership generation changed before validation. It causes a body replay.
 _Avoid_: Validation conflict, read conflict, stale read
 
 **Write-back**:
@@ -209,19 +227,22 @@ Concurrent access to the same data by two transactions, where at least one of th
 **Lock**:
 A claim that a transaction takes on the data that it reads or writes. Wound-wait resolves conflicts between the holders of conflicting locks.
 
+**Wound-wait**:
+The rule that resolves a lock conflict by priority: a requester with priority over the holder wounds it, and a requester with lower or equal priority waits for the holder.
+
 **Key lock**:
 A lock on one logical key, recorded in the key's leaf entry. It can lock a key that has no current value.
 _Avoid_: Entry lock
 
 **Membership lock**:
-A lock on the set of logical keys in one leaf. Range scans hold it shared, and changes to the key set hold it exclusively.
+A lock on the key membership of one leaf. Range scans hold it shared, and changes to the key membership hold it exclusively.
 _Avoid_: Membership hold
 
 **Directory lock**:
 A lock on the child bindings in one collection record.
 
 **Serial acquisition**:
-Lock acquisition that locks the leaves of one transaction one at a time, in ascending leaf path order. This global order cannot deadlock, so a transaction switches to it under a renewed identity when parallel acquisition does not make progress.
+Lock acquisition that locks the leaves of one transaction one at a time, in ascending order of their stored-object paths. This global order cannot deadlock. A transaction locks its leaves in parallel by default, and switches to serial acquisition under a renewed identity when parallel acquisition does not make progress.
 _Avoid_: Serial locking, serial validation, serial mode
 
 **Wound**:
@@ -240,7 +261,7 @@ _Avoid_: Version, backend version, CAS token, generation, ETag
 A backend change of one stored object that takes effect only if its precondition holds: a CAS or a conditional delete. A conditional delete also succeeds when the object is already absent, so it is not a CAS.
 
 **CAS**:
-A conditional mutation that creates or replaces one stored object only if its current state is the expected state: absence or an exact revision. An applied CAS shows that the expected state was current when the CAS took effect.
+A conditional mutation that creates or replaces one stored object only if the object is in the expected state: absent, or at an exact revision. An applied CAS shows that the expected state was current when the CAS took effect.
 _Avoid_: Conditional write
 
 **Applied mutation**:
@@ -261,17 +282,20 @@ _Avoid_: Indeterminate, ambiguous, or uncertain mutation
 
 ## Currentness
 
-**Sequence point**:
-A point on one database-local timeline, which orders currentness evidence within one open database. It is neither wall time nor comparable across database instances.
-_Avoid_: Timestamp, epoch, logical clock
+**Currentness**:
+The property that a known state of one stored object is still its latest state in the backend. It is different from the current state of a logical key, which is the committed state in its leaf entry.
 
-**Currentness barrier**:
-A sequence point allocated to separate finished work from work not yet started: no operation that definitively completed before the allocation reaches it, and every operation invoked after it does.
-_Avoid_: Anchor, epoch, fresh read
+**Sequence point**:
+A point on the local timeline of one database instance, which orders currentness evidence within that instance. It is neither wall time nor comparable across database instances.
+_Avoid_: Timestamp, epoch, logical clock
 
 **Invocation point**:
 The sequence point allocated immediately before one backend operation starts. The operation takes effect at or after it.
 _Avoid_: Invocation watermark
+
+**Currentness barrier**:
+A sequence point allocated to separate finished work from work not yet started: every operation that definitively completed before the allocation has an earlier invocation point, and every operation invoked after the allocation has an invocation point at or after it.
+_Avoid_: Anchor, epoch, fresh read
 
 **Observation**:
 The exact state of one stored object, or its absence, as a read returned it or an applied mutation installed it, with its currentness watermark. It does not prove that the state is current now.
@@ -281,7 +305,7 @@ The sequence point an observation carries, after which its state was known to be
 _Avoid_: Anchor, observation timestamp, read watermark
 
 **Freshness requirement**:
-The rule a read applies to decide whether existing evidence can serve it: accept any watermark, or only a watermark that reached a stated bound. A reader states that bound as a currentness barrier.
+The rule a read applies to decide whether an existing observation can serve it: accept any currentness watermark, or only a watermark that reached a stated bound. A reader states that bound as a currentness barrier.
 _Avoid_: Consistency level, staleness policy
 
 **Stale read**:
@@ -306,11 +330,17 @@ A node that routes key ranges to child nodes through separators.
 _Avoid_: Interior node
 
 **Leaf**:
-A terminal node of a collection tree. In one exact state, it owns a contiguous logical-key range and is the physical mutation unit for that range.
+A terminal node of a collection tree. In one exact state, it owns a contiguous logical-key range, and every change of a key in that range is a CAS of the leaf.
 _Avoid_: Shard, leaf shard
 
+**Leaf entry**:
+The part of a leaf that holds the current state and key locks of one logical key.
+
+**Key membership**:
+The set of logical keys in one leaf whose current state is an inline or external value.
+
 **Membership generation**:
-A leaf counter that changes when a transaction changes, or can change, the set of logical keys in the leaf.
+A leaf counter that changes when a transaction changes, or can change, the key membership of the leaf.
 _Avoid_: Membership version
 
 **Routing**:
@@ -336,7 +366,7 @@ One group of operations coordinated by one database instance for one leaf until 
 _Avoid_: Fold round, CAS (when referring to the whole round)
 
 **Round member**:
-One operation from one transaction identity in a coordinator round, with its own mutation decision and outcome. Its leaf changes are admitted together or not at all.
+One operation from one transaction identity in a coordinator round, with its own proposed leaf changes and outcome. A mutation plan includes all of its leaf changes or none of them.
 _Avoid_: Fold member
 
 **Mutation plan**:
@@ -346,12 +376,15 @@ _Avoid_: Fold, fold plan
 ## Structural changes
 
 **Topology**:
-The nodes, separators, and links of one collection tree.
+The nodes, separators, and sibling links of one collection tree.
 _Avoid_: Tree shape
 
 **Structural change**:
 A change of the topology of one collection tree, such as a split.
 _Avoid_: Topology change
+
+**Split**:
+A structural change that moves the upper part of one node's key range into a new sibling node. A tree root instead splits in place into two new children.
 
 **Topology participant**:
 A transaction identity that a collection record lists while it can make structural changes to the collection tree.
@@ -362,16 +395,22 @@ The durable plan of one structural change, written by one topology participant. 
 _Avoid_: Structural log, structural record, topology intent
 
 **Structural gate**:
-An exclusive claim on one node that admits structural changes to that node. A release or a recovery fence must remove it before another structural change starts.
+An exclusive claim on one node that allows structural changes to that node. A release or a recovery fence must remove it before another structural change starts.
 _Avoid_: Structure lock, structure-write lock
 
 **Topology freeze**:
-A claim on a collection record, held by the transaction identity that prepares a drop of the collection. It admits no new topology participant, and the existing participants must complete or be recovered before the drop continues.
+A claim on a collection record, held by the transaction identity that prepares a drop of the collection. It allows no new topology participant, and the existing participants must complete or be recovered before the drop continues.
 
 ## Maintenance
 
+**Recovery**:
+Work that completes or reverts the durable effects of an interrupted operation from durable state alone, for example after a transaction owner stops.
+
+**GC**:
+Background work that reclaims the durable effects of transactions, and deletes the transaction records that no stored object names.
+
 **GC hint**:
-A local report that a transaction identity can have GC work. It makes the identity a GC candidate without a GC scan.
+A report within one database instance that a transaction identity can have GC work. It makes the identity a GC candidate without a GC scan.
 _Avoid_: Cleanup hint
 
 **GC candidate**:
@@ -387,11 +426,11 @@ The time after the last refresh of a transaction record during which GC keeps th
 _Avoid_: Cleanup horizon, sweep horizon, retention horizon, lease horizon, safety lease
 
 **Pinned wound**:
-A wounded transaction record that GC keeps until the owner proves retirement and changes it to aborted.
+A wounded transaction record that GC keeps until the owner proves protocol-clean retirement and changes it to aborted.
 _Avoid_: Pinned transaction marker, pinned wound marker
 
 **GC backlog**:
-Known GC work that is ready to run but has not completed. Retained live values, pinned wounds, and work awaiting its next permitted check do not by themselves constitute GC backlog.
+Known GC work that is ready to run but has not completed. Transaction records that stored objects still name, pinned wounds, and work that waits for its next permitted check are not GC backlog by themselves.
 _Avoid_: Cleanup backlog, transaction-object count, garbage count
 
 **GC scan**:
