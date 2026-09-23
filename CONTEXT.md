@@ -147,7 +147,7 @@ Protocol work that the transaction owner runs under one transaction identity and
 ## Commit
 
 **Transaction record**:
-The durable record of one transaction identity. It holds the identity's status, lease, and recovery manifest, and the committed values after commit.
+The durable record of one transaction identity. It holds the identity's status, lease, and recovery manifest, and the committed values after commit. The owner writes it only when the protocol needs it, so a holder can have no transaction record for a short time.
 _Avoid_: Transaction log, transaction object, tx log, log object
 
 **Recovery manifest**:
@@ -183,6 +183,9 @@ A current state that records that its writer deleted the key.
 The transaction identity whose commit produced the current state of one logical key.
 _Avoid_: Version, writer token, value version
 
+**Effective writer**:
+The writer that reads of one logical key observe: the committed holder of a write lock or create lock on the key, if one exists; otherwise the writer of the key's current state. The two are different only until the write-back of a committed transaction completes.
+
 **Direct commit**:
 A commit that validates and publishes all point accesses of one transaction with one CAS of one leaf, without locks or a transaction record.
 _Avoid_: Logless commit, same-leaf commit
@@ -191,8 +194,12 @@ _Avoid_: Logless commit, same-leaf commit
 A commit that locks the access set, validates its reads, and then makes the transaction record committed.
 _Avoid_: Logged protocol, regular commit protocol, locked path
 
+**Commit point**:
+The CAS that decides whether a transaction commits: in a locked commit, the CAS that makes its transaction record committed; in a direct commit, the leaf CAS. After it takes effect, the staged changes are committed, even if write-back has not run.
+_Avoid_: Commit flip
+
 **Validation**:
-The check that every point read in an access set still observes the same writer, and that every read of an absent key and every range scan still observes the same membership generation. GlassDB validates the reads before it commits or returns a body outcome.
+The check that every point read in an access set still observes the same effective writer, and that every read of an absent key and every range scan still observes the same membership generation. GlassDB validates the reads before it commits or returns a body outcome.
 
 **Optimistic validation**:
 Validation of an access set before the transaction holds any lock.
@@ -202,8 +209,12 @@ _Avoid_: Read-only fast path
 Validation of an access set while the transaction holds its locks.
 
 **Invalidated read**:
-A read in an access set whose observed writer or observed membership generation changed before validation. It causes a body replay.
+A read in an access set whose effective writer or membership generation changed before validation. It causes a body replay.
 _Avoid_: Validation conflict, read conflict, stale read
+
+**Locked replay**:
+A body replay after locked validation, under the same transaction identity, that keeps its key locks and membership locks. Other transactions cannot write the keys that it already locked, so their writes to those keys cannot cause another invalidated read.
+_Avoid_: Pessimistic fallback, pessimistic retry
 
 **Write-back**:
 The publication of a committed transaction's changes into the objects that it locked, together with the release of those locks.
@@ -230,9 +241,21 @@ A claim that a transaction takes on the data that it reads or writes. Wound-wait
 **Wound-wait**:
 The rule that resolves a lock conflict by priority: a requester with priority over the holder wounds it, and a requester with lower or equal priority waits for the holder.
 
+**Hold-and-wait**:
+The way that a lock requester waits for a holder under wound-wait: it keeps all the locks that it already holds, and it does not renew its identity or replay its body.
+
 **Key lock**:
 A lock on one logical key, recorded in the key's leaf entry. It can lock a key that has no current value.
 _Avoid_: Entry lock
+
+**Read lock**:
+A key lock that a transaction takes on a key that it reads. More than one transaction identity can hold it on the same key. Its sole holder can change it to a write lock or a create lock.
+
+**Write lock**:
+An exclusive key lock that a transaction takes to delete a key, or to write a value for a key in the key membership.
+
+**Create lock**:
+An exclusive key lock that a transaction takes to write a value for a key that is not in the key membership.
 
 **Membership lock**:
 A lock on the key membership of one leaf. Range scans hold it shared, and changes to the key membership hold it exclusively.
@@ -246,7 +269,7 @@ Lock acquisition that locks the leaves of one transaction one at a time, in asce
 _Avoid_: Serial locking, serial validation, serial mode
 
 **Wound**:
-The conditional change of a pending transaction record to wounded, usually by another transaction. After it, the identity can never commit.
+The conditional change of a transaction record from pending, or from absent, to wounded, usually by another transaction. After it, the identity can never commit.
 
 **Fence**:
 A durable change that stops earlier work from publishing more effects, even if that work is still running. A wound, for example, fences the owner of the wounded identity.
@@ -293,8 +316,14 @@ _Avoid_: Timestamp, epoch, logical clock
 The sequence point allocated immediately before one backend operation starts. The operation takes effect at or after it.
 _Avoid_: Invocation watermark
 
+**Definitive result**:
+A backend result that shows the outcome of one operation: the state or absence that a read found, or an applied or rejected mutation. A result that does not show the outcome, such as an in-doubt mutation or a failed read, is not definitive.
+
+**Path lane**:
+The admission rule that lets only one backend read or conditional mutation of one stored object run at a time within one database instance. An operation gets its invocation point after it enters the lane, and updates what the instance knows about the object before it leaves. Thus the order of invocation points agrees with the order of the operations in the backend.
+
 **Currentness barrier**:
-A sequence point allocated to separate finished work from work not yet started: every operation that definitively completed before the allocation has an earlier invocation point, and every operation invoked after the allocation has an invocation point at or after it.
+A sequence point allocated to separate finished work from work not yet started: every operation that returned a definitive result before the allocation has an earlier invocation point, and every operation invoked after the allocation has an invocation point at or after it.
 _Avoid_: Anchor, epoch, fresh read
 
 **Observation**:
@@ -303,6 +332,9 @@ The exact state of one stored object, or its absence, as a read returned it or a
 **Currentness watermark**:
 The sequence point an observation carries, after which its state was known to be current. It is allocated before the read or mutation that produced the observation, so it states nothing about the state after that operation.
 _Avoid_: Anchor, observation timestamp, read watermark
+
+**Revision-conditional read**:
+A read of one stored object that returns its state only if its revision is different from a known revision. Otherwise it shows that the known state was still current when the read took effect, and it does not transfer the object content.
 
 **Freshness requirement**:
 The rule a read applies to decide whether an existing observation can serve it: accept any currentness watermark, or only a watermark that reached a stated bound. A reader states that bound as a currentness barrier.

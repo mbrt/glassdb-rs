@@ -75,7 +75,7 @@ impl<V> CasResult<V> {
 ///
 /// Only the storage mutation implementation may construct a receipt, after a
 /// definitive backend success. Reads, rejections, plans with no staged changes, and in-doubt
-/// results must not be converted into receipts. Batch-member participation is
+/// results must not be converted into receipts. Round-member participation is
 /// separate from this storage proof and belongs to the coordinator.
 ///
 /// The expected revision identifies the precondition; `None` means absence for

@@ -519,19 +519,19 @@ comparisons with Postgres, Spanner, CockroachDB, and others — see the
  └────────┘ └───┬────┘
                 │
                 ▼
-           ┌─────────┐
-           │ Cleanup │  Async: write values back to keys, unlock, GC record
-           └─────────┘
+         ┌────────────┐
+         │ Write-back │  Async: publish values, release locks, schedule GC
+         └────────────┘
 ```
 
 During **Execute**, reads go through the cache and are tracked, and writes are
 staged in memory. No locks are held in this phase.
 
 During **Validate**, the algorithm acquires locks and checks that every
-observed writer still matches the current state. If any key was modified by a
-concurrent transaction, the current transaction replays the body — but
-crucially, it does so with locks still held, so the second pass is guaranteed
-to succeed (at most one body replay).
+observed writer is still the effective writer. If a concurrent transaction
+changed a read key, the current transaction does a **locked replay**: it replays
+the body while it keeps its locks, so the keys that it already locked cannot
+change again.
 
 After **Commit**, the transaction record is the durable commit point. The async
 write-back phase writes the new values back to keys, releases locks, and
@@ -567,8 +567,8 @@ When transactions _do_ conflict:
 
 1. Both reach the validate phase and try to lock overlapping keys.
 2. One wins the lock; the other detects a writer mismatch.
-3. The loser replays the body with its locks held (pessimistic fallback),
-   guaranteeing progress.
+3. The loser does a locked replay: it replays the body while it keeps its
+   locks, so a write to those keys cannot invalidate it again.
 
 ### Distributed Locks
 
@@ -625,13 +625,13 @@ foreground wait.
 | --------- | :-----------: | :--------------------: | :------------: | :-------------: |
 | Read      |       ✓       |           ✓            |      wait      |      wait       |
 | Write     |       ✓       | upgrade if sole holder |      wait      |      wait       |
-| Create    |       ✓       |          wait          |      wait      |      wait       |
+| Create    |       ✓       | upgrade if sole holder |      wait      |      wait       |
 
 - Multiple transactions can hold **read** locks simultaneously.
-- **Write** locks are exclusive. A read lock can be upgraded to write only if
-  the requesting transaction is the sole holder.
-- **Create** locks are used when a key doesn't yet exist, to prevent concurrent
-  creation.
+- **Write** and **create** locks are exclusive. A read lock can be upgraded to
+  either one only if the requesting transaction is the sole holder.
+- **Create** locks are used when a put targets a key outside the key
+  membership, to prevent concurrent creation.
 
 ### Transaction Records
 
@@ -664,12 +664,12 @@ The record is serialized as a Protocol Buffer and contains:
 
 The transaction record serves two critical purposes:
 
-1. **Atomic commit point.** A transaction is committed if and only if its
+1. **Atomic commit point.** A locked commit takes effect if and only if its
    record object exists with status "committed". All the multi-key writes become
    durable in a single object write.
 2. **Crash recovery synchronization.** Other transactions can inspect a record
-   to determine whether a lock holder is still active, and can attempt to abort
-   an expired transaction by conditionally writing to its record.
+   to determine whether a lock holder is still active, and can wound a holder
+   whose lease expired with a CAS of its record.
 
 ### Commit Protocol
 
@@ -678,7 +678,7 @@ The validate-and-commit sequence:
 1. **Parallel lock acquisition.** Lock all read and written keys in parallel,
    with a bound on the number of incomplete leaf operations. Conflicts are
    resolved by the wound-wait rule (see [Deadlock
-   Handling](#deadlock-handling)): an older transaction aborts younger holders,
+   Handling](#deadlock-handling)): an older transaction wounds younger holders,
    a younger one waits. A deadlock timeout falls back to serial acquisition only
    if contention prevents progress.
 
@@ -686,8 +686,8 @@ The validate-and-commit sequence:
    leaf observations. If a physical state changed, it resolves the complete
    logical point-read set. Validation with locks held always uses the logical
    path and treats the transaction's own exclusive holder as protection around
-   the predecessor state. If a read predicate changed, the transaction replays
-   the body with locks held.
+   the predecessor state. If a read predicate changed, the transaction does a
+   locked replay.
 
 3. **Write transaction record.** Write the record object atomically. After this
    point, the transaction is considered committed.
@@ -769,12 +769,12 @@ durable, because replaying against a generation change that was never stored
 would repeat the same failure. Cancellation before dispatch leaves no state,
 while cancellation after dispatch is crash-equivalent.
 
-#### Body replay with locks held
+#### Locked replay
 
-When a transaction fails validation, it replays the body with its locks still
-held. This means the second pass runs under pessimistic locking and is
-guaranteed to succeed — no further conflicts are possible. This bounds body
-replays to one per conflict.
+When locked validation finds an invalidated read, the transaction replays the
+body under the same identity and keeps its key locks and membership locks.
+Other transactions cannot write the keys that it already locked, so sustained
+writes to those keys cannot make the body replay without limit.
 
 #### Transaction interruption
 
@@ -802,7 +802,8 @@ conflicts with current holders:
   record gets a final status before the requester takes the lock. A foreign or
   in-doubt wound writes a pinned `Wounded` status; a Database with proof that
   its local victim has retired writes `Aborted` directly.
-- If the requester is **younger**, it **waits** for the holder to finish.
+- If the requester is **younger**, it **waits** for the holder to finish, and
+  keeps the locks that it already holds (**hold-and-wait**).
 
 Since an older transaction never waits for a younger one, the wait-for graph
 stays acyclic and no cycle can form. When `Algo` observes a wound, it ends and
@@ -846,7 +847,7 @@ this:
 4. **Local retirement handoff.** Cancellation, unwinding, and failed owner-side
    finalization keep the identity retirement guard armed. Its synchronous handoff removes
    process-local ownership from diagnostics and admits waited recovery before
-   control leaves the owner. A cleanup failure is diagnostic only; durable
+   control leaves the owner. A retirement failure is diagnostic only; durable
    wounds, leases, help-forward, and GC retain recovery ownership.
 
 ## Storage, Caching & Consistency
@@ -933,9 +934,9 @@ Applied CASes return a **CAS receipt** that records the precondition, original
 invocation point, and exact installed state. A receipt proves that one
 conditional transition took effect; it does not prove that the installed state
 is still current, and a later read cannot renew its precondition proof. The leaf
-coordinator adds batch-member participation on top: a staged member receives the
-receipt only from the CAS that carried its changes, while a skipped member
-retains the loaded observation. See the
+coordinator adds round-member participation on top: a staged round member
+receives the receipt only from the CAS that carried its changes, while a skipped
+round member retains the loaded observation. See the
 [cache guide](guides/caching.md#cas-receipts) and the
 [coordinator rules](guides/caching.md#coordinator-mutation-evidence).
 
@@ -974,8 +975,8 @@ narrow startup-only exception; it uses raw backend operations because it is
 created or validated once before normal concurrent access begins.
 
 Reconciliation is conservative and never guesses. A definitive outcome installs
-the exact observed or resulting state, a clean precondition failure invalidates
-only matching expected knowledge, and an in-doubt mutation removes all usable
+the exact observed or resulting state, a rejected mutation invalidates only
+matching expected knowledge, and an in-doubt mutation removes all usable
 knowledge for the path. Cancellation is part of the protocol: after
 mutation dispatch, a guard invalidates the entire path before releasing the lane,
 because the remote mutation may still take effect later. Read cancellation

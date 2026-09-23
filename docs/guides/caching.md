@@ -294,7 +294,7 @@ observation retained by a plan with no staged changes. Typed node storage
 preserves the storage receipt, and the coordinator retains it after successful
 persistence; it does not reconstruct it.
 
-The coordinator owns batch-member participation:
+The coordinator owns round-member participation:
 
 - A staged member may receive the receipt only from the CAS that carried its
   changes.

@@ -84,7 +84,7 @@ piece is wiring the conflict path to wait rather than abort.
 
 This ADR changes **only the conflict action and its supporting lifecycle**. The
 five-phase protocol, the shard-CAS lock step, wound-wait priority, the
-serial-sorted lock order, the commit flip, write-back, and the on-disk formats
+serial-sorted lock order, the commit point, write-back, and the on-disk formats
 are all unchanged from ADR-017–021. (Read-writer validation was later lifted out
 of the shard CAS into `Algo` — see "Read-writer validation lives in `Algo`,
 after locking" — but the lock CAS itself is otherwise as in ADR-020.)
@@ -313,7 +313,7 @@ the DST executor (ADR-008/013).
 
 Every CAS site keeps [ADR-009](009-in-doubt-conditional-writes.md): the lazy
 pending-record create (`write_if_not_exists`), the refresher CAS, the shard/root
-lock CAS, the wound/abort CAS, the commit flip, and write-back all recover an
+lock CAS, the wound/abort CAS, the commit point, and write-back all recover an
 `Unavailable` outcome in place by read-back and idempotent re-apply. Waiting adds
 no new CAS site — it only consumes a peer's status — so it introduces no new
 in-doubt case.
@@ -343,14 +343,13 @@ in-doubt case.
   exercise it unchanged.
 - The change is **localised to the conflict path and the transaction lifecycle**;
   no on-disk format, no proto, and no change to the shard lock CAS, the commit
-  flip, or write-back. (Read-writer validation was additionally lifted out of the
-  shard CAS into `Algo`, post-lock — see "Read-writer validation lives in `Algo`,
-  after locking" — leaving the locker a pure locking mechanism.) The dormant
-  `wait_for_tx` / `refresh_pending` machinery is
-  activated rather than newly built, and both the deadlock-timeout serial
-  fallback and CAS-contention retry are handled inside `Algo` (release + re-lock
-  under the same id) exactly as v1's `serial_validate` did, rather than surfaced
-  to the db retry loop.
+  point, or write-back. (Read-writer validation was additionally lifted out of
+  the shard CAS into `Algo`, post-lock — see "Read-writer validation lives in
+  `Algo`, after locking" — leaving the locker a pure locking mechanism.) The
+  dormant `wait_for_tx` / `refresh_pending` machinery is activated rather than
+  newly built, and both the deadlock-timeout serial fallback and CAS-contention
+  retry are handled inside `Algo` (release + re-lock under the same id) exactly
+  as v1's `serial_validate` did, rather than surfaced to the db retry loop.
 - After this ADR the v2 engine matches **v1's concurrency behaviour**; the only
   remaining difference from v1 is the lock **granularity** (per-shard entries vs.
   per-key objects), which is unchanged here.
