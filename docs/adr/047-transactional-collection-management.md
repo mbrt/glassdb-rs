@@ -4,7 +4,7 @@
 
 Accepted — implemented (`glassdb::Transaction` collection APIs,
 transaction-record collection manifests, root directory coordination, topology
-freeze participation, per-node delete intents, and asynchronous recovery/GC).
+freeze participation, per-node drop intents, and asynchronous recovery/GC).
 Topology participation and settlement are refined by
 [ADR-049](049-participant-owned-topology-intents.md).
 [ADR-050](050-separate-collection-record-and-tree-root.md) separates the
@@ -33,9 +33,9 @@ ADR-046 separates logical names from physical collection identity, but its
 independently implementable first stage still publishes a prepared root into
 one parent outside a database transaction. Creation cannot commit atomically
 with initial data, nested collection changes, or a future schema catalog, and
-there is no collection deletion operation.
+there is no collection drop operation.
 
-GlassDB needs collection creation, lookup, listing, and deletion to compose
+GlassDB needs collection creation, lookup, listing, and drop to compose
 atomically with data writes and with each other. This completes the
 transactional surface and provides the storage primitive a future SQL layer
 needs to transact schema-catalog changes together with their physical
@@ -72,7 +72,7 @@ let active = tx.create_collection(&users, b"active").await?;
 A transactional list is serializable and reflects the transaction's own
 creates and drops. A standalone list can become stale after it returns, like
 any query result, but a returned handle remains safe: it either accesses the
-listed incarnation or reports `StaleCollection`.
+listed collection or reports `StaleCollection`.
 
 Collection operations have read-your-writes semantics. In particular:
 
@@ -86,10 +86,10 @@ Collection operations have read-your-writes semantics. In particular:
   rejected initially.
 
 Strict create reports `AlreadyExists`. Create-if-absent returns the existing
-incarnation with `created = false`. Opening a missing name reports `NotFound`;
+collection with `created = false`. Opening a missing name reports `NotFound`;
 using an obsolete bound handle reports `StaleCollection`; dropping a collection
 with children reports `NotEmpty`. Invalid names, cross-database handles, and an
-attempt to drop the database root report `InvalidInput`.
+attempt to drop the root collection report `InvalidInput`.
 
 ### Transactional creation and directories
 
@@ -108,7 +108,7 @@ directory lookup.
 ### Drop and stale-handle fencing
 
 Drop compares the handle's direct parent entry with its exact `CollectionId`.
-It succeeds only when that incarnation is still bound there and has no child
+It succeeds only when that collection is still bound there and has no child
 collections in the transaction's logical view. User data need not be empty.
 There is no cascade or recursive drop.
 
@@ -119,10 +119,10 @@ excludes new participants, completes or recovers existing ones, and thereby
 prevents a new node from being published. Only structural and lifecycle
 operations pay this root-coordination cost; ordinary point operations do not.
 
-With topology frozen, drop enumerates the incarnation-unique prefix. For every
+With topology frozen, drop enumerates the collection-ID prefix. For every
 root, index, and leaf node, including extant temporarily unreachable structural
 nodes, it acquires ADR-044's structural gate, reconciles existing holders, and
-installs a collection-delete intent with a conditional node rewrite. The
+installs a drop intent with a conditional node rewrite. The
 structural gate can then be released; the intent itself prevents subsequent
 stable rewrites or structural-gate acquisition. Drop holds at most one
 structural gate at a time.
@@ -139,28 +139,29 @@ check:
 
 - a pending intent participates in normal wound-wait resolution;
 - an aborted intent may be helped away; and
-- a committed intent is a durable deletion fence and yields
+- a committed drop intent makes the node stale and yields
   `StaleCollection`.
 
 Only after every reachable or publishable node is fenced may the ordinary
 transaction commit. That one outcome makes both the parent-entry removal and
-every delete intent effective. A racing old transaction therefore either
+every drop intent effective. A racing old transaction therefore either
 serializes before the drop or conflicts; it cannot commit a write to the dropped
-incarnation afterward. Missing physical nodes after reclamation also mean
+collection afterward. Missing physical nodes after reclamation also mean
 `StaleCollection`, never an empty collection.
 
 Preparation is recoverable and may temporarily block already-fenced ranges if
-the client stops partway through. Aborting the transaction cancels the whole
-drop, and later operations may help clear its intents. Once committed, logical
-deletion is immediate. Physical reclamation later reads each remaining object
-and uses ADR-042's exact-revision conditional delete; a rejected mutation causes
-re-evaluation rather than deletion of an unobserved state. Now-unreachable value
-reclamation remains asynchronous under the existing GC protocol.
+the database instance stops partway through. Aborting the transaction cancels
+the whole drop, and later operations may help clear its intents. Once committed,
+logical drop is immediate. Physical reclamation later reads each remaining
+object and uses ADR-042's exact-revision conditional delete; a rejected mutation
+causes re-evaluation rather than deletion of an unobserved state.
+Now-unreachable value reclamation remains asynchronous under the existing GC
+protocol.
 
 `read_stale` is the deliberate exception to current-liveness validation. It may
 return pre-drop data within its requested staleness bound, even after drop has
-committed. If it observes the committed fence it fails, and it never aliases a
-replacement because collection IDs are not reused.
+committed. If it observes a committed drop intent it fails, and it never aliases
+a replacement because collection IDs are not reused.
 
 ### Relationship to other database models
 
@@ -170,7 +171,7 @@ replacement because collection IDs are not reused.
   fence deliberately provides the stronger stale-handle guarantee needed here.
 - [bbolt] creates and deletes buckets in ordinary transactions. Its bucket
   handles are transaction-scoped; GlassDB handles may outlive a transaction and
-  are therefore incarnation-bound instead.
+  are therefore collection-ID-bound instead.
 - [PostgreSQL system catalogs] are regular tables, and DDL such as `DROP TABLE`
   takes [strong table locks]. GlassDB follows that composable model: a future SQL
   layer can update its catalog records and collections in one transaction, with
@@ -192,7 +193,7 @@ replacement because collection IDs are not reused.
   `O(number of collection nodes)`, and abandoned preparation can cause temporary
   blocking. This moves work to rare destructive operations and keeps normal
   point operations free of a lifecycle-root read.
-- Logical deletion precedes physical reclamation, so dropped data may continue
+- Logical drop precedes physical reclamation, so dropped data may continue
   consuming storage until background cleanup completes.
 - Rename, move, collection metadata/options, recursive drop, and snapshot-read
   behavior remain out of scope.

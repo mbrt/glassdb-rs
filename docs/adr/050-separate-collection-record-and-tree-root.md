@@ -7,7 +7,7 @@ Accepted — implemented.
 This supersedes the ADR-031 and ADR-046 clauses that make `_i`
 both the collection record and the B-link tree root. The B-link topology,
 fixed-address root split, transactional collection semantics, and all-node
-deletion fencing remain unchanged.
+drop-intent installation remain unchanged.
 
 This changes the unreleased v2 layout in place. Development databases use the
 new format directly; there is no migration or compatibility fallback.
@@ -25,13 +25,13 @@ metadata mutation, even though their logical fields are disjoint. The combined
 representation also requires storage, routing, coordination, splitting, and
 lifecycle code to treat a root leaf differently from every other node.
 
-Collection creation, deletion, and root splits are rare, so this coupling is
+Collection creation, drop, and root splits are rare, so this coupling is
 not primarily a throughput concern. The stronger motivation is a stable
 boundary between collection control state and key coordination state.
 
 ## Decision
 
-Use separate fixed-path objects beneath each incarnation-addressed collection
+Use separate fixed-path objects beneath each ID-addressed collection
 prefix:
 
 ```text
@@ -50,8 +50,8 @@ existing in-place root-split protocol. Its path never changes and `_i` contains
 no root pointer.
 
 Key routing starts directly at `_r`. An ordinary point operation on an already
-resolved collection does not read `_i`; collection deletion remains visible
-through the delete intents installed on `_r` and every other node.
+resolved collection does not read `_i`; collection drop remains visible
+through the drop intents installed on `_r` and every other node.
 
 Transactional creation prepares both objects before publishing the parent
 directory binding. A visible binding therefore implies that the collection

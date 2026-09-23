@@ -451,10 +451,13 @@ impl PreparedCollectionRecoveryControl {
                                 && glassdb_storage::txrecord::status(value)
                                     .is_ok_and(|status| status == TxCommitStatus::Aborted) =>
                         {
-                            if let Ok(ObjectPath::Transaction { db_root, id }) =
+                            if let Ok(ObjectPath::Transaction { db_prefix, id }) =
                                 ObjectPath::try_from(*path)
-                                && let Ok(record) =
-                                    glassdb_storage::txrecord::decode(db_root.as_str(), &id, value)
+                                && let Ok(record) = glassdb_storage::txrecord::decode(
+                                    db_prefix.as_str(),
+                                    &id,
+                                    value,
+                                )
                             {
                                 control.armed.store(false, Ordering::SeqCst);
                                 retired =

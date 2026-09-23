@@ -5,7 +5,7 @@ use std::mem;
 use std::sync::{Arc, Mutex};
 
 use glassdb_concurr::{RetryConfig, rt};
-use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, StructuralIntentId, TxId};
+use glassdb_data::{CollectionAddress, DbPrefix, NodeToken, ObjectPath, StructuralIntentId, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
     CollectionStore, CurrentnessBarrier, LeafObservation, LockType, Node, NodeStore, Observation,
@@ -32,7 +32,7 @@ pub(super) struct StructuralRecovery {
     structural_nodes: StructuralNodeAccess,
     publisher: SeparatorPublisher,
     timeline: Timeline,
-    db_root: DbRoot,
+    db_prefix: DbPrefix,
     retry: RetryConfig,
     scan_cursor: Arc<Mutex<Option<glassdb_backend::ListCursor>>>,
 }
@@ -306,7 +306,7 @@ impl StructuralRecovery {
         structural_nodes: StructuralNodeAccess,
         publisher: SeparatorPublisher,
         timeline: Timeline,
-        db_root: DbRoot,
+        db_prefix: DbPrefix,
         retry: RetryConfig,
     ) -> Self {
         Self {
@@ -318,7 +318,7 @@ impl StructuralRecovery {
             structural_nodes,
             publisher,
             timeline,
-            db_root,
+            db_prefix,
             retry,
             scan_cursor: Arc::new(Mutex::new(None)),
         }
@@ -344,7 +344,7 @@ impl StructuralRecovery {
         let observed = self
             .intent_store
             .write(
-                collection.db_root_component(),
+                collection.db_prefix_component(),
                 &intent_id,
                 &StructuralIntent {
                     collection: collection.clone(),
@@ -742,7 +742,7 @@ impl StructuralRecovery {
         let cursor = self.scan_cursor.lock().unwrap().clone();
         let page = match self
             .intent_store
-            .discover_page(&self.db_root, cursor.as_ref(), recovery_start)
+            .discover_page(&self.db_prefix, cursor.as_ref(), recovery_start)
             .await
         {
             Ok(page) => page,
@@ -890,7 +890,7 @@ impl StructuralRecovery {
             let intents = self
                 .intent_store
                 .discover_for_participant(
-                    settlement.collection.db_root_component(),
+                    settlement.collection.db_prefix_component(),
                     &settlement.participant,
                     requirement,
                 )

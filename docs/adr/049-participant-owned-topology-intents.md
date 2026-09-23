@@ -22,7 +22,7 @@ remove it while the split continued and later created a node.
 
 ## Decision
 
-- A topology participant is a durable pending transaction with a topology lock
+- A topology participant is a durable pending transaction with a topology freeze
   back-reference.
 - Before registering in the collection root, it writes a `Preparing` structural
   intent under `_s/<participant-id>/<intent-id>`. The intent reserves every node

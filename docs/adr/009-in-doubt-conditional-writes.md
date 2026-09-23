@@ -76,20 +76,20 @@ recover it on its own**:
    freely.
 
 3. **The locked commit path retries `Unavailable` internally.** A transaction
-   record is keyed by its tx id; only the owning client writes `committed`, and
-   third parties only write to it to wound (status `aborted`). The conditional
-   write (`write_if_not_exists` / `write_if`) is therefore idempotent across
-   retries: as long as the record is not yet final, any race (our own
-   `refresh_pending` advancing the pending record, a wound, or our own previously
-   landed attempt) is safe to resolve by re-reading. `Monitor::set_final_log`
-   therefore retries on `Unavailable`; if a previous attempt actually landed,
-   the retry observes the existing record via `Precondition`, reads its commit
-   status, and treats a final status matching its own intent as success
-   (`committed==committed` is necessarily our own write; `aborted==aborted`
-   converges on the desired outcome regardless of who wrote it). A mismatched
-   final status (we wanted `committed` but found `aborted`) is still surfaced
-   as `AlreadyFinalized`, which the commit path maps to a wound. This recovery
-   is invisible to the caller.
+   record is keyed by its tx id; only the owning database instance writes
+   `committed`, and third parties only write to it to wound (status `aborted`).
+   The conditional write (`write_if_not_exists` / `write_if`) is therefore
+   idempotent across retries: as long as the record is not yet final, any race
+   (our own `refresh_pending` advancing the pending record, a wound, or our own
+   previously landed attempt) is safe to resolve by re-reading.
+   `Monitor::set_final_log` therefore retries on `Unavailable`; if a previous
+   attempt actually landed, the retry observes the existing record via
+   `Precondition`, reads its commit status, and treats a final status matching
+   its own intent as success (`committed==committed` is necessarily our own
+   write; `aborted==aborted` converges on the desired outcome regardless of who
+   wrote it). A mismatched final status (we wanted `committed` but found
+   `aborted`) is still surfaced as `AlreadyFinalized`, which the commit path
+   maps to a wound. This recovery is invisible to the caller.
 
 4. **Pre-commit operations recover `Unavailable` in place.** An in-doubt
    outcome while acquiring a *lock* happens before the commit point: no
@@ -190,4 +190,4 @@ record, so GC does not widen the in-doubt window.
   the backend must surface `Unavailable`.
 - The deterministic fuzzer (ADR-011, on the in-repo executor) is the system-level
   guard: with the `FaultBackend` lost-ack/fault injection it asserts
-  `acked <= final <= started` under injected faults and client crashes.
+  `acked <= final <= started` under injected faults and process crashes.

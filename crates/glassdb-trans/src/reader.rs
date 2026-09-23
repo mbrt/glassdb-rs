@@ -200,7 +200,7 @@ mod tests {
     use crate::engine::{AssemblyFixture, EngineConfig};
     use crate::key_state_resolver::KeyStateResolver;
     use glassdb_backend::memory::MemoryBackend;
-    use glassdb_data::{CollectionAddress, DbRoot, TxId};
+    use glassdb_data::{CollectionAddress, DbPrefix, TxId};
     use glassdb_storage::transaction::{TxRecord, TxWrite};
     use glassdb_storage::{CurrentState, LeafBody, LeafEntry, Node, TreeRouter};
     use std::num::NonZeroUsize;
@@ -211,12 +211,12 @@ mod tests {
             let backend = Arc::new(MemoryBackend::new());
             let local = AssemblyFixture::new(
                 backend.clone(),
-                DbRoot::try_from("db").unwrap(),
+                DbPrefix::try_from("db").unwrap(),
                 &EngineConfig::default(),
             );
             let peer = AssemblyFixture::new(
                 backend,
-                DbRoot::try_from("db").unwrap(),
+                DbPrefix::try_from("db").unwrap(),
                 &EngineConfig::default(),
             );
             let collection = CollectionAddress::root("db");

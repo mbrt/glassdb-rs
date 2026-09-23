@@ -33,7 +33,7 @@ pub struct StructuralIntent {
 }
 
 impl StructuralIntent {
-    /// Reports whether this intent splits the collection root.
+    /// Reports whether this intent splits the tree root.
     pub fn is_root(&self) -> bool {
         self.source_token.is_none()
     }
@@ -128,10 +128,10 @@ impl StructuralIntent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glassdb_data::{CollectionId, DbRoot};
+    use glassdb_data::{CollectionId, DbPrefix};
 
     fn collection() -> CollectionAddress {
-        CollectionAddress::from_db_root(DbRoot::try_from("db").unwrap(), CollectionId::root())
+        CollectionAddress::from_db_prefix(DbPrefix::try_from("db").unwrap(), CollectionId::root())
     }
 
     #[test]

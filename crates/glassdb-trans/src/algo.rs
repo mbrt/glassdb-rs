@@ -579,7 +579,7 @@ impl Algo {
                 Ok(())
             }
             // The commit point won before cleanup observed its result. Its
-            // collection objects and delete fences now belong to the committed
+            // collection objects and drop intents now belong to the committed
             // record and must be left for write-back/recovery.
             OwnerAbortOutcome::Committed => {
                 tx.commit();
@@ -1274,7 +1274,7 @@ mod tests {
     use glassdb_backend::{Backend, StatsBackend, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
     use glassdb_data::{
-        CollectionAddress, CollectionId, DatabaseId, DbRoot, LeafRef, NodeToken, ObjectPath,
+        CollectionAddress, CollectionId, DatabaseId, DbPrefix, LeafRef, NodeToken, ObjectPath,
     };
     use glassdb_storage::transaction::{TxCommitStatus, TxRecordStore};
     use glassdb_storage::{
@@ -1289,8 +1289,8 @@ mod tests {
         CollectionAddress::root(TEST_DB)
     }
 
-    fn test_db_root() -> DbRoot {
-        DbRoot::try_from(TEST_DB).unwrap()
+    fn test_db_prefix() -> DbPrefix {
+        DbPrefix::try_from(TEST_DB).unwrap()
     }
 
     pub(super) fn test_root_path() -> ObjectPath {
@@ -1353,9 +1353,9 @@ mod tests {
         config.set_cache_size(cache_bytes);
         config.set_split_policy(split_policy);
         config.set_protocol_timing(ProtocolTiming::simulation());
-        let foundation = AssemblyFixture::new(b.clone(), test_db_root(), &config);
+        let foundation = AssemblyFixture::new(b.clone(), test_db_prefix(), &config);
 
-        // Create the collection root so the test collection exists up front.
+        // Create the tree root so the test collection exists up front.
         foundation
             .records
             .create_record(&test_collection(), &CollectionRecord::new())
@@ -1367,7 +1367,7 @@ mod tests {
             .await
             .unwrap();
 
-        let engine = engine_fixture(&foundation, test_db_root(), config, managed_retirement);
+        let engine = engine_fixture(&foundation, test_db_prefix(), config, managed_retirement);
         let algo = engine.algo.clone();
         (
             algo,
@@ -1541,8 +1541,8 @@ mod tests {
     // Regression (review 1.1 / ADR-022): the committed transaction record must
     // record its full lock set, not just its writes, so GC's reverse liveness
     // check and lock pruning operate on real records. A transaction that reads one
-    // key and creates another records both entry locks plus the leaf's structure
-    // and membership scopes (ADR-032).
+    // key and creates another records both key locks plus the leaf's structural
+    // gate and membership scopes (ADR-032).
     #[tokio::test]
     async fn commit_records_locks() {
         let (tm, tctx) = new_algo().await;
@@ -1568,11 +1568,11 @@ mod tests {
             .await
             .unwrap();
         let record = record.value().unwrap();
-        assert!(record.locks.contains(&TxLock::Entry {
+        assert!(record.locks.contains(&TxLock::Key {
             key: readp,
             typ: LockType::Read,
         }));
-        assert!(record.locks.contains(&TxLock::Entry {
+        assert!(record.locks.contains(&TxLock::Key {
             key: writep,
             typ: LockType::Write,
         }));
@@ -1659,7 +1659,7 @@ mod tests {
             },
         );
         let id = handle.id().clone();
-        let lock = TxLock::Topology {
+        let lock = TxLock::TopologyFreeze {
             collection: test_collection(),
         };
         tm.mon
@@ -1783,7 +1783,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(root.collection_delete_intent(), None);
+        assert_eq!(root.drop_intent(), None);
         let (record, _) = tctx
             .records
             .load_record(&dropped, Requirement::ANY)
@@ -1832,7 +1832,7 @@ mod tests {
         commit_writes(&tm2, vec![wa(&kb, b"x1")]).await;
         let ra = do_read(&tctx, &ka).await;
 
-        // Another client overwrites `k`, making `ra` stale.
+        // Another database instance overwrites `k`, making `ra` stale.
         commit_writes(&tm2, vec![wa(&ka, b"v2")]).await;
 
         let external = vec![b'x'; InlinePolicy::default().max_value_bytes + 1];
@@ -1944,7 +1944,7 @@ mod tests {
         tm.end(&mut h).await.unwrap();
     }
 
-    // A database can contain an unsafe singleton written by an older client or
+    // A database can contain an unsafe singleton written by an older database instance or
     // admitted under a former policy. If capacity remains unavailable while the
     // splitter cannot relieve it, lock acquisition must report the bounded wait
     // instead of retrying forever.
@@ -2192,7 +2192,7 @@ mod tests {
         assert_eq!(outcome, BodyDecision::ReturnOutcome);
         assert_ne!(*h.id(), id_before);
         let status_objects = CachedStore::new(status_backend, 1024, Timeline::new(), None);
-        let status_records = TxRecordStore::new(status_objects.clone(), test_db_root());
+        let status_records = TxRecordStore::new(status_objects.clone(), test_db_prefix());
         let old_status = status_records
             .commit_status_at(&id_before, Requirement::ANY)
             .await
@@ -2253,8 +2253,8 @@ mod tests {
     #[derive(Debug, Default)]
     pub(super) struct WriteCounts {
         // Writes to a leaf coordination object (ADR-031): a standalone node
-        // `/_n/` or the collection root `/_r`, which holds the small collection's
-        // single leaf entries. Entry-lock and write-back CAS both land here and
+        // `/_n/` or the tree root `/_r`, which holds the small collection's
+        // single leaf entries. Key-lock and write-back CAS both land here and
         // cannot be told apart by path alone.
         pub(super) leaf: usize,
         pub(super) tx: usize,
@@ -2285,7 +2285,7 @@ mod tests {
     fn write_counts_parses_transaction_shard_named_like_node() {
         let id = TxId::from_bytes(vec![0x97, 0x30]);
         let path = ObjectPath::Transaction {
-            db_root: test_db_root(),
+            db_prefix: test_db_prefix(),
             id,
         }
         .to_string();
@@ -2714,7 +2714,7 @@ mod tests {
         let read = do_read(&tctx, &ka).await;
         let barrier = tctx.timeline.currentness_barrier();
 
-        // A separate client rewrites the shared leaf for B. Its cache is
+        // A separate database instance rewrites the shared leaf for B. Its cache is
         // independent, so it cannot advance the retained observation of A in
         // this database.
         let external_timeline = Timeline::new();
@@ -2834,7 +2834,7 @@ mod tests {
             .unwrap();
         let record = record.value().unwrap();
         for key in [ka, kb] {
-            assert!(record.locks.contains(&TxLock::Entry {
+            assert!(record.locks.contains(&TxLock::Key {
                 key,
                 typ: LockType::Read,
             }));
@@ -3107,7 +3107,7 @@ mod tests {
             .await
             .unwrap();
         let record = record.value().unwrap();
-        assert!(record.locks.contains(&TxLock::Entry {
+        assert!(record.locks.contains(&TxLock::Key {
             key: key_path,
             typ: LockType::Write,
         }));

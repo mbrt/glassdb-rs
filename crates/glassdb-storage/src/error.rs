@@ -22,7 +22,7 @@ pub enum StorageError {
     /// A key was not found in a committed transaction record.
     #[error("key not found in committed transaction")]
     KeyNotFound,
-    /// The addressed collection incarnation was durably deleted.
+    /// The addressed collection was dropped.
     #[error("stale collection handle")]
     StaleCollection,
     /// Any other storage error (parsing, invariant violations, etc.), with an
@@ -56,11 +56,11 @@ impl StorageError {
         }
     }
 
-    /// Classifies physical absence while addressing a collection incarnation.
+    /// Classifies physical absence while addressing a collection.
     ///
-    /// Non-root collection identities are never reused, so a missing physical
-    /// tree means the bound handle is stale. The permanent database root keeps
-    /// the ordinary not-found classification.
+    /// Non-root collection IDs are never reused, so a missing physical tree
+    /// means the bound handle is stale. The root collection keeps the ordinary
+    /// not-found classification.
     #[must_use]
     pub fn classify_collection_absence(self, collection: &CollectionAddress) -> Self {
         match self {
@@ -148,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn collection_absence_distinguishes_root_from_bound_incarnations() {
+    fn collection_absence_distinguishes_the_root_collection_from_child_collections() {
         let root = CollectionAddress::root("db");
         let child = CollectionAddress::new("db", CollectionId::from_slice(&[1; 16]).unwrap());
 

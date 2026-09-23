@@ -235,7 +235,7 @@ async fn panicking_locked_replay_hands_off_its_retained_resources() {
 
 /// Collection preparation happens before locked validation. A panic on the
 /// retained replay must leave the logical name absent while durable recovery
-/// later reclaims the unreachable physical incarnation.
+/// later reclaims the unreachable physical collection objects.
 #[tokio::test(start_paused = true)]
 async fn panicking_locked_replay_records_its_prepared_collection_for_recovery() {
     let recovery = PreparedCollectionRecoveryControl::wrap(mem());

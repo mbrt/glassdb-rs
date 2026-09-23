@@ -112,7 +112,7 @@ impl From<&str> for ObjectKey {
     fn from(encoded: &str) -> Self {
         Self {
             object: ObjectPath::DatabaseMetadata {
-                db_root: glassdb_data::DbRoot::try_from("test").unwrap(),
+                db_prefix: glassdb_data::DbPrefix::try_from("test").unwrap(),
             },
             encoded: Arc::from(encoded),
         }

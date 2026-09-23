@@ -35,7 +35,7 @@ under simulation. Adding another accelerated clock would duplicate the runtime
 seam and would require every database and simulated service to receive the same
 instance.
 
-Every database client in a scaled benchmark must use one time rate. A
+Every database instance in a scaled benchmark must use one time rate. A
 process-wide setting enforces that requirement by construction. Not every
 duration in the process belongs to the model, however: workload convergence and
 the harness's drain deadline still need real watchdogs. The runtime seam must
@@ -111,15 +111,15 @@ operations and retries need no conversion.
 
 ### Restrict acceleration to coherent synthetic processes
 
-All database clients, simulated backends, and provider emulators in one scaled
+All database instances, simulated backends, and provider emulators in one scaled
 process automatically share the runtime rate. A synthetic provider's
 server-time observations and client-side retry timers must use the runtime seam
 as well, or be disabled when they cannot be injected.
 
 Real S3 and GCS runs use the real-time configuration. Acceleration is not a
 distributed production option: separate processes cannot share an anchor, and
-a scaled client clock cannot be compared safely with an unscaled provider
-clock.
+a scaled database-instance clock cannot be compared safely with an unscaled
+provider clock.
 
 The runtime-seam check rejects model-time reads or waits that bypass `rt`.
 Engine time has no unscaled exception. Benchmark and external lifecycle code
@@ -166,7 +166,7 @@ flexibility that the benchmark must not use.
 source. Existing anchored tests would require less change, but production would
 retain two time abstractions whose values must advance consistently. Anchoring
 wall time to Tokio belongs naturally beside `rt::Instant`, and existing tests do
-not require simultaneous database clients with independent clock offsets.
+not require simultaneous database instances with independent clock offsets.
 
 ### Scale each timing configuration independently
 

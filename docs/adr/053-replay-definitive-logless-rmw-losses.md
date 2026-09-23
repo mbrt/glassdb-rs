@@ -95,7 +95,7 @@ The regular locked commit is the sole fallback when the direct commit
 encounters state that cannot be resolved by replaying its body, including:
 
 - a live or unknown transaction holder;
-- a structural gate or collection-deletion fence;
+- a structural gate or drop intent;
 - a missing key or another unsupported transaction shape;
 - an inline value or leaf that exceeds direct-admission limits; or
 - exhaustion or routing conditions that do not certify the body-replay case.

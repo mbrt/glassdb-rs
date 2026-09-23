@@ -16,10 +16,10 @@ coordinator (ADR-028/029) all carry over unchanged.
 
 [ADR-046](046-incarnation-addressed-collections.md) supersedes this ADR's
 physical-root existence marker and name-only subcollection directory with direct
-parent mappings and incarnation-unique physical prefixes. [ADR-047]
-proposes transactional management and all-node deletion fencing on top, using
-ADR-044's structural gate for per-node quiescence. The B-link topology and key
-hot-path decisions here are unchanged.
+parent mappings and per-collection-ID physical prefixes. [ADR-047]
+proposes transactional management and all-node drop-intent installation on
+top, using ADR-044's structural gate for per-node quiescence. The B-link
+topology and key hot-path decisions here are unchanged.
 
 [ADR-050](050-separate-collection-record-and-tree-root.md) supersedes this
 ADR's combined `_i` collection-record/tree-root representation. The tree now
@@ -54,10 +54,10 @@ which in turn wants a growable, range-addressed directory rather than a fixed
 hash space — which also resolves (1), (2), and (4).
 
 The invariants any scheme must keep (unchanged from ADR-016): stateless,
-ephemeral, uncoordinated clients; **content CAS on a single object** as the only
-primitive; **reads/overwrites of an existing key must not touch a central
-object** (the hot-path invariant); a **deterministic, DST-replayable** mapping;
-and compatibility with wound-wait, leases, GC, and the shard-mutation
+ephemeral, uncoordinated database instances; **content CAS on a single object**
+as the only primitive; **reads/overwrites of an existing key must not touch a
+central object** (the hot-path invariant); a **deterministic, DST-replayable**
+mapping; and compatibility with wound-wait, leases, GC, and the shard-mutation
 coordinator, which all address shards by identity.
 
 ## Decision
@@ -111,12 +111,12 @@ A key's leaf is found by descending from the root object `_i` through index
 nodes. Every node **self-describes** the range it covers (its high-key), so the
 descent is **cached and self-correcting**:
 
-- Clients cache interior nodes, including the root `_i` (revalidated by version
-  like any coordination object, ADR-023). A hit descends from the cache with no
-  central read.
+- Database instances cache interior nodes, including the root `_i` (revalidated
+  by version like any coordination object, ADR-023). A hit descends from the
+  cache with no central read.
 - If a lookup reaches a node whose high-key shows the key belongs further right —
-  a split moved it after the cache was taken — the client **follows the
-  right-sibling link** (B-link's defining property) or re-descends from a
+  a split moved it after the cache was taken — the database instance **follows
+  the right-sibling link** (B-link's defining property) or re-descends from a
   refreshed `_i`. The rare stale case self-heals.
 
 This is the range analogue of the ADR-018 root-generation trick and the ADR-030

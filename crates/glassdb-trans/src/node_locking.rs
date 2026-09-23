@@ -93,7 +93,7 @@ impl<'a> NodeLockReconciler<'a> {
         &self,
         locks: &mut NodeLocks,
     ) -> Result<Option<TxId>, TransError> {
-        if let Some(holder) = self.reconcile_delete_intent(locks).await? {
+        if let Some(holder) = self.reconcile_drop_intent(locks).await? {
             return Ok(Some(holder));
         }
         let Some(holder) = locks.structural_gate().holders().first().cloned() else {
@@ -112,13 +112,13 @@ impl<'a> NodeLockReconciler<'a> {
     /// Closes the structural gate after quiescing membership holders.
     ///
     /// Returns the live holder to wait for, or leaves both node-lock scopes free
-    /// of finalized foreign holders with structure-write installed for this
+    /// of finalized foreign holders with a structural gate installed for this
     /// operation.
     pub(crate) async fn acquire_structural_gate(
         &self,
         locks: &mut NodeLocks,
     ) -> Result<Option<TxId>, TransError> {
-        if let Some(holder) = self.reconcile_delete_intent(locks).await? {
+        if let Some(holder) = self.reconcile_drop_intent(locks).await? {
             return Ok(Some(holder));
         }
         if locks.structural_gate().contains(self.id) {
@@ -163,11 +163,11 @@ impl<'a> NodeLockReconciler<'a> {
         Ok(None)
     }
 
-    async fn reconcile_delete_intent(
+    async fn reconcile_drop_intent(
         &self,
         locks: &mut NodeLocks,
     ) -> Result<Option<TxId>, TransError> {
-        let Some(holder) = locks.delete_intent().cloned() else {
+        let Some(holder) = locks.drop_intent().cloned() else {
             return Ok(None);
         };
         if &holder == self.id {
@@ -176,12 +176,12 @@ impl<'a> NodeLockReconciler<'a> {
         match self.monitor.tx_status(&holder).await? {
             TxCommitStatus::Ok => Err(TransError::StaleCollection),
             TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
-                locks.remove_delete_intent(&holder);
+                locks.remove_drop_intent(&holder);
                 Ok(None)
             }
             TxCommitStatus::Pending => match try_reclaim(self.monitor, self.id, &holder).await? {
                 Reclaim::Wounded => {
-                    locks.remove_delete_intent(&holder);
+                    locks.remove_drop_intent(&holder);
                     Ok(None)
                 }
                 Reclaim::Wait => Ok(Some(holder)),

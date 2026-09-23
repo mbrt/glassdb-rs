@@ -300,19 +300,19 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use glassdb_backend::memory::MemoryBackend;
-    use glassdb_data::{CollectionAddress, DbRoot, NodeToken, StructuralIntentId, TxId};
+    use glassdb_data::{CollectionAddress, DbPrefix, NodeToken, StructuralIntentId, TxId};
 
     use super::*;
 
     #[test]
     fn every_object_path_variant_is_classified() {
-        let db_root = DbRoot::try_from("db").unwrap();
+        let db_prefix = DbPrefix::try_from("db").unwrap();
         let collection = CollectionAddress::root("db");
         let participant = TxId::from_bytes(b"participant".to_vec());
         let cases = [
             (
                 ObjectPath::DatabaseMetadata {
-                    db_root: db_root.clone(),
+                    db_prefix: db_prefix.clone(),
                 },
                 ObjectRole::DatabaseMetadata,
             ),
@@ -337,14 +337,14 @@ mod tests {
             ),
             (
                 ObjectPath::Transaction {
-                    db_root: db_root.clone(),
+                    db_prefix: db_prefix.clone(),
                     id: participant.clone(),
                 },
                 ObjectRole::TransactionRecord,
             ),
             (
                 ObjectPath::StructuralIntent {
-                    db_root,
+                    db_prefix,
                     participant,
                     intent_id: StructuralIntentId::from(NodeToken::from_bytes([2; 16])),
                 },

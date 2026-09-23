@@ -500,7 +500,7 @@ mod tests {
 
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_concurr::Background;
-    use glassdb_data::DbRoot;
+    use glassdb_data::DbPrefix;
     use glassdb_storage::{CachedStore, Timeline};
 
     use super::*;
@@ -515,7 +515,7 @@ mod tests {
             None,
         );
         let records = CollectionStore::new(objects.clone());
-        let transactions = TxRecordStore::new(objects, DbRoot::try_from("db").unwrap());
+        let transactions = TxRecordStore::new(objects, DbPrefix::try_from("db").unwrap());
         let background = Arc::new(Background::new());
         let monitor = Monitor::with_config(
             transactions.clone(),
@@ -570,12 +570,12 @@ mod tests {
         let backend = Arc::new(MemoryBackend::new());
         let local = AssemblyFixture::new(
             backend.clone(),
-            DbRoot::try_from("db").unwrap(),
+            DbPrefix::try_from("db").unwrap(),
             &EngineConfig::default(),
         );
         let peer = AssemblyFixture::new(
             backend,
-            DbRoot::try_from("db").unwrap(),
+            DbPrefix::try_from("db").unwrap(),
             &EngineConfig::default(),
         );
         let parent = CollectionAddress::root("db");

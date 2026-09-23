@@ -190,13 +190,13 @@ the **same official sequence the engine uses for a contended expiry**
    `timestamp`; GC removes it only once it is past the horizon *from that abort*, not
    immediately (see [Aborted records are tombstones](#aborted-records-are-tombstones-until-a-lease-after-the-abort)).
 
-This ordering is what **minimizes uncertainty for observing clients**: a
-transaction's status only ever moves forward (`pending → aborted`), its locks are
-released only *after* its death is durable, and the record is removed last. A peer
-therefore always sees one of `pending`, `aborted`, or — after deletion — `missing`
-(resolved by the `handle_unknown_tx` grace), and never a lock that vanished out from
-under a live owner. Pruning and deletion thus only ever touch a **finalized**
-transaction.
+This ordering is what **minimizes uncertainty for observing database
+instances**: a transaction's status only ever moves forward (`pending →
+aborted`), its locks are released only *after* its death is durable, and the
+record is removed last. A peer therefore always sees one of `pending`,
+`aborted`, or — after deletion — `missing` (resolved by the `handle_unknown_tx`
+grace), and never a lock that vanished out from under a live owner. Pruning and
+deletion thus only ever touch a **finalized** transaction.
 
 ### The safety horizon reuses the ADR-021 lease
 
@@ -248,10 +248,10 @@ the delete is safe.
 
 Releasing an aborted candidate's locks is safe immediately, but **deleting its
 record is not** — the record is a *tombstone* that other parties may still consult.
-The client that owned the transaction may have been stuck (a long pause, a slow
-shard write) and, on waking, still issue **one more lock CAS** under that `txid`, or
-its refresher may still run. So GC keeps the aborted record until a full safety lease
-has elapsed **since the abort**:
+The database instance that owned the transaction may have been stuck (a long
+pause, a slow shard write) and, on waking, still issue **one more lock CAS**
+under that `txid`, or its refresher may still run. So GC keeps the aborted
+record until a full safety lease has elapsed **since the abort**:
 
 ```
 deletable  ⟺  now > abort_timestamp + PENDING_TX_TIMEOUT + MAX_CLOCK_SKEW
@@ -344,8 +344,8 @@ GC's contract is twofold and load-bearing:
    (a committed record that is some key's `current_writer`, or one still in its
    commit→write-back gap), and
 2. it never deletes any transaction record **within the safety horizon** — for an aborted
-   record, measured **from the abort**, so the tombstone outlives any client that
-   could still act under that `txid`.
+   record, measured **from the abort**, so the tombstone outlives any database
+   instance that could still act under that `txid`.
 
 (1) follows from the reverse check plus completeness: a committed record always
 records its full back-references, so "its recorded entries no longer name it" means
@@ -369,7 +369,7 @@ reclaim aggressively while never endangering live data.
 
 ### Subcollection teardown
 
-A subcollection delete removes the child's name from the parent root under the
+A subcollection drop removes the child's name from the parent root under the
 parent's membership write lock (ADR-018), after which the child root and its
 shards are unreachable from the membership tree. GC reclaims them as a reachability
 case: an `_s/` or `_i` object under a prefix that no live parent lists is garbage

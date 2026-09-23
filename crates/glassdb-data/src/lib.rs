@@ -13,7 +13,7 @@ pub use collection_id::{CollectionId, MAX_COLLECTION_NAME_BYTES};
 pub use database_id::{DATABASE_ID_BYTES, DatabaseId};
 pub use entropy::shuffle;
 pub use paths::{
-    CollectionAddress, DbRoot, LeafRef, LogicalKey, NodeToken, ObjectPath, PathError,
+    CollectionAddress, DbPrefix, LeafRef, LogicalKey, NodeToken, ObjectPath, PathError,
     StructuralIntentId,
 };
 pub use txid::TxId;

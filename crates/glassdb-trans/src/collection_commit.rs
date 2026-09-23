@@ -18,7 +18,7 @@ pub(crate) struct CollectionHandleState {
     accesses: CatalogAccesses,
     reservations: CollectionReservations,
     prepared: BTreeSet<CollectionAddress>,
-    fenced_drops: BTreeSet<CollectionAddress>,
+    drop_intent_targets: BTreeSet<CollectionAddress>,
 }
 
 /// Issues reusable collection IDs within one transaction identity.
@@ -84,7 +84,7 @@ impl CollectionHandleState {
             accesses,
             reservations: CollectionReservations::new(reservation_limit),
             prepared: BTreeSet::new(),
-            fenced_drops: BTreeSet::new(),
+            drop_intent_targets: BTreeSet::new(),
         }
     }
 
@@ -114,7 +114,7 @@ impl CollectionHandleState {
         // Old body handles must never allocate from the replacement identity.
         self.reservations = CollectionReservations::new(self.reservations.limit);
         self.prepared.clear();
-        self.fenced_drops.clear();
+        self.drop_intent_targets.clear();
     }
 
     /// Returns the complete recovery manifest for the committed transaction.
@@ -199,7 +199,7 @@ impl CollectionCommit {
     ) -> Result<(), TransError> {
         let active_drops = handle.active_drops();
         let discarded = handle
-            .fenced_drops
+            .drop_intent_targets
             .difference(&active_drops)
             .cloned()
             .collect::<Vec<_>>();
@@ -209,13 +209,13 @@ impl CollectionCommit {
             .clear_aborted_drops(id, &discarded, Requirement::ANY)
             .await?;
         handle
-            .fenced_drops
+            .drop_intent_targets
             .retain(|drop| active_drops.contains(drop));
         Ok(())
     }
 
     /// Persists the collection recovery metadata before physical preparation
-    /// can make new incarnation objects visible to recovery.
+    /// can make new collection objects visible to recovery.
     pub(crate) async fn persist_manifest(
         &self,
         id: &TxId,
@@ -280,7 +280,7 @@ impl CollectionCommit {
             .await
     }
 
-    /// Installs deletion fences for every drop in the current body run.
+    /// Installs drop intents for every drop in the current body run.
     pub(crate) async fn fence(
         &self,
         id: &TxId,
@@ -288,9 +288,9 @@ impl CollectionCommit {
     ) -> Result<(), TransError> {
         // Remember every target before its fencing starts so a partial commit
         // is recoverable by a same-identity body replay or abort.
-        handle.fenced_drops.extend(handle.active_drops());
+        handle.drop_intent_targets.extend(handle.active_drops());
         self.lifecycle
-            .fence_drops(id, &handle.accesses.changes)
+            .install_drop_intents(id, &handle.accesses.changes)
             .await
     }
 
@@ -309,7 +309,11 @@ impl CollectionCommit {
         if let Err(error) = self.lifecycle.reclaim(&unused).await {
             tracing::debug!(%error, "prepared-collection cleanup deferred");
         }
-        let dropped = handle.fenced_drops.iter().cloned().collect::<Vec<_>>();
+        let dropped = handle
+            .drop_intent_targets
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
         if let Err(error) = self.lifecycle.reclaim(&dropped).await {
             tracing::debug!(%error, "dropped-collection cleanup deferred");
         }
@@ -321,7 +325,11 @@ impl CollectionCommit {
         id: &TxId,
         handle: &CollectionHandleState,
     ) -> Result<(), TransError> {
-        let drops = handle.fenced_drops.iter().cloned().collect::<Vec<_>>();
+        let drops = handle
+            .drop_intent_targets
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
         // Abort runs after fencing stops and shares its cache, as retry cleanup
         // does. Recovered cleanup needs its separate acknowledgement bound.
         self.lifecycle
@@ -367,7 +375,7 @@ mod tests {
             1,
         );
         handle.prepared.insert(collection.clone());
-        handle.fenced_drops.insert(address(2));
+        handle.drop_intent_targets.insert(address(2));
         let retired_reservations = handle.reservations();
         let parent = CollectionAddress::root("db");
         let old_id = retired_reservations.reserve(&parent, b"child").unwrap();
@@ -389,7 +397,7 @@ mod tests {
         assert_eq!(handle.accesses.changes.len(), 1);
         assert_eq!(handle.accesses.changes[0].collection, collection);
         assert!(handle.prepared.is_empty());
-        assert!(handle.fenced_drops.is_empty());
+        assert!(handle.drop_intent_targets.is_empty());
     }
 
     #[test]
@@ -405,7 +413,7 @@ mod tests {
         );
         handle.prepared.insert(earlier.clone());
 
-        let retained_lock = TxLock::Topology {
+        let retained_lock = TxLock::TopologyFreeze {
             collection: CollectionAddress::root("db"),
         };
         let recovery = handle.pending_manifest(TxRecoveryManifest {

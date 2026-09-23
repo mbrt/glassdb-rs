@@ -119,10 +119,11 @@ In production the `Clock` is `Clock::real()`, i.e. nanosecond units (from
 clock, but two independent `begin` calls are separated by real work
 (allocations, a backend round-trip, etc.), so two contending transactions
 landing on the exact same nanosecond is improbable in a single process. Across
-clients on different machines the wall clocks are not synchronized to nanosecond
-precision, so exact collisions are effectively impossible; clock skew there makes
-the global order approximate, but wound-wait only needs *some* consistent order,
-and any residual tie or skew-induced cycle is still caught by the serial fallback.
+database instances on different machines the wall clocks are not synchronized to
+nanosecond precision, so exact collisions are effectively impossible; clock skew
+there makes the global order approximate, but wound-wait only needs *some*
+consistent order, and any residual tie or skew-induced cycle is still caught by
+the serial fallback.
 
 The one place collisions are common is the **test environment**: under
 `tokio::time::pause` the virtual clock only advances when every task blocks on a
@@ -133,12 +134,12 @@ handled explicitly rather than assumed away.
 ### Victim restart
 
 A wounded transaction's record is durably set to `aborted` via a conditional write
-(`Monitor::wound_tx`), so both the local victim and any other client observe the
-abort. `Algo::commit` surfaces this as `TransError::Wounded` (checked at the top
-of each commit round and when the final record write fails, mapped from
-`TransError::AlreadyFinalized`). The DB replay loop then restarts the victim with
-`Algo::rebegin` (which calls `TxId::renew`), reusing its original priority so it
-is not starved on the replay.
+(`Monitor::wound_tx`), so both the local victim and any other database instance
+observe the abort. `Algo::commit` surfaces this as `TransError::Wounded`
+(checked at the top of each commit round and when the final record write fails,
+mapped from `TransError::AlreadyFinalized`). The DB replay loop then restarts
+the victim with `Algo::rebegin` (which calls `TxId::renew`), reusing its
+original priority so it is not starved on the replay.
 
 ### Serial locking as a safety net
 

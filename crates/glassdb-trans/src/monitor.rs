@@ -68,10 +68,10 @@ pub struct ProtocolTiming {
 
 impl ProtocolTiming {
     /// Creates a timing profile with an explicit pending-transaction timeout
-    /// and maximum expected clock skew between database clients.
+    /// and maximum expected clock skew between database instances.
     ///
-    /// `max_clock_skew` must conservatively bound the clocks of every client
-    /// using the database; underestimating it can reclaim a live transaction.
+    /// `max_clock_skew` must conservatively bound the clocks of every database
+    /// instance using the database; underestimating it can reclaim a live transaction.
     ///
     /// # Panics
     ///
@@ -743,7 +743,7 @@ impl Monitor {
         })
     }
 
-    /// Whether this client still tracks `tid` as one of its locked-commit identities.
+    /// Whether this database instance still tracks `tid` as one of its locked-commit identities.
     /// A wounded identity remains tracked until its owner acknowledges it or
     /// cancellation recovery releases local ownership. Transactions that never
     /// engage the locked commit are not tracked.
@@ -2089,7 +2089,7 @@ mod tests {
 
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
-    use glassdb_data::{CollectionAddress, CollectionId, DbRoot};
+    use glassdb_data::{CollectionAddress, CollectionId, DbPrefix};
     use glassdb_storage::transaction::{TxCollectionOp, TxWrite};
     use glassdb_storage::{CachedStore, LockType, Timeline};
 
@@ -2277,7 +2277,7 @@ mod tests {
         let parent = CollectionAddress::root("test");
         let created = collection_address(1);
         let manifest = TxRecoveryManifest {
-            locks: vec![TxLock::Topology {
+            locks: vec![TxLock::TopologyFreeze {
                 collection: parent.clone(),
             }],
             collection_changes: vec![TxCollectionChange {
@@ -2331,7 +2331,7 @@ mod tests {
     ) -> (Monitor, TestCtx) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(b, 1 << 20, timeline.clone(), None);
-        let tx_records = TxRecordStore::new(objects.clone(), DbRoot::try_from("test").unwrap());
+        let tx_records = TxRecordStore::new(objects.clone(), DbPrefix::try_from("test").unwrap());
         let bg = Arc::new(Background::new());
         let mon = Monitor::with_config(
             tx_records.clone(),
@@ -2484,7 +2484,7 @@ mod tests {
         let parent = CollectionAddress::root("test");
         let created = collection_address(1);
         let recovery = TxRecoveryManifest {
-            locks: vec![TxLock::Topology {
+            locks: vec![TxLock::TopologyFreeze {
                 collection: parent.clone(),
             }],
             collection_changes: vec![TxCollectionChange {
@@ -2541,7 +2541,7 @@ mod tests {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon, t) = new_test_monitor(b);
         let tx = TxId::from_bytes(b"updated".to_vec());
-        let lock = TxLock::Topology {
+        let lock = TxLock::TopologyFreeze {
             collection: CollectionAddress::root("test"),
         };
         mon.begin_persisted_tx(
@@ -2601,7 +2601,7 @@ mod tests {
         let tx = TxId::from_bytes(b"tx2".to_vec());
         mon1.begin_tx(&tx);
         let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Ok);
-        record.locks = vec![TxLock::Entry {
+        record.locks = vec![TxLock::Key {
             key,
             typ: LockType::Write,
         }];
@@ -2616,7 +2616,7 @@ mod tests {
         let (owner, _owner_ctx) = new_test_monitor(b.clone());
         let (wounder, _wounder_ctx) = new_test_monitor(b);
         let tx = TxId::from_bytes(b"commit-loser".to_vec());
-        let lock = TxLock::Topology {
+        let lock = TxLock::TopologyFreeze {
             collection: CollectionAddress::root("test"),
         };
         let recovery = TxRecoveryManifest {
@@ -2657,7 +2657,7 @@ mod tests {
         let (owner, _owner_ctx) = new_test_monitor(b.clone());
         let (wounder, wounder_ctx) = new_test_monitor(b);
         let tx = TxId::from_bytes(b"reclaimed-wound".to_vec());
-        let lock = TxLock::Topology {
+        let lock = TxLock::TopologyFreeze {
             collection: CollectionAddress::root("test"),
         };
         owner
@@ -2702,7 +2702,7 @@ mod tests {
         let (owner, _owner_ctx) = new_test_monitor(b.clone());
         let (wounder, wounder_ctx) = new_test_monitor(b);
         let tx = TxId::from_bytes(b"lazy-suspended-owner".to_vec());
-        let lock = TxLock::Topology {
+        let lock = TxLock::TopologyFreeze {
             collection: CollectionAddress::root("test"),
         };
 
@@ -2748,7 +2748,7 @@ mod tests {
         let (owner, _owner_ctx) = new_test_monitor(b.clone());
         let (_collector, collector_ctx) = new_test_monitor(b);
         let tx = TxId::from_bytes(b"reclaimed-in-doubt".to_vec());
-        let lock = TxLock::Topology {
+        let lock = TxLock::TopologyFreeze {
             collection: CollectionAddress::root("test"),
         };
         owner
@@ -2813,7 +2813,7 @@ mod tests {
         let b: Arc<dyn Backend> = backend.clone();
         let (owner, _owner_ctx) = new_test_monitor(b);
         let tx = TxId::from_bytes(b"unconfirmable".to_vec());
-        let lock = TxLock::Topology {
+        let lock = TxLock::TopologyFreeze {
             collection: CollectionAddress::root("test"),
         };
         owner
@@ -2887,7 +2887,7 @@ mod tests {
         let (owner, _owner_ctx) = new_test_monitor(b.clone());
         let (_racer, racer_ctx) = new_test_monitor(b);
         let tx = TxId::from_bytes(b"commit-read-retry".to_vec());
-        let lock = TxLock::Topology {
+        let lock = TxLock::TopologyFreeze {
             collection: CollectionAddress::root("test"),
         };
         owner
@@ -2976,7 +2976,7 @@ mod tests {
         let committed = TxId::from_bytes(b"committed".to_vec());
         mon.begin_tx(&committed);
         let mut record = TxRecord::new(committed.clone(), TxCommitStatus::Ok);
-        record.locks.push(TxLock::Entry {
+        record.locks.push(TxLock::Key {
             key: logical_key(b"key"),
             typ: LockType::Write,
         });
@@ -3143,7 +3143,7 @@ mod tests {
             .unwrap();
 
         let mut refreshed = TxRecord::new(tx.clone(), TxCommitStatus::Pending);
-        refreshed.locks.push(TxLock::Entry {
+        refreshed.locks.push(TxLock::Key {
             key: logical_key(b"new-lock"),
             typ: LockType::Write,
         });
@@ -3225,7 +3225,7 @@ mod tests {
         mon1.begin_tx(&tx);
         let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Ok);
         record.writes = vec![TxWriteForTest::w(&key, b"val1")];
-        record.locks = vec![TxLock::Entry {
+        record.locks = vec![TxLock::Key {
             key: key.clone(),
             typ: LockType::Write,
         }];
@@ -3314,7 +3314,7 @@ mod tests {
         let key = logical_key(b"key");
         mon.begin_tx(&tx);
         let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Ok);
-        record.locks.push(TxLock::Entry {
+        record.locks.push(TxLock::Key {
             key,
             typ: LockType::Write,
         });
@@ -3454,7 +3454,7 @@ mod tests {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon, t) = new_test_monitor(b.clone());
         let tx = TxId::from_bytes(b"tx1".to_vec());
-        let locks = vec![TxLock::Entry {
+        let locks = vec![TxLock::Key {
             key: logical_key(b"k"),
             typ: LockType::Write,
         }];

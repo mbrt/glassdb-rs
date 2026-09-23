@@ -20,10 +20,10 @@ latency.
 
 Stopping after that loss moves work off the hot path, but does not provide
 physical convergence. The holder remains authoritative, so reads stay correct
-by resolving the committed transaction record. Fresh clients and cache
-evictions must nevertheless reload that record, and a full-leaf scan pays once
-for every distinct unresolved transaction. GC cannot remove a record while a
-holder still references it. Permanent deferral therefore turns a transient
+by resolving the committed transaction record. Fresh database instances and
+cache evictions must nevertheless reload that record, and a full-leaf scan pays
+once for every distinct unresolved transaction. GC cannot remove a record while
+a holder still references it. Permanent deferral therefore turns a transient
 contention optimization into unbounded read amplification and retention.
 
 A focused experiment instead delayed one retry until contention became quiet.
@@ -36,7 +36,7 @@ work without waiting through the delay. See the
 
 The delay must remain only a scheduling optimization. Durable holders and
 transaction records continue to carry correctness across cancellation, process
-failure, and independently configured clients.
+failure, and independently configured database instances.
 
 ## Decision
 
@@ -207,7 +207,8 @@ write-back.
 
 Cross-instance batching could coalesce more work, but requires a new distributed
 coordination protocol for an optimization whose durable state is already safe.
-Database-local scheduling preserves independent clients and failure domains.
+Database-local scheduling preserves independent database instances and failure
+domains.
 
 ### Persist the queue or reconstruct it at startup
 

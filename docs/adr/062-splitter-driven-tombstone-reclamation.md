@@ -116,8 +116,8 @@ proportional to transaction-record garbage.
 ### Accept loss of direct recovery evidence
 
 Tombstones have no provenance or publication-age field. The splitter may
-reclaim one immediately after it becomes quiescent, including while the client
-is recovering an unavailable direct CAS.
+reclaim one immediately after it becomes quiescent, including while the database
+instance is recovering an unavailable direct CAS.
 
 An exact surviving marker still proves a whole ADR-061 transaction landed.
 When cleanup removes the last marker, recovery reports `InDoubt` unless other
@@ -137,8 +137,8 @@ check and ADR-057's recovery horizon govern reclamation of that record.
 ### Require database protocol v3
 
 An older v2 client validates unmarked point absence without the generation and
-is unsafe once another client can remove tombstones. The database metadata
-version therefore advances to v3 so old binaries fail closed.
+is unsafe once another database instance can remove tombstones. The database
+metadata version therefore advances to v3 so old binaries fail closed.
 
 Mixed v2/v3 operation and automatic migration are unsupported. Opening a v2
 database with a v3 client fails with a clear version error; development

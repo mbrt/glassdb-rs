@@ -25,12 +25,13 @@ parts of `tokio`. Object-store faults are injected at the `Backend` trait rather
 than through a simulated network. ADR-048 applies the same principle to the
 optional disk cache through a narrow byte-level media model rather than a
 general simulated filesystem. For _this_ system — a **library over object
-storage** where clients coordinate only through the store and there is no
-peer-to-peer network — it scores best on determinism, fuzz-guidability, and
-efficiency. The full media-fault space is explored against `PersistentCache`;
-`CachedStore` uses selected faults, and every existing database fuzz target
-replays each input both without L2 and with L2 under basic media faults.
-This costs ownership of a small executor, media model, and `--cfg sim` seam.
+storage** where database instances coordinate only through the store and there
+is no peer-to-peer network — it scores best on determinism, fuzz-guidability,
+and efficiency. The full media-fault space is explored against
+`PersistentCache`; `CachedStore` uses selected faults, and every existing
+database fuzz target replays each input both without L2 and with L2 under basic
+media faults. This costs ownership of a small executor, media model, and `--cfg
+sim` seam.
 
 | Criterion                             | Current (in-repo `DetExecutor`)                                                        | madsim                                                                 | turmoil                                                                    | mad-turmoil                                                                 |
 | ------------------------------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | -------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
@@ -84,7 +85,7 @@ not. Inline values and tombstones can have valid direct writers, so a writer
 identity without a record is not by itself a consistency failure.
 
 The history target additionally generates collection lifecycle operations
-(creation, deletion, recreation, nested children, collection values) on shared
+(creation, drop, recreation, nested children, collection values) on shared
 names, and can couple them with a key write in another collection or an explicit
 abort. Its model checks public results and full shared directory membership as
 well as values. It classifies errors and possible outcomes only from public
@@ -134,9 +135,9 @@ constrain that choice.
 
 ## Why the architecture matters here
 
-GlassDB coordinates through **object storage**. Clients never talk to each
-other; the shared, contended correctness boundary is the store. The optional
-disk cache adds disposable local persistence but no new coordination
+GlassDB coordinates through **object storage**. Database instances never talk
+to each other; the shared, contended correctness boundary is the store. The
+optional disk cache adds disposable local persistence but no new coordination
 authority. Those facts drive the comparison:
 
 - The meaningful fault boundary is **one database instance's transport to the

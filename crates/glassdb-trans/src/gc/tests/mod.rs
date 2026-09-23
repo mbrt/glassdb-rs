@@ -11,7 +11,7 @@ use glassdb_backend as backend;
 use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend};
 use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
 use glassdb_concurr::RetryConfig;
-use glassdb_data::{CollectionAddress, CollectionId, DbRoot, LogicalKey, NodeToken, ObjectPath};
+use glassdb_data::{CollectionAddress, CollectionId, DbPrefix, LogicalKey, NodeToken, ObjectPath};
 use glassdb_storage::transaction::{
     TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxRecord, TxRecordStore, TxWrite,
 };
@@ -89,9 +89,9 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
         let peer = new_ctx_with(backend.clone()).await;
         let hooked = HookBackend::new(backend);
         let config = EngineConfig::default();
-        let db_root = DbRoot::try_from("db").unwrap();
-        let owner = AssemblyFixture::new(hooked.clone(), db_root.clone(), &config);
-        let engine = engine_fixture(&owner, db_root, config, false);
+        let db_prefix = DbPrefix::try_from("db").unwrap();
+        let owner = AssemblyFixture::new(hooked.clone(), db_prefix.clone(), &config);
+        let engine = engine_fixture(&owner, db_prefix, config, false);
         let prepared = CollectionAddress::new(
             "db",
             glassdb_data::CollectionId::from_slice(&[7; 16]).unwrap(),
@@ -240,7 +240,7 @@ async fn new_ctx_with_interval(backend: Arc<dyn Backend>, pending_timeout: Durat
 }
 
 async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -> Ctx {
-    let foundation = AssemblyFixture::new(backend, DbRoot::try_from("db").unwrap(), config);
+    let foundation = AssemblyFixture::new(backend, DbPrefix::try_from("db").unwrap(), config);
     let tx_records = foundation.tx_records.clone();
     let records = foundation.records.clone();
     let structural_intents = foundation.structural_intents.clone();
@@ -323,7 +323,7 @@ fn key_path(k: &[u8]) -> LogicalKey {
 }
 
 fn write_lock(k: &[u8]) -> TxLock {
-    TxLock::Entry {
+    TxLock::Key {
         key: key_path(k),
         typ: LockType::Write,
     }
@@ -675,7 +675,7 @@ async fn committed_drop_is_recovered_while_the_record_stores_a_live_value() {
             .unwrap()
     );
     let mut child_node = Node::leaf(LeafBody::new());
-    child_node.set_collection_delete_intent(id.clone());
+    child_node.set_drop_intent(id.clone());
     assert!(ctx.nodes.create_root(&child, &child_node).await.unwrap());
 
     let mut record = committed(id.clone(), PAST_HORIZON, &[b"k"], &[]);
@@ -737,7 +737,7 @@ async fn committed_references_in_a_reclaimed_collection_are_absent() {
         deleted: false,
         prev_writer: TxId::default(),
     });
-    record.locks.push(TxLock::Entry {
+    record.locks.push(TxLock::Key {
         key,
         typ: LockType::Write,
     });
@@ -856,7 +856,7 @@ async fn reference_checks_refresh_leaves_without_refreshing_indexes() {
         // publishes it, so skipping the terminal-leaf check would lose the record.
         let peer = AssemblyFixture::new(
             memory,
-            DbRoot::try_from("db").unwrap(),
+            DbPrefix::try_from("db").unwrap(),
             &EngineConfig::default(),
         );
         let id = tx(1);
@@ -948,7 +948,7 @@ async fn reference_checks_follow_a_split_behind_a_cached_parent() {
             .unwrap();
         let peer = AssemblyFixture::new(
             memory,
-            DbRoot::try_from("db").unwrap(),
+            DbPrefix::try_from("db").unwrap(),
             &EngineConfig::default(),
         );
         let body = LeafBody::from_entries([writer_entry(b"pear", &id)]);
@@ -1007,7 +1007,7 @@ async fn reference_checks_refresh_a_cached_leaf_that_became_an_index() {
     let ctx = new_ctx_with(recorder).await;
     let peer = AssemblyFixture::new(
         memory,
-        DbRoot::try_from("db").unwrap(),
+        DbPrefix::try_from("db").unwrap(),
         &EngineConfig::default(),
     );
     let id = tx(1);
@@ -1065,7 +1065,7 @@ async fn reference_checks_refresh_a_cached_leaf_that_became_an_index() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn committed_entry_lock_keeps_the_record_and_lock() {
+async fn committed_key_lock_keeps_the_record_and_lock() {
     let ctx = new_ctx().await;
     let id = tx(1);
     ctx.tx_records
@@ -1145,12 +1145,12 @@ async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
 
         let owner = AssemblyFixture::new(
             memory,
-            DbRoot::try_from("db").unwrap(),
+            DbPrefix::try_from("db").unwrap(),
             &EngineConfig::default(),
         );
         let engine = engine_fixture(
             &owner,
-            DbRoot::try_from("db").unwrap(),
+            DbPrefix::try_from("db").unwrap(),
             EngineConfig::default(),
             false,
         );
@@ -1327,12 +1327,12 @@ async fn entry_release_follows_splits_without_refreshing_cached_indexes() {
         }
         let owner = AssemblyFixture::new(
             memory,
-            DbRoot::try_from("db").unwrap(),
+            DbPrefix::try_from("db").unwrap(),
             &EngineConfig::default(),
         );
         let engine = engine_fixture(
             &owner,
-            DbRoot::try_from("db").unwrap(),
+            DbPrefix::try_from("db").unwrap(),
             EngineConfig::default(),
             false,
         );
@@ -1473,7 +1473,7 @@ async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
     let ctx = new_ctx_with(Arc::new(recorded)).await;
     let owner = AssemblyFixture::new(
         backend,
-        DbRoot::try_from("db").unwrap(),
+        DbPrefix::try_from("db").unwrap(),
         &EngineConfig::default(),
     );
     let coord = LeafCoordinator::with_hinter(
@@ -1654,7 +1654,7 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
     let ctx = new_ctx_with(backend.clone()).await;
     let owner = AssemblyFixture::new(
         backend,
-        DbRoot::try_from("db").unwrap(),
+        DbPrefix::try_from("db").unwrap(),
         &EngineConfig::default(),
     );
     let locker = CollectionLocker::new(
@@ -1971,7 +1971,7 @@ async fn committed_directory_removal_does_not_prove_other_records_clear() {
         assert!(ctx.records.store_record(&parent, &observed).await.unwrap());
         let owner = AssemblyFixture::new(
             backend,
-            DbRoot::try_from("db").unwrap(),
+            DbPrefix::try_from("db").unwrap(),
             &EngineConfig::default(),
         );
         let locker = CollectionLocker::new(
@@ -2108,7 +2108,7 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
     let ctx = new_ctx_with(backend.clone()).await;
     let owner = AssemblyFixture::new(
         backend,
-        DbRoot::try_from("db").unwrap(),
+        DbPrefix::try_from("db").unwrap(),
         &EngineConfig::default(),
     );
     let locker = CollectionLocker::new(
@@ -2181,7 +2181,7 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
         .await
         .unwrap();
     lifecycle
-        .fence_drops(&id, std::slice::from_ref(&change))
+        .install_drop_intents(&id, std::slice::from_ref(&change))
         .await
         .unwrap();
     locker
@@ -2387,11 +2387,11 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
     let ctx = new_ctx_with(backend.clone()).await;
     let owner = AssemblyFixture::new(
         backend,
-        DbRoot::try_from("db").unwrap(),
+        DbPrefix::try_from("db").unwrap(),
         &EngineConfig::default(),
     );
     let id = tx(85);
-    let mut locks = vec![TxLock::Topology {
+    let mut locks = vec![TxLock::TopologyFreeze {
         collection: collection(),
     }];
     if matches!(case, TopologyCleanup::DirectoryRemoved) {
@@ -2417,7 +2417,7 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
     let prepared = owner
         .structural_intents
         .write(
-            collection().db_root_component(),
+            collection().db_prefix_component(),
             &StructuralIntentId::from(&right),
             &StructuralIntent {
                 collection: collection(),
@@ -2649,7 +2649,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
     let ctx = new_ctx_with(backend.clone()).await;
     let owner = AssemblyFixture::new(
         backend,
-        DbRoot::try_from("db").unwrap(),
+        DbPrefix::try_from("db").unwrap(),
         &EngineConfig::default(),
     );
     let lifecycle = CollectionLifecycle::new(
@@ -2781,7 +2781,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
     locker.acquire(&target, &id, LockType::Read).await.unwrap();
     owner.monitor.record_tx_locks(&id, locks.clone());
     lifecycle
-        .fence_drops(&id, std::slice::from_ref(&change))
+        .install_drop_intents(&id, std::slice::from_ref(&change))
         .await
         .unwrap();
     operation.complete();
@@ -2859,7 +2859,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
                     );
                 Box::pin(async move {
                     if fail {
-                        Err(BackendError::other("drop fence check failed"))
+                        Err(BackendError::other("drop intent check failed"))
                     } else {
                         Ok(())
                     }
@@ -2887,7 +2887,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
             .load_node_at_state(path, verification)
             .await
             .unwrap();
-        if node.value().unwrap().collection_delete_intent() == Some(&id) {
+        if node.value().unwrap().drop_intent() == Some(&id) {
             remaining.push(path.to_string());
         }
     }
@@ -2901,7 +2901,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
     }
     assert!(
         remaining.is_empty(),
-        "GC deleted the record with drop fences still present: {remaining:?}"
+        "GC deleted the record with drop intents still present: {remaining:?}"
     );
     let node_expected: &[&str] = match case {
         DropCleanup::CachedFences => &["write_if"],
@@ -3003,7 +3003,7 @@ async fn pending_and_wounded_candidates_only_read_their_records() {
         background.shutdown().await;
 
         let path = ObjectPath::Transaction {
-            db_root: DbRoot::try_from("db").unwrap(),
+            db_prefix: DbPrefix::try_from("db").unwrap(),
             id: id.clone(),
         }
         .to_string();
@@ -3328,7 +3328,7 @@ async fn cached_candidate_converges_after_a_peer_deletes_it() {
         .unwrap();
     let peer = TxRecordStore::new(
         CachedStore::new(backend, 1 << 20, Timeline::new(), None),
-        DbRoot::try_from("db").unwrap(),
+        DbPrefix::try_from("db").unwrap(),
     );
     let observed = peer.get_at(&id, Requirement::ANY).await.unwrap();
     peer.delete(&observed).await.unwrap();
@@ -3503,7 +3503,7 @@ async fn reference_checks_follow_candidate_filtering() {
     let resume = Arc::new(Notify::new());
     hooked.set_before({
         let path = ObjectPath::Transaction {
-            db_root: DbRoot::try_from("db").unwrap(),
+            db_prefix: DbPrefix::try_from("db").unwrap(),
             id: id.clone(),
         }
         .to_string();
@@ -3542,7 +3542,7 @@ async fn reference_checks_follow_candidate_filtering() {
         .unwrap();
     let peer = AssemblyFixture::new(
         backend,
-        DbRoot::try_from("db").unwrap(),
+        DbPrefix::try_from("db").unwrap(),
         &EngineConfig::default(),
     );
     let mut edit = peer

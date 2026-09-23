@@ -45,7 +45,7 @@ pub use disk_cache::{
 pub use error::StorageError;
 pub use inline::InlinePolicy;
 pub use leaf::{CurrentState, LeafBody, LeafEntry};
-pub use lock::{EntryLockState, ExclusiveGate, LockType, SharedExclusiveLock};
+pub use lock::{ExclusiveGate, KeyLockState, LockType, SharedExclusiveLock};
 pub use node::{
     IndexNode, InvalidSplitPolicy, Node, NodeBody, NodeLocks, NodeToken, SplitPolicy,
     SplitPolicyBuilder,

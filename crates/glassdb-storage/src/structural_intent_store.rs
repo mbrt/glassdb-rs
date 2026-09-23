@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use glassdb_backend as backend;
-use glassdb_data::{DbRoot, ObjectPath, StructuralIntentId, TxId};
+use glassdb_data::{DbPrefix, ObjectPath, StructuralIntentId, TxId};
 
 use crate::cached_store::{CachedStore, CasResult, Codec, Observation, Requirement};
 use crate::error::StorageError;
@@ -61,12 +61,12 @@ impl StructuralIntentStore {
     /// Creates a structural intent and returns its exact observation.
     pub async fn write(
         &self,
-        db_root: &DbRoot,
+        db_prefix: &DbPrefix,
         intent_id: &StructuralIntentId,
         intent: &StructuralIntent,
     ) -> Result<Observation<StructuralIntent>, StorageError> {
         let path = ObjectPath::StructuralIntent {
-            db_root: db_root.clone(),
+            db_prefix: db_prefix.clone(),
             participant: intent.participant_id.clone(),
             intent_id: intent_id.clone(),
         };
@@ -104,10 +104,10 @@ impl StructuralIntentStore {
     /// are candidates, and only absence must meet `requirement`.
     pub async fn discover(
         &self,
-        db_root: &DbRoot,
+        db_prefix: &DbPrefix,
         requirement: Requirement,
     ) -> Result<Vec<(StructuralIntentId, Observation<StructuralIntent>)>, StorageError> {
-        let prefix = ObjectPath::structural_intents_prefix(db_root);
+        let prefix = ObjectPath::structural_intents_prefix(db_prefix);
         self.discover_under(&prefix, requirement).await
     }
 
@@ -121,11 +121,11 @@ impl StructuralIntentStore {
     /// that a present candidate still exists or advance its evidence.
     pub async fn discover_page(
         &self,
-        db_root: &DbRoot,
+        db_prefix: &DbPrefix,
         cursor: Option<&backend::ListCursor>,
         requirement: Requirement,
     ) -> Result<StructuralIntentPage, StorageError> {
-        let prefix = ObjectPath::structural_intents_prefix(db_root);
+        let prefix = ObjectPath::structural_intents_prefix(db_prefix);
         self.read_page(&prefix, cursor, requirement).await
     }
 
@@ -135,11 +135,11 @@ impl StructuralIntentStore {
     /// are candidates, and only absence must meet `requirement`.
     pub async fn discover_for_participant(
         &self,
-        db_root: &DbRoot,
+        db_prefix: &DbPrefix,
         participant: &TxId,
         requirement: Requirement,
     ) -> Result<Vec<(StructuralIntentId, Observation<StructuralIntent>)>, StorageError> {
-        let prefix = ObjectPath::participant_structural_intents_prefix(db_root, participant);
+        let prefix = ObjectPath::participant_structural_intents_prefix(db_prefix, participant);
         self.discover_under(&prefix, requirement).await
     }
 
@@ -266,8 +266,8 @@ mod tests {
         NodeToken::from_bytes([byte; 16])
     }
 
-    fn db_root() -> DbRoot {
-        DbRoot::try_from("db").unwrap()
+    fn db_prefix() -> DbPrefix {
+        DbPrefix::try_from("db").unwrap()
     }
 
     fn intent_id(byte: u8) -> StructuralIntentId {
@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn structural_codec_rejects_a_different_path_participant() {
         let path = ObjectPath::StructuralIntent {
-            db_root: db_root(),
+            db_prefix: db_prefix(),
             participant: TxId::from_bytes(b"path-participant".to_vec()),
             intent_id: intent_id(1),
         };
@@ -307,7 +307,7 @@ mod tests {
         let participant = TxId::from_bytes(b"participant".to_vec());
         let preparing = intent(&participant, StructuralIntentPhase::Preparing);
         let created = store
-            .write(&db_root(), &intent_id(1), &preparing)
+            .write(&db_prefix(), &intent_id(1), &preparing)
             .await
             .unwrap();
 
@@ -321,7 +321,7 @@ mod tests {
         store.delete(&updated).await.unwrap();
         assert!(
             store
-                .discover(&db_root(), Requirement::ANY)
+                .discover(&db_prefix(), Requirement::ANY)
                 .await
                 .unwrap()
                 .is_empty()
@@ -337,14 +337,14 @@ mod tests {
             intent.created_tokens = vec![token(i as u8)];
             intent.split_key = vec![i as u8];
             store
-                .write(&db_root(), &intent_id(i as u8), &intent)
+                .write(&db_prefix(), &intent_id(i as u8), &intent)
                 .await
                 .unwrap();
         }
 
         let intents = store
             .discover(
-                &db_root(),
+                &db_prefix(),
                 Requirement::after(store.timeline.currentness_barrier()),
             )
             .await
@@ -360,7 +360,7 @@ mod tests {
         for participant in [&first, &second] {
             store
                 .write(
-                    &db_root(),
+                    &db_prefix(),
                     &intent_id(1),
                     &intent(participant, StructuralIntentPhase::Preparing),
                 )
@@ -370,7 +370,7 @@ mod tests {
 
         let intents = store
             .discover_for_participant(
-                &db_root(),
+                &db_prefix(),
                 &first,
                 Requirement::after(store.timeline.currentness_barrier()),
             )
@@ -398,14 +398,14 @@ mod tests {
         requirement: Requirement,
     ) -> Result<Vec<(StructuralIntentId, Observation<StructuralIntent>)>, StorageError> {
         match discovery {
-            Discovery::All => store.discover(&db_root(), requirement).await,
+            Discovery::All => store.discover(&db_prefix(), requirement).await,
             Discovery::Page => store
-                .discover_page(&db_root(), None, requirement)
+                .discover_page(&db_prefix(), None, requirement)
                 .await
                 .map(|page| page.intents),
             Discovery::Participant => {
                 store
-                    .discover_for_participant(&db_root(), participant, requirement)
+                    .discover_for_participant(&db_prefix(), participant, requirement)
                     .await
             }
         }
@@ -423,7 +423,10 @@ mod tests {
                 let store = store_over(recorder);
                 let participant = TxId::from_bytes(b"participant".to_vec());
                 let body = intent(&participant, phase);
-                store.write(&db_root(), &intent_id(1), &body).await.unwrap();
+                store
+                    .write(&db_prefix(), &intent_id(1), &body)
+                    .await
+                    .unwrap();
                 let requirement = Requirement::after(store.timeline.currentness_barrier());
                 operations.lock().unwrap().clear();
 
@@ -452,7 +455,7 @@ mod tests {
             let store = StructuralIntentStore::new(objects.clone());
             let participant = TxId::from_bytes(b"participant".to_vec());
             let path = ObjectPath::StructuralIntent {
-                db_root: db_root(),
+                db_prefix: db_prefix(),
                 participant: participant.clone(),
                 intent_id: intent_id(1),
             };
@@ -468,7 +471,9 @@ mod tests {
             );
             let peer = store_over(memory);
             let body = intent(&participant, StructuralIntentPhase::Preparing);
-            peer.write(&db_root(), &intent_id(1), &body).await.unwrap();
+            peer.write(&db_prefix(), &intent_id(1), &body)
+                .await
+                .unwrap();
             let requirement = Requirement::after(timeline.currentness_barrier());
             hooks.set_before(|op| {
                 let fail = matches!(
@@ -512,10 +517,10 @@ mod tests {
             let participant = TxId::from_bytes(b"participant".to_vec());
             let preparing = intent(&participant, StructuralIntentPhase::Preparing);
             local
-                .write(&db_root(), &intent_id(1), &preparing)
+                .write(&db_prefix(), &intent_id(1), &preparing)
                 .await
                 .unwrap();
-            let prior = peer.discover(&db_root(), Requirement::ANY).await.unwrap();
+            let prior = peer.discover(&db_prefix(), Requirement::ANY).await.unwrap();
             let ready = intent(&participant, StructuralIntentPhase::Ready);
             assert!(peer.update(&prior[0].1, &ready).await.unwrap().is_some());
 
@@ -532,7 +537,7 @@ mod tests {
             ));
             let verifier = store_over(memory);
             let current = verifier
-                .discover(&db_root(), Requirement::ANY)
+                .discover(&db_prefix(), Requirement::ANY)
                 .await
                 .unwrap();
             assert_eq!(current[0].1.value().map(Arc::as_ref), Some(&ready));
@@ -548,7 +553,7 @@ mod tests {
             assert_eq!(calls, ["list", "read"]);
             local.delete(&found[0].1).await.unwrap();
             assert!(
-                peer.discover(&db_root(), Requirement::ANY)
+                peer.discover(&db_prefix(), Requirement::ANY)
                     .await
                     .unwrap()
                     .is_empty()

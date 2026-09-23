@@ -145,7 +145,7 @@ mod tests {
 
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::{CollectionId, DbRoot};
+    use glassdb_data::{CollectionId, DbPrefix};
     use glassdb_storage::transaction::{
         TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxRecord, TxRecordStore,
     };
@@ -164,7 +164,7 @@ mod tests {
         );
         let records = CollectionStore::new(objects.clone());
         let background = Arc::new(Background::new());
-        let transactions = TxRecordStore::new(objects, DbRoot::try_from("db").unwrap());
+        let transactions = TxRecordStore::new(objects, DbPrefix::try_from("db").unwrap());
         let monitor = Monitor::with_config(
             transactions.clone(),
             timeline.clone(),

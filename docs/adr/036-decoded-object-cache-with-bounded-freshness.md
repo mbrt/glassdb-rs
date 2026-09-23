@@ -132,11 +132,11 @@ is the result's `current-after` watermark. An operation that started before
 The response time has a different role: after a successful mutation, the store
 publishes the submitted value in the cache after receiving the response and
 before returning to its caller. This gives local call/publication ordering, but
-response time is not a freshness watermark. Another client may overwrite the
-object after the backend applies this mutation but before its response arrives;
-stamping the submitted value with response time would then claim freshness it
-never had. Reads and writes therefore use the same operation-start watermark,
-despite publishing their results only on completion.
+response time is not a freshness watermark. Another database instance may
+overwrite the object after the backend applies this mutation but before its
+response arrives; stamping the submitted value with response time would then
+claim freshness it never had. Reads and writes therefore use the same
+operation-start watermark, despite publishing their results only on completion.
 
 A present entry is revalidated with the existing revision-conditional read. An
 unchanged response advances its watermark without transferring or decoding the
@@ -182,10 +182,10 @@ transaction.
 
 Consequently, an otherwise idle read-only transaction whose key and finalized
 transaction record are cached still performs one conditional read per distinct
-terminal leaf during validation. The database cannot infer that other clients
-did not write after the cached leaf was last validated. Removing that floor
-would require a stronger primitive such as a freshness lease, exclusive-client
-mode, or change stream.
+terminal leaf during validation. The database cannot infer that other database
+instances did not write after the cached leaf was last validated. Removing that
+floor would require a stronger primitive such as a freshness lease,
+exclusive-client mode, or change stream.
 
 ### Watermark ownership and propagation
 
@@ -297,7 +297,7 @@ cannot expose:
 - unchanged conditional reads advance, but never regress, the watermark; and
 - cached absence races safely with create, delete, and delayed reads.
 
-Transaction-level deterministic simulation and multi-client integration tests
+Transaction-level deterministic simulation and multi-instance integration tests
 remain the end-to-end safety net. They assert serializability under reordered
 responses, rejected CAS mutations, lost acknowledgements, and outages, and also pin the
 intended operation shape: an idle cached read-only transaction performs one

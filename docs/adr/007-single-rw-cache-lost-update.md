@@ -7,10 +7,10 @@ Accepted
 ## Context
 
 `FuzzConcurrentTx` (the serializability fuzzer) found a strict-serializability
-violation: two clients incrementing the same keys could lose an update —
-e.g. key `k1` ended at `4` when every committed increment summed to `7`. One
-transaction's committed write was silently overwritten by another transaction
-that had read a stale value yet passed commit-time validation.
+violation: two database instances incrementing the same keys could lose an
+update — e.g. key `k1` ended at `4` when every committed increment summed to
+`7`. One transaction's committed write was silently overwritten by another
+transaction that had read a stale value yet passed commit-time validation.
 
 ### Root cause
 

@@ -520,7 +520,7 @@ impl Gc {
             .locks
             .iter()
             .filter(|lock| match lock {
-                TxLock::Entry { .. } => false,
+                TxLock::Key { .. } => false,
                 TxLock::Directory { collection, .. } => !removed_directories.contains(collection),
                 _ => true,
             })
@@ -617,7 +617,7 @@ impl Gc {
             .map(|write| (write.key.clone(), CheckKind::Writer))
             .collect();
         for lock in &record.locks {
-            if let TxLock::Entry { key, .. } = lock {
+            if let TxLock::Key { key, .. } = lock {
                 items.push((key.clone(), CheckKind::Holder));
             }
         }
@@ -684,7 +684,7 @@ impl Gc {
         let topology: BTreeSet<_> = locks
             .iter()
             .filter_map(|lock| match lock {
-                TxLock::Topology { collection } => Some(collection),
+                TxLock::TopologyFreeze { collection } => Some(collection),
                 _ => None,
             })
             .collect();
@@ -692,7 +692,7 @@ impl Gc {
             let records = self
                 .structural_intents
                 .discover_for_participant(
-                    collection.db_root_component(),
+                    collection.db_prefix_component(),
                     tid,
                     Requirement::after(barrier),
                 )

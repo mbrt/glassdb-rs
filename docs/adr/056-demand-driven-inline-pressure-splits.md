@@ -21,7 +21,7 @@ decision. The pressure signal and one-split-per-request policy remain.
 
 [ADR-072](072-persisted-database-settings.md) refines the configuration agreement:
 hard coordination limits and transaction timing are stored in database metadata;
-inline budgets and soft split thresholds remain local to each client.
+inline budgets and soft split thresholds remain local to each database instance.
 
 ## Context
 
@@ -102,11 +102,11 @@ recoverable split protocol applies unchanged.
 Pressure requests are bounded and coalesced like ordinary split hints. Dropping
 one affects only future direct-commit coverage; it cannot affect correctness.
 
-All clients of one database are expected to use consistent `InlinePolicy` and
-`SplitPolicy` settings. Persisting or enforcing that agreement is deferred.
-Inconsistent clients remain safe, but may make conflicting performance choices
-and permanently reshape the shared tree according to whichever client requests
-a split.
+All database instances of one database are expected to use consistent
+`InlinePolicy` and `SplitPolicy` settings. Persisting or enforcing that
+agreement is deferred. Inconsistent database instances remain safe, but may make
+conflicting performance choices and permanently reshape the shared tree
+according to whichever database instance requests a split.
 
 Ordinary capacity splits and inline-pressure splits must be attributable
 separately. Completed work, transient deferral, and requests discarded as no
@@ -130,8 +130,9 @@ This is an observability requirement, not a prescribed public statistics API.
   future mutations on the locked commit.
 - Direct-commit, transaction, node, and structural-log formats are unchanged.
   No correctness state or reclamation obligation is introduced.
-- Client-local tuning already influences shared topology through `SplitPolicy`;
-  inline pressure adds another reason consistent configuration matters.
+- Database-instance-local tuning already influences shared topology through
+  `SplitPolicy`; inline pressure adds another reason consistent configuration
+  matters.
 
 ## Alternatives considered
 

@@ -141,10 +141,10 @@ impl KeyStateResolver {
         self.monitor.committed_value(key, writer).await
     }
 
-    /// Rejects a node whose collection-delete intent committed, waiting for a
+    /// Rejects a node whose drop intent committed, waiting for a
     /// pending intent and ignoring an aborted one.
     pub(crate) async fn ensure_collection_live(&self, node: &Node) -> Result<(), StorageError> {
-        let Some(holder) = node.collection_delete_intent() else {
+        let Some(holder) = node.drop_intent() else {
             return Ok(());
         };
         match self
@@ -269,9 +269,9 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::{CollectionAddress, DbRoot};
+    use glassdb_data::{CollectionAddress, DbPrefix};
     use glassdb_storage::transaction::{TxLock, TxRecord, TxRecordStore, TxWrite};
-    use glassdb_storage::{CachedStore, EntryLockState, Timeline};
+    use glassdb_storage::{CachedStore, KeyLockState, Timeline};
 
     use super::*;
     use crate::monitor::ProtocolTiming;
@@ -281,7 +281,7 @@ mod tests {
     fn monitor_over(backend: Arc<dyn Backend>) -> (Monitor, Arc<Background>) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        let transactions = TxRecordStore::new(objects, DbRoot::try_from("db").unwrap());
+        let transactions = TxRecordStore::new(objects, DbPrefix::try_from("db").unwrap());
         let background = Arc::new(Background::new());
         let monitor = Monitor::with_config(
             transactions,
@@ -310,7 +310,7 @@ mod tests {
             let backend: Arc<dyn Backend> = Arc::new(recorder);
             let timeline = Timeline::new();
             let objects = CachedStore::new(backend.clone(), 1 << 20, timeline, None);
-            let transactions = TxRecordStore::new(objects, DbRoot::try_from("db").unwrap());
+            let transactions = TxRecordStore::new(objects, DbPrefix::try_from("db").unwrap());
             Self {
                 backend,
                 operations,
@@ -332,7 +332,7 @@ mod tests {
             deleted: Option<bool>,
         ) {
             let mut record = TxRecord::new(holder.clone(), status);
-            record.locks.push(TxLock::Entry {
+            record.locks.push(TxLock::Key {
                 key: key.clone(),
                 typ,
             });
@@ -502,9 +502,9 @@ mod tests {
         let mut holders = holders.into_iter();
         let first = holders.next().expect("a held lock needs a holder");
         let mut lock = match typ {
-            LockType::Read => EntryLockState::read(first),
-            LockType::Write => EntryLockState::write(first),
-            LockType::Create => EntryLockState::create(first),
+            LockType::Read => KeyLockState::read(first),
+            LockType::Write => KeyLockState::write(first),
+            LockType::Create => KeyLockState::create(first),
             LockType::Unknown | LockType::None => panic!("a held lock needs a held type"),
         };
         for holder in holders {

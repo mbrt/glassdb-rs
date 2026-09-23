@@ -344,7 +344,7 @@ impl NodeStore {
         Ok(())
     }
 
-    /// Lists observed standalone nodes under one incarnation-unique collection
+    /// Lists observed standalone nodes under one collection-ID prefix
     /// prefix, including temporarily unreachable structural nodes.
     ///
     /// Uses the same body requirements and absence rules as [`Self::scan_nodes`].

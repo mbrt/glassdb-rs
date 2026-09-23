@@ -40,7 +40,7 @@ impl CollectionRecord {
         }
     }
 
-    /// Returns the incarnation bound to direct child `name`.
+    /// Returns the collection ID bound to direct child `name`.
     pub fn child(&self, name: &[u8]) -> Option<CollectionId> {
         self.children.get(name).copied()
     }
@@ -71,7 +71,7 @@ impl CollectionRecord {
         })
     }
 
-    /// Removes a direct child binding, returning its former incarnation.
+    /// Removes a direct child binding, returning its former collection ID.
     pub fn remove_child(&mut self, name: &[u8]) -> Option<CollectionId> {
         self.children.remove(name)
     }

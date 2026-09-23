@@ -37,7 +37,7 @@ use glassdb_concurr::{RetryConfig, join_all_bounded, map_all_bounded, rt};
 use glassdb_data::{LeafRef, LogicalKey, ObjectPath, TxId};
 use glassdb_storage::transaction::TxLock;
 use glassdb_storage::{
-    CurrentState, CurrentnessBarrier, EntryLockState, LeafEntry, LeafObservation, LockType,
+    CurrentState, CurrentnessBarrier, KeyLockState, LeafEntry, LeafObservation, LockType,
     NodeLocks, Requirement, StorageError, TreeRouter,
 };
 
@@ -57,7 +57,7 @@ const RELEASE_CONTENTION_ROUNDS: usize = 8;
 
 #[derive(Clone, Copy)]
 struct HeldLeaf {
-    entry_lock: LockType,
+    key_lock: LockType,
     membership: LockType,
 }
 
@@ -106,7 +106,7 @@ struct KeyIntent {
 /// The keys a transaction touches in one leaf, plus the leaf's location
 /// (ADR-031).
 struct RoutedLockGroup {
-    /// The leaf's object path: the collection root `_r` for a small collection's
+    /// The leaf's object path: the tree root `_r` for a small collection's
     /// single leaf, else a standalone node `_n`, resolved by descent. This is
     /// the coordinator submit target.
     path: ObjectPath,
@@ -205,12 +205,9 @@ impl LockedTx {
     pub(crate) fn locked_paths(&self) -> Vec<TxLock> {
         let mut out = Vec::new();
         for group in self.groups.values() {
-            debug_assert_eq!(
-                group.receipt.held().entry_lock,
-                entry_lock_type(&group.intents)
-            );
+            debug_assert_eq!(group.receipt.held().key_lock, key_lock_type(&group.intents));
             for intent in &group.intents {
-                out.push(TxLock::Entry {
+                out.push(TxLock::Key {
                     key: intent.key.clone(),
                     typ: lock_type(intent.desired),
                 });
@@ -226,7 +223,7 @@ impl LockedTx {
     }
 }
 
-/// The lock type a `Desired` intention records for an entry lock.
+/// The lock type a `Desired` intention records for a key lock.
 fn lock_type(desired: Desired) -> LockType {
     match desired {
         Desired::Read => LockType::Read,
@@ -402,7 +399,7 @@ impl LeafResolver for AcquireOperation {
             membership = locks.membership().lock_type();
         }
         let outcome = MemberOutcome::Locked {
-            typ: entry_lock_type(&self.intents),
+            typ: key_lock_type(&self.intents),
             membership,
         };
         let retained = locks == *staged_locks
@@ -463,7 +460,7 @@ impl LeafOperation for AcquireOperation {
         match outcome {
             MemberOutcome::Locked { typ, membership } => {
                 let held = HeldLeaf {
-                    entry_lock: typ,
+                    key_lock: typ,
                     membership,
                 };
                 evidence
@@ -487,7 +484,7 @@ impl LeafOperation for AcquireOperation {
 
 /// The lock type recorded for a leaf hold: its strongest intention, so the
 /// diagnostic snapshot distinguishes read-only from write holders.
-fn entry_lock_type(intents: &[KeyIntent]) -> LockType {
+fn key_lock_type(intents: &[KeyIntent]) -> LockType {
     if intents.iter().any(|i| !matches!(i.desired, Desired::Read)) {
         LockType::Write
     } else if intents.is_empty() {
@@ -778,7 +775,7 @@ enum ReleaseOutcome {
     Released(bool),
     Observed(LeafObservation),
     Wait(TxId),
-    /// The round ended without proving the holds were dropped. Re-submit.
+    /// The round ended without proving the holds were released. Re-submit.
     Contended,
 }
 
@@ -800,7 +797,7 @@ async fn resolve_and_lock(
 
     // Resolve existing holders other than us via the shared resolver: a
     // committed exclusive holder is help-forwarded (its value becomes the
-    // effective one), aborted/missing holders are dropped, and the live pending
+    // effective one), aborted/missing holders are removed, and the live pending
     // ones come back as conflicts to wound-wait. The monitor accounts for lease expiry
     // and the unknown-tx grace period in `tx_status`, so a holder still seen
     // as `Pending` here is genuinely live (ADR-021).
@@ -831,7 +828,7 @@ async fn resolve_and_lock(
 
     match intent.desired {
         Desired::Read => {
-            let mut lock = EntryLockState::read(id.clone());
+            let mut lock = KeyLockState::read(id.clone());
             for holder in pending {
                 lock.acquire_read(holder);
             }
@@ -854,7 +851,7 @@ async fn resolve_and_lock(
 }
 
 /// Stages `id`'s write-back on its `intents`: publish the committed pointer
-/// (`current_writer` / tombstone) for each key it still holds and drop its hold
+/// (`current_writer` / tombstone) for each key it still holds and remove its hold
 /// (ADR-020). Returns one changed entry per affected key; keys `id` no longer
 /// holds are skipped, so re-running is a no-op (idempotent, ADR-009). Publishing
 /// only `id`'s own monotonic pointer, this never conflicts with another member.
@@ -902,7 +899,7 @@ fn writeback_changes(
     }
 }
 
-/// Stages `id`'s release: drop its hold from **every** entry in the leaf,
+/// Stages `id`'s release: remove its hold from **every** entry in the leaf,
 /// publishing nothing. Release does not know the tx's keys (it runs from the
 /// per-tx bookkeeping, ADR-024), so it sweeps the loaded entries. Idempotent —
 /// entries `id` does not hold are untouched.
@@ -1158,7 +1155,7 @@ impl KeyLocker {
         let mut leaf_paths = BTreeSet::new();
         for lock in locks {
             match lock {
-                TxLock::Entry { key, .. } => {
+                TxLock::Key { key, .. } => {
                     by_collection
                         .entry(key.collection().clone())
                         .or_insert_with(Vec::new)
@@ -1167,7 +1164,7 @@ impl KeyLocker {
                 TxLock::Membership { leaf, .. } => {
                     leaf_paths.insert(leaf.object_path());
                 }
-                TxLock::Directory { .. } | TxLock::Topology { .. } => {}
+                TxLock::Directory { .. } | TxLock::TopologyFreeze { .. } => {}
             }
         }
         for items in by_collection.into_values() {
@@ -1379,7 +1376,7 @@ impl KeyLocker {
                 membership: group.membership,
                 requirement,
             };
-            // A leaf object is absent only when its collection incarnation was
+            // A leaf object is absent only when its collection was
             // durably dropped: identities are never reused, so the handle this
             // acquire addresses is stale rather than the object merely missing.
             let coordinated = self
@@ -1443,7 +1440,7 @@ mod tests {
     };
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
-    use glassdb_data::{CollectionAddress, CollectionId, DbRoot, ObjectPath};
+    use glassdb_data::{CollectionAddress, CollectionId, DbPrefix, ObjectPath};
     use glassdb_storage::transaction::TxCommitStatus;
     use glassdb_storage::{
         CollectionRecord, LeafBody, LeafEntry, Node, NodeStore, SplitPolicy, Timeline, TreeRouter,
@@ -1492,7 +1489,7 @@ mod tests {
         config.set_cache_size(1 << 20);
         config.set_protocol_timing(ProtocolTiming::simulation());
         config.set_transaction_leaf_parallelism(parallelism);
-        let foundation = AssemblyFixture::new(b, DbRoot::try_from("test").unwrap(), &config);
+        let foundation = AssemblyFixture::new(b, DbPrefix::try_from("test").unwrap(), &config);
         let timeline = foundation.timeline.clone();
         let tx_records = foundation.tx_records.clone();
         let mon = foundation.monitor.clone();
@@ -1694,7 +1691,7 @@ mod tests {
         let groups = group_of(key, put_intent(key));
         lock_ok(&locker, &tx, &groups).await;
 
-        // A create installs the entry lock and membership-W while proving the
+        // A create installs the key lock and membership-W while proving the
         // structural gate open in the same leaf CAS.
         let e = entry_of(&ctx, key).await.expect("entry installed");
         assert_eq!(e.lock_type(), LockType::Create);
@@ -1888,7 +1885,7 @@ mod tests {
         lock_ok(&locker, &tx, &group_of(b"target", put_intent(b"target"))).await;
 
         let unrelated_path = ObjectPath::Transaction {
-            db_root: DbRoot::try_from("test").unwrap(),
+            db_prefix: DbPrefix::try_from("test").unwrap(),
             id: unrelated,
         }
         .to_string();
@@ -3109,7 +3106,7 @@ mod tests {
         ));
     }
 
-    // A collection incarnation is never reused, so a leaf the acquire cannot
+    // A collection ID is never reused, so a leaf the acquire cannot
     // load means a peer dropped that collection. The acquire must report the
     // handle as stale, which replays the body, instead of a bare absence that
     // escapes to the caller as a missing object.

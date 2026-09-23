@@ -1,7 +1,7 @@
 //! Tree descent over the B-link tree (ADR-031).
 //!
 //! The [`TreeRouter`] routes a key to an observed leaf by descending from
-//! the collection root `_r` through index nodes, and it enumerates the leaves
+//! the tree root `_r` through index nodes, and it enumerates the leaves
 //! in key order for listing. Descent is **self-correcting**: every node carries
 //! a high-key and a right-sibling, so a lookup that lands too far left —
 //! because a split moved the key rightward after the cache was taken — steps
@@ -611,7 +611,7 @@ impl TreeRouter {
     /// Routes `key` to a leaf by descending from the root `_r` and
     /// following right-sibling links to self-correct past in-progress splits.
     ///
-    /// A missing collection root is reported as [`StorageError::NotFound`].
+    /// A missing tree root is reported as [`StorageError::NotFound`].
     pub async fn route_key(
         &self,
         collection: &CollectionAddress,
@@ -735,7 +735,7 @@ impl TreeRouter {
     /// Routes `(key, payload)` items to observed leaves, returning one
     /// group per touched leaf with its leaf observation. Callers hand it
     /// logical keys and never compute a location themselves; routing is by
-    /// descent from the collection root, not by any fixed hash (ADR-031).
+    /// descent from the tree root, not by any fixed hash (ADR-031).
     ///
     /// The interior-vs-leaf requirement split of [`route_key_with_requirements`] lets the
     /// coordination hot path route keys without checking the root `_r`.

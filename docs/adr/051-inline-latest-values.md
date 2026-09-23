@@ -146,7 +146,7 @@ record, and needs no write-back. The CAS is the commit point.
 
 An already-committed holder awaiting write-back may be help-forwarded and
 replaced in the same CAS. A live pending or unknown conflicting entry holder, a
-live structural gate, or a collection-deletion fence makes direct commit
+live structural gate, or a drop intent makes direct commit
 ineligible before it writes. Leaf membership locks do not conflict with an
 overwrite because it cannot change the key set. Ineligible transactions fall back
 to the existing locked commit; values that miss only the inline size or leaf

@@ -52,7 +52,7 @@ pub mod transaction_record {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CollectionWrites {
-    /// Stable incarnation ID. The database root comes from the enclosing
+    /// Stable collection ID. The database prefix comes from the enclosing
     /// transaction record's physical path and is deliberately omitted.
     #[prost(bytes = "vec", tag = "1")]
     pub collection_id: ::prost::alloc::vec::Vec<u8>,
@@ -84,13 +84,13 @@ pub mod write {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CollectionLocks {
     #[prost(message, repeated, tag = "1")]
-    pub entry_locks: ::prost::alloc::vec::Vec<EntryLock>,
+    pub key_locks: ::prost::alloc::vec::Vec<KeyLock>,
     #[prost(message, repeated, tag = "2")]
     pub membership_locks: ::prost::alloc::vec::Vec<MembershipLock>,
     #[prost(enumeration = "lock::LockType", tag = "3")]
     pub directory_lock: i32,
     #[prost(bool, tag = "4")]
-    pub topology_lock: bool,
+    pub topology_freeze: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CollectionChange {
@@ -136,7 +136,7 @@ pub mod collection_change {
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct EntryLock {
+pub struct KeyLock {
     #[prost(bytes = "vec", tag = "1")]
     pub key: ::prost::alloc::vec::Vec<u8>,
     #[prost(enumeration = "lock::LockType", tag = "2")]
@@ -276,16 +276,15 @@ pub struct Node {
     #[prost(string, tag = "2")]
     pub right_sibling: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "5")]
-    pub structure_lock: ::core::option::Option<NodeLock>,
+    pub structural_gate: ::core::option::Option<NodeLock>,
     #[prost(message, optional, tag = "6")]
     pub membership_lock: ::core::option::Option<NodeLock>,
     #[prost(uint64, tag = "7")]
     pub membership_generation: u64,
-    /// A transaction preparing collection deletion. Its final status determines
-    /// whether this is an ignorable obsolete intent or a durable stale-handle
-    /// fence.
+    /// The transaction identity that drops the collection. Its final status
+    /// decides whether this drop intent is obsolete or makes the node stale.
     #[prost(bytes = "vec", tag = "8")]
-    pub collection_delete_intent: ::prost::alloc::vec::Vec<u8>,
+    pub drop_intent: ::prost::alloc::vec::Vec<u8>,
     #[prost(oneof = "node::Body", tags = "3, 4")]
     pub body: ::core::option::Option<node::Body>,
 }
@@ -417,7 +416,7 @@ pub struct CollectionDirectoryEntry {
     /// Raw child name.
     #[prost(bytes = "vec", tag = "1")]
     pub name: ::prost::alloc::vec::Vec<u8>,
-    /// Stable 16-byte incarnation ID.
+    /// Stable 16-byte collection ID.
     #[prost(bytes = "vec", tag = "2")]
     pub collection_id: ::prost::alloc::vec::Vec<u8>,
 }

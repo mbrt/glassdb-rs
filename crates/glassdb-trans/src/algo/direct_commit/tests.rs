@@ -94,7 +94,7 @@ async fn membership_generation(tctx: &Tctx) -> u64 {
 
 // Single-rw commit (ADR-030): a lone read-modify-write whose read was
 // superseded by *another instance* is caught with a transparent body replay, never
-// a surfaced error, and never commits its stale value. This client's cached
+// a surfaced error, and never commits its stale value. This database instance's cached
 // snapshot predates the peer's create, so the key reads as absent — an
 // unsupported shape rather than a certified stale read, which is why the
 // locked commit takes over instead of replaying the body (ADR-053). It resolves
@@ -109,7 +109,7 @@ async fn single_rw_stale_read_renews_and_converges() {
     commit_writes(&tm2, vec![wa(&keyp, b"v1")]).await;
     let ra = do_read(&tctx, &keyp).await;
 
-    // Another client overwrites the key, making `ra` stale.
+    // Another database instance overwrites the key, making `ra` stale.
     let h2 = commit_writes(&tm2, vec![wa(&keyp, b"v2")]).await;
 
     let mut h = begin_accesses(
@@ -391,7 +391,7 @@ fn external_value() -> Vec<u8> {
 // CAS, one leaf write-back CAS (run synchronously here because there is no
 // background executor), and no separate membership write — and the new
 // value is durable and readable. With split deferred the leaf is the
-// collection root `_r`, so both leaf CAS's land there (ADR-031).
+// tree root `_r`, so both leaf CAS's land there (ADR-031).
 #[tokio::test]
 async fn an_overwrite_over_the_inline_budget_uses_a_locked_commit() {
     let (tm, tctx, log) = new_recording_algo().await;
@@ -730,7 +730,7 @@ async fn direct_commit_replaces_a_committed_holder() {
 
 // ADR-051 regression: every reason a resolver declines to publish the commit
 // marker must be classified against the round's in-doubt evidence, not just
-// the lost-race one. A structural gate or a collection-delete fence that
+// the lost-race one. A structural gate or a drop intent that
 // appears *after* an in-doubt CAS is no proof that the CAS did not land, so
 // reporting `Moved` there would let locked commit replay a body whose direct
 // commit may already be durable (and since superseded, invisible).
@@ -753,9 +753,9 @@ async fn direct_commit_blocked_after_in_doubt_cas_stays_in_doubt() {
     let mut gated = NodeLocks::default();
     gated.set_structural_gate(TxId::with_priority(1, b"splitter"));
     let mut fenced = NodeLocks::default();
-    fenced.set_delete_intent(TxId::with_priority(1, b"dropper"));
+    fenced.set_drop_intent(TxId::with_priority(1, b"dropper"));
 
-    for (what, locks) in [("a structural gate", &gated), ("a delete fence", &fenced)] {
+    for (what, locks) in [("a structural gate", &gated), ("a drop intent", &fenced)] {
         // Nothing was written yet, so locked commit may take over.
         let outcome = resolve_outcome(&resolver, &tctx, ReloadCause::Fresh, &staged, locks).await;
         assert!(
@@ -1240,7 +1240,7 @@ async fn direct_commit_superseded_read_replays_in_place() {
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
 
     // Read v1, then let a later commit supersede it. Both values are this
-    // client's own, so its snapshot sees the winner rather than a stale leaf.
+    // database instance's own, so its snapshot sees the winner rather than a stale leaf.
     let stale = do_read(&tctx, &keyp).await;
     let winner = commit_writes(&tm, vec![wa(&keyp, b"v2")])
         .await
@@ -1832,12 +1832,12 @@ async fn direct_commit_reroutes_once_then_falls_back() {
 }
 
 // The complete dependency set, not just the writes, must have one physical CAS
-// target. Distinct collection roots are a deterministic two-leaf fixture.
+// target. Distinct tree roots are a deterministic two-leaf fixture.
 #[tokio::test]
 async fn cross_leaf_member_uses_a_locked_commit() {
     let (tm, tctx, log) = new_recording_algo().await;
     let other = CollectionAddress::new(
-        test_collection().db_root(),
+        test_collection().db_prefix(),
         CollectionId::from_slice(&[9; 16]).unwrap(),
     );
     tctx.records

@@ -20,7 +20,7 @@ pub enum Error {
     /// The requested collection name is already bound.
     #[error("collection already exists")]
     AlreadyExists,
-    /// The collection handle names an incarnation that has been deleted.
+    /// The collection handle names a collection that was dropped.
     #[error("stale collection handle")]
     StaleCollection,
     /// The collection still has direct child collections.

@@ -134,7 +134,7 @@ pub struct WriteRateLimits {
     pub prefix_write_ps: RateLimit,
     /// Selects how many leading `/`-separated path segments form a throttled
     /// prefix, i.e. the partition granularity (depth 1 groups every object
-    /// under the database root into a single hot partition; depth 2 throttles
+    /// under the database prefix into a single hot partition; depth 2 throttles
     /// each immediate subtree independently). Ignored when both prefix limits
     /// are unlimited.
     pub prefix_depth: usize,

@@ -72,7 +72,7 @@ impl TryFrom<&String> for CollectionPath {
     }
 }
 
-/// A named group of key-value pairs bound to one collection incarnation.
+/// A named group of key-value pairs bound to one collection ID.
 #[derive(Clone)]
 pub struct Collection {
     address: CollectionAddress,
@@ -207,21 +207,21 @@ impl Collection {
     /// Returns an owned iterator over direct child bindings in raw-name order.
     ///
     /// All I/O and serializable validation complete before the iterator is
-    /// returned. Each yielded handle remains bound to the listed incarnation.
+    /// returned. Each yielded handle remains bound to the listed collection ID.
     pub async fn iter_collections(&self) -> Result<CollectionIter, Error> {
         self.db
             .tx(|tx| async move { tx.iter_collections(self).await })
             .await
     }
 
-    /// Non-recursively drops this exact collection incarnation.
+    /// Non-recursively drops this exact collection.
     pub async fn drop_collection(&self) -> Result<(), Error> {
         self.db
             .tx(|tx| async move { tx.drop_collection(self).await })
             .await
     }
 
-    /// Returns this handle's direct logical name, or `None` for the database root.
+    /// Returns this handle's direct logical name, or `None` for the root collection.
     pub fn name(&self) -> Option<&[u8]> {
         self.name.as_deref()
     }

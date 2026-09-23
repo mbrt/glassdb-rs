@@ -82,8 +82,8 @@ safety proof.
 
 The same direct-to-`Aborted` rule applies to an ordinary owner-initiated abort
 that establishes the retirement and cleanup proof. A newly opened Database is
-not the owner of transactions abandoned by an earlier incarnation and cannot
-acknowledge them merely because it uses the same database.
+not the owner of transactions abandoned by an earlier database instance and
+cannot acknowledge them merely because it uses the same database.
 
 Transactions that can create recovery-owned physical resources must persist
 their complete recovery manifest before those effects can become durable. A

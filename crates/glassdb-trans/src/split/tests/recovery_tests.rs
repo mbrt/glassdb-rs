@@ -27,7 +27,7 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
         // The split has completed its tree change, but failed intent deletion
         // leaves both the Ready intent and participant for background recovery.
         hooks.set_before({
-            let prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+            let prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
             move |op| {
                 let fail =
                     matches!(op, BackendOp::DeleteIf { path, .. } if path.starts_with(&prefix));
@@ -95,7 +95,7 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
             let owner = owner.clone();
             let participant = participant.clone();
             let prefix =
-                ObjectPath::participant_structural_intents_prefix(&db_root("db"), &participant);
+                ObjectPath::participant_structural_intents_prefix(&db_prefix("db"), &participant);
             move |op| {
                 let depart = matches!(op, BackendOp::List { .. }) && op.path() == prefix;
                 let owner = owner.clone();
@@ -167,7 +167,7 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
             .await
             .unwrap();
         assert!(record.value().unwrap().locks.iter().any(|lock| {
-            matches!(lock, TxLock::Topology { collection: target } if target == &collection())
+            matches!(lock, TxLock::TopologyFreeze { collection: target } if target == &collection())
         }));
         return;
     }
@@ -236,7 +236,7 @@ async fn recovery_retries_a_cached_preparing_intent_after_the_peer_publishes_rea
     let peer_bg = Arc::new(Background::new());
     let recovering = splitter(&local, &local_bg, tiny());
     let owner = splitter(&peer, &peer_bg, tiny());
-    let prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+    let prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
     // The recovering instance discovers Preparing before the owner advances
     // it. Failed owner cleanup then leaves the completed split for recovery.
     hooks.set_after({
@@ -360,7 +360,7 @@ async fn settlement_cancels_a_prepared_split_before_node_creation() {
         .await
         .unwrap();
     let expected_listing =
-        ObjectPath::participant_structural_intents_prefix(&db_root("db"), &participant);
+        ObjectPath::participant_structural_intents_prefix(&db_prefix("db"), &participant);
     let listings: Vec<_> = operations
         .lock()
         .unwrap()
@@ -471,7 +471,7 @@ async fn structural_split_failure_transition_table() {
 
         let root_path = root_path().to_string();
         let nodes_prefix = ObjectPath::nodes_prefix(&collection());
-        let structural_prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+        let structural_prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
         let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         backend.set_before({
             let fired = fired.clone();
@@ -797,7 +797,7 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
         "recovery must defer to the live split rather than reclaim its child"
     );
     let recorded = std::mem::take(&mut *operations.lock().unwrap());
-    let intent_prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+    let intent_prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
     assert!(
         recorded.iter().all(|op| {
             !op.path.starts_with(&intent_prefix) || !matches!(op.op, "read" | "read_if_modified")
@@ -916,7 +916,7 @@ async fn check_recovery_batch_reuses_source_reads(explicit: bool) {
         assert!(sp.recover_structural_intents().await.unwrap());
     }
     let recorded = std::mem::take(&mut *operations.lock().unwrap());
-    let intent_prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+    let intent_prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
     assert!(
         recorded.iter().all(|op| {
             !op.path.starts_with(&intent_prefix) || !matches!(op.op, "read" | "read_if_modified")
@@ -982,7 +982,7 @@ async fn participant_settlement_reuses_source_reads_across_a_discovered_batch() 
 async fn later_participant_discovery_checks_sources_after_its_own_ready_intents() {
     for explicit in [false, true] {
         let memory = Arc::new(MemoryBackend::new());
-        let prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+        let prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
         let (backend, gate) = OpGate::wrap(
             memory.clone(),
             move |op| matches!(op, BackendOp::DeleteIf { path, .. } if path.starts_with(&prefix)),
@@ -1053,7 +1053,7 @@ async fn later_participant_discovery_checks_sources_after_its_own_ready_intents(
         gate.release();
         recovering.await.unwrap();
 
-        let prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+        let prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
         let body_reads: Vec<_> = operations
             .lock()
             .unwrap()
@@ -1182,7 +1182,7 @@ async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
 /// newer one.
 #[tokio::test]
 async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
-    let intents_prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+    let intents_prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
     let (backend, gate) = OpGate::wrap(
         Arc::new(MemoryBackend::new()),
         move |op| matches!(op, BackendOp::Read { path } if path.starts_with(&intents_prefix)),
@@ -1589,7 +1589,7 @@ async fn sweep_defers_one_failed_parent_split_and_continues() {
     intent_ids.sort();
     s.intent_store
         .write(
-            &db_root("db"),
+            &db_prefix("db"),
             &StructuralIntentId::from(intent_ids[0].clone()),
             &request_record,
         )
@@ -1597,7 +1597,7 @@ async fn sweep_defers_one_failed_parent_split_and_continues() {
         .unwrap();
     s.intent_store
         .write(
-            &db_root("db"),
+            &db_prefix("db"),
             &StructuralIntentId::from(intent_ids[1].clone()),
             &orphan_intent,
         )
@@ -1643,7 +1643,7 @@ async fn explicit_settlement_returns_a_parent_split_error() {
     sp.mon.abort_owned_tx(&participant).await.unwrap();
     s.intent_store
         .write(
-            &db_root("db"),
+            &db_prefix("db"),
             &StructuralIntentId::from(test_token("request-intent")),
             &intent,
         )

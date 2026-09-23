@@ -285,11 +285,11 @@ impl DirectCommitOperation {
     ) -> Result<bool, TransError> {
         // Pruning only the staged copy keeps this outside the lock lifecycle:
         // finalized metadata becomes durable iff the publication CAS lands.
-        if let Some(holder) = locks.delete_intent().cloned() {
+        if let Some(holder) = locks.drop_intent().cloned() {
             match ctx.tmon.tx_status(&holder).await? {
                 TxCommitStatus::Ok => return Err(TransError::StaleCollection),
                 TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
-                    locks.remove_delete_intent(&holder);
+                    locks.remove_drop_intent(&holder);
                 }
                 TxCommitStatus::Pending | TxCommitStatus::Unknown => return Ok(true),
             }

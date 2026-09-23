@@ -172,7 +172,7 @@ impl Transaction {
         Ok(())
     }
 
-    /// Returns this transaction's handle to the permanent database root.
+    /// Returns this transaction's handle to the root collection.
     pub fn root_collection(&self) -> Collection {
         Collection::new_root(self.db.clone())
     }
@@ -256,7 +256,7 @@ impl Transaction {
     /// The directory observation and materialization complete before the
     /// iterator is returned; the enclosing transaction validates that
     /// observation when it commits. Each yielded handle remains
-    /// bound to the listed incarnation.
+    /// bound to the listed collection ID.
     pub async fn iter_collections(&self, parent: &Collection) -> Result<CollectionIter, Error> {
         self.admit_operation(parent)?;
         self.ensure_directory(parent.address()).await?;
@@ -281,7 +281,7 @@ impl Transaction {
         Ok(CollectionIter::new(entries))
     }
 
-    /// Non-recursively drops the exact collection incarnation bound by `collection`.
+    /// Non-recursively drops the exact collection bound by `collection`.
     pub async fn drop_collection(&self, collection: &Collection) -> Result<(), Error> {
         self.admit_operation(collection)?;
         if collection.address().id().is_root() {
@@ -410,7 +410,7 @@ impl Transaction {
         }
         inner.operations += 1;
         if collection.database_id() != self.db.database_id
-            || collection.address().db_root() != self.db.name
+            || collection.address().db_prefix() != self.db.name
         {
             return Err(Error::InvalidInput(
                 "collection handle belongs to a different database".into(),

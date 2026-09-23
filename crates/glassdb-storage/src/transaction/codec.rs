@@ -25,7 +25,7 @@ impl TxRecordCodec {
 
     fn encode_for_database(
         record: &TxRecord,
-        expected_db_root: Option<&str>,
+        expected_db_prefix: Option<&str>,
     ) -> Result<Vec<u8>, StorageError> {
         let timestamp = record
             .timestamp
@@ -33,7 +33,7 @@ impl TxRecordCodec {
         if record.id.is_unset() {
             return Err(StorageError::other("empty transaction identity"));
         }
-        validate_database_membership(record, expected_db_root)?;
+        validate_database_membership(record, expected_db_prefix)?;
 
         let mut collection_writes: BTreeMap<CollectionAddress, pb::CollectionWrites> =
             BTreeMap::new();
@@ -73,14 +73,18 @@ impl TxRecordCodec {
         Ok(encoded.encode_to_vec())
     }
 
-    /// Decodes a transaction-record body using the database root from its object path.
-    pub(crate) fn decode(db_root: &str, id: &TxId, bytes: &[u8]) -> Result<TxRecord, StorageError> {
+    /// Decodes a transaction-record body using the database prefix from its object path.
+    pub(crate) fn decode(
+        db_prefix: &str,
+        id: &TxId,
+        bytes: &[u8],
+    ) -> Result<TxRecord, StorageError> {
         let encoded = parse_record(bytes)?;
         let status = decode_status(encoded.status())?;
-        let (writes, locks) = decode_collection_writes(db_root, &encoded.writes)?;
-        let collection_changes = decode_collection_changes(db_root, &encoded.collection_changes)?;
+        let (writes, locks) = decode_collection_writes(db_prefix, &encoded.writes)?;
+        let collection_changes = decode_collection_changes(db_prefix, &encoded.collection_changes)?;
         let prepared_collections =
-            decode_prepared_collections(db_root, &encoded.prepared_collection_ids)?;
+            decode_prepared_collections(db_prefix, &encoded.prepared_collection_ids)?;
 
         Ok(TxRecord {
             id: id.clone(),
@@ -103,16 +107,16 @@ impl Codec for TxRecordCodec {
     type Value = TxRecord;
 
     fn decode(path: &ObjectPath, body: &[u8]) -> Result<Self::Value, StorageError> {
-        let ObjectPath::Transaction { db_root, id } = path else {
+        let ObjectPath::Transaction { db_prefix, id } = path else {
             return Err(StorageError::other(
                 "transaction record has a non-transaction path",
             ));
         };
-        TxRecordCodec::decode(db_root.as_str(), id, body)
+        TxRecordCodec::decode(db_prefix.as_str(), id, body)
     }
 
     fn encode(path: &ObjectPath, record: &Self::Value) -> Result<Vec<u8>, StorageError> {
-        let ObjectPath::Transaction { db_root, id } = path else {
+        let ObjectPath::Transaction { db_prefix, id } = path else {
             return Err(StorageError::other(
                 "transaction record has a non-transaction path",
             ));
@@ -122,7 +126,7 @@ impl Codec for TxRecordCodec {
                 "transaction-record path does not match its ID",
             ));
         }
-        TxRecordCodec::encode_for_database(record, Some(db_root.as_str()))
+        TxRecordCodec::encode_for_database(record, Some(db_prefix.as_str()))
     }
 
     fn size(record: &Self::Value) -> usize {
@@ -137,11 +141,11 @@ impl Codec for TxRecordCodec {
                 .locks
                 .iter()
                 .map(|lock| match lock {
-                    TxLock::Entry { key, .. } => key.key().len(),
+                    TxLock::Key { key, .. } => key.key().len(),
                     TxLock::Membership { leaf, .. } => {
                         leaf.node_token().map_or(0, |token| token.as_str().len())
                     }
-                    TxLock::Directory { .. } | TxLock::Topology { .. } => 0,
+                    TxLock::Directory { .. } | TxLock::TopologyFreeze { .. } => 0,
                 })
                 .sum::<usize>()
             + record
@@ -190,16 +194,16 @@ fn decode_status(status: pb::transaction_record::Status) -> Result<TxCommitStatu
 }
 
 fn decode_collection_writes(
-    db_root: &str,
+    db_prefix: &str,
     encoded: &[pb::CollectionWrites],
 ) -> Result<(Vec<TxWrite>, Vec<TxLock>), StorageError> {
     let mut writes = Vec::new();
     let mut locks = Vec::new();
     for group in encoded {
-        let collection = decode_collection_id(db_root, &group.collection_id)?;
+        let collection = decode_collection_id(db_prefix, &group.collection_id)?;
         writes.extend(decode_writes(&collection, &group.writes));
         if let Some(group_locks) = &group.locks {
-            locks.extend(decode_entry_locks(&collection, &group_locks.entry_locks));
+            locks.extend(decode_key_locks(&collection, &group_locks.key_locks));
             locks.extend(decode_membership_locks(
                 &collection,
                 &group_locks.membership_locks,
@@ -211,8 +215,8 @@ fn decode_collection_writes(
                     typ,
                 });
             }
-            if group_locks.topology_lock {
-                locks.push(TxLock::Topology {
+            if group_locks.topology_freeze {
+                locks.push(TxLock::TopologyFreeze {
                     collection: collection.clone(),
                 });
             }
@@ -233,10 +237,10 @@ fn decode_writes(collection: &CollectionAddress, encoded: &[pb::Write]) -> Vec<T
         .collect()
 }
 
-fn decode_entry_locks(collection: &CollectionAddress, encoded: &[pb::EntryLock]) -> Vec<TxLock> {
+fn decode_key_locks(collection: &CollectionAddress, encoded: &[pb::KeyLock]) -> Vec<TxLock> {
     encoded
         .iter()
-        .map(|lock| TxLock::Entry {
+        .map(|lock| TxLock::Key {
             key: LogicalKey::new(collection.clone(), &lock.key),
             typ: parse_lock_type(lock.lock_type),
         })
@@ -273,7 +277,7 @@ fn decode_membership_locks(
 }
 
 fn decode_collection_changes(
-    db_root: &str,
+    db_prefix: &str,
     encoded: &[pb::CollectionChange],
 ) -> Result<Vec<TxCollectionChange>, StorageError> {
     encoded
@@ -284,8 +288,8 @@ fn decode_collection_changes(
                     "transaction record has an invalid collection name",
                 ));
             }
-            let parent = decode_collection_id(db_root, &change.parent_collection_id)?;
-            let collection = decode_collection_id(db_root, &change.collection_id)?;
+            let parent = decode_collection_id(db_prefix, &change.parent_collection_id)?;
+            let collection = decode_collection_id(db_prefix, &change.collection_id)?;
             if collection.id().is_root() {
                 return Err(StorageError::other(
                     "transaction record changes the permanent root collection",
@@ -311,13 +315,13 @@ fn decode_collection_changes(
 }
 
 fn decode_prepared_collections(
-    db_root: &str,
+    db_prefix: &str,
     encoded: &[Vec<u8>],
 ) -> Result<Vec<CollectionAddress>, StorageError> {
     encoded
         .iter()
         .map(|id| {
-            let collection = decode_collection_id(db_root, id)?;
+            let collection = decode_collection_id(db_prefix, id)?;
             if collection.id().is_root() {
                 return Err(StorageError::other(
                     "transaction record prepares the permanent root collection",
@@ -369,9 +373,9 @@ fn append_lock(
     lock: &TxLock,
 ) {
     let collection = match lock {
-        TxLock::Entry { key, .. } => key.collection(),
+        TxLock::Key { key, .. } => key.collection(),
         TxLock::Membership { leaf, .. } => leaf.collection(),
-        TxLock::Directory { collection, .. } | TxLock::Topology { collection } => collection,
+        TxLock::Directory { collection, .. } | TxLock::TopologyFreeze { collection } => collection,
     };
     let group = collection_writes
         .entry(collection.clone())
@@ -383,7 +387,7 @@ fn append_lock(
     let locks = group.locks.get_or_insert_with(pb::CollectionLocks::default);
 
     match lock {
-        TxLock::Entry { key, typ } => locks.entry_locks.push(pb::EntryLock {
+        TxLock::Key { key, typ } => locks.key_locks.push(pb::KeyLock {
             key: key.key().to_vec(),
             lock_type: lock_type_to_proto(*typ) as i32,
         }),
@@ -400,39 +404,39 @@ fn append_lock(
         TxLock::Directory { typ, .. } => {
             locks.directory_lock = lock_type_to_proto(*typ) as i32;
         }
-        TxLock::Topology { .. } => {
-            locks.topology_lock = true;
+        TxLock::TopologyFreeze { .. } => {
+            locks.topology_freeze = true;
         }
     }
 }
 
 fn decode_collection_id(
-    db_root: &str,
+    db_prefix: &str,
     collection_id: &[u8],
 ) -> Result<CollectionAddress, StorageError> {
     let id = CollectionId::from_slice(collection_id)
         .ok_or_else(|| StorageError::other("transaction record has an invalid collection ID"))?;
-    Ok(CollectionAddress::new(db_root, id))
+    Ok(CollectionAddress::new(db_prefix, id))
 }
 
 fn validate_database_membership(
     record: &TxRecord,
-    expected_db_root: Option<&str>,
+    expected_db_prefix: Option<&str>,
 ) -> Result<(), StorageError> {
-    let mut db_root: Option<String> = None;
+    let mut db_prefix: Option<String> = None;
     let mut check = |collection: &CollectionAddress| -> Result<(), StorageError> {
-        if expected_db_root.is_some_and(|expected| expected != collection.db_root()) {
+        if expected_db_prefix.is_some_and(|expected| expected != collection.db_prefix()) {
             return Err(StorageError::other(
-                "transaction-record path does not match its database root",
+                "transaction-record path does not match its database prefix",
             ));
         }
-        match db_root.as_deref() {
-            Some(root) if root != collection.db_root() => Err(StorageError::other(
-                "transaction record spans multiple database roots",
+        match db_prefix.as_deref() {
+            Some(root) if root != collection.db_prefix() => Err(StorageError::other(
+                "transaction record spans multiple database prefixes",
             )),
             Some(_) => Ok(()),
             None => {
-                db_root = Some(collection.db_root().to_string());
+                db_prefix = Some(collection.db_prefix().to_string());
                 Ok(())
             }
         }
@@ -442,9 +446,9 @@ fn validate_database_membership(
     }
     for lock in &record.locks {
         match lock {
-            TxLock::Entry { key, .. } => check(key.collection())?,
+            TxLock::Key { key, .. } => check(key.collection())?,
             TxLock::Membership { leaf, .. } => check(leaf.collection())?,
-            TxLock::Directory { collection, .. } | TxLock::Topology { collection } => {
+            TxLock::Directory { collection, .. } | TxLock::TopologyFreeze { collection } => {
                 check(collection)?
             }
         }
@@ -487,8 +491,8 @@ fn proto_ts_to_system(timestamp: prost_types::Timestamp) -> SystemTime {
 mod tests {
     use super::*;
 
-    fn collection(db_root: &str, byte: u8) -> CollectionAddress {
-        CollectionAddress::new(db_root, CollectionId::from_slice(&[byte; 16]).unwrap())
+    fn collection(db_prefix: &str, byte: u8) -> CollectionAddress {
+        CollectionAddress::new(db_prefix, CollectionId::from_slice(&[byte; 16]).unwrap())
     }
 
     fn record_with_status(status: TxCommitStatus) -> TxRecord {
@@ -497,10 +501,10 @@ mod tests {
         record
     }
 
-    fn complete_record(db_root: &str) -> TxRecord {
-        let parent = collection(db_root, 1);
-        let created = collection(db_root, 2);
-        let dropped = collection(db_root, 3);
+    fn complete_record(db_prefix: &str) -> TxRecord {
+        let parent = collection(db_prefix, 1);
+        let created = collection(db_prefix, 2);
+        let dropped = collection(db_prefix, 3);
         TxRecord {
             id: TxId::from_bytes(vec![1, 2, 3, 4]),
             timestamp: Some(UNIX_EPOCH + Duration::from_secs(42)),
@@ -520,7 +524,7 @@ mod tests {
                 },
             ],
             locks: vec![
-                TxLock::Entry {
+                TxLock::Key {
                     key: LogicalKey::new(parent.clone(), b"entry"),
                     typ: LockType::Write,
                 },
@@ -536,7 +540,7 @@ mod tests {
                     collection: parent.clone(),
                     typ: LockType::Write,
                 },
-                TxLock::Topology {
+                TxLock::TopologyFreeze {
                     collection: created.clone(),
                 },
             ],
@@ -642,23 +646,23 @@ mod tests {
             relocated
                 .writes
                 .iter()
-                .all(|write| write.key.collection().db_root() == "moved")
+                .all(|write| write.key.collection().db_prefix() == "moved")
         );
         assert!(relocated.locks.iter().all(|lock| match lock {
-            TxLock::Entry { key, .. } => key.collection().db_root() == "moved",
-            TxLock::Membership { leaf, .. } => leaf.collection().db_root() == "moved",
-            TxLock::Directory { collection, .. } | TxLock::Topology { collection } => {
-                collection.db_root() == "moved"
+            TxLock::Key { key, .. } => key.collection().db_prefix() == "moved",
+            TxLock::Membership { leaf, .. } => leaf.collection().db_prefix() == "moved",
+            TxLock::Directory { collection, .. } | TxLock::TopologyFreeze { collection } => {
+                collection.db_prefix() == "moved"
             }
         }));
         assert!(relocated.collection_changes.iter().all(|change| {
-            change.parent.db_root() == "moved" && change.collection.db_root() == "moved"
+            change.parent.db_prefix() == "moved" && change.collection.db_prefix() == "moved"
         }));
         assert!(
             relocated
                 .prepared_collections
                 .iter()
-                .all(|collection| collection.db_root() == "moved")
+                .all(|collection| collection.db_prefix() == "moved")
         );
         assert_eq!(TxRecordCodec::encode(&relocated).unwrap(), bytes);
     }

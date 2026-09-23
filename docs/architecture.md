@@ -14,10 +14,10 @@ model, and [CONTEXT.md](../CONTEXT.md) defines the vocabulary.
 
 GlassDB is designed around a specific set of constraints:
 
-- **Stateless clients, no server component.** The entire database is a
-  client-side Rust library. There is no server to deploy, no coordinator, and no
-  direct communication between clients. All coordination happens through object
-  storage.
+- **Stateless database instances, no server component.** The entire database is
+  a client-side Rust library. There is no server to deploy, no coordinator, and
+  no direct communication between database instances. All coordination happens
+  through object storage.
 - **Optimistic locking.** Optimized for workloads where conflicts between
   transactions are rare. Readers are rarely blocked.
 - **Strict serializability.** The strongest isolation level — transactions
@@ -39,7 +39,7 @@ The explicit tradeoffs are:
 
 ```
 ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
-│  Client A   │  │  Client B   │  │  Client C   │
+│  Process A  │  │  Process B  │  │  Process C  │
 │ ┌─────────┐ │  │ ┌─────────┐ │  │ ┌─────────┐ │
 │ │ App     │ │  │ │ App     │ │  │ │ App     │ │
 │ │ Code    │ │  │ │ Code    │ │  │ │ Code    │ │
@@ -58,8 +58,9 @@ The explicit tradeoffs are:
               └───────────────────┘
 ```
 
-Each client embeds GlassDB as a library. Clients are completely independent and
-ephemeral — they can scale to zero and back without any coordination. The only
+Each application process embeds GlassDB as a library and opens its own database
+instance. The processes are completely independent and ephemeral — they can
+scale to zero and back without any coordination. The only
 shared state is the object storage bucket, which provides strong consistency for
 single-object operations and conditional mutations for atomic state transitions.
 
@@ -121,9 +122,9 @@ one split of a divisible node; the blocked operation then retries admission.
 Earlier formats require recreation; see
 [ADR-072](adr/072-persisted-database-settings.md).
 
-Client key-size limits apply to write admission, including overwrites. Reads,
-deletions, and scans ignore this local limit so clients can access keys created
-by another database instance.
+Database-instance key-size limits apply to write admission, including
+overwrites. Reads, deletions, and scans ignore this local limit so database
+instances can access keys created by another database instance.
 
 The database instance does not cap concurrent transaction calls or stale reads.
 It tracks active calls so shutdown can reject new calls and wait for existing
@@ -240,18 +241,18 @@ Collection management travels beside key access: logical directory reads plus
 exact create and drop binding changes. `Transaction` overlays those changes for
 read-your-writes behavior, and the same accesses survive body replays under one
 transaction identity. `CollectionCommit` owns their recovery-manifest
-projection, physical preparation, catalog validation, drop fencing, and physical
-cleanup. `Algo` composes those phases with collection and key locking around the
-same validation barrier and transaction-record status flip.
+projection, physical preparation, catalog validation, drop-intent installation,
+and physical cleanup. `Algo` composes those phases with collection and key
+locking around the same validation barrier and transaction-record status flip.
 
 A drop additionally freezes the target collection's split topology and installs
-the transaction identity as a delete intent on every root, index, and leaf
+the transaction identity as a drop intent on every root, index, and leaf
 object, so every pre-existing participant settles before node enumeration.
 Normal point operations inspect only the terminal node they already access: an
 aborted intent is removable, a pending intent participates in wound-wait, and a
 committed intent reports a stale collection handle.
 
-A later drop replaces an aborted or wounded owner's delete intent in the same
+A later drop replaces an aborted or wounded owner's drop intent in the same
 revision-checked CAS that installs its own fence, because resolving the old
 owner's status does not clear the stored intent and rereading alone cannot make
 progress. Other pending holders must still be resolved before that CAS, and a
@@ -272,7 +273,7 @@ locking still start only when the commit protocol requires them.
 Lock ownership is centralized behind two views of `Locker`. The key view takes
 logical key accesses and owns node-lock acquisition, write-back, and release.
 The collection view takes collection addresses and coordinates directory and
-topology locks in collection records.
+topology freezes in collection records.
 
 `CollectionStateResolver` is the shared mechanism beneath collection semantics
 and locking. It loads collection records, reconciles foreign topology and
@@ -319,9 +320,9 @@ does not consume the transaction GC candidate queue.
 | `Algo`                | commit **policy** | transaction identity and retirement, direct-vs-locked selection, lock→validate→commit→write-back orchestration, **post-lock read validation**, conflict policy, body-replay decision, GC candidate hints | transaction-body execution, leaf routing, CAS details, caching, collection lifecycle implementation, GC execution |
 | `DirectCommit`        | direct commit mechanism | one-leaf and physical eligibility, atomic inline/tombstone publication, transaction-local recovery classification | access normalization, transaction records, range and catalog validation, waiting or wounding holders |
 | `GcHints`             | GC candidate seam | bounded nonblocking candidate reports, observable hint loss, wakeups and de-duplication | GC execution, transaction policy, backend storage |
-| `CollectionCommit`    | collection-commit **policy** | same-identity collection replay state, durable manifest fields, incarnation preparation, validation, drop fencing, post-commit and post-abort cleanup | key locking, key validation, the atomic commit decision |
+| `CollectionCommit`    | collection-commit **policy** | same-identity collection replay state, durable manifest fields, collection-ID preparation, validation, drop-intent installation, post-commit and post-abort cleanup | key locking, key validation, the atomic commit decision |
 | `Locker::keys`        | key-lock **policy** | key→leaf grouping, parallel and serial acquisition, hold-and-wait, acquire / write-back / release operations | access normalization, collection-directory semantics |
-| `Locker::collections` | collection-lock **policy** | directory and topology lock acquisition, recovery write-back and release | key routing, B-link topology, catalog semantics |
+| `Locker::collections` | collection-lock **policy** | directory and topology freeze acquisition, recovery write-back and release | key routing, B-link topology, catalog semantics |
 | `CollectionStateResolver` | collection-state mechanism | resolved record loads, foreign-holder reconciliation, committed directory write-back assistance | key routing, B-link topology, catalog semantics |
 | `CollectionCatalog`   | collection semantics | logical snapshots, read-your-writes validation, capacity and precondition checks | locking policy, CAS, wound-wait |
 | `LeafCoordinator`     | shared mutation engine | one round per object: batching, oldest-first mutation planning, routing and capacity admission, exclusion of overlapping direct members, one CAS per attempt, per-member in-doubt state, reload-recover, vestigial-entry pruning | operation-specific results, cross-leaf strategy, transaction lifecycle, commit orchestration, GC selection |
@@ -697,7 +698,7 @@ The validate-and-commit sequence:
    record, and a delete as a tombstone
    ([ADR-054](adr/054-reserve-inline-publication-for-logless-commits.md)). This
    can happen asynchronously because the transaction record is the source of
-   truth. If the client crashes, another transaction can read the record and
+   truth. If the process crashes, another transaction can read the record and
    complete the write-back, or just observe the committed values from the
    record. A live
    structural holder defers to lazy recovery.
@@ -742,7 +743,7 @@ complete durable result.
 Direct admission requires all output values to fit the per-value inline limit
 and the complete post-state to fit the aggregate and encoded leaf limits. There
 is no direct-specific key-count cap. Range scans, collection-catalog operations,
-cross-leaf point dependencies, structural or deletion fencing, and live or
+cross-leaf point dependencies, structural gates or drop intents, and live or
 unknown holders use the locked [commit protocol](#commit-protocol). Direct
 commit never waits for or wounds a holder. A failed multi-key admission does not
 request a pressure split, because a split could destroy the member's one-leaf
@@ -822,8 +823,9 @@ every identity renewal and livelock. See [ADR-002](adr/002-wound-wait-locking.md
 
 ### Crash Recovery
 
-If a client crashes mid-transaction (or its transaction future is dropped),
-other clients can recover. The lifecycle monitor drives this:
+If a database instance crashes mid-transaction (or its transaction future is
+dropped), other database instances can recover. The lifecycle monitor drives
+this:
 
 1. **Lock leases.** While holding locks, a transaction periodically refreshes
    its transaction record with a new timestamp, at half the pending-transaction
@@ -1026,7 +1028,7 @@ missing-collection results.
 
 `CollectionPath` values are unresolved sequences of raw names. Resolving one
 walks the direct-child directory in each parent record and returns a collection
-bound to an opaque incarnation ID. Logical keys pair that bound address with raw
+bound to an opaque collection ID. Logical keys pair that bound address with raw
 key bytes; point operations route by ID without revalidating ancestors.
 
 Only backend objects have type markers:
@@ -1043,8 +1045,8 @@ Only backend objects have type markers:
 Collection IDs — not names — are encoded into physical collection namespaces
 with a custom **order-preserving** base64 alphabet. Keys live inside leaf
 objects and remain raw bytes. Transaction records store raw keys and collection
-IDs; the database root comes from the transaction record's location, so moving a
-database does not invalidate its records.
+IDs; the database prefix comes from the transaction record's location, so moving
+a database does not invalidate its records.
 
 ### Collections
 
@@ -1140,7 +1142,7 @@ implements a candidate-driven **reverse mark-sweep**
   locks not with its own CAS but by calling the `Locker`'s per-object unlock
   methods, so the release batches through the same leaf coordinator as live
   traffic (ADR-029); the coordinator prunes an entry before persistence when it
-  becomes vestigial. Entry references, membership holds, directory holders, and
+  becomes vestigial. Entry references, membership locks, directory holders, and
   topology participants are separate obligations, each with its own completion
   evidence. GC deletes only the exact candidate revision it checked, and
   reclaims a dropped collection one node page at a time, removing the root and

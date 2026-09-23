@@ -259,7 +259,7 @@ One backend test separates request dispatch from remote application, abandons
 the local mutation, completes shutdown, then applies the request and verifies
 that subsequent read/CAS or recovery safely reconciles it.
 Transaction simulation remains the end-to-end check under reordered responses,
-lost acknowledgements, outages, and client crashes. Hot-object, slow-read, and
+lost acknowledgements, outages, and process crashes. Hot-object, slow-read, and
 ordinary multi-path benchmarks gate any relaxation of the exclusive read lane.
 
 ## Discarded options
@@ -273,9 +273,9 @@ also cannot order overlapping operations: object stores do not promise that
 acknowledgements arrive in linearization order.
 
 Stamping a result with completion as `current_after` is stronger than either
-ordering mistake. Another client may replace the state after this operation
-linearizes but before its response arrives, so completion would claim freshness
-the result never established.
+ordering mistake. Another database instance may replace the state after this
+operation linearizes but before its response arrives, so completion would claim
+freshness the result never established.
 
 ### Track spans without serializing same-path calls
 
@@ -347,7 +347,7 @@ Transferring an invoked mutation to a database-owned worker would preserve its
 place in the local path order and often recover a definitive result. That edge
 is not observable by the caller that abandoned the operation, however, and
 GlassDB must already tolerate the same mutation arriving from another database
-instance or a crashed client. Continuing it would require a task registry,
+instance or a crashed process. Continuing it would require a task registry,
 ownership handoff, panic containment, and shutdown draining, while a slow call
 would retain the path lane after its caller no longer needs it. Invalidating
 knowledge and applying the existing external-writer model gives the required

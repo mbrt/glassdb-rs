@@ -5,14 +5,47 @@ by project area.
 
 ## Database access
 
+**Database**:
+The durable collections and protocol state that one backend stores under one database prefix. Its database ID identifies it: if its metadata is deleted and created again, the result is a different database with the same name.
+
+**Database prefix**:
+The top-level object-path component under which one database stores all its objects. It is the validated database name.
+_Avoid_: Database root, DB root
+
 **Database instance**:
 A local runtime created by one successful database open. Cloned handles share that instance; separate opens create separate instances, including within one process.
+_Avoid_: Client
 
 ## Data model
 
 **Collection**:
-An ordered group of key-value pairs within one database. It has a stable identity, even if its name is removed and later reused, and can contain named child collections.
+An ordered group of key-value pairs within one database. Its collection ID identifies it, even if its name is removed and later reused, and it can contain named child collections.
 _Avoid_: Table, bucket
+
+**Collection ID**:
+The identity of one collection within its database. GlassDB never reuses it: a collection created with the name of a dropped collection gets a new collection ID.
+_Avoid_: Incarnation, incarnation ID
+
+**Root collection**:
+The permanent collection that each database has. It has a reserved collection ID and cannot be dropped.
+_Avoid_: Database root
+
+**Binding**:
+The entry in a parent collection that maps one child name to one collection ID.
+
+**Collection record**:
+The object that holds one collection's child bindings, directory lock, topology participants, and topology freeze. Data-path operations do not read it.
+
+**Collection handle**:
+A value that names one collection by its collection ID. It stays bound to that collection and becomes stale when the collection is dropped.
+
+**Drop**:
+The removal of one collection and its binding. A drop is not recursive: a collection with child collections cannot be dropped.
+_Avoid_: Delete (which applies to logical keys)
+
+**Drop intent**:
+A mark on one node of a collection, owned by the transaction identity that drops the collection. Its owner's status decides its effect: after the owner commits, every later access through the node reports the collection handle as stale.
+_Avoid_: Delete intent, drop fence, deletion fence
 
 **Logical key**:
 Raw key bytes interpreted within one collection. Equal bytes in different collections identify different logical keys.
@@ -118,6 +151,22 @@ _Avoid_: Read-only fast path
 **Locked validation**:
 Validation of an access set while the transaction holds its locks.
 
+## Locks
+
+**Holder**:
+A transaction identity that a lock records as holding it.
+
+**Key lock**:
+A lock on one logical key, recorded in the key's leaf entry. It can lock a key that has no current value.
+_Avoid_: Entry lock
+
+**Membership lock**:
+A lock on the set of logical keys in one leaf. Range scans hold it shared, and changes to the key set hold it exclusively.
+_Avoid_: Membership hold
+
+**Directory lock**:
+A lock on the child bindings in one collection record.
+
 ## Conditional mutations
 
 **Revision**:
@@ -155,6 +204,10 @@ The rule a read applies to decide whether existing evidence can serve it: accept
 _Avoid_: Consistency level, staleness policy
 
 ## Point routing
+
+**Tree root**:
+The node at the fixed path of one collection's tree, where every routing starts. It is separate from the collection record.
+_Avoid_: Root (alone), collection root
 
 **Leaf**:
 A terminal physical node in one collection's range-partitioned tree. In one exact state, it owns a contiguous logical-key range and is the physical mutation unit for that range.
@@ -203,6 +256,10 @@ _Avoid_: Structural log, structural record
 **Structural gate**:
 An exclusive, durably recorded claim on one node that admits changes to the node's shape. One transaction identity holds it at a time, and a release or a recovery fence must remove it before another shape change starts.
 _Avoid_: Structure lock, structure-write lock
+
+**Topology freeze**:
+A claim on a collection record, owned by the transaction identity that prepares a drop of the collection. It admits no new topology participant, and the existing participants must complete or be recovered before the drop continues.
+_Avoid_: Topology lock
 
 ## Maintenance
 

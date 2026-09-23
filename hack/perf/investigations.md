@@ -17,7 +17,7 @@ compares contention or latency between the two acquisition paths.
 
 ### Finding
 
-A collection root `_r` starts as a leaf and becomes an index after its first
+A tree root `_r` starts as a leaf and becomes an index after its first
 split
 ([ADR-050](../../docs/adr/050-separate-collection-record-and-tree-root.md)). As a
 leaf, it is the CAS unit for its keys and has the same coordination semantics as
@@ -133,9 +133,9 @@ so the measured benefit did not justify maintaining the additional protocol.
 The implementation and its architecture documentation were cleanly restored to
 their pre-ADR-060 state. The earlier rejection of permanently abandoning a
 cleanly losing write-back still stands: it caused repeated transaction-record
-reads for fresh clients and prevented reclamation. Pre-existing per-member
-in-doubt attribution and the safety improvements from the review-blind-spots
-work remain unchanged.
+reads for fresh database instances and prevented reclamation. Pre-existing
+per-member in-doubt attribution and the safety improvements from the
+review-blind-spots work remain unchanged.
 
 ## 2026-08-12: fixed-topology coordinator retry attribution
 
@@ -208,9 +208,10 @@ A process-local post-miss batching window does not solve distributed
 contention. A `200 ms` window shifted capacity toward reads and hurt write
 shapes without reliably reducing misses. A `10/25/50 ms` sweep gave an initial
 signal at `50 ms`, but an alternating confirmation did not reproduce a
-coherent write gain. Such a window delays an independent client's next CAS; it
-does not remove any required backend operation and can move capacity between
-shapes. It is rejected together with broad retry-backoff changes.
+coherent write gain. Such a window delays an independent database instance's
+next CAS; it does not remove any required backend operation and can move
+capacity between shapes. It is rejected together with broad retry-backoff
+changes.
 
 The focused throughput variant stopped only a committed write-back after its
 first clean `PreconditionMiss`. It did not abandon an unavailable or in-doubt
@@ -274,11 +275,12 @@ The read cost depends on shape and cache lifetime:
 The scan experiment left two put keys from each of eight distinct committed
 transactions on one leaf and opened 12 fresh Databases. The normal tree issued
 zero transaction-record reads; the deferred tree issued exactly `96` (`8` per
-client). Reopening another 12-client wave issued the same `96` again, with p50
-`220–239 ms`. Terminal-status caching removes the cost for repeated reads in
-one Database, but a new client or later cache eviction pays once per distinct
-holder. Deferring only puts or holders without a membership lock avoids the
-delete-specific point-read penalty, but not this linear scan amplification.
+database instance). Reopening another 12-instance wave issued the same `96`
+again, with p50 `220–239 ms`. Terminal-status caching removes the cost for
+repeated reads in one Database, but a new database instance or later cache
+eviction pays once per distinct holder. Deferring only puts or holders without a
+membership lock avoids the delete-specific point-read penalty, but not this
+linear scan amplification.
 
 Read resolution only help-forwards a committed holder logically. It does not
 rewrite the leaf. GC also does not finish key write-back: a committed
@@ -348,7 +350,7 @@ engine shutdown closes and flushes the queue before closing background task
 admission. A queue entry groups intents by transaction id, and different ids
 are submitted together so the existing coordinator performs the actual CAS
 coalescing. This preserves independent Database instances and introduces no
-cross-client coordination.
+cross-instance coordination.
 
 ### Conclusion
 
@@ -454,14 +456,15 @@ without failures or shutdown timeout.
   `rwMany` ratios were `0.98`, `0.97`, and `0.92`. Physical reads per
   transaction were mixed as the workload state changed. Besides not producing
   a stable gain, process-local coalescing would optimize colocated benchmark
-  clients rather than the distributed case the affinity sweep represents.
+  database instances rather than the distributed case the affinity sweep
+  represents.
 
 No status singleflight, cleanup suppression, unbounded write-back concurrency,
 or backoff change is justified. A follow-up should hold the settled tree fixed
 between paired variants and split the coordinator's time outside resolver
 evaluation among local owner queueing, backend mutation/rate limiting, and retry
 sleep. Any proposed protocol fix should reduce required leaf-CAS work for
-independent clients, rather than rely on sharing process-local state.
+independent database instances, rather than rely on sharing process-local state.
 
 ## 2026-08-11: ADR-050 resolved-handle routing
 
@@ -514,10 +517,10 @@ single-root collection and a split tree.
 
 Two of the three long `lo/0%` cells each recorded one zero-byte `_i` read among
 thousands of transactions. A focused path probe reproduced it only after a
-long cell: it targets an absent collection incarnation. Static call-chain
+long cell: it targets an absent collection ID. Static call-chain
 review distinguishes it from data routing (`TreeRouter` has no
 `CollectionStore`): this is delayed background lifecycle/GC reclamation of an
-unreachable prepared incarnation, not logical-path revalidation. Its cost is
+unreachable prepared collection, not logical-path revalidation. Its cost is
 negligible and belongs to background lifecycle cleanup, not foreground routing.
 
 ### Phase attribution
@@ -538,8 +541,8 @@ Lock grouping remains below one millisecond in every cell. Point-route cache
 hit rate is at least 97%; moreover, mean point-route time in spread mode moves
 slightly in the wrong direction for the hypothesis (`1.96 ms` at 0% versus
 `2.39 ms` at 100%). The much larger route-call and L1-read volume at 0% is
-downstream re-resolution driven by cross-client protocol work, not two physical
-loads inside one ADR-050 descent.
+downstream re-resolution driven by cross-instance protocol work, not two
+physical loads inside one ADR-050 descent.
 
 The post-lock interval also rejects shortening lock lifetime as this fix.
 Validation-to-transaction-record commit is essentially invariant at `60–61 ms`;
@@ -654,7 +657,7 @@ cache and shard coordinator. It can batch local submissions into fewer CAS
 rounds and already knows the status of its own transactions. At 0%, the same
 logical collection load is distributed across independent coordinators. They
 cannot merge across processes, issue competing node CASes, reload losers, and
-read foreign transaction records. The dominant cost is therefore cross-client
+read foreign transaction records. The dominant cost is therefore cross-instance
 node arbitration and lost local batching; foreign status resolution is a
 secondary cost. It is not a holder-polling delay.
 
@@ -713,7 +716,7 @@ from `95–98` to `113` transactions/s and `rwMany` from `34–35` to `37`, but
 reduces `roMulti` from `44–45` to `33.6`. This confirms a genuine parallelism
 versus routing/fan-out trade-off, not a universally better tree shape. Lowering
 the global/default threshold is therefore rejected. A future split response
-would need to be demand-driven by sustained cross-client CAS contention,
+would need to be demand-driven by sustained cross-instance CAS contention,
 bounded above a leaf-size floor, and evaluated separately for single- and
 multi-key shapes.
 
@@ -770,7 +773,7 @@ singleton local membership does not imply low distributed contention.
 
 Proportionally shortening the five-second suspected-deadlock timeout at
 `delay-scale=0.5` changed aggregate throughput by only about `3%` and did not
-repair the cross-client gap. No production retry or deadlock-timing change is
+repair the cross-instance gap. No production retry or deadlock-timing change is
 supported by these experiments.
 
 ### Corrected affinity curves
@@ -866,7 +869,7 @@ the current engine, not a cross-version throughput ratio.
 The original `0.02` absolute throughput and tail numbers are not
 decision-grade. They amplify engine retries by 50 and quantize backend sleeps.
 The corrected affinity effect is nevertheless real: it survives the
-uncompressed control and is explained by per-client batching/cache boundaries.
+uncompressed control and is explained by per-instance batching/cache boundaries.
 Partial affinity does not gradually recover the cost; complete collection
 ownership is qualitatively different.
 
@@ -874,14 +877,14 @@ The production-timescale baseline also separates two signals that were
 previously conflated. Current one-key throughput is already at v0.1.0 parity
 despite its roughly five-times-higher p50, while deterministic backend work is
 substantially lower. The next investigation should therefore target the
-current engine's cross-client shard-CAS rounds, not the `readRepeat`
+current engine's cross-instance shard-CAS rounds, not the `readRepeat`
 classification or the retired rw9010 throughput number.
 
-The coordinator counters establish cross-client leaf false sharing, but neither
-a global nor a demand-driven tree-shape change is supported. The global-cap
-screen trades lower contention for much more structural work and worse
-multi-key fan-out. The per-leaf probe finds no small hot subset: misses cover
-every active leaf, and the busiest quarter captures only `37–38%` of them.
+The coordinator counters establish cross-instance leaf false sharing, but
+neither a global nor a demand-driven tree-shape change is supported. The
+global-cap screen trades lower contention for much more structural work and
+worse multi-key fan-out. The per-leaf probe finds no small hot subset: misses
+cover every active leaf, and the busiest quarter captures only `37–38%` of them.
 Addressing this gap requires reducing cross-Database ownership and coordination
 cost rather than interpreting widespread CAS misses as local split pressure.
 
@@ -1005,8 +1008,8 @@ also exposes a workload not covered by the original `lo/shared` guardrail. In
 `1.764`. The same cell's read-only shapes become over `6x` faster and the other
 mixed cells are mostly flat or better, so this is not a uniform slowdown.
 The result is consistent with smaller leaf transfers helping cached reads while
-cross-client external-value resolution adds transaction-record lookups and a long
-tail to contended multi-key mutations. That attribution needs a repeated,
+cross-instance external-value resolution adds transaction-record lookups and a
+long tail to contended multi-key mutations. That attribution needs a repeated,
 phase-level run before changing policy.
 
 ### Multi-RMW tail follow-up
@@ -1016,7 +1019,7 @@ supports ADR-054 and does not justify a tail-specific engine change.
 
 The follow-up first isolates ADR-054 by comparing its accepted parent
 `f618e738` with implementation `7bc6fb01`. Three alternating S3-profile
-`hi/per-shape` pairs use eight workers per shape, four client Databases per
+`hi/per-shape` pairs use eight workers per shape, four `Database` instances per
 shape, eight hot keys, a 10% throughput-CI target, and a 30-second cap. Every
 shape converges with zero failures.
 
@@ -1039,7 +1042,7 @@ hits and misses. The wrapper perturbs scheduling, so its timing is not used;
 the operation and byte deltas are stable and all runs still converge without
 failures.
 
-For `rwMany` in the cross-client `per-shape` topology:
+For `rwMany` in the cross-instance `per-shape` topology:
 
 - transaction-record body reads rise by only `11.3–14.8 B/transaction`; physical
   transaction-record calls are too variable to distinguish because unchanged
@@ -1050,11 +1053,11 @@ For `rwMany` in the cross-client `per-shape` topology:
 
 The shared-Database topology makes the added transaction-record body transfer
 almost disappear (`0.071–0.079 B/transaction` across the whole mixed cell),
-confirming that the decoded cache absorbs repeated resolution when clients
-share it. Cross-client caches cannot share that entry, but their extra body
-transfer remains much smaller than the leaf bytes no longer rewritten.
-Shutdown attribution is zero for every per-shape run and negligible in the
-shared runs, so this is a foreground representation trade-off rather than
+confirming that the decoded cache absorbs repeated resolution when workers
+share it. Cross-instance caches cannot share that entry, but their
+extra body transfer remains much smaller than the leaf bytes no longer
+rewritten. Shutdown attribution is zero for every per-shape run and negligible
+in the shared runs, so this is a foreground representation trade-off rather than
 deferred cleanup.
 
 ### Demand-driven split validation
@@ -1187,8 +1190,8 @@ The trade-off is earlier, durable splitting and more leaves for dense 1 KiB
 sets. Workloads that have measured request count as more important than leaf
 bytes can still opt into 64 KiB through `DatabaseBuilder`. Lowering the default
 is correctness-safe: existing inline values are grandfathered and the policy is
-not persisted. Clients of one database should nevertheless deploy the same
-configuration, because pressure splits durably change its topology.
+not persisted. Database instances of one database should nevertheless deploy the
+same configuration, because pressure splits durably change its topology.
 
 ### Post-selection guardrails
 
@@ -1223,7 +1226,7 @@ values; workloads that prefer fewer objects can select 64 KiB explicitly.
 ADR-054 removes locked write-back amplification, and ADR-056 supplies the
 focused inline-capacity fix without globally lowering split thresholds. The
 multi-RMW follow-up finds no durable tail regression and shows that the
-cross-client transaction-record transfer is small beside the saved leaf bytes.
+cross-instance transaction-record transfer is small beside the saved leaf bytes.
 The focused split result proves that pressure is observed, rerouted, converted
 into capacity, and repaid by later mutations. It did not establish that the
 then-current 1 KiB/64 KiB budgets were optimal, nor quantify permanent widening

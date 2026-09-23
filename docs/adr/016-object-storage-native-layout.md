@@ -10,7 +10,7 @@ three object kinds, dropping tags) stands.
 
 [ADR-046](046-incarnation-addressed-collections.md) supersedes this ADR's
 collection-existence and name-only subcollection-directory clauses with
-incarnation IDs and direct `name → ID` parent directories. [ADR-047]
+collection IDs and direct `name → ID` parent directories. [ADR-047]
 proposes making management of that hierarchy transactional.
 
 [ADR-047]: 047-transactional-collection-management.md

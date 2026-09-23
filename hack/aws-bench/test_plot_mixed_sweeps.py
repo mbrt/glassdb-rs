@@ -211,10 +211,10 @@ class MixedSweepPlotterTest(unittest.TestCase):
             plotter.plot_affinity_latency(affinities, Path("plots"))
 
         expected_titles = [
-            "1 DB client",
-            "3 DB clients",
-            "5 DB clients",
-            "7 DB clients",
+            "1 DB instance",
+            "3 DB instances",
+            "5 DB instances",
+            "7 DB instances",
         ]
         throughput = figures["affinity-throughput.png"]
         latency = figures["affinity-latency.png"]

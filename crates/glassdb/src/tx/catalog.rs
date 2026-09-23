@@ -107,7 +107,7 @@ impl CatalogOverlay {
         Ok(current)
     }
 
-    /// Stages a child creation and returns its incarnation and creation result.
+    /// Stages a child creation and returns its collection ID and creation result.
     pub(super) fn create_child(
         &mut self,
         parent: &CollectionAddress,
@@ -135,7 +135,7 @@ impl CatalogOverlay {
             if matches!(mode, CreateMode::Strict) {
                 return Err(Error::AlreadyExists);
             }
-            let address = CollectionAddress::new(parent.db_root(), id);
+            let address = CollectionAddress::new(parent.db_prefix(), id);
             let created = self.created.contains(&address);
             return Ok((address, created));
         }
@@ -151,7 +151,7 @@ impl CatalogOverlay {
                 resource: "collection reservations",
                 limit: error.limit,
             })?;
-        let address = CollectionAddress::new(parent.db_root(), id);
+        let address = CollectionAddress::new(parent.db_prefix(), id);
         self.directories
             .get_mut(parent)
             .expect("directory was loaded above")
@@ -171,7 +171,7 @@ impl CatalogOverlay {
         Ok((address, true))
     }
 
-    /// Stages a non-recursive drop of an exact collection incarnation.
+    /// Stages a non-recursive drop of an exact collection.
     pub(super) fn drop_collection(
         &mut self,
         parent: CollectionAddress,

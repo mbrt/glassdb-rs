@@ -343,7 +343,7 @@ def plot_worker_latency(data: pd.DataFrame, out_dir: Path) -> Path:
 
 
 def _database_title(databases: int) -> str:
-    suffix = "client" if databases == 1 else "clients"
+    suffix = "instance" if databases == 1 else "instances"
     return f"{databases} DB {suffix}"
 
 

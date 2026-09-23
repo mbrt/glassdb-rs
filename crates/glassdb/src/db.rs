@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use glassdb_backend::Backend;
 use glassdb_concurr::rt;
-use glassdb_data::{DatabaseId, DbRoot};
+use glassdb_data::{DatabaseId, DbPrefix};
 use glassdb_storage::{InlinePolicy, PersistentCacheConfig, PersistentCacheMedia, SplitPolicy};
 use glassdb_trans::{
     AccessSet, BodyDecision, CatalogAccesses, Engine, EngineConfig, EngineTransaction, GcLimits,
@@ -126,7 +126,7 @@ impl DatabaseBuilder {
 
     /// Proposes transaction timing for a new database. Existing databases load
     /// their timing from metadata and ignore this proposal. The clock-skew
-    /// allowance must bound every client using the database.
+    /// allowance must bound every database instance using the database.
     ///
     /// Durations must fit in unsigned 64-bit nanoseconds, and the pending
     /// timeout must be at least two nanoseconds so its refresh interval is nonzero.
@@ -148,7 +148,8 @@ impl DatabaseBuilder {
             transaction_limits,
         } = self;
 
-        DbRoot::try_from(name.as_str()).map_err(|error| Error::InvalidInput(error.to_string()))?;
+        DbPrefix::try_from(name.as_str())
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
         let backend = Arc::new(glassdb_backend::StatsBackend::new(b));
         let metadata =
             check_or_create_db_meta(&backend, &name, split_policy, protocol_timing).await?;
@@ -255,7 +256,7 @@ impl Database {
         Collection::new_root(self.inner.clone())
     }
 
-    /// Resolves a logical path to its currently bound collection incarnation.
+    /// Resolves a logical path to its currently bound collection ID.
     ///
     /// A string names one top-level collection; use [`CollectionPath`] for a
     /// nested path.
@@ -698,22 +699,22 @@ mod tests {
         let peer = Database::open("collectionreplay", backend).await.unwrap();
         let peer_root = peer.root_collection();
         peer_root.write(b"key", b"initial").await.unwrap();
-        let incarnations = Arc::new(Mutex::new(Vec::new()));
+        let collection_ids = Arc::new(Mutex::new(Vec::new()));
         let bodies = Arc::new(AtomicUsize::new(0));
 
         let child = db
             .tx({
-                let incarnations = incarnations.clone();
+                let collection_ids = collection_ids.clone();
                 let bodies = bodies.clone();
                 move |tx| {
-                    let incarnations = incarnations.clone();
+                    let collection_ids = collection_ids.clone();
                     let peer_root = peer_root.clone();
                     let first = bodies.fetch_add(1, Ordering::SeqCst) == 0;
                     async move {
                         let root = tx.root_collection();
                         tx.read(&root, b"key").await?;
                         let child = tx.create_collection(&root, b"child").await?;
-                        incarnations.lock().unwrap().push(child.address().clone());
+                        collection_ids.lock().unwrap().push(child.address().clone());
                         if first {
                             peer_root.write(b"key", b"changed").await?;
                         }
@@ -727,9 +728,9 @@ mod tests {
 
         assert_eq!(bodies.load(Ordering::SeqCst), 2);
         {
-            let incarnations = incarnations.lock().unwrap();
-            assert_eq!(incarnations[0], incarnations[1]);
-            assert_eq!(child.address(), &incarnations[1]);
+            let collection_ids = collection_ids.lock().unwrap();
+            assert_eq!(collection_ids[0], collection_ids[1]);
+            assert_eq!(child.address(), &collection_ids[1]);
         }
         child.write(b"child-key", b"value").await.unwrap();
         assert_eq!(child.read(b"child-key").await.unwrap().unwrap(), b"value");
@@ -747,19 +748,19 @@ mod tests {
             .unwrap();
         let remaining = fail_root_conflicts(&backend, SERIAL_TRANSITION_CONFLICTS);
         let bodies = Arc::new(AtomicUsize::new(0));
-        let incarnations = Arc::new(Mutex::new(Vec::new()));
+        let collection_ids = Arc::new(Mutex::new(Vec::new()));
 
         let child = db
             .tx({
                 let bodies = bodies.clone();
-                let incarnations = incarnations.clone();
+                let collection_ids = collection_ids.clone();
                 move |tx| {
                     bodies.fetch_add(1, Ordering::SeqCst);
-                    let incarnations = incarnations.clone();
+                    let collection_ids = collection_ids.clone();
                     async move {
                         let root = tx.root_collection();
                         let child = tx.create_collection(&root, b"child").await?;
-                        incarnations.lock().unwrap().push(child.address().clone());
+                        collection_ids.lock().unwrap().push(child.address().clone());
                         tx.write(&root, b"key", b"value")?;
                         Ok(child)
                     }
@@ -771,8 +772,8 @@ mod tests {
         assert_eq!(remaining.load(Ordering::SeqCst), 0);
         assert_eq!(bodies.load(Ordering::SeqCst), 2);
         {
-            let incarnations = incarnations.lock().unwrap();
-            assert_ne!(incarnations[0], incarnations[1]);
+            let collection_ids = collection_ids.lock().unwrap();
+            assert_ne!(collection_ids[0], collection_ids[1]);
         }
         assert_eq!(child.name(), Some(b"child".as_slice()));
         db.shutdown().await;

@@ -373,7 +373,7 @@ async fn subcollection_listing_is_root_driven_and_create_if_absent_is_idempotent
     // A freshly created collection has no subcollections.
     assert!(list_collections_of(&parent).await.is_empty());
 
-    // Repeating create-if-absent returns the same incarnation and registers it
+    // Repeating create-if-absent returns the same collection ID and registers it
     // exactly once.
     let first = parent.create_collection_if_absent(b"child").await.unwrap();
     let second = parent.create_collection_if_absent(b"child").await.unwrap();

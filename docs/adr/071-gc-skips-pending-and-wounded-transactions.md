@@ -29,7 +29,7 @@ GC reads the transaction record first and applies these rules:
 - `Aborted`: after the safety horizon, remove recorded aborted effects and
   conditionally delete the record when cleanup is complete.
 - Committed: after the safety horizon, check recorded references and conditionally
-  delete the record only when none remain and cleanup is complete. Entry locks
+  delete the record only when none remain and cleanup is complete. Key locks
   awaiting write-back retain the record.
 
 Finding a GC candidate does not initiate pending expiry or wounding. Monitor

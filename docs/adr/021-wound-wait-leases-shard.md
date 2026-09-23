@@ -37,9 +37,9 @@ contending transactions with wound-wait, but defers the mechanism that reclaims
 the locks of a **crashed or abandoned** one — the lease — to this ADR.
 [ADR-019](019-unified-transaction-object.md) similarly left a placeholder for a
 lease field. Without leases the protocol is only happy-path correct: a dropped
-client holding a write lock on a shard entry blocks that key forever, and a
-younger transaction that must _wait_ on a dead older holder hangs (wound-wait
-never aborts the older one).
+database instance holding a write lock on a shard entry blocks that key forever,
+and a younger transaction that must _wait_ on a dead older holder hangs
+(wound-wait never aborts the older one).
 
 The v1 mechanism (`crates/glassdb-trans/src/monitor.rs`) is the reference:
 

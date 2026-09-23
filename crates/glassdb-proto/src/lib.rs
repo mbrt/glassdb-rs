@@ -35,7 +35,7 @@ mod tests {
                     },
                 ],
                 locks: Some(CollectionLocks {
-                    entry_locks: vec![EntryLock {
+                    key_locks: vec![KeyLock {
                         key: b"Hello".to_vec(),
                         lock_type: lock::LockType::Write as i32,
                     }],
@@ -44,7 +44,7 @@ mod tests {
                         lock_type: lock::LockType::Read as i32,
                     }],
                     directory_lock: 0,
-                    topology_lock: false,
+                    topology_freeze: false,
                 }),
             }],
             collection_changes: vec![],

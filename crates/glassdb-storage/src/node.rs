@@ -144,7 +144,7 @@ impl IndexNode {
 /// Size admission limits and soft thresholds for coordination-node splits.
 ///
 /// The hard cap and reserved headroom are shared database settings. Soft
-/// thresholds tune each client's background splitting (ADR-031, ADR-072).
+/// thresholds tune each database instance's background splitting (ADR-031, ADR-072).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SplitPolicy {
     /// Maximum leaf entries before it is a split candidate.
@@ -317,7 +317,7 @@ pub struct NodeLocks {
     structure: ExclusiveGate,
     membership: SharedExclusiveLock,
     membership_generation: u64,
-    delete_intent: Option<TxId>,
+    drop_intent: Option<TxId>,
 }
 
 impl NodeLocks {
@@ -344,22 +344,22 @@ impl NodeLocks {
         self.membership_generation = self.membership_generation.wrapping_add(1);
     }
 
-    /// Returns the transaction preparing deletion of the containing collection.
-    pub fn delete_intent(&self) -> Option<&TxId> {
-        self.delete_intent.as_ref()
+    /// Returns the transaction preparing a drop of the containing collection.
+    pub fn drop_intent(&self) -> Option<&TxId> {
+        self.drop_intent.as_ref()
     }
 
-    /// Installs the collection-delete intent owned by `id`.
-    pub fn set_delete_intent(&mut self, id: TxId) {
-        self.delete_intent = Some(id);
+    /// Installs the drop intent owned by `id`.
+    pub fn set_drop_intent(&mut self, id: TxId) {
+        self.drop_intent = Some(id);
     }
 
-    /// Removes the collection-delete intent when it is owned by `id`.
-    pub fn remove_delete_intent(&mut self, id: &TxId) -> bool {
-        if self.delete_intent.as_ref() != Some(id) {
+    /// Removes the drop intent when it is owned by `id`.
+    pub fn remove_drop_intent(&mut self, id: &TxId) -> bool {
+        if self.drop_intent.as_ref() != Some(id) {
             return false;
         }
-        self.delete_intent = None;
+        self.drop_intent = None;
         true
     }
 
@@ -400,7 +400,7 @@ impl NodeLocks {
         removed
     }
 
-    /// Removes the transaction's membership hold.
+    /// Removes the transaction's membership lock.
     ///
     /// Structural gates have a separate lifecycle and cannot be released by
     /// ordinary transaction cleanup.
@@ -514,19 +514,19 @@ impl Node {
         self.locks.structural_gate()
     }
 
-    /// Returns the transaction preparing deletion of this node's collection.
-    pub fn collection_delete_intent(&self) -> Option<&TxId> {
-        self.locks.delete_intent()
+    /// Returns the transaction preparing a drop of this node's collection.
+    pub fn drop_intent(&self) -> Option<&TxId> {
+        self.locks.drop_intent()
     }
 
-    /// Installs a collection-delete intent on this node.
-    pub fn set_collection_delete_intent(&mut self, id: TxId) {
-        self.locks.set_delete_intent(id);
+    /// Installs a drop intent on this node.
+    pub fn set_drop_intent(&mut self, id: TxId) {
+        self.locks.set_drop_intent(id);
     }
 
-    /// Clears a collection-delete intent owned by `id`.
-    pub fn remove_collection_delete_intent(&mut self, id: &TxId) -> bool {
-        self.locks.remove_delete_intent(id)
+    /// Clears a drop intent owned by `id`.
+    pub fn remove_drop_intent(&mut self, id: &TxId) -> bool {
+        self.locks.remove_drop_intent(id)
     }
 
     /// Returns the complete node-level coordination state.
@@ -738,14 +738,14 @@ impl Node {
             high_key: self.high_key.clone().unwrap_or_default(),
             right_sibling: self.right_sibling.clone().unwrap_or_default(),
             body: Some(body),
-            structure_lock: (!self.locks.structure.is_empty())
+            structural_gate: (!self.locks.structure.is_empty())
                 .then(|| self.locks.structure.to_pb()),
             membership_lock: (!self.locks.membership.is_empty())
                 .then(|| self.locks.membership.to_pb()),
             membership_generation: self.locks.membership_generation,
-            collection_delete_intent: self
+            drop_intent: self
                 .locks
-                .delete_intent
+                .drop_intent
                 .as_ref()
                 .map(|id| id.as_bytes().to_vec())
                 .unwrap_or_default(),
@@ -758,13 +758,12 @@ impl Node {
             Some(pb::node::Body::Leaf(leaf)) => NodeBody::Leaf(LeafBody::from_pb(leaf)?),
             None => NodeBody::Leaf(LeafBody::new()),
         };
-        let structure = ExclusiveGate::from_pb(raw.structure_lock).map_err(|_| {
+        let structure = ExclusiveGate::from_pb(raw.structural_gate).map_err(|_| {
             StorageError::other("node structural gate must be empty or have one write holder")
         })?;
         let membership = SharedExclusiveLock::from_pb(raw.membership_lock)
             .map_err(|_| StorageError::other("node has invalid membership lock"))?;
-        let delete_intent = (!raw.collection_delete_intent.is_empty())
-            .then(|| TxId::from_bytes(raw.collection_delete_intent));
+        let drop_intent = (!raw.drop_intent.is_empty()).then(|| TxId::from_bytes(raw.drop_intent));
         Ok(Node {
             high_key: (!raw.high_key.is_empty()).then_some(raw.high_key),
             right_sibling: (!raw.right_sibling.is_empty()).then_some(raw.right_sibling),
@@ -773,7 +772,7 @@ impl Node {
                 structure,
                 membership,
                 membership_generation: raw.membership_generation,
-                delete_intent,
+                drop_intent,
             },
         })
     }
@@ -848,7 +847,7 @@ mod tests {
             },
         ] {
             let raw = pb::Node {
-                structure_lock: Some(gate),
+                structural_gate: Some(gate),
                 ..pb::Node::default()
             };
             assert!(Node::decode(&raw.encode_to_vec()).is_err());

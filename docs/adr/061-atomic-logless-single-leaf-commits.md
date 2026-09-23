@@ -83,8 +83,8 @@ installs no lock, performs no preparatory mutation, and needs no write-back.
 
 An actual absent-to-present or present-to-absent transition advances the leaf's
 membership generation in that same CAS. It may proceed only while the
-structural gate and collection-deletion fence are absent and no live or unknown
-membership holder conflicts. Finalized entry or membership holders may be
+structural gate and drop intent are absent and no live or unknown
+membership holder conflicts. Finalized key-lock or membership holders may be
 reconciled during resolver evaluation; direct commit never waits for, wounds, or
 otherwise changes a live holder before its commit CAS.
 
@@ -113,7 +113,7 @@ A transaction with any point-read dependency replays its body after a
 certified stale read or same-round exclusion. A blind transaction uses the
 regular locked commit after exclusion, preserving bounded progress rather than
 resubmitting indefinitely. A live or unknown holder, structural gate,
-collection-deletion fence, stable admission failure, or other state requiring
+drop intent, stable admission failure, or other state requiring
 coordination also selects the locked commit.
 
 These decisions are member-atomic: direct commit never publishes a subset,

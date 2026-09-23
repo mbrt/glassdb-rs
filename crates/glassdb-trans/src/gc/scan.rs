@@ -277,7 +277,7 @@ mod tests {
     use glassdb_backend::{
         Backend, BackendError, ListLimit, ListPage, ReadReply, Revision, memory::MemoryBackend,
     };
-    use glassdb_data::{DbRoot, ObjectPath};
+    use glassdb_data::{DbPrefix, ObjectPath};
     use glassdb_storage::{CachedStore, Timeline};
     use std::collections::BTreeSet;
     use std::sync::Mutex;
@@ -371,13 +371,13 @@ mod tests {
             hold_first_group: AtomicBool::new(false),
             held_group: Mutex::new(None),
         });
-        let db_root = DbRoot::try_from("scan").unwrap();
+        let db_prefix = DbPrefix::try_from("scan").unwrap();
         let mut objects = Vec::new();
         for i in 0..count {
             let prefix = ((i % 4096) as u16) << 4;
             let id = TxId::from_bytes(vec![(prefix >> 8) as u8, prefix as u8, (i / 4096) as u8]);
             let path = ObjectPath::Transaction {
-                db_root: db_root.clone(),
+                db_prefix: db_prefix.clone(),
                 id,
             }
             .to_string();
@@ -389,7 +389,7 @@ mod tests {
         }
         let tx_records = TxRecordStore::new(
             CachedStore::new(backend.clone(), 1 << 20, Timeline::new(), None),
-            db_root,
+            db_prefix,
         );
         let counters = Arc::new(Counters::default());
         (

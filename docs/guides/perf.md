@@ -32,7 +32,7 @@ sorted serial acquisition.
   --num-keys=5000 --duration=3s --max-duration=30s --target-ci=0.10
   --split-quiet=3s --split-settle-timeout=45s`
 - the focused `large_transactions` Criterion benchmark puts one logical key in
-  each of 16 or 64 independent collection-root leaves. It uses the S3 delay
+  each of 16 or 64 independent tree-root leaves. It uses the S3 delay
   profile, one rate-limit prefix per collection, and 10 samples per timed cell.
   Like all groups in the `transactions` benchmark, it uses `20x` model time.
   The same benchmark-only change was applied to the base
@@ -85,9 +85,9 @@ leaves.
 ### README graphs
 
 The updated worker sweep uses the target, the same S3 model, three runs, 5,000
-logical keys per collection, 100% affinity, five `Database` clients, and 1 then
-10 through 200 workers per shape. All 63 cells converge with zero failures and
-a maximum relative throughput-CI half-width of `0.0996`.
+logical keys per collection, 100% affinity, five `Database` instances, and 1
+then 10 through 200 workers per shape. All 63 cells converge with zero failures
+and a maximum relative throughput-CI half-width of `0.0996`.
 
 At one worker per shape, `roMulti` reaches `14.72 tx/s` with `61.58 ms` p50.
 At 200 workers per shape, throughput is `2,520.09 tx/s` for `roSingle`,
@@ -785,7 +785,7 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - ratio = v2 / v1 (throughput >1 good; latency/ops/cost <1 good)
 - each line ends in a `=> better/WORSE/~same` verdict read in that
   metric's own direction, so no axis has to be interpreted by hand
-- `autoresearch-*` is **deterministic** (single-client backend ops/tx,
+- `autoresearch-*` is **deterministic** (single-instance backend ops/tx,
   lower is better) — the most trustworthy signal; `mix-*` cells run
   until their throughput 95% CI reaches --target-ci, so a converged
   ratio is significant — `[unconverged]` marks a cell that hit its time
@@ -868,7 +868,7 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - ratio = v2 / v1 (throughput >1 good; latency/ops/cost <1 good)
 - each line ends in a `=> better/WORSE/~same` verdict read in that
   metric's own direction, so no axis has to be interpreted by hand
-- `autoresearch-*` is **deterministic** (single-client backend ops/tx,
+- `autoresearch-*` is **deterministic** (single-instance backend ops/tx,
   lower is better) — the most trustworthy signal; `mix-*` cells run
   until their throughput 95% CI reaches --target-ci, so a converged
   ratio is significant — `[unconverged]` marks a cell that hit its time
@@ -951,7 +951,7 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - ratio = v2 / v1 (throughput >1 good; latency/ops/cost <1 good)
 - each line ends in a `=> better/WORSE/~same` verdict read in that
   metric's own direction, so no axis has to be interpreted by hand
-- `autoresearch-*` is **deterministic** (single-client backend ops/tx,
+- `autoresearch-*` is **deterministic** (single-instance backend ops/tx,
   lower is better) — the most trustworthy signal; `mix-*` cells run
   until their throughput 95% CI reaches --target-ci, so a converged
   ratio is significant — `[unconverged]` marks a cell that hit its time
@@ -1015,7 +1015,7 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - ratio = v2 / v1 (throughput >1 good; latency/ops/cost <1 good)
 - each line ends in a `=> better/WORSE/~same` verdict read in that
   metric's own direction, so no axis has to be interpreted by hand
-- `autoresearch-*` is **deterministic** (single-client backend ops/tx,
+- `autoresearch-*` is **deterministic** (single-instance backend ops/tx,
   lower is better) — the most trustworthy signal; `mix-*` and
   `deadlock-*` are **[noisy]** (contention-bound, short windows) and
   `[low-sample]` marks an aggregated cell below the trust floor

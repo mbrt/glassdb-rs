@@ -184,11 +184,11 @@ impl LockState {
 
 /// A valid lock state for one leaf entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EntryLockState {
+pub struct KeyLockState {
     state: LockState,
 }
 
-impl EntryLockState {
+impl KeyLockState {
     /// Creates a shared-read state held by `holder`.
     pub fn read(holder: TxId) -> Self {
         let mut lock = Self::default();

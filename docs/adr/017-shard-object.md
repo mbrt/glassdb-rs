@@ -50,11 +50,12 @@ I/O: the largest piece we can land and verify in isolation.
   used for in-memory sharding (`glassdb-concurr::shard::index`,
   [ADR-001](001-sharded-db-maps.md)). It is dependency-free, deterministic, and
   stable across processes and under `--cfg sim` — all required for correctness
-  (every client must agree on the mapping) and for DST replay. The hash is taken
-  over the **raw user key bytes**, not the base64 path encoding. FNV-1a's low
-  bits are adequate for bucketing (the existing distribution test confirms a
-  reasonable spread); if distribution becomes a problem it can be changed behind
-  the same `shard_index` function, but only as a format migration.
+  (every database instance must agree on the mapping) and for DST replay. The
+  hash is taken over the **raw user key bytes**, not the base64 path encoding.
+  FNV-1a's low bits are adequate for bucketing (the existing distribution test
+  confirms a reasonable spread); if distribution becomes a problem it can be
+  changed behind the same `shard_index` function, but only as a format
+  migration.
 
 ### Path
 

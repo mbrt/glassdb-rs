@@ -22,7 +22,7 @@
 //!   risking a double-apply on a body replay under a renewed identity. A *fast follow-on writer* that
 //!   moves the entry first is the reachable case and is covered below; anything
 //!   else that prevents resolver evaluation after a reload from proving it
-//!   (a structural gate or a collection-delete fence arriving in the same window)
+//!   (a structural gate or a drop intent arriving in the same window)
 //!   is classified the same way, pinned by unit tests next to the resolvers
 //!   because no interleaving reproduces it reliably.
 //! - Locked commit's commit point (the `_t/` flip) and its leaf lock CAS
@@ -406,7 +406,7 @@ async fn single_rw_lost_ack_then_moved_surfaces_in_doubt() {
         .unwrap();
     seed(&coll, b"k", 10).await;
 
-    // A second, independent client over the same backend is the competitor.
+    // A second, independent database instance over the same backend is the competitor.
     let other = Database::open("example", backend.clone()).await.unwrap();
     let other_coll = other
         .open_collection(&CollectionPath::new(b"c").unwrap())
@@ -416,7 +416,7 @@ async fn single_rw_lost_ack_then_moved_surfaces_in_doubt() {
     settle_writebacks().await;
 
     // The moment our lock CAS lands (but before its ack is lost), let the
-    // competing client overwrite the key. It finds our lock, help-forwards our
+    // competing database instance overwrite the key. It finds our lock, help-forwards our
     // committed value, then commits its own — so our subsequent read-back finds
     // the entry moved past us to a real, committed transaction, not a forged one.
     let _ = arm_after(
@@ -555,7 +555,7 @@ async fn local_write_recovers_after_an_unconfirmed_commit_landed() {
 /// outcome transparently instead of surfacing the uncertainty.
 ///
 /// It recovers by reading the record status back. The record is keyed by
-/// transaction identity, and only this client writes `committed` under it.
+/// transaction identity, and only this database instance writes `committed` under it.
 /// Thus, a final `committed` status is its own landed write and resolves to a
 /// commit outcome. Reading instead of issuing the conditional write again
 /// keeps the commit point driven exactly once. Thus, no extra body execution

@@ -31,11 +31,11 @@ pub fn encode(record: &TxRecord) -> Result<Vec<u8>, StorageError> {
 /// Decodes a transaction record from its protobuf body. The status and timestamp
 /// are read from the body, not tags (ADR-019).
 pub fn decode(
-    db_root: &str,
+    db_prefix: &str,
     id: &glassdb_data::TxId,
     buf: &[u8],
 ) -> Result<TxRecord, StorageError> {
-    TxRecordCodec::decode(db_root, id, buf)
+    TxRecordCodec::decode(db_prefix, id, buf)
 }
 
 /// Decodes only the transaction status without requiring relocation context.
@@ -98,7 +98,7 @@ mod tests {
             timestamp: Some(UNIX_EPOCH + Duration::from_secs(42)),
             status: TxCommitStatus::Pending,
             writes: Vec::new(),
-            locks: vec![TxLock::Entry {
+            locks: vec![TxLock::Key {
                 key: key(b"hello"),
                 typ: LockType::Write,
             }],

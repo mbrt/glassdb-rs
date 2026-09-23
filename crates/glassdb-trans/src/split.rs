@@ -8,7 +8,7 @@
 //! never a key-space enumeration.
 //!
 //! Every split is a sequence of independent, idempotent compare-and-swaps under
-//! a one-node structure-write lock. Before joining collection topology in
+//! a one-node structural gate. Before joining collection topology in
 //! `_i`, it writes a `Preparing` intent below its topology participant's `_s`
 //! prefix.
 //! After taking the source gate it conditionally advances that intent to
@@ -29,17 +29,17 @@
 //!    right-link hop; recurse when the parent itself overflows. Purely an
 //!    optimization — correctness never depends on it landing.
 //!
-//! A leaf split, including a root-leaf split, acquires structure-write through
+//! A leaf split, including a root-leaf split, acquires a structural gate through
 //! the shared [`LeafCoordinator`], in the same batched CAS stream as data
 //! mutations on that leaf. Interior indexes use direct structural CASes.
-//! The source shrink (or root rewrite) releases structure-write inline, so no
+//! The source shrink (or root rewrite) releases the structural gate inline, so no
 //! unlocked post-split state is exposed before a separate release CAS.
 //! Once a leaf is quiescent behind that gate, holder-free tombstones are
 //! removed before the final reason check. The compacted leaf either cancels the
 //! split in one CAS or supplies the ordinary recoverable split outputs
 //! (ADR-062).
 //!
-//! The collection root `_r` cannot move (its address is fixed), so when it
+//! The tree root `_r` cannot move (its address is fixed), so when it
 //! overflows it splits **in place**: two children are created and the root is
 //! rewritten into a two-entry index over them, growing the tree's height while
 //! leaving the independent collection record untouched.
@@ -54,7 +54,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use glassdb_concurr::{Background, RetryConfig, ScanCadence, rt};
-use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, TxId};
+use glassdb_data::{CollectionAddress, DbPrefix, NodeToken, ObjectPath, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxRecord};
 use glassdb_storage::{
     CollectionStore, CurrentnessBarrier, IndexNode, InlinePolicy, LeafBody, LeafEntry,
@@ -1232,7 +1232,7 @@ impl Splitter {
         mon: Monitor,
         key_state: KeyStateResolver,
         retry: RetryConfig,
-        db_root: DbRoot,
+        db_prefix: DbPrefix,
         policy: SplitPolicy,
         inline: InlinePolicy,
         cleanup_hints: GcHints,
@@ -1254,7 +1254,7 @@ impl Splitter {
             timeline,
             mon,
             key_state,
-            db_root,
+            db_prefix,
             coord.clone(),
             candidates,
             retry,
@@ -1308,7 +1308,7 @@ impl Splitter {
         timeline: Timeline,
         mon: Monitor,
         key_state: KeyStateResolver,
-        db_root: DbRoot,
+        db_prefix: DbPrefix,
         coord: LeafCoordinator,
         candidates: SplitCandidates,
         retry: RetryConfig,
@@ -1332,7 +1332,7 @@ impl Splitter {
             structural_nodes.clone(),
             publisher.clone(),
             timeline.clone(),
-            db_root,
+            db_prefix,
             retry,
         );
         Splitter {
@@ -1618,7 +1618,7 @@ impl Splitter {
             .begin_persisted_tx(
                 id,
                 TxRecoveryManifest {
-                    locks: vec![TxLock::Topology {
+                    locks: vec![TxLock::TopologyFreeze {
                         collection: collection.clone(),
                     }],
                     ..TxRecoveryManifest::default()
@@ -1664,7 +1664,7 @@ impl Splitter {
             .await
     }
 
-    /// Releases a structure-write holder after its node mutation has landed.
+    /// Releases a structural gate after its node mutation has landed.
     async fn release_structural_gate(
         &self,
         collection: &CollectionAddress,
@@ -1880,7 +1880,7 @@ impl Splitter {
         }
     }
 
-    /// Rewrites the fixed collection root against the observation in its Ready
+    /// Rewrites the fixed tree root against the observation in its Ready
     /// intent.
     async fn store_split_root(
         &self,
@@ -2168,7 +2168,7 @@ impl Splitter {
 
     async fn finalize_topology_split(&self, collection: &CollectionAddress, id: &TxId) {
         let mut record = TxRecord::new(id.clone(), TxCommitStatus::Ok);
-        record.locks.push(TxLock::Topology {
+        record.locks.push(TxLock::TopologyFreeze {
             collection: collection.clone(),
         });
         if let Err(e) = self.mon.commit_tx(record).await {
@@ -2336,8 +2336,8 @@ mod tests {
         CollectionAddress::from_physical_prefix(prefix).unwrap()
     }
 
-    fn db_root(value: &str) -> DbRoot {
-        DbRoot::try_from(value).unwrap()
+    fn db_prefix(value: &str) -> DbPrefix {
+        DbPrefix::try_from(value).unwrap()
     }
 
     fn test_token(value: &str) -> NodeToken {
@@ -2506,7 +2506,7 @@ mod tests {
         ) -> Result<Observation<StructuralIntent>, StorageError> {
             self.intent_store
                 .write(
-                    &db_root("db"),
+                    &db_prefix("db"),
                     &StructuralIntentId::from(test_token(intent_id)),
                     &canonical_intent(intent),
                 )
@@ -2520,7 +2520,7 @@ mod tests {
         ) -> Result<Vec<(StructuralIntentId, Observation<StructuralIntent>)>, StorageError>
         {
             self.intent_store
-                .discover(&db_root(root), requirement)
+                .discover(&db_prefix(root), requirement)
                 .await
         }
     }
@@ -2532,7 +2532,7 @@ mod tests {
     fn store_with_backend(backend: Arc<dyn Backend>) -> TestStore {
         let mut config = EngineConfig::default();
         config.set_cache_size(1 << 20);
-        let foundation = AssemblyFixture::new(backend, db_root("db"), &config);
+        let foundation = AssemblyFixture::new(backend, db_prefix("db"), &config);
         TestStore {
             records: foundation.records.clone(),
             nodes: foundation.nodes.clone(),
@@ -2633,7 +2633,7 @@ mod tests {
             store.timeline.clone(),
             mon,
             key_state,
-            db_root("db"),
+            db_prefix("db"),
             coord,
             candidates,
             RetryConfig::default(),
@@ -3079,7 +3079,7 @@ mod tests {
             .unwrap()
             .is_empty()
         );
-        let transaction_prefix = format!("{}/_t/", db_root("db"));
+        let transaction_prefix = format!("{}/_t/", db_prefix("db"));
         assert_eq!(
             s.objects
                 .list(
@@ -3972,7 +3972,7 @@ mod tests {
             .await
             .unwrap()
         else {
-            panic!("entry lock must be acquired before the split");
+            panic!("key lock must be acquired before the split");
         };
         record.locks = locked.locked_paths();
         other_mon.commit_tx(record).await.unwrap();
@@ -4329,7 +4329,7 @@ mod tests {
         assert_eq!(recovered_coordination.topology_participants().count(), 0);
     }
 
-    /// Controls a hook that rejects conditional writes to the collection root.
+    /// Controls a hook that rejects conditional writes to the tree root.
     struct RootWriteBlocker {
         blocked: std::sync::atomic::AtomicBool,
     }

@@ -5,14 +5,14 @@ use std::time::{Duration, UNIX_EPOCH};
 use glassdb::backend::{BackendError, memory::MemoryBackend};
 use glassdb::middleware::{BackendOp, HookBackend};
 use glassdb::{Backend, Database};
-use glassdb_data::{DbRoot, TxId};
+use glassdb_data::{DbPrefix, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxRecord, TxRecordStore};
 use glassdb_storage::{CachedStore, Requirement, StorageError, Timeline};
 
 fn tx_record_store(backend: Arc<dyn Backend>) -> TxRecordStore {
     TxRecordStore::new(
         CachedStore::new(backend, 1 << 20, Timeline::new(), None),
-        DbRoot::try_from("gc").unwrap(),
+        DbPrefix::try_from("gc").unwrap(),
     )
 }
 

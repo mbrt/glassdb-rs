@@ -7,7 +7,7 @@ use std::time::Duration;
 use glassdb_backend::{Backend, BackendError, BackendStats, StatsBackend};
 use glassdb_concurr::{Background, DedupKeySnapshot, RetryConfig};
 use glassdb_data::{
-    CollectionAddress, CollectionId, DatabaseId, DbRoot, LogicalKey, ObjectPath, TxId,
+    CollectionAddress, CollectionId, DatabaseId, DbPrefix, LogicalKey, ObjectPath, TxId,
 };
 use glassdb_storage::transaction::TxRecordStore;
 use glassdb_storage::{
@@ -32,7 +32,7 @@ use crate::reader::{ReadOutcome, Reader};
 use crate::split::{Splitter, SplitterStats};
 use crate::tlocker::{Locker, LockerStats};
 
-/// Balances backend traffic and memory use for a default production client.
+/// Balances backend traffic and memory use for a default production database instance.
 const DEFAULT_CACHE_SIZE: usize = 512 * 1024 * 1024;
 const DEFAULT_TRANSACTION_LEAF_PARALLELISM: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 const DEFAULT_COLLECTION_RESERVATION_LIMIT: usize = 1024;
@@ -383,7 +383,7 @@ impl AssemblyFoundation {
         backend: Arc<StatsBackend>,
         persistent: Option<PersistentCache>,
         timeline: Timeline,
-        db_root: DbRoot,
+        db_prefix: DbPrefix,
         config: &EngineConfig,
     ) -> Self {
         let dyn_backend: Arc<dyn Backend> = backend.clone();
@@ -392,7 +392,7 @@ impl AssemblyFoundation {
         let records = CollectionStore::new(objects.clone());
         let nodes = NodeStore::new(objects.clone(), config.transaction_leaf_parallelism);
         let structural_intents = StructuralIntentStore::new(objects.clone());
-        let tx_records = TxRecordStore::new(objects.clone(), db_root);
+        let tx_records = TxRecordStore::new(objects.clone(), db_prefix);
         let background = Arc::new(Background::new());
         let monitor = Monitor::with_config(
             tx_records.clone(),
@@ -433,12 +433,16 @@ pub(crate) struct AssemblyFixture {
 #[cfg(test)]
 impl AssemblyFixture {
     /// Creates a dormant test foundation over the supplied backend.
-    pub(crate) fn new(backend: Arc<dyn Backend>, db_root: DbRoot, config: &EngineConfig) -> Self {
+    pub(crate) fn new(
+        backend: Arc<dyn Backend>,
+        db_prefix: DbPrefix,
+        config: &EngineConfig,
+    ) -> Self {
         let foundation = AssemblyFoundation::new(
             Arc::new(StatsBackend::new(backend)),
             None,
             Timeline::new(),
-            db_root,
+            db_prefix,
             config,
         );
         Self {
@@ -484,8 +488,8 @@ impl DormantEngine {
         backend: Arc<StatsBackend>,
         config: EngineConfig,
     ) -> Result<Self, StorageError> {
-        let db_root = DbRoot::try_from(name)
-            .map_err(|error| StorageError::with_source("validating database root", error))?;
+        let db_prefix = DbPrefix::try_from(name)
+            .map_err(|error| StorageError::with_source("validating database prefix", error))?;
         let (persistent, timeline) = match config.persistent_cache.clone() {
             Some(setup) => {
                 let opened =
@@ -498,9 +502,9 @@ impl DormantEngine {
             None => (None, Timeline::new()),
         };
         let foundation =
-            AssemblyFoundation::new(backend, persistent, timeline, db_root.clone(), &config);
-        verify_permanent_collection(&db_root, &foundation).await?;
-        Ok(Self::from_foundation(foundation, db_root, config, true))
+            AssemblyFoundation::new(backend, persistent, timeline, db_prefix.clone(), &config);
+        verify_permanent_collection(&db_prefix, &foundation).await?;
+        Ok(Self::from_foundation(foundation, db_prefix, config, true))
     }
 
     /// Starts maintenance work and returns the live engine.
@@ -512,7 +516,7 @@ impl DormantEngine {
 
     fn from_foundation(
         foundation: AssemblyFoundation,
-        db_root: DbRoot,
+        db_prefix: DbPrefix,
         config: EngineConfig,
         managed_retirement: bool,
     ) -> Self {
@@ -564,7 +568,7 @@ impl DormantEngine {
             monitor.clone(),
             key_state,
             retry,
-            db_root,
+            db_prefix,
             split_policy,
             inline_policy,
             cleanup_hints.clone(),
@@ -648,13 +652,13 @@ pub(crate) struct EngineFixture {
 #[cfg(test)]
 pub(crate) fn engine_fixture(
     fixture: &AssemblyFixture,
-    db_root: DbRoot,
+    db_prefix: DbPrefix,
     config: EngineConfig,
     managed_retirement: bool,
 ) -> EngineFixture {
     let dormant = DormantEngine::from_foundation(
         fixture.foundation.clone(),
-        db_root,
+        db_prefix,
         config,
         managed_retirement,
     );
@@ -666,10 +670,10 @@ pub(crate) fn engine_fixture(
 }
 
 async fn verify_permanent_collection(
-    db_root: &DbRoot,
+    db_prefix: &DbPrefix,
     foundation: &AssemblyFoundation,
 ) -> Result<(), StorageError> {
-    let collection = CollectionAddress::from_db_root(db_root.clone(), CollectionId::root());
+    let collection = CollectionAddress::from_db_prefix(db_prefix.clone(), CollectionId::root());
     let requirement = Requirement::after(foundation.timeline.currentness_barrier());
     match foundation
         .records

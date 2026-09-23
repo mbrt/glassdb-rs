@@ -81,17 +81,17 @@ If an operation was invoked at `T`, a definitive result stamped with `T` means:
 
 This is a lower-bound proof, not a lease. It does not promise that the state is
 still current when the call returns, and `T` is neither a wall-clock timestamp
-nor an exact database snapshot. Another client may change the object after the
-operation linearizes but before its response arrives, which is why response
-time would be an unsound, overly strong watermark.
+nor an exact database snapshot. Another database instance may change the object
+after the operation linearizes but before its response arrives, which is why
+response time would be an unsound, overly strong watermark.
 
 Sequence points are normally meaningful only within one open database. They
-are not exchanged between clients or independent database openings. The
-persistent cache is the narrow exception: it persists points only so a new
+are not exchanged between database instances or independent database openings.
+The persistent cache is the narrow exception: it persists points only so a new
 opening of the same database identity can start its timeline strictly after all
 recoverable cache evidence. Consequently, an old L2 body may satisfy `ANY`, but
-a requirement created in the new session forces validation before that body
-can satisfy it.
+a requirement created in the new session forces validation before that body can
+satisfy it.
 
 ## Requirements
 
@@ -479,8 +479,8 @@ Three rules recur:
 - **Completion needs a removal CAS or a bounded no-op.** An applied conditional
   removal proves completion by itself. A present state without the holder proves
   completion only when its evidence meets the caller's requirement; otherwise the
-  caller rereads under that requirement. Each obligation — entry locks,
-  membership holds, directory holders, topology participants, and the collection
+  caller rereads under that requirement. Each obligation — key locks,
+  membership locks, directory holders, topology participants, and the collection
   record — keeps its own completion evidence. Refreshing one object supplies no
   evidence about another.
 

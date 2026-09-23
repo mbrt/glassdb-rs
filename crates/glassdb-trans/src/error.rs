@@ -34,7 +34,7 @@ pub enum TransError {
     /// User data cannot fit in the configured coordination-object limit.
     #[error("invalid input: {0}")]
     InvalidInput(String),
-    /// The addressed collection incarnation was durably deleted.
+    /// The addressed collection was dropped.
     #[error("stale collection handle")]
     StaleCollection,
     /// Any other transaction error, with an optional underlying cause.

@@ -3,7 +3,7 @@ use std::fmt;
 use crate::base64;
 use crate::txid::TxId;
 
-use super::{DbRoot, ObjectPath, PathError};
+use super::{DbPrefix, ObjectPath, PathError};
 
 const TRANSACTION_MARKER: &str = "_t";
 
@@ -20,7 +20,7 @@ pub(super) fn parse_object(path: &str) -> Option<Result<ObjectPath, PathError>> 
     }
     Some(decode_parts(path, a, b, encoded).and_then(|id| {
         Ok(ObjectPath::Transaction {
-            db_root: DbRoot::try_from(prefix)?,
+            db_prefix: DbPrefix::try_from(prefix)?,
             id,
         })
     }))

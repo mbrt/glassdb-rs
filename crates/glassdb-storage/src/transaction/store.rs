@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use glassdb_backend as backend;
 use glassdb_concurr::rt;
-use glassdb_data::{DbRoot, ObjectPath, TxId};
+use glassdb_data::{DbPrefix, ObjectPath, TxId};
 
 use crate::cached_store::{CachedStore, CasResult, ObjectKey, Observation, Requirement};
 use crate::error::StorageError;
@@ -50,15 +50,15 @@ pub struct TxListPage {
 /// Reads and writes transaction records under a path prefix.
 #[derive(Clone)]
 pub struct TxRecordStore {
-    db_root: DbRoot,
+    db_prefix: DbPrefix,
     records: crate::cached_store::TypedCachedStore<TxRecordCodec>,
 }
 
 impl TxRecordStore {
-    /// Creates a store for transaction records under `db_root`.
-    pub fn new(objects: CachedStore, db_root: DbRoot) -> Self {
+    /// Creates a store for transaction records under `db_prefix`.
+    pub fn new(objects: CachedStore, db_prefix: DbPrefix) -> Self {
         TxRecordStore {
-            db_root,
+            db_prefix,
             records: objects.typed(),
         }
     }
@@ -73,7 +73,7 @@ impl TxRecordStore {
         requirement: Requirement,
     ) -> Result<TxStatus, StorageError> {
         let path = ObjectKey::from(ObjectPath::Transaction {
-            db_root: self.db_root.clone(),
+            db_prefix: self.db_prefix.clone(),
             id: id.clone(),
         });
         let observation = match self.cached_final(&path)? {
@@ -93,7 +93,7 @@ impl TxRecordStore {
         requirement: Requirement,
     ) -> Result<Observation<TxRecord>, StorageError> {
         let path = ObjectKey::from(ObjectPath::Transaction {
-            db_root: self.db_root.clone(),
+            db_prefix: self.db_prefix.clone(),
             id: id.clone(),
         });
         let observation = match self.cached_final(&path)? {
@@ -114,7 +114,7 @@ impl TxRecordStore {
         let mut persisted = l.clone();
         persisted.timestamp = Some(ts);
         let path = ObjectPath::Transaction {
-            db_root: self.db_root.clone(),
+            db_prefix: self.db_prefix.clone(),
             id: l.id.clone(),
         };
         match self.records.create(path, None, Arc::new(persisted)).await? {
@@ -177,14 +177,14 @@ impl TxRecordStore {
         cursor: Option<&backend::ListCursor>,
         limit: backend::ListLimit,
     ) -> Result<TxListPage, StorageError> {
-        let prefix = ObjectPath::transaction_scan_prefix(&self.db_root, depth, index)
+        let prefix = ObjectPath::transaction_scan_prefix(&self.db_prefix, depth, index)
             .map_err(|error| StorageError::with_source("transaction scan prefix", error))?;
         let page = self.records.list(&prefix, cursor, limit).await?;
         let ids = page
             .objects
             .iter()
             .filter_map(|path| match path.object_path() {
-                ObjectPath::Transaction { db_root, id } if db_root == &self.db_root => {
+                ObjectPath::Transaction { db_prefix, id } if db_prefix == &self.db_prefix => {
                     Some(id.clone())
                 }
                 _ => None,
@@ -266,26 +266,26 @@ mod tests {
     use glassdb_data::{CollectionAddress, CollectionId, LeafRef, LogicalKey};
     use tokio::sync::Notify;
 
-    fn db_root() -> DbRoot {
-        DbRoot::try_from("db").unwrap()
+    fn db_prefix() -> DbPrefix {
+        DbPrefix::try_from("db").unwrap()
     }
 
     fn new_tx_record_store() -> TxRecordStore {
         let backend = Arc::new(MemoryBackend::new());
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        TxRecordStore::new(objects, db_root())
+        TxRecordStore::new(objects, db_prefix())
     }
 
-    fn test_collection(db_root: &str, byte: u8) -> CollectionAddress {
-        CollectionAddress::new(db_root, CollectionId::from_slice(&[byte; 16]).unwrap())
+    fn test_collection(db_prefix: &str, byte: u8) -> CollectionAddress {
+        CollectionAddress::new(db_prefix, CollectionId::from_slice(&[byte; 16]).unwrap())
     }
 
     fn new_recording_tx_record_store() -> (TxRecordStore, OpLog) {
         let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let operations = backend.log();
         let objects = CachedStore::new(Arc::new(backend), 1 << 20, Timeline::new(), None);
-        (TxRecordStore::new(objects, db_root()), operations)
+        (TxRecordStore::new(objects, db_prefix()), operations)
     }
 
     fn assert_operations(operations: &OpLog, expected: &[&str]) {
@@ -541,7 +541,7 @@ mod tests {
                     leaf: LeafRef::root(collection),
                     typ: LockType::Read,
                 },
-                TxLock::Entry {
+                TxLock::Key {
                     key: key.clone(),
                     typ: LockType::Write,
                 },
@@ -549,7 +549,7 @@ mod tests {
                     collection: test_collection("db", 1),
                     typ: LockType::Write,
                 },
-                TxLock::Topology {
+                TxLock::TopologyFreeze {
                     collection: test_collection("db", 1),
                 },
             ],
@@ -571,7 +571,7 @@ mod tests {
             leaf: LeafRef::root(test_collection("db", 1)),
             typ: LockType::Read,
         }));
-        assert!(got.locks.contains(&TxLock::Entry {
+        assert!(got.locks.contains(&TxLock::Key {
             key,
             typ: LockType::Write,
         }));
@@ -579,7 +579,7 @@ mod tests {
             collection: test_collection("db", 1),
             typ: LockType::Write,
         }));
-        assert!(got.locks.contains(&TxLock::Topology {
+        assert!(got.locks.contains(&TxLock::TopologyFreeze {
             collection: test_collection("db", 1),
         }));
         assert_eq!(got.collection_changes, record.collection_changes);
@@ -607,7 +607,7 @@ mod tests {
     async fn commit_status_waits_for_in_flight_create() {
         let id = TxId::from_bytes(vec![1, 2, 3, 4]);
         let transaction_path = ObjectPath::Transaction {
-            db_root: db_root(),
+            db_prefix: db_prefix(),
             id: id.clone(),
         }
         .to_string();
@@ -646,7 +646,7 @@ mod tests {
         });
 
         let objects = CachedStore::new(backend, 1 << 20, Timeline::new(), None);
-        let logger = TxRecordStore::new(objects, db_root());
+        let logger = TxRecordStore::new(objects, db_prefix());
         let record = TxRecord::new(id.clone(), TxCommitStatus::Ok);
 
         let creating = tokio::spawn({
@@ -716,11 +716,11 @@ mod tests {
             let timeline = Timeline::new();
             let logger = TxRecordStore::new(
                 CachedStore::new(backend.clone(), 1 << 20, timeline.clone(), None),
-                db_root(),
+                db_prefix(),
             );
             let peer = TxRecordStore::new(
                 CachedStore::new(backend, 1 << 20, Timeline::new(), None),
-                db_root(),
+                db_prefix(),
             );
             let id = TxId::from_bytes(vec![4, 3, 2, 4]);
             logger
@@ -752,7 +752,7 @@ mod tests {
         let operations = backend.log();
         let timeline = Timeline::new();
         let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone(), None);
-        let logger = TxRecordStore::new(objects, db_root());
+        let logger = TxRecordStore::new(objects, db_prefix());
         let id = TxId::from_bytes(vec![4, 3, 2, 2]);
         logger
             .set(&TxRecord::new(id.clone(), TxCommitStatus::Pending))
@@ -784,7 +784,7 @@ mod tests {
         let operations = backend.log();
         let timeline = Timeline::new();
         let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone(), None);
-        let logger = TxRecordStore::new(objects, db_root());
+        let logger = TxRecordStore::new(objects, db_prefix());
         let id = TxId::from_bytes(vec![4, 3, 2, 3]);
         logger
             .set(&TxRecord::new(id.clone(), TxCommitStatus::Wounded))

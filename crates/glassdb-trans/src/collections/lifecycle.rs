@@ -1,4 +1,4 @@
-//! Physical preparation, fencing, and reclamation of collection incarnations.
+//! Physical preparation, fencing, and reclamation of collections.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -34,7 +34,7 @@ pub trait TopologySettler: Send + Sync {
     ) -> Result<(), TransError>;
 }
 
-/// Drives collection incarnations through preparation, deletion, and cleanup.
+/// Drives collections through preparation, dropping, and cleanup.
 #[derive(Clone)]
 pub struct CollectionLifecycle {
     records: CollectionStore,
@@ -100,8 +100,8 @@ impl CollectionLifecycle {
         Ok(())
     }
 
-    /// Installs delete intents on all nodes of every staged drop.
-    pub(crate) async fn fence_drops(
+    /// Installs drop intents on all nodes of every staged drop.
+    pub(crate) async fn install_drop_intents(
         &self,
         id: &TxId,
         changes: &[CollectionChange],
@@ -124,7 +124,7 @@ impl CollectionLifecycle {
         Ok(())
     }
 
-    /// Clears delete preparation that a transaction no longer needs.
+    /// Clears drop preparation that a transaction no longer needs.
     ///
     /// The transaction must have stopped fencing these collections. A present
     /// state without its intent or freeze must satisfy `requirement`. Owner
@@ -276,13 +276,13 @@ impl CollectionLifecycle {
                 Err(StorageError::NotFound) => return Ok(()),
                 Err(error) => return Err(error.into()),
             };
-            if node.collection_delete_intent() == Some(id) {
+            if node.drop_intent() == Some(id) {
                 // Local retry cleanup updates this same cache. Another owner
                 // can replace our intent only after we can no longer commit.
                 return Ok(());
             }
-            if let Some(holder) = node.collection_delete_intent().cloned() {
-                self.resolve_delete_holder(&holder, id).await?;
+            if let Some(holder) = node.drop_intent().cloned() {
+                self.resolve_drop_intent_holder(&holder, id).await?;
             }
             if let Some(holder) = self.pending_node_holder(&node, id).await? {
                 self.resolve_pending_holder(&holder, id).await?;
@@ -292,7 +292,7 @@ impl CollectionLifecycle {
             // exact-revision rewrite fuses the remaining one-shot structural
             // exclusion with intent installation: a late node CAS either lands
             // first and makes us retry, or loses and then observes the intent.
-            node.set_collection_delete_intent(id.clone());
+            node.set_drop_intent(id.clone());
             if self
                 .nodes
                 .store_node(collection, token, &node, Some(&observed))
@@ -312,13 +312,13 @@ impl CollectionLifecycle {
         let mut backoff = self.retry.backoff();
         loop {
             let (mut root, observed) = self.nodes.load_root(collection, Requirement::ANY).await?;
-            if root.collection_delete_intent() == Some(id) {
+            if root.drop_intent() == Some(id) {
                 // As for node intents, local cleanup shares this cache and
                 // foreign replacement requires that we can no longer commit.
                 return Ok(());
             }
-            if let Some(holder) = root.collection_delete_intent().cloned() {
-                self.resolve_delete_holder(&holder, id).await?;
+            if let Some(holder) = root.drop_intent().cloned() {
+                self.resolve_drop_intent_holder(&holder, id).await?;
             }
             if let Some(holder) = self.pending_node_holder(&root, id).await? {
                 self.resolve_pending_holder(&holder, id).await?;
@@ -326,7 +326,7 @@ impl CollectionLifecycle {
             }
             // As for standalone nodes, the exact-revision rewrite closes the
             // final race without leaving a separate gate to recover on abort.
-            root.set_collection_delete_intent(id.clone());
+            root.set_drop_intent(id.clone());
             if self.nodes.store_root(collection, &root, &observed).await? {
                 return Ok(());
             }
@@ -366,8 +366,8 @@ impl CollectionLifecycle {
         Ok(())
     }
 
-    /// Establishes that a foreign delete intent can be replaced.
-    async fn resolve_delete_holder(&self, holder: &TxId, id: &TxId) -> Result<(), TransError> {
+    /// Establishes that a foreign drop intent can be replaced.
+    async fn resolve_drop_intent_holder(&self, holder: &TxId, id: &TxId) -> Result<(), TransError> {
         match resolve_tx_conflict(&self.monitor, id, holder).await? {
             TxFinalStatus::Committed => Err(TransError::StaleCollection),
             TxFinalStatus::Aborted => Ok(()),
@@ -387,7 +387,7 @@ impl CollectionLifecycle {
                 .nodes
                 .load_node(collection, token, read_requirement)
                 .await?;
-            if !node.remove_collection_delete_intent(id) {
+            if !node.remove_drop_intent(id) {
                 if observed.satisfies(requirement) {
                     return Ok(false);
                 }
@@ -421,7 +421,7 @@ impl CollectionLifecycle {
                     Err(StorageError::NotFound) => return Ok(changed),
                     Err(error) => return Err(error.into()),
                 };
-            if !root.remove_collection_delete_intent(id) {
+            if !root.remove_drop_intent(id) {
                 if observed.satisfies(requirement) {
                     break;
                 }
@@ -467,7 +467,7 @@ mod tests {
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
     use glassdb_concurr::Background;
-    use glassdb_data::{CollectionId, DbRoot, NodeToken, ObjectPath};
+    use glassdb_data::{CollectionId, DbPrefix, NodeToken, ObjectPath};
     use glassdb_storage::transaction::{
         TxCollectionChange, TxCollectionOp, TxRecord, TxRecordStore,
     };
@@ -599,12 +599,12 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(recorder);
         let owner = AssemblyFixture::new(
             hooks.clone(),
-            DbRoot::try_from("db").unwrap(),
+            DbPrefix::try_from("db").unwrap(),
             &EngineConfig::default(),
         );
         let peer = AssemblyFixture::new(
             backend.clone(),
-            DbRoot::try_from("db").unwrap(),
+            DbPrefix::try_from("db").unwrap(),
             &EngineConfig::default(),
         );
         let owner_lifecycle = lifecycle(&owner);
@@ -691,7 +691,7 @@ mod tests {
             .await
             .unwrap();
         owner_lifecycle
-            .fence_drops(&first, std::slice::from_ref(&change))
+            .install_drop_intents(&first, std::slice::from_ref(&change))
             .await
             .unwrap();
         match status {
@@ -717,7 +717,7 @@ mod tests {
         // branch. Start wounded so repeated status reads can bound a broken
         // loop; cached immutable Aborted status could otherwise hide it.
         let status_path = ObjectPath::Transaction {
-            db_root: DbRoot::try_from("db").unwrap(),
+            db_prefix: DbPrefix::try_from("db").unwrap(),
             id: first.clone(),
         }
         .to_string();
@@ -746,7 +746,7 @@ mod tests {
                 Box::pin(async move {
                     if repeated {
                         return Err(BackendError::other(
-                            "delete-intent resolution made no progress",
+                            "drop-intent resolution made no progress",
                         ));
                     }
                     if cleanup {
@@ -771,7 +771,7 @@ mod tests {
         });
         operations.lock().unwrap().clear();
         let result = peer_lifecycle
-            .fence_drops(&second, std::slice::from_ref(&change))
+            .install_drop_intents(&second, std::slice::from_ref(&change))
             .await;
         hooks.clear_before();
         let recorded = std::mem::take(&mut *operations.lock().unwrap());
@@ -800,7 +800,7 @@ mod tests {
         }
         if status != TxCommitStatus::Ok {
             peer_lifecycle
-                .fence_drops(&second, std::slice::from_ref(&change))
+                .install_drop_intents(&second, std::slice::from_ref(&change))
                 .await
                 .unwrap();
             let replay = std::mem::take(&mut *operations.lock().unwrap());
@@ -817,10 +817,7 @@ mod tests {
                 .load_node_at_state(&path, Requirement::ANY)
                 .await
                 .unwrap();
-            assert_eq!(
-                observed.value().unwrap().collection_delete_intent(),
-                Some(expected)
-            );
+            assert_eq!(observed.value().unwrap().drop_intent(), Some(expected));
         }
     }
 
@@ -855,7 +852,7 @@ mod tests {
         let peer = store(backend.clone());
         let background = Arc::new(Background::new());
         let monitor = Monitor::with_config(
-            TxRecordStore::new(primary.objects.clone(), DbRoot::try_from("db").unwrap()),
+            TxRecordStore::new(primary.objects.clone(), DbPrefix::try_from("db").unwrap()),
             primary.timeline.clone(),
             Arc::downgrade(&background),
             RetryConfig::default(),
@@ -966,7 +963,7 @@ mod tests {
             .load_node(&collection(), &node_token(SOURCE_TOKEN), Requirement::ANY)
             .await
             .unwrap();
-        assert_eq!(final_source.collection_delete_intent(), Some(&drop_id));
+        assert_eq!(final_source.drop_intent(), Some(&drop_id));
         assert_eq!(
             final_source.right_sibling(),
             shrink_landed.then_some(RIGHT_TOKEN)
@@ -989,7 +986,7 @@ mod tests {
         let primary = store(backend.clone());
         let background = Arc::new(Background::new());
         let monitor = Monitor::with_config(
-            TxRecordStore::new(primary.objects.clone(), DbRoot::try_from("db").unwrap()),
+            TxRecordStore::new(primary.objects.clone(), DbPrefix::try_from("db").unwrap()),
             primary.timeline.clone(),
             Arc::downgrade(&background),
             RetryConfig::default(),

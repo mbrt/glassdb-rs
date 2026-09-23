@@ -15,7 +15,7 @@ per-leaf generation validation.
 
 [ADR-046](046-incarnation-addressed-collections.md) supersedes this ADR's
 physical-root existence rule, name-derived child addressing, and name-only
-subcollection directory with incarnation IDs and direct parent
+subcollection directory with collection IDs and direct parent
 mappings. [ADR-047](047-transactional-collection-management.md) makes creation,
 listing, and teardown of that hierarchy transactional and supersedes the
 standalone lifecycle protocol. This ADR's
@@ -209,9 +209,9 @@ read-lock fallback), so it is serializable without a `_c/` prefix scan.
   committed together so the name and the child root appear atomically (sequencing
   in ADR-020). `Collection::collection(name)` keeps deriving the child prefix via
   `paths::from_collection`.
-- **Delete** a subcollection: remove the name under the parent membership write
+- **Drop** a subcollection: remove the name under the parent membership write
   lock. Tearing down the child's shards / transaction records is reclamation,
-  deferred to ADR-022; v1 has no collection-delete API, so this only fixes the
+  deferred to ADR-022; v1 has no collection-drop API, so this only fixes the
   membership contract, not a full recursive teardown.
 
 ## Consequences
@@ -224,7 +224,7 @@ read-lock fallback), so it is serializable without a `_c/` prefix scan.
   write the root. Only create/delete and listing do, exactly the operations
   ADR-016 said may serialize on membership.
 - Membership coordination is coarse — one lock per collection covers all key and
-  subcollection create/delete — trading concurrency for a simple, obviously
+  subcollection create/drop — trading concurrency for a simple, obviously
   correct MVP, with finer-grained tokens available later.
 - The root gains a real format (`CollectionRoot` protobuf) and a recorded
   `shard_count`, pinning the key→shard mapping per collection and giving a fail-

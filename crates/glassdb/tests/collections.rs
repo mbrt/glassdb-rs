@@ -139,7 +139,7 @@ async fn strict_and_idempotent_create_have_distinct_race_contracts() {
 }
 
 #[tokio::test]
-async fn child_listing_returns_sorted_incarnation_bound_handles() {
+async fn child_listing_returns_sorted_id_bound_handles() {
     let db = Database::open("example", MemoryBackend::new())
         .await
         .unwrap();
@@ -447,7 +447,7 @@ async fn collection_changes_compose_with_data_and_nested_changes() {
             let (same_users, created) = tx.create_collection_if_absent(&root, b"users").await?;
             glassdb::ensure_tx!(
                 created,
-                Error::internal("transaction did not retain its staged collection incarnation")
+                Error::internal("transaction did not retain its staged collection ID")
             );
             tx.write(&same_users, b"second-handle", b"ready")?;
             let active = tx.create_collection(&users, b"active").await?;
@@ -569,7 +569,7 @@ async fn explicit_abort_replays_invalidated_reads_without_publishing_changes() {
 }
 
 #[tokio::test]
-async fn collection_creation_reuses_its_reserved_incarnation_across_body_replay() {
+async fn collection_creation_reuses_its_reserved_collection_id_across_body_replay() {
     let backend = Arc::new(MemoryBackend::new());
     let db = Database::open("example", backend.clone()).await.unwrap();
     let peer = Database::open("example", backend).await.unwrap();
@@ -834,7 +834,7 @@ async fn collection_drop_replays_transactional_lookup() {
 }
 
 #[tokio::test]
-async fn a_cached_handle_in_another_client_observes_the_drop_fence() {
+async fn a_cached_handle_in_another_instance_observes_the_drop_intent() {
     let backend = Arc::new(MemoryBackend::new());
     let first = Database::open("example", backend.clone()).await.unwrap();
     let second = Database::open("example", backend).await.unwrap();

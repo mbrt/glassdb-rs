@@ -21,7 +21,7 @@ message TransactionRecord {
 }
 
 message CollectionWrites {
-    // Stable incarnation ID. The database root comes from the enclosing
+    // Stable collection ID. The database prefix comes from the enclosing
     // transaction record's physical path and is deliberately omitted.
     bytes collection_id = 1;
     repeated Write writes = 2;
@@ -40,10 +40,10 @@ message Write {
 }
 
 message CollectionLocks {
-    repeated EntryLock entry_locks = 1;
+    repeated KeyLock key_locks = 1;
     repeated MembershipLock membership_locks = 2;
     Lock.LockType directory_lock = 3;
-    bool topology_lock = 4;
+    bool topology_freeze = 4;
 }
 
 message CollectionChange {
@@ -59,7 +59,7 @@ message CollectionChange {
     Operation operation = 4;
 }
 
-message EntryLock {
+message KeyLock {
     bytes key = 1;
     Lock.LockType lock_type = 2;
 }
@@ -145,13 +145,12 @@ message Node {
         // An index node: separator keys mapping ranges to child nodes.
         IndexNode index = 4;
     }
-    NodeLock structure_lock = 5;
+    NodeLock structural_gate = 5;
     NodeLock membership_lock = 6;
     uint64 membership_generation = 7;
-    // A transaction preparing collection deletion. Its final status determines
-    // whether this is an ignorable obsolete intent or a durable stale-handle
-    // fence.
-    bytes collection_delete_intent = 8;
+    // The transaction identity that drops the collection. Its final status
+    // decides whether this drop intent is obsolete or makes the node stale.
+    bytes drop_intent = 8;
 }
 
 // A structural intent for one split. It lives at
@@ -222,6 +221,6 @@ message CollectionRecord {
 message CollectionDirectoryEntry {
     // Raw child name.
     bytes name = 1;
-    // Stable 16-byte incarnation ID.
+    // Stable 16-byte collection ID.
     bytes collection_id = 2;
 }

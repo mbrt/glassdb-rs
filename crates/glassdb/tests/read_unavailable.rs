@@ -28,7 +28,7 @@ use glassdb::{CollectionPath, Database, Error};
 /// The object kind whose reads a [`ReadFaults`] decorator faults.
 #[derive(Clone, Copy)]
 enum FaultTarget {
-    /// A coordination leaf: a node (`/_n/`) or the collection root (`/_r`).
+    /// A coordination leaf: a node (`/_n/`) or the tree root (`/_r`).
     Leaf,
     /// A collection's lifecycle and directory record (`/_i`).
     CollectionRecord,

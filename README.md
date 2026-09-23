@@ -118,9 +118,9 @@ This project makes the following specific tradeoffs:
 
 - Optimizes for rare conflicts between transactions (optimistic locking).
 - Readers are rarely blocked.
-- Clients are completely stateless and ephemeral. For example, they can be
-  scaled down to zero. We avoid explicit coordination between clients (e.g.
-  there's no need for consensus messages).
+- Database instances are completely stateless and ephemeral. For example, they
+  can be scaled down to zero. We avoid explicit coordination between database
+  instances (e.g. there's no need for consensus messages).
 - Requires access to object storage (the lowest latency the better) with
   requests preconditions (both Google GCS and AWS S3 meet the requirements).
 - Assumes that, when transactions race each other, it's better to be slow than
@@ -209,7 +209,7 @@ This is a lot slower than most databases, but still has a few advantages:
 
 The benchmark below uses 5,000 keys per collection. It runs single-key and
 10-key read-only and read-modify-write transaction shapes together. It varies
-each shape from 1 through 200 workers and opens up to five `Database` clients,
+each shape from 1 through 200 workers and opens up to five `Database` instances,
 each with an independent collection.
 
 ### Throughput

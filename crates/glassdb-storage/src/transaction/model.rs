@@ -160,7 +160,7 @@ pub struct TxWrite {
 /// A transaction lock backreference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxLock {
-    Entry {
+    Key {
         key: LogicalKey,
         typ: LockType,
     },
@@ -172,7 +172,7 @@ pub enum TxLock {
         collection: CollectionAddress,
         typ: LockType,
     },
-    Topology {
+    TopologyFreeze {
         collection: CollectionAddress,
     },
 }
@@ -181,10 +181,10 @@ impl TxLock {
     /// Returns the lock type recorded for this backreference.
     pub fn typ(&self) -> LockType {
         match self {
-            TxLock::Entry { typ, .. }
+            TxLock::Key { typ, .. }
             | TxLock::Membership { typ, .. }
             | TxLock::Directory { typ, .. } => *typ,
-            TxLock::Topology { .. } => LockType::Write,
+            TxLock::TopologyFreeze { .. } => LockType::Write,
         }
     }
 }

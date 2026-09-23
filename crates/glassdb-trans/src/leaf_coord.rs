@@ -2,7 +2,7 @@
 //! mutation engine through which every leaf entry mutation flows.
 //!
 //! The only coordination primitive is a content compare-and-swap on a B-link
-//! leaf: a node (`{prefix}/_n/<token>`) or the collection root (`{prefix}/_r`,
+//! leaf: a node (`{prefix}/_n/<token>`) or the tree root (`{prefix}/_r`,
 //! the root leaf while the collection is small, ADR-031). Concurrent
 //! transactions contending one object are **deduplicated** (ADR-025/026): each
 //! per-object mutation is submitted to a [`Dedup`] keyed on the object path, so
@@ -384,7 +384,7 @@ struct LeafMember {
 /// carries one transaction; a merged request accumulates several compatible
 /// ones.
 ///
-/// The leaf is identified by its object `path` — the collection root `_r` for a
+/// The leaf is identified by its object `path` — the tree root `_r` for a
 /// small collection's single leaf, else a standalone node `_n`, resolved by
 /// descent. `members` maps each contending transaction to its installed
 /// resolver and outcome slot. `requirement` combines the members' bounds for
@@ -1062,7 +1062,7 @@ impl LeafCoordinator {
     /// while a plan with no changes checks it explicitly. A changed state
     /// requires a new plan, not just newer evidence attached to the old outcome.
     ///
-    /// `path` is the leaf's object path — the collection root `_r` for a small
+    /// `path` is the leaf's object path — the tree root `_r` for a small
     /// collection's single leaf, else a standalone node `_n` resolved by descent
     /// ([`TreeRouter`](glassdb_storage::TreeRouter)).
     async fn submit_leaf(
@@ -1131,7 +1131,7 @@ mod tests {
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
     };
     use glassdb_concurr::Background;
-    use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath};
+    use glassdb_data::{CollectionAddress, DbPrefix, NodeToken, ObjectPath};
     use glassdb_storage::{CachedStore, CurrentState, LeafBody, LockType, Node, Timeline};
 
     const COLL: &str = "coordp";
@@ -1224,7 +1224,7 @@ mod tests {
 
         let mut config = EngineConfig::default();
         config.set_cache_size(1 << 20);
-        let foundation = AssemblyFixture::new(backend, DbRoot::try_from(COLL).unwrap(), &config);
+        let foundation = AssemblyFixture::new(backend, DbPrefix::try_from(COLL).unwrap(), &config);
         let timeline = foundation.timeline.clone();
         let bg = foundation.background.clone();
         let mon = foundation.monitor.clone();

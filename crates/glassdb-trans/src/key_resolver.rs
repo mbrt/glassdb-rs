@@ -501,7 +501,7 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::{CollectionId, DbRoot, ObjectPath};
+    use glassdb_data::{CollectionId, DbPrefix, ObjectPath};
     use glassdb_storage::transaction::{TxCommitStatus, TxRecordStore};
     use glassdb_storage::{
         CachedStore, CurrentState, LeafBody, LeafEntry, Node, NodeStore, Timeline, TreeRouter,
@@ -538,7 +538,7 @@ mod tests {
     ) -> (KeyResolver, Monitor, Timeline, Arc<Background>) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        let tx_records = TxRecordStore::new(objects.clone(), DbRoot::try_from(DB).unwrap());
+        let tx_records = TxRecordStore::new(objects.clone(), DbPrefix::try_from(DB).unwrap());
         let bg = Arc::new(Background::new());
         let mon = Monitor::with_config(
             tx_records,

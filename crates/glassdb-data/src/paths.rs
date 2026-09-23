@@ -15,9 +15,9 @@ const DATABASE_METADATA_OBJECT: &str = "glassdb";
 
 /// A database's top-level physical object-path component.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct DbRoot(Arc<str>);
+pub struct DbPrefix(Arc<str>);
 
-impl DbRoot {
+impl DbPrefix {
     /// Maximum number of bytes in the encoded path component.
     pub const MAX_ENCODED_LEN: usize = 255;
 
@@ -27,25 +27,25 @@ impl DbRoot {
     }
 }
 
-impl TryFrom<&str> for DbRoot {
+impl TryFrom<&str> for DbPrefix {
     type Error = PathError;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        validate_db_root(value)?;
-        Ok(DbRoot(Arc::from(value)))
+        validate_db_prefix(value)?;
+        Ok(DbPrefix(Arc::from(value)))
     }
 }
 
-impl TryFrom<String> for DbRoot {
+impl TryFrom<String> for DbPrefix {
     type Error = PathError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        validate_db_root(&value)?;
-        Ok(DbRoot(Arc::from(value)))
+        validate_db_prefix(&value)?;
+        Ok(DbPrefix(Arc::from(value)))
     }
 }
 
-impl std::str::FromStr for DbRoot {
+impl std::str::FromStr for DbPrefix {
     type Err = PathError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -53,13 +53,13 @@ impl std::str::FromStr for DbRoot {
     }
 }
 
-impl AsRef<str> for DbRoot {
+impl AsRef<str> for DbPrefix {
     fn as_ref(&self) -> &str {
         self.as_str()
     }
 }
 
-impl std::fmt::Display for DbRoot {
+impl std::fmt::Display for DbPrefix {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
@@ -204,13 +204,13 @@ impl std::fmt::Display for StructuralIntentId {
     }
 }
 
-fn validate_db_root(value: &str) -> Result<(), PathError> {
+fn validate_db_prefix(value: &str) -> Result<(), PathError> {
     if value.is_empty()
-        || value.len() > DbRoot::MAX_ENCODED_LEN
+        || value.len() > DbPrefix::MAX_ENCODED_LEN
         || !value.bytes().all(|byte| byte.is_ascii_alphanumeric())
     {
         return Err(PathError::InvalidComponent {
-            component: "database root",
+            component: "database prefix",
             value: value.to_string(),
         });
     }
@@ -238,57 +238,57 @@ fn validate_random_component(
     Ok(())
 }
 
-/// The physical address of one collection incarnation within a database.
+/// The physical address of one collection within a database.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CollectionAddress {
-    db_root: DbRoot,
+    db_prefix: DbPrefix,
     id: CollectionId,
 }
 
 impl CollectionAddress {
-    /// Creates an address from a database root and collection identity.
-    pub fn new(db_root: impl Into<Arc<str>>, id: CollectionId) -> Self {
-        let db_root = db_root.into();
-        let db_root = DbRoot::try_from(db_root.as_ref())
-            .expect("database root must be a valid physical path component");
-        CollectionAddress { db_root, id }
+    /// Creates an address from a database prefix and collection identity.
+    pub fn new(db_prefix: impl Into<Arc<str>>, id: CollectionId) -> Self {
+        let db_prefix = db_prefix.into();
+        let db_prefix = DbPrefix::try_from(db_prefix.as_ref())
+            .expect("database prefix must be a valid physical path component");
+        CollectionAddress { db_prefix, id }
     }
 
-    /// Creates an address from an already validated database root.
-    pub fn from_db_root(db_root: DbRoot, id: CollectionId) -> Self {
-        CollectionAddress { db_root, id }
+    /// Creates an address from an already validated database prefix.
+    pub fn from_db_prefix(db_prefix: DbPrefix, id: CollectionId) -> Self {
+        CollectionAddress { db_prefix, id }
     }
 
-    /// Creates the permanent root collection address for `db_root`.
-    pub fn root(db_root: impl Into<Arc<str>>) -> Self {
-        Self::new(db_root, CollectionId::root())
+    /// Creates the permanent root collection address for `db_prefix`.
+    pub fn root(db_prefix: impl Into<Arc<str>>) -> Self {
+        Self::new(db_prefix, CollectionId::root())
     }
 
-    /// Returns this address's database root.
-    pub fn db_root(&self) -> &str {
-        self.db_root.as_str()
+    /// Returns this address's database prefix.
+    pub fn db_prefix(&self) -> &str {
+        self.db_prefix.as_str()
     }
 
-    /// Returns the validated database-root component.
-    pub fn db_root_component(&self) -> &DbRoot {
-        &self.db_root
+    /// Returns the validated database-prefix component.
+    pub fn db_prefix_component(&self) -> &DbPrefix {
+        &self.db_prefix
     }
 
-    /// Returns this collection's stable incarnation identity.
+    /// Returns this collection's stable collection ID.
     pub fn id(&self) -> CollectionId {
         self.id
     }
 
     /// Renders the collection prefix used for physical backend objects.
     pub fn physical_prefix(&self) -> String {
-        tree::collection_prefix(self.db_root.as_str(), self.id)
+        tree::collection_prefix(self.db_prefix.as_str(), self.id)
     }
 
-    /// Parses an incarnation-addressed physical collection prefix.
+    /// Parses an ID-addressed physical collection prefix.
     pub fn from_physical_prefix(prefix: &str) -> Result<Self, PathError> {
-        let (db_root, id) = tree::parse_collection_prefix(prefix)?;
-        Ok(CollectionAddress::from_db_root(
-            DbRoot::try_from(db_root)?,
+        let (db_prefix, id) = tree::parse_collection_prefix(prefix)?;
+        Ok(CollectionAddress::from_db_prefix(
+            DbPrefix::try_from(db_prefix)?,
             id,
         ))
     }
@@ -332,7 +332,7 @@ pub enum LeafRef {
 }
 
 impl LeafRef {
-    /// Creates a collection-root leaf reference.
+    /// Creates a tree-root leaf reference.
     pub fn root(collection: CollectionAddress) -> Self {
         LeafRef::Root(collection)
     }
@@ -349,7 +349,7 @@ impl LeafRef {
         }
     }
 
-    /// Returns the standalone node token, or `None` for the collection root.
+    /// Returns the standalone node token, or `None` for the tree root.
     pub fn node_token(&self) -> Option<&NodeToken> {
         match self {
             LeafRef::Root(_) => None,
@@ -375,11 +375,11 @@ impl LeafRef {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ObjectPath {
     /// The database format and stable-identity record.
-    DatabaseMetadata { db_root: DbRoot },
+    DatabaseMetadata { db_prefix: DbPrefix },
     /// A collection's lifecycle and directory record.
     CollectionRecord { collection: CollectionAddress },
     /// A transaction record, deterministically sharded by its encoded ID.
-    Transaction { db_root: DbRoot, id: TxId },
+    Transaction { db_prefix: DbPrefix, id: TxId },
     /// The fixed root of a collection's B-link tree.
     TreeRoot { collection: CollectionAddress },
     /// A standalone node in a collection's B-link tree.
@@ -389,7 +389,7 @@ pub enum ObjectPath {
     },
     /// A participant-owned structural intent.
     StructuralIntent {
-        db_root: DbRoot,
+        db_prefix: DbPrefix,
         participant: TxId,
         intent_id: StructuralIntentId,
     },
@@ -407,51 +407,54 @@ impl ObjectPath {
     }
 
     /// Returns the listing prefix for one deterministic transaction shard.
-    pub fn transaction_shard_prefix(db_root: &DbRoot, shard: usize) -> String {
-        transaction::shard_prefix(db_root.as_str(), shard)
+    pub fn transaction_shard_prefix(db_prefix: &DbPrefix, shard: usize) -> String {
+        transaction::shard_prefix(db_prefix.as_str(), shard)
     }
 
     /// Returns a transaction listing prefix at one of the three supported depths.
     pub fn transaction_scan_prefix(
-        db_root: &DbRoot,
+        db_prefix: &DbPrefix,
         depth: u8,
         index: usize,
     ) -> Result<String, PathError> {
-        transaction::scan_prefix(db_root.as_str(), depth, index)
+        transaction::scan_prefix(db_prefix.as_str(), depth, index)
     }
 
     /// Returns the database-wide structural-intent listing prefix.
-    pub fn structural_intents_prefix(db_root: &DbRoot) -> String {
-        structural::directory(db_root.as_str())
+    pub fn structural_intents_prefix(db_prefix: &DbPrefix) -> String {
+        structural::directory(db_prefix.as_str())
     }
 
     /// Returns one participant's structural-intent listing prefix.
-    pub fn participant_structural_intents_prefix(db_root: &DbRoot, participant: &TxId) -> String {
-        structural::participant_directory(db_root.as_str(), participant)
+    pub fn participant_structural_intents_prefix(
+        db_prefix: &DbPrefix,
+        participant: &TxId,
+    ) -> String {
+        structural::participant_directory(db_prefix.as_str(), participant)
     }
 }
 
 impl std::fmt::Display for ObjectPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ObjectPath::DatabaseMetadata { db_root } => {
-                write!(f, "{db_root}/{DATABASE_METADATA_OBJECT}")
+            ObjectPath::DatabaseMetadata { db_prefix } => {
+                write!(f, "{db_prefix}/{DATABASE_METADATA_OBJECT}")
             }
             ObjectPath::CollectionRecord { collection } => {
                 tree::write_collection_record(f, collection)
             }
-            ObjectPath::Transaction { db_root, id } => {
-                transaction::write_object(f, db_root.as_str(), id)
+            ObjectPath::Transaction { db_prefix, id } => {
+                transaction::write_object(f, db_prefix.as_str(), id)
             }
             ObjectPath::TreeRoot { collection } => tree::write_tree_root(f, collection),
             ObjectPath::Node { collection, token } => {
                 tree::write_node(f, collection, token.as_str())
             }
             ObjectPath::StructuralIntent {
-                db_root,
+                db_prefix,
                 participant,
                 intent_id,
-            } => structural::write_intent(f, db_root.as_str(), participant, intent_id.as_str()),
+            } => structural::write_intent(f, db_prefix.as_str(), participant, intent_id.as_str()),
         }
     }
 }
@@ -460,9 +463,9 @@ impl TryFrom<&str> for ObjectPath {
     type Error = PathError;
 
     fn try_from(path: &str) -> Result<Self, Self::Error> {
-        if let Some(db_root) = path.strip_suffix("/glassdb") {
+        if let Some(db_prefix) = path.strip_suffix("/glassdb") {
             return Ok(ObjectPath::DatabaseMetadata {
-                db_root: DbRoot::try_from(db_root)?,
+                db_prefix: DbPrefix::try_from(db_prefix)?,
             });
         }
         if let Some(result) = transaction::parse_object(path) {
@@ -529,28 +532,28 @@ mod tests {
     }
 
     #[test]
-    fn database_root_validation_boundaries() {
-        let shortest = DbRoot::try_from("a").unwrap();
+    fn database_prefix_validation_boundaries() {
+        let shortest = DbPrefix::try_from("a").unwrap();
         assert_eq!(shortest.as_str(), "a");
         assert_eq!(shortest.to_string(), "a");
 
-        let longest = "a".repeat(DbRoot::MAX_ENCODED_LEN);
+        let longest = "a".repeat(DbPrefix::MAX_ENCODED_LEN);
         assert_eq!(
-            DbRoot::try_from(longest.clone()).unwrap().as_str(),
+            DbPrefix::try_from(longest.clone()).unwrap().as_str(),
             longest.as_str()
         );
 
         assert!(matches!(
-            DbRoot::try_from(""),
+            DbPrefix::try_from(""),
             Err(PathError::InvalidComponent { .. })
         ));
         assert!(matches!(
-            DbRoot::try_from("a".repeat(DbRoot::MAX_ENCODED_LEN + 1)),
+            DbPrefix::try_from("a".repeat(DbPrefix::MAX_ENCODED_LEN + 1)),
             Err(PathError::InvalidComponent { .. })
         ));
         for invalid in ["db-name", "db_name", "db/name", "db name", "dé"] {
             assert!(matches!(
-                DbRoot::try_from(invalid),
+                DbPrefix::try_from(invalid),
                 Err(PathError::InvalidComponent { .. })
             ));
         }
@@ -605,20 +608,20 @@ mod tests {
 
     #[test]
     fn every_object_path_variant_round_trips() {
-        let db_root = DbRoot::try_from("db").unwrap();
+        let db_prefix = DbPrefix::try_from("db").unwrap();
         let collection = CollectionAddress::root("db");
         let token = NodeToken::from_bytes([7; NODE_TOKEN_BYTES]);
         let participant = TxId::from_bytes(b"participant".to_vec());
         let intent_id = StructuralIntentId::from(NodeToken::from_bytes([9; NODE_TOKEN_BYTES]));
         let paths = [
             ObjectPath::DatabaseMetadata {
-                db_root: db_root.clone(),
+                db_prefix: db_prefix.clone(),
             },
             ObjectPath::CollectionRecord {
                 collection: collection.clone(),
             },
             ObjectPath::Transaction {
-                db_root: db_root.clone(),
+                db_prefix: db_prefix.clone(),
                 id: TxId::from_bytes(vec![1, 2, 3, 4]),
             },
             ObjectPath::TreeRoot {
@@ -626,7 +629,7 @@ mod tests {
             },
             ObjectPath::Node { collection, token },
             ObjectPath::StructuralIntent {
-                db_root,
+                db_prefix,
                 participant,
                 intent_id,
             },
@@ -693,7 +696,7 @@ mod tests {
     #[test]
     fn collection_address_and_key_round_trip() {
         let collection = CollectionAddress::new("db", collection_id(7));
-        assert_eq!(collection.db_root(), "db");
+        assert_eq!(collection.db_prefix(), "db");
         assert_eq!(collection.id(), collection_id(7));
         assert_eq!(
             CollectionAddress::from_physical_prefix(&collection.physical_prefix()).unwrap(),
@@ -702,7 +705,7 @@ mod tests {
 
         let key = LogicalKey::new(collection, b"Hello");
         assert_eq!(key.key(), b"Hello");
-        assert_eq!(key.collection().db_root(), "db");
+        assert_eq!(key.collection().db_prefix(), "db");
     }
 
     #[test]
@@ -728,7 +731,7 @@ mod tests {
         assert_eq!(base64::encode(b"Hello"), "H6KgQ6w");
         assert_eq!(base64::encode(&[0, 1, 2, 3, 4]), "00420kF");
         assert_eq!(base64::encode(b"ab"), "NL8");
-        let db_root = DbRoot::try_from("db").unwrap();
+        let db_prefix = DbPrefix::try_from("db").unwrap();
         let collection = CollectionAddress::root("db");
         let collection_prefix = "db/_c/0000000000000000000000";
         let token = NodeToken::from_bytes([0; NODE_TOKEN_BYTES]);
@@ -760,7 +763,7 @@ mod tests {
         );
         assert_eq!(
             ObjectPath::Transaction {
-                db_root: db_root.clone(),
+                db_prefix: db_prefix.clone(),
                 id: participant.clone(),
             }
             .to_string(),
@@ -768,7 +771,7 @@ mod tests {
         );
         assert_eq!(
             ObjectPath::StructuralIntent {
-                db_root: db_root.clone(),
+                db_prefix: db_prefix.clone(),
                 participant: participant.clone(),
                 intent_id,
             }
@@ -780,13 +783,13 @@ mod tests {
             format!("{collection_prefix}/_n/")
         );
         assert_eq!(
-            ObjectPath::transaction_shard_prefix(&db_root, 16),
+            ObjectPath::transaction_shard_prefix(&db_prefix, 16),
             "db/_t/0/F/"
         );
         assert_eq!(ObjectPath::transaction_shard(&participant), 16);
-        assert_eq!(ObjectPath::structural_intents_prefix(&db_root), "db/_s/");
+        assert_eq!(ObjectPath::structural_intents_prefix(&db_prefix), "db/_s/");
         assert_eq!(
-            ObjectPath::participant_structural_intents_prefix(&db_root, &participant),
+            ObjectPath::participant_structural_intents_prefix(&db_prefix, &participant),
             "db/_s/0F8310/"
         );
     }
