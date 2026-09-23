@@ -1209,7 +1209,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
         "a value no leaf can admit does not request a split"
     );
 
-    // The round-level classifications: a same-key claim proves this member
+    // The round-level classifications: a same-key reservation proves this member
     // staged nothing, while a spent CAS budget proves nothing about an
     // earlier evaluation of the same round. And a blind overwrite has no
     // read-dependent computation to reevaluate.
@@ -1333,7 +1333,7 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
     assert_eq!(leaf_stores(&log, &test_root_path().to_string()), 1);
     assert!(entry(&tctx, &kb).await.unwrap().is_locked_by(&driver));
 
-    // Which member wins the round's claim depends on id order; that exactly
+    // Which member wins the round's reservation depends on id order; that exactly
     // one does is the property under test.
     let (winner, mut replayed) = match (&r1, &r2) {
         (Ok(BodyDecision::ReturnOutcome), Ok(BodyDecision::ReplayBody)) => (h1.id().clone(), h2),

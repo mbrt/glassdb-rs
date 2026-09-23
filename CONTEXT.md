@@ -44,7 +44,7 @@ The removal of one collection and its binding. A drop is not recursive: a collec
 _Avoid_: Delete (which applies to logical keys)
 
 **Drop intent**:
-A mark on one node of a collection, owned by the transaction identity that drops the collection. Its owner's status decides its effect: after the owner commits, every later access through the node reports the collection handle as stale.
+A claim on one node of a collection, held by the transaction identity that drops the collection. After the holder commits, every later access through the node reports the collection handle as stale.
 _Avoid_: Delete intent, drop fence, deletion fence
 
 **Logical key**:
@@ -74,7 +74,7 @@ The currentness barrier one transaction allocates to open validation, and the la
 _Avoid_: Validation watermark, validation timestamp
 
 **Transaction identity**:
-A durable protocol identity that owns one transaction's locks, status, and recovery resources.
+A durable protocol identity that holds one transaction's claims and owns its status and recovery resources.
 _Avoid_: Lock owner ID, transaction attempt
 
 **Identity renewal**:
@@ -151,10 +151,16 @@ _Avoid_: Read-only fast path
 **Locked validation**:
 Validation of an access set while the transaction holds its locks.
 
-## Locks
+## Claims and locks
+
+**Claim**:
+A durable mark on one stored object that names the transaction identity that holds it. The holder's transaction record decides its meaning: while the holder can still commit, the claim excludes conflicting work, and after that it takes effect or can be removed.
 
 **Holder**:
-A transaction identity that a lock records as holding it.
+The transaction identity that a claim names.
+
+**Lock**:
+A claim that a transaction takes on the data that it reads or writes. Wound-wait resolves conflicts between the holders of conflicting locks.
 
 **Key lock**:
 A lock on one logical key, recorded in the key's leaf entry. It can lock a key that has no current value.
@@ -222,11 +228,11 @@ The resolution of a logical key or range endpoint to a leaf by descent through a
 _Avoid_: Shard calculation, ownership proof
 
 **Leaf observation**:
-An exact observed state of one leaf, with a currentness watermark after which that state was known to be current. It does not claim that the state is current now.
+An exact observed state of one leaf, with a currentness watermark after which that state was known to be current. It does not prove that the state is current now.
 _Avoid_: Fresh leaf, leaf version, freshness observation
 
 **Routed leaf group**:
-One leaf observation and the ordered logical keys associated with it by one routing operation. The group records that routing result; it is not a durable ownership claim.
+One leaf observation and the ordered logical keys associated with it by one routing operation. The group records that routing result; it is not a claim.
 _Avoid_: Leaf group, owning leaf group, point-leaf plan
 
 **Separator**:
@@ -250,15 +256,15 @@ _Avoid_: Fold, fold plan
 ## Topology changes
 
 **Structural intent**:
-A durable claim for one planned topology change, owned by a topology participant until the change is completed or recovered.
+The durable plan of one topology change, written by one topology participant. It stays until the change is completed or recovered.
 _Avoid_: Structural log, structural record
 
 **Structural gate**:
-An exclusive, durably recorded claim on one node that admits changes to the node's shape. One transaction identity holds it at a time, and a release or a recovery fence must remove it before another shape change starts.
+An exclusive claim on one node that admits changes to the node's shape. A release or a recovery fence must remove it before another shape change starts.
 _Avoid_: Structure lock, structure-write lock
 
 **Topology freeze**:
-A claim on a collection record, owned by the transaction identity that prepares a drop of the collection. It admits no new topology participant, and the existing participants must complete or be recovered before the drop continues.
+A claim on a collection record, held by the transaction identity that prepares a drop of the collection. It admits no new topology participant, and the existing participants must complete or be recovered before the drop continues.
 _Avoid_: Topology lock
 
 ## Maintenance

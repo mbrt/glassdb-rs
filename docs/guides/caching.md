@@ -321,7 +321,7 @@ operation.
 Each attempt takes its members and their combined requirement from one merged
 request after the leaf load. Members that join during that load can strengthen
 the requirement, and resolver-requested bounds remain in force across retries.
-A resolver's requirement applies to dependent object reads; it does not claim
+A resolver's requirement applies to dependent object reads; it does not guarantee
 that the loaded or staged leaf already satisfies the bound.
 
 The first leaf load uses `ANY` as a speculative CAS precondition, including for

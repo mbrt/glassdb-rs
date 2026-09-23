@@ -62,7 +62,7 @@ impl SlowMutationController {
         }
     }
 
-    fn claim(&self) -> Option<Duration> {
+    fn next_delay(&self) -> Option<Duration> {
         let ordinal = self.seen.fetch_add(1, Ordering::SeqCst);
         if ordinal != self.plan.ordinal || self.injected.swap(true, Ordering::SeqCst) {
             return None;
@@ -87,7 +87,9 @@ fn delay_selected(
     controller: &Arc<SlowMutationController>,
     operation: &BackendOp<'_>,
 ) -> HookFuture {
-    let duration = is_mutation(operation).then(|| controller.claim()).flatten();
+    let duration = is_mutation(operation)
+        .then(|| controller.next_delay())
+        .flatten();
     Box::pin(async move {
         if let Some(duration) = duration {
             rt::sleep(duration).await;

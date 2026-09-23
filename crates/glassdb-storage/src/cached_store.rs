@@ -3042,7 +3042,7 @@ mod tests {
     }
 
     // Model invariant: NotFound is successful convergence on absence, but it
-    // does not claim the retained present observation survived until this
+    // does not prove that the retained present observation survived until this
     // delete's invocation.
     #[tokio::test]
     async fn delete_not_found_converges_without_advancing_expected() {

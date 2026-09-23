@@ -346,7 +346,7 @@ async fn read_retry_budget_applies_to_each_point_read() {
 /// Resolving a collection name loads the parent's directory record. That load
 /// leaves the calling transaction's staged changes untouched, so an outage
 /// during it is the retry-safe `Error::Unavailable`, not `Error::InDoubt`.
-/// Reporting it as in-doubt claims the transaction may have committed when it
+/// Reporting it as in-doubt states that the transaction may have committed when it
 /// never left its body (found by the `history` fuzz target, whose oracle
 /// rejects an in-doubt outcome that no commit outcome can explain).
 ///

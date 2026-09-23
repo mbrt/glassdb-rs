@@ -343,7 +343,7 @@ The [glossary](../CONTEXT.md#leaf-coordination) defines **coordinator round**,
 | --- | --- | --- |
 | Combine compatible submissions for one leaf | Batch submissions | Form or extend a coordinator round. This does not evaluate the operations or prove that they can all stage changes. |
 | Obtain one member's decision | Evaluate a resolver | Ask the member's resolver to propose all of its changes, or none, against the current staged entries. |
-| Build one attempt's proposed leaf state | Build a mutation plan | Check routing and publication claims, evaluate admitted resolvers in priority order, and admit their proposed changes within the leaf's capacity limits. Later resolvers see earlier admitted changes. |
+| Build one attempt's proposed leaf state | Build a mutation plan | Check routing and publication-key reservations, evaluate admitted resolvers in priority order, and admit their proposed changes within the leaf's capacity limits. Later resolvers see earlier admitted changes. |
 | Store the proposed changes | Persist a mutation plan | Issue one conditional leaf mutation if any member staged changes. A plan with no staged changes retains the loaded observation without a CAS. |
 | Recover after contention or an in-doubt result | Reload and rebuild the mutation plan | Load another leaf observation and repeat planning, while retaining each member's unresolved in-doubt state. |
 
@@ -753,7 +753,7 @@ A non-landing direct outcome is classified as a whole
 ([ADR-053](adr/053-replay-definitive-logless-rmw-losses.md)). A read-dependent
 member whose loss is certified replays its body under the same, still-unengaged
 identity; a blind member and a member requiring coordination take the locked
-commit path. Within one coordinator round, an earlier direct member claims all
+commit path. Within one coordinator round, an earlier direct member reserves all
 of its output keys, so any later overlapping publisher is excluded as a whole,
 while disjoint direct members may share the same physical leaf CAS.
 
@@ -1163,7 +1163,7 @@ implements a candidate-driven **reverse mark-sweep**
 GC finds lost hints through recursive transaction-record scans, which are a
 backstop rather than the primary feed. Each scan turn makes at most one LIST
 request, subject to available candidate capacity. Separate Database instances
-use independent shuffled prefix passes, with no claims, leases, or coordination
+use independent shuffled prefix passes, with no prefix reservations, leases, or coordination
 writes.
 
 Each instance selects one traversal depth — the transaction root, one of 64

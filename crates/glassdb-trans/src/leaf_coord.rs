@@ -307,10 +307,10 @@ pub(crate) trait LeafResolver: Send + Sync {
         self.exhausted_outcome(in_doubt)
     }
 
-    /// The outcome delivered when a peer already claimed one of this member's
+    /// The outcome delivered when a peer already reserved one of this member's
     /// [`publication_keys`](LeafResolver::publication_keys) as a direct
     /// publication this round, so this member staged nothing. Distinct
-    /// from exhaustion: the peer's claim proves this member staged nothing,
+    /// from exhaustion: the peer's reservation proves this member staged nothing,
     /// which a spent CAS budget does not, so a resolver may treat it as a
     /// certified loss rather than an unknown one (ADR-053). `in_doubt` still
     /// reports whether an *earlier* attempt of this round carried this member's
@@ -329,7 +329,7 @@ pub(crate) trait LeafResolver: Send + Sync {
     }
 
     /// The raw keys whose current committed state this member may replace.
-    /// Once a direct-commit member claims a key, any later publisher intersecting it
+    /// Once a direct-commit member reserves a key, any later publisher intersecting it
     /// is excluded as a whole. Lock-only and release-only mutations leave this
     /// empty because they preserve current-state markers.
     fn publication_keys(&self) -> Vec<&[u8]> {
@@ -836,7 +836,7 @@ impl CasWorker {
         // observed.
         //
         // It is per member rather than per round: a member the in-doubt CAS did
-        // not carry — one skipped for a same-key direct claim, or merged into
+        // not carry — one skipped for a same-key direct reservation, or merged into
         // the batch afterwards — definitively did not land, and inheriting the
         // batch's in-doubt outcome would strand it over a write it never made.
         let mut in_doubt: BTreeSet<TxId> = BTreeSet::new();
@@ -2614,7 +2614,7 @@ mod tests {
                     ..
                 })
             ),
-            "the second claimant stages nothing and does not land"
+            "the second member to reserve the key stages nothing and does not land"
         );
         coord.close().await;
 
@@ -2627,7 +2627,7 @@ mod tests {
     }
 
     // A direct-commit-shaped resolver (ADR-051): the entry it stages is
-    // the only record of its commit, so it claims its key for the round and
+    // the only record of its commit, so it reserves its key for the round and
     // classifies an unfinished round the way `DirectCommitOperation` does — the
     // outcome stays in doubt only if its own stage rode a CAS that may have
     // landed. `replayable` models a read-modify-write, whose certified losses are
@@ -3080,7 +3080,7 @@ mod tests {
 
         // The older member drives the round and parks in the gated load; the
         // younger one queues into that still-open batch, where its key is
-        // already claimed.
+        // already reserved.
         gate.arm();
         let (c1, t1) = (coord.clone(), first.clone());
         let driver = tokio::spawn(async move {
@@ -3130,8 +3130,8 @@ mod tests {
         coord.close().await;
     }
 
-    // ADR-053: a same-key claim is reported through `excluded_outcome`, not
-    // `exhausted_outcome`. The distinction is load-bearing — the claim proves the
+    // ADR-053: a same-key reservation is reported through `excluded_outcome`, not
+    // `exhausted_outcome`. The distinction is load-bearing — the reservation proves the
     // excluded member staged nothing at all, while a spent CAS budget proves
     // nothing about an earlier attempt — so a read-modify-write shaped member
     // learns a *replayable* loss where an exhausted round would only tell it the
@@ -3192,7 +3192,7 @@ mod tests {
 
     // ADR-053: an excluded member does not inherit the uncertainty of a *different*
     // member's write. Even when the round's first CAS comes back in-doubt, the
-    // member that was skipped for a same-key claim issued no write of its own, so
+    // member that was skipped for a same-key reservation issued no write of its own, so
     // its own lack of durable effects still certifies a replay rather than
     // stranding it in-doubt.
     #[tokio::test(start_paused = true)]

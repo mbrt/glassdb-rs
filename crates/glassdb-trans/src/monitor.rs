@@ -835,7 +835,7 @@ impl Monitor {
         {
             // This handshake shares the owner-state lock with local wounding.
             // Either the wound closes admission first, or the commit is marked
-            // as dispatched before a local task can claim safe retirement.
+            // as dispatched before a local task can report safe retirement.
             self.start_terminal_commit(&tid)?;
             self.stop_tx_refresh(&tid);
             // `context` preserves the `AlreadyFinalized` sentinel so the commit
@@ -2739,7 +2739,7 @@ mod tests {
     // was lost, and whose committed record GC then reclaimed, cannot establish
     // its own outcome from storage — the durable evidence is gone. That must
     // surface as the irreducible in-doubt outcome rather than an internal error,
-    // and the record must not be re-created, which would claim a commit that a
+    // and the record must not be re-created, which would state a commit that a
     // peer's wound may equally have decided.
     #[tokio::test(start_paused = true)]
     async fn commit_reports_in_doubt_when_its_landed_write_was_reclaimed() {

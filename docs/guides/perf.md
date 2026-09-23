@@ -199,7 +199,7 @@ gain, while aggregate throughput is effectively flat and individual shapes are
 mixed. Because counters are sampled after shutdown, the lower median backend
 work and coordinator retry rate represent coalescing rather than omitted
 cleanup. The earlier temporary prototype's `1.079` aggregate ratio did not
-reproduce reliably enough to claim as the implementation result.
+reproduce reliably enough to report as the implementation result.
 
 ## Current tree: baseline reassessment after inline-policy tuning
 
