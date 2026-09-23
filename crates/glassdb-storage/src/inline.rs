@@ -1,7 +1,7 @@
 //! Budgets bounding how much committed value data leaf entries carry inline
 //! (ADR-051, ADR-061).
 
-/// Default largest value eligible for a logless direct commit.
+/// Default largest value eligible for a direct commit.
 const DEFAULT_MAX_VALUE_BYTES: usize = 1024;
 
 /// Default largest aggregate inline payload one leaf may carry.
@@ -9,9 +9,9 @@ const DEFAULT_MAX_LEAF_BYTES: usize = 16 * 1024;
 
 /// How much committed value data a leaf may carry inline.
 ///
-/// The budgets govern new authoritative inline values published by logless
-/// direct commits (ADR-051, ADR-054, ADR-061). A value that misses either takes the
-/// regular logged protocol and is eventually published as an external pointer.
+/// The budgets govern new authoritative inline values published by direct
+/// commits (ADR-051, ADR-054, ADR-061). A value that misses either takes the
+/// locked commit protocol and is eventually published as an external pointer.
 /// The budgets are a runtime tuning knob, never persisted, and values already
 /// inline are grandfathered — lowering a budget leaves them alone, because an
 /// inline value may be a key's only copy. The default admits values up to 1 KiB
@@ -34,7 +34,7 @@ impl Default for InlinePolicy {
 }
 
 impl InlinePolicy {
-    /// The policy that disables logless direct publication.
+    /// The policy that disables direct publication.
     pub fn none() -> Self {
         InlinePolicy {
             max_value_bytes: 0,

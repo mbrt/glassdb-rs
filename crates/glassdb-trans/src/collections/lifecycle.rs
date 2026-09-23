@@ -73,7 +73,7 @@ impl CollectionLifecycle {
             .iter()
             .filter(|change| change.op == CollectionOp::Create)
         {
-            // These fresh identities belong to this active attempt. A create
+            // These fresh identities belong to this active transaction identity. A create
             // conflict invalidates obsolete local knowledge; success updates
             // this cache. Both existence checks can therefore use ANY.
             if !self
@@ -468,7 +468,9 @@ mod tests {
     use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
     use glassdb_concurr::Background;
     use glassdb_data::{CollectionId, DbRoot, NodeToken, ObjectPath};
-    use glassdb_storage::transaction::{TLogger, TxCollectionChange, TxCollectionOp, TxLog};
+    use glassdb_storage::transaction::{
+        TxCollectionChange, TxCollectionOp, TxRecord, TxRecordStore,
+    };
     use glassdb_storage::{CachedStore, CurrentState, IndexNode, LeafBody, LeafEntry, Timeline};
     use tokio::sync::Notify;
 
@@ -700,9 +702,9 @@ mod tests {
                 );
             }
             TxCommitStatus::Ok => {
-                let mut log = TxLog::new(first.clone(), TxCommitStatus::Ok);
-                log.collection_changes = manifest.collection_changes.clone();
-                owner.monitor.commit_tx(log).await.unwrap();
+                let mut record = TxRecord::new(first.clone(), TxCommitStatus::Ok);
+                record.collection_changes = manifest.collection_changes.clone();
+                owner.monitor.commit_tx(record).await.unwrap();
             }
             _ => panic!("the first drop must be terminal"),
         }
@@ -853,7 +855,7 @@ mod tests {
         let peer = store(backend.clone());
         let background = Arc::new(Background::new());
         let monitor = Monitor::with_config(
-            TLogger::new(primary.objects.clone(), DbRoot::try_from("db").unwrap()),
+            TxRecordStore::new(primary.objects.clone(), DbRoot::try_from("db").unwrap()),
             primary.timeline.clone(),
             Arc::downgrade(&background),
             RetryConfig::default(),
@@ -889,7 +891,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let (mut shrunk, source_version) = primary
+        let (mut shrunk, source_observation) = primary
             .nodes
             .load_node(&collection(), &node_token(SOURCE_TOKEN), Requirement::ANY)
             .await
@@ -924,7 +926,7 @@ mod tests {
                     &collection(),
                     &node_token(SOURCE_TOKEN),
                     &shrunk,
-                    Some(&source_version),
+                    Some(&source_observation),
                 )
                 .await
                 .unwrap();
@@ -935,14 +937,14 @@ mod tests {
             let shrinking = tokio::spawn({
                 let nodes = primary.nodes.clone();
                 let shrunk = shrunk.clone();
-                let source_version = source_version.clone();
+                let source_observation = source_observation.clone();
                 async move {
                     nodes
                         .store_node(
                             &collection(),
                             &node_token(SOURCE_TOKEN),
                             &shrunk,
-                            Some(&source_version),
+                            Some(&source_observation),
                         )
                         .await
                 }
@@ -987,7 +989,7 @@ mod tests {
         let primary = store(backend.clone());
         let background = Arc::new(Background::new());
         let monitor = Monitor::with_config(
-            TLogger::new(primary.objects.clone(), DbRoot::try_from("db").unwrap()),
+            TxRecordStore::new(primary.objects.clone(), DbRoot::try_from("db").unwrap()),
             primary.timeline.clone(),
             Arc::downgrade(&background),
             RetryConfig::default(),

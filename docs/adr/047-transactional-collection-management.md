@@ -3,7 +3,7 @@
 ## Status
 
 Accepted — implemented (`glassdb::Transaction` collection APIs,
-transaction-log collection manifests, root directory coordination, topology
+transaction-record collection manifests, root directory coordination, topology
 freeze participation, per-node delete intents, and asynchronous recovery/GC).
 Topology participation and settlement are refined by
 [ADR-049](049-participant-owned-topology-intents.md).
@@ -153,7 +153,7 @@ Preparation is recoverable and may temporarily block already-fenced ranges if
 the client stops partway through. Aborting the transaction cancels the whole
 drop, and later operations may help clear its intents. Once committed, logical
 deletion is immediate. Physical reclamation later reads each remaining object
-and uses ADR-042's exact-revision conditional delete; a conflict causes
+and uses ADR-042's exact-revision conditional delete; a rejected mutation causes
 re-evaluation rather than deletion of an unobserved state. Now-unreachable value
 reclamation remains asynchronous under the existing GC protocol.
 

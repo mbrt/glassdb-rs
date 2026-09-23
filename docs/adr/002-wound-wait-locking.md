@@ -53,7 +53,7 @@ or backend calls. The ID layout is:
 
 - The **timestamp suffix** is the priority: an earlier timestamp is older /
   higher priority (`TxId::older`).
-- The **random prefix comes first** so that transaction-log keys (`_t/<tx-id>`)
+- The **random prefix comes first** so that transaction-record keys (`_t/<tx-id>`)
   keep a high-entropy prefix. Object stores such as S3 partition by key prefix;
   a timestamp prefix would funnel sequential commits into a single hot
   partition, so the entropy must lead.
@@ -74,8 +74,8 @@ Wound-wait needs the priority relation to be both:
 Property (2) is what rules out breaking ties with the random prefix. A wounded
 transaction restarts with a *renewed* ID (`TxId::renew`) that preserves its
 timestamp but mints a **fresh** random prefix — the prefix has to change so the
-restarted attempt gets a distinct log object (`_t/<tx-id>`), since the aborted
-attempt already owns the old one and lock tags reference the specific ID.
+renewed identity gets a distinct transaction record (`_t/<tx-id>`), since the aborted
+identity already owns the old one and lock tags reference the specific ID.
 Ordering on that prefix would therefore flip the relative order of two
 equal-timestamp transactions on every restart, so they could wound each other
 indefinitely:
@@ -91,7 +91,7 @@ before the timestamp-only rule was adopted.
 
 Ordering equal-timestamp transactions *is* possible, but only with a tiebreak
 that is itself stable across restarts. That means splitting the two roles the
-prefix plays today — ordering vs. per-attempt log-object uniqueness — into
+prefix plays today — ordering vs. per-identity transaction-record uniqueness — into
 separate fields, e.g. `[stable nonce][attempt epoch][timestamp]` compared as
 `(timestamp, stable nonce)`. We chose not to, because the payoff is small (see
 below) and it adds a field and an invariant to keep correct.
@@ -132,13 +132,13 @@ handled explicitly rather than assumed away.
 
 ### Victim restart
 
-A wounded transaction's log is durably set to `aborted` via a conditional write
+A wounded transaction's record is durably set to `aborted` via a conditional write
 (`Monitor::wound_tx`), so both the local victim and any other client observe the
 abort. `Algo::commit` surfaces this as `TransError::Wounded` (checked at the top
-of each commit round and when the final log write fails, mapped from
-`TransError::AlreadyFinalized`). The DB retry loop then restarts the victim with
+of each commit round and when the final record write fails, mapped from
+`TransError::AlreadyFinalized`). The DB replay loop then restarts the victim with
 `Algo::rebegin` (which calls `TxId::renew`), reusing its original priority so it
-is not starved on the retry.
+is not starved on the replay.
 
 ### Serial locking as a safety net
 

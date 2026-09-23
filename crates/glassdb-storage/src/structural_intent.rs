@@ -7,7 +7,7 @@ use glassdb_data::{CollectionAddress, NodeToken, TxId};
 
 use crate::error::StorageError;
 
-/// Whether a split intent has captured the source version needed by recovery.
+/// Whether a split intent has captured the source revision needed by recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StructuralIntentPhase {
     /// Tokens are reserved, but no structural node may have been created yet.
@@ -25,7 +25,7 @@ pub enum StructuralIntentPhase {
 pub struct StructuralIntent {
     pub collection: CollectionAddress,
     pub source_token: Option<NodeToken>,
-    pub source_version: String,
+    pub source_revision: String,
     pub created_tokens: Vec<NodeToken>,
     pub split_key: Vec<u8>,
     pub participant_id: TxId,
@@ -57,7 +57,7 @@ impl StructuralIntent {
                 .source_token
                 .as_ref()
                 .map_or_else(String::new, ToString::to_string),
-            source_version: self.source_version.clone(),
+            source_revision: self.source_revision.clone(),
             created_tokens: self
                 .created_tokens
                 .iter()
@@ -116,7 +116,7 @@ impl StructuralIntent {
         Ok(StructuralIntent {
             collection,
             source_token,
-            source_version: raw.source_version,
+            source_revision: raw.source_revision,
             created_tokens,
             split_key: raw.split_key,
             participant_id,
@@ -139,7 +139,7 @@ mod tests {
         let intent = StructuralIntent {
             collection: collection(),
             source_token: Some(NodeToken::from_bytes([1; 16])),
-            source_version: "v7".to_string(),
+            source_revision: "v7".to_string(),
             created_tokens: vec![NodeToken::from_bytes([2; 16])],
             split_key: b"m".to_vec(),
             participant_id: TxId::from_bytes(b"participant".to_vec()),
@@ -153,7 +153,7 @@ mod tests {
         let intent = StructuralIntent {
             collection: collection(),
             source_token: None,
-            source_version: "v1".to_string(),
+            source_revision: "v1".to_string(),
             created_tokens: vec![
                 NodeToken::from_bytes([1; 16]),
                 NodeToken::from_bytes([2; 16]),
@@ -171,7 +171,7 @@ mod tests {
         let intent = StructuralIntent {
             collection: collection(),
             source_token: None,
-            source_version: "v1".to_string(),
+            source_revision: "v1".to_string(),
             created_tokens: vec![NodeToken::from_bytes([0; 16])],
             split_key: Vec::new(),
             participant_id: TxId::from_bytes(b"participant".to_vec()),

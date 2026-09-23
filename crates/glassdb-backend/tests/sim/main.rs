@@ -10,7 +10,7 @@ mod sim_tests {
     use glassdb_backend::middleware::{
         DelayBackend, FaultBackend, FaultOptions, Latency, gcs_delays,
     };
-    use glassdb_backend::{Backend, BackendError, Version, memory::MemoryBackend};
+    use glassdb_backend::{Backend, BackendError, Revision, memory::MemoryBackend};
     use glassdb_concurr::exec::{TapeScheduler, block_on_with};
     use glassdb_concurr::{entropy, rt};
 
@@ -70,7 +70,7 @@ mod sim_tests {
                 let mut old_read = pin!(async {
                     if conditional {
                         backend
-                            .read_if_modified("p", &Version::new("different"))
+                            .read_if_modified("p", &Revision::new("different"))
                             .await
                     } else {
                         backend.read("p").await
@@ -88,12 +88,12 @@ mod sim_tests {
                     .unwrap();
                 let newer_reply = backend.read("p").await.unwrap();
                 assert_eq!(newer_reply.contents, b"new");
-                assert_eq!(newer_reply.version, updated);
+                assert_eq!(newer_reply.revision, updated);
                 assert_eq!(start.elapsed(), Duration::ZERO);
 
                 let older_reply = old_read.await.unwrap();
                 assert_eq!(older_reply.contents, b"old");
-                assert_eq!(older_reply.version, original);
+                assert_eq!(older_reply.revision, original);
                 assert_eq!(start.elapsed(), Duration::from_millis(5));
             });
         }
@@ -133,7 +133,7 @@ mod sim_tests {
                 let mut read = pin!(async {
                     if conditional {
                         backend
-                            .read_if_modified("p", &Version::new("missing"))
+                            .read_if_modified("p", &Revision::new("missing"))
                             .await
                     } else {
                         backend.read("p").await
@@ -202,7 +202,7 @@ mod sim_tests {
 
             let reply = read.await.unwrap();
             assert_eq!(reply.contents, b"selected");
-            assert_eq!(reply.version, selected);
+            assert_eq!(reply.revision, selected);
             assert_eq!(start.elapsed(), Duration::from_millis(12));
         });
     }
@@ -225,11 +225,11 @@ mod sim_tests {
             let installed = memory.read("p").await.unwrap();
             assert_eq!(installed.contents, b"installed");
             memory
-                .write_if("p", b"new".to_vec(), &installed.version)
+                .write_if("p", b"new".to_vec(), &installed.revision)
                 .await
                 .unwrap();
 
-            assert_eq!(write.await.unwrap(), installed.version);
+            assert_eq!(write.await.unwrap(), installed.revision);
             assert_eq!(memory.read("p").await.unwrap().contents, b"new");
         });
     }

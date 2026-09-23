@@ -64,10 +64,10 @@ outage.
    This deliberately stays in the engine layer rather than in `Global` or the
    backend. Those layers know read-vs-write, but that distinction alone is not
    enough: some commit-path reads *confirm a pending write* (e.g.
-   `Monitor::set_final_log` re-reads `commit_status` after an in-doubt log write;
+   `Monitor::set_final_log` re-reads `commit_status` after an in-doubt record write;
    lock acquisition re-reads metadata while resolving an in-doubt writer). When
-   such a read fails it inherits the mutation's uncertainty and must stay
-   in-doubt. `Global::get_metadata` and the tx-log reads serve exactly those
+   such a read fails it inherits the mutation's in-doubt outcome and must stay
+   in-doubt. `Global::get_metadata` and the transaction-record reads serve exactly those
    contexts, so a blanket downgrade there would mislabel real in-doubt commit
    outcomes as retry-safe. Hence the conservative default lives in `From`, and
    only genuine user reads opt out via `from_read`.
@@ -93,7 +93,7 @@ read-style retry — that is the lost-update hazard
 ## Consequences
 
 - A transient read outage is recovered transparently, below `Database::tx`, so
-  the user closure is not re-run. A sustained outage surfaces as a clean,
+  the user closure is not replayed. A sustained outage surfaces as a clean,
   matchable `Error::Unavailable` (never `InDoubt`, never `Internal`), which a
   caller can safely retry because the read had no side effects.
 - `BackendError::Unavailable` now carries two related meanings: an in-doubt

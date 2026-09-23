@@ -128,9 +128,9 @@ impl Collection {
     where
         F: FnMut(Vec<u8>) -> Result<Vec<u8>, Error> + Send,
     {
-        // The transaction body is rerun on conflict, so it must be `FnMut`. An
+        // The transaction body is replayed on conflict, so it must be `FnMut`. An
         // `async move` block would move `f` into the future (making the closure
-        // `FnOnce`), so share it through an `Arc<Mutex<_>>` cloned per attempt.
+        // `FnOnce`), so share it through an `Arc<Mutex<_>>` cloned per body execution.
         // The update function is synchronous, so the guard is never held across an
         // `.await`.
         let f = Arc::new(Mutex::new(f));

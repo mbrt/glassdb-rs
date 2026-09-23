@@ -1,19 +1,19 @@
-//! The transactional read path for the v2 object-native engine (ADR-017/020).
+//! The transactional read path (ADR-017/020).
 //!
-//! A key's value no longer lives in a per-key object; it lives in the
-//! transaction object of whichever transaction last committed it. Reading a key
+//! A key's value does not live in a per-key object. It lives inline in the
+//! leaf, or in the transaction record of the key's writer. Reading a key
 //! therefore resolves its leaf entry to an *effective writer* — delegated to
 //! the [`KeyResolver`], the shared home for that coordination step — and then
-//! materializes the value from that writer's decoded transaction object through
+//! materializes the value from that writer's decoded transaction record through
 //! the [`Monitor`].
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use glassdb_concurr::{RetryConfig, rt};
-use glassdb_data::LogicalKey;
+use glassdb_data::{LogicalKey, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
-use glassdb_storage::{Requirement, StorageError, Timeline, Version};
+use glassdb_storage::{Requirement, StorageError, Timeline};
 
 use crate::access::ReadEvidence;
 use crate::error::trans_to_storage;
@@ -22,13 +22,13 @@ use crate::key_state_resolver::ResolvedValue;
 
 const READ_UNAVAILABLE_RETRIES: usize = 5;
 
-/// The result of reading a key: the raw value and its storage version. The
-/// version's writer is the *effective writer* the read resolved through, which
-/// is the optimistic-validation token the commit path checks.
+/// The result of reading a key: the raw value and its writer. The writer is the
+/// *effective writer* the read resolved through, which optimistic validation
+/// checks at commit.
 #[derive(Debug, Clone, Default)]
 pub struct ReadValue {
     pub value: Arc<[u8]>,
-    pub version: Version,
+    pub writer: TxId,
 }
 
 /// The value of a logical key and its validation evidence.
@@ -53,7 +53,7 @@ impl ReadOutcome {
 
 /// Reads values by resolving a key's leaf entry to its effective committed
 /// writer (via the [`KeyResolver`]) and materializing the value from that writer's
-/// transaction object.
+/// transaction record.
 #[derive(Clone)]
 pub struct Reader {
     resolver: KeyResolver,
@@ -110,7 +110,7 @@ impl Reader {
     }
 
     /// Resolves `key` to its effective writer (via the [`KeyResolver`]), then
-    /// materializes the value from that writer's transaction object.
+    /// materializes the value from that writer's transaction record.
     async fn resolve_value(
         &self,
         key: &LogicalKey,
@@ -134,15 +134,12 @@ impl Reader {
             };
             let last_writer = Some(writer.clone());
             // An inline value or tombstone in the leaf is the writer's own
-            // authoritative evidence, so the transaction object adds nothing
+            // authoritative evidence, so the transaction record adds nothing
             // (ADR-051).
             match resolved.value {
                 ResolvedValue::Inline(value) => {
                     return Ok(ReadOutcome::new(
-                        Some(ReadValue {
-                            value,
-                            version: Version { writer },
-                        }),
+                        Some(ReadValue { value, writer }),
                         ReadEvidence::new(last_writer, leaf),
                     ));
                 }
@@ -161,17 +158,17 @@ impl Reader {
                 Err(error) => return Err(trans_to_storage(error)),
             };
             if cv.status != TxCommitStatus::Ok {
-                // The resolved writer's transaction object is not authoritatively
+                // The resolved writer's transaction record is not authoritatively
                 // committed. A staleness-tolerant resolution can name a writer
-                // whose committed log was already garbage-collected: it read a
+                // whose committed record was already garbage-collected: it read a
                 // cached leaf still pointing at a `current_writer` that newer
-                // commits superseded, and GC reclaimed that log once no *fresh*
+                // commits superseded, and GC reclaimed that record once no *fresh*
                 // leaf referenced it (ADR-022). That is a stale-leaf signal, not
                 // a genuine absence, so re-resolve once against fresh evidence,
-                // which sees the key's current writer whose log still exists. A
+                // which sees the key's current writer whose record still exists. A
                 // writer that is still unresolvable under fresh evidence is truly
-                // in-doubt: report absence so transaction validation retries
-                // rather than trusting an empty placeholder.
+                // in-doubt: report absence so transaction validation replays the
+                // body rather than trusting an empty placeholder.
                 let fresh = Requirement::after(self.timeline.currentness_barrier());
                 if !refreshed && requirement.stricter(fresh) != requirement {
                     requirement = fresh;
@@ -185,10 +182,9 @@ impl Reader {
                 // absence, independent of freshness.
                 return Ok(ReadOutcome::new(None, ReadEvidence::new(last_writer, leaf)));
             }
-            let version = Version { writer };
             let value = (!cv.value.deleted).then_some(ReadValue {
                 value: cv.value.value,
-                version,
+                writer,
             });
             return Ok(ReadOutcome::new(
                 value,
@@ -205,7 +201,7 @@ mod tests {
     use crate::key_state_resolver::KeyStateResolver;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_data::{CollectionAddress, DbRoot, TxId};
-    use glassdb_storage::transaction::{TxLog, TxWrite};
+    use glassdb_storage::transaction::{TxRecord, TxWrite};
     use glassdb_storage::{CurrentState, LeafBody, LeafEntry, Node, TreeRouter};
     use std::num::NonZeroUsize;
 
@@ -226,14 +222,14 @@ mod tests {
             let collection = CollectionAddress::root("db");
             let key = LogicalKey::new(collection.clone(), b"key");
             let old = TxId::from_bytes(vec![1]);
-            let mut log = TxLog::new(old.clone(), TxCommitStatus::Ok);
-            log.writes.push(TxWrite {
+            let mut record = TxRecord::new(old.clone(), TxCommitStatus::Ok);
+            record.writes.push(TxWrite {
                 key: key.clone(),
                 value: Arc::from(&b"old"[..]),
                 deleted: false,
                 prev_writer: TxId::default(),
             });
-            let local_log = local.tlogger.set(&log).await.unwrap();
+            let local_record = local.tx_records.set(&record).await.unwrap();
             let mut entry = LeafEntry::new(b"key");
             if held {
                 entry.replace_write_lock(old.clone());
@@ -273,11 +269,15 @@ mod tests {
                 .store_root(&collection, &updated, &root)
                 .await
                 .unwrap();
-            let observed = peer.tlogger.get_at(&old, Requirement::ANY).await.unwrap();
-            peer.tlogger.delete(&observed).await.unwrap();
-            local.tlogger.delete(&local_log).await.unwrap();
+            let observed = peer
+                .tx_records
+                .get_at(&old, Requirement::ANY)
+                .await
+                .unwrap();
+            peer.tx_records.delete(&observed).await.unwrap();
+            local.tx_records.delete(&local_record).await.unwrap();
             assert!(matches!(
-                local.tlogger.get_at(&old, Requirement::ANY).await,
+                local.tx_records.get_at(&old, Requirement::ANY).await,
                 Err(StorageError::NotFound)
             ));
             match operation {
@@ -326,7 +326,7 @@ mod tests {
                     );
                     let state = CollectionStateResolver::new(
                         local.records.clone(),
-                        local.tlogger.clone(),
+                        local.tx_records.clone(),
                         local.timeline.clone(),
                         local.monitor.clone(),
                         RetryConfig::default(),

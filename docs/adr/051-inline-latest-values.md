@@ -11,19 +11,19 @@ This supersedes:
 - [ADR-017](017-shard-object.md)'s `current_writer` / `deleted` current-value
   representation;
 - [ADR-019](019-unified-transaction-object.md)'s decision that transaction
-  objects are the only durable home for values and that write-back never copies
+  records are the only durable home for values and that write-back never copies
   values; and
 - [ADR-027](027-single-rw-parallel-lock-publish.md)'s two-write single
   read-write path when the new value is eligible for inlining.
 
 [ADR-053](053-replay-definitive-logless-rmw-losses.md) refines the fallback
-policy: ADR-027 is removed entirely, so an ineligible attempt either replays its
-body or takes the regular locked protocol. The direct-commit decisions here,
+policy: ADR-027 is removed entirely, so an ineligible transaction either replays its
+body or takes the regular locked commit. The direct-commit decisions here,
 including its in-doubt contract, are unchanged.
 
 [ADR-054](054-reserve-inline-publication-for-logless-commits.md) supersedes this
 ADR's ordinary write-back and help-forward inlining while retaining
-authoritative inline values and logless direct commit.
+authoritative inline values and direct commit.
 
 [ADR-061](061-atomic-logless-single-leaf-commits.md) supersedes this ADR's
 initial one-existing-key direct-commit eligibility and recovery scope. The
@@ -34,10 +34,10 @@ lifetime: a quiescent tombstone may be compacted during split processing once
 unmarked absence is protected by a leaf generation.
 
 This also refines
-[ADR-022](022-garbage-collection-mark-sweep.md)'s transaction-object liveness
+[ADR-022](022-garbage-collection-mark-sweep.md)'s transaction-record liveness
 model and extends [ADR-028](028-shard-mutation-coordinator.md)'s shard-mutation
-coordinator. Existing transaction objects retain their current reachability
-rules, but an inline writer ID need not have a transaction object.
+coordinator. Existing transaction records retain their current reachability
+rules, but an inline writer ID need not have a transaction record.
 
 This changes the unreleased v2 layout in place. Development databases use the
 new format directly; there is no migration or compatibility fallback.
@@ -45,15 +45,15 @@ new format directly; there is no migration or compatibility fallback.
 ## Context
 
 A latest-value read currently resolves the key's leaf entry and then loads the
-transaction object named by `current_writer`. This second object lookup is
+transaction record named by `current_writer`. This second object lookup is
 necessary even for a tiny value and can transfer unrelated values written by
 the same transaction.
 
-The single read-write fast path likewise creates a committed transaction object
+The single read-write fast path likewise creates a committed transaction record
 and installs a leaf lock in parallel, then asynchronously converts the lock to a
 writer pointer. A small overwrite already fits in the leaf CAS that validates
 its predecessor. Keeping its value there would make that CAS a self-contained
-commit and remove both the transaction-object write and write-back.
+commit and remove both the transaction-record write and write-back.
 
 Inlining every value without bounds would have the opposite effect on writes:
 all coordination mutations rewrite the complete leaf, so large inline bodies
@@ -76,12 +76,12 @@ Tombstone { writer }
 ```
 
 `writer` remains the value's optimistic-validation token. It identifies the
-transaction that produced the version, but it is no longer universally a
-pointer to a transaction object.
+transaction that wrote the value, but it is no longer universally a
+pointer to a transaction record.
 
-An inline value is authoritative latest-value evidence. Its transaction object
+An inline value is authoritative latest-value evidence. Its transaction record
 may exist because an ordinary committed transaction was written back, or may
-never have existed because the logless fast path committed it. The entry records
+never have existed because the direct fast path committed it. The entry records
 no provenance bit. Empty inline values remain distinguishable from an absent
 inline field, and invalid combinations are rejected as corrupt state.
 
@@ -93,10 +93,10 @@ while the entry still names that writer.
 
 Readers resolve locks before interpreting current state. They return `Inline`
 directly without consulting transaction status, load the named transaction
-object for `External`, and treat `Tombstone` as absent. A committed exclusive
+record for `External`, and treat `Tombstone` as absent. A committed exclusive
 holder ahead of the recorded current state still resolves through its
-transaction object; predecessor inline bytes are not its value. Read validation
-continues to compare writer IDs even when two versions contain equal bytes.
+transaction record; predecessor inline bytes are not its value. Read validation
+continues to compare writer IDs even when two writes contain equal bytes.
 
 ### Bound inline admission
 
@@ -118,7 +118,7 @@ There is no background promotion pass. Inline admission is considered when:
 
 - ordinary write-back publishes a committed `Put`;
 - help-forwarding already has the exact committed bytes; or
-- the logless single read-write path publishes its value.
+- the direct single read-write path publishes its value.
 
 Ordinary write-back considers each value independently. If bytes are
 unavailable, either budget is exceeded, or the inline form cannot fit the node,
@@ -126,9 +126,9 @@ it publishes `External` and releases the lock. Inlining is never allowed to
 delay commit convergence or lock release. Tombstones carry no value payload.
 
 For ordinary transactions, an inline writer remains a normal ADR-022 reference:
-an existing transaction object stays live while any current entry or lock names
+an existing transaction record stays live while any current entry or lock names
 its ID. Inlining does not make that object collectable earlier. This deliberately
-duplicates some current small values between leaves and transaction logs.
+duplicates some current small values between leaves and transaction records.
 
 ### Commit eligible single read-write transactions in one leaf CAS
 
@@ -142,28 +142,28 @@ When the new value satisfies both inline budgets, submit a direct commit through
 the shard coordinator. One conditional leaf CAS re-resolves the effective
 predecessor, validates an observed read when present, and publishes
 `Inline { writer: txid, value }`. It installs no lock, creates no transaction
-object, and needs no write-back. The CAS is the commit point.
+record, and needs no write-back. The CAS is the commit point.
 
 An already-committed holder awaiting write-back may be help-forwarded and
 replaced in the same CAS. A live pending or unknown conflicting entry holder, a
-live structural gate, or a collection-deletion fence makes the direct path
+live structural gate, or a collection-deletion fence makes direct commit
 ineligible before it writes. Leaf membership locks do not conflict with an
-overwrite because it cannot change the key set. Ineligible attempts fall back
-to the existing logged protocol; values that miss only the inline size or leaf
-budget retain ADR-027's logged single read-write optimization.
+overwrite because it cannot change the key set. Ineligible transactions fall back
+to the existing locked commit; values that miss only the inline size or leaf
+budget retain ADR-027's locked single read-write optimization.
 
 All entry mutations continue to flow through ADR-028's coordinator. At most one
 direct commit for a given key may stage in one coordinator CAS round, so another
 batched blind writer cannot erase the first commit's recovery evidence within
-that same uncertain write. Direct commits for disjoint keys may still share a
+that same in-doubt write. Direct commits for disjoint keys may still share a
 round.
 
-The direct attempt publishes no pre-commit identity and cannot participate in
+Direct commit publishes no pre-commit identity and cannot participate in
 wound-wait. Another database instance cannot wound or abort it. Cancellation
 before dispatch leaves no state; cancellation after dispatch is crash-equivalent
 and the CAS may have committed. Cancellation must not create an aborted
-transaction object for the invisible logless ID. Once an attempt falls back and
-registers with the logged lock protocol, the existing abort and lease behavior
+transaction record for the invisible direct-commit ID. Once the transaction falls back and
+registers with the locked commit, the existing abort and lease behavior
 applies.
 
 ### Preserve honest in-doubt outcomes
@@ -172,18 +172,18 @@ After an unavailable direct CAS:
 
 - observing the exact inline state with this writer ID proves commit;
 - observing the unchanged predicate permits an idempotent retry; and
-- observing that the entry moved after the uncertain write is irreducibly
+- observing that the entry moved after the in-doubt write is irreducibly
   in-doubt.
 
-The last case surfaces `InDoubt` rather than re-running the transaction and
+The last case surfaces `InDoubt` rather than replaying the body and
 risking double application. A concurrent split may require rerouting recovery;
 if the commit marker can no longer be proven, the same conservative result
-applies. This is ADR-009's existing contract for a logless conditional commit,
+applies. This is ADR-009's existing contract for a direct conditional commit,
 not a new availability guarantee.
 
-A logless writer ID may later appear as a predecessor or GC hint even though no
-transaction object exists. That absence is expected. Log listing remains the
-completeness mechanism for real transaction objects, and the usual reverse
+A direct-commit writer ID may later appear as a predecessor or GC hint even though no
+transaction record exists. That absence is expected. Record listing remains the
+completeness mechanism for real transaction records, and the usual reverse
 reference check retains or reclaims them unchanged.
 
 ### Leave broader atomic leaf commits and snapshot history to follow-ups
@@ -199,30 +199,30 @@ they are not part of the initial path.
 - An inline latest-value read needs only the leaf object and benefits directly
   from the decoded and persistent object caches.
 - An eligible small single read-write transaction commits with one conditional
-  leaf write, no transaction object, no lock publication, no write-back, and no
-  orphan log.
+  leaf write, no transaction record, no lock publication, no write-back, and no
+  orphan record.
 - Ordinary committed values may become faster to read after best-effort
   write-back without changing their atomic commit or GC lifecycle.
 - Leaf bodies, leaf CASes, cache entries, and split copies become larger.
   Per-value and aggregate budgets bound this amplification but reduce the
   fraction of values that can be inlined.
-- Logged inline values consume duplicate durable and cached space for as long as
-  their transaction objects remain referenced.
+- Locked inline values consume duplicate durable and cached space for as long as
+  their transaction records remain referenced.
 - Inline admission is intentionally non-uniform and history-dependent. A small
   value may remain external because its leaf has no budget, and no background
   task later promotes it.
-- Transaction IDs no longer imply transaction-object existence. Code that needs
-  status or a logged value must be guided by the tagged current state or by a
+- Transaction IDs no longer imply transaction-record existence. Code that needs
+  status or an external value must be guided by the tagged current state or by a
   lock, not by the writer ID alone.
-- The direct path retains ADR-009's user-visible in-doubt outcome and makes
-  post-dispatch cancellation potentially committed, as any abandoned logless
+- Direct commit retains ADR-009's user-visible in-doubt outcome and makes
+  post-dispatch cancellation potentially committed, as any abandoned direct
   conditional write must be.
 - Thresholds and budgets require benchmarks that measure saved read operations
   against leaf size, CAS latency, split rate, and cache pressure.
 
 ## Alternatives considered
 
-### Keep all values only in transaction objects
+### Keep all values only in transaction records
 
 This preserves small coordination objects and one value representation, but it
 retains an avoidable object lookup on small reads and an avoidable object write
@@ -230,14 +230,14 @@ on the single read-write path.
 
 ### Treat inline bytes as a disposable cache
 
-This would require a transaction object for every value and would preserve the
+This would require a transaction record for every value and would preserve the
 two-write fast path. It gives up the main latency improvement while adding
 coherency states between the cache copy and its authority.
 
-### Record whether each inline value has a backing log
+### Record whether each inline value has a backing record
 
-A provenance bit would permit safe demotion of logged inline values and make a
-missing backing log diagnosable. It adds another invariant and is unnecessary
+A provenance bit would permit safe demotion of locked inline values and make a
+missing backing record diagnosable. It adds another invariant and is unnecessary
 with admission-only budgeting, so it is deferred.
 
 ### Rely only on the existing leaf hard cap

@@ -27,7 +27,7 @@ pub struct ScanResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EffectivePointAccessState {
     pub(crate) writer: Option<TxId>,
-    pub(crate) membership_version: u64,
+    pub(crate) membership_generation: u64,
 }
 
 impl ScanResult {
@@ -298,7 +298,7 @@ impl KeyResolver {
         };
         Ok(LeafCoverage {
             path: loc.path.to_string().into(),
-            membership_version: node.map_or(0, |node| node.membership_version()),
+            membership_generation: node.map_or(0, |node| node.membership_generation()),
             pending_membership,
             observation: loc.observation.clone(),
         })
@@ -341,7 +341,7 @@ impl KeyResolver {
                     if let Err(error) = self.state.ensure_collection_live(node).await {
                         return vec![(first_ordinal, Err(TransError::from(error)))];
                     }
-                    let membership_version = node.membership_version();
+                    let membership_generation = node.membership_generation();
                     let leaf = match node.as_leaf() {
                         Some(leaf) => leaf,
                         None => {
@@ -371,7 +371,7 @@ impl KeyResolver {
                                 *ordinal,
                                 Ok(EffectivePointAccessState {
                                     writer: resolved.writer,
-                                    membership_version,
+                                    membership_generation,
                                 }),
                             )),
                             Err(error) => {
@@ -419,7 +419,7 @@ impl KeyResolver {
     /// `requirement` is forwarded to the descent: same-leaf direct commit passes
     /// [`Requirement::ANY`] so its eligibility check reuses a leaf already
     /// cached by the transaction, without a revalidation round-trip; a stale
-    /// copy is caught by the publication's version-conditional CAS (ADR-030).
+    /// copy is caught by the publication's revision-conditional CAS (ADR-030).
     pub(crate) async fn resolve_key(
         &self,
         key: &LogicalKey,
@@ -502,7 +502,7 @@ mod tests {
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::{CollectionId, DbRoot, ObjectPath};
-    use glassdb_storage::transaction::{TLogger, TxCommitStatus};
+    use glassdb_storage::transaction::{TxCommitStatus, TxRecordStore};
     use glassdb_storage::{
         CachedStore, CurrentState, LeafBody, LeafEntry, Node, NodeStore, Timeline, TreeRouter,
     };
@@ -538,10 +538,10 @@ mod tests {
     ) -> (KeyResolver, Monitor, Timeline, Arc<Background>) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        let tl = TLogger::new(objects.clone(), DbRoot::try_from(DB).unwrap());
+        let tx_records = TxRecordStore::new(objects.clone(), DbRoot::try_from(DB).unwrap());
         let bg = Arc::new(Background::new());
         let mon = Monitor::with_config(
-            tl,
+            tx_records,
             timeline.clone(),
             Arc::downgrade(&bg),
             RetryConfig::default(),
@@ -689,16 +689,16 @@ mod tests {
     // Commits `writer`'s value for `key` through the monitor (a tombstone when
     // `deleted`), so a later help-forward of that holder observes it.
     async fn commit_value(mon: &Monitor, key: &[u8], writer: &TxId, deleted: bool) {
-        use glassdb_storage::transaction::{TxLog, TxWrite};
+        use glassdb_storage::transaction::{TxRecord, TxWrite};
         mon.begin_tx(writer);
-        let mut tl = TxLog::new(writer.clone(), TxCommitStatus::Ok);
-        tl.writes = vec![TxWrite {
+        let mut record = TxRecord::new(writer.clone(), TxCommitStatus::Ok);
+        record.writes = vec![TxWrite {
             key: logical_key(key),
             value: Arc::from(b"v".as_slice()),
             deleted,
             prev_writer: TxId::default(),
         }];
-        mon.commit_tx(tl).await.unwrap();
+        mon.commit_tx(record).await.unwrap();
     }
 
     // Installs a write-locked entry for `key` whose only holder is `holder` and
@@ -820,7 +820,7 @@ mod tests {
         assert_eq!(out[0].writer, Some(live));
         assert_eq!(out[1].writer, Some(tomb), "a tombstone still has a writer");
         assert_eq!(out[2].writer, None, "an absent key resolves to no writer");
-        assert!(out.iter().all(|state| state.membership_version == 0));
+        assert!(out.iter().all(|state| state.membership_generation == 0));
     }
 
     #[tokio::test]
@@ -961,7 +961,7 @@ mod tests {
     }
 
     // ADR-051: an inline value in the leaf is the writer's own authoritative
-    // evidence, so the read serves it without opening a transaction object.
+    // evidence, so the read serves it without opening a transaction record.
     #[tokio::test]
     async fn inline_value_reads_without_a_transaction_object() {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
@@ -982,11 +982,11 @@ mod tests {
             .unwrap();
         let value = out.value.expect("inline value is present");
         assert_eq!(value.value.as_ref(), b"hello");
-        assert_eq!(value.version.writer, writer);
+        assert_eq!(value.writer, writer);
         assert_eq!(
             count_tx_reads(&log),
             0,
-            "an inline value needs no transaction object"
+            "an inline value needs no transaction record"
         );
     }
 
@@ -1015,7 +1015,7 @@ mod tests {
         assert_eq!(
             count_tx_reads(&log),
             0,
-            "a tombstone needs no transaction object"
+            "a tombstone needs no transaction record"
         );
     }
 
@@ -1041,13 +1041,14 @@ mod tests {
         let value = out.value.expect("the holder committed a live value");
         // `commit_value` writes b"v"; the stale inline b"old-value" must not win.
         assert_eq!(value.value.as_ref(), b"v");
-        assert_eq!(value.version.writer, new);
+        assert_eq!(value.writer, new);
     }
 
     // Read validation is a writer-identity comparison, not a value comparison:
-    // two versions holding identical bytes are still distinct versions.
+    // two values holding identical bytes from different writers are still
+    // distinct values.
     #[tokio::test]
-    async fn equal_inline_bytes_from_different_writers_are_distinct_versions() {
+    async fn equal_inline_bytes_from_different_writers_are_distinct_values() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let seed_store = store_over(backend.clone()).await;
         let (resolver, _mon, timeline, _bg) = resolver_over(backend).await;
@@ -1070,9 +1071,9 @@ mod tests {
         assert_eq!(before.value.as_ref().unwrap().value.as_ref(), b"same");
         assert_eq!(after.value.as_ref().unwrap().value.as_ref(), b"same");
         assert_ne!(
-            before.value.unwrap().version,
-            after.value.unwrap().version,
-            "equal bytes under different writers are different versions"
+            before.value.unwrap().writer,
+            after.value.unwrap().writer,
+            "equal bytes under different writers are different values"
         );
     }
 }

@@ -43,6 +43,6 @@ outcome.
 
 ## Consequences
 
-Transaction logging, transaction GC, and structural recovery have independent
+Transaction records, transaction GC, and structural recovery have independent
 schemas and lifecycles. Recovery can list only the low-cardinality in-progress
 split set, at the cost of one additional database-wide object namespace.

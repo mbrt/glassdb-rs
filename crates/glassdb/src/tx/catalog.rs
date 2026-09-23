@@ -31,7 +31,7 @@ pub(super) struct CatalogOverlay {
 struct DirectoryState {
     base: BTreeMap<Vec<u8>, CollectionId>,
     current: BTreeMap<Vec<u8>, CollectionId>,
-    version: u64,
+    generation: u64,
 }
 
 impl CatalogOverlay {
@@ -47,12 +47,12 @@ impl CatalogOverlay {
         }
     }
 
-    /// Reports whether a collection was created by the current body attempt.
+    /// Reports whether a collection was created by the current body execution.
     pub(super) fn is_created(&self, collection: &CollectionAddress) -> bool {
         self.created.contains(collection)
     }
 
-    /// Reports whether a collection was dropped by the current body attempt.
+    /// Reports whether a collection was dropped by the current body execution.
     pub(super) fn is_dropped(&self, collection: &CollectionAddress) -> bool {
         self.dropped.contains(collection)
     }
@@ -94,7 +94,7 @@ impl CatalogOverlay {
             .directories
             .get(parent)
             .expect("directory was loaded above");
-        let version = state.version;
+        let generation = state.generation;
         let current = state
             .current
             .iter()
@@ -102,7 +102,7 @@ impl CatalogOverlay {
             .collect();
         self.reads.push(DirectoryRead {
             parent: parent.clone(),
-            kind: DirectoryReadKind::Listing { version },
+            kind: DirectoryReadKind::Listing { generation },
         });
         Ok(current)
     }
@@ -205,12 +205,12 @@ impl CatalogOverlay {
             .directories
             .get(collection)
             .expect("target directory was loaded above");
-        let target_version = target.version;
+        let target_generation = target.generation;
         let target_not_empty = !target.current.is_empty();
         self.reads.push(DirectoryRead {
             parent: collection.clone(),
             kind: DirectoryReadKind::Listing {
-                version: target_version,
+                generation: target_generation,
             },
         });
         if target_not_empty {
@@ -264,7 +264,7 @@ impl CatalogOverlay {
                 DirectoryState {
                     base: BTreeMap::new(),
                     current: BTreeMap::new(),
-                    version: 0,
+                    generation: 0,
                 },
             );
             return Ok(false);
@@ -284,7 +284,7 @@ impl CatalogOverlay {
             .or_insert_with(|| DirectoryState {
                 base: children.clone(),
                 current: children,
-                version: snapshot.version,
+                generation: snapshot.generation,
             });
     }
 

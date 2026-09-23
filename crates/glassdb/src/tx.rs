@@ -33,7 +33,7 @@ use crate::scan::{KeyPage, KeyScan};
 /// durability-safe to cancel by being dropped (`tokio::time::timeout`,
 /// `select!`, or `JoinHandle::abort`). When the future is dropped mid-flight
 /// the surrounding `Database::tx` uses an internal RAII guard to hand any
-/// engine-side attempt to managed retirement. Panics use the same handoff.
+/// active transaction identity to managed retirement. Panics use the same handoff.
 /// Durable helpers and garbage collection may reclaim physical resources
 /// asynchronously.
 pub struct Transaction {
@@ -255,7 +255,7 @@ impl Transaction {
     ///
     /// The directory observation and materialization complete before the
     /// iterator is returned; the enclosing transaction validates that
-    /// observation when its attempt completes. Each yielded handle remains
+    /// observation when it commits. Each yielded handle remains
     /// bound to the listed incarnation.
     pub async fn iter_collections(&self, parent: &Collection) -> Result<CollectionIter, Error> {
         self.admit_operation(parent)?;
@@ -450,16 +450,16 @@ mod tests {
 
     // ADR-031 phantom prevention, the in-flight case: when a key is created
     // *while* a listing transaction is running — after it scanned the leaf but
-    // before it validated — the create rewrites the covered leaf, bumping its
-    // version. The listing's commit validation detects the changed snapshot and
-    // re-runs the transaction; the retry re-scans a current leaf observation and
-    // includes the racing key. A create is never silently dropped from a listing
+    // before it validated — the create rewrites the covered leaf, which gives it
+    // a new revision. The listing's commit validation detects the changed
+    // snapshot and replays the body; the replay re-scans a current leaf
+    // observation and includes the racing key. A create is never silently dropped from a listing
     // it raced.
     #[tokio::test]
-    async fn listing_retries_to_include_a_key_added_during_the_scan() {
+    async fn listing_replays_to_include_a_key_added_during_the_scan() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let db = Database::open("example", backend).await.unwrap();
-        let path = CollectionPath::new(b"phantom-retry").unwrap();
+        let path = CollectionPath::new(b"phantom-replay").unwrap();
         let coll = db.create_collection(&path).await.unwrap();
 
         let seed: Vec<Vec<u8>> = (0u32..5).map(|i| i.to_be_bytes().to_vec()).collect();
@@ -468,20 +468,20 @@ mod tests {
         }
 
         let extra = 999u32.to_be_bytes().to_vec();
-        let first_attempt = AtomicBool::new(true);
+        let first_execution = AtomicBool::new(true);
 
-        // The listing runs in a read-only transaction. On its first attempt a
+        // The listing runs in a read-only transaction. On its first body execution a
         // concurrent transaction commits a new key *after* the scan recorded the
         // leaf observation revision, modeling a create that lands mid-listing. That
-        // invalidates the recorded snapshot, forcing the listing to retry.
+        // invalidates the recorded snapshot, forcing a body replay.
         let listed = db
             .tx(|tx| {
                 let coll = coll.clone();
                 let extra = extra.clone();
-                let first_attempt = &first_attempt;
+                let first_execution = &first_execution;
                 async move {
                     let keys = tx.scan_keys(&coll, KeyScan::all()).await?.into_keys();
-                    if first_attempt.swap(false, Ordering::SeqCst) {
+                    if first_execution.swap(false, Ordering::SeqCst) {
                         coll.write(&extra, b"v").await?;
                     }
                     Ok(keys)
@@ -492,7 +492,7 @@ mod tests {
 
         assert!(
             listed.contains(&extra),
-            "the key created during the listing is included after the retry"
+            "the key created during the listing is included after the replay"
         );
         let mut expected: Vec<Vec<u8>> = seed;
         expected.push(extra);
@@ -502,8 +502,8 @@ mod tests {
             "the listing observes the full, sorted committed set"
         );
         assert!(
-            db.stats().transactions.retries >= 1,
-            "the listing must have retried after its snapshot was invalidated"
+            db.stats().transactions.replays >= 1,
+            "the listing must have been replayed after its snapshot was invalidated"
         );
     }
 }

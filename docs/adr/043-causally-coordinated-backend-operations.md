@@ -161,7 +161,7 @@ are not discoverable by new cache reads. A future concurrent-read optimization
 may add provenance-bearing tombstones internally.
 
 Any later definitive read or successful mutation may install usable knowledge
-again. A clean mutation precondition failure only proves the expected
+again. A clean rejected mutation only proves the expected
 observation obsolete; because it does not identify the current state, knowledge
 remains uncertain until another operation does.
 
@@ -174,10 +174,10 @@ mere existence cannot publish newer user-visible state. An identity object
 becomes live only through a separately revision-fenced reference or through
 idempotent recovery of that identity.
 
-Transaction objects use fresh transaction IDs and
+Transaction records use fresh transaction IDs and
 [ADR-022](022-garbage-collection-mark-sweep.md)'s reference-checked GC;
 structural nodes and records use fresh random tokens and
-[ADR-032](032-node-locking-and-coordinated-splits.md)'s version-fenced
+[ADR-032](032-node-locking-and-coordinated-splits.md)'s revision-fenced
 reachability. A late object therefore belongs to its original lifecycle rather
 than replacing a newer one. In particular, a structural node created after its
 write-ahead record was resolved cannot become reachable without the

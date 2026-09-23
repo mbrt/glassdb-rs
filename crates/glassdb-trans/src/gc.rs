@@ -2,9 +2,9 @@
 //!
 //! Candidates record the keys and locks that can reference their transaction
 //! identity. GC checks these recorded references instead of scanning every leaf
-//! (ADR-022). A committed log stays live while a reference names it.
+//! (ADR-022). A committed record stays live while a reference names it.
 //!
-//! GC skips missing, pending, and wounded logs (ADR-071). It filters
+//! GC skips missing, pending, and wounded records (ADR-071). It filters
 //! committed and acknowledged aborted candidates by
 //! durable status and the safety horizon before capturing a fresh requirement
 //! for reference checks. Cached leaf contents from before eligibility cannot
@@ -32,7 +32,7 @@ use glassdb_data::{LogicalKey, TxId};
 use glassdb_storage::{
     CurrentnessBarrier, NodeStore, Observation, Requirement, StorageError, StructuralIntentStore,
     Timeline, TreeRouter,
-    transaction::{TLogger, TxCollectionOp, TxCommitStatus, TxLock, TxLog, TxRecordState},
+    transaction::{TxCollectionOp, TxCommitStatus, TxLock, TxRecord, TxRecordState, TxRecordStore},
 };
 use tokio::sync::Notify;
 
@@ -50,7 +50,7 @@ const ADMISSION_BATCH: usize = 64;
 /// GC hint queue limits for one database instance.
 ///
 /// Excess hints are discarded without delaying writers. GC scans can still
-/// discover their transaction objects and use a separate candidate budget.
+/// discover their transaction records and use a separate candidate budget.
 #[derive(Debug, Clone, Copy)]
 pub struct GcLimits {
     /// Maximum reports waiting for admission. Defaults to 4,096.
@@ -77,7 +77,7 @@ type Listing = BoxFuture<'static, (GcScan, Result<Option<Vec<TxId>>, StorageErro
 
 /// Whether a transaction's durable state permits reclamation of its effects.
 enum GcEligibility {
-    Ready(Observation<TxLog>),
+    Ready(Observation<TxRecord>),
     Deferred(Duration),
     Retained,
 }
@@ -292,7 +292,7 @@ impl Candidates {
 /// Owns GC scheduling and reclamation without delaying candidate producers.
 #[derive(Clone)]
 pub(crate) struct Gc {
-    tl: TLogger,
+    tx_records: TxRecordStore,
     structural_intents: StructuralIntentStore,
     collection_lifecycle: CollectionLifecycle,
     router: TreeRouter,
@@ -307,7 +307,7 @@ impl Gc {
     /// Creates GC with bounded candidate admission and adaptive scans.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        tl: TLogger,
+        tx_records: TxRecordStore,
         nodes: NodeStore,
         structural_intents: StructuralIntentStore,
         timeline: Timeline,
@@ -318,7 +318,7 @@ impl Gc {
         max_checks: NonZeroUsize,
     ) -> Self {
         Self {
-            tl,
+            tx_records,
             structural_intents,
             collection_lifecycle,
             router: TreeRouter::new(nodes, std::num::NonZeroUsize::MIN),
@@ -420,10 +420,10 @@ impl Gc {
         barrier: CurrentnessBarrier,
     ) -> Result<GcEligibility, TransError> {
         // GC needs exact durable evidence for reclamation. A status cached
-        // without its log cannot authorize deletion, and absence must not
+        // without its record cannot authorize deletion, and absence must not
         // create a wound marker merely because a scan or hint named an ID.
         let status = self
-            .tl
+            .tx_records
             .commit_status_at(tid, Requirement::after(barrier))
             .await?;
         match TxRecordState::try_from_observation(&status.observation)? {
@@ -447,15 +447,15 @@ impl Gc {
     async fn try_reclaim(
         &self,
         tid: &TxId,
-        observed: &Observation<TxLog>,
+        observed: &Observation<TxRecord>,
         barrier: CurrentnessBarrier,
     ) -> Result<GcOutcome, TransError> {
-        let log = observed
+        let record = observed
             .value()
-            .ok_or_else(|| StorageError::other("GC candidate has no transaction log"))?;
-        match log.status {
-            TxCommitStatus::Ok => self.reclaim_committed(tid, log, observed, barrier).await,
-            TxCommitStatus::Aborted => self.reclaim_aborted(tid, log, observed, barrier).await,
+            .ok_or_else(|| StorageError::other("GC candidate has no transaction record"))?;
+        match record.status {
+            TxCommitStatus::Ok => self.reclaim_committed(tid, record, observed, barrier).await,
+            TxCommitStatus::Aborted => self.reclaim_aborted(tid, record, observed, barrier).await,
             TxCommitStatus::Pending | TxCommitStatus::Unknown | TxCommitStatus::Wounded => {
                 Ok(GcOutcome::Retained)
             }
@@ -465,38 +465,43 @@ impl Gc {
     /// A committed candidate past the horizon is deleted only once its complete
     /// record proves it unreferenced. Any recorded write still pointed at by a
     /// `current_writer`, or any recorded lock still held (the commit→write-back
-    /// gap), keeps it. A committed object is never pruned or force-aborted — its
+    /// gap), keeps it. A committed record is never pruned or force-aborted — its
     /// locks become `current_writer` through write-back, never through GC.
     async fn reclaim_committed(
         &self,
         tid: &TxId,
-        log: &TxLog,
-        observation: &Observation<TxLog>,
+        record: &TxRecord,
+        observation: &Observation<TxRecord>,
         barrier: CurrentnessBarrier,
     ) -> Result<GcOutcome, TransError> {
-        // Collection effects are independent of the transaction object's value
+        // Collection effects are independent of the transaction record's value
         // reachability. A crash after the commit point must not leave a dropped
-        // collection forever merely because this same log stores a live value
+        // collection forever merely because this same record stores a live value
         // in another collection.
         let removed_directories = self
             .locker
             .collections()
-            .recover_write_back(tid, &log.collection_changes, &log.locks, Requirement::ANY)
+            .recover_write_back(
+                tid,
+                &record.collection_changes,
+                &record.locks,
+                Requirement::ANY,
+            )
             .await?;
         let mut changed = !removed_directories.is_empty();
-        let dropped = log
+        let dropped = record
             .collection_changes
             .iter()
             .filter(|change| change.op == TxCollectionOp::Drop)
             .map(|change| change.collection.clone())
             .collect::<Vec<_>>();
-        let active_created = log
+        let active_created = record
             .collection_changes
             .iter()
             .filter(|change| change.op == TxCollectionOp::Create)
             .map(|change| change.collection.clone())
             .collect::<BTreeSet<_>>();
-        let unused_prepared = log
+        let unused_prepared = record
             .prepared_collections
             .iter()
             .filter(|collection| !active_created.contains(*collection))
@@ -504,14 +509,14 @@ impl Gc {
             .collect::<Vec<_>>();
         changed |= self.collection_lifecycle.reclaim(&dropped).await?;
         changed |= self.collection_lifecycle.reclaim(&unused_prepared).await?;
-        if self.entries_referenced(tid, log, barrier).await? {
+        if self.entries_referenced(tid, record, barrier).await? {
             return Ok(GcOutcome::from_progress(changed));
         }
-        // The original log's entry references are clear. Applied directory
+        // The original record's entry references are clear. Applied directory
         // write-back proves removal even after cache eviction: this
         // committed identity cannot acquire those holders again. Keep every
         // other directory and all membership/topology obligations.
-        let mut remaining: Vec<_> = log
+        let mut remaining: Vec<_> = record
             .locks
             .iter()
             .filter(|lock| match lock {
@@ -526,7 +531,7 @@ impl Gc {
             .collections()
             .recover_write_back(
                 tid,
-                &log.collection_changes,
+                &record.collection_changes,
                 &remaining,
                 Requirement::after(barrier),
             )
@@ -540,7 +545,7 @@ impl Gc {
         if !released.complete {
             return Ok(GcOutcome::from_progress(changed));
         }
-        self.tl.delete(observation).await?;
+        self.tx_records.delete(observation).await?;
         Ok(GcOutcome::Reclaimed)
     }
 
@@ -550,29 +555,29 @@ impl Gc {
     async fn reclaim_aborted(
         &self,
         tid: &TxId,
-        log: &TxLog,
-        observation: &Observation<TxLog>,
+        record: &TxRecord,
+        observation: &Observation<TxRecord>,
         barrier: CurrentnessBarrier,
     ) -> Result<GcOutcome, TransError> {
-        let reclaimed = self.cleanup_aborted_effects(tid, log, barrier).await?;
+        let reclaimed = self.cleanup_aborted_effects(tid, record, barrier).await?;
         if !reclaimed.complete {
             return Ok(GcOutcome::from_progress(reclaimed.changed));
         }
-        self.tl.delete(observation).await?;
+        self.tx_records.delete(observation).await?;
         Ok(GcOutcome::Reclaimed)
     }
 
     async fn cleanup_aborted_effects(
         &self,
         tid: &TxId,
-        log: &TxLog,
+        record: &TxRecord,
         barrier: CurrentnessBarrier,
     ) -> Result<Reclamation, TransError> {
-        let mut reclaimed = self.release_locks(tid, &log.locks, barrier).await?;
+        let mut reclaimed = self.release_locks(tid, &record.locks, barrier).await?;
         if !reclaimed.complete {
             return Ok(reclaimed);
         }
-        let drops = log
+        let drops = record
             .collection_changes
             .iter()
             .filter(|change| change.op == TxCollectionOp::Drop)
@@ -584,7 +589,7 @@ impl Gc {
             .await?;
         reclaimed.changed |= self
             .collection_lifecycle
-            .reclaim(&log.prepared_collections)
+            .reclaim(&record.prepared_collections)
             .await?;
         Ok(reclaimed)
     }
@@ -603,15 +608,15 @@ impl Gc {
     async fn entries_referenced(
         &self,
         tid: &TxId,
-        log: &TxLog,
+        record: &TxRecord,
         barrier: CurrentnessBarrier,
     ) -> Result<bool, TransError> {
-        let mut items: Vec<(LogicalKey, CheckKind)> = log
+        let mut items: Vec<(LogicalKey, CheckKind)> = record
             .writes
             .iter()
             .map(|write| (write.key.clone(), CheckKind::Writer))
             .collect();
-        for lock in &log.locks {
+        for lock in &record.locks {
             if let TxLock::Entry { key, .. } = lock {
                 items.push((key.clone(), CheckKind::Holder));
             }
@@ -748,7 +753,11 @@ impl Scheduler {
             checks: OptionFuture::default(),
             checking: false,
             concurrency: 1,
-            scan: Some(GcScan::new(gc.tl.clone(), counters.clone(), retry_delay)),
+            scan: Some(GcScan::new(
+                gc.tx_records.clone(),
+                counters.clone(),
+                retry_delay,
+            )),
             listing: OptionFuture::default(),
             cadence: ScanCadence::new(
                 (retry_delay / 16).max(Duration::from_millis(1)),
@@ -924,12 +933,12 @@ impl GcHints {
         }
     }
 
-    /// Reports one transaction object for a reverse liveness check.
+    /// Reports one transaction record for a reverse liveness check.
     pub(crate) fn schedule(&self, tid: TxId) {
         self.schedule_all([tid]);
     }
 
-    /// Reports transaction objects for reverse liveness checks.
+    /// Reports transaction records for reverse liveness checks.
     pub(crate) fn schedule_all(&self, tids: impl IntoIterator<Item = TxId>) {
         for tid in tids {
             if self.limits.max_pending_hints == 0 {
@@ -983,7 +992,7 @@ pub struct GcStats {
     /// Checks that reclaimed resources or advanced recovery, including transaction deletion.
     /// Concurrent deletions can count as progress in more than one Database instance.
     pub progress: u64,
-    /// Transaction-object LIST requests.
+    /// Transaction-record LIST requests.
     pub lists: u64,
 }
 

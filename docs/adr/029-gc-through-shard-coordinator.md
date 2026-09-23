@@ -23,7 +23,7 @@ The `Clock`-based time-source detail is superseded by
 [ADR-062](062-splitter-driven-tombstone-reclamation.md) adds
 structural-gate-owned compaction of quiescent tombstones. Ordinary preparation for
 persistence still prunes only holder-free entries in `Absent` state, and
-transaction-object GC does not become a leaf scanner.
+transaction-record GC does not become a leaf scanner.
 
 ## Context
 
@@ -127,9 +127,9 @@ The claim is that routing GC's release through the coordinator and pruning befor
 persistence **preserves ADR-022's safety argument exactly**, while removing the
 racing CAS.
 
-- **GC's safety invariant is untouched.** ADR-022's contract — never delete an
-  object holding live values while referenced, never delete within the horizon
-  (for an aborted object, measured from the abort) — is a property of _what GC
+- **GC's safety invariant is untouched.** ADR-022's contract — never delete a
+  record holding live values while referenced, never delete within the horizon
+  (for an aborted record, measured from the abort) — is a property of _what GC
   decides_ (status resolution, the horizon, force-abort before any lock moves),
   not of _how the release CAS is issued_. Relocating the release changes none of
   those decisions. GC still releases only for **finalized** candidates (aborted,
@@ -154,7 +154,7 @@ racing CAS.
   only when it is vestigial — no holder and no `current_writer`. Such an entry
   references **no** txid, so pruning it removes nothing from the live set of
   ADR-022's reachability graph. In particular it can never make a
-  still-referenced transaction object look collectable: a referenced object is
+  still-referenced transaction record look collectable: a referenced record is
   named by a `current_writer` or a `locked_by`, neither of which a vestigial
   entry has. The prune is safe on **every** coordinated mutation path, not just
   GC's — an acquire or write-back round that incidentally leaves an unrelated

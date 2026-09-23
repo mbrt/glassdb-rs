@@ -139,7 +139,7 @@ async fn seed_shared(mem: Arc<dyn Backend>, key: &[u8], v: i64) {
 
 /// A transient read outage is ridden over by the reader's bounded in-place
 /// retry: the value is returned and the transaction's closure runs only once
-/// (the retry happens below `Database::tx`, not as a whole-transaction retry).
+/// (the retry happens below `Database::tx`, not as a body replay).
 #[tokio::test(start_paused = true)]
 async fn transient_read_unavailability_is_retried_transparently() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -170,7 +170,7 @@ async fn transient_read_unavailability_is_retried_transparently() {
         .expect("a transient read outage must be retried, not surfaced");
 
     assert_eq!(read_int(&got.unwrap()), 10);
-    // The retry happened inside the reader, not as a whole-transaction retry.
+    // The retry happened inside the reader, not as a body replay.
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     // The two injected faults plus the successful read.
     assert!(
@@ -185,7 +185,7 @@ async fn transient_read_unavailability_is_retried_transparently() {
 /// complete, the body's error must not escape: the value it was derived from may
 /// be a stale cached read that a committed writer already superseded. The caller
 /// learns about the failed validation instead, as the retry-safe
-/// `Error::Unavailable` (a read-only attempt stages no write, so nothing is in
+/// `Error::Unavailable` (a read-only transaction stages no write, so nothing is in
 /// doubt).
 #[tokio::test(start_paused = true)]
 async fn error_outcome_does_not_escape_failed_validation() {

@@ -22,7 +22,7 @@ transaction.
 
 In particular, an ordinary lock acquisition must reconcile the node's entry
 and node-lock holders before it can establish structure-R. Each mutation also
-adds a durable structure holder and transaction-log back-reference, retains
+adds a durable structure holder and transaction-record back-reference, retains
 them through write-back, and later removes them. Measurements that separated
 stable-leaf traffic from forced splits found that this holder reconciliation,
 rather than routing or the split itself, dominates the regression.

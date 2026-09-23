@@ -79,16 +79,16 @@ failure.
 These workloads check consistency through public state and transaction
 histories. Maintenance scenarios are in scope when they can change those
 results — deleting a transaction body still required by a current key writer
-must be detected — while leaked logs and incomplete physical cleanup alone are
-not. Inline values and tombstones can have valid logless writers, so a writer
-identity without a log is not by itself a consistency failure.
+must be detected — while leaked records and incomplete physical cleanup alone are
+not. Inline values and tombstones can have valid direct writers, so a writer
+identity without a record is not by itself a consistency failure.
 
 The history target additionally generates collection lifecycle operations
 (creation, deletion, recreation, nested children, collection values) on shared
 names, and can couple them with a key write in another collection or an explicit
 abort. Its model checks public results and full shared directory membership as
 well as values. It classifies errors and possible outcomes only from public
-results, never from transaction objects, locks, caches, or monitor state. After
+results, never from transaction records, locks, caches, or monitor state. After
 an unavailable or in-doubt result, the client keeps using the same instance
 unless a crash interrupts it, and the failed operation stays consumed: an
 in-doubt operation may commit once or not at all, and later public observations

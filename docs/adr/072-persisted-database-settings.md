@@ -9,7 +9,7 @@ Accepted — first pass implemented. Limits are recorded under Consequences.
 Before v4, each database instance supplies its own hard coordination limits and
 transaction timing. Smaller limits can prevent a client from modifying existing
 data. Different timing profiles disagree about lease expiry and the interval
-during which an ambiguous commit can recover before GC deletes its record.
+during which an in-doubt commit can recover before GC deletes its record.
 
 ## Decision
 

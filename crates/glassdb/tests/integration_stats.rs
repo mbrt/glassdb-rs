@@ -9,7 +9,7 @@ use integration_support::{create_top, init_db, mem, open_top, read_int, rmw, wri
 // The distributed locker's counters are surfaced through `Database::stats()`
 // (the same reset-on-read accumulation pattern as the backend object counters),
 // not only through the internal diagnostics snapshot. A committed write
-// transaction takes the locked commit path (a read-only commit does not), so it
+// transaction uses locked commit (a read-only commit does not), so it
 // must bump `locker.calls` while a pure read leaves the counter unchanged.
 #[tokio::test(start_paused = true)]
 async fn stats_report_locker_activity() {
@@ -50,7 +50,7 @@ async fn stats_report_locker_activity() {
         "one round cannot serve more work than was submitted"
     );
 
-    // A read-only transaction commits via the lock-free fast path, so the
+    // A read-only transaction commits via optimistic validation, so the
     // counter is unchanged across it.
     let _ = coll.read(b"key1").await.unwrap();
     let after_read = db.stats();

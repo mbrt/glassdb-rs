@@ -134,7 +134,7 @@ pub(super) fn with_tape(
 mod sim_tests {
     use std::num::NonZeroUsize;
 
-    use glassdb_backend::{BackendError, Version, memory::MemoryBackend};
+    use glassdb_backend::{BackendError, Revision, memory::MemoryBackend};
     use glassdb_concurr::exec;
 
     use super::*;
@@ -215,7 +215,7 @@ mod sim_tests {
             );
 
             slow.read("p").await.unwrap();
-            slow.read_if_modified("p", &Version::new("different"))
+            slow.read_if_modified("p", &Revision::new("different"))
                 .await
                 .unwrap();
             slow.list("", None, NonZeroUsize::new(10).unwrap())

@@ -3,36 +3,36 @@
 //! Object storage (S3/GCS) offers no at-most-once request id: if a conditional
 //! write's first attempt lands but its acknowledgement is lost, a retry — at any
 //! layer (the SDK, a proxy, the service) — observes a precondition failure that
-//! is indistinguishable from a genuine conflict. A backend reports such an
-//! uncertain conditional write as [`BackendError::Unavailable`] rather than a
+//! is indistinguishable from a genuine rejection. A backend reports such an
+//! in-doubt conditional write as [`BackendError::Unavailable`] rather than a
 //! confident `Precondition`.
 //!
 //! In v2 every commit point is a CAS on a coordination object whose durable
 //! state disambiguates the outcome, so the engine recovers most in-doubt
 //! outcomes by reading that object back:
 //!
-//! - The logless direct commit path (ADR-061) commits an eligible complete
+//! - Direct commit (ADR-061) commits an eligible complete
 //!   same-leaf point transaction with one leaf CAS that publishes every inline
 //!   value or tombstone. A lost ack is resolved by reloading the leaf: any exact
 //!   own output proves the whole member committed, while unchanged predecessors
 //!   prove it did not land (retry the idempotent CAS).
 //!
-//!   An uncertain CAS is irreducibly in-doubt exactly when the read-back cannot
+//!   An in-doubt CAS stays in doubt exactly when the read-back cannot
 //!   prove that state either way — surfaced as [`Error::InDoubt`] rather than
-//!   risking a double-apply on a renewed re-run. A *fast follow-on writer* that
+//!   risking a double-apply on a body replay under a renewed identity. A *fast follow-on writer* that
 //!   moves the entry first is the reachable case and is covered below; anything
 //!   else that prevents resolver evaluation after a reload from proving it
 //!   (a structural gate or a collection-delete fence arriving in the same window)
 //!   is classified the same way, pinned by unit tests next to the resolvers
 //!   because no interleaving reproduces it reliably.
-//! - The logged path's commit point (the `_t/` flip) and its leaf lock CAS
+//! - Locked commit's commit point (the `_t/` flip) and its leaf lock CAS
 //!   (a node `_n/` or the root `_r`) are recovered in place the same way (they
 //!   are idempotent under their own preconditions). A value the inline budgets
-//!   reject takes that path (ADR-053), so its lost-ack lock CAS is proved by the
+//!   reject uses locked commit (ADR-053), so its lost-ack lock CAS is proved by the
 //!   lock this transaction already holds.
 //!
-//! The engine never retries a transaction *transparently* across an in-doubt
-//! commit point in a way that could double-apply a landed write. The caller
+//! The engine never replays a transaction body *transparently* across an
+//! in-doubt commit point in a way that could double-apply a landed write. The caller
 //! decides whether to retry a surfaced in-doubt (with its own idempotency) or
 //! accept the uncertainty.
 //!
@@ -43,7 +43,7 @@
 //! write that never landed), while an `after` hook sees the *landed* result and
 //! may transform it (turn an `Ok` into `Unavailable`, modelling a lost ack) and
 //! run async side effects. A normal in-memory backend never produces
-//! `Unavailable`, so the harness injects it. To exercise the direct path's one
+//! `Unavailable`, so the harness injects it. To exercise direct commit's one
 //! irreducible in-doubt an `after` hook can interpose a genuine competing
 //! transaction at the instant a lost-ack write lands, rather than forging any
 //! protocol state.
@@ -67,8 +67,8 @@ type After = Box<dyn for<'a, 'b> Fn(&BackendOp<'a>, HookOutcome<'b>) -> HookFutu
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 type Competitor = Box<dyn FnOnce() -> BoxFuture<()> + Send + Sync>;
 
-fn is_committed_tx_log(body: &[u8]) -> bool {
-    glassdb_storage::txobject::status(body)
+fn is_committed_tx_record(body: &[u8]) -> bool {
+    glassdb_storage::txrecord::status(body)
         .map(|status| status == TxCommitStatus::Ok)
         .unwrap_or(false)
 }
@@ -78,12 +78,12 @@ fn leaf_cas(op: &BackendOp<'_>) -> bool {
         if path.contains("/_n/") || path.ends_with("/_r"))
 }
 
-fn committed_log(op: &BackendOp<'_>) -> bool {
+fn committed_record(op: &BackendOp<'_>) -> bool {
     matches!(
         op,
         BackendOp::WriteIf { path, value, .. }
             | BackendOp::WriteIfNotExists { path, value }
-            if path.contains("/_t/") && is_committed_tx_log(value)
+            if path.contains("/_t/") && is_committed_tx_record(value)
     )
 }
 
@@ -111,7 +111,7 @@ async fn delayed_local_commit_acknowledgement_does_not_hide_committed_values() {
             let applied = applied.clone();
             let acknowledge = acknowledge.clone();
             move |op, outcome| {
-                let delay = outcome.is_success() && committed_log(op);
+                let delay = outcome.is_success() && committed_record(op);
                 let applied = applied.clone();
                 let acknowledge = acknowledge.clone();
                 Box::pin(async move {
@@ -217,17 +217,17 @@ fn arm_before(backend: &HookBackend, before: Before) {
 }
 
 fn arm_after(backend: &HookBackend, after: After) -> Arc<AtomicUsize> {
-    let committed_log_writes = Arc::new(AtomicUsize::new(0));
+    let committed_record_writes = Arc::new(AtomicUsize::new(0));
     backend.set_after({
-        let committed_log_writes = committed_log_writes.clone();
+        let committed_record_writes = committed_record_writes.clone();
         move |op, outcome| {
-            if committed_log(op) {
-                committed_log_writes.fetch_add(1, Ordering::SeqCst);
+            if committed_record(op) {
+                committed_record_writes.fetch_add(1, Ordering::SeqCst);
             }
             after(op, outcome)
         }
     });
-    committed_log_writes
+    committed_record_writes
 }
 
 fn lost_ack(op: &str) -> BackendError {
@@ -264,7 +264,7 @@ fn incremented_value(key: &[u8], current: i64) -> Result<Vec<u8>, Error> {
 }
 
 /// Encodes `n` padded past the inline per-value budget (ADR-051), so its commit
-/// takes the regular locked path rather than the logless one (ADR-053).
+/// uses a locked commit rather than direct commit (ADR-053).
 fn write_padded_int(n: i64) -> Vec<u8> {
     let mut v = write_int(n);
     v.resize(4096, 0);
@@ -285,13 +285,13 @@ async fn settle_writebacks() {
 }
 
 /// A single-key read-modify-write over an existing key whose small value the
-/// inline budgets admit: its commit takes the logless one-CAS path (ADR-051).
+/// inline budgets admit: its commit uses direct commit (ADR-051).
 async fn increment(db: &Database, coll: &Collection, key: &'static [u8]) -> Result<(), Error> {
     increment_with(db, coll, key, write_int).await
 }
 
 /// The same read-modify-write with a value the inline budgets reject, so its
-/// commit takes the regular locked path: a write lock, a committed object, then a
+/// commit uses a locked commit: a write lock, a committed record, then a
 /// write-back that publishes the pointer.
 async fn increment_padded(
     db: &Database,
@@ -308,7 +308,7 @@ async fn increment_with(
     encode: fn(i64) -> Vec<u8>,
 ) -> Result<(), Error> {
     // `coll` is already a reference, so `async move` copies it (references are
-    // `Copy`); the closure stays `FnMut` and can be re-run on a transparent retry.
+    // `Copy`); the closure stays `FnMut` and can be replayed.
     db.tx(|tx| async move {
         let cur = match tx.read(coll, key).await {
             Ok(Some(v)) => try_read_int(&v).ok_or_else(|| {
@@ -325,11 +325,11 @@ async fn increment_with(
     .await
 }
 
-/// The logless one-CAS path (ADR-051): a lost ack on the commit CAS is
+/// Direct commit (ADR-051): a lost ack on the commit CAS is
 /// *resolved to committed* by reading the leaf back — the entry now holds this
 /// transaction's exact inline value, so the write demonstrably landed. The
 /// engine returns a commit outcome (not in-doubt) and applies the value exactly once.
-/// Unlike v1's logless path, the published state itself is the disambiguating
+/// Unlike v1's direct path, the published state itself is the disambiguating
 /// coordination evidence.
 #[tokio::test(start_paused = true)]
 async fn single_rw_lost_ack_on_leaf_cas_resolves_committed() {
@@ -387,7 +387,7 @@ async fn locked_single_rw_lost_ack_on_lock_cas_resolves_committed() {
     assert_eq!(got, 11, "value must be applied exactly once");
 }
 
-/// The direct commit path's one irreducible in-doubt (ADR-051): our commit CAS
+/// Direct commit's one irreducible in-doubt (ADR-051): our commit CAS
 /// lands but loses its ack *and*, in the window before
 /// we read the leaf back, a **genuine competing transaction** takes the key and
 /// moves the entry past us. The read-back shows another writer, so the engine can
@@ -439,7 +439,7 @@ async fn single_rw_lost_ack_then_moved_surfaces_in_doubt() {
          irreducibly in-doubt, got {res:?}"
     );
 
-    // The competitor's write is the durable one; our uncertain write did not win.
+    // The competitor's write is the durable one; our in-doubt write did not win.
     assert_eq!(read_int(&coll.read(b"k").await.unwrap().unwrap()), 99);
 }
 
@@ -482,7 +482,7 @@ async fn single_rw_in_doubt_not_landed_retries_and_commits() {
 
 // Local ownership must end even when the commit result remains unknown, or a
 // later transaction waits forever on the stopped owner's in-memory Pending state.
-async fn local_write_after_uncertain_logged_commit(landed: bool) {
+async fn local_write_after_in_doubt_locked_commit(landed: bool) {
     let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
     let db = Database::builder("test", backend.clone())
         .protocol_timing(glassdb::ProtocolTiming::simulation())
@@ -495,7 +495,7 @@ async fn local_write_after_uncertain_logged_commit(landed: bool) {
 
     if landed {
         backend.set_after(|operation, _| {
-            let unavailable = committed_log(operation)
+            let unavailable = committed_record(operation)
                 || matches!(operation,
                     BackendOp::Read { path } | BackendOp::ReadIfModified { path, .. }
                         if path.contains("/_t/"));
@@ -509,14 +509,14 @@ async fn local_write_after_uncertain_logged_commit(landed: bool) {
         });
     } else {
         // The refresher must not create Pending first: that would let commit
-        // recovery retry instead of reaching the missing-record ambiguity.
+        // recovery retry instead of reaching the in-doubt missing record.
         backend.set_before(|operation| {
             let unavailable = matches!(operation,
                 BackendOp::WriteIf { path, .. } | BackendOp::WriteIfNotExists { path, .. }
                     if path.contains("/_t/"));
             Box::pin(async move {
                 if unavailable {
-                    Err(not_applied("transaction log write"))
+                    Err(not_applied("transaction record write"))
                 } else {
                     Ok(())
                 }
@@ -542,27 +542,27 @@ async fn local_write_after_uncertain_logged_commit(landed: bool) {
 
 #[tokio::test]
 async fn local_write_recovers_after_a_commit_did_not_land() {
-    local_write_after_uncertain_logged_commit(false).await;
+    local_write_after_in_doubt_locked_commit(false).await;
 }
 
 #[tokio::test]
 async fn local_write_recovers_after_an_unconfirmed_commit_landed() {
-    local_write_after_uncertain_logged_commit(true).await;
+    local_write_after_in_doubt_locked_commit(true).await;
 }
 
-/// The logged path: when the *committed* transaction-log write —
+/// Locked commit: when the *committed* transaction-record write —
 /// the commit point — lands but loses its ack, the engine must recover the
 /// outcome transparently instead of surfacing the uncertainty.
 ///
-/// It recovers by reading the log status back. The log is keyed by transaction
-/// identity, and only this client writes `committed` under it. Thus, a final
-/// `committed` status is its own landed write and resolves to a commit outcome.
-/// Reading instead of issuing the conditional write again keeps the commit
-/// point driven exactly once. Thus, no extra attempt widens the window in
-/// which GC could reclaim the
-/// very record the engine needs to read (ADR-057).
+/// It recovers by reading the record status back. The record is keyed by
+/// transaction identity, and only this client writes `committed` under it.
+/// Thus, a final `committed` status is its own landed write and resolves to a
+/// commit outcome. Reading instead of issuing the conditional write again
+/// keeps the commit point driven exactly once. Thus, no extra body execution
+/// widens the window in which GC could reclaim the very record the engine
+/// needs to read (ADR-057).
 #[tokio::test(start_paused = true)]
-async fn logged_commit_lost_ack_recovers_transparently() {
+async fn locked_commit_lost_ack_recovers_transparently() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = HookBackend::new(mem);
     let db = Database::builder("example", backend.clone())
@@ -578,16 +578,16 @@ async fn logged_commit_lost_ack_recovers_transparently() {
     seed(&coll, b"a", 0).await;
     seed(&coll, b"b", 0).await;
 
-    // Seeding committed its own logs; count only commit points from here on.
+    // Seeding committed its own records; count only commit points from here on.
 
-    // Trap the commit point: the transaction log written as committed (a write
+    // Trap the commit point: the transaction record written as committed (a write
     // to a `/_t/` path whose body decodes as committed). Let it land, then lose
     // the ack.
-    let committed_log_writes = arm_after(&backend, lost_ack_after(committed_log));
+    let committed_record_writes = arm_after(&backend, lost_ack_after(committed_record));
 
     // The disabled inline policy makes this fixture explicitly exercise the
-    // locked, log-based path. Capture `coll` by reference so the body stays
-    // `FnMut` (re-runnable on a retry).
+    // locked commit. Capture `coll` by reference so the body stays
+    // `FnMut` (replayable).
     let coll = &coll;
     db.tx(|tx| async move {
         let a = read_existing_int(&tx, coll, b"a").await?;
@@ -596,7 +596,7 @@ async fn logged_commit_lost_ack_recovers_transparently() {
         tx.write(coll, b"b", &incremented_value(b"b", b)?)
     })
     .await
-    .expect("the logged commit must recover the in-doubt log write transparently");
+    .expect("the locked commit must recover the in-doubt record write transparently");
 
     // Each write applied exactly once — the safety invariant.
     assert_eq!(read_int(&coll.read(b"a").await.unwrap().unwrap()), 1);
@@ -604,16 +604,16 @@ async fn logged_commit_lost_ack_recovers_transparently() {
 
     // The commit point is driven exactly once — the lost-ack write itself.
     // Anything above one would mean the engine re-issued the conditional write
-    // instead of recognizing its own landed log by reading the status back.
+    // instead of recognizing its own landed record by reading the status back.
     assert_eq!(
-        committed_log_writes.load(Ordering::SeqCst),
+        committed_record_writes.load(Ordering::SeqCst),
         1,
         "the in-doubt commit point must be resolved by reading, not re-issued",
     );
 }
 
 #[tokio::test(start_paused = true)]
-async fn logged_commit_recovery_deadline_bounds_status_reads() {
+async fn locked_commit_recovery_deadline_bounds_status_reads() {
     let horizon = Duration::from_secs(1);
     for (ack_delay, status_delay) in [
         (Duration::ZERO, None),
@@ -639,7 +639,7 @@ async fn logged_commit_recovery_deadline_bounds_status_reads() {
                 let status_reads = status_reads.clone();
                 let release_reads = release_reads.clone();
                 move |operation, outcome| {
-                    let commit = outcome.is_success() && committed_log(operation);
+                    let commit = outcome.is_success() && committed_record(operation);
                     let status_read = commit_applied.load(Ordering::SeqCst)
                         && matches!(operation,
                         BackendOp::Read { path } | BackendOp::ReadIfModified { path, .. }
@@ -697,7 +697,7 @@ async fn logged_commit_recovery_deadline_bounds_status_reads() {
 /// in place by re-reading the lock metadata (which reveals whether the write
 /// took). The locker therefore retries on `Unavailable` instead of surfacing
 /// it, exactly as it already does for a stale `Precondition`. The whole
-/// transaction commits successfully without re-running the user's closure.
+/// transaction commits successfully without a body replay.
 #[tokio::test(start_paused = true)]
 async fn lock_acquisition_lost_ack_retries_in_place() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -720,10 +720,10 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
     // actually applied but the locker observes `Unavailable`.
     let _ = arm_after(&backend, lost_ack_after(leaf_cas));
 
-    // Inline publication is disabled so this fixture takes the locked,
-    // log-based path. Capture `coll` by reference so the body stays `FnMut`
-    // (re-runnable, though we expect no closure re-run here — the lock retry is
-    // invisible to `Database::tx`).
+    // Inline publication is disabled so this fixture takes a locked commit.
+    // Capture `coll` by reference so the body stays `FnMut` (replayable,
+    // though we expect no body replay here — the lock retry is invisible to
+    // `Database::tx`).
     let coll = &coll;
     db.tx(|tx| async move {
         let a = read_existing_int(&tx, coll, b"a").await?;
@@ -746,7 +746,7 @@ async fn lock_acquisition_lost_ack_retries_in_place() {
 /// over-eagerly treating every precondition as in-doubt, which would break
 /// liveness (and the fault-free exact invariant) under normal contention.
 #[tokio::test(start_paused = true)]
-async fn clean_conflict_on_single_rw_still_commits() {
+async fn clean_rejection_on_single_rw_still_commits() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let backend = HookBackend::new(mem);
     let db = Database::open("example", backend.clone()).await.unwrap();
@@ -769,7 +769,7 @@ async fn clean_conflict_on_single_rw_still_commits() {
 
     increment(&db, &coll, b"k")
         .await
-        .expect("a clean conflict must be retried transparently, not surfaced");
+        .expect("a clean rejection must be retried transparently, not surfaced");
 
     let got = read_int(&coll.read(b"k").await.unwrap().unwrap());
     assert_eq!(got, 42, "the increment must be applied exactly once");

@@ -7,8 +7,8 @@ Object-storage backend abstraction for [GlassDB](https://github.com/mbrt/glassdb
 a stateless ACID key/value store on top of object storage.
 
 The `Backend` trait is a small, content-CAS-only contract over an object store:
-plain and version-conditional reads, conditional writes and deletion, and list.
-Every object carries an opaque CAS version (its ETag or generation), which is the
+plain and revision-conditional reads, conditional writes and deletion, and list.
+Every object carries an opaque CAS revision (its ETag or generation), which is the
 only token used for conditional operations.
 
 This crate also ships an in-memory backend for tests and benchmarks, plus
@@ -36,11 +36,11 @@ async fn backend_conformance() {
 }
 ```
 
-The suite checks contents and versions, conditional reads and mutations,
+The suite checks contents and revisions, conditional reads and mutations,
 competing mutations, and recursive paginated listing. It leaves fixtures under
 `__glassdb_backend_conformance__/` and `__glassdb_list_conformance__/`. Run it
 without external writers or injected faults. Keep provider-specific tests for
-transport failures, retries, and ambiguous mutation outcomes.
+transport failures, retries, and in-doubt mutation outcomes.
 
 ## License
 

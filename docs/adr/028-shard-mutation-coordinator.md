@@ -60,11 +60,11 @@ admission. ADR-026 extends the same `Dedup` to **release** and **write-back**.
 Both live *inside* the `Locker`.
 
 ADR-027's single read-write fast path is the one mutation that **opts out**. To
-commit a lone overwrite in ~1 RTT it issues its committed object and its shard
+commit a lone overwrite in ~1 RTT it issues its committed record and its shard
 lock install *concurrently*, and — because the batching machinery is private to
 `Locker` — it installs the lock with its **own** direct shard CAS plus a private
 reload/reclassify retry loop. That raw CAS then **races** the deduplicated rounds
-on the same shard: full-path acquires, other single read-write installs, and
+on the same shard: locked-commit acquires, other single read-write installs, and
 in-flight write-backs. It is the exact "racing CASes" cost that ADR-025/026 removed
 everywhere else, reintroduced on the fast path's install.
 
@@ -186,7 +186,7 @@ content; the rest is relocation of proven code.
 5. **Explicit in-doubt attribution.** The engine surfaces the store outcome to the
    resolver on reload; the resolver classifies **for itself**. For a pre-commit
    `Acquire`/`Release`/`WriteBack` this is a blind idempotent retry (nothing has
-   committed). For **CommitInstall** — whose committed object is being written in
+   committed). For **CommitInstall** — whose committed record is being written in
    parallel — the resolver reaches `Landed` (its lock present or help-forwarded),
    re-stage (still eligible), `Moved` (a precondition miss with the entry moved
    past it), or `InDoubt` (an `Unavailable` CAS *and* the entry then moved, so

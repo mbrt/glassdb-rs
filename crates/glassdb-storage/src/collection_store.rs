@@ -23,7 +23,7 @@ use crate::lock::SharedExclusiveLock;
 pub struct CollectionRecord {
     children: BTreeMap<Vec<u8>, CollectionId>,
     directory_lock: SharedExclusiveLock,
-    directory_version: u64,
+    directory_generation: u64,
     topology_freeze: Option<TxId>,
     topology_participants: BTreeSet<TxId>,
 }
@@ -34,7 +34,7 @@ impl CollectionRecord {
         CollectionRecord {
             children: BTreeMap::new(),
             directory_lock: SharedExclusiveLock::default(),
-            directory_version: 0,
+            directory_generation: 0,
             topology_freeze: None,
             topology_participants: BTreeSet::new(),
         }
@@ -88,9 +88,9 @@ impl CollectionRecord {
         &self.directory_lock
     }
 
-    /// Returns the directory activity version.
-    pub fn directory_version(&self) -> u64 {
-        self.directory_version
+    /// Returns the directory activity generation.
+    pub fn directory_generation(&self) -> u64 {
+        self.directory_generation
     }
 
     /// Installs a shared directory holder.
@@ -109,8 +109,8 @@ impl CollectionRecord {
     }
 
     /// Records one committed directory mutation batch.
-    pub fn advance_directory_version(&mut self) {
-        self.directory_version = self.directory_version.wrapping_add(1);
+    pub fn advance_directory_generation(&mut self) {
+        self.directory_generation = self.directory_generation.wrapping_add(1);
     }
 
     /// Returns the transaction currently freezing collection topology.
@@ -212,7 +212,7 @@ impl CollectionRecord {
             directory_lock: SharedExclusiveLock::from_pb(raw.directory_lock).map_err(|_| {
                 StorageError::other("collection record has an invalid directory lock")
             })?,
-            directory_version: raw.directory_version,
+            directory_generation: raw.directory_generation,
             topology_freeze: (!raw.topology_freeze.is_empty())
                 .then(|| TxId::from_bytes(raw.topology_freeze)),
             topology_participants: raw
@@ -236,7 +236,7 @@ impl CollectionRecord {
                 })
                 .collect(),
             directory_lock: (!self.directory_lock.is_empty()).then(|| self.directory_lock.to_pb()),
-            directory_version: self.directory_version,
+            directory_generation: self.directory_generation,
             topology_freeze: self
                 .topology_freeze
                 .as_ref()
@@ -337,7 +337,7 @@ impl CollectionStore {
             .await
         {
             Ok(CasResult::Applied(_)) => Ok(true),
-            Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(false),
+            Ok(CasResult::Rejected) | Err(StorageError::NotFound) => Ok(false),
             Err(error) => Err(error),
         }
     }
@@ -369,7 +369,7 @@ impl CollectionStore {
             .await?
         {
             CasResult::Applied(receipt) => Ok(Some(receipt.into_installed())),
-            CasResult::Conflict => Ok(None),
+            CasResult::Rejected => Ok(None),
         }
     }
 
@@ -417,12 +417,12 @@ mod tests {
         let participant = TxId::from_bytes(vec![3]);
         let mut record = CollectionRecord::new();
         record.add_directory_reader(directory_reader.clone());
-        record.advance_directory_version();
+        record.advance_directory_generation();
         assert!(record.set_topology_freeze(freeze.clone()));
         assert!(record.add_topology_participant(freeze.clone()));
 
         let decoded = CollectionRecord::decode(&record.encode()).unwrap();
-        assert_eq!(decoded.directory_version(), 1);
+        assert_eq!(decoded.directory_generation(), 1);
         assert!(decoded.directory_lock().contains(&directory_reader));
         assert_eq!(decoded.topology_freeze(), Some(&freeze));
         assert!(

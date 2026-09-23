@@ -196,7 +196,7 @@ async fn scan_then_create_prevents_phantom_write_skew() {
         .unwrap()
         .into_keys();
     assert_eq!(keys.len(), 1, "only one create-if-empty may commit");
-    assert!(db.stats().transactions.retries >= 1);
+    assert!(db.stats().transactions.replays >= 1);
 }
 
 #[tokio::test]
@@ -228,7 +228,7 @@ async fn key_scan_validates_ranges_and_collection_existence() {
 // ADR-031 phantom prevention, end-to-end: a listing that observes a set of keys
 // commits against a validated snapshot, so a key created *after* the scan is
 // never included, and a listing whose snapshot a concurrent commit invalidated
-// transparently re-runs to a fresh, consistent view. The listing is a read-only
+// is transparently replayed to a fresh, consistent view. The listing is a read-only
 // serializable transaction, so its result is always sorted and internally
 // consistent.
 #[tokio::test]
@@ -293,7 +293,7 @@ async fn listing_hides_keys_from_aborted_transactions() {
 
     // With inline publication disabled, a transaction creates two brand-new
     // keys and reaches the commit-log write (so its create locks are already
-    // installed in the leaf), then is cancelled mid-commit. The attempt
+    // installed in the leaf), then is cancelled mid-commit. The transaction
     // cancellation guard asynchronously marks it aborted: the ghost keys were
     // "added" by a transaction that never committed.
     let arrived = pause.arm("/_t/");

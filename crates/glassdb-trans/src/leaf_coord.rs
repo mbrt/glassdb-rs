@@ -14,14 +14,14 @@
 //! The coordinator owns the cross-operation protocol required to combine
 //! heterogeneous mutations safely: transaction identity, oldest-first member
 //! order, per-member in-doubt attribution, routing and capacity admission, and
-//! same-key exclusion for logless publication. Each attempt loads the leaf,
+//! same-key exclusion for direct publication. Each attempt loads the leaf,
 //! builds a mutation plan from the round's installed [`LeafOperation`] resolvers,
 //! and persists staged changes with one CAS after removing vestigial entries.
 //! Recovery reloads the leaf and rebuilds the plan before the coordinator
 //! delivers each member's outcome (ADR-029). Each policy owner packages its
 //! mutation decision and typed result in a `LeafOperation`:
 //! [`Locker`](crate::tlocker::Locker) supplies acquire / write-back / release,
-//! direct commit supplies atomic logless publication, and the splitter supplies
+//! direct commit supplies atomic direct publication, and the splitter supplies
 //! leaf structural-gate acquisition. Cross-leaf strategy stays with the
 //! `Locker`, not in the engine.
 
@@ -112,21 +112,21 @@ pub(crate) enum MemberOutcome {
     /// The submitted leaf no longer covers one of this operation's keys. The
     /// caller must descend again and regroup before retrying.
     Reroute,
-    /// A logless direct commit landed: this transaction's value is published in
-    /// the leaf's version chain, or it was already there (idempotent, ADR-051).
+    /// A direct commit landed: this transaction's value is published inline in
+    /// the leaf, or it was already there (idempotent, ADR-051).
     Landed,
-    /// A logless direct commit lost the race: the entry moved to another writer
-    /// (or the key is now genuinely locked by someone else), so only the regular
-    /// locked protocol can resolve it. Definitively did not land.
+    /// A direct commit lost the race: the entry moved to another writer
+    /// (or the key is now genuinely locked by someone else), so only a locked
+    /// commit can resolve it. Definitively did not land.
     Moved,
-    /// A logless direct commit definitively staged nothing *and* the round
+    /// A direct commit definitively staged nothing *and* the round
     /// certifies it left no durable state anywhere, so its read-modify-write
-    /// body may be reevaluated against the current version under the same id
+    /// body may be reevaluated against the current leaf state under the same id
     /// rather than publishing a holder (ADR-053).
     Replay,
     /// A commit-critical CAS was in-doubt (`Unavailable`) and resolver evaluation
     /// could not prove whether it landed, so the commit may or may not have happened:
-    /// the one irreducible ambiguity, surfaced rather than risking a
+    /// the one irreducible in-doubt case, surfaced rather than risking a
     /// double-apply.
     InDoubt(String),
 }
@@ -184,8 +184,8 @@ pub(crate) struct CoordinatedOutcome {
 }
 
 /// Whether a resolver is evaluated on the first attempt or after a reload.
-/// Reloads can follow a CAS conflict, an uncertain CAS, or a stale transaction
-/// dependency. `in_doubt` records unresolved uncertainty only for this member
+/// Reloads can follow a rejected CAS, an in-doubt CAS, or a stale transaction
+/// dependency. `in_doubt` records an unresolved in-doubt outcome only for this member
 /// from a prior CAS that included its staged changes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReloadCause {
@@ -236,7 +236,7 @@ pub(crate) enum Step {
     },
     /// Propose no changes. Delivery still waits for successful persistence if
     /// another member staged changes, because this outcome can depend on them.
-    /// A logless member that reports `Landed` also protects its existing markers
+    /// A direct-commit member that reports `Landed` also protects its existing markers
     /// from later publishers in this mutation plan.
     Skip { outcome: MemberOutcome },
 }
@@ -282,7 +282,7 @@ pub(crate) trait LeafResolver: Send + Sync {
     /// preserves it. Any other decision certifies that the resolver reconciled
     /// the earlier CAS; in particular, a new stage must already be safe to
     /// apply zero or one additional time. That reconciliation must remain valid
-    /// even if this plan is discarded or its CAS conflicts.
+    /// even if this plan is discarded or its CAS is rejected.
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
@@ -308,8 +308,8 @@ pub(crate) trait LeafResolver: Send + Sync {
     }
 
     /// The outcome delivered when a peer already claimed one of this member's
-    /// [`publication_keys`](LeafResolver::publication_keys) as a logless
-    /// publication this attempt, so this member staged nothing. Distinct
+    /// [`publication_keys`](LeafResolver::publication_keys) as a direct
+    /// publication this round, so this member staged nothing. Distinct
     /// from exhaustion: the peer's claim proves this member staged nothing,
     /// which a spent CAS budget does not, so a resolver may treat it as a
     /// certified loss rather than an unknown one (ADR-053). `in_doubt` still
@@ -329,21 +329,21 @@ pub(crate) trait LeafResolver: Send + Sync {
     }
 
     /// The raw keys whose current committed state this member may replace.
-    /// Once a logless member claims a key, any later publisher intersecting it
+    /// Once a direct-commit member claims a key, any later publisher intersecting it
     /// is excluded as a whole. Lock-only and release-only mutations leave this
     /// empty because they preserve current-state markers.
     fn publication_keys(&self) -> Vec<&[u8]> {
-        self.logless_publication_keys()
+        self.direct_publication_keys()
     }
 
     /// The [`publication_keys`](LeafResolver::publication_keys) this member
-    /// commits loglessly (ADR-051): their leaf state is the commit's only durable
+    /// uses direct commit (ADR-051): their leaf state is the commit's only durable
     /// record, so no later publisher may stage over them in the same CAS. The
     /// coordinator lets at most one member stage per key per round and tells the
     /// rest they did not land. Disjoint keys still share a round. The default is
-    /// empty: a member backed by a transaction object records its commit outside
+    /// empty: a member backed by a transaction record stores its commit outside
     /// the leaf and needs no exclusivity.
-    fn logless_publication_keys(&self) -> Vec<&[u8]> {
+    fn direct_publication_keys(&self) -> Vec<&[u8]> {
         Vec::new()
     }
 }
@@ -569,7 +569,7 @@ impl CasWorker {
         for member in members.values() {
             member.resolver.observe_loaded(&plan.entries);
         }
-        // A logless stage is its commit's only evidence, so another member may
+        // A direct-commit stage is its commit's only evidence, so another member may
         // not overwrite it before the shared CAS (ADR-051).
         let mut protected_markers: BTreeSet<Vec<u8>> = BTreeSet::new();
         for (tx, member) in ordered {
@@ -650,7 +650,7 @@ impl CasWorker {
                             protected_markers.extend(
                                 member
                                     .resolver
-                                    .logless_publication_keys()
+                                    .direct_publication_keys()
                                     .into_iter()
                                     .map(<[u8]>::to_vec),
                             );
@@ -675,7 +675,7 @@ impl CasWorker {
                         protected_markers.extend(
                             member
                                 .resolver
-                                .logless_publication_keys()
+                                .direct_publication_keys()
                                 .into_iter()
                                 .map(<[u8]>::to_vec),
                         );
@@ -798,7 +798,7 @@ impl CasWorker {
                 self.core.hinter.observe_leaf(path, &new_leaf);
                 Ok(PersistResult::Applied(receipt))
             }
-            Ok(CasResult::Conflict) => Ok(PersistResult::PreconditionMiss),
+            Ok(CasResult::Rejected) => Ok(PersistResult::PreconditionMiss),
             Err(StorageError::Unavailable(_)) => {
                 Ok(PersistResult::InDoubt(plan.staged_ids().cloned().collect()))
             }
@@ -829,15 +829,16 @@ impl CasWorker {
         // The members whose changes rode a CAS that came back in-doubt. For them
         // in-doubt is *sticky* across planning retries until their resolver returns a
         // reconciled, non-InDoubt decision: that write may have landed durably
-        // (and been help-forwarded to a peer), so a later precondition-miss must
-        // not downgrade the ambiguity to a definitive loss. Commit-install
+        // (and been help-forwarded to a peer), so a later rejected CAS must
+        // not downgrade the in-doubt outcome to a definitive loss. Commit-install
         // would otherwise misclassify a landed-but-unacked lock as `Moved` and
-        // unsafely discard the outcome and rerun a commit a peer already observed.
+        // unsafely discard the body outcome and replay a commit a peer already
+        // observed.
         //
-        // It is per member rather than per round: a member the uncertain CAS did
-        // not carry — one skipped for a same-key logless claim, or merged into
+        // It is per member rather than per round: a member the in-doubt CAS did
+        // not carry — one skipped for a same-key direct claim, or merged into
         // the batch afterwards — definitively did not land, and inheriting the
-        // batch's ambiguity would strand it in-doubt over a write it never made.
+        // batch's in-doubt outcome would strand it over a write it never made.
         let mut in_doubt: BTreeSet<TxId> = BTreeSet::new();
         // Retain both submitted and resolver-requested bounds across retries.
         // ANY seeds need no preliminary check when a CAS confirms their state.
@@ -883,7 +884,7 @@ impl CasWorker {
             // A round whose every caller has gone away must stop here: nothing
             // consumes its outcomes, and planning again would publish state on
             // behalf of abandoned transactions — including, after a precondition
-            // miss proved the first CAS did not land, a brand-new logless
+            // miss proved the first CAS did not land, a brand-new direct
             // publication over a newer writer.
             let Some(merged) = batch.merged() else {
                 return Ok(());
@@ -909,13 +910,13 @@ impl CasWorker {
                 PersistResult::Applied(receipt) => (loaded_observation, Some(receipt)),
                 PersistResult::Unchanged(observed) => (observed, None),
                 // The CAS did not land, or the clean plan's loaded state
-                // changed. Neither resolves an earlier uncertain mutation.
+                // changed. Neither resolves an earlier in-doubt mutation.
                 PersistResult::PreconditionMiss => {
                     reloaded = true;
                     continue;
                 }
                 // Rebuilding the plan from a reloaded leaf is idempotent. Only the
-                // members this uncertain CAS actually carried inherit its doubt.
+                // members this in-doubt CAS actually carried inherit its doubt.
                 PersistResult::InDoubt(staged_ids) => {
                     in_doubt.extend(staged_ids);
                     reloaded = true;
@@ -2557,12 +2558,12 @@ mod tests {
         );
     }
 
-    // ADR-051: a logless commit's staged entry is the only record that it ran, so
+    // ADR-051: a direct commit's staged entry is the only record that it ran, so
     // a second one on the same key must not stage in the same CAS — it would
-    // erase the first's evidence inside one uncertain write. The loser is told it
-    // did not land and takes the logged protocol instead.
+    // erase the first's evidence inside one in-doubt write. The loser is told it
+    // did not land and takes a locked commit instead.
     #[tokio::test(start_paused = true)]
-    async fn one_logless_commit_per_key_stages_per_round() {
+    async fn one_direct_commit_per_key_stages_per_round() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (backend, gate) = Gate::wrap(mem);
         let backend = backend as Arc<dyn Backend>;
@@ -2578,7 +2579,7 @@ mod tests {
             c1.submit_leaf(
                 &leaf(),
                 &t1,
-                Arc::new(StageInline::logless(b"k", &t1, b"first")),
+                Arc::new(StageInline::direct(b"k", &t1, b"first")),
                 Requirement::ANY,
             )
             .await
@@ -2589,7 +2590,7 @@ mod tests {
             c2.submit_leaf(
                 &leaf(),
                 &t2,
-                Arc::new(StageInline::logless(b"k", &t2, b"second")),
+                Arc::new(StageInline::direct(b"k", &t2, b"second")),
                 Requirement::ANY,
             )
             .await
@@ -2625,21 +2626,21 @@ mod tests {
         );
     }
 
-    // A logless direct-commit-shaped resolver (ADR-051): the entry it stages is
+    // A direct-commit-shaped resolver (ADR-051): the entry it stages is
     // the only record of its commit, so it claims its key for the round and
     // classifies an unfinished round the way `DirectCommitOperation` does — the
-    // ambiguity is irreducible only if its own stage rode a CAS that may have
+    // outcome stays in doubt only if its own stage rode a CAS that may have
     // landed. `replayable` models a read-modify-write, whose certified losses are
     // `Replay` rather than `Moved` (ADR-053), and makes exclusion observably
     // distinct from exhaustion.
-    struct LoglessCommitProbe {
+    struct DirectCommitProbe {
         key: Vec<u8>,
         tx: TxId,
         value: Arc<[u8]>,
         replayable: bool,
     }
 
-    impl LoglessCommitProbe {
+    impl DirectCommitProbe {
         fn new(key: &[u8], tx: &TxId, value: &[u8]) -> Self {
             Self {
                 key: key.to_vec(),
@@ -2658,7 +2659,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl LeafResolver for LoglessCommitProbe {
+    impl LeafResolver for DirectCommitProbe {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
@@ -2683,14 +2684,14 @@ mod tests {
 
         fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome {
             if in_doubt {
-                return MemberOutcome::InDoubt("logless commit after an uncertain CAS".into());
+                return MemberOutcome::InDoubt("direct commit after an in-doubt CAS".into());
             }
             MemberOutcome::Moved
         }
 
         fn excluded_outcome(&self, in_doubt: bool) -> MemberOutcome {
             if in_doubt {
-                return MemberOutcome::InDoubt("logless commit after an uncertain CAS".into());
+                return MemberOutcome::InDoubt("direct commit after an in-doubt CAS".into());
             }
             if self.replayable {
                 return MemberOutcome::Replay;
@@ -2702,7 +2703,7 @@ mod tests {
             vec![self.key.as_slice()]
         }
 
-        fn logless_publication_keys(&self) -> Vec<&[u8]> {
+        fn direct_publication_keys(&self) -> Vec<&[u8]> {
             vec![self.key.as_slice()]
         }
     }
@@ -2710,7 +2711,7 @@ mod tests {
     struct MultiPublisherProbe {
         keys: Vec<Vec<u8>>,
         tx: TxId,
-        logless: bool,
+        direct: bool,
         already_landed: bool,
     }
 
@@ -2719,7 +2720,7 @@ mod tests {
             Self {
                 keys: keys.iter().map(|key| key.to_vec()).collect(),
                 tx: tx.clone(),
-                logless: true,
+                direct: true,
                 already_landed: false,
             }
         }
@@ -2728,7 +2729,7 @@ mod tests {
             Self {
                 keys: keys.iter().map(|key| key.to_vec()).collect(),
                 tx: tx.clone(),
-                logless: false,
+                direct: false,
                 already_landed: false,
             }
         }
@@ -2778,9 +2779,9 @@ mod tests {
         }
 
         fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome {
-            if in_doubt && self.logless {
-                MemberOutcome::InDoubt("multi-key logless probe is uncertain".into())
-            } else if self.logless {
+            if in_doubt && self.direct {
+                MemberOutcome::InDoubt("multi-key direct probe is in doubt".into())
+            } else if self.direct {
                 MemberOutcome::Moved
             } else {
                 MemberOutcome::Reroute
@@ -2791,8 +2792,8 @@ mod tests {
             self.keys.iter().map(Vec::as_slice).collect()
         }
 
-        fn logless_publication_keys(&self) -> Vec<&[u8]> {
-            if self.logless {
+        fn direct_publication_keys(&self) -> Vec<&[u8]> {
+            if self.direct {
                 self.keys.iter().map(Vec::as_slice).collect()
             } else {
                 Vec::new()
@@ -2873,7 +2874,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn disjoint_multi_key_logless_members_share_one_cas() {
+    async fn disjoint_multi_key_direct_members_share_one_cas() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (backend, gate) = Gate::wrap(mem);
         let backend = backend as Arc<dyn Backend>;
@@ -2926,7 +2927,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn observed_logless_marker_protects_later_publishers() {
+    async fn observed_direct_marker_protects_later_publishers() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (backend, gate) = Gate::wrap(mem);
         let backend = backend as Arc<dyn Backend>;
@@ -3029,7 +3030,7 @@ mod tests {
     }
 
     // A member that never stages, but exposes whether the coordinator attributed
-    // an earlier uncertain CAS to it through its final outcome.
+    // an earlier in-doubt CAS to it through its final outcome.
     struct SkipCauseProbe;
 
     #[async_trait::async_trait]
@@ -3042,7 +3043,7 @@ mod tests {
         ) -> Result<Step, TransError> {
             let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true });
             let outcome = if in_doubt {
-                MemberOutcome::InDoubt("uncertain CAS attributed to skipped member".into())
+                MemberOutcome::InDoubt("in-doubt CAS attributed to skipped member".into())
             } else {
                 MemberOutcome::Moved
             };
@@ -3055,19 +3056,19 @@ mod tests {
 
         fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome {
             if in_doubt {
-                MemberOutcome::InDoubt("uncertain CAS attributed to skipped member".into())
+                MemberOutcome::InDoubt("in-doubt CAS attributed to skipped member".into())
             } else {
                 MemberOutcome::Moved
             }
         }
     }
 
-    // Regression: an uncertain CAS clouds the members it carried, not the whole
-    // batch. Two logless commits on one key share a round, where the second is
+    // Regression: an in-doubt CAS clouds the members it carried, not the whole
+    // batch. Two direct commits on one key share a round, where the second is
     // deliberately skipped; when the first's CAS comes back in-doubt and the
     // round retries, that skipped member must still learn it definitively did
-    // not land. Inheriting the batch's ambiguity would surface an unresolvable
-    // in-doubt for a write it never issued.
+    // not land. Inheriting the batch's in-doubt outcome would surface an
+    // unresolvable in-doubt error for a write it never issued.
     #[tokio::test(start_paused = true)]
     async fn a_skipped_member_does_not_inherit_the_rounds_in_doubt() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -3086,7 +3087,7 @@ mod tests {
             c1.submit_leaf(
                 &leaf(),
                 &t1,
-                Arc::new(LoglessCommitProbe::new(b"k", &t1, b"first")),
+                Arc::new(DirectCommitProbe::new(b"k", &t1, b"first")),
                 Requirement::ANY,
             )
             .await
@@ -3097,7 +3098,7 @@ mod tests {
             c2.submit_leaf(
                 &leaf(),
                 &t2,
-                Arc::new(LoglessCommitProbe::new(b"k", &t2, b"second")),
+                Arc::new(DirectCommitProbe::new(b"k", &t2, b"second")),
                 Requirement::ANY,
             )
             .await
@@ -3136,7 +3137,7 @@ mod tests {
     // learns a *replayable* loss where an exhausted round would only tell it the
     // entry moved.
     #[tokio::test(start_paused = true)]
-    async fn an_excluded_logless_member_learns_a_replayable_loss() {
+    async fn an_excluded_direct_member_learns_a_replayable_loss() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (backend, gate) = Gate::wrap(mem);
         let (coord, _nodes, _timeline, _bg) = coord_over(backend as Arc<dyn Backend>).await;
@@ -3149,7 +3150,7 @@ mod tests {
             c1.submit_leaf(
                 &leaf(),
                 &t1,
-                Arc::new(LoglessCommitProbe::replayable(b"k", &t1, b"first")),
+                Arc::new(DirectCommitProbe::replayable(b"k", &t1, b"first")),
                 Requirement::ANY,
             )
             .await
@@ -3160,7 +3161,7 @@ mod tests {
             c2.submit_leaf(
                 &leaf(),
                 &t2,
-                Arc::new(LoglessCommitProbe::replayable(b"k", &t2, b"second")),
+                Arc::new(DirectCommitProbe::replayable(b"k", &t2, b"second")),
                 Requirement::ANY,
             )
             .await
@@ -3209,7 +3210,7 @@ mod tests {
             c1.submit_leaf(
                 &leaf(),
                 &t1,
-                Arc::new(LoglessCommitProbe::replayable(b"k", &t1, b"first")),
+                Arc::new(DirectCommitProbe::replayable(b"k", &t1, b"first")),
                 Requirement::ANY,
             )
             .await
@@ -3220,7 +3221,7 @@ mod tests {
             c2.submit_leaf(
                 &leaf(),
                 &t2,
-                Arc::new(LoglessCommitProbe::replayable(b"k", &t2, b"second")),
+                Arc::new(DirectCommitProbe::replayable(b"k", &t2, b"second")),
                 Requirement::ANY,
             )
             .await
@@ -3426,7 +3427,7 @@ mod tests {
         );
     }
 
-    // Publishes `key`'s current value as a logless commit marker (ADR-051).
+    // Publishes `key`'s current value as a direct commit marker (ADR-051).
     struct StageInline {
         key: Vec<u8>,
         tx: TxId,
@@ -3434,7 +3435,7 @@ mod tests {
     }
 
     impl StageInline {
-        fn logless(key: &[u8], tx: &TxId, value: &[u8]) -> Self {
+        fn direct(key: &[u8], tx: &TxId, value: &[u8]) -> Self {
             Self {
                 key: key.to_vec(),
                 tx: tx.clone(),
@@ -3474,7 +3475,7 @@ mod tests {
             MemberOutcome::Conflict
         }
 
-        fn logless_publication_keys(&self) -> Vec<&[u8]> {
+        fn direct_publication_keys(&self) -> Vec<&[u8]> {
             vec![self.key.as_slice()]
         }
     }
@@ -3501,10 +3502,10 @@ mod tests {
             .unwrap()
     }
 
-    // A logless commit's leaf entry is the value's only copy, so an over-cap
+    // A direct commit's leaf entry is the value's only copy, so an over-cap
     // stage must be rejected rather than silently losing the value.
     #[tokio::test]
-    async fn an_oversized_logless_inline_payload_is_rejected() {
+    async fn an_oversized_direct_inline_payload_is_rejected() {
         let tx = TxId::with_priority(1, b"t");
         let value = b"a-value-that-does-not-fit";
         let policy = policy_rejecting_inline(b"k", &tx, value);
@@ -3516,7 +3517,7 @@ mod tests {
             .submit_leaf(
                 &leaf(),
                 &tx,
-                Arc::new(StageInline::logless(b"k", &tx, value)),
+                Arc::new(StageInline::direct(b"k", &tx, value)),
                 Requirement::ANY,
             )
             .await
@@ -3538,9 +3539,9 @@ mod tests {
     // An inline entry may fit the physical object while still consuming more
     // than its half of the content budget. Publishing it would let a later
     // accepted key strand this leaf as an unsplittable singleton, so the direct
-    // attempt must fall back without issuing a futile split hint.
+    // commit must fall back without issuing a futile split hint.
     #[tokio::test]
-    async fn a_logless_inline_entry_must_preserve_the_split_budget() {
+    async fn a_direct_inline_entry_must_preserve_the_split_budget() {
         let tx = TxId::with_priority(1, b"t");
         let value = b"inline";
         let inline = LeafEntry::new(b"k").with_current(CurrentState::Inline {
@@ -3573,7 +3574,7 @@ mod tests {
             .submit_leaf(
                 &leaf(),
                 &tx,
-                Arc::new(StageInline::logless(b"k", &tx, value)),
+                Arc::new(StageInline::direct(b"k", &tx, value)),
                 Requirement::ANY,
             )
             .await
@@ -3648,9 +3649,9 @@ mod tests {
     }
 
     // An unresolved member must decline to propose a replacement stage. Its
-    // uncertainty belongs only to the member carried by the failed CAS;
-    // clouding a co-batched member that never staged would manufacture
-    // ambiguity for a write it never issued.
+    // in-doubt outcome belongs only to the member carried by the failed CAS;
+    // clouding a co-batched member that never staged would put a write it
+    // never issued in doubt.
     #[tokio::test(start_paused = true)]
     async fn unreconciled_member_does_not_restage_after_in_doubt() {
         let tx = TxId::with_priority(1, b"t");
@@ -3870,7 +3871,7 @@ mod tests {
     }
 
     // A commit-shaped resolver that stages once, then refuses to restage until
-    // its uncertain CAS can be reconciled. Records the later evaluation's cause so
+    // its in-doubt CAS can be reconciled. Records the later evaluation's cause so
     // tests can pin the coordinator's sticky attribution.
     struct StickyCommitProbe {
         key: Vec<u8>,
@@ -3925,15 +3926,15 @@ mod tests {
         }
     }
 
-    // Regression (logless commit double-apply): once any CAS in a round comes
+    // Regression (direct commit double-apply): once any CAS in a round comes
     // back in-doubt, its write may have landed durably and been help-forwarded to
     // a peer, so the in-doubt classification must stay *sticky* across a later
-    // precondition-miss. Otherwise a commit that landed-but-unacked and was then
+    // rejected CAS. Otherwise a commit that landed-but-unacked and was then
     // superseded is misclassified `Moved`, and its caller executes a
     // non-idempotent transaction body again after a peer observed its write.
     // This breaks the `final <= started` serializability bound.
     //
-    // This pins the coordinator half of the fix in isolation: the uncertain
+    // This pins the coordinator half of the fix in isolation: the in-doubt
     // member declines to restage while an idempotent peer drives the later CAS.
     // The *end-to-end* manifestation (a real commit being interrupted and
     // double-applying under the true 3-way co-batched interleaving) is covered
@@ -3942,9 +3943,9 @@ mod tests {
     // (`crates/glassdb/tests/fuzz_corpus.rs`) replays through the sim scheduler.
     // That interleaving cannot be forced by the plain-tokio in-doubt harness
     // (`crates/glassdb/tests/in_doubt.rs`), whose 2-step lost-ack→moved case
-    // classifies in-doubt without ever hitting the resetting precondition-miss.
+    // classifies in-doubt without ever hitting the resetting rejected CAS.
     #[tokio::test(start_paused = true)]
-    async fn in_doubt_cas_stays_in_doubt_across_a_later_precondition_miss() {
+    async fn in_doubt_cas_stays_in_doubt_across_a_later_rejected_cas() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         // The leaf must exist so the round's CAS is a `write_if` (the faulted op),
         // not a create.
@@ -4004,7 +4005,7 @@ mod tests {
         assert_eq!(
             *seen_in_doubt.lock().unwrap(),
             Some(true),
-            "the precondition-miss after an in-doubt CAS must keep the cause in-doubt"
+            "the rejected CAS after an in-doubt CAS must keep the cause in-doubt"
         );
         assert!(
             matches!(
@@ -4111,19 +4112,19 @@ mod tests {
         let backend: Arc<dyn Backend> = in_doubt_then_miss_forever(gated as Arc<dyn Backend>);
         let (coord, _nodes, _timeline, _bg) = coord_over_fast(backend).await;
 
-        let uncertain = TxId::with_priority(2, b"uncertain");
+        let in_doubt = TxId::with_priority(2, b"in-doubt");
         let retrying = TxId::with_priority(3, b"retrying");
         let seen_in_doubt = Arc::new(Mutex::new(None));
         gate.arm();
         let (driver_coord, driver_tx, driver_seen) =
-            (coord.clone(), uncertain.clone(), seen_in_doubt.clone());
+            (coord.clone(), in_doubt.clone(), seen_in_doubt.clone());
         let driver = tokio::spawn(async move {
             driver_coord
                 .submit_leaf(
                     &leaf(),
                     &driver_tx,
                     Arc::new(StickyCommitProbe {
-                        key: b"uncertain".to_vec(),
+                        key: b"in-doubt".to_vec(),
                         tx: driver_tx.clone(),
                         evaluations: std::sync::atomic::AtomicUsize::new(0),
                         seen_in_doubt: driver_seen,
@@ -4163,7 +4164,7 @@ mod tests {
                     ..
                 })
             ),
-            "exhaustion after an in-doubt CAS must preserve uncertainty"
+            "exhaustion after an in-doubt CAS must stay in doubt"
         );
         assert!(matches!(
             retrying_outcome,

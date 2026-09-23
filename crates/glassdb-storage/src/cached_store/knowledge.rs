@@ -53,7 +53,7 @@ pub(super) struct FetchResult {
     evidence: Evidence,
 }
 
-/// Present knowledge retained for a version-conditional backend read.
+/// Present knowledge retained for a revision-conditional backend read.
 #[derive(Clone)]
 pub(super) struct PresentSeed {
     value: ErasedValue,

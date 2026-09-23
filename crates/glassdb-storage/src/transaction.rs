@@ -1,12 +1,12 @@
-//! Transaction-log data shared by persistence and transaction processing.
+//! Transaction-record data shared by persistence and transaction processing.
 
 mod codec;
 mod model;
 mod store;
 
-pub(crate) use codec::TxLogCodec;
+pub(crate) use codec::TxRecordCodec;
 pub use model::{
-    TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLifecycleRelation, TxLock, TxLog,
+    TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLifecycleRelation, TxLock, TxRecord,
     TxRecordState, TxWrite,
 };
-pub use store::{TLogger, TxListPage, TxStatus};
+pub use store::{TxListPage, TxRecordStore, TxStatus};

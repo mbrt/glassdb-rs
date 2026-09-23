@@ -9,7 +9,7 @@
 //! proves the schedule itself replayed deterministically.
 //!
 //! Each record captures the method tag and a canonical encoding of every
-//! argument that crosses the boundary (path, value, and expected version). The
+//! argument that crosses the boundary (path, value, and expected revision). The
 //! recording order is the call-issue order; under a deterministic schedule that
 //! order is itself deterministic, which is exactly the property under test.
 
@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
+use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Revision};
 
 /// A single recorded backend operation: the method tag, the primary path, and a
 /// canonical encoding of the remaining arguments.
@@ -29,7 +29,7 @@ pub struct OpRecord {
     /// The object (or directory) path the call targeted.
     pub path: String,
     /// Canonical little-endian, length-prefixed encoding of the remaining
-    /// arguments (value, expected version), in the order they appear in the
+    /// arguments (value, expected revision), in the order they appear in the
     /// method signature.
     pub args: Vec<u8>,
 }
@@ -55,7 +55,7 @@ fn enc_bytes(buf: &mut Vec<u8>, b: &[u8]) {
     buf.extend_from_slice(b);
 }
 
-fn enc_version(buf: &mut Vec<u8>, v: &Version) {
+fn enc_revision(buf: &mut Vec<u8>, v: &Revision) {
     enc_bytes(buf, v.token.as_bytes());
 }
 
@@ -116,10 +116,10 @@ impl Backend for RecordingBackend {
     async fn read_if_modified(
         &self,
         path: &str,
-        expected: &Version,
+        expected: &Revision,
     ) -> Result<ReadReply, BackendError> {
         let mut args = Vec::new();
-        enc_version(&mut args, expected);
+        enc_revision(&mut args, expected);
         self.record("read_if_modified", path, args);
         self.inner.read_if_modified(path, expected).await
     }
@@ -128,11 +128,11 @@ impl Backend for RecordingBackend {
         &self,
         path: &str,
         value: Vec<u8>,
-        expected: &Version,
-    ) -> Result<Version, BackendError> {
+        expected: &Revision,
+    ) -> Result<Revision, BackendError> {
         let mut args = Vec::new();
         enc_bytes(&mut args, &value);
-        enc_version(&mut args, expected);
+        enc_revision(&mut args, expected);
         self.record("write_if", path, args);
         self.inner.write_if(path, value, expected).await
     }
@@ -141,16 +141,16 @@ impl Backend for RecordingBackend {
         &self,
         path: &str,
         value: Vec<u8>,
-    ) -> Result<Version, BackendError> {
+    ) -> Result<Revision, BackendError> {
         let mut args = Vec::new();
         enc_bytes(&mut args, &value);
         self.record("write_if_not_exists", path, args);
         self.inner.write_if_not_exists(path, value).await
     }
 
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Revision) -> Result<(), BackendError> {
         let mut args = Vec::new();
-        enc_version(&mut args, expected);
+        enc_revision(&mut args, expected);
         self.record("delete_if", path, args);
         self.inner.delete_if(path, expected).await
     }
@@ -222,9 +222,9 @@ mod tests {
         // The create encoded its value into args; a plain read carries none.
         assert!(!recorded[0].args.is_empty());
         assert!(recorded[1].args.is_empty());
-        // read_if_modified encoded the expected version.
+        // read_if_modified encoded the expected revision.
         assert!(!recorded[2].args.is_empty());
-        // delete_if also encoded the expected version.
+        // delete_if also encoded the expected revision.
         assert!(!recorded[3].args.is_empty());
         // list records the absent cursor and positive page limit.
         assert!(!recorded[4].args.is_empty());

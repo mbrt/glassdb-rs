@@ -20,7 +20,7 @@
 //! - [`HistoryWorkload`] checks complete point/group-read, write, and
 //!   membership-scan and shared collection histories against an
 //!   implementation-independent sequential specification. Its clients continue
-//!   after admissible public errors while retaining uncertain outcomes.
+//!   after admissible public errors while retaining in-doubt outcomes.
 
 mod api;
 mod cycle;

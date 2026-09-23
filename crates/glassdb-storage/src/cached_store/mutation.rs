@@ -12,29 +12,27 @@ use crate::timeline::SequencePoint;
 
 /// The knowledge transition implied by a completed backend mutation call.
 pub(super) enum MutationOutcome<T> {
-    Success {
+    Applied {
         value: T,
         current_at: Option<SequencePoint>,
     },
-    Conflict,
+    Rejected,
     DefiniteFailure(StorageError),
-    Uncertain(StorageError),
+    InDoubt(StorageError),
 }
 
 impl<T> MutationOutcome<T> {
-    pub(super) fn success(value: T, current_at: Option<SequencePoint>) -> Self {
-        Self::Success { value, current_at }
+    pub(super) fn applied(value: T, current_at: Option<SequencePoint>) -> Self {
+        Self::Applied { value, current_at }
     }
 
-    pub(super) fn conflict() -> Self {
-        Self::Conflict
+    pub(super) fn rejected() -> Self {
+        Self::Rejected
     }
 
     pub(super) fn failed(error: BackendError) -> Self {
         match error {
-            BackendError::Unavailable(message) => {
-                Self::Uncertain(StorageError::Unavailable(message))
-            }
+            BackendError::Unavailable(message) => Self::InDoubt(StorageError::Unavailable(message)),
             error => Self::DefiniteFailure(error.into()),
         }
     }
@@ -78,7 +76,7 @@ impl MutationRound {
         apply_success: impl FnOnce(T) -> R,
     ) -> Result<Option<R>, StorageError> {
         match outcome {
-            MutationOutcome::Success { value, current_at } => {
+            MutationOutcome::Applied { value, current_at } => {
                 self.begin_path_change();
                 let result = apply_success(value);
                 if let Some(current_at) = current_at {
@@ -88,7 +86,7 @@ impl MutationRound {
                 self.complete();
                 Ok(Some(result))
             }
-            MutationOutcome::Conflict => {
+            MutationOutcome::Rejected => {
                 self.begin_path_change();
                 self.knowledge
                     .invalidate_expected(&self.path, &self.expected);
@@ -100,7 +98,7 @@ impl MutationRound {
                 self.complete();
                 Err(error)
             }
-            MutationOutcome::Uncertain(error) => {
+            MutationOutcome::InDoubt(error) => {
                 self.begin_path_change();
                 self.knowledge.invalidate(&self.path);
                 self.invalidate_l2();

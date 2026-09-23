@@ -9,7 +9,7 @@ use glassdb_concurr::{Background, DedupKeySnapshot, RetryConfig};
 use glassdb_data::{
     CollectionAddress, CollectionId, DatabaseId, DbRoot, LogicalKey, ObjectPath, TxId,
 };
-use glassdb_storage::transaction::TLogger;
+use glassdb_storage::transaction::TxRecordStore;
 use glassdb_storage::{
     CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, LeafBody, Node,
     NodeStore, PersistentCache, PersistentCacheConfig, PersistentCacheMedia, Requirement,
@@ -136,11 +136,12 @@ impl Default for EngineConfig {
     }
 }
 
-/// An opaque transaction attempt owned by [`Engine`].
+/// An opaque transaction handle owned by [`Engine`]. It lives across all body
+/// replays and identity renewals of one transaction.
 pub struct EngineTransaction(Handle);
 
 impl EngineTransaction {
-    /// Returns the attempt's transaction identity.
+    /// Returns the current transaction identity.
     pub fn id(&self) -> &TxId {
         self.0.id()
     }
@@ -163,7 +164,7 @@ pub struct EngineStats {
     pub locker: LockerStats,
     /// Shared leaf-coordinator activity.
     pub coordinator: LeafCoordinatorStats,
-    /// Logless direct-commit coverage.
+    /// Direct-commit coverage.
     pub direct_commit: DirectCommitStats,
     /// Background tree-split activity.
     pub splitter: SplitterStats,
@@ -256,7 +257,7 @@ impl Engine {
         self.collection_catalog.snapshot(parent).await
     }
 
-    /// Starts a transaction attempt from its collected logical accesses.
+    /// Starts a transaction from its collected logical accesses.
     pub fn begin_transaction(
         &self,
         accesses: AccessSet,
@@ -265,7 +266,7 @@ impl Engine {
         EngineTransaction(self.algo.begin(accesses, catalog_accesses))
     }
 
-    /// Replaces the logical accesses of an uncommitted transaction attempt.
+    /// Replaces the logical accesses of an uncommitted transaction.
     pub fn reset_transaction(
         &self,
         tx: &mut EngineTransaction,
@@ -284,12 +285,12 @@ impl Engine {
         self.algo.validate_reads(&mut tx.0).await
     }
 
-    /// Commits an attempt or reports that the body must run again.
+    /// Commits a transaction or reports that the body must run again.
     pub async fn commit(&self, tx: &mut EngineTransaction) -> Result<BodyDecision, TransError> {
         self.algo.commit(&mut tx.0).await
     }
 
-    /// Finalizes a transaction attempt, aborting it when necessary.
+    /// Finalizes a transaction, aborting its current identity when necessary.
     pub async fn end(&self, tx: &mut EngineTransaction) -> Result<(), TransError> {
         self.algo.end(&mut tx.0).await
     }
@@ -372,7 +373,7 @@ struct AssemblyFoundation {
     nodes: NodeStore,
     structural_intents: StructuralIntentStore,
     timeline: Timeline,
-    tlogger: TLogger,
+    tx_records: TxRecordStore,
     background: Arc<Background>,
     monitor: Monitor,
 }
@@ -391,10 +392,10 @@ impl AssemblyFoundation {
         let records = CollectionStore::new(objects.clone());
         let nodes = NodeStore::new(objects.clone(), config.transaction_leaf_parallelism);
         let structural_intents = StructuralIntentStore::new(objects.clone());
-        let tlogger = TLogger::new(objects.clone(), db_root);
+        let tx_records = TxRecordStore::new(objects.clone(), db_root);
         let background = Arc::new(Background::new());
         let monitor = Monitor::with_config(
-            tlogger.clone(),
+            tx_records.clone(),
             timeline.clone(),
             Arc::downgrade(&background),
             config.retry,
@@ -407,7 +408,7 @@ impl AssemblyFoundation {
             nodes,
             structural_intents,
             timeline,
-            tlogger,
+            tx_records,
             background,
             monitor,
         }
@@ -424,7 +425,7 @@ pub(crate) struct AssemblyFixture {
     pub(crate) nodes: NodeStore,
     pub(crate) structural_intents: StructuralIntentStore,
     pub(crate) timeline: Timeline,
-    pub(crate) tlogger: TLogger,
+    pub(crate) tx_records: TxRecordStore,
     pub(crate) background: Arc<Background>,
     pub(crate) monitor: Monitor,
 }
@@ -446,7 +447,7 @@ impl AssemblyFixture {
             nodes: foundation.nodes.clone(),
             structural_intents: foundation.structural_intents.clone(),
             timeline: foundation.timeline.clone(),
-            tlogger: foundation.tlogger.clone(),
+            tx_records: foundation.tx_records.clone(),
             background: foundation.background.clone(),
             monitor: foundation.monitor.clone(),
             foundation,
@@ -461,7 +462,7 @@ impl AssemblyFixture {
         protocol_timing: ProtocolTiming,
     ) -> Monitor {
         Monitor::with_config(
-            self.tlogger.clone(),
+            self.tx_records.clone(),
             self.timeline.clone(),
             Arc::downgrade(background),
             retry,
@@ -532,14 +533,14 @@ impl DormantEngine {
             nodes,
             structural_intents,
             timeline,
-            tlogger,
+            tx_records,
             background,
             monitor,
         } = foundation;
         let background_weak = Arc::downgrade(&background);
         let collection_state = CollectionStateResolver::new(
             records.clone(),
-            tlogger.clone(),
+            tx_records.clone(),
             timeline.clone(),
             monitor.clone(),
             retry,
@@ -584,7 +585,7 @@ impl DormantEngine {
             Arc::new(splitter.clone()),
         );
         let gc = Gc::new(
-            tlogger.clone(),
+            tx_records.clone(),
             nodes.clone(),
             structural_intents,
             timeline.clone(),

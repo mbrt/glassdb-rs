@@ -38,9 +38,9 @@ codec is an internal error. Cached values are immutable and shared, so a caller
 clones a value before modifying and submitting it.
 
 The cache holds physical objects such as collection records, tree nodes,
-transaction objects, and structural intents. It does not maintain a separate
+transaction records, and structural intents. It does not maintain a separate
 materialized key-value cache. Higher layers derive a logical key value from its
-cached leaf and, when necessary, its writer's cached transaction object.
+cached leaf and, when necessary, its writer's cached transaction record.
 
 The optional L2 stores exact encoded present bodies, opaque revisions, and
 their existing currentness points. It is best-effort: an unavailable, corrupt,
@@ -55,18 +55,18 @@ For a physical path, the discoverable cache state is one of:
 | --- | --- |
 | Present | A decoded value, its opaque backend CAS revision, and evidence about when that state was current. |
 | Absent | Definitive evidence that the object did not exist. |
-| No entry | No usable knowledge; the path is uncached or uncertain. |
+| No entry | No usable knowledge; the path is uncached or in doubt. |
 
 Absence is a real negative cache entry. Uncertainty is deliberately not an
 entry variant: there is nothing an ordinary lookup can accidentally return. A
-conflict, an indeterminate mutation, or an undecodable changed object can
+conflict, an in-doubt mutation, or an undecodable changed object can
 remove discoverable knowledge without inventing a replacement.
 
-A revision wraps the backend's opaque content-CAS token. Higher layers can
+A revision wraps the backend's opaque content revision. Higher layers can
 retain and compare it or pass it back to a conditional operation, but cannot
 interpret or manufacture it. Revisions identify semantic content state rather
 than an observable history of rewrites; equivalent contents may therefore
-reuse a token.
+reuse a revision.
 
 ## Sequence points and currentness
 
@@ -105,12 +105,12 @@ A read states the minimum evidence it needs as a freshness requirement:
 
 `ANY` deliberately permits stale data. It is useful for optimistic transaction
 execution and idempotent CAS loops, where a stale starting point can only fail
-validation or lose its precondition. A known-obsolete or uncertain state is no
+validation or lose its precondition. A known-obsolete or in-doubt state is no
 longer discoverable, so even `ANY` cannot return it.
 
 `after(barrier)` and `within(...)` first try the cache. If the entry's evidence is
 too old, `CachedStore` checks the backend. A present state uses a
-version-conditional read: an unchanged response reuses the decoded body and
+revision-conditional read: an unchanged response reuses the decoded body and
 advances its evidence, a changed response transfers and decodes the new body,
 and a definitive absence installs confirmed absence. An absent state has no
 conditional revision, so validating it requires an ordinary read.
@@ -217,7 +217,7 @@ coordination prevents older backend reads from replacing that state afterward.
 A later cached state without the holder therefore means the holder has already
 been resolved, and a stale state containing the holder loses its write-back CAS.
 This is not a recovery interface for another instance's locks, and its result
-does not authorize deletion of the transaction object: GC checks references with
+does not authorize deletion of the transaction record: GC checks references with
 its own barrier.
 
 ## Observations
@@ -337,7 +337,7 @@ state advances the original observation, and a changed state requires a reload
 and a new plan. Do not return an old decision with evidence for a different
 state. A leaf CAS cannot repair dependent reads made with a weaker requirement.
 Resolvers may retain only facts that remain valid when a plan is discarded;
-this also applies to reconciliation of an earlier uncertain CAS. An exact
+this also applies to reconciliation of an earlier in-doubt CAS. An exact
 historical own marker can prove that a mutation landed; a staged proposal cannot.
 
 Acquisition still uses the validation barrier to find current scan coverage and
@@ -376,10 +376,10 @@ Mutation outcomes are reconciled conservatively while holding the lane:
 - Success publishes the exact installed state before returning.
 - A clean precondition conflict invalidates only matching expected knowledge;
   it cannot erase a different state already known locally.
-- An unavailable result after dispatch makes the whole path uncertain, because
+- An unavailable result after dispatch makes the whole path in doubt, because
   the mutation may or may not have landed.
 - Cancellation, panic, or task failure after mutation dispatch follows the
-  same uncertain transition before releasing the lane.
+  same in-doubt transition before releasing the lane.
 - Cancellation before dispatch has no cache effect.
 
 Read cancellation needs no invalidation because a read cannot mutate backend
@@ -428,7 +428,7 @@ real-time edge rather than invocation or response order alone.
 
 Same-state validation merges evidence with a maximum, while a different state
 replaces discoverable knowledge. A conflict removes only the exact state it
-proved obsolete. An indeterminate or cancelled mutation removes usable
+proved obsolete. An in-doubt or cancelled mutation removes usable
 knowledge instead of choosing between the old and proposed states. Thus the
 cache either exposes a state supported by a definitive operation or exposes no
 state at all.
@@ -441,11 +441,11 @@ order local publication; the backend remains the global authority.
 ### 4. Transactions validate speculative cache use
 
 `ANY` is not itself a strong read. Transaction execution may use it because the
-body is retryable and retains the physical observations on which it depended.
+body is replayable and retains the physical observations on which it depended.
 After the body, validation captures one currentness barrier and checks those
 dependencies against it. If a state changed, the higher-level resolver compares
-its logical writer or membership evidence and the transaction retries when its
-result was invalidated.
+its logical writer or membership evidence and the transaction replays the body
+when its result was invalidated.
 
 Point validation batches this work by physical leaf path: it checks exact
 retained leaf observations first, and resolves the complete logical point-read
@@ -491,9 +491,9 @@ completion, because the identity cannot acquire the holder again.
 
 Committed directory write-back keeps its two phases in order. GC first attempts
 write-back with `ANY`, so directory progress survives a live entry that keeps the
-log, and completes the remaining directories under its post-eligibility bound
+record, and completes the remaining directories under its post-eligibility bound
 only after the live-entry early return. Moving the bounded phase earlier would
-add directory reads on every repeated check of a log that still stores live
+add directory reads on every repeated check of a record that still stores live
 values.
 
 Discovery listings follow the same shape: a present cached body is an acceptable
@@ -519,7 +519,7 @@ create more intents.
   the barrier; it does not promise that state remains current at return.
 - Sequence points are local causal evidence, not portable timestamps.
 - The generic cache does not infer object-specific facts. For example, the
-  transaction-object store may cache finalized transactions indefinitely only
+  transaction-record store may cache finalized transactions indefinitely only
   because that type separately guarantees immutability.
 - Listing is an uncached pass-through. Each page is strongly observed as one
   backend request, but a multi-page listing is not a snapshot.

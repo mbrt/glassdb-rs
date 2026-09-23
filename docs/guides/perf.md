@@ -12,8 +12,8 @@ include a reference to the commit or ADR that introduced the change.
 [ADR-064](../adr/064-bounded-parallel-point-leaf-work.md) runs independent
 point-access work on distinct leaves with a transaction-local limit of 16.
 [ADR-065](../adr/065-renewed-transaction-identity-on-serial-fallback.md) gives a
-new transaction identity to an attempt that changes from parallel to sorted
-serial lock acquisition.
+renewed transaction identity when lock acquisition changes from parallel to
+sorted serial acquisition.
 
 ### Setup
 
@@ -57,7 +57,7 @@ The 10-key cell gives a clear multi-key read improvement. It does not establish
 a multi-key write change. The single-key throughput moves by less than 7%, and
 the branch adds no backend operation to the single-key paths. Aggregate backend
 operations per completed transaction increase from `4.24` to `4.62` (`1.089`),
-while transaction retries fall from `0.00361` to `0.00229` (`0.635`).
+while body replays fall from `0.00361` to `0.00229` (`0.635`).
 
 ### Large transactions
 
@@ -95,7 +95,7 @@ At 200 workers per shape, throughput is `2,520.09 tx/s` for `roSingle`,
 for `rwMany`. The graph now shows the low-concurrency multi-leaf read gain and
 the high-concurrency multi-key write limit.
 
-## ADR-061: atomic logless commits within one leaf
+## ADR-061: atomic direct commits within one leaf
 
 [ADR-061](../adr/061-atomic-logless-single-leaf-commits.md) generalizes direct
 commit from one existing-key overwrite to complete point-access transactions
@@ -124,7 +124,7 @@ deletes publish atomically in one CAS when the complete output fits inline.
 - every same-leaf-contention transaction remains a direct candidate. The short
   simulated-provider windows land `29–30/30` directly, with at most `0.07` lock
   calls per transaction when clean CAS contention exhausts the bounded direct
-  retry and selects the regular fallback; memory cells land `30/30`
+  retry and selects the locked commit fallback; memory cells land `30/30`
 - direct counters count transactions rather than keys or physical CAS attempts,
   as required by the ADR
 
@@ -152,7 +152,7 @@ The pre-existing benchmarks provide the paired regression check:
 
 The single-key intervals overlap (`9.19–9.60 µs` base and `9.43–9.52 µs`
 target), so the implementation does not establish a regression in the original
-fast path. For 10-key RMW, backend work falls from `3.20` writes and `0.63`
+single-key direct commit. For 10-key RMW, backend work falls from `3.20` writes and `0.63`
 reads per transaction to exactly one write and no reads.
 
 ## ADR-060: bounded delayed write-back convergence
@@ -235,7 +235,7 @@ reproduce reliably enough to claim as the implementation result.
   a near-zero cached-read p50
 - noisy deadlock p50 and p90 geomeans are `2.00` and `1.78`; the three one-key
   p50 ratios are `5.24–5.29`
-- backend operations/transaction fall to a `0.47` geomean and retries to
+- backend operations/transaction fall to a `0.47` geomean and replays to
   `0.14`. The deterministic autoresearch score falls from `403.43` to `98.13`
   (`0.243`)
 - autoresearch secondary geomeans move to `2.79` allocation bytes/transaction,
@@ -341,11 +341,11 @@ eligible direct commit.
   splits. Starting from one leaf, the final leaf count is therefore `1` on the
   base and `3` on the target
 
-## ADR-054: reserve inline publication for logless commits
+## ADR-054: reserve inline publication for direct commits
 
 [ADR-054](../adr/054-reserve-inline-publication-for-logless-commits.md) stops
-logged write-back and help-forwarding from copying values into leaf entries.
-Logless direct commits retain authoritative inline values.
+locked write-back and help-forwarding from copying values into leaf entries.
+Direct commits retain authoritative inline values.
 
 ### Setup
 
@@ -374,7 +374,7 @@ Logless direct commits retain authoritative inline values.
   write-heavy `1.25`. Per-cell ratios span `0.43–1.24`, `1.01–1.17`, and
   `0.72–2.09`, respectively
 - deadlock sweep: p50 and p90 geomeans `0.97`, throughput `1.03`, and
-  retries/transaction `0.95`
+  replays/transaction `0.95`
 - mixbench throughput geomeans: `roMulti 1.72`, `roSingle 1.72`,
   `rwMany 0.77`, and `rwSingle 1.19`
 - shared-Database aggregate operations/transaction: high contention `0.90`,
@@ -387,11 +387,11 @@ Logless direct commits retain authoritative inline values.
   writes/transaction `3.156` to `3.309`, and total operations/transaction
   `4.482` to `5.073`
 
-## ADR-053: replay definitive logless RMW losses
+## ADR-053: replay definitive direct RMW losses
 
 [ADR-053](../adr/053-replay-definitive-logless-rmw-losses.md) replays an
-eligible read-modify-write after a certified logless loss instead of publishing
-a holder, and removes ADR-027's separate logged single-RW fallback.
+eligible read-modify-write after a certified direct loss instead of publishing
+a holder, and removes ADR-027's separate locked single-RW fallback.
 
 ### Setup
 
@@ -423,10 +423,10 @@ The five-writer, one-key workload recovers on every paired run:
   falls from `3.78–4.24 s` to `0.72–0.76 s` (`0.17–0.20`)
 - successful transactions/run rise from `87–97` to `437–455`. Worker drain
   falls from `50.1–56.0 ms` to `10.0–10.9 ms`
-- retries/transaction rise from `2.03–2.40` to `3.32–3.50`, as expected when
+- replays/transaction rise from `2.03–2.40` to `3.32–3.50`, as expected when
   certified losses replay the body. Direct land rate rises from `1.0–2.0%` to
-  `22.2–23.2%`, and the extra attempts now produce useful progress rather than
-  a persistent logged phase
+  `22.2–23.2%`, and the extra replays now produce useful progress rather than
+  a persistent locked phase
 
 The balanced one-Database rw9010 guard remains flat: aggregate throughput
 ratios are `1.00`, `1.01`, and `1.01`; backend operations/transaction ratios
@@ -437,7 +437,7 @@ one Database.
 
 - uncontended autoresearch `singleRMW` is unchanged at `70.79` weighted
   cost/transaction, with exactly the same reads, writes, lists, and zero
-  retries. Wall time moves from `12.48` to `11.60 µs/transaction` (`0.93`);
+  replays. Wall time moves from `12.48` to `11.60 µs/transaction` (`0.93`);
   this noisy secondary axis does not indicate a regression
 - across the three repeated `hi/shared` pairs, aggregate throughput ratios are
   `0.98–1.12` (median `0.99`), while `rwSingle` is `0.97–1.21` (median
@@ -449,9 +449,9 @@ one Database.
 
 The repeated `lo/shared` cell is a separate warning: aggregate throughput is
 `0.78–0.87` of the base and `rwSingle` is `0.52–0.89`. This topology co-locates
-direct single-RMW and logged multi-key traffic, so it is not the uncontended
+direct single-RMW and locked multi-key traffic, so it is not the uncontended
 direct-path guardrail. The result is consistent with ADR-053's accepted cost
-for falling back to regular locking, but these measurements do not attribute
+for falling back to locked commit, but these measurements do not attribute
 the cause. Backend-operation ratios are mixed (`0.66–1.38`) rather than showing
 a uniform amplification. Carry this signal into inline-admission and
 direct-commit-coverage measurement.
@@ -490,7 +490,7 @@ estimator and should not be compared directly without reprocessing their CSVs.
   `0.99` in write-heavy. Strong reads improve slightly in the first two mixes;
   the completion result does not support a broad throughput recovery or
   regression
-- backend operations/transaction are `0.97`, `0.88`, and `1.05`; retries per
+- backend operations/transaction are `0.97`, `0.88`, and `1.05`; replays per
   transaction are `1.05`, `1.05`, and `1.04`
 - current workers overrun the requested 8-second measurement window by
   `12.0–26.9 s` at 10 and 20 Databases. The ADR-044 binary predates the split
@@ -506,7 +506,7 @@ The one-key, five-writer cell is the clear localized regression:
   runs. The target records 148 successful samples versus 326 in the reference
 - the target has 405 direct candidates: 14 land and 391 (`96.5%`) do not. That
   is `2.74` candidates per completed transaction, alongside 257
-  logged-transaction retries
+  locked-transaction replays
 - larger fully overlapping transactions are mixed around parity. Across all
   key counts, the noisy p50 and p90 geomeans are `1.18` and `1.19`; the
   one-key direct-path eligibility is what makes the outlier distinct
@@ -514,7 +514,7 @@ The one-key, five-writer cell is the clear localized regression:
 The two durable counters prove that the direct path does not retain its
 uncontended advantage under same-key contention. Reason-specific instrumentation
 should remain temporary while the next P1 identifies whether batch exclusion,
-leaf-CAS loss, or renewed transaction re-entry dominates.
+leaf-CAS loss, or identity renewal dominates.
 
 ### Secondary signals
 
@@ -529,7 +529,7 @@ leaf-CAS loss, or renewed transaction re-entry dominates.
 [ADR-051](../adr/051-inline-latest-values.md) makes a small committed value part
 of the leaf entry that names its writer, so a latest read can be served from the
 node alone, and an eligible single read-write transaction commits in one
-conditional leaf CAS with no lock, no transaction object, and no write-back.
+conditional leaf CAS with no lock, no transaction record, and no write-back.
 
 ### Setup
 
@@ -569,7 +569,7 @@ conditional leaf CAS with no lock, no transaction object, and no write-back.
   memory `16.8 ms` to `22.5 ms` against a base 95% interval of `13.2–20.5 ms`
 
 The read short-circuit does not move the read-only workloads here because their
-transaction objects are already served by the decoded cache
+transaction records are already served by the decoded cache
 ([ADR-036](../adr/036-decoded-object-cache-with-bounded-freshness.md)) in steady
 state; it converts an already-cheap cached read into no read at all, which shows
 up as CPU and allocation savings rather than fewer backend operations. The
@@ -579,9 +579,9 @@ saved backend read matters on a cold or evicted cache.
 
 - zero transaction failures in all four cells
 - lo/shared aggregate backend operations/tx: `0.367` to `0.238` (`0.65`);
-  retries/tx `0.0109` to `0.0073` => better
+  replays/tx `0.0109` to `0.0073` => better
 - hi/shared aggregate backend operations/tx: `0.618` to `0.567` (`0.92`);
-  retries/tx `0.310` to `0.277` => better
+  replays/tx `0.310` to `0.277` => better
 - hi/per-shape mix-tps[rwSingle]: `3.00` to `5.82` with p50 `217 ms` to
   `113 ms` => better
 - lo/shared mix-tps[rwSingle]: `4.62` to `2.24` => WORSE, while its read shapes
@@ -589,7 +589,7 @@ saved backend read matters on a cold or evicted cache.
 
 The lo/shared write regression is not a protocol regression: that cell is
 saturated (p50 above one second for a single-key RMW on both sides), performs
-35% fewer backend operations per transaction, and retries less; the read shapes
+35% fewer backend operations per transaction, and replays less; the read shapes
 absorb the freed capacity. Short saturated cells redistribute throughput between
 concurrently running shapes, so these cells are indicative only.
 
@@ -598,7 +598,7 @@ concurrently running shapes, so these cells are indicative only.
 The 1 KiB / 64 KiB defaults are the tunable outcome, not a measured optimum.
 The trade-off they price is visible above: every leaf CAS carries the inline
 bytes of its whole leaf, which costs encode/CAS work on write-heavy multi-key
-workloads (`batchWrite100`), and buys the transaction-object read plus, for a
+workloads (`batchWrite100`), and buys the transaction-record read plus, for a
 single read-write transaction, two of its three object writes.
 
 ## ADR-044: CAS-fenced structural gate
@@ -629,7 +629,7 @@ whole node.
   `1.30`. The short sweep is mixed and should not be treated as a proven
   throughput improvement
 - rw9010 backend operations/transaction geomean: balanced `0.64`, read-heavy
-  `0.80`, write-heavy `0.51`; node operations and transaction-log operations
+  `0.80`, write-heavy `0.51`; node operations and transaction-record operations
   both fall in all three mixes
 - deterministic efficiency score: `122.18` to `120.39` (`0.985`, effectively
   unchanged). Single-RMW cost falls to `0.932` and multi-RMW cost to `0.967`;
@@ -643,11 +643,11 @@ whole node.
 
 The deterministic stable-leaf regression tests provide the direct protocol
 check: an ordinary mutation neither records a structural lock nor resolves an
-unrelated entry holder, and a single-RMW transaction falls back from the fast
-path when a gate is present. The benchmark confirms the expected reduction in
+unrelated entry holder, and a single-RMW transaction falls back from the direct
+commit path when a gate is present. The benchmark confirms the expected reduction in
 backend work without establishing an overall throughput win.
 
-## ADR-031–ADR-043 and transaction-log refactoring
+## ADR-031–ADR-043 and transaction-record refactoring
 
 This cumulative comparison covers dynamic range sharding
 ([ADR-031](../adr/031-dynamic-range-sharding.md)), node-level locking and
@@ -656,7 +656,7 @@ the subsequent listing and transaction changes, the decoded object cache
 ([ADR-036](../adr/036-decoded-object-cache-with-bounded-freshness.md)), and the
 causally coordinated backend operations of
 [ADR-043](../adr/043-causally-coordinated-backend-operations.md). The target also
-includes the transaction-log refactor in `f9625778` (PR #21).
+includes the transaction-record refactor in `f9625778` (PR #21).
 
 ### compare-refs full summary
 
@@ -685,7 +685,7 @@ includes the transaction-log refactor in `f9625778` (PR #21).
 - latency-p50[strong-read]: ratio b/a min=0.91 median=0.97 max=1.99 (geomean=1.14, n=4) => better
 - latency-p50[weak-read]: ratio b/a min=5.00 median=620.35 max=894.40 (geomean=199.88, n=4) => WORSE
 - latency-p50[write]: ratio b/a min=1.03 median=6.90 max=30.69 (geomean=5.06, n=4) => WORSE
-- retries: ratio b/a min=0.03 median=0.06 max=1.64 (geomean=0.11, n=4) => better
+- replays: ratio b/a min=0.03 median=0.06 max=1.64 (geomean=0.11, n=4) => better
 - backend-ops/tx: ratio b/a min=0.42 median=0.75 max=1.53 (geomean=0.77, n=4) => better
 
 ### rw9010/readheavy
@@ -696,7 +696,7 @@ includes the transaction-log refactor in `f9625778` (PR #21).
 - latency-p50[strong-read]: ratio b/a min=0.53 median=0.95 max=1.92 (geomean=0.98, n=4) => better
 - latency-p50[weak-read]: ratio b/a min=6.25 median=280.20 max=909.30 (geomean=69.90, n=4) => WORSE
 - latency-p50[write]: ratio b/a min=1.06 median=6.19 max=21.40 (geomean=4.47, n=4) => WORSE
-- retries: ratio b/a min=0.01 median=0.03 max=1.38 (geomean=0.07, n=4) => better
+- replays: ratio b/a min=0.01 median=0.03 max=1.38 (geomean=0.07, n=4) => better
 - backend-ops/tx: ratio b/a min=0.48 median=0.67 max=1.20 (geomean=0.71, n=4) => better
 
 ### rw9010/writeheavy
@@ -707,7 +707,7 @@ includes the transaction-log refactor in `f9625778` (PR #21).
 - latency-p50[strong-read]: ratio b/a min=0.93 median=1.12 max=2.20 (geomean=1.27, n=4) => WORSE
 - latency-p50[weak-read]: ratio b/a min=0.62 median=0.76 max=4.43 (geomean=1.12, n=4) => better
 - latency-p50[write]: ratio b/a min=1.35 median=5.51 max=19.67 (geomean=4.38, n=4) => WORSE
-- retries: ratio b/a min=0.20 median=0.37 max=1.09 (geomean=0.40, n=4) => better
+- replays: ratio b/a min=0.20 median=0.37 max=1.09 (geomean=0.40, n=4) => better
 - backend-ops/tx: ratio b/a min=0.33 median=1.42 max=3.36 (geomean=1.19, n=4) => WORSE
 
 ### deadlock
@@ -729,8 +729,8 @@ includes the transaction-log refactor in `f9625778` (PR #21).
 - mix-ops/tx[lo/roSingle]: ratio b/a=0.56 (1 point) n_min=96356 => better
 - mix-ops/tx[lo/rwMany]: ratio b/a=1.03 (1 point) n_min=394 => WORSE
 - mix-ops/tx[lo/rwSingle]: ratio b/a=3.33 (1 point) n_min=1201 => WORSE
-- mix-retries/tx[hi] [unconverged]: ratio b/a min=0.09 median=0.82 max=4.99 (geomean=0.51, n=4) => better
-- mix-retries/tx[lo]: ratio b/a min=0.03 median=0.93 max=462.57 (geomean=0.96, n=4) => better
+- mix-replays/tx[hi] [unconverged]: ratio b/a min=0.09 median=0.82 max=4.99 (geomean=0.51, n=4) => better
+- mix-replays/tx[lo]: ratio b/a min=0.03 median=0.93 max=462.57 (geomean=0.96, n=4) => better
 - mix-agg-ops/tx[hi]: ratio b/a=0.12 (1 point) => better
 - mix-agg-ops/tx[lo]: ratio b/a=0.04 (1 point) => better
 
@@ -767,7 +767,7 @@ The earlier deadlock `NotFound` started with ADR-036's cache and is addressed by
 ADR-043's completion-before-invocation ordering. This full target run completes
 the deadlock matrix. During the full rw9010 validation, a second false
 `NotFound` exposed a transaction-lifecycle invariant violation: missing-object
-expiry could re-read a concurrently committed object and pass that final
+expiry could re-read a concurrently committed record and pass that final
 observation to `force_abort`, allowing `committed → aborted`. Status appearance
 now re-enters ordinary resolution, and `force_abort` independently refuses to
 overwrite a final observation. The remaining 36–50 second cells are therefore
@@ -799,7 +799,7 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - latency-p50[strong-read]: ratio b/a min=0.97 median=0.98 max=0.99 (geomean=0.98, n=2) => ~same
 - latency-p50[weak-read]: ratio b/a min=0.92 median=0.93 max=0.94 (geomean=0.93, n=2) => better
 - latency-p50[write]: ratio b/a min=0.96 median=0.97 max=0.97 (geomean=0.97, n=2) => better
-- retries: ratio b/a min=0.96 median=1.00 max=1.07 (geomean=1.01, n=5) => ~same
+- replays: ratio b/a min=0.96 median=1.00 max=1.07 (geomean=1.01, n=5) => ~same
 - backend-ops/tx: ratio b/a min=0.96 median=1.00 max=1.06 (geomean=1.01, n=5) => ~same
 
 ### rw9010/readheavy
@@ -810,7 +810,7 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - latency-p50[strong-read]: ratio b/a min=0.98 median=1.22 max=1.45 (geomean=1.19, n=2) => WORSE
 - latency-p50[weak-read]: ratio b/a min=1.03 median=1.04 max=1.05 (geomean=1.04, n=2) => WORSE
 - latency-p50[write]: ratio b/a min=0.98 median=1.00 max=1.03 (geomean=1.00, n=2) => ~same
-- retries: ratio b/a min=0.95 median=1.00 max=1.01 (geomean=0.98, n=3) => ~same
+- replays: ratio b/a min=0.95 median=1.00 max=1.01 (geomean=0.98, n=3) => ~same
 - backend-ops/tx: ratio b/a min=0.95 median=1.00 max=1.01 (geomean=0.99, n=3) => ~same
 
 ### rw9010/writeheavy
@@ -821,7 +821,7 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - latency-p50[strong-read]: ratio b/a min=1.00 median=1.01 max=1.02 (geomean=1.01, n=2) => ~same
 - latency-p50[weak-read]: ratio b/a min=1.00 median=1.15 max=1.31 (geomean=1.14, n=2) => WORSE
 - latency-p50[write]: ratio b/a min=0.99 median=1.00 max=1.00 (geomean=1.00, n=2) => ~same
-- retries: ratio b/a min=0.98 median=1.00 max=1.01 (geomean=1.00, n=7) => ~same
+- replays: ratio b/a min=0.98 median=1.00 max=1.01 (geomean=1.00, n=7) => ~same
 - backend-ops/tx: ratio b/a min=0.99 median=1.00 max=1.01 (geomean=1.00, n=7) => ~same
 
 ### deadlock
@@ -843,8 +843,8 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - mix-ops/tx[lo/roSingle]: ratio b/a=1.00 (1 point) n_min=2064 => ~same
 - mix-ops/tx[lo/rwMany]: ratio b/a=0.99 (1 point) n_min=172 => ~same
 - mix-ops/tx[lo/rwSingle]: ratio b/a=0.73 (1 point) n_min=677 => better
-- mix-retries/tx[hi] [unconverged]: ratio b/a min=0.38 median=0.67 max=1.49 (geomean=0.71, n=4) => better
-- mix-retries/tx[lo]: ratio b/a min=0.36 median=0.95 max=1.25 (geomean=0.80, n=4) => better
+- mix-replays/tx[hi] [unconverged]: ratio b/a min=0.38 median=0.67 max=1.49 (geomean=0.71, n=4) => better
+- mix-replays/tx[lo]: ratio b/a min=0.36 median=0.95 max=1.25 (geomean=0.80, n=4) => better
 - mix-agg-ops/tx[hi]: ratio b/a=1.02 (1 point) => WORSE
 - mix-agg-ops/tx[lo]: ratio b/a=0.92 (1 point) => better
 
@@ -882,7 +882,7 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - latency-p50[strong-read]: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00, n=2) => ~same
 - latency-p50[weak-read]: ratio b/a min=0.97 median=1.02 max=1.08 (geomean=1.02, n=2) => WORSE
 - latency-p50[write]: ratio b/a min=1.01 median=1.01 max=1.02 (geomean=1.01, n=2) => ~same
-- retries: ratio b/a min=0.98 median=1.00 max=1.04 (geomean=1.00, n=5) => ~same
+- replays: ratio b/a min=0.98 median=1.00 max=1.04 (geomean=1.00, n=5) => ~same
 - backend-ops/tx: ratio b/a min=0.98 median=1.00 max=1.03 (geomean=1.00, n=5) => ~same
 
 ### rw9010/readheavy
@@ -893,7 +893,7 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - latency-p50[strong-read]: ratio b/a min=0.98 median=0.98 max=0.99 (geomean=0.98, n=2) => ~same
 - latency-p50[weak-read]: ratio b/a min=0.93 median=1.01 max=1.08 (geomean=1.01, n=2) => ~same
 - latency-p50[write]: ratio b/a min=0.98 median=0.99 max=1.00 (geomean=0.99, n=2) => ~same
-- retries: ratio b/a min=1.01 median=1.01 max=1.05 (geomean=1.02, n=5) => ~same
+- replays: ratio b/a min=1.01 median=1.01 max=1.05 (geomean=1.02, n=5) => ~same
 - backend-ops/tx: ratio b/a min=1.01 median=1.01 max=1.04 (geomean=1.02, n=5) => ~same
 
 ### rw9010/writeheavy
@@ -904,7 +904,7 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - latency-p50[strong-read]: ratio b/a min=1.00 median=1.01 max=1.01 (geomean=1.01, n=2) => ~same
 - latency-p50[weak-read]: ratio b/a min=0.80 median=0.91 max=1.01 (geomean=0.90, n=2) => better
 - latency-p50[write]: ratio b/a min=0.99 median=0.99 max=1.00 (geomean=0.99, n=2) => ~same
-- retries: ratio b/a min=0.98 median=1.00 max=1.02 (geomean=1.00, n=11) => ~same
+- replays: ratio b/a min=0.98 median=1.00 max=1.02 (geomean=1.00, n=11) => ~same
 - backend-ops/tx: ratio b/a min=0.99 median=1.00 max=1.02 (geomean=1.00, n=11) => ~same
 
 ### deadlock
@@ -926,8 +926,8 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - mix-ops/tx[lo/roSingle]: ratio b/a=0.99 (1 point) n_min=2297 => ~same
 - mix-ops/tx[lo/rwMany]: ratio b/a=0.98 (1 point) n_min=149 => better
 - mix-ops/tx[lo/rwSingle]: ratio b/a=1.00 (1 point) n_min=714 => ~same
-- mix-retries/tx[hi] [unconverged]: ratio b/a min=0.85 median=0.97 max=1.32 (geomean=1.01, n=4) => better
-- mix-retries/tx[lo]: ratio b/a min=0.76 median=0.82 max=1.07 (geomean=0.86, n=4) => better
+- mix-replays/tx[hi] [unconverged]: ratio b/a min=0.85 median=0.97 max=1.32 (geomean=1.01, n=4) => better
+- mix-replays/tx[lo]: ratio b/a min=0.76 median=0.82 max=1.07 (geomean=0.86, n=4) => better
 - mix-agg-ops/tx[hi]: ratio b/a=0.99 (1 point) => ~same
 - mix-agg-ops/tx[lo]: ratio b/a=1.00 (1 point) => ~same
 
@@ -965,7 +965,7 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - latency-p50[strong-read]: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00, n=2) => ~same
 - latency-p50[weak-read]: ratio b/a min=0.75 median=0.84 max=0.92 (geomean=0.83, n=2) => better
 - latency-p50[write]: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00, n=2) => ~same
-- retries: ratio b/a min=1.00 median=1.00 max=1.01 (geomean=1.00, n=4) => ~same
+- replays: ratio b/a min=1.00 median=1.00 max=1.01 (geomean=1.00, n=4) => ~same
 - backend-ops/tx: ratio b/a min=1.00 median=1.00 max=1.01 (geomean=1.00, n=4) => ~same
 
 ### rw9010/readheavy
@@ -976,7 +976,7 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - latency-p50[strong-read]: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00, n=2) => ~same
 - latency-p50[weak-read]: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00, n=2) => ~same
 - latency-p50[write]: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00, n=2) => ~same
-- retries: ratio b/a min=0.96 median=0.99 max=1.01 (geomean=0.99, n=4) => ~same
+- replays: ratio b/a min=0.96 median=0.99 max=1.01 (geomean=0.99, n=4) => ~same
 - backend-ops/tx: ratio b/a min=0.96 median=0.99 max=1.01 (geomean=0.99, n=4) => ~same
 
 ### rw9010/writeheavy
@@ -987,7 +987,7 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - latency-p50[strong-read]: ratio b/a min=1.00 median=1.01 max=1.01 (geomean=1.01, n=2) => ~same
 - latency-p50[weak-read]: ratio b/a min=1.02 median=1.04 max=1.06 (geomean=1.04, n=2) => WORSE
 - latency-p50[write]: ratio b/a min=1.00 median=1.00 max=1.01 (geomean=1.00, n=2) => ~same
-- retries: ratio b/a min=0.97 median=1.00 max=1.03 (geomean=1.00, n=6) => ~same
+- replays: ratio b/a min=0.97 median=1.00 max=1.03 (geomean=1.00, n=6) => ~same
 - backend-ops/tx: ratio b/a min=0.98 median=1.00 max=1.02 (geomean=1.00, n=6) => ~same
 
 ### deadlock
@@ -1028,7 +1028,7 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - latency-p50[strong-read]: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00, n=2) => ~same
 - latency-p50[weak-read]: ratio b/a min=0.88 median=0.90 max=0.92 (geomean=0.90, n=2) => better
 - latency-p50[write]: ratio b/a min=0.99 median=0.99 max=0.99 (geomean=0.99, n=2) => ~same
-- retries: ratio b/a min=1.00 median=1.04 max=1.06 (geomean=1.04, n=4) => WORSE
+- replays: ratio b/a min=1.00 median=1.04 max=1.06 (geomean=1.04, n=4) => WORSE
 - backend-ops/tx: ratio b/a min=1.00 median=1.04 max=1.05 (geomean=1.03, n=4) => WORSE
 
 ### rw9010/readheavy
@@ -1039,7 +1039,7 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - latency-p50[strong-read]: ratio b/a min=0.98 median=0.99 max=1.00 (geomean=0.99, n=2) => ~same
 - latency-p50[weak-read]: ratio b/a min=0.92 median=0.96 max=1.00 (geomean=0.96, n=2) => better
 - latency-p50[write]: ratio b/a min=0.97 median=0.98 max=1.00 (geomean=0.98, n=2) => ~same
-- retries: ratio b/a min=1.05 median=1.05 max=1.05 (geomean=1.05, n=3) => WORSE
+- replays: ratio b/a min=1.05 median=1.05 max=1.05 (geomean=1.05, n=3) => WORSE
 - backend-ops/tx: ratio b/a min=1.04 median=1.05 max=1.05 (geomean=1.05, n=3) => WORSE
 
 ### rw9010/writeheavy
@@ -1050,7 +1050,7 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - latency-p50[strong-read]: ratio b/a min=0.99 median=1.00 max=1.02 (geomean=1.00, n=2) => ~same
 - latency-p50[weak-read]: ratio b/a min=0.96 median=0.99 max=1.02 (geomean=0.99, n=2) => ~same
 - latency-p50[write]: ratio b/a min=1.00 median=1.00 max=1.01 (geomean=1.00, n=2) => ~same
-- retries: ratio b/a min=1.00 median=1.00 max=1.02 (geomean=1.00, n=5) => ~same
+- replays: ratio b/a min=1.00 median=1.00 max=1.02 (geomean=1.00, n=5) => ~same
 - backend-ops/tx: ratio b/a min=1.00 median=1.00 max=1.01 (geomean=1.00, n=5) => ~same
 
 ### deadlock
@@ -1072,8 +1072,8 @@ some safe places ([ADR-030](../adr/030-seed-shard-loads.md)).
 - mix-ops/tx[lo/roSingle]: ratio b/a=1.01 (1 point) n_min=2229 => ~same
 - mix-ops/tx[lo/rwMany] [low-sample]: ratio b/a=0.99 (1 point) n_min=129 => ~same
 - mix-ops/tx[lo/rwSingle] [low-sample]: ratio b/a=1.37 (1 point) n_min=865 => WORSE
-- mix-retries/tx[hi] [noisy]: ratio b/a min=0.83 median=1.04 max=1.73 (geomean=1.11, n=4) => WORSE
-- mix-retries/tx[lo] [noisy]: ratio b/a min=0.69 median=0.91 max=1.87 (geomean=1.01, n=4) => better
+- mix-replays/tx[hi] [noisy]: ratio b/a min=0.83 median=1.04 max=1.73 (geomean=1.11, n=4) => WORSE
+- mix-replays/tx[lo] [noisy]: ratio b/a min=0.69 median=0.91 max=1.87 (geomean=1.01, n=4) => better
 - mix-agg-ops/tx[hi]: ratio b/a=1.05 (1 point) => WORSE
 - mix-agg-ops/tx[lo]: ratio b/a=1.06 (1 point) => WORSE
 
@@ -1107,7 +1107,7 @@ transactions.
 - latency-p50[strong-read]: ratio b/a min=0.99 median=1.00 max=1.02 (geomean=1.00)
 - latency-p50[weak-read]: ratio b/a min=1.00 median=1.00 max=1.10 (geomean=1.02)
 - latency-p50[write]: ratio b/a min=0.99 median=1.01 max=1.02 (geomean=1.01)
-- retries: ratio b/a min=0.98 median=1.00 max=1.01 (geomean=1.00)
+- replays: ratio b/a min=0.98 median=1.00 max=1.01 (geomean=1.00)
 - backend-ops/tx: ratio b/a min=0.98 median=1.00 max=1.01 (geomean=1.00)
 
 ### rw9010/readheavy
@@ -1118,7 +1118,7 @@ transactions.
 - latency-p50[strong-read]: ratio b/a min=0.97 median=0.99 max=1.00 (geomean=0.99)
 - latency-p50[weak-read]: ratio b/a min=0.90 median=1.00 max=1.12 (geomean=1.00)
 - latency-p50[write]: ratio b/a min=0.99 median=1.00 max=1.00 (geomean=0.99)
-- retries: ratio b/a min=0.98 median=1.00 max=1.01 (geomean=1.00)
+- replays: ratio b/a min=0.98 median=1.00 max=1.01 (geomean=1.00)
 - backend-ops/tx: ratio b/a min=0.98 median=1.00 max=1.02 (geomean=1.00)
 
 ### rw9010/writeheavy
@@ -1129,7 +1129,7 @@ transactions.
 - latency-p50[strong-read]: ratio b/a min=0.98 median=1.00 max=1.00 (geomean=1.00)
 - latency-p50[weak-read]: ratio b/a min=1.00 median=1.00 max=1.05 (geomean=1.01)
 - latency-p50[write]: ratio b/a min=0.98 median=1.00 max=1.01 (geomean=1.00)
-- retries: ratio b/a min=0.99 median=1.00 max=1.01 (geomean=1.00)
+- replays: ratio b/a min=0.99 median=1.00 max=1.01 (geomean=1.00)
 - backend-ops/tx: ratio b/a min=0.99 median=1.00 max=1.01 (geomean=1.00)
 
 ### deadlock
@@ -1151,8 +1151,8 @@ transactions.
 - mix-ops/tx[lo/roSingle]: ratio b/a min=1.00 median=1.00 max=1.00 (geomean=1.00)
 - mix-ops/tx[lo/rwMany]: ratio b/a min=0.98 median=0.98 max=0.98 (geomean=0.98)
 - mix-ops/tx[lo/rwSingle]: ratio b/a min=0.63 median=0.63 max=0.63 (geomean=0.63)
-- mix-retries/tx[hi]: ratio b/a min=0.89 median=1.11 max=1.34 (geomean=1.10)
-- mix-retries/tx[lo]: ratio b/a min=0.86 median=1.00 max=1.67 (geomean=1.09)
+- mix-replays/tx[hi]: ratio b/a min=0.89 median=1.11 max=1.34 (geomean=1.10)
+- mix-replays/tx[lo]: ratio b/a min=0.86 median=1.00 max=1.67 (geomean=1.09)
 - mix-agg-ops/tx[hi]: ratio b/a min=0.96 median=0.96 max=0.96 (geomean=0.96)
 - mix-agg-ops/tx[lo]: ratio b/a min=0.87 median=0.87 max=0.87 (geomean=0.87)
 
@@ -1180,7 +1180,7 @@ Caching improvements and lock-dedup work.
 - latency-p50[strong-read]: ratio b/a min=0.53 median=0.82 max=0.85 (geomean=0.74)
 - latency-p50[weak-read]: ratio b/a min=0.83 median=0.92 max=1.00 (geomean=0.91)
 - latency-p50[write]: ratio b/a min=0.48 median=0.66 max=0.67 (geomean=0.61)
-- retries: ratio b/a min=1.07 median=1.17 max=1.18 (geomean=1.14)
+- replays: ratio b/a min=1.07 median=1.17 max=1.18 (geomean=1.14)
 - backend-ops/tx: ratio b/a min=1.06 median=1.15 max=1.15 (geomean=1.12)
 
 ### rw9010/readheavy
@@ -1191,7 +1191,7 @@ Caching improvements and lock-dedup work.
 - latency-p50[strong-read]: ratio b/a min=0.53 median=0.83 max=1.26 (geomean=0.82)
 - latency-p50[weak-read]: ratio b/a min=0.83 median=1.00 max=1.25 (geomean=1.01)
 - latency-p50[write]: ratio b/a min=0.48 median=0.65 max=0.88 (geomean=0.65)
-- retries: no data
+- replays: no data
 - backend-ops/tx: no data
 
 ### rw9010/writeheavy
@@ -1202,7 +1202,7 @@ Caching improvements and lock-dedup work.
 - latency-p50[strong-read]: ratio b/a min=0.44 median=0.85 max=0.88 (geomean=0.73)
 - latency-p50[weak-read]: ratio b/a min=0.71 median=0.91 max=0.98 (geomean=0.87)
 - latency-p50[write]: ratio b/a min=0.48 median=0.68 max=0.72 (geomean=0.63)
-- retries: ratio b/a min=1.04 median=1.04 max=1.04 (geomean=1.04)
+- replays: ratio b/a min=1.04 median=1.04 max=1.04 (geomean=1.04)
 - backend-ops/tx: ratio b/a min=1.03 median=1.03 max=1.03 (geomean=1.03)
 
 ### deadlock
@@ -1224,8 +1224,8 @@ Caching improvements and lock-dedup work.
 - mix-ops/tx[lo/roSingle]: ratio b/a min=1.04 median=1.04 max=1.04 (geomean=1.04)
 - mix-ops/tx[lo/rwMany]: ratio b/a min=0.99 median=0.99 max=0.99 (geomean=0.99)
 - mix-ops/tx[lo/rwSingle]: ratio b/a min=1.02 median=1.02 max=1.02 (geomean=1.02)
-- mix-retries/tx[hi]: ratio b/a min=0.48 median=0.78 max=1.30 (geomean=0.78)
-- mix-retries/tx[lo]: ratio b/a min=0.88 median=2.04 max=2.54 (geomean=1.72)
+- mix-replays/tx[hi]: ratio b/a min=0.48 median=0.78 max=1.30 (geomean=0.78)
+- mix-replays/tx[lo]: ratio b/a min=0.88 median=2.04 max=2.54 (geomean=1.72)
 - mix-agg-ops/tx[hi]: ratio b/a min=1.84 median=1.84 max=1.84 (geomean=1.84)
 - mix-agg-ops/tx[lo]: ratio b/a min=2.15 median=2.15 max=2.15 (geomean=2.15)
 
@@ -1253,7 +1253,7 @@ Designed in [ADR-024](../adr/024-hold-and-wait-conflict-resolution.md).
 - latency-p50[strong-read]: ratio b/a min=0.95 median=1.11 max=1.14 (geomean=1.08)
 - latency-p50[weak-read]: ratio b/a min=0.00 median=0.00 max=0.56 (geomean=0.00)
 - latency-p50[write]: ratio b/a min=1.17 median=1.39 max=1.41 (geomean=1.34)
-- retries: no data
+- replays: no data
 - backend-ops/tx: no data
 
 ### rw9010/readheavy
@@ -1264,7 +1264,7 @@ Designed in [ADR-024](../adr/024-hold-and-wait-conflict-resolution.md).
 - latency-p50[strong-read]: ratio b/a min=1.00 median=1.11 max=1.41 (geomean=1.15)
 - latency-p50[weak-read]: ratio b/a min=0.00 median=0.00 max=0.80 (geomean=0.01)
 - latency-p50[write]: ratio b/a min=1.21 median=1.36 max=1.60 (geomean=1.37)
-- retries: no data
+- replays: no data
 - backend-ops/tx: no data
 
 ### rw9010/writeheavy
@@ -1275,7 +1275,7 @@ Designed in [ADR-024](../adr/024-hold-and-wait-conflict-resolution.md).
 - latency-p50[strong-read]: ratio b/a min=1.01 median=1.06 max=1.08 (geomean=1.05)
 - latency-p50[weak-read]: ratio b/a min=0.94 median=0.97 max=1.14 (geomean=1.00)
 - latency-p50[write]: ratio b/a min=1.20 median=1.34 max=1.38 (geomean=1.31)
-- retries: ratio b/a min=1.22 median=1.24 max=1.25 (geomean=1.24)
+- replays: ratio b/a min=1.22 median=1.24 max=1.25 (geomean=1.24)
 - backend-ops/tx: ratio b/a min=1.15 median=1.17 max=1.17 (geomean=1.17)
 
 ### deadlock
@@ -1297,8 +1297,8 @@ Designed in [ADR-024](../adr/024-hold-and-wait-conflict-resolution.md).
 - mix-ops/tx[lo/roSingle]: ratio b/a min=0.99 median=0.99 max=0.99 (geomean=0.99)
 - mix-ops/tx[lo/rwMany]: ratio b/a min=1.20 median=1.20 max=1.20 (geomean=1.20)
 - mix-ops/tx[lo/rwSingle]: ratio b/a min=1.17 median=1.17 max=1.17 (geomean=1.17)
-- mix-retries/tx[hi]: ratio b/a min=0.42 median=1.79 max=3.53 (geomean=1.29)
-- mix-retries/tx[lo]: ratio b/a min=1.18 median=1.39 max=4.49 (geomean=1.79)
+- mix-replays/tx[hi]: ratio b/a min=0.42 median=1.79 max=3.53 (geomean=1.29)
+- mix-replays/tx[lo]: ratio b/a min=1.18 median=1.39 max=4.49 (geomean=1.79)
 - mix-agg-ops/tx[hi]: ratio b/a min=1.15 median=1.15 max=1.15 (geomean=1.15)
 - mix-agg-ops/tx[lo]: ratio b/a min=1.09 median=1.09 max=1.09 (geomean=1.09)
 
@@ -1326,7 +1326,7 @@ Implemented by ADRs 016–023.
 - latency-p50[strong-read]: ratio b/a min=0.69 median=0.72 max=1.88 (geomean=0.90)
 - latency-p50[weak-read]: ratio b/a min=1.12 median=630.88 max=839.30 (geomean=137.82)
 - latency-p50[write]: ratio b/a min=1.47 median=1.51 max=2.40 (geomean=1.68)
-- retries: no data
+- replays: no data
 - backend-ops/tx: no data
 
 ### rw9010/readheavy
@@ -1337,7 +1337,7 @@ Implemented by ADRs 016–023.
 - latency-p50[strong-read]: ratio b/a min=0.65 median=1.03 max=1.90 (geomean=1.04)
 - latency-p50[weak-read]: ratio b/a min=1.12 median=464.42 max=783.50 (geomean=116.48)
 - latency-p50[write]: ratio b/a min=1.27 median=1.49 max=2.41 (geomean=1.61)
-- retries: no data
+- replays: no data
 - backend-ops/tx: no data
 
 ### rw9010/writeheavy
@@ -1348,7 +1348,7 @@ Implemented by ADRs 016–023.
 - latency-p50[strong-read]: ratio b/a min=0.70 median=0.74 max=2.11 (geomean=0.95)
 - latency-p50[weak-read]: ratio b/a min=1.20 median=283.42 max=661.00 (geomean=32.14)
 - latency-p50[write]: ratio b/a min=1.54 median=1.60 max=2.48 (geomean=1.77)
-- retries: no data
+- replays: no data
 - backend-ops/tx: no data
 
 ### deadlock
@@ -1370,8 +1370,8 @@ Implemented by ADRs 016–023.
 - mix-ops/tx[lo/roSingle]: ratio b/a min=2.32 median=2.32 max=2.32 (geomean=2.32)
 - mix-ops/tx[lo/rwMany]: ratio b/a min=2.60 median=2.60 max=2.60 (geomean=2.60)
 - mix-ops/tx[lo/rwSingle]: ratio b/a min=3.12 median=3.12 max=3.12 (geomean=3.12)
-- mix-retries/tx[hi]: ratio b/a min=0.59 median=1.56 max=2.62 (geomean=1.39)
-- mix-retries/tx[lo]: ratio b/a min=0.14 median=0.40 max=0.68 (geomean=0.35)
+- mix-replays/tx[hi]: ratio b/a min=0.59 median=1.56 max=2.62 (geomean=1.39)
+- mix-replays/tx[lo]: ratio b/a min=0.14 median=0.40 max=0.68 (geomean=0.35)
 - mix-agg-ops/tx[hi]: ratio b/a min=1.83 median=1.83 max=1.83 (geomean=1.83)
 - mix-agg-ops/tx[lo]: ratio b/a min=2.32 median=2.32 max=2.32 (geomean=2.32)
 

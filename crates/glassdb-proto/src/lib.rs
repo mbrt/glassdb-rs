@@ -13,13 +13,13 @@ mod tests {
     use prost::Message;
 
     #[test]
-    fn transaction_log_round_trip() {
-        let log = TransactionLog {
+    fn transaction_record_round_trip() {
+        let record = TransactionRecord {
             timestamp: Some(prost_types::Timestamp {
                 seconds: 1_700_000_000,
                 nanos: 123_000_000,
             }),
-            status: transaction_log::Status::Committed as i32,
+            status: transaction_record::Status::Committed as i32,
             writes: vec![CollectionWrites {
                 collection_id: vec![1; 16],
                 writes: vec![
@@ -51,10 +51,10 @@ mod tests {
             prepared_collection_ids: vec![],
         };
 
-        let bytes = log.encode_to_vec();
-        let decoded = TransactionLog::decode(bytes.as_slice()).unwrap();
-        assert_eq!(decoded, log);
-        assert_eq!(decoded.status, transaction_log::Status::Committed as i32);
+        let bytes = record.encode_to_vec();
+        let decoded = TransactionRecord::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, record);
+        assert_eq!(decoded.status, transaction_record::Status::Committed as i32);
         match &decoded.writes[0].writes[0].val_delete {
             Some(write::ValDelete::Value(v)) => assert_eq!(v, b"world!"),
             other => panic!("unexpected val_delete: {other:?}"),

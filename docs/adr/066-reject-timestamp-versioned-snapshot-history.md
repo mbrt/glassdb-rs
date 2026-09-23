@@ -43,7 +43,7 @@ The reasons are:
 
 - **It removes the one-CAS commit.** Mandatory history needs an immutable
   payload and a certificate for each version. One leaf CAS cannot write them, so
-  each small overwrite falls back to the logged protocol. Databases that never
+  each small overwrite falls back to the locked commit. Databases that never
   read a snapshot pay that regression.
 - **Cut safety needs an undocumented guarantee.** The margin holds only if the
   clocks in the S3 or Cloud Storage fleet agree inside a stated bound. Neither
@@ -65,7 +65,7 @@ The reasons are:
   that needs a stable multi-key view must build one itself.
 - The backend trait keeps its current shape. No backend must report a server
   time, and no deployment must trust the clock of the object store.
-- The logless single-leaf commit stays as ADR-061 defines it.
+- The direct single-leaf commit stays as ADR-061 defines it.
 - ADR numbers 037 to 041, 052, and 055 stay reserved for link stability.
 
 ## Alternatives considered

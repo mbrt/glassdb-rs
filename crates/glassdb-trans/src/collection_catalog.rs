@@ -39,7 +39,7 @@ impl CollectionCatalog {
                 .children()
                 .map(|(name, id)| (name.to_vec(), id))
                 .collect(),
-            version: record.directory_version(),
+            generation: record.directory_generation(),
         })
     }
 
@@ -88,7 +88,9 @@ impl CollectionCatalog {
             };
             let valid = match &read.kind {
                 DirectoryReadKind::Entry { name, collection } => record.child(name) == *collection,
-                DirectoryReadKind::Listing { version } => record.directory_version() == *version,
+                DirectoryReadKind::Listing { generation } => {
+                    record.directory_generation() == *generation
+                }
             };
             if !valid {
                 return Ok(false);
@@ -145,7 +147,7 @@ mod tests {
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::{CollectionId, DbRoot};
     use glassdb_storage::transaction::{
-        TLogger, TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxLog,
+        TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxRecord, TxRecordStore,
     };
     use glassdb_storage::{CachedStore, CollectionStore, LockType, Timeline};
 
@@ -162,7 +164,7 @@ mod tests {
         );
         let records = CollectionStore::new(objects.clone());
         let background = Arc::new(Background::new());
-        let transactions = TLogger::new(objects, DbRoot::try_from("db").unwrap());
+        let transactions = TxRecordStore::new(objects, DbRoot::try_from("db").unwrap());
         let monitor = Monitor::with_config(
             transactions.clone(),
             timeline.clone(),
@@ -194,18 +196,18 @@ mod tests {
         record.set_directory_writer(id.clone());
         assert!(records.create_record(&parent, &record).await.unwrap());
         monitor.begin_tx(&id);
-        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
-        log.locks.push(TxLock::Directory {
+        let mut tx_record = TxRecord::new(id.clone(), TxCommitStatus::Ok);
+        tx_record.locks.push(TxLock::Directory {
             collection: parent.clone(),
             typ: LockType::Write,
         });
-        log.collection_changes.push(TxCollectionChange {
+        tx_record.collection_changes.push(TxCollectionChange {
             parent: parent.clone(),
             name: b"child".to_vec(),
             collection: child.clone(),
             op: TxCollectionOp::Create,
         });
-        monitor.commit_tx(log).await.unwrap();
+        monitor.commit_tx(tx_record).await.unwrap();
 
         let snapshot = catalog.snapshot(&parent).await.unwrap();
 

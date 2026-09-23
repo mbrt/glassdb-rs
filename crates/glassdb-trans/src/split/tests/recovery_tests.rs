@@ -158,15 +158,15 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
             "a failed departure check cannot report a completed sweep"
         );
         assert!(record.topology_participants().any(|id| id == &participant));
-        // The transaction object remains available to GC even though intent
+        // The transaction record remains available to GC even though intent
         // discovery can no longer find this participant on its next sweep.
-        let log = verifier
+        let record = verifier
             .foundation
-            .tlogger
+            .tx_records
             .get_at(&participant, Requirement::ANY)
             .await
             .unwrap();
-        assert!(log.value().unwrap().locks.iter().any(|lock| {
+        assert!(record.value().unwrap().locks.iter().any(|lock| {
             matches!(lock, TxLock::Topology { collection: target } if target == &collection())
         }));
         return;
@@ -687,7 +687,7 @@ async fn structural_recovery_defers_while_the_source_writer_is_live() {
     let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
     s.create_root(COLL, &root).await.unwrap();
     let mut intent = nonroot_intent("L", "R", b"m");
-    intent.source_version = gated_revision(&s, "L").await;
+    intent.source_revision = gated_revision(&s, "L").await;
     s.write_structural_intent("R", &intent).await.unwrap();
 
     assert!(!sp.recover_structural_intents().await.unwrap());
@@ -767,7 +767,7 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
 
     // The in-flight split (peer, sharing the backend): take the source gate
     // and create the sibling. `s`'s cache is unaware of both writes.
-    let (mut gated, version) = peer
+    let (mut gated, observation) = peer
         .load_node(
             COLL,
             "L",
@@ -777,7 +777,7 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
         .unwrap();
     gated.set_structural_gate(id.clone());
     assert!(
-        peer.store_node(COLL, "L", &gated, Some(&version))
+        peer.store_node(COLL, "L", &gated, Some(&observation))
             .await
             .unwrap()
     );
@@ -788,7 +788,7 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
     // The intent is written after the gate and records the gated revision, so
     // recovery can tell that the split's publish CAS can still land.
     let mut intent = nonroot_intent("L", "R", b"m");
-    intent.source_version = gated_revision(&peer, "L").await;
+    intent.source_revision = gated_revision(&peer, "L").await;
     s.write_structural_intent("R", &intent).await.unwrap();
 
     operations.lock().unwrap().clear();
@@ -840,7 +840,7 @@ async fn stage_recovery_split(
     let mut intent = nonroot_intent("L", sibling, b"");
     intent.participant_id = participant.clone();
     intent.phase = StructuralIntentPhase::Preparing;
-    intent.source_version.clear();
+    intent.source_revision.clear();
     let prepared = s.write_structural_intent(sibling, &intent).await.unwrap();
     let (mut source, observed) = s.load_node(COLL, "L", Requirement::ANY).await.unwrap();
     source.set_structural_gate(worker.clone());
@@ -852,7 +852,7 @@ async fn stage_recovery_split(
     let (mut source, gated) = s.load_node(COLL, "L", Requirement::ANY).await.unwrap();
     let (right, split_key) = source.split(sibling).unwrap();
     source.remove_structural_gate(worker);
-    intent.source_version = gated.revision().unwrap().serialize().to_string();
+    intent.source_revision = gated.revision().unwrap().serialize().to_string();
     intent.split_key = split_key;
     intent.phase = StructuralIntentPhase::Ready;
     assert!(
@@ -1116,10 +1116,10 @@ async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
     source.set_structural_gate(abandoned.clone());
     s.store_node(COLL, "L", &source, None).await.unwrap();
     let mut intent = nonroot_intent("L", "R", b"m");
-    intent.source_version = gated_revision(&s, "L").await;
+    intent.source_revision = gated_revision(&s, "L").await;
 
     // The abandoned worker loses the source to a later split of the same node.
-    let (mut source, version) = s
+    let (mut source, observation) = s
         .load_node(
             COLL,
             "L",
@@ -1130,7 +1130,7 @@ async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
     source.remove_structural_gate(&abandoned);
     source.set_structural_gate(newcomer.clone());
     assert!(
-        s.store_node(COLL, "L", &source, Some(&version))
+        s.store_node(COLL, "L", &source, Some(&observation))
             .await
             .unwrap()
     );
@@ -1205,7 +1205,7 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
     let mut intent = StructuralIntent {
         collection: collection(),
         source_token: None,
-        source_version: String::new(),
+        source_revision: String::new(),
         created_tokens: vec![test_token("L"), test_token("R")],
         split_key: b"m".to_vec(),
         participant_id: participant.clone(),
@@ -1225,7 +1225,7 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
         .await
         .unwrap();
 
-    let (mut root, version) = peer
+    let (mut root, observation) = peer
         .load_root(
             COLL,
             Requirement::after(peer.timeline.currentness_barrier()),
@@ -1233,7 +1233,7 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
         .await
         .unwrap();
     root.set_structural_gate(worker.clone());
-    assert!(peer.store_root(COLL, &root, &version).await.unwrap());
+    assert!(peer.store_root(COLL, &root, &observation).await.unwrap());
     let (_, gated) = peer
         .load_root_node(
             COLL,
@@ -1242,7 +1242,7 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
         .await
         .unwrap()
         .unwrap();
-    intent.source_version = gated.revision().unwrap().serialize().to_string();
+    intent.source_revision = gated.revision().unwrap().serialize().to_string();
     intent.phase = StructuralIntentPhase::Ready;
     assert!(
         peer.intent_store
@@ -1323,7 +1323,7 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
     let intent = StructuralIntent {
         collection: collection(),
         source_token: Some(test_token("L")),
-        source_version: superseded_source_version(),
+        source_revision: superseded_source_revision(),
         created_tokens: vec![test_token("R")],
         split_key: b"t".to_vec(),
         participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
@@ -1458,7 +1458,7 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
     let mut original = leaf_node(&[b"a", b"b", b"m", b"n"], None, None);
     original.set_structural_gate(id.clone());
     s.store_node(COLL, "L", &original, None).await.unwrap();
-    let (mut shrunk, source_version) = s
+    let (mut shrunk, source_observation) = s
         .load_node(
             COLL,
             "L",
@@ -1475,7 +1475,11 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
     let intent = StructuralIntent {
         collection: collection(),
         source_token: Some(test_token("L")),
-        source_version: source_version.revision().unwrap().serialize().to_string(),
+        source_revision: source_observation
+            .revision()
+            .unwrap()
+            .serialize()
+            .to_string(),
         created_tokens: vec![test_token("R")],
         split_key,
         participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
@@ -1496,7 +1500,7 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
     gate.wait_until_entered().await;
 
     assert!(
-        peer.store_node(COLL, "L", &shrunk, Some(&source_version))
+        peer.store_node(COLL, "L", &shrunk, Some(&source_observation))
             .await
             .unwrap()
     );
@@ -1560,7 +1564,7 @@ async fn recovery_that_needs_a_parent_split(
     let intent = StructuralIntent {
         collection: collection(),
         source_token: Some(test_token("L")),
-        source_version: superseded_source_version(),
+        source_revision: superseded_source_revision(),
         created_tokens: vec![test_token("R")],
         split_key: b"t".to_vec(),
         participant_id: participant.clone(),

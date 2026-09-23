@@ -244,7 +244,7 @@ impl PauseControl {
         // With the tagless backend (ADR-023) the commit status is in the object
         // body, so decode it to recognize the pinned wound written for a
         // cancelled owner whose in-flight mutation did not acknowledge return.
-        if !path.contains("/_t/") || !is_wounded_tx_log(value) {
+        if !path.contains("/_t/") || !is_wounded_tx_record(value) {
             return None;
         }
         self.wound_write_gate.lock().unwrap().take()
@@ -349,14 +349,14 @@ impl Default for ParentWriteControl {
 
 type LeafCasGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
-/// Parks one logless leaf CAS and counts abort-side transaction-log writes.
-pub struct LoglessCommitControl {
+/// Parks one direct-commit leaf CAS and counts abort-side transaction-record writes.
+pub struct DirectCommitControl {
     backend: Arc<HookBackend>,
     aborted_writes: Arc<AtomicUsize>,
     gate: Arc<Mutex<Option<LeafCasGate>>>,
 }
 
-impl LoglessCommitControl {
+impl DirectCommitControl {
     pub fn wrap(inner: Arc<dyn Backend>) -> Self {
         let backend = HookBackend::new(inner);
         let aborted_writes = Arc::new(AtomicUsize::new(0));
@@ -372,7 +372,7 @@ impl LoglessCommitControl {
                     }
                     BackendOp::WriteIf { path, value, .. }
                     | BackendOp::WriteIfNotExists { path, value }
-                        if path.contains("/_t/") && is_abort_side_tx_log(value) =>
+                        if path.contains("/_t/") && is_abort_side_tx_record(value) =>
                     {
                         aborted_writes.fetch_add(1, Ordering::SeqCst);
                     }
@@ -448,21 +448,19 @@ impl PreparedCollectionRecoveryControl {
                         BackendOp::WriteIf { path, value, .. }
                         | BackendOp::WriteIfNotExists { path, value }
                             if path.contains("/_t/")
-                                && glassdb_storage::txobject::status(value)
+                                && glassdb_storage::txrecord::status(value)
                                     .is_ok_and(|status| status == TxCommitStatus::Aborted) =>
                         {
                             if let Ok(ObjectPath::Transaction { db_root, id }) =
                                 ObjectPath::try_from(*path)
-                                && let Ok(log) =
-                                    glassdb_storage::txobject::decode(db_root.as_str(), &id, value)
+                                && let Ok(record) =
+                                    glassdb_storage::txrecord::decode(db_root.as_str(), &id, value)
                             {
                                 control.armed.store(false, Ordering::SeqCst);
-                                retired = control
-                                    .retired
-                                    .lock()
-                                    .unwrap()
-                                    .take()
-                                    .map(|retired| (retired, log.prepared_collections.len()));
+                                retired =
+                                    control.retired.lock().unwrap().take().map(|retired| {
+                                        (retired, record.prepared_collections.len())
+                                    });
                             }
                         }
                         _ => {}
@@ -523,7 +521,7 @@ impl RetirementFailureControl {
                 let fail = match operation {
                     BackendOp::WriteIf { value, .. }
                     | BackendOp::WriteIfNotExists { value, .. } => {
-                        is_aborted_tx_log(value) && control.armed.swap(false, Ordering::SeqCst)
+                        is_aborted_tx_record(value) && control.armed.swap(false, Ordering::SeqCst)
                     }
                     _ => false,
                 };
@@ -554,7 +552,7 @@ impl RetirementFailureControl {
                     && control.failure_observed.load(Ordering::SeqCst)
                     && match operation {
                         BackendOp::WriteIf { value, .. }
-                        | BackendOp::WriteIfNotExists { value, .. } => is_aborted_tx_log(value),
+                        | BackendOp::WriteIfNotExists { value, .. } => is_aborted_tx_record(value),
                         _ => false,
                     })
                 .then(|| control.recovered.lock().unwrap().take())
@@ -595,20 +593,20 @@ fn is_leaf_path(path: &str) -> bool {
     path.ends_with("/_r") || path.contains("/_n/")
 }
 
-/// Reports whether `body` is an abort-side terminal transaction object.
-fn is_abort_side_tx_log(body: &[u8]) -> bool {
-    glassdb_storage::txobject::status(body)
+/// Reports whether `body` is an abort-side terminal transaction record.
+fn is_abort_side_tx_record(body: &[u8]) -> bool {
+    glassdb_storage::txrecord::status(body)
         .map(|status| matches!(status, TxCommitStatus::Aborted | TxCommitStatus::Wounded))
         .unwrap_or(false)
 }
 
-fn is_aborted_tx_log(body: &[u8]) -> bool {
-    glassdb_storage::txobject::status(body).is_ok_and(|status| status == TxCommitStatus::Aborted)
+fn is_aborted_tx_record(body: &[u8]) -> bool {
+    glassdb_storage::txrecord::status(body).is_ok_and(|status| status == TxCommitStatus::Aborted)
 }
 
 /// Reports whether `body` is a pinned transaction wound.
-fn is_wounded_tx_log(body: &[u8]) -> bool {
-    glassdb_storage::txobject::status(body)
+fn is_wounded_tx_record(body: &[u8]) -> bool {
+    glassdb_storage::txrecord::status(body)
         .map(|status| status == TxCommitStatus::Wounded)
         .unwrap_or(false)
 }

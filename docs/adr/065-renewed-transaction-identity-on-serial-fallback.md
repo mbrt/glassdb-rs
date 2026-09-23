@@ -1,4 +1,4 @@
-# ADR-065: Renew transaction identity on serial fallback
+# ADR-065: Renewed transaction identity on serial fallback
 
 ## Status
 
@@ -46,7 +46,7 @@ Every transition from a running parallel acquisition episode into sorted serial
 acquisition renews the transaction identity. There is no foreground release
 sweep in this path.
 
-The attempt owner performs the transition with the general engine interfaces
+The transaction owner performs the transition with the general engine interfaces
 that it already uses for a wound:
 
 1. End the old identity. This closes admission and makes the identity terminal
@@ -54,7 +54,7 @@ that it already uses for a wound:
    conditional write leaves an unresolved owner operation, so the existing end
    path pins the identity as wounded. A completed conflict episode can be
    acknowledged as aborted. If end fails, no replacement identity is created.
-2. Begin again from the ended attempt, preserving wound-wait priority.
+2. Begin again from the ended identity, preserving wound-wait priority.
 3. Enter sorted serial acquisition directly under the renewed identity.
 
 The renewed identity samples a new validation lower bound, acquires the
@@ -65,7 +65,7 @@ never look like the renewed transaction's own out-of-order lock.
 
 Renewal replaces the identity, not the work. A point or range transaction keeps
 the completed transaction body's access set and normal outcome and re-enters the
-commit phases without running the body again. A transaction that creates or
+commit phases without replaying the body. A transaction that creates or
 drops a collection keeps its existing wound-style body replay, because its
 prepared collection resources belong to the old identity. If later validation
 rejects a retained read, the ordinary transparent body replay applies; the
@@ -73,7 +73,7 @@ transition alone never causes one.
 
 The sorted serial mechanism itself does not change. It visits current groups one
 at a time in ascending leaf-path order, has one incomplete leaf operation at a
-time, and arms no timeout. An attempt that starts directly in serial mode holds
+time, and arms no timeout. A commit pass that starts directly in serial mode holds
 no parallel locks under its current identity and needs no transition. A later
 serial conflict or capacity failure keeps its sorted prefix locks and retries
 under the same identity, because it is already inside the serial mechanism.
@@ -83,7 +83,7 @@ under the same identity, because it is already inside the serial mechanism.
 - The serial progress proof holds again. A transaction that enters the sorted
   order can no longer hold an out-of-order lock under its current identity,
   even when a leaf write landed after its acquisition future was dropped.
-- One transition creates one abort-side transaction object. This is GC debt
+- One transition creates one abort-side transaction record. This is GC debt
   that ADR-024 avoided. The transition is rare, because it needs a deadlock
   timeout or a repeated conflict threshold, and the alternative is an unsound
   progress guarantee.
@@ -93,11 +93,11 @@ under the same identity, because it is already inside the serial mechanism.
 - Old locks are reclaimed as the renewed identity reaches them, or later by
   recovery, instead of by a foreground sweep. A peer that meets one of those
   locks resolves an abort-side holder, which it already knows how to do.
-- Retirement has one shape. Wound restart, abnormal abandonment, and the serial
+- Retirement has one shape. Wound identity renewal, abnormal abandonment, and the serial
   transition all end the identity through the same path, so there is one place
   where terminal status becomes durable.
 - The deadlock timeout stops being an internal control signal that `Algo`
-  resolves alone. The attempt owner, which owns the handle and the retirement
+  resolves alone. The transaction owner, which owns the handle and the retirement
   guard, decides the transition. This keeps identity replacement where identity
   ownership already is.
 - A transaction that transitions keeps its executed body. Only collection

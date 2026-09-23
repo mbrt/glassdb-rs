@@ -9,9 +9,8 @@ use glassdb::{Database, Error, InlinePolicy};
 pub mod integration_support;
 
 use integration_support::{
-    LoglessCommitControl, PauseControl, PreparedCollectionRecoveryControl,
-    RetirementFailureControl, incremented_value, init_db, mem, read_int, read_int_from_tx, rmw,
-    write_int,
+    DirectCommitControl, PauseControl, PreparedCollectionRecoveryControl, RetirementFailureControl,
+    incremented_value, init_db, mem, read_int, read_int_from_tx, rmw, write_int,
 };
 
 const STALE_BODY_PANIC: &str = "panic after observing a stale snapshot";
@@ -77,7 +76,7 @@ async fn cancelled_tx_future_does_not_block_followups() {
 
     let coll_ref = &coll;
     // The closure stages a write and then blocks forever; the outer timeout
-    // drops the entire `Database::tx` future. Because engine attempts begin only
+    // drops the entire `Database::tx` future. Because commit begins only
     // after a transaction body returns, cancelling here discards the staged state without
     // requiring engine cleanup.
     let r = tokio::time::timeout(Duration::from_millis(50), async {
@@ -156,7 +155,7 @@ async fn first_execution_stale_panic_discards_staged_data_and_catalog_changes() 
     db.shutdown().await;
 }
 
-/// A stale locked attempt replays its body while retaining its identity and
+/// A stale locked transaction replays its body while retaining its identity and
 /// locks. If that replay panics before returning a future, ownership of those
 /// resources is handed to recovery before the unwind reaches the caller.
 #[tokio::test(start_paused = true)]
@@ -365,15 +364,15 @@ async fn failed_finalization_keeps_the_retirement_guard_armed() {
     db.shutdown().await;
 }
 
-/// A dropped attempt on the logless one-CAS path (ADR-051) must not write an
-/// aborted transaction object. That id never took a logged identity: it is
+/// A dropped transaction on direct commit (ADR-051) must not write an
+/// aborted transaction record. That id never took a locked identity: it is
 /// invisible to peers, holds no lock, and — once its CAS is dispatched — may in
 /// fact have committed, so an abort marker would be both pointless and a lie.
 #[tokio::test(start_paused = true)]
-async fn cancelled_logless_commit_writes_no_aborted_object() {
+async fn cancelled_direct_commit_writes_no_aborted_record() {
     use std::time::Duration;
 
-    let control = LoglessCommitControl::wrap(mem());
+    let control = DirectCommitControl::wrap(mem());
     let db = Database::open("example", control.backend()).await.unwrap();
     let coll = db
         .root_collection()
@@ -387,7 +386,7 @@ async fn cancelled_logless_commit_writes_no_aborted_object() {
 
     let (arrived, release) = control.arm();
 
-    // A lone small overwrite of an existing key: eligible for the logless path,
+    // A lone small overwrite of an existing key: eligible for direct commit,
     // whose commit is the parked leaf CAS.
     let stalled = tokio::spawn({
         let db = db.clone();
@@ -410,7 +409,7 @@ async fn cancelled_logless_commit_writes_no_aborted_object() {
     assert_eq!(
         control.aborted_writes(),
         0,
-        "a cancelled logless attempt must not invent an aborted transaction"
+        "a cancelled direct commit must not invent an aborted transaction record"
     );
 }
 
@@ -439,7 +438,7 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
     let (lock_landed, release_lock) = pause.arm_leaf_write_gate();
 
     // Inline publication is disabled so the transaction reaches the standard
-    // locked commit path and its transaction-log write.
+    // locked commit and its committed transaction-record write.
     let stalled = tokio::spawn({
         let db = db.clone();
         let coll = coll.clone();
@@ -458,7 +457,7 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
     lock_landed.await.unwrap();
 
     // Drop the future. The engine transaction's retirement guard starts a
-    // background task that writes the pinned Wounded marker to the tx log via
+    // background task that writes the pinned Wounded marker to the tx record via
     // the now-disarmed backend.
     stalled.abort();
     let _ = stalled.await;
@@ -490,18 +489,18 @@ async fn cancelled_tx_during_commit_unblocks_peer_promptly() {
     assert_eq!(read_int(&v2), 12);
 }
 
-/// The locked path installs its lock before writing its committed transaction
-/// object, so a future dropped in that window leaves a lock behind whose object
-/// never landed. The path takes its logged identity *before* those writes, so the
+/// Locked commit installs its lock before writing its committed transaction
+/// record, so a future dropped in that window leaves a lock behind whose record
+/// never landed. The protocol takes its locked identity *before* those writes, so the
 /// cancellation guard can finalize the identity. A peer then resolves the
-/// cancelled holder immediately instead of waiting out the unknown-transaction
+/// cancelled holder immediately instead of waiting out the in-doubt transaction
 /// grace period.
 #[tokio::test(start_paused = true)]
 async fn cancelled_single_rw_commit_unblocks_peer_promptly() {
     use std::time::Duration;
 
-    // Over the inline budget, so the commit takes the locked path rather than the
-    // logless one-CAS path (ADR-051), which takes no identity at all.
+    // Over the inline budget, so the commit uses locked commit rather than
+    // direct commit (ADR-051), which takes no identity at all.
     fn padded(tag: u8) -> Vec<u8> {
         vec![tag; 2048]
     }
@@ -520,7 +519,7 @@ async fn cancelled_single_rw_commit_unblocks_peer_promptly() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Park the lock CAS after it lands. Dropping the future here leaves exactly
-    // the holder-without-an-object state, before terminal commit dispatch.
+    // the holder-without-a-record state, before terminal commit dispatch.
     let (installed, release_lock) = pause.arm_leaf_write_gate();
     let stalled = tokio::spawn({
         let db = db.clone();
@@ -552,7 +551,7 @@ async fn cancelled_single_rw_commit_unblocks_peer_promptly() {
     peer.unwrap();
 
     let value = coll.read(b"k").await.unwrap().unwrap();
-    assert_eq!(value[0], 7, "the cancelled attempt never committed");
+    assert_eq!(value[0], 7, "the cancelled transaction never committed");
 }
 
 /// Clean shutdown waits for the async wound scheduled when a transaction is

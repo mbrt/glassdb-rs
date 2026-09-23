@@ -15,22 +15,22 @@ read or write needs their resources. Retaining these objects costs less than
 actively resolving them. Pending transaction expiry and wounding already belong
 to Monitor.
 
-A `Wounded` log can remain pinned indefinitely. Each GC scan that finds it can
+A `Wounded` record can remain pinned indefinitely. Each GC scan that finds it can
 repeat checks of every recorded lock and collection effect. A previous cleanup
 pass cannot prove completion: an operation already in flight at the wound can
 publish an effect later. This creates recurring request cost with no finite end.
 
 ## Decision
 
-GC reads the transaction log first and applies these rules:
+GC reads the transaction record first and applies these rules:
 
 - Missing, `Pending`, or `Wounded`: skip without inspecting or changing its
   recorded resources. GC never removes a pinned wound marker.
 - `Aborted`: after the safety horizon, remove recorded aborted effects and
-  conditionally delete the log when cleanup is complete.
+  conditionally delete the record when cleanup is complete.
 - Committed: after the safety horizon, check recorded references and conditionally
-  delete the log only when none remain and cleanup is complete. Entry locks
-  awaiting write-back retain the log.
+  delete the record only when none remain and cleanup is complete. Entry locks
+  awaiting write-back retain the record.
 
 Finding a GC candidate does not initiate pending expiry or wounding. Monitor
 keeps that responsibility when reads or lock operations need to resolve a
@@ -41,18 +41,18 @@ which ordinary GC applies.
 
 GC filters candidates by durable status and the safety horizon under one
 `Requirement`, then captures a fresh `Requirement` for reference checks.
-Final-log retention still protects ambiguous commit recovery under
+Final-record retention still protects in-doubt commit recovery under
 [ADR-057](057-bounded-in-doubt-commit-recovery.md).
 
 ## Consequences
 
-Pending and wounded logs and their unused resources can remain indefinitely.
+Pending and wounded records and their unused resources can remain indefinitely.
 We accept their storage cost to avoid active resolution and repeated resource
 checks. These statuses cause no cleanup retry or positive scan-demand signal;
 retained objects alone are not GC backlog.
 
 Later hints or GC scans, including hints received during a check, can schedule
-another log read. This can detect owner acknowledgement, so the decision does
+another record read. This can detect owner acknowledgement, so the decision does
 not eliminate all request cost for retained objects. Wound markers remain pinned
 until owner retirement.
 

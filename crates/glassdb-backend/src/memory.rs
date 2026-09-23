@@ -1,6 +1,6 @@
 //! In-memory backend for testing and development (ADR-016, ADR-023, ADR-042).
 //!
-//! Content-CAS only: the opaque version token is the object generation, bumped
+//! Content-CAS only: the opaque revision token is the object generation, bumped
 //! on every content write. This matches the (now generation-only) GCS token,
 //! so the in-memory backend keeps modelling production conditional-mutation
 //! semantics.
@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::implementation::{bind_list_cursor, list_provider_token};
-use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
+use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Revision};
 
 #[derive(Clone, Default)]
 struct Object {
@@ -20,8 +20,8 @@ struct Object {
 }
 
 impl Object {
-    fn version(&self) -> Version {
-        Version::new(self.generation.to_string())
+    fn revision(&self) -> Revision {
+        Revision::new(self.generation.to_string())
     }
 }
 
@@ -73,23 +73,23 @@ impl Backend for MemoryBackend {
         let obj = state.objects.get(path).ok_or(BackendError::NotFound)?;
         Ok(ReadReply {
             contents: obj.data.clone(),
-            version: obj.version(),
+            revision: obj.revision(),
         })
     }
 
     async fn read_if_modified(
         &self,
         path: &str,
-        expected: &Version,
+        expected: &Revision,
     ) -> Result<ReadReply, BackendError> {
         let state = self.state.lock().unwrap();
         let obj = state.objects.get(path).ok_or(BackendError::NotFound)?;
-        if &obj.version() == expected {
+        if &obj.revision() == expected {
             return Err(BackendError::Precondition);
         }
         Ok(ReadReply {
             contents: obj.data.clone(),
-            version: obj.version(),
+            revision: obj.revision(),
         })
     }
 
@@ -97,43 +97,43 @@ impl Backend for MemoryBackend {
         &self,
         path: &str,
         value: Vec<u8>,
-        expected: &Version,
-    ) -> Result<Version, BackendError> {
+        expected: &Revision,
+    ) -> Result<Revision, BackendError> {
         let mut state = self.state.lock().unwrap();
         let mut obj = state
             .objects
             .get(path)
             .ok_or(BackendError::NotFound)?
             .clone();
-        if &obj.version() != expected {
+        if &obj.revision() != expected {
             return Err(BackendError::Precondition);
         }
         state.update_data(&mut obj, value);
-        let version = obj.version();
+        let revision = obj.revision();
         state.objects.insert(path.to_string(), obj);
-        Ok(version)
+        Ok(revision)
     }
 
     async fn write_if_not_exists(
         &self,
         path: &str,
         value: Vec<u8>,
-    ) -> Result<Version, BackendError> {
+    ) -> Result<Revision, BackendError> {
         let mut state = self.state.lock().unwrap();
         if state.objects.contains_key(path) {
             return Err(BackendError::Precondition);
         }
         let mut obj = Object::default();
         state.update_data(&mut obj, value);
-        let version = obj.version();
+        let revision = obj.revision();
         state.objects.insert(path.to_string(), obj);
-        Ok(version)
+        Ok(revision)
     }
 
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Revision) -> Result<(), BackendError> {
         let mut state = self.state.lock().unwrap();
         let object = state.objects.get(path).ok_or(BackendError::NotFound)?;
-        if &object.version() != expected {
+        if &object.revision() != expected {
             return Err(BackendError::Precondition);
         }
         state.objects.remove(path);

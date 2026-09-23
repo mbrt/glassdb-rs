@@ -36,9 +36,9 @@ const CURRENT_TOMBSTONE_TAG: u32 = 4;
 /// where the value itself lives.
 ///
 /// `writer` is the optimistic-validation token the commit path compares. It
-/// identifies the transaction that produced the version, but it is not
-/// universally a pointer to a transaction object: a logless commit publishes
-/// [`CurrentState::Inline`] without ever writing one.
+/// identifies the writer, but it is not universally a pointer to a transaction
+/// record: a direct commit publishes [`CurrentState::Inline`] without ever
+/// writing one.
 ///
 /// An inline value is authoritative latest-value evidence. Readers return it
 /// directly, without consulting the writer's transaction status.
@@ -47,7 +47,7 @@ pub enum CurrentState {
     /// The key has no committed value yet.
     #[default]
     Absent,
-    /// The value lives in the writer's transaction object.
+    /// The value lives in the writer's transaction record.
     External { writer: TxId },
     /// The value is authoritative here in the leaf entry.
     Inline { writer: TxId, value: Arc<[u8]> },
@@ -56,8 +56,7 @@ pub enum CurrentState {
 }
 
 impl CurrentState {
-    /// The transaction that produced this version, or `None` when the key has
-    /// no committed value.
+    /// The writer of this value, or `None` when the key has no committed value.
     pub fn writer(&self) -> Option<&TxId> {
         match self {
             CurrentState::Absent => None,

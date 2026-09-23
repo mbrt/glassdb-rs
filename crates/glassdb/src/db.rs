@@ -1,5 +1,5 @@
 //! The database entry point. Ported from the Go `db.go`: opening a database,
-//! the transaction retry loop, collections, and stats.
+//! the body replay loop, collections, and stats.
 
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -114,9 +114,9 @@ impl DatabaseBuilder {
         self
     }
 
-    /// Overrides the budgets for logless direct commits whose authoritative
-    /// value is stored in the leaf (ADR-051, ADR-054). Values outside the
-    /// budgets take the regular logged protocol. Budgets are local to each
+    /// Overrides the budgets for direct commits whose authoritative value is
+    /// stored in the leaf (ADR-051, ADR-054). Values outside the budgets take
+    /// locked commit. Budgets are local to each
     /// database instance. Aggregate pressure can request shared tree splits
     /// (ADR-056).
     pub fn inline_policy(mut self, policy: InlinePolicy) -> Self {
@@ -315,20 +315,20 @@ impl Database {
             .await
     }
 
-    /// Executes `f` within a serializable transaction, retrying on conflicts.
+    /// Executes `f` within a serializable transaction, replaying it on conflicts.
     /// The value returned by `f` on a successful commit is returned to the
     /// caller.
     ///
     /// `f` receives the [`Transaction`] handle by value and returns a future, so the
     /// transaction future is `Send` and can be `tokio::spawn`-ed. Write the body
-    /// as `|tx| async move { ... }`. The framework owns the retry loop and may
+    /// as `|tx| async move { ... }`. The framework owns body replay and may
     /// invoke `f` multiple times, so `f` must be `FnMut`.
     ///
     /// # Error outcomes
     ///
-    /// When `f` returns an error outcome, the attempt's writes are discarded and
-    /// its reads are validated. If those reads were inconsistent, `f` is invoked
-    /// again; otherwise the original error is returned. Conditions derived from
+    /// When `f` returns an error outcome, the writes of that execution are
+    /// discarded and its reads are validated. If those reads were inconsistent,
+    /// `f` is replayed; otherwise the original error is returned. Conditions derived from
     /// transaction reads must therefore return an error, for example with
     /// [`crate::ensure_tx!`], rather than assert or panic.
     ///
@@ -342,20 +342,20 @@ impl Database {
     /// # Panics
     ///
     /// A panic from `f` propagates with its original payload. It is neither
-    /// read-validated nor retried, even when the execution observed an
+    /// read-validated nor replayed, even when the execution observed an
     /// inconsistent snapshot. Uncommitted database changes stay unpublished.
-    /// If an earlier execution left an engine attempt active for a retained
-    /// retry, unwinding synchronously hands that attempt to managed recovery;
-    /// physical lock and prepared-object reclamation may finish later.
+    /// If an earlier execution left a transaction identity active for a
+    /// body replay, unwinding synchronously hands that identity to managed
+    /// recovery; physical lock and prepared-object reclamation may finish later.
     ///
     /// # Cancellation
     ///
     /// This future is durability-safe to cancel: dropping it cannot produce a
-    /// partial logical commit. Active attempt resources are handed to managed
-    /// recovery before the future is destroyed. Cancellation does not guarantee
-    /// rollback, because a transaction-log commit or logless value CAS already
-    /// dispatched when the future is dropped may still commit even though the
-    /// caller receives no result.
+    /// partial logical commit. The resources of an active transaction identity
+    /// are handed to managed recovery before the future is destroyed.
+    /// Cancellation does not guarantee rollback, because a transaction-record
+    /// commit or direct-commit leaf CAS already dispatched when the future is
+    /// dropped may still commit even though the caller receives no result.
     pub async fn tx<T, F, Fut>(&self, f: F) -> Result<T, Error>
     where
         F: FnMut(Transaction) -> Fut + Send,
@@ -537,7 +537,7 @@ impl DbInner {
         Fut: Future<Output = Result<T, Error>> + Send,
         T: Send,
     {
-        let mut driver = AttemptDriver::new(&self.engine);
+        let mut driver = TransactionDriver::new(&self.engine);
 
         let result: Result<T, Error> = loop {
             let tx = Transaction::new(self.clone(), driver.handle.collection_reservations());
@@ -558,8 +558,8 @@ impl DbInner {
             } else {
                 // The transaction body returned an error outcome. It might be based
                 // on a spurious read, so validate only the reads. The error may
-                // escape only once validation has certified that snapshot: an
-                // attempt that could not finish proves nothing about the reads
+                // escape only once validation has certified that snapshot: a
+                // validation that could not finish proves nothing about the reads
                 // behind the error, so the caller learns about the failed
                 // validation instead.
                 match driver
@@ -571,7 +571,7 @@ impl DbInner {
                     Err(e) => break Err(Error::from_read_trans(e)),
                 }
             }
-            stats.retries += 1;
+            stats.replays += 1;
         };
 
         let end_result = driver.finish().await;
@@ -585,12 +585,12 @@ impl DbInner {
 }
 
 /// Drives the engine-side transitions for one public transaction.
-struct AttemptDriver<'a> {
+struct TransactionDriver<'a> {
     engine: &'a Engine,
     handle: EngineTransaction,
 }
 
-impl<'a> AttemptDriver<'a> {
+impl<'a> TransactionDriver<'a> {
     fn new(engine: &'a Engine) -> Self {
         Self {
             engine,
@@ -619,7 +619,7 @@ impl<'a> AttemptDriver<'a> {
         self.engine.commit(&mut self.handle).await
     }
 
-    /// Finalizes any active engine attempt.
+    /// Finalizes the active transaction identity, if any.
     async fn finish(mut self) -> Result<(), TransError> {
         self.engine.end(&mut self.handle).await
     }

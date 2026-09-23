@@ -18,24 +18,24 @@ The bug is an interaction between two existing mechanisms:
 
 1. **The single read-modify-write fast path** (`commitSingleRW`). A transaction
    that only reads and writes a single key commits with one conditional backend
-   write and writes **no transaction-log object** (`_t/<tx-id>`). This is a large
+   write and writes **no transaction record** (`_t/<tx-id>`). This is a large
    latency win, but it means the transaction's commit status and committed value
-   cannot be recovered from the log afterwards.
+   cannot be recovered from the record afterwards.
 
 2. **Validation refreshing the local cache.** When a transaction reads a value
    and then finds, at validation time, that the key was written by someone else,
    `validateLockedRead` / `validateReadNotFound` ask `Monitor.CommittedValue` for
    the writer's committed value and store it in the local cache, tagged with that
-   writer's ID, so the retry can revalidate quickly.
+   writer's ID, so the replay can revalidate quickly.
 
 When the relevant writer committed through the single-RW fast path,
-`CommittedValue` has no log to consult and returns a non-`OK` status with an
+`CommittedValue` has no record to consult and returns a non-`OK` status with an
 **unresolved / empty value**. The old code only skipped the cache update when the
 value was literally `NotWritten`; for an unresolved-but-present status it cached
 the *guessed* value bytes paired with the *real* writer ID.
 
-That produces a poisoned cache entry: value bytes from one version, writer tag
-from a newer version. A later single-RW commit on that key validates with
+That produces a poisoned cache entry: value bytes from one writer, writer tag
+from a newer writer. A later single-RW commit on that key validates with
 `checkReadVersionUnlocked`, which trusts the entry because its writer tag matches
 the live `last-writer` — even though the value is stale. The conditional write
 then succeeds and clobbers the newer value: a lost update, and a strict
@@ -53,7 +53,7 @@ minimized nor turned into a regression test. Three independent sources of
 nondeterminism, none of them controlled by `testing/synctest`, were responsible:
 
 - **Random transaction-ID prefixes.** `data.NewTId` draws its prefix from
-  `crypto/rand`, so IDs (and therefore tx-log object keys, and the order tied to
+  `crypto/rand`, so IDs (and therefore transaction-record keys, and the order tied to
   them) differed on every run.
 - **Go map iteration order.** Several commit-path steps built slices by ranging
   over a map, so the order of backend operations a transaction issued varied run
@@ -69,16 +69,16 @@ nondeterminism, none of them controlled by `testing/synctest`, were responsible:
 In `validateLockedRead` and `validateReadNotFound`, only refresh the local cache
 with a writer's value when `CommittedValue` resolved it **authoritatively**
 (`Status == OK` and the value is written). Otherwise — the writer used the
-single-RW fast path and its value is unresolvable from the log — do not cache a
+single-RW fast path and its value is unresolvable from the record — do not cache a
 guessed value. `validateLockedRead` instead invalidates the stale entry
-(`local.MarkValueOutated`) so the retry re-reads the authoritative value straight
+(`local.MarkValueOutated`) so the replay re-reads the authoritative value straight
 from storage; `validateReadNotFound` simply retries without touching the cache.
 
 This removes the only paths that paired a value with a writer that did not
 produce it, so `checkReadVersionUnlocked` can no longer be fooled into accepting a
-stale read. Correctness comes from re-reading storage on retry, which already
+stale read. Correctness comes from re-reading storage on replay, which already
 returns the genuine committed value (its `last-writer` tag still names the
-single-RW writer), so no extra log lookup or backend round-trip is needed on the
+single-RW writer), so no extra record lookup or backend round-trip is needed on the
 common path.
 
 ### Make the fuzzer deterministic (Go only; deferred in Rust)
@@ -93,13 +93,13 @@ need not be mirrored.
 ## Consequences
 
 - The local cache can no longer hold a value whose bytes and writer tag come from
-  different versions via the validation paths, closing the lost-update hole.
+  different writers via the validation paths, closing the lost-update hole.
 - On the uncommon path where a single-RW writer's value is unresolvable, a
-  transaction does one extra retry (re-reading from storage) instead of trusting a
+  transaction does one extra replay (re-reading from storage) instead of trusting a
   cached guess. This trades a small amount of work under contention for
   correctness.
 - `single_rw_lost_update` (in `glassdb-trans` algo tests) is a deterministic
-  regression test that recreates the exact poisoning sequence: a logless
+  regression test that recreates the exact poisoning sequence: a direct
   single-RW writer, a victim with a stale read, and a pending lock that forces
   validation down the unresolvable branch. It asserts the victim subsequently
   reads the authoritative value rather than the cached guess; it fails against

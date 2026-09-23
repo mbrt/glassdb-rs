@@ -121,7 +121,7 @@ impl PersistentBridge {
         };
         let size = C::size(&decoded);
         let value = Arc::new(decoded);
-        let revision = Revision::from_backend(backend::Version::new(token));
+        let revision = Revision::from_backend(backend::Revision::new(token));
         let seed = knowledge.install_persistent::<C>(
             key.as_str(),
             value,

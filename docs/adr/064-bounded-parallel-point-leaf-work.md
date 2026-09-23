@@ -59,7 +59,7 @@ understands the rule:
 
 There is no shared routed point-leaf plan, no stateful point-leaf workflow, and
 no domain-aware foreground executor. `AccessSet` stays the only point-access
-fact shared between direct commit and the logged path. A routed leaf group is
+fact shared between direct commit and the locked commit. A routed leaf group is
 the temporary result of one routing operation, not a durable ownership claim.
 
 ## Consequences

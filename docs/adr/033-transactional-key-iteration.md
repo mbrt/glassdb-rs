@@ -38,7 +38,7 @@ GlassDB provides forward, keys-only transactional scans over raw key bytes:
 A scan records both its logical result and the physical leaves through its
 effective frontier. When a positive limit is filled, the frontier is the last
 key returned; otherwise it is the range end. Validation first uses each leaf's
-membership version and pending membership holders as an OCC shortcut. If that
+membership generation and pending membership holders as an OCC shortcut. If that
 physical evidence changed, it re-resolves the same predicate and accepts the
 scan when the logical page is unchanged. Thus value overwrites and pure splits
 do not cause false conflicts, while creates and deletes in the observed
@@ -46,7 +46,7 @@ predicate do.
 
 Transactions containing both a scan and a write take structure-read and
 membership-read locks on every covered leaf and revalidate after locking. If a
-limited page's frontier moves outward, the transaction retries while retaining
+limited page's frontier moves outward, the transaction re-validates while retaining
 its locks, extends the locked range, and repeats until the page is stable.
 
 A read-only transaction uses OCC and takes no locks on its first attempt. If

@@ -10,7 +10,7 @@ use glassdb_storage::{
     CurrentState, InlinePolicy, LeafEntry, NodeLocks, Requirement, StorageError, TreeRouter,
 };
 
-use super::attempt::AttemptState;
+use super::handle_state::HandleState;
 use crate::access::{AccessSet, ReadPredicate, WriteOp};
 use crate::error::TransError;
 use crate::gc::GcHints;
@@ -24,7 +24,7 @@ use crate::split::SplitHintSink;
 /// Direct same-leaf commit coverage for one snapshot or accumulated interval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DirectCommitStats {
-    /// Mutation attempts shaped and routed for the direct path.
+    /// Mutation attempts shaped and routed for direct commit.
     pub candidates: u64,
     /// Candidates that committed directly.
     pub landed: u64,
@@ -54,7 +54,7 @@ struct DirectCommitCounters {
     landed: AtomicU64,
 }
 
-/// Owns the logless same-leaf commit subprotocol.
+/// Owns the direct same-leaf commit subprotocol.
 #[derive(Clone)]
 pub(super) struct DirectCommit {
     router: TreeRouter,
@@ -66,7 +66,7 @@ pub(super) struct DirectCommit {
 }
 
 impl DirectCommit {
-    /// Creates the direct-commit path over the engine's shared collaborators.
+    /// Creates direct commit over the engine's shared collaborators.
     pub(super) fn new(
         router: TreeRouter,
         coord: LeafCoordinator,
@@ -92,20 +92,20 @@ impl DirectCommit {
         }
     }
 
-    /// Attempts one atomic logless commit for a complete point transaction.
+    /// Attempts one atomic direct commit for a complete point transaction.
     ///
     /// An eligible member publishes every output in one conditional leaf CAS.
-    /// It creates no transaction object or lock and has no write-back phase.
-    /// Certified losses either replay the body or use the regular locked path;
-    /// an unresolved CAS is never rerun as a new transaction (ADR-061).
+    /// It creates no transaction record or lock and has no write-back phase.
+    /// Certified losses either replay the body or fall back to a locked commit;
+    /// an unresolved in-doubt CAS never leads to a body replay (ADR-061).
     pub(super) async fn try_commit(
         &self,
         id: &TxId,
         accesses: &AccessSet,
-        state: &mut AttemptState,
-    ) -> Result<DirectAttempt, TransError> {
+        state: &mut HandleState,
+    ) -> Result<DirectOutcome, TransError> {
         let Some(member) = direct_member(accesses) else {
-            return Ok(DirectAttempt::Locked);
+            return Ok(DirectOutcome::Locked);
         };
         // A zero policy disables the protocol even for all-delete members. All
         // put bytes must be durable in the commit leaf itself.
@@ -118,15 +118,15 @@ impl DirectCommit {
                 )
             })
         {
-            return Ok(DirectAttempt::Locked);
+            return Ok(DirectOutcome::Locked);
         }
         let Some(mut leaf_path) = self.route_member(&member).await? else {
-            return Ok(DirectAttempt::Locked);
+            return Ok(DirectOutcome::Locked);
         };
         self.counters.candidates.fetch_add(1, Ordering::Relaxed);
 
         // A split can stale the path between grouping and submission. One fresh
-        // regroup preserves the direct path for that race; repeated topology
+        // regroup preserves direct commit for that race; repeated topology
         // churn falls back instead of borrowing the coordinator's CAS budget.
         let mut rerouted = false;
         loop {
@@ -143,21 +143,21 @@ impl DirectCommit {
                     self.counters.landed.fetch_add(1, Ordering::Relaxed);
                     state.commit();
                     self.cleanup_hints.schedule_all(predecessors);
-                    return Ok(DirectAttempt::Committed);
+                    return Ok(DirectOutcome::Committed);
                 }
                 DirectMutationOutcome::InDoubt(msg) => {
                     return Err(TransError::Storage(StorageError::Unavailable(msg)));
                 }
-                DirectMutationOutcome::Replay => return Ok(DirectAttempt::Replay),
+                DirectMutationOutcome::Replay => return Ok(DirectOutcome::Replay),
                 DirectMutationOutcome::Reroute if !rerouted => {
                     let Some(path) = self.route_member(&member).await? else {
-                        return Ok(DirectAttempt::Locked);
+                        return Ok(DirectOutcome::Locked);
                     };
                     leaf_path = path;
                     rerouted = true;
                 }
                 DirectMutationOutcome::Locked | DirectMutationOutcome::Reroute => {
-                    return Ok(DirectAttempt::Locked);
+                    return Ok(DirectOutcome::Locked);
                 }
             }
         }
@@ -245,12 +245,12 @@ impl DirectCommitOperation {
         }
     }
 
-    /// Returns transaction-object references displaced by the landed member.
+    /// Returns transaction-record references displaced by the landed member.
     fn predecessors(&self) -> Vec<TxId> {
         let mut predecessors = BTreeSet::new();
         if let Some(staged) = self.staged_over.lock().unwrap().as_ref() {
-            // Inline values and tombstones can have logless writers. Scans find
-            // any transaction objects that remain behind those states.
+            // Inline values and tombstones can have direct-commit writers. Scans find
+            // any transaction records that remain behind those states.
             predecessors.extend(staged.values().filter_map(|state| match state {
                 CurrentState::External { writer } => Some(writer.clone()),
                 _ => None,
@@ -317,7 +317,7 @@ impl DirectCommitOperation {
         Ok(false)
     }
 
-    /// Produces the ordinary policy decision after uncertainty, if any, has
+    /// Produces the ordinary policy decision after an in-doubt CAS, if any, has
     /// been resolved as a definite non-landing.
     async fn resolve_fresh(
         &self,
@@ -347,7 +347,7 @@ impl DirectCommitOperation {
             });
         }
 
-        // Coordination blockers win over a stale-read replay. Retrying a body
+        // Coordination blockers win over a stale-read replay. Replaying a body
         // while the same live holder remains would otherwise spin.
         if resolutions.iter().any(|state| !state.pending.is_empty()) {
             return Ok(Step::Skip {
@@ -361,7 +361,7 @@ impl DirectCommitOperation {
             .zip(resolutions)
             .any(|(key, state)| {
                 key.read.as_ref().is_some_and(|read| {
-                    !read.validates(state.writer.as_ref(), locks.membership_version())
+                    !read.validates(state.writer.as_ref(), locks.membership_generation())
                 })
             })
         {
@@ -369,7 +369,7 @@ impl DirectCommitOperation {
             // generation. A skipped publication would discard that change, so
             // replaying the same absence read could never converge. The locked
             // path makes the cleanup durable before validating the read.
-            let outcome = if locks.membership_version() != staged_locks.membership_version() {
+            let outcome = if locks.membership_generation() != staged_locks.membership_generation() {
                 MemberOutcome::Moved
             } else {
                 MemberOutcome::Replay
@@ -435,7 +435,7 @@ impl DirectCommitOperation {
             ));
         }
         if changes_membership {
-            locks.advance_membership_version();
+            locks.advance_membership_generation();
         }
         *self.staged_over.lock().unwrap() = Some(predecessors);
         Ok(Step::Stage {
@@ -530,15 +530,15 @@ impl DirectCommitOperation {
         if self.proven_landed() {
             MemberOutcome::Landed
         } else if in_doubt {
-            self.ambiguous_outcome()
+            self.in_doubt_outcome()
         } else {
             otherwise
         }
     }
 
-    fn ambiguous_outcome(&self) -> MemberOutcome {
+    fn in_doubt_outcome(&self) -> MemberOutcome {
         MemberOutcome::InDoubt(format!(
-            "direct commit for {} could not be resolved after an uncertain CAS",
+            "direct commit for {} could not be resolved after an in-doubt CAS",
             self.id
         ))
     }
@@ -577,7 +577,7 @@ impl LeafResolver for DirectCommitOperation {
         let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true });
         if in_doubt && !self.proves_non_landing(&resolutions) {
             return Ok(Step::Skip {
-                outcome: self.ambiguous_outcome(),
+                outcome: self.in_doubt_outcome(),
             });
         }
         self.resolve_fresh(ctx, staged, staged_locks, &resolutions)
@@ -608,7 +608,7 @@ impl LeafResolver for DirectCommitOperation {
             .collect()
     }
 
-    fn logless_publication_keys(&self) -> Vec<&[u8]> {
+    fn direct_publication_keys(&self) -> Vec<&[u8]> {
         self.member
             .output_keys()
             .map(|key| key.raw_key.as_slice())
@@ -673,14 +673,14 @@ enum DirectMutationOutcome {
     Locked,
 }
 
-/// What an attempted direct commit established about its transaction.
+/// What a tried direct commit established about its transaction.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum DirectAttempt {
+pub(super) enum DirectOutcome {
     /// The one-CAS commit landed.
     Committed,
-    /// Nothing durable landed and read-dependent computation must be rerun.
+    /// Nothing durable landed and the body must be replayed.
     Replay,
-    /// The regular logged protocol must coordinate the transaction.
+    /// A locked commit must coordinate the transaction.
     Locked,
 }
 

@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use glassdb_concurr::Tape;
 use glassdb_concurr::rt;
 
-use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
+use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Revision};
 
 /// Probabilities (out of 256) governing transport faults, plus the maximum
 /// injected delay. A probability of zero disables that behaviour.
@@ -221,7 +221,7 @@ impl Backend for FaultBackend {
     async fn read_if_modified(
         &self,
         path: &str,
-        expected: &Version,
+        expected: &Revision,
     ) -> Result<ReadReply, BackendError> {
         self.transport(|| self.inner.read_if_modified(path, expected))
             .await
@@ -231,8 +231,8 @@ impl Backend for FaultBackend {
         &self,
         path: &str,
         value: Vec<u8>,
-        expected: &Version,
-    ) -> Result<Version, BackendError> {
+        expected: &Revision,
+    ) -> Result<Revision, BackendError> {
         self.transport(|| self.inner.write_if(path, value, expected))
             .await
     }
@@ -241,12 +241,12 @@ impl Backend for FaultBackend {
         &self,
         path: &str,
         value: Vec<u8>,
-    ) -> Result<Version, BackendError> {
+    ) -> Result<Revision, BackendError> {
         self.transport(|| self.inner.write_if_not_exists(path, value))
             .await
     }
 
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Revision) -> Result<(), BackendError> {
         self.transport(|| self.inner.delete_if(path, expected))
             .await
     }
@@ -385,7 +385,7 @@ mod tests {
     #[tokio::test]
     async fn delete_lost_ack_reports_unavailable_after_landing() {
         let mem = Arc::new(MemoryBackend::new());
-        let version = mem.write_if_not_exists("p", b"v".to_vec()).await.unwrap();
+        let revision = mem.write_if_not_exists("p", b"v".to_vec()).await.unwrap();
         let backend: Arc<dyn Backend> = mem.clone();
         let opts = FaultOptions {
             delay_prob: 0,
@@ -397,7 +397,7 @@ mod tests {
         let fault = FaultBackend::with_tape(backend, vec![0, 0], 1, opts);
         fault.set_active(true);
 
-        let error = fault.delete_if("p", &version).await.unwrap_err();
+        let error = fault.delete_if("p", &revision).await.unwrap_err();
 
         assert!(
             matches!(error, BackendError::Unavailable(message) if message.contains("lost ack"))

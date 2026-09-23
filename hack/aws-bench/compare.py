@@ -28,7 +28,7 @@ so for an engine comparison with ``--label-a v1 --label-b v2`` a ratio above 1.0
 means v2 has more of that quantity than v1:
 
 * throughput ratio > 1  -> v2 is faster (good);
-* latency / retries / backend-ops / cost ratio < 1 -> v2 is cheaper (good).
+* latency / replays / backend-ops / cost ratio < 1 -> v2 is cheaper (good).
 
 Two original use cases are both covered by this generic shape:
 
@@ -37,7 +37,7 @@ Two original use cases are both covered by this generic shape:
 * fake vs real S3: ``--a out --label-a real --b out-fake --label-b fake``.
 
 It also writes overlay PNGs (``cmp-tx-throughput.png``, ``cmp-tx-latency.png``,
-``cmp-retries.png``, ``cmp-contention-latency.png``) into ``--out`` so the curves
+``cmp-replays.png``, ``cmp-contention-latency.png``) into ``--out`` so the curves
 can be eyeballed together.
 """
 
@@ -65,6 +65,26 @@ import seaborn as sns
 # coordination into object reads/writes), so summing every class is what makes
 # the efficiency number comparable across versions.
 OP_COLS = ["obj-write", "obj-read", "obj-list", "meta-write", "meta-read"]
+
+
+def perfbench_body_replays(cell: dict) -> int:
+    # Older perfbench JSON used ``retries`` for body replay counts.
+    return cell.get("replays", cell.get("retries", 0))
+
+
+def perfbench_body_replays_per_tx(mapping: dict) -> float:
+    return mapping.get("replaysPerTx", mapping.get("retriesPerTx", 0))
+
+
+def with_num_replays(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure a ``num-replays`` column, accepting legacy ``num-retries`` CSV."""
+    d = df.copy()
+    if "num-replays" not in d.columns:
+        if "num-retries" in d.columns:
+            d["num-replays"] = d["num-retries"]
+        else:
+            d["num-replays"] = 0
+    return d
 
 
 def read_csv(input_dir: Path, name: str) -> pd.DataFrame | None:
@@ -105,7 +125,9 @@ def read_first_json(input_dir: Path, *names: str) -> Any | None:
     return None
 
 
-def perfbench_contention_frames(input_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame] | None:
+def perfbench_contention_frames(
+    input_dir: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame] | None:
     """Convert a current contention envelope to the historical table shapes."""
     paths = [input_dir / "contention.json"]
     if not paths[0].exists():
@@ -123,7 +145,9 @@ def perfbench_contention_frames(input_dir: Path) -> tuple[pd.DataFrame, pd.DataF
             external_run += 1
             for cell in run.get("cells", []):
                 if cell.get("failures") != 0:
-                    raise ValueError(f"{path}: contention cell did not complete cleanly")
+                    raise ValueError(
+                        f"{path}: contention cell did not complete cleanly"
+                    )
                 identity = {
                     "run": run_id,
                     "num-keys": cell["numKeys"],
@@ -140,7 +164,7 @@ def perfbench_contention_frames(input_dir: Path) -> tuple[pd.DataFrame, pd.DataF
                         "count": cell["committed"],
                         "cell-duration-ms": cell["durationMs"],
                         "tx-per-sec": cell["txPerSec"],
-                        "num-retries": cell["retries"],
+                        "num-replays": perfbench_body_replays(cell),
                         "direct-candidates": cell["directCandidates"],
                         "direct-landed": cell["directLanded"],
                         "worker-drain-ms": cell["workerDrainMs"],
@@ -163,7 +187,7 @@ def perfbench_inline_frame(input_dir: Path) -> pd.DataFrame | None:
         "txPerSec": "tx-per-sec",
         "p50Ms": "p50-ms",
         "p90Ms": "p90-ms",
-        "retries": "retries",
+        "replays": "replays",
         "lockCalls": "lock-calls",
         "directCandidates": "direct-candidates",
         "directLanded": "direct-landed",
@@ -180,7 +204,10 @@ def perfbench_inline_frame(input_dir: Path) -> pd.DataFrame | None:
     external_run = 1
     for path in paths:
         report = json.loads(path.read_text())
-        if report.get("schemaVersion") != 1 or report.get("scenario") != "inline-pressure":
+        if (
+            report.get("schemaVersion") != 1
+            or report.get("scenario") != "inline-pressure"
+        ):
             raise ValueError(f"{path}: incompatible perfbench schema")
         for run in report.get("runs", []):
             run_id = external_run if len(paths) > 1 else run["run"]
@@ -188,7 +215,14 @@ def perfbench_inline_frame(input_dir: Path) -> pd.DataFrame | None:
             for phase in run.get("phases", []):
                 row = {"run": run_id, "phase": phase["phase"]}
                 row.update(
-                    {legacy: phase.get(current) for current, legacy in fields.items()}
+                    {
+                        legacy: (
+                            perfbench_body_replays(phase)
+                            if current == "replays"
+                            else phase.get(current)
+                        )
+                        for current, legacy in fields.items()
+                    }
                 )
                 rows.append(row)
     return pd.DataFrame(rows)
@@ -258,7 +292,7 @@ def _verdict(ratio: float, lower_is_better: bool | None) -> str:
     """A direction-aware `=> better/WORSE/~same` tag for a ratio (b/a), or an
     empty string when the metric has no meaningful direction (or the ratio is
     NaN). `lower_is_better` encodes the metric's polarity: cost/latency/ops/
-    retries improve as the ratio drops, throughput as it rises."""
+    replays improve as the ratio drops, throughput as it rises."""
     if lower_is_better is None or ratio != ratio:
         return ""
     if abs(ratio - 1.0) <= SAME_TOL:
@@ -325,9 +359,7 @@ def throughput_duration_column(df: pd.DataFrame) -> str:
     durations = df["cell-duration-ms"]
     if (~np.isfinite(durations) | (durations <= 0)).any():
         raise ValueError("throughput cells must have a positive finite duration")
-    distinct = df.groupby(["run", "num-db"])["cell-duration-ms"].nunique(
-        dropna=False
-    )
+    distinct = df.groupby(["run", "num-db"])["cell-duration-ms"].nunique(dropna=False)
     if (distinct != 1).any():
         cells = distinct[distinct != 1].index.tolist()
         raise ValueError(f"throughput rows disagree on the common cell clock: {cells}")
@@ -343,9 +375,9 @@ def aggregate_throughput(df: pd.DataFrame) -> pd.DataFrame:
         cell_duration_ms=(duration_col, "max"),
     )
     grouped["total-tps"] = (
-        grouped["count"] * 1000.0 / grouped["cell_duration_ms"].where(
-            grouped["cell_duration_ms"] > 0
-        )
+        grouped["count"]
+        * 1000.0
+        / grouped["cell_duration_ms"].where(grouped["cell_duration_ms"] > 0)
     )
     return grouped
 
@@ -359,9 +391,9 @@ def throughput_fairness(df: pd.DataFrame) -> pd.DataFrame:
         cell_duration_ms=(duration_col, "max"),
     )
     per_db["db-tps"] = (
-        per_db["count"] * 1000.0 / per_db["cell_duration_ms"].where(
-            per_db["cell_duration_ms"] > 0
-        )
+        per_db["count"]
+        * 1000.0
+        / per_db["cell_duration_ms"].where(per_db["cell_duration_ms"] > 0)
     )
     rows = []
     for (run, num_db), group in per_db.groupby(["run", "num-db"]):
@@ -450,15 +482,14 @@ def latency_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
     return merged
 
 
-def retries_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
+def replays_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
     def agg(df: pd.DataFrame) -> pd.DataFrame:
-        d = with_run_identity(df, ["num-db", "db"])
+        d = with_num_replays(with_run_identity(df, ["num-db", "db"]))
         d["logical-tx"] = logical_tx_series(d)
-        g = (
-            d.groupby(["run", "num-db"], as_index=False)
-            .agg({"num-retries": "sum", "logical-tx": "sum"})
+        g = d.groupby(["run", "num-db"], as_index=False).agg(
+            {"num-replays": "sum", "logical-tx": "sum"}
         )
-        g["retries-per-tx"] = g["num-retries"] / g["logical-tx"].where(
+        g["replays-per-tx"] = g["num-replays"] / g["logical-tx"].where(
             g["logical-tx"] > 0
         )
         g["concurrent"] = g["num-db"] * conc_per_db
@@ -466,7 +497,7 @@ def retries_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
 
     merged = paired_merge(agg(a), agg(b), ["run", "num-db", "concurrent"])
     merged["ratio"] = merged.apply(
-        lambda r: _ratio(r["retries-per-tx_b"], r["retries-per-tx_a"]), axis=1
+        lambda r: _ratio(r["replays-per-tx_b"], r["replays-per-tx_a"]), axis=1
     )
     return merged
 
@@ -483,9 +514,7 @@ def backend_ops_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
             .agg({"backend-ops": "sum", "logical-tx": "sum"})
             .reset_index()
         )
-        g["ops-per-tx"] = g["backend-ops"] / g["logical-tx"].where(
-            g["logical-tx"] > 0
-        )
+        g["ops-per-tx"] = g["backend-ops"] / g["logical-tx"].where(g["logical-tx"] > 0)
         g["concurrent"] = g["num-db"] * conc_per_db
         return g
 
@@ -540,18 +569,10 @@ def diagnostic_batch_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
             & (df["metric"].isin(["submissions", "rounds"]))
         ]
         if d.empty:
-            return pd.DataFrame(
-                columns=["run", "num-db", "concurrent", "batch-factor"]
-            )
-        g = (
-            d.groupby(["run", "num-db", "metric"])["value"]
-            .sum()
-            .unstack(fill_value=0)
-        )
+            return pd.DataFrame(columns=["run", "num-db", "concurrent", "batch-factor"])
+        g = d.groupby(["run", "num-db", "metric"])["value"].sum().unstack(fill_value=0)
         if "submissions" not in g or "rounds" not in g:
-            return pd.DataFrame(
-                columns=["run", "num-db", "concurrent", "batch-factor"]
-            )
+            return pd.DataFrame(columns=["run", "num-db", "concurrent", "batch-factor"])
         g["batch-factor"] = g["submissions"] / g["rounds"].where(g["rounds"] > 0)
         g = g.reset_index()
         g["concurrent"] = g["num-db"] * conc_per_db
@@ -564,13 +585,10 @@ def diagnostic_batch_table(a: pd.DataFrame, b: pd.DataFrame, conc_per_db: int):
     return merged
 
 
-def diagnostic_role_totals(
-    table: pd.DataFrame, metrics: list[str]
-) -> pd.DataFrame:
+def diagnostic_role_totals(table: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
     """Aggregate selected backend metrics by physical object role."""
     selected = table[
-        table["component"].str.startswith("backend.")
-        & table["metric"].isin(metrics)
+        table["component"].str.startswith("backend.") & table["metric"].isin(metrics)
     ]
     if selected.empty:
         return pd.DataFrame()
@@ -595,9 +613,7 @@ def inline_pressure_table(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
         # across the schema boundary.
         d = d[d["phase"] != "shutdown"].copy()
         logical_tx = d["logical-tx"].where(d["logical-tx"] > 0)
-        direct_candidates = d["direct-candidates"].where(
-            d["direct-candidates"] > 0
-        )
+        direct_candidates = d["direct-candidates"].where(d["direct-candidates"] > 0)
         d["direct-land-rate"] = d["direct-landed"] / direct_candidates
         d["lock-calls-per-tx"] = d["lock-calls"] / logical_tx
         d["backend-ops-per-tx"] = d["backend-ops"] / logical_tx
@@ -658,13 +674,12 @@ def contention_stats_table(a: pd.DataFrame, b: pd.DataFrame):
             "direct-landed" if "direct-landed" in d.columns else "direct-commits"
         )
         d["tx-per-sec"] = (
-            d["count"] * 1000.0 / d["cell-duration-ms"].where(
-                d["cell-duration-ms"] > 0
-            )
+            d["count"] * 1000.0 / d["cell-duration-ms"].where(d["cell-duration-ms"] > 0)
         )
-        d["retries-per-tx"] = d["num-retries"] / d["count"].where(d["count"] > 0)
-        d["direct-candidates-per-tx"] = (
-            d[candidates_col] / d["count"].where(d["count"] > 0)
+        d = with_num_replays(d)
+        d["replays-per-tx"] = d["num-replays"] / d["count"].where(d["count"] > 0)
+        d["direct-candidates-per-tx"] = d[candidates_col] / d["count"].where(
+            d["count"] > 0
         )
         d["direct-land-rate"] = d[landed_col] / d[candidates_col].where(
             d[candidates_col] > 0
@@ -674,7 +689,7 @@ def contention_stats_table(a: pd.DataFrame, b: pd.DataFrame):
                 "run",
                 "num-keys",
                 "tx-per-sec",
-                "retries-per-tx",
+                "replays-per-tx",
                 "direct-candidates-per-tx",
                 "direct-land-rate",
                 "worker-drain-ms",
@@ -684,7 +699,7 @@ def contention_stats_table(a: pd.DataFrame, b: pd.DataFrame):
     merged = paired_merge(select(a), select(b), ["run", "num-keys"])
     for metric in [
         "tx-per-sec",
-        "retries-per-tx",
+        "replays-per-tx",
         "direct-candidates-per-tx",
         "direct-land-rate",
         "worker-drain-ms",
@@ -778,8 +793,11 @@ def mixed_shape_table(a: Any, b: Any) -> pd.DataFrame:
                         if ox and oy
                         else float("nan")
                     ),
-                    "retries-ratio": (
-                        _ratio(oy["retriesPerTx"], ox["retriesPerTx"])
+                    "replays-ratio": (
+                        _ratio(
+                            perfbench_body_replays_per_tx(oy),
+                            perfbench_body_replays_per_tx(ox),
+                        )
                         if ox and oy
                         else float("nan")
                     ),
@@ -801,7 +819,7 @@ def _paired_converged(grp: pd.DataFrame) -> pd.Series | None:
 
 
 def mixed_aggregate_table(a: Any, b: Any) -> pd.DataFrame:
-    """Whole-cell aggregate ops/tx and retries/tx per workload cell."""
+    """Whole-cell aggregate ops/tx and replays/tx per workload cell."""
     ca, cb = _indexed_mixed_cells(a), _indexed_mixed_cells(b)
     rows = []
     for key in sorted(set(ca) & set(cb)):
@@ -819,8 +837,9 @@ def mixed_aggregate_table(a: Any, b: Any) -> pd.DataFrame:
                 "ops-ratio": _ratio(
                     ob.get("totalOpsPerTx", 0), oa.get("totalOpsPerTx", 0)
                 ),
-                "retries-ratio": _ratio(
-                    ob.get("retriesPerTx", 0), oa.get("retriesPerTx", 0)
+                "replays-ratio": _ratio(
+                    perfbench_body_replays_per_tx(ob),
+                    perfbench_body_replays_per_tx(oa),
                 ),
             }
         )
@@ -939,17 +958,16 @@ def _tidy_latency(a, b, la, lb, conc_per_db):
     return pd.concat(frames, ignore_index=True)
 
 
-def _tidy_retries(a, b, la, lb, conc_per_db):
+def _tidy_replays(a, b, la, lb, conc_per_db):
     frames = []
     for src, df in ((la, a), (lb, b)):
-        d = with_run_identity(df, ["num-db", "db"])
+        d = with_num_replays(with_run_identity(df, ["num-db", "db"]))
         d["logical-tx"] = logical_tx_series(d)
-        d = (
-            d.groupby(["run", "num-db"], as_index=False)
-            .agg({"num-retries": "sum", "logical-tx": "sum"})
+        d = d.groupby(["run", "num-db"], as_index=False).agg(
+            {"num-replays": "sum", "logical-tx": "sum"}
         )
         d["concurrent"] = d["num-db"] * conc_per_db
-        d["retries-per-tx"] = d["num-retries"] / d["logical-tx"].where(
+        d["replays-per-tx"] = d["num-replays"] / d["logical-tx"].where(
             d["logical-tx"] > 0
         )
         d["source"] = src
@@ -1006,22 +1024,22 @@ def plot_overlay_latency(data, out_dir: Path) -> None:
     _save(fig, out_dir, "cmp-tx-latency.png")
 
 
-def plot_overlay_retries(data, out_dir: Path) -> None:
+def plot_overlay_replays(data, out_dir: Path) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
     sns.lineplot(
         data=data,
         x="concurrent",
-        y="retries-per-tx",
+        y="replays-per-tx",
         style="source",
         estimator="median",
         errorbar=None,
         marker="o",
         ax=ax,
     )
-    ax.set_title("Transaction retries")
+    ax.set_title("Transaction replays")
     ax.set_xlabel("Concurrent transactions")
-    ax.set_ylabel("Retries per transaction")
-    _save(fig, out_dir, "cmp-retries.png")
+    ax.set_ylabel("Replays per transaction")
+    _save(fig, out_dir, "cmp-replays.png")
 
 
 def plot_overlay_contention(data, out_dir: Path) -> None:
@@ -1180,16 +1198,16 @@ def main() -> int:
 
     a_st, b_st = read_csv(args.a, "stats.csv"), read_csv(args.b, "stats.csv")
     if a_st is not None and b_st is not None:
-        tbl = retries_table(a_st, b_st, cpd)
+        tbl = replays_table(a_st, b_st, cpd)
         cols = [
             "run",
             "concurrent",
-            "retries-per-tx_a",
-            "retries-per-tx_b",
+            "replays-per-tx_a",
+            "replays-per-tx_b",
             "ratio",
         ]
-        print_table(f"Retries per transaction ({lb}/{la})", tbl[cols])
-        summaries.append(summarize("retries", tbl["ratio"], lower_is_better=True))
+        print_table(f"Replays per transaction ({lb}/{la})", tbl[cols])
+        summaries.append(summarize("replays", tbl["ratio"], lower_is_better=True))
 
         tbl = backend_ops_table(a_st, b_st, cpd)
         cols = ["run", "concurrent", "ops-per-tx_a", "ops-per-tx_b", "ratio"]
@@ -1223,9 +1241,7 @@ def main() -> int:
                         lower_is_better=True,
                     )
                 )
-        role_totals = diagnostic_role_totals(
-            tbl, ["read-bytes", "write-bytes"]
-        )
+        role_totals = diagnostic_role_totals(tbl, ["read-bytes", "write-bytes"])
         if not role_totals.empty:
             for component, group in role_totals.groupby("component"):
                 summaries.append(
@@ -1241,10 +1257,7 @@ def main() -> int:
             direction = (
                 None
                 if component == "splitter"
-                or (
-                    component == "direct_commit"
-                    and metric in ["candidates", "landed"]
-                )
+                or (component == "direct_commit" and metric in ["candidates", "landed"])
                 else True
             )
             summaries.append(
@@ -1396,9 +1409,9 @@ def main() -> int:
             "tx-per-sec_a",
             "tx-per-sec_b",
             "tx-per-sec-ratio",
-            "retries-per-tx_a",
-            "retries-per-tx_b",
-            "retries-per-tx-ratio",
+            "replays-per-tx_a",
+            "replays-per-tx_b",
+            "replays-per-tx-ratio",
             "direct-candidates-per-tx_a",
             "direct-candidates-per-tx_b",
             "direct-land-rate_a",
@@ -1411,7 +1424,7 @@ def main() -> int:
         )
         for metric, lower_is_better in [
             ("tx-per-sec", False),
-            ("retries-per-tx", True),
+            ("replays-per-tx", True),
             ("direct-candidates-per-tx", True),
             ("direct-land-rate", False),
             ("worker-drain-ms", True),
@@ -1442,7 +1455,7 @@ def main() -> int:
                 "opsPerTx_a",
                 "opsPerTx_b",
                 "ops-ratio",
-                "retries-ratio",
+                "replays-ratio",
             ]
             print_table(f"Mixed workload per-shape ({lb}/{la})", tbl[cols])
             # Throughput ratio per shape (geomean aggregates mode/affinity cells).
@@ -1475,8 +1488,8 @@ def main() -> int:
             for mode, grp in ops.groupby("mode"):
                 summaries.append(
                     summarize(
-                        f"mix-retries/tx[{mode}]",
-                        grp["retries-ratio"],
+                        f"mix-replays/tx[{mode}]",
+                        grp["replays-ratio"],
                         lower_is_better=True,
                         converged=_paired_converged(grp),
                     )
@@ -1494,8 +1507,8 @@ def main() -> int:
                 )
                 summaries.append(
                     summarize(
-                        f"mix-agg-retries/tx[{mode}/{layout}]",
-                        grp["retries-ratio"],
+                        f"mix-agg-replays/tx[{mode}/{layout}]",
+                        grp["replays-ratio"],
                         lower_is_better=True,
                     )
                 )
@@ -1533,7 +1546,7 @@ def main() -> int:
             )
             plot_overlay_latency(tidy, out_dir)
         if a_st is not None and b_st is not None:
-            plot_overlay_retries(_tidy_retries(a_st, b_st, la, lb, cpd), out_dir)
+            plot_overlay_replays(_tidy_replays(a_st, b_st, la, lb, cpd), out_dir)
         if a_dl is not None and b_dl is not None:
             plot_overlay_contention(_tidy_contention(a_dl, b_dl, la, lb), out_dir)
 

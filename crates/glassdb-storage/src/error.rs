@@ -19,7 +19,7 @@ pub enum StorageError {
     /// been applied.
     #[error("storage outcome unknown (in doubt): {0}")]
     Unavailable(String),
-    /// A key was not found in a committed transaction log.
+    /// A key was not found in a committed transaction record.
     #[error("key not found in committed transaction")]
     KeyNotFound,
     /// The addressed collection incarnation was durably deleted.

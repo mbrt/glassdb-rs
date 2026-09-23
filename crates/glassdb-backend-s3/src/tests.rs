@@ -12,7 +12,7 @@ use aws_sdk_s3::primitives::SdkBody;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::http::StatusCode;
 use glassdb_backend::middleware::ProviderLatencyProfile;
-use glassdb_backend::{Backend, BackendError, ListLimit, Version};
+use glassdb_backend::{Backend, BackendError, ListLimit, Revision};
 use hyper::Method;
 
 use crate::fake_server::{FakeS3, FakeS3Options};
@@ -138,13 +138,13 @@ fn http_status_provider_facts_preserve_public_errors() {
         ),
         (
             500,
-            ProviderFact::Ambiguous,
+            ProviderFact::InDoubt,
             PublicError::Other,
             PublicError::Unavailable,
         ),
         (
             502,
-            ProviderFact::Ambiguous,
+            ProviderFact::InDoubt,
             PublicError::Other,
             PublicError::Unavailable,
         ),
@@ -156,7 +156,7 @@ fn http_status_provider_facts_preserve_public_errors() {
         ),
         (
             504,
-            ProviderFact::Ambiguous,
+            ProviderFact::InDoubt,
             PublicError::Other,
             PublicError::Unavailable,
         ),
@@ -258,21 +258,21 @@ fn transport_provider_facts_preserve_public_errors() {
         (
             "timeout",
             timeout_failure as FailureFactory,
-            ProviderFact::Ambiguous,
+            ProviderFact::InDoubt,
             PublicError::Other,
             PublicError::Unavailable,
         ),
         (
             "dispatch",
             dispatch_failure as FailureFactory,
-            ProviderFact::Ambiguous,
+            ProviderFact::InDoubt,
             PublicError::Other,
             PublicError::Unavailable,
         ),
         (
             "response",
             response_failure as FailureFactory,
-            ProviderFact::Ambiguous,
+            ProviderFact::InDoubt,
             PublicError::Other,
             PublicError::Unavailable,
         ),
@@ -335,21 +335,21 @@ fn list_cursor_errors_use_normalized_metadata() {
 #[derive(Clone, Copy, Debug)]
 enum PutEvent {
     Applied,
-    AppliedWithoutVersion,
+    AppliedWithoutRevision,
     Failed(ProviderFact),
 }
 
 impl PutEvent {
     fn into_event(self) -> ConditionalPutEvent<PutObjectError> {
         match self {
-            PutEvent::Applied => ConditionalPutEvent::Applied(Version::new("\"version\"")),
-            PutEvent::AppliedWithoutVersion => ConditionalPutEvent::AppliedWithoutVersion,
+            PutEvent::Applied => ConditionalPutEvent::Applied(Revision::new("\"etag\"")),
+            PutEvent::AppliedWithoutRevision => ConditionalPutEvent::AppliedWithoutRevision,
             PutEvent::Failed(fact) => {
                 let (code, status) = match fact {
                     ProviderFact::Precondition => (Some("PreconditionFailed"), 412),
                     ProviderFact::Conflict => (Some("ConditionalRequestConflict"), 409),
                     ProviderFact::Throttle => (Some("SlowDown"), 503),
-                    ProviderFact::Ambiguous => (None, 500),
+                    ProviderFact::InDoubt => (None, 500),
                     ProviderFact::NotFound => (Some("NoSuchKey"), 404),
                     ProviderFact::Other => (Some("AccessDenied"), 403),
                 };
@@ -390,8 +390,8 @@ fn conditional_put_transition_table() {
             false,
         ),
         (
-            "success without version",
-            &[PutEvent::AppliedWithoutVersion],
+            "success without revision",
+            &[PutEvent::AppliedWithoutRevision],
             &[PutAction::InDoubt],
             false,
         ),
@@ -402,9 +402,9 @@ fn conditional_put_transition_table() {
             false,
         ),
         (
-            "ambiguity followed by precondition",
+            "in-doubt attempt followed by precondition",
             &[
-                PutEvent::Failed(ProviderFact::Ambiguous),
+                PutEvent::Failed(ProviderFact::InDoubt),
                 PutEvent::Failed(ProviderFact::Precondition),
             ],
             &[PutAction::Retry(conflict_backoff(0)), PutAction::InDoubt],
@@ -429,9 +429,9 @@ fn conditional_put_transition_table() {
             false,
         ),
         (
-            "terminal failure after ambiguity",
+            "terminal failure after in-doubt attempt",
             &[
-                PutEvent::Failed(ProviderFact::Ambiguous),
+                PutEvent::Failed(ProviderFact::InDoubt),
                 PutEvent::Failed(ProviderFact::Other),
             ],
             &[PutAction::Retry(conflict_backoff(0)), PutAction::InDoubt],
@@ -468,8 +468,8 @@ fn conditional_put_retry_exhaustion_table() {
             false,
         ),
         (
-            "ambiguity",
-            ProviderFact::Ambiguous,
+            "in-doubt attempt",
+            ProviderFact::InDoubt,
             DEFAULT_MAX_ATTEMPTS,
             PutAction::InDoubt,
             true,
@@ -504,8 +504,8 @@ fn conditional_put_retry_budget_is_shared_across_provider_facts() {
     }
 
     assert_eq!(
-        put_action(state.transition(PutEvent::Failed(ProviderFact::Ambiguous).into_event())),
-        PutAction::Terminal(ProviderFact::Ambiguous)
+        put_action(state.transition(PutEvent::Failed(ProviderFact::InDoubt).into_event())),
+        PutAction::Terminal(ProviderFact::InDoubt)
     );
     assert!(!state.may_have_applied);
 }
@@ -563,16 +563,16 @@ async fn list_rejects_invalid_provider_cursor() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn identical_content_keeps_version() {
+async fn identical_content_keeps_revision() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
     // With ADR-023 the body itself drives the ETag (no nonce), so re-uploading
-    // identical bytes yields the same version, exactly as real S3 behaves.
+    // identical bytes yields the same revision, exactly as real S3 behaves.
     let v1 = b.write_if_not_exists("k", b"same".to_vec()).await.unwrap();
     let v2 = b.write_if("k", b"same".to_vec(), &v1).await.unwrap();
     assert_eq!(v1, v2);
 
-    // Distinct content yields a distinct version.
+    // Distinct content yields a distinct revision.
     let v3 = b.write_if("k", b"other".to_vec(), &v2).await.unwrap();
     assert_ne!(v1, v3);
 }
@@ -638,7 +638,7 @@ async fn read_transient_failure_surfaces_unavailable() {
 // reported as a confident `Precondition`. Object storage has no at-most-once
 // request id, so when the SDK (or any layer) re-sends a conditional PUT whose
 // first attempt landed, the retry observes a precondition failure for its own
-// write that is indistinguishable from a real conflict. The S3 backend therefore
+// write that is indistinguishable from a genuine rejection. The S3 backend therefore
 // owns the conditional-write retry loop and surfaces such an outcome as
 // `Unavailable`; the engine then fails the transaction in-doubt rather than
 // retrying it into a double-apply. These tests would see `Precondition` against
@@ -691,10 +691,10 @@ async fn write_if_lost_ack_is_in_doubt() {
 async fn delete_if_lost_ack_is_in_doubt() {
     let fake = FakeS3::start().await;
     let b = backend(&fake);
-    let version = b.write_if_not_exists("k", b"v".to_vec()).await.unwrap();
+    let revision = b.write_if_not_exists("k", b"v".to_vec()).await.unwrap();
 
     fake.set_lost_ack(1);
-    let err = b.delete_if("k", &version).await.unwrap_err();
+    let err = b.delete_if("k", &revision).await.unwrap_err();
     assert!(matches!(err, BackendError::Unavailable(_)));
     assert!(matches!(b.read("k").await, Err(BackendError::NotFound)));
 }

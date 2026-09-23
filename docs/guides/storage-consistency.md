@@ -16,7 +16,7 @@ and moves. Changes to their exports must preserve the same restrictions. The
 ## E1: Sequence points belong to one database instance
 
 An operation's point is allocated immediately before backend invocation. It is
-a lower bound on when its exact state was current, not a content version or a
+a lower bound on when its exact state was current, not a revision or a
 completion point. Completion time cannot advance its evidence, and a newer
 point cannot order the contents returned by overlapping operations. Points
 from different database instances are not comparable.
@@ -53,13 +53,13 @@ to typed stores. Preserving the
 cache implementation's existing access does not give other storage modules
 permission to manufacture observations.
 
-The shared evidence cell and the backend version inside a revision remain
+The shared evidence cell and the backend revision inside a `Revision` remain
 private to their module. The cache implementation advances evidence through the
-provided operations and borrows the backend version for conditional operations;
-neither can be stored, swapped, or replaced directly. Do not add public
-constructors, `Default`, conversion traits, or mutable access to the backend
-version. Higher layers may retain, compare, and serialize a revision, but cannot
-manufacture one.
+provided operations and borrows that token for conditional operations; neither
+can be stored, swapped, or replaced directly. Do not add public constructors,
+`Default`, conversion traits, or mutable access to the backend revision. Higher
+layers may retain, compare, and serialize a `Revision`, but cannot manufacture
+one.
 
 Advance evidence only from a definitive backend result or confirmed evidence
 for that exact state. Equal contents at different paths are not the same state.
@@ -79,7 +79,7 @@ receipt. Keep the expected revision, exact installed observation, and original
 invocation point bound to that mutation. Checking the installed state later
 cannot renew the precondition proof.
 
-Reads, failed or indeterminate mutations, and plans with no staged changes
+Reads, failed or in-doubt mutations, and plans with no staged changes
 cannot become receipts. Conversion to the installed observation remains
 explicit. Do not add `Deref`, `AsRef`, `From`, payload mapping, or raw-point
 extraction. Participation in a coordinator batch is a separate proof owned by

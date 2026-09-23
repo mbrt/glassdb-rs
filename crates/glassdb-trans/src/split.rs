@@ -55,7 +55,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use glassdb_concurr::{Background, RetryConfig, ScanCadence, rt};
 use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, TxId};
-use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxLog};
+use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxRecord};
 use glassdb_storage::{
     CollectionStore, CurrentnessBarrier, IndexNode, InlinePolicy, LeafBody, LeafEntry,
     LeafObservation, LockType, Node, NodeStore, Requirement, SplitPolicy, StorageError,
@@ -346,7 +346,7 @@ impl StructuralNodeAccess {
     async fn finalize_split(&self, id: &TxId) {
         if let Err(error) = self
             .mon
-            .commit_tx(TxLog::new(id.clone(), TxCommitStatus::Ok))
+            .commit_tx(TxRecord::new(id.clone(), TxCommitStatus::Ok))
             .await
         {
             tracing::debug!(
@@ -475,7 +475,7 @@ impl SeparatorPublisher {
                 ObjectPath::Node { token, .. } => Some(token.clone()),
                 _ => return Err(TransError::other("router returned a non-node parent path")),
             };
-            let Some((lock_id, locked_parent, locked_version)) = self
+            let Some((lock_id, locked_parent, observation)) = self
                 .structure
                 .begin_gated_split(&separator.collection, parent_token.as_ref())
                 .await?
@@ -487,7 +487,7 @@ impl SeparatorPublisher {
                     separator,
                     &parent.path,
                     &locked_parent,
-                    &locked_version,
+                    &observation,
                     &lock_id,
                     publication.start,
                 )
@@ -521,7 +521,7 @@ impl SeparatorPublisher {
         separator: &PendingSeparator,
         parent_path: &ObjectPath,
         parent: &Node,
-        version: &LeafObservation,
+        observation: &LeafObservation,
         lock_id: &TxId,
         barrier: CurrentnessBarrier,
     ) -> Result<Option<SeparatorPublicationOutcome>, TransError> {
@@ -564,7 +564,7 @@ impl SeparatorPublisher {
         updated.remove_structural_gate(lock_id);
         if self
             .structure
-            .store_structural_node(&updated, version)
+            .store_structural_node(&updated, observation)
             .await?
             .is_none()
         {
@@ -588,7 +588,7 @@ impl SeparatorPublisher {
     /// A split publishes its separator into the parent as a follow-on step, so
     /// the index can lag behind the leaf chain until a later sweep reconciles it
     /// (ADR-031). `parent` is the caller's own observed index, so the result
-    /// reconciles against the version the caller goes on to write.
+    /// reconciles against the revision the caller goes on to write.
     async fn missing_separators(
         &self,
         collection: &CollectionAddress,
@@ -2160,18 +2160,18 @@ impl Splitter {
     }
 
     /// Finalizes the split's ephemeral wound-wait identity without creating a
-    /// transaction object. Structural state, not transaction status, records
+    /// transaction record. Structural state, not transaction status, records
     /// the split's durable outcome.
     async fn finalize_split(&self, id: &TxId) {
         self.structural_nodes.finalize_split(id).await;
     }
 
     async fn finalize_topology_split(&self, collection: &CollectionAddress, id: &TxId) {
-        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
-        log.locks.push(TxLock::Topology {
+        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Ok);
+        record.locks.push(TxLock::Topology {
             collection: collection.clone(),
         });
-        if let Err(e) = self.mon.commit_tx(log).await {
+        if let Err(e) = self.mon.commit_tx(record).await {
             tracing::debug!(
                 target: "glassdb::splitter",
                 error = %e,
@@ -2670,15 +2670,15 @@ mod tests {
 
     /// A recorded source revision that no stored node carries, so recovery
     /// reads the worker that recorded it as unable to publish.
-    fn superseded_source_version() -> String {
-        "superseded-source-version".to_string()
+    fn superseded_source_revision() -> String {
+        "superseded-source-revision".to_string()
     }
 
     fn nonroot_intent(source: &str, right: &str, split_key: &[u8]) -> StructuralIntent {
         StructuralIntent {
             collection: collection(),
             source_token: Some(test_token(source)),
-            source_version: superseded_source_version(),
+            source_revision: superseded_source_revision(),
             created_tokens: vec![test_token(right)],
             split_key: split_key.to_vec(),
             participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
@@ -2719,7 +2719,7 @@ mod tests {
             retained,
         ]));
         let mut locks = node.locks().clone();
-        locks.advance_membership_version();
+        locks.advance_membership_generation();
         node.set_locks(locks);
 
         assert_eq!(
@@ -2733,7 +2733,7 @@ mod tests {
             leaf.lookup(b"locked").unwrap().current.writer(),
             Some(&retained_writer)
         );
-        assert_eq!(node.membership_version(), 1);
+        assert_eq!(node.membership_generation(), 1);
     }
 
     #[tokio::test]
@@ -2747,8 +2747,8 @@ mod tests {
             tombstone(b"c", second.clone()),
         ]));
         let mut locks = root.locks().clone();
-        locks.advance_membership_version();
-        locks.advance_membership_version();
+        locks.advance_membership_generation();
+        locks.advance_membership_generation();
         root.set_locks(locks);
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
@@ -2766,7 +2766,7 @@ mod tests {
         let leaf = root.as_leaf().expect("compaction avoided height growth");
         assert_eq!(leaf.len(), 1);
         assert!(leaf.lookup(b"a").unwrap().exists());
-        assert_eq!(root.membership_version(), 2);
+        assert_eq!(root.membership_generation(), 2);
         assert!(
             s.list_nodes(COLL, Requirement::after(s.timeline.currentness_barrier()))
                 .await
@@ -2908,8 +2908,8 @@ mod tests {
             tombstone(b"d", writer.clone()),
         ]));
         let mut locks = source.locks().clone();
-        locks.advance_membership_version();
-        locks.advance_membership_version();
+        locks.advance_membership_generation();
+        locks.advance_membership_generation();
         source.set_locks(locks);
         s.store_node(COLL, "L", &source, None).await.unwrap();
         s.create_root(
@@ -2936,7 +2936,7 @@ mod tests {
         assert_eq!(leaves.len(), 2);
         assert!(leaves.iter().all(|leaf| {
             let node = leaf.node().unwrap();
-            node.membership_version() == 2
+            node.membership_generation() == 2
                 && node
                     .as_leaf()
                     .unwrap()
@@ -3382,7 +3382,7 @@ mod tests {
                     &StructuralIntent {
                         collection: collection(),
                         source_token: Some(test_token("L6")),
-                        source_version: superseded_source_version(),
+                        source_revision: superseded_source_revision(),
                         created_tokens: vec![test_token("L7")],
                         split_key: b"h".to_vec(),
                         participant_id: participant.clone(),
@@ -3906,7 +3906,7 @@ mod tests {
         let (sp, _) = splitter_and_monitor(&s, &bg, tiny());
         let holder = TxId::with_priority(1, b"committed");
         let other_bg = Arc::new(Background::new());
-        let other_transactions = other.foundation.tlogger.clone();
+        let other_transactions = other.foundation.tx_records.clone();
         let other_mon = other.foundation.monitor_for(
             &other_bg,
             RetryConfig::default(),
@@ -3936,8 +3936,8 @@ mod tests {
             std::num::NonZeroUsize::MIN,
         );
         other_mon.begin_tx(&holder);
-        let mut log = TxLog::new(holder.clone(), TxCommitStatus::Ok);
-        log.writes.push(TxWrite {
+        let mut record = TxRecord::new(holder.clone(), TxCommitStatus::Ok);
+        record.writes.push(TxWrite {
             key: LogicalKey::new(collection(), b"d"),
             value: Arc::from(b"new-d".as_slice()),
             deleted: false,
@@ -3974,8 +3974,8 @@ mod tests {
         else {
             panic!("entry lock must be acquired before the split");
         };
-        log.locks = locked.locked_paths();
-        other_mon.commit_tx(log).await.unwrap();
+        record.locks = locked.locked_paths();
+        other_mon.commit_tx(record).await.unwrap();
 
         let held = other
             .nodes

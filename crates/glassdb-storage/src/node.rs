@@ -316,7 +316,7 @@ impl Default for SplitPolicy {
 pub struct NodeLocks {
     structure: ExclusiveGate,
     membership: SharedExclusiveLock,
-    membership_version: u64,
+    membership_generation: u64,
     delete_intent: Option<TxId>,
 }
 
@@ -332,16 +332,16 @@ impl NodeLocks {
     }
 
     /// Returns the membership generation used by scans and unmarked point absence.
-    pub fn membership_version(&self) -> u64 {
-        self.membership_version
+    pub fn membership_generation(&self) -> u64 {
+        self.membership_generation
     }
 
     /// Records one logical membership change without installing a holder.
     ///
-    /// Logless commits have no prepare/release lock lifecycle, so their commit
+    /// Direct commits have no prepare/release lock lifecycle, so their commit
     /// CAS advances the scan-validation generation directly (ADR-061).
-    pub fn advance_membership_version(&mut self) {
-        self.membership_version = self.membership_version.wrapping_add(1);
+    pub fn advance_membership_generation(&mut self) {
+        self.membership_generation = self.membership_generation.wrapping_add(1);
     }
 
     /// Returns the transaction preparing deletion of the containing collection.
@@ -386,7 +386,7 @@ impl NodeLocks {
             return;
         }
         self.membership.set_writer(id);
-        self.membership_version = self.membership_version.wrapping_add(1);
+        self.membership_generation = self.membership_generation.wrapping_add(1);
     }
 
     /// Removes one membership holder and records released write activity.
@@ -395,7 +395,7 @@ impl NodeLocks {
             self.membership.lock_type() == LockType::Write && self.membership.contains(id);
         let removed = self.membership.remove(id);
         if removed && was_writer {
-            self.membership_version = self.membership_version.wrapping_add(1);
+            self.membership_generation = self.membership_generation.wrapping_add(1);
         }
         removed
     }
@@ -408,7 +408,7 @@ impl NodeLocks {
         self.remove_membership_holder(id)
     }
 
-    /// Clears transient holders while preserving the membership version.
+    /// Clears transient holders while preserving the membership generation.
     fn clear_holders(&mut self) {
         self.structure.clear();
         self.membership.clear();
@@ -571,8 +571,8 @@ impl Node {
     }
 
     /// Returns the leaf membership generation.
-    pub fn membership_version(&self) -> u64 {
-        self.locks.membership_version()
+    pub fn membership_generation(&self) -> u64 {
+        self.locks.membership_generation()
     }
 
     /// Returns the canonical encoded size without transient node locks.
@@ -742,7 +742,7 @@ impl Node {
                 .then(|| self.locks.structure.to_pb()),
             membership_lock: (!self.locks.membership.is_empty())
                 .then(|| self.locks.membership.to_pb()),
-            membership_version: self.locks.membership_version,
+            membership_generation: self.locks.membership_generation,
             collection_delete_intent: self
                 .locks
                 .delete_intent
@@ -772,7 +772,7 @@ impl Node {
             locks: NodeLocks {
                 structure,
                 membership,
-                membership_version: raw.membership_version,
+                membership_generation: raw.membership_generation,
                 delete_intent,
             },
         })
@@ -818,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_preserves_node_locks_and_membership_version() {
+    fn round_trip_preserves_node_locks_and_membership_generation() {
         let gate = TxId::from_bytes(vec![2]);
         let writer = TxId::from_bytes(vec![1]);
         let mut node = Node::leaf(LeafBody::new());
@@ -828,7 +828,7 @@ mod tests {
         let decoded = Node::decode(&node.encode()).unwrap();
         assert_eq!(decoded.structural_gate().holders(), &[gate]);
         assert_eq!(decoded.membership_lock().holders(), &[writer]);
-        assert_eq!(decoded.membership_version(), 1);
+        assert_eq!(decoded.membership_generation(), 1);
     }
 
     #[test]
@@ -884,30 +884,30 @@ mod tests {
     }
 
     #[test]
-    fn membership_version_tracks_write_lock_activity() {
+    fn membership_generation_tracks_write_lock_activity() {
         let id = TxId::from_bytes(vec![1]);
         let mut node = Node::leaf(LeafBody::new());
 
         node.add_membership_reader(id.clone());
-        assert_eq!(node.membership_version(), 0);
+        assert_eq!(node.membership_generation(), 0);
         assert!(node.remove_membership_holder(&id));
-        assert_eq!(node.membership_version(), 0);
+        assert_eq!(node.membership_generation(), 0);
 
         node.set_membership_writer(id.clone());
-        assert_eq!(node.membership_version(), 1);
+        assert_eq!(node.membership_generation(), 1);
         node.set_membership_writer(id.clone());
-        assert_eq!(node.membership_version(), 1);
+        assert_eq!(node.membership_generation(), 1);
         assert!(node.remove_membership_holder(&id));
-        assert_eq!(node.membership_version(), 2);
+        assert_eq!(node.membership_generation(), 2);
         assert!(!node.remove_membership_holder(&id));
-        assert_eq!(node.membership_version(), 2);
+        assert_eq!(node.membership_generation(), 2);
 
-        node.locks.advance_membership_version();
-        assert_eq!(node.membership_version(), 3);
+        node.locks.advance_membership_generation();
+        assert_eq!(node.membership_generation(), 3);
 
-        node.locks.membership_version = u64::MAX;
+        node.locks.membership_generation = u64::MAX;
         node.set_membership_writer(id);
-        assert_eq!(node.membership_version(), 0);
+        assert_eq!(node.membership_generation(), 0);
     }
 
     #[test]
@@ -980,13 +980,13 @@ mod tests {
             entry(b"d", 4),
         ]));
         let mut locks = src.locks().clone();
-        locks.advance_membership_version();
-        locks.advance_membership_version();
+        locks.advance_membership_generation();
+        locks.advance_membership_generation();
         src.set_locks(locks);
 
         let (right, _) = src.split("newRight").expect("splittable");
-        assert_eq!(src.membership_version(), 2);
-        assert_eq!(right.membership_version(), 2);
+        assert_eq!(src.membership_generation(), 2);
+        assert_eq!(right.membership_generation(), 2);
     }
 
     #[test]
@@ -1304,7 +1304,7 @@ mod tests {
     }
 
     // Golden vector for the ADR-032 node-lock fields. Changing their tags,
-    // lock-type values, holder encoding, or membership-version encoding must
+    // lock-type values, holder encoding, or membership-generation encoding must
     // break this test.
     #[test]
     fn golden_node_locks_encoding() {

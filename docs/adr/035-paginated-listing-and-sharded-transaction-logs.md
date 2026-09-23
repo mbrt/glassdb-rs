@@ -1,10 +1,10 @@
-# ADR-035: Paginated listing and sharded transaction logs
+# ADR-035: Paginated listing and sharded transaction records
 
 ## Status
 
 Accepted — implemented.
 
-Refines the transaction-object path of
+Refines the transaction-record path of
 [ADR-019](019-unified-transaction-object.md), the candidate discovery of
 [ADR-022](022-garbage-collection-mark-sweep.md), and the `list` method of
 [ADR-023](023-slimmed-backend-trait.md). Their transaction lifecycle, value
@@ -12,7 +12,7 @@ safety, horizon, and reclamation decisions are unchanged.
 
 [ADR-034](034-separate-structural-log-namespace.md) remains authoritative for
 structural records: they stay in the independent `_s` namespace and recovery
-loop and are not transaction-log records or GC candidates.
+loop and are not transaction records or GC candidates.
 
 [ADR-070](070-demand-driven-garbage-collection.md) supersedes the two-character
 transaction directory with a hierarchy that permits broad and narrow scans,
@@ -24,7 +24,7 @@ implemented. The paginated backend contract remains unchanged.
 `Backend::list` returns every immediate child of a directory in one `Vec`. The
 S3 and GCS backends consume every provider page before returning, and GC then
 sorts the complete flat `_t/` result merely to select a small local page. A
-database with many transaction objects therefore pays unbounded transfer,
+database with many transaction records therefore pays unbounded transfer,
 latency, and memory on every nominally paged GC cycle.
 
 A lexicographic `start_after` cursor is not portable: S3 directory buckets
@@ -75,7 +75,7 @@ S3 maps `cursor` to `ContinuationToken` and `limit` to `MaxKeys`; GCS maps them
 to `pageToken` and `maxResults`. Both omit the delimiter. This subset also
 supports S3 directory buckets, whose listing prefixes must end in `/`.
 
-### Transaction logs use 4,096 deterministic shards
+### Transaction records use 4,096 deterministic shards
 
 Transaction records move from `{db}/_t/{encoded-txid}` to:
 

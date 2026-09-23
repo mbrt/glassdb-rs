@@ -22,7 +22,7 @@ impl ReadEvidence {
     pub(crate) fn new(last_writer: Option<TxId>, leaf: LeafObservation) -> Self {
         let absence_generation = last_writer
             .is_none()
-            .then(|| leaf.value().map_or(0, |node| node.membership_version()));
+            .then(|| leaf.value().map_or(0, |node| node.membership_generation()));
         Self {
             predicate: ReadPredicate::new(last_writer, absence_generation),
             leaf,
@@ -37,8 +37,8 @@ impl ReadEvidence {
         &self.predicate
     }
 
-    pub(crate) fn validates(&self, writer: Option<&TxId>, membership_version: u64) -> bool {
-        self.predicate.validates(writer, membership_version)
+    pub(crate) fn validates(&self, writer: Option<&TxId>, membership_generation: u64) -> bool {
+        self.predicate.validates(writer, membership_generation)
     }
 }
 
@@ -57,11 +57,11 @@ impl ReadPredicate {
         }
     }
 
-    pub(crate) fn validates(&self, writer: Option<&TxId>, membership_version: u64) -> bool {
+    pub(crate) fn validates(&self, writer: Option<&TxId>, membership_generation: u64) -> bool {
         self.last_writer.as_ref() == writer
             && self
                 .absence_generation
-                .is_none_or(|observed| observed == membership_version)
+                .is_none_or(|observed| observed == membership_generation)
     }
 }
 
@@ -90,8 +90,8 @@ impl ReadAccess {
         self.evidence.predicate()
     }
 
-    pub(crate) fn validates(&self, writer: Option<&TxId>, membership_version: u64) -> bool {
-        self.evidence.validates(writer, membership_version)
+    pub(crate) fn validates(&self, writer: Option<&TxId>, membership_generation: u64) -> bool {
+        self.evidence.validates(writer, membership_generation)
     }
 }
 
@@ -168,7 +168,7 @@ impl ScanEvidence {
 }
 
 /// A range/sorted listing performed within a transaction (ADR-031 phantom
-/// prevention). It records the logical page plus the membership version and
+/// prevention). It records the logical page plus the membership generation and
 /// pending membership-write holders of every covered leaf. Commit validates
 /// those dependencies and falls back to the logical page after physical churn.
 #[derive(Debug, Clone)]
@@ -278,7 +278,7 @@ pub struct ScanMutation {
 #[derive(Debug, Clone)]
 pub(crate) struct LeafCoverage {
     pub(crate) path: Arc<str>,
-    pub(crate) membership_version: u64,
+    pub(crate) membership_generation: u64,
     pub(crate) pending_membership: Vec<TxId>,
     pub(crate) observation: LeafObservation,
 }
@@ -286,7 +286,7 @@ pub(crate) struct LeafCoverage {
 impl PartialEq for LeafCoverage {
     fn eq(&self, other: &Self) -> bool {
         self.path == other.path
-            && self.membership_version == other.membership_version
+            && self.membership_generation == other.membership_generation
             && self.pending_membership == other.pending_membership
     }
 }
@@ -360,7 +360,7 @@ impl AccessSet {
         }
     }
 
-    /// Returns the complete point-mutation shape used by logless commit.
+    /// Returns the complete point-mutation shape used by direct commit.
     pub(crate) fn direct_shape(&self) -> Option<DirectShape<'_>> {
         (self.has_writes() && self.scans.is_empty()).then_some(DirectShape { accesses: self })
     }

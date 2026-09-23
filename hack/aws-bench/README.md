@@ -52,7 +52,7 @@ cargo run --release -p glassdb-bench-scale --bin perfbench -- \
 Every shape runs until all shapes reach the requested throughput confidence
 interval, or the cell reaches `--max-duration`. Capped shapes are marked
 unconverged. Whole-cell results include backend operations and transaction
-retries plus coordinator submissions, rounds, CAS retries, members per round, and
+replays plus coordinator submissions, rounds, CAS retries, members per round, and
 direct-path coverage, all derived from the public `Database::stats()` counters.
 
 ### Worker and affinity sweep plots
@@ -60,7 +60,7 @@ direct-path coverage, all derived from the public `Database::stats()` counters.
 The canonical scale plots use the low-contention mixed workload and the local
 S3 model. `--prefix-depth=3` gives each physical collection subtree
 (`db/_c/<collection-id>`) an independent simulated S3 request-rate bucket;
-database-wide transaction-log shards remain separate prefixes. Build once and
+database-wide transaction-record shards remain separate prefixes. Build once and
 run the two grids:
 
 ```bash

@@ -21,7 +21,7 @@ pub enum DirectoryReadKind {
         collection: Option<CollectionId>,
     },
     Listing {
-        version: u64,
+        generation: u64,
     },
 }
 
@@ -73,7 +73,7 @@ impl CatalogAccesses {
 #[derive(Debug, Clone)]
 pub struct DirectorySnapshot {
     pub children: Vec<(Vec<u8>, CollectionId)>,
-    pub version: u64,
+    pub generation: u64,
 }
 
 #[cfg(test)]
@@ -103,11 +103,11 @@ mod tests {
                 },
                 DirectoryRead {
                     parent: created.clone(),
-                    kind: DirectoryReadKind::Listing { version: 0 },
+                    kind: DirectoryReadKind::Listing { generation: 0 },
                 },
                 DirectoryRead {
                     parent: durable.clone(),
-                    kind: DirectoryReadKind::Listing { version: 7 },
+                    kind: DirectoryReadKind::Listing { generation: 7 },
                 },
             ],
             changes: vec![CollectionChange {

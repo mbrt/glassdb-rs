@@ -24,6 +24,10 @@ _Avoid_: Object key, object path
 The caller-supplied computation that stages transaction changes and returns a body outcome when it completes. GlassDB may execute it more than once.
 _Avoid_: Callback, user closure
 
+**Body replay**:
+An execution of the transaction body that replaces the discarded body outcome of an earlier execution in the same transaction.
+_Avoid_: Retry, re-run, transaction retry
+
 **Point access**:
 An access to one exact logical key, as distinct from an access to a key range. It can read the key, write it, or do both.
 _Avoid_: Point, point item
@@ -37,11 +41,19 @@ The currentness barrier one transaction allocates to open validation, and the la
 _Avoid_: Validation watermark, validation timestamp
 
 **Transaction identity**:
-A durable protocol identity that correlates one transaction's locks, status, and recovery resources. Replacing it does not by itself repeat the transaction body or discard that body's access set and body outcome.
-_Avoid_: Lock owner ID
+A durable protocol identity that owns one transaction's locks, status, and recovery resources.
+_Avoid_: Lock owner ID, transaction attempt
+
+**Identity renewal**:
+The replacement of a transaction identity with a new identity that keeps the same wound-wait priority. It does not by itself replay the transaction body or discard that body's access set and body outcome.
+_Avoid_: Replacement identity, restart
+
+**Commit pass**:
+One run of the commit protocol for one body outcome under one transaction identity. It ends when the body outcome can be returned, when the identity must be renewed, when the body must be replayed, or with an error. Identity renewal and body replay each start a new commit pass.
+_Avoid_: Attempt, commit attempt
 
 **Body outcome**:
-The value returned by one execution of a transaction body. GlassDB can discard the outcome and execute the body again.
+The value returned by one execution of a transaction body. GlassDB can discard the outcome and replay the body.
 _Avoid_: Normal outcome
 
 **Commit outcome**:
@@ -78,11 +90,53 @@ _Avoid_: Immediate cleanup, complete deletion
 The synchronous transfer of responsibility for an interrupted transaction to managed recovery work before control leaves its owner. Protocol-clean retirement may follow asynchronously.
 _Avoid_: Synchronous cleanup
 
-## Currentness
+**Owner operation**:
+Protocol work that the owner of a transaction identity runs under that identity and that can still publish effects. Each commit pass is one owner operation. While one is active or unresolved, retirement cannot prove that the identity can publish nothing more.
+
+## Commit
+
+**Transaction record**:
+The durable record of one transaction identity. It holds the identity's status, lease, and recovery manifest, and the committed values after commit.
+_Avoid_: Transaction log, transaction object, tx log, log object
+
+**Writer**:
+The transaction identity whose commit produced the current value of one logical key.
+_Avoid_: Version, writer token, value version
+
+**Direct commit**:
+A commit that validates and publishes all point accesses of one transaction with one conditional mutation of one leaf, without locks or a transaction record.
+_Avoid_: Logless commit, same-leaf commit
+
+**Locked commit**:
+A commit that locks the access set, validates its reads, and then makes the transaction record committed.
+_Avoid_: Logged protocol, regular commit protocol, locked path
+
+**Optimistic validation**:
+Validation of an access set before the transaction holds any lock.
+_Avoid_: Read-only fast path
+
+**Locked validation**:
+Validation of an access set while the transaction holds its locks.
+
+## Conditional mutations
+
+**Revision**:
+The opaque token that identifies one content state of one stored object. It does not order states.
+_Avoid_: Version, backend version, CAS token, generation, ETag
 
 **Applied mutation**:
 A conditional backend mutation known to have taken effect on one stored object. This does not establish that the installed state is still current.
 _Avoid_: Committed mutation
+
+**Rejected mutation**:
+A conditional backend mutation that did not take effect because its precondition was false.
+_Avoid_: Conflict, precondition failure
+
+**In-doubt mutation**:
+A conditional backend mutation whose result does not show whether it took effect.
+_Avoid_: Indeterminate, ambiguous, or uncertain mutation
+
+## Currentness
 
 **Sequence point**:
 A point on one database-local timeline, which orders currentness evidence within one open database. It is neither wall time nor comparable across database instances.
@@ -105,6 +159,10 @@ _Avoid_: Consistency level, staleness policy
 **Leaf**:
 A terminal physical node in one collection's range-partitioned tree. In one exact state, it owns a contiguous logical-key range and is the physical mutation unit for that range.
 _Avoid_: Shard, leaf shard
+
+**Membership generation**:
+A leaf counter that changes when a transaction changes, or can change, the set of logical keys in the leaf.
+_Avoid_: Membership version
 
 **Routing**:
 The resolution of a logical key or range endpoint to a leaf by descent through a collection's tree. Its result records observed placement; it does not reserve the key or keep that placement current.
@@ -149,7 +207,7 @@ _Avoid_: Structure lock, structure-write lock
 ## Maintenance
 
 **GC candidate**:
-A transaction identity selected for a check of its remaining references and recovery resources. Selection does not prove that its transaction object can be deleted.
+A transaction identity selected for a check of its remaining references and recovery resources. Selection does not prove that its transaction record can be deleted.
 _Avoid_: Cleanup candidate
 
 **GC backlog**:
@@ -157,5 +215,5 @@ Known GC work that is ready to run but has not completed. Retained live values, 
 _Avoid_: Cleanup backlog, transaction-object count, garbage count
 
 **GC scan**:
-A traversal of stored transaction objects to find GC candidates independently of local hints. Scans of structural intents belong to structural recovery.
-_Avoid_: Recovery scan (when referring to transaction-object GC)
+A traversal of stored transaction records to find GC candidates independently of local hints. Scans of structural intents belong to structural recovery.
+_Avoid_: Recovery scan (when referring to transaction-record GC)

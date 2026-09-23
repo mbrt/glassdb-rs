@@ -10,7 +10,7 @@ Supersedes the fixed-hash key→shard mapping and fixed shard count of
 addressing, the fixed `SHARD_COUNT`), and [ADR-018](018-collection-root-membership.md)
 (the recorded fixed `shard_count` and the single coarse membership lock). The
 shard _entry_ model (lock type, `locked_by`, `current_writer`, tombstone) from
-ADR-017, the transaction object (ADR-019), the commit/write-back protocol
+ADR-017, the transaction record (ADR-019), the commit/write-back protocol
 (ADR-020), wound-wait/leases (ADR-021), GC (ADR-022), and the shard-mutation
 coordinator (ADR-028/029) all carry over unchanged.
 
@@ -119,7 +119,7 @@ descent is **cached and self-correcting**:
   right-sibling link** (B-link's defining property) or re-descends from a
   refreshed `_i`. The rare stale case self-heals.
 
-This is the range analogue of the ADR-018 root-version trick and the ADR-030
+This is the range analogue of the ADR-018 root-generation trick and the ADR-030
 `AllowStale` seed: the hot path reads only the leaf; higher levels are cached and
 change only on splits/merges.
 
@@ -180,7 +180,7 @@ coordination:
   version**; a split during the scan is absorbed by following the right-link. A
   membership change bumps its leaf's version, so equal endpoints prove no
   create/delete raced within a leaf — the per-leaf analogue of ADR-018's
-  root-version validation. Under contention the scan escalates to **per-leaf read
+  root-generation validation. Under contention the scan escalates to **per-leaf read
   locks** over the covered range. Range boundaries are protected the same way
   (validate/lock the boundary leaf), preventing boundary phantoms.
 

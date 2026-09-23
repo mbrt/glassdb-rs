@@ -95,7 +95,7 @@ async fn reopening_uses_the_stored_commit_recovery_timeout() {
             BackendOp::WriteIf { path, value, .. }
                 | BackendOp::WriteIfNotExists { path, value }
                 if path.contains("/_t/")
-                    && glassdb_storage::txobject::status(value)
+                    && glassdb_storage::txrecord::status(value)
                         .is_ok_and(|status| status == TxCommitStatus::Ok));
         let status_read = matches!(op,
             BackendOp::Read { path } | BackendOp::ReadIfModified { path, .. }
@@ -202,7 +202,7 @@ async fn opening_ignores_invalid_creation_proposals() {
 async fn inline_options_remain_local_to_each_client() {
     let backend = Arc::new(MemoryBackend::new());
     let direct = Database::open("local", backend.clone()).await.unwrap();
-    let logged = Database::builder("local", backend.clone())
+    let locked = Database::builder("local", backend.clone())
         .inline_policy(InlinePolicy::none())
         .open()
         .await
@@ -213,22 +213,22 @@ async fn inline_options_remain_local_to_each_client() {
         .await
         .unwrap();
     assert_eq!(
-        logged.root_collection().read(b"key").await.unwrap(),
+        locked.root_collection().read(b"key").await.unwrap(),
         Some(b"inline".to_vec())
     );
     assert_eq!(direct.stats().direct_commit.landed, 1);
-    logged
+    locked
         .root_collection()
-        .write(b"key", b"logged")
+        .write(b"key", b"locked")
         .await
         .unwrap();
     assert_eq!(
         direct.root_collection().read(b"key").await.unwrap(),
-        Some(b"logged".to_vec())
+        Some(b"locked".to_vec())
     );
-    assert_eq!(logged.stats().direct_commit.landed, 0);
+    assert_eq!(locked.stats().direct_commit.landed, 0);
     direct.shutdown().await;
-    logged.shutdown().await;
+    locked.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]

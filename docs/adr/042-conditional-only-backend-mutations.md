@@ -21,7 +21,7 @@ writes. S3 and GCS also support deleting the current object only when its
 or
 [generation](https://docs.cloud.google.com/storage/docs/request-preconditions)
 matches a supplied revision. Maintenance code normally reads the transaction
-log, structural record, or node it intends to reclaim before deleting it, but
+record, structural record, or node it intends to reclaim before deleting it, but
 currently discards that observation at the delete boundary.
 
 ## Decision
@@ -41,7 +41,7 @@ validator, not a unique mutation identifier; rewriting equivalent contents may
 be indistinguishable, consistent with ADR-036's state-based cache semantics.
 
 A caller must retain a present observation until deletion or read the object
-again. Transaction-log GC, structural recovery, and orphan-node cleanup carry
+again. Transaction-record GC, structural recovery, and orphan-node cleanup carry
 that observation to `delete_if`; an extra read is acceptable on a cleanup path
 that otherwise lacks one.
 
@@ -51,9 +51,9 @@ Deletion outcomes update knowledge as follows:
   expected observation's evidence to that invocation, and installs absence;
 - `NotFound` is successful convergence on definitive absence and also makes the
   expected observation obsolete;
-- a clean precondition failure makes the expected observation obsolete but
+- a clean rejected mutation makes the expected observation obsolete but
   does not identify the current state; and
-- an ambiguous outcome is `Unavailable` and leaves the path uncertain under
+- an in-doubt outcome is `Unavailable` and leaves the path in doubt under
   ADR-009.
 
 For every mutation, `Unavailable` means the request may have applied. Any other
@@ -96,7 +96,7 @@ no compatibility benefit.
 - Backend implementations map every engine mutation to a native conditional
   object-store operation; no read-then-mutate emulation is permitted.
 - Cleanup APIs must propagate revisions and may perform an additional read.
-- A conflict may invalidate old knowledge without revealing the winner, so a
+- A rejected mutation may invalidate old knowledge without revealing the winner, so a
   caller that needs the current state performs an explicit read.
 - Removing two trait methods is a breaking change for external backend
   implementations and for middleware that mirrors `Backend`.

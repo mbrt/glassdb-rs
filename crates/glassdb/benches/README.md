@@ -41,7 +41,7 @@ background work, measurement variance, and total process time together.
 | Case | Condition | Transactions per iteration |
 | --- | --- | ---: |
 | `warm_read` | One key, 256-byte value, warmed client caches | 1 |
-| `warm_read_external` | One key, 1,025-byte value stored in a transaction log, warmed client caches | 1 |
+| `warm_read_external` | One key, 1,025-byte value stored in a transaction record, warmed client caches | 1 |
 | `fresh_client_read` | Same contents; reopen client and collection before each read | 1 |
 | `rmw_inline_1024` | One key; 1,024-byte value at the default inline limit | 1 |
 | `rmw_external_1025` | One key; 1,025-byte value above that limit | 1 |
@@ -88,7 +88,7 @@ depend on the host. Real-provider costs require separate measurements.
 Exact protocol guarantees belong in integration/simulation tests, not timing
 assertions. Fixture preparation, transaction completion, and zero backend reads
 for warmed inline writes are checked by the benchmark harness. The inline-write
-and transaction-log cache checks use separate, undelayed memory backends.
+and transaction-record cache checks use separate, undelayed memory backends.
 The inline-write check freezes model time to exclude GC deadlines. `make test-bench`
 runs all benchmark targets in test mode, including these checks.
 

@@ -8,8 +8,8 @@ The conditional mutation surface is refined by
 [ADR-042](042-conditional-only-backend-mutations.md), and post-dispatch
 cancellation and cache reconciliation are refined by
 [ADR-043](043-causally-coordinated-backend-operations.md). The
-garbage-collection interaction below — and with it the claim that the logged
-commit path always recovers an in-doubt log write — is refined by
+garbage-collection interaction below — and with it the claim that the locked
+commit path always recovers an in-doubt record write — is refined by
 [ADR-057](057-bounded-in-doubt-commit-recovery.md).
 
 ## Context
@@ -21,14 +21,14 @@ conditional writes (`write_if`, `write_if_not_exists`, `set_tags_if`,
 
 > If a conditional write's first attempt *lands* but its acknowledgement is
 > *lost*, any retry observes a precondition failure (S3 `412`/`409`, GCS
-> `conditionNotMet`) that is **indistinguishable from a genuine conflict**.
+> `conditionNotMet`) that is **indistinguishable from a rejected mutation**.
 
 The deterministic fuzzer (ADR-008) made this concrete. Once its `NetBackend`
 modelled real object storage faithfully — at-least-once delivery, no dedup — a
 single-key increment could be applied twice (`final > started`): a conditional
 write landed, its ack was dropped, the retry saw a `Precondition`, the engine
-treated it as a clean conflict and re-applied. The logless single-RW fast path
-(ADR-007) is the sharpest case: it keeps no transaction log, so the outcome
+treated it as a rejected mutation and re-applied. The direct single-RW fast path
+(ADR-007) is the sharpest case: it keeps no transaction record, so the outcome
 cannot be reconstructed, and a *transparent, exactly-once* retry is impossible.
 
 The danger is not hypothetical to the simulator only — it depends on whether a
@@ -54,11 +54,11 @@ tested for each one that can actually lose an acknowledgement.
 
 ## Decision
 
-### At-most-once, with in-doubt scoped to the logless path
+### At-most-once, with in-doubt scoped to the direct path
 
 We do **not** attempt transparent exactly-once retries when there is nothing to
-disambiguate them with (the logless single-RW path). The contract is
-**at-most-once application + report the uncertainty only when the engine cannot
+disambiguate them with (the direct single-RW path). The contract is
+**at-most-once application + report in-doubt only when the engine cannot
 recover it on its own**:
 
 1. **New error variant `BackendError::InDoubt(String)`** — "the operation's
@@ -67,23 +67,23 @@ recover it on its own**:
    helpers at every layer, and is deliberately **not** classified as
    `retry`/`wounded`/`precondition`.
 
-2. **Backends own conditional-write retries and must report an uncertain
+2. **Backends own conditional-write retries and must report an in-doubt
    outcome as `Unavailable`, never as a confident `Precondition`.** Concretely,
    a backend returns `Unavailable` when (a) it observes a precondition failure on
-   a conditional write *after an attempt whose outcome was ambiguous* (a lost or
+   a conditional write *after an attempt whose outcome was in doubt* (a lost or
    possibly-applied earlier attempt), or (b) it exhausts its retry budget.
    Reads and unconditional (idempotent) writes are unaffected and may be retried
    freely.
 
-3. **The logged commit path retries `Unavailable` internally.** A transaction
-   log is keyed by its tx id; only the owning client writes `committed`, and
+3. **The locked commit path retries `Unavailable` internally.** A transaction
+   record is keyed by its tx id; only the owning client writes `committed`, and
    third parties only write to it to wound (status `aborted`). The conditional
    write (`write_if_not_exists` / `write_if`) is therefore idempotent across
-   retries: as long as the log is not yet final, any race (our own
-   `refresh_pending` advancing the pending log, a wound, or our own previously
+   retries: as long as the record is not yet final, any race (our own
+   `refresh_pending` advancing the pending record, a wound, or our own previously
    landed attempt) is safe to resolve by re-reading. `Monitor::set_final_log`
    therefore retries on `Unavailable`; if a previous attempt actually landed,
-   the retry observes the existing log via `Precondition`, reads its commit
+   the retry observes the existing record via `Precondition`, reads its commit
    status, and treats a final status matching its own intent as success
    (`committed==committed` is necessarily our own write; `aborted==aborted`
    converges on the desired outcome regardless of who wrote it). A mismatched
@@ -98,48 +98,48 @@ recover it on its own**:
    idempotent. The locker therefore retries the lock operation itself on
    `Unavailable` (`LockerWorker::run` reloads metadata and re-attempts,
    exactly as it already does for a stale `Precondition`), resolving the
-   uncertainty in place. The exception is `LockType::Create`: its outcome
-   under in-doubt is genuinely ambiguous from outside the writer (same
+   in-doubt outcome in place. The exception is `LockType::Create`: its outcome
+   under in-doubt cannot be resolved from outside the writer (same
    reasoning as the single-RW fast path), so a `Create` in-doubt result is
    not retried by the locker. This recovery never escalates into a
-   whole-transaction retry that would needlessly re-run the user's closure.
+   body replay that would needlessly replay the user's closure.
 
 5. **The single-RW fast path first re-issues the idempotent CAS, then surfaces
-   only the irreducible in-doubt.** The fast path is logless: its value write is
+   only the irreducible in-doubt.** The fast path is direct: its value write is
    the commit point. On an `Unavailable` outcome the engine re-issues the *same*
-   conditional write unchanged (same expected version, same value). That write
+   conditional write unchanged (same expected revision, same value). That write
    is idempotent under its own precondition — no re-read is needed, the
    precondition is what enforces "only when nothing changed":
-   - it **lands** (`Ok`) only when the object is still at the expected version
+   - it **lands** (`Ok`) only when the object is still at the expected revision
      (no writer changed it, so our earlier attempt did not land either): the
      value is applied exactly once and the transaction commits. This recovers
      the common in-doubt case where the write never landed (e.g. the backend
      exhausted its retry budget on transient errors);
    - it fails the **precondition** when a change already happened. A precondition
      seen *after* an in-doubt attempt is itself in-doubt: our earlier attempt may
-     have committed, and with no transaction log that is indistinguishable from a
-     genuine conflict from outside the writer, so it is reported as `Unavailable`.
+     have committed, and with no transaction record that is indistinguishable from a
+     rejected mutation from outside the writer, so it is reported as `Unavailable`.
 
-   `Database::tx`'s loop only re-runs on `retry`/`wounded`; an `Unavailable` that
+   `Database::tx`'s loop only replays the body on `retry`/`wounded`; an `Unavailable` that
    the fast path could not resolve breaks out as `Error::InDoubt`. The
    transaction may or may not have committed; the caller decides whether to retry
-   (with its own idempotency) or accept the uncertainty. Re-issuing the CAS is
+   (with its own idempotency) or accept the in-doubt outcome. Re-issuing the CAS is
    safe — it cannot double-apply — because a write that already landed changed the
-   object's version, so the precondition rejects the retry rather than applying it
+   object's revision, so the precondition rejects the retry rather than applying it
    a second time.
 
-This let us **keep the single-RW fast path**: it stays a logless CAS, and its one
+This let us **keep the single-RW fast path**: it stays a direct CAS, and its one
 unsafe interleaving (lost ack + re-observed precondition) is reported as in-doubt
 instead of being retried into a double-apply.
 
 ### Per-backend obligations
 
-| Backend | Conditional-write retry | Ambiguous outcome → |
+| Backend | Conditional-write retry | In-doubt outcome → |
 |---------|-------------------------|---------------------|
 | Memory  | n/a (local, atomic)     | cannot occur |
 | `FaultBackend` (sim) | lost-ack injection | a landed conditional write reported as `Unavailable` (modelling a lost acknowledgement) |
-| S3 | SDK retryer **disabled** for conditional `PutObject`; backend owns the loop | ambiguous attempt (timeout/dispatch/`5xx`) then `412` → `Unavailable`; budget exhaustion → `Unavailable` |
-| GCS | none (single attempt) | transport error or `5xx` on a conditional request → `Unavailable`; a clean `412`/`409` is a genuine conflict (GCS applies conditional writes atomically and we never retry, so it did not take effect) → `Precondition` |
+| S3 | SDK retryer **disabled** for conditional `PutObject`; backend owns the loop | in-doubt attempt (timeout/dispatch/`5xx`) then `412` → `Unavailable`; budget exhaustion → `Unavailable` |
+| GCS | none (single attempt) | transport error or `5xx` on a conditional request → `Unavailable`; a clean `412`/`409` is a rejected mutation (GCS applies conditional writes atomically and we never retry, so it did not take effect) → `Precondition` |
 
 For S3, the backend now distinguishes attempt outcomes itself instead of
 delegating to the SDK retryer (which hides intermediate attempts): a `409`
@@ -151,11 +151,11 @@ re-applying them is harmless.
 
 ### Garbage-collection interaction
 
-Transaction logs are deleted asynchronously, well after the writes they describe
-are materialized, so a finalized log being garbage-collected never turns a
-genuine commit into a phantom conflict during commit or recovery. The in-doubt
+Transaction records are deleted asynchronously, well after the writes they describe
+are materialized, so a finalized record being garbage-collected never turns a
+genuine commit into a phantom rejected mutation during commit or recovery. The in-doubt
 outcome concerns the *acknowledgement* of a write, not the later absence of a
-log, so GC does not widen the in-doubt window.
+record, so GC does not widen the in-doubt window.
 
 ## Consequences
 
@@ -164,7 +164,7 @@ log, so GC does not widen the in-doubt window.
   in-doubt result as a confident `Precondition` would re-introduce it, so the
   property is tested per backend.
 - Applications must handle `Error::InDoubt`, but **only the single-RW fast
-  path** can produce it: a logged-commit transaction recovers transparently. The
+  path** can produce it: a locked-commit transaction recovers transparently. The
   honest contract for a stateless store over object storage is that the fast
   path is in-doubt under a lost ack; callers add idempotency (e.g. a
   client-supplied write token) if they need to retry safely.
@@ -177,9 +177,9 @@ log, so GC does not widen the in-doubt window.
   single-RW path surfaces `Unavailable` without double-applying (the re-issued
   CAS hits a real precondition because the earlier attempt landed); an in-doubt
   outcome on a write that did *not* land is recovered transparently by re-issuing
-  the idempotent CAS, committing exactly once; the logged path recovers
-  transparently (engine retries the log write and recognizes its own landed log
-  via `Precondition`); a *clean* conflict still retries transparently on the fast
+  the idempotent CAS, committing exactly once; a locked commit recovers
+  transparently (engine retries the record write and recognizes its own landed record
+  via `Precondition`); a *clean* rejected mutation still retries transparently on the fast
   path.
 - `crates/glassdb-backend/src/middleware/fault.rs` — the `FaultBackend` lost-ack
   path (`active_eventually_injects_faults`, `same_seed_same_fault_sequence`).

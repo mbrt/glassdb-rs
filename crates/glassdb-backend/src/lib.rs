@@ -1,10 +1,10 @@
 //! Object-storage backend abstraction (ADR-016, ADR-023, ADR-042).
 //!
 //! A [`Backend`] is a small, content-CAS-only contract over an object store:
-//! reads (plain and version-conditional), conditional writes and deletion, and
+//! reads (plain and revision-conditional), conditional writes and deletion, and
 //! list. Coordination state lives entirely in object **content**; there are no
-//! metadata tags. Every object carries an opaque CAS [`Version`] (its
-//! ETag/generation), which is the only token used for conditional reads and
+//! metadata tags. Every object carries an opaque [`Revision`] (the provider's
+//! ETag or generation), which is the only token used for conditional reads and
 //! mutations.
 
 use std::num::NonZeroUsize;
@@ -58,8 +58,9 @@ pub enum BackendError {
     /// The object does not exist.
     #[error("object not found")]
     NotFound,
-    /// A conditional operation's precondition failed (version mismatch). For a
-    /// conditional mutation this means the expected state was not current; for
+    /// A conditional operation's precondition failed (revision mismatch). For a
+    /// conditional mutation this means the mutation was rejected because the
+    /// expected state was not current; for
     /// [`Backend::read_if_modified`] it means "not modified" — the caller's
     /// cached copy is still current.
     #[error("precondition failed")]
@@ -72,9 +73,9 @@ pub enum BackendError {
     /// applied. Returned when a call cannot be completed with a definitive
     /// answer — e.g. a conditional mutation whose acknowledgement was lost and
     /// whose retry then observed a precondition failure (so it cannot be told
-    /// apart from a genuine conflict), or a sustained outage that exhausts the
-    /// retry budget. Because a mutation's outcome can be in doubt, it must *not*
-    /// be blindly retried; the caller decides how to proceed.
+    /// apart from a genuine rejection), or a sustained outage that exhausts the
+    /// retry budget. Because a mutation can be in doubt, it must *not* be
+    /// blindly retried; the caller decides how to proceed.
     #[error("storage outcome unknown (in doubt): {0}")]
     Unavailable(String),
     /// Any other backend error, with an optional underlying cause.
@@ -108,38 +109,39 @@ impl BackendError {
     }
 }
 
-/// An opaque CAS token identifying an object's content state.
+/// An opaque token identifying an object's content state: the S3 ETag or the
+/// GCS generation.
 ///
 /// Stored objects have nonempty tokens. At one path, different contents must
 /// have different tokens, but equivalent contents may retain the same token.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct Version {
+pub struct Revision {
     pub token: Arc<str>,
 }
 
-impl Version {
+impl Revision {
     /// Wraps a token string.
     ///
-    /// The token is stored behind an `Arc` so cloning a `Version` - which
+    /// The token is stored behind an `Arc` so cloning a `Revision` - which
     /// happens on every cached read and CAS comparison - is a refcount bump
     /// rather than a string copy.
     pub fn new(token: impl Into<Arc<str>>) -> Self {
-        Version {
+        Revision {
             token: token.into(),
         }
     }
 
-    /// Reports whether the version is unset.
+    /// Reports whether the revision is unset.
     pub fn is_unset(&self) -> bool {
         self.token.is_empty()
     }
 }
 
-/// The contents and version of a read object.
+/// The contents and revision of a read object.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReadReply {
     pub contents: Vec<u8>,
-    pub version: Version,
+    pub revision: Revision,
 }
 
 /// An opaque continuation token for a paginated listing.
@@ -173,7 +175,7 @@ pub struct ListPage {
 /// The conditional-only contract with an object store (ADR-023, ADR-042).
 ///
 /// The surface is content-CAS only: there are no metadata tags, and the opaque
-/// [`Version`] is the sole conditional token. Single-object reads and
+/// [`Revision`] is the sole conditional token. Single-object reads and
 /// conditional mutations must be linearizable, including reads invoked after a
 /// definitive mutation completes. Eventually consistent implementations are
 /// not supported. For mutations,
@@ -186,7 +188,7 @@ pub trait Backend: Send + Sync {
     /// Reads the full object.
     async fn read(&self, path: &str) -> Result<ReadReply, BackendError>;
 
-    /// Reads the object only if its version differs from `expected`; otherwise
+    /// Reads the object only if its revision differs from `expected`; otherwise
     /// returns [`BackendError::Precondition`] to signal "not modified" (the
     /// caller's cached copy at `expected` is still current). Maps to a native
     /// conditional GET (`If-None-Match` / `ifGenerationNotMatch`), so a hot,
@@ -196,13 +198,13 @@ pub trait Backend: Send + Sync {
     async fn read_if_modified(
         &self,
         path: &str,
-        expected: &Version,
+        expected: &Revision,
     ) -> Result<ReadReply, BackendError>;
 
-    /// Conditionally writes if the object exists and its version matches
-    /// `expected`, returning the new version.
+    /// Conditionally writes if the object exists and its revision matches
+    /// `expected`, returning the new revision.
     ///
-    /// For a present object, a stale or unset version returns
+    /// For a present object, a stale or unset revision returns
     /// [`BackendError::Precondition`]. A missing object returns
     /// [`BackendError::NotFound`] or [`BackendError::Precondition`]; neither
     /// outcome creates an object.
@@ -210,26 +212,26 @@ pub trait Backend: Send + Sync {
         &self,
         path: &str,
         value: Vec<u8>,
-        expected: &Version,
-    ) -> Result<Version, BackendError>;
+        expected: &Revision,
+    ) -> Result<Revision, BackendError>;
 
     /// Creates the object only if it does not already exist, returning its
-    /// version. An existing object returns [`BackendError::Precondition`].
+    /// revision. An existing object returns [`BackendError::Precondition`].
     async fn write_if_not_exists(
         &self,
         path: &str,
         value: Vec<u8>,
-    ) -> Result<Version, BackendError>;
+    ) -> Result<Revision, BackendError>;
 
-    /// Deletes the object only if its version matches `expected`.
+    /// Deletes the object only if its revision matches `expected`.
     ///
-    /// For a present object, a stale or unset version returns
+    /// For a present object, a stale or unset revision returns
     /// [`BackendError::Precondition`].
     /// A missing object may be reported as [`BackendError::NotFound`] or as
-    /// success; both mean the path has converged on absence. An unset version
+    /// success; both mean the path has converged on absence. An unset revision
     /// may also return [`BackendError::Precondition`] for a missing object.
-    /// An ambiguous outcome is always [`BackendError::Unavailable`].
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError>;
+    /// An in-doubt delete always returns [`BackendError::Unavailable`].
+    async fn delete_if(&self, path: &str, expected: &Revision) -> Result<(), BackendError>;
 
     /// Lists one page of object paths recursively.
     ///
@@ -261,7 +263,7 @@ impl<B: Backend + ?Sized + 'static> Backend for std::sync::Arc<B> {
     async fn read_if_modified(
         &self,
         path: &str,
-        expected: &Version,
+        expected: &Revision,
     ) -> Result<ReadReply, BackendError> {
         (**self).read_if_modified(path, expected).await
     }
@@ -270,8 +272,8 @@ impl<B: Backend + ?Sized + 'static> Backend for std::sync::Arc<B> {
         &self,
         path: &str,
         value: Vec<u8>,
-        expected: &Version,
-    ) -> Result<Version, BackendError> {
+        expected: &Revision,
+    ) -> Result<Revision, BackendError> {
         (**self).write_if(path, value, expected).await
     }
 
@@ -279,11 +281,11 @@ impl<B: Backend + ?Sized + 'static> Backend for std::sync::Arc<B> {
         &self,
         path: &str,
         value: Vec<u8>,
-    ) -> Result<Version, BackendError> {
+    ) -> Result<Revision, BackendError> {
         (**self).write_if_not_exists(path, value).await
     }
 
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Revision) -> Result<(), BackendError> {
         (**self).delete_if(path, expected).await
     }
 

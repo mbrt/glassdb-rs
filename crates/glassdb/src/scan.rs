@@ -7,7 +7,7 @@ use crate::Error;
 /// Describes one forward scan over a collection's raw key bytes.
 ///
 /// The descriptor borrows its bounds and is [`Copy`], so the same scan can be
-/// reused directly by every attempt of a retryable transaction.
+/// reused directly by every body execution of a replaying transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyScan<'a> {
     bounds: ScanBounds<'a>,

@@ -14,12 +14,12 @@ pub enum TransError {
     /// The transaction should be retried from the beginning (Go `ErrRetry`).
     #[error("retry transaction")]
     Retry,
-    /// The remote transaction log was already committed or aborted.
+    /// The remote transaction record was already committed or aborted.
     #[error("transaction was already finalized")]
     AlreadyFinalized,
     /// The transaction was aborted by a higher-priority transaction under the
     /// wound-wait rule (Go `ErrWounded`). It must be retried from the beginning
-    /// with a fresh attempt that preserves the original priority.
+    /// with a renewed identity that preserves the original priority.
     #[error("transaction was wounded")]
     Wounded,
     /// Internal: resolve a stale reference again at the supplied observation bound.

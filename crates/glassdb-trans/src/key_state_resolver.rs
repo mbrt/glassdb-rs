@@ -13,14 +13,14 @@ use crate::monitor::{KeyCommitStatus, Monitor, TxFinalStatus};
 ///
 /// A leaf entry that names the effective writer is authoritative about its own
 /// value (ADR-051), so resolution can answer whether that state is inline
-/// without touching a transaction object.
+/// without touching a transaction record.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum ResolvedValue {
     /// The leaf names a writer behind the effective one, so only the effective
-    /// writer's transaction object can supply its value.
+    /// writer's transaction record can supply its value.
     #[default]
     Unresolved,
-    /// The effective writer's value lives in its transaction object.
+    /// The effective writer's value lives in its transaction record.
     External,
     /// The effective writer's authoritative value bytes.
     Inline(Arc<[u8]>),
@@ -270,7 +270,7 @@ mod tests {
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
     use glassdb_concurr::{Background, RetryConfig};
     use glassdb_data::{CollectionAddress, DbRoot};
-    use glassdb_storage::transaction::{TLogger, TxLock, TxLog, TxWrite};
+    use glassdb_storage::transaction::{TxLock, TxRecord, TxRecordStore, TxWrite};
     use glassdb_storage::{CachedStore, EntryLockState, Timeline};
 
     use super::*;
@@ -281,7 +281,7 @@ mod tests {
     fn monitor_over(backend: Arc<dyn Backend>) -> (Monitor, Arc<Background>) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        let transactions = TLogger::new(objects, DbRoot::try_from("db").unwrap());
+        let transactions = TxRecordStore::new(objects, DbRoot::try_from("db").unwrap());
         let background = Arc::new(Background::new());
         let monitor = Monitor::with_config(
             transactions,
@@ -300,7 +300,7 @@ mod tests {
     struct ResolutionHarness {
         backend: Arc<dyn Backend>,
         operations: OpLog,
-        transactions: TLogger,
+        transactions: TxRecordStore,
     }
 
     impl ResolutionHarness {
@@ -310,7 +310,7 @@ mod tests {
             let backend: Arc<dyn Backend> = Arc::new(recorder);
             let timeline = Timeline::new();
             let objects = CachedStore::new(backend.clone(), 1 << 20, timeline, None);
-            let transactions = TLogger::new(objects, DbRoot::try_from("db").unwrap());
+            let transactions = TxRecordStore::new(objects, DbRoot::try_from("db").unwrap());
             Self {
                 backend,
                 operations,
@@ -331,20 +331,20 @@ mod tests {
             status: TxCommitStatus,
             deleted: Option<bool>,
         ) {
-            let mut log = TxLog::new(holder.clone(), status);
-            log.locks.push(TxLock::Entry {
+            let mut record = TxRecord::new(holder.clone(), status);
+            record.locks.push(TxLock::Entry {
                 key: key.clone(),
                 typ,
             });
             if let Some(deleted) = deleted {
-                log.writes.push(TxWrite {
+                record.writes.push(TxWrite {
                     key: key.clone(),
                     value: Arc::from(b"holder-value".as_slice()),
                     deleted,
                     prev_writer: TxId::default(),
                 });
             }
-            self.transactions.set(&log).await.unwrap();
+            self.transactions.set(&record).await.unwrap();
         }
 
         fn clear_operations(&self) {
@@ -363,7 +363,7 @@ mod tests {
                     matches!(operation.op, "read" | "read_if_modified")
                         && operation.path.contains("/_t/")
                 }),
-                "{context}: resolution must only read transaction objects: {operations:?}"
+                "{context}: resolution must only read transaction records: {operations:?}"
             );
         }
     }
@@ -795,7 +795,7 @@ mod tests {
         let holder = TxId::with_priority(2, b"holder");
 
         monitor.begin_tx(&holder);
-        let mut committed = TxLog::new(holder.clone(), TxCommitStatus::Pending);
+        let mut committed = TxRecord::new(holder.clone(), TxCommitStatus::Pending);
         committed.writes = vec![TxWrite {
             key: key.clone(),
             value: Arc::from(b"v".as_slice()),

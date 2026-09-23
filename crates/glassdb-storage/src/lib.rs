@@ -1,5 +1,5 @@
 //! Decoded, byte-bounded physical-object storage plus leaf/root coordination,
-//! transaction-log persistence, and structural intents for split recovery.
+//! transaction-record persistence, and structural intents for split recovery.
 
 pub mod cache;
 mod cache_stats;
@@ -17,8 +17,7 @@ mod structural_intent_store;
 mod timeline;
 pub mod transaction;
 mod tree_router;
-pub mod txobject;
-mod version;
+pub mod txrecord;
 mod wire_size;
 
 /// Persistent-cache media and harnesses for deterministic simulation.
@@ -58,4 +57,3 @@ pub use structural_intent::{StructuralIntent, StructuralIntentPhase};
 pub use structural_intent_store::{StructuralIntentPage, StructuralIntentStore};
 pub use timeline::{CurrentnessBarrier, Requirement, SequencePoint, Timeline};
 pub use tree_router::{RoutedLeaf, RoutedLeafGroup, TreeRouter};
-pub use version::Version;

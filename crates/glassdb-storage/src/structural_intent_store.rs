@@ -76,7 +76,7 @@ impl StructuralIntentStore {
             .await
         {
             Ok(CasResult::Applied(receipt)) => Ok(receipt.into_installed()),
-            Ok(CasResult::Conflict) => Err(StorageError::Precondition),
+            Ok(CasResult::Rejected) => Err(StorageError::Precondition),
             Err(e) => Err(e),
         }
     }
@@ -93,7 +93,7 @@ impl StructuralIntentStore {
             .await
         {
             Ok(CasResult::Applied(receipt)) => Ok(Some(receipt.into_installed())),
-            Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(None),
+            Ok(CasResult::Rejected) | Err(StorageError::NotFound) => Ok(None),
             Err(error) => Err(error),
         }
     }
@@ -278,7 +278,7 @@ mod tests {
         StructuralIntent {
             collection: CollectionAddress::root("db"),
             source_token: Some(token(200)),
-            source_version: "v1".to_string(),
+            source_revision: "v1".to_string(),
             created_tokens: vec![token(201)],
             split_key: b"split".to_vec(),
             participant_id: participant.clone(),

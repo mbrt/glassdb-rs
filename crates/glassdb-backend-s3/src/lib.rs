@@ -3,7 +3,7 @@
 //! Each logical key maps to a single S3 object whose body holds the value.
 //! Coordination is content CAS only: conditional writes use `If-Match` /
 //! `If-None-Match` and conditional deletion uses `If-Match` on the object ETag.
-//! The opaque [`Version`] token is that ETag (kept verbatim, quotes included).
+//! The opaque [`Revision`] token is that ETag (kept verbatim, quotes included).
 //! Conditional reads use `If-None-Match`.
 
 use std::future::Future;
@@ -17,7 +17,7 @@ use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use glassdb_backend::implementation::{bind_list_cursor, list_provider_token};
 use glassdb_backend::{
-    Backend, BackendError, Cause, ListCursor, ListLimit, ListPage, ReadReply, Version,
+    Backend, BackendError, Cause, ListCursor, ListLimit, ListPage, ReadReply, Revision,
 };
 
 const MAX_LIST_PAGE_SIZE: usize = 1_000;
@@ -161,8 +161,8 @@ impl S3Backend {
         let cfg = aws_sdk_s3::config::Builder::default().retry_config(retry);
         match op.customize().config_override(cfg).send().await {
             Ok(out) => match out.e_tag().filter(|etag| !etag.is_empty()) {
-                Some(etag) => ConditionalPutEvent::Applied(Version::new(etag)),
-                None => ConditionalPutEvent::AppliedWithoutVersion,
+                Some(etag) => ConditionalPutEvent::Applied(Revision::new(etag)),
+                None => ConditionalPutEvent::AppliedWithoutRevision,
             },
             Err(e) => ConditionalPutEvent::Failed(Box::new(ProviderFailure::from(e))),
         }
@@ -173,7 +173,7 @@ impl S3Backend {
         path: &str,
         value: Vec<u8>,
         conds: PutConds,
-    ) -> Result<Version, BackendError> {
+    ) -> Result<Revision, BackendError> {
         if let Some(m) = &conds.if_match
             && m.is_empty()
         {
@@ -186,10 +186,11 @@ impl S3Backend {
 
         // A conditional write is NOT idempotent under retry: if an attempt lands
         // but its acknowledgement is lost, a re-send sees its own write and
-        // returns a precondition failure indistinguishable from a real conflict.
+        // returns a precondition failure indistinguishable from a genuine
+        // rejection.
         // We therefore disable the SDK retryer and own the loop, so we can taint
         // such a precondition as in-doubt instead of reporting a confident
-        // conflict (which the engine would retry into a double-apply). See
+        // rejection (which the engine would retry into a double-apply). See
         // ADR-009.
         let mut state = ConditionalPutState::default();
         loop {
@@ -197,7 +198,7 @@ impl S3Backend {
                 .send_put(path, &value, &conds, RetryConfig::disabled())
                 .await;
             match state.transition(event) {
-                ConditionalPutAction::Return(version) => return Ok(version),
+                ConditionalPutAction::Return(revision) => return Ok(revision),
                 ConditionalPutAction::Retry(after) => glassdb_concurr::rt::sleep(after).await,
                 ConditionalPutAction::Precondition => return Err(BackendError::Precondition),
                 ConditionalPutAction::InDoubt => return Err(in_doubt("Write", path)),
@@ -211,14 +212,14 @@ impl S3Backend {
 
 /// An observation produced by one conditional PutObject attempt.
 enum ConditionalPutEvent<E> {
-    Applied(Version),
-    AppliedWithoutVersion,
+    Applied(Revision),
+    AppliedWithoutRevision,
     Failed(Box<ProviderFailure<E>>),
 }
 
 /// The next effect required by conditional PutObject policy.
 enum ConditionalPutAction<E> {
-    Return(Version),
+    Return(Revision),
     Retry(Duration),
     Precondition,
     InDoubt,
@@ -239,10 +240,10 @@ impl ConditionalPutState {
         self.attempts += 1;
 
         let failure = match event {
-            ConditionalPutEvent::Applied(version) => {
-                return ConditionalPutAction::Return(version);
+            ConditionalPutEvent::Applied(revision) => {
+                return ConditionalPutAction::Return(revision);
             }
-            ConditionalPutEvent::AppliedWithoutVersion => {
+            ConditionalPutEvent::AppliedWithoutRevision => {
                 return ConditionalPutAction::InDoubt;
             }
             ConditionalPutEvent::Failed(failure) => failure,
@@ -257,7 +258,7 @@ impl ConditionalPutState {
                 ConditionalPutAction::Retry(conflict_backoff(attempt))
             }
             // A timeout, dispatch failure, or non-throttle 5xx may have applied.
-            ProviderFact::Ambiguous if attempt < DEFAULT_MAX_ATTEMPTS => {
+            ProviderFact::InDoubt if attempt < DEFAULT_MAX_ATTEMPTS => {
                 self.may_have_applied = true;
                 ConditionalPutAction::Retry(conflict_backoff(attempt))
             }
@@ -293,7 +294,7 @@ impl Backend for S3Backend {
                 .send(),
         )
         .await?;
-        let version = version_from_etag(out.e_tag());
+        let revision = revision_from_etag(out.e_tag());
         let stored = out
             .body
             .collect()
@@ -304,14 +305,14 @@ impl Backend for S3Backend {
             .to_vec();
         Ok(ReadReply {
             contents: stored,
-            version,
+            revision,
         })
     }
 
     async fn read_if_modified(
         &self,
         path: &str,
-        expected: &Version,
+        expected: &Revision,
     ) -> Result<ReadReply, BackendError> {
         if expected.is_unset() {
             return self.read(path).await;
@@ -333,7 +334,7 @@ impl Backend for S3Backend {
                 .send(),
         )
         .await?;
-        let version = version_from_etag(out.e_tag());
+        let revision = revision_from_etag(out.e_tag());
         let stored = out
             .body
             .collect()
@@ -344,7 +345,7 @@ impl Backend for S3Backend {
             .to_vec();
         Ok(ReadReply {
             contents: stored,
-            version,
+            revision,
         })
     }
 
@@ -352,8 +353,8 @@ impl Backend for S3Backend {
         &self,
         path: &str,
         value: Vec<u8>,
-        expected: &Version,
-    ) -> Result<Version, BackendError> {
+        expected: &Revision,
+    ) -> Result<Revision, BackendError> {
         self.put(
             path,
             value,
@@ -369,7 +370,7 @@ impl Backend for S3Backend {
         &self,
         path: &str,
         value: Vec<u8>,
-    ) -> Result<Version, BackendError> {
+    ) -> Result<Revision, BackendError> {
         self.put(
             path,
             value,
@@ -381,7 +382,7 @@ impl Backend for S3Backend {
         .await
     }
 
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Revision) -> Result<(), BackendError> {
         if expected.is_unset() {
             return Err(BackendError::Precondition);
         }
@@ -400,10 +401,7 @@ impl Backend for S3Backend {
             Ok(_) => Ok(()),
             Err(error) => {
                 let failure = ProviderFailure::from(error);
-                if matches!(
-                    failure.fact,
-                    ProviderFact::Ambiguous | ProviderFact::Throttle
-                ) {
+                if matches!(failure.fact, ProviderFact::InDoubt | ProviderFact::Throttle) {
                     Err(in_doubt("DeleteIf", path))
                 } else {
                     Err(annotate("DeleteIf", path, failure))
@@ -457,12 +455,12 @@ impl Backend for S3Backend {
     }
 }
 
-/// Builds an opaque [`Version`] from an S3 ETag, kept verbatim (quotes
+/// Builds an opaque [`Revision`] from an S3 ETag, kept verbatim (quotes
 /// included).
-fn version_from_etag(etag: Option<&str>) -> Version {
+fn revision_from_etag(etag: Option<&str>) -> Revision {
     match etag {
-        Some(e) => Version::new(e),
-        None => Version::default(),
+        Some(e) => Revision::new(e),
+        None => Revision::default(),
     }
 }
 
@@ -510,7 +508,7 @@ enum ProviderFact {
     Precondition,
     Conflict,
     Throttle,
-    Ambiguous,
+    InDoubt,
     NotFound,
     Other,
 }
@@ -541,8 +539,8 @@ where
             }
             (_, _, SdkError::TimeoutError(_))
             | (_, _, SdkError::DispatchFailure(_))
-            | (_, _, SdkError::ResponseError(_)) => ProviderFact::Ambiguous,
-            (_, Some(status @ 500..=599), _) if status != 503 => ProviderFact::Ambiguous,
+            | (_, _, SdkError::ResponseError(_)) => ProviderFact::InDoubt,
+            (_, Some(status @ 500..=599), _) if status != 503 => ProviderFact::InDoubt,
             (Some("SlowDown" | "ThrottlingException"), _, _) | (_, Some(429 | 503), _) => {
                 ProviderFact::Throttle
             }
@@ -613,10 +611,7 @@ fn annotate_read_failure<E>(
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    if matches!(
-        failure.fact,
-        ProviderFact::Throttle | ProviderFact::Ambiguous
-    ) {
+    if matches!(failure.fact, ProviderFact::Throttle | ProviderFact::InDoubt) {
         return BackendError::Unavailable(format!(
             "{op}({path}): transient backend failure, retryable"
         ));
@@ -645,7 +640,7 @@ where
     match failure.fact {
         ProviderFact::Precondition | ProviderFact::Conflict => BackendError::Precondition,
         ProviderFact::NotFound => BackendError::NotFound,
-        ProviderFact::Throttle | ProviderFact::Ambiguous | ProviderFact::Other => {
+        ProviderFact::Throttle | ProviderFact::InDoubt | ProviderFact::Other => {
             failure.into_other(op, path)
         }
     }
@@ -656,7 +651,7 @@ where
 /// or an exhausted retry budget).
 fn in_doubt(op: &str, path: &str) -> BackendError {
     BackendError::Unavailable(format!(
-        "{op}({path}): conditional mutation outcome unknown after a lost or ambiguous attempt"
+        "{op}({path}): conditional mutation outcome unknown after a lost or in-doubt attempt"
     ))
 }
 

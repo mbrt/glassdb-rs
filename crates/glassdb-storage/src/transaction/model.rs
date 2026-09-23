@@ -33,7 +33,7 @@ impl TxCommitStatus {
     }
 }
 
-/// The normalized durable state of a transaction-log record.
+/// The normalized durable state of a transaction record.
 ///
 /// Missing records are represented explicitly; [`TxCommitStatus::Unknown`] is
 /// never a persisted state.
@@ -73,8 +73,8 @@ impl TxRecordState {
     }
 
     /// Returns the normalized state represented by an exact observation.
-    pub fn try_from_observation(observed: &Observation<TxLog>) -> Result<Self, StorageError> {
-        Self::try_from_status(observed.value().map(|log| log.status))
+    pub fn try_from_observation(observed: &Observation<TxRecord>) -> Result<Self, StorageError> {
+        Self::try_from_status(observed.value().map(|record| record.status))
     }
 
     /// Relates this state to a desired durable state using the transaction
@@ -104,9 +104,9 @@ impl TxRecordState {
     }
 }
 
-/// The full contents of a transaction log entry.
+/// The full contents of a transaction record.
 #[derive(Debug, Clone)]
-pub struct TxLog {
+pub struct TxRecord {
     pub id: TxId,
     /// `None` means "use the current time when persisting".
     pub timestamp: Option<SystemTime>,
@@ -117,10 +117,10 @@ pub struct TxLog {
     pub prepared_collections: Vec<CollectionAddress>,
 }
 
-impl TxLog {
-    /// Creates an empty log for the given transaction.
+impl TxRecord {
+    /// Creates an empty record for the given transaction.
     pub fn new(id: TxId, status: TxCommitStatus) -> Self {
-        TxLog {
+        TxRecord {
             id,
             timestamp: None,
             status,

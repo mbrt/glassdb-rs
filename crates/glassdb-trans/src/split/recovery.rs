@@ -232,9 +232,9 @@ impl PreparedIntent {
         Ok(Self { observed, intent })
     }
 
-    fn into_ready(self, source_version: String, split_key: Vec<u8>) -> ReadyIntent {
+    fn into_ready(self, source_revision: String, split_key: Vec<u8>) -> ReadyIntent {
         let mut intent = self.intent;
-        intent.source_version = source_version;
+        intent.source_revision = source_revision;
         intent.split_key = split_key;
         intent.phase = StructuralIntentPhase::Ready;
         ReadyIntent {
@@ -349,7 +349,7 @@ impl StructuralRecovery {
                 &StructuralIntent {
                     collection: collection.clone(),
                     source_token: source_token.cloned(),
-                    source_version: String::new(),
+                    source_revision: String::new(),
                     created_tokens,
                     split_key: Vec::new(),
                     participant_id: participant.clone(),
@@ -368,7 +368,7 @@ impl StructuralRecovery {
         observation: &LeafObservation,
         split_key: Vec<u8>,
     ) -> ReadyIntentTransition {
-        let source_version = match observation.revision() {
+        let source_revision = match observation.revision() {
             Some(revision) => revision.serialize().to_string(),
             None => {
                 return ReadyIntentTransition::RetryCleanly(TransError::other(
@@ -378,7 +378,7 @@ impl StructuralRecovery {
         };
         let collection = prepared.intent.collection.clone();
         let source_token = prepared.intent.source_token.clone();
-        let mut ready = prepared.into_ready(source_version, split_key);
+        let mut ready = prepared.into_ready(source_revision, split_key);
         match self
             .intent_store
             .update(&ready.expected, &ready.intent)
@@ -936,12 +936,12 @@ impl StructuralRecovery {
             return Ok(IntentRecoveryPhase::Delete);
         }
 
-        if intent.source_version.is_empty() {
+        if intent.source_revision.is_empty() {
             // A Ready transition records the revision its worker publishes
             // from. Without it there is nothing to fence against, so the intent
             // must not be classified at all.
             return Err(TransError::other(
-                "Ready structural intent records no source version",
+                "Ready structural intent records no source revision",
             ));
         }
 
@@ -954,7 +954,7 @@ impl StructuralRecovery {
             .fence_source_writer(
                 collection,
                 intent.source_token.as_ref(),
-                &intent.source_version,
+                &intent.source_revision,
                 barrier,
             )
             .await?
@@ -1032,7 +1032,7 @@ impl StructuralRecovery {
         Ok(IntentRecoveryPhase::Delete)
     }
 
-    /// Fences the worker that recorded `source_version` before classifying
+    /// Fences the worker that recorded `source_revision` before classifying
     /// created-node reachability.
     ///
     /// That revision is the whole question. A worker publishes its split with
@@ -1045,7 +1045,7 @@ impl StructuralRecovery {
         &self,
         collection: &CollectionAddress,
         token: Option<&NodeToken>,
-        source_version: &str,
+        source_revision: &str,
         barrier: CurrentnessBarrier,
     ) -> Result<bool, TransError> {
         for _ in 0..PARENT_RETRIES {
@@ -1054,7 +1054,7 @@ impl StructuralRecovery {
             };
             if !observed
                 .revision()
-                .is_some_and(|revision| revision.serialize() == source_version)
+                .is_some_and(|revision| revision.serialize() == source_revision)
             {
                 return Ok(true);
             }
@@ -1072,7 +1072,7 @@ impl StructuralRecovery {
             }
             // A finalized holder can still have its publish CAS in flight. This
             // cleanup CAS either wins first and fences that publish, or loses
-            // and the next iteration sees the source past `source_version`.
+            // and the next iteration sees the source past `source_revision`.
             self.structural_nodes
                 .release_structural_gate(collection, token, holder)
                 .await?;

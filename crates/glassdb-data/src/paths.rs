@@ -378,7 +378,7 @@ pub enum ObjectPath {
     DatabaseMetadata { db_root: DbRoot },
     /// A collection's lifecycle and directory record.
     CollectionRecord { collection: CollectionAddress },
-    /// A transaction log, deterministically sharded by its encoded ID.
+    /// A transaction record, deterministically sharded by its encoded ID.
     Transaction { db_root: DbRoot, id: TxId },
     /// The fixed root of a collection's B-link tree.
     TreeRoot { collection: CollectionAddress },
@@ -396,7 +396,7 @@ pub enum ObjectPath {
 }
 
 impl ObjectPath {
-    /// Returns the deterministic transaction-log shard containing `id`.
+    /// Returns the deterministic transaction-record shard containing `id`.
     pub fn transaction_shard(id: &TxId) -> usize {
         transaction::shard(id)
     }

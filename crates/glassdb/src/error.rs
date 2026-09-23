@@ -37,8 +37,8 @@ pub enum Error {
     AlreadyFinalized,
     /// The transaction's outcome is unknown (in doubt): a storage operation
     /// could not be confirmed, so it may or may not have been applied. The
-    /// engine deliberately does *not* retry such a transaction transparently,
-    /// because a retry could double-apply a write that actually landed. The
+    /// engine deliberately does *not* replay such a transaction transparently,
+    /// because a body replay could double-apply a write that actually landed. The
     /// caller decides whether to retry (with its own idempotency) or accept the
     /// uncertainty.
     #[error("transaction outcome unknown (in doubt): {0}")]

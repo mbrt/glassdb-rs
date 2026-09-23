@@ -27,11 +27,11 @@ inline budgets and soft split thresholds remain local to each client.
 
 ADR-051's aggregate inline budget bounds the value bytes rewritten with every
 leaf mutation. Once authoritative inline values consume that budget, another
-otherwise eligible direct commit falls back to the regular locked protocol.
+otherwise eligible direct commit falls back to the regular locked commit.
 ADR-053 deliberately made that the sole fallback, and measured it as materially
 slower than a landing direct commit.
 
-ADR-054 stopped logged values from consuming new inline capacity, but it could
+ADR-054 stopped locked values from consuming new inline capacity, but it could
 not remove authoritative inline values. A leaf can therefore remain saturated
 while still being well below ADR-031's ordinary entry-count and encoded-byte
 split thresholds. Its stable admission failures do not currently cause the tree
@@ -54,7 +54,7 @@ rejection is sufficient evidence of demand.
 Only potentially recoverable aggregate pressure does so. Disabled inlining, a
 value above the per-value limit, and a value that cannot fit within the
 aggregate budget even in an otherwise empty leaf continue directly to the
-locked protocol without requesting a split. Exact encoded-object capacity
+locked commit without requesting a split. Exact encoded-object capacity
 remains ADR-031's separate size-based concern.
 
 The rejected mutation does not wait for structural work. It immediately uses
@@ -127,7 +127,7 @@ This is an observability requirement, not a prescribed public statistics API.
   inline relief. Repeated demand is required to drive further splits.
 - The optimization provides no eventual-admission guarantee. Volatile hints,
   transient contention, an unsplittable leaf, or an unhelpful median can leave
-  future mutations on the locked path.
+  future mutations on the locked commit.
 - Direct-commit, transaction, node, and structural-log formats are unchanged.
   No correctness state or reclamation obligation is introduced.
 - Client-local tuning already influences shared topology through `SplitPolicy`;
@@ -146,7 +146,7 @@ admission is a more specific demand signal.
 This could avoid the first locked fallback, but couples foreground latency and
 transaction cancellation to a multi-step background structural protocol. It
 also needs a progress policy when splitting is delayed or insufficient. The
-locked protocol already provides bounded semantic progress.
+locked commit already provides bounded semantic progress.
 
 ### Split repeatedly until the requested value fits
 
@@ -177,6 +177,6 @@ accepted as the initial signal.
 
 ### Demote existing inline values under pressure
 
-An authoritative inline value may have no transaction object, so demotion can
+An authoritative inline value may have no transaction record, so demotion can
 destroy the only durable copy. Adding provenance and externalization would be a
 different value-lifecycle protocol, not a split policy.

@@ -2,8 +2,8 @@
 //!
 //! A transaction body can observe reads that validation later finds
 //! inconsistent. It must return an error for read-derived failures so GlassDB
-//! can retry that attempt. Panics bypass validation and replay even though
-//! framework-owned attempt resources are retired safely.
+//! must replay the body. Panics bypass validation and replay even though
+//! framework-owned transaction identity resources are retired safely.
 
 pub mod integration_support;
 

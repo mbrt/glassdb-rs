@@ -6,30 +6,30 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
+use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Revision};
 
 /// A backend operation presented to a hook before and after it is forwarded.
 #[derive(Debug, Clone, Copy)]
 pub enum BackendOp<'a> {
     /// A full object read.
     Read { path: &'a str },
-    /// A version-conditional object read.
+    /// A revision-conditional object read.
     ReadIfModified {
         path: &'a str,
-        expected: &'a Version,
+        expected: &'a Revision,
     },
     /// A compare-and-swap object write.
     WriteIf {
         path: &'a str,
         value: &'a [u8],
-        expected: &'a Version,
+        expected: &'a Revision,
     },
     /// A create-if-absent object write.
     WriteIfNotExists { path: &'a str, value: &'a [u8] },
     /// A revision-conditional object deletion.
     DeleteIf {
         path: &'a str,
-        expected: &'a Version,
+        expected: &'a Revision,
     },
     /// One page of a prefix listing.
     List {
@@ -159,7 +159,7 @@ impl Backend for HookBackend {
     async fn read_if_modified(
         &self,
         path: &str,
-        expected: &Version,
+        expected: &Revision,
     ) -> Result<ReadReply, BackendError> {
         self.hooked(BackendOp::ReadIfModified { path, expected }, || {
             self.inner.read_if_modified(path, expected)
@@ -171,8 +171,8 @@ impl Backend for HookBackend {
         &self,
         path: &str,
         value: Vec<u8>,
-        expected: &Version,
-    ) -> Result<Version, BackendError> {
+        expected: &Revision,
+    ) -> Result<Revision, BackendError> {
         self.hooked(
             BackendOp::WriteIf {
                 path,
@@ -188,7 +188,7 @@ impl Backend for HookBackend {
         &self,
         path: &str,
         value: Vec<u8>,
-    ) -> Result<Version, BackendError> {
+    ) -> Result<Revision, BackendError> {
         self.hooked(
             BackendOp::WriteIfNotExists {
                 path,
@@ -199,7 +199,7 @@ impl Backend for HookBackend {
         .await
     }
 
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Revision) -> Result<(), BackendError> {
         self.hooked(BackendOp::DeleteIf { path, expected }, || {
             self.inner.delete_if(path, expected)
         })
@@ -255,29 +255,29 @@ mod tests {
             }
         });
 
-        let version = backend
+        let revision = backend
             .write_if_not_exists("p", b"one".to_vec())
             .await
             .unwrap();
         backend.read("p").await.unwrap();
         assert!(matches!(
-            backend.read_if_modified("p", &version).await,
+            backend.read_if_modified("p", &revision).await,
             Err(BackendError::Precondition)
         ));
-        let version = backend
-            .write_if("p", b"two".to_vec(), &version)
+        let revision = backend
+            .write_if("p", b"two".to_vec(), &revision)
             .await
             .unwrap();
         backend
             .write_if_not_exists("q", b"three".to_vec())
             .await
             .unwrap();
-        backend.delete_if("p", &version).await.unwrap();
+        backend.delete_if("p", &revision).await.unwrap();
         backend
             .list("", None, ListLimit::new(1).unwrap())
             .await
             .unwrap();
-        assert!(!version.is_unset());
+        assert!(!revision.is_unset());
         assert_eq!(seen.load(Ordering::SeqCst), (1 << 6) - 1);
     }
 

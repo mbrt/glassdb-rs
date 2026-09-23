@@ -59,7 +59,7 @@ struct PhaseResult {
     tx_per_sec: Option<f64>,
     p50_ms: Option<f64>,
     p90_ms: Option<f64>,
-    retries: u64,
+    replays: u64,
     lock_calls: u64,
     direct_candidates: u64,
     direct_landed: u64,
@@ -320,7 +320,7 @@ impl Measured {
 
 #[derive(Clone, Copy)]
 struct ProtocolStats {
-    retries: u64,
+    replays: u64,
     lock_calls: u64,
     direct_candidates: u64,
     direct_landed: u64,
@@ -335,7 +335,7 @@ struct ProtocolStats {
 
 fn protocol_stats(stats: Stats) -> ProtocolStats {
     ProtocolStats {
-        retries: stats.transactions.retries,
+        replays: stats.transactions.replays,
         lock_calls: stats.locker.calls,
         direct_candidates: stats.direct_commit.candidates,
         direct_landed: stats.direct_commit.landed,
@@ -374,7 +374,7 @@ fn result(phase: &str, measured: Measured, stats: Stats, backend: BackendBreakdo
         tx_per_sec,
         p50_ms,
         p90_ms,
-        retries: protocol.retries,
+        replays: protocol.replays,
         lock_calls: protocol.lock_calls,
         direct_candidates: protocol.direct_candidates,
         direct_landed: protocol.direct_landed,

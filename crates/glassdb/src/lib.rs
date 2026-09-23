@@ -2,7 +2,8 @@
 //!
 //! Public API: [`Database`] opens a database over a
 //! [`glassdb_backend::Backend`], [`Collection`] groups keys, and [`Transaction`] runs a
-//! serializable transaction (with automatic conflict retries) via [`Database::tx`].
+//! serializable transaction (with automatic body replays on conflict) via
+//! [`Database::tx`].
 //!
 //! # Cancellation
 //!
@@ -10,13 +11,13 @@
 //! future mid-flight is equivalent to a crash and is recovered by the commit
 //! protocol, so it never corrupts data. Cancel by wrapping the future with
 //! `tokio::time::timeout`, `tokio::select!`, or aborting a `JoinHandle`. Locks
-//! held by an interrupted local attempt are synchronously handed to managed
+//! held by an interrupted local transaction are synchronously handed to managed
 //! retirement; helpers and garbage collection may reclaim their physical
 //! resources later. See [`Database::tx`] for details.
 //!
 //! # Transaction-body panics
 //!
-//! Panics propagate without read validation or transparent retry, including on
+//! Panics propagate without read validation or body replay, including on
 //! stale snapshots. The unwind path uses the same managed retirement as
 //! cancellation, so framework-owned transaction resources remain recoverable.
 
@@ -43,10 +44,10 @@ pub use scan::{KeyPage, KeyScan};
 pub use stats::{Stats, TransactionStats};
 pub use tx::Transaction;
 
-/// Returns an error from a transaction attempt when `condition` is false.
+/// Returns an error from a transaction body when `condition` is false.
 ///
 /// This is the transaction-body analogue of `assert!`: returning the error lets
-/// [`Database::tx`] validate the attempt's reads and retry if they were
+/// [`Database::tx`] validate the transaction's reads and replay the body if they were
 /// inconsistent. Assertions and other panics bypass that validation; their
 /// cleanup safety does not make them snapshot-transparent.
 #[macro_export]

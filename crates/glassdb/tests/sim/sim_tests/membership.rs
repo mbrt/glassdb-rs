@@ -104,8 +104,8 @@ fn full_universe_lists_every_key_across_leaves() {
 #[test]
 fn membership_holds_under_faults() {
     // With faults the invariant relaxes to the in-doubt bound: a listed key must
-    // be either the last committed state or the ambiguous outcome of an op left
-    // in-doubt. A lost or fabricated create/delete outside that bound panics
+    // be either the last committed state or a possible outcome of an op left
+    // in doubt. A lost or fabricated create/delete outside that bound panics
     // inside the harness.
     let workload = contended_membership();
     for seed in [0u64, 3, 99, 2024] {

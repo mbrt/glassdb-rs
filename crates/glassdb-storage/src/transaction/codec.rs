@@ -9,42 +9,42 @@ use glassdb_data::{
 use glassdb_proto as pb;
 use prost::Message;
 
-use super::{TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxLog, TxWrite};
+use super::{TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxRecord, TxWrite};
 use crate::cached_store::Codec;
 use crate::error::StorageError;
 use crate::lock::{LockType, lock_type_from_proto as parse_lock_type, lock_type_to_proto};
 
-/// Canonical protobuf codec for transaction-log objects.
-pub(crate) struct TxLogCodec;
+/// Canonical protobuf codec for transaction-record objects.
+pub(crate) struct TxRecordCodec;
 
-impl TxLogCodec {
-    /// Encodes a transaction log as its canonical persisted body.
-    pub(crate) fn encode(log: &TxLog) -> Result<Vec<u8>, StorageError> {
-        Self::encode_for_database(log, None)
+impl TxRecordCodec {
+    /// Encodes a transaction record as its canonical persisted body.
+    pub(crate) fn encode(record: &TxRecord) -> Result<Vec<u8>, StorageError> {
+        Self::encode_for_database(record, None)
     }
 
     fn encode_for_database(
-        log: &TxLog,
+        record: &TxRecord,
         expected_db_root: Option<&str>,
     ) -> Result<Vec<u8>, StorageError> {
-        let timestamp = log
+        let timestamp = record
             .timestamp
-            .ok_or_else(|| StorageError::other("transaction log has no persisted timestamp"))?;
-        if log.id.is_unset() {
+            .ok_or_else(|| StorageError::other("transaction record has no persisted timestamp"))?;
+        if record.id.is_unset() {
             return Err(StorageError::other("empty transaction identity"));
         }
-        validate_database_membership(log, expected_db_root)?;
+        validate_database_membership(record, expected_db_root)?;
 
         let mut collection_writes: BTreeMap<CollectionAddress, pb::CollectionWrites> =
             BTreeMap::new();
-        for write in &log.writes {
+        for write in &record.writes {
             append_write(&mut collection_writes, write);
         }
-        for lock in &log.locks {
+        for lock in &record.locks {
             append_lock(&mut collection_writes, lock);
         }
 
-        let collection_changes = log
+        let collection_changes = record
             .collection_changes
             .iter()
             .map(|change| pb::CollectionChange {
@@ -58,13 +58,13 @@ impl TxLogCodec {
             })
             .collect();
 
-        let status = encode_status(log.status)?;
-        let encoded = pb::TransactionLog {
+        let status = encode_status(record.status)?;
+        let encoded = pb::TransactionRecord {
             timestamp: Some(system_to_proto_ts(timestamp)),
             status: status as i32,
             writes: collection_writes.into_values().collect(),
             collection_changes,
-            prepared_collection_ids: log
+            prepared_collection_ids: record
                 .prepared_collections
                 .iter()
                 .map(|collection| collection.id().as_bytes().to_vec())
@@ -73,16 +73,16 @@ impl TxLogCodec {
         Ok(encoded.encode_to_vec())
     }
 
-    /// Decodes a transaction-log body using the database root from its object path.
-    pub(crate) fn decode(db_root: &str, id: &TxId, bytes: &[u8]) -> Result<TxLog, StorageError> {
-        let encoded = parse_log(bytes)?;
+    /// Decodes a transaction-record body using the database root from its object path.
+    pub(crate) fn decode(db_root: &str, id: &TxId, bytes: &[u8]) -> Result<TxRecord, StorageError> {
+        let encoded = parse_record(bytes)?;
         let status = decode_status(encoded.status())?;
         let (writes, locks) = decode_collection_writes(db_root, &encoded.writes)?;
         let collection_changes = decode_collection_changes(db_root, &encoded.collection_changes)?;
         let prepared_collections =
             decode_prepared_collections(db_root, &encoded.prepared_collection_ids)?;
 
-        Ok(TxLog {
+        Ok(TxRecord {
             id: id.clone(),
             timestamp: encoded.timestamp.map(proto_ts_to_system),
             status,
@@ -93,46 +93,47 @@ impl TxLogCodec {
         })
     }
 
-    /// Decodes only the commit status from a transaction-log body.
+    /// Decodes only the commit status from a transaction-record body.
     pub(crate) fn decode_status(bytes: &[u8]) -> Result<TxCommitStatus, StorageError> {
-        decode_status(parse_log(bytes)?.status())
+        decode_status(parse_record(bytes)?.status())
     }
 }
 
-impl Codec for TxLogCodec {
-    type Value = TxLog;
+impl Codec for TxRecordCodec {
+    type Value = TxRecord;
 
     fn decode(path: &ObjectPath, body: &[u8]) -> Result<Self::Value, StorageError> {
         let ObjectPath::Transaction { db_root, id } = path else {
             return Err(StorageError::other(
-                "transaction log has a non-transaction path",
+                "transaction record has a non-transaction path",
             ));
         };
-        TxLogCodec::decode(db_root.as_str(), id, body)
+        TxRecordCodec::decode(db_root.as_str(), id, body)
     }
 
-    fn encode(path: &ObjectPath, log: &Self::Value) -> Result<Vec<u8>, StorageError> {
+    fn encode(path: &ObjectPath, record: &Self::Value) -> Result<Vec<u8>, StorageError> {
         let ObjectPath::Transaction { db_root, id } = path else {
             return Err(StorageError::other(
-                "transaction log has a non-transaction path",
+                "transaction record has a non-transaction path",
             ));
         };
-        if id != &log.id {
+        if id != &record.id {
             return Err(StorageError::other(
-                "transaction-log path does not match its ID",
+                "transaction-record path does not match its ID",
             ));
         }
-        TxLogCodec::encode_for_database(log, Some(db_root.as_str()))
+        TxRecordCodec::encode_for_database(record, Some(db_root.as_str()))
     }
 
-    fn size(log: &Self::Value) -> usize {
-        log.writes
+    fn size(record: &Self::Value) -> usize {
+        record
+            .writes
             .iter()
             .map(|write| {
                 write.key.key().len() + write.value.len() + write.prev_writer.as_bytes().len()
             })
             .sum::<usize>()
-            + log
+            + record
                 .locks
                 .iter()
                 .map(|lock| match lock {
@@ -143,13 +144,13 @@ impl Codec for TxLogCodec {
                     TxLock::Directory { .. } | TxLock::Topology { .. } => 0,
                 })
                 .sum::<usize>()
-            + log
+            + record
                 .collection_changes
                 .iter()
                 .map(|change| change.name.len() + 32)
                 .sum::<usize>()
-            + log.prepared_collections.len() * 16
-            + std::mem::size_of::<TxLog>()
+            + record.prepared_collections.len() * 16
+            + std::mem::size_of::<TxRecord>()
     }
 
     fn accepts(path: &ObjectPath) -> bool {
@@ -157,32 +158,34 @@ impl Codec for TxLogCodec {
     }
 
     fn name() -> &'static str {
-        "transaction log"
+        "transaction record"
     }
 }
 
-fn parse_log(bytes: &[u8]) -> Result<pb::TransactionLog, StorageError> {
-    pb::TransactionLog::decode(bytes)
-        .map_err(|error| StorageError::with_source("unmarshalling transaction log", error))
+fn parse_record(bytes: &[u8]) -> Result<pb::TransactionRecord, StorageError> {
+    pb::TransactionRecord::decode(bytes)
+        .map_err(|error| StorageError::with_source("unmarshalling transaction record", error))
 }
 
-fn encode_status(status: TxCommitStatus) -> Result<pb::transaction_log::Status, StorageError> {
+fn encode_status(status: TxCommitStatus) -> Result<pb::transaction_record::Status, StorageError> {
     match status {
-        TxCommitStatus::Ok => Ok(pb::transaction_log::Status::Committed),
-        TxCommitStatus::Aborted => Ok(pb::transaction_log::Status::Aborted),
-        TxCommitStatus::Pending => Ok(pb::transaction_log::Status::Pending),
-        TxCommitStatus::Wounded => Ok(pb::transaction_log::Status::Wounded),
+        TxCommitStatus::Ok => Ok(pb::transaction_record::Status::Committed),
+        TxCommitStatus::Aborted => Ok(pb::transaction_record::Status::Aborted),
+        TxCommitStatus::Pending => Ok(pb::transaction_record::Status::Pending),
+        TxCommitStatus::Wounded => Ok(pb::transaction_record::Status::Wounded),
         TxCommitStatus::Unknown => Err(StorageError::other("unsupported commit status")),
     }
 }
 
-fn decode_status(status: pb::transaction_log::Status) -> Result<TxCommitStatus, StorageError> {
+fn decode_status(status: pb::transaction_record::Status) -> Result<TxCommitStatus, StorageError> {
     match status {
-        pb::transaction_log::Status::Committed => Ok(TxCommitStatus::Ok),
-        pb::transaction_log::Status::Aborted => Ok(TxCommitStatus::Aborted),
-        pb::transaction_log::Status::Pending => Ok(TxCommitStatus::Pending),
-        pb::transaction_log::Status::Wounded => Ok(TxCommitStatus::Wounded),
-        pb::transaction_log::Status::Default => Err(StorageError::other("unknown commit status")),
+        pb::transaction_record::Status::Committed => Ok(TxCommitStatus::Ok),
+        pb::transaction_record::Status::Aborted => Ok(TxCommitStatus::Aborted),
+        pb::transaction_record::Status::Pending => Ok(TxCommitStatus::Pending),
+        pb::transaction_record::Status::Wounded => Ok(TxCommitStatus::Wounded),
+        pb::transaction_record::Status::Default => {
+            Err(StorageError::other("unknown commit status"))
+        }
     }
 }
 
@@ -257,7 +260,7 @@ fn decode_membership_locks(
                 }
                 _ => {
                     return Err(StorageError::other(
-                        "transaction log has invalid membership lock",
+                        "transaction record has invalid membership lock",
                     ));
                 }
             };
@@ -278,14 +281,14 @@ fn decode_collection_changes(
         .map(|change| {
             if change.name.is_empty() || change.name.len() > MAX_COLLECTION_NAME_BYTES {
                 return Err(StorageError::other(
-                    "transaction log has an invalid collection name",
+                    "transaction record has an invalid collection name",
                 ));
             }
             let parent = decode_collection_id(db_root, &change.parent_collection_id)?;
             let collection = decode_collection_id(db_root, &change.collection_id)?;
             if collection.id().is_root() {
                 return Err(StorageError::other(
-                    "transaction log changes the permanent root collection",
+                    "transaction record changes the permanent root collection",
                 ));
             }
             let op = match change.operation() {
@@ -293,7 +296,7 @@ fn decode_collection_changes(
                 pb::collection_change::Operation::Drop => TxCollectionOp::Drop,
                 pb::collection_change::Operation::Unknown => {
                     return Err(StorageError::other(
-                        "transaction log has an unknown collection operation",
+                        "transaction record has an unknown collection operation",
                     ));
                 }
             };
@@ -317,7 +320,7 @@ fn decode_prepared_collections(
             let collection = decode_collection_id(db_root, id)?;
             if collection.id().is_root() {
                 return Err(StorageError::other(
-                    "transaction log prepares the permanent root collection",
+                    "transaction record prepares the permanent root collection",
                 ));
             }
             Ok(collection)
@@ -408,24 +411,24 @@ fn decode_collection_id(
     collection_id: &[u8],
 ) -> Result<CollectionAddress, StorageError> {
     let id = CollectionId::from_slice(collection_id)
-        .ok_or_else(|| StorageError::other("transaction log has an invalid collection ID"))?;
+        .ok_or_else(|| StorageError::other("transaction record has an invalid collection ID"))?;
     Ok(CollectionAddress::new(db_root, id))
 }
 
 fn validate_database_membership(
-    log: &TxLog,
+    record: &TxRecord,
     expected_db_root: Option<&str>,
 ) -> Result<(), StorageError> {
     let mut db_root: Option<String> = None;
     let mut check = |collection: &CollectionAddress| -> Result<(), StorageError> {
         if expected_db_root.is_some_and(|expected| expected != collection.db_root()) {
             return Err(StorageError::other(
-                "transaction-log path does not match its database root",
+                "transaction-record path does not match its database root",
             ));
         }
         match db_root.as_deref() {
             Some(root) if root != collection.db_root() => Err(StorageError::other(
-                "transaction log spans multiple database roots",
+                "transaction record spans multiple database roots",
             )),
             Some(_) => Ok(()),
             None => {
@@ -434,10 +437,10 @@ fn validate_database_membership(
             }
         }
     };
-    for write in &log.writes {
+    for write in &record.writes {
         check(write.key.collection())?;
     }
-    for lock in &log.locks {
+    for lock in &record.locks {
         match lock {
             TxLock::Entry { key, .. } => check(key.collection())?,
             TxLock::Membership { leaf, .. } => check(leaf.collection())?,
@@ -446,11 +449,11 @@ fn validate_database_membership(
             }
         }
     }
-    for change in &log.collection_changes {
+    for change in &record.collection_changes {
         check(&change.parent)?;
         check(&change.collection)?;
     }
-    for collection in &log.prepared_collections {
+    for collection in &record.prepared_collections {
         check(collection)?;
     }
     Ok(())
@@ -488,17 +491,17 @@ mod tests {
         CollectionAddress::new(db_root, CollectionId::from_slice(&[byte; 16]).unwrap())
     }
 
-    fn log_with_status(status: TxCommitStatus) -> TxLog {
-        let mut log = TxLog::new(TxId::from_bytes(vec![1, 2, 3, 4]), status);
-        log.timestamp = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
-        log
+    fn record_with_status(status: TxCommitStatus) -> TxRecord {
+        let mut record = TxRecord::new(TxId::from_bytes(vec![1, 2, 3, 4]), status);
+        record.timestamp = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        record
     }
 
-    fn complete_log(db_root: &str) -> TxLog {
+    fn complete_record(db_root: &str) -> TxRecord {
         let parent = collection(db_root, 1);
         let created = collection(db_root, 2);
         let dropped = collection(db_root, 3);
-        TxLog {
+        TxRecord {
             id: TxId::from_bytes(vec![1, 2, 3, 4]),
             timestamp: Some(UNIX_EPOCH + Duration::from_secs(42)),
             status: TxCommitStatus::Pending,
@@ -555,13 +558,13 @@ mod tests {
         }
     }
 
-    fn encoded_log() -> pb::TransactionLog {
-        pb::TransactionLog {
+    fn encoded_record() -> pb::TransactionRecord {
+        pb::TransactionRecord {
             timestamp: Some(prost_types::Timestamp {
                 seconds: 42,
                 nanos: 0,
             }),
-            status: pb::transaction_log::Status::Committed as i32,
+            status: pb::transaction_record::Status::Committed as i32,
             writes: Vec::new(),
             collection_changes: Vec::new(),
             prepared_collection_ids: Vec::new(),
@@ -577,11 +580,11 @@ mod tests {
         }
     }
 
-    fn assert_rejected(encoded: pb::TransactionLog) {
+    fn assert_rejected(encoded: pb::TransactionRecord) {
         let bytes = encoded.encode_to_vec();
         assert!(
-            TxLogCodec::decode("db", &TxId::from_bytes(vec![1]), &bytes).is_err(),
-            "malformed transaction log unexpectedly decoded"
+            TxRecordCodec::decode("db", &TxId::from_bytes(vec![1]), &bytes).is_err(),
+            "malformed transaction record unexpectedly decoded"
         );
     }
 
@@ -593,45 +596,47 @@ mod tests {
             TxCommitStatus::Pending,
             TxCommitStatus::Wounded,
         ] {
-            let log = log_with_status(status);
-            let bytes = TxLogCodec::encode(&log).unwrap();
-            assert_eq!(TxLogCodec::decode_status(&bytes).unwrap(), status);
+            let record = record_with_status(status);
+            let bytes = TxRecordCodec::encode(&record).unwrap();
+            assert_eq!(TxRecordCodec::decode_status(&bytes).unwrap(), status);
             assert_eq!(
-                TxLogCodec::decode("db", &log.id, &bytes).unwrap().status,
+                TxRecordCodec::decode("db", &record.id, &bytes)
+                    .unwrap()
+                    .status,
                 status
             );
         }
 
-        assert!(TxLogCodec::encode(&log_with_status(TxCommitStatus::Unknown)).is_err());
-        for status in [pb::transaction_log::Status::Default as i32, 99] {
-            let mut encoded = encoded_log();
+        assert!(TxRecordCodec::encode(&record_with_status(TxCommitStatus::Unknown)).is_err());
+        for status in [pb::transaction_record::Status::Default as i32, 99] {
+            let mut encoded = encoded_record();
             encoded.status = status;
             let bytes = encoded.encode_to_vec();
-            assert!(TxLogCodec::decode_status(&bytes).is_err());
-            assert!(TxLogCodec::decode("db", &TxId::from_bytes(vec![1]), &bytes).is_err());
+            assert!(TxRecordCodec::decode_status(&bytes).is_err());
+            assert!(TxRecordCodec::decode("db", &TxId::from_bytes(vec![1]), &bytes).is_err());
         }
     }
 
     #[test]
     fn repeated_fields_and_every_lock_shape_round_trip() {
-        let log = complete_log("db");
-        let bytes = TxLogCodec::encode(&log).unwrap();
-        let decoded = TxLogCodec::decode("db", &log.id, &bytes).unwrap();
+        let record = complete_record("db");
+        let bytes = TxRecordCodec::encode(&record).unwrap();
+        let decoded = TxRecordCodec::decode("db", &record.id, &bytes).unwrap();
 
-        assert_eq!(decoded.id, log.id);
-        assert_eq!(decoded.timestamp, log.timestamp);
-        assert_eq!(decoded.status, log.status);
-        assert_eq!(decoded.writes, log.writes);
-        assert_eq!(decoded.locks, log.locks);
-        assert_eq!(decoded.collection_changes, log.collection_changes);
-        assert_eq!(decoded.prepared_collections, log.prepared_collections);
+        assert_eq!(decoded.id, record.id);
+        assert_eq!(decoded.timestamp, record.timestamp);
+        assert_eq!(decoded.status, record.status);
+        assert_eq!(decoded.writes, record.writes);
+        assert_eq!(decoded.locks, record.locks);
+        assert_eq!(decoded.collection_changes, record.collection_changes);
+        assert_eq!(decoded.prepared_collections, record.prepared_collections);
     }
 
     #[test]
     fn every_collection_address_is_relocated_without_changing_bytes() {
-        let log = complete_log("original");
-        let bytes = TxLogCodec::encode(&log).unwrap();
-        let relocated = TxLogCodec::decode("moved", &log.id, &bytes).unwrap();
+        let record = complete_record("original");
+        let bytes = TxRecordCodec::encode(&record).unwrap();
+        let relocated = TxRecordCodec::decode("moved", &record.id, &bytes).unwrap();
 
         assert!(
             relocated
@@ -655,13 +660,13 @@ mod tests {
                 .iter()
                 .all(|collection| collection.db_root() == "moved")
         );
-        assert_eq!(TxLogCodec::encode(&relocated).unwrap(), bytes);
+        assert_eq!(TxRecordCodec::encode(&relocated).unwrap(), bytes);
     }
 
     #[test]
     fn one_transaction_cannot_span_database_roots() {
-        let mut log = log_with_status(TxCommitStatus::Ok);
-        log.writes = vec![
+        let mut record = record_with_status(TxCommitStatus::Ok);
+        record.writes = vec![
             TxWrite {
                 key: LogicalKey::new(collection("first", 1), b"a"),
                 value: Arc::from(&b"a"[..]),
@@ -676,22 +681,22 @@ mod tests {
             },
         ];
 
-        assert!(TxLogCodec::encode(&log).is_err());
+        assert!(TxRecordCodec::encode(&record).is_err());
     }
 
     #[test]
     fn malformed_protobuf_and_status_are_rejected() {
-        assert!(TxLogCodec::decode_status(&[0xff]).is_err());
-        assert!(TxLogCodec::decode("db", &TxId::from_bytes(vec![1]), &[0xff]).is_err());
+        assert!(TxRecordCodec::decode_status(&[0xff]).is_err());
+        assert!(TxRecordCodec::decode("db", &TxId::from_bytes(vec![1]), &[0xff]).is_err());
 
-        let mut encoded = encoded_log();
-        encoded.status = pb::transaction_log::Status::Default as i32;
+        let mut encoded = encoded_record();
+        encoded.status = pb::transaction_record::Status::Default as i32;
         assert_rejected(encoded);
     }
 
     #[test]
     fn status_only_decode_ignores_unrelated_semantic_payload_errors() {
-        let mut encoded = encoded_log();
+        let mut encoded = encoded_record();
         encoded.writes.push(pb::CollectionWrites {
             collection_id: vec![1],
             writes: Vec::new(),
@@ -700,15 +705,15 @@ mod tests {
         let bytes = encoded.encode_to_vec();
 
         assert_eq!(
-            TxLogCodec::decode_status(&bytes).unwrap(),
+            TxRecordCodec::decode_status(&bytes).unwrap(),
             TxCommitStatus::Ok
         );
-        assert!(TxLogCodec::decode("db", &TxId::from_bytes(vec![1]), &bytes).is_err());
+        assert!(TxRecordCodec::decode("db", &TxId::from_bytes(vec![1]), &bytes).is_err());
     }
 
     #[test]
     fn malformed_collection_ids_are_rejected_in_every_repeated_field() {
-        let mut group = encoded_log();
+        let mut group = encoded_record();
         group.writes.push(pb::CollectionWrites {
             collection_id: vec![1; 15],
             writes: Vec::new(),
@@ -716,19 +721,19 @@ mod tests {
         });
         assert_rejected(group);
 
-        let mut parent = encoded_log();
+        let mut parent = encoded_record();
         let mut change = encoded_change();
         change.parent_collection_id = vec![1; 15];
         parent.collection_changes.push(change);
         assert_rejected(parent);
 
-        let mut child = encoded_log();
+        let mut child = encoded_record();
         let mut change = encoded_change();
         change.collection_id = vec![2; 15];
         child.collection_changes.push(change);
         assert_rejected(child);
 
-        let mut prepared = encoded_log();
+        let mut prepared = encoded_record();
         prepared.prepared_collection_ids.push(vec![3; 15]);
         assert_rejected(prepared);
     }
@@ -740,7 +745,7 @@ mod tests {
             Some(pb::membership_lock::Target::Root(false)),
             Some(pb::membership_lock::Target::Node(String::new())),
         ] {
-            let mut encoded = encoded_log();
+            let mut encoded = encoded_record();
             encoded.writes.push(pb::CollectionWrites {
                 collection_id: vec![1; 16],
                 writes: Vec::new(),
@@ -759,7 +764,7 @@ mod tests {
     #[test]
     fn malformed_collection_changes_are_rejected() {
         for name in [Vec::new(), vec![b'x'; MAX_COLLECTION_NAME_BYTES + 1]] {
-            let mut encoded = encoded_log();
+            let mut encoded = encoded_record();
             let mut change = encoded_change();
             change.name = name;
             encoded.collection_changes.push(change);
@@ -767,14 +772,14 @@ mod tests {
         }
 
         for operation in [pb::collection_change::Operation::Unknown as i32, 99] {
-            let mut encoded = encoded_log();
+            let mut encoded = encoded_record();
             let mut change = encoded_change();
             change.operation = operation;
             encoded.collection_changes.push(change);
             assert_rejected(encoded);
         }
 
-        let mut encoded = encoded_log();
+        let mut encoded = encoded_record();
         let mut change = encoded_change();
         change.collection_id = vec![0; 16];
         encoded.collection_changes.push(change);
@@ -783,7 +788,7 @@ mod tests {
 
     #[test]
     fn preparing_the_permanent_root_is_rejected() {
-        let mut encoded = encoded_log();
+        let mut encoded = encoded_record();
         encoded.prepared_collection_ids.push(vec![0; 16]);
         assert_rejected(encoded);
     }

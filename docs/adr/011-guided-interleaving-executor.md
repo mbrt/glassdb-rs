@@ -126,7 +126,7 @@ flowchart TD
   became a `#[cfg(sim)]` one. HashMap-order nondeterminism stays neutralized by
   the existing path-sorting (ADR-008).
 - **Deterministic wall clock.** `rt::system_now()` returns a fixed epoch plus
-  virtual time under the executor, so persisted transaction-log timestamps are a
+  virtual time under the executor, so persisted transaction-record timestamps are a
   pure function of the seed; `Clock::anchored_at` reads `rt::Instant` so the
   monitor's clock follows the same virtual time.
 - **Per-client transport fault injection** (replaces the madsim network nemesis).

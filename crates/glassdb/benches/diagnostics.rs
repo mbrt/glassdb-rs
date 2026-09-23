@@ -12,7 +12,7 @@ use glassdb::middleware::RecordingBackend;
 use glassdb::{Backend, Collection, Database, Error, InlinePolicy, Stats};
 use glassdb_backend::memory::MemoryBackend;
 use glassdb_backend::middleware::{DelayBackend, s3_delays};
-use glassdb_backend::{BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
+use glassdb_backend::{BackendError, ListCursor, ListLimit, ListPage, ReadReply, Revision};
 use glassdb_data::ObjectPath;
 use serde_json::{Value, json};
 
@@ -424,7 +424,7 @@ fn benches(c: &mut Criterion) {
             // Unselected cases do no setup; selected cases keep one fixture across samples.
             let measurement = measurement.get_or_insert_with(|| {
                 if case == Case::WarmExternalRead {
-                    rt.block_on(verify_transaction_log_cache());
+                    rt.block_on(verify_transaction_record_cache());
                 }
                 if matches!(case, Case::InlineRmw | Case::SharedLeafRmw) {
                     rt.block_on(verify_inline_write_reads(case));
@@ -493,7 +493,7 @@ impl Backend for BodyBytes {
     async fn read_if_modified(
         &self,
         path: &str,
-        expected: &Version,
+        expected: &Revision,
     ) -> Result<ReadReply, BackendError> {
         let reply = self.inner.read_if_modified(path, expected).await?;
         self.count_read(&reply);
@@ -504,8 +504,8 @@ impl Backend for BodyBytes {
         &self,
         path: &str,
         value: Vec<u8>,
-        expected: &Version,
-    ) -> Result<Version, BackendError> {
+        expected: &Revision,
+    ) -> Result<Revision, BackendError> {
         self.written
             .fetch_add(value.len() as u64, Ordering::Relaxed);
         self.inner.write_if(path, value, expected).await
@@ -515,13 +515,13 @@ impl Backend for BodyBytes {
         &self,
         path: &str,
         value: Vec<u8>,
-    ) -> Result<Version, BackendError> {
+    ) -> Result<Revision, BackendError> {
         self.written
             .fetch_add(value.len() as u64, Ordering::Relaxed);
         self.inner.write_if_not_exists(path, value).await
     }
 
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Revision) -> Result<(), BackendError> {
         self.inner.delete_if(path, expected).await
     }
 
@@ -536,30 +536,30 @@ impl Backend for BodyBytes {
 }
 
 /// Checks that repeated transactional reads reuse cached transaction contents.
-async fn verify_transaction_log_cache() {
+async fn verify_transaction_record_cache() {
     const READS: u64 = 30;
     let backend = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
     let operations = backend.log();
-    let writer = Database::builder("logcache", backend.clone())
+    let writer = Database::builder("recordcache", backend.clone())
         .inline_policy(InlinePolicy::none())
         .open()
         .await
-        .expect("open log-cache writer");
+        .expect("open record-cache writer");
     let value = vec![7; EXTERNAL_VALUE_BYTES];
     writer
         .root_collection()
         .write(b"key", &value)
         .await
-        .expect("seed logged value");
+        .expect("seed external value");
     writer.shutdown().await;
 
-    let reader = Database::open("logcache", backend)
+    let reader = Database::open("recordcache", backend)
         .await
-        .expect("open log-cache reader");
+        .expect("open record-cache reader");
     let collection = reader.root_collection();
     operations.lock().unwrap().clear();
     assert_eq!(collection.read(b"key").await.unwrap().unwrap(), value);
-    let logs: BTreeSet<_> = operations
+    let records: BTreeSet<_> = operations
         .lock()
         .unwrap()
         .iter()
@@ -573,8 +573,8 @@ async fn verify_transaction_log_cache() {
         .map(|operation| operation.path.clone())
         .collect();
     assert!(
-        !logs.is_empty(),
-        "the cold read must load a transaction log"
+        !records.is_empty(),
+        "the cold read must load a transaction record"
     );
     operations.lock().unwrap().clear();
 
@@ -588,20 +588,20 @@ async fn verify_transaction_log_cache() {
         warm.backend.obj_reads > 0,
         "reads must still validate leaves"
     );
-    // Count attempts, including conditional requests that transfer no body.
-    // Other transaction objects can belong to background work.
+    // Count backend reads, including conditional requests that transfer no body.
+    // Other transaction records can belong to background work.
     let repeated: Vec<_> = operations
         .lock()
         .unwrap()
         .iter()
         .filter(|operation| {
-            logs.contains(&operation.path) && matches!(operation.op, "read" | "read_if_modified")
+            records.contains(&operation.path) && matches!(operation.op, "read" | "read_if_modified")
         })
         .cloned()
         .collect();
     assert!(
         repeated.is_empty(),
-        "cached transaction logs were read again: {repeated:?}"
+        "cached transaction records were read again: {repeated:?}"
     );
     reader.shutdown().await;
 }

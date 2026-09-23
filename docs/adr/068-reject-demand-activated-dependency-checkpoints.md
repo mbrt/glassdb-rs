@@ -49,7 +49,7 @@ Do not implement demand-activated dependency checkpoints. The reasons are:
 - **The recovery step is unproved, and it is the centre of the design.** A
   rebase may exclude a session that does not answer only with a proof that every
   data leaf, catalog root, absence condition, and deletion route is covered, and
-  with a proof that each logged transaction lies wholly before or after the cut.
+  with a proof that each locked transaction lies wholly before or after the cut.
   The design states both as conditions for a future prototype, not as results.
   Until they exist, one crashed writer can hold snapshot progress and its
   retained state for an unbounded time.

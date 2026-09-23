@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use glassdb_concurr::{RetryConfig, map_all_bounded, rt};
 use glassdb_data::{CollectionAddress, TxId};
 use glassdb_storage::transaction::{
-    TLogger, TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock,
+    TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxRecordStore,
 };
 use glassdb_storage::{
     CollectionRecord, CollectionStore, LockType, Observation, Requirement, StorageError, Timeline,
@@ -33,7 +33,7 @@ impl LockedDirectories {
 #[derive(Clone)]
 pub(crate) struct CollectionStateResolver {
     records: CollectionStore,
-    transactions: TLogger,
+    transactions: TxRecordStore,
     timeline: Timeline,
     monitor: Monitor,
     retry: RetryConfig,
@@ -286,7 +286,7 @@ impl CollectionStateResolver {
     /// Creates collection-state resolution over record and transaction stores.
     pub(crate) fn new(
         records: CollectionStore,
-        transactions: TLogger,
+        transactions: TxRecordStore,
         timeline: Timeline,
         monitor: Monitor,
         retry: RetryConfig,
@@ -435,7 +435,7 @@ impl CollectionStateResolver {
                 }
             }
             if changed {
-                record.advance_directory_version();
+                record.advance_directory_generation();
             }
             record.remove_directory_holder(id);
             if self.records.store_record(&record, &observed).await? {
@@ -452,7 +452,7 @@ impl CollectionStateResolver {
     ) -> Result<(), TransError> {
         // Final-status resolution shares this store and has observed immutable
         // committed contents. ANY cannot restore an older Pending body; it
-        // still does not prove that the transaction object remains present.
+        // still does not prove that the transaction record remains present.
         let observed = self
             .transactions
             .get_at(id, Requirement::ANY)
@@ -460,16 +460,16 @@ impl CollectionStateResolver {
             .map_err(|error| {
                 TransError::Storage(error.context(format!("loading committed transaction {id}")))
             })?;
-        let log = observed.value().ok_or_else(|| {
-            TransError::other(format!("committed transaction log disappeared for {id}"))
+        let record = observed.value().ok_or_else(|| {
+            TransError::other(format!("committed transaction record disappeared for {id}"))
         })?;
-        if log.status != TxCommitStatus::Ok {
+        if record.status != TxCommitStatus::Ok {
             return Err(TransError::other(format!(
-                "transaction {id} finalized as committed but its log has status {:?}",
-                log.status
+                "transaction {id} finalized as committed but its record has status {:?}",
+                record.status
             )));
         }
-        let changes = Self::recover_changes(&log.collection_changes);
+        let changes = Self::recover_changes(&record.collection_changes);
         // Resolution observed this holder through the same record cache. A
         // later no-holder state proves removal; a retained holder seeds CAS.
         self.apply_committed_write_back(parent, id, &changes, Requirement::ANY)
@@ -515,7 +515,7 @@ mod tests {
             None,
         );
         let records = CollectionStore::new(objects.clone());
-        let transactions = TLogger::new(objects, DbRoot::try_from("db").unwrap());
+        let transactions = TxRecordStore::new(objects, DbRoot::try_from("db").unwrap());
         let background = Arc::new(Background::new());
         let monitor = Monitor::with_config(
             transactions.clone(),
@@ -562,10 +562,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reclaimed_log_refreshes_a_cached_directory_holder() {
+    async fn reclaimed_record_refreshes_a_cached_directory_holder() {
         use crate::engine::{AssemblyFixture, EngineConfig};
         use glassdb_data::CollectionId;
-        use glassdb_storage::transaction::TxLog;
+        use glassdb_storage::transaction::TxRecord;
 
         let backend = Arc::new(MemoryBackend::new());
         let local = AssemblyFixture::new(
@@ -580,9 +580,9 @@ mod tests {
         );
         let parent = CollectionAddress::root("db");
         let old = TxId::from_bytes(vec![1]);
-        let local_log = local
-            .tlogger
-            .set(&TxLog::new(old.clone(), TxCommitStatus::Ok))
+        let local_record = local
+            .tx_records
+            .set(&TxRecord::new(old.clone(), TxCommitStatus::Ok))
             .await
             .unwrap();
         assert_eq!(
@@ -601,16 +601,20 @@ mod tests {
         let child = CollectionId::from_slice(&[1; 16]).unwrap();
         record.add_child(b"child".to_vec(), child).unwrap();
         peer.records.store_record(&record, &observed).await.unwrap();
-        let observed = peer.tlogger.get_at(&old, Requirement::ANY).await.unwrap();
-        peer.tlogger.delete(&observed).await.unwrap();
-        local.tlogger.delete(&local_log).await.unwrap();
+        let observed = peer
+            .tx_records
+            .get_at(&old, Requirement::ANY)
+            .await
+            .unwrap();
+        peer.tx_records.delete(&observed).await.unwrap();
+        local.tx_records.delete(&local_record).await.unwrap();
         assert!(matches!(
-            local.tlogger.get_at(&old, Requirement::ANY).await,
+            local.tx_records.get_at(&old, Requirement::ANY).await,
             Err(StorageError::NotFound)
         ));
         let resolver = CollectionStateResolver::new(
             local.records.clone(),
-            local.tlogger.clone(),
+            local.tx_records.clone(),
             local.timeline.clone(),
             local.monitor.clone(),
             RetryConfig::default(),

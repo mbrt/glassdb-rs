@@ -613,7 +613,7 @@ mod sim_tests {
             }
             let healing = (op.op_id == 1).then(|| state.inject_failure());
             let result = if op.op_id == 1 && matches!(state.failure, PublicFailure::Read) {
-                // A public point read exposes Unavailable without an uncertain
+                // A public point read exposes Unavailable without an in-doubt
                 // mutation. It makes no change to the history's modeled state.
                 db.root_collection()
                     .read_stale(b"unavailable-probe", Duration::ZERO)
@@ -716,7 +716,7 @@ mod sim_tests {
                         let state = Arc::new(workload.new_state());
                         let media = media_tape.map(|tape| RunMedia::new(tape, 0, 2));
                         // Use the ordinary public backend interface for injection.
-                        // No transaction object, fence, cache, or monitor state
+                        // No transaction record, fence, cache, or monitor state
                         // participates in error classification or verification.
                         let seed_backend: Arc<dyn Backend> = workload.backend.clone();
                         let seed = RecoveryWorkload::open_db(&seed_backend, None)
@@ -750,7 +750,7 @@ mod sim_tests {
                 }
                 assert!(
                     in_doubt,
-                    "no uncertain public outcome: peer={peer}, cached={cached}"
+                    "no in-doubt public outcome: peer={peer}, cached={cached}"
                 );
             }
         }

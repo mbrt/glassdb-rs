@@ -56,7 +56,7 @@ async fn main() -> Result<(), glassdb::Error> {
     let v = users.read(b"alice").await?.expect("alice exists");
     assert_eq!(v, b"hello");
 
-    // Multi-key serializable transaction with automatic conflict retries.
+    // Multi-key serializable transaction with automatic body replays on conflict.
     // `tx` is an owned handle.
     let users = &users;
     db.tx(|tx| async move {
@@ -145,7 +145,7 @@ One example could be storing user settings. Every key is
 dedicated to one user and the value contains all the settings. This way we can
 update each user independently (and scale horizontally). In the rare case where
 two updates for the same user arrive concurrently, we _don't_ produce an
-inconsistent result but retry the transaction.
+inconsistent result but replay the transaction body.
 
 ### Example 2: Low frequency updates
 
@@ -234,8 +234,7 @@ rises when hitting S3 prefix write limits:
 
 ![](docs/img/tx-latency.png)
 
-The p50-p90 bands also show tail-latency growth. Transaction retries can add
-more delay after a conflict.
+The p50-p90 bands also show tail-latency growth. Body replays can add more delay after a conflict.
 
 ## Development
 

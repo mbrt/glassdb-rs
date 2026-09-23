@@ -10,7 +10,7 @@
 //! A freshness requirement states local currentness, not a durable guarantee.
 //! Each cache entry is `Present` (a decoded value, its [`Revision`], and a
 //! current-after [`SequencePoint`]), `Absent` (a current-after watermark,
-//! no revision), or uncertain (no entry: no usable discoverable knowledge). Each
+//! no revision), or in doubt (no entry: no usable discoverable knowledge). Each
 //! successful read returns an [`Observation`]
 //! that references monotonic currentness evidence shared with the current cache
 //! entry; the observation stays usable even after that entry is evicted or
@@ -211,7 +211,7 @@ impl CachedStore {
     /// Reads the object at `path`, serving a cached entry that satisfies `req`
     /// or checking through the backend otherwise. Returns an [`Observation`],
     /// whose `value()` is `None` for an object that does not exist. A new read
-    /// never returns a positively known-obsolete value from uncertain state.
+    /// never returns a positively known-obsolete value from in-doubt state.
     async fn read<C: Codec>(
         &self,
         key: ObjectKey,
@@ -227,7 +227,7 @@ impl CachedStore {
     }
 
     /// Returns the cached observation for `path` without contacting the backend,
-    /// or `None` when it is not cached. A committed/aborted object is immutable,
+    /// or `None` when it is not cached. A committed/aborted record is immutable,
     /// so its cached copy is authoritative indefinitely; callers use this to
     /// serve terminal objects without a currentness-check round-trip.
     fn peek<C: Codec>(
@@ -271,9 +271,9 @@ impl CachedStore {
     }
 
     /// Creates the object only if absent. On success publishes the value; on a
-    /// conflict (it already exists) invalidates the cached absence and reports
-    /// [`CasResult::Conflict`]; an in-doubt outcome makes path knowledge
-    /// uncertain and surfaces `Unavailable`.
+    /// rejection (it already exists) invalidates the cached absence and reports
+    /// [`CasResult::Rejected`]; an in-doubt outcome makes path knowledge
+    /// in doubt and surfaces `Unavailable`.
     async fn create<C: Codec>(
         &self,
         key: ObjectKey,
@@ -294,20 +294,20 @@ impl CachedStore {
         );
         let invoked = self.next_invocation();
         let outcome = match self.backend.write_if_not_exists(&path, bytes).await {
-            Ok(version) => MutationOutcome::success(version, Some(invoked)),
-            Err(BackendError::Precondition) => MutationOutcome::conflict(),
+            Ok(revision) => MutationOutcome::applied(revision, Some(invoked)),
+            Err(BackendError::Precondition) => MutationOutcome::rejected(),
             Err(error) => MutationOutcome::failed(error),
         };
-        let applied = round.finish(outcome, |version| {
+        let applied = round.finish(outcome, |revision| {
             self.knowledge.install_mutation::<C>(
                 key,
                 value,
                 size,
-                Revision::from_backend(version),
+                Revision::from_backend(revision),
                 invoked,
             )
         })?;
-        Ok(applied.map_or(CasResult::Conflict, |installed| {
+        Ok(applied.map_or(CasResult::Rejected, |installed| {
             CasResult::Applied(CasReceipt {
                 expected_revision: None,
                 installed,
@@ -329,11 +329,13 @@ impl CachedStore {
         let size = C::size(&value);
         let key = expected.key.clone();
         let path = key.encoded().clone();
-        let revision = expected
+        let expected_revision = expected
             .revision
             .clone()
             .ok_or_else(|| StorageError::other("CAS requires a present observation"))?;
-        let expected_state = self.knowledge.expected_present(revision.clone(), expected);
+        let expected_state = self
+            .knowledge
+            .expected_present(expected_revision.clone(), expected);
         let permit = self.coordinator.acquire(&path).await;
         let round = MutationRound::new(
             self.knowledge.clone(),
@@ -345,22 +347,22 @@ impl CachedStore {
         let invoked = self.next_invocation();
         let outcome = match self
             .backend
-            .write_if(&path, bytes, revision.version())
+            .write_if(&path, bytes, expected_revision.backend())
             .await
         {
-            Ok(version) => MutationOutcome::success(Some(version), Some(invoked)),
-            Err(BackendError::NotFound) => MutationOutcome::success(None, None),
-            Err(BackendError::Precondition) => MutationOutcome::conflict(),
+            Ok(installed) => MutationOutcome::applied(Some(installed), Some(invoked)),
+            Err(BackendError::NotFound) => MutationOutcome::applied(None, None),
+            Err(BackendError::Precondition) => MutationOutcome::rejected(),
             Err(error) => MutationOutcome::failed(error),
         };
-        let completed = round.finish(outcome, |version| match version {
-            Some(version) => CasResult::Applied(CasReceipt {
-                expected_revision: Some(revision),
+        let completed = round.finish(outcome, |installed| match installed {
+            Some(installed) => CasResult::Applied(CasReceipt {
+                expected_revision: Some(expected_revision),
                 installed: self.knowledge.install_mutation::<C>(
                     key,
                     value,
                     size,
-                    Revision::from_backend(version),
+                    Revision::from_backend(installed),
                     invoked,
                 ),
                 invoked,
@@ -368,16 +370,16 @@ impl CachedStore {
             None => {
                 self.knowledge
                     .install_absent_observation::<C::Value>(key, invoked);
-                CasResult::Conflict
+                CasResult::Rejected
             }
         })?;
-        Ok(completed.unwrap_or(CasResult::Conflict))
+        Ok(completed.unwrap_or(CasResult::Rejected))
     }
 
     /// Deletes the exact present observation and returns the installed absence.
-    /// A missing object is successful convergence; a conflict invalidates the
+    /// A missing object is successful convergence; a rejection invalidates the
     /// expected revision if still cached, while an in-doubt outcome makes all
-    /// path knowledge uncertain.
+    /// path knowledge in doubt.
     async fn delete<C: Codec>(
         &self,
         expected: &Observation<C::Value>,
@@ -398,10 +400,10 @@ impl CachedStore {
             permit,
         );
         let invoked = self.next_invocation();
-        let outcome = match self.backend.delete_if(&path, revision.version()).await {
-            Ok(()) => MutationOutcome::success((), Some(invoked)),
-            Err(BackendError::NotFound) => MutationOutcome::success((), None),
-            Err(BackendError::Precondition) => MutationOutcome::conflict(),
+        let outcome = match self.backend.delete_if(&path, revision.backend()).await {
+            Ok(()) => MutationOutcome::applied((), Some(invoked)),
+            Err(BackendError::NotFound) => MutationOutcome::applied((), None),
+            Err(BackendError::Precondition) => MutationOutcome::rejected(),
             Err(error) => MutationOutcome::failed(error),
         };
         round
@@ -494,7 +496,7 @@ impl CachedStore {
         }
     }
 
-    /// Runs one backend read for a path: a version-conditional check when
+    /// Runs one backend read for a path: a revision-conditional check when
     /// a present revision is known, else an ordinary read.
     async fn do_fetch<C: Codec>(
         &self,
@@ -506,11 +508,11 @@ impl CachedStore {
         match seed {
             Some(seed) => match self
                 .backend
-                .read_if_modified(key.as_str(), seed.revision().version())
+                .read_if_modified(key.as_str(), seed.revision().backend())
                 .await
             {
                 Ok(reply) => {
-                    self.publish_present::<C>(key, reply.contents, reply.version, invoked, state)
+                    self.publish_present::<C>(key, reply.contents, reply.revision, invoked, state)
                 }
                 Err(BackendError::Precondition) => {
                     Ok(self.publish_unchanged(key.as_str(), seed, invoked))
@@ -522,7 +524,7 @@ impl CachedStore {
             },
             None => match self.backend.read(key.as_str()).await {
                 Ok(reply) => {
-                    self.publish_present::<C>(key, reply.contents, reply.version, invoked, state)
+                    self.publish_present::<C>(key, reply.contents, reply.revision, invoked, state)
                 }
                 Err(BackendError::NotFound) => {
                     Ok(self.publish_absent(key.as_str(), invoked, state))
@@ -537,7 +539,7 @@ impl CachedStore {
         &self,
         key: &ObjectKey,
         bytes: Vec<u8>,
-        version: backend::Version,
+        revision: backend::Revision,
         invoked: SequencePoint,
         state: &Arc<PathState>,
     ) -> Result<FetchResult, StorageError> {
@@ -552,7 +554,7 @@ impl CachedStore {
         };
         let size = C::size(&decoded);
         let value = Arc::new(decoded);
-        let revision = Revision::from_backend(version);
+        let revision = Revision::from_backend(revision);
         let change = self.persistent.begin_change(state);
         let fetched = self.knowledge.install_fetched::<C>(
             key.as_str(),
@@ -840,23 +842,23 @@ mod tests {
     // than a unique mutation. Recreating equivalent bytes deliberately reuses
     // the same token.
     #[derive(Default)]
-    struct ContentVersionBackend {
+    struct ContentRevisionBackend {
         objects: Mutex<HashMap<String, Vec<u8>>>,
     }
 
-    impl ContentVersionBackend {
-        fn version(value: &[u8]) -> backend::Version {
-            backend::Version::new(format!("{value:?}"))
+    impl ContentRevisionBackend {
+        fn revision(value: &[u8]) -> backend::Revision {
+            backend::Revision::new(format!("{value:?}"))
         }
     }
 
     #[async_trait::async_trait]
-    impl Backend for ContentVersionBackend {
+    impl Backend for ContentRevisionBackend {
         async fn read(&self, path: &str) -> Result<backend::ReadReply, BackendError> {
             let objects = self.objects.lock().unwrap();
             let contents = objects.get(path).cloned().ok_or(BackendError::NotFound)?;
             Ok(backend::ReadReply {
-                version: Self::version(&contents),
+                revision: Self::revision(&contents),
                 contents,
             })
         }
@@ -864,10 +866,10 @@ mod tests {
         async fn read_if_modified(
             &self,
             path: &str,
-            expected: &backend::Version,
+            expected: &backend::Revision,
         ) -> Result<backend::ReadReply, BackendError> {
             let reply = self.read(path).await?;
-            if &reply.version == expected {
+            if &reply.revision == expected {
                 Err(BackendError::Precondition)
             } else {
                 Ok(reply)
@@ -878,39 +880,39 @@ mod tests {
             &self,
             path: &str,
             value: Vec<u8>,
-            expected: &backend::Version,
-        ) -> Result<backend::Version, BackendError> {
+            expected: &backend::Revision,
+        ) -> Result<backend::Revision, BackendError> {
             let mut objects = self.objects.lock().unwrap();
             let current = objects.get_mut(path).ok_or(BackendError::NotFound)?;
-            if &Self::version(current) != expected {
+            if &Self::revision(current) != expected {
                 return Err(BackendError::Precondition);
             }
             *current = value;
-            Ok(Self::version(current))
+            Ok(Self::revision(current))
         }
 
         async fn write_if_not_exists(
             &self,
             path: &str,
             value: Vec<u8>,
-        ) -> Result<backend::Version, BackendError> {
+        ) -> Result<backend::Revision, BackendError> {
             let mut objects = self.objects.lock().unwrap();
             if objects.contains_key(path) {
                 return Err(BackendError::Precondition);
             }
-            let version = Self::version(&value);
+            let revision = Self::revision(&value);
             objects.insert(path.to_string(), value);
-            Ok(version)
+            Ok(revision)
         }
 
         async fn delete_if(
             &self,
             path: &str,
-            expected: &backend::Version,
+            expected: &backend::Revision,
         ) -> Result<(), BackendError> {
             let mut objects = self.objects.lock().unwrap();
             let current = objects.get(path).ok_or(BackendError::NotFound)?;
-            if &Self::version(current) != expected {
+            if &Self::revision(current) != expected {
                 return Err(BackendError::Precondition);
             }
             objects.remove(path);
@@ -1336,7 +1338,7 @@ mod tests {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum ExpectedMutationResult {
         Applied,
-        Conflict,
+        Rejected,
         Deleted,
         Precondition,
         Unavailable,
@@ -1364,8 +1366,8 @@ mod tests {
                     kind: ExpectedMutationResult::Applied,
                     observation: Some(receipt.into_installed()),
                 },
-                Ok(CasResult::Conflict) => MutationResult {
-                    kind: ExpectedMutationResult::Conflict,
+                Ok(CasResult::Rejected) => MutationResult {
+                    kind: ExpectedMutationResult::Rejected,
                     observation: None,
                 },
                 Err(StorageError::Unavailable(_)) => MutationResult {
@@ -1389,8 +1391,8 @@ mod tests {
                     kind: ExpectedMutationResult::Applied,
                     observation: Some(receipt.into_installed()),
                 },
-                Ok(CasResult::Conflict) => MutationResult {
-                    kind: ExpectedMutationResult::Conflict,
+                Ok(CasResult::Rejected) => MutationResult {
+                    kind: ExpectedMutationResult::Rejected,
                     observation: None,
                 },
                 Err(StorageError::Unavailable(_)) => MutationResult {
@@ -1466,7 +1468,7 @@ mod tests {
                     .write_if(
                         "p",
                         WINNER_VALUE.to_vec(),
-                        expected.revision().unwrap().version(),
+                        expected.revision().unwrap().backend(),
                     )
                     .await
                     .unwrap();
@@ -1474,7 +1476,7 @@ mod tests {
             (_, KnowledgeCase::Missing) => {
                 protocol
                     .memory
-                    .delete_if("p", expected.revision().unwrap().version())
+                    .delete_if("p", expected.revision().unwrap().backend())
                     .await
                     .unwrap();
             }
@@ -1523,17 +1525,17 @@ mod tests {
             next_read_operations: &[],
         },
         MutationCase {
-            name: "create conflicts with stale absence",
+            name: "create rejects stale absence",
             kind: MutationKind::Create,
             knowledge: KnowledgeCase::Stale,
             completion: CompletionCase::Natural,
-            result: ExpectedMutationResult::Conflict,
+            result: ExpectedMutationResult::Rejected,
             advance_expected: false,
             next_value: ExpectedValue::Winner,
             next_read_operations: &["read"],
         },
         MutationCase {
-            name: "create lost acknowledgement is uncertain",
+            name: "create lost acknowledgement is in doubt",
             kind: MutationKind::Create,
             knowledge: KnowledgeCase::Absent,
             completion: CompletionCase::UnavailableAfterApply,
@@ -1553,7 +1555,7 @@ mod tests {
             next_read_operations: &[],
         },
         MutationCase {
-            name: "cancelled invoked create is uncertain",
+            name: "cancelled invoked create is in doubt",
             kind: MutationKind::Create,
             knowledge: KnowledgeCase::Absent,
             completion: CompletionCase::CancelledAfterApply,
@@ -1573,21 +1575,21 @@ mod tests {
             next_read_operations: &[],
         },
         MutationCase {
-            name: "CAS conflict invalidates stale revision",
+            name: "CAS rejection invalidates stale revision",
             kind: MutationKind::Cas,
             knowledge: KnowledgeCase::Stale,
             completion: CompletionCase::Natural,
-            result: ExpectedMutationResult::Conflict,
+            result: ExpectedMutationResult::Rejected,
             advance_expected: false,
             next_value: ExpectedValue::Winner,
             next_read_operations: &["read"],
         },
         MutationCase {
-            name: "CAS conflict preserves known winner",
+            name: "CAS rejection preserves known winner",
             kind: MutationKind::Cas,
             knowledge: KnowledgeCase::KnownWinner,
             completion: CompletionCase::Natural,
-            result: ExpectedMutationResult::Conflict,
+            result: ExpectedMutationResult::Rejected,
             advance_expected: false,
             next_value: ExpectedValue::Winner,
             next_read_operations: &[],
@@ -1597,13 +1599,13 @@ mod tests {
             kind: MutationKind::Cas,
             knowledge: KnowledgeCase::Missing,
             completion: CompletionCase::Natural,
-            result: ExpectedMutationResult::Conflict,
+            result: ExpectedMutationResult::Rejected,
             advance_expected: false,
             next_value: ExpectedValue::Absent,
             next_read_operations: &[],
         },
         MutationCase {
-            name: "CAS lost acknowledgement is uncertain",
+            name: "CAS lost acknowledgement is in doubt",
             kind: MutationKind::Cas,
             knowledge: KnowledgeCase::Matching,
             completion: CompletionCase::UnavailableAfterApply,
@@ -1623,7 +1625,7 @@ mod tests {
             next_read_operations: &[],
         },
         MutationCase {
-            name: "cancelled invoked CAS is uncertain",
+            name: "cancelled invoked CAS is in doubt",
             kind: MutationKind::Cas,
             knowledge: KnowledgeCase::Matching,
             completion: CompletionCase::CancelledAfterApply,
@@ -1643,7 +1645,7 @@ mod tests {
             next_read_operations: &[],
         },
         MutationCase {
-            name: "delete conflict invalidates stale revision",
+            name: "delete rejection invalidates stale revision",
             kind: MutationKind::Delete,
             knowledge: KnowledgeCase::Stale,
             completion: CompletionCase::Natural,
@@ -1653,7 +1655,7 @@ mod tests {
             next_read_operations: &["read"],
         },
         MutationCase {
-            name: "delete conflict preserves known winner",
+            name: "delete rejection preserves known winner",
             kind: MutationKind::Delete,
             knowledge: KnowledgeCase::KnownWinner,
             completion: CompletionCase::Natural,
@@ -1673,7 +1675,7 @@ mod tests {
             next_read_operations: &[],
         },
         MutationCase {
-            name: "delete lost acknowledgement is uncertain",
+            name: "delete lost acknowledgement is in doubt",
             kind: MutationKind::Delete,
             knowledge: KnowledgeCase::Matching,
             completion: CompletionCase::UnavailableAfterApply,
@@ -1693,7 +1695,7 @@ mod tests {
             next_read_operations: &[],
         },
         MutationCase {
-            name: "cancelled invoked delete is uncertain",
+            name: "cancelled invoked delete is in doubt",
             kind: MutationKind::Delete,
             knowledge: KnowledgeCase::Matching,
             completion: CompletionCase::CancelledAfterApply,
@@ -2174,11 +2176,11 @@ mod tests {
             next_value: ExpectedValue::Proposed,
         },
         L2MutationCase {
-            name: "L2 create conflict invalidates persisted state",
+            name: "L2 create rejection invalidates persisted state",
             kind: MutationKind::Create,
             remote: L2RemoteCase::Matching,
             completion: CompletionCase::Natural,
-            result: ExpectedMutationResult::Conflict,
+            result: ExpectedMutationResult::Rejected,
             advance_expected: false,
             next_value: ExpectedValue::Old,
         },
@@ -2219,11 +2221,11 @@ mod tests {
             next_value: ExpectedValue::Proposed,
         },
         L2MutationCase {
-            name: "L2 CAS conflict invalidates persisted stale revision",
+            name: "L2 CAS rejection invalidates persisted stale revision",
             kind: MutationKind::Cas,
             remote: L2RemoteCase::Stale,
             completion: CompletionCase::Natural,
-            result: ExpectedMutationResult::Conflict,
+            result: ExpectedMutationResult::Rejected,
             advance_expected: false,
             next_value: ExpectedValue::Winner,
         },
@@ -2232,7 +2234,7 @@ mod tests {
             kind: MutationKind::Cas,
             remote: L2RemoteCase::Missing,
             completion: CompletionCase::Natural,
-            result: ExpectedMutationResult::Conflict,
+            result: ExpectedMutationResult::Rejected,
             advance_expected: false,
             next_value: ExpectedValue::Absent,
         },
@@ -2273,7 +2275,7 @@ mod tests {
             next_value: ExpectedValue::Absent,
         },
         L2MutationCase {
-            name: "L2 delete conflict invalidates persisted stale revision",
+            name: "L2 delete rejection invalidates persisted stale revision",
             kind: MutationKind::Delete,
             remote: L2RemoteCase::Stale,
             completion: CompletionCase::Natural,
@@ -2324,7 +2326,7 @@ mod tests {
         for case in L2_MUTATION_CASES {
             let directory = TempDir::new().unwrap();
             let protocol = ProtocolBackend::new();
-            let old_version = protocol
+            let old_revision = protocol
                 .memory
                 .write_if_not_exists("p", OLD_VALUE.to_vec())
                 .await
@@ -2355,12 +2357,12 @@ mod tests {
                 L2RemoteCase::Stale => {
                     protocol
                         .memory
-                        .write_if("p", WINNER_VALUE.to_vec(), &old_version)
+                        .write_if("p", WINNER_VALUE.to_vec(), &old_revision)
                         .await
                         .unwrap();
                 }
                 L2RemoteCase::Missing => {
-                    protocol.memory.delete_if("p", &old_version).await.unwrap();
+                    protocol.memory.delete_if("p", &old_revision).await.unwrap();
                 }
             }
             protocol.clear_operations();
@@ -2521,11 +2523,11 @@ mod tests {
         assert!(o2.is_current_after(barrier));
     }
 
-    // Model invariant: `Any` never returns an entry a conflict invalidated. A
-    // stale CAS makes the exact starting entry uncertain, so the next `Any`
+    // Model invariant: `Any` never returns an entry a rejection invalidated. A
+    // stale CAS makes the exact starting entry in doubt, so the next `Any`
     // re-reads the backend and observes the winner.
     #[tokio::test]
-    async fn any_rereads_after_conflict_invalidates_starting_entry() {
+    async fn any_rereads_after_rejection_invalidates_starting_entry() {
         let mem = Arc::new(MemoryBackend::new());
         let rec = Arc::new(RecordingBackend::new(mem));
         let log = rec.log();
@@ -2544,7 +2546,7 @@ mod tests {
         replace_value(&s2, &obs, v(b"b")).await;
 
         let r = s1.compare_and_swap(&obs, v(b"c")).await.unwrap();
-        assert!(!r.is_applied(), "the stale CAS conflicts");
+        assert!(!r.is_applied(), "the stale CAS was rejected");
         clear(&log);
 
         let got = s1.read("p", Requirement::ANY).await.unwrap();
@@ -2565,7 +2567,7 @@ mod tests {
     // Regression: two observations of one committed revision are the same state
     // even when they hold distinct evidence cells. A cache eviction and reload
     // (modeled here by two independent caches over one backend) mints a fresh
-    // cell for the unchanged version; `same_state` must still hold, otherwise a
+    // cell for the unchanged revision; `same_state` must still hold, otherwise a
     // lock CAS fails to certify a read taken before the reload.
     #[tokio::test]
     async fn same_state_holds_across_independent_evidence_for_one_revision() {
@@ -2580,7 +2582,7 @@ mod tests {
         assert_eq!(
             obs_a.revision(),
             obs_b.revision(),
-            "both observed the same committed version"
+            "both observed the same committed revision"
         );
         assert!(
             obs_a.same_state(&obs_b),
@@ -2611,7 +2613,7 @@ mod tests {
             .into_installed();
 
         replace_value(&s2, &obs, v(b"b")).await;
-        s1.compare_and_swap(&obs, v(b"c")).await.unwrap(); // conflict -> uncertain
+        s1.compare_and_swap(&obs, v(b"c")).await.unwrap(); // rejection -> in doubt
 
         assert_eq!(obs.value().unwrap().as_slice(), b"a", "still inspectable");
 
@@ -2804,10 +2806,10 @@ mod tests {
         assert!(reloaded.current_after() >= before);
     }
 
-    // Model invariant: a CAS conflict neither advances the expected observation
+    // Model invariant: a rejected CAS neither advances the expected observation
     // nor installs the proposed value.
     #[tokio::test]
-    async fn cas_conflict_advances_nothing() {
+    async fn cas_rejection_advances_nothing() {
         let mem = Arc::new(MemoryBackend::new());
         let backend: Arc<dyn Backend> = Arc::new(mem);
         let s1 = bytes_store(backend.clone());
@@ -2827,7 +2829,7 @@ mod tests {
         assert!(!r.is_applied());
         assert!(
             obs.current_after() < before,
-            "conflict must not advance the observation"
+            "rejection must not advance the observation"
         );
         let got = s1.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(
@@ -2838,10 +2840,10 @@ mod tests {
     }
 
     // Model invariant: an in-doubt CAS makes all discoverable path knowledge
-    // uncertain and does not advance the observation's watermark. The
+    // in doubt and does not advance the observation's watermark. The
     // underlying write may still have landed, which a later `Any` read discovers.
     #[tokio::test]
-    async fn cas_in_doubt_makes_path_uncertain() {
+    async fn cas_in_doubt_makes_path_in_doubt() {
         let hook = HookBackend::new(Arc::new(MemoryBackend::new()));
         let backend: Arc<dyn Backend> = hook.clone();
         let s = bytes_store(backend);
@@ -2873,7 +2875,7 @@ mod tests {
             obs.current_after() < before,
             "an in-doubt outcome must not advance the observation"
         );
-        // The path became uncertain, so Any re-reads and finds the write
+        // The path became in doubt, so Any re-reads and finds the write
         // that actually landed.
         let got = s.read("p", Requirement::ANY).await.unwrap();
         assert_eq!(got.value().unwrap().as_slice(), b"b");
@@ -2941,14 +2943,14 @@ mod tests {
     // therefore restores the original CAS predicate, which remains valid.
     #[tokio::test]
     async fn cas_executes_after_revision_aba() {
-        let content = Arc::new(ContentVersionBackend::default());
+        let content = Arc::new(ContentRevisionBackend::default());
         let backend: Arc<dyn Backend> = content.clone();
         let store = bytes_store(backend);
         let expected = create_value(&store, "p", v(b"a")).await;
         let other_path = create_value(&store, "q", v(b"a")).await;
         assert_eq!(expected.revision(), other_path.revision());
         content
-            .delete_if("p", expected.revision().unwrap().version())
+            .delete_if("p", expected.revision().unwrap().backend())
             .await
             .unwrap();
         content
@@ -3073,14 +3075,14 @@ mod tests {
     // a local NotFound response was delayed.
     #[tokio::test]
     async fn fresh_read_discovers_external_recreation_after_delayed_not_found() {
-        let content = Arc::new(ContentVersionBackend::default());
+        let content = Arc::new(ContentRevisionBackend::default());
         let inner: Arc<dyn Backend> = content.clone();
         let hook = HookBackend::new(inner);
         let backend: Arc<dyn Backend> = hook.clone();
         let store = bytes_store(backend);
         let expected = create_value(&store, "p", v(b"a")).await;
         content
-            .delete_if("p", expected.revision().unwrap().version())
+            .delete_if("p", expected.revision().unwrap().backend())
             .await
             .unwrap();
 
@@ -3126,7 +3128,7 @@ mod tests {
     // cached starting revision, forcing the next unbounded read to discover the
     // winner without deleting it.
     #[tokio::test]
-    async fn delete_conflict_invalidates_expected_and_preserves_winner() {
+    async fn delete_rejection_invalidates_expected_and_preserves_winner() {
         let memory = Arc::new(MemoryBackend::new());
         let recording = Arc::new(RecordingBackend::new(memory));
         let log = recording.log();
@@ -3151,7 +3153,7 @@ mod tests {
         assert_eq!(count(&log, "read"), 1);
     }
 
-    // Model invariant: a lost delete acknowledgement makes the path uncertain.
+    // Model invariant: a lost delete acknowledgement makes the path in doubt.
     // The expected cache entry is invalidated and its evidence is not advanced,
     // even when the underlying deletion actually landed.
     #[tokio::test]
@@ -3480,7 +3482,7 @@ mod tests {
     // Dropping a mutation after dispatch removes discoverable knowledge before
     // releasing the lane, even when the remote write already applied.
     #[tokio::test]
-    async fn cancelling_invoked_mutation_makes_cache_uncertain() {
+    async fn cancelling_invoked_mutation_makes_cache_in_doubt() {
         let rec = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
         let log = rec.log();
         let inner: Arc<dyn Backend> = rec;

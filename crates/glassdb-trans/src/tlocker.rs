@@ -177,16 +177,16 @@ impl LockedTx {
 
     /// Reports whether this transaction acquired its hold from the exact leaf
     /// state that was observed earlier, with evidence reaching `barrier`, and
-    /// left that leaf with the membership version `membership_version`.
+    /// left that leaf with the membership generation `membership_generation`.
     ///
     /// One coordinated round publishes every member's staged change in a single
     /// CAS (ADR-028), so matching the pre-CAS state alone would hide a peer's
     /// create or delete that landed in the very same CAS. The installed state
-    /// is what ADR-032's membership-version condition must compare against.
+    /// is what ADR-032's membership-generation condition must compare against.
     pub(crate) fn certifies_membership(
         &self,
         observed: &LeafObservation,
-        membership_version: u64,
+        membership_generation: u64,
         barrier: CurrentnessBarrier,
     ) -> bool {
         self.groups.get(observed.path()).is_some_and(|group| {
@@ -196,11 +196,11 @@ impl LockedTx {
                     .evidence
                     .installed()
                     .and_then(|installed| installed.value())
-                    .is_some_and(|node| node.membership_version() == membership_version)
+                    .is_some_and(|node| node.membership_generation() == membership_generation)
         })
     }
 
-    /// The typed entry and leaf locks GC records on the transaction object for
+    /// The typed entry and leaf locks GC records on the transaction record for
     /// its reverse liveness check and lock pruning (ADR-022).
     pub(crate) fn locked_paths(&self) -> Vec<TxLock> {
         let mut out = Vec::new();
@@ -261,7 +261,7 @@ async fn build_groups(
         .collect();
     // Route with interior nodes served from cache (ADR-031 hot-path invariant):
     // a stale index misroute self-corrects via right-links, and the leaf's own
-    // coordination CAS revalidates at the version, so neither the root `_r` nor
+    // coordination CAS revalidates at the revision, so neither the root `_r` nor
     // the terminal leaf needs a separate validation read.
     let grouped = router
         .route_keys_with_requirements(items, Requirement::ANY, Requirement::ANY)
@@ -617,7 +617,7 @@ impl LeafOperation for WriteBackOperation {
                 outcome: MemberOutcome::Wait(_),
                 ..
             }) => {
-                // The committed log makes later publication and cleanup
+                // The committed record makes later publication and cleanup
                 // recoverable, so a live structural gate need not delay commit.
                 Ok(WriteBackOutcome::Deferred)
             }
@@ -688,7 +688,7 @@ impl LeafResolver for ReleaseOperation {
     fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
         // Exhaustion proves nothing about the holds this transaction still has
         // in the leaf. Reporting a release the round never made would let the
-        // caller retire a transaction object its holders still point at.
+        // caller retire a transaction record its holders still point at.
         MemberOutcome::Conflict
     }
 
@@ -788,7 +788,7 @@ enum ReleaseOutcome {
 /// if a live holder this transaction cannot wound must be waited on
 /// (hold-and-wait, ADR-024).
 ///
-/// Read-version validation is not done here — the engine validates reads after
+/// Read-writer validation is not done here — the engine validates reads after
 /// every lock is held (ADR-024).
 async fn resolve_and_lock(
     ctx: &ResolveCtx<'_>,
@@ -881,8 +881,8 @@ fn writeback_changes(
                     superseded.push(prev.clone());
                 }
                 // Replaying a write-back must not demote an authoritative
-                // direct-commit value. A newly published logged write points
-                // to its transaction object instead (ADR-054).
+                // direct-commit value. A newly published value in the
+                // transaction record points to that record instead (ADR-054).
                 if e.current.writer() != Some(id) {
                     e.current = if matches!(intent.desired, Desired::Delete) {
                         CurrentState::Tombstone { writer: id.clone() }
@@ -1068,16 +1068,16 @@ impl KeyLocker {
     /// reclaimed lazily by the next contender or lease expiry), so this never
     /// fails an already-committed transaction. A live structural holder defers
     /// the affected leaf rather than making post-commit cleanup wait.
-    /// Cancellation can leave a partial pass, but the committed log remains
+    /// Cancellation can leave a partial pass, but the committed record remains
     /// authoritative and every landed CAS is safe to repeat.
     ///
     /// `locked` must come from this locker's database instance. Locking and
     /// write-back share cache knowledge; this is not a recovery interface for
     /// another instance's locks.
     ///
-    /// Returns displaced external transaction-object references as GC candidates.
-    /// Inline values and tombstones can have logless writers; GC scans discover
-    /// any transaction objects behind those states.
+    /// Returns displaced external transaction-record references as GC candidates.
+    /// Inline values and tombstones can have direct-commit writers; GC scans discover
+    /// any transaction records behind those states.
     pub(crate) async fn write_back(&self, id: &TxId, locked: &LockedTx) -> Vec<TxId> {
         // A cancelled partial pass may lose these hints; GC's paged scan is
         // complete without them.
@@ -1138,7 +1138,7 @@ impl KeyLocker {
                 ReleaseOutcome::Contended => {}
             }
             // Failed CASes or repeatedly insufficient observations cannot
-            // establish completion. Keep the log for a later cleanup attempt.
+            // establish completion. Keep the transaction record for a later cleanup attempt.
             contended += 1;
             if contended == RELEASE_CONTENTION_ROUNDS {
                 return Err(TransError::Retry);
@@ -1233,8 +1233,8 @@ impl KeyLocker {
     ) -> Result<LeafSetOutcome, TransError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         // The first lock for this transaction starts the background refresh so a
-        // long-lived holder's pending object is written lazily, keeping its
-        // lease alive (the tx object is otherwise written only at commit).
+        // long-lived holder's pending record is written lazily, keeping its
+        // lease alive (the transaction record is otherwise written only at commit).
         if !groups.is_empty() {
             self.tmon.start_refresh_tx(id);
         }
@@ -1494,7 +1494,7 @@ mod tests {
         config.set_transaction_leaf_parallelism(parallelism);
         let foundation = AssemblyFixture::new(b, DbRoot::try_from("test").unwrap(), &config);
         let timeline = foundation.timeline.clone();
-        let tl = foundation.tlogger.clone();
+        let tx_records = foundation.tx_records.clone();
         let mon = foundation.monitor.clone();
         let records = foundation.records.clone();
         let nodes = foundation.nodes.clone();
@@ -1525,7 +1525,7 @@ mod tests {
             router,
             CollectionStateResolver::new(
                 records,
-                tl,
+                tx_records,
                 timeline.clone(),
                 mon.clone(),
                 RetryConfig::default(),
@@ -1710,7 +1710,7 @@ mod tests {
         assert!(loaded.node().structural_gate().holders().is_empty());
         assert_eq!(loaded.node().membership_lock().lock_type(), LockType::Write);
         assert!(loaded.node().membership_lock().contains(&tx));
-        assert_eq!(loaded.node().membership_version(), 1);
+        assert_eq!(loaded.node().membership_generation(), 1);
     }
 
     #[tokio::test]
@@ -1833,7 +1833,7 @@ mod tests {
             LeafEntry::new(b"apple").with_current(current.clone())
         ]));
         let mut locks = edit.locks().clone();
-        locks.advance_membership_version();
+        locks.advance_membership_generation();
         edit.set_locks(locks);
         assert!(peer.commit_leaf(edit).await.unwrap().is_applied());
 
@@ -1866,7 +1866,7 @@ mod tests {
         assert_eq!(entry.current, current);
         assert_eq!(entry.lock_type(), LockType::Write);
         assert_eq!(entry.lock_holders(), std::slice::from_ref(&tx));
-        assert_eq!(node.membership_version(), 1);
+        assert_eq!(node.membership_generation(), 1);
         assert!(!node.membership_lock().contains(&tx));
     }
 
@@ -1929,7 +1929,7 @@ mod tests {
         assert!(!waiting.is_finished());
 
         ctx.monitor
-            .commit_tx(glassdb_storage::transaction::TxLog::new(
+            .commit_tx(glassdb_storage::transaction::TxRecord::new(
                 gate,
                 TxCommitStatus::Ok,
             ))
@@ -2019,11 +2019,11 @@ mod tests {
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
         assert!(loaded.node().membership_lock().holders().is_empty());
-        assert_eq!(loaded.node().membership_version(), 0);
+        assert_eq!(loaded.node().membership_generation(), 0);
     }
 
     #[tokio::test]
-    async fn scan_membership_reader_does_not_bump_version() {
+    async fn scan_membership_reader_does_not_bump_membership_generation() {
         let (locker, ctx) = init_tl_test().await;
         let key = b"key";
         seed_committed(&ctx, key, b"old").await;
@@ -2045,7 +2045,7 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.node().membership_lock().lock_type(), LockType::Read);
         assert!(loaded.node().membership_lock().contains(&tx));
-        assert_eq!(loaded.node().membership_version(), 0);
+        assert_eq!(loaded.node().membership_generation(), 0);
 
         locker
             .keys()
@@ -2061,13 +2061,13 @@ mod tests {
             .await
             .unwrap();
         assert!(loaded.node().membership_lock().holders().is_empty());
-        assert_eq!(loaded.node().membership_version(), 0);
+        assert_eq!(loaded.node().membership_generation(), 0);
     }
 
     // ADR-026: a release is complete only when the current node proves the
     // holder is gone. A spent CAS budget proves nothing, so the release must
     // keep converging — a caller that took exhaustion for a removal would
-    // retire a transaction object the leaf still points at.
+    // retire a transaction record the leaf still points at.
     #[tokio::test(start_paused = true)]
     async fn a_release_that_spends_its_cas_budget_keeps_converging() {
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
@@ -2255,7 +2255,7 @@ mod tests {
     // committed value.
     #[tokio::test(start_paused = true)]
     async fn younger_proceeds_after_older_holder_commits() {
-        use glassdb_storage::transaction::{TxLog, TxWrite};
+        use glassdb_storage::transaction::{TxRecord, TxWrite};
         let (locker, ctx) = init_tl_test().await;
         let key = b"key";
         seed_committed(&ctx, key, b"v0").await;
@@ -2286,14 +2286,14 @@ mod tests {
         );
 
         // `old` commits its write, then publishes the pointer and releases.
-        let mut tl = TxLog::new(old.clone(), TxCommitStatus::Ok);
-        tl.writes = vec![TxWrite {
+        let mut record = TxRecord::new(old.clone(), TxCommitStatus::Ok);
+        record.writes = vec![TxWrite {
             key: logical_key(key),
             value: Arc::from(&b"v1"[..]),
             deleted: false,
             prev_writer: TxId::default(),
         }];
-        ctx.monitor.commit_tx(tl).await.unwrap();
+        ctx.monitor.commit_tx(record).await.unwrap();
         locker.keys().write_back(&old, &old_locked).await;
 
         let outcome = waiting.await.unwrap().unwrap();
@@ -2336,7 +2336,7 @@ mod tests {
             .unwrap();
         assert!(loaded.node().structural_gate().holders().is_empty());
         assert!(loaded.node().membership_lock().holders().is_empty());
-        assert_eq!(loaded.node().membership_version(), 2);
+        assert_eq!(loaded.node().membership_generation(), 2);
     }
 
     #[tokio::test]
@@ -2456,10 +2456,11 @@ mod tests {
     }
 
     // A later acquisition help-forwards committed holders as transaction-object
-    // pointers. Logged values are not copied into leaf entries (ADR-054).
+    // pointers. Values in the transaction record are not copied into leaf entries
+    // (ADR-054).
     #[tokio::test]
-    async fn committed_logged_values_are_help_forwarded_as_external() {
-        use glassdb_storage::transaction::{TxLog, TxWrite};
+    async fn committed_record_values_are_help_forwarded_as_external() {
+        use glassdb_storage::transaction::{TxRecord, TxWrite};
         let (locker, ctx) = init_tl_test().await;
         let first = b"key-a".to_vec();
         let second = same_leaf_sibling(&first);
@@ -2474,8 +2475,8 @@ mod tests {
             &group_of_intents(vec![put_intent(&first), put_intent(&second)]),
         )
         .await;
-        let mut tl = TxLog::new(writer.clone(), TxCommitStatus::Ok);
-        tl.writes = [(&first, b"aaaaa"), (&second, b"bbbbb")]
+        let mut record = TxRecord::new(writer.clone(), TxCommitStatus::Ok);
+        record.writes = [(&first, b"aaaaa"), (&second, b"bbbbb")]
             .into_iter()
             .map(|(key, value)| TxWrite {
                 key: logical_key(key),
@@ -2484,7 +2485,7 @@ mod tests {
                 prev_writer: TxId::default(),
             })
             .collect();
-        ctx.monitor.commit_tx(tl).await.unwrap();
+        ctx.monitor.commit_tx(record).await.unwrap();
 
         let reader = mk_tid(2, "reader");
         ctx.monitor.begin_tx(&reader);
@@ -2599,7 +2600,7 @@ mod tests {
     // The node's hard cap is no licence to demote either: an acquisition whose
     // staged entry no longer fits is refused rather than republishing the value
     // it carries forward as a pointer. That value may be the key's only copy —
-    // a logless writer (ADR-051) has no transaction object to restore it from.
+    // a direct-commit writer (ADR-051) has no transaction record to restore it from.
     #[tokio::test]
     async fn a_full_leaf_refuses_a_lock_rather_than_dropping_an_inline_value() {
         let key = b"key";
@@ -2655,17 +2656,17 @@ mod tests {
     // Helper: commit a value for `key` so the leaf records a `current_writer`,
     // making the key exist (so subsequent writes take a Write, not Create, lock).
     async fn seed_committed(ctx: &TlCtx, key: &[u8], value: &[u8]) {
-        use glassdb_storage::transaction::{TxLog, TxWrite};
+        use glassdb_storage::transaction::{TxRecord, TxWrite};
         let writer = mk_tid(0, "seed");
         ctx.monitor.begin_tx(&writer);
-        let mut tl = TxLog::new(writer.clone(), TxCommitStatus::Ok);
-        tl.writes = vec![TxWrite {
+        let mut record = TxRecord::new(writer.clone(), TxCommitStatus::Ok);
+        record.writes = vec![TxWrite {
             key: logical_key(key),
             value: Arc::from(value),
             deleted: false,
             prev_writer: TxId::default(),
         }];
-        ctx.monitor.commit_tx(tl).await.unwrap();
+        ctx.monitor.commit_tx(record).await.unwrap();
 
         // Install the committed pointer directly in the collection's leaf `_r`.
         let path = root_path();
@@ -2976,12 +2977,12 @@ mod tests {
 
     #[tokio::test]
     async fn directory_release_and_write_back_obey_the_bound() {
-        use glassdb_storage::transaction::TxLog;
+        use glassdb_storage::transaction::TxRecord;
         for write_back in [false, true] {
             let (locker, ctx, gate) = batch_gated_locker(NonZeroUsize::new(2).unwrap()).await;
             let id = mk_tid(1, "directory");
             let (locks, changes) = seed_directory_locks(&ctx, &id).await;
-            let mut log = TxLog::new(
+            let mut record = TxRecord::new(
                 id.clone(),
                 if write_back {
                     TxCommitStatus::Ok
@@ -2989,8 +2990,8 @@ mod tests {
                     TxCommitStatus::Aborted
                 },
             );
-            log.locks = locks.clone();
-            ctx._foundation.tlogger.set(&log).await.unwrap();
+            record.locks = locks.clone();
+            ctx._foundation.tx_records.set(&record).await.unwrap();
             gate.arm();
             let (changed, widths) = operation_widths(
                 async {
@@ -3217,7 +3218,7 @@ mod tests {
 
     #[tokio::test]
     async fn committed_write_back_obeys_the_leaf_bound() {
-        use glassdb_storage::transaction::{TxLog, TxWrite};
+        use glassdb_storage::transaction::{TxRecord, TxWrite};
 
         let (locker, ctx, gate) = batch_gated_locker(NonZeroUsize::new(2).unwrap()).await;
         let groups = groups_on_distinct_leaves(&ctx, 5).await;
@@ -3235,9 +3236,9 @@ mod tests {
             .collect();
         let receipts = lock_ok(&locker, &tx, &groups).await;
         let locked = LockedTx::from_receipts(groups, receipts).unwrap();
-        let mut log = TxLog::new(tx.clone(), TxCommitStatus::Ok);
-        log.writes = writes;
-        ctx.monitor.commit_tx(log).await.unwrap();
+        let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Ok);
+        record.writes = writes;
+        ctx.monitor.commit_tx(record).await.unwrap();
 
         gate.arm();
         let (superseded, widths) =
@@ -3408,19 +3409,19 @@ mod tests {
     // Locks + commits `key` for `tx`, leaving the leaf entry holding the write
     // lock, so a later `write_back` publishes it. Returns the acquired handle.
     async fn lock_commit(locker: &Locker, ctx: &TlCtx, tx: &TxId, key: &[u8]) -> LockedTx {
-        use glassdb_storage::transaction::{TxLog, TxWrite};
+        use glassdb_storage::transaction::{TxRecord, TxWrite};
         ctx.monitor.begin_tx(tx);
         let groups = group_of(key, put_intent(key));
         let receipts = lock_ok(locker, tx, &groups).await;
         let locked = LockedTx::from_receipts(groups, receipts).unwrap();
-        let mut tl = TxLog::new(tx.clone(), TxCommitStatus::Ok);
-        tl.writes = vec![TxWrite {
+        let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Ok);
+        record.writes = vec![TxWrite {
             key: logical_key(key),
             value: Arc::from(&b"v"[..]),
             deleted: false,
             prev_writer: TxId::default(),
         }];
-        ctx.monitor.commit_tx(tl).await.unwrap();
+        ctx.monitor.commit_tx(record).await.unwrap();
         locked
     }
 
@@ -3968,7 +3969,7 @@ mod tests {
             .await
             .unwrap();
         let observed = loaded.observation().clone();
-        let observed_membership = loaded.node().membership_version();
+        let observed_membership = loaded.node().membership_generation();
         let barrier = ctx.timeline.currentness_barrier();
 
         // The gated leaf load keeps the round open, so the peer's create and

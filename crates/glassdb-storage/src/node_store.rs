@@ -1,7 +1,7 @@
 //! Typed persistence for B-link tree nodes.
 //!
 //! Tree roots (`_r`) and standalone nodes (`_n/<token>`) are the coordination
-//! units. Mutations use create-if-absent, version-conditional compare-and-swap,
+//! units. Mutations use create-if-absent, revision-conditional compare-and-swap,
 //! or exact-revision deletion (ADR-023/ADR-031/ADR-042), all through the decoded
 //! [`CachedStore`].
 
@@ -306,7 +306,7 @@ impl NodeStore {
         };
         match res {
             Ok(CasResult::Applied(_)) => Ok(true),
-            Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(false),
+            Ok(CasResult::Rejected) | Err(StorageError::NotFound) => Ok(false),
             Err(error) => Err(error),
         }
     }
@@ -333,7 +333,7 @@ impl NodeStore {
             .await
         {
             Ok(CasResult::Applied(receipt)) => Ok(Some(receipt.into_installed())),
-            Ok(CasResult::Conflict) | Err(StorageError::NotFound) => Ok(None),
+            Ok(CasResult::Rejected) | Err(StorageError::NotFound) => Ok(None),
             Err(error) => Err(error),
         }
     }
@@ -440,7 +440,7 @@ impl NodeStore {
             .await;
         match result {
             Ok(result) => Ok(result),
-            Err(StorageError::NotFound) => Ok(CasResult::Conflict),
+            Err(StorageError::NotFound) => Ok(CasResult::Rejected),
             Err(error) => Err(error),
         }
     }
@@ -490,7 +490,7 @@ impl NodeStore {
         };
         match self.nodes.create(path, None, Arc::new(root.clone())).await {
             Ok(CasResult::Applied(_)) => Ok(true),
-            Ok(CasResult::Conflict) => Ok(false),
+            Ok(CasResult::Rejected) => Ok(false),
             Err(error) => Err(error),
         }
     }
@@ -511,7 +511,7 @@ impl NodeStore {
             .await?
         {
             CasResult::Applied(receipt) => Ok(Some(receipt.into_installed())),
-            CasResult::Conflict => Ok(None),
+            CasResult::Rejected => Ok(None),
         }
     }
 

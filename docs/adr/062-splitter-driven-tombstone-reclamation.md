@@ -5,14 +5,14 @@
 Accepted — implemented.
 
 Refines [ADR-051](051-inline-latest-values.md)'s tombstone lifetime and
-[ADR-061](061-atomic-logless-single-leaf-commits.md)'s logless deletes.
+[ADR-061](061-atomic-logless-single-leaf-commits.md)'s direct deletes.
 
 Supersedes [ADR-022](022-garbage-collection-mark-sweep.md)'s rule that a current
 writer is never cleared, only for `Tombstone` state. Inline and external current
 writers remain live value references. It also refines
 [ADR-029](029-gc-through-shard-coordinator.md)'s vestigial-entry rule and
-[ADR-032](032-node-locking-and-coordinated-splits.md)'s membership version by
-making that version the generation for unmarked point absence.
+[ADR-032](032-node-locking-and-coordinated-splits.md)'s membership generation by
+using it as the durable generation for unmarked point absence.
 
 It refines [ADR-031](031-dynamic-range-sharding.md) and
 [ADR-056](056-demand-driven-inline-pressure-splits.md) by compacting a leaf
@@ -23,9 +23,9 @@ This is a protocol-incompatible change and establishes database protocol v3.
 ## Context
 
 A tombstone is currently permanent until a later write replaces it. The
-transaction-object collector never clears one: GC starts from transaction
-objects and checks their recorded back-references, while a logless tombstone
-has no transaction object or durable cleanup candidate at all.
+transaction-record collector never clears one: GC starts from transaction
+records and checks their recorded back-references, while a direct-commit tombstone
+has no transaction record or durable cleanup candidate at all.
 
 Repeated deletion of one key does not accumulate entries, but distinct deleted
 keys preserve the collection's historical key set in its leaves. Tombstones can
@@ -36,7 +36,7 @@ merge is not implemented.
 Naively removing a tombstone is unsafe. A point read made after removal records
 unmarked absence; a later create, delete, and second removal could return to the
 same evidence and let the old read validate across an ABA cycle. Tombstones are
-also direct-commit recovery markers, so reclaiming them can make an uncertain
+also direct-commit recovery markers, so reclaiming them can make an in-doubt
 commit impossible to resolve.
 
 The splitter already visits a complete leaf under the structural gate exactly
@@ -45,9 +45,9 @@ compact absence before deciding whether the tree must grow.
 
 ## Decision
 
-### Use the membership version as an absence generation
+### Use the membership generation as an absence generation
 
-The leaf membership version also serves as the durable generation for a point
+The leaf membership generation also serves as the durable generation for a point
 read that observes no writer. Such a read records both logical absence and the
 leaf generation. After physical leaf evidence changes, it validates only if the
 key is still absent and the generation is unchanged.
@@ -57,8 +57,8 @@ that tombstone invalidates the read because the writer disappears. A read made
 after removal records the absence generation instead.
 
 A leaf CAS that contains any real absent-to-present or present-to-absent
-transition changes the generation. The regular locked protocol already records
-membership-write activity; a logless ADR-061 create or delete changes it in the
+transition changes the generation. The regular locked commit already records
+membership-write activity; a direct ADR-061 create or delete changes it in the
 direct commit CAS. A delete of an already absent key need not change it because
 logical membership did not change.
 
@@ -81,8 +81,8 @@ structural gate and quiesces the leaf under the existing split protocol. It then
 removes every holder-free tombstone before making the final split decision.
 
 Compaction is provenance-blind. It applies equally to tombstones written by
-logged transactions and to logless direct commits. Distinguishing them would
-require a new format bit or a transaction-object lookup per entry and changes
+locked transactions and to direct commits. Distinguishing them would
+require a new format bit or a transaction-record lookup per entry and changes
 neither logical safety nor the desired leaf contents.
 
 The splitter reevaluates the original split reason against the compacted leaf:
@@ -102,16 +102,16 @@ retain tombstones forever. Active ranges that create split pressure can receive
 opportunistic cleanup; the tree itself remains at its historical high-water
 mark.
 
-### Hand removed logged writers to ordinary GC
+### Hand removed locked writers to ordinary GC
 
 After removal is durable, every removed writer ID is submitted as an ordinary
-transaction-object cleanup hint. GC applies its existing reverse reference
-check and safety horizon; another current value or holder still naming a logged
-transaction keeps it live. A logless ID simply has no object to collect.
+transaction-record cleanup hint. GC applies its existing reverse reference
+check and safety horizon; another current value or holder still naming a locked
+transaction keeps it live. A direct-commit ID simply has no record to collect.
 
-The existing transaction-object collector does not scan leaves and does not
+The existing transaction-record collector does not scan leaves and does not
 become responsible for tombstone discovery. Its candidate-driven cost remains
-proportional to transaction-object garbage.
+proportional to transaction-record garbage.
 
 ### Accept loss of direct recovery evidence
 
@@ -130,9 +130,9 @@ not provide a publication-age guarantee because transaction IDs record
 transaction start, and adding durable age or provenance solely for recovery is
 rejected.
 
-Logged commit recovery remains based on the transaction object rather than the
+Locked commit recovery remains based on the transaction record rather than the
 leaf tombstone. Once the tombstone reference is removed, ADR-022's reverse
-check and ADR-057's recovery horizon govern reclamation of that object.
+check and ADR-057's recovery horizon govern reclamation of that record.
 
 ### Require database protocol v3
 
@@ -161,12 +161,12 @@ compaction and no longer requires a split afterward.
   tree.
 - Cold under-cap tombstones still have no eventual-reclamation guarantee, and
   empty or underfull nodes are not merged.
-- Logged transaction objects may become collectable once their tombstone
+- Locked transaction records may become collectable once their tombstone
   references disappear.
 - Unmarked absence reads gain conservative leaf-wide membership conflicts but
   remain safe across create/delete/reclaim cycles.
 - Splitter work becomes responsible for a logical compaction decision in
-  addition to topology, while transaction-object GC remains candidate-driven.
+  addition to topology, while transaction-record GC remains candidate-driven.
 - Direct delete commits have a larger `InDoubt` surface because their only
   markers may disappear immediately.
 - Database protocol v3 prevents old absence-validation semantics from sharing
@@ -174,22 +174,22 @@ compaction and no longer requires a split afterward.
 
 ## Alternatives considered
 
-### Extend transaction-object GC to find tombstones
+### Extend transaction-record GC to find tombstones
 
-Logless tombstones have no transaction object or back-reference from which the
+Direct-commit tombstones have no transaction record or back-reference from which the
 current collector can discover them. A forward leaf scan would make GC cost
 proportional to database size rather than garbage.
 
 ### Enqueue every delete for background compaction
 
 A volatile queue can be lost, while a durable queue adds another write to the
-strictly one-CAS direct path. It also risks making background CAS volume
+strictly one-CAS direct commit. It also risks making background CAS volume
 proportional to deletes even when leaves have ample capacity. Split pressure is
 the workload signal that justifies compaction.
 
 ### Retain tombstones permanently
 
-This preserves per-key recovery and absence versions but makes deleted history
+This preserves per-key recovery and absence generations but makes deleted history
 consume leaf capacity forever and can cause avoidable irreversible splits.
 
 ### Keep a compact per-key absence generation
