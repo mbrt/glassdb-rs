@@ -15,7 +15,7 @@
 //! heterogeneous mutations safely: transaction identity, oldest-first member
 //! order, per-member in-doubt attribution, routing and capacity admission, and
 //! same-key exclusion for direct publication. Each attempt loads the leaf,
-//! builds a mutation plan from the round's installed [`LeafOperation`] resolvers,
+//! builds a mutation plan from the round's installed [`LeafOperation`] policies,
 //! and persists staged changes with one CAS after removing vestigial entries.
 //! Recovery reloads the leaf and rebuilds the plan before the coordinator
 //! delivers each member's outcome (ADR-029). Each policy owner packages its
@@ -124,7 +124,7 @@ pub(crate) enum MemberOutcome {
     /// body may be reevaluated against the current leaf state under the same id
     /// rather than publishing a holder (ADR-053).
     Replay,
-    /// A commit-critical CAS was in-doubt (`Unavailable`) and resolver evaluation
+    /// A commit-critical CAS was in-doubt (`Unavailable`) and policy evaluation
     /// could not prove whether it landed, so the commit may or may not have happened:
     /// the one irreducible in-doubt case, surfaced rather than risking a
     /// double-apply.
@@ -183,7 +183,7 @@ pub(crate) struct CoordinatedOutcome {
     pub(crate) evidence: Option<CoordinationEvidence>,
 }
 
-/// Whether a resolver is evaluated on the first attempt or after a reload.
+/// Whether a policy is evaluated on the first attempt or after a reload.
 /// Reloads can follow a rejected CAS, an in-doubt CAS, or a stale transaction
 /// dependency. `in_doubt` records an unresolved in-doubt outcome only for this member
 /// from a prior CAS that included its staged changes.
@@ -222,7 +222,7 @@ pub(crate) enum StageAdmission {
     AddsKey,
 }
 
-/// One resolver's proposed decision: either stage entry and node-lock changes
+/// One policy's proposed decision: either stage entry and node-lock changes
 /// alongside its member outcome, or stage nothing.
 pub(crate) enum Step {
     /// Apply these entry changes and replace the running node-lock state. The
@@ -249,7 +249,7 @@ impl Step {
     }
 }
 
-/// Transaction-state services and retry context for one resolver evaluation.
+/// Transaction-state services and retry context for one policy evaluation.
 pub(crate) struct ResolveCtx<'a> {
     pub(crate) key_state: &'a KeyStateResolver,
     pub(crate) tmon: &'a Monitor,
@@ -260,18 +260,18 @@ pub(crate) struct ResolveCtx<'a> {
 }
 
 /// The policy for one round member's mutation decision on a staged leaf state.
-/// Resolver implementations own the acquire, write-back, release, and
+/// Policy implementations own the acquire, write-back, release, and
 /// direct-commit decisions; the coordinator
 /// owns the ordering, admission, and recovery contract they share (ADR-028).
 #[async_trait]
-pub(crate) trait LeafResolver: Send + Sync {
-    /// Lets a resolver retain evidence from the leaf exactly as loaded, before
+pub(crate) trait MemberPolicy: Send + Sync {
+    /// Lets a policy retain evidence from the leaf exactly as loaded, before
     /// any earlier-ordered member stages over it. Direct commit uses this to
-    /// remember an exact own marker; other resolvers need no initial leaf state.
+    /// remember an exact own marker; other policies need no initial leaf state.
     fn observe_loaded(&self, _entries: &BTreeMap<Vec<u8>, LeafEntry>) {}
 
     /// Resolves this member against entries and node locks as currently staged
-    /// this round. Resolvers cannot mutate node topology.
+    /// this round. Policies cannot mutate node topology.
     ///
     /// Use `ctx.requirement` for dependent object reads. The leaf state can
     /// predate that bound; the coordinator confirms it by CAS or a currentness
@@ -279,7 +279,7 @@ pub(crate) trait LeafResolver: Send + Sync {
     /// resolution. Retained facts must remain valid when a plan is discarded.
     ///
     /// When `ctx.cause` carries unresolved uncertainty, returning `InDoubt`
-    /// preserves it. Any other decision certifies that the resolver reconciled
+    /// preserves it. Any other decision certifies that the policy reconciled
     /// the earlier CAS; in particular, a new stage must already be safe to
     /// apply zero or one additional time. That reconciliation must remain valid
     /// even if this plan is discarded or its CAS is rejected.
@@ -298,7 +298,7 @@ pub(crate) trait LeafResolver: Send + Sync {
 
     /// The outcome delivered when this round cannot produce a definitive
     /// result. `in_doubt` reports whether a CAS carrying *this member's* stage
-    /// may have landed, so a non-idempotent resolver cannot downgrade
+    /// may have landed, so a non-idempotent policy cannot downgrade
     /// uncertainty while ending the round.
     fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome;
 
@@ -308,10 +308,10 @@ pub(crate) trait LeafResolver: Send + Sync {
     }
 
     /// The outcome delivered when a peer already reserved one of this member's
-    /// [`publication_keys`](LeafResolver::publication_keys) as a direct
+    /// [`publication_keys`](MemberPolicy::publication_keys) as a direct
     /// publication this round, so this member staged nothing. Distinct
     /// from exhaustion: the peer's reservation proves this member staged nothing,
-    /// which a spent CAS budget does not, so a resolver may treat it as a
+    /// which a spent CAS budget does not, so a policy may treat it as a
     /// certified loss rather than an unknown one (ADR-053). `in_doubt` still
     /// reports whether an *earlier* attempt of this round carried this member's
     /// own stage.
@@ -322,7 +322,7 @@ pub(crate) trait LeafResolver: Send + Sync {
     /// The raw keys defining this member's leaf-local scope. The coordinator
     /// verifies that the loaded leaf still covers every key before evaluation
     /// (ADR-031). This includes read-only dependencies when their placement
-    /// matters. A resolver whose decision is valid for the leaf as a whole may
+    /// matters. A policy whose decision is valid for the leaf as a whole may
     /// leave the scope empty.
     fn leaf_scope_keys(&self) -> Vec<&[u8]> {
         Vec::new()
@@ -336,7 +336,7 @@ pub(crate) trait LeafResolver: Send + Sync {
         self.direct_publication_keys()
     }
 
-    /// The [`publication_keys`](LeafResolver::publication_keys) this member
+    /// The [`publication_keys`](MemberPolicy::publication_keys) this member
     /// uses direct commit (ADR-051): their leaf state is the commit's only durable
     /// record, so no later publisher may stage over them in the same CAS. The
     /// coordinator lets at most one member stage per key per round and tells the
@@ -351,9 +351,9 @@ pub(crate) trait LeafResolver: Send + Sync {
 /// One complete operation submitted to the shared leaf-mutation engine.
 ///
 /// The operation owns its target, transaction identity, freshness requirement,
-/// resolver policy, and typed result. The coordinator runs the shared mutation
+/// member policy, and typed result. The coordinator runs the shared mutation
 /// mechanism and returns the raw round result to the operation for translation.
-pub(crate) trait LeafOperation: LeafResolver {
+pub(crate) trait LeafOperation: MemberPolicy {
     /// The result vocabulary exposed to this operation's caller.
     type Output;
 
@@ -371,11 +371,11 @@ pub(crate) trait LeafOperation: LeafResolver {
     fn complete(&self, outcome: Option<CoordinatedOutcome>) -> Result<Self::Output, TransError>;
 }
 
-/// One transaction's participation in a leaf CAS batch: its installed resolver
+/// One transaction's participation in a leaf CAS batch: its installed policy
 /// and where to deliver its outcome.
 #[derive(Clone)]
 struct LeafMember {
-    resolver: Arc<dyn LeafResolver>,
+    policy: Arc<dyn MemberPolicy>,
     slot: OutcomeSlot,
 }
 
@@ -387,7 +387,7 @@ struct LeafMember {
 /// The leaf is identified by its object `path` — the tree root `_r` for a
 /// small collection's single leaf, else a standalone node `_n`, resolved by
 /// descent. `members` maps each contending transaction to its installed
-/// resolver and outcome slot. `requirement` combines the members' bounds for
+/// policy and outcome slot. `requirement` combines the members' bounds for
 /// dependent reads and completion checks. The first attempt can reuse any
 /// cached leaf as a CAS precondition. Failed mutations invalidate their seed;
 /// retries retain the requirement and use the winner or newer shared knowledge
@@ -405,10 +405,10 @@ impl MergeRequest for CasReq {
         // at once — e.g. GC releasing a presumed-dead transaction's holds
         // (ADR-029) while that transaction's own acquire is still resolving on
         // the same object (ADR-025). Each submission carries its own outcome
-        // slot, but a coordinator round runs at most one resolver per transaction identity
+        // slot, but a coordinator round runs at most one policy per transaction identity
         // and the dedup delivers to *every* merged submission. Merging two
         // submissions that share an id would collapse them to a single map
-        // entry — silently dropping one submission's resolver and its outcome
+        // entry — silently dropping one submission's policy and its outcome
         // slot, leaving that caller a delivered-but-empty slot. Decline the
         // merge on any id overlap so the colliding submission runs in its own
         // subsequent round instead.
@@ -436,7 +436,7 @@ impl MergeRequest for CasReq {
         // instead of FIFO-blocking behind an unrelated writer (ADR-026); an
         // exclusive acquire / direct commit keeps FIFO order. A pure scheduling
         // hint — merging itself no longer depends on it.
-        self.members.values().all(|m| m.resolver.reorderable())
+        self.members.values().all(|m| m.policy.reorderable())
     }
 }
 
@@ -567,7 +567,7 @@ impl CasWorker {
         // member evaluation order. Give every member a chance to retain it before a
         // preceding publisher can replace the corresponding entry in memory.
         for member in members.values() {
-            member.resolver.observe_loaded(&plan.entries);
+            member.policy.observe_loaded(&plan.entries);
         }
         // A direct-commit stage is its commit's only evidence, so another member may
         // not overwrite it before the shared CAS (ADR-051).
@@ -588,34 +588,34 @@ impl CasWorker {
             };
 
             let needs_reroute = member
-                .resolver
+                .policy
                 .leaf_scope_keys()
                 .iter()
                 .any(|&key| !edit.covers(key));
             if needs_reroute {
                 plan.members.push(PlannedMember {
                     id: tx.clone(),
-                    outcome: member.resolver.reroute_outcome(member_in_doubt),
+                    outcome: member.policy.reroute_outcome(member_in_doubt),
                     participation: Participation::Skipped,
                 });
                 continue;
             }
             let protected_marker_conflict = member
-                .resolver
+                .policy
                 .publication_keys()
                 .iter()
                 .any(|&key| protected_markers.contains(key));
             if protected_marker_conflict {
                 plan.members.push(PlannedMember {
                     id: tx.clone(),
-                    outcome: member.resolver.excluded_outcome(member_in_doubt),
+                    outcome: member.policy.excluded_outcome(member_in_doubt),
                     participation: Participation::Skipped,
                 });
                 continue;
             }
 
             let step = member
-                .resolver
+                .policy
                 .resolve(&ctx, &plan.entries, &plan.locks)
                 .await?;
             if member_in_doubt && !matches!(step.outcome(), MemberOutcome::InDoubt(_)) {
@@ -638,7 +638,7 @@ impl CasWorker {
                     match self.capacity_decision(
                         path,
                         edit,
-                        member.resolver.as_ref(),
+                        member.policy.as_ref(),
                         member_in_doubt,
                         &plan.entries,
                         proposed,
@@ -649,7 +649,7 @@ impl CasWorker {
                             }
                             protected_markers.extend(
                                 member
-                                    .resolver
+                                    .policy
                                     .direct_publication_keys()
                                     .into_iter()
                                     .map(<[u8]>::to_vec),
@@ -674,7 +674,7 @@ impl CasWorker {
                     if matches!(&outcome, MemberOutcome::Landed) {
                         protected_markers.extend(
                             member
-                                .resolver
+                                .policy
                                 .direct_publication_keys()
                                 .into_iter()
                                 .map(<[u8]>::to_vec),
@@ -696,7 +696,7 @@ impl CasWorker {
         &self,
         path: &ObjectPath,
         edit: &LeafEdit,
-        resolver: &dyn LeafResolver,
+        policy: &dyn MemberPolicy,
         in_doubt: bool,
         entries: &BTreeMap<Vec<u8>, LeafEntry>,
         proposed: ProposedStage,
@@ -743,7 +743,7 @@ impl CasWorker {
         let outcome = if proposed.admission == StageAdmission::AddsKey {
             MemberOutcome::LeafFull
         } else if in_doubt {
-            resolver.exhausted_outcome(true)
+            policy.exhausted_outcome(true)
         } else {
             MemberOutcome::Conflict
         };
@@ -823,11 +823,11 @@ impl CasWorker {
         // that require bounded evidence before completion.
         rt::yield_now().await;
         let mut backoff = self.core.retry.backoff();
-        // Resolvers must distinguish the first attempt from recovery after a CAS
+        // Policies must distinguish the first attempt from recovery after a CAS
         // failure or a stale transaction dependency.
         let mut reloaded = false;
         // The members whose changes rode a CAS that came back in-doubt. For them
-        // in-doubt is *sticky* across planning retries until their resolver returns a
+        // in-doubt is *sticky* across planning retries until their policy returns a
         // reconciled, non-InDoubt decision: that write may have landed durably
         // (and been help-forwarded to a peer), so a later rejected CAS must
         // not downgrade the in-doubt outcome to a definitive loss. Commit-install
@@ -840,7 +840,7 @@ impl CasWorker {
         // the batch afterwards — definitively did not land, and inheriting the
         // batch's in-doubt outcome would strand it over a write it never made.
         let mut in_doubt: BTreeSet<TxId> = BTreeSet::new();
-        // Retain both submitted and resolver-requested bounds across retries.
+        // Retain both submitted and policy-requested bounds across retries.
         // ANY seeds need no preliminary check when a CAS confirms their state.
         let mut load_requirement = Requirement::ANY;
         for attempt in 0..CAS_RETRIES {
@@ -861,13 +861,13 @@ impl CasWorker {
             let edit = match loaded {
                 Ok(loaded) => loaded.into_edit(),
                 // A root split can turn the routed root leaf into an index
-                // between grouping and this load. Deliver each resolver's
+                // between grouping and this load. Deliver each policy's
                 // reroute outcome so its caller rebuilds the current leaf set.
                 Err(StorageError::Precondition) => {
                     let members = leaf_members(batch);
                     for (tx, member) in &members {
                         *member.slot.lock().unwrap() = Some(CoordinatedOutcome {
-                            outcome: member.resolver.reroute_outcome(in_doubt.contains(tx)),
+                            outcome: member.policy.reroute_outcome(in_doubt.contains(tx)),
                             evidence: None,
                         });
                     }
@@ -950,12 +950,12 @@ impl CasWorker {
             return Ok(());
         }
         // Bounded CAS budget exhausted under churn: each member gets its
-        // resolver's exhaustion outcome. Acquirers conflict and release/re-lock;
+        // policy's exhaustion outcome. Acquirers conflict and release/re-lock;
         // write-backs re-descend and releases re-submit, because exhaustion does
         // not prove convergence.
         for (tx, m) in &leaf_members(batch) {
             *m.slot.lock().unwrap() = Some(CoordinatedOutcome {
-                outcome: m.resolver.exhausted_outcome(in_doubt.contains(tx)),
+                outcome: m.policy.exhausted_outcome(in_doubt.contains(tx)),
                 evidence: None,
             });
         }
@@ -1041,14 +1041,14 @@ impl LeafCoordinator {
     {
         let operation = Arc::new(operation);
         let requirement = operation.requirement();
-        let resolver: Arc<dyn LeafResolver> = operation.clone();
+        let policy: Arc<dyn MemberPolicy> = operation.clone();
         let outcome = self
-            .submit_leaf(operation.path(), operation.id(), resolver, requirement)
+            .submit_leaf(operation.path(), operation.id(), policy, requirement)
             .await?;
         operation.complete(outcome)
     }
 
-    /// Submits one operation's resolver through the [`Dedup`] and awaits its
+    /// Submits one operation's policy through the [`Dedup`] and awaits its
     /// single-round [`CoordinatedOutcome`]. The worker merges it into any
     /// in-flight round for the leaf, evaluates it, retries CAS contention / in-doubt
     /// internally, and deposits the policy outcome plus its physical evidence
@@ -1069,7 +1069,7 @@ impl LeafCoordinator {
         &self,
         path: &ObjectPath,
         id: &TxId,
-        resolver: Arc<dyn LeafResolver>,
+        policy: Arc<dyn MemberPolicy>,
         requirement: Requirement,
     ) -> Result<Option<CoordinatedOutcome>, TransError> {
         let slot: OutcomeSlot = Arc::new(Mutex::new(None));
@@ -1077,7 +1077,7 @@ impl LeafCoordinator {
         members.insert(
             id.clone(),
             LeafMember {
-                resolver,
+                policy,
                 slot: slot.clone(),
             },
         );
@@ -1330,7 +1330,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl LeafResolver for StageLock {
+    impl MemberPolicy for StageLock {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
@@ -1405,7 +1405,7 @@ mod tests {
     struct SkipRelease;
 
     #[async_trait::async_trait]
-    impl LeafResolver for SkipRelease {
+    impl MemberPolicy for SkipRelease {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
@@ -1432,17 +1432,17 @@ mod tests {
 
     // Each member records its id and the previously staged keys so tests can
     // check evaluation order and which admitted changes later members observe.
-    type ResolverTrace = Arc<Mutex<Vec<(TxId, Vec<Vec<u8>>)>>>;
+    type PolicyTrace = Arc<Mutex<Vec<(TxId, Vec<Vec<u8>>)>>>;
 
     // Retains the state seen during evaluation to check ordered staging.
     struct Recorder {
         key: Vec<u8>,
         tx: TxId,
-        trace: ResolverTrace,
+        trace: PolicyTrace,
     }
 
     #[async_trait::async_trait]
-    impl LeafResolver for Recorder {
+    impl MemberPolicy for Recorder {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
@@ -1473,7 +1473,7 @@ mod tests {
         }
     }
 
-    // A resolver whose outcome exposes the state used for its decision.
+    // A policy whose outcome exposes the state used for its decision.
     struct RequirementProbe {
         tx: TxId,
         stage_until_present: bool,
@@ -1482,7 +1482,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl LeafResolver for RequirementProbe {
+    impl MemberPolicy for RequirementProbe {
         async fn resolve(
             &self,
             ctx: &ResolveCtx<'_>,
@@ -1759,7 +1759,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl LeafResolver for ValidateOnce {
+    impl MemberPolicy for ValidateOnce {
         async fn resolve(
             &self,
             ctx: &ResolveCtx<'_>,
@@ -1787,12 +1787,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_any_joiner_preserves_a_resolvers_retry_requirement() {
+    async fn an_any_joiner_preserves_a_policy_retry_requirement() {
         let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
         let recorder = RecordingBackend::new(hooks.clone());
         let operations = recorder.log();
         let (coord, _, timeline, _bg) = coord_over_fast(Arc::new(recorder)).await;
-        let resolver = Arc::new(ValidateOnce {
+        let policy = Arc::new(ValidateOnce {
             timeline,
             requested: Mutex::new(None),
         });
@@ -1800,20 +1800,20 @@ mod tests {
         operations.lock().unwrap().clear();
         let driver = tokio::spawn({
             let coord = coord.clone();
-            let resolver = resolver.clone();
+            let policy = policy.clone();
             async move {
                 coord
                     .submit_leaf(
                         &leaf(),
                         &TxId::with_priority(1, b"driver"),
-                        resolver,
+                        policy,
                         Requirement::ANY,
                     )
                     .await
             }
         });
         entered.notified().await;
-        let requirement = resolver.requested.lock().unwrap().unwrap();
+        let requirement = policy.requested.lock().unwrap().unwrap();
         let requirements = Arc::new(Mutex::new(Vec::new()));
         let joiner = tokio::spawn({
             let coord = coord.clone();
@@ -2218,7 +2218,7 @@ mod tests {
             )
             .await
             .unwrap();
-        // Re-route: the acquire-shaped resolver's exhausted/re-route outcome is a
+        // Re-route: the acquire-shaped policy's exhausted/re-route outcome is a
         // `Conflict`, which its caller turns into release-and-relock.
         assert!(matches!(
             out,
@@ -2281,7 +2281,7 @@ mod tests {
         );
     }
 
-    // A resolver that stages nothing (`Skip`) still gets its outcome and the
+    // A policy that stages nothing (`Skip`) still gets its outcome and the
     // loaded observation, but the round issues no CAS.
     #[tokio::test]
     async fn leaf_skip_delivers_outcome_without_cas() {
@@ -2492,7 +2492,7 @@ mod tests {
         let (coord, _nodes, _timeline, _bg) = coord_over(recorder as Arc<dyn Backend>).await;
         log.lock().unwrap().clear();
 
-        let trace: ResolverTrace = Arc::new(Mutex::new(Vec::new()));
+        let trace: PolicyTrace = Arc::new(Mutex::new(Vec::new()));
         let old = TxId::with_priority(1, b"old");
         let young = TxId::with_priority(2, b"young");
 
@@ -2552,7 +2552,7 @@ mod tests {
         coord.close().await;
 
         let trace = trace.lock().unwrap();
-        assert_eq!(trace.len(), 2, "both resolvers are evaluated once");
+        assert_eq!(trace.len(), 2, "both policies are evaluated once");
         assert_eq!(trace[0].0, old, "the older member is evaluated first");
         assert_eq!(trace[1].0, young);
         assert!(
@@ -2629,7 +2629,7 @@ mod tests {
         );
     }
 
-    // A direct-commit-shaped resolver (ADR-051): the entry it stages is
+    // A direct-commit-shaped policy (ADR-051): the entry it stages is
     // the only record of its commit, so it reserves its key for the round and
     // classifies an unfinished round the way `DirectCommitOperation` does — the
     // outcome stays in doubt only if its own stage rode a CAS that may have
@@ -2662,7 +2662,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl LeafResolver for DirectCommitProbe {
+    impl MemberPolicy for DirectCommitProbe {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
@@ -2746,7 +2746,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl LeafResolver for MultiPublisherProbe {
+    impl MemberPolicy for MultiPublisherProbe {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
@@ -3037,7 +3037,7 @@ mod tests {
     struct SkipCauseProbe;
 
     #[async_trait::async_trait]
-    impl LeafResolver for SkipCauseProbe {
+    impl MemberPolicy for SkipCauseProbe {
         async fn resolve(
             &self,
             ctx: &ResolveCtx<'_>,
@@ -3261,7 +3261,7 @@ mod tests {
     // two operations in flight on the same leaf at once — GC releasing a
     // presumed-dead transaction's holds (ADR-029) while that transaction's own
     // acquire is still resolving on the same object (ADR-025). Both submissions
-    // carry their own outcome slot, but a coordinator round runs one resolver per id and
+    // carry their own outcome slot, but a coordinator round runs one policy per id and
     // the dedup delivers to every merged submission; merging them would collapse
     // the two slots into one and leave the loser a delivered-but-empty slot. The
     // coordinator must instead serialize same-identity submissions into separate rounds
@@ -3448,7 +3448,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl LeafResolver for StageInline {
+    impl MemberPolicy for StageInline {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
@@ -3605,7 +3605,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl LeafResolver for CapacityAfterInDoubt {
+    impl MemberPolicy for CapacityAfterInDoubt {
         async fn resolve(
             &self,
             ctx: &ResolveCtx<'_>,
@@ -3873,7 +3873,7 @@ mod tests {
         backend
     }
 
-    // A commit-shaped resolver that stages once, then refuses to restage until
+    // A commit-shaped policy that stages once, then refuses to restage until
     // its in-doubt CAS can be reconciled. Records the later evaluation's cause so
     // tests can pin the coordinator's sticky attribution.
     struct StickyCommitProbe {
@@ -3884,7 +3884,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl LeafResolver for StickyCommitProbe {
+    impl MemberPolicy for StickyCommitProbe {
         async fn resolve(
             &self,
             ctx: &ResolveCtx<'_>,
@@ -4031,7 +4031,7 @@ mod tests {
         coord.close().await;
     }
 
-    // An idempotent resolver that can safely acknowledge uncertainty by
+    // An idempotent policy that can safely acknowledge uncertainty by
     // proposing the same state again.
     struct AlwaysStageProbe {
         key: Vec<u8>,
@@ -4039,7 +4039,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl LeafResolver for AlwaysStageProbe {
+    impl MemberPolicy for AlwaysStageProbe {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
@@ -4075,7 +4075,7 @@ mod tests {
     }
 
     // The first CAS becomes in-doubt and every subsequent CAS misses, driving
-    // the coordinator through its exhaustion exit rather than a resolver exit.
+    // the coordinator through its exhaustion exit rather than a policy exit.
     fn in_doubt_then_miss_forever(inner: Arc<dyn Backend>) -> Arc<HookBackend> {
         let backend = HookBackend::new(inner);
         let leaf_cas = Arc::new(std::sync::atomic::AtomicUsize::new(0));

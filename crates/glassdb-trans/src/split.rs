@@ -74,7 +74,7 @@ use crate::node_locking::{
 };
 
 use recovery::{
-    PreparedIntent, PreparedIntentCleanup, ReadyIntent, ReadyIntentCompletion,
+    PreparedIntent, PreparedIntentCancellation, ReadyIntent, ReadyIntentCompletion,
     ReadyIntentTransition, RecoveryAction, RecoveryStep, StructuralRecovery,
 };
 
@@ -902,7 +902,7 @@ impl<'a> StructuralSplitAttempt<'a> {
             .recovery
             .prepare_intent(self.collection, self.target.source_token(), participant)
             .await?;
-        let cleanup = prepared.cleanup_witness();
+        let cancellation = prepared.cancellation_witness();
         let outcome = match topology {
             StructuralSplitTopology::Owned => {
                 match self
@@ -916,7 +916,7 @@ impl<'a> StructuralSplitAttempt<'a> {
             }
             StructuralSplitTopology::Joined(_) => self.coordinate(prepared).await,
         };
-        self.finish(outcome, &cleanup, topology).await
+        self.finish(outcome, &cancellation, topology).await
     }
 
     async fn coordinate(&self, prepared: PreparedIntent) -> SplitAttemptOutcome {
@@ -943,7 +943,7 @@ impl<'a> StructuralSplitAttempt<'a> {
     async fn finish(
         &self,
         outcome: SplitAttemptOutcome,
-        prepared: &PreparedIntentCleanup,
+        prepared: &PreparedIntentCancellation,
         topology: StructuralSplitTopology<'_>,
     ) -> Result<(), TransError> {
         let SplitAttemptOutcome { result, state } = outcome;
@@ -1205,7 +1205,7 @@ pub struct Splitter {
     structural_nodes: StructuralNodeAccess,
     timeline: Timeline,
     // The candidate feed this splitter drains. The coordinator receives a
-    // clone for stored-leaf capacity; direct resolvers receive lightweight hint
+    // clone for stored-leaf capacity; direct-commit policies receive lightweight hint
     // sinks for inline-pressure observations.
     candidates: SplitCandidates,
     publisher: SeparatorPublisher,

@@ -16,9 +16,9 @@ control state.
 
 Parallel lock acquisition can deadlock between equal-priority transactions.
 [ADR-024](024-hold-and-wait-conflict-resolution.md) breaks the cycle with a
-deadlock timeout and the sorted serial lock order. Its rule is: release the
-out-of-order locks, then acquire again in ascending leaf-path order under the
-same transaction identity. The serial order gives progress only if no
+deadlock timeout and the sorted order of serial acquisition. Its rule is:
+release the out-of-order locks, then acquire again in ascending leaf-path order
+under the same transaction identity. The serial order gives progress only if no
 contender holds a lock out of that order.
 
 The release step cannot keep that promise. The timeout drops the acquisition
@@ -73,10 +73,11 @@ transition alone never causes one.
 
 The sorted serial mechanism itself does not change. It visits current groups one
 at a time in ascending leaf-path order, has one incomplete leaf operation at a
-time, and arms no timeout. A commit pass that starts directly in serial mode holds
-no parallel locks under its current identity and needs no transition. A later
-serial conflict or capacity failure keeps its sorted prefix locks and retries
-under the same identity, because it is already inside the serial mechanism.
+time, and arms no timeout. A commit pass that starts directly with serial
+acquisition holds no parallel locks under its current identity and needs no
+transition. A later serial conflict or capacity failure keeps its sorted prefix
+locks and retries under the same identity, because it is already inside the
+serial mechanism.
 
 ## Consequences
 

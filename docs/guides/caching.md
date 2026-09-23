@@ -305,8 +305,8 @@ The coordinator owns batch-member participation:
   complete a staged member.
 
 A skipped member's loaded observation is not always sufficient to prove its
-outcome. A resolver can skip because an earlier member has already staged the
-required change; for example, a release can skip after an earlier acquire
+outcome. A member policy can skip because an earlier member has already staged
+the required change; for example, a release can skip after an earlier acquire
 removed its holder with a final status in the staged leaf. Such a result must
 wait for the plan's CAS to succeed. A rejected CAS or in-doubt result must cause
 a reload and a new mutation plan before completion.
@@ -320,9 +320,9 @@ operation.
 
 Each attempt takes its members and their combined requirement from one merged
 request after the leaf load. Members that join during that load can strengthen
-the requirement, and resolver-requested bounds remain in force across retries.
-A resolver's requirement applies to dependent object reads; it does not guarantee
-that the loaded or staged leaf already satisfies the bound.
+the requirement, and policy-requested bounds remain in force across retries. A
+member policy's requirement applies to dependent object reads; it does not
+guarantee that the loaded or staged leaf already satisfies the bound.
 
 The first leaf load uses `ANY` as a speculative CAS precondition, including for
 lock acquisition. This does not weaken the submitted requirement. Retries load
@@ -336,9 +336,10 @@ the exact loaded state: sufficient evidence costs no I/O, an unchanged backend
 state advances the original observation, and a changed state requires a reload
 and a new plan. Do not return an old decision with evidence for a different
 state. A leaf CAS cannot repair dependent reads made with a weaker requirement.
-Resolvers may retain only facts that remain valid when a plan is discarded;
-this also applies to reconciliation of an earlier in-doubt CAS. An exact
-historical own marker can prove that a mutation landed; a staged proposal cannot.
+Member policies may retain only facts that remain valid when a plan is
+discarded; this also applies to reconciliation of an earlier in-doubt CAS. An
+exact historical own marker can prove that a mutation landed; a staged proposal
+cannot.
 
 Acquisition still uses the validation barrier to find current scan coverage and
 to resolve transaction dependencies. Point and scan validation after locking

@@ -99,7 +99,7 @@ impl TxId {
     /// tiebreak would let two equal-timestamp transactions flip their relative
     /// order on each wound and livelock by wounding each other forever.
     /// Transactions sharing a timestamp are therefore never ordered against each
-    /// other; that rare tie is left to the serial-locking deadlock safety net.
+    /// other; that rare tie is left to the serial-acquisition deadlock safety net.
     pub fn older(&self, other: &TxId) -> bool {
         self.priority() < other.priority()
     }

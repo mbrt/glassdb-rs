@@ -10,7 +10,7 @@ use super::super::tests::{
 use super::super::*;
 use super::*;
 use crate::key_state_resolver::KeyStateResolver;
-use crate::leaf_coord::{LeafResolver, MemberOutcome, ReloadCause, ResolveCtx, Step};
+use crate::leaf_coord::{MemberOutcome, MemberPolicy, ReloadCause, ResolveCtx, Step};
 use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend};
 use glassdb_backend::{Backend, memory::MemoryBackend};
 use glassdb_data::{CollectionAddress, CollectionId, NodeToken};
@@ -19,9 +19,9 @@ use glassdb_storage::{
     CollectionRecord, CurrentState, IndexNode, LeafBody, LeafEntry, Node, NodeLocks,
 };
 
-/// Evaluates one resolver and retains its proposed decision.
+/// Evaluates one policy and retains its proposed decision.
 async fn resolve_step(
-    resolver: &dyn LeafResolver,
+    policy: &dyn MemberPolicy,
     tctx: &Tctx,
     cause: ReloadCause,
     staged: &BTreeMap<Vec<u8>, LeafEntry>,
@@ -34,23 +34,23 @@ async fn resolve_step(
         requirement: Requirement::ANY,
         cause,
     };
-    resolver.resolve(&ctx, staged, locks).await.unwrap()
+    policy.resolve(&ctx, staged, locks).await.unwrap()
 }
 
 /// Classifies a direct-commit outcome for a chosen leaf state and reload cause.
 async fn resolve_outcome(
-    resolver: &dyn LeafResolver,
+    policy: &dyn MemberPolicy,
     tctx: &Tctx,
     cause: ReloadCause,
     staged: &BTreeMap<Vec<u8>, LeafEntry>,
     locks: &NodeLocks,
 ) -> MemberOutcome {
-    match resolve_step(resolver, tctx, cause, staged, locks).await {
+    match resolve_step(policy, tctx, cause, staged, locks).await {
         Step::Skip { outcome } | Step::Stage { outcome, .. } => outcome,
     }
 }
 
-fn put_resolver(
+fn put_policy(
     tm: &Algo,
     id: TxId,
     key: LogicalKey,
@@ -96,12 +96,12 @@ async fn membership_generation(tctx: &Tctx) -> u64 {
 // superseded by *another instance* is caught with a transparent body replay, never
 // a surfaced error, and never commits its stale value. This database instance's cached
 // snapshot predates the peer's create, so the key reads as absent — an
-// unsupported shape rather than a certified stale read, which is why the
+// unsupported shape rather than a certified invalidated read, which is why the
 // locked commit takes over instead of replaying the body (ADR-053). It resolves
 // as `Wounded` or `Retry` depending on whether the snapshot survived to the
-// commit resolver evaluation; both converge on a fresh read.
+// direct-commit policy evaluation; both converge on a fresh read.
 #[tokio::test]
-async fn single_rw_stale_read_renews_and_converges() {
+async fn single_rw_invalidated_read_renews_and_converges() {
     let (tm, tctx) = new_algo().await;
     let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
     let keyp = logical_key(b"k");
@@ -556,7 +556,7 @@ async fn a_blind_put_over_the_inline_budget_uses_a_locked_commit() {
 // committed holder as effectively unlocked — help-forwarding it as the
 // predecessor — and stay on direct commit, rather than bailing to
 // locked commit on the mere presence of the lock (the measured regression).
-// A stale read replays instead.
+// An invalidated read replays instead.
 #[tokio::test]
 async fn a_committed_holder_keeps_the_next_writer_on_direct_commit() {
     let (tm, tctx) = new_algo().await;
@@ -728,7 +728,7 @@ async fn direct_commit_replaces_a_committed_holder() {
     assert_eq!(&*value.value, b"v3");
 }
 
-// ADR-051 regression: every reason a resolver declines to publish the commit
+// ADR-051 regression: every reason a policy declines to publish the commit
 // marker must be classified against the round's in-doubt evidence, not just
 // the lost-race one. A structural gate or a drop intent that
 // appears *after* an in-doubt CAS is no proof that the CAS did not land, so
@@ -741,7 +741,7 @@ async fn direct_commit_blocked_after_in_doubt_cas_stays_in_doubt() {
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
 
     let seed = entry(&tctx, b"k").await.unwrap();
-    let resolver = put_resolver(
+    let policy = put_policy(
         &tm,
         TxId::with_priority(2, b"direct"),
         keyp.clone(),
@@ -757,14 +757,14 @@ async fn direct_commit_blocked_after_in_doubt_cas_stays_in_doubt() {
 
     for (what, locks) in [("a structural gate", &gated), ("a drop intent", &fenced)] {
         // Nothing was written yet, so locked commit may take over.
-        let outcome = resolve_outcome(&resolver, &tctx, ReloadCause::Fresh, &staged, locks).await;
+        let outcome = resolve_outcome(&policy, &tctx, ReloadCause::Fresh, &staged, locks).await;
         assert!(
             matches!(outcome, MemberOutcome::Moved),
             "{what} on a first evaluation proves nothing was written, got {outcome:?}"
         );
 
         let outcome = resolve_outcome(
-            &resolver,
+            &policy,
             &tctx,
             ReloadCause::Reloaded { in_doubt: true },
             &staged,
@@ -783,7 +783,7 @@ async fn direct_membership_change_neither_waits_for_nor_wounds_a_live_holder() {
     let (tm, tctx) = new_algo().await;
     let holder = TxId::with_priority(9, b"membership-holder");
     tctx.tmon.begin_tx(&holder);
-    let direct = put_resolver(
+    let direct = put_policy(
         &tm,
         TxId::with_priority(1, b"direct"),
         logical_key(b"new"),
@@ -806,7 +806,7 @@ async fn direct_membership_change_neither_waits_for_nor_wounds_a_live_holder() {
 #[tokio::test]
 async fn direct_commit_replays_an_absence_read_from_an_older_generation() {
     let (tm, tctx) = new_algo().await;
-    let direct = put_resolver(
+    let direct = put_policy(
         &tm,
         TxId::with_priority(1, b"direct"),
         logical_key(b"missing"),
@@ -838,7 +838,7 @@ async fn a_blind_put_after_an_in_doubt_cas_never_republishes_over_a_newer_writer
     let seed = entry(&tctx, b"k").await.unwrap();
     let locks = NodeLocks::default();
 
-    let blind = put_resolver(
+    let blind = put_policy(
         &tm,
         TxId::with_priority(9, b"blind"),
         keyp.clone(),
@@ -907,7 +907,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
         Vec::new(),
     ))
     .unwrap();
-    let resolver = DirectCommitOperation::new(
+    let policy = DirectCommitOperation::new(
         id.clone(),
         test_root_path(),
         member,
@@ -928,7 +928,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
     ]);
     assert!(matches!(
         resolve_step(
-            &resolver,
+            &policy,
             &tctx,
             ReloadCause::Fresh,
             &predecessors,
@@ -953,7 +953,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
     ]);
     assert!(matches!(
         resolve_step(
-            &resolver,
+            &policy,
             &tctx,
             ReloadCause::Reloaded { in_doubt: true },
             &recovered,
@@ -964,7 +964,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
             outcome: MemberOutcome::Landed
         }
     ));
-    assert!(resolver.proven_landed());
+    assert!(policy.proven_landed());
 }
 
 #[tokio::test]
@@ -977,7 +977,7 @@ async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
         Vec::new(),
     ))
     .unwrap();
-    let resolver = DirectCommitOperation::new(
+    let policy = DirectCommitOperation::new(
         id,
         test_root_path(),
         member,
@@ -987,7 +987,7 @@ async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
     let empty = BTreeMap::new();
     assert!(matches!(
         resolve_step(
-            &resolver,
+            &policy,
             &tctx,
             ReloadCause::Fresh,
             &empty,
@@ -998,7 +998,7 @@ async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
     ));
     assert!(matches!(
         resolve_step(
-            &resolver,
+            &policy,
             &tctx,
             ReloadCause::Reloaded { in_doubt: true },
             &empty,
@@ -1021,7 +1021,7 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
         Vec::new(),
     ))
     .unwrap();
-    let resolver = DirectCommitOperation::new(
+    let policy = DirectCommitOperation::new(
         id,
         test_root_path(),
         member,
@@ -1037,7 +1037,7 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
     )]);
     assert!(matches!(
         resolve_step(
-            &resolver,
+            &policy,
             &tctx,
             ReloadCause::Fresh,
             &unchanged,
@@ -1048,7 +1048,7 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
     ));
     assert!(matches!(
         resolve_step(
-            &resolver,
+            &policy,
             &tctx,
             ReloadCause::Reloaded { in_doubt: true },
             &unchanged,
@@ -1063,7 +1063,7 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
 }
 
 // ADR-053: only a *superseded read* certifies the body-replay case, and an
-// in-doubt CAS still outranks it. Every other way a resolver declines is either
+// in-doubt CAS still outranks it. Every other way a policy declines is either
 // state direct commit cannot arbitrate or evidence that proves nothing, so
 // it reports `Moved` and locked commit takes over. Classifying too
 // broadly would spin the body forever against a holder or a closed budget.
@@ -1078,7 +1078,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     let split_hints = tm.direct_commit.split_hints.clone();
 
     let direct = |read_writer: Option<TxId>| {
-        put_resolver(
+        put_policy(
             &tm,
             TxId::with_priority(9, b"direct"),
             keyp.clone(),
@@ -1147,7 +1147,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
         "a put over a tombstone is a direct create, got {outcome:?}"
     );
 
-    // Aggregate inline admission is owned by the direct resolver. Existing
+    // Aggregate inline admission is owned by the direct-commit policy. Existing
     // inline values consume the leaf budget, while this key's prior state
     // is replaced rather than double-counted.
     let mut budgeted = direct(Some(current.clone()));
@@ -1590,7 +1590,7 @@ async fn cross_key_aggregate_rejection_does_not_hint() {
         writes: 1,
         has_reads: true,
     };
-    let resolver = DirectCommitOperation::new(
+    let policy = DirectCommitOperation::new(
         TxId::with_priority(1, b"direct"),
         test_root_path(),
         member,
@@ -1610,7 +1610,7 @@ async fn cross_key_aggregate_rejection_does_not_hint() {
 
     assert!(matches!(
         resolve_step(
-            &resolver,
+            &policy,
             &tctx,
             ReloadCause::Fresh,
             &staged,
@@ -1929,7 +1929,7 @@ async fn an_absence_read_uses_locked_write_back_for_a_membership_writer_with_fin
         .unwrap();
     let mut locks = NodeLocks::default();
     locks.set_membership_writer(holder);
-    let mut direct = put_resolver(
+    let mut direct = put_policy(
         &tm,
         TxId::with_priority(2, b"direct"),
         logical_key(b"missing"),

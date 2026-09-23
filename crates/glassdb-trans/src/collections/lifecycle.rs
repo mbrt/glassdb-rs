@@ -592,7 +592,7 @@ mod tests {
         )
     }
 
-    async fn refence_final_drop(status: TxCommitStatus, with_child: bool, cleanup_races: bool) {
+    async fn refence_final_drop(status: TxCommitStatus, with_child: bool, reclamation_races: bool) {
         let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
         let recorder = RecordingBackend::new(hooks.clone());
         let operations = recorder.log();
@@ -722,7 +722,7 @@ mod tests {
         }
         .to_string();
         let status_reads = AtomicUsize::new(0);
-        let cleanup_armed = AtomicBool::new(cleanup_races);
+        let reclamation_armed = AtomicBool::new(reclamation_races);
         let contested_path = paths.last().unwrap().to_string();
         hooks.set_before({
             let owner_lifecycle = owner_lifecycle.clone();
@@ -736,9 +736,9 @@ mod tests {
                     BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
                 ) && op.path() == status_path;
                 let repeated = status_read && status_reads.fetch_add(1, Ordering::SeqCst) >= 7;
-                let cleanup = matches!(op, BackendOp::WriteIf { .. })
+                let reclamation = matches!(op, BackendOp::WriteIf { .. })
                     && op.path() == contested_path
-                    && cleanup_armed.swap(false, Ordering::SeqCst);
+                    && reclamation_armed.swap(false, Ordering::SeqCst);
                 let owner_lifecycle = owner_lifecycle.clone();
                 let owner_monitor = owner_monitor.clone();
                 let collection = collection.clone();
@@ -749,7 +749,7 @@ mod tests {
                             "drop-intent resolution made no progress",
                         ));
                     }
-                    if cleanup {
+                    if reclamation {
                         // Acknowledged owner release wins after the new drop
                         // selected its revision, so replacement must retry.
                         owner_monitor
@@ -791,7 +791,7 @@ mod tests {
                 .collect();
             let expected_calls: &[&str] = if status == TxCommitStatus::Committed {
                 &[]
-            } else if cleanup_races && path == contested_path {
+            } else if reclamation_races && path == contested_path {
                 &["read", "write_if", "read", "write_if"]
             } else {
                 &["read", "write_if"]

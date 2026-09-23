@@ -13,12 +13,12 @@ use integration_support::{
     incremented_value, init_db, mem, read_int, read_int_from_tx, rmw, write_int,
 };
 
-const STALE_BODY_PANIC: &str = "panic after observing a stale snapshot";
+const INVALIDATED_READ_PANIC: &str = "panic after observing an invalidated read";
 const RETAINED_LOCK_PANIC: &str = "panicking locked replay";
 const PREPARED_COLLECTION_PANIC: &str = "panic with a prepared collection";
 
-fn panic_after_stale_read() -> ! {
-    std::panic::panic_any(STALE_BODY_PANIC)
+fn panic_after_invalidated_read() -> ! {
+    std::panic::panic_any(INVALIDATED_READ_PANIC)
 }
 
 fn panic_during_locked_replay() -> ! {
@@ -102,10 +102,10 @@ async fn cancelled_tx_future_does_not_block_followups() {
 }
 
 /// A panic interrupts the transaction instead of returning a body outcome. Even
-/// if a read becomes stale, it escapes without validation or replay and all
+/// if a read is invalidated, it escapes without validation or replay and all
 /// body-local changes remain unpublished.
 #[tokio::test]
-async fn first_execution_stale_panic_discards_staged_data_and_catalog_changes() {
+async fn first_execution_invalidated_read_panic_discards_staged_data_and_catalog_changes() {
     let backend = mem();
     let setup = Database::open("example", backend.clone()).await.unwrap();
     let setup_coll = setup
@@ -136,7 +136,7 @@ async fn first_execution_stale_panic_discards_staged_data_and_catalog_changes() 
             tx.write(&temporary, b"staged", b"not-visible")?;
             invalidator_coll.write(b"guard", b"new").await?;
             invalidator.shutdown().await;
-            panic_after_stale_read();
+            panic_after_invalidated_read();
             #[allow(unreachable_code)]
             Ok::<(), Error>(())
         }
@@ -147,7 +147,7 @@ async fn first_execution_stale_panic_discards_staged_data_and_catalog_changes() 
     let payload = outcome.expect_err("the transaction body should propagate its panic");
     assert_eq!(
         payload.downcast_ref::<&'static str>(),
-        Some(&STALE_BODY_PANIC)
+        Some(&INVALIDATED_READ_PANIC)
     );
     assert_eq!(executions.load(Ordering::SeqCst), 1);
     assert_eq!(coll.read(b"staged").await.unwrap(), None);

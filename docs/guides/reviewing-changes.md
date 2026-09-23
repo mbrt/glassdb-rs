@@ -21,17 +21,17 @@ change affects and verify that the existing evidence guarantees still hold.
 The recurring question to ask of the diff is: **does each responsibility live
 with its rightful owner?**
 
-- Check that the *mechanism* (generic engines: dedup, resolver evaluation loops,
-  CAS/retry) stays free of *policy* (locking, wound-wait, commit, transaction
-  identities). Policy should live in the pluggable pieces owners install (e.g.
-  resolvers), not baked into the engine.
+- Check that the *mechanism* (generic engines: dedup, member policy evaluation
+  loops, CAS/retry) stays free of *policy* (locking, wound-wait, commit,
+  transaction identities). Policy should live in the pluggable pieces owners
+  install (e.g. member policies), not baked into the engine.
 - Flag it when an engine names a domain concept (`LockType`, wound-wait,
   membership, `TxCommitStatus`): the concept has likely leaked in from a caller
   and should move out.
 - Watch for **asymmetry**: when two similar things are handled differently (e.g.
-  leaves via installed resolvers but roots via engine-internal special-casing),
-  suspect that the odd one out has policy baked into the mechanism. Ask for them
-  to be made symmetric.
+  leaves via installed member policies but roots via engine-internal
+  special-casing), suspect that the odd one out has policy baked into the
+  mechanism. Ask for them to be made symmetric.
 
 ## Ownership of state and behavior
 

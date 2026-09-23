@@ -47,7 +47,7 @@ did per key; this ADR restores it at shard/root granularity.
 Route `Locker::lock_shard` and `Locker::lock_root` through a single
 `Dedup<CasReq, StorageError, CasWorker>` keyed on the **object path** (the shard
 or root path — the CAS unit). Everything above `lock_shard` / `lock_root`
-(`lock_shards`' parallel and serial modes, `lock`, the `LockedTx` handle,
+(`lock_shards`' parallel and serial acquisition, `lock`, the `LockedTx` handle,
 write-back, and `release_locks`) is unchanged: the deduplication lives strictly
 beneath the per-object lock step.
 

@@ -62,7 +62,7 @@ async fn handled_size_error_does_not_replace_a_staged_value() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn size_error_based_on_a_stale_read_replays_the_body() {
+async fn size_error_based_on_an_invalidated_read_replays_the_body() {
     let db = Database::builder("limits", MemoryBackend::new())
         .transaction_limits(TransactionLimits {
             max_value_bytes: 1,

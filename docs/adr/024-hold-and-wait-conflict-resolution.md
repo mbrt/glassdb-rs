@@ -21,8 +21,8 @@ locked and frozen, `Algo` re-resolves the read set's effective writers — reusi
 the optimistic validation routine — and a read whose value moved replays the body
 holding its locks (`TransError::Retry`) instead of releasing and renewing. Body
 replays are therefore limited to the two cases that prove they are needed: a
-**stale read**, and a **genuine wound** (a higher-priority peer aborted us, so our
-id is dead and must be renewed).
+**invalidated read**, and a **genuine wound** (a higher-priority peer aborted
+us, so our id is dead and must be renewed).
 
 It **supersedes the MVP-only deviations** of
 [ADR-020](020-commit-write-back-protocol.md) (§ "MVP realisation" and § "MVP vs.
@@ -128,13 +128,13 @@ locks and re-acquire under the same id after a backoff, escalating to the serial
 order if contention persists — so a lost race is no longer a renew-and-replay
 `Wounded`; it never discards the executed body.
 
-A **stale read** re-validates against the refreshed state holding the locks
-already taken (the dormant `ValidateRetry` path); only a read whose value actually
-moved forces a body replay, and even then under the same held locks rather than a
-released-and-renewed identity. This validation now lives in `Algo`, **after** every
-read is locked (so its value is frozen), reusing the same effective-writer check
-as optimistic validation (see the next section). This is the hold-and-retry that
-the MVP replaced with release-and-retry.
+A possibly **invalidated read** re-validates against the refreshed state holding
+the locks already taken (the dormant `ValidateRetry` path); only a read whose
+value actually moved forces a body replay, and even then under the same held
+locks rather than a released-and-renewed identity. This validation now lives in
+`Algo`, **after** every read is locked (so its value is frozen), reusing the
+same effective-writer check as optimistic validation (see the next section).
+This is the hold-and-retry that the MVP replaced with release-and-retry.
 
 ### Read-writer validation lives in `Algo`, after locking
 
@@ -154,9 +154,9 @@ compares it to the observed token, reusing the exact routine optimistic validati
 uses. A mismatch replays the body holding the locks (`Retry`). Because the
 moved key is itself locked during the replay, this restores v1's guarantee that
 the replay holds **all** its locks (the shard-CAS variant left the stale key
-unlocked). The locker no longer carries read tokens or returns a stale-read
-outcome — `LockOutcome` is just `Locked | Conflict` — so it is a pure locking
-mechanism and read validation exists in exactly one place.
+unlocked). The locker no longer carries read tokens or returns an
+invalidated-read outcome — `LockOutcome` is just `Locked | Conflict` — so it is
+a pure locking mechanism and read validation exists in exactly one place.
 
 Validating after locking is correct and is *not* a new TOCTOU window: a peer can
 only change a read key's effective writer by committing a write to it, which

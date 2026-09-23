@@ -1633,7 +1633,7 @@ async fn membership_only_gc_reuses_a_cached_holder_for_its_cas() {
 }
 
 #[derive(Clone, Copy)]
-enum DirectoryCleanup {
+enum DirectoryReclamation {
     StaleNoHolder,
     CachedHolder,
     ReadFailure,
@@ -1642,7 +1642,7 @@ enum DirectoryCleanup {
     CommittedHolder,
 }
 
-async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
+async fn reclaim_directory(typ: LockType, case: DirectoryReclamation) {
     use crate::collection_coordination::CollectionLocker;
     use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
 
@@ -1688,7 +1688,7 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
     operation.complete();
     if matches!(
         case,
-        DirectoryCleanup::CommittedReleased | DirectoryCleanup::CommittedHolder
+        DirectoryReclamation::CommittedReleased | DirectoryReclamation::CommittedHolder
     ) {
         let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
         record.locks = locks.clone();
@@ -1701,7 +1701,7 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
     }
     if matches!(
         case,
-        DirectoryCleanup::CachedHolder | DirectoryCleanup::CommittedHolder
+        DirectoryReclamation::CachedHolder | DirectoryReclamation::CommittedHolder
     ) {
         ctx.records
             .load_record(
@@ -1717,7 +1717,7 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
     .to_string();
     if matches!(
         case,
-        DirectoryCleanup::OwnerReleased | DirectoryCleanup::CommittedReleased
+        DirectoryReclamation::OwnerReleased | DirectoryReclamation::CommittedReleased
     ) {
         operations.lock().unwrap().clear();
         assert!(locker.release(&id, &locks, Requirement::ANY).await.unwrap());
@@ -1739,7 +1739,7 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
         .await
         .unwrap();
     let barrier = ctx.timeline.currentness_barrier();
-    if matches!(case, DirectoryCleanup::ReadFailure) {
+    if matches!(case, DirectoryReclamation::ReadFailure) {
         hooks.set_before({
             let path = path.clone();
             move |op| {
@@ -1786,11 +1786,11 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
         .map(|op| op.op)
         .collect();
     let expected: &[&str] = match case {
-        DirectoryCleanup::StaleNoHolder | DirectoryCleanup::ReadFailure => {
+        DirectoryReclamation::StaleNoHolder | DirectoryReclamation::ReadFailure => {
             &["read_if_modified", "write_if"]
         }
-        DirectoryCleanup::CachedHolder | DirectoryCleanup::CommittedHolder => &["write_if"],
-        DirectoryCleanup::OwnerReleased | DirectoryCleanup::CommittedReleased => {
+        DirectoryReclamation::CachedHolder | DirectoryReclamation::CommittedHolder => &["write_if"],
+        DirectoryReclamation::OwnerReleased | DirectoryReclamation::CommittedReleased => {
             &["read_if_modified"]
         }
     };
@@ -1799,18 +1799,18 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
 
 #[tokio::test]
 async fn aborted_directory_reader_gc_refreshes_a_cached_no_holder() {
-    reclaim_directory(LockType::Read, DirectoryCleanup::StaleNoHolder).await;
+    reclaim_directory(LockType::Read, DirectoryReclamation::StaleNoHolder).await;
 }
 
 #[tokio::test]
 async fn aborted_directory_writer_gc_refreshes_a_cached_no_holder() {
-    reclaim_directory(LockType::Write, DirectoryCleanup::StaleNoHolder).await;
+    reclaim_directory(LockType::Write, DirectoryReclamation::StaleNoHolder).await;
 }
 
 #[tokio::test]
 async fn directory_gc_reuses_a_cached_holder_for_its_cas() {
     for typ in [LockType::Read, LockType::Write] {
-        reclaim_directory(typ, DirectoryCleanup::CachedHolder).await;
+        reclaim_directory(typ, DirectoryReclamation::CachedHolder).await;
     }
 }
 
@@ -1934,7 +1934,7 @@ async fn committed_directory_gc_reuses_removal_after_cache_eviction() {
 #[tokio::test]
 async fn committed_directory_gc_needs_no_read_after_a_warm_removal() {
     for typ in [LockType::Read, LockType::Write] {
-        reclaim_directory(typ, DirectoryCleanup::CommittedHolder).await;
+        reclaim_directory(typ, DirectoryReclamation::CommittedHolder).await;
     }
 }
 
@@ -2350,15 +2350,15 @@ async fn live_values_skip_bounded_directory_completion() {
 
 #[tokio::test]
 async fn aborted_directory_gc_keeps_the_record_if_the_record_check_fails() {
-    reclaim_directory(LockType::Read, DirectoryCleanup::ReadFailure).await;
+    reclaim_directory(LockType::Read, DirectoryReclamation::ReadFailure).await;
 }
 
 #[tokio::test]
 async fn directory_gc_checks_owner_release_once() {
     for typ in [LockType::Read, LockType::Write] {
         for case in [
-            DirectoryCleanup::OwnerReleased,
-            DirectoryCleanup::CommittedReleased,
+            DirectoryReclamation::OwnerReleased,
+            DirectoryReclamation::CommittedReleased,
         ] {
             reclaim_directory(typ, case).await;
         }
@@ -2366,7 +2366,7 @@ async fn directory_gc_checks_owner_release_once() {
 }
 
 #[derive(Clone, Copy)]
-enum TopologyCleanup {
+enum TopologyReclamation {
     StaleNoParticipant,
     CachedParticipant,
     ReadFailure,
@@ -2374,7 +2374,7 @@ enum TopologyCleanup {
     DirectoryRemoved,
 }
 
-async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
+async fn reclaim_topology(committed: bool, case: TopologyReclamation) {
     use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
     use glassdb_data::{NodeToken, StructuralIntentId};
     use glassdb_storage::{StructuralIntent, StructuralIntentPhase};
@@ -2394,7 +2394,7 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
     let mut locks = vec![TxLock::TopologyParticipant {
         collection: collection(),
     }];
-    if matches!(case, TopologyCleanup::DirectoryRemoved) {
+    if matches!(case, TopologyReclamation::DirectoryRemoved) {
         locks.push(TxLock::Directory {
             collection: collection(),
             typ: LockType::Read,
@@ -2437,7 +2437,7 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
         .await
         .unwrap();
     assert!(record.add_topology_participant(id.clone()));
-    if matches!(case, TopologyCleanup::DirectoryRemoved) {
+    if matches!(case, TopologyReclamation::DirectoryRemoved) {
         record.add_directory_reader(id.clone());
     }
     assert!(
@@ -2451,7 +2451,7 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
         collection: collection(),
     }
     .to_string();
-    if !matches!(case, TopologyCleanup::IntentRemaining) {
+    if !matches!(case, TopologyReclamation::IntentRemaining) {
         // A canceled Preparing intent has not created any nodes. Departure
         // can then fail before finalization, leaving only the participant.
         owner.structural_intents.delete(&prepared).await.unwrap();
@@ -2496,7 +2496,7 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
     }
     if matches!(
         case,
-        TopologyCleanup::CachedParticipant | TopologyCleanup::DirectoryRemoved
+        TopologyReclamation::CachedParticipant | TopologyReclamation::DirectoryRemoved
     ) {
         ctx.records
             .load_record(
@@ -2514,7 +2514,7 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
         .await
         .unwrap();
     let barrier = ctx.timeline.currentness_barrier();
-    if matches!(case, TopologyCleanup::IntentRemaining) {
+    if matches!(case, TopologyReclamation::IntentRemaining) {
         operations.lock().unwrap().clear();
         assert_eq!(
             ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
@@ -2524,7 +2524,7 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
         assert!(operations.lock().unwrap().iter().all(|op| op.path != path));
         owner.structural_intents.delete(&prepared).await.unwrap();
     }
-    if matches!(case, TopologyCleanup::ReadFailure) {
+    if matches!(case, TopologyReclamation::ReadFailure) {
         hooks.set_before({
             let path = path.clone();
             move |op| {
@@ -2574,8 +2574,8 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
         .map(|op| op.op)
         .collect();
     let expected: &[&str] = match case {
-        TopologyCleanup::CachedParticipant => &["write_if"],
-        TopologyCleanup::DirectoryRemoved => &["write_if", "write_if"],
+        TopologyReclamation::CachedParticipant => &["write_if"],
+        TopologyReclamation::DirectoryRemoved => &["write_if", "write_if"],
         _ => &["read_if_modified", "write_if"],
     };
     assert_eq!(calls, expected);
@@ -2592,42 +2592,42 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
 
 #[tokio::test]
 async fn committed_directory_removal_keeps_topology_reclamation() {
-    reclaim_topology(true, TopologyCleanup::DirectoryRemoved).await;
+    reclaim_topology(true, TopologyReclamation::DirectoryRemoved).await;
 }
 
 #[tokio::test]
 async fn committed_topology_gc_refreshes_a_cached_no_participant() {
-    reclaim_topology(true, TopologyCleanup::StaleNoParticipant).await;
+    reclaim_topology(true, TopologyReclamation::StaleNoParticipant).await;
 }
 
 #[tokio::test]
 async fn aborted_topology_gc_refreshes_a_cached_no_participant() {
-    reclaim_topology(false, TopologyCleanup::StaleNoParticipant).await;
+    reclaim_topology(false, TopologyReclamation::StaleNoParticipant).await;
 }
 
 #[tokio::test]
 async fn topology_gc_reuses_a_cached_participant_for_its_cas() {
     for committed in [false, true] {
-        reclaim_topology(committed, TopologyCleanup::CachedParticipant).await;
+        reclaim_topology(committed, TopologyReclamation::CachedParticipant).await;
     }
 }
 
 #[tokio::test]
 async fn topology_gc_keeps_the_record_if_the_record_check_fails() {
     for committed in [false, true] {
-        reclaim_topology(committed, TopologyCleanup::ReadFailure).await;
+        reclaim_topology(committed, TopologyReclamation::ReadFailure).await;
     }
 }
 
 #[tokio::test]
 async fn topology_gc_keeps_the_record_and_participant_until_intents_settle() {
     for committed in [false, true] {
-        reclaim_topology(committed, TopologyCleanup::IntentRemaining).await;
+        reclaim_topology(committed, TopologyReclamation::IntentRemaining).await;
     }
 }
 
 #[derive(Clone, Copy)]
-enum DropCleanup {
+enum DropReclamation {
     StaleFences,
     CachedFences,
     CachedFreeze,
@@ -2635,7 +2635,7 @@ enum DropCleanup {
     ReadFailure,
 }
 
-async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropCleanup) {
+async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropReclamation) {
     use crate::collection_coordination::CollectionLocker;
     use crate::collections::{CollectionChange, CollectionOp};
     use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
@@ -2800,7 +2800,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
         observed.value().unwrap().locks,
         if durable_locks { locks } else { Vec::new() }
     );
-    if matches!(case, DropCleanup::CachedFences) {
+    if matches!(case, DropReclamation::CachedFences) {
         let requirement = Requirement::after(ctx.timeline.currentness_barrier());
         for path in &node_paths {
             ctx.nodes
@@ -2809,7 +2809,10 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
                 .unwrap();
         }
     }
-    if matches!(case, DropCleanup::CachedFences | DropCleanup::CachedFreeze) {
+    if matches!(
+        case,
+        DropReclamation::CachedFences | DropReclamation::CachedFreeze
+    ) {
         ctx.records
             .load_record(
                 &target,
@@ -2818,7 +2821,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
             .await
             .unwrap();
     }
-    if matches!(case, DropCleanup::OwnerCleared) {
+    if matches!(case, DropReclamation::OwnerCleared) {
         operations.lock().unwrap().clear();
         assert!(
             lifecycle
@@ -2848,7 +2851,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
         assert!(operations.lock().unwrap().iter().all(|op| op.op == "list"));
     }
     let barrier = ctx.timeline.currentness_barrier();
-    if matches!(case, DropCleanup::ReadFailure) {
+    if matches!(case, DropReclamation::ReadFailure) {
         hooks.set_before({
             let path = node_paths.last().unwrap().to_string();
             move |op| {
@@ -2904,11 +2907,11 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
         "GC deleted the record with drop intents still present: {remaining:?}"
     );
     let node_expected: &[&str] = match case {
-        DropCleanup::CachedFences => &["write_if"],
-        DropCleanup::OwnerCleared => &["read_if_modified"],
-        DropCleanup::StaleFences | DropCleanup::CachedFreeze | DropCleanup::ReadFailure => {
-            &["read_if_modified", "write_if"]
-        }
+        DropReclamation::CachedFences => &["write_if"],
+        DropReclamation::OwnerCleared => &["read_if_modified"],
+        DropReclamation::StaleFences
+        | DropReclamation::CachedFreeze
+        | DropReclamation::ReadFailure => &["read_if_modified", "write_if"],
     };
     for path in node_paths.iter().map(ToString::to_string) {
         let calls: Vec<_> = recorded
@@ -2925,7 +2928,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
         .collect();
     let record_expected: &[&str] = if durable_locks {
         &["read_if_modified", "write_if", "write_if"]
-    } else if matches!(case, DropCleanup::CachedFreeze) {
+    } else if matches!(case, DropReclamation::CachedFreeze) {
         &["write_if"]
     } else {
         node_expected
@@ -2944,37 +2947,37 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
 
 #[tokio::test(start_paused = true)]
 async fn aborted_drop_gc_clears_cached_root_fence_and_freeze() {
-    reclaim_aborted_drop(false, false, DropCleanup::StaleFences).await;
+    reclaim_aborted_drop(false, false, DropReclamation::StaleFences).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn aborted_drop_gc_clears_cached_index_and_child_fences() {
-    reclaim_aborted_drop(true, false, DropCleanup::StaleFences).await;
+    reclaim_aborted_drop(true, false, DropReclamation::StaleFences).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn aborted_drop_gc_reuses_directory_release_evidence() {
-    reclaim_aborted_drop(true, true, DropCleanup::StaleFences).await;
+    reclaim_aborted_drop(true, true, DropReclamation::StaleFences).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn aborted_drop_gc_reuses_cached_fences_for_its_cas() {
-    reclaim_aborted_drop(true, false, DropCleanup::CachedFences).await;
+    reclaim_aborted_drop(true, false, DropReclamation::CachedFences).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn aborted_drop_gc_checks_stale_nodes_without_rechecking_a_cached_freeze() {
-    reclaim_aborted_drop(true, false, DropCleanup::CachedFreeze).await;
+    reclaim_aborted_drop(true, false, DropReclamation::CachedFreeze).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn aborted_drop_owner_release_needs_no_extra_reads() {
-    reclaim_aborted_drop(true, false, DropCleanup::OwnerCleared).await;
+    reclaim_aborted_drop(true, false, DropReclamation::OwnerCleared).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn aborted_drop_gc_keeps_the_record_if_a_fence_check_fails() {
-    reclaim_aborted_drop(true, false, DropCleanup::ReadFailure).await;
+    reclaim_aborted_drop(true, false, DropReclamation::ReadFailure).await;
 }
 
 #[tokio::test(start_paused = true)]

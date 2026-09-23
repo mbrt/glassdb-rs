@@ -44,7 +44,7 @@ pub(super) struct PreparedIntent {
 }
 
 /// Retains the exact cancellable observation after split coordination starts.
-pub(super) struct PreparedIntentCleanup {
+pub(super) struct PreparedIntentCancellation {
     observed: Observation<StructuralIntent>,
 }
 
@@ -185,8 +185,8 @@ enum ParticipantSettlementStep {
 
 impl PreparedIntent {
     /// Retains the authority needed to cancel this exact prepared intent.
-    pub(super) fn cleanup_witness(&self) -> PreparedIntentCleanup {
-        PreparedIntentCleanup {
+    pub(super) fn cancellation_witness(&self) -> PreparedIntentCancellation {
+        PreparedIntentCancellation {
             observed: self.observed.clone(),
         }
     }
@@ -406,10 +406,10 @@ impl StructuralRecovery {
     /// Deletes one exact prepared intent after clean cancellation.
     pub(super) async fn discard_prepared(
         &self,
-        cleanup: &PreparedIntentCleanup,
+        cancellation: &PreparedIntentCancellation,
     ) -> Result<(), TransError> {
         self.intent_store
-            .delete(&cleanup.observed)
+            .delete(&cancellation.observed)
             .await
             .map_err(Into::into)
     }

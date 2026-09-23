@@ -1908,7 +1908,7 @@ mod sim_tests {
     }
 
     #[test]
-    fn rejects_stale_read_and_accepts_concurrent_control() {
+    fn rejects_outdated_read_and_accepts_concurrent_control() {
         let initial = state(&[(0, 0)]);
         let write = op(
             0,
@@ -1920,7 +1920,7 @@ mod sim_tests {
                 BodyState::CommitOutcome,
             ),
         );
-        let stale_read = op(
+        let outdated_read = op(
             1,
             2,
             Some(3),
@@ -1933,7 +1933,9 @@ mod sim_tests {
                 BodyState::CommitOutcome,
             ),
         );
-        assert!(check_history(&initial, &[write.clone(), stale_read], &state(&[(0, 1)])).is_err());
+        assert!(
+            check_history(&initial, &[write.clone(), outdated_read], &state(&[(0, 1)])).is_err()
+        );
 
         let concurrent_read = op(
             1,

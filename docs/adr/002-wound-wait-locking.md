@@ -22,7 +22,7 @@ holds `b` and wants `a`.
 The only mechanism for breaking such cycles was a timeout: a transaction that
 could not make progress for `MAX_DEADLOCK_TIMEOUT` (5 seconds) released all its
 locks and restarted, acquiring them one at a time in a globally sorted order
-(serial locking). Sorted-order locking cannot deadlock, so this always made
+(serial acquisition). Sorted-order locking cannot deadlock, so this always made
 progress — but only after eating the full multi-second timeout. Under sustained
 contention on a handful of keys, latency spiked into the tens of seconds.
 
@@ -60,8 +60,8 @@ or backend calls. The ID layout is:
 
 Priority depends **only on the timestamp** — never on the random prefix.
 Transactions sharing a timestamp are not ordered against each other: neither is
-`older`, so neither wounds the other and they fall through to the serial-locking
-safety net.
+`older`, so neither wounds the other and they fall through to the
+serial-acquisition safety net.
 
 ### Why equal timestamps are not ordered
 
@@ -109,8 +109,8 @@ data layer, for two reasons:
   `tokio::time::pause`, so priorities are deterministic in tests and consistent
   with the monitor's expiry logic (which already uses the same clock).
 - A literal `SystemTime::now()` would ignore paused time, making test ordering
-  flaky, and would silently bypass the equal-timestamp serial-locking path that
-  wound-wait relies on.
+  flaky, and would silently bypass the equal-timestamp serial-acquisition path
+  that wound-wait relies on.
 
 ### How likely are timestamp collisions?
 
@@ -141,12 +141,12 @@ mapped from `TransError::AlreadyFinalized`). The DB replay loop then restarts
 the victim with `Algo::rebegin` (which calls `TxId::renew`), reusing its
 original priority so it is not starved on the replay.
 
-### Serial locking as a safety net
+### Serial acquisition as a safety net
 
-Sorted-order serial locking is kept, but is now a backstop rather than the
+Sorted-order serial acquisition is kept, but is now a backstop rather than the
 primary mechanism. Wound-wait resolves priority-ordered conflicts immediately;
 the 5-second timeout only fires under sustained contention or for the rare case
-of equal-priority transactions deadlocking, at which point serial locking
+of equal-priority transactions deadlocking, at which point serial acquisition
 guarantees progress.
 
 ## Consequences
@@ -160,8 +160,8 @@ guarantees progress.
 - Older transactions are favored, which bounds starvation: a wounded victim
   keeps its priority and eventually becomes the oldest contender.
 - Equal-timestamp transactions are intentionally not ordered, so they can still
-  deadlock; this is delegated to the serial-locking safety net. This keeps the
-  priority order stable across restarts and avoids a wound livelock.
+  deadlock; this is delegated to the serial-acquisition safety net. This keeps
+  the priority order stable across restarts and avoids a wound livelock.
 - The transaction-ID layout is now load-bearing: the timestamp encodes priority
   and the random prefix preserves object-store partition spread. Tests that need
   deterministic priorities build IDs with `TxId::with_priority`.

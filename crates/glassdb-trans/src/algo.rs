@@ -16,12 +16,12 @@
 //! (hold-and-wait, ADR-024) instead of aborting; an older one wounds the holder
 //! and proceeds. Distinct priorities cannot deadlock (wound-wait keeps the
 //! wait-for graph acyclic); two equal-priority transactions that would cycle are
-//! broken by escalating to the serial order. Lock acquisition has two modes: the
-//! default **parallel** path locks every leaf concurrently; after a
+//! broken by escalating to serial acquisition. Lock acquisition has two modes:
+//! the default **parallel acquisition** locks every leaf concurrently; after a
 //! [`MAX_DEADLOCK_TIMEOUT`] wait, after [`SERIAL_FALLBACK_AFTER`] identity
 //! renewals, or after [`SERIAL_FALLBACK_AFTER`] parallel acquisition passes that
 //! end in a lock conflict, the commit pass ends and the parallel identity is
-//! renewed for the **serial** sorted order. First-CAS-wins on the
+//! renewed for **serial acquisition** in sorted order. First-CAS-wins on the
 //! lowest contended leaf then guarantees that one contender makes progress.
 
 use std::sync::{Arc, Weak};
@@ -53,18 +53,18 @@ pub use direct_commit::DirectCommitStats;
 use direct_commit::{DirectCommit, DirectOutcome};
 use handle_state::HandleState;
 
-/// Threshold for escalating to sorted serial lock acquisition (ADR-020).
+/// Threshold for escalating to serial acquisition (ADR-020).
 /// [`Handle::should_acquire_serially`] treats this many [`HandleState::renewals`]
 /// as a serial trigger, and parallel acquisition uses the same count for
-/// acquisition passes that end in a lock conflict. The parallel path
-/// is fast but can *livelock* two equal-priority transactions that each grab a
-/// different leaf first; sorted acquisition, where first-CAS-wins on the lowest
+/// acquisition passes that end in a lock conflict. Parallel acquisition is fast
+/// but can *livelock* two equal-priority transactions that each grab a
+/// different leaf first; serial acquisition, where first-CAS-wins on the lowest
 /// contended leaf, guarantees one of them makes progress.
 const SERIAL_FALLBACK_AFTER: usize = 3;
 
-/// Upper bound on how long a transaction blocks acquiring its locks in the
-/// default parallel mode before suspecting a deadlock and escalating to the
-/// serial sorted-locking fallback (ADR-024). Under hold-and-wait a
+/// Upper bound on how long a transaction blocks acquiring its locks with the
+/// default parallel acquisition before suspecting a deadlock and escalating to
+/// the serial-acquisition fallback (ADR-024). Under hold-and-wait a
 /// younger-or-equal transaction *waits* for a conflicting holder while keeping
 /// its locks; distinct priorities cannot cycle (wound-wait), but two
 /// equal-priority transactions can each wait on the other forever. This timeout
@@ -155,7 +155,7 @@ pub struct Handle {
     /// Per-transaction backoff for the internal CAS-contention retry in
     /// [`Algo::acquire_locks`] (a lost leaf/root CAS race): advanced before each
     /// same-identity re-lock so churning contenders spread out instead of busy-looping.
-    /// Body replay after a wound or stale read and read-only validation do not
+    /// Body replay after a wound or invalidated read and read-only validation do not
     /// use this schedule.
     backoff: Backoff,
     retirement: IdentityRetirementGuard,
@@ -253,7 +253,7 @@ impl PassOutcome {
 }
 
 /// Outcome of one lock-acquisition episode. Read validation happens after
-/// [`Acquired::Locked`], so a stale read is not an acquisition outcome.
+/// [`Acquired::Locked`], so an invalidated read is not an acquisition outcome.
 enum Acquired {
     /// Every lock is held; proceed to validate reads, then the commit point.
     Locked(LockedTx),
@@ -779,7 +779,7 @@ impl Algo {
         self.mon.record_tx_locks(&tx.id, locks.clone());
 
         // Validate point reads and scans after their entry/predicate locks are
-        // held. A stale dependency replays the body under the same id while the
+        // held. An invalidated read replays the body under the same id while the
         // acquired locks prevent another change in the validation-to-commit gap.
         if !self
             .validate(
@@ -928,10 +928,9 @@ impl Algo {
     /// leaf holds across complete-set retries.
     ///
     /// A parallel timeout or repeated conflicting acquisition passes end the
-    /// commit pass and ask for an identity renewal for sorted serial
-    /// acquisition. An
-    /// identity that already starts in serial mode keeps its sorted prefix and
-    /// retries lock acquisition without another renewal.
+    /// commit pass and ask for an identity renewal for serial acquisition. An
+    /// identity that already starts with serial acquisition keeps its sorted
+    /// prefix and retries lock acquisition without another renewal.
     async fn acquire_locks(
         &self,
         tx: &mut Handle,
@@ -1815,7 +1814,7 @@ mod tests {
     // the replay holds all its locks. An over-inline-budget output explicitly
     // forces locked commit.
     #[tokio::test]
-    async fn stale_read_write_retries_holding_locks() {
+    async fn invalidated_read_write_retries_holding_locks() {
         let (tm, tctx) = new_algo().await;
         let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
         let ka = logical_key(b"k");
@@ -1841,7 +1840,7 @@ mod tests {
         );
         assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
 
-        // The moved key is locked by us when the stale read is signalled: the
+        // The moved key is locked by us when the invalidated read is signalled: the
         // replay owns the lock and cannot lose it again to the same race.
         let e = entry(&tctx, b"k").await.expect("entry exists");
         assert_eq!(e.lock_holders(), std::slice::from_ref(h.id()));
@@ -1872,7 +1871,7 @@ mod tests {
     }
 
     // ADR-065: a timed-out parallel acquisition asks its owner to make the old
-    // identity durably abort-side before it renews for sorted serial locking.
+    // identity durably abort-side before it renews for serial acquisition.
     #[tokio::test(start_paused = true)]
     async fn deadlock_timeout_renews_before_serial_acquisition() {
         use crate::tlocker::LockOutcome;
@@ -1913,7 +1912,7 @@ mod tests {
         });
 
         // The parallel wait times out. The algorithm retires the old identity
-        // and continues under a renewed identity in serial mode.
+        // and continues under a renewed identity with serial acquisition.
         rt::sleep(MAX_DEADLOCK_TIMEOUT + Duration::from_secs(1)).await;
         assert!(!committing.is_finished());
 
@@ -2095,7 +2094,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn stale_read_replay_reports_an_earlier_internal_renewal() {
+    async fn invalidated_read_replay_reports_an_earlier_internal_renewal() {
         let (backend, flaky) = FlakyCas::wrap(
             Arc::new(MemoryBackend::new()),
             test_root_path().to_string(),
@@ -2197,7 +2196,7 @@ mod tests {
 
         // The whole budget was consumed, so the transaction did exhaust the
         // serial CAS budget (the `Conflict` path), not merely time out in
-        // parallel mode.
+        // parallel acquisition.
         assert_eq!(flaky.remaining(), 0, "expected sustained CAS contention");
         let attempts = flaky.attempts();
         assert!(attempts.len() > failures);

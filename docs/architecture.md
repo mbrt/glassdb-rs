@@ -152,7 +152,7 @@ attempt, builds a mutation plan in wound-wait order, and persists staged changes
 with one CAS (ADR-028/029). The coordinator is a transaction-aware shared
 mutation engine: it owns identity, ordering, admission, and recovery across a
 heterogeneous round, while `Algo`, the `Locker`, and the `Splitter` supply each
-operation's target, resolver policy, and typed result. The operation types stay
+operation's target, member policy, and typed result. The operation types stay
 with their policy owners: the coordinator reads a member outcome only for
 admission, exclusion, and delivery, never for operation-specific policy.
 
@@ -163,12 +163,12 @@ aggregate backend scheduler; backend adapters keep responsibility for queues,
 connections, retries, and provider throttling
 ([ADR-064](adr/064-bounded-parallel-point-leaf-work.md)).
 
-`Algo` owns every parallel-to-serial lock transition. It ends the old identity
-and waits for a durable abort-side status before it renews the opaque handle.
-The replacement keeps its priority and cannot publish until the old identity is
-terminal. Point and range work continues without another body execution, while
-collection changes replay the body because their physical resources belonged to
-the old identity
+`Algo` owns every transition from parallel to serial acquisition. It ends the
+old identity and waits for a durable abort-side status before it renews the
+opaque handle. The replacement keeps its priority and cannot publish until the
+old identity has a final status. Point and range work continues without another
+body execution, while collection changes replay the body because their physical
+resources belonged to the old identity
 ([ADR-065](adr/065-renewed-transaction-identity-on-serial-fallback.md)).
 
 ```mermaid
@@ -342,20 +342,20 @@ The [glossary](../CONTEXT.md#leaf-coordination) defines **coordinator round**,
 | Work | Term | Meaning |
 | --- | --- | --- |
 | Combine compatible submissions for one leaf | Batch submissions | Form or extend a coordinator round. This does not evaluate the operations or prove that they can all stage changes. |
-| Obtain one member's decision | Evaluate a resolver | Ask the member's resolver to propose all of its changes, or none, against the current staged entries. |
-| Build one attempt's proposed leaf state | Build a mutation plan | Check routing and publication-key reservations, evaluate admitted resolvers in priority order, and admit their proposed changes within the leaf's capacity limits. Later resolvers see earlier admitted changes. |
+| Obtain one member's decision | Evaluate a member policy | Ask the member's policy to propose all of its changes, or none, against the current staged entries. |
+| Build one attempt's proposed leaf state | Build a mutation plan | Check routing and publication-key reservations, evaluate admitted member policies in priority order, and admit their proposed changes within the leaf's capacity limits. Later member policies see earlier admitted changes. |
 | Store the proposed changes | Persist a mutation plan | Issue one conditional leaf mutation if any member staged changes. A plan with no staged changes retains the loaded observation without a CAS. |
 | Recover after contention or an in-doubt result | Reload and rebuild the mutation plan | Load another leaf observation and repeat planning, while retaining each member's unresolved in-doubt state. |
 
 Priority order means oldest wound-wait priority first, with transaction-identity
 bytes as a deterministic tie-break within the round. A later member cannot wound
 an earlier member, and the tie-break does not change persistent wound-wait
-priority. Each member's changes pass admission together or not at all. Resolver
-evaluation can consult transaction state and perform protocol work, such as
-wounding a holder, so building a mutation plan is not a pure computation; but it
-does not itself persist the proposed leaf state. An outcome proposed with staged
-changes is delivered only after the CAS succeeds, and a member skipped because
-an earlier member already staged its change must wait for the same CAS.
+priority. Each member's changes pass admission together or not at all. Member
+policy evaluation can consult transaction state and perform protocol work, such
+as wounding a holder, so building a mutation plan is not a pure computation; but
+it does not itself persist the proposed leaf state. An outcome proposed with
+staged changes is delivered only after the CAS succeeds, and a member skipped
+because an earlier member already staged its change must wait for the same CAS.
 
 Earlier revisions used **fold** for several of these steps. Code, guides, and
 ADRs now use the specific terms above.
@@ -374,7 +374,7 @@ representation:
   returns a conflict — both logical, never nodes. `Algo` maps a normal conflict
   to a complete-access-set body replay under the same identity while it keeps landed
   leaf holds. After sustained parallel conflict, `Algo` ends the identity, renews
-  it, and continues in serial mode.
+  it, and continues with serial acquisition.
 
 Read-writer validation is **not** at this seam. Once the locks come back, every
 touched key is locked and its value frozen, so `Algo` re-resolves each read's
@@ -679,8 +679,8 @@ The validate-and-commit sequence:
    with a bound on the number of incomplete leaf operations. Conflicts are
    resolved by the wound-wait rule (see [Deadlock
    Handling](#deadlock-handling)): an older transaction aborts younger holders,
-   a younger one waits. A deadlock timeout falls back to serial locking only if
-   contention prevents progress.
+   a younger one waits. A deadlock timeout falls back to serial acquisition only
+   if contention prevents progress.
 
 2. **Writer verification.** Optimistic point validation first checks retained
    leaf observations. If a physical state changed, it resolves the complete
@@ -762,13 +762,12 @@ marker for this identity proves the entire member landed. With no marker,
 unchanged predecessors prove non-landing only when at least one output could not
 have collapsed back to that predecessor through tombstone reclamation, so an
 all-unmarked-absence delete that remains in doubt can surface as an in-doubt
-error. Valid reads
-may retry direct, while a stale read replays the body. If pruning a membership
-holder with a final status changes the temporary generation and read validation
-fails, the locked commit path makes that pruning durable, because replaying
-against a generation change that was never stored would repeat the same failure.
-Cancellation before dispatch leaves no state, while cancellation after dispatch
-is crash-equivalent.
+error. Valid reads may retry direct, while an invalidated read replays the body.
+If pruning a membership holder with a final status changes the temporary
+generation and read validation fails, the locked commit path makes that pruning
+durable, because replaying against a generation change that was never stored
+would repeat the same failure. Cancellation before dispatch leaves no state,
+while cancellation after dispatch is crash-equivalent.
 
 #### Body replay with locks held
 
@@ -810,11 +809,11 @@ stays acyclic and no cycle can form. When `Algo` observes a wound, it ends and
 renews the identity before it asks the database loop to replay the body. The
 renewed identity preserves its original priority, so it is not starved.
 
-**Serial locking is kept as a safety net.** Parallel validation arms a deadlock
-timeout; if it fires — meaning sustained contention, or two equal-priority
-transactions that wound-wait does not order — the transaction falls back to
-**serial validation**, acquiring locks one at a time in sorted path order. Total
-ordering cannot deadlock, guaranteeing progress.
+**Serial acquisition is kept as a safety net.** Parallel acquisition arms a
+deadlock timeout; if it fires — meaning sustained contention, or two
+equal-priority transactions that wound-wait does not order — the transaction
+falls back to **serial acquisition**, acquiring locks one at a time in sorted
+path order. Total ordering cannot deadlock, guaranteeing progress.
 
 Priority depends only on the identity's timestamp, never on its random prefix,
 because renewal keeps the timestamp but changes the prefix on each identity

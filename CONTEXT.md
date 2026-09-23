@@ -70,12 +70,15 @@ The point reads, final key writes, and range scans from one execution of a trans
 _Avoid_: Data, transaction data
 
 **Validation barrier**:
-The currentness barrier one transaction allocates to open validation, and the landmark its key locking, collection locking, and status flip are organized around. The access set's retained observations are rechecked at or after it, which is why transaction body reads may accept any watermark.
+The currentness barrier that one transaction allocates after its body and before validation. Validation rechecks the access set at or after it, so transaction body reads can accept any watermark.
 _Avoid_: Validation watermark, validation timestamp
 
 **Transaction identity**:
 A durable protocol identity that holds one transaction's claims and owns its status and recovery resources.
 _Avoid_: Lock owner ID, transaction attempt
+
+**Engaged identity**:
+A transaction identity that started a locked commit or locked validation. It can have durable effects, so it must reach a final status.
 
 **Priority**:
 The wound-wait rank of a transaction identity. An older identity has priority: it can wound a younger holder, and a younger requester waits for an older holder. Identities with equal priority are not ordered.
@@ -182,7 +185,7 @@ Validation of an access set while the transaction holds its locks.
 
 **Invalidated read**:
 A read in an access set whose observed writer or observed key membership changed before validation. It causes a body replay.
-_Avoid_: Validation conflict, read conflict
+_Avoid_: Validation conflict, read conflict, stale read
 
 **Write-back**:
 The publication of a committed transaction's changes into the objects that it locked, together with the release of those locks.
@@ -216,6 +219,10 @@ _Avoid_: Membership hold
 
 **Directory lock**:
 A lock on the child bindings in one collection record.
+
+**Serial acquisition**:
+Lock acquisition that locks the leaves of one transaction one at a time, in ascending leaf path order. This global order cannot deadlock, so a transaction switches to it under a renewed identity when parallel acquisition does not make progress.
+_Avoid_: Serial locking, serial validation, serial mode
 
 **Wound**:
 The conditional change of a pending transaction record to wounded, usually by another transaction. After it, the identity can never commit.
@@ -276,6 +283,9 @@ _Avoid_: Anchor, observation timestamp, read watermark
 **Freshness requirement**:
 The rule a read applies to decide whether existing evidence can serve it: accept any watermark, or only a watermark that reached a stated bound. A reader states that bound as a currentness barrier.
 _Avoid_: Consistency level, staleness policy
+
+**Stale read**:
+A read outside a transaction that accepts a committed state known to be current within a stated age.
 
 ## Point routing
 

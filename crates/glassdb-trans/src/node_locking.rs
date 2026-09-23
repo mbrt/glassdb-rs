@@ -15,7 +15,7 @@ use glassdb_storage::{LeafEntry, LeafObservation, LockType, NodeLocks, Requireme
 use crate::error::TransError;
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{
-    CoordinatedOutcome, LeafOperation, LeafResolver, MemberOutcome, ResolveCtx, StageAdmission,
+    CoordinatedOutcome, LeafOperation, MemberOutcome, MemberPolicy, ResolveCtx, StageAdmission,
     Step,
 };
 use crate::monitor::Monitor;
@@ -122,7 +122,7 @@ impl<'a> NodeLockReconciler<'a> {
             return Ok(Some(holder));
         }
         if locks.structural_gate().contains(self.id) {
-            self.prune_finalized_membership(locks).await?;
+            self.prune_final_membership(locks).await?;
             return Ok(None);
         }
         for holder in locks.structural_gate().holders().to_vec() {
@@ -247,7 +247,7 @@ impl<'a> NodeLockReconciler<'a> {
     /// Removes membership holders with a final status after their entry state was
     /// reconciled. Unknown holders remain live until the monitor classifies
     /// them through its missing-transaction grace period.
-    async fn prune_finalized_membership(&self, locks: &mut NodeLocks) -> Result<(), TransError> {
+    async fn prune_final_membership(&self, locks: &mut NodeLocks) -> Result<(), TransError> {
         for holder in locks.membership().holders().to_vec() {
             if &holder != self.id && self.monitor.tx_status(&holder).await?.is_final() {
                 locks.remove_membership_holder(&holder);
@@ -278,7 +278,7 @@ impl StructuralGateOperation {
 }
 
 #[async_trait]
-impl LeafResolver for StructuralGateOperation {
+impl MemberPolicy for StructuralGateOperation {
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,

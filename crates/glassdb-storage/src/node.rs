@@ -310,7 +310,7 @@ impl Default for SplitPolicy {
 /// The node-level coordination state threaded through a leaf CAS round.
 ///
 /// Keeping this separate from the node's topology prevents transaction-engine
-/// resolvers from replacing bounds, sibling links, or the node body while they
+/// member policies from replacing bounds, sibling links, or the node body while they
 /// only intend to change locks.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NodeLocks {

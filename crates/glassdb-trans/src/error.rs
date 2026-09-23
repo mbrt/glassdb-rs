@@ -14,8 +14,8 @@ pub enum TransError {
     /// The transaction should be retried from the beginning (Go `ErrRetry`).
     #[error("retry transaction")]
     Retry,
-    /// The remote transaction record was already committed or aborted.
-    #[error("transaction was already finalized")]
+    /// The transaction record already has a final status.
+    #[error("transaction already has a final status")]
     AlreadyFinalized,
     /// The transaction was aborted by a higher-priority transaction under the
     /// wound-wait rule (Go `ErrWounded`). It must be retried from the beginning

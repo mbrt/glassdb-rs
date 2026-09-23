@@ -16,7 +16,7 @@ use crate::error::TransError;
 use crate::gc::GcHints;
 use crate::key_state_resolver::HolderResolution;
 use crate::leaf_coord::{
-    CoordinatedOutcome, LeafCoordinator, LeafOperation, LeafResolver, MemberOutcome, ReloadCause,
+    CoordinatedOutcome, LeafCoordinator, LeafOperation, MemberOutcome, MemberPolicy, ReloadCause,
     ResolveCtx, StageAdmission, Step,
 };
 use crate::split::SplitHintSink;
@@ -350,7 +350,7 @@ impl DirectCommitOperation {
             });
         }
 
-        // Coordination blockers win over a stale-read replay. Replaying a body
+        // Coordination blockers win over an invalidated-read replay. Replaying a body
         // while the same live holder remains would otherwise spin.
         if resolutions.iter().any(|state| !state.pending.is_empty()) {
             return Ok(Step::Skip {
@@ -556,7 +556,7 @@ impl DirectCommitOperation {
 }
 
 #[async_trait]
-impl LeafResolver for DirectCommitOperation {
+impl MemberPolicy for DirectCommitOperation {
     fn observe_loaded(&self, entries: &BTreeMap<Vec<u8>, LeafEntry>) {
         if self.has_marker(entries) {
             self.remember_landed();

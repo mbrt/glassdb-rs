@@ -41,7 +41,7 @@ acquires locks, commits, and publishes its writes.
 
 The reference is the v1 algorithm (`crates/glassdb-trans/src/algo.rs`):
 optimistic read validation, parallel lock acquisition with wound-wait
-([ADR-002](002-wound-wait-locking.md)), a serial sorted-locking fallback for
+([ADR-002](002-wound-wait-locking.md)), a sorted serial-acquisition fallback for
 suspected deadlocks, a locked commit point, and asynchronous lock release /
 write-back. The isolation level (strict serializable) and the wound-wait rule are
 unchanged. What changes is the **granularity and the medium**: locks move from

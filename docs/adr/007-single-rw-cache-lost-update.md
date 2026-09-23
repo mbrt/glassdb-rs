@@ -75,11 +75,11 @@ guessed value. `validateLockedRead` instead invalidates the stale entry
 from storage; `validateReadNotFound` simply retries without touching the cache.
 
 This removes the only paths that paired a value with a writer that did not
-produce it, so `checkReadVersionUnlocked` can no longer be fooled into accepting a
-stale read. Correctness comes from re-reading storage on replay, which already
-returns the genuine committed value (its `last-writer` tag still names the
-single-RW writer), so no extra record lookup or backend round-trip is needed on the
-common path.
+produce it, so `checkReadVersionUnlocked` can no longer be fooled into accepting
+an invalidated read. Correctness comes from re-reading storage on replay, which
+already returns the genuine committed value (its `last-writer` tag still names
+the single-RW writer), so no extra record lookup or backend round-trip is needed
+on the common path.
 
 ### Make the fuzzer deterministic (Go only; deferred in Rust)
 
@@ -100,7 +100,7 @@ need not be mirrored.
   correctness.
 - `single_rw_lost_update` (in `glassdb-trans` algo tests) is a deterministic
   regression test that recreates the exact poisoning sequence: a direct
-  single-RW writer, a victim with a stale read, and a pending lock that forces
-  validation down the unresolvable branch. It asserts the victim subsequently
-  reads the authoritative value rather than the cached guess; it fails against
-  the pre-fix validation code and passes after it.
+  single-RW writer, a victim with an invalidated read, and a pending lock that
+  forces validation down the unresolvable branch. It asserts the victim
+  subsequently reads the authoritative value rather than the cached guess; it
+  fails against the pre-fix validation code and passes after it.

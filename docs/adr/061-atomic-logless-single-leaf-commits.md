@@ -110,7 +110,7 @@ member's output marker. If their written-key sets overlap, the later member is
 excluded as a whole before staging anything.
 
 A transaction with any point-read dependency replays its body after a
-certified stale read or same-round exclusion. A blind transaction uses the
+certified invalidated read or same-round exclusion. A blind transaction uses the
 regular locked commit after exclusion, preserving bounded progress rather than
 resubmitting indefinitely. A live or unknown holder, structural gate,
 drop intent, stable admission failure, or other state requiring

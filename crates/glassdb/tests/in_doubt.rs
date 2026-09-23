@@ -21,9 +21,9 @@
 //!   prove that state either way — surfaced as [`Error::InDoubt`] rather than
 //!   risking a double-apply on a body replay under a renewed identity. A *fast follow-on writer* that
 //!   moves the entry first is the reachable case and is covered below; anything
-//!   else that prevents resolver evaluation after a reload from proving it
+//!   else that prevents member policy evaluation after a reload from proving it
 //!   (a structural gate or a drop intent arriving in the same window)
-//!   is classified the same way, pinned by unit tests next to the resolvers
+//!   is classified the same way, pinned by unit tests next to the member policies
 //!   because no interleaving reproduces it reliably.
 //! - Locked commit's commit point (the `_t/` flip) and its leaf lock CAS
 //!   (a node `_n/` or the root `_r`) are recovered in place the same way (they

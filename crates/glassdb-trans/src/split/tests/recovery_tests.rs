@@ -1,14 +1,14 @@
 use super::*;
 
 #[derive(Clone, Copy)]
-enum ParticipantCleanup {
+enum ParticipantReclamation {
     StaleRecord,
     CachedParticipant,
     OwnerDeparted,
     ReadFailure,
 }
 
-async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
+async fn recover_peer_participant(committed: bool, case: ParticipantReclamation) {
     let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
     let recorder = RecordingBackend::new(hooks.clone());
     let operations = recorder.log();
@@ -81,7 +81,7 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
         collection: collection(),
     }
     .to_string();
-    if matches!(case, ParticipantCleanup::CachedParticipant) {
+    if matches!(case, ParticipantReclamation::CachedParticipant) {
         local
             .records
             .load_record(
@@ -91,7 +91,7 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
             .await
             .unwrap();
     }
-    if matches!(case, ParticipantCleanup::OwnerDeparted) {
+    if matches!(case, ParticipantReclamation::OwnerDeparted) {
         // A peer can complete departure after this sweep deletes the intent
         // and before it checks the collection record.
         hooks.set_before({
@@ -117,7 +117,7 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
             }
         });
     }
-    if matches!(case, ParticipantCleanup::ReadFailure) {
+    if matches!(case, ParticipantReclamation::ReadFailure) {
         hooks.set_before({
             let path = record_path.clone();
             move |op| {
@@ -155,7 +155,7 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
         .load_record(&collection(), Requirement::ANY)
         .await
         .unwrap();
-    if matches!(case, ParticipantCleanup::ReadFailure) {
+    if matches!(case, ParticipantReclamation::ReadFailure) {
         assert!(
             result.is_err(),
             "a failed departure check cannot report a completed sweep"
@@ -188,10 +188,10 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
         .map(|op| op.op)
         .collect();
     let expected: &[&str] = match case {
-        ParticipantCleanup::StaleRecord => &["read_if_modified", "write_if"],
-        ParticipantCleanup::CachedParticipant => &["write_if"],
-        ParticipantCleanup::OwnerDeparted => &["write_if", "read_if_modified"],
-        ParticipantCleanup::ReadFailure => unreachable!(),
+        ParticipantReclamation::StaleRecord => &["read_if_modified", "write_if"],
+        ParticipantReclamation::CachedParticipant => &["write_if"],
+        ParticipantReclamation::OwnerDeparted => &["write_if", "read_if_modified"],
+        ParticipantReclamation::ReadFailure => unreachable!(),
     };
     assert_eq!(record_calls, expected);
     operations.lock().unwrap().clear();
@@ -202,28 +202,28 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
 #[tokio::test]
 async fn background_recovery_removes_participants_from_stale_records() {
     for committed in [false, true] {
-        recover_peer_participant(committed, ParticipantCleanup::StaleRecord).await;
+        recover_peer_participant(committed, ParticipantReclamation::StaleRecord).await;
     }
 }
 
 #[tokio::test]
 async fn background_recovery_removes_cached_participants_without_a_read() {
     for committed in [false, true] {
-        recover_peer_participant(committed, ParticipantCleanup::CachedParticipant).await;
+        recover_peer_participant(committed, ParticipantReclamation::CachedParticipant).await;
     }
 }
 
 #[tokio::test]
 async fn background_recovery_checks_departure_after_another_instance_removes_the_participant() {
     for committed in [false, true] {
-        recover_peer_participant(committed, ParticipantCleanup::OwnerDeparted).await;
+        recover_peer_participant(committed, ParticipantReclamation::OwnerDeparted).await;
     }
 }
 
 #[tokio::test]
 async fn background_recovery_reports_failed_departure_checks() {
     for committed in [false, true] {
-        recover_peer_participant(committed, ParticipantCleanup::ReadFailure).await;
+        recover_peer_participant(committed, ParticipantReclamation::ReadFailure).await;
     }
 }
 

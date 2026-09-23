@@ -14,8 +14,8 @@ use glassdb_trans::TransError;
 #[non_exhaustive]
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
-    /// The requested object does not exist.
-    #[error("object not found")]
+    /// The requested key or collection does not exist.
+    #[error("not found")]
     NotFound,
     /// The requested collection name is already bound.
     #[error("collection already exists")]
@@ -32,8 +32,8 @@ pub enum Error {
     /// A conditional operation's precondition failed.
     #[error("precondition failed")]
     Precondition,
-    /// The transaction was already committed or aborted remotely.
-    #[error("transaction was already finalized")]
+    /// The transaction already has a final status.
+    #[error("transaction already has a final status")]
     AlreadyFinalized,
     /// The transaction's outcome is unknown (in doubt): a storage operation
     /// could not be confirmed, so it may or may not have been applied. The

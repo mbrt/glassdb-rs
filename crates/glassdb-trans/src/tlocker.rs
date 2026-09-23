@@ -19,11 +19,12 @@
 //! the locker shares with the direct commit mechanism so every leaf/root
 //! mutation flows through one place (ADR-028, ADR-061).
 //!
-//! Lock acquisition has two modes (ADR-020): the default **parallel** path locks
-//! every touched leaf concurrently; the **serial** fallback locks them one at a
-//! time in ascending leaf path order so equal-priority contenders queue on the
-//! lowest contended leaf and exactly one wins it (first-CAS-wins), guaranteeing
-//! progress where the parallel path could livelock.
+//! Lock acquisition has two modes (ADR-020): the default **parallel
+//! acquisition** locks every touched leaf concurrently; the **serial
+//! acquisition** fallback locks them one at a time in ascending leaf path order
+//! so equal-priority contenders queue on the lowest contended leaf and exactly
+//! one wins it (first-CAS-wins), guaranteeing progress where parallel
+//! acquisition could livelock.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
@@ -45,8 +46,8 @@ use crate::access::{AccessSet, WriteOp};
 use crate::collection_coordination::{CollectionLocker, CollectionStateResolver};
 use crate::error::TransError;
 use crate::leaf_coord::{
-    CoordinatedOutcome, CoordinationEvidence, LeafCoordinator, LeafOperation, LeafResolver,
-    MemberOutcome, ResolveCtx, StageAdmission, Step,
+    CoordinatedOutcome, CoordinationEvidence, LeafCoordinator, LeafOperation, MemberOutcome,
+    MemberPolicy, ResolveCtx, StageAdmission, Step,
 };
 use crate::monitor::Monitor;
 use crate::node_locking::NodeLockReconciler;
@@ -350,7 +351,7 @@ struct AcquireOperation {
 }
 
 #[async_trait]
-impl LeafResolver for AcquireOperation {
+impl MemberPolicy for AcquireOperation {
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
@@ -506,7 +507,7 @@ struct WriteBackOperation {
 }
 
 #[async_trait]
-impl LeafResolver for WriteBackOperation {
+impl MemberPolicy for WriteBackOperation {
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
@@ -638,7 +639,7 @@ struct ReleaseOperation {
 }
 
 #[async_trait]
-impl LeafResolver for ReleaseOperation {
+impl MemberPolicy for ReleaseOperation {
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
@@ -950,12 +951,12 @@ enum LeafOutcome {
 }
 
 /// How a hold-and-wait wake happened, so the re-poll cadence can be tuned: a
-/// holder *finalizing* is real progress, while a poll timeout saw no event and
-/// only re-checks for a lock released without finalizing.
+/// holder that reaches a final status is real progress, while a poll timeout
+/// only re-checks for a lock that the holder released before its final status.
 enum Woke {
-    /// The holder's committed or aborted status was durably verified.
-    Finalized,
-    /// The backed-off poll timer elapsed with no finalize event.
+    /// The holder's final status was durably verified.
+    FinalStatus,
+    /// The backed-off poll timer elapsed before the holder reached a final status.
     PollTimeout,
 }
 
@@ -1129,7 +1130,7 @@ impl KeyLocker {
                 }
                 ReleaseOutcome::Wait(holder) => {
                     let delay = backoff.next_delay();
-                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await? {
+                    if let Woke::FinalStatus = self.wait_for_holder(&holder, delay).await? {
                         backoff = self.retry.backoff();
                     }
                     continue;
@@ -1403,7 +1404,7 @@ impl KeyLocker {
                 // cannot-deadlock serial order.
                 AcquireOutcome::Wait(holder) => {
                     let delay = backoff.next_delay();
-                    if let Woke::Finalized = self.wait_for_holder(&holder, delay).await? {
+                    if let Woke::FinalStatus = self.wait_for_holder(&holder, delay).await? {
                         backoff = self.retry.backoff();
                     }
                 }
@@ -1413,15 +1414,15 @@ impl KeyLocker {
         }
     }
 
-    /// Parks until the conflicting `holder` finalizes **or** `timeout` elapses,
-    /// whichever comes first, then lets the caller re-resolve, reporting which
-    /// woke it.
+    /// Parks until the conflicting `holder` reaches a final status **or**
+    /// `timeout` elapses, whichever comes first, then lets the caller
+    /// re-resolve, reporting which woke it.
     async fn wait_for_holder(&self, holder: &TxId, timeout: Duration) -> Result<Woke, TransError> {
         let wait = self.tmon.await_tx_final(holder);
         tokio::select! {
             status = wait => {
                 status?;
-                Ok(Woke::Finalized)
+                Ok(Woke::FinalStatus)
             },
             _ = rt::sleep(timeout) => Ok(Woke::PollTimeout),
         }
@@ -1587,18 +1588,18 @@ mod tests {
 
     #[test]
     fn exhausted_write_back_requires_rerouting() {
-        let resolver = WriteBackOperation {
+        let policy = WriteBackOperation {
             id: mk_tid(1, "writer"),
             path: root_path(),
             intents: Arc::new(vec![put_intent(b"key")]),
         };
 
         assert!(matches!(
-            resolver.exhausted_outcome(false),
+            policy.exhausted_outcome(false),
             MemberOutcome::Reroute
         ));
         assert!(matches!(
-            resolver.exhausted_outcome(true),
+            policy.exhausted_outcome(true),
             MemberOutcome::Reroute
         ));
     }
@@ -1655,7 +1656,7 @@ mod tests {
         );
     }
 
-    // Acquires leaf locks in parallel mode, asserting success.
+    // Acquires leaf locks with parallel acquisition, asserting success.
     async fn lock_ok(
         locker: &Locker,
         id: &TxId,

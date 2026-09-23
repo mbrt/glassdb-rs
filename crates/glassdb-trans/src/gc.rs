@@ -561,7 +561,7 @@ impl Gc {
         observation: &Observation<TxRecord>,
         barrier: CurrentnessBarrier,
     ) -> Result<GcOutcome, TransError> {
-        let reclaimed = self.cleanup_aborted_effects(tid, record, barrier).await?;
+        let reclaimed = self.reclaim_aborted_effects(tid, record, barrier).await?;
         if !reclaimed.complete {
             return Ok(GcOutcome::from_progress(reclaimed.changed));
         }
@@ -569,7 +569,7 @@ impl Gc {
         Ok(GcOutcome::Reclaimed)
     }
 
-    async fn cleanup_aborted_effects(
+    async fn reclaim_aborted_effects(
         &self,
         tid: &TxId,
         record: &TxRecord,
