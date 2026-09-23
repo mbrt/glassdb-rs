@@ -181,7 +181,7 @@ class CompareTest(unittest.TestCase):
                     "affinityPct": 50,
                     "aggregateOps": {
                         "totalOpsPerTx": ops,
-                        "retriesPerTx": 0.25,
+                        "replaysPerTx": 0.25,
                     },
                     "shapes": [
                         {
@@ -209,7 +209,7 @@ class CompareTest(unittest.TestCase):
             "mode": "hi",
             "affinityPct": 100,
             "failures": 0,
-            "aggregateOps": {"totalOpsPerTx": 2, "retriesPerTx": 0},
+            "aggregateOps": {"totalOpsPerTx": 2, "replaysPerTx": 0},
             "shapes": [
                 {
                     "shape": "rwSingle",
@@ -264,7 +264,7 @@ class CompareTest(unittest.TestCase):
                             "durationMs": 1000,
                             "txPerSec": 2,
                             "samplesMs": [10, 20],
-                            "retries": 1,
+                            "replays": 1,
                             "directCandidates": 2,
                             "directLanded": 1,
                             "workerDrainMs": 3,
@@ -281,6 +281,56 @@ class CompareTest(unittest.TestCase):
 
         self.assertEqual(samples["latency-ms"].tolist(), [10, 20])
         self.assertEqual(stats.loc[0, "direct-landed"], 1)
+
+    def test_perfbench_contention_envelope_accepts_legacy_replay_keys(self) -> None:
+        report = {
+            "schemaVersion": 1,
+            "scenario": "contention",
+            "runs": [
+                {
+                    "run": 1,
+                    "cells": [
+                        {
+                            "numKeys": 1,
+                            "overlap": 1,
+                            "overlapPct": 100,
+                            "committed": 2,
+                            "durationMs": 1000,
+                            "txPerSec": 2,
+                            "samplesMs": [10],
+                            "retries": 3,
+                            "directCandidates": 0,
+                            "directLanded": 0,
+                            "workerDrainMs": 0,
+                            "failures": 0,
+                        }
+                    ],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "contention.json").write_text(json.dumps(report))
+            _, stats = compare.perfbench_contention_frames(path)
+
+        self.assertEqual(stats.loc[0, "num-replays"], 3)
+
+    def test_mixed_aggregate_table_accepts_legacy_replays_per_tx(self) -> None:
+        def cells(replays_per_tx: float):
+            return [
+                {
+                    "mode": "lo",
+                    "affinityPct": 50,
+                    "aggregateOps": {
+                        "totalOpsPerTx": 1,
+                        "retriesPerTx": replays_per_tx,
+                    },
+                    "shapes": [],
+                }
+            ]
+
+        table = compare.mixed_aggregate_table(cells(0.5), cells(1.0))
+        self.assertEqual(table.loc[0, "replays-ratio"], 2.0)
 
     def test_inconsistent_common_cell_clock_is_rejected(self) -> None:
         rows = pd.DataFrame(

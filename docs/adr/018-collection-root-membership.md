@@ -10,12 +10,12 @@ recorded fixed `shard_count` (sharding becomes dynamic and range-partitioned) an
 the **single coarse membership lock** (replaced by per-leaf/range membership
 coordination). The `_i` object and the OCC listing/validation *principle* carry
 over — ADR-031 makes `_i` itself the B-link tree's (fixed-path) root node, including
-the collection metadata in it, and generalizes root-version validation to
-per-leaf version validation.
+the collection metadata in it, and generalizes root-revision validation to
+per-leaf generation validation.
 
 [ADR-046](046-incarnation-addressed-collections.md) supersedes this ADR's
 physical-root existence rule, name-derived child addressing, and name-only
-subcollection directory with incarnation IDs and direct parent
+subcollection directory with collection IDs and direct parent
 mappings. [ADR-047](047-transactional-collection-management.md) makes creation,
 listing, and teardown of that hierarchy transactional and supersedes the
 standalone lifecycle protocol. This ADR's
@@ -66,7 +66,7 @@ versions a membership operation takes and why.
 The root keeps the existing path `{prefix}/_i` (the `_i` marker and
 `paths::collection_info` are reused), but its body changes from the marker bytes
 to a protobuf `CollectionRoot`, encoded with the existing toolchain like the
-shard and tx-log:
+shard and transaction record:
 
 ```proto
 message CollectionRoot {
@@ -101,7 +101,7 @@ the root) is deliberate:
 
 - Keys can be numerous (the 50k-key benchmark); a central key list would make the
   root huge and rewritten on every create/delete. Sharding keeps a key
-  create/delete touching exactly one shard plus a root version bump.
+  create/delete touching exactly one shard plus a root revision bump.
 - Subcollections are expected to be few, so an explicit list in the root costs
   little and buys *consistent enumeration without a scan* and a single membership
   token shared with key listing. (Unbounded subcollection fan-out is an accepted
@@ -124,7 +124,7 @@ correctness bug) — while it only saves the *discovery* `list`, not the dominan
 per-shard GETs, and `list` is a primitive the slimmed `Backend` keeps anyway. It
 also couples the background reclaimer to the foreground membership lock. If
 revisited, the safe framing is to treat the set as a **hint** validated by the
-root version (every membership change already bumps the root, §below), never as
+root revision (every membership change already bumps the root, §below), never as
 authoritative state, so a stale bit can never drop a key.
 
 ### Membership changes and the root invariant
@@ -138,7 +138,7 @@ keeps the read/write hot path free of the root, as ADR-016 requires.
 The load-bearing invariant:
 
 > **Every membership change writes the root** (by taking and releasing its
-> membership lock). Therefore the root's object **version** (generation / ETag) is
+> membership lock). Therefore the root's object **revision** (generation / ETag) is
 > a complete summary of all membership changes to the collection.
 
 This is what makes a cross-shard scan validatable with a *single* comparison
@@ -155,7 +155,7 @@ per ADR-017). Holding the root write lock for the operation's duration:
   lock, and with other membership writers;
 - gives membership changes the same wound-wait fairness and liveness as the rest
   of S2PL, rather than a raw CAS-retry race (concurrent creates already serialize
-  on the root object's CAS regardless, since they all must bump its version; the
+  on the root object's CAS regardless, since they all must bump its revision; the
   lock just makes that serialization fair and starvation-bounded).
 
 All membership changes in a collection — key *and* subcollection — share this one
@@ -170,15 +170,15 @@ fallback ([ADR-002](002-wound-wait-locking.md)) — the root and shard paths are
 deterministic and sortable. The exact acquisition sequence and its atomic commit
 are ADR-020.
 
-### Listing: optimistic on the root version, read-lock fallback
+### Listing: optimistic on the root revision, read-lock fallback
 
 Listing keys (or subcollections) is **optimistic** and lock-free in the common
 case:
 
-1. Read the root; record its version `V0` (and, for subcollections, its list).
+1. Read the root; record its revision `V0` (and, for subcollections, its list).
 2. Scan: for keys, `list` + GET the existing shards and union live entries; for
    subcollections, take the names from the root.
-3. Re-read the root version `V1`. If `V1 == V0`, the snapshot is consistent —
+3. Re-read the root revision `V1`. If `V1 == V0`, the snapshot is consistent —
    object generations are monotonic and every membership change bumps the root,
    so equal endpoints prove no create/delete/subcollection-change committed during
    the scan. Return the result.
@@ -187,7 +187,7 @@ case:
 
 Value writes to existing keys change shards but not membership and never touch the
 root, so they never invalidate a listing — the read-set validation collapses from
-"every shard version" to the **single root version**, which summarizes the whole
+"every shard revision" to the **single root revision**, which summarizes the whole
 membership read set (the analog of the cycle observer validating a read set with
 one comparison).
 
@@ -201,7 +201,7 @@ baseline the optimism shortcuts.
 ### Subcollections
 
 The root's `subcollections` list is the authoritative directory of child
-collections; enumeration is the listing protocol above (OCC on the root version,
+collections; enumeration is the listing protocol above (OCC on the root revision,
 read-lock fallback), so it is serializable without a `_c/` prefix scan.
 
 - **Create** a subcollection: add its name to the parent root's list (under the
@@ -209,14 +209,14 @@ read-lock fallback), so it is serializable without a `_c/` prefix scan.
   committed together so the name and the child root appear atomically (sequencing
   in ADR-020). `Collection::collection(name)` keeps deriving the child prefix via
   `paths::from_collection`.
-- **Delete** a subcollection: remove the name under the parent membership write
-  lock. Tearing down the child's shards / transaction objects is reclamation,
-  deferred to ADR-022; v1 has no collection-delete API, so this only fixes the
+- **Drop** a subcollection: remove the name under the parent membership write
+  lock. Tearing down the child's shards / transaction records is reclamation,
+  deferred to ADR-022; v1 has no collection-drop API, so this only fixes the
   membership contract, not a full recursive teardown.
 
 ## Consequences
 
-- Listing becomes properly serializable: a single root-version comparison
+- Listing becomes properly serializable: a single root-revision comparison
   validates an entire cross-shard scan, because every existence change is funneled
   through the root. Read-mostly listing stays lock-free; only churn forces the
   read lock.
@@ -224,14 +224,14 @@ read-lock fallback), so it is serializable without a `_c/` prefix scan.
   write the root. Only create/delete and listing do, exactly the operations
   ADR-016 said may serialize on membership.
 - Membership coordination is coarse — one lock per collection covers all key and
-  subcollection create/delete — trading concurrency for a simple, obviously
+  subcollection create/drop — trading concurrency for a simple, obviously
   correct MVP, with finer-grained tokens available later.
 - The root gains a real format (`CollectionRoot` protobuf) and a recorded
   `shard_count`, pinning the key→shard mapping per collection and giving a fail-
   fast guard against a future `C` change. A new golden vector is needed, and the
   v1 one-byte marker is dropped.
 - `Collection::keys` changes from a `_k/` prefix scan to a shard `list` + GET +
-  union with root-version validation; `Collection::collections` reads the root
+  union with root-revision validation; `Collection::collections` reads the root
   list instead of scanning `_c/`. Listing a large collection costs ~`C` shard
   GETs — the inherent price of enumerating every key, and a motivation to keep the
   optimistic path cache-friendly.

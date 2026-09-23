@@ -50,7 +50,7 @@ The shard (`{prefix}/_s/<i>`) and collection root (`{prefix}/_i`) are the v2 CAS
 coordination units ([ADR-017](017-shard-object.md),
 [ADR-020](020-commit-write-back-protocol.md)). Every concurrency operation is a
 read-modify-write of one such object: acquiring locks, publishing
-`current_writer` pointers on write-back, and releasing locks.
+external values on write-back, and releasing locks.
 
 Two ADRs already batch these across transactions. ADR-025 routes lock
 **acquisition** through a per-object `Dedup`: contenders on one shard merge into a
@@ -60,11 +60,11 @@ admission. ADR-026 extends the same `Dedup` to **release** and **write-back**.
 Both live *inside* the `Locker`.
 
 ADR-027's single read-write fast path is the one mutation that **opts out**. To
-commit a lone overwrite in ~1 RTT it issues its committed object and its shard
+commit a lone overwrite in ~1 RTT it issues its committed record and its shard
 lock install *concurrently*, and — because the batching machinery is private to
 `Locker` — it installs the lock with its **own** direct shard CAS plus a private
 reload/reclassify retry loop. That raw CAS then **races** the deduplicated rounds
-on the same shard: full-path acquires, other single read-write installs, and
+on the same shard: locked-commit acquires, other single read-write installs, and
 in-flight write-backs. It is the exact "racing CASes" cost that ADR-025/026 removed
 everywhere else, reintroduced on the fast path's install.
 
@@ -94,11 +94,11 @@ object state to build a mutation plan.
 
 **All shard-entry mutations flow through one ShardCoordinator instance.** The only
 documented exception is [ADR-022](022-garbage-collection-mark-sweep.md)'s mark-sweep,
-which prunes dead locks/pointers out-of-band and is idempotent and best-effort by
-construction. This invariant is what removes the racing CAS at its root: install,
-acquire, write-back, and release for a shard all land in one single-flight
-keyspace, so they are serialized and batched instead of competing on the object's
-version.
+which prunes dead locks/external values out-of-band and is idempotent and
+best-effort by construction. This invariant is what removes the racing CAS at
+its root: install, acquire, write-back, and release for a shard all land in one
+single-flight keyspace, so they are serialized and batched instead of competing
+on the object's version.
 
 ### Mechanism: single-flight, ordered mutation planning, CAS retry
 
@@ -173,9 +173,9 @@ content; the rest is relocation of proven code.
    (the `Dedup` cancel contract) and rebuilds the mutation plan on every reload,
    so a resolver re-run whose effect is already present must be a no-op:
    re-installing one's own lock is idempotent, and a write-back publishes only
-   its own monotonic pointer. This is precisely what makes precondition/in-doubt
-   recovery *free* — the same resolver runs on the first attempt and on every
-   reload.
+   its own monotonic external value. This is precisely what makes
+   precondition/in-doubt recovery *free* — the same resolver runs on the first
+   attempt and on every reload.
 
 4. **Per-member outcome side-channel.** `Dedup` fans out one shared result, but
    members have heterogeneous outcomes. Each member's outcome is deposited into its
@@ -186,7 +186,7 @@ content; the rest is relocation of proven code.
 5. **Explicit in-doubt attribution.** The engine surfaces the store outcome to the
    resolver on reload; the resolver classifies **for itself**. For a pre-commit
    `Acquire`/`Release`/`WriteBack` this is a blind idempotent retry (nothing has
-   committed). For **CommitInstall** — whose committed object is being written in
+   committed). For **CommitInstall** — whose committed record is being written in
    parallel — the resolver reaches `Landed` (its lock present or help-forwarded),
    re-stage (still eligible), `Moved` (a precondition miss with the entry moved
    past it), or `InDoubt` (an `Unavailable` CAS *and* the entry then moved, so
@@ -231,7 +231,7 @@ content; the rest is relocation of proven code.
   wait-for cycle spanning shards.
 - **ADR-027's fast-path correctness is preserved.** CommitInstall participates in
   wound-wait (it holds a lock during the pre-commit window), records the same
-  back-references for GC ([ADR-022](022-garbage-collection-mark-sweep.md)),
+  recovery manifest for GC ([ADR-022](022-garbage-collection-mark-sweep.md)),
   help-forwards the resolved predecessor into `current_writer`, and surfaces the
   same single irreducible in-doubt — all now as one resolver rather than a private
   path.

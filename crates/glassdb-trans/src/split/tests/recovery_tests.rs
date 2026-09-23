@@ -1,14 +1,14 @@
 use super::*;
 
 #[derive(Clone, Copy)]
-enum ParticipantCleanup {
+enum ParticipantReclamation {
     StaleRecord,
     CachedParticipant,
     OwnerDeparted,
     ReadFailure,
 }
 
-async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
+async fn recover_peer_participant(committed: bool, case: ParticipantReclamation) {
     let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
     let recorder = RecordingBackend::new(hooks.clone());
     let operations = recorder.log();
@@ -27,7 +27,7 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
         // The split has completed its tree change, but failed intent deletion
         // leaves both the Ready intent and participant for background recovery.
         hooks.set_before({
-            let prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+            let prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
             move |op| {
                 let fail =
                     matches!(op, BackendOp::DeleteIf { path, .. } if path.starts_with(&prefix));
@@ -57,7 +57,10 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
         let intent = intents[0].1.value().unwrap();
         assert_eq!(intent.phase, StructuralIntentPhase::Ready);
         let id = intent.participant_id.clone();
-        assert_eq!(owner.mon.tx_status(&id).await.unwrap(), TxCommitStatus::Ok);
+        assert_eq!(
+            owner.mon.tx_status(&id).await.unwrap(),
+            TxCommitStatus::Committed
+        );
         id
     } else {
         let id = TxId::with_priority(1, b"peer-participant");
@@ -78,7 +81,7 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
         collection: collection(),
     }
     .to_string();
-    if matches!(case, ParticipantCleanup::CachedParticipant) {
+    if matches!(case, ParticipantReclamation::CachedParticipant) {
         local
             .records
             .load_record(
@@ -88,14 +91,14 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
             .await
             .unwrap();
     }
-    if matches!(case, ParticipantCleanup::OwnerDeparted) {
+    if matches!(case, ParticipantReclamation::OwnerDeparted) {
         // A peer can complete departure after this sweep deletes the intent
         // and before it checks the collection record.
         hooks.set_before({
             let owner = owner.clone();
             let participant = participant.clone();
             let prefix =
-                ObjectPath::participant_structural_intents_prefix(&db_root("db"), &participant);
+                ObjectPath::participant_structural_intents_prefix(&db_prefix("db"), &participant);
             move |op| {
                 let depart = matches!(op, BackendOp::List { .. }) && op.path() == prefix;
                 let owner = owner.clone();
@@ -114,7 +117,7 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
             }
         });
     }
-    if matches!(case, ParticipantCleanup::ReadFailure) {
+    if matches!(case, ParticipantReclamation::ReadFailure) {
         hooks.set_before({
             let path = record_path.clone();
             move |op| {
@@ -152,22 +155,25 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
         .load_record(&collection(), Requirement::ANY)
         .await
         .unwrap();
-    if matches!(case, ParticipantCleanup::ReadFailure) {
+    if matches!(case, ParticipantReclamation::ReadFailure) {
         assert!(
             result.is_err(),
             "a failed departure check cannot report a completed sweep"
         );
         assert!(record.topology_participants().any(|id| id == &participant));
-        // The transaction object remains available to GC even though intent
+        // The transaction record remains available to GC even though intent
         // discovery can no longer find this participant on its next sweep.
-        let log = verifier
+        let record = verifier
             .foundation
-            .tlogger
+            .tx_records
             .get_at(&participant, Requirement::ANY)
             .await
             .unwrap();
-        assert!(log.value().unwrap().locks.iter().any(|lock| {
-            matches!(lock, TxLock::Topology { collection: target } if target == &collection())
+        assert!(record.value().unwrap().locks.iter().any(|lock| {
+            matches!(
+                lock,
+                TxLock::TopologyParticipant { collection: target } if target == &collection()
+            )
         }));
         return;
     }
@@ -182,10 +188,10 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
         .map(|op| op.op)
         .collect();
     let expected: &[&str] = match case {
-        ParticipantCleanup::StaleRecord => &["read_if_modified", "write_if"],
-        ParticipantCleanup::CachedParticipant => &["write_if"],
-        ParticipantCleanup::OwnerDeparted => &["write_if", "read_if_modified"],
-        ParticipantCleanup::ReadFailure => unreachable!(),
+        ParticipantReclamation::StaleRecord => &["read_if_modified", "write_if"],
+        ParticipantReclamation::CachedParticipant => &["write_if"],
+        ParticipantReclamation::OwnerDeparted => &["write_if", "read_if_modified"],
+        ParticipantReclamation::ReadFailure => unreachable!(),
     };
     assert_eq!(record_calls, expected);
     operations.lock().unwrap().clear();
@@ -196,28 +202,28 @@ async fn recover_peer_participant(committed: bool, case: ParticipantCleanup) {
 #[tokio::test]
 async fn background_recovery_removes_participants_from_stale_records() {
     for committed in [false, true] {
-        recover_peer_participant(committed, ParticipantCleanup::StaleRecord).await;
+        recover_peer_participant(committed, ParticipantReclamation::StaleRecord).await;
     }
 }
 
 #[tokio::test]
 async fn background_recovery_removes_cached_participants_without_a_read() {
     for committed in [false, true] {
-        recover_peer_participant(committed, ParticipantCleanup::CachedParticipant).await;
+        recover_peer_participant(committed, ParticipantReclamation::CachedParticipant).await;
     }
 }
 
 #[tokio::test]
 async fn background_recovery_checks_departure_after_another_instance_removes_the_participant() {
     for committed in [false, true] {
-        recover_peer_participant(committed, ParticipantCleanup::OwnerDeparted).await;
+        recover_peer_participant(committed, ParticipantReclamation::OwnerDeparted).await;
     }
 }
 
 #[tokio::test]
 async fn background_recovery_reports_failed_departure_checks() {
     for committed in [false, true] {
-        recover_peer_participant(committed, ParticipantCleanup::ReadFailure).await;
+        recover_peer_participant(committed, ParticipantReclamation::ReadFailure).await;
     }
 }
 
@@ -236,9 +242,9 @@ async fn recovery_retries_a_cached_preparing_intent_after_the_peer_publishes_rea
     let peer_bg = Arc::new(Background::new());
     let recovering = splitter(&local, &local_bg, tiny());
     let owner = splitter(&peer, &peer_bg, tiny());
-    let prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+    let prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
     // The recovering instance discovers Preparing before the owner advances
-    // it. Failed owner cleanup then leaves the completed split for recovery.
+    // it. Failed intent deletion then leaves the completed split for recovery.
     hooks.set_after({
         let local = local.clone();
         let prefix = prefix.clone();
@@ -360,7 +366,7 @@ async fn settlement_cancels_a_prepared_split_before_node_creation() {
         .await
         .unwrap();
     let expected_listing =
-        ObjectPath::participant_structural_intents_prefix(&db_root("db"), &participant);
+        ObjectPath::participant_structural_intents_prefix(&db_prefix("db"), &participant);
     let listings: Vec<_> = operations
         .lock()
         .unwrap()
@@ -471,7 +477,7 @@ async fn structural_split_failure_transition_table() {
 
         let root_path = root_path().to_string();
         let nodes_prefix = ObjectPath::nodes_prefix(&collection());
-        let structural_prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+        let structural_prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
         let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         backend.set_before({
             let fired = fired.clone();
@@ -687,7 +693,7 @@ async fn structural_recovery_defers_while_the_source_writer_is_live() {
     let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
     s.create_root(COLL, &root).await.unwrap();
     let mut intent = nonroot_intent("L", "R", b"m");
-    intent.source_version = gated_revision(&s, "L").await;
+    intent.source_revision = gated_revision(&s, "L").await;
     s.write_structural_intent("R", &intent).await.unwrap();
 
     assert!(!sp.recover_structural_intents().await.unwrap());
@@ -767,7 +773,7 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
 
     // The in-flight split (peer, sharing the backend): take the source gate
     // and create the sibling. `s`'s cache is unaware of both writes.
-    let (mut gated, version) = peer
+    let (mut gated, observation) = peer
         .load_node(
             COLL,
             "L",
@@ -777,7 +783,7 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
         .unwrap();
     gated.set_structural_gate(id.clone());
     assert!(
-        peer.store_node(COLL, "L", &gated, Some(&version))
+        peer.store_node(COLL, "L", &gated, Some(&observation))
             .await
             .unwrap()
     );
@@ -788,7 +794,7 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
     // The intent is written after the gate and records the gated revision, so
     // recovery can tell that the split's publish CAS can still land.
     let mut intent = nonroot_intent("L", "R", b"m");
-    intent.source_version = gated_revision(&peer, "L").await;
+    intent.source_revision = gated_revision(&peer, "L").await;
     s.write_structural_intent("R", &intent).await.unwrap();
 
     operations.lock().unwrap().clear();
@@ -797,7 +803,7 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
         "recovery must defer to the live split rather than reclaim its child"
     );
     let recorded = std::mem::take(&mut *operations.lock().unwrap());
-    let intent_prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+    let intent_prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
     assert!(
         recorded.iter().all(|op| {
             !op.path.starts_with(&intent_prefix) || !matches!(op.op, "read" | "read_if_modified")
@@ -840,7 +846,7 @@ async fn stage_recovery_split(
     let mut intent = nonroot_intent("L", sibling, b"");
     intent.participant_id = participant.clone();
     intent.phase = StructuralIntentPhase::Preparing;
-    intent.source_version.clear();
+    intent.source_revision.clear();
     let prepared = s.write_structural_intent(sibling, &intent).await.unwrap();
     let (mut source, observed) = s.load_node(COLL, "L", Requirement::ANY).await.unwrap();
     source.set_structural_gate(worker.clone());
@@ -852,7 +858,7 @@ async fn stage_recovery_split(
     let (mut source, gated) = s.load_node(COLL, "L", Requirement::ANY).await.unwrap();
     let (right, split_key) = source.split(sibling).unwrap();
     source.remove_structural_gate(worker);
-    intent.source_version = gated.revision().unwrap().serialize().to_string();
+    intent.source_revision = gated.revision().unwrap().serialize().to_string();
     intent.split_key = split_key;
     intent.phase = StructuralIntentPhase::Ready;
     assert!(
@@ -916,7 +922,7 @@ async fn check_recovery_batch_reuses_source_reads(explicit: bool) {
         assert!(sp.recover_structural_intents().await.unwrap());
     }
     let recorded = std::mem::take(&mut *operations.lock().unwrap());
-    let intent_prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+    let intent_prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
     assert!(
         recorded.iter().all(|op| {
             !op.path.starts_with(&intent_prefix) || !matches!(op.op, "read" | "read_if_modified")
@@ -982,7 +988,7 @@ async fn participant_settlement_reuses_source_reads_across_a_discovered_batch() 
 async fn later_participant_discovery_checks_sources_after_its_own_ready_intents() {
     for explicit in [false, true] {
         let memory = Arc::new(MemoryBackend::new());
-        let prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+        let prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
         let (backend, gate) = OpGate::wrap(
             memory.clone(),
             move |op| matches!(op, BackendOp::DeleteIf { path, .. } if path.starts_with(&prefix)),
@@ -1040,7 +1046,7 @@ async fn later_participant_discovery_checks_sources_after_its_own_ready_intents(
         };
         gate.wait_until_entered().await;
         // Recovery has checked the unsplit source for the first batch. A peer
-        // can create more recovery work under this finalized participant, just
+        // can create more recovery work under this participant with a final status, just
         // as recursive parent recovery can. Its new sibling is now reachable.
         let later_worker = TxId::with_priority(1, b"later-worker");
         let (published, expected) =
@@ -1053,7 +1059,7 @@ async fn later_participant_discovery_checks_sources_after_its_own_ready_intents(
         gate.release();
         recovering.await.unwrap();
 
-        let prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+        let prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
         let body_reads: Vec<_> = operations
             .lock()
             .unwrap()
@@ -1116,10 +1122,10 @@ async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
     source.set_structural_gate(abandoned.clone());
     s.store_node(COLL, "L", &source, None).await.unwrap();
     let mut intent = nonroot_intent("L", "R", b"m");
-    intent.source_version = gated_revision(&s, "L").await;
+    intent.source_revision = gated_revision(&s, "L").await;
 
     // The abandoned worker loses the source to a later split of the same node.
-    let (mut source, version) = s
+    let (mut source, observation) = s
         .load_node(
             COLL,
             "L",
@@ -1130,7 +1136,7 @@ async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
     source.remove_structural_gate(&abandoned);
     source.set_structural_gate(newcomer.clone());
     assert!(
-        s.store_node(COLL, "L", &source, Some(&version))
+        s.store_node(COLL, "L", &source, Some(&observation))
             .await
             .unwrap()
     );
@@ -1182,7 +1188,7 @@ async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
 /// newer one.
 #[tokio::test]
 async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
-    let intents_prefix = ObjectPath::structural_intents_prefix(&db_root("db"));
+    let intents_prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
     let (backend, gate) = OpGate::wrap(
         Arc::new(MemoryBackend::new()),
         move |op| matches!(op, BackendOp::Read { path } if path.starts_with(&intents_prefix)),
@@ -1205,7 +1211,7 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
     let mut intent = StructuralIntent {
         collection: collection(),
         source_token: None,
-        source_version: String::new(),
+        source_revision: String::new(),
         created_tokens: vec![test_token("L"), test_token("R")],
         split_key: b"m".to_vec(),
         participant_id: participant.clone(),
@@ -1225,7 +1231,7 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
         .await
         .unwrap();
 
-    let (mut root, version) = peer
+    let (mut root, observation) = peer
         .load_root(
             COLL,
             Requirement::after(peer.timeline.currentness_barrier()),
@@ -1233,7 +1239,7 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
         .await
         .unwrap();
     root.set_structural_gate(worker.clone());
-    assert!(peer.store_root(COLL, &root, &version).await.unwrap());
+    assert!(peer.store_root(COLL, &root, &observation).await.unwrap());
     let (_, gated) = peer
         .load_root_node(
             COLL,
@@ -1242,7 +1248,7 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
         .await
         .unwrap()
         .unwrap();
-    intent.source_version = gated.revision().unwrap().serialize().to_string();
+    intent.source_revision = gated.revision().unwrap().serialize().to_string();
     intent.phase = StructuralIntentPhase::Ready;
     assert!(
         peer.intent_store
@@ -1323,7 +1329,7 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
     let intent = StructuralIntent {
         collection: collection(),
         source_token: Some(test_token("L")),
-        source_version: superseded_source_version(),
+        source_revision: superseded_source_revision(),
         created_tokens: vec![test_token("R")],
         split_key: b"t".to_vec(),
         participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
@@ -1458,7 +1464,7 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
     let mut original = leaf_node(&[b"a", b"b", b"m", b"n"], None, None);
     original.set_structural_gate(id.clone());
     s.store_node(COLL, "L", &original, None).await.unwrap();
-    let (mut shrunk, source_version) = s
+    let (mut shrunk, source_observation) = s
         .load_node(
             COLL,
             "L",
@@ -1475,7 +1481,11 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
     let intent = StructuralIntent {
         collection: collection(),
         source_token: Some(test_token("L")),
-        source_version: source_version.revision().unwrap().serialize().to_string(),
+        source_revision: source_observation
+            .revision()
+            .unwrap()
+            .serialize()
+            .to_string(),
         created_tokens: vec![test_token("R")],
         split_key,
         participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
@@ -1496,7 +1506,7 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
     gate.wait_until_entered().await;
 
     assert!(
-        peer.store_node(COLL, "L", &shrunk, Some(&source_version))
+        peer.store_node(COLL, "L", &shrunk, Some(&source_observation))
             .await
             .unwrap()
     );
@@ -1560,7 +1570,7 @@ async fn recovery_that_needs_a_parent_split(
     let intent = StructuralIntent {
         collection: collection(),
         source_token: Some(test_token("L")),
-        source_version: superseded_source_version(),
+        source_revision: superseded_source_revision(),
         created_tokens: vec![test_token("R")],
         split_key: b"t".to_vec(),
         participant_id: participant.clone(),
@@ -1585,7 +1595,7 @@ async fn sweep_defers_one_failed_parent_split_and_continues() {
     intent_ids.sort();
     s.intent_store
         .write(
-            &db_root("db"),
+            &db_prefix("db"),
             &StructuralIntentId::from(intent_ids[0].clone()),
             &request_record,
         )
@@ -1593,7 +1603,7 @@ async fn sweep_defers_one_failed_parent_split_and_continues() {
         .unwrap();
     s.intent_store
         .write(
-            &db_root("db"),
+            &db_prefix("db"),
             &StructuralIntentId::from(intent_ids[1].clone()),
             &orphan_intent,
         )
@@ -1639,7 +1649,7 @@ async fn explicit_settlement_returns_a_parent_split_error() {
     sp.mon.abort_owned_tx(&participant).await.unwrap();
     s.intent_store
         .write(
-            &db_root("db"),
+            &db_prefix("db"),
             &StructuralIntentId::from(test_token("request-intent")),
             &intent,
         )

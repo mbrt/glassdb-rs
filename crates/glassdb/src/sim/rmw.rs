@@ -19,7 +19,7 @@ pub const RMW_KEY_COUNT: usize = 4;
 const INCREMENT_COLLECTION: &[u8] = b"fuzz";
 
 /// A single operation performed by a client, all wrapped in their own
-/// transaction (with automatic conflict retries).
+/// transaction (with automatic body replays on conflict).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RmwOp {
     /// Read-modify-write: increment a single key.
@@ -121,7 +121,7 @@ impl RmwAcct {
 }
 
 /// Attempts a single op in its own transaction, updating `acct`: `started` is
-/// bumped before the attempt, `acked` only after a commit outcome. A failure leaves the op
+/// bumped before the transaction, `acked` only after a commit outcome. A failure leaves the op
 /// counted in `started` but not `acked` (i.e. in-doubt).
 async fn run_one(
     db: &Database,
@@ -134,7 +134,7 @@ async fn run_one(
             acct.lock().unwrap().started[*k] += 1;
             // Bind a reference so the `async move` body captures `&Vec`
             // (`Copy`) instead of moving the key, keeping the closure
-            // `FnMut` for retries.
+            // `FnMut` for body replays.
             let kn = &key_name(*k);
             db.tx(|tx| async move {
                 let cur = read_int_from_tx(&tx, coll, kn).await?;

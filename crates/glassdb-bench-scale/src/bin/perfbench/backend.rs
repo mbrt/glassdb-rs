@@ -200,7 +200,7 @@ mod tests {
             "mixed",
         ])?;
         let backend = cli.backend.initialize().await?.backend();
-        let version = backend.write_if_not_exists("db/key", vec![7]).await?;
+        let revision = backend.write_if_not_exists("db/key", vec![7]).await?;
         let mut elapsed = Vec::new();
         for _ in 0..2 {
             let start = tokio::time::Instant::now();
@@ -213,11 +213,11 @@ mod tests {
 
         // The object limiter admits an initial burst. Check the next window
         // after that burst has used more than its one-write-per-second budget.
-        let version = backend.write_if("db/key", vec![8], &version).await?;
-        let version = backend.write_if("db/key", vec![9], &version).await?;
+        let revision = backend.write_if("db/key", vec![8], &revision).await?;
+        let revision = backend.write_if("db/key", vec![9], &revision).await?;
         tokio::time::advance(Duration::from_secs(1)).await;
         let start = tokio::time::Instant::now();
-        backend.write_if("db/key", vec![10], &version).await?;
+        backend.write_if("db/key", vec![10], &revision).await?;
         assert!(start.elapsed() >= Duration::from_millis(500));
         Ok(())
     }

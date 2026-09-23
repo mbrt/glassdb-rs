@@ -180,18 +180,14 @@ class MixedSweepPlotterTest(unittest.TestCase):
         colors = plotter._shape_colors()
 
         line_figure, line_axis = plotter.plt.subplots()
-        plotter._plot_shape_lines(
-            line_axis, medians, "workers", "throughput", colors
-        )
+        plotter._plot_shape_lines(line_axis, medians, "workers", "throughput", colors)
         self.assertEqual(len(line_axis.lines), len(plotter.SHAPES))
         self.assertEqual(len(line_axis.collections), 0)
         self.assertTrue(all(line.get_marker() == "None" for line in line_axis.lines))
         plotter.plt.close(line_figure)
 
         band_figure, band_axis = plotter.plt.subplots()
-        plotter._plot_shape_latency_bands(
-            band_axis, medians, "workers", colors
-        )
+        plotter._plot_shape_latency_bands(band_axis, medians, "workers", colors)
         self.assertEqual(len(band_axis.lines), len(plotter.SHAPES))
         self.assertEqual(len(band_axis.collections), len(plotter.SHAPES))
         self.assertTrue(all(line.get_marker() == "None" for line in band_axis.lines))
@@ -215,14 +211,16 @@ class MixedSweepPlotterTest(unittest.TestCase):
             plotter.plot_affinity_latency(affinities, Path("plots"))
 
         expected_titles = [
-            "1 DB client",
-            "3 DB clients",
-            "5 DB clients",
-            "7 DB clients",
+            "1 DB instance",
+            "3 DB instances",
+            "5 DB instances",
+            "7 DB instances",
         ]
         throughput = figures["affinity-throughput.png"]
         latency = figures["affinity-latency.png"]
-        self.assertEqual([axis.get_title() for axis in throughput.axes], expected_titles)
+        self.assertEqual(
+            [axis.get_title() for axis in throughput.axes], expected_titles
+        )
         self.assertEqual([axis.get_title() for axis in latency.axes], expected_titles)
         self.assertTrue(
             all(len(axis.lines) == len(plotter.SHAPES) for axis in throughput.axes)

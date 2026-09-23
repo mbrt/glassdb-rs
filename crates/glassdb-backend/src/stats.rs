@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 
-use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
+use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Revision};
 
 /// Snapshot of backend operation counters.
 ///
@@ -80,7 +80,7 @@ impl Backend for StatsBackend {
     async fn read_if_modified(
         &self,
         path: &str,
-        expected: &Version,
+        expected: &Revision,
     ) -> Result<ReadReply, BackendError> {
         self.obj_reads.fetch_add(1, Ordering::Relaxed);
         self.inner.read_if_modified(path, expected).await
@@ -90,8 +90,8 @@ impl Backend for StatsBackend {
         &self,
         path: &str,
         value: Vec<u8>,
-        expected: &Version,
-    ) -> Result<Version, BackendError> {
+        expected: &Revision,
+    ) -> Result<Revision, BackendError> {
         self.obj_writes.fetch_add(1, Ordering::Relaxed);
         self.inner.write_if(path, value, expected).await
     }
@@ -100,12 +100,12 @@ impl Backend for StatsBackend {
         &self,
         path: &str,
         value: Vec<u8>,
-    ) -> Result<Version, BackendError> {
+    ) -> Result<Revision, BackendError> {
         self.obj_writes.fetch_add(1, Ordering::Relaxed);
         self.inner.write_if_not_exists(path, value).await
     }
 
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Revision) -> Result<(), BackendError> {
         self.obj_writes.fetch_add(1, Ordering::Relaxed);
         self.inner.delete_if(path, expected).await
     }

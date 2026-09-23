@@ -161,7 +161,7 @@ are not discoverable by new cache reads. A future concurrent-read optimization
 may add provenance-bearing tombstones internally.
 
 Any later definitive read or successful mutation may install usable knowledge
-again. A clean mutation precondition failure only proves the expected
+again. A clean rejected mutation only proves the expected
 observation obsolete; because it does not identify the current state, knowledge
 remains uncertain until another operation does.
 
@@ -174,10 +174,10 @@ mere existence cannot publish newer user-visible state. An identity object
 becomes live only through a separately revision-fenced reference or through
 idempotent recovery of that identity.
 
-Transaction objects use fresh transaction IDs and
+Transaction records use fresh transaction IDs and
 [ADR-022](022-garbage-collection-mark-sweep.md)'s reference-checked GC;
 structural nodes and records use fresh random tokens and
-[ADR-032](032-node-locking-and-coordinated-splits.md)'s version-fenced
+[ADR-032](032-node-locking-and-coordinated-splits.md)'s revision-fenced
 reachability. A late object therefore belongs to its original lifecycle rather
 than replacing a newer one. In particular, a structural node created after its
 write-ahead record was resolved cannot become reachable without the
@@ -189,7 +189,7 @@ creation to affect the live tree or transaction state.
 ADR-036's `read_stale` remains an approximate cache policy only. It may use a
 monotonic elapsed-time sample to derive an explicitly approximate
 `SequencePoint` cutoff, but duration-to-sequence conversion is confined to that
-API. Causal validation, mutation receipts, and recovery never perform time
+API. Causal validation, CAS receipts, and recovery never perform time
 arithmetic. Snapshot reads are expected to supersede `read_stale` for real
 bounded-staleness guarantees.
 
@@ -259,7 +259,7 @@ One backend test separates request dispatch from remote application, abandons
 the local mutation, completes shutdown, then applies the request and verifies
 that subsequent read/CAS or recovery safely reconciles it.
 Transaction simulation remains the end-to-end check under reordered responses,
-lost acknowledgements, outages, and client crashes. Hot-object, slow-read, and
+lost acknowledgements, outages, and process crashes. Hot-object, slow-read, and
 ordinary multi-path benchmarks gate any relaxation of the exclusive read lane.
 
 ## Discarded options
@@ -273,9 +273,9 @@ also cannot order overlapping operations: object stores do not promise that
 acknowledgements arrive in linearization order.
 
 Stamping a result with completion as `current_after` is stronger than either
-ordering mistake. Another client may replace the state after this operation
-linearizes but before its response arrives, so completion would claim freshness
-the result never established.
+ordering mistake. Another database instance may replace the state after this
+operation linearizes but before its response arrives, so completion would claim
+freshness the result never established.
 
 ### Track spans without serializing same-path calls
 
@@ -347,7 +347,7 @@ Transferring an invoked mutation to a database-owned worker would preserve its
 place in the local path order and often recover a definitive result. That edge
 is not observable by the caller that abandoned the operation, however, and
 GlassDB must already tolerate the same mutation arriving from another database
-instance or a crashed client. Continuing it would require a task registry,
+instance or a crashed process. Continuing it would require a task registry,
 ownership handoff, panic containment, and shutdown draining, while a slow call
 would retain the path lane after its caller no longer needs it. Invalidating
 knowledge and applying the existing external-writer model gives the required

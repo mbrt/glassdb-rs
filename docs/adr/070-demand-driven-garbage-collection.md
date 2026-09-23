@@ -8,7 +8,7 @@ Accepted — implemented.
 resolution of pending candidates and cleanup of wounded candidates.
 
 Refines GC scheduling in
-[ADR-022](022-garbage-collection-mark-sweep.md), transaction-object placement and
+[ADR-022](022-garbage-collection-mark-sweep.md), transaction-record placement and
 GC scans in
 [ADR-035](035-paginated-listing-and-sharded-transaction-logs.md), and structural
 recovery cadence in [ADR-034](034-separate-structural-log-namespace.md).
@@ -20,7 +20,7 @@ accepted.
 Each independently opened `Database` instance starts a periodic GC loop. Cloned
 handles share that instance and its GC work; separate opens create separate
 instances, including within one process. A cycle consumes local hints, makes up
-to 64 LIST requests looking for a non-empty page among 4,096 transaction-log
+to 64 LIST requests looking for a non-empty page among 4,096 transaction-record
 prefixes, and checks GC candidates sequentially. Idle instances pay for sparse
 scans. Busy instances cannot increase their GC rate beyond the work one loop
 completes between fixed delays.
@@ -35,7 +35,7 @@ waste LIST page capacity; fewer prefixes make individual traversals longer in
 large databases. A fixed count does not suit both cases.
 
 GC cost should follow useful work, with an allowance for GC scans. GC backlog
-must never make writers wait. Live values and pinned `Wounded` markers can
+must never make writers wait. Live values and pinned wounds can
 remain stored indefinitely; their presence alone is not GC backlog.
 
 ## Decision
@@ -62,7 +62,7 @@ Local hints wake GC without causing a LIST. The `Database` instance de-duplicate
 GC candidates and retains deferred checks with retry times in bounded memory.
 The first admitted hint schedules a check after the pending timeout plus the
 clock-skew allowance. Further hints and scans preserve that deadline. Scan-only
-candidates can be checked immediately. The observed log's safety horizon can
+candidates can be checked immediately. The observed record's safety horizon can
 defer a check further; hints cannot bring it forward. This trades longer storage
 and buffering for fewer premature requests.
 
@@ -78,7 +78,7 @@ effects under [ADR-059](059-pin-foreign-wounds-until-owner-retirement.md).
 
 ### Transaction paths permit broad and narrow scans
 
-Store transaction objects at:
+Store transaction records at:
 
 ```text
 {db}/_t/{a}/{b}/{encoded-txid}
@@ -90,7 +90,7 @@ three depths:
 
 | Prefix | Scan scope |
 | --- | --- |
-| `{db}/_t/` | All transaction objects |
+| `{db}/_t/` | All transaction records |
 | `{db}/_t/{a}/` | One of 64 groups |
 | `{db}/_t/{a}/{b}/` | One of 4,096 smaller groups |
 
@@ -115,7 +115,7 @@ independent random scheduling to reduce simultaneous duplicate work;
 overlapping scans remain safe under the existing reclamation rules.
 
 Each instance selects one depth for new traversals: the root, 64 prefixes, or
-4,096 prefixes. Those prefixes cover the whole transaction-log namespace.
+4,096 prefixes. Those prefixes cover the whole transaction-record namespace.
 Start at the root. Transaction identities have uniformly random leading bytes,
 so a few randomly selected prefixes provide an estimate for the whole database.
 Use that estimate to change the instance's scan depth, without separate choices
@@ -170,7 +170,7 @@ the existing reclamation checks continue to determine deletion safety.
 Adjust the delay between scan turns from recent useful work per LIST. Resources
 reclaimed or recovery advanced permit faster scans; repeated unproductive
 results increase the delay. Smooth the observations and add random variation.
-Live objects, unchanged pinned markers, and successful no-ops are not positive
+Live objects, unchanged pinned wounds, and successful no-ops are not positive
 demand signals. Errors use separate retry handling and are not evidence of an
 idle database. Retain a finite maximum delay; never disable scans permanently.
 
@@ -199,7 +199,7 @@ experiments with idle, sparse, dense, overloaded, and changing workloads.
 
 Structural recovery scans examine structural intents. They keep their own
 namespace, recovery rules, and work budget, with an independent adaptive cadence
-and local recovery signals. The transaction-log hierarchy applies to GC scans.
+and local recovery signals. The transaction-record hierarchy applies to GC scans.
 
 GC candidate scheduling and local scan state belong in the maintenance module,
 behind the small producer hint interface. Transaction and structural recovery
@@ -249,6 +249,6 @@ application transactions. Object storage remains the only shared dependency.
   undiscovered indefinitely.
 - **Make writers pay cleanup debt or wait for queue space.** This violates
   writer independence. Unlimited GC concurrency also risks delaying writers.
-- **Require durable publication of every cleanup hint.** Surviving a failure
+- **Require durable publication of every GC hint.** Surviving a failure
   between mutation and publication would require a larger transaction-protocol
   change. Local hints plus scans keep that obligation off the commit path.

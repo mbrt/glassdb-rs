@@ -8,7 +8,7 @@ stateless ACID key/value store on top of object storage.
 
 Each logical key maps to a single GCS object whose body holds the value. GCS
 provides native content compare-and-swap through object `generation`
-preconditions, so the opaque version token is the object generation: conditional
+preconditions, so the opaque revision token is the object generation: conditional
 reads use `ifGenerationNotMatch`, while writes and deletion require an exact
 generation condition.
 

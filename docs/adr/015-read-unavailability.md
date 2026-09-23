@@ -21,7 +21,7 @@ backend) had two gaps under a backend outage:
 A read is idempotent: re-reading can never double-apply anything, so it is always
 safe to retry ([ADR-009](009-in-doubt-conditional-writes.md): "reads and
 unconditional (idempotent) writes ... may be retried freely"). The whole in-doubt
-machinery exists *only* because a conditional write cannot be safely retried;
+machinery exists *only* because a conditional mutation cannot be safely retried;
 that reasoning does not apply to reads. Consequently `Error::InDoubt` — whose
 contract is "a mutation may or may not have applied" — is the wrong
 classification for a side-effect-free read that simply could not complete.
@@ -64,10 +64,10 @@ outage.
    This deliberately stays in the engine layer rather than in `Global` or the
    backend. Those layers know read-vs-write, but that distinction alone is not
    enough: some commit-path reads *confirm a pending write* (e.g.
-   `Monitor::set_final_log` re-reads `commit_status` after an in-doubt log write;
+   `Monitor::set_final_log` re-reads `commit_status` after an in-doubt record write;
    lock acquisition re-reads metadata while resolving an in-doubt writer). When
-   such a read fails it inherits the mutation's uncertainty and must stay
-   in-doubt. `Global::get_metadata` and the tx-log reads serve exactly those
+   such a read fails it inherits the mutation's in-doubt outcome and must stay
+   in-doubt. `Global::get_metadata` and the transaction-record reads serve exactly those
    contexts, so a blanket downgrade there would mislabel real in-doubt commit
    outcomes as retry-safe. Hence the conservative default lives in `From`, and
    only genuine user reads opt out via `from_read`.
@@ -83,25 +83,25 @@ outage.
    - **S3**: reads, HEADs, and the GET behind `set_tags_if` go through `run`,
      which now maps SDK errors via `annotate_read`: a throttle (`503`/`429`),
      timeout, dispatch failure, or `5xx` becomes `Unavailable`. The
-     conditional-write path keeps `annotate` unchanged, so a transient failure
-     that never landed is *not* mislabelled in-doubt.
+     conditional-mutation path keeps `annotate` unchanged, so a transient
+     failure that never landed is *not* mislabelled in-doubt.
 
-Conditional writes / commit are explicitly **not** routed through this
+Conditional mutations / commit are explicitly **not** routed through this
 read-style retry — that is the lost-update hazard
 [ADR-009](009-in-doubt-conditional-writes.md) prevents.
 
 ## Consequences
 
 - A transient read outage is recovered transparently, below `Database::tx`, so
-  the user closure is not re-run. A sustained outage surfaces as a clean,
+  the user closure is not replayed. A sustained outage surfaces as a clean,
   matchable `Error::Unavailable` (never `InDoubt`, never `Internal`), which a
   caller can safely retry because the read had no side effects.
 - `BackendError::Unavailable` now carries two related meanings: an in-doubt
-  conditional-write outcome (the original ADR-009 use) and a transient failure of
-  an idempotent request (safe to retry). Both are "the outcome could not be
-  confirmed"; the distinction that matters — whether a retry could double-apply —
-  is made by the *operation*, which is why only the read path reclassifies it as
-  `Error::Unavailable`.
+  conditional-mutation outcome (the original ADR-009 use) and a transient
+  failure of an idempotent request (safe to retry). Both are "the outcome could
+  not be confirmed"; the distinction that matters — whether a retry could
+  double-apply — is made by the *operation*, which is why only the read path
+  reclassifies it as `Error::Unavailable`.
 - Regression tests document the behavior: `crates/glassdb/tests/read_unavailable.rs`
   (transparent retry on a transient read outage; `Error::Unavailable` on a
   sustained one), and per-backend read reclassification in

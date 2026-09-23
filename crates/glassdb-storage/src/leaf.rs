@@ -17,7 +17,7 @@ use glassdb_proto as pb;
 use prost::Message;
 
 use crate::error::StorageError;
-use crate::lock::{EntryLockState, LockType, lock_type_to_proto};
+use crate::lock::{KeyLockState, LockType, lock_type_to_proto};
 use crate::wire_size::{
     length_delimited_field, nonempty_length_delimited_field, nonzero_varint_field,
     present_varint_field,
@@ -36,9 +36,9 @@ const CURRENT_TOMBSTONE_TAG: u32 = 4;
 /// where the value itself lives.
 ///
 /// `writer` is the optimistic-validation token the commit path compares. It
-/// identifies the transaction that produced the version, but it is not
-/// universally a pointer to a transaction object: a logless commit publishes
-/// [`CurrentState::Inline`] without ever writing one.
+/// identifies the writer, but it does not always refer to a transaction
+/// record: a direct commit publishes [`CurrentState::Inline`] without ever
+/// writing one.
 ///
 /// An inline value is authoritative latest-value evidence. Readers return it
 /// directly, without consulting the writer's transaction status.
@@ -47,7 +47,7 @@ pub enum CurrentState {
     /// The key has no committed value yet.
     #[default]
     Absent,
-    /// The value lives in the writer's transaction object.
+    /// The value lives in the writer's transaction record.
     External { writer: TxId },
     /// The value is authoritative here in the leaf entry.
     Inline { writer: TxId, value: Arc<[u8]> },
@@ -56,8 +56,7 @@ pub enum CurrentState {
 }
 
 impl CurrentState {
-    /// The transaction that produced this version, or `None` when the key has
-    /// no committed value.
+    /// The writer of this value, or `None` when the key has no committed value.
     pub fn writer(&self) -> Option<&TxId> {
         match self {
             CurrentState::Absent => None,
@@ -103,7 +102,7 @@ pub struct LeafEntry {
     pub key: Vec<u8>,
     /// The key's committed current value, separate from the lock state above.
     pub current: CurrentState,
-    lock: EntryLockState,
+    lock: KeyLockState,
 }
 
 impl LeafEntry {
@@ -112,7 +111,7 @@ impl LeafEntry {
         LeafEntry {
             key: key.into(),
             current: CurrentState::Absent,
-            lock: EntryLockState::default(),
+            lock: KeyLockState::default(),
         }
     }
 
@@ -142,18 +141,18 @@ impl LeafEntry {
         self.lock.acquire_read(holder);
     }
 
-    /// Replaces the entry lock with one exclusive writer.
+    /// Replaces the key lock with one exclusive writer.
     pub fn replace_write_lock(&mut self, holder: TxId) {
-        self.replace_lock(EntryLockState::write(holder));
+        self.replace_lock(KeyLockState::write(holder));
     }
 
-    /// Replaces the entry lock with one exclusive creator.
+    /// Replaces the key lock with one exclusive creator.
     pub fn replace_create_lock(&mut self, holder: TxId) {
-        self.replace_lock(EntryLockState::create(holder));
+        self.replace_lock(KeyLockState::create(holder));
     }
 
-    /// Replaces the entry lock with a validated state.
-    pub fn replace_lock(&mut self, lock: EntryLockState) {
+    /// Replaces the key lock with a validated state.
+    pub fn replace_lock(&mut self, lock: KeyLockState) {
         self.lock = lock;
     }
 
@@ -226,7 +225,7 @@ fn current_state_field_len(current: &CurrentState) -> usize {
     length_delimited_field(ENTRY_CURRENT_TAG, current_len)
 }
 
-/// A decoded leaf: the coordination directory for the keys that map to it.
+/// A decoded leaf: the leaf entries for the keys that map to it.
 ///
 /// Entries are stored keyed by their raw key bytes, so iteration and encoding
 /// are in canonical key order.
@@ -351,7 +350,7 @@ fn entry_to_proto(e: &LeafEntry) -> pb::LeafEntry {
 }
 
 fn entry_from_proto(e: pb::LeafEntry) -> Result<LeafEntry, StorageError> {
-    let lock = EntryLockState::from_wire(e.lock_type, e.locked_by)
+    let lock = KeyLockState::from_wire(e.lock_type, e.locked_by)
         .map_err(|_| StorageError::other("leaf entry has an invalid lock"))?;
     Ok(LeafEntry {
         key: e.key,
@@ -421,7 +420,7 @@ mod tests {
         LeafBody::from_entries([entry.clone()]).encode()
     }
 
-    fn with_lock(mut entry: LeafEntry, lock: EntryLockState) -> LeafEntry {
+    fn with_lock(mut entry: LeafEntry, lock: KeyLockState) -> LeafEntry {
         entry.replace_lock(lock);
         entry
     }
@@ -486,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_entry_lock_acquisition_is_canonical_and_idempotent() {
+    fn shared_key_lock_acquisition_is_canonical_and_idempotent() {
         let first = tx(&[1]);
         let second = tx(&[2]);
         let mut entry = LeafEntry::new(b"key");
@@ -506,7 +505,7 @@ mod tests {
         reverse.acquire_read_lock(second.clone());
         assert_eq!(encode_entry(&reverse), encoded);
 
-        let mut replacement = EntryLockState::read(second);
+        let mut replacement = KeyLockState::read(second);
         replacement.acquire_read(first.clone());
         assert_eq!(replacement.lock_type(), LockType::Read);
         assert!(replacement.contains(&first));
@@ -525,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_entry_lock_replacement_and_release_are_idempotent() {
+    fn exclusive_key_lock_replacement_and_release_are_idempotent() {
         let writer = tx(&[3]);
         let creator = tx(&[4]);
         let unrelated = tx(&[5]);
@@ -561,14 +560,14 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        let mut read_lock = EntryLockState::read(tx(&[5]));
+        let mut read_lock = KeyLockState::read(tx(&[5]));
         read_lock.acquire_read(tx(&[6]));
         let leaf = LeafBody::from_entries([
             with_lock(
                 LeafEntry::new(b"alpha").with_current(CurrentState::External {
                     writer: tx(&[9, 9]),
                 }),
-                EntryLockState::write(tx(&[1, 2, 3, 4])),
+                KeyLockState::write(tx(&[1, 2, 3, 4])),
             ),
             with_lock(LeafEntry::new(b"beta"), read_lock),
             LeafEntry::new(b"gamma").with_current(CurrentState::Tombstone { writer: tx(&[7]) }),
@@ -698,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn decoding_rejects_inconsistent_entry_locks() {
+    fn decoding_rejects_inconsistent_key_locks() {
         use pb::lock::LockType as PbLockType;
 
         let invalid_locks = [
@@ -793,7 +792,7 @@ mod tests {
     fn lookup_and_exists() {
         let locked_only = with_lock(
             LeafEntry::new(b"locked-only"),
-            EntryLockState::create(tx(&[3])),
+            KeyLockState::create(tx(&[3])),
         );
         let leaf = LeafBody::from_entries([
             LeafEntry::new(b"live").with_current(CurrentState::External { writer: tx(&[1]) }),
@@ -892,7 +891,7 @@ mod tests {
             writer: tx(&[0xaa, 0xbb]),
         });
         let leaf =
-            LeafBody::from_entries([with_lock(entry, EntryLockState::write(tx(&[1, 2, 3, 4])))]);
+            LeafBody::from_entries([with_lock(entry, KeyLockState::write(tx(&[1, 2, 3, 4])))]);
         let got = leaf.encode();
         let want = [
             0x0a, 0x17, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a, 0x04, 0x01,
@@ -909,7 +908,7 @@ mod tests {
             value: Arc::from(b"hi".as_slice()),
         });
         let leaf =
-            LeafBody::from_entries([with_lock(entry, EntryLockState::write(tx(&[1, 2, 3, 4])))]);
+            LeafBody::from_entries([with_lock(entry, KeyLockState::write(tx(&[1, 2, 3, 4])))]);
         let got = leaf.encode();
         let want = [
             0x0a, 0x19, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a, 0x04, 0x01,

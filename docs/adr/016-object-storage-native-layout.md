@@ -10,7 +10,7 @@ three object kinds, dropping tags) stands.
 
 [ADR-046](046-incarnation-addressed-collections.md) supersedes this ADR's
 collection-existence and name-only subcollection-directory clauses with
-incarnation IDs and direct `name → ID` parent directories. [ADR-047]
+collection IDs and direct `name → ID` parent directories. [ADR-047]
 proposes making management of that hierarchy transactional.
 
 [ADR-047]: 047-transactional-collection-management.md
@@ -53,20 +53,20 @@ Three object kinds (details in the follow-on ADRs):
   **lock table**, the **MVCC version index** (current-writer txid per key), and
   the **per-shard key directory** (which of its keys exist). It is the unit of
   CAS; reading or writing an *existing* key touches only its shard.
-- **Transaction object** — unified; small while pending (lease + lock
-  intentions), fat once committed (it then carries the transaction's written
+- **Transaction record** — unified; small while pending (lease + recovery
+  manifest), fat once committed (it then carries the transaction's written
   values). Values live *only* here; there are no per-key value objects.
 - **Collection root** — small; records collection existence, the (constant)
   shard count, and the **list of subcollections**. It is the
   **membership-coordination point**: key creation and deletion take a write lock
   on it so the key set changes consistently (phantom prevention), and key /
-  subcollection listing validates against its version optimistically, taking a
+  subcollection listing validates against its generation optimistically, taking a
   read lock only under contention.
 
 Isolation remains **strict serializable**, enforced by the same S2PL +
 wound-wait protocol ([ADR-002](002-wound-wait-locking.md)) relocated to shard
-granularity. Commit is the CAS that flips the transaction object to committed;
-write-back is an async per-shard CAS that publishes current-writer pointers and
+granularity. Commit is the CAS that flips the transaction record to committed;
+write-back is an async per-shard CAS that publishes external values and
 releases locks together. The in-doubt reasoning of
 [ADR-009](009-in-doubt-conditional-writes.md) carries over to the new CAS sites.
 
@@ -75,14 +75,14 @@ adopt the new layout, and on-disk / commit-protocol compatibility with the Go
 original is **dropped**.
 
 This ADR records only the umbrella direction. Follow-on ADRs record the sharded
-directory, unified transaction objects, commit/write-back, wound-wait at shard
+directory, unified transaction record layout, commit/write-back, wound-wait at shard
 granularity, mark-sweep garbage collection, and the slimmed `Backend` trait.
 
 ## Consequences
 
 - The engine depends only on content CAS, which S3 and GCS both provide
   natively. The worst S3 cost — rewriting whole values to flip lock bits —
-  disappears, and a value is uploaded exactly once (into its transaction object).
+  disappears, and a value is uploaded exactly once (into its transaction record).
 - The `Backend` trait sheds the GCS-shaped primitives S3 lacks (`get_metadata`,
   `set_tags_if`, `read_if_modified`) along with all tags, the S3 nonce, and
   `delete_if` (and its TOCTOU window). Target surface: `read`, `write`,
@@ -92,13 +92,13 @@ granularity, mark-sweep garbage collection, and the slimmed `Backend` trait.
   write-parallelism knob and bounds per-shard throughput (roughly `1 / RTT`).
 - Reads change shape: a strong read consults the (cached, conditionally-GET'd)
   shard for the current writer, then materializes the value from that immutable
-  transaction object. Co-located keys share one shard read, and immutable value
+  transaction record. Co-located keys share one shard read, and immutable value
   blobs are cacheable indefinitely.
 - Key creation and deletion serialize on the collection root (the membership
   lock), as in the current design; reads and writes of *existing* keys do not, so
-  the hot path is unaffected. Listing is optimistic against the root version,
+  the hot path is unaffected. Listing is optimistic against the root generation,
   with a read-lock fallback under contention.
-- Garbage collection becomes a reachability problem — a transaction object is
+- Garbage collection becomes a reachability problem — a transaction record is
   live while any shard references its txid — handled by mark-sweep in the MVP.
 - Dropping Go format compatibility means regenerating the golden vectors and
   `RecordingBackend` byte-stream expectations; the layout-independent DST oracles

@@ -12,13 +12,13 @@ use crate::collections::{CatalogAccesses, CollectionLifecycle, CollectionOp};
 use crate::error::TransError;
 use crate::monitor::{Monitor, TxRecoveryManifest};
 
-/// Collection accesses and physical resources retained across one transaction
-/// identity's body retries.
-pub(crate) struct CollectionAttempt {
+/// Collection accesses and physical resources retained across the body replays
+/// of one transaction identity.
+pub(crate) struct CollectionHandleState {
     accesses: CatalogAccesses,
     reservations: CollectionReservations,
     prepared: BTreeSet<CollectionAddress>,
-    fenced_drops: BTreeSet<CollectionAddress>,
+    drop_intent_targets: BTreeSet<CollectionAddress>,
 }
 
 /// Issues reusable collection IDs within one transaction identity.
@@ -77,14 +77,14 @@ pub(crate) struct CollectionCommit {
     split_policy: SplitPolicy,
 }
 
-impl CollectionAttempt {
+impl CollectionHandleState {
     /// Starts collection tracking with a fixed reservation limit.
     pub(crate) fn new(accesses: CatalogAccesses, reservation_limit: usize) -> Self {
         Self {
             accesses,
             reservations: CollectionReservations::new(reservation_limit),
             prepared: BTreeSet::new(),
-            fenced_drops: BTreeSet::new(),
+            drop_intent_targets: BTreeSet::new(),
         }
     }
 
@@ -114,7 +114,7 @@ impl CollectionAttempt {
         // Old body handles must never allocate from the replacement identity.
         self.reservations = CollectionReservations::new(self.reservations.limit);
         self.prepared.clear();
-        self.fenced_drops.clear();
+        self.drop_intent_targets.clear();
     }
 
     /// Returns the complete recovery manifest for the committed transaction.
@@ -192,73 +192,76 @@ impl CollectionCommit {
 
     /// Clears drop preparation left by an earlier body run under the same
     /// transaction identity.
-    pub(crate) async fn reconcile_retry(
+    pub(crate) async fn reconcile_replay(
         &self,
         id: &TxId,
-        attempt: &mut CollectionAttempt,
+        handle: &mut CollectionHandleState,
     ) -> Result<(), TransError> {
-        let active_drops = attempt.active_drops();
-        let discarded = attempt
-            .fenced_drops
+        let active_drops = handle.active_drops();
+        let discarded = handle
+            .drop_intent_targets
             .difference(&active_drops)
             .cloned()
             .collect::<Vec<_>>();
         // Fencing has stopped. Cleanup shares the cache that installed this
-        // attempt's intents and freeze, so no-change results can use ANY.
+        // identity's intents and freeze, so no-change results can use ANY.
         self.lifecycle
             .clear_aborted_drops(id, &discarded, Requirement::ANY)
             .await?;
-        attempt
-            .fenced_drops
+        handle
+            .drop_intent_targets
             .retain(|drop| active_drops.contains(drop));
         Ok(())
     }
 
     /// Persists the collection recovery metadata before physical preparation
-    /// can make new incarnation objects visible to recovery.
+    /// can make new collection objects visible to recovery.
     pub(crate) async fn persist_manifest(
         &self,
         id: &TxId,
         is_new: bool,
-        attempt: &CollectionAttempt,
+        handle: &CollectionHandleState,
     ) -> Result<(), TransError> {
-        debug_assert!(attempt.has_writes());
+        debug_assert!(handle.has_writes());
         if is_new {
-            let recovery = attempt.pending_manifest(TxRecoveryManifest::default());
+            let recovery = handle.pending_manifest(TxRecoveryManifest::default());
             self.monitor.begin_persisted_tx(id, recovery).await
         } else {
             self.monitor
                 .update_pending_tx(id, |pending| {
                     let current = std::mem::take(pending);
-                    *pending = attempt.pending_manifest(current);
+                    *pending = handle.pending_manifest(current);
                 })
                 .await
         }
     }
 
     /// Prepares every newly created collection and records its ownership in the
-    /// in-memory attempt state.
-    pub(crate) async fn prepare(&self, attempt: &mut CollectionAttempt) -> Result<(), TransError> {
-        let created = attempt.created_collections().cloned().collect::<Vec<_>>();
-        attempt.prepared.extend(created);
+    /// in-memory collection handle state.
+    pub(crate) async fn prepare(
+        &self,
+        handle: &mut CollectionHandleState,
+    ) -> Result<(), TransError> {
+        let created = handle.created_collections().cloned().collect::<Vec<_>>();
+        handle.prepared.extend(created);
         self.lifecycle
-            .prepare_collections(&attempt.accesses.changes)
+            .prepare_collections(&handle.accesses.changes)
             .await
     }
 
-    /// Validates the attempt's logical directory observations and mutations at
+    /// Validates the handle's logical directory observations and mutations at
     /// the supplied commit barrier.
     pub(crate) async fn validate(
         &self,
         id: Option<&TxId>,
-        attempt: &CollectionAttempt,
+        handle: &CollectionHandleState,
         barrier: CurrentnessBarrier,
     ) -> Result<bool, TransError> {
         self.catalog
             .validate(
                 id,
-                &attempt.accesses.reads,
-                &attempt.accesses.changes,
+                &handle.accesses.reads,
+                &handle.accesses.changes,
                 barrier,
                 &self.split_policy,
             )
@@ -268,37 +271,37 @@ impl CollectionCommit {
     /// Validates durable directory observations without staged collection changes.
     pub(crate) async fn validate_reads(
         &self,
-        attempt: &CollectionAttempt,
+        handle: &CollectionHandleState,
         barrier: CurrentnessBarrier,
     ) -> Result<bool, TransError> {
-        let reads = attempt.accesses.clone().into_read_only();
+        let reads = handle.accesses.clone().into_read_only();
         self.catalog
             .validate(None, &reads.reads, &[], barrier, &self.split_policy)
             .await
     }
 
-    /// Installs deletion fences for every drop in the current body run.
+    /// Installs drop intents for every drop in the current body run.
     pub(crate) async fn fence(
         &self,
         id: &TxId,
-        attempt: &mut CollectionAttempt,
+        handle: &mut CollectionHandleState,
     ) -> Result<(), TransError> {
-        // Remember every target before its fencing starts so a partial attempt
-        // is recoverable by a same-identity body retry or abort.
-        attempt.fenced_drops.extend(attempt.active_drops());
+        // Remember every target before its fencing starts so a partial commit
+        // is recoverable by a same-identity body replay or abort.
+        handle.drop_intent_targets.extend(handle.active_drops());
         self.lifecycle
-            .fence_drops(id, &attempt.accesses.changes)
+            .install_drop_intents(id, &handle.accesses.changes)
             .await
     }
 
     /// Reclaims physical collection objects that the committed logical changes
     /// no longer need.
-    pub(crate) async fn finish_committed(&self, attempt: &CollectionAttempt) {
-        let active_prepared = attempt
+    pub(crate) async fn finish_committed(&self, handle: &CollectionHandleState) {
+        let active_prepared = handle
             .created_collections()
             .cloned()
             .collect::<BTreeSet<_>>();
-        let unused = attempt
+        let unused = handle
             .prepared
             .difference(&active_prepared)
             .cloned()
@@ -306,7 +309,11 @@ impl CollectionCommit {
         if let Err(error) = self.lifecycle.reclaim(&unused).await {
             tracing::debug!(%error, "prepared-collection cleanup deferred");
         }
-        let dropped = attempt.fenced_drops.iter().cloned().collect::<Vec<_>>();
+        let dropped = handle
+            .drop_intent_targets
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
         if let Err(error) = self.lifecycle.reclaim(&dropped).await {
             tracing::debug!(%error, "dropped-collection cleanup deferred");
         }
@@ -316,15 +323,19 @@ impl CollectionCommit {
     pub(crate) async fn abort(
         &self,
         id: &TxId,
-        attempt: &CollectionAttempt,
+        handle: &CollectionHandleState,
     ) -> Result<(), TransError> {
-        let drops = attempt.fenced_drops.iter().cloned().collect::<Vec<_>>();
+        let drops = handle
+            .drop_intent_targets
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
         // Abort runs after fencing stops and shares its cache, as retry cleanup
         // does. Recovered cleanup needs its separate acknowledgement bound.
         self.lifecycle
             .clear_aborted_drops(id, &drops, Requirement::ANY)
             .await?;
-        let prepared = attempt.prepared.iter().cloned().collect::<Vec<_>>();
+        let prepared = handle.prepared.iter().cloned().collect::<Vec<_>>();
         self.lifecycle.reclaim(&prepared).await.map(|_| ())
     }
 }
@@ -354,24 +365,24 @@ mod tests {
     }
 
     #[test]
-    fn renewed_attempt_keeps_accesses_without_old_physical_resources() {
+    fn renewed_identity_keeps_accesses_without_old_physical_resources() {
         let collection = address(1);
-        let mut attempt = CollectionAttempt::new(
+        let mut handle = CollectionHandleState::new(
             CatalogAccesses {
                 reads: Vec::new(),
                 changes: vec![create_change(collection.clone())],
             },
             1,
         );
-        attempt.prepared.insert(collection.clone());
-        attempt.fenced_drops.insert(address(2));
-        let retired_reservations = attempt.reservations();
+        handle.prepared.insert(collection.clone());
+        handle.drop_intent_targets.insert(address(2));
+        let retired_reservations = handle.reservations();
         let parent = CollectionAddress::root("db");
         let old_id = retired_reservations.reserve(&parent, b"child").unwrap();
 
-        attempt.renew();
+        handle.renew();
 
-        let reservations = attempt.reservations();
+        let reservations = handle.reservations();
         assert_ne!(reservations.reserve(&parent, b"child").unwrap(), old_id);
         assert_eq!(
             retired_reservations.reserve(&parent, b"child").unwrap(),
@@ -383,29 +394,29 @@ mod tests {
                 1
             );
         }
-        assert_eq!(attempt.accesses.changes.len(), 1);
-        assert_eq!(attempt.accesses.changes[0].collection, collection);
-        assert!(attempt.prepared.is_empty());
-        assert!(attempt.fenced_drops.is_empty());
+        assert_eq!(handle.accesses.changes.len(), 1);
+        assert_eq!(handle.accesses.changes[0].collection, collection);
+        assert!(handle.prepared.is_empty());
+        assert!(handle.drop_intent_targets.is_empty());
     }
 
     #[test]
     fn durable_projections_preserve_prepared_roots_from_prior_body_runs() {
         let earlier = address(1);
         let active = address(2);
-        let mut attempt = CollectionAttempt::new(
+        let mut handle = CollectionHandleState::new(
             CatalogAccesses {
                 reads: Vec::new(),
                 changes: vec![create_change(active.clone())],
             },
             0,
         );
-        attempt.prepared.insert(earlier.clone());
+        handle.prepared.insert(earlier.clone());
 
-        let retained_lock = TxLock::Topology {
+        let retained_lock = TxLock::TopologyParticipant {
             collection: CollectionAddress::root("db"),
         };
-        let recovery = attempt.pending_manifest(TxRecoveryManifest {
+        let recovery = handle.pending_manifest(TxRecoveryManifest {
             locks: vec![retained_lock.clone()],
             ..TxRecoveryManifest::default()
         });
@@ -416,8 +427,8 @@ mod tests {
         );
         assert_eq!(recovery.collection_changes.len(), 1);
 
-        attempt.prepared.insert(active.clone());
-        let committed = attempt.committed_manifest(vec![retained_lock.clone()]);
+        handle.prepared.insert(active.clone());
+        let committed = handle.committed_manifest(vec![retained_lock.clone()]);
         assert_eq!(committed.locks, vec![retained_lock]);
         assert_eq!(
             committed.prepared_collections,

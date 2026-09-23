@@ -6,7 +6,7 @@ Accepted — implemented.
 
 [ADR-071](071-gc-skips-pending-and-wounded-transactions.md) supersedes
 candidate-driven wounding and cleanup of wounded candidates: GC skips missing,
-pending, and wounded transaction logs.
+pending, and wounded transaction records.
 
 This refines the lazy pending-object protocol in
 [ADR-021](021-wound-wait-leases-shard.md),
@@ -19,18 +19,18 @@ of a final commit whose outcome may already have landed.
 ## Context
 
 ADR-024 permits a transaction to publish its identity as a lock holder before
-its pending transaction object exists. The background refresher later creates
-the object with create-if-absent semantics. A foreign wound creates an aborted
-object at the same path, and ADR-022 retains that tombstone long enough for an
+its pending transaction record exists. The background refresher later creates
+the record with create-if-absent semantics. A foreign wound creates an aborted
+record at the same path, and ADR-022 retains that tombstone long enough for an
 ordinarily delayed owner to observe it.
 
 No finite lifetime covers an unbounded suspension or partition. An owner can
-publish a holder, stop before creating its pending object, and resume only after
+publish a holder, stop before creating its pending record, and resume only after
 a peer has wounded it and GC has deleted the abort tombstone. The path is absent
 again, so a new `pending` or `committed` create can resurrect an identity whose
 holders peers already reclaimed.
 
-Preparing every pending object before the first holder closes the gap, but adds
+Preparing every pending record before the first holder closes the gap, but adds
 one serial backend operation and latency wave to every locked transaction. The
 optimistic alternative is to make the exceptional foreign wound, rather than
 the normal transaction, carry the durable fence.
@@ -46,7 +46,7 @@ retirement of the transaction identity writes `Wounded`:
 - an observed `pending` object is changed to `Wounded` with CAS; and
 - the wound must be durable before any holder is released or reused.
 
-`Wounded` is terminal for transaction semantics. Readers, lock resolvers, and
+`Wounded` is final for transaction semantics. Readers, lock resolvers, and
 helpers treat it as an abort; a lease refresh or commit cannot replace it.
 Unlike `Aborted`, however, it is pinned. General GC may clear stale holders and
 reclaim resources whose cleanup remains durably described, but it may not
@@ -59,7 +59,7 @@ retirement proof writes `Wounded`.
 
 A Database that wounds one of its own locally tracked identities closes new
 owner work and checks the retirement proof atomically with that closure. If no
-owner operation is active or unresolved and no terminal commit has an ambiguous
+owner operation is active or unresolved and no commit write has an in-doubt
 outcome, it writes `Aborted` directly; `Wounded` must not appear as an
 intermediate state. If any of those facts is unknown, it durably writes
 `Wounded` immediately and leaves owner acknowledgement to the normal path.
@@ -68,7 +68,7 @@ intermediate state. If any of those facts is unknown, it durably writes
 
 When the owning transaction observes `Wounded`, it first retires that identity
 in its local transaction state. Before acknowledging the wound, it must know
-that no unresolved transaction-object create or commit can later land and that
+that no unresolved transaction-record create or commit can later land and that
 any recovery-owned physical effects still have a durable cleanup owner. A
 dropped or in-doubt mutation that cannot satisfy this condition leaves the
 object pinned.
@@ -82,8 +82,8 @@ safety proof.
 
 The same direct-to-`Aborted` rule applies to an ordinary owner-initiated abort
 that establishes the retirement and cleanup proof. A newly opened Database is
-not the owner of transactions abandoned by an earlier incarnation and cannot
-acknowledge them merely because it uses the same database.
+not the owner of transactions abandoned by an earlier database instance and
+cannot acknowledge them merely because it uses the same database.
 
 Transactions that can create recovery-owned physical resources must persist
 their complete recovery manifest before those effects can become durable. A
@@ -94,7 +94,7 @@ cannot retroactively describe unknown resources.
 
 - The uncontended lazy transaction path gains no pending-object operation or
   latency wave before its first holder.
-- Foreign wounds gain a distinct terminal transition. Healthy owners normally
+- Foreign wounds gain a distinct final transition. Healthy owners normally
   acknowledge it promptly, after which existing finite GC applies.
 - A permanently dead owner, or one with an unresolved mutation, leaves a small
   `Wounded` object indefinitely. Repeated failures can therefore grow retained
@@ -103,7 +103,7 @@ cannot retroactively describe unknown resources.
 - Stale holders can be released while the marker remains, so a pinned wound
   does not have to keep user keys blocked.
 - `Wounded` and `Aborted` make the lifecycle proof visible in durable state:
-  terminal-but-unacknowledged is distinct from terminal-and-GC-eligible.
+  final-but-unacknowledged is distinct from final-and-GC-eligible.
 
 ## Future optimizations
 
@@ -115,14 +115,14 @@ initial protocol keeps the explicit `Wounded → Aborted` handoff; direct deleti
 is a cleanup-only optimization.
 
 Finite reclamation without owner acknowledgement would require a stronger time
-contract. One possible design would associate every exact transaction-object
-version with a provider-assigned application time and make each refresh or
+contract. One possible design would associate every exact transaction-record
+revision with a provider-assigned application time and make each refresh or
 commit carry the previous valid refresh time. Every observer would interpret a
 mutation whose application time exceeds that chained lease as aborted, and an
 expired chain could never be restarted under the same identity. Only then could
 GC delete an unacknowledged wound knowing that a later create self-invalidates.
 
-The current backend exposes only object contents and an opaque version, and the
+The current backend exposes only object contents and an opaque revision, and the
 current transaction timestamp is client-authored. A future time-based design
 therefore needs a separate ADR proving provider timestamp availability,
 cross-object rate and skew bounds, cache propagation, and fail-closed behavior.
@@ -132,12 +132,12 @@ A fresh timestamp field or a local pre-write deadline by itself is not a fence.
 
 - **Prepare `pending` before every holder.** This gives a simple retained-CAS
   fence and finite cleanup, but adds a serial operation and wave to the normal
-  locked path.
+  locked commit.
 - **Keep ordinary abort tombstones for a longer finite interval.** Any finite
   interval can be exceeded by suspension or partition.
 - **Retain every foreign wound forever without acknowledgement.** This is safe
   but misses the common cleanup opportunity when the owner returns and
   definitively retires the identity.
 - **Authorize deletion from a local GC enqueue.** A queue entry is not durable,
-  does not settle ambiguous writes, and cannot transfer cleanup ownership after
+  does not settle in-doubt writes, and cannot transfer cleanup ownership after
   the process stops.

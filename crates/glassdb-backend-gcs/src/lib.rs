@@ -2,7 +2,7 @@
 //!
 //! Each logical key maps to a single GCS object whose body holds the value.
 //! GCS provides native content compare-and-swap through object `generation`
-//! preconditions, so the opaque [`Version`] token is the object generation.
+//! preconditions, so the opaque [`Revision`] token is the object generation.
 //! Conditional reads use `ifGenerationNotMatch`; writes and deletion require an
 //! exact generation condition.
 
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use glassdb_backend::implementation::{bind_list_cursor, list_provider_token};
 use glassdb_backend::{
-    Backend, BackendError, Cause, ListCursor, ListLimit, ListPage, ReadReply, Version,
+    Backend, BackendError, Cause, ListCursor, ListLimit, ListPage, ReadReply, Revision,
 };
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::header::CONTENT_TYPE;
@@ -234,7 +234,7 @@ impl GcsBackend {
                 .to_vec();
             return Ok(ReadReply {
                 contents,
-                version: attrs.version(),
+                revision: attrs.revision(),
             });
         }
         Err(BackendError::other(format!(
@@ -243,13 +243,13 @@ impl GcsBackend {
     }
 
     /// Uploads `value` as a multipart insert with the required generation
-    /// precondition, returning the new version.
+    /// precondition, returning the new revision.
     async fn upload(
         &self,
         path: &str,
         value: Vec<u8>,
         if_generation_match: String,
-    ) -> Result<Version, BackendError> {
+    ) -> Result<Revision, BackendError> {
         let body = multipart_body(&object_metadata_json(path), &value);
         let query = [
             ("uploadType", "multipart".to_string()),
@@ -272,7 +272,7 @@ impl GcsBackend {
         })?;
         obj.generation
             .filter(|generation| !generation.is_empty())
-            .map(Version::new)
+            .map(Revision::new)
             .ok_or_else(|| {
                 BackendError::Unavailable(format!(
                     "Write({path}): mutation applied but response omitted its generation"
@@ -291,7 +291,7 @@ impl Backend for GcsBackend {
     async fn read_if_modified(
         &self,
         path: &str,
-        expected: &Version,
+        expected: &Revision,
     ) -> Result<ReadReply, BackendError> {
         if expected.is_unset() {
             return self.read(path).await;
@@ -308,13 +308,13 @@ impl Backend for GcsBackend {
             return Err(BackendError::Precondition);
         }
         check_status(status, "ReadIfModified", path)?;
-        let version = generation_from_headers(&resp);
+        let revision = generation_from_headers(&resp);
         let contents = resp.bytes().await.map_err(|e| {
             BackendError::with_source(format!("ReadIfModified({path}): reading body"), e)
         })?;
         Ok(ReadReply {
             contents: contents.to_vec(),
-            version,
+            revision,
         })
     }
 
@@ -322,8 +322,8 @@ impl Backend for GcsBackend {
         &self,
         path: &str,
         value: Vec<u8>,
-        expected: &Version,
-    ) -> Result<Version, BackendError> {
+        expected: &Revision,
+    ) -> Result<Revision, BackendError> {
         let generation = parse_token(expected)?;
         self.upload(path, value, generation).await
     }
@@ -332,11 +332,11 @@ impl Backend for GcsBackend {
         &self,
         path: &str,
         value: Vec<u8>,
-    ) -> Result<Version, BackendError> {
+    ) -> Result<Revision, BackendError> {
         self.upload(path, value, "0".to_string()).await
     }
 
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Revision) -> Result<(), BackendError> {
         let generation = parse_token(expected)?;
         let rb = self
             .http
@@ -388,22 +388,22 @@ struct ObjectResource {
 }
 
 impl ObjectResource {
-    fn version(&self) -> Version {
+    fn revision(&self) -> Revision {
         match &self.generation {
-            Some(g) => Version::new(g.as_str()),
-            None => Version::default(),
+            Some(g) => Revision::new(g.as_str()),
+            None => Revision::default(),
         }
     }
 }
 
-/// Builds a [`Version`] from the `x-goog-generation` header of a media
+/// Builds a [`Revision`] from the `x-goog-generation` header of a media
 /// download. GCS always sets it on a successful object GET; absent it, an unset
-/// version is returned (the cache will simply re-read fully next time).
-fn generation_from_headers(resp: &reqwest::Response) -> Version {
+/// revision is returned (the cache will simply re-read fully next time).
+fn generation_from_headers(resp: &reqwest::Response) -> Revision {
     resp.headers()
         .get("x-goog-generation")
         .and_then(|v| v.to_str().ok())
-        .map(Version::new)
+        .map(Revision::new)
         .unwrap_or_default()
 }
 
@@ -416,10 +416,10 @@ struct ListResponse {
     next_page_token: Option<String>,
 }
 
-/// Returns the `generation` carried by an opaque [`Version`] token. A null
+/// Returns the `generation` carried by an opaque [`Revision`] token. A null
 /// token cannot match any stored object, so it is reported as a failed
 /// precondition.
-fn parse_token(v: &Version) -> Result<String, BackendError> {
+fn parse_token(v: &Revision) -> Result<String, BackendError> {
     if v.token.is_empty() {
         return Err(BackendError::Precondition);
     }

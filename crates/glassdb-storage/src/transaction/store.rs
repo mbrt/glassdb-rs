@@ -1,5 +1,5 @@
-//! Transaction-log persistence. Ported from the Go
-//! `internal/storage/tlogger.go`. Logs are protobuf bodies; the commit status
+//! Transaction-record persistence. Ported from the Go
+//! `internal/storage/tlogger.go`. Records are protobuf bodies; the commit status
 //! and timestamp live in the body itself (ADR-019/ADR-023), not in object tags.
 
 use std::sync::Arc;
@@ -7,27 +7,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use glassdb_backend as backend;
 use glassdb_concurr::rt;
-use glassdb_data::{DbRoot, ObjectPath, TxId};
+use glassdb_data::{DbPrefix, ObjectPath, TxId};
 
 use crate::cached_store::{CachedStore, CasResult, ObjectKey, Observation, Requirement};
 use crate::error::StorageError;
-use crate::transaction::{TxCommitStatus, TxLifecycleRelation, TxLog, TxLogCodec, TxRecordState};
+use crate::transaction::{
+    TxCommitStatus, TxLifecycleRelation, TxRecord, TxRecordCodec, TxRecordState,
+};
 
-const TRANSACTION_SHARD_COUNT: usize = 64 * 64;
+const TRANSACTION_PREFIX_COUNT: usize = 64 * 64;
 
-/// The commit status of a transaction along with its timestamp and version.
+/// The commit status of a transaction along with its timestamp and revision.
 #[derive(Debug, Clone)]
 pub struct TxStatus {
     pub status: TxCommitStatus,
     pub last_update: SystemTime,
-    pub observation: Observation<TxLog>,
+    pub observation: Observation<TxRecord>,
 }
 
 impl TxStatus {
-    /// Creates a transaction status view from an observed log object.
-    pub fn from_observation(observation: Observation<TxLog>) -> Self {
+    /// Creates a transaction status view from an observed transaction record.
+    pub fn from_observation(observation: Observation<TxRecord>) -> Self {
         let (status, last_update) = match observation.value() {
-            Some(log) => (log.status, log.timestamp.unwrap_or(UNIX_EPOCH)),
+            Some(record) => (record.status, record.timestamp.unwrap_or(UNIX_EPOCH)),
             None => (TxCommitStatus::Unknown, UNIX_EPOCH),
         };
         Self {
@@ -45,19 +47,19 @@ pub struct TxListPage {
     pub next: Option<backend::ListCursor>,
 }
 
-/// Reads and writes transaction logs under a path prefix.
+/// Reads and writes transaction records under a path prefix.
 #[derive(Clone)]
-pub struct TLogger {
-    db_root: DbRoot,
-    logs: crate::cached_store::TypedCachedStore<TxLogCodec>,
+pub struct TxRecordStore {
+    db_prefix: DbPrefix,
+    records: crate::cached_store::TypedCachedStore<TxRecordCodec>,
 }
 
-impl TLogger {
-    /// Creates a logger storing logs under `db_root`.
-    pub fn new(objects: CachedStore, db_root: DbRoot) -> Self {
-        TLogger {
-            db_root,
-            logs: objects.typed(),
+impl TxRecordStore {
+    /// Creates a store for transaction records under `db_prefix`.
+    pub fn new(objects: CachedStore, db_prefix: DbPrefix) -> Self {
+        TxRecordStore {
+            db_prefix,
+            records: objects.typed(),
         }
     }
 
@@ -71,12 +73,12 @@ impl TLogger {
         requirement: Requirement,
     ) -> Result<TxStatus, StorageError> {
         let path = ObjectKey::from(ObjectPath::Transaction {
-            db_root: self.db_root.clone(),
+            db_prefix: self.db_prefix.clone(),
             id: id.clone(),
         });
         let observation = match self.cached_final(&path)? {
             Some(observation) => observation,
-            None => self.logs.read(path, requirement).await?,
+            None => self.records.read(path, requirement).await?,
         };
         Ok(TxStatus::from_observation(observation))
     }
@@ -89,14 +91,14 @@ impl TLogger {
         &self,
         id: &TxId,
         requirement: Requirement,
-    ) -> Result<Observation<TxLog>, StorageError> {
+    ) -> Result<Observation<TxRecord>, StorageError> {
         let path = ObjectKey::from(ObjectPath::Transaction {
-            db_root: self.db_root.clone(),
+            db_prefix: self.db_prefix.clone(),
             id: id.clone(),
         });
         let observation = match self.cached_final(&path)? {
             Some(observation) => observation,
-            None => self.logs.read(path, requirement).await?,
+            None => self.records.read(path, requirement).await?,
         };
         if observation.is_absent() {
             Err(StorageError::NotFound)
@@ -105,66 +107,63 @@ impl TLogger {
         }
     }
 
-    /// Creates a transaction's initial log, failing if one already exists.
-    pub async fn set(&self, l: &TxLog) -> Result<Observation<TxLog>, StorageError> {
+    /// Creates a transaction's initial record, failing if one already exists.
+    pub async fn set(&self, l: &TxRecord) -> Result<Observation<TxRecord>, StorageError> {
         validate_lifecycle_transition(None, Some(l.status))?;
         let ts = l.timestamp.unwrap_or_else(rt::system_now);
         let mut persisted = l.clone();
         persisted.timestamp = Some(ts);
         let path = ObjectPath::Transaction {
-            db_root: self.db_root.clone(),
+            db_prefix: self.db_prefix.clone(),
             id: l.id.clone(),
         };
-        match self.logs.create(path, None, Arc::new(persisted)).await? {
+        match self.records.create(path, None, Arc::new(persisted)).await? {
             CasResult::Applied(receipt) => Ok(receipt.into_installed()),
-            CasResult::Conflict => Err(StorageError::Precondition),
+            CasResult::Rejected => Err(StorageError::Precondition),
         }
     }
 
-    /// Transitions a mutable log if its current version matches `expected`.
+    /// Transitions a mutable record if its current revision matches `expected`.
     ///
-    /// Immutable logs are not replaceable. A wounded log has one permitted
+    /// Immutable records are not replaceable. A wounded record has one permitted
     /// transition to aborted when its owner acknowledges retirement.
     pub async fn set_if(
         &self,
-        l: &TxLog,
-        expected: &Observation<TxLog>,
-    ) -> Result<Observation<TxLog>, StorageError> {
-        let current = expected
-            .value()
-            .ok_or_else(|| StorageError::other("transaction log CAS requires a present value"))?;
+        l: &TxRecord,
+        expected: &Observation<TxRecord>,
+    ) -> Result<Observation<TxRecord>, StorageError> {
+        let current = expected.value().ok_or_else(|| {
+            StorageError::other("transaction record replace requires a present value")
+        })?;
         validate_lifecycle_transition(Some(current.status), Some(l.status))?;
         let ts = l.timestamp.unwrap_or_else(rt::system_now);
         let mut persisted = l.clone();
         persisted.timestamp = Some(ts);
-        match self
-            .logs
-            .compare_and_swap(expected, Arc::new(persisted))
-            .await?
-        {
+        match self.records.replace(expected, Arc::new(persisted)).await? {
             CasResult::Applied(receipt) => Ok(receipt.into_installed()),
-            CasResult::Conflict => Err(StorageError::Precondition),
+            CasResult::Rejected => Err(StorageError::Precondition),
         }
     }
 
-    /// Returns every physical transaction-log shard.
-    pub fn transaction_shards(&self) -> impl Iterator<Item = usize> {
-        0..TRANSACTION_SHARD_COUNT
+    /// Returns the index of every transaction prefix.
+    pub fn transaction_prefix_indexes(&self) -> impl Iterator<Item = usize> {
+        0..TRANSACTION_PREFIX_COUNT
     }
 
-    /// Returns the physical shard containing `id`.
-    pub fn transaction_shard(&self, id: &TxId) -> usize {
-        ObjectPath::transaction_shard(id)
+    /// Returns the index of the transaction prefix that contains `id`.
+    pub fn transaction_prefix_index(&self, id: &TxId) -> usize {
+        ObjectPath::transaction_prefix_index(id)
     }
 
-    /// Lists one page of transaction identities from `shard`.
+    /// Lists one page of transaction identities from the transaction prefix at
+    /// `index`.
     pub async fn list_transaction_ids(
         &self,
-        shard: usize,
+        index: usize,
         cursor: Option<&backend::ListCursor>,
         limit: backend::ListLimit,
     ) -> Result<TxListPage, StorageError> {
-        self.scan_transaction_ids(2, shard, cursor, limit).await
+        self.scan_transaction_ids(2, index, cursor, limit).await
     }
 
     /// Lists transaction identities at the requested prefix depth.
@@ -175,14 +174,14 @@ impl TLogger {
         cursor: Option<&backend::ListCursor>,
         limit: backend::ListLimit,
     ) -> Result<TxListPage, StorageError> {
-        let prefix = ObjectPath::transaction_scan_prefix(&self.db_root, depth, index)
+        let prefix = ObjectPath::transaction_scan_prefix(&self.db_prefix, depth, index)
             .map_err(|error| StorageError::with_source("transaction scan prefix", error))?;
-        let page = self.logs.list(&prefix, cursor, limit).await?;
+        let page = self.records.list(&prefix, cursor, limit).await?;
         let ids = page
             .objects
             .iter()
             .filter_map(|path| match path.object_path() {
-                ObjectPath::Transaction { db_root, id } if db_root == &self.db_root => {
+                ObjectPath::Transaction { db_prefix, id } if db_prefix == &self.db_prefix => {
                     Some(id.clone())
                 }
                 _ => None,
@@ -194,24 +193,27 @@ impl TLogger {
         })
     }
 
-    /// Removes an exact immutable log during GC, converging if it is missing.
+    /// Removes an exact immutable record during GC, converging if it is missing.
     ///
-    /// Pending and wounded logs must first transition to aborted; deleting one
+    /// Pending and wounded records must first transition to aborted; deleting one
     /// directly fails locally with [`StorageError::Precondition`].
-    pub async fn delete(&self, expected: &Observation<TxLog>) -> Result<(), StorageError> {
+    pub async fn delete(&self, expected: &Observation<TxRecord>) -> Result<(), StorageError> {
         let current = expected.value().ok_or_else(|| {
-            StorageError::other("transaction log deletion requires a present value")
+            StorageError::other("transaction record deletion requires a present value")
         })?;
         validate_lifecycle_transition(Some(current.status), None)?;
-        self.logs.delete(expected).await?;
+        self.records.delete(expected).await?;
         Ok(())
     }
 
-    fn cached_final(&self, path: &ObjectKey) -> Result<Option<Observation<TxLog>>, StorageError> {
-        Ok(self.logs.peek(path)?.filter(|observation| {
+    fn cached_final(
+        &self,
+        path: &ObjectKey,
+    ) -> Result<Option<Observation<TxRecord>>, StorageError> {
+        Ok(self.records.peek(path)?.filter(|observation| {
             observation
                 .value()
-                .is_some_and(|log| log.status.is_immutable())
+                .is_some_and(|record| record.status.is_immutable())
         }))
     }
 }
@@ -220,7 +222,7 @@ impl TLogger {
 ///
 /// Immutable objects are cached indefinitely, so replacing one would invalidate
 /// knowledge held by every database instance that has observed it. `Wounded`
-/// is terminal for transaction semantics but remains mutable until its owner
+/// is a final status for transaction semantics but remains mutable until its owner
 /// acknowledges it as `Aborted`.
 fn validate_lifecycle_transition(
     current: Option<TxCommitStatus>,
@@ -261,26 +263,26 @@ mod tests {
     use glassdb_data::{CollectionAddress, CollectionId, LeafRef, LogicalKey};
     use tokio::sync::Notify;
 
-    fn db_root() -> DbRoot {
-        DbRoot::try_from("db").unwrap()
+    fn db_prefix() -> DbPrefix {
+        DbPrefix::try_from("db").unwrap()
     }
 
-    fn new_tlogger() -> TLogger {
+    fn new_tx_record_store() -> TxRecordStore {
         let backend = Arc::new(MemoryBackend::new());
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        TLogger::new(objects, db_root())
+        TxRecordStore::new(objects, db_prefix())
     }
 
-    fn test_collection(db_root: &str, byte: u8) -> CollectionAddress {
-        CollectionAddress::new(db_root, CollectionId::from_slice(&[byte; 16]).unwrap())
+    fn test_collection(db_prefix: &str, byte: u8) -> CollectionAddress {
+        CollectionAddress::new(db_prefix, CollectionId::from_slice(&[byte; 16]).unwrap())
     }
 
-    fn new_recording_tlogger() -> (TLogger, OpLog) {
+    fn new_recording_tx_record_store() -> (TxRecordStore, OpLog) {
         let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let operations = backend.log();
         let objects = CachedStore::new(Arc::new(backend), 1 << 20, Timeline::new(), None);
-        (TLogger::new(objects, db_root()), operations)
+        (TxRecordStore::new(objects, db_prefix()), operations)
     }
 
     fn assert_operations(operations: &OpLog, expected: &[&str]) {
@@ -292,10 +294,10 @@ mod tests {
 
     #[tokio::test]
     async fn mutations_reject_transaction_identity_mismatches_before_backend_io() {
-        let (logger, operations) = new_recording_tlogger();
+        let (logger, operations) = new_recording_tx_record_store();
         let id = TxId::from_bytes(vec![1, 2, 3, 4]);
         let observed = logger
-            .set(&TxLog::new(id, TxCommitStatus::Pending))
+            .set(&TxRecord::new(id, TxCommitStatus::Pending))
             .await
             .unwrap();
         assert_operations(&operations, &["write_if_not_exists"]);
@@ -304,7 +306,7 @@ mod tests {
         assert!(
             logger
                 .set_if(
-                    &TxLog::new(different_id, TxCommitStatus::Pending),
+                    &TxRecord::new(different_id, TxCommitStatus::Pending),
                     &observed,
                 )
                 .await
@@ -313,7 +315,7 @@ mod tests {
         assert_operations(&operations, &[]);
 
         let mut wrong_database =
-            TxLog::new(TxId::from_bytes(vec![5, 6, 7, 8]), TxCommitStatus::Pending);
+            TxRecord::new(TxId::from_bytes(vec![5, 6, 7, 8]), TxCommitStatus::Pending);
         wrong_database.writes.push(TxWrite {
             key: LogicalKey::new(test_collection("other", 1), b"key"),
             value: Arc::from(&b"value"[..]),
@@ -326,16 +328,16 @@ mod tests {
 
     #[tokio::test]
     async fn allowed_lifecycle_transitions_add_no_backend_reads() {
-        let (logger, operations) = new_recording_tlogger();
+        let (logger, operations) = new_recording_tx_record_store();
 
         for (suffix, status) in [
             (1, TxCommitStatus::Pending),
-            (2, TxCommitStatus::Ok),
+            (2, TxCommitStatus::Committed),
             (3, TxCommitStatus::Aborted),
             (7, TxCommitStatus::Wounded),
         ] {
             let id = TxId::from_bytes(vec![9, suffix]);
-            let observed = logger.set(&TxLog::new(id, status)).await.unwrap();
+            let observed = logger.set(&TxRecord::new(id, status)).await.unwrap();
             assert_operations(&operations, &["write_if_not_exists"]);
             if status.is_immutable() {
                 logger.delete(&observed).await.unwrap();
@@ -345,20 +347,26 @@ mod tests {
 
         let committed_id = TxId::from_bytes(vec![9, 4]);
         let pending = logger
-            .set(&TxLog::new(committed_id.clone(), TxCommitStatus::Pending))
+            .set(&TxRecord::new(
+                committed_id.clone(),
+                TxCommitStatus::Pending,
+            ))
             .await
             .unwrap();
         assert_operations(&operations, &["write_if_not_exists"]);
         let refreshed = logger
             .set_if(
-                &TxLog::new(committed_id.clone(), TxCommitStatus::Pending),
+                &TxRecord::new(committed_id.clone(), TxCommitStatus::Pending),
                 &pending,
             )
             .await
             .unwrap();
         assert_operations(&operations, &["write_if"]);
         let committed = logger
-            .set_if(&TxLog::new(committed_id, TxCommitStatus::Ok), &refreshed)
+            .set_if(
+                &TxRecord::new(committed_id, TxCommitStatus::Committed),
+                &refreshed,
+            )
             .await
             .unwrap();
         assert_operations(&operations, &["write_if"]);
@@ -367,32 +375,38 @@ mod tests {
 
         let aborted_id = TxId::from_bytes(vec![9, 5]);
         let pending = logger
-            .set(&TxLog::new(aborted_id.clone(), TxCommitStatus::Pending))
+            .set(&TxRecord::new(aborted_id.clone(), TxCommitStatus::Pending))
             .await
             .unwrap();
         assert_operations(&operations, &["write_if_not_exists"]);
         logger
-            .set_if(&TxLog::new(aborted_id, TxCommitStatus::Aborted), &pending)
+            .set_if(
+                &TxRecord::new(aborted_id, TxCommitStatus::Aborted),
+                &pending,
+            )
             .await
             .unwrap();
         assert_operations(&operations, &["write_if"]);
 
         let wounded_id = TxId::from_bytes(vec![9, 6]);
         let pending = logger
-            .set(&TxLog::new(wounded_id.clone(), TxCommitStatus::Pending))
+            .set(&TxRecord::new(wounded_id.clone(), TxCommitStatus::Pending))
             .await
             .unwrap();
         assert_operations(&operations, &["write_if_not_exists"]);
         let wounded = logger
             .set_if(
-                &TxLog::new(wounded_id.clone(), TxCommitStatus::Wounded),
+                &TxRecord::new(wounded_id.clone(), TxCommitStatus::Wounded),
                 &pending,
             )
             .await
             .unwrap();
         assert_operations(&operations, &["write_if"]);
         let aborted = logger
-            .set_if(&TxLog::new(wounded_id, TxCommitStatus::Aborted), &wounded)
+            .set_if(
+                &TxRecord::new(wounded_id, TxCommitStatus::Aborted),
+                &wounded,
+            )
             .await
             .unwrap();
         assert_operations(&operations, &["write_if"]);
@@ -402,21 +416,24 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_lifecycle_transitions_issue_no_backend_operations() {
-        let (logger, operations) = new_recording_tlogger();
+        let (logger, operations) = new_recording_tx_record_store();
 
-        for (suffix, current) in [(1, TxCommitStatus::Ok), (2, TxCommitStatus::Aborted)] {
+        for (suffix, current) in [(1, TxCommitStatus::Committed), (2, TxCommitStatus::Aborted)] {
             let id = TxId::from_bytes(vec![10, suffix]);
-            let observed = logger.set(&TxLog::new(id.clone(), current)).await.unwrap();
+            let observed = logger
+                .set(&TxRecord::new(id.clone(), current))
+                .await
+                .unwrap();
             assert_operations(&operations, &["write_if_not_exists"]);
             for next in [
                 TxCommitStatus::Pending,
-                TxCommitStatus::Ok,
+                TxCommitStatus::Committed,
                 TxCommitStatus::Aborted,
                 TxCommitStatus::Wounded,
             ] {
                 assert!(matches!(
                     logger
-                        .set_if(&TxLog::new(id.clone(), next), &observed)
+                        .set_if(&TxRecord::new(id.clone(), next), &observed)
                         .await,
                     Err(StorageError::Precondition)
                 ));
@@ -435,7 +452,7 @@ mod tests {
 
         let pending_id = TxId::from_bytes(vec![10, 3]);
         let pending = logger
-            .set(&TxLog::new(pending_id.clone(), TxCommitStatus::Pending))
+            .set(&TxRecord::new(pending_id.clone(), TxCommitStatus::Pending))
             .await
             .unwrap();
         assert_operations(&operations, &["write_if_not_exists"]);
@@ -447,7 +464,7 @@ mod tests {
 
         let wounded_id = TxId::from_bytes(vec![10, 4]);
         let wounded = logger
-            .set(&TxLog::new(wounded_id.clone(), TxCommitStatus::Wounded))
+            .set(&TxRecord::new(wounded_id.clone(), TxCommitStatus::Wounded))
             .await
             .unwrap();
         assert_operations(&operations, &["write_if_not_exists"]);
@@ -458,12 +475,12 @@ mod tests {
         assert_operations(&operations, &[]);
         for next in [
             TxCommitStatus::Pending,
-            TxCommitStatus::Ok,
+            TxCommitStatus::Committed,
             TxCommitStatus::Wounded,
         ] {
             assert!(matches!(
                 logger
-                    .set_if(&TxLog::new(wounded_id.clone(), next), &wounded)
+                    .set_if(&TxRecord::new(wounded_id.clone(), next), &wounded)
                     .await,
                 Err(StorageError::Precondition)
             ));
@@ -481,7 +498,10 @@ mod tests {
 
         assert!(matches!(
             logger
-                .set_if(&TxLog::new(pending_id, TxCommitStatus::Unknown), &pending,)
+                .set_if(
+                    &TxRecord::new(pending_id, TxCommitStatus::Unknown),
+                    &pending,
+                )
                 .await,
             Err(StorageError::Other { .. })
         ));
@@ -489,7 +509,7 @@ mod tests {
 
         assert!(matches!(
             logger
-                .set(&TxLog::new(
+                .set(&TxRecord::new(
                     TxId::from_bytes(vec![10, 4]),
                     TxCommitStatus::Unknown,
                 ))
@@ -501,15 +521,15 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip() {
-        let t = new_tlogger();
+        let t = new_tx_record_store();
         let id = TxId::from_bytes(vec![1, 2, 3, 4]);
         let collection = test_collection("db", 1);
         let child = test_collection("db", 2);
         let key = LogicalKey::new(collection.clone(), b"hello");
-        let log = TxLog {
+        let record = TxRecord {
             id: id.clone(),
             timestamp: Some(UNIX_EPOCH + Duration::from_millis(1_700_000_000_000)),
-            status: TxCommitStatus::Ok,
+            status: TxCommitStatus::Committed,
             writes: vec![TxWrite {
                 key: key.clone(),
                 value: Arc::from(&b"world"[..]),
@@ -521,7 +541,7 @@ mod tests {
                     leaf: LeafRef::root(collection),
                     typ: LockType::Read,
                 },
-                TxLock::Entry {
+                TxLock::Key {
                     key: key.clone(),
                     typ: LockType::Write,
                 },
@@ -529,7 +549,7 @@ mod tests {
                     collection: test_collection("db", 1),
                     typ: LockType::Write,
                 },
-                TxLock::Topology {
+                TxLock::TopologyParticipant {
                     collection: test_collection("db", 1),
                 },
             ],
@@ -541,17 +561,17 @@ mod tests {
             }],
             prepared_collections: vec![child],
         };
-        t.set(&log).await.unwrap();
+        t.set(&record).await.unwrap();
 
         let got = t.get_at(&id, Requirement::ANY).await.unwrap();
         let got = got.value().unwrap();
-        assert_eq!(got.status, TxCommitStatus::Ok);
-        assert_eq!(got.writes, log.writes);
+        assert_eq!(got.status, TxCommitStatus::Committed);
+        assert_eq!(got.writes, record.writes);
         assert!(got.locks.contains(&TxLock::Membership {
             leaf: LeafRef::root(test_collection("db", 1)),
             typ: LockType::Read,
         }));
-        assert!(got.locks.contains(&TxLock::Entry {
+        assert!(got.locks.contains(&TxLock::Key {
             key,
             typ: LockType::Write,
         }));
@@ -559,19 +579,19 @@ mod tests {
             collection: test_collection("db", 1),
             typ: LockType::Write,
         }));
-        assert!(got.locks.contains(&TxLock::Topology {
+        assert!(got.locks.contains(&TxLock::TopologyParticipant {
             collection: test_collection("db", 1),
         }));
-        assert_eq!(got.collection_changes, log.collection_changes);
-        assert_eq!(got.prepared_collections, log.prepared_collections);
+        assert_eq!(got.collection_changes, record.collection_changes);
+        assert_eq!(got.prepared_collections, record.prepared_collections);
 
         let status = t.commit_status_at(&id, Requirement::ANY).await.unwrap();
-        assert_eq!(status.status, TxCommitStatus::Ok);
+        assert_eq!(status.status, TxCommitStatus::Committed);
     }
 
     #[tokio::test]
     async fn commit_status_unknown_when_absent() {
-        let t = new_tlogger();
+        let t = new_tx_record_store();
         let status = t
             .commit_status_at(&TxId::from_bytes(vec![7]), Requirement::ANY)
             .await
@@ -579,7 +599,7 @@ mod tests {
         assert_eq!(status.status, TxCommitStatus::Unknown);
     }
 
-    // Regression for the false-NotFound race: once a transaction-log create
+    // Regression for the false-NotFound race: once a transaction-record create
     // owns its path lane, a same-path status read must wait instead of reaching
     // the backend and observing absence before the create linearizes. After the
     // create completes, the reader rechecks and reuses the published object.
@@ -587,7 +607,7 @@ mod tests {
     async fn commit_status_waits_for_in_flight_create() {
         let id = TxId::from_bytes(vec![1, 2, 3, 4]);
         let transaction_path = ObjectPath::Transaction {
-            db_root: db_root(),
+            db_prefix: db_prefix(),
             id: id.clone(),
         }
         .to_string();
@@ -626,12 +646,12 @@ mod tests {
         });
 
         let objects = CachedStore::new(backend, 1 << 20, Timeline::new(), None);
-        let logger = TLogger::new(objects, db_root());
-        let log = TxLog::new(id.clone(), TxCommitStatus::Ok);
+        let logger = TxRecordStore::new(objects, db_prefix());
+        let record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
 
         let creating = tokio::spawn({
             let logger = logger.clone();
-            async move { logger.set(&log).await }
+            async move { logger.set(&record).await }
         });
         create_started.notified().await;
 
@@ -655,7 +675,7 @@ mod tests {
         release_create.notify_one();
         creating.await.unwrap().unwrap();
         let status = reading.await.unwrap().unwrap();
-        assert_eq!(status.status, TxCommitStatus::Ok);
+        assert_eq!(status.status, TxCommitStatus::Committed);
         assert_eq!(
             reads.load(Ordering::SeqCst),
             0,
@@ -664,46 +684,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_returns_log_and_version() {
-        let t = new_tlogger();
+    async fn get_returns_record_and_revision() {
+        let t = new_tx_record_store();
         let id = TxId::from_bytes(vec![1, 2, 3, 4]);
         let key = LogicalKey::new(test_collection("db", 1), b"hello");
-        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
-        log.timestamp = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
-        log.writes = vec![TxWrite {
+        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+        record.timestamp = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        record.writes = vec![TxWrite {
             key,
             value: Arc::from(&b"world"[..]),
             deleted: false,
             prev_writer: TxId::default(),
         }];
-        let stored_v = t.set(&log).await.unwrap();
+        let stored_v = t.set(&record).await.unwrap();
 
         let got = t.get_at(&id, Requirement::ANY).await.unwrap();
-        let version = got.revision().cloned();
+        let revision = got.revision().cloned();
         let got = got.value().unwrap();
-        assert_eq!(got.status, TxCommitStatus::Ok);
-        assert_eq!(got.writes, log.writes);
-        assert_eq!(got.timestamp, log.timestamp);
-        assert_eq!(version.as_ref(), stored_v.revision());
+        assert_eq!(got.status, TxCommitStatus::Committed);
+        assert_eq!(got.writes, record.writes);
+        assert_eq!(got.timestamp, record.timestamp);
+        assert_eq!(revision.as_ref(), stored_v.revision());
     }
 
     #[tokio::test]
     async fn final_contents_remain_cached_after_peer_deletion() {
-        for status in [TxCommitStatus::Ok, TxCommitStatus::Aborted] {
+        for status in [TxCommitStatus::Committed, TxCommitStatus::Aborted] {
             let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
             let operations = backend.log();
             let backend = Arc::new(backend);
             let timeline = Timeline::new();
-            let logger = TLogger::new(
+            let logger = TxRecordStore::new(
                 CachedStore::new(backend.clone(), 1 << 20, timeline.clone(), None),
-                db_root(),
+                db_prefix(),
             );
-            let peer = TLogger::new(
+            let peer = TxRecordStore::new(
                 CachedStore::new(backend, 1 << 20, Timeline::new(), None),
-                db_root(),
+                db_prefix(),
             );
             let id = TxId::from_bytes(vec![4, 3, 2, 4]);
-            logger.set(&TxLog::new(id.clone(), status)).await.unwrap();
+            logger
+                .set(&TxRecord::new(id.clone(), status))
+                .await
+                .unwrap();
             let observed = peer.get_at(&id, Requirement::ANY).await.unwrap();
             peer.delete(&observed).await.unwrap();
             operations.lock().unwrap().clear();
@@ -724,15 +747,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_logs_still_obey_generic_freshness() {
+    async fn pending_records_still_obey_generic_freshness() {
         let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let operations = backend.log();
         let timeline = Timeline::new();
         let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone(), None);
-        let logger = TLogger::new(objects, db_root());
+        let logger = TxRecordStore::new(objects, db_prefix());
         let id = TxId::from_bytes(vec![4, 3, 2, 2]);
         logger
-            .set(&TxLog::new(id.clone(), TxCommitStatus::Pending))
+            .set(&TxRecord::new(id.clone(), TxCommitStatus::Pending))
             .await
             .unwrap();
         operations.lock().unwrap().clear();
@@ -756,15 +779,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wounded_logs_are_not_cached_as_immutable() {
+    async fn wounded_records_are_not_cached_as_immutable() {
         let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let operations = backend.log();
         let timeline = Timeline::new();
         let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone(), None);
-        let logger = TLogger::new(objects, db_root());
+        let logger = TxRecordStore::new(objects, db_prefix());
         let id = TxId::from_bytes(vec![4, 3, 2, 3]);
         logger
-            .set(&TxLog::new(id.clone(), TxCommitStatus::Wounded))
+            .set(&TxRecord::new(id.clone(), TxCommitStatus::Wounded))
             .await
             .unwrap();
         operations.lock().unwrap().clear();
@@ -788,25 +811,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_transaction_ids_pages_one_shard() {
-        let t = new_tlogger();
+    async fn list_transaction_ids_pages_one_transaction_prefix() {
+        let t = new_tx_record_store();
         let ids = [
             TxId::from_bytes(vec![1, 2]),
             TxId::from_bytes(vec![1, 3]),
             TxId::from_bytes(vec![1, 4]),
         ];
         for id in &ids {
-            t.set(&TxLog::new(id.clone(), TxCommitStatus::Aborted))
+            t.set(&TxRecord::new(id.clone(), TxCommitStatus::Aborted))
                 .await
                 .unwrap();
         }
-        let shard = t.transaction_shard(&ids[0]);
-        assert!(ids.iter().all(|id| t.transaction_shard(id) == shard));
+        let prefix_index = t.transaction_prefix_index(&ids[0]);
+        assert!(
+            ids.iter()
+                .all(|id| t.transaction_prefix_index(id) == prefix_index)
+        );
         let limit = backend::ListLimit::new(2).unwrap();
-        let first = t.list_transaction_ids(shard, None, limit).await.unwrap();
+        let first = t
+            .list_transaction_ids(prefix_index, None, limit)
+            .await
+            .unwrap();
         assert_eq!(first.ids.len(), 2);
         let second = t
-            .list_transaction_ids(shard, first.next.as_ref(), limit)
+            .list_transaction_ids(prefix_index, first.next.as_ref(), limit)
             .await
             .unwrap();
         assert!(second.next.is_none());
@@ -820,7 +849,7 @@ mod tests {
 
     #[tokio::test]
     async fn recursive_scans_page_only_the_selected_scope() {
-        let t = new_tlogger();
+        let t = new_tx_record_store();
         let ids = [
             TxId::from_bytes(vec![1, 2]),
             TxId::from_bytes(vec![1, 3]),
@@ -828,12 +857,12 @@ mod tests {
             TxId::from_bytes(vec![80, 3]),
         ];
         for id in &ids {
-            t.set(&TxLog::new(id.clone(), TxCommitStatus::Aborted))
+            t.set(&TxRecord::new(id.clone(), TxCommitStatus::Aborted))
                 .await
                 .unwrap();
         }
-        let shard = t.transaction_shard(&ids[0]);
-        for (depth, index) in [(0, 0), (1, shard / 64), (2, shard)] {
+        let prefix_index = t.transaction_prefix_index(&ids[0]);
+        for (depth, index) in [(0, 0), (1, prefix_index / 64), (2, prefix_index)] {
             let mut cursor = None;
             let mut found = Vec::new();
             loop {
@@ -856,8 +885,8 @@ mod tests {
                 .iter()
                 .filter(|id| match depth {
                     0 => true,
-                    1 => t.transaction_shard(id) / 64 == index,
-                    _ => t.transaction_shard(id) == index,
+                    1 => t.transaction_prefix_index(id) / 64 == index,
+                    _ => t.transaction_prefix_index(id) == index,
                 })
                 .cloned()
                 .collect();

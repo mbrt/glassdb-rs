@@ -22,10 +22,11 @@ transaction.
 
 In particular, an ordinary lock acquisition must reconcile the node's entry
 and node-lock holders before it can establish structure-R. Each mutation also
-adds a durable structure holder and transaction-log back-reference, retains
-them through write-back, and later removes them. Measurements that separated
-stable-leaf traffic from forced splits found that this holder reconciliation,
-rather than routing or the split itself, dominates the regression.
+adds a durable structure holder and transaction-record recovery-manifest entry,
+retains them through write-back, and later removes them. Measurements that
+separated stable-leaf traffic from forced splits found that this holder
+reconciliation, rather than routing or the split itself, dominates the
+regression.
 
 The fix must remove that stable-path cost without returning to ADR-031's
 lock-free split starvation. It must also remain correct across independently
@@ -40,7 +41,7 @@ MVCC solely for this coordination would be disproportionate.
 Treat the node's structure lock as a persisted, exclusive **structural gate**.
 Only an operation that changes the node's shape holds it. Ordinary data
 mutations and escalated scans no longer acquire structure-R or record a
-structure-lock back-reference.
+structure-lock recovery-manifest entry.
 
 The node protocols become:
 
@@ -51,7 +52,7 @@ The node protocols become:
 | create | gate absent | membership-W and per-key create |
 | delete | gate absent | membership-W and per-key write |
 | escalated scan | gate absent | membership-R |
-| node-shape change | hold the gate | its structural writes |
+| structural change | hold the gate | its structural writes |
 
 The gate cross-conflicts with both membership-R and membership-W. This keeps an
 escalated scan or membership mutation from spanning a split without requiring
@@ -73,12 +74,12 @@ structural-gate acquisition.
 A structural operation loads the full node, resolves every live per-key and
 membership holder under the existing wound-wait and transaction-status rules,
 and conditionally installs the gate together with the resolved state. It waits
-for an older pending holder, wounds a younger one, helps a committed holder
-forward, and removes an aborted holder. It does not install the gate while any
+for an older pending holder, wounds a younger one, help-forwards a committed
+holder, and removes an aborted holder. It does not install the gate while any
 holder can still perform a later rewrite of that node.
 
-Gate installation and ordinary node mutation use the same backend conditional
-write boundary. For a mutation `M` and gate installation `G` on one node:
+Gate installation and ordinary node mutation use the same backend CAS boundary.
+For a mutation `M` and gate installation `G` on one node:
 
 - if `M` lands first, `G` loses its precondition, reloads the node, and
   reconciles `M`'s holder; and
@@ -96,12 +97,12 @@ gated follow-on, and the shrink CAS remains the split's linearization point.
 
 ### Converge delayed write-back explicitly
 
-A write-back using a pre-gate observation cannot mutate a gated node: its
-conditional write either precedes gate installation or fails. After reloading,
-it may finish without another write only when routing and the current node state
-prove that its holder is gone, because successful gate acquisition has already
-resolved it. A holder that is still present must be resolved normally; it is
-not silently discarded.
+A write-back using a pre-gate observation cannot mutate a gated node: its CAS
+either precedes gate installation or fails. After reloading, it may finish
+without another write only when routing and the current node state prove that
+its holder is gone, because successful gate acquisition has already resolved it.
+A holder that is still present must be resolved normally; it is not silently
+discarded.
 
 This rule makes late write-back converge after help-forwarding while preventing
 a committed value from being lost merely because a gate appeared. It applies

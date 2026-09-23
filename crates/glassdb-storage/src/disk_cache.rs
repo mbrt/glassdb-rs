@@ -13,8 +13,8 @@ use crate::cache_stats::CacheMetrics;
 use crate::timeline::SequencePoint;
 
 mod admission;
+mod change;
 mod disk;
-mod fence;
 mod file_media;
 mod format;
 mod media;
@@ -24,7 +24,7 @@ pub(crate) mod sim_harness;
 pub(crate) mod sim_media;
 mod worker;
 
-pub(crate) use fence::{FenceContext, FenceGuard, PathFence};
+pub(crate) use change::{PathChangeOwner, PathChanges, PendingChange};
 use file_media::FileMedia;
 use format::{CacheGeometry, PRODUCTION_GEOMETRY};
 use media::CacheMedia;
@@ -169,16 +169,16 @@ impl PersistentCache {
         }
     }
 
-    pub(crate) fn begin_fence(&self, context: Arc<dyn FenceContext>) -> Option<FenceGuard> {
+    pub(crate) fn begin_change(&self, owner: Arc<dyn PathChangeOwner>) -> Option<PendingChange> {
         let inner = self.inner.as_ref()?;
         if !inner.shared.enabled.load(Ordering::Acquire) {
             return None;
         }
-        let Some(guard) = inner.shared.fences.begin(context) else {
-            inner.disable_message("persistent-cache path-fence capacity exhausted");
+        let Some(change) = inner.shared.change_limit.begin(owner) else {
+            inner.disable_message("persistent-cache pending-change capacity exhausted");
             return None;
         };
-        Some(guard)
+        Some(change)
     }
 
     pub(crate) fn disable_slow_lookup(&self) {
@@ -187,10 +187,10 @@ impl PersistentCache {
         }
     }
 
-    pub(crate) fn reject_corrupt_candidate(&self, path: Arc<str>, context: Arc<dyn FenceContext>) {
+    pub(crate) fn reject_corrupt_candidate(&self, path: Arc<str>, owner: Arc<dyn PathChangeOwner>) {
         self.metrics.l2_error();
-        if let Some(guard) = self.begin_fence(context) {
-            self.invalidate(path, guard);
+        if let Some(change) = self.begin_change(owner) {
+            self.invalidate(path, change);
         }
     }
 
@@ -200,25 +200,25 @@ impl PersistentCache {
         revision: Vec<u8>,
         body: Vec<u8>,
         current_after: SequencePoint,
-        fence: FenceGuard,
+        change: PendingChange,
     ) {
         let Some(inner) = &self.inner else {
             return;
         };
         if u32::try_from(path.len()).is_err() {
-            self.invalidate(path, fence);
+            self.invalidate(path, change);
             return;
         }
         let format = &inner.shared.disk.format;
         let size = match format.record_bytes(revision.len(), body.len()) {
             Some(size) if size <= format.maximum_record_bytes() => size,
             _ => {
-                self.invalidate(path, fence);
+                self.invalidate(path, change);
                 return;
             }
         };
         let Some(payload) = inner.shared.admission.reserve_payload(size) else {
-            self.invalidate(path, fence);
+            self.invalidate(path, change);
             return;
         };
         inner.enqueue_required(Work::Replace {
@@ -226,28 +226,28 @@ impl PersistentCache {
             revision,
             body,
             current_after,
-            fence,
+            change,
             payload,
         });
     }
 
-    pub(crate) fn invalidate(&self, path: Arc<str>, fence: FenceGuard) {
+    pub(crate) fn invalidate(&self, path: Arc<str>, change: PendingChange) {
         let Some(inner) = &self.inner else {
             return;
         };
         if u32::try_from(path.len()).is_err() {
             return;
         }
-        inner.enqueue_required(Work::Invalidate { path, fence });
+        inner.enqueue_required(Work::Invalidate { path, change });
     }
 
-    pub(crate) fn record_present_hit(&self, path: &Arc<str>, context: Arc<dyn FenceContext>) {
+    pub(crate) fn record_present_hit(&self, path: &Arc<str>, owner: Arc<dyn PathChangeOwner>) {
         let Some(inner) = &self.inner else {
             return;
         };
-        let fence = context.fence();
+        let path_changes = owner.path_changes();
         if !inner.shared.enabled.load(Ordering::Acquire)
-            || fence.is_active()
+            || path_changes.is_pending()
             || u32::try_from(path.len()).is_err()
         {
             return;
@@ -256,16 +256,16 @@ impl PersistentCache {
         if !inner.shared.admission.observe_hit(fingerprint) {
             return;
         }
-        let (epoch, active) = fence.snapshot();
-        if active {
+        let (latest, pending) = path_changes.snapshot();
+        if pending {
             return;
         }
         let Some(promotion) = inner.shared.admission.reserve_promotion(path) else {
             return;
         };
         let _ = inner.enqueue_optional(move |optional| Work::Promote {
-            context,
-            epoch,
+            owner,
+            latest,
             optional,
             promotion,
         });
@@ -459,14 +459,14 @@ mod tests {
         body: &[u8],
         current_after: SequencePoint,
     ) {
-        let fence = Arc::new(PathFence::default());
-        let guard = cache.begin_fence(fence).unwrap();
+        let path_changes = Arc::new(PathChanges::default());
+        let change = cache.begin_change(path_changes).unwrap();
         cache.replace(
             Arc::from(path),
             revision.to_vec(),
             body.to_vec(),
             current_after,
-            guard,
+            change,
         );
     }
 
@@ -879,19 +879,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fence_guard_retains_its_semantic_context_until_release() {
-        struct TestContext {
-            fence: PathFence,
+    async fn pending_change_retains_its_owner_until_release() {
+        struct TestOwner {
+            path_changes: PathChanges,
             dropped: Arc<AtomicBool>,
         }
 
-        impl FenceContext for TestContext {
-            fn fence(&self) -> &PathFence {
-                &self.fence
+        impl PathChangeOwner for TestOwner {
+            fn path_changes(&self) -> &PathChanges {
+                &self.path_changes
             }
         }
 
-        impl Drop for TestContext {
+        impl Drop for TestOwner {
             fn drop(&mut self) {
                 self.dropped.store(true, Ordering::SeqCst);
             }
@@ -900,27 +900,27 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cache = open(&dir, id(1)).await;
         let dropped = Arc::new(AtomicBool::new(false));
-        let context = Arc::new(TestContext {
-            fence: PathFence::default(),
+        let owner = Arc::new(TestOwner {
+            path_changes: PathChanges::default(),
             dropped: dropped.clone(),
         });
-        let guard = cache.begin_fence(context.clone()).unwrap();
+        let change = cache.begin_change(owner.clone()).unwrap();
 
-        drop(context);
+        drop(owner);
         assert!(!dropped.load(Ordering::SeqCst));
-        drop(guard);
+        drop(change);
         assert!(dropped.load(Ordering::SeqCst));
 
         cache.shutdown().await;
     }
 
     #[tokio::test]
-    async fn newer_path_epoch_cancels_an_older_admission() {
+    async fn newer_path_change_cancels_an_older_admission() {
         let dir = TempDir::new().unwrap();
         let cache = open(&dir, id(1)).await;
-        let fence = Arc::new(PathFence::default());
-        let older = cache.begin_fence(fence.clone()).unwrap();
-        let newer = cache.begin_fence(fence.clone()).unwrap();
+        let path_changes = Arc::new(PathChanges::default());
+        let older = cache.begin_change(path_changes.clone()).unwrap();
+        let newer = cache.begin_change(path_changes.clone()).unwrap();
 
         cache.replace(
             Arc::from("db/object"),
@@ -940,7 +940,7 @@ mod tests {
         let record = cache.lookup(Arc::from("db/object")).await.unwrap();
         assert_eq!(record.revision, b"r2");
         assert_eq!(record.body, b"new");
-        assert!(!fence.is_active());
+        assert!(!path_changes.is_pending());
         cache.shutdown().await;
     }
 

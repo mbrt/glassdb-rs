@@ -20,7 +20,7 @@ acquire before sorted serial acquisition.
 In v1 the `Locker` wrapped every per-**key** lock/unlock request in
 `glassdb_concurr::Dedup`: concurrent requests for the same key **merged** (a
 shared-read batch, or a lock coalesced with an unlock) or **queued**, and a
-single per-key worker drove the conditional writes. N transactions read-locking
+single per-key worker drove the CASes. N transactions read-locking
 one key therefore cost **one** backend operation, not N — the deduplication win.
 
 The v2 engine ([ADR-017](017-shard-object.md), [ADR-020](020-commit-write-back-protocol.md))
@@ -47,7 +47,7 @@ did per key; this ADR restores it at shard/root granularity.
 Route `Locker::lock_shard` and `Locker::lock_root` through a single
 `Dedup<CasReq, StorageError, CasWorker>` keyed on the **object path** (the shard
 or root path — the CAS unit). Everything above `lock_shard` / `lock_root`
-(`lock_shards`' parallel and serial modes, `lock`, the `LockedTx` handle,
+(`lock_shards`' parallel and serial acquisition, `lock`, the `LockedTx` handle,
 write-back, and `release_locks`) is unchanged: the deduplication lives strictly
 beneath the per-object lock step.
 

@@ -21,17 +21,17 @@ decision. The pressure signal and one-split-per-request policy remain.
 
 [ADR-072](072-persisted-database-settings.md) refines the configuration agreement:
 hard coordination limits and transaction timing are stored in database metadata;
-inline budgets and soft split thresholds remain local to each client.
+inline budgets and soft split thresholds remain local to each database instance.
 
 ## Context
 
 ADR-051's aggregate inline budget bounds the value bytes rewritten with every
 leaf mutation. Once authoritative inline values consume that budget, another
-otherwise eligible direct commit falls back to the regular locked protocol.
+otherwise eligible direct commit falls back to the regular locked commit.
 ADR-053 deliberately made that the sole fallback, and measured it as materially
 slower than a landing direct commit.
 
-ADR-054 stopped logged values from consuming new inline capacity, but it could
+ADR-054 stopped locked values from consuming new inline capacity, but it could
 not remove authoritative inline values. A leaf can therefore remain saturated
 while still being well below ADR-031's ordinary entry-count and encoded-byte
 split thresholds. Its stable admission failures do not currently cause the tree
@@ -54,7 +54,7 @@ rejection is sufficient evidence of demand.
 Only potentially recoverable aggregate pressure does so. Disabled inlining, a
 value above the per-value limit, and a value that cannot fit within the
 aggregate budget even in an otherwise empty leaf continue directly to the
-locked protocol without requesting a split. Exact encoded-object capacity
+locked commit without requesting a split. Exact encoded-object capacity
 remains ADR-031's separate size-based concern.
 
 The rejected mutation does not wait for structural work. It immediately uses
@@ -102,11 +102,11 @@ recoverable split protocol applies unchanged.
 Pressure requests are bounded and coalesced like ordinary split hints. Dropping
 one affects only future direct-commit coverage; it cannot affect correctness.
 
-All clients of one database are expected to use consistent `InlinePolicy` and
-`SplitPolicy` settings. Persisting or enforcing that agreement is deferred.
-Inconsistent clients remain safe, but may make conflicting performance choices
-and permanently reshape the shared tree according to whichever client requests
-a split.
+All database instances of one database are expected to use consistent
+`InlinePolicy` and `SplitPolicy` settings. Persisting or enforcing that
+agreement is deferred. Inconsistent database instances remain safe, but may make
+conflicting performance choices and permanently reshape the shared tree
+according to whichever database instance requests a split.
 
 Ordinary capacity splits and inline-pressure splits must be attributable
 separately. Completed work, transient deferral, and requests discarded as no
@@ -127,11 +127,12 @@ This is an observability requirement, not a prescribed public statistics API.
   inline relief. Repeated demand is required to drive further splits.
 - The optimization provides no eventual-admission guarantee. Volatile hints,
   transient contention, an unsplittable leaf, or an unhelpful median can leave
-  future mutations on the locked path.
+  future mutations on the locked commit.
 - Direct-commit, transaction, node, and structural-log formats are unchanged.
   No correctness state or reclamation obligation is introduced.
-- Client-local tuning already influences shared topology through `SplitPolicy`;
-  inline pressure adds another reason consistent configuration matters.
+- Database-instance-local tuning already influences shared topology through
+  `SplitPolicy`; inline pressure adds another reason consistent configuration
+  matters.
 
 ## Alternatives considered
 
@@ -146,11 +147,11 @@ admission is a more specific demand signal.
 This could avoid the first locked fallback, but couples foreground latency and
 transaction cancellation to a multi-step background structural protocol. It
 also needs a progress policy when splitting is delayed or insufficient. The
-locked protocol already provides bounded semantic progress.
+locked commit already provides bounded semantic progress.
 
 ### Split repeatedly until the requested value fits
 
-One request could then cause several irreversible topology changes after its
+One request could then cause several irreversible structural changes after its
 mutation has already completed through fallback. Requiring another real
 failure before each additional split bounds structural amplification by
 continued demand.
@@ -158,15 +159,15 @@ continued demand.
 ### Choose a split point by inline bytes
 
 A pressure-aware separator could create headroom in fewer splits, but conflicts
-with entry-count balance and introduces another tree-shape policy. Retaining the
+with entry-count balance and introduces another topology policy. Retaining the
 median isolates this decision; load-aware splitting can be evaluated
 separately.
 
 ### Hint only the originally observed path
 
-This is smaller than a key-directed request, but concurrent topology changes can
-move the target before the background worker runs. Splitting the stale source
-may do nothing for the demand that justified it.
+This is smaller than a key-directed request, but concurrent structural changes
+can move the target before the background worker runs. Splitting the stale
+source may do nothing for the demand that justified it.
 
 ### Require repeated failures before the first split
 
@@ -177,6 +178,6 @@ accepted as the initial signal.
 
 ### Demote existing inline values under pressure
 
-An authoritative inline value may have no transaction object, so demotion can
+An authoritative inline value may have no transaction record, so demotion can
 destroy the only durable copy. Adding provenance and externalization would be a
 different value-lifecycle protocol, not a split policy.

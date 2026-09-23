@@ -1,4 +1,4 @@
-//! Stable identity for one collection incarnation.
+//! Stable identity for one collection.
 
 use glassdb_concurr::entropy::fill_bytes;
 
@@ -8,15 +8,15 @@ const COLLECTION_ID_BYTES: usize = 16;
 /// Maximum number of raw bytes in one logical collection name.
 pub const MAX_COLLECTION_NAME_BYTES: usize = 255;
 
-/// The opaque identity of one collection incarnation.
+/// The opaque identity of one collection.
 ///
-/// The all-zero value is reserved for the permanent database root. Randomly
+/// The all-zero value is reserved for the root collection. Randomly
 /// generated IDs are therefore always non-zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CollectionId([u8; COLLECTION_ID_BYTES]);
 
 impl CollectionId {
-    /// Returns the reserved identity of the permanent database root collection.
+    /// Returns the reserved collection ID of the root collection.
     pub const fn root() -> Self {
         Self([0; COLLECTION_ID_BYTES])
     }
@@ -43,7 +43,7 @@ impl CollectionId {
         &self.0
     }
 
-    /// Reports whether this is the reserved database-root identity.
+    /// Reports whether this is the reserved root collection ID.
     pub fn is_root(self) -> bool {
         self.0 == [0; COLLECTION_ID_BYTES]
     }

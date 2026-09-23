@@ -11,9 +11,9 @@ use glassdb_backend as backend;
 use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend};
 use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
 use glassdb_concurr::RetryConfig;
-use glassdb_data::{CollectionAddress, CollectionId, DbRoot, LogicalKey, NodeToken, ObjectPath};
+use glassdb_data::{CollectionAddress, CollectionId, DbPrefix, LogicalKey, NodeToken, ObjectPath};
 use glassdb_storage::transaction::{
-    TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxLog, TxWrite,
+    TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxRecord, TxRecordStore, TxWrite,
 };
 use glassdb_storage::{
     CollectionRecord, CollectionStore, CurrentState, IndexNode, LeafBody, LeafEntry, LockType,
@@ -65,7 +65,7 @@ const PAST_HORIZON: Duration = Duration::from_secs(120);
 struct Ctx {
     gc: Gc,
     hints: GcHints,
-    tl: TLogger,
+    tx_records: TxRecordStore,
     records: CollectionStore,
     nodes: NodeStore,
     timeline: Timeline,
@@ -89,9 +89,9 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
         let peer = new_ctx_with(backend.clone()).await;
         let hooked = HookBackend::new(backend);
         let config = EngineConfig::default();
-        let db_root = DbRoot::try_from("db").unwrap();
-        let owner = AssemblyFixture::new(hooked.clone(), db_root.clone(), &config);
-        let engine = engine_fixture(&owner, db_root, config, false);
+        let db_prefix = DbPrefix::try_from("db").unwrap();
+        let owner = AssemblyFixture::new(hooked.clone(), db_prefix.clone(), &config);
+        let engine = engine_fixture(&owner, db_prefix, config, false);
         let prepared = CollectionAddress::new(
             "db",
             glassdb_data::CollectionId::from_slice(&[7; 16]).unwrap(),
@@ -210,7 +210,7 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
         assert_ne!(handle.id(), &old_id);
         assert_eq!(
             owner
-                .tlogger
+                .tx_records
                 .commit_status_at(&old_id, Requirement::ANY)
                 .await
                 .unwrap()
@@ -240,8 +240,8 @@ async fn new_ctx_with_interval(backend: Arc<dyn Backend>, pending_timeout: Durat
 }
 
 async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -> Ctx {
-    let foundation = AssemblyFixture::new(backend, DbRoot::try_from("db").unwrap(), config);
-    let tl = foundation.tlogger.clone();
+    let foundation = AssemblyFixture::new(backend, DbPrefix::try_from("db").unwrap(), config);
+    let tx_records = foundation.tx_records.clone();
     let records = foundation.records.clone();
     let structural_intents = foundation.structural_intents.clone();
     let nodes = foundation.nodes.clone();
@@ -274,7 +274,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
         router,
         CollectionStateResolver::new(
             records.clone(),
-            tl.clone(),
+            tx_records.clone(),
             timeline.clone(),
             mon.clone(),
             RetryConfig::default(),
@@ -285,7 +285,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
     );
     let hints = GcHints::default();
     let gc = Gc::new(
-        tl.clone(),
+        tx_records.clone(),
         nodes.clone(),
         structural_intents,
         timeline.clone(),
@@ -304,7 +304,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
     Ctx {
         gc,
         hints,
-        tl,
+        tx_records,
         records,
         nodes,
         timeline,
@@ -323,7 +323,7 @@ fn key_path(k: &[u8]) -> LogicalKey {
 }
 
 fn write_lock(k: &[u8]) -> TxLock {
-    TxLock::Entry {
+    TxLock::Key {
         key: key_path(k),
         typ: LockType::Write,
     }
@@ -364,11 +364,11 @@ async fn lookup_entry(ctx: &Ctx, key: &[u8]) -> Option<LeafEntry> {
     loaded.entries().lookup(key).cloned()
 }
 
-fn committed(id: TxId, offset: Duration, writes: &[&[u8]], locks: &[&[u8]]) -> TxLog {
-    TxLog {
+fn committed(id: TxId, offset: Duration, writes: &[&[u8]], locks: &[&[u8]]) -> TxRecord {
+    TxRecord {
         id,
         timestamp: Some(base() - offset),
-        status: TxCommitStatus::Ok,
+        status: TxCommitStatus::Committed,
         writes: writes
             .iter()
             .map(|k| TxWrite {
@@ -396,9 +396,9 @@ fn locked_entry(key: &[u8], holder: &TxId) -> LeafEntry {
     entry
 }
 
-async fn is_gone(tl: &TLogger, id: &TxId) -> bool {
+async fn is_gone(tx_records: &TxRecordStore, id: &TxId) -> bool {
     matches!(
-        tl.get_at(id, Requirement::ANY).await,
+        tx_records.get_at(id, Requirement::ANY).await,
         Err(StorageError::NotFound)
     )
 }
@@ -435,7 +435,7 @@ async fn check_hints_and_scan_page(ctx: &Ctx) {
         }
     }
     let page = ctx
-        .tl
+        .tx_records
         .scan_transaction_ids(0, 0, None, backend::ListLimit::new(1000).unwrap())
         .await
         .unwrap();
@@ -446,14 +446,14 @@ async fn check_hints_and_scan_page(ctx: &Ctx) {
     }
 }
 
-// A committed object whose written key has since been overwritten by a newer
+// A committed record whose written key has since been overwritten by a newer
 // writer holds no reference and is swept. Fed via the paged list (no hint),
 // so the list feed is exercised too.
 #[tokio::test(start_paused = true)]
 async fn committed_unreferenced_is_collected() {
     let ctx = new_ctx().await;
     let (old, new) = (tx(1), tx(2));
-    ctx.tl
+    ctx.tx_records
         .set(&committed(old.clone(), PAST_HORIZON, &[b"k"], &[b"k"]))
         .await
         .unwrap();
@@ -462,23 +462,23 @@ async fn committed_unreferenced_is_collected() {
 
     check_hints_and_scan_page(&ctx).await;
 
-    assert!(is_gone(&ctx.tl, &old).await);
+    assert!(is_gone(&ctx.tx_records, &old).await);
     assert_eq!(
         ctx.coord.stats_and_reset().submissions,
         0,
-        "an unreferenced committed object needs no key-lock release"
+        "an unreferenced committed record needs no key-lock release"
     );
 }
 
-// ADR-051: the successor that superseded a committed writer may be a logless
-// commit with no transaction object of its own. Liveness is decided by the
+// ADR-051: the successor that superseded a committed writer may be a direct
+// commit with no transaction record of its own. Liveness is decided by the
 // entry's writer id, not by that successor's existence, so the predecessor is
 // still swept.
 #[tokio::test(start_paused = true)]
-async fn committed_superseded_by_a_logless_writer_is_collected() {
+async fn committed_superseded_by_a_direct_writer_is_collected() {
     let ctx = new_ctx().await;
-    let (old, logless) = (tx(1), tx(2));
-    ctx.tl
+    let (old, direct) = (tx(1), tx(2));
+    ctx.tx_records
         .set(&committed(old.clone(), PAST_HORIZON, &[b"k"], &[]))
         .await
         .unwrap();
@@ -486,7 +486,7 @@ async fn committed_superseded_by_a_logless_writer_is_collected() {
         &ctx,
         b"k",
         LeafEntry::new(b"k").with_current(CurrentState::Inline {
-            writer: logless.clone(),
+            writer: direct.clone(),
             value: Arc::from(&b"v2"[..]),
         }),
     )
@@ -494,10 +494,10 @@ async fn committed_superseded_by_a_logless_writer_is_collected() {
 
     check_hints_and_scan_page(&ctx).await;
 
-    assert!(is_gone(&ctx.tl, &old).await);
+    assert!(is_gone(&ctx.tx_records, &old).await);
     assert!(
-        is_gone(&ctx.tl, &logless).await,
-        "the logless successor never had an object to collect"
+        is_gone(&ctx.tx_records, &direct).await,
+        "the direct-commit successor never had a record to collect"
     );
 }
 
@@ -517,13 +517,13 @@ async fn committed_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
         .create_root(&prepared, &Node::leaf(LeafBody::new()))
         .await
         .unwrap();
-    let mut log = committed(id.clone(), PAST_HORIZON, &[], &[]);
-    log.prepared_collections.push(prepared.clone());
-    ctx.tl.set(&log).await.unwrap();
+    let mut record = committed(id.clone(), PAST_HORIZON, &[], &[]);
+    record.prepared_collections.push(prepared.clone());
+    ctx.tx_records.set(&record).await.unwrap();
 
     check_hints_and_scan_page(&ctx).await;
 
-    assert!(is_gone(&ctx.tl, &id).await);
+    assert!(is_gone(&ctx.tx_records, &id).await);
     assert!(matches!(
         ctx.nodes.load_root(&prepared, Requirement::ANY).await,
         Err(StorageError::NotFound)
@@ -546,15 +546,15 @@ async fn aborted_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
         .create_root(&prepared, &Node::leaf(LeafBody::new()))
         .await
         .unwrap();
-    let mut log = committed(id.clone(), PAST_HORIZON, &[], &[]);
-    log.status = TxCommitStatus::Aborted;
-    log.prepared_collections.push(prepared.clone());
-    ctx.tl.set(&log).await.unwrap();
+    let mut record = committed(id.clone(), PAST_HORIZON, &[], &[]);
+    record.status = TxCommitStatus::Aborted;
+    record.prepared_collections.push(prepared.clone());
+    ctx.tx_records.set(&record).await.unwrap();
     ctx.hints.schedule(id.clone());
 
     check_hints_and_scan_page(&ctx).await;
 
-    assert!(is_gone(&ctx.tl, &id).await);
+    assert!(is_gone(&ctx.tx_records, &id).await);
     assert!(matches!(
         ctx.nodes.load_root(&prepared, Requirement::ANY).await,
         Err(StorageError::NotFound)
@@ -566,7 +566,7 @@ async fn aborted_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn collection_cleanup_conflict_keeps_the_recovery_manifest() {
+async fn rejected_collection_reclamation_keeps_the_recovery_manifest() {
     let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
     let ctx = new_ctx_with(backend.clone()).await;
     let id = tx(1);
@@ -582,9 +582,9 @@ async fn collection_cleanup_conflict_keeps_the_recovery_manifest() {
         .create_root(&prepared, &Node::leaf(LeafBody::new()))
         .await
         .unwrap();
-    let mut log = committed(id.clone(), PAST_HORIZON, &[], &[]);
-    log.prepared_collections.push(prepared.clone());
-    ctx.tl.set(&log).await.unwrap();
+    let mut record = committed(id.clone(), PAST_HORIZON, &[], &[]);
+    record.prepared_collections.push(prepared.clone());
+    ctx.tx_records.set(&record).await.unwrap();
 
     let root_path = ObjectPath::CollectionRecord {
         collection: prepared.clone(),
@@ -614,8 +614,8 @@ async fn collection_cleanup_conflict_keeps_the_recovery_manifest() {
     check_hints_and_scan_page(&ctx).await;
 
     assert!(
-        !is_gone(&ctx.tl, &id).await,
-        "cleanup conflicts must retain the only durable orphan manifest"
+        !is_gone(&ctx.tx_records, &id).await,
+        "rejected reclamation CASes must retain the only durable orphan manifest"
     );
     assert!(
         ctx.records
@@ -627,7 +627,7 @@ async fn collection_cleanup_conflict_keeps_the_recovery_manifest() {
     backend.clear_before();
     ctx.hints.schedule(id.clone());
     check_hints_and_scan_page(&ctx).await;
-    assert!(is_gone(&ctx.tl, &id).await);
+    assert!(is_gone(&ctx.tx_records, &id).await);
     assert!(matches!(
         ctx.nodes.load_root(&prepared, Requirement::ANY).await,
         Err(StorageError::NotFound)
@@ -635,7 +635,7 @@ async fn collection_cleanup_conflict_keeps_the_recovery_manifest() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn committed_drop_is_recovered_while_the_log_stores_a_live_value() {
+async fn committed_drop_is_recovered_while_the_record_stores_a_live_value() {
     let ctx = new_ctx().await;
     let id = tx(1);
     let child = CollectionAddress::new(
@@ -675,11 +675,11 @@ async fn committed_drop_is_recovered_while_the_log_stores_a_live_value() {
             .unwrap()
     );
     let mut child_node = Node::leaf(LeafBody::new());
-    child_node.set_collection_delete_intent(id.clone());
+    child_node.set_drop_intent(id.clone());
     assert!(ctx.nodes.create_root(&child, &child_node).await.unwrap());
 
-    let mut log = committed(id.clone(), PAST_HORIZON, &[b"k"], &[]);
-    log.locks.extend([
+    let mut record = committed(id.clone(), PAST_HORIZON, &[b"k"], &[]);
+    record.locks.extend([
         TxLock::Directory {
             collection: collection(),
             typ: LockType::Write,
@@ -689,20 +689,20 @@ async fn committed_drop_is_recovered_while_the_log_stores_a_live_value() {
             typ: LockType::Read,
         },
     ]);
-    log.collection_changes.push(TxCollectionChange {
+    record.collection_changes.push(TxCollectionChange {
         parent: collection(),
         name: b"child".to_vec(),
         collection: child.clone(),
         op: TxCollectionOp::Drop,
     });
-    ctx.tl.set(&log).await.unwrap();
+    ctx.tx_records.set(&record).await.unwrap();
     ctx.hints.schedule(id.clone());
 
     check_hints_and_scan_page(&ctx).await;
 
     assert!(
-        !is_gone(&ctx.tl, &id).await,
-        "the live root value still needs its transaction object"
+        !is_gone(&ctx.tx_records, &id).await,
+        "the live root value still needs its transaction record"
     );
     let (parent_record, _) = ctx
         .records
@@ -729,33 +729,33 @@ async fn committed_references_in_a_reclaimed_collection_are_absent() {
         CollectionId::from_slice(&[9; 16]).expect("fixed ID has the required width"),
     );
     let key = LogicalKey::new(missing, b"k");
-    let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
-    log.timestamp = Some(base() - PAST_HORIZON);
-    log.writes.push(TxWrite {
+    let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+    record.timestamp = Some(base() - PAST_HORIZON);
+    record.writes.push(TxWrite {
         key: key.clone(),
         value: Arc::from(&b"v"[..]),
         deleted: false,
         prev_writer: TxId::default(),
     });
-    log.locks.push(TxLock::Entry {
+    record.locks.push(TxLock::Key {
         key,
         typ: LockType::Write,
     });
-    ctx.tl.set(&log).await.unwrap();
+    ctx.tx_records.set(&record).await.unwrap();
     ctx.hints.schedule(id.clone());
 
     check_hints_and_scan_page(&ctx).await;
 
-    assert!(is_gone(&ctx.tl, &id).await);
+    assert!(is_gone(&ctx.tx_records, &id).await);
 }
 
-// A committed object still named by its key's `current_writer` is the live
+// A committed record still named by its key's `current_writer` is the live
 // value: it must never be collected.
 #[tokio::test(start_paused = true)]
 async fn committed_still_referenced_is_kept() {
     let ctx = new_ctx().await;
     let t = tx(1);
-    ctx.tl
+    ctx.tx_records
         .set(&committed(t.clone(), PAST_HORIZON, &[b"k"], &[]))
         .await
         .unwrap();
@@ -764,9 +764,9 @@ async fn committed_still_referenced_is_kept() {
 
     check_hints_and_scan_page(&ctx).await;
 
-    let log = ctx.tl.get_at(&t, Requirement::ANY).await.unwrap();
-    let log = log.value().unwrap();
-    assert_eq!(log.status, TxCommitStatus::Ok);
+    let record = ctx.tx_records.get_at(&t, Requirement::ANY).await.unwrap();
+    let record = record.value().unwrap();
+    assert_eq!(record.status, TxCommitStatus::Committed);
 }
 
 async fn replace_root(nodes: &NodeStore, node: &Node) {
@@ -853,14 +853,14 @@ async fn reference_checks_refresh_leaves_without_refreshing_indexes() {
         .await;
 
         // The GC cache predates the reference. An independent instance
-        // publishes it, so skipping the terminal-leaf check would lose the log.
+        // publishes it, so skipping the terminal-leaf check would lose the record.
         let peer = AssemblyFixture::new(
             memory,
-            DbRoot::try_from("db").unwrap(),
+            DbPrefix::try_from("db").unwrap(),
             &EngineConfig::default(),
         );
         let id = tx(1);
-        ctx.tl
+        ctx.tx_records
             .set(&committed(
                 id.clone(),
                 PAST_HORIZON,
@@ -888,14 +888,14 @@ async fn reference_checks_refresh_leaves_without_refreshing_indexes() {
             .check_batch(vec![id.clone()], NonZeroUsize::MIN)
             .await;
         assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Retained);
-        assert!(!is_gone(&peer.tlogger, &id).await);
+        assert!(!is_gone(&peer.tx_records, &id).await);
         assert_eq!(
             tree_reads(&operations),
             [("read_if_modified", node_path(&leaf).to_string())]
         );
 
         // A later overwrite removes the last reference. GC must refresh the
-        // same leaf again before deleting the candidate's exact log revision.
+        // same leaf again before deleting the candidate's exact record revision.
         let replacement = LeafEntry::new(b"key").with_current(CurrentState::Inline {
             writer: tx(2),
             value: Arc::from(b"new-value".as_slice()),
@@ -913,7 +913,7 @@ async fn reference_checks_refresh_leaves_without_refreshing_indexes() {
             .check_batch(vec![id.clone()], NonZeroUsize::MIN)
             .await;
         assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Reclaimed);
-        assert!(is_gone(&ctx.tl, &id).await);
+        assert!(is_gone(&ctx.tx_records, &id).await);
         assert_eq!(
             tree_reads(&operations),
             [("read_if_modified", node_path(&leaf).to_string())]
@@ -942,13 +942,13 @@ async fn reference_checks_follow_a_split_behind_a_cached_parent() {
         )
         .await;
         let id = tx(1);
-        ctx.tl
+        ctx.tx_records
             .set(&committed(id.clone(), PAST_HORIZON, &[b"pear"], &[b"pear"]))
             .await
             .unwrap();
         let peer = AssemblyFixture::new(
             memory,
-            DbRoot::try_from("db").unwrap(),
+            DbPrefix::try_from("db").unwrap(),
             &EngineConfig::default(),
         );
         let body = LeafBody::from_entries([writer_entry(b"pear", &id)]);
@@ -988,7 +988,7 @@ async fn reference_checks_follow_a_split_behind_a_cached_parent() {
             .check_batch(vec![id.clone()], NonZeroUsize::MIN)
             .await;
         assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Retained);
-        assert!(!is_gone(&peer.tlogger, &id).await);
+        assert!(!is_gone(&peer.tx_records, &id).await);
         assert_eq!(
             tree_reads(&operations),
             [
@@ -1007,11 +1007,11 @@ async fn reference_checks_refresh_a_cached_leaf_that_became_an_index() {
     let ctx = new_ctx_with(recorder).await;
     let peer = AssemblyFixture::new(
         memory,
-        DbRoot::try_from("db").unwrap(),
+        DbPrefix::try_from("db").unwrap(),
         &EngineConfig::default(),
     );
     let id = tx(1);
-    ctx.tl
+    ctx.tx_records
         .set(&committed(id.clone(), PAST_HORIZON, &[b"pear"], &[]))
         .await
         .unwrap();
@@ -1054,7 +1054,7 @@ async fn reference_checks_refresh_a_cached_leaf_that_became_an_index() {
         .check_batch(vec![id.clone()], NonZeroUsize::MIN)
         .await;
     assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Retained);
-    assert!(!is_gone(&peer.tlogger, &id).await);
+    assert!(!is_gone(&peer.tx_records, &id).await);
     assert_eq!(
         tree_reads(&operations),
         [
@@ -1065,10 +1065,10 @@ async fn reference_checks_refresh_a_cached_leaf_that_became_an_index() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn committed_entry_lock_keeps_the_log_and_lock() {
+async fn committed_key_lock_keeps_the_record_and_lock() {
     let ctx = new_ctx().await;
     let id = tx(1);
-    ctx.tl
+    ctx.tx_records
         .set(&committed(id.clone(), PAST_HORIZON, &[b"k"], &[b"k"]))
         .await
         .unwrap();
@@ -1076,7 +1076,7 @@ async fn committed_entry_lock_keeps_the_log_and_lock() {
 
     check_hints_and_scan_page(&ctx).await;
 
-    assert!(!is_gone(&ctx.tl, &id).await);
+    assert!(!is_gone(&ctx.tx_records, &id).await);
     assert_eq!(
         lookup_entry(&ctx, b"k").await.unwrap().lock_holders(),
         std::slice::from_ref(&id)
@@ -1145,12 +1145,12 @@ async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
 
         let owner = AssemblyFixture::new(
             memory,
-            DbRoot::try_from("db").unwrap(),
+            DbPrefix::try_from("db").unwrap(),
             &EngineConfig::default(),
         );
         let engine = engine_fixture(
             &owner,
-            DbRoot::try_from("db").unwrap(),
+            DbPrefix::try_from("db").unwrap(),
             EngineConfig::default(),
             false,
         );
@@ -1212,8 +1212,8 @@ async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
         );
 
         // Enter reclamation after eligibility, retaining GC's pre-acquisition
-        // leaf cache. A failed terminal check must preserve the recovery log.
-        let observed = ctx.tl.get_at(&id, Requirement::ANY).await.unwrap();
+        // leaf cache. A failed GC check must preserve the recovery record.
+        let observed = ctx.tx_records.get_at(&id, Requirement::ANY).await.unwrap();
         let barrier = ctx.timeline.currentness_barrier();
         hooks.set_before({
             let path = node_path(&leaf).to_string();
@@ -1225,7 +1225,7 @@ async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
                     );
                 Box::pin(async move {
                     if fail {
-                        Err(BackendError::other("terminal check failed"))
+                        Err(BackendError::other("GC check failed"))
                     } else {
                         Ok(())
                     }
@@ -1233,7 +1233,7 @@ async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
             }
         });
         assert!(ctx.gc.try_reclaim(&id, &observed, barrier).await.is_err());
-        assert!(!is_gone(&ctx.tl, &id).await);
+        assert!(!is_gone(&ctx.tx_records, &id).await);
         hooks.clear_before();
         // Use a new pass's bound: the failed attempt may have refreshed indexes.
         let barrier = ctx.timeline.currentness_barrier();
@@ -1242,7 +1242,7 @@ async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
             ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
             GcOutcome::Reclaimed
         );
-        assert!(is_gone(&ctx.tl, &id).await);
+        assert!(is_gone(&ctx.tx_records, &id).await);
         assert_eq!(
             tree_reads(&operations),
             [
@@ -1327,19 +1327,19 @@ async fn entry_release_follows_splits_without_refreshing_cached_indexes() {
         }
         let owner = AssemblyFixture::new(
             memory,
-            DbRoot::try_from("db").unwrap(),
+            DbPrefix::try_from("db").unwrap(),
             &EngineConfig::default(),
         );
         let engine = engine_fixture(
             &owner,
-            DbRoot::try_from("db").unwrap(),
+            DbPrefix::try_from("db").unwrap(),
             EngineConfig::default(),
             false,
         );
         let locks = vec![write_lock(b"pear")];
-        let mut log = TxLog::new(id.clone(), TxCommitStatus::Aborted);
-        log.locks = locks.clone();
-        owner.tlogger.set(&log).await.unwrap();
+        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Aborted);
+        record.locks = locks.clone();
+        owner.tx_records.set(&record).await.unwrap();
         // A split resolves holds before moving entries. Keep the recovering
         // instance's old held leaf while the peer removes the aborted hold.
         assert!(
@@ -1428,12 +1428,12 @@ async fn entry_release_follows_splits_without_refreshing_cached_indexes() {
 async fn committed_membership_lock_is_released_before_deletion() {
     let ctx = new_ctx().await;
     let id = tx(1);
-    let mut log = committed(id.clone(), PAST_HORIZON, &[b"k"], &[b"k"]);
-    log.locks.push(TxLock::Membership {
+    let mut record = committed(id.clone(), PAST_HORIZON, &[b"k"], &[b"k"]);
+    record.locks.push(TxLock::Membership {
         leaf: glassdb_data::LeafRef::root(collection()),
         typ: LockType::Write,
     });
-    ctx.tl.set(&log).await.unwrap();
+    ctx.tx_records.set(&record).await.unwrap();
     store_entry(&ctx, b"k", writer_entry(b"k", &tx(2))).await;
     let loaded = ctx
         .nodes
@@ -1448,7 +1448,7 @@ async fn committed_membership_lock_is_released_before_deletion() {
 
     check_hints_and_scan_page(&ctx).await;
 
-    assert!(is_gone(&ctx.tl, &id).await);
+    assert!(is_gone(&ctx.tx_records, &id).await);
     let loaded = ctx
         .nodes
         .load_leaf(
@@ -1473,7 +1473,7 @@ async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
     let ctx = new_ctx_with(Arc::new(recorded)).await;
     let owner = AssemblyFixture::new(
         backend,
-        DbRoot::try_from("db").unwrap(),
+        DbPrefix::try_from("db").unwrap(),
         &EngineConfig::default(),
     );
     let coord = LeafCoordinator::with_hinter(
@@ -1490,7 +1490,7 @@ async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
         router.clone(),
         CollectionStateResolver::new(
             owner.records.clone(),
-            owner.tlogger.clone(),
+            owner.tx_records.clone(),
             owner.timeline.clone(),
             owner.monitor.clone(),
             RetryConfig::default(),
@@ -1555,9 +1555,9 @@ async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
             .unwrap();
     }
     if committed {
-        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
-        log.locks = locks.clone();
-        owner.monitor.commit_tx(log).await.unwrap();
+        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+        record.locks = locks.clone();
+        owner.monitor.commit_tx(record).await.unwrap();
     } else {
         assert_eq!(
             owner.monitor.abort_owned_tx(&id).await.unwrap(),
@@ -1565,10 +1565,10 @@ async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
         );
     }
 
-    // Exercise reclamation after eligibility. Passing the retention horizon
+    // Exercise reclamation after eligibility. Passing the safety horizon
     // cannot repair either instance's cached leaf.
     let observed = ctx
-        .tl
+        .tx_records
         .get_at(&id, Requirement::after(ctx.timeline.currentness_barrier()))
         .await
         .unwrap();
@@ -1578,7 +1578,7 @@ async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
         ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
         GcOutcome::Reclaimed
     );
-    assert!(is_gone(&ctx.tl, &id).await);
+    assert!(is_gone(&ctx.tx_records, &id).await);
     let recorded = std::mem::take(&mut *operations.lock().unwrap());
     ctx.coord.stats_and_reset();
     assert!(
@@ -1599,7 +1599,7 @@ async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
         .unwrap();
     assert!(
         !leaf.node().membership_lock().contains(&id),
-        "GC deleted the transaction log while its membership reader remained"
+        "GC deleted the transaction record while its membership reader remained"
     );
     let path = root_path().to_string();
     let calls: Vec<_> = recorded
@@ -1633,7 +1633,7 @@ async fn membership_only_gc_reuses_a_cached_holder_for_its_cas() {
 }
 
 #[derive(Clone, Copy)]
-enum DirectoryCleanup {
+enum DirectoryReclamation {
     StaleNoHolder,
     CachedHolder,
     ReadFailure,
@@ -1642,7 +1642,7 @@ enum DirectoryCleanup {
     CommittedHolder,
 }
 
-async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
+async fn reclaim_directory(typ: LockType, case: DirectoryReclamation) {
     use crate::collection_coordination::CollectionLocker;
     use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
 
@@ -1654,13 +1654,13 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
     let ctx = new_ctx_with(backend.clone()).await;
     let owner = AssemblyFixture::new(
         backend,
-        DbRoot::try_from("db").unwrap(),
+        DbPrefix::try_from("db").unwrap(),
         &EngineConfig::default(),
     );
     let locker = CollectionLocker::new(
         CollectionStateResolver::new(
             owner.records.clone(),
-            owner.tlogger.clone(),
+            owner.tx_records.clone(),
             owner.timeline.clone(),
             owner.monitor.clone(),
             RetryConfig::default(),
@@ -1688,11 +1688,11 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
     operation.complete();
     if matches!(
         case,
-        DirectoryCleanup::CommittedReleased | DirectoryCleanup::CommittedHolder
+        DirectoryReclamation::CommittedReleased | DirectoryReclamation::CommittedHolder
     ) {
-        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
-        log.locks = locks.clone();
-        owner.monitor.commit_tx(log).await.unwrap();
+        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+        record.locks = locks.clone();
+        owner.monitor.commit_tx(record).await.unwrap();
     } else {
         assert_eq!(
             owner.monitor.abort_owned_tx(&id).await.unwrap(),
@@ -1701,7 +1701,7 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
     }
     if matches!(
         case,
-        DirectoryCleanup::CachedHolder | DirectoryCleanup::CommittedHolder
+        DirectoryReclamation::CachedHolder | DirectoryReclamation::CommittedHolder
     ) {
         ctx.records
             .load_record(
@@ -1717,7 +1717,7 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
     .to_string();
     if matches!(
         case,
-        DirectoryCleanup::OwnerReleased | DirectoryCleanup::CommittedReleased
+        DirectoryReclamation::OwnerReleased | DirectoryReclamation::CommittedReleased
     ) {
         operations.lock().unwrap().clear();
         assert!(locker.release(&id, &locks, Requirement::ANY).await.unwrap());
@@ -1732,14 +1732,14 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
         assert!(operations.lock().unwrap().is_empty());
     }
     // Enter reclamation after eligibility. Waiting out retention cannot
-    // change either instance's cached record.
+    // change either instance's cached leaf.
     let observed = ctx
-        .tl
+        .tx_records
         .get_at(&id, Requirement::after(ctx.timeline.currentness_barrier()))
         .await
         .unwrap();
     let barrier = ctx.timeline.currentness_barrier();
-    if matches!(case, DirectoryCleanup::ReadFailure) {
+    if matches!(case, DirectoryReclamation::ReadFailure) {
         hooks.set_before({
             let path = path.clone();
             move |op| {
@@ -1758,7 +1758,7 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
             }
         });
         assert!(ctx.gc.try_reclaim(&id, &observed, barrier).await.is_err());
-        assert!(!is_gone(&ctx.tl, &id).await);
+        assert!(!is_gone(&ctx.tx_records, &id).await);
         hooks.clear_before();
     }
     operations.lock().unwrap().clear();
@@ -1766,7 +1766,7 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
         ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
         GcOutcome::Reclaimed
     );
-    assert!(is_gone(&ctx.tl, &id).await);
+    assert!(is_gone(&ctx.tx_records, &id).await);
     let recorded = std::mem::take(&mut *operations.lock().unwrap());
     let (record, _) = owner
         .records
@@ -1778,7 +1778,7 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
         .unwrap();
     assert!(
         !record.directory_lock().contains(&id),
-        "GC deleted the transaction log while its directory holder remained"
+        "GC deleted the transaction record while its directory holder remained"
     );
     let calls: Vec<_> = recorded
         .iter()
@@ -1786,11 +1786,11 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
         .map(|op| op.op)
         .collect();
     let expected: &[&str] = match case {
-        DirectoryCleanup::StaleNoHolder | DirectoryCleanup::ReadFailure => {
+        DirectoryReclamation::StaleNoHolder | DirectoryReclamation::ReadFailure => {
             &["read_if_modified", "write_if"]
         }
-        DirectoryCleanup::CachedHolder | DirectoryCleanup::CommittedHolder => &["write_if"],
-        DirectoryCleanup::OwnerReleased | DirectoryCleanup::CommittedReleased => {
+        DirectoryReclamation::CachedHolder | DirectoryReclamation::CommittedHolder => &["write_if"],
+        DirectoryReclamation::OwnerReleased | DirectoryReclamation::CommittedReleased => {
             &["read_if_modified"]
         }
     };
@@ -1799,18 +1799,18 @@ async fn reclaim_directory(typ: LockType, case: DirectoryCleanup) {
 
 #[tokio::test]
 async fn aborted_directory_reader_gc_refreshes_a_cached_no_holder() {
-    reclaim_directory(LockType::Read, DirectoryCleanup::StaleNoHolder).await;
+    reclaim_directory(LockType::Read, DirectoryReclamation::StaleNoHolder).await;
 }
 
 #[tokio::test]
 async fn aborted_directory_writer_gc_refreshes_a_cached_no_holder() {
-    reclaim_directory(LockType::Write, DirectoryCleanup::StaleNoHolder).await;
+    reclaim_directory(LockType::Write, DirectoryReclamation::StaleNoHolder).await;
 }
 
 #[tokio::test]
 async fn directory_gc_reuses_a_cached_holder_for_its_cas() {
     for typ in [LockType::Read, LockType::Write] {
-        reclaim_directory(typ, DirectoryCleanup::CachedHolder).await;
+        reclaim_directory(typ, DirectoryReclamation::CachedHolder).await;
     }
 }
 
@@ -1883,17 +1883,17 @@ async fn committed_directory_gc_reuses_removal_after_cache_eviction() {
             .unwrap();
     }
     operation.complete();
-    let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
-    log.locks = locks.clone();
-    ctx.mon.commit_tx(log).await.unwrap();
-    let observed = ctx.tl.get_at(&id, Requirement::ANY).await.unwrap();
+    let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+    record.locks = locks.clone();
+    ctx.mon.commit_tx(record).await.unwrap();
+    let observed = ctx.tx_records.get_at(&id, Requirement::ANY).await.unwrap();
     let barrier = ctx.timeline.currentness_barrier();
     operations.lock().unwrap().clear();
     assert_eq!(
         ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
         GcOutcome::Reclaimed
     );
-    assert!(is_gone(&ctx.tl, &id).await);
+    assert!(is_gone(&ctx.tx_records, &id).await);
     let recorded = std::mem::take(&mut *operations.lock().unwrap());
     for lock in &locks {
         let TxLock::Directory { collection, .. } = lock else {
@@ -1934,7 +1934,7 @@ async fn committed_directory_gc_reuses_removal_after_cache_eviction() {
 #[tokio::test]
 async fn committed_directory_gc_needs_no_read_after_a_warm_removal() {
     for typ in [LockType::Read, LockType::Write] {
-        reclaim_directory(typ, DirectoryCleanup::CommittedHolder).await;
+        reclaim_directory(typ, DirectoryReclamation::CommittedHolder).await;
     }
 }
 
@@ -1971,13 +1971,13 @@ async fn committed_directory_removal_does_not_prove_other_records_clear() {
         assert!(ctx.records.store_record(&parent, &observed).await.unwrap());
         let owner = AssemblyFixture::new(
             backend,
-            DbRoot::try_from("db").unwrap(),
+            DbPrefix::try_from("db").unwrap(),
             &EngineConfig::default(),
         );
         let locker = CollectionLocker::new(
             CollectionStateResolver::new(
                 owner.records.clone(),
-                owner.tlogger.clone(),
+                owner.tx_records.clone(),
                 owner.timeline.clone(),
                 owner.monitor.clone(),
                 RetryConfig::default(),
@@ -2014,9 +2014,9 @@ async fn committed_directory_removal_does_not_prove_other_records_clear() {
                 .unwrap();
         }
         operation.complete();
-        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
-        log.locks = locks;
-        owner.monitor.commit_tx(log).await.unwrap();
+        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+        record.locks = locks;
+        owner.monitor.commit_tx(record).await.unwrap();
         // Only the parent's holder is visible to speculative write-back.
         // The child's old no-holder record must still get the bounded check.
         ctx.records
@@ -2026,7 +2026,7 @@ async fn committed_directory_removal_does_not_prove_other_records_clear() {
             )
             .await
             .unwrap();
-        let observed = ctx.tl.get_at(&id, Requirement::ANY).await.unwrap();
+        let observed = ctx.tx_records.get_at(&id, Requirement::ANY).await.unwrap();
         let barrier = ctx.timeline.currentness_barrier();
         let child_path = ObjectPath::CollectionRecord {
             collection: child.clone(),
@@ -2058,7 +2058,7 @@ async fn committed_directory_removal_does_not_prove_other_records_clear() {
         } else {
             assert_eq!(result.unwrap(), GcOutcome::Reclaimed);
         }
-        assert_eq!(is_gone(&ctx.tl, &id).await, !fail_check);
+        assert_eq!(is_gone(&ctx.tx_records, &id).await, !fail_check);
         let recorded = std::mem::take(&mut *operations.lock().unwrap());
         let expected: &[&str] = if fail_check {
             &["read_if_modified"]
@@ -2108,13 +2108,13 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
     let ctx = new_ctx_with(backend.clone()).await;
     let owner = AssemblyFixture::new(
         backend,
-        DbRoot::try_from("db").unwrap(),
+        DbPrefix::try_from("db").unwrap(),
         &EngineConfig::default(),
     );
     let locker = CollectionLocker::new(
         CollectionStateResolver::new(
             owner.records.clone(),
-            owner.tlogger.clone(),
+            owner.tx_records.clone(),
             owner.timeline.clone(),
             owner.monitor.clone(),
             RetryConfig::default(),
@@ -2153,26 +2153,26 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
         change.expected = Some(child.id());
     }
     // GC retains this no-holder parent while the owner acquires its writer.
-    let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
-    log.locks = vec![TxLock::Directory {
+    let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+    record.locks = vec![TxLock::Directory {
         collection: collection(),
         typ: LockType::Write,
     }];
-    log.collection_changes = vec![TxCollectionChange {
+    record.collection_changes = vec![TxCollectionChange {
         parent: collection(),
         name: change.name.clone(),
         collection: child.clone(),
         op,
     }];
     if op == TxCollectionOp::Create {
-        log.prepared_collections = vec![child.clone()];
+        record.prepared_collections = vec![child.clone()];
     }
     if matches!(case, DirectoryWriteBack::LiveValue) {
-        log.writes = committed(id.clone(), PAST_HORIZON, &[b"k"], &[]).writes;
+        record.writes = committed(id.clone(), PAST_HORIZON, &[b"k"], &[]).writes;
     }
     owner
         .monitor
-        .begin_persisted_tx(&id, TxRecoveryManifest::from_log(&log))
+        .begin_persisted_tx(&id, TxRecoveryManifest::from_record(&record))
         .await
         .unwrap();
     let operation = owner.monitor.begin_owner_operation(&id).unwrap();
@@ -2181,7 +2181,7 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
         .await
         .unwrap();
     lifecycle
-        .fence_drops(&id, std::slice::from_ref(&change))
+        .install_drop_intents(&id, std::slice::from_ref(&change))
         .await
         .unwrap();
     locker
@@ -2189,13 +2189,13 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
         .await
         .unwrap();
     operation.complete();
-    owner.monitor.commit_tx(log.clone()).await.unwrap();
+    owner.monitor.commit_tx(record.clone()).await.unwrap();
     if matches!(case, DirectoryWriteBack::LiveValue) {
         locker
             .write_back(
                 &id,
                 std::slice::from_ref(&change),
-                &log.locks,
+                &record.locks,
                 Requirement::ANY,
             )
             .await
@@ -2206,7 +2206,7 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
         collection: collection(),
     }
     .to_string();
-    let observed = ctx.tl.get_at(&id, Requirement::ANY).await.unwrap();
+    let observed = ctx.tx_records.get_at(&id, Requirement::ANY).await.unwrap();
     if matches!(
         case,
         DirectoryWriteBack::WriteFailure | DirectoryWriteBack::LostWriteReply
@@ -2245,7 +2245,7 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
                 .await
                 .is_err()
         );
-        assert!(!is_gone(&ctx.tl, &id).await);
+        assert!(!is_gone(&ctx.tx_records, &id).await);
         let (record, _) = owner
             .records
             .load_record(
@@ -2270,17 +2270,17 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
         .unwrap();
     let live_value = matches!(case, DirectoryWriteBack::LiveValue);
     if live_value {
-        assert!(!is_gone(&ctx.tl, &id).await);
+        assert!(!is_gone(&ctx.tx_records, &id).await);
         // Each GC pass captures a new bound. A live value must continue to
-        // bypass bounded directory completion after owner cleanup.
+        // bypass bounded directory completion after owner write-back.
         ctx.gc
             .try_reclaim(&id, &observed, ctx.timeline.currentness_barrier())
             .await
             .unwrap();
-        assert!(!is_gone(&ctx.tl, &id).await);
+        assert!(!is_gone(&ctx.tx_records, &id).await);
     } else {
         assert_eq!(outcome, GcOutcome::Reclaimed);
-        assert!(is_gone(&ctx.tl, &id).await);
+        assert!(is_gone(&ctx.tx_records, &id).await);
     }
     let recorded = std::mem::take(&mut *operations.lock().unwrap());
     let calls: Vec<_> = recorded
@@ -2330,7 +2330,7 @@ async fn committed_directory_changes_finish_in_one_gc_pass() {
 }
 
 #[tokio::test]
-async fn committed_directory_write_back_failure_keeps_the_log() {
+async fn committed_directory_write_back_failure_keeps_the_record() {
     for op in [TxCollectionOp::Create, TxCollectionOp::Drop] {
         for case in [
             DirectoryWriteBack::WriteFailure,
@@ -2349,16 +2349,16 @@ async fn live_values_skip_bounded_directory_completion() {
 }
 
 #[tokio::test]
-async fn aborted_directory_gc_keeps_the_log_if_the_record_check_fails() {
-    reclaim_directory(LockType::Read, DirectoryCleanup::ReadFailure).await;
+async fn aborted_directory_gc_keeps_the_record_if_the_record_check_fails() {
+    reclaim_directory(LockType::Read, DirectoryReclamation::ReadFailure).await;
 }
 
 #[tokio::test]
-async fn directory_gc_checks_owner_cleanup_once() {
+async fn directory_gc_checks_owner_release_once() {
     for typ in [LockType::Read, LockType::Write] {
         for case in [
-            DirectoryCleanup::OwnerReleased,
-            DirectoryCleanup::CommittedReleased,
+            DirectoryReclamation::OwnerReleased,
+            DirectoryReclamation::CommittedReleased,
         ] {
             reclaim_directory(typ, case).await;
         }
@@ -2366,7 +2366,7 @@ async fn directory_gc_checks_owner_cleanup_once() {
 }
 
 #[derive(Clone, Copy)]
-enum TopologyCleanup {
+enum TopologyReclamation {
     StaleNoParticipant,
     CachedParticipant,
     ReadFailure,
@@ -2374,7 +2374,7 @@ enum TopologyCleanup {
     DirectoryRemoved,
 }
 
-async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
+async fn reclaim_topology(committed: bool, case: TopologyReclamation) {
     use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
     use glassdb_data::{NodeToken, StructuralIntentId};
     use glassdb_storage::{StructuralIntent, StructuralIntentPhase};
@@ -2387,14 +2387,14 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
     let ctx = new_ctx_with(backend.clone()).await;
     let owner = AssemblyFixture::new(
         backend,
-        DbRoot::try_from("db").unwrap(),
+        DbPrefix::try_from("db").unwrap(),
         &EngineConfig::default(),
     );
     let id = tx(85);
-    let mut locks = vec![TxLock::Topology {
+    let mut locks = vec![TxLock::TopologyParticipant {
         collection: collection(),
     }];
-    if matches!(case, TopologyCleanup::DirectoryRemoved) {
+    if matches!(case, TopologyReclamation::DirectoryRemoved) {
         locks.push(TxLock::Directory {
             collection: collection(),
             typ: LockType::Read,
@@ -2417,12 +2417,12 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
     let prepared = owner
         .structural_intents
         .write(
-            collection().db_root_component(),
+            collection().db_prefix_component(),
             &StructuralIntentId::from(&right),
             &StructuralIntent {
                 collection: collection(),
                 source_token: None,
-                source_version: String::new(),
+                source_revision: String::new(),
                 created_tokens: vec![left, right],
                 split_key: Vec::new(),
                 participant_id: id.clone(),
@@ -2437,7 +2437,7 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
         .await
         .unwrap();
     assert!(record.add_topology_participant(id.clone()));
-    if matches!(case, TopologyCleanup::DirectoryRemoved) {
+    if matches!(case, TopologyReclamation::DirectoryRemoved) {
         record.add_directory_reader(id.clone());
     }
     assert!(
@@ -2451,7 +2451,7 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
         collection: collection(),
     }
     .to_string();
-    if !matches!(case, TopologyCleanup::IntentRemaining) {
+    if !matches!(case, TopologyReclamation::IntentRemaining) {
         // A canceled Preparing intent has not created any nodes. Departure
         // can then fail before finalization, leaving only the participant.
         owner.structural_intents.delete(&prepared).await.unwrap();
@@ -2485,9 +2485,9 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
     }
     operation.complete();
     if committed {
-        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
-        log.locks = locks;
-        owner.monitor.commit_tx(log).await.unwrap();
+        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+        record.locks = locks;
+        owner.monitor.commit_tx(record).await.unwrap();
     } else {
         assert_eq!(
             owner.monitor.abort_owned_tx(&id).await.unwrap(),
@@ -2496,7 +2496,7 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
     }
     if matches!(
         case,
-        TopologyCleanup::CachedParticipant | TopologyCleanup::DirectoryRemoved
+        TopologyReclamation::CachedParticipant | TopologyReclamation::DirectoryRemoved
     ) {
         ctx.records
             .load_record(
@@ -2509,22 +2509,22 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
     // Enter reclamation after eligibility. Retention cannot refresh the
     // collection record cached before participant registration.
     let observed = ctx
-        .tl
+        .tx_records
         .get_at(&id, Requirement::after(ctx.timeline.currentness_barrier()))
         .await
         .unwrap();
     let barrier = ctx.timeline.currentness_barrier();
-    if matches!(case, TopologyCleanup::IntentRemaining) {
+    if matches!(case, TopologyReclamation::IntentRemaining) {
         operations.lock().unwrap().clear();
         assert_eq!(
             ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
             GcOutcome::Retained
         );
-        assert!(!is_gone(&ctx.tl, &id).await);
+        assert!(!is_gone(&ctx.tx_records, &id).await);
         assert!(operations.lock().unwrap().iter().all(|op| op.path != path));
         owner.structural_intents.delete(&prepared).await.unwrap();
     }
-    if matches!(case, TopologyCleanup::ReadFailure) {
+    if matches!(case, TopologyReclamation::ReadFailure) {
         hooks.set_before({
             let path = path.clone();
             move |op| {
@@ -2543,7 +2543,7 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
             }
         });
         assert!(ctx.gc.try_reclaim(&id, &observed, barrier).await.is_err());
-        assert!(!is_gone(&ctx.tl, &id).await);
+        assert!(!is_gone(&ctx.tx_records, &id).await);
         hooks.clear_before();
     }
     operations.lock().unwrap().clear();
@@ -2551,7 +2551,7 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
         ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
         GcOutcome::Reclaimed
     );
-    assert!(is_gone(&ctx.tl, &id).await);
+    assert!(is_gone(&ctx.tx_records, &id).await);
     let recorded = std::mem::take(&mut *operations.lock().unwrap());
     let (record, _) = owner
         .records
@@ -2565,7 +2565,7 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
         record
             .topology_participants()
             .all(|participant| participant != &id),
-        "GC deleted the transaction log while its topology participant remained"
+        "GC deleted the transaction record while its topology participant remained"
     );
     assert!(!record.directory_lock().contains(&id));
     let calls: Vec<_> = recorded
@@ -2574,8 +2574,8 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
         .map(|op| op.op)
         .collect();
     let expected: &[&str] = match case {
-        TopologyCleanup::CachedParticipant => &["write_if"],
-        TopologyCleanup::DirectoryRemoved => &["write_if", "write_if"],
+        TopologyReclamation::CachedParticipant => &["write_if"],
+        TopologyReclamation::DirectoryRemoved => &["write_if", "write_if"],
         _ => &["read_if_modified", "write_if"],
     };
     assert_eq!(calls, expected);
@@ -2591,43 +2591,43 @@ async fn reclaim_topology(committed: bool, case: TopologyCleanup) {
 }
 
 #[tokio::test]
-async fn committed_directory_removal_keeps_topology_cleanup() {
-    reclaim_topology(true, TopologyCleanup::DirectoryRemoved).await;
+async fn committed_directory_removal_keeps_topology_reclamation() {
+    reclaim_topology(true, TopologyReclamation::DirectoryRemoved).await;
 }
 
 #[tokio::test]
 async fn committed_topology_gc_refreshes_a_cached_no_participant() {
-    reclaim_topology(true, TopologyCleanup::StaleNoParticipant).await;
+    reclaim_topology(true, TopologyReclamation::StaleNoParticipant).await;
 }
 
 #[tokio::test]
 async fn aborted_topology_gc_refreshes_a_cached_no_participant() {
-    reclaim_topology(false, TopologyCleanup::StaleNoParticipant).await;
+    reclaim_topology(false, TopologyReclamation::StaleNoParticipant).await;
 }
 
 #[tokio::test]
 async fn topology_gc_reuses_a_cached_participant_for_its_cas() {
     for committed in [false, true] {
-        reclaim_topology(committed, TopologyCleanup::CachedParticipant).await;
+        reclaim_topology(committed, TopologyReclamation::CachedParticipant).await;
     }
 }
 
 #[tokio::test]
-async fn topology_gc_keeps_the_log_if_the_record_check_fails() {
+async fn topology_gc_keeps_the_record_if_the_record_check_fails() {
     for committed in [false, true] {
-        reclaim_topology(committed, TopologyCleanup::ReadFailure).await;
+        reclaim_topology(committed, TopologyReclamation::ReadFailure).await;
     }
 }
 
 #[tokio::test]
-async fn topology_gc_keeps_the_log_and_participant_until_intents_settle() {
+async fn topology_gc_keeps_the_record_and_participant_until_intents_settle() {
     for committed in [false, true] {
-        reclaim_topology(committed, TopologyCleanup::IntentRemaining).await;
+        reclaim_topology(committed, TopologyReclamation::IntentRemaining).await;
     }
 }
 
 #[derive(Clone, Copy)]
-enum DropCleanup {
+enum DropReclamation {
     StaleFences,
     CachedFences,
     CachedFreeze,
@@ -2635,7 +2635,7 @@ enum DropCleanup {
     ReadFailure,
 }
 
-async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropCleanup) {
+async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropReclamation) {
     use crate::collection_coordination::CollectionLocker;
     use crate::collections::{CollectionChange, CollectionOp};
     use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
@@ -2649,7 +2649,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
     let ctx = new_ctx_with(backend.clone()).await;
     let owner = AssemblyFixture::new(
         backend,
-        DbRoot::try_from("db").unwrap(),
+        DbPrefix::try_from("db").unwrap(),
         &EngineConfig::default(),
     );
     let lifecycle = CollectionLifecycle::new(
@@ -2662,7 +2662,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
     let locker = CollectionLocker::new(
         CollectionStateResolver::new(
             owner.records.clone(),
-            owner.tlogger.clone(),
+            owner.tx_records.clone(),
             owner.timeline.clone(),
             owner.monitor.clone(),
             RetryConfig::default(),
@@ -2781,7 +2781,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
     locker.acquire(&target, &id, LockType::Read).await.unwrap();
     owner.monitor.record_tx_locks(&id, locks.clone());
     lifecycle
-        .fence_drops(&id, std::slice::from_ref(&change))
+        .install_drop_intents(&id, std::slice::from_ref(&change))
         .await
         .unwrap();
     operation.complete();
@@ -2792,7 +2792,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
         OwnerAbortOutcome::Acknowledged
     );
     let observed = ctx
-        .tl
+        .tx_records
         .get_at(&id, Requirement::after(ctx.timeline.currentness_barrier()))
         .await
         .unwrap();
@@ -2800,7 +2800,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
         observed.value().unwrap().locks,
         if durable_locks { locks } else { Vec::new() }
     );
-    if matches!(case, DropCleanup::CachedFences) {
+    if matches!(case, DropReclamation::CachedFences) {
         let requirement = Requirement::after(ctx.timeline.currentness_barrier());
         for path in &node_paths {
             ctx.nodes
@@ -2809,7 +2809,10 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
                 .unwrap();
         }
     }
-    if matches!(case, DropCleanup::CachedFences | DropCleanup::CachedFreeze) {
+    if matches!(
+        case,
+        DropReclamation::CachedFences | DropReclamation::CachedFreeze
+    ) {
         ctx.records
             .load_record(
                 &target,
@@ -2818,7 +2821,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
             .await
             .unwrap();
     }
-    if matches!(case, DropCleanup::OwnerCleared) {
+    if matches!(case, DropReclamation::OwnerCleared) {
         operations.lock().unwrap().clear();
         assert!(
             lifecycle
@@ -2837,7 +2840,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
                 .filter(|op| op.path == path)
                 .map(|op| op.op)
                 .collect();
-            assert_eq!(calls, ["write_if"], "owner cleanup for {path}");
+            assert_eq!(calls, ["write_if"], "owner release for {path}");
         }
         assert!(
             !lifecycle
@@ -2848,7 +2851,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
         assert!(operations.lock().unwrap().iter().all(|op| op.op == "list"));
     }
     let barrier = ctx.timeline.currentness_barrier();
-    if matches!(case, DropCleanup::ReadFailure) {
+    if matches!(case, DropReclamation::ReadFailure) {
         hooks.set_before({
             let path = node_paths.last().unwrap().to_string();
             move |op| {
@@ -2859,7 +2862,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
                     );
                 Box::pin(async move {
                     if fail {
-                        Err(BackendError::other("drop fence check failed"))
+                        Err(BackendError::other("drop intent check failed"))
                     } else {
                         Ok(())
                     }
@@ -2867,7 +2870,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
             }
         });
         assert!(ctx.gc.try_reclaim(&id, &observed, barrier).await.is_err());
-        assert!(!is_gone(&ctx.tl, &id).await);
+        assert!(!is_gone(&ctx.tx_records, &id).await);
         hooks.clear_before();
     }
     // Enter reclamation after eligibility. Retention cannot refresh any of
@@ -2877,7 +2880,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
         ctx.gc.try_reclaim(&id, &observed, barrier).await.unwrap(),
         GcOutcome::Reclaimed
     );
-    assert!(is_gone(&ctx.tl, &id).await);
+    assert!(is_gone(&ctx.tx_records, &id).await);
     let recorded = std::mem::take(&mut *operations.lock().unwrap());
     let mut remaining = Vec::new();
     let verification = Requirement::after(owner.timeline.currentness_barrier());
@@ -2887,7 +2890,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
             .load_node_at_state(path, verification)
             .await
             .unwrap();
-        if node.value().unwrap().collection_delete_intent() == Some(&id) {
+        if node.value().unwrap().drop_intent() == Some(&id) {
             remaining.push(path.to_string());
         }
     }
@@ -2901,14 +2904,14 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
     }
     assert!(
         remaining.is_empty(),
-        "GC deleted the log with drop fences still present: {remaining:?}"
+        "GC deleted the record with drop intents still present: {remaining:?}"
     );
     let node_expected: &[&str] = match case {
-        DropCleanup::CachedFences => &["write_if"],
-        DropCleanup::OwnerCleared => &["read_if_modified"],
-        DropCleanup::StaleFences | DropCleanup::CachedFreeze | DropCleanup::ReadFailure => {
-            &["read_if_modified", "write_if"]
-        }
+        DropReclamation::CachedFences => &["write_if"],
+        DropReclamation::OwnerCleared => &["read_if_modified"],
+        DropReclamation::StaleFences
+        | DropReclamation::CachedFreeze
+        | DropReclamation::ReadFailure => &["read_if_modified", "write_if"],
     };
     for path in node_paths.iter().map(ToString::to_string) {
         let calls: Vec<_> = recorded
@@ -2916,7 +2919,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
             .filter(|op| op.path == path)
             .map(|op| op.op)
             .collect();
-        assert_eq!(calls, node_expected, "GC node cleanup for {path}");
+        assert_eq!(calls, node_expected, "GC node reclamation for {path}");
     }
     let record_calls: Vec<_> = recorded
         .iter()
@@ -2925,7 +2928,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
         .collect();
     let record_expected: &[&str] = if durable_locks {
         &["read_if_modified", "write_if", "write_if"]
-    } else if matches!(case, DropCleanup::CachedFreeze) {
+    } else if matches!(case, DropReclamation::CachedFreeze) {
         &["write_if"]
     } else {
         node_expected
@@ -2944,41 +2947,41 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropC
 
 #[tokio::test(start_paused = true)]
 async fn aborted_drop_gc_clears_cached_root_fence_and_freeze() {
-    reclaim_aborted_drop(false, false, DropCleanup::StaleFences).await;
+    reclaim_aborted_drop(false, false, DropReclamation::StaleFences).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn aborted_drop_gc_clears_cached_index_and_child_fences() {
-    reclaim_aborted_drop(true, false, DropCleanup::StaleFences).await;
+    reclaim_aborted_drop(true, false, DropReclamation::StaleFences).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn aborted_drop_gc_reuses_directory_release_evidence() {
-    reclaim_aborted_drop(true, true, DropCleanup::StaleFences).await;
+    reclaim_aborted_drop(true, true, DropReclamation::StaleFences).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn aborted_drop_gc_reuses_cached_fences_for_its_cas() {
-    reclaim_aborted_drop(true, false, DropCleanup::CachedFences).await;
+    reclaim_aborted_drop(true, false, DropReclamation::CachedFences).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn aborted_drop_gc_checks_stale_nodes_without_rechecking_a_cached_freeze() {
-    reclaim_aborted_drop(true, false, DropCleanup::CachedFreeze).await;
+    reclaim_aborted_drop(true, false, DropReclamation::CachedFreeze).await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn aborted_drop_owner_cleanup_needs_no_extra_reads() {
-    reclaim_aborted_drop(true, false, DropCleanup::OwnerCleared).await;
+async fn aborted_drop_owner_release_needs_no_extra_reads() {
+    reclaim_aborted_drop(true, false, DropReclamation::OwnerCleared).await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn aborted_drop_gc_keeps_the_log_if_a_fence_check_fails() {
-    reclaim_aborted_drop(true, false, DropCleanup::ReadFailure).await;
+async fn aborted_drop_gc_keeps_the_record_if_a_fence_check_fails() {
+    reclaim_aborted_drop(true, false, DropReclamation::ReadFailure).await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn pending_and_wounded_candidates_only_read_their_logs() {
+async fn pending_and_wounded_candidates_only_read_their_records() {
     for (status, age) in [TxCommitStatus::Pending, TxCommitStatus::Wounded]
         .into_iter()
         .flat_map(|status| [Duration::ZERO, PAST_HORIZON].map(|age| (status, age)))
@@ -2987,10 +2990,10 @@ async fn pending_and_wounded_candidates_only_read_their_logs() {
         let operations = backend.log();
         let ctx = new_ctx_with(Arc::new(backend)).await;
         let id = tx(1);
-        let mut log = TxLog::new(id.clone(), status);
-        log.timestamp = Some(base() - age);
-        log.locks = vec![write_lock(b"k")];
-        ctx.tl.set(&log).await.unwrap();
+        let mut record = TxRecord::new(id.clone(), status);
+        record.timestamp = Some(base() - age);
+        record.locks = vec![write_lock(b"k")];
+        ctx.tx_records.set(&record).await.unwrap();
         store_entry(&ctx, b"k", locked_entry(b"k", &id)).await;
         operations.lock().unwrap().clear();
 
@@ -3003,7 +3006,7 @@ async fn pending_and_wounded_candidates_only_read_their_logs() {
         background.shutdown().await;
 
         let path = ObjectPath::Transaction {
-            db_root: DbRoot::try_from("db").unwrap(),
+            db_prefix: DbPrefix::try_from("db").unwrap(),
             id: id.clone(),
         }
         .to_string();
@@ -3018,7 +3021,7 @@ async fn pending_and_wounded_candidates_only_read_their_logs() {
                     op.op == "list"
                         || (op.path == path && matches!(op.op, "read" | "read_if_modified"))
                 }),
-                "pending and wounded candidates must only read their logs"
+                "pending and wounded candidates must only read their records"
             );
         }
         let stats = ctx.gc.stats_and_reset();
@@ -3028,7 +3031,7 @@ async fn pending_and_wounded_candidates_only_read_their_logs() {
         assert_eq!(diagnostics.ready, 0);
         assert_eq!(diagnostics.deferred, 0);
         assert_eq!(diagnostics.in_flight, 0);
-        let got = ctx.tl.get_at(&id, Requirement::ANY).await.unwrap();
+        let got = ctx.tx_records.get_at(&id, Requirement::ANY).await.unwrap();
         assert_eq!(got.value().unwrap().status, status);
         assert_eq!(
             lookup_entry(&ctx, b"k").await.unwrap().lock_holders(),
@@ -3043,10 +3046,10 @@ async fn lock_acquisition_resolves_a_wound_that_gc_leaves_alone() {
 
     let ctx = new_ctx().await;
     let wounded = tx(1);
-    let mut log = TxLog::new(wounded.clone(), TxCommitStatus::Wounded);
-    log.timestamp = Some(base() - PAST_HORIZON);
-    log.locks = vec![write_lock(b"k")];
-    ctx.tl.set(&log).await.unwrap();
+    let mut record = TxRecord::new(wounded.clone(), TxCommitStatus::Wounded);
+    record.timestamp = Some(base() - PAST_HORIZON);
+    record.locks = vec![write_lock(b"k")];
+    ctx.tx_records.set(&record).await.unwrap();
     store_entry(&ctx, b"k", locked_entry(b"k", &wounded)).await;
     check_hints_and_scan_page(&ctx).await;
     assert!(
@@ -3082,57 +3085,61 @@ async fn lock_acquisition_resolves_a_wound_that_gc_leaves_alone() {
     assert!(!entry.is_locked_by(&wounded));
     assert!(entry.is_locked_by(&contender));
     check_hints_and_scan_page(&ctx).await;
-    let got = ctx.tl.get_at(&wounded, Requirement::ANY).await.unwrap();
+    let got = ctx
+        .tx_records
+        .get_at(&wounded, Requirement::ANY)
+        .await
+        .unwrap();
     assert_eq!(got.value().unwrap().status, TxCommitStatus::Wounded);
 }
 
-// An acknowledged aborted object still within its cleanup horizon keeps its
+// An acknowledged aborted record still within its safety horizon keeps its
 // locks and remains available to ordinary late observers.
 #[tokio::test(start_paused = true)]
 async fn recent_aborted_tombstone_is_kept() {
     let ctx = new_ctx().await;
     let t = tx(1);
-    let mut log = TxLog::new(t.clone(), TxCommitStatus::Aborted);
-    log.timestamp = Some(base());
-    log.locks = vec![write_lock(b"k")];
-    ctx.tl.set(&log).await.unwrap();
+    let mut record = TxRecord::new(t.clone(), TxCommitStatus::Aborted);
+    record.timestamp = Some(base());
+    record.locks = vec![write_lock(b"k")];
+    ctx.tx_records.set(&record).await.unwrap();
     store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
     ctx.hints.schedule(t.clone());
 
     check_hints_and_scan_page(&ctx).await;
 
-    assert!(!is_gone(&ctx.tl, &t).await);
+    assert!(!is_gone(&ctx.tx_records, &t).await);
     let e = lookup_entry(&ctx, b"k").await.unwrap();
     assert_eq!(e.lock_holders(), std::slice::from_ref(&t));
 }
 
-// An aborted object past its tombstone lease has its recorded lock pruned
+// An aborted record past its tombstone lease has its recorded lock pruned
 // (the vestigial entry removed) and is then deleted.
 #[tokio::test(start_paused = true)]
 async fn expired_aborted_prunes_locks_and_is_deleted() {
     let ctx = new_ctx().await;
     let t = tx(1);
-    let mut log = TxLog::new(t.clone(), TxCommitStatus::Aborted);
-    log.timestamp = Some(base() - PAST_HORIZON);
-    log.locks = vec![write_lock(b"k")];
-    ctx.tl.set(&log).await.unwrap();
+    let mut record = TxRecord::new(t.clone(), TxCommitStatus::Aborted);
+    record.timestamp = Some(base() - PAST_HORIZON);
+    record.locks = vec![write_lock(b"k")];
+    ctx.tx_records.set(&record).await.unwrap();
     store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
     ctx.hints.schedule(t.clone());
 
     check_hints_and_scan_page(&ctx).await;
 
-    assert!(is_gone(&ctx.tl, &t).await);
+    assert!(is_gone(&ctx.tx_records, &t).await);
     assert!(lookup_entry(&ctx, b"k").await.is_none());
 }
 
-// A shared hint for a logless writer has no object and is a harmless no-op.
+// A shared hint for a direct-commit writer has no record and is a harmless no-op.
 #[tokio::test(start_paused = true)]
-async fn logless_cleanup_hint_is_a_noop() {
+async fn direct_gc_hint_is_a_noop() {
     let ctx = new_ctx().await;
     let t = tx(9);
     ctx.hints.schedule(t.clone());
     check_hints_and_scan_page(&ctx).await;
-    assert!(is_gone(&ctx.tl, &t).await);
+    assert!(is_gone(&ctx.tx_records, &t).await);
 }
 
 // ADR-029: GC's lock reclamation flows through the leaf coordinator
@@ -3145,7 +3152,7 @@ async fn gc_release_merges_into_live_acquire_round() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     let (backend, gate) = Gate::wrap(mem);
     let rec = Arc::new(RecordingBackend::new(backend));
-    let log = rec.log();
+    let record = rec.log();
     let ctx = new_ctx_with(rec).await;
 
     let ka = b"key-a".to_vec();
@@ -3173,15 +3180,15 @@ async fn gc_release_merges_into_live_acquire_round() {
     edit.set_entries(leaf);
     assert!(ctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 
-    let mut dead_log = TxLog::new(dead.clone(), TxCommitStatus::Aborted);
-    dead_log.timestamp = Some(base() - PAST_HORIZON);
-    dead_log.locks = vec![write_lock(&ka)];
-    ctx.tl.set(&dead_log).await.unwrap();
+    let mut dead_record = TxRecord::new(dead.clone(), TxCommitStatus::Aborted);
+    dead_record.timestamp = Some(base() - PAST_HORIZON);
+    dead_record.locks = vec![write_lock(&ka)];
+    ctx.tx_records.set(&dead_record).await.unwrap();
 
     let live = TxId::with_priority(2_000_000_000, b"live");
     ctx.mon.begin_tx(&live);
 
-    let before = count_stores(&log, &leaf_path_string);
+    let before = count_stores(&record, &leaf_path_string);
     gate.arm();
 
     // Drive GC's release and the live acquire concurrently: the first becomes
@@ -3221,7 +3228,7 @@ async fn gc_release_merges_into_live_acquire_round() {
     );
 
     assert_eq!(
-        count_stores(&log, &leaf_path_string) - before,
+        count_stores(&record, &leaf_path_string) - before,
         1,
         "GC release and the live acquire share a single leaf CAS"
     );
@@ -3237,9 +3244,10 @@ async fn gc_release_merges_into_live_acquire_round() {
     );
 }
 
-/// Counts the CAS stores (conditional write / create) issued against `path`.
-fn count_stores(log: &glassdb_backend::middleware::OpLog, path: &str) -> usize {
-    log.lock()
+/// Counts the CASes issued against `path`.
+fn count_stores(op_log: &glassdb_backend::middleware::OpLog, path: &str) -> usize {
+    op_log
+        .lock()
         .unwrap()
         .iter()
         .filter(|r| r.path == path && (r.op == "write_if" || r.op == "write_if_not_exists"))
@@ -3317,13 +3325,13 @@ async fn cached_candidate_converges_after_a_peer_deletes_it() {
     let backend = Arc::new(backend);
     let ctx = new_ctx_with(backend.clone()).await;
     let id = tx(14);
-    ctx.tl
+    ctx.tx_records
         .set(&committed(id.clone(), PAST_HORIZON, &[], &[]))
         .await
         .unwrap();
-    let peer = TLogger::new(
+    let peer = TxRecordStore::new(
         CachedStore::new(backend, 1 << 20, Timeline::new(), None),
-        DbRoot::try_from("db").unwrap(),
+        DbPrefix::try_from("db").unwrap(),
     );
     let observed = peer.get_at(&id, Requirement::ANY).await.unwrap();
     peer.delete(&observed).await.unwrap();
@@ -3341,7 +3349,7 @@ async fn cached_candidate_converges_after_a_peer_deletes_it() {
             .all(|operation| operation.op == "delete_if"),
         "a cached final candidate needs no presence check"
     );
-    assert!(is_gone(&ctx.tl, &id).await);
+    assert!(is_gone(&ctx.tx_records, &id).await);
 
     assert_eq!(
         check_candidate(&ctx.gc, &id).await.unwrap(),
@@ -3353,7 +3361,7 @@ async fn cached_candidate_converges_after_a_peer_deletes_it() {
 async fn hinted_candidates_wait_without_restarting_the_deadline() {
     let ctx = new_ctx().await;
     let id = tx(11);
-    ctx.tl
+    ctx.tx_records
         .set(&committed(id.clone(), PAST_HORIZON, &[], &[]))
         .await
         .unwrap();
@@ -3363,7 +3371,7 @@ async fn hinted_candidates_wait_without_restarting_the_deadline() {
     for _ in 0..64 {
         rt::yield_now().await;
     }
-    assert!(!is_gone(&ctx.tl, &id).await);
+    assert!(!is_gone(&ctx.tx_records, &id).await);
     assert_eq!(ctx.gc.diagnostics().deferred, 1);
     let delay = ctx.gc.timing.pending_timeout() + ctx.gc.timing.max_clock_skew();
     tokio::time::advance(delay / 2).await;
@@ -3374,12 +3382,12 @@ async fn hinted_candidates_wait_without_restarting_the_deadline() {
     for _ in 0..64 {
         rt::yield_now().await;
     }
-    assert!(!is_gone(&ctx.tl, &id).await);
+    assert!(!is_gone(&ctx.tx_records, &id).await);
     tokio::time::advance(delay / 2).await;
     for _ in 0..64 {
         rt::yield_now().await;
     }
-    assert!(is_gone(&ctx.tl, &id).await);
+    assert!(is_gone(&ctx.tx_records, &id).await);
     let stats = ctx.gc.stats_and_reset();
     assert_eq!(stats.progress, 1);
     bg.shutdown().await;
@@ -3391,7 +3399,7 @@ async fn concurrent_candidates_share_one_leaf_validation() {
     let operations = backend.log();
     let ctx = new_ctx_with(Arc::new(backend)).await;
     for id in [tx(1), tx(2)] {
-        ctx.tl
+        ctx.tx_records
             .set(&committed(id.clone(), PAST_HORIZON, &[b"k"], &[b"k"]))
             .await
             .unwrap();
@@ -3425,11 +3433,11 @@ async fn young_final_candidates_complete_without_a_reference_pass() {
     let ids = vec![tx(1), tx(2)];
     for (id, status) in ids
         .iter()
-        .zip([TxCommitStatus::Ok, TxCommitStatus::Aborted])
+        .zip([TxCommitStatus::Committed, TxCommitStatus::Aborted])
     {
-        let mut log = committed(id.clone(), Duration::ZERO, &[b"k"], &[b"k"]);
-        log.status = status;
-        ctx.tl.set(&log).await.unwrap();
+        let mut record = committed(id.clone(), Duration::ZERO, &[b"k"], &[b"k"]);
+        record.status = status;
+        ctx.tx_records.set(&record).await.unwrap();
     }
     operations.lock().unwrap().clear();
 
@@ -3454,7 +3462,7 @@ async fn reference_checks_reuse_a_concurrent_writer_observation() {
     let operations = backend.log();
     let ctx = new_ctx_with(Arc::new(backend)).await;
     let id = tx(1);
-    ctx.tl
+    ctx.tx_records
         .set(&committed(id.clone(), PAST_HORIZON, &[b"k"], &[b"k"]))
         .await
         .unwrap();
@@ -3470,7 +3478,7 @@ async fn reference_checks_reuse_a_concurrent_writer_observation() {
 
     assert_eq!(outcomes.len(), 1);
     assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Reclaimed);
-    assert!(is_gone(&ctx.tl, &id).await);
+    assert!(is_gone(&ctx.tx_records, &id).await);
     let root = root_path().to_string();
     assert_eq!(
         operations
@@ -3490,15 +3498,15 @@ async fn reference_checks_follow_candidate_filtering() {
     let hooked = HookBackend::new(backend.clone());
     let ctx = new_ctx_with(hooked.clone()).await;
     let id = tx(2);
-    let mut log = committed(id.clone(), Duration::ZERO, &[b"k"], &[b"k"]);
-    log.status = TxCommitStatus::Pending;
-    ctx.tl.set(&log).await.unwrap();
+    let mut record = committed(id.clone(), Duration::ZERO, &[b"k"], &[b"k"]);
+    record.status = TxCommitStatus::Pending;
+    ctx.tx_records.set(&record).await.unwrap();
     store_entry(&ctx, b"k", writer_entry(b"k", &tx(3))).await;
     let entered = Arc::new(Notify::new());
     let resume = Arc::new(Notify::new());
     hooked.set_before({
         let path = ObjectPath::Transaction {
-            db_root: DbRoot::try_from("db").unwrap(),
+            db_prefix: DbPrefix::try_from("db").unwrap(),
             id: id.clone(),
         }
         .to_string();
@@ -3527,7 +3535,7 @@ async fn reference_checks_follow_candidate_filtering() {
     entered.notified().await;
 
     // Cache absence after the status bound, before the peer's commit. A
-    // reference check using that first bound would wrongly accept this leaf.
+    // GC check using that first bound would wrongly accept this leaf.
     ctx.nodes
         .load_leaf(
             &root_path(),
@@ -3537,7 +3545,7 @@ async fn reference_checks_follow_candidate_filtering() {
         .unwrap();
     let peer = AssemblyFixture::new(
         backend,
-        DbRoot::try_from("db").unwrap(),
+        DbPrefix::try_from("db").unwrap(),
         &EngineConfig::default(),
     );
     let mut edit = peer
@@ -3548,12 +3556,12 @@ async fn reference_checks_follow_candidate_filtering() {
         .into_edit();
     edit.set_entries(LeafBody::from_entries([locked_entry(b"k", &id)]));
     assert!(peer.nodes.commit_leaf(edit).await.unwrap().is_applied());
-    log.status = TxCommitStatus::Ok;
+    record.status = TxCommitStatus::Committed;
     // Native paused time does not advance wall time. The old timestamp stands
     // for a filter delayed until after this commit's safety horizon.
-    log.timestamp = Some(base() - PAST_HORIZON);
-    let pending = peer.tlogger.get_at(&id, Requirement::ANY).await.unwrap();
-    peer.tlogger.set_if(&log, &pending).await.unwrap();
+    record.timestamp = Some(base() - PAST_HORIZON);
+    let pending = peer.tx_records.get_at(&id, Requirement::ANY).await.unwrap();
+    peer.tx_records.set_if(&record, &pending).await.unwrap();
     resume.notify_one();
     for _ in 0..64 {
         rt::yield_now().await;
@@ -3567,7 +3575,7 @@ async fn reference_checks_follow_candidate_filtering() {
     assert_eq!(diagnostics.ready, 0);
     assert_eq!(diagnostics.deferred, 0);
     assert_eq!(diagnostics.in_flight, 0);
-    assert!(!is_gone(&ctx.tl, &id).await);
+    assert!(!is_gone(&ctx.tx_records, &id).await);
     assert!(lookup_entry(&ctx, b"k").await.unwrap().is_locked_by(&id));
 }
 
@@ -3576,7 +3584,7 @@ async fn a_transient_failure_keeps_the_candidate_until_retry() {
     let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
     let ctx = new_ctx_with_interval(backend.clone(), Duration::from_millis(10)).await;
     let id = tx(12);
-    ctx.tl
+    ctx.tx_records
         .set(&committed(id.clone(), PAST_HORIZON, &[], &[]))
         .await
         .unwrap();
@@ -3595,7 +3603,7 @@ async fn a_transient_failure_keeps_the_candidate_until_retry() {
     ctx.gc.start(&bg);
     ctx.hints.schedule(id.clone());
     wait_for_hint_deadline(&ctx).await;
-    assert!(!is_gone(&ctx.tl, &id).await);
+    assert!(!is_gone(&ctx.tx_records, &id).await);
     assert_eq!(ctx.gc.diagnostics().deferred, 1);
     for _ in 0..20 {
         tokio::time::advance(Duration::from_millis(2)).await;
@@ -3603,7 +3611,7 @@ async fn a_transient_failure_keeps_the_candidate_until_retry() {
             rt::yield_now().await;
         }
     }
-    assert!(is_gone(&ctx.tl, &id).await);
+    assert!(is_gone(&ctx.tx_records, &id).await);
     let stats = ctx.gc.stats_and_reset();
     assert_eq!(stats.failures, 1);
     assert_eq!(stats.progress, 1);
@@ -3615,7 +3623,7 @@ async fn a_ready_hint_queue_does_not_starve_the_scan() {
     let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
     let ctx = new_ctx_with_interval(backend.clone(), Duration::from_millis(10)).await;
     let id = tx(13);
-    ctx.tl
+    ctx.tx_records
         .set(&committed(id.clone(), PAST_HORIZON, &[], &[]))
         .await
         .unwrap();
@@ -3646,7 +3654,7 @@ async fn a_ready_hint_queue_does_not_starve_the_scan() {
         rt::yield_now().await;
     }
     assert!(ctx.gc.stats_and_reset().lists > 0);
-    assert!(is_gone(&ctx.tl, &id).await);
+    assert!(is_gone(&ctx.tx_records, &id).await);
     assert!(reclaimed_with_ready_hints.load(Ordering::SeqCst));
     bg.shutdown().await;
 }

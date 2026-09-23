@@ -1,7 +1,7 @@
 //! Regression tests for transient read unavailability.
 //!
-//! A read is side-effect-free, so unlike a conditional write it can always be
-//! retried safely (ADR-009). The engine therefore retries an in-doubt
+//! A read is side-effect-free, so unlike a conditional mutation it can always
+//! be retried safely (ADR-009). The engine therefore retries an in-doubt
 //! (`Unavailable`) read in place with backoff, recovering a transient backend
 //! outage transparently; a sustained outage surfaces as the dedicated
 //! [`Error::Unavailable`] (never the in-doubt [`Error::InDoubt`], which concerns
@@ -28,7 +28,7 @@ use glassdb::{CollectionPath, Database, Error};
 /// The object kind whose reads a [`ReadFaults`] decorator faults.
 #[derive(Clone, Copy)]
 enum FaultTarget {
-    /// A coordination leaf: a node (`/_n/`) or the collection root (`/_r`).
+    /// A coordination leaf: a node (`/_n/`) or the tree root (`/_r`).
     Leaf,
     /// A collection's lifecycle and directory record (`/_i`).
     CollectionRecord,
@@ -139,7 +139,7 @@ async fn seed_shared(mem: Arc<dyn Backend>, key: &[u8], v: i64) {
 
 /// A transient read outage is ridden over by the reader's bounded in-place
 /// retry: the value is returned and the transaction's closure runs only once
-/// (the retry happens below `Database::tx`, not as a whole-transaction retry).
+/// (the retry happens below `Database::tx`, not as a body replay).
 #[tokio::test(start_paused = true)]
 async fn transient_read_unavailability_is_retried_transparently() {
     let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -170,7 +170,7 @@ async fn transient_read_unavailability_is_retried_transparently() {
         .expect("a transient read outage must be retried, not surfaced");
 
     assert_eq!(read_int(&got.unwrap()), 10);
-    // The retry happened inside the reader, not as a whole-transaction retry.
+    // The retry happened inside the reader, not as a body replay.
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     // The two injected faults plus the successful read.
     assert!(
@@ -185,7 +185,7 @@ async fn transient_read_unavailability_is_retried_transparently() {
 /// complete, the body's error must not escape: the value it was derived from may
 /// be a stale cached read that a committed writer already superseded. The caller
 /// learns about the failed validation instead, as the retry-safe
-/// `Error::Unavailable` (a read-only attempt stages no write, so nothing is in
+/// `Error::Unavailable` (a read-only transaction stages no write, so nothing is in
 /// doubt).
 #[tokio::test(start_paused = true)]
 async fn error_outcome_does_not_escape_failed_validation() {
@@ -346,7 +346,7 @@ async fn read_retry_budget_applies_to_each_point_read() {
 /// Resolving a collection name loads the parent's directory record. That load
 /// leaves the calling transaction's staged changes untouched, so an outage
 /// during it is the retry-safe `Error::Unavailable`, not `Error::InDoubt`.
-/// Reporting it as in-doubt claims the transaction may have committed when it
+/// Reporting it as in-doubt states that the transaction may have committed when it
 /// never left its body (found by the `history` fuzz target, whose oracle
 /// rejects an in-doubt outcome that no commit outcome can explain).
 ///

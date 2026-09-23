@@ -50,7 +50,7 @@ async fn rw() {
     let stats = db.stats();
     assert_eq!(stats.transactions.completed, 3);
     assert_eq!(stats.transactions.writes, 1);
-    assert_eq!(stats.transactions.retries, 0);
+    assert_eq!(stats.transactions.replays, 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -185,13 +185,13 @@ async fn delete() {
     let stats = db.stats();
     assert_eq!(stats.transactions.completed, 4);
     assert_eq!(stats.transactions.writes, 2);
-    assert!(stats.transactions.retries <= 1);
+    assert!(stats.transactions.replays <= 1);
 }
 
 /// Regression: reading a found key and deleting that same key in one
 /// transaction must commit. ADR-061 publishes the deletion as an authoritative
 /// tombstone in the direct leaf CAS; before direct deletes were supported this
-/// shape had to route cleanly through the locked protocol rather than reaching
+/// shape had to route cleanly through locked commit rather than reaching
 /// a conditional-delete path without a lock.
 #[tokio::test(start_paused = true)]
 async fn read_then_delete_single_tx() {
@@ -296,7 +296,7 @@ async fn rmw_single() {
     assert_eq!(stats.transactions.completed, 31);
     assert_eq!(stats.transactions.reads, 30);
     assert_eq!(stats.transactions.writes, 30);
-    assert_eq!(stats.transactions.retries, 0);
+    assert_eq!(stats.transactions.replays, 0);
 
     let val = coll.read(key).await.unwrap().unwrap();
     assert_eq!(read_int(&val), 30);
@@ -320,11 +320,11 @@ async fn concurrent_rmw() {
     assert_eq!(read_int(&val), 60);
 }
 
-// ADR-053: a single-key read-modify-write whose version is superseded before it
+// ADR-053: a single-key read-modify-write whose writer is superseded before it
 // publishes replays its body, reevaluating against the winner under the same
 // transaction. The caller sees one successful commit applied exactly once, and
-// the key stays on the logless path — falling back to locking would publish a
-// holder that pushes its next writer off the direct path for no reason.
+// the key stays on direct commit — falling back to locking would publish a
+// holder that pushes its next writer off direct commit for no reason.
 #[tokio::test(start_paused = true)]
 async fn a_superseded_read_modify_write_replays_without_locking() {
     let db = init_db(mem()).await;
@@ -351,7 +351,7 @@ async fn a_superseded_read_modify_write_replays_without_locking() {
     assert_eq!(
         attempts.load(Ordering::SeqCst),
         2,
-        "the superseded attempt replays its body once"
+        "the superseded transaction replays its body once"
     );
     assert_eq!(
         read_int(&coll.read(b"key").await.unwrap().unwrap()),
@@ -364,7 +364,7 @@ async fn a_superseded_read_modify_write_replays_without_locking() {
     let delta = db.stats() - before;
     assert_eq!(delta.direct_commit.landed, 2);
     assert_eq!(delta.locker.calls, 0, "a replayed loss publishes no holder");
-    assert_eq!(delta.transactions.retries, 1);
+    assert_eq!(delta.transactions.replays, 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -381,7 +381,7 @@ async fn multiple_rmw_single() {
 
     let stats = db.stats();
     assert_eq!(stats.transactions.completed, 32);
-    assert_eq!(stats.transactions.retries, 0);
+    assert_eq!(stats.transactions.replays, 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -449,7 +449,7 @@ async fn concurrent_reads() {
 
     let stats = db.stats();
     assert_eq!(stats.transactions.completed, 32);
-    assert_eq!(stats.transactions.retries, 0);
+    assert_eq!(stats.transactions.replays, 0);
 
     for k in keys {
         let b = coll.read(k).await.unwrap().unwrap();
@@ -495,7 +495,7 @@ async fn read_stale() {
 
     let stats = db.stats();
     assert_eq!(stats.transactions.completed, 31);
-    assert_eq!(stats.transactions.retries, 0);
+    assert_eq!(stats.transactions.replays, 0);
 }
 #[tokio::test(start_paused = true)]
 async fn builder_custom_options() {

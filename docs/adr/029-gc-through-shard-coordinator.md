@@ -23,7 +23,7 @@ The `Clock`-based time-source detail is superseded by
 [ADR-062](062-splitter-driven-tombstone-reclamation.md) adds
 structural-gate-owned compaction of quiescent tombstones. Ordinary preparation for
 persistence still prunes only holder-free entries in `Absent` state, and
-transaction-object GC does not become a leaf scanner.
+transaction-record GC does not become a leaf scanner.
 
 ## Context
 
@@ -88,12 +88,12 @@ not an aspiration with a footnote.
   **dropping vestigial entries before persistence** (below). It remains
   ignorant of locks, transaction ids, wound-wait, commit, and _now_ GC.
 - **GC (policy, one responsibility relocated).** GC keeps every ADR-022 policy
-  decision — candidate selection, the safety horizon, reverse liveness check,
+  decision — candidate selection, the safety horizon, GC check,
   the abort-then-release-then-delete ordering, tombstone retention. What changes
   is purely _how it applies a release_: instead of its own CAS loop, GC calls the
   `Locker`'s per-object **unlock methods** (shard-holder release and
   root-membership release), driving them from the dead candidate's recorded lock
-  set. GC still reads shards and roots directly for its reverse check (a read
+  set. GC still reads shards and roots directly for its GC check (a read
   path, untouched).
 - **The release resolvers stay private to the `Locker`.** The "drop this id's
   holds, publish nothing, idempotent and best-effort" shard and root release
@@ -127,15 +127,15 @@ The claim is that routing GC's release through the coordinator and pruning befor
 persistence **preserves ADR-022's safety argument exactly**, while removing the
 racing CAS.
 
-- **GC's safety invariant is untouched.** ADR-022's contract — never delete an
-  object holding live values while referenced, never delete within the horizon
-  (for an aborted object, measured from the abort) — is a property of _what GC
+- **GC's safety invariant is untouched.** ADR-022's contract — never delete a
+  record holding live values while referenced, never delete within the horizon
+  (for an aborted record, measured from the abort) — is a property of _what GC
   decides_ (status resolution, the horizon, force-abort before any lock moves),
   not of _how the release CAS is issued_. Relocating the release changes none of
-  those decisions. GC still releases only for **finalized** candidates (aborted,
-  or dead-pending only after a successful `pending → aborted` force-abort) and
-  **never** releases a committed candidate, so a coordinator release can never
-  race a live owner's own write-back on the same object.
+  those decisions. GC still releases only for candidates with **final status**
+  (aborted, or dead-pending only after a successful `pending → aborted`
+  force-abort) and **never** releases a committed candidate, so a coordinator
+  release can never race a live owner's own write-back on the same object.
 - **Release is idempotent and commutes within a mutation plan.** A release
   stages the removal of exactly one txid from the entries that name it and
   publishes nothing. Planned alongside other members (a disjoint acquire, a
@@ -146,7 +146,7 @@ racing CAS.
   holder: a no-op, inheriting ADR-009 parity. So the coordinator's existing
   reload-recover loop subsumes GC's hand-rolled retry with no new CAS site and
   no new in-doubt case.
-- **The reference set still only shrinks.** ADR-022's reverse check is safe
+- **The reference set still only shrinks.** ADR-022's GC check is safe
   because a candidate's references move monotonically away from it. A release
   through the coordinator only ever _removes_ the candidate's txid, never adds a
   reference, so the monotonic-shrink property the check depends on is preserved.
@@ -154,14 +154,14 @@ racing CAS.
   only when it is vestigial — no holder and no `current_writer`. Such an entry
   references **no** txid, so pruning it removes nothing from the live set of
   ADR-022's reachability graph. In particular it can never make a
-  still-referenced transaction object look collectable: a referenced object is
+  still-referenced transaction record look collectable: a referenced record is
   named by a `current_writer` or a `locked_by`, neither of which a vestigial
   entry has. The prune is safe on **every** coordinated mutation path, not just
   GC's — an acquire or write-back round that incidentally leaves an unrelated
   entry vestigial may drop it with the same reasoning.
 - **`current_writer` is still never cleared by GC.** Pruning removes only
-  entries with no `current_writer`; the live value pointer is replaced solely by
-  a newer writer's write-back, exactly as before.
+  entries with no `current_writer`; the live external value is replaced solely
+  by a newer writer's write-back, exactly as before.
 
 ## Consequences
 

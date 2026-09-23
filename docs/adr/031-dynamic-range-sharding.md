@@ -10,16 +10,16 @@ Supersedes the fixed-hash key→shard mapping and fixed shard count of
 addressing, the fixed `SHARD_COUNT`), and [ADR-018](018-collection-root-membership.md)
 (the recorded fixed `shard_count` and the single coarse membership lock). The
 shard _entry_ model (lock type, `locked_by`, `current_writer`, tombstone) from
-ADR-017, the transaction object (ADR-019), the commit/write-back protocol
+ADR-017, the transaction record (ADR-019), the commit/write-back protocol
 (ADR-020), wound-wait/leases (ADR-021), GC (ADR-022), and the shard-mutation
 coordinator (ADR-028/029) all carry over unchanged.
 
 [ADR-046](046-incarnation-addressed-collections.md) supersedes this ADR's
 physical-root existence marker and name-only subcollection directory with direct
-parent mappings and incarnation-unique physical prefixes. [ADR-047]
-proposes transactional management and all-node deletion fencing on top, using
-ADR-044's structural gate for per-node quiescence. The B-link topology and key
-hot-path decisions here are unchanged.
+parent mappings and per-collection-ID physical prefixes. [ADR-047]
+proposes transactional management and all-node drop-intent installation on
+top, using ADR-044's structural gate for per-node quiescence. The B-link
+topology and key hot-path decisions here are unchanged.
 
 [ADR-050](050-separate-collection-record-and-tree-root.md) supersedes this
 ADR's combined `_i` collection-record/tree-root representation. The tree now
@@ -54,17 +54,17 @@ which in turn wants a growable, range-addressed directory rather than a fixed
 hash space — which also resolves (1), (2), and (4).
 
 The invariants any scheme must keep (unchanged from ADR-016): stateless,
-ephemeral, uncoordinated clients; **content CAS on a single object** as the only
-primitive; **reads/overwrites of an existing key must not touch a central
-object** (the hot-path invariant); a **deterministic, DST-replayable** mapping;
-and compatibility with wound-wait, leases, GC, and the shard-mutation
+ephemeral, uncoordinated database instances; **content CAS on a single object**
+as the only primitive; **reads/overwrites of an existing key must not touch a
+central object** (the hot-path invariant); a **deterministic, DST-replayable**
+mapping; and compatibility with wound-wait, leases, GC, and the shard-mutation
 coordinator, which all address shards by identity.
 
 ## Decision
 
-Replace hash sharding with an **order-preserving, range-partitioned
-coordination directory**: a **B-link tree** ([Lehman & Yao]) of objects per
-collection, mutated only by content CAS.
+Replace hash sharding with an **order-preserving, range-partitioned collection
+tree**: a **B-link tree** ([Lehman & Yao]) of objects per collection, mutated
+only by content CAS.
 
 ### Object model
 
@@ -78,7 +78,7 @@ collection, mutated only by content CAS.
   any root-level structural change _and_ on membership change, coupling the two;
   this is accepted deliberately to keep the object model minimal (see
   Consequences).
-- **Index node** (interior, including the root at height ≥ 2). An ordered list of
+- **Index node** (including the root at height ≥ 2). An ordered list of
   separator keys → child-node pointers, plus a **high-key** and a
   **right-sibling** pointer. Maps a key range to the child that owns it.
 - **Leaf shard** (including the root at height 1). Owns a contiguous key range and
@@ -111,15 +111,15 @@ A key's leaf is found by descending from the root object `_i` through index
 nodes. Every node **self-describes** the range it covers (its high-key), so the
 descent is **cached and self-correcting**:
 
-- Clients cache interior nodes, including the root `_i` (revalidated by version
-  like any coordination object, ADR-023). A hit descends from the cache with no
-  central read.
+- Database instances cache index nodes, including the root `_i` (revalidated
+  by version like any coordination object, ADR-023). A hit descends from the
+  cache with no central read.
 - If a lookup reaches a node whose high-key shows the key belongs further right —
-  a split moved it after the cache was taken — the client **follows the
-  right-sibling link** (B-link's defining property) or re-descends from a
+  a split moved it after the cache was taken — the database instance **follows
+  the right-sibling link** (B-link's defining property) or re-descends from a
   refreshed `_i`. The rare stale case self-heals.
 
-This is the range analogue of the ADR-018 root-version trick and the ADR-030
+This is the range analogue of the ADR-018 root-generation trick and the ADR-030
 `AllowStale` seed: the hot path reads only the leaf; higher levels are cached and
 change only on splits/merges.
 
@@ -180,7 +180,7 @@ coordination:
   version**; a split during the scan is absorbed by following the right-link. A
   membership change bumps its leaf's version, so equal endpoints prove no
   create/delete raced within a leaf — the per-leaf analogue of ADR-018's
-  root-version validation. Under contention the scan escalates to **per-leaf read
+  root-generation validation. Under contention the scan escalates to **per-leaf read
   locks** over the covered range. Range boundaries are protected the same way
   (validate/lock the boundary leaf), preventing boundary phantoms.
 
@@ -188,10 +188,10 @@ coordination:
 
 Mechanisms are unchanged (ADR-021/022), now at leaf/index granularity. GC and
 crash recovery **re-resolve** a key's shard through the _current_ topology; a
-back-reference to a node that a split/merge has removed triggers a topology
-refresh rather than a lost reference. Index and leaf nodes holding locks are live
-references; orphaned split siblings (a crash before step 2) are unreferenced and
-reclaimable.
+recovery-manifest entry for a node that a split/merge has removed triggers a
+topology refresh rather than a lost reference. Index and leaf nodes holding
+locks are live references; orphaned split siblings (a crash before step 2) are
+unreferenced and reclaimable.
 
 ## Consequences
 
@@ -204,7 +204,7 @@ reclaimable.
 - **Finer membership concurrency**: create/delete serialize only within a leaf's
   range, not the whole collection.
 - **The hot path is preserved**: reads/overwrites of an existing key still touch
-  only the leaf; interior nodes including the root `_i` are cached and
+  only the leaf; index nodes including the root `_i` are cached and
   self-correcting via B-link right-links, so they stay off the hot path as the
   collection root did in ADR-018.
 - **Fewer objects, at the cost of coupling.** The collection metadata (existence,

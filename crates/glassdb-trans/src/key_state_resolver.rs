@@ -13,14 +13,14 @@ use crate::monitor::{KeyCommitStatus, Monitor, TxFinalStatus};
 ///
 /// A leaf entry that names the effective writer is authoritative about its own
 /// value (ADR-051), so resolution can answer whether that state is inline
-/// without touching a transaction object.
+/// without touching a transaction record.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum ResolvedValue {
     /// The leaf names a writer behind the effective one, so only the effective
-    /// writer's transaction object can supply its value.
+    /// writer's transaction record can supply its value.
     #[default]
     Unresolved,
-    /// The effective writer's value lives in its transaction object.
+    /// The effective writer's value lives in its transaction record.
     External,
     /// The effective writer's authoritative value bytes.
     Inline(Arc<[u8]>),
@@ -141,10 +141,10 @@ impl KeyStateResolver {
         self.monitor.committed_value(key, writer).await
     }
 
-    /// Rejects a node whose collection-delete intent committed, waiting for a
+    /// Rejects a node whose drop intent committed, waiting for a
     /// pending intent and ignoring an aborted one.
     pub(crate) async fn ensure_collection_live(&self, node: &Node) -> Result<(), StorageError> {
-        let Some(holder) = node.collection_delete_intent() else {
+        let Some(holder) = node.drop_intent() else {
             return Ok(());
         };
         match self
@@ -245,7 +245,7 @@ impl KeyStateResolver {
             .committed_value_at(key, holder, requirement)
             .await?;
         match committed.status {
-            TxCommitStatus::Ok => {
+            TxCommitStatus::Committed => {
                 if !committed.value.not_written {
                     resolved.writer = Some(holder.clone());
                     resolved.value = ResolvedValue::Unresolved;
@@ -269,9 +269,9 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::{CollectionAddress, DbRoot};
-    use glassdb_storage::transaction::{TLogger, TxLock, TxLog, TxWrite};
-    use glassdb_storage::{CachedStore, EntryLockState, Timeline};
+    use glassdb_data::{CollectionAddress, DbPrefix};
+    use glassdb_storage::transaction::{TxLock, TxRecord, TxRecordStore, TxWrite};
+    use glassdb_storage::{CachedStore, KeyLockState, Timeline};
 
     use super::*;
     use crate::monitor::ProtocolTiming;
@@ -281,7 +281,7 @@ mod tests {
     fn monitor_over(backend: Arc<dyn Backend>) -> (Monitor, Arc<Background>) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(backend, 1 << 20, timeline.clone(), None);
-        let transactions = TLogger::new(objects, DbRoot::try_from("db").unwrap());
+        let transactions = TxRecordStore::new(objects, DbPrefix::try_from("db").unwrap());
         let background = Arc::new(Background::new());
         let monitor = Monitor::with_config(
             transactions,
@@ -300,7 +300,7 @@ mod tests {
     struct ResolutionHarness {
         backend: Arc<dyn Backend>,
         operations: OpLog,
-        transactions: TLogger,
+        transactions: TxRecordStore,
     }
 
     impl ResolutionHarness {
@@ -310,7 +310,7 @@ mod tests {
             let backend: Arc<dyn Backend> = Arc::new(recorder);
             let timeline = Timeline::new();
             let objects = CachedStore::new(backend.clone(), 1 << 20, timeline, None);
-            let transactions = TLogger::new(objects, DbRoot::try_from("db").unwrap());
+            let transactions = TxRecordStore::new(objects, DbPrefix::try_from("db").unwrap());
             Self {
                 backend,
                 operations,
@@ -331,20 +331,20 @@ mod tests {
             status: TxCommitStatus,
             deleted: Option<bool>,
         ) {
-            let mut log = TxLog::new(holder.clone(), status);
-            log.locks.push(TxLock::Entry {
+            let mut record = TxRecord::new(holder.clone(), status);
+            record.locks.push(TxLock::Key {
                 key: key.clone(),
                 typ,
             });
             if let Some(deleted) = deleted {
-                log.writes.push(TxWrite {
+                record.writes.push(TxWrite {
                     key: key.clone(),
                     value: Arc::from(b"holder-value".as_slice()),
                     deleted,
                     prev_writer: TxId::default(),
                 });
             }
-            self.transactions.set(&log).await.unwrap();
+            self.transactions.set(&record).await.unwrap();
         }
 
         fn clear_operations(&self) {
@@ -363,7 +363,7 @@ mod tests {
                     matches!(operation.op, "read" | "read_if_modified")
                         && operation.path.contains("/_t/")
                 }),
-                "{context}: resolution must only read transaction objects: {operations:?}"
+                "{context}: resolution must only read transaction records: {operations:?}"
             );
         }
     }
@@ -460,7 +460,7 @@ mod tests {
         fn status(self) -> TxCommitStatus {
             match self {
                 Self::Pending => TxCommitStatus::Pending,
-                Self::CommittedLive | Self::CommittedDeleted => TxCommitStatus::Ok,
+                Self::CommittedLive | Self::CommittedDeleted => TxCommitStatus::Committed,
                 Self::Aborted => TxCommitStatus::Aborted,
                 Self::Wounded => TxCommitStatus::Wounded,
             }
@@ -502,9 +502,9 @@ mod tests {
         let mut holders = holders.into_iter();
         let first = holders.next().expect("a held lock needs a holder");
         let mut lock = match typ {
-            LockType::Read => EntryLockState::read(first),
-            LockType::Write => EntryLockState::write(first),
-            LockType::Create => EntryLockState::create(first),
+            LockType::Read => KeyLockState::read(first),
+            LockType::Write => KeyLockState::write(first),
+            LockType::Create => KeyLockState::create(first),
             LockType::Unknown | LockType::None => panic!("a held lock needs a held type"),
         };
         for holder in holders {
@@ -681,7 +681,7 @@ mod tests {
             let wounded = TxId::with_priority(5, b"wounded");
             for (holder, status) in [
                 (&pending, TxCommitStatus::Pending),
-                (&committed, TxCommitStatus::Ok),
+                (&committed, TxCommitStatus::Committed),
                 (&aborted, TxCommitStatus::Aborted),
                 (&wounded, TxCommitStatus::Wounded),
             ] {
@@ -736,7 +736,7 @@ mod tests {
                     &holder,
                     lock_type,
                     if lock_type == LockType::Write {
-                        TxCommitStatus::Ok
+                        TxCommitStatus::Committed
                     } else {
                         TxCommitStatus::Pending
                     },
@@ -795,7 +795,7 @@ mod tests {
         let holder = TxId::with_priority(2, b"holder");
 
         monitor.begin_tx(&holder);
-        let mut committed = TxLog::new(holder.clone(), TxCommitStatus::Pending);
+        let mut committed = TxRecord::new(holder.clone(), TxCommitStatus::Pending);
         committed.writes = vec![TxWrite {
             key: key.clone(),
             value: Arc::from(b"v".as_slice()),
@@ -822,7 +822,7 @@ mod tests {
         monitor.commit_tx(committed).await.unwrap();
         assert_eq!(
             monitor.tx_status(&holder).await.unwrap(),
-            TxCommitStatus::Ok,
+            TxCommitStatus::Committed,
             "the holder committed before the second resolution"
         );
 

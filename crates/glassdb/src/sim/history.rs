@@ -2,7 +2,7 @@
 //!
 //! This module models public point and concurrent-group reads, writes, deletes,
 //! normalized key membership scans, and shared collection lifecycle operations.
-//! It does not inspect transaction logs, cached objects, or other implementation
+//! It does not inspect transaction records, cached objects, or other implementation
 //! state, so the oracle cannot accidentally reproduce the protocol it checks.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -91,7 +91,7 @@ enum BodyState {
 /// One complete execution of a public transaction body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BodyTrace {
-    /// Retry number within the public transaction, starting at zero.
+    /// Body execution number within the public transaction, starting at zero.
     body_number: usize,
     /// Point reads, unordered read groups, scans, and resolved local mutations
     /// in program order.
@@ -116,7 +116,7 @@ enum HistoryOutcome {
     Interrupted,
 }
 
-/// A public transaction invocation and every body execution caused by retries.
+/// A public transaction invocation and every body execution caused by replays.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PublicOp {
     /// Stable workload operation identifier.
@@ -125,7 +125,7 @@ struct PublicOp {
     client_id: usize,
     /// Checker-owned event point at invocation.
     invocation_point: u64,
-    /// Body executions in retry order.
+    /// Body executions in execution order.
     body_executions: Vec<BodyTrace>,
     /// Checker-owned event point at public notification, absent for interruption.
     notification_point: Option<u64>,
@@ -613,7 +613,7 @@ pub struct HistoryTransaction {
     pub op_id: u64,
     /// Owning client.
     pub client_id: usize,
-    /// Instructions interpreted in order on every internal retry.
+    /// Instructions interpreted in order on every body execution.
     pub instructions: Vec<HistoryInstruction>,
 }
 
@@ -965,9 +965,10 @@ async fn interpret_body(
     program: &HistoryTransaction,
     recorder: &HistoryRecorder,
 ) -> Result<(), Error> {
-    // Install an incomplete attempt before the first await. If the enclosing
-    // public future is dropped during this body, an earlier retry attempt that
-    // reached commit cannot be mistaken for the interrupted attempt's effect.
+    // Install an incomplete body execution before the first await. If the
+    // enclosing public future is dropped during this body, an earlier body
+    // execution that reached commit cannot be mistaken for the interrupted
+    // execution's effect.
     let body_number = recorder.begin_body(program.op_id);
     let mut registers = [None::<Option<u8>>; HISTORY_REGISTER_COUNT];
     let mut actions = Vec::new();
@@ -1594,7 +1595,7 @@ mod sim_tests {
     }
 
     #[test]
-    fn uncertain_collection_commit_can_follow_a_later_public_operation() {
+    fn in_doubt_collection_commit_can_follow_a_later_public_operation() {
         let initial = AbstractState::default();
         let collection = Some(CollectionState::default());
         let mut final_state = initial.clone();
@@ -1907,7 +1908,7 @@ mod sim_tests {
     }
 
     #[test]
-    fn rejects_stale_read_and_accepts_concurrent_control() {
+    fn rejects_outdated_read_and_accepts_concurrent_control() {
         let initial = state(&[(0, 0)]);
         let write = op(
             0,
@@ -1919,7 +1920,7 @@ mod sim_tests {
                 BodyState::CommitOutcome,
             ),
         );
-        let stale_read = op(
+        let outdated_read = op(
             1,
             2,
             Some(3),
@@ -1932,7 +1933,9 @@ mod sim_tests {
                 BodyState::CommitOutcome,
             ),
         );
-        assert!(check_history(&initial, &[write.clone(), stale_read], &state(&[(0, 1)])).is_err());
+        assert!(
+            check_history(&initial, &[write.clone(), outdated_read], &state(&[(0, 1)])).is_err()
+        );
 
         let concurrent_read = op(
             1,
@@ -2281,7 +2284,7 @@ mod sim_tests {
     }
 
     #[test]
-    fn interrupted_incomplete_retry_cannot_reuse_an_earlier_commit_outcome() {
+    fn interrupted_incomplete_replay_cannot_reuse_an_earlier_commit_outcome() {
         let initial = state(&[(0, 0)]);
         let mut interrupted = increment(0, 0, 1, 0);
         interrupted.notification_point = None;
@@ -2297,7 +2300,7 @@ mod sim_tests {
     }
 
     #[test]
-    fn rejects_malformed_retry_numbers_and_mutation_summaries() {
+    fn rejects_malformed_body_numbers_and_mutation_summaries() {
         let initial = state(&[(0, 0)]);
         let mut wrong_number = increment(0, 0, 1, 0);
         wrong_number.body_executions[0].body_number = 1;

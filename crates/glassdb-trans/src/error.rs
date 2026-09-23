@@ -14,12 +14,12 @@ pub enum TransError {
     /// The transaction should be retried from the beginning (Go `ErrRetry`).
     #[error("retry transaction")]
     Retry,
-    /// The remote transaction log was already committed or aborted.
-    #[error("transaction was already finalized")]
+    /// The transaction record already has a final status.
+    #[error("transaction already has a final status")]
     AlreadyFinalized,
     /// The transaction was aborted by a higher-priority transaction under the
     /// wound-wait rule (Go `ErrWounded`). It must be retried from the beginning
-    /// with a fresh attempt that preserves the original priority.
+    /// with a renewed identity that preserves the original priority.
     #[error("transaction was wounded")]
     Wounded,
     /// Internal: resolve a stale reference again at the supplied observation bound.
@@ -34,7 +34,7 @@ pub enum TransError {
     /// User data cannot fit in the configured coordination-object limit.
     #[error("invalid input: {0}")]
     InvalidInput(String),
-    /// The addressed collection incarnation was durably deleted.
+    /// The addressed collection was dropped.
     #[error("stale collection handle")]
     StaleCollection,
     /// Any other transaction error, with an optional underlying cause.

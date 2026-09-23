@@ -22,21 +22,22 @@ The `mixed` scenario runs four transaction shapes concurrently:
 - `roSingle`: one-key serializable read;
 - `roMulti`: multi-key serializable read.
 
-Every client `Database` runs every shape and has a distinct home collection.
+Every open `Database` runs every shape and has a distinct home collection.
 For each transaction it chooses its home with the configured affinity;
 otherwise it chooses uniformly among all collections. The default
-`0,25,50,75,100%` sweep ranges from no client-specific preference to complete
-client isolation. The separate `lo` and `hi` modes vary the key pool within a
+`0,25,50,75,100%` sweep ranges from no instance-specific preference to complete
+instance isolation. The separate `lo` and `hi` modes vary the key pool within a
 collection, keeping key contention independent from collection affinity.
 `--workers-per-shape` and `--databases` also accept comma-separated sweeps.
 The Database value is a limit: each cell opens the smaller of that limit and
-its worker count, ensuring that every open client runs every shape. Results
-record the limit, active client count, and worker count separately.
+its worker count, ensuring that every open database instance runs every shape.
+Results record the limit, active database-instance count, and worker count
+separately.
 
-Each cell gets an isolated database namespace. A throwaway client seeds every
-collection and observes its completed-split counter. Any change resets the
-quiet timer. Fresh measurement clients open only after that counter stays
-unchanged for `--split-quiet`; failure to settle before
+Each cell gets an isolated database namespace. A throwaway database instance
+seeds every collection and observes its completed-split counter. Any change
+resets the quiet timer. Fresh measurement database instances open only after
+that counter stays unchanged for `--split-quiet`; failure to settle before
 `--split-settle-timeout` fails the cell. Setup split count and settlement wall
 time are included in each result.
 
@@ -52,7 +53,7 @@ cargo run --release -p glassdb-bench-scale --bin perfbench -- \
 Every shape runs until all shapes reach the requested throughput confidence
 interval, or the cell reaches `--max-duration`. Capped shapes are marked
 unconverged. Whole-cell results include backend operations and transaction
-retries plus coordinator submissions, rounds, CAS retries, members per round, and
+replays plus coordinator submissions, rounds, CAS retries, members per round, and
 direct-path coverage, all derived from the public `Database::stats()` counters.
 
 ### Worker and affinity sweep plots
@@ -60,7 +61,7 @@ direct-path coverage, all derived from the public `Database::stats()` counters.
 The canonical scale plots use the low-contention mixed workload and the local
 S3 model. `--prefix-depth=3` gives each physical collection subtree
 (`db/_c/<collection-id>`) an independent simulated S3 request-rate bucket;
-database-wide transaction-log shards remain separate prefixes. Build once and
+database-wide transaction-record shards remain separate prefixes. Build once and
 run the two grids:
 
 ```bash
@@ -88,7 +89,7 @@ uv run hack/aws-bench/plot-mixed-sweeps.py
 The plotter requires three clean, converged runs. Throughput is shown as the
 cross-run median line. Latency uses the cross-run median p50 as a line and the
 area from p50 through p90 as a band. Affinity figures put all transaction shapes
-on one panel per Database-client count. The four figures are written under
+on one panel per Database-instance count. The four figures are written under
 `hack/aws-bench/out-sweeps/`.
 
 ## Focused scenarios

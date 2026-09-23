@@ -15,8 +15,8 @@ use crate::cache_stats::CacheMetrics;
 use crate::timeline::SequencePoint;
 
 use super::admission::{Admission, OptionalReservation, PayloadReservation, PromotionReservation};
+use super::change::{PathChangeOwner, PathChanges, PendingChange, PendingChangeLimit};
 use super::disk::{Disk, WriterState, open_disk};
-use super::fence::{FenceContext, FenceGuard, FenceTracker, PathFence};
 use super::format::CacheGeometry;
 use super::media::CacheMedia;
 use super::{EncodedBody, OpenedPersistentCache, PersistentCache, PersistentCacheConfig};
@@ -197,7 +197,7 @@ impl CacheInner {
             enabled: AtomicBool::new(true),
             metrics,
             admission: Arc::new(Admission::new(writer.filter.clone())),
-            fences: FenceTracker::new(),
+            change_limit: PendingChangeLimit::new(),
             shutdown_requested: AtomicBool::new(false),
         });
         (
@@ -266,7 +266,7 @@ pub(super) struct Shared {
     pub(super) enabled: AtomicBool,
     metrics: Arc<CacheMetrics>,
     pub(super) admission: Arc<Admission>,
-    pub(super) fences: FenceTracker,
+    pub(super) change_limit: PendingChangeLimit,
     shutdown_requested: AtomicBool,
 }
 
@@ -329,18 +329,18 @@ pub(super) enum Work {
         revision: Vec<u8>,
         body: Vec<u8>,
         current_after: SequencePoint,
-        // Drop releases the path only after publication finishes.
-        fence: FenceGuard,
+        // Drop ends the path change only after publication finishes.
+        change: PendingChange,
         payload: PayloadReservation,
     },
     Invalidate {
         path: Arc<str>,
-        // Drop releases the path only after invalidation finishes.
-        fence: FenceGuard,
+        // Drop ends the path change only after invalidation finishes.
+        change: PendingChange,
     },
     Promote {
-        context: Arc<dyn FenceContext>,
-        epoch: u64,
+        owner: Arc<dyn PathChangeOwner>,
+        latest: u64,
         optional: OptionalReservation,
         promotion: PromotionReservation,
     },
@@ -419,7 +419,7 @@ async fn handle_work(shared: &Shared, writer: &mut WriterState, work: Work) -> C
             revision,
             body,
             current_after,
-            fence,
+            change,
             payload,
         } => {
             handle_replace(
@@ -429,18 +429,18 @@ async fn handle_work(shared: &Shared, writer: &mut WriterState, work: Work) -> C
                 revision,
                 body,
                 current_after,
-                fence,
+                change,
                 payload,
             )
             .await
         }
-        Work::Invalidate { path, fence } => handle_invalidate(shared, writer, path, fence).await,
+        Work::Invalidate { path, change } => handle_invalidate(shared, writer, path, change).await,
         Work::Promote {
-            context,
-            epoch,
+            owner,
+            latest,
             optional,
             promotion,
-        } => handle_promote(shared, writer, context, epoch, optional, promotion).await,
+        } => handle_promote(shared, writer, owner, latest, optional, promotion).await,
         Work::Shutdown => handle_shutdown(shared, writer).await,
     }
 }
@@ -465,12 +465,12 @@ async fn handle_replace(
     revision: Vec<u8>,
     body: Vec<u8>,
     current_after: SequencePoint,
-    fence: FenceGuard,
+    change: PendingChange,
     payload: PayloadReservation,
 ) -> ControlFlow<()> {
     // Payload pressure bounds queued bytes, not the worker's active append.
     drop(payload);
-    let result = if shared.enabled.load(Ordering::Acquire) && fence.is_current() {
+    let result = if shared.enabled.load(Ordering::Acquire) && change.is_latest() {
         let result = writer.append(&path, &revision, &body, current_after).await;
         if let Ok(slot) = result {
             let earned = slot.record_bytes / PROMOTION_EARN_DIVISOR;
@@ -482,7 +482,7 @@ async fn handle_replace(
         Ok(())
     };
     disable_after_work_error(shared, &result);
-    drop(fence);
+    drop(change);
     ControlFlow::Continue(())
 }
 
@@ -490,7 +490,7 @@ async fn handle_invalidate(
     shared: &Shared,
     writer: &mut WriterState,
     path: Arc<str>,
-    fence: FenceGuard,
+    change: PendingChange,
 ) -> ControlFlow<()> {
     let result = if shared.enabled.load(Ordering::Acquire) {
         writer.invalidate(&path).await
@@ -498,22 +498,29 @@ async fn handle_invalidate(
         Ok(())
     };
     disable_after_work_error(shared, &result);
-    drop(fence);
+    drop(change);
     ControlFlow::Continue(())
 }
 
 async fn handle_promote(
     shared: &Shared,
     writer: &mut WriterState,
-    context: Arc<dyn FenceContext>,
-    epoch: u64,
+    owner: Arc<dyn PathChangeOwner>,
+    latest: u64,
     optional: OptionalReservation,
     promotion: PromotionReservation,
 ) -> ControlFlow<()> {
     // Queue pressure excludes work once its handler starts running.
     drop(optional);
     let result = if shared.enabled.load(Ordering::Acquire) {
-        promote(shared, writer, promotion.path(), context.fence(), epoch).await
+        promote(
+            shared,
+            writer,
+            promotion.path(),
+            owner.path_changes(),
+            latest,
+        )
+        .await
     } else {
         Ok(())
     };
@@ -573,10 +580,10 @@ async fn promote(
     shared: &Shared,
     writer: &mut WriterState,
     path: &str,
-    fence: &PathFence,
-    epoch: u64,
+    path_changes: &PathChanges,
+    latest: u64,
 ) -> io::Result<()> {
-    if fence.snapshot() != (epoch, false) {
+    if path_changes.snapshot() != (latest, false) {
         return Ok(());
     }
     let Some(slot) = shared.disk.current_slot(path).await? else {
@@ -604,7 +611,9 @@ async fn promote(
     let Some(record) = shared.disk.read_record(path, slot).await? else {
         return Ok(());
     };
-    if fence.snapshot() != (epoch, false) || shared.disk.current_slot(path).await? != Some(slot) {
+    if path_changes.snapshot() != (latest, false)
+        || shared.disk.current_slot(path).await? != Some(slot)
+    {
         return Ok(());
     }
     let promoted = writer
@@ -666,7 +675,7 @@ mod tests {
 
     fn assert_no_reservations(shared: &Shared) {
         assert_eq!(shared.admission.reservation_counts(), (0, 0, 0));
-        assert_eq!(shared.fences.active_count(), 0);
+        assert_eq!(shared.change_limit.pending_count(), 0);
     }
 
     async fn fail_work(fixture: &mut Fixture, work: Work) -> ControlFlow<()> {
@@ -682,7 +691,7 @@ mod tests {
         fixture: &mut Fixture,
         work: Work,
         in_flight_admission: (u64, usize, usize),
-        in_flight_fences: usize,
+        pending_changes: usize,
     ) {
         let mut pause = fixture.media.pause_next_operation();
         let shared = fixture.inner.shared.clone();
@@ -691,7 +700,7 @@ mod tests {
         let task = tokio::spawn(async move { handle_work(&task_shared, &mut writer, work).await });
         pause.wait_until_entered().await;
         assert_eq!(shared.admission.reservation_counts(), in_flight_admission);
-        assert_eq!(shared.fences.active_count(), in_flight_fences);
+        assert_eq!(shared.change_limit.pending_count(), pending_changes);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         pause.resume();
@@ -706,34 +715,34 @@ mod tests {
 
         let path = Arc::<str>::from("db/promote");
         let promotion = shared.admission.reserve_promotion(&path).unwrap();
-        let context = Arc::new(PathFence::default());
-        let (epoch, active) = context.snapshot();
-        assert!(!active);
+        let owner = Arc::new(PathChanges::default());
+        let (latest, pending) = owner.snapshot();
+        assert!(!pending);
         assert!(
             !fixture
                 .inner
                 .enqueue_optional(move |optional| Work::Promote {
-                    context,
-                    epoch,
+                    owner,
+                    latest,
                     optional,
                     promotion,
                 })
         );
         assert_no_reservations(&shared);
 
-        let context = Arc::new(PathFence::default());
-        let fence = shared.fences.begin(context.clone()).unwrap();
+        let owner = Arc::new(PathChanges::default());
+        let change = shared.change_limit.begin(owner.clone()).unwrap();
         let payload = shared.admission.reserve_payload(123).unwrap();
         fixture.inner.enqueue_required(Work::Replace {
             path: Arc::from("db/replace"),
             revision: b"r1".to_vec(),
             body: b"body".to_vec(),
             current_after: point(1),
-            fence,
+            change,
             payload,
         });
         assert_no_reservations(&shared);
-        assert!(!context.is_active());
+        assert!(!owner.is_pending());
     }
 
     #[tokio::test]
@@ -758,8 +767,8 @@ mod tests {
 
         let mut replace = fixture().await;
         let shared = replace.inner.shared.clone();
-        let context = Arc::new(PathFence::default());
-        let fence = shared.fences.begin(context.clone()).unwrap();
+        let owner = Arc::new(PathChanges::default());
+        let change = shared.change_limit.begin(owner.clone()).unwrap();
         let payload = shared.admission.reserve_payload(123).unwrap();
         assert_eq!(
             fail_work(
@@ -769,46 +778,46 @@ mod tests {
                     revision: b"r1".to_vec(),
                     body: b"body".to_vec(),
                     current_after: point(1),
-                    fence,
+                    change,
                     payload,
                 },
             )
             .await,
             ControlFlow::Continue(())
         );
-        assert!(!context.is_active());
+        assert!(!owner.is_pending());
 
         let mut invalidate = fixture().await;
         let shared = invalidate.inner.shared.clone();
-        let context = Arc::new(PathFence::default());
-        let fence = shared.fences.begin(context.clone()).unwrap();
+        let owner = Arc::new(PathChanges::default());
+        let change = shared.change_limit.begin(owner.clone()).unwrap();
         assert_eq!(
             fail_work(
                 &mut invalidate,
                 Work::Invalidate {
                     path: Arc::from("db/invalidate"),
-                    fence,
+                    change,
                 },
             )
             .await,
             ControlFlow::Continue(())
         );
-        assert!(!context.is_active());
+        assert!(!owner.is_pending());
 
         let mut promote = fixture().await;
         let shared = promote.inner.shared.clone();
         let path = Arc::<str>::from("db/promote");
         let optional = shared.admission.reserve_optional().unwrap();
         let promotion = shared.admission.reserve_promotion(&path).unwrap();
-        let context = Arc::new(PathFence::default());
-        let (epoch, active) = context.snapshot();
-        assert!(!active);
+        let owner = Arc::new(PathChanges::default());
+        let (latest, pending) = owner.snapshot();
+        assert!(!pending);
         assert_eq!(
             fail_work(
                 &mut promote,
                 Work::Promote {
-                    context,
-                    epoch,
+                    owner,
+                    latest,
                     optional,
                     promotion,
                 },
@@ -845,8 +854,8 @@ mod tests {
 
         let mut replace = fixture().await;
         let shared = replace.inner.shared.clone();
-        let context = Arc::new(PathFence::default());
-        let fence = shared.fences.begin(context.clone()).unwrap();
+        let owner = Arc::new(PathChanges::default());
+        let change = shared.change_limit.begin(owner.clone()).unwrap();
         let payload = shared.admission.reserve_payload(123).unwrap();
         cancel_work(
             &mut replace,
@@ -855,44 +864,44 @@ mod tests {
                 revision: b"r1".to_vec(),
                 body: b"body".to_vec(),
                 current_after: point(1),
-                fence,
+                change,
                 payload,
             },
             (0, 0, 0),
             1,
         )
         .await;
-        assert!(!context.is_active());
+        assert!(!owner.is_pending());
 
         let mut invalidate = fixture().await;
         let shared = invalidate.inner.shared.clone();
-        let context = Arc::new(PathFence::default());
-        let fence = shared.fences.begin(context.clone()).unwrap();
+        let owner = Arc::new(PathChanges::default());
+        let change = shared.change_limit.begin(owner.clone()).unwrap();
         cancel_work(
             &mut invalidate,
             Work::Invalidate {
                 path: Arc::from("db/invalidate"),
-                fence,
+                change,
             },
             (0, 0, 0),
             1,
         )
         .await;
-        assert!(!context.is_active());
+        assert!(!owner.is_pending());
 
         let mut promote = fixture().await;
         let shared = promote.inner.shared.clone();
         let path = Arc::<str>::from("db/promote");
         let optional = shared.admission.reserve_optional().unwrap();
         let promotion = shared.admission.reserve_promotion(&path).unwrap();
-        let context = Arc::new(PathFence::default());
-        let (epoch, active) = context.snapshot();
-        assert!(!active);
+        let owner = Arc::new(PathChanges::default());
+        let (latest, pending) = owner.snapshot();
+        assert!(!pending);
         cancel_work(
             &mut promote,
             Work::Promote {
-                context,
-                epoch,
+                owner,
+                latest,
                 optional,
                 promotion,
             },
@@ -911,15 +920,15 @@ mod tests {
         let shared = fixture.inner.shared.clone();
         let mut pause = fixture.media.pause_next_operation();
 
-        let active_context = Arc::new(PathFence::default());
-        let active_fence = shared.fences.begin(active_context.clone()).unwrap();
+        let active_owner = Arc::new(PathChanges::default());
+        let active_change = shared.change_limit.begin(active_owner.clone()).unwrap();
         let active_payload = shared.admission.reserve_payload(111).unwrap();
         fixture.inner.enqueue_required(Work::Replace {
             path: Arc::from("db/active"),
             revision: b"r1".to_vec(),
             body: b"body".to_vec(),
             current_after: point(1),
-            fence: active_fence,
+            change: active_change,
             payload: active_payload,
         });
         let worker = fixture.worker.take().unwrap();
@@ -937,51 +946,51 @@ mod tests {
                 })
         );
 
-        let replace_context = Arc::new(PathFence::default());
-        let replace_fence = shared.fences.begin(replace_context.clone()).unwrap();
+        let replace_owner = Arc::new(PathChanges::default());
+        let replace_change = shared.change_limit.begin(replace_owner.clone()).unwrap();
         let replace_payload = shared.admission.reserve_payload(123).unwrap();
         fixture.inner.enqueue_required(Work::Replace {
             path: Arc::from("db/replace"),
             revision: b"r2".to_vec(),
             body: b"queued".to_vec(),
             current_after: point(2),
-            fence: replace_fence,
+            change: replace_change,
             payload: replace_payload,
         });
 
-        let invalidate_context = Arc::new(PathFence::default());
-        let invalidate_fence = shared.fences.begin(invalidate_context.clone()).unwrap();
+        let invalidate_owner = Arc::new(PathChanges::default());
+        let invalidate_change = shared.change_limit.begin(invalidate_owner.clone()).unwrap();
         fixture.inner.enqueue_required(Work::Invalidate {
             path: Arc::from("db/invalidate"),
-            fence: invalidate_fence,
+            change: invalidate_change,
         });
 
         let promotion_path = Arc::<str>::from("db/promote");
         let promotion = shared.admission.reserve_promotion(&promotion_path).unwrap();
-        let promotion_context = Arc::new(PathFence::default());
-        let (epoch, active) = promotion_context.snapshot();
-        assert!(!active);
+        let promotion_owner = Arc::new(PathChanges::default());
+        let (latest, pending) = promotion_owner.snapshot();
+        assert!(!pending);
         assert!(
             fixture
                 .inner
                 .enqueue_optional(move |optional| Work::Promote {
-                    context: promotion_context,
-                    epoch,
+                    owner: promotion_owner,
+                    latest,
                     optional,
                     promotion,
                 })
         );
 
         assert_eq!(shared.admission.reservation_counts(), (123, 2, 1));
-        assert_eq!(shared.fences.active_count(), 3);
+        assert_eq!(shared.change_limit.pending_count(), 3);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         pause.resume();
 
         assert_no_reservations(&shared);
-        assert!(!active_context.is_active());
-        assert!(!replace_context.is_active());
-        assert!(!invalidate_context.is_active());
+        assert!(!active_owner.is_pending());
+        assert!(!replace_owner.is_pending());
+        assert!(!invalidate_owner.is_pending());
         assert!(lookup_result.await.is_err());
     }
 }

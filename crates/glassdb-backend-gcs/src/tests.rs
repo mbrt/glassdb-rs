@@ -27,7 +27,7 @@ async fn list_rejects_invalid_provider_cursor() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn write_produces_fresh_version_each_time() {
+async fn write_produces_fresh_revision_each_time() {
     let fake = FakeGcs::start().await;
     let b = fake.backend();
     let v1 = b.write_if_not_exists("k", b"same".to_vec()).await.unwrap();
@@ -35,10 +35,10 @@ async fn write_produces_fresh_version_each_time() {
     assert_ne!(v1, v2);
 }
 
-// In-doubt contract (ADR-009): a conditional write whose outcome is uncertain
+// In-doubt contract (ADR-009): a conditional write whose outcome is in doubt
 // must NOT be reported as a confident error the engine would retry into a
 // double-apply. GCS applies conditional writes atomically and this backend does
-// not retry them, so a clean precondition is a genuine conflict; but a `5xx`
+// not retry them, so a clean precondition is a genuine rejection; but a `5xx`
 // (or a transport error) leaves the write in doubt — it may have landed before
 // the failure — and must surface as `Unavailable`. These tests would see
 // `Other` against the pre-fix code, which mapped any non-precondition status to
@@ -83,10 +83,10 @@ async fn write_if_lost_ack_is_in_doubt() {
 async fn delete_if_lost_ack_is_in_doubt() {
     let fake = FakeGcs::start().await;
     let b = fake.backend();
-    let version = b.write_if_not_exists("k", b"v".to_vec()).await.unwrap();
+    let revision = b.write_if_not_exists("k", b"v".to_vec()).await.unwrap();
 
     fake.set_lost_ack(1);
-    let err = b.delete_if("k", &version).await.unwrap_err();
+    let err = b.delete_if("k", &revision).await.unwrap_err();
     assert!(matches!(err, BackendError::Unavailable(_)));
     assert!(matches!(b.read("k").await, Err(BackendError::NotFound)));
 }

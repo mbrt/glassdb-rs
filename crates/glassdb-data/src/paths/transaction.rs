@@ -3,7 +3,7 @@ use std::fmt;
 use crate::base64;
 use crate::txid::TxId;
 
-use super::{DbRoot, ObjectPath, PathError};
+use super::{DbPrefix, ObjectPath, PathError};
 
 const TRANSACTION_MARKER: &str = "_t";
 
@@ -20,7 +20,7 @@ pub(super) fn parse_object(path: &str) -> Option<Result<ObjectPath, PathError>> 
     }
     Some(decode_parts(path, a, b, encoded).and_then(|id| {
         Ok(ObjectPath::Transaction {
-            db_root: DbRoot::try_from(prefix)?,
+            db_prefix: DbPrefix::try_from(prefix)?,
             id,
         })
     }))
@@ -28,23 +28,23 @@ pub(super) fn parse_object(path: &str) -> Option<Result<ObjectPath, PathError>> 
 
 pub(super) fn write_object(f: &mut fmt::Formatter<'_>, prefix: &str, id: &TxId) -> fmt::Result {
     let encoded = base64::encode(id.as_bytes());
-    let shard = shard_for_encoding(&encoded);
+    let symbols = prefix_symbols(&encoded);
     write!(
         f,
         "{prefix}/{TRANSACTION_MARKER}/{}/{}/{encoded}",
-        &shard[..1],
-        &shard[1..]
+        &symbols[..1],
+        &symbols[1..]
     )
 }
 
-pub(super) fn shard(id: &TxId) -> usize {
+pub(super) fn prefix_index(id: &TxId) -> usize {
     let encoded = base64::encode(id.as_bytes());
-    base64::decode_u12(shard_for_encoding(&encoded))
-        .expect("transaction shard uses the base64 alphabet")
+    base64::decode_u12(prefix_symbols(&encoded))
+        .expect("transaction prefix uses the base64 alphabet")
 }
 
-pub(super) fn shard_prefix(prefix: &str, shard: usize) -> String {
-    let symbols = base64::encode_u12(shard);
+pub(super) fn index_prefix(prefix: &str, index: usize) -> String {
+    let symbols = base64::encode_u12(index);
     let symbols = std::str::from_utf8(&symbols).expect("base64 alphabet is ASCII");
     format!(
         "{prefix}/{TRANSACTION_MARKER}/{}/{}/",
@@ -68,17 +68,17 @@ pub(super) fn scan_prefix(prefix: &str, depth: u8, index: usize) -> Result<Strin
                 char::from(symbols[0])
             ))
         }
-        _ => Ok(shard_prefix(prefix, index)),
+        _ => Ok(index_prefix(prefix, index)),
     }
 }
 
 fn decode_parts(source: &str, a: &str, b: &str, encoded: &str) -> Result<TxId, PathError> {
-    let shard = shard_for_encoding(encoded).as_bytes();
+    let symbols = prefix_symbols(encoded).as_bytes();
     if a.len() != 1
         || b.len() != 1
         || encoded.is_empty()
-        || a.as_bytes() != &shard[..1]
-        || b.as_bytes() != &shard[1..]
+        || a.as_bytes() != &symbols[..1]
+        || b.as_bytes() != &symbols[1..]
     {
         return Err(PathError::Parse(source.to_string()));
     }
@@ -89,6 +89,6 @@ fn decode_parts(source: &str, a: &str, b: &str, encoded: &str) -> Result<TxId, P
     Ok(TxId::from_bytes(bytes))
 }
 
-fn shard_for_encoding(encoded: &str) -> &str {
+fn prefix_symbols(encoded: &str) -> &str {
     encoded.get(..2).unwrap_or("00")
 }

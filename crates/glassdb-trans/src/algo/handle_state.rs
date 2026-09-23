@@ -1,7 +1,7 @@
-//! Validated lifecycle transitions for one transaction attempt.
+//! Validated lifecycle transitions for one transaction handle.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AttemptPhase {
+enum IdentityPhase {
     New,
     Engaged,
     Committed,
@@ -20,67 +20,67 @@ enum AcquisitionMode {
 }
 
 /// Correlated lifecycle state for one transaction handle.
-pub(super) struct AttemptState {
-    phase: AttemptPhase,
+pub(super) struct HandleState {
+    phase: IdentityPhase,
     validation_mode: ReadValidationMode,
     acquisition_mode: AcquisitionMode,
     renewals: usize,
 }
 
-impl AttemptState {
+impl HandleState {
     pub(super) fn new() -> Self {
-        AttemptState {
-            phase: AttemptPhase::New,
+        HandleState {
+            phase: IdentityPhase::New,
             validation_mode: ReadValidationMode::Optimistic,
             acquisition_mode: AcquisitionMode::Parallel,
             renewals: 0,
         }
     }
 
-    /// Gives an active attempt a durable identity, reporting whether this is
-    /// its first engagement.
+    /// Makes the current transaction identity durable, reporting whether this
+    /// is its first engagement.
     pub(super) fn engage(&mut self) -> bool {
         match self.phase {
-            AttemptPhase::New => {
-                self.phase = AttemptPhase::Engaged;
+            IdentityPhase::New => {
+                self.phase = IdentityPhase::Engaged;
                 self.validation_mode = ReadValidationMode::Locked;
                 true
             }
-            AttemptPhase::Engaged => false,
-            AttemptPhase::Committed => panic!("cannot engage a committed transaction"),
+            IdentityPhase::Engaged => false,
+            IdentityPhase::Committed => panic!("cannot engage a committed transaction"),
         }
     }
 
-    /// Marks the attempt terminal after its commit point has won.
+    /// Marks the transaction committed after its commit point has won.
     pub(super) fn commit(&mut self) {
         match self.phase {
-            AttemptPhase::New | AttemptPhase::Engaged => {
-                self.phase = AttemptPhase::Committed;
+            IdentityPhase::New | IdentityPhase::Engaged => {
+                self.phase = IdentityPhase::Committed;
             }
-            AttemptPhase::Committed => panic!("cannot commit a committed transaction"),
+            IdentityPhase::Committed => panic!("cannot commit a committed transaction"),
         }
     }
 
-    /// Escalates subsequent read validation to the locked path.
+    /// Escalates subsequent read validation to locked validation.
     pub(super) fn force_locked_reads(&mut self) {
         match self.phase {
-            AttemptPhase::New | AttemptPhase::Engaged => {
+            IdentityPhase::New | IdentityPhase::Engaged => {
                 self.validation_mode = ReadValidationMode::Locked;
             }
-            AttemptPhase::Committed => {
+            IdentityPhase::Committed => {
                 panic!("cannot change read validation for a committed transaction")
             }
         }
     }
 
-    /// Forces all later lock acquisition for this attempt and its replacements
+    /// Forces all later lock acquisition for this identity and its renewals
     /// to use the sorted serial order.
     pub(super) fn force_serial_acquisition(&mut self) {
         match self.phase {
-            AttemptPhase::New | AttemptPhase::Engaged => {
+            IdentityPhase::New | IdentityPhase::Engaged => {
                 self.acquisition_mode = AcquisitionMode::ForcedSerial;
             }
-            AttemptPhase::Committed => {
+            IdentityPhase::Committed => {
                 panic!("cannot change lock acquisition for a committed transaction")
             }
         }
@@ -91,11 +91,11 @@ impl AttemptState {
     pub(super) fn renew(&mut self) {
         match self.phase {
             // The engine renewal boundary historically accepts any active
-            // opaque handle. Wound cleanup may also discover a concurrent
-            // terminal outcome before the driver consumes and renews the
+            // opaque handle. Wound handling may also discover a concurrent
+            // final status before the driver consumes and renews the
             // handle, so renewal must remain valid from every phase.
-            AttemptPhase::New | AttemptPhase::Engaged | AttemptPhase::Committed => {
-                self.phase = AttemptPhase::New;
+            IdentityPhase::New | IdentityPhase::Engaged | IdentityPhase::Committed => {
+                self.phase = IdentityPhase::New;
                 self.validation_mode = ReadValidationMode::Locked;
                 self.renewals += 1;
             }
@@ -103,7 +103,7 @@ impl AttemptState {
     }
 
     pub(super) fn needs_abort(&self) -> bool {
-        self.phase == AttemptPhase::Engaged
+        self.phase == IdentityPhase::Engaged
     }
 
     pub(super) fn should_lock_reads(&self) -> bool {
@@ -116,7 +116,7 @@ impl AttemptState {
 
     pub(super) fn assert_resettable(&self) {
         assert!(
-            self.phase != AttemptPhase::Committed,
+            self.phase != IdentityPhase::Committed,
             "cannot reset a committed transaction"
         );
     }
@@ -131,45 +131,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transition_table_preserves_attempt_invariants() {
-        let mut direct = AttemptState::new();
+    fn transition_table_preserves_handle_invariants() {
+        let mut direct = HandleState::new();
         direct.commit();
-        assert_eq!(direct.phase, AttemptPhase::Committed);
+        assert_eq!(direct.phase, IdentityPhase::Committed);
         assert_eq!(direct.validation_mode, ReadValidationMode::Optimistic);
         assert_eq!(direct.acquisition_mode, AcquisitionMode::Parallel);
 
-        let mut retry = AttemptState::new();
-        retry.force_locked_reads();
-        assert_eq!(retry.phase, AttemptPhase::New);
-        assert_eq!(retry.validation_mode, ReadValidationMode::Locked);
+        let mut replayed = HandleState::new();
+        replayed.force_locked_reads();
+        assert_eq!(replayed.phase, IdentityPhase::New);
+        assert_eq!(replayed.validation_mode, ReadValidationMode::Locked);
 
-        let mut engaged = AttemptState::new();
+        let mut engaged = HandleState::new();
         assert!(engaged.engage());
         assert!(!engaged.engage());
         assert!(engaged.needs_abort());
-        assert_eq!(engaged.phase, AttemptPhase::Engaged);
+        assert_eq!(engaged.phase, IdentityPhase::Engaged);
         assert_eq!(engaged.validation_mode, ReadValidationMode::Locked);
 
         engaged.renew();
-        assert_eq!(engaged.phase, AttemptPhase::New);
+        assert_eq!(engaged.phase, IdentityPhase::New);
         assert_eq!(engaged.validation_mode, ReadValidationMode::Locked);
         assert_eq!(engaged.acquisition_mode, AcquisitionMode::Parallel);
         assert_eq!(engaged.renewals, 1);
         assert!(!engaged.needs_abort());
 
-        let mut committed = AttemptState::new();
+        let mut committed = HandleState::new();
         committed.engage();
         committed.commit();
-        assert_eq!(committed.phase, AttemptPhase::Committed);
+        assert_eq!(committed.phase, IdentityPhase::Committed);
         assert_eq!(committed.validation_mode, ReadValidationMode::Locked);
         assert!(!committed.needs_abort());
 
         committed.renew();
-        assert_eq!(committed.phase, AttemptPhase::New);
+        assert_eq!(committed.phase, IdentityPhase::New);
         assert_eq!(committed.validation_mode, ReadValidationMode::Locked);
         assert_eq!(committed.renewals, 1);
 
-        let mut serial = AttemptState::new();
+        let mut serial = HandleState::new();
         serial.engage();
         serial.force_serial_acquisition();
         serial.renew();
@@ -178,8 +178,8 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "cannot reset a committed transaction")]
-    fn committed_attempt_cannot_be_reset() {
-        let mut state = AttemptState::new();
+    fn committed_handle_cannot_be_reset() {
+        let mut state = HandleState::new();
         state.commit();
         state.assert_resettable();
     }

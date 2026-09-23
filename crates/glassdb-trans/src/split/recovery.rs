@@ -5,7 +5,7 @@ use std::mem;
 use std::sync::{Arc, Mutex};
 
 use glassdb_concurr::{RetryConfig, rt};
-use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, StructuralIntentId, TxId};
+use glassdb_data::{CollectionAddress, DbPrefix, NodeToken, ObjectPath, StructuralIntentId, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
     CollectionStore, CurrentnessBarrier, LeafObservation, LockType, Node, NodeStore, Observation,
@@ -32,7 +32,7 @@ pub(super) struct StructuralRecovery {
     structural_nodes: StructuralNodeAccess,
     publisher: SeparatorPublisher,
     timeline: Timeline,
-    db_root: DbRoot,
+    db_prefix: DbPrefix,
     retry: RetryConfig,
     scan_cursor: Arc<Mutex<Option<glassdb_backend::ListCursor>>>,
 }
@@ -44,7 +44,7 @@ pub(super) struct PreparedIntent {
 }
 
 /// Retains the exact cancellable observation after split coordination starts.
-pub(super) struct PreparedIntentCleanup {
+pub(super) struct PreparedIntentCancellation {
     observed: Observation<StructuralIntent>,
 }
 
@@ -164,7 +164,7 @@ enum IntentRecoveryStep {
     },
 }
 
-/// Resumable settlement of one finalized topology participant.
+/// Resumable settlement of one topology participant with a final status.
 struct ParticipantSettlement {
     collection: CollectionAddress,
     participant: TxId,
@@ -185,8 +185,8 @@ enum ParticipantSettlementStep {
 
 impl PreparedIntent {
     /// Retains the authority needed to cancel this exact prepared intent.
-    pub(super) fn cleanup_witness(&self) -> PreparedIntentCleanup {
-        PreparedIntentCleanup {
+    pub(super) fn cancellation_witness(&self) -> PreparedIntentCancellation {
+        PreparedIntentCancellation {
             observed: self.observed.clone(),
         }
     }
@@ -232,9 +232,9 @@ impl PreparedIntent {
         Ok(Self { observed, intent })
     }
 
-    fn into_ready(self, source_version: String, split_key: Vec<u8>) -> ReadyIntent {
+    fn into_ready(self, source_revision: String, split_key: Vec<u8>) -> ReadyIntent {
         let mut intent = self.intent;
-        intent.source_version = source_version;
+        intent.source_revision = source_revision;
         intent.split_key = split_key;
         intent.phase = StructuralIntentPhase::Ready;
         ReadyIntent {
@@ -306,7 +306,7 @@ impl StructuralRecovery {
         structural_nodes: StructuralNodeAccess,
         publisher: SeparatorPublisher,
         timeline: Timeline,
-        db_root: DbRoot,
+        db_prefix: DbPrefix,
         retry: RetryConfig,
     ) -> Self {
         Self {
@@ -318,7 +318,7 @@ impl StructuralRecovery {
             structural_nodes,
             publisher,
             timeline,
-            db_root,
+            db_prefix,
             retry,
             scan_cursor: Arc::new(Mutex::new(None)),
         }
@@ -344,12 +344,12 @@ impl StructuralRecovery {
         let observed = self
             .intent_store
             .write(
-                collection.db_root_component(),
+                collection.db_prefix_component(),
                 &intent_id,
                 &StructuralIntent {
                     collection: collection.clone(),
                     source_token: source_token.cloned(),
-                    source_version: String::new(),
+                    source_revision: String::new(),
                     created_tokens,
                     split_key: Vec::new(),
                     participant_id: participant.clone(),
@@ -368,7 +368,7 @@ impl StructuralRecovery {
         observation: &LeafObservation,
         split_key: Vec<u8>,
     ) -> ReadyIntentTransition {
-        let source_version = match observation.revision() {
+        let source_revision = match observation.revision() {
             Some(revision) => revision.serialize().to_string(),
             None => {
                 return ReadyIntentTransition::RetryCleanly(TransError::other(
@@ -378,7 +378,7 @@ impl StructuralRecovery {
         };
         let collection = prepared.intent.collection.clone();
         let source_token = prepared.intent.source_token.clone();
-        let mut ready = prepared.into_ready(source_version, split_key);
+        let mut ready = prepared.into_ready(source_revision, split_key);
         match self
             .intent_store
             .update(&ready.expected, &ready.intent)
@@ -406,10 +406,10 @@ impl StructuralRecovery {
     /// Deletes one exact prepared intent after clean cancellation.
     pub(super) async fn discard_prepared(
         &self,
-        cleanup: &PreparedIntentCleanup,
+        cancellation: &PreparedIntentCancellation,
     ) -> Result<(), TransError> {
         self.intent_store
-            .delete(&cleanup.observed)
+            .delete(&cancellation.observed)
             .await
             .map_err(Into::into)
     }
@@ -446,7 +446,7 @@ impl StructuralRecovery {
         }
     }
 
-    /// Starts explicit settlement of one finalized topology participant.
+    /// Starts explicit settlement of one topology participant with a final status.
     ///
     /// The caller must share the cache that admitted the participant or
     /// installed a topology freeze with the participant still present.
@@ -742,7 +742,7 @@ impl StructuralRecovery {
         let cursor = self.scan_cursor.lock().unwrap().clone();
         let page = match self
             .intent_store
-            .discover_page(&self.db_root, cursor.as_ref(), recovery_start)
+            .discover_page(&self.db_prefix, cursor.as_ref(), recovery_start)
             .await
         {
             Ok(page) => page,
@@ -890,7 +890,7 @@ impl StructuralRecovery {
             let intents = self
                 .intent_store
                 .discover_for_participant(
-                    settlement.collection.db_root_component(),
+                    settlement.collection.db_prefix_component(),
                     &settlement.participant,
                     requirement,
                 )
@@ -936,12 +936,12 @@ impl StructuralRecovery {
             return Ok(IntentRecoveryPhase::Delete);
         }
 
-        if intent.source_version.is_empty() {
+        if intent.source_revision.is_empty() {
             // A Ready transition records the revision its worker publishes
             // from. Without it there is nothing to fence against, so the intent
             // must not be classified at all.
             return Err(TransError::other(
-                "Ready structural intent records no source version",
+                "Ready structural intent records no source revision",
             ));
         }
 
@@ -954,7 +954,7 @@ impl StructuralRecovery {
             .fence_source_writer(
                 collection,
                 intent.source_token.as_ref(),
-                &intent.source_version,
+                &intent.source_revision,
                 barrier,
             )
             .await?
@@ -1032,7 +1032,7 @@ impl StructuralRecovery {
         Ok(IntentRecoveryPhase::Delete)
     }
 
-    /// Fences the worker that recorded `source_version` before classifying
+    /// Fences the worker that recorded `source_revision` before classifying
     /// created-node reachability.
     ///
     /// That revision is the whole question. A worker publishes its split with
@@ -1045,7 +1045,7 @@ impl StructuralRecovery {
         &self,
         collection: &CollectionAddress,
         token: Option<&NodeToken>,
-        source_version: &str,
+        source_revision: &str,
         barrier: CurrentnessBarrier,
     ) -> Result<bool, TransError> {
         for _ in 0..PARENT_RETRIES {
@@ -1054,7 +1054,7 @@ impl StructuralRecovery {
             };
             if !observed
                 .revision()
-                .is_some_and(|revision| revision.serialize() == source_version)
+                .is_some_and(|revision| revision.serialize() == source_revision)
             {
                 return Ok(true);
             }
@@ -1070,9 +1070,9 @@ impl StructuralRecovery {
             if self.mon.tx_status(holder).await? == TxCommitStatus::Pending {
                 return Ok(false);
             }
-            // A finalized holder can still have its publish CAS in flight. This
+            // A holder with a final status can still have its publish CAS in flight. This
             // cleanup CAS either wins first and fences that publish, or loses
-            // and the next iteration sees the source past `source_version`.
+            // and the next iteration sees the source past `source_revision`.
             self.structural_nodes
                 .release_structural_gate(collection, token, holder)
                 .await?;

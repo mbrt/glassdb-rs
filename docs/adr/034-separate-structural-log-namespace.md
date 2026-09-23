@@ -15,7 +15,7 @@ structural recovery keeps its own namespace, rules, and work budget.
 ## Context
 
 Transaction records and split-recovery records have different schemas,
-cardinality, and lifecycles. Transaction records are finalized by commit or
+cardinality, and lifecycles. Transaction records reach final status by commit or
 abort and reclaimed by transaction GC. Structural records are short-lived
 write-ahead notes whose outcome is decided from tree reachability and which need
 an independent recovery cadence.
@@ -26,8 +26,8 @@ outcome.
 
 ## Decision
 
-- `_t/<txid>` contains only transaction status, values, lease, and lock
-  back-references.
+- `_t/<txid>` contains only transaction status, values, lease, and recovery
+  manifest.
 - A split's wound-wait identity is ephemeral and does not create a `_t` record;
   the tree and its `_s` record are the durable authority for split progress.
 - A split writes a minimal record at the database-wide
@@ -43,6 +43,6 @@ outcome.
 
 ## Consequences
 
-Transaction logging, transaction GC, and structural recovery have independent
+Transaction records, transaction GC, and structural recovery have independent
 schemas and lifecycles. Recovery can list only the low-cardinality in-progress
 split set, at the cost of one additional database-wide object namespace.

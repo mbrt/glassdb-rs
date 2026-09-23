@@ -254,8 +254,8 @@ requested path. Thus a fingerprint collision or torn slot only causes a bounded
 extra read or an early eviction; it cannot return another path.
 
 Publication clears every occupied slot with the same fingerprint before
-installing one new pointer; invalidation clears all such slots. A path fence is
-released only after these writes complete. A fingerprint collision can
+installing one new pointer; invalidation clears all such slots. A path change
+ends only after these writes complete. A fingerprint collision can
 therefore evict another path but cannot preserve an older value for the changed
 path. When installing a pointer, prefer an empty slot, then a slot whose
 segment generation is stale. If none exists, replace the slot with the lowest
@@ -347,18 +347,18 @@ that the simple format cannot meet recovery-time or throughput targets.
 Do not admit bodies directly from successful mutations. An ordinary L1
 capacity eviction does not affect L2. When L1 accepts knowledge that proves an
 L2 value superseded--a mutation, deletion or missing result, or a backend read
-with a different revision--fence the path, cancel older queued admissions and
-promotions, and clear every matching index slot. The fence makes the old value
-logically unreachable immediately; once the worker clears its pointer, its
-bytes remain dead until segment reuse. This prevents a write-only or frequently
-rewritten path from repeatedly filling L2.
+with a different revision--begin a path change, cancel older queued admissions
+and promotions, and clear every matching index slot. The pending path change
+makes the old value logically unreachable immediately; once the worker clears
+its pointer, its bytes remain dead until segment reuse. This prevents a
+write-only or frequently rewritten path from repeatedly filling L2.
 
 Admit an encoded body only when a backend read returns that body and L1 accepts
 it through its non-regression transition. If that read superseded an old L2
-value, publish the accepted body under the same fence after clearing the old
-pointer. An unchanged conditional read appends nothing. This read-driven policy
-may require one backend fetch after a mutation or restart before the new value
-becomes L2-resident, which is preferable to letting unproven write utility
+value, publish the accepted body in the same path change after clearing the
+old pointer. An unchanged conditional read appends nothing. This read-driven
+policy may require one backend fetch after a mutation or restart before the new
+value becomes L2-resident, which is preferable to letting unproven write utility
 displace the read working set.
 
 Pure FIFO can still evict an old entry that remains useful. Approximate a
@@ -377,7 +377,7 @@ probe, but cannot affect the body ultimately returned.
 Promotions are asynchronous and coalesced by path within the bounded worker
 queue. Before reading or copying a record, the worker checks the age and token
 budget, then verifies that the same generation and record offset are still the
-published pointer and that no path fence is active; otherwise it drops the
+published pointer and that no path change is pending; otherwise it drops the
 request. A successful promotion appends the verified revision and body,
 publishes the new pointer, and leaves the old bytes dead until segment reuse.
 
@@ -398,15 +398,15 @@ shutdown drains and syncs the worker; abrupt termination may lose the tail
 without affecting database durability.
 
 Before making a path-changing L1 transition visible or queueing its L2 work,
-install a bounded in-memory fence that suppresses L2 lookup for that path until
-the worker clears the old pointer or publishes the accepted read body. This
-prevents delayed admission or promotion from resurrecting knowledge that the
-current process already invalidated.
+begin a bounded in-memory path change that suppresses L2 lookup for that path
+until the worker clears the old pointer or publishes the accepted read body.
+This prevents delayed admission or promotion from resurrecting knowledge that
+the current process already invalidated.
 
 Queue saturation may drop an optional admission or promotion. If the worker or
-fence cannot make a required supersession or invalidation visible, disable L2
-for that open database and fall back to L1 plus the backend. After restart, an
-older surviving candidate is safe because its evidence precedes the reopened
+path change cannot make a required supersession or invalidation visible, disable
+L2 for that open database and fall back to L1 plus the backend. After restart,
+an older surviving candidate is safe because its evidence precedes the reopened
 timeline.
 
 ### Fail open and expose degradation

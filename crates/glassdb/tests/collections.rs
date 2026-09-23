@@ -139,7 +139,7 @@ async fn strict_and_idempotent_create_have_distinct_race_contracts() {
 }
 
 #[tokio::test]
-async fn child_listing_returns_sorted_incarnation_bound_handles() {
+async fn child_listing_returns_sorted_id_bound_handles() {
     let db = Database::open("example", MemoryBackend::new())
         .await
         .unwrap();
@@ -187,7 +187,7 @@ async fn child_listing_returns_sorted_incarnation_bound_handles() {
 }
 
 #[tokio::test]
-async fn child_listing_retries_after_the_directory_changes() {
+async fn child_listing_replays_after_the_directory_changes() {
     let backend = Arc::new(MemoryBackend::new());
     let db = Database::open("example", backend.clone()).await.unwrap();
     let peer = Database::open("example", backend).await.unwrap();
@@ -343,7 +343,7 @@ async fn initialized_database_never_recreates_a_missing_permanent_record() {
     let record_path = "example/_c/0000000000000000000000/_i";
     let record = backend.read(record_path).await.unwrap();
     backend
-        .delete_if(record_path, &record.version)
+        .delete_if(record_path, &record.revision)
         .await
         .unwrap();
 
@@ -366,7 +366,7 @@ async fn initialized_database_never_recreates_a_missing_permanent_tree_root() {
 
     let root_path = "example/_c/0000000000000000000000/_r";
     let root = backend.read(root_path).await.unwrap();
-    backend.delete_if(root_path, &root.version).await.unwrap();
+    backend.delete_if(root_path, &root.revision).await.unwrap();
 
     let reopened = Database::open("example", backend.clone()).await;
     assert!(
@@ -401,7 +401,7 @@ async fn missing_bound_tree_root_is_not_empty_or_recreated_by_data_operations() 
         .unwrap();
     let observed = backend.read(&child_root).await.unwrap();
     backend
-        .delete_if(&child_root, &observed.version)
+        .delete_if(&child_root, &observed.revision)
         .await
         .unwrap();
 
@@ -447,7 +447,7 @@ async fn collection_changes_compose_with_data_and_nested_changes() {
             let (same_users, created) = tx.create_collection_if_absent(&root, b"users").await?;
             glassdb::ensure_tx!(
                 created,
-                Error::internal("transaction did not retain its staged collection incarnation")
+                Error::internal("transaction did not retain its staged collection ID")
             );
             tx.write(&same_users, b"second-handle", b"ready")?;
             let active = tx.create_collection(&users, b"active").await?;
@@ -494,7 +494,7 @@ async fn collection_changes_compose_with_data_and_nested_changes() {
 }
 
 #[tokio::test]
-async fn failed_transaction_retries_invalidated_reads_without_publishing_changes() {
+async fn failed_transaction_replays_invalidated_reads_without_publishing_changes() {
     let backend = Arc::new(MemoryBackend::new());
     let db = Database::open("example", backend.clone()).await.unwrap();
     let peer = Database::open("example", backend).await.unwrap();
@@ -531,7 +531,7 @@ async fn failed_transaction_retries_invalidated_reads_without_publishing_changes
 }
 
 #[tokio::test]
-async fn explicit_abort_retries_invalidated_reads_without_publishing_changes() {
+async fn explicit_abort_replays_invalidated_reads_without_publishing_changes() {
     let backend = Arc::new(MemoryBackend::new());
     let db = Database::open("example", backend.clone()).await.unwrap();
     let peer = Database::open("example", backend).await.unwrap();
@@ -569,7 +569,7 @@ async fn explicit_abort_retries_invalidated_reads_without_publishing_changes() {
 }
 
 #[tokio::test]
-async fn collection_creation_reuses_its_reserved_incarnation_across_retry() {
+async fn collection_creation_reuses_its_reserved_collection_id_across_body_replay() {
     let backend = Arc::new(MemoryBackend::new());
     let db = Database::open("example", backend.clone()).await.unwrap();
     let peer = Database::open("example", backend).await.unwrap();
@@ -591,7 +591,7 @@ async fn collection_creation_reuses_its_reserved_incarnation_across_retry() {
             let attempted_handles = attempted_handles.clone();
             async move {
                 tx.read(&root, b"guard").await?.ok_or(Error::NotFound)?;
-                let collection = tx.create_collection(&root, b"created-on-retry").await?;
+                let collection = tx.create_collection(&root, b"created-on-replay").await?;
                 tx.write(&collection, b"k", b"v")?;
                 {
                     let mut handles = attempted_handles
@@ -683,7 +683,7 @@ async fn not_empty_is_revalidated_before_it_is_returned() {
 
     assert!(
         !first_attempt.load(Ordering::SeqCst),
-        "the first attempt must observe the child"
+        "the first body execution must observe the child"
     );
     assert!(matches!(
         parent.read(b"k").await,
@@ -757,7 +757,7 @@ async fn children_can_be_dropped_before_their_parent_in_one_transaction() {
 }
 
 #[tokio::test]
-async fn collection_drop_retries_transactional_lookup() {
+async fn collection_drop_replays_transactional_lookup() {
     // Cover directory validation, point validation, lock acquisition, and
     // validation of an error outcome with the same deterministic drop.
     for (read_key, write, abort) in [
@@ -834,7 +834,7 @@ async fn collection_drop_retries_transactional_lookup() {
 }
 
 #[tokio::test]
-async fn a_cached_handle_in_another_client_observes_the_drop_fence() {
+async fn a_cached_handle_in_another_instance_observes_the_drop_intent() {
     let backend = Arc::new(MemoryBackend::new());
     let first = Database::open("example", backend.clone()).await.unwrap();
     let second = Database::open("example", backend).await.unwrap();

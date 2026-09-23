@@ -7,7 +7,7 @@ Accepted — implemented.
 This supersedes the ADR-031 and ADR-046 clauses that make `_i`
 both the collection record and the B-link tree root. The B-link topology,
 fixed-address root split, transactional collection semantics, and all-node
-deletion fencing remain unchanged.
+drop-intent installation remain unchanged.
 
 This changes the unreleased v2 layout in place. Development databases use the
 new format directly; there is no migration or compatibility fallback.
@@ -19,19 +19,19 @@ to minimize object kinds and let a small collection use that object directly as
 its only leaf. Transactional collection management has since added directory
 coordination and topology-lifecycle state to the same object.
 
-The two parts now have independent responsibilities but share a CAS revision
+The two parts now have independent responsibilities but share a revision
 and size limit. A key mutation in a root leaf conflicts with a collection
 metadata mutation, even though their logical fields are disjoint. The combined
 representation also requires storage, routing, coordination, splitting, and
 lifecycle code to treat a root leaf differently from every other node.
 
-Collection creation, deletion, and root splits are rare, so this coupling is
+Collection creation, drop, and root splits are rare, so this coupling is
 not primarily a throughput concern. The stronger motivation is a stable
 boundary between collection control state and key coordination state.
 
 ## Decision
 
-Use separate fixed-path objects beneath each incarnation-addressed collection
+Use separate fixed-path objects beneath each ID-addressed collection
 prefix:
 
 ```text
@@ -50,24 +50,24 @@ existing in-place root-split protocol. Its path never changes and `_i` contains
 no root pointer.
 
 Key routing starts directly at `_r`. An ordinary point operation on an already
-resolved collection does not read `_i`; collection deletion remains visible
-through the delete intents installed on `_r` and every other node.
+resolved collection does not read `_i`; collection drop remains visible
+through the drop intents installed on `_r` and every other node.
 
 Transactional creation prepares both objects before publishing the parent
 directory binding. A visible binding therefore implies that the collection
 record and tree root have both been prepared. Partial preparation remains
 undiscoverable and recoverable under the collection lifecycle protocol.
 
-Collection topology changes join and leave lifecycle coordination in `_i`, then
-mutate `_r` and `_n` through the ordinary node protocol. Collection drop freezes
-topology in `_i`, fences `_r` and all `_n` nodes, commits the parent-directory
-removal, and later reclaims the data nodes, `_r`, and `_i`. Thus collection
-directory locking and data-node locking have separate physical domains while
-remaining part of one transaction.
+Collection structural changes join and leave lifecycle coordination in `_i`,
+then mutate `_r` and `_n` through the ordinary node protocol. Collection drop
+freezes topology in `_i`, fences `_r` and all `_n` nodes, commits the
+parent-directory removal, and later reclaims the `_n` nodes, `_r`, and `_i`.
+Thus collection directory locking and node locking have separate physical
+domains while remaining part of one transaction.
 
 ## Consequences
 
-- Collection metadata and root-leaf data no longer share a CAS revision or
+- Collection metadata and root-leaf data no longer share a revision or
   object-size budget.
 - Every key-bearing leaf has one node representation and mutation path.
   Collection metadata does not need to be preserved while rewriting a leaf.

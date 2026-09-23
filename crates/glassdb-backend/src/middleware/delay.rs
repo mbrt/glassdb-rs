@@ -12,7 +12,7 @@ use glassdb_concurr::entropy;
 use glassdb_concurr::rt::{self, Instant};
 use rand::TryRng;
 
-use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
+use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Revision};
 
 use super::latency::{Lognormal, LognormalError};
 
@@ -127,14 +127,14 @@ pub struct WriteRateLimits {
     /// Caps the GET/HEAD request rate against a shared key prefix, modeling
     /// S3's documented per-prefix request-rate limit. A request that would
     /// exceed the rate is delayed (not failed) until the bucket refills, so the
-    /// cap bounds throughput without inflating transaction-retry counts.
+    /// cap bounds throughput without inflating body-replay counts.
     pub prefix_read_ps: RateLimit,
     /// Caps the PUT/POST/DELETE request rate against a shared key prefix (the
     /// write analog of [`Self::prefix_read_ps`]).
     pub prefix_write_ps: RateLimit,
     /// Selects how many leading `/`-separated path segments form a throttled
     /// prefix, i.e. the partition granularity (depth 1 groups every object
-    /// under the database root into a single hot partition; depth 2 throttles
+    /// under the database prefix into a single hot partition; depth 2 throttles
     /// each immediate subtree independently). Ignored when both prefix limits
     /// are unlimited.
     pub prefix_depth: usize,
@@ -252,7 +252,7 @@ impl Backend for DelayBackend {
     async fn read_if_modified(
         &self,
         path: &str,
-        expected: &Version,
+        expected: &Revision,
     ) -> Result<ReadReply, BackendError> {
         self.prefix_read_wait(path).await;
         self.delay(&self.obj_read).await;
@@ -263,8 +263,8 @@ impl Backend for DelayBackend {
         &self,
         path: &str,
         value: Vec<u8>,
-        expected: &Version,
-    ) -> Result<Version, BackendError> {
+        expected: &Revision,
+    ) -> Result<Revision, BackendError> {
         self.prefix_write_wait(path).await;
         self.object_write_wait(path).await;
         self.delay(&self.obj_write).await;
@@ -275,14 +275,14 @@ impl Backend for DelayBackend {
         &self,
         path: &str,
         value: Vec<u8>,
-    ) -> Result<Version, BackendError> {
+    ) -> Result<Revision, BackendError> {
         self.prefix_write_wait(path).await;
         self.object_write_wait(path).await;
         self.delay(&self.obj_write).await;
         self.inner.write_if_not_exists(path, value).await
     }
 
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Revision) -> Result<(), BackendError> {
         self.prefix_write_wait(path).await;
         self.object_write_wait(path).await;
         self.delay(&self.obj_write).await;

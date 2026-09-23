@@ -19,7 +19,7 @@ The first mechanism was storage-native versioning. Every supported bucket keeps
 each overwritten or deleted object, through S3 Versioning or Cloud Storage
 Object Versioning. The retained versions are then a complete journal of every
 commit: successive leaf versions contain the direct commits, and the transaction
-objects contain the logged ones. A background compiler reads that journal
+records contain the locked ones. A background compiler reads that journal
 through new version-listing, version-read, and version-delete backend
 operations, and builds immutable checkpoint trees. A snapshot read binds one
 published checkpoint and never touches live state.
@@ -32,7 +32,7 @@ timestamp was certainly in the past, and only then reported success. This
 therefore share no lock.
 
 The commit path itself kept its accepted shape: one leaf CAS for a direct
-commit, the locked protocol for a logged one, and no history object.
+commit, the locked commit, and no history object.
 
 ## Decision
 

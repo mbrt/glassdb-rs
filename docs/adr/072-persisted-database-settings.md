@@ -7,9 +7,10 @@ Accepted — first pass implemented. Limits are recorded under Consequences.
 ## Context
 
 Before v4, each database instance supplies its own hard coordination limits and
-transaction timing. Smaller limits can prevent a client from modifying existing
-data. Different timing profiles disagree about lease expiry and the interval
-during which an ambiguous commit can recover before GC deletes its record.
+transaction timing. Smaller limits can prevent a database instance from
+modifying existing data. Different timing profiles disagree about lease expiry
+and the interval during which an in-doubt commit can recover before GC deletes
+its record.
 
 ## Decision
 
@@ -36,8 +37,8 @@ rules for inline budgets remain unchanged.
 
 A new database instance can operate with the original shared settings without
 the caller supplying them again. Metadata, instead of deployment configuration,
-owns the agreement between clients. Clients must still satisfy the configured
-clock-skew allowance.
+owns the agreement between database instances. Database instances must still
+satisfy the configured clock-skew allowance.
 
 The existing split-policy type still contains both creation settings and local
 thresholds. A separate public creation-options interface is deferred.
@@ -52,7 +53,7 @@ all transient lock sets or split outputs fit a chosen configuration.
 
 - Require equal settings from every opener. This requires callers to retain
   configuration that the database can load itself.
-- Persist every option. This prevents clients from independently choosing their
-  resource use and maintenance schedule.
+- Persist every option. This prevents database instances from independently
+  choosing their resource use and maintenance schedule.
 - Infer settings for existing databases. Stored objects cannot establish the
   original timing profile or admission limits.

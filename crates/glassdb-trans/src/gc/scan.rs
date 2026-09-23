@@ -6,7 +6,7 @@ use std::time::Duration;
 use glassdb_backend::ListCursor;
 use glassdb_concurr::rt;
 use glassdb_data::{TxId, shuffle};
-use glassdb_storage::{StorageError, transaction::TLogger};
+use glassdb_storage::{StorageError, transaction::TxRecordStore};
 
 use super::Counters;
 
@@ -49,7 +49,7 @@ struct Sample {
 
 /// Traverses the transaction namespace with bounded, adaptive LIST work.
 pub(super) struct GcScan {
-    tl: TLogger,
+    tx_records: TxRecordStore,
     counters: Arc<Counters>,
     depth: u8,
     generation: u64,
@@ -64,10 +64,14 @@ pub(super) struct GcScan {
 }
 
 impl GcScan {
-    pub(super) fn new(tl: TLogger, counters: Arc<Counters>, retry_delay: Duration) -> Self {
+    pub(super) fn new(
+        tx_records: TxRecordStore,
+        counters: Arc<Counters>,
+        retry_delay: Duration,
+    ) -> Self {
         counters.prefix_count.store(1, Ordering::Relaxed);
         Self {
-            tl,
+            tx_records,
             counters,
             depth: 0,
             generation: 0,
@@ -118,7 +122,7 @@ impl GcScan {
             None => return Ok(None),
         };
         self.counters.lists.fetch_add(1, Ordering::Relaxed);
-        let response = self.tl.scan_transaction_ids(
+        let response = self.tx_records.scan_transaction_ids(
             scan.depth,
             scan.index,
             scan.cursor.as_ref(),
@@ -271,9 +275,9 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use glassdb_backend::{
-        Backend, BackendError, ListLimit, ListPage, ReadReply, Version, memory::MemoryBackend,
+        Backend, BackendError, ListLimit, ListPage, ReadReply, Revision, memory::MemoryBackend,
     };
-    use glassdb_data::{DbRoot, ObjectPath};
+    use glassdb_data::{DbPrefix, ObjectPath};
     use glassdb_storage::{CachedStore, Timeline};
     use std::collections::BTreeSet;
     use std::sync::Mutex;
@@ -296,7 +300,7 @@ mod tests {
         async fn read_if_modified(
             &self,
             path: &str,
-            expected: &Version,
+            expected: &Revision,
         ) -> Result<ReadReply, BackendError> {
             self.inner.read_if_modified(path, expected).await
         }
@@ -304,18 +308,18 @@ mod tests {
             &self,
             path: &str,
             value: Vec<u8>,
-            expected: &Version,
-        ) -> Result<Version, BackendError> {
+            expected: &Revision,
+        ) -> Result<Revision, BackendError> {
             self.inner.write_if(path, value, expected).await
         }
         async fn write_if_not_exists(
             &self,
             path: &str,
             value: Vec<u8>,
-        ) -> Result<Version, BackendError> {
+        ) -> Result<Revision, BackendError> {
             self.inner.write_if_not_exists(path, value).await
         }
-        async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+        async fn delete_if(&self, path: &str, expected: &Revision) -> Result<(), BackendError> {
             self.inner.delete_if(path, expected).await
         }
         async fn list(
@@ -356,7 +360,7 @@ mod tests {
     ) -> (
         GcScan,
         Arc<ShortPages>,
-        Vec<(String, Version)>,
+        Vec<(String, Revision)>,
         Arc<Counters>,
     ) {
         let backend = Arc::new(ShortPages {
@@ -367,29 +371,29 @@ mod tests {
             hold_first_group: AtomicBool::new(false),
             held_group: Mutex::new(None),
         });
-        let db_root = DbRoot::try_from("scan").unwrap();
+        let db_prefix = DbPrefix::try_from("scan").unwrap();
         let mut objects = Vec::new();
         for i in 0..count {
             let prefix = ((i % 4096) as u16) << 4;
             let id = TxId::from_bytes(vec![(prefix >> 8) as u8, prefix as u8, (i / 4096) as u8]);
             let path = ObjectPath::Transaction {
-                db_root: db_root.clone(),
+                db_prefix: db_prefix.clone(),
                 id,
             }
             .to_string();
-            let version = backend
+            let revision = backend
                 .write_if_not_exists(&path, Vec::new())
                 .await
                 .unwrap();
-            objects.push((path, version));
+            objects.push((path, revision));
         }
-        let tl = TLogger::new(
+        let tx_records = TxRecordStore::new(
             CachedStore::new(backend.clone(), 1 << 20, Timeline::new(), None),
-            db_root,
+            db_prefix,
         );
         let counters = Arc::new(Counters::default());
         (
-            GcScan::new(tl, counters.clone(), Duration::from_secs(1)),
+            GcScan::new(tx_records, counters.clone(), Duration::from_secs(1)),
             backend,
             objects,
             counters,
@@ -432,8 +436,8 @@ mod tests {
                 .any(|(prefix, continued)| prefix == "scan/_t/" && *continued)
         );
         assert!(!seen.is_empty());
-        for (path, version) in objects {
-            backend.delete_if(&path, &version).await.unwrap();
+        for (path, revision) in objects {
+            backend.delete_if(&path, &revision).await.unwrap();
         }
         for _ in 0..100 {
             scan.turn().await.unwrap();
@@ -475,9 +479,9 @@ mod tests {
         assert!(scan.turn().await.is_err());
         let held = backend.held_group.lock().unwrap().clone().unwrap();
         // Later empty scans must not replace the selected sample that failed.
-        for (path, version) in &objects {
+        for (path, revision) in &objects {
             if !path.starts_with(&held) {
-                backend.delete_if(path, version).await.unwrap();
+                backend.delete_if(path, revision).await.unwrap();
             }
         }
         for _ in 0..40 {
@@ -498,9 +502,9 @@ mod tests {
         assert!(completed, "the failed sample must resume and finish");
         // Its 64 objects keep the four-sample estimate above the root threshold.
         assert_eq!(counters.prefix_count.load(Ordering::Relaxed), 64);
-        for (path, version) in &objects {
+        for (path, revision) in &objects {
             if path.starts_with(&held) {
-                backend.delete_if(path, version).await.unwrap();
+                backend.delete_if(path, revision).await.unwrap();
             }
         }
         for _ in 0..40 {

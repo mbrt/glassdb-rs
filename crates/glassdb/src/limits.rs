@@ -26,7 +26,7 @@ pub struct TransactionLimits {
     /// writes. This does not include retained read or scan observations.
     pub max_write_bytes: usize,
     /// Maximum new collection bindings reserved by one transaction identity.
-    /// Defaults to 1,024. Reservations survive body retries and are not refunded
+    /// Defaults to 1,024. Reservations survive body replays and are not refunded
     /// when a staged collection is dropped. Existing bindings remain usable.
     pub max_collection_reservations: usize,
 }

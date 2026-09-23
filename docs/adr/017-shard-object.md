@@ -23,7 +23,7 @@ We want to build and verify v2 incrementally, without first settling the whole
 protocol. The shard's **data model**, its **key→shard mapping**, and its
 **on-disk encoding** are the foundation every later piece builds on, and — exactly
 like today's pure `compute_lock_update` (`glassdb-storage/src/locker.rs`) and the
-tx-log marshalling (`glassdb-storage/src/tlogger.rs`) — they can be defined and
+transaction-record marshalling (`glassdb-storage/src/tlogger.rs`) — they can be defined and
 unit-tested as pure, I/O-free units. The encoding in particular is worth fixing
 first: it is persisted and compared across processes, so it should be canonical
 and golden-vector-anchored before anything depends on it.
@@ -50,11 +50,12 @@ I/O: the largest piece we can land and verify in isolation.
   used for in-memory sharding (`glassdb-concurr::shard::index`,
   [ADR-001](001-sharded-db-maps.md)). It is dependency-free, deterministic, and
   stable across processes and under `--cfg sim` — all required for correctness
-  (every client must agree on the mapping) and for DST replay. The hash is taken
-  over the **raw user key bytes**, not the base64 path encoding. FNV-1a's low
-  bits are adequate for bucketing (the existing distribution test confirms a
-  reasonable spread); if distribution becomes a problem it can be changed behind
-  the same `shard_index` function, but only as a format migration.
+  (every database instance must agree on the mapping) and for DST replay. The
+  hash is taken over the **raw user key bytes**, not the base64 path encoding.
+  FNV-1a's low bits are adequate for bucketing (the existing distribution test
+  confirms a reasonable spread); if distribution becomes a problem it can be
+  changed behind the same `shard_index` function, but only as a format
+  migration.
 
 ### Path
 
@@ -73,8 +74,8 @@ is tombstoned. The **minimal** entry is:
 - `key` — the key identity (raw key bytes); the entry's sort key.
 - `lock_type` — `none | read | write | create`.
 - `locked_by` — the set of txids holding the lock (more than one only for `read`).
-- `current_writer` — the txid of the transaction object holding the committed
-  value (the MVCC pointer); unset if the key has no committed value yet.
+- `current_writer` — the txid of the transaction record holding the committed
+  value (the external value); unset if the key has no committed value yet.
 - `deleted` — tombstone flag.
 
 Derived: a key **exists** iff it has an entry with `current_writer` set and
@@ -92,7 +93,7 @@ for reclamation, lease back-references) are added by those ADRs, not here.
 - Encoded as **protobuf** via a new `glassdb-proto` message, reusing the existing
   toolchain. Entries are serialized **sorted by key** so the encoding is
   canonical, deterministic, and anchored by golden vectors — the same
-  encoding-fidelity practice used for paths and tx logs.
+  encoding-fidelity practice used for paths and transaction records.
 - Soft size budget per shard (~256 keys / tens of KB) to keep CAS cheap;
   exceeding it is an accepted MVP limitation (resharding deferred, ADR-016).
 

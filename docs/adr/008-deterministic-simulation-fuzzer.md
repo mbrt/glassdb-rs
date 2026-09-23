@@ -84,12 +84,12 @@ builds without madsim):
   That is sound because the engine's writes are conditional (CAS): a re-delivered
   write observes a `Precondition` for its own already-applied write, exactly as S3
   returns when the SDK retries a conditional `PUT` whose ack was lost. Crucially,
-  `NetBackend` does *not* pass that ambiguous `Precondition` up as a confident
-  conflict: once a response has been lost, a `Precondition` on a *conditional
-  write* is indistinguishable from "my own write landed", so it is converted to
-  the in-doubt `BackendError::InDoubt` (the in-doubt backend contract is
-  [ADR-009](009-in-doubt-conditional-writes.md)). This exposes the engine's
-  "did my commit land?" handling rather than masking it;
+  `NetBackend` does *not* pass that in-doubt `Precondition` up as a confident
+  rejected mutation: once a response has been lost, a `Precondition` on a *conditional
+  mutation* is indistinguishable from "my own write landed", so it is converted
+  to the in-doubt `BackendError::InDoubt` (the in-doubt backend contract is
+  [ADR-009](009-in-doubt-conditional-writes.md)). This exposes the engine's "did
+  my commit land?" handling rather than masking it;
 - a **nemesis node** drives a seeded sequence of faults via `NetSim`/`Handle`
   (`clog_link`/`disconnect`/`clog_node`, `pause`/`resume`, `kill`), eventually
   healing every network fault (some long enough to outlast the retry budget) and
@@ -109,7 +109,7 @@ acked commit is durable (`acked <= final`); every committed increment came from
 some started op committing at most once (`final <= started`). The harness never
 retries an op itself, so an increment is left in-doubt (counted in `started`, not
 `acked`) when a client crashes mid-commit or a sustained outage exhausts
-`NetBackend`'s retry budget and fails the transaction; conditional writes (CAS)
+`NetBackend`'s retry budget and fails the transaction; conditional mutations
 keep each in-doubt op applied at most once even when a retry re-delivers it. With
 `FaultConfig` disabled, `started == acked == final == expected`, so the original
 exact check is also asserted.
@@ -147,7 +147,7 @@ of the seed:
    `txid.rs`), which is seeded by the runtime.
 3. **Time.** `DatabaseBuilder::deterministic_time` makes the monitor's `Clock` anchor a
    *fixed* wall-clock base to `tokio::time::Instant` (`Clock::anchored_at`).
-   Since `TxId` timestamps come from this clock, transaction-log object keys
+   Since `TxId` timestamps come from this clock, transaction-record keys
    become deterministic. (Default stays `Clock::real()` in production.)
 4. **`HashMap` iteration order.** `std`'s `RandomState` is reseeded per process,
    so any commit-path slice built by iterating a `HashMap` would differ between
@@ -205,7 +205,7 @@ the workload result.
   and nemesis (feature `sim`).
 - `crates/glassdb-backend/src/net.rs` — the RPC transport: `serve_backend`
   (server, applies every request) and `NetBackend` (client, bounded retry +
-  in-doubt conversion for ambiguous conditional writes, see ADR-009).
+  in-doubt conversion for in-doubt mutations, see ADR-009).
   `#[cfg(madsim)]`.
 - `crates/glassdb-backend/src/middleware/recording.rs` — `RecordingBackend`.
 - The `CancelToken` referenced in the *Decision* above was later removed when cancellation throughout the engine became future-drop (`tokio::select!`, `JoinHandle::abort`). The remaining outside-the-future wakeup primitive is `tokio_util::sync::CancellationToken` (over `tokio::sync::Notify`), used in `JoinHandle::abort`, `Dedup::close`, and the sim crash nemesis. `tokio_util` is once again usable now that ADR-011 replaced madsim with the in-repo `DetExecutor`, which redirects only `tokio::spawn` and `tokio::time`.

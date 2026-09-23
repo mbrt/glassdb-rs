@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use glassdb_backend::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
+use glassdb_backend::{
+    Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Revision,
+};
 use glassdb_data::ObjectPath;
 
 /// Reads, mutations, and lists attributed to one physical object role.
@@ -44,7 +46,7 @@ pub struct BackendBreakdown {
     pub database_metadata: OperationCounts,
     pub collection_record: OperationCounts,
     pub node: OperationCounts,
-    pub transaction_log: OperationCounts,
+    pub transaction_record: OperationCounts,
     pub structural_intent: OperationCounts,
     pub other: OperationCounts,
 }
@@ -55,7 +57,7 @@ impl BackendBreakdown {
             ("backend.database_metadata", self.database_metadata),
             ("backend.collection_record", self.collection_record),
             ("backend.node", self.node),
-            ("backend.transaction_log", self.transaction_log),
+            ("backend.transaction_record", self.transaction_record),
             ("backend.structural_intent", self.structural_intent),
             ("backend.other", self.other),
         ]
@@ -85,7 +87,7 @@ impl Sub for BackendBreakdown {
             database_metadata: self.database_metadata - other.database_metadata,
             collection_record: self.collection_record - other.collection_record,
             node: self.node - other.node,
-            transaction_log: self.transaction_log - other.transaction_log,
+            transaction_record: self.transaction_record - other.transaction_record,
             structural_intent: self.structural_intent - other.structural_intent,
             other: self.other - other.other,
         }
@@ -97,7 +99,7 @@ enum ObjectRole {
     DatabaseMetadata,
     CollectionRecord,
     Node,
-    TransactionLog,
+    TransactionRecord,
     StructuralIntent,
     Other,
 }
@@ -128,7 +130,7 @@ struct Counters {
     database_metadata: AtomicCounts,
     collection_record: AtomicCounts,
     node: AtomicCounts,
-    transaction_log: AtomicCounts,
+    transaction_record: AtomicCounts,
     structural_intent: AtomicCounts,
     other: AtomicCounts,
 }
@@ -139,7 +141,7 @@ impl Counters {
             ObjectRole::DatabaseMetadata => &self.database_metadata,
             ObjectRole::CollectionRecord => &self.collection_record,
             ObjectRole::Node => &self.node,
-            ObjectRole::TransactionLog => &self.transaction_log,
+            ObjectRole::TransactionRecord => &self.transaction_record,
             ObjectRole::StructuralIntent => &self.structural_intent,
             ObjectRole::Other => &self.other,
         }
@@ -150,7 +152,7 @@ impl Counters {
             database_metadata: self.database_metadata.snapshot(),
             collection_record: self.collection_record.snapshot(),
             node: self.node.snapshot(),
-            transaction_log: self.transaction_log.snapshot(),
+            transaction_record: self.transaction_record.snapshot(),
             structural_intent: self.structural_intent.snapshot(),
             other: self.other.snapshot(),
         }
@@ -231,7 +233,7 @@ fn classify_object(path: &ObjectPath) -> ObjectRole {
         ObjectPath::DatabaseMetadata { .. } => ObjectRole::DatabaseMetadata,
         ObjectPath::CollectionRecord { .. } => ObjectRole::CollectionRecord,
         ObjectPath::TreeRoot { .. } | ObjectPath::Node { .. } => ObjectRole::Node,
-        ObjectPath::Transaction { .. } => ObjectRole::TransactionLog,
+        ObjectPath::Transaction { .. } => ObjectRole::TransactionRecord,
         ObjectPath::StructuralIntent { .. } => ObjectRole::StructuralIntent,
     }
 }
@@ -248,7 +250,7 @@ impl Backend for ClassifiedBackend {
     async fn read_if_modified(
         &self,
         path: &str,
-        expected: &Version,
+        expected: &Revision,
     ) -> Result<ReadReply, BackendError> {
         self.count_read(path);
         let reply = self.inner.read_if_modified(path, expected).await?;
@@ -260,8 +262,8 @@ impl Backend for ClassifiedBackend {
         &self,
         path: &str,
         value: Vec<u8>,
-        expected: &Version,
-    ) -> Result<Version, BackendError> {
+        expected: &Revision,
+    ) -> Result<Revision, BackendError> {
         self.count_write(path);
         self.count_write_bytes(path, value.len());
         self.inner.write_if(path, value, expected).await
@@ -271,13 +273,13 @@ impl Backend for ClassifiedBackend {
         &self,
         path: &str,
         value: Vec<u8>,
-    ) -> Result<Version, BackendError> {
+    ) -> Result<Revision, BackendError> {
         self.count_write(path);
         self.count_write_bytes(path, value.len());
         self.inner.write_if_not_exists(path, value).await
     }
 
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Revision) -> Result<(), BackendError> {
         self.count_write(path);
         self.inner.delete_if(path, expected).await
     }
@@ -298,19 +300,19 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use glassdb_backend::memory::MemoryBackend;
-    use glassdb_data::{CollectionAddress, DbRoot, NodeToken, StructuralIntentId, TxId};
+    use glassdb_data::{CollectionAddress, DbPrefix, NodeToken, StructuralIntentId, TxId};
 
     use super::*;
 
     #[test]
     fn every_object_path_variant_is_classified() {
-        let db_root = DbRoot::try_from("db").unwrap();
+        let db_prefix = DbPrefix::try_from("db").unwrap();
         let collection = CollectionAddress::root("db");
         let participant = TxId::from_bytes(b"participant".to_vec());
         let cases = [
             (
                 ObjectPath::DatabaseMetadata {
-                    db_root: db_root.clone(),
+                    db_prefix: db_prefix.clone(),
                 },
                 ObjectRole::DatabaseMetadata,
             ),
@@ -335,14 +337,14 @@ mod tests {
             ),
             (
                 ObjectPath::Transaction {
-                    db_root: db_root.clone(),
+                    db_prefix: db_prefix.clone(),
                     id: participant.clone(),
                 },
-                ObjectRole::TransactionLog,
+                ObjectRole::TransactionRecord,
             ),
             (
                 ObjectPath::StructuralIntent {
-                    db_root,
+                    db_prefix,
                     participant,
                     intent_id: StructuralIntentId::from(NodeToken::from_bytes([2; 16])),
                 },
@@ -386,7 +388,7 @@ mod tests {
             .unwrap();
         let (backend, handle) = wrap(inner);
 
-        let version = backend
+        let revision = backend
             .write_if_not_exists(COLLECTION_RECORD, b"root".to_vec())
             .await
             .unwrap();
@@ -394,12 +396,12 @@ mod tests {
         assert_eq!(reply.contents, b"root");
         assert!(matches!(
             backend
-                .read_if_modified(COLLECTION_RECORD, &reply.version)
+                .read_if_modified(COLLECTION_RECORD, &reply.revision)
                 .await,
             Err(BackendError::Precondition)
         ));
-        let version = backend
-            .write_if(COLLECTION_RECORD, b"new".to_vec(), &version)
+        let revision = backend
+            .write_if(COLLECTION_RECORD, b"new".to_vec(), &revision)
             .await
             .unwrap();
         let first_page = backend
@@ -419,7 +421,7 @@ mod tests {
         assert_eq!(second_page.objects, [SECOND_OBJECT]);
         assert!(second_page.next.is_none());
         backend
-            .delete_if(COLLECTION_RECORD, &version)
+            .delete_if(COLLECTION_RECORD, &revision)
             .await
             .unwrap();
         assert!(matches!(

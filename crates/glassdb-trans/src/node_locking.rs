@@ -15,7 +15,7 @@ use glassdb_storage::{LeafEntry, LeafObservation, LockType, NodeLocks, Requireme
 use crate::error::TransError;
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{
-    CoordinatedOutcome, LeafOperation, LeafResolver, MemberOutcome, ResolveCtx, StageAdmission,
+    CoordinatedOutcome, LeafOperation, MemberOutcome, MemberPolicy, ResolveCtx, StageAdmission,
     Step,
 };
 use crate::monitor::Monitor;
@@ -86,14 +86,14 @@ impl<'a> NodeLockReconciler<'a> {
     /// Admits an ordinary node rewrite by proving the gate absent in the state
     /// that will be conditionally replaced.
     ///
-    /// A live gate has priority over new traffic. A finalized gate can be
+    /// A live gate has priority over new traffic. A gate whose holder has a final status can be
     /// removed by this same CAS: if its structural write was still in flight,
-    /// only one of the two conditional writes can land.
+    /// only one of the two CASes can land.
     pub(crate) async fn admit_non_structural(
         &self,
         locks: &mut NodeLocks,
     ) -> Result<Option<TxId>, TransError> {
-        if let Some(holder) = self.reconcile_delete_intent(locks).await? {
+        if let Some(holder) = self.reconcile_drop_intent(locks).await? {
             return Ok(Some(holder));
         }
         let Some(holder) = locks.structural_gate().holders().first().cloned() else {
@@ -112,17 +112,17 @@ impl<'a> NodeLockReconciler<'a> {
     /// Closes the structural gate after quiescing membership holders.
     ///
     /// Returns the live holder to wait for, or leaves both node-lock scopes free
-    /// of finalized foreign holders with structure-write installed for this
-    /// operation.
+    /// of foreign holders with a final status, with a structural gate installed
+    /// for this operation.
     pub(crate) async fn acquire_structural_gate(
         &self,
         locks: &mut NodeLocks,
     ) -> Result<Option<TxId>, TransError> {
-        if let Some(holder) = self.reconcile_delete_intent(locks).await? {
+        if let Some(holder) = self.reconcile_drop_intent(locks).await? {
             return Ok(Some(holder));
         }
         if locks.structural_gate().contains(self.id) {
-            self.prune_finalized_membership(locks).await?;
+            self.prune_final_membership(locks).await?;
             return Ok(None);
         }
         for holder in locks.structural_gate().holders().to_vec() {
@@ -136,7 +136,7 @@ impl<'a> NodeLockReconciler<'a> {
                     }
                 }
                 TxCommitStatus::Unknown => return Ok(Some(holder)),
-                TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
+                TxCommitStatus::Committed | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
             }
             locks.remove_structural_gate(&holder);
         }
@@ -155,7 +155,7 @@ impl<'a> NodeLockReconciler<'a> {
                     }
                 }
                 TxCommitStatus::Unknown => return Ok(Some(holder)),
-                TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
+                TxCommitStatus::Committed | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
             }
             locks.remove_membership_holder(&holder);
         }
@@ -163,25 +163,25 @@ impl<'a> NodeLockReconciler<'a> {
         Ok(None)
     }
 
-    async fn reconcile_delete_intent(
+    async fn reconcile_drop_intent(
         &self,
         locks: &mut NodeLocks,
     ) -> Result<Option<TxId>, TransError> {
-        let Some(holder) = locks.delete_intent().cloned() else {
+        let Some(holder) = locks.drop_intent().cloned() else {
             return Ok(None);
         };
         if &holder == self.id {
             return Ok(None);
         }
         match self.monitor.tx_status(&holder).await? {
-            TxCommitStatus::Ok => Err(TransError::StaleCollection),
+            TxCommitStatus::Committed => Err(TransError::StaleCollection),
             TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
-                locks.remove_delete_intent(&holder);
+                locks.remove_drop_intent(&holder);
                 Ok(None)
             }
             TxCommitStatus::Pending => match try_reclaim(self.monitor, self.id, &holder).await? {
                 Reclaim::Wounded => {
-                    locks.remove_delete_intent(&holder);
+                    locks.remove_drop_intent(&holder);
                     Ok(None)
                 }
                 Reclaim::Wait => Ok(Some(holder)),
@@ -222,7 +222,9 @@ impl<'a> NodeLockReconciler<'a> {
                         }
                     }
                     TxCommitStatus::Unknown => return Ok(Some(holder)),
-                    TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
+                    TxCommitStatus::Committed
+                    | TxCommitStatus::Aborted
+                    | TxCommitStatus::Wounded => {}
                 }
                 locks.remove_membership_holder(&holder);
             }
@@ -242,10 +244,10 @@ impl<'a> NodeLockReconciler<'a> {
         Ok(None)
     }
 
-    /// Removes finalized membership holders after their entry state was
+    /// Removes membership holders with a final status after their entry state was
     /// reconciled. Unknown holders remain live until the monitor classifies
     /// them through its missing-transaction grace period.
-    async fn prune_finalized_membership(&self, locks: &mut NodeLocks) -> Result<(), TransError> {
+    async fn prune_final_membership(&self, locks: &mut NodeLocks) -> Result<(), TransError> {
         for holder in locks.membership().holders().to_vec() {
             if &holder != self.id && self.monitor.tx_status(&holder).await?.is_final() {
                 locks.remove_membership_holder(&holder);
@@ -276,7 +278,7 @@ impl StructuralGateOperation {
 }
 
 #[async_trait]
-impl LeafResolver for StructuralGateOperation {
+impl MemberPolicy for StructuralGateOperation {
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,

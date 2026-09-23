@@ -38,7 +38,7 @@ pub(super) async fn execute_step(
         .await?;
     let result = execute_program(db, &collection, program, &allowed, after).await;
 
-    // A stale observation retries before this error can escape. A stable one is
+    // A stale observation replays the body before this error can escape. A stable one is
     // a real workload invariant failure.
     if let Err(error) = &result
         && let Some(message) = api_invariant_message(error)

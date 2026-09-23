@@ -1,4 +1,4 @@
-# ADR-046: Incarnation-addressed collection format
+# ADR-046: ID-addressed collection format
 
 ## Status
 
@@ -18,7 +18,7 @@ collection management on this identity and resolution model. This ADR is
 deliberately implementable without ADR-047.
 
 [ADR-050](050-separate-collection-record-and-tree-root.md) supersedes the
-combined `_i` record/root layout. Incarnation addressing and direct
+combined `_i` record/root layout. ID addressing and direct
 `name → ID` directories are unchanged.
 
 Physical creation and reclamation follow
@@ -43,7 +43,7 @@ collection is open, point operations must not revalidate that path.
 
 ## Decision
 
-### Incarnation identity and physical layout
+### Collection identity and physical layout
 
 Every collection has an opaque, client-generated `CollectionId` that is unique
 within the database and never reused. Exact width and encoding are format
@@ -79,16 +79,17 @@ A `CollectionPath` is an unresolved sequence of names, not a data handle.
 Opening it walks direct-child directories from `root_collection()` and costs
 `O(depth)` when cold. Opening is therefore fallible and asynchronous.
 
-A `Collection` is bound to one incarnation. Except for the permanent database
-root, it carries the collection ID plus its direct parent-and-name binding. Data
-routing uses only the ID; the direct binding lets later lifecycle operations
-compare the exact parent entry without a full-path or reverse-catalog lookup.
+A `Collection` is bound to one collection ID. Except for the permanent root
+collection, it carries the collection ID plus its direct parent-and-name
+binding. Data routing uses only the ID; the direct binding lets later lifecycle
+operations compare the exact parent entry without a full-path or
+reverse-catalog lookup.
 The root needs no parent binding because it cannot be dropped. A handle never
 automatically rebinds to a different ID at the same logical name.
 
 Immediate-child listing reads the bounded directory in the parent's `_i`; it
 does not walk the parent's data tree or reopen each child. It returns entries
-containing both the raw name and an incarnation-bound `Collection`, in name
+containing both the raw name and a collection-ID-bound `Collection`, in name
 order. A list can become stale after it returns, but its handles remain bound to
 the IDs that were listed.
 
@@ -121,7 +122,7 @@ likewise return one current directory view, not a multi-operation transactional
 snapshot. ADR-047 replaces these limitations without changing IDs, physical
 paths, or path resolution.
 
-Collection deletion is not introduced by this ADR.
+Collection drop is not introduced by this ADR.
 
 ## Consequences
 
@@ -137,8 +138,8 @@ Collection deletion is not introduced by this ADR.
   reclamation, but cannot expose a parent mapping to an uncreated root.
 - Stable physical IDs make a future rename or move possible without relocating
   data, and prevent [ADR-045](045-optional-persistent-encoded-body-l2-cache.md)
-  entries from aliasing a replacement incarnation. Rename, move,
-  metadata/options, deletion, transactional management, and snapshot behavior
+  entries from aliasing a replacement collection. Rename, move,
+  metadata/options, drop, transactional management, and snapshot behavior
   remain out of scope.
 - The public collection API and physical format both change incompatibly. The
   current format is changed in place; existing development databases are

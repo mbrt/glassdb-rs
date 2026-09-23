@@ -7,7 +7,7 @@ Superseded: durable benchmarks did not justify the scheduler, so ordinary conver
 This refines [ADR-020](020-commit-write-back-protocol.md)'s asynchronous,
 idempotent write-back and [ADR-028](028-shard-mutation-coordinator.md)'s retry
 policy. It does not change the commit point, the authority of committed
-transaction objects, or the coordinator's mutation semantics.
+transaction records, or the coordinator's mutation semantics.
 
 ## Context
 
@@ -20,23 +20,23 @@ latency.
 
 Stopping after that loss moves work off the hot path, but does not provide
 physical convergence. The holder remains authoritative, so reads stay correct
-by resolving the committed transaction object. Fresh clients and cache
-evictions must nevertheless reload that object, and a full-leaf scan pays once
-for every distinct unresolved transaction. GC cannot remove an object while a
-holder still references it. Permanent deferral therefore turns a transient
+by resolving the committed transaction record. Fresh database instances and
+cache evictions must nevertheless reload that record, and a full-leaf scan pays
+once for every distinct unresolved transaction. GC cannot remove a record while
+a holder still references it. Permanent deferral therefore turns a transient
 contention optimization into unbounded read amplification and retention.
 
 A focused experiment instead delayed one retry until contention became quiet.
 It improved median aggregate throughput by `7.9%`, coalesced `47` transaction
-intents into `35` leaf batches, and left fresh scans with no transaction-object
-reads after convergence. Definitive and ambiguous backend failures retained
+intents into `35` leaf batches, and left fresh scans with no transaction-record
+reads after convergence. Definitive and in-doubt backend failures retained
 their existing reconciliation behavior, and graceful shutdown forced pending
 work without waiting through the delay. See the
 [performance investigation](../../hack/perf/investigations.md#delayed-retry-validation).
 
 The delay must remain only a scheduling optimization. Durable holders and
-transaction objects continue to carry correctness across cancellation, process
-failure, and independently configured clients.
+transaction records continue to carry correctness across cancellation, process
+failure, and independently configured database instances.
 
 ## Decision
 
@@ -51,7 +51,7 @@ only after all of the following are known:
 - a local delayed-retry scheduler accepts ownership of that work.
 
 This is the clean precondition-loss case. An unavailable or in-doubt mutation,
-a structural move, a non-leaf mutation, or any other ambiguous outcome follows
+a structural move, a non-leaf mutation, or any other in-doubt outcome follows
 the ordinary reconciliation path without delay. A write-back whose effect is
 already present is complete.
 
@@ -109,7 +109,7 @@ their batching and mutation order.
 
 Accepting an intent transfers local ownership independently of cancellation of
 the submitting future. Until delayed write-back lands, the committed transaction
-object and its leaf holder remain the only durable authority. The scheduler is
+record and its leaf holder remain the only durable authority. The scheduler is
 not persisted, is not a GC root, and does not participate in read resolution.
 Reads tolerate the temporary holder lookup and do not force an early drain.
 
@@ -123,7 +123,7 @@ Delayed work gains no separate error channel or retry semantics. As with
 independently place a timeout around asynchronous shutdown.
 
 Dropping or crashing a `Database` may discard its volatile schedule. Durable
-holders keep reads correct and transaction objects live, and later ordinary
+holders keep reads correct and transaction records live, and later ordinary
 activity may converge them. No startup scan, persistent retry queue, or
 cross-database coordination is introduced. A crash can consequently leave
 physical cleanup and its read cost pending until such activity occurs; this is
@@ -147,7 +147,7 @@ include post-shutdown backend work so the optimization cannot hide cleanup debt.
   fewer later coordinator rounds without weakening logical visibility.
 - Eligibility for another convergence attempt remains bounded even on a
   continuously busy leaf. A delayed attempt cannot defer itself again.
-- Reads during the delay may load a transaction object, and transaction objects
+- Reads during the delay may load a transaction record, and transaction records
   remain live longer. The additional delay introduced by this policy is bounded
   during normal operation and is accepted in exchange for lower write
   contention.
@@ -175,7 +175,7 @@ material throughput bottleneck.
 ### Stop write-back permanently after a clean loss
 
 Logical reads remain correct through the committed holder, but fresh scans pay
-transaction-object reads indefinitely and GC must retain the referenced log.
+transaction-record reads indefinitely and GC must retain the referenced record.
 Warm caches conceal rather than resolve that debt.
 
 ### Use an unbounded quiet-period debounce
@@ -207,11 +207,12 @@ write-back.
 
 Cross-instance batching could coalesce more work, but requires a new distributed
 coordination protocol for an optimization whose durable state is already safe.
-Database-local scheduling preserves independent clients and failure domains.
+Database-local scheduling preserves independent database instances and failure
+domains.
 
 ### Persist the queue or reconstruct it at startup
 
-The holder and committed transaction object already encode everything required
+The holder and committed transaction record already encode everything required
 for correct reads and eventual activity-driven convergence. A second durable
 work log or a startup tree scan would add write and recovery cost to optimize an
 exceptional contention path.

@@ -23,7 +23,7 @@ transparent-retry path it takes_ — never _what a committed transaction decides
 Every shard mutation is a load-modify-CAS of one coordination object through the
 coordinator (ADR-028): load once per attempt, build the round's mutation plan,
 CAS once, recover by reload. The object cache (ADR-023) serves a cached shard by
-revalidating it with a version-conditional `read_if_modified`, which is a
+revalidating it with a revision-conditional `read_if_modified`, which is a
 **backend read even when the object is unchanged** (the backend answers "not
 modified" but the round trip — and the op-count it costs — still happen). So
 _every_ `load_shard` costs one backend read regardless of cache warmth: caching
@@ -59,7 +59,7 @@ revalidation round-trip.
 Add a **`Freshness` flag** to the object-cache read path (`ObjectCache::read`,
 and through it `ShardStore::load_shard` and `Resolver::resolve_key`):
 
-- `Latest` revalidates a cached copy with the version-conditional
+- `Latest` revalidates a cached copy with the revision-conditional
   `read_if_modified`, exactly as before. Every reader that must observe the
   newest state keeps `Latest`.
 - `AllowStale` serves a cached copy _as-is_, skipping the round-trip, and falls
@@ -100,28 +100,28 @@ attempt uses to build its plan_, never the precondition logic or any commit
 decision — so it cannot cause a lost update, a double-apply, or a stale commit.
 
 - **A stale cached shard self-corrects.** Planning from a stale snapshot
-  produces a store whose `expected` version no longer matches the backend, so
-  the CAS misses; the round then reloads (`Latest`) and rebuilds the plan from
-  fresh bytes — the exact precondition-miss recovery ADR-028 already runs. The
+  produces a store whose `expected` revision no longer matches the backend, so
+  the CAS is rejected; the round then reloads (`Latest`) and rebuilds the plan from
+  fresh bytes — the exact rejected-CAS recovery ADR-028 already runs. The
   idempotent plan rebuild contract (ADR-028 contract 3) holds identically
   whether the first attempt read the cache or the backend.
-- **Stale eligibility cannot commit, only re-run.** Between the read and the
+- **Stale eligibility cannot commit, only body replay.** Between the read and the
   commit a concurrent writer may move the shard. With `AllowStale` the single-RW
   eligibility check may run on the cached (stale) snapshot and _pass_ a
   read-modify-write whose read was in fact superseded. It still cannot commit on
-  outdated state: the version-conditional install CAS misses, the coordinator
+  outdated state: the revision-conditional install CAS misses, the coordinator
   reloads fresh, evaluates the resolver again, and finds the read superseded, so
   the fast path renews (`Wounded`). The lock CAS never landed, so no lock is
-  held and the speculatively-written committed object is in no shard's
+  held and the speculatively-written committed record is in no shard's
   `locked_by` — it cannot be help-forwarded and is an orphan GC reclaims (no
-  lost update, no double-apply). A `Wounded` renew is a **transparent re-run**
-  at the user level: the db retry loop treats it exactly like the full path's
-  `Retry`, and the re-run's read (`Latest`) refreshes the cache so it converges.
+  lost update, no double-apply). A `Wounded` renew is a **transparent body replay**
+  at the user level: the db retry loop treats it exactly like the locked commit's
+  `Retry`, and the replay's read (`Latest`) refreshes the cache so it converges.
   The only observable change is _which_ retry a superseded read takes: `Wounded`
-  (renew, no lock held) when the stale snapshot passed the check, vs. the full
-  path's in-place `Retry` (holding its locks, ADR-024) when the eligibility
+  (renew, no lock held) when the stale snapshot passed the check, vs. the locked
+  commit's in-place `Retry` (holding its locks, ADR-024) when the eligibility
   snapshot was fresh — whether it was fresh depends only on cache warmth. The
-  ADR-024 "retry holding locks" guarantee is a full-path property, where a lock
+  ADR-024 "retry holding locks" guarantee is a locked-commit property, where a lock
   is actually held; a superseded fast-path read holds none.
 - **No new CAS site, no new in-doubt case.** The coordinator's CAS sites, version
   conditions, and ADR-009 in-doubt recovery are untouched; `AllowStale` only
@@ -135,7 +135,7 @@ executor (ADR-008/013). A stale `AllowStale` snapshot that races a concurrent
 writer produces a deterministic extra plan + CAS miss + reload, exercised by the
 fuzzer. The retry flavour for a superseded single-RW read (`Wounded` vs `Retry`)
 is a function of cache warmth, which is deterministic per executor; both are
-transparent re-runs that converge, so neither the serializability / cycle oracles
+transparent body replays that converge, so neither the serializability / cycle oracles
 nor the op-stream self-check are affected. The existing minimized corpus still
 passes against the leaner op shape (no regeneration was required).
 

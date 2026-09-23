@@ -139,7 +139,7 @@ impl PendingOutcomes {
 }
 
 /// Per-key membership accounting. `committed[k]` is the definite liveness from
-/// acknowledged ops; `pending[k]` is the set of ambiguous outcomes left by
+/// acknowledged ops; `pending[k]` is the set of possible outcomes left by
 /// in-flight ops since the last ack (a possibility is added before each op runs,
 /// and the whole set is cleared on the next ack), i.e. the in-doubt cases a fault
 /// can leave behind.

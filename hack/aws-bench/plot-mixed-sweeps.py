@@ -123,9 +123,7 @@ def read_report(path: Path) -> tuple[ReportMetadata, pd.DataFrame]:
             database_limit = _integer(
                 cell.get("databaseLimit"), f"{label}.databaseLimit", minimum=1
             )
-            databases = _integer(
-                cell.get("databases"), f"{label}.databases", minimum=1
-            )
+            databases = _integer(cell.get("databases"), f"{label}.databases", minimum=1)
             workers = _integer(
                 cell.get("workersPerShape"), f"{label}.workersPerShape", minimum=1
             )
@@ -217,9 +215,7 @@ def validate_worker_sweep(data: pd.DataFrame) -> None:
     _require_values(data, "run", EXPECTED_RUNS, "worker sweep")
     _require_values(data, "mode", ("lo",), "worker sweep")
     _require_values(data, "affinity", (100,), "worker sweep")
-    _require_values(
-        data, "database_limit", (WORKER_DATABASE_LIMIT,), "worker sweep"
-    )
+    _require_values(data, "database_limit", (WORKER_DATABASE_LIMIT,), "worker sweep")
     _require_values(data, "workers", WORKER_POINTS, "worker sweep")
     _require_complete_grid(
         data,
@@ -247,9 +243,7 @@ def validate_affinity_sweep(data: pd.DataFrame) -> None:
 def median_rows(data: pd.DataFrame, dimensions: list[str]) -> pd.DataFrame:
     """Return cross-run median metrics for each plotted series point."""
     return (
-        data.groupby([*dimensions, "shape"], as_index=False, sort=True)[
-            list(METRICS)
-        ]
+        data.groupby([*dimensions, "shape"], as_index=False, sort=True)[list(METRICS)]
         .median()
         .reset_index(drop=True)
     )
@@ -265,9 +259,7 @@ def _save(fig: plt.Figure, out_dir: Path, name: str) -> Path:
 
 
 def _shape_colors() -> dict[str, Any]:
-    return dict(
-        zip(SHAPES, sns.color_palette("colorblind", len(SHAPES)), strict=True)
-    )
+    return dict(zip(SHAPES, sns.color_palette("colorblind", len(SHAPES)), strict=True))
 
 
 def _plot_shape_lines(
@@ -339,8 +331,7 @@ def plot_worker_latency(data: pd.DataFrame, out_dir: Path) -> Path:
     fig, ax = plt.subplots(figsize=(14, 6))
     _plot_shape_latency_bands(ax, medians, "workers", colors)
     ax.set_title(
-        "Mixed-workload latency with isolated collections\n"
-        "p50 line; p50–p90 band"
+        "Mixed-workload latency with isolated collections\np50 line; p50–p90 band"
     )
     ax.set_xlabel("Concurrent workers per shape")
     ax.set_ylabel("Latency (ms)")
@@ -352,7 +343,7 @@ def plot_worker_latency(data: pd.DataFrame, out_dir: Path) -> Path:
 
 
 def _database_title(databases: int) -> str:
-    suffix = "client" if databases == 1 else "clients"
+    suffix = "instance" if databases == 1 else "instances"
     return f"{databases} DB {suffix}"
 
 
@@ -410,9 +401,7 @@ def plot_affinity_latency(data: pd.DataFrame, out_dir: Path) -> Path:
         ax.set_ylabel("Latency (ms)")
         ax.set_xticks(AFFINITY_POINTS)
     handles, labels = axes.flat[0].get_legend_handles_labels()
-    fig.suptitle(
-        "Latency by home-collection affinity — p50 line; p50–p90 band", y=0.99
-    )
+    fig.suptitle("Latency by home-collection affinity — p50 line; p50–p90 band", y=0.99)
     fig.legend(
         handles,
         labels,

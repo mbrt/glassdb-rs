@@ -13,7 +13,7 @@ const TX_ID_TS_OFF: usize = 8;
 /// persisted representation of the Go `data.TxID` (`[]byte`).
 ///
 /// The layout is `[8 bytes random][8 bytes big-endian UnixNano timestamp]`. The
-/// random bytes come first so that transaction-log keys keep a high-entropy
+/// random bytes come first so that transaction-record paths keep a high-entropy
 /// prefix, spreading writes across object-storage partitions instead of
 /// clustering sequential commits into a single hot partition. The timestamp
 /// suffix encodes the transaction priority used by the wound-wait rule: an
@@ -26,7 +26,7 @@ const TX_ID_TS_OFF: usize = 8;
 /// not wound-wait priority order; use [`TxId::older`] for priority decisions.
 ///
 /// The bytes are stored behind an `Arc` so that cloning an id - which happens
-/// pervasively (lockers, last-writer versions, cache entries, every commit) -
+/// pervasively (lockers, writers, cache entries, every commit) -
 /// is a refcount bump rather than a heap allocation and copy.
 #[derive(Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TxId(Arc<[u8]>);
@@ -80,8 +80,9 @@ impl TxId {
 
     /// Returns a transaction identity that preserves the priority of
     /// `self` but uses a fresh random prefix. A wounded transaction reuses its
-    /// priority on restart to avoid starvation, while the new prefix gives it a
-    /// distinct log object that lands in a different storage partition.
+    /// priority on identity renewal to avoid starvation, while the new prefix
+    /// gives it a distinct transaction record that lands in a different storage
+    /// partition.
     pub fn renew(&self) -> Self {
         let mut b = vec![0u8; Self::MAX_GENERATED_ENCODED_LEN];
         fill_bytes(&mut b[..TX_ID_TS_OFF]);
@@ -98,7 +99,7 @@ impl TxId {
     /// tiebreak would let two equal-timestamp transactions flip their relative
     /// order on each wound and livelock by wounding each other forever.
     /// Transactions sharing a timestamp are therefore never ordered against each
-    /// other; that rare tie is left to the serial-locking deadlock safety net.
+    /// other; that rare tie is left to the serial-acquisition deadlock safety net.
     pub fn older(&self, other: &TxId) -> bool {
         self.priority() < other.priority()
     }

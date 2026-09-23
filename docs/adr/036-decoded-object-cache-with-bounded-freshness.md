@@ -15,7 +15,7 @@ This supersedes
 while preserving its reuse optimization as an `Any` read followed by CAS.
 It refines only the caching part of
 [ADR-023](023-slimmed-backend-trait.md): the slim `Backend` trait, opaque content
-versions, and version-conditional read remain unchanged.
+revisions, and revision-conditional read remain unchanged.
 
 Terminology below was later aligned with `CONTEXT.md` as errata, with no change
 to any decision: what this ADR called a "validation watermark" is a *currentness
@@ -26,12 +26,12 @@ open validation. `LogicalTime` is now `SequencePoint`, retained here as written.
 
 The storage layer currently has two cache facades over one LRU:
 
-- `ObjectCache` stores encoded object bodies and opaque backend versions. A
+- `ObjectCache` stores encoded object bodies and opaque backend revisions. A
   caller chooses either `Latest`, which always revalidates a hit, or
   `AllowStale`, which accepts it without a bound.
 - `ValueCache` stores materialized key values with elapsed-time staleness and an
   `outdated` flag. These values are derived from a node's effective writer and
-  that writer's transaction object.
+  that writer's transaction record.
 
 This split repeats decoding, gives different object classes different freshness
 semantics, and makes higher layers maintain a second cache of derived state. The
@@ -67,15 +67,15 @@ decoded value before changing it and submits the new value through the typed
 store.
 
 The cache holds decoded physical objects, including collection roots, nodes,
-transaction objects, and structural logs. It does not hold a second materialized
+transaction records, and structural logs. It does not hold a second materialized
 key-value cache. A key value is derived from its cached node and decoded
-transaction object; a decoded transaction object may index its writes to make
+transaction record; a decoded transaction record may index its writes to make
 that derivation cheap. Dependency rules remain in the higher-level resolver,
 not in a generic cache dependency graph.
 
 All object body reads and mutations go through this boundary. Listing also goes
 through it but remains an uncached pass-through because a prefix has no object
-version. The one-off database-metadata check/create performed while opening a
+revision. The one-off database-metadata check/create performed while opening a
 database may continue to use `Backend` directly.
 
 ### Freshness is a local currentness watermark
@@ -96,7 +96,7 @@ remain useful after that state is evicted or invalidated as the current cache
 entry: invalidation changes what a new read may use, but does not revoke the
 historical fact that the observed state was current after its watermark.
 
-`Revision` is the cached-store-owned opaque content-CAS token. Higher layers may
+`Revision` is the cached-store-owned opaque content revision. Higher layers may
 retain, compare, pass, and where recovery requires it serialize a revision, but
 do not interpret or manufacture one.
 
@@ -132,13 +132,13 @@ is the result's `current-after` watermark. An operation that started before
 The response time has a different role: after a successful mutation, the store
 publishes the submitted value in the cache after receiving the response and
 before returning to its caller. This gives local call/publication ordering, but
-response time is not a freshness watermark. Another client may overwrite the
-object after the backend applies this mutation but before its response arrives;
-stamping the submitted value with response time would then claim freshness it
-never had. Reads and writes therefore use the same operation-start watermark,
-despite publishing their results only on completion.
+response time is not a freshness watermark. Another database instance may
+overwrite the object after the backend applies this mutation but before its
+response arrives; stamping the submitted value with response time would then
+claim freshness it never had. Reads and writes therefore use the same
+operation-start watermark, despite publishing their results only on completion.
 
-A present entry is revalidated with the existing version-conditional read. An
+A present entry is revalidated with the existing revision-conditional read. An
 unchanged response advances its watermark without transferring or decoding the
 body. A changed response replaces it with the newly decoded value and revision.
 An absent entry has no conditional token, so revalidating it requires an
@@ -149,14 +149,14 @@ The cache proves current semantic state, not an observable write history.
 Canonical objects with identical contents are equivalent to an object that was
 not rewritten; no nonce is introduced. Higher-level logical validation tokens
 remain responsible for meaningful changes: point reads compare unique writer
-transaction IDs, and scans compare membership versions plus pending-transaction
+transaction IDs, and scans compare membership generations plus pending-transaction
 dependencies.
 
 Object-specific invariants may be stronger than generic freshness. In
-particular, a typed transaction-object store may serve a cached committed or
-aborted object indefinitely because terminal transaction objects are immutable.
-Pending objects still honor the caller's bound. The generic cache does not know
-transaction states or other dependency semantics.
+particular, a typed transaction-record store may serve a cached committed or
+aborted record indefinitely because transaction records with final status are
+immutable. Pending records still honor the caller's bound. The generic cache
+does not know transaction states or other dependency semantics.
 
 ### OCC propagates one lower bound through its dependencies
 
@@ -180,12 +180,12 @@ leaf install CAS validates the observed writer while installing the lock. A CAS
 performed by an earlier transaction cannot certify freshness for a later
 transaction.
 
-Consequently, an otherwise idle read-only transaction whose key and finalized
-transaction object are cached still performs one conditional read per distinct
-terminal leaf during validation. The database cannot infer that other clients
-did not write after the cached leaf was last validated. Removing that floor
-would require a stronger primitive such as a freshness lease, exclusive-client
-mode, or change stream.
+Consequently, an otherwise idle read-only transaction whose key and transaction
+record with final status are cached still performs one conditional read per
+distinct terminal leaf during validation. The database cannot infer that other
+database instances did not write after the cached leaf was last validated.
+Removing that floor would require a stronger primitive such as a freshness
+lease, exclusive-client mode, or change stream.
 
 ### Watermark ownership and propagation
 
@@ -207,7 +207,7 @@ barrier or successful CAS from which to inherit one:
 - a non-transactional metadata read samples once when its API promises a current
   snapshot and has no later validation step.
 
-Typed storage, transaction-log persistence, writer resolution, shard
+Typed storage, transaction-record persistence, writer resolution, shard
 coordination, and locking do not own time. They accept a caller-supplied
 `Requirement`. Transaction execution reads and scans may use `Any` because their
 retained observations are checked after the transaction's validation barrier.
@@ -218,7 +218,7 @@ A successful CAS advances the retained precondition observation to the CAS
 start watermark. That receipt is propagated to later phases: lock acquisition
 uses it as physical read-validation evidence, and write-back uses it instead of
 sampling time or revalidating the just-installed leaf. Structural code likewise
-uses a successful lock or mutation receipt for post-CAS reloads and related
+uses a successful lock or other CAS receipt for post-CAS reloads and related
 tree walks. A receipt must not be replaced with a later `now()`: the later time
 would claim freshness the CAS did not establish.
 
@@ -231,19 +231,19 @@ observation remained current after `started-at`, immediately before replacing
 it, and may advance that observation's watermark. A successful delete installs
 absence under the same rule.
 
-A CAS or create conflict proves that the operation's starting revision or
+A rejected CAS or create mutation proves that the operation's starting revision or
 cached absence is obsolete. The cache invalidates that exact starting entry only
 if it is still current locally; it must not discard a different value or a later
-validation installed concurrently. Conflict does not automatically fetch the
+validation installed concurrently. A rejected mutation does not automatically fetch the
 winner. A caller that needs it follows with an explicit `Any` or `AtLeast`
-read. The conflict does not revoke or advance currentness evidence previously
+read. A rejected mutation does not revoke or advance currentness evidence previously
 issued for the starting observation.
 
 An in-doubt mutation likewise invalidates its exact starting knowledge but
 installs neither the old nor the proposed state, because either may be wrong.
 Protocol-specific recovery performs an explicit bounded read or its existing
 read-back procedure. Existing observations retain their established
-watermarks, but the uncertain outcome cannot advance them.
+watermarks, but the in-doubt outcome cannot advance them.
 
 A positively known-obsolete value is `Missing`, not a form of stale data. `Any`
 never returns it. An `Arc` already held by a caller remains inspectable, but a
@@ -265,14 +265,14 @@ elapsed real time.
 
 A small reference state machine covers `Present`, `Absent`, and `Missing`
 entries; opaque revisions; currentness watermarks; and read, create, CAS, delete,
-conflict, and in-doubt outcomes. Model-based tests vary invocation, backend
+rejected mutation, and in-doubt outcomes. Model-based tests vary invocation, backend
 linearization, and response order independently and assert that:
 
 - `LogicalTime` and installed watermarks never regress;
 - a result is stamped with its operation start even when the clock advances
   before completion, and a mutation is not published before backend success;
 - `AtLeast(T)` never uses an operation started before `T`;
-- `Any` never returns an entry already invalidated by conflict or an in-doubt
+- `Any` never returns an entry already invalidated by a rejected mutation or an in-doubt
   mutation;
 - an observation's established watermark remains usable after its current
   entry is invalidated, but invalidation does not advance that watermark; and
@@ -284,22 +284,22 @@ cannot expose:
 
 - a delayed old read completing after a newer read or write cannot overwrite
   the newer entry;
-- conflict or in-doubt invalidation removes only the exact starting knowledge
+- rejected-mutation or in-doubt invalidation removes only the exact starting knowledge
   and preserves a concurrently installed value or later validation;
 - an invalidated observation can satisfy an older bound from its retained
   evidence, while a new read cannot rediscover it and a stricter bound requires
   backend validation;
 - successful CAS advances both its expected observation's evidence and the
-  installed state from its start time, while conflict and in-doubt outcomes do
+  installed state from its start time, while rejected-mutation and in-doubt outcomes do
   neither;
 - waiters share an in-flight validation only when its start satisfies their
   bound, while a stricter waiter causes a later validation;
 - unchanged conditional reads advance, but never regress, the watermark; and
 - cached absence races safely with create, delete, and delayed reads.
 
-Transaction-level deterministic simulation and multi-client integration tests
+Transaction-level deterministic simulation and multi-instance integration tests
 remain the end-to-end safety net. They assert serializability under reordered
-responses, CAS conflicts, lost acknowledgements, and outages, and also pin the
+responses, rejected CAS mutations, lost acknowledgements, and outages, and also pin the
 intended operation shape: an idle cached read-only transaction performs one
 conditional validation per terminal leaf, while a successful post-barrier CAS
 requires no extra validation read for the object it covers.
@@ -314,7 +314,7 @@ requires no extra validation read for the object it covers.
   paths disappear.
 - `AtLeast` expresses the actual read guarantee and lets OCC, concurrent
   validation, and post-barrier CASes reuse sufficiently recent knowledge.
-- CAS conflicts and in-doubt writes improve cache knowledge without forcing an
+- Rejected CAS mutations and in-doubt writes improve cache knowledge without forcing an
   automatic read, while exact conditional invalidation prevents response races
   from regressing the cache.
 - Invalidation may remove a state from the current cache without wasting the

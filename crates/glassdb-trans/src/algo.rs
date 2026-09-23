@@ -2,13 +2,13 @@
 //! object-native engine (ADR-016 … ADR-021).
 //!
 //! A complete point transaction whose dependencies and inline-admissible outputs
-//! share one leaf first attempts ADR-061's logless one-CAS commit. Other
-//! read-write transactions validate their reads and install locks with one
-//! read-modify-write CAS per touched leaf, flip their transaction object to
-//! committed, then publish `current_writer` pointers and release their locks.
-//! A read-only transaction starts on a pure optimistic fast path. If validation
-//! fails, retries lock their point reads and scan predicates so sustained churn
-//! cannot make them retry forever.
+//! share one leaf first tries ADR-061's direct commit. Other read-write
+//! transactions validate their reads and install locks with one read-modify-write
+//! CAS per touched leaf, flip their transaction record to committed, then publish
+//! current states and release their locks. A read-only transaction
+//! starts with optimistic validation. If validation fails, later body replays
+//! use locked validation on their point reads and scan predicates so sustained
+//! churn cannot make them replay the body forever.
 //!
 //! Concurrency control (ADR-002 / ADR-020 / ADR-021 / ADR-024): strict two-phase
 //! locking with wound-wait and leases for crash recovery. On a conflict it cannot
@@ -16,26 +16,27 @@
 //! (hold-and-wait, ADR-024) instead of aborting; an older one wounds the holder
 //! and proceeds. Distinct priorities cannot deadlock (wound-wait keeps the
 //! wait-for graph acyclic); two equal-priority transactions that would cycle are
-//! broken by escalating to the serial order. Lock acquisition has two modes: the
-//! default **parallel** path locks every leaf concurrently; after a
-//! [`MAX_DEADLOCK_TIMEOUT`] wait or [`SERIAL_FALLBACK_AFTER`] failed attempts,
-//! the attempt owner ends the parallel identity and renews it before the
-//! **serial** sorted order. First-CAS-wins on the lowest contended leaf then
-//! guarantees that one contender makes progress.
+//! broken by escalating to serial acquisition. Lock acquisition has two modes:
+//! the default **parallel acquisition** locks every leaf concurrently; after a
+//! [`MAX_DEADLOCK_TIMEOUT`] wait, after [`SERIAL_FALLBACK_AFTER`] identity
+//! renewals, or after [`SERIAL_FALLBACK_AFTER`] parallel acquisition passes that
+//! end in a lock conflict, the commit pass ends and the parallel identity is
+//! renewed for **serial acquisition** in sorted order. First-CAS-wins on the
+//! lowest contended leaf then guarantees that one contender makes progress.
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use glassdb_concurr::{Background, Backoff, RetryConfig, rt};
 use glassdb_data::{LogicalKey, TxId};
-use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxLog, TxWrite};
+use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxRecord, TxWrite};
 use glassdb_storage::{
     CurrentnessBarrier, InlinePolicy, LeafObservationCheck, LockType, NodeStore, Requirement,
     SplitPolicy, StorageError, Timeline, TreeRouter,
 };
 
 use crate::access::{AccessSet, LeafCoverage, ReadAccess, WriteOp};
-use crate::collection_commit::{CollectionAttempt, CollectionCommit, CollectionReservations};
+use crate::collection_commit::{CollectionCommit, CollectionHandleState, CollectionReservations};
 use crate::collections::CatalogAccesses;
 use crate::error::TransError;
 use crate::gc::GcHints;
@@ -45,29 +46,30 @@ use crate::monitor::{Monitor, OwnerAbortOutcome};
 use crate::split::SplitHintSink;
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
-mod attempt;
 mod direct_commit;
+mod handle_state;
 
-use attempt::AttemptState;
 pub use direct_commit::DirectCommitStats;
-use direct_commit::{DirectAttempt, DirectCommit};
+use direct_commit::{DirectCommit, DirectOutcome};
+use handle_state::HandleState;
 
-/// Number of failed parallel-locking attempts before a transaction escalates to
-/// the serial sorted-locking fallback (ADR-020). The parallel path is fast but
-/// can *livelock* two equal-priority transactions that each grab a different
-/// leaf first; after this many failures the transaction switches to sorted
-/// acquisition, where first-CAS-wins on the lowest contended leaf guarantees
-/// one of them makes progress.
+/// Threshold for escalating to serial acquisition (ADR-020).
+/// [`Handle::should_acquire_serially`] treats this many [`HandleState::renewals`]
+/// as a serial trigger, and parallel acquisition uses the same count for
+/// acquisition passes that end in a lock conflict. Parallel acquisition is fast
+/// but can *livelock* two equal-priority transactions that each grab a
+/// different leaf first; serial acquisition, where first-CAS-wins on the lowest
+/// contended leaf, guarantees one of them makes progress.
 const SERIAL_FALLBACK_AFTER: usize = 3;
 
-/// Upper bound on how long a transaction blocks acquiring its locks in the
-/// default parallel mode before suspecting a deadlock and escalating to the
-/// serial sorted-locking fallback (ADR-024). Under hold-and-wait a
+/// Upper bound on how long a transaction blocks acquiring its locks with the
+/// default parallel acquisition before suspecting a deadlock and escalating to
+/// the serial-acquisition fallback (ADR-024). Under hold-and-wait a
 /// younger-or-equal transaction *waits* for a conflicting holder while keeping
 /// its locks; distinct priorities cannot cycle (wound-wait), but two
 /// equal-priority transactions can each wait on the other forever. This timeout
-/// bounds that wait: on elapse the attempt owner ends the identity and renews
-/// it for the global sorted order, where one contender always completes. Reuses
+/// bounds that wait: on elapse the commit pass ends and the identity is renewed
+/// for the global sorted order, where one contender always completes. Reuses
 /// v1's 5s budget (ADR-002 / architecture.md).
 const MAX_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -76,18 +78,18 @@ const MAX_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(5);
 /// foreground progress.
 const MAX_LEAF_FULL_WAIT: Duration = Duration::from_secs(30);
 
-struct AttemptRetirement {
+struct IdentityRetirement {
     mon: Monitor,
-    cleanup_hints: GcHints,
+    gc_hints: GcHints,
     background: Option<Weak<Background>>,
 }
 
-impl AttemptRetirement {
+impl IdentityRetirement {
     /// Hands an unfinished transaction identity to managed recovery.
     fn retire_unfinished(&self, tx_id: &TxId) {
-        // An optimistic read-only validation and a logless one-CAS commit have
-        // no logged identity. Publishing an abort for either would invent a
-        // transaction that peers never observed.
+        // Optimistic validation and a direct one-CAS commit have no locked-commit
+        // identity. Publishing an abort for either would invent a transaction
+        // that peers never observed.
         if !self.mon.is_tracked_local(tx_id) {
             return;
         }
@@ -95,24 +97,24 @@ impl AttemptRetirement {
             return;
         };
         let mon = self.mon.clone();
-        let cleanup_hints = self.cleanup_hints.clone();
+        let gc_hints = self.gc_hints.clone();
         let tx_id = tx_id.clone();
         bg.spawn_waited(async move {
             if mon.abort_owned_tx(&tx_id).await.is_ok() {
-                cleanup_hints.schedule(tx_id);
+                gc_hints.schedule(tx_id);
             }
         });
     }
 }
 
 /// Hands the active identity to recovery if its owner future does not finish.
-struct AttemptRetirementGuard {
-    retirement: Arc<AttemptRetirement>,
+struct IdentityRetirementGuard {
+    retirement: Arc<IdentityRetirement>,
     armed: Option<TxId>,
 }
 
-impl AttemptRetirementGuard {
-    fn new(retirement: Arc<AttemptRetirement>, tx_id: TxId) -> Self {
+impl IdentityRetirementGuard {
+    fn new(retirement: Arc<IdentityRetirement>, tx_id: TxId) -> Self {
         Self {
             retirement,
             armed: Some(tx_id),
@@ -138,7 +140,7 @@ impl AttemptRetirementGuard {
     }
 }
 
-impl Drop for AttemptRetirementGuard {
+impl Drop for IdentityRetirementGuard {
     fn drop(&mut self) {
         self.retire_current();
     }
@@ -147,16 +149,16 @@ impl Drop for AttemptRetirementGuard {
 /// An opaque handle to an in-progress transaction managed by [`Algo`].
 pub struct Handle {
     accesses: AccessSet,
-    collections: CollectionAttempt,
-    state: AttemptState,
+    collections: CollectionHandleState,
+    state: HandleState,
     id: TxId,
     /// Per-transaction backoff for the internal CAS-contention retry in
     /// [`Algo::acquire_locks`] (a lost leaf/root CAS race): advanced before each
     /// same-identity re-lock so churning contenders spread out instead of busy-looping.
-    /// Body replay after a wound or stale read and read-only validation do not
+    /// Body replay after a wound or invalidated read and read-only validation do not
     /// use this schedule.
     backoff: Backoff,
-    retirement: AttemptRetirementGuard,
+    retirement: IdentityRetirementGuard,
 }
 
 impl Handle {
@@ -170,8 +172,8 @@ impl Handle {
         self.collections.reservations()
     }
 
-    /// Whether this read-only attempt is past its optimistic first try and must
-    /// use the locked validation path.
+    /// Whether this read-only transaction is past optimistic validation and must
+    /// use locked validation.
     fn should_lock_reads(&self) -> bool {
         self.state.should_lock_reads()
     }
@@ -222,11 +224,12 @@ impl Handle {
 pub enum BodyDecision {
     /// The body outcome can be returned.
     ReturnOutcome,
-    /// The engine changed attempt state and needs fresh logical accesses.
+    /// Handle state changed and the transaction needs fresh logical accesses.
     ReplayBody,
 }
 
-enum AttemptOutcome {
+/// The non-error end of one commit pass.
+enum PassOutcome {
     Complete,
     RenewForSerial {
         replay_body: bool,
@@ -237,7 +240,7 @@ enum AttemptOutcome {
     },
 }
 
-impl AttemptOutcome {
+impl PassOutcome {
     fn has_pending_writes(&self) -> bool {
         matches!(
             self,
@@ -249,13 +252,13 @@ impl AttemptOutcome {
     }
 }
 
-/// Outcome of one lock-acquisition episode. Read-version validation happens
-/// after [`Acquired::Locked`], so a stale read is not an acquisition outcome.
+/// Outcome of one lock-acquisition episode. Read validation happens after
+/// [`Acquired::Locked`], so an invalidated read is not an acquisition outcome.
 enum Acquired {
     /// Every lock is held; proceed to validate reads, then the commit point.
     Locked(LockedTx),
-    /// A higher-priority peer aborted this transaction: renew the id and re-run
-    /// ([`TransError::Wounded`]).
+    /// A higher-priority peer aborted this transaction: renew the id and replay
+    /// the body ([`TransError::Wounded`]).
     Wounded,
     /// Parallel acquisition must end before the replacement identity enters
     /// sorted serial acquisition.
@@ -319,7 +322,7 @@ pub struct Algo {
     locker: Locker,
     direct_commit: DirectCommit,
     mon: Monitor,
-    cleanup_hints: GcHints,
+    gc_hints: GcHints,
     timeline: Timeline,
     // Factory for each transaction's same-identity acquisition schedule. Other
     // coordination loops own independent schedules from the same engine policy.
@@ -327,7 +330,7 @@ pub struct Algo {
     split_policy: SplitPolicy,
     collection_reservation_limit: usize,
     collection_commit: CollectionCommit,
-    retirement: Arc<AttemptRetirement>,
+    retirement: Arc<IdentityRetirement>,
     // Weak so a captured `Algo` clone inside a spawned retirement task does not
     // keep [`Background`] alive past DB shutdown.
     background: Option<Weak<Background>>,
@@ -347,7 +350,7 @@ impl Algo {
         coord: LeafCoordinator,
         mon: Monitor,
         collection_commit: CollectionCommit,
-        cleanup_hints: GcHints,
+        gc_hints: GcHints,
         background: Option<Weak<Background>>,
         router: TreeRouter,
         resolver: KeyResolver,
@@ -356,16 +359,11 @@ impl Algo {
         inline_policy: InlinePolicy,
         split_hints: SplitHintSink,
     ) -> Self {
-        let direct_commit = DirectCommit::new(
-            router,
-            coord,
-            inline_policy,
-            split_hints,
-            cleanup_hints.clone(),
-        );
-        let retirement = Arc::new(AttemptRetirement {
+        let direct_commit =
+            DirectCommit::new(router, coord, inline_policy, split_hints, gc_hints.clone());
+        let retirement = Arc::new(IdentityRetirement {
             mon: mon.clone(),
-            cleanup_hints: cleanup_hints.clone(),
+            gc_hints: gc_hints.clone(),
             background: background.clone(),
         });
         Algo {
@@ -374,7 +372,7 @@ impl Algo {
             locker,
             direct_commit,
             mon,
-            cleanup_hints,
+            gc_hints,
             timeline,
             acquisition_retry,
             split_policy,
@@ -396,12 +394,12 @@ impl Algo {
         let id = TxId::new_at(rt::system_now());
         Handle {
             accesses,
-            collections: CollectionAttempt::new(
+            collections: CollectionHandleState::new(
                 catalog_accesses,
                 self.collection_reservation_limit,
             ),
-            state: AttemptState::new(),
-            retirement: AttemptRetirementGuard::new(self.retirement.clone(), id.clone()),
+            state: HandleState::new(),
+            retirement: IdentityRetirementGuard::new(self.retirement.clone(), id.clone()),
             id,
             backoff: self.acquisition_retry.backoff(),
         }
@@ -410,9 +408,9 @@ impl Algo {
     /// Validates all reads and applies all writes.
     pub async fn commit(&self, tx: &mut Handle) -> Result<BodyDecision, TransError> {
         loop {
-            match self.commit_once(tx).await {
-                Ok(AttemptOutcome::Complete) => return Ok(BodyDecision::ReturnOutcome),
-                Ok(AttemptOutcome::RenewForSerial { replay_body, .. }) => {
+            match self.commit_pass(tx).await {
+                Ok(PassOutcome::Complete) => return Ok(BodyDecision::ReturnOutcome),
+                Ok(PassOutcome::RenewForSerial { replay_body, .. }) => {
                     self.renew_for_serial(tx).await?;
                     if replay_body {
                         return Ok(BodyDecision::ReplayBody);
@@ -425,7 +423,7 @@ impl Algo {
                 Err(TransError::Retry) => {
                     return Ok(BodyDecision::ReplayBody);
                 }
-                Err(error) => return self.retry_changed_catalog(tx, error).await,
+                Err(error) => return self.replay_changed_catalog(tx, error).await,
             }
         }
     }
@@ -433,9 +431,9 @@ impl Algo {
     /// Validates the reads and range scans of a read-only transaction.
     pub async fn validate_reads(&self, tx: &mut Handle) -> Result<BodyDecision, TransError> {
         loop {
-            match self.validate_reads_once(tx).await {
-                Ok(AttemptOutcome::Complete) => return Ok(BodyDecision::ReturnOutcome),
-                Ok(AttemptOutcome::RenewForSerial { replay_body, .. }) => {
+            match self.validation_pass(tx).await {
+                Ok(PassOutcome::Complete) => return Ok(BodyDecision::ReturnOutcome),
+                Ok(PassOutcome::RenewForSerial { replay_body, .. }) => {
                     debug_assert!(
                         !replay_body,
                         "read-only validation cannot change collections"
@@ -449,7 +447,7 @@ impl Algo {
                 Err(TransError::Retry) => {
                     return Ok(BodyDecision::ReplayBody);
                 }
-                Err(error) => return self.retry_changed_catalog(tx, error).await,
+                Err(error) => return self.replay_changed_catalog(tx, error).await,
             }
         }
     }
@@ -472,8 +470,8 @@ impl Algo {
     }
 
     /// Aborts a non-committed, engaged transaction, acknowledging it when safe
-    /// and releasing its locks lazily. An optimistic read-only attempt never
-    /// engaged, so there is nothing to abort.
+    /// and releasing its locks lazily. A read-only transaction that never left
+    /// optimistic validation never engaged, so there is nothing to abort.
     pub async fn end(&self, tx: &mut Handle) -> Result<(), TransError> {
         let result = self.end_inner(tx).await;
         if result.is_ok() {
@@ -482,38 +480,35 @@ impl Algo {
         result
     }
 
-    async fn commit_once(&self, tx: &mut Handle) -> Result<AttemptOutcome, TransError> {
+    /// Runs one commit pass as one owner operation of the current identity.
+    async fn commit_pass(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
         let owner_operation = self.mon.begin_owner_operation(&tx.id)?;
         let result = self.commit_inner(tx).await;
         let result = self.resolve_reclaimed_resources(tx, result).await;
         // Completing the guard proves that no old-identity write can land
         // after retirement. Dropping it records the opposite fact.
-        if !result
-            .as_ref()
-            .is_ok_and(AttemptOutcome::has_pending_writes)
-        {
+        if !result.as_ref().is_ok_and(PassOutcome::has_pending_writes) {
             owner_operation.complete();
         }
         result
     }
 
-    async fn validate_reads_once(&self, tx: &mut Handle) -> Result<AttemptOutcome, TransError> {
+    /// Runs one read-only commit pass as one owner operation of the current
+    /// identity.
+    async fn validation_pass(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
         let owner_operation = self.mon.begin_owner_operation(&tx.id)?;
-        let result = self.validate_attempt_reads(tx).await;
+        let result = self.validate_handle_reads(tx).await;
         let result = self.resolve_reclaimed_resources(tx, result).await;
         // Completing the guard proves that no old-identity write can land
         // after retirement. Dropping it records the opposite fact.
-        if !result
-            .as_ref()
-            .is_ok_and(AttemptOutcome::has_pending_writes)
-        {
+        if !result.as_ref().is_ok_and(PassOutcome::has_pending_writes) {
             owner_operation.complete();
         }
         result
     }
 
-    /// Retries a collection conflict when the body's directory observations changed.
-    async fn retry_changed_catalog(
+    /// Replays the body when a stale-collection error follows changed directory observations.
+    async fn replay_changed_catalog(
         &self,
         tx: &mut Handle,
         error: TransError,
@@ -526,7 +521,7 @@ impl Algo {
         }
         // Acquisition can stop before it records all held locks. Retire the
         // identity before the recheck, so a foreign directory holder cannot
-        // wait for this attempt while the recheck waits for that holder.
+        // wait for this identity while the recheck waits for that holder.
         self.end(tx).await?;
         let barrier = self.timeline.currentness_barrier();
         if self
@@ -540,12 +535,12 @@ impl Algo {
         Ok(BodyDecision::ReplayBody)
     }
 
-    /// Resolves attempt failures caused by a wounded owner's reclaimed resources.
+    /// Resolves commit failures caused by a wounded owner's reclaimed resources.
     async fn resolve_reclaimed_resources(
         &self,
         tx: &Handle,
-        result: Result<AttemptOutcome, TransError>,
-    ) -> Result<AttemptOutcome, TransError> {
+        result: Result<PassOutcome, TransError>,
+    ) -> Result<PassOutcome, TransError> {
         if tx.needs_abort()
             && matches!(
                 result,
@@ -567,7 +562,7 @@ impl Algo {
         }
         match self.mon.abort_owned_tx(&tx.id).await? {
             OwnerAbortOutcome::Acknowledged => {
-                self.cleanup_hints.schedule(tx.id.clone());
+                self.gc_hints.schedule(tx.id.clone());
                 self.collection_commit.abort(&tx.id, &tx.collections).await
             }
             // A dropped or otherwise unresolved owner operation was pinned as
@@ -575,17 +570,17 @@ impl Algo {
             // cleanup; local rollback must not race an effect that may land
             // after this future returns.
             OwnerAbortOutcome::Pinned => {
-                self.cleanup_hints.schedule(tx.id.clone());
+                self.gc_hints.schedule(tx.id.clone());
                 Ok(())
             }
             // The commit point won before cleanup observed its result. Its
-            // collection objects and delete fences now belong to the committed
-            // log and must be left for write-back/recovery.
+            // collection objects and drop intents now belong to the committed
+            // record and must be left for write-back/recovery.
             OwnerAbortOutcome::Committed => {
                 tx.commit();
                 Ok(())
             }
-            // The terminal write was dispatched but its result is no longer
+            // The commit write was dispatched but its result is no longer
             // abortable. Preserve its resources exactly as for an observed
             // committed winner.
             OwnerAbortOutcome::CommitOutcomePreserved => {
@@ -620,7 +615,7 @@ impl Algo {
         tx.renew();
     }
 
-    async fn commit_inner(&self, tx: &mut Handle) -> Result<AttemptOutcome, TransError> {
+    async fn commit_inner(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
         if !tx.accesses.has_writes() && !tx.collections.has_writes() {
             if tx.should_lock_reads() {
                 self.validate_coordination_keys(&tx.accesses)?;
@@ -629,11 +624,11 @@ impl Algo {
             return self.commit_readonly(tx).await;
         }
         self.validate_coordination_keys(&tx.accesses)?;
-        // Try the logless direct path first: a complete point transaction whose
+        // Try direct commit first: a complete point transaction whose
         // dependencies share one leaf and whose outputs fit inline commits in
-        // one leaf CAS with no transaction object (ADR-061). It writes nothing
-        // unless it commits, so a non-landing attempt is classified rather than
-        // failed (ADR-053).
+        // one leaf CAS with no transaction record (ADR-061). It writes nothing
+        // unless it commits, so a non-landing direct commit is classified rather
+        // than failed (ADR-053).
         if tx.collections.accesses().reads.is_empty()
             && tx.collections.accesses().changes.is_empty()
         {
@@ -642,20 +637,20 @@ impl Algo {
                 .try_commit(&tx.id, &tx.accesses, &mut tx.state)
                 .await?
             {
-                DirectAttempt::Committed => return Ok(AttemptOutcome::Complete),
-                // A certified logless loss reevaluates the body rather than
+                DirectOutcome::Committed => return Ok(PassOutcome::Complete),
+                // A certified direct-commit loss reevaluates the body rather than
                 // publishing a holder that would make every subsequent direct
-                // attempt on the key ineligible (ADR-053). The id is unengaged —
-                // no object, no lock, no published identity — so the ordinary
+                // commit on the key ineligible (ADR-053). The id is unengaged —
+                // no record, no lock, no published identity — so the ordinary
                 // retry contract applies with no cleanup.
-                DirectAttempt::Replay => return Err(TransError::Retry),
-                DirectAttempt::Locked => {}
+                DirectOutcome::Replay => return Err(TransError::Retry),
+                DirectOutcome::Locked => {}
             }
         }
         self.commit_locked(tx).await
     }
 
-    async fn validate_attempt_reads(&self, tx: &mut Handle) -> Result<AttemptOutcome, TransError> {
+    async fn validate_handle_reads(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
         if tx.accesses.has_writes() || tx.collections.has_writes() {
             return Err(TransError::other(
                 "cannot validate only reads when writes are present",
@@ -675,7 +670,7 @@ impl Algo {
                 .validate(None, &tx.collections, barrier)
                 .await?
         {
-            return Ok(AttemptOutcome::Complete);
+            return Ok(PassOutcome::Complete);
         }
         tx.force_locked_reads();
         Err(TransError::Retry)
@@ -693,18 +688,19 @@ impl Algo {
         Ok(())
     }
 
-    /// Read-only fast path: re-resolve each read's effective writer against the
-    /// nodes and commit if none changed. The first attempt takes no locks; a
-    /// failed validation makes the next attempt use the locked path.
+    /// Optimistic validation for read-only commit: re-resolve each read's
+    /// effective writer against the nodes and commit if none changed. The first
+    /// body execution takes no locks; a failed validation makes the next replay
+    /// use locked validation.
     ///
     /// A failed validation does not back off before signalling [`Retry`]: the
-    /// re-run re-reads the authoritative values (the cache was just invalidated)
+    /// replay re-reads the authoritative values (the cache was just invalidated)
     /// rather than busy-spinning on the stale ones, and an idle delay would only
     /// add commit latency.
     ///
     /// [`Retry`]: TransError::Retry
-    async fn commit_readonly(&self, tx: &mut Handle) -> Result<AttemptOutcome, TransError> {
-        // Read-only commit has no mutation receipt; this barrier separates the
+    async fn commit_readonly(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
+        // Read-only commit has no CAS receipt; this barrier separates the
         // completed body from the physical observations that certify it.
         let barrier = self.timeline.currentness_barrier();
         if self
@@ -716,18 +712,19 @@ impl Algo {
                 .await?
         {
             tx.commit();
-            return Ok(AttemptOutcome::Complete);
+            return Ok(PassOutcome::Complete);
         }
         tx.force_locked_reads();
         Err(TransError::Retry)
     }
 
-    /// Locked path for read-write transactions and escalated read-only retries.
-    async fn commit_locked(&self, tx: &mut Handle) -> Result<AttemptOutcome, TransError> {
+    /// Locked commit for read-write transactions and read-only transactions that
+    /// escalated to locked validation.
+    async fn commit_locked(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
         let is_new = tx.engage();
 
         self.collection_commit
-            .reconcile_retry(&tx.id, &mut tx.collections)
+            .reconcile_replay(&tx.id, &mut tx.collections)
             .await?;
         if tx.collections.has_writes() {
             let result = self
@@ -761,19 +758,19 @@ impl Algo {
         let requirement = Requirement::after(barrier);
         let locked = match self.acquire_locks(tx, requirement).await? {
             Acquired::Locked(l) => l,
-            // A higher-priority peer aborted us: renew the id and re-run.
+            // A higher-priority peer aborted us: renew the id and replay the body.
             Acquired::Wounded => return Err(TransError::Wounded),
             Acquired::RenewForSerial { pending_writes } => {
-                return Ok(AttemptOutcome::RenewForSerial {
+                return Ok(PassOutcome::RenewForSerial {
                     replay_body: tx.collections.has_writes(),
                     pending_writes,
                 });
             }
         };
 
-        // Record the held lock set so both the committed object (below) and the
-        // refresher's pending object describe their own back-references, which
-        // is what lets GC prune this transaction's locks by reverse check
+        // Record the held lock set so both the committed record (below) and the
+        // refresher's pending record describe their own recovery manifest, which
+        // is what lets GC prune this transaction's locks by a GC check
         // (ADR-022). This tracks the latest acquire; a body replay that drops
         // keys may under-record, which only defers those stale locks to lazy
         // reclaim, never a correctness loss.
@@ -782,7 +779,7 @@ impl Algo {
         self.mon.record_tx_locks(&tx.id, locks.clone());
 
         // Validate point reads and scans after their entry/predicate locks are
-        // held. A stale dependency re-runs the body under the same id while the
+        // held. An invalidated read replays the body under the same id while the
         // acquired locks prevent another change in the validation-to-commit gap.
         if !self
             .validate(
@@ -810,13 +807,13 @@ impl Algo {
             .fence(&tx.id, &mut tx.collections)
             .await?;
 
-        // Commit point: create-or-flip the transaction object to committed.
+        // Commit point: create-or-flip the transaction record to committed.
         if let Err(e) = self
             .commit_writes(&tx.accesses, &tx.collections, locks.clone(), &tx.id)
             .await
         {
             if matches!(e, TransError::AlreadyFinalized) {
-                // An abort-side terminal status won between locking and commit.
+                // An abort-side final status won between locking and commit.
                 return Err(TransError::Wounded);
             }
             return Err(e.context(format!("committing writes for tx {}", tx.id)));
@@ -840,13 +837,14 @@ impl Algo {
         self.collection_commit
             .finish_committed(&tx.collections)
             .await;
-        Ok(AttemptOutcome::Complete)
+        Ok(PassOutcome::Complete)
     }
 
-    /// Acquires and validates an escalated read-only attempt whose user body
-    /// returned an error. The caller will abort through [`Algo::end`] after a
-    /// successful validation, so this deliberately does not commit the handle.
-    async fn validate_locked_reads(&self, tx: &mut Handle) -> Result<AttemptOutcome, TransError> {
+    /// Acquires and validates a read-only transaction whose body returned an
+    /// error after escalating to locked validation. The caller will abort
+    /// through [`Algo::end`] after a successful validation, so this deliberately
+    /// does not commit the handle.
+    async fn validate_locked_reads(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
         self.validate_coordination_keys(&tx.accesses)?;
         if tx.engage() {
             self.mon.begin_tx(&tx.id);
@@ -864,7 +862,7 @@ impl Algo {
             Acquired::Locked(locked) => locked,
             Acquired::Wounded => return Err(TransError::Wounded),
             Acquired::RenewForSerial { pending_writes } => {
-                return Ok(AttemptOutcome::RenewForSerial {
+                return Ok(PassOutcome::RenewForSerial {
                     replay_body: false,
                     pending_writes,
                 });
@@ -888,7 +886,7 @@ impl Algo {
                 .validate(Some(&tx.id), &tx.collections, barrier)
                 .await?
         {
-            return Ok(AttemptOutcome::Complete);
+            return Ok(PassOutcome::Complete);
         }
         self.locker
             .collections()
@@ -897,31 +895,31 @@ impl Algo {
         Err(TransError::Retry)
     }
 
-    /// Publishes the committed transaction's pointers and releases its locks.
+    /// Publishes the committed transaction's current states and releases its locks.
     /// Idempotent and best-effort: the transaction is already durably committed,
-    /// so a write-back failure only delays lazy lock cleanup, never the result.
+    /// so a write-back failure only delays lazy lock release, never the result.
     /// It is spawned in the background so commit returns immediately rather than
-    /// waiting for the pointer publishes and lock releases; a shutdown drains
+    /// waiting for the current-state publishes and lock releases; a shutdown drains
     /// the spawned task (`Background::spawn_waited`). A live holder defers that
-    /// cleanup rather than making the task wait. Without a background executor
+    /// write-back rather than making the task wait. Without a background executor
     /// (unit tests, or after shutdown dropped it) it releases inline so locks are
     /// not left to lazy reclaim.
     async fn write_back(&self, id: &TxId, locked: LockedTx) {
         match self.background.as_ref().and_then(|w| w.upgrade()) {
             Some(bg) => {
                 let locker = self.locker.clone();
-                let cleanup_hints = self.cleanup_hints.clone();
+                let gc_hints = self.gc_hints.clone();
                 let id = id.clone();
                 // Cancelling a dedup driver may need to spawn a successor for
                 // merged callers, so shutdown drains this finite pass.
                 bg.spawn_waited(async move {
                     let superseded = locker.keys().write_back(&id, &locked).await;
-                    cleanup_hints.schedule_all(superseded);
+                    gc_hints.schedule_all(superseded);
                 });
             }
             None => {
                 let superseded = self.locker.keys().write_back(id, &locked).await;
-                self.cleanup_hints.schedule_all(superseded);
+                self.gc_hints.schedule_all(superseded);
             }
         }
     }
@@ -929,10 +927,10 @@ impl Algo {
     /// Acquires every lock the transaction needs while retaining successful
     /// leaf holds across complete-set retries.
     ///
-    /// A parallel timeout or sustained completed conflict pass asks the attempt
-    /// owner to end this identity and renew it for sorted serial acquisition.
-    /// An attempt that already starts in serial mode keeps its sorted prefix and
-    /// retries without another renewal.
+    /// A parallel timeout or repeated conflicting acquisition passes end the
+    /// commit pass and ask for an identity renewal for serial acquisition. An
+    /// identity that already starts with serial acquisition keeps its sorted
+    /// prefix and retries lock acquisition without another renewal.
     async fn acquire_locks(
         &self,
         tx: &mut Handle,
@@ -962,9 +960,9 @@ impl Algo {
             };
             match outcome {
                 Ok(LockOutcome::Locked(l)) => return Ok(Acquired::Locked(l)),
-                // A complete failed pass keeps any leaf holds that landed. The
-                // next complete pass can recognize or idempotently complete
-                // those same-identity holds.
+                // A failed acquisition pass keeps any leaf holds that landed.
+                // The next acquisition pass can recognize or idempotently
+                // complete those same-identity holds.
                 Ok(LockOutcome::Conflict) => {
                     conflicts += 1;
                     if !serial && conflicts >= SERIAL_FALLBACK_AFTER {
@@ -1080,8 +1078,8 @@ impl Algo {
     /// Reports whether every covered leaf is still in the exact state the scan
     /// observed, which needs no re-resolution of the page.
     ///
-    /// This is stronger than ADR-032's membership-version condition, so it also
-    /// covers what that version cannot: a split does not bump it, but a split
+    /// This is stronger than ADR-032's membership-generation condition, so it also
+    /// covers what that generation cannot: a split does not bump it, but a split
     /// rewrites the leaf it shrinks, and new leaves enter a range only through
     /// such a rewrite. Exact per-leaf state equality therefore leaves the
     /// covered leaf set unchanged, and the set comparison stays in the logical
@@ -1100,7 +1098,7 @@ impl Algo {
             let unchanged = match lock_validation {
                 Some(locked) => locked.certifies_membership(
                     &coverage.observation,
-                    coverage.membership_version,
+                    coverage.membership_generation,
                     barrier,
                 ),
                 None => matches!(
@@ -1140,7 +1138,7 @@ impl Algo {
             .effective_point_states(&keys, own_lock_holder, Requirement::after(barrier))
             .await?;
         for (r, state) in accesses.point_reads().iter().zip(current) {
-            if !r.validates(state.writer.as_ref(), state.membership_version) {
+            if !r.validates(state.writer.as_ref(), state.membership_generation) {
                 return Ok(false);
             }
         }
@@ -1148,9 +1146,10 @@ impl Algo {
     }
 
     /// Re-scans every range the transaction listed and reports whether each
-    /// still covers the same leaves at the same membership versions (ADR-032).
+    /// still covers the same leaves at the same membership generations (ADR-032).
     /// Pending membership writers observed by the original scan are rechecked
-    /// because their commit transition does not itself bump the node version.
+    /// because their commit transition does not itself bump the membership
+    /// generation.
     /// If physical coverage changed, status-aware resolution distinguishes a
     /// harmless split from a logical page change.
     async fn validate_scans_inner(
@@ -1173,7 +1172,7 @@ impl Algo {
             let unchanged = current.len() == scan.covered().len()
                 && !current.iter().zip(scan.covered()).any(|(now, observed)| {
                     now.path != observed.path
-                        || now.membership_version != observed.membership_version
+                        || now.membership_generation != observed.membership_generation
                 });
             if unchanged && !self.any_committed(scan.covered(), barrier).await? {
                 continue;
@@ -1209,7 +1208,7 @@ impl Algo {
                     .mon
                     .tx_status_at(holder, Requirement::after(barrier))
                     .await?
-                    == TxCommitStatus::Ok
+                    == TxCommitStatus::Committed
                 {
                     return Ok(true);
                 }
@@ -1218,36 +1217,36 @@ impl Algo {
         Ok(false)
     }
 
-    /// Builds and writes the committed transaction object (the commit point).
+    /// Builds and writes the committed transaction record (the commit point).
     /// Records `locks` (the held lock set) alongside `writes` so the object
-    /// carries its full back-reference set for GC's reverse check (ADR-022).
+    /// carries its full recovery manifest for the GC check (ADR-022).
     async fn commit_writes(
         &self,
         accesses: &AccessSet,
-        collections: &CollectionAttempt,
+        collections: &CollectionHandleState,
         locks: Vec<TxLock>,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let mut tl = TxLog::new(id.clone(), TxCommitStatus::Ok);
+        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
         for w in accesses.final_writes() {
             let (value, deleted): (Arc<[u8]>, bool) = match w.operation() {
                 WriteOp::Put(value) => (value.clone(), false),
                 WriteOp::Delete => (Arc::from(&[] as &[u8]), true),
             };
-            tl.writes.push(TxWrite {
+            record.writes.push(TxWrite {
                 key: w.key().clone(),
                 value,
                 deleted,
                 prev_writer: TxId::default(),
             });
         }
-        collections.committed_manifest(locks).apply_to(&mut tl);
+        collections.committed_manifest(locks).apply_to(&mut record);
         // `context` preserves the `AlreadyFinalized` sentinel and any in-doubt
         // outcome instead of collapsing them into a generic error.
         self.mon
-            .commit_tx(tl)
+            .commit_tx(record)
             .await
-            .map_err(|e| e.context("creating transaction object"))
+            .map_err(|e| e.context("creating transaction record"))
     }
 }
 
@@ -1269,9 +1268,9 @@ mod tests {
     use glassdb_backend::{Backend, StatsBackend, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
     use glassdb_data::{
-        CollectionAddress, CollectionId, DatabaseId, DbRoot, LeafRef, NodeToken, ObjectPath,
+        CollectionAddress, CollectionId, DatabaseId, DbPrefix, LeafRef, NodeToken, ObjectPath,
     };
-    use glassdb_storage::transaction::{TLogger, TxCommitStatus};
+    use glassdb_storage::transaction::{TxCommitStatus, TxRecordStore};
     use glassdb_storage::{
         CachedStore, CollectionRecord, CollectionStore, CurrentState, LeafBody, LeafEntry, Node,
         NodeStore, StorageError, TreeRouter,
@@ -1284,8 +1283,8 @@ mod tests {
         CollectionAddress::root(TEST_DB)
     }
 
-    fn test_db_root() -> DbRoot {
-        DbRoot::try_from(TEST_DB).unwrap()
+    fn test_db_prefix() -> DbPrefix {
+        DbPrefix::try_from(TEST_DB).unwrap()
     }
 
     pub(super) fn test_root_path() -> ObjectPath {
@@ -1300,7 +1299,7 @@ mod tests {
 
     pub(super) struct Tctx {
         pub(super) backend: Arc<dyn Backend>,
-        pub(super) tlogger: TLogger,
+        pub(super) tx_records: TxRecordStore,
         pub(super) tmon: Monitor,
         pub(super) records: CollectionStore,
         pub(super) nodes: NodeStore,
@@ -1348,9 +1347,9 @@ mod tests {
         config.set_cache_size(cache_bytes);
         config.set_split_policy(split_policy);
         config.set_protocol_timing(ProtocolTiming::simulation());
-        let foundation = AssemblyFixture::new(b.clone(), test_db_root(), &config);
+        let foundation = AssemblyFixture::new(b.clone(), test_db_prefix(), &config);
 
-        // Create the collection root so the test collection exists up front.
+        // Create the tree root so the test collection exists up front.
         foundation
             .records
             .create_record(&test_collection(), &CollectionRecord::new())
@@ -1362,13 +1361,13 @@ mod tests {
             .await
             .unwrap();
 
-        let engine = engine_fixture(&foundation, test_db_root(), config, managed_retirement);
+        let engine = engine_fixture(&foundation, test_db_prefix(), config, managed_retirement);
         let algo = engine.algo.clone();
         (
             algo,
             Tctx {
                 backend: b,
-                tlogger: foundation.tlogger.clone(),
+                tx_records: foundation.tx_records.clone(),
                 tmon: foundation.monitor.clone(),
                 records: foundation.records.clone(),
                 nodes: foundation.nodes.clone(),
@@ -1494,7 +1493,7 @@ mod tests {
         let mut peer_handle = begin_accesses(&peer, accesses);
         tokio::time::timeout(Duration::from_secs(1), peer.commit(&mut peer_handle))
             .await
-            .expect("protocol helping did not make progress")
+            .expect("protocol help-forward did not make progress")
             .unwrap();
         peer.end(&mut peer_handle).await.unwrap();
     }
@@ -1514,17 +1513,17 @@ mod tests {
         tm.end(&mut h).await.unwrap();
 
         let status = tctx
-            .tlogger
+            .tx_records
             .commit_status_at(&tid, Requirement::ANY)
             .await
             .unwrap();
         assert_eq!(status.status, TxCommitStatus::Unknown);
         assert!(
             matches!(
-                tctx.tlogger.get_at(&tid, Requirement::ANY).await,
+                tctx.tx_records.get_at(&tid, Requirement::ANY).await,
                 Err(StorageError::NotFound)
             ),
-            "a direct create has no transaction object"
+            "a direct create has no transaction record"
         );
 
         // The leaf entry points at the committed writer and the lock is gone.
@@ -1533,11 +1532,11 @@ mod tests {
         assert!(e.lock_holders().is_empty());
     }
 
-    // Regression (review 1.1 / ADR-022): the committed transaction object must
-    // record its full lock set, not just its writes, so GC's reverse liveness
-    // check and lock pruning operate on real logs. A transaction that reads one
-    // key and creates another records both entry locks plus the leaf's structure
-    // and membership scopes (ADR-032).
+    // Regression (review 1.1 / ADR-022): the committed transaction record must
+    // record its full lock set, not just its writes, so the GC check
+    // and lock pruning operate on real records. A transaction that reads one
+    // key and creates another records both key locks plus the leaf's structural
+    // gate and membership scopes (ADR-032).
     #[tokio::test]
     async fn commit_records_locks() {
         let (tm, tctx) = new_algo().await;
@@ -1548,34 +1547,38 @@ mod tests {
         commit_writes(&tm, vec![wa(&readp, b"seed")]).await;
 
         let r = do_read(&tctx, &readp).await;
-        let logged = vec![b'v'; InlinePolicy::default().max_value_bytes + 1];
+        let external = vec![b'v'; InlinePolicy::default().max_value_bytes + 1];
         let mut h = begin_accesses(
             &tm,
-            AccessSet::new(vec![r], vec![wa(&writep, &logged)], Vec::new()),
+            AccessSet::new(vec![r], vec![wa(&writep, &external)], Vec::new()),
         );
         tm.commit(&mut h).await.unwrap();
         let tid = h.id().clone();
         tm.end(&mut h).await.unwrap();
 
-        let txlog = tctx.tlogger.get_at(&tid, Requirement::ANY).await.unwrap();
-        let txlog = txlog.value().unwrap();
-        assert!(txlog.locks.contains(&TxLock::Entry {
+        let record = tctx
+            .tx_records
+            .get_at(&tid, Requirement::ANY)
+            .await
+            .unwrap();
+        let record = record.value().unwrap();
+        assert!(record.locks.contains(&TxLock::Key {
             key: readp,
             typ: LockType::Read,
         }));
-        assert!(txlog.locks.contains(&TxLock::Entry {
+        assert!(record.locks.contains(&TxLock::Key {
             key: writep,
             typ: LockType::Write,
         }));
         let leaf = LeafRef::root(test_collection());
-        assert!(txlog.locks.contains(&TxLock::Membership {
+        assert!(record.locks.contains(&TxLock::Membership {
             leaf,
             typ: LockType::Write,
         }));
     }
 
     #[tokio::test]
-    async fn committed_manifest_preserves_prepared_roots_from_earlier_attempts() {
+    async fn committed_manifest_preserves_prepared_roots_from_earlier_body_runs() {
         let (tm, tctx) = new_algo().await;
         let earlier = CollectionAddress::new(
             TEST_DB,
@@ -1622,11 +1625,11 @@ mod tests {
             .await
             .unwrap();
 
-        let log = tctx.tlogger.get_at(&id, Requirement::ANY).await.unwrap();
-        let log = log.value().unwrap();
-        assert_eq!(log.prepared_collections, vec![earlier, active.clone()]);
-        assert_eq!(log.collection_changes.len(), 1);
-        assert_eq!(log.collection_changes[0].collection, active);
+        let record = tctx.tx_records.get_at(&id, Requirement::ANY).await.unwrap();
+        let record = record.value().unwrap();
+        assert_eq!(record.prepared_collections, vec![earlier, active.clone()]);
+        assert_eq!(record.collection_changes.len(), 1);
+        assert_eq!(record.collection_changes[0].collection, active);
     }
 
     #[tokio::test]
@@ -1650,7 +1653,7 @@ mod tests {
             },
         );
         let id = handle.id().clone();
-        let lock = TxLock::Topology {
+        let lock = TxLock::TopologyParticipant {
             collection: test_collection(),
         };
         tm.mon
@@ -1669,13 +1672,13 @@ mod tests {
             .await
             .unwrap();
 
-        let log = tctx.tlogger.get_at(&id, Requirement::ANY).await.unwrap();
-        let log = log.value().unwrap();
-        assert_eq!(log.status, TxCommitStatus::Pending);
-        assert_eq!(log.locks, vec![lock]);
-        assert_eq!(log.collection_changes.len(), 1);
-        assert_eq!(log.collection_changes[0].collection, created.clone());
-        assert_eq!(log.prepared_collections, vec![created]);
+        let record = tctx.tx_records.get_at(&id, Requirement::ANY).await.unwrap();
+        let record = record.value().unwrap();
+        assert_eq!(record.status, TxCommitStatus::Pending);
+        assert_eq!(record.locks, vec![lock]);
+        assert_eq!(record.collection_changes.len(), 1);
+        assert_eq!(record.collection_changes[0].collection, created.clone());
+        assert_eq!(record.prepared_collections, vec![created]);
     }
 
     #[tokio::test]
@@ -1722,7 +1725,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_retried_body_clears_a_discarded_partial_drop() {
+    async fn a_replayed_body_clears_a_discarded_partial_drop() {
         let (tm, tctx) = new_algo().await;
         let dropped = CollectionAddress::new(
             TEST_DB,
@@ -1774,7 +1777,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(root.collection_delete_intent(), None);
+        assert_eq!(root.drop_intent(), None);
         let (record, _) = tctx
             .records
             .load_record(&dropped, Requirement::ANY)
@@ -1805,13 +1808,13 @@ mod tests {
     }
 
     // Full path (ADR-024): a read whose value moved before it was locked does not
-    // abort-and-renew; it re-runs the body in place (`Retry`) while holding its
+    // abort-and-renew; it replays the body in place (`Retry`) while holding its
     // locks. The engine validates *after* locking, so unlike a pre-lock check the
-    // moved key is itself locked during the re-run window — the v1 guarantee that
-    // the retry holds all its locks. An over-inline-budget output explicitly
-    // forces the full locked path.
+    // moved key is itself locked during the replay window — the v1 guarantee that
+    // the replay holds all its locks. An over-inline-budget output explicitly
+    // forces locked commit.
     #[tokio::test]
-    async fn stale_read_write_retries_holding_locks() {
+    async fn invalidated_read_write_retries_holding_locks() {
         let (tm, tctx) = new_algo().await;
         let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
         let ka = logical_key(b"k");
@@ -1823,18 +1826,22 @@ mod tests {
         commit_writes(&tm2, vec![wa(&kb, b"x1")]).await;
         let ra = do_read(&tctx, &ka).await;
 
-        // Another client overwrites `k`, making `ra` stale.
+        // Another database instance overwrites `k`, making `ra` stale.
         commit_writes(&tm2, vec![wa(&ka, b"v2")]).await;
 
-        let logged = vec![b'x'; InlinePolicy::default().max_value_bytes + 1];
+        let external = vec![b'x'; InlinePolicy::default().max_value_bytes + 1];
         let mut h = begin_accesses(
             &tm,
-            AccessSet::new(vec![ra], vec![wa(&ka, b"v3"), wa(&kb, &logged)], Vec::new()),
+            AccessSet::new(
+                vec![ra],
+                vec![wa(&ka, b"v3"), wa(&kb, &external)],
+                Vec::new(),
+            ),
         );
         assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
 
-        // The moved key is locked by us when the stale read is signalled: the
-        // re-run owns the lock and cannot lose it again to the same race.
+        // The moved key is locked by us when the invalidated read is signalled: the
+        // replay owns the lock and cannot lose it again to the same race.
         let e = entry(&tctx, b"k").await.expect("entry exists");
         assert_eq!(e.lock_holders(), std::slice::from_ref(h.id()));
 
@@ -1864,7 +1871,7 @@ mod tests {
     }
 
     // ADR-065: a timed-out parallel acquisition asks its owner to make the old
-    // identity durably abort-side before it renews for sorted serial locking.
+    // identity durably abort-side before it renews for serial acquisition.
     #[tokio::test(start_paused = true)]
     async fn deadlock_timeout_renews_before_serial_acquisition() {
         use crate::tlocker::LockOutcome;
@@ -1905,12 +1912,12 @@ mod tests {
         });
 
         // The parallel wait times out. The algorithm retires the old identity
-        // and continues under a renewed identity in serial mode.
+        // and continues under a renewed identity with serial acquisition.
         rt::sleep(MAX_DEADLOCK_TIMEOUT + Duration::from_secs(1)).await;
         assert!(!committing.is_finished());
 
         let old_status = tctx
-            .tlogger
+            .tx_records
             .commit_status_at(&id_before, Requirement::ANY)
             .await
             .unwrap();
@@ -1931,7 +1938,7 @@ mod tests {
         tm.end(&mut h).await.unwrap();
     }
 
-    // A database can contain an unsafe singleton written by an older client or
+    // A database can contain an unsafe singleton written by an older database instance or
     // admitted under a former policy. If capacity remains unavailable while the
     // splitter cannot relieve it, lock acquisition must report the bounded wait
     // instead of retrying forever.
@@ -2004,7 +2011,7 @@ mod tests {
             tm.commit(&mut handle),
         )
         .await
-        .expect("the unchanged full leaf must produce a terminal result")
+        .expect("the unchanged full leaf must produce a final result")
         .unwrap_err();
         match error {
             TransError::Other { msg, .. } => {
@@ -2087,7 +2094,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn stale_read_replay_reports_an_earlier_internal_renewal() {
+    async fn invalidated_read_replay_reports_an_earlier_internal_renewal() {
         let (backend, flaky) = FlakyCas::wrap(
             Arc::new(MemoryBackend::new()),
             test_root_path().to_string(),
@@ -2095,14 +2102,14 @@ mod tests {
         );
         let (algo, context) = new_algo_from_backend(backend).await;
         let key = logical_key(b"key");
-        let logged = vec![1; InlinePolicy::default().max_value_bytes + 1];
-        commit_writes(&algo, vec![wa(&key, &logged)]).await;
+        let external = vec![1; InlinePolicy::default().max_value_bytes + 1];
+        commit_writes(&algo, vec![wa(&key, &external)]).await;
         let stale = do_read(&context, &key).await;
         commit_writes(&algo, vec![wa(&key, b"changed")]).await;
         flaky.arm();
         let mut handle = begin_accesses(
             &algo,
-            AccessSet::new(vec![stale], vec![wa(&key, &logged)], Vec::new()),
+            AccessSet::new(vec![stale], vec![wa(&key, &external)], Vec::new()),
         );
         let old_id = handle.id().clone();
         assert_eq!(
@@ -2118,7 +2125,7 @@ mod tests {
     // serial acquisition. They do not replay the transaction body.
     //
     // Direct publication is disabled explicitly so this test genuinely
-    // exercises the full locked path's renewed serial-fallback behaviour.
+    // exercises locked commit's renewed serial-fallback behaviour.
     #[tokio::test(start_paused = true)]
     async fn cas_contention_renews_before_serial_acquisition() {
         let retry = RetryConfig {
@@ -2179,8 +2186,8 @@ mod tests {
         assert_eq!(outcome, BodyDecision::ReturnOutcome);
         assert_ne!(*h.id(), id_before);
         let status_objects = CachedStore::new(status_backend, 1024, Timeline::new(), None);
-        let status_logger = TLogger::new(status_objects.clone(), test_db_root());
-        let old_status = status_logger
+        let status_records = TxRecordStore::new(status_objects.clone(), test_db_prefix());
+        let old_status = status_records
             .commit_status_at(&id_before, Requirement::ANY)
             .await
             .unwrap();
@@ -2189,7 +2196,7 @@ mod tests {
 
         // The whole budget was consumed, so the transaction did exhaust the
         // serial CAS budget (the `Conflict` path), not merely time out in
-        // parallel mode.
+        // parallel acquisition.
         assert_eq!(flaky.remaining(), 0, "expected sustained CAS contention");
         let attempts = flaky.attempts();
         assert!(attempts.len() > failures);
@@ -2221,7 +2228,7 @@ mod tests {
     }
 
     // Builds an algo whose backend records every operation, so tests can prove
-    // which commit path ran by counting the CAS writes it issued.
+    // whether direct commit or locked commit ran by counting the CAS writes it issued.
     pub(super) async fn new_recording_algo() -> (Algo, Tctx, OpLog) {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let rec = Arc::new(RecordingBackend::new(mem));
@@ -2230,18 +2237,18 @@ mod tests {
         (tm, tctx, log)
     }
 
-    // CAS-write counts by object kind, the fingerprint of a commit path: a
-    // logless direct commit (ADR-051) issues one leaf write and no tx object at
-    // all; the locked path issues one tx-object write and two leaf writes (the
-    // lock CAS then the write-back CAS that publishes the pointer — run
+    // CAS-write counts by object kind, the fingerprint of direct commit vs locked commit: a
+    // Direct commit (ADR-051) issues one leaf write and no transaction record at
+    // all; locked commit issues one transaction-record write and two leaf writes (the
+    // lock CAS then the write-back CAS that publishes the current state — run
     // synchronously here because tests build the algo with no background
     // executor). Node-level
     // locks are included in those writes rather than adding another CAS (ADR-032).
     #[derive(Debug, Default)]
     pub(super) struct WriteCounts {
         // Writes to a leaf coordination object (ADR-031): a standalone node
-        // `/_n/` or the collection root `/_r`, which holds the small collection's
-        // single leaf entries. Entry-lock and write-back CAS both land here and
+        // `/_n/` or the tree root `/_r`, which holds the small collection's
+        // single leaf entries. Key-lock and write-back CAS both land here and
         // cannot be told apart by path alone.
         pub(super) leaf: usize,
         pub(super) tx: usize,
@@ -2269,10 +2276,10 @@ mod tests {
     // substring checks would mistake its object create for a standalone-node
     // write and make commit-path counts depend on random transaction entropy.
     #[test]
-    fn write_counts_parses_transaction_shard_named_like_node() {
+    fn write_counts_parses_transaction_prefix_named_like_node() {
         let id = TxId::from_bytes(vec![0x97, 0x30]);
         let path = ObjectPath::Transaction {
-            db_root: test_db_root(),
+            db_prefix: test_db_prefix(),
             id,
         }
         .to_string();
@@ -2319,12 +2326,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logged_rw_commit_reuses_cached_leaf() {
+    async fn locked_rw_commit_reuses_cached_leaf() {
         let (tm, tctx, log) = new_recording_algo_big_cache().await;
         let key = logical_key(b"key");
         commit_writes(&tm, vec![wa(&key, b"initial")]).await;
         let read = do_read(&tctx, &key).await;
-        // This value requires the logged protocol, including lock acquisition,
+        // This value requires locked commit, including lock acquisition,
         // post-lock validation, and write-back.
         let value = vec![b'x'; InlinePolicy::default().max_value_bytes + 1];
         let mut handle = begin_accesses(
@@ -2429,8 +2436,8 @@ mod tests {
         let mut edit = loaded.into_edit();
         edit.set_entries(LeafBody::new());
         let mut locks = edit.locks().clone();
-        locks.advance_membership_version();
-        locks.advance_membership_version();
+        locks.advance_membership_generation();
+        locks.advance_membership_generation();
         edit.set_locks(locks);
         assert!(tctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
         assert!(
@@ -2525,18 +2532,18 @@ mod tests {
         let accesses = AccessSet::new(vec![read], Vec::new(), Vec::new());
         let barrier = tctx.timeline.currentness_barrier();
 
-        // Finalize only the transaction object. The leaf still contains the
+        // Finalize only the transaction record. The leaf still contains the
         // same pending lock, so leaf validation alone cannot detect that the
         // effective writer moved.
-        let mut log = TxLog::new(holder.clone(), TxCommitStatus::Ok);
-        log.locks = locked.locked_paths();
-        log.writes.push(TxWrite {
+        let mut record = TxRecord::new(holder.clone(), TxCommitStatus::Committed);
+        record.locks = locked.locked_paths();
+        record.writes.push(TxWrite {
             key: keyp,
             value: Arc::from(b"v2".as_slice()),
             deleted: false,
             prev_writer: previous,
         });
-        tctx.tmon.commit_tx(log).await.unwrap();
+        tctx.tmon.commit_tx(record).await.unwrap();
 
         assert!(
             !tm.validate_read_observations(&accesses, barrier, None)
@@ -2608,7 +2615,7 @@ mod tests {
         let kb = logical_key(b"b");
         commit_writes(&tm, vec![wa(&ka, b"a0"), wa(&kb, b"b0")]).await;
 
-        // `commit_writes` publishes pointers in a background task. This test is
+        // `commit_writes` publishes current states in a background task. This test is
         // about the next lock CAS's receipt, so first wait until that unrelated
         // setup CAS has left the shared leaf quiescent; otherwise it can change
         // the exact observation between `do_read` and the lock under test.
@@ -2627,7 +2634,7 @@ mod tests {
 
         let read = do_read(&tctx, &ka).await;
         let observed = read.observation().clone();
-        let observed_membership = observed.value().unwrap().membership_version();
+        let observed_membership = observed.value().unwrap().membership_generation();
         let barrier = tctx.timeline.currentness_barrier();
 
         // Another transaction's disjoint lock CAS validates the same pre-CAS
@@ -2701,7 +2708,7 @@ mod tests {
         let read = do_read(&tctx, &ka).await;
         let barrier = tctx.timeline.currentness_barrier();
 
-        // A separate client rewrites the shared leaf for B. Its cache is
+        // A separate database instance rewrites the shared leaf for B. Its cache is
         // independent, so it cannot advance the retained observation of A in
         // this database.
         let external_timeline = Timeline::new();
@@ -2735,7 +2742,7 @@ mod tests {
         edit.set_entries(LeafBody::from_entries(entries.into_values()));
         assert!(external.commit_leaf(edit).await.unwrap().is_applied());
 
-        // A local disjoint lock observes that external version and publishes a
+        // A local disjoint lock observes that external state and publishes a
         // still newer state after our barrier. The original physical revision
         // no longer matches, but A's effective writer remains unchanged.
         let other = TxId::with_priority(4, b"other");
@@ -2786,7 +2793,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readonly_retry_locks_its_complete_point_read_set() {
+    async fn readonly_replay_locks_its_complete_point_read_set() {
         let (tm, tctx) = new_algo().await;
         let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
         let ka = logical_key(b"a");
@@ -2804,20 +2811,24 @@ mod tests {
             assert_eq!(
                 entry(&tctx, key).await.unwrap().lock_type(),
                 LockType::None,
-                "the failed OCC attempt must not lock"
+                "failed optimistic validation must not lock"
             );
         }
 
-        // The retry re-reads, then its second validation acquires locks for the
+        // The replay re-reads, then its second validation acquires locks for the
         // complete fresh read set before deciding whether it can commit.
         let ra = do_read(&tctx, &ka).await;
         let rb = do_read(&tctx, &kb).await;
         tm.reset(&mut h, AccessSet::new(vec![ra, rb], Vec::new(), Vec::new()));
         tm.commit(&mut h).await.unwrap();
-        let log = tctx.tlogger.get_at(h.id(), Requirement::ANY).await.unwrap();
-        let log = log.value().unwrap();
+        let record = tctx
+            .tx_records
+            .get_at(h.id(), Requirement::ANY)
+            .await
+            .unwrap();
+        let record = record.value().unwrap();
         for key in [ka, kb] {
-            assert!(log.locks.contains(&TxLock::Entry {
+            assert!(record.locks.contains(&TxLock::Key {
                 key,
                 typ: LockType::Read,
             }));
@@ -2873,7 +2884,7 @@ mod tests {
         assert!(entry(&tctx, b"k2").await.unwrap().exists());
     }
 
-    // Installs live committed pointers for `keys` directly in the collection's
+    // Installs live committed current states for `keys` directly in the collection's
     // root leaf `_r` (no lock holders or pending write-back), giving scan tests a
     // stable membership baseline.
     async fn seed_live_keys(tctx: &Tctx, keys: &[&[u8]]) {
@@ -2973,7 +2984,7 @@ mod tests {
 
     // ADR-031 phantom prevention: a listing whose covered leaves are unchanged
     // commits, but one whose leaf a concurrent create mutated (bumping the leaf
-    // version) fails validation and must re-run — so the create can never appear
+    // generation) fails validation and must replay the body — so the create can never appear
     // as a phantom inside an already-validated snapshot.
     #[tokio::test]
     async fn scan_detects_racing_create() {
@@ -3000,23 +3011,23 @@ mod tests {
         );
         assert!(
             stale.should_lock_reads(),
-            "scan retry escalates to read locks"
+            "scan body replay escalates to read locks"
         );
 
-        // The retry computes a fresh page, then commits through the locked path.
+        // The body replay computes a fresh page, then commits through locked commit.
         let (fresh, keys) = scan_accesses(&tctx).await;
         assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
         tm.reset(&mut stale, fresh);
         tctx.locker.stats_and_reset();
         tm.commit(&mut stale).await.unwrap();
         assert!(tctx.locker.stats_and_reset().calls >= 1);
-        let log = tctx
-            .tlogger
+        let record = tctx
+            .tx_records
             .get_at(stale.id(), Requirement::ANY)
             .await
             .unwrap();
-        let log = log.value().unwrap();
-        assert!(log.locks.iter().any(|lock| matches!(
+        let record = record.value().unwrap();
+        assert!(record.locks.iter().any(|lock| matches!(
             lock,
             TxLock::Membership {
                 typ: LockType::Read,
@@ -3055,17 +3066,17 @@ mod tests {
         let (scan, keys) = scan_accesses(&tctx).await;
         assert!(keys.is_empty());
 
-        // Commit only the transaction object: membership_version is unchanged
+        // Commit only the transaction record: membership_generation is unchanged
         // until write-back, so the dependency is what must reject validation.
-        let mut log = TxLog::new(holder.clone(), TxCommitStatus::Ok);
-        log.locks = locked.locked_paths();
-        log.writes.push(TxWrite {
+        let mut record = TxRecord::new(holder.clone(), TxCommitStatus::Committed);
+        record.locks = locked.locked_paths();
+        record.writes.push(TxWrite {
             key: key_path,
             value: Arc::from(b"value".as_slice()),
             deleted: false,
             prev_writer: TxId::default(),
         });
-        tctx.tmon.commit_tx(log).await.unwrap();
+        tctx.tmon.commit_tx(record).await.unwrap();
 
         let mut stale = begin_accesses(&tm, scan);
         assert_eq!(
@@ -3084,18 +3095,18 @@ mod tests {
 
         let mut handle = begin_accesses(&tm, accesses);
         tm.commit(&mut handle).await.unwrap();
-        let log = tctx
-            .tlogger
+        let record = tctx
+            .tx_records
             .get_at(handle.id(), Requirement::ANY)
             .await
             .unwrap();
-        let log = log.value().unwrap();
-        assert!(log.locks.contains(&TxLock::Entry {
+        let record = record.value().unwrap();
+        assert!(record.locks.contains(&TxLock::Key {
             key: key_path,
             typ: LockType::Write,
         }));
         let leaf = LeafRef::root(test_collection());
-        assert!(log.locks.contains(&TxLock::Membership {
+        assert!(record.locks.contains(&TxLock::Membership {
             leaf,
             typ: LockType::Read,
         }));
@@ -3131,7 +3142,7 @@ mod tests {
             BodyDecision::ReplayBody
         );
 
-        // The body re-runs while S0 stays locked. Its new frontier is `m`, so
+        // The body replays while S0 stays locked. Its new frontier is `m`, so
         // the next validation adds S1 before committing.
         let (fresh, keys) =
             scan_accesses_for_range(&tctx, range, vec![wa(&logical_key(b"a"), b"updated")]).await;
@@ -3140,17 +3151,17 @@ mod tests {
         tm.reset(&mut handle, fresh);
         tm.commit(&mut handle).await.unwrap();
 
-        let log = tctx
-            .tlogger
+        let record = tctx
+            .tx_records
             .get_at(handle.id(), Requirement::ANY)
             .await
             .unwrap();
-        let log = log.value().unwrap();
+        let record = record.value().unwrap();
         for token in [
             NodeToken::from_bytes([0; 16]),
             NodeToken::from_bytes([1; 16]),
         ] {
-            assert!(log.locks.contains(&TxLock::Membership {
+            assert!(record.locks.contains(&TxLock::Membership {
                 leaf: LeafRef::node(test_collection(), token),
                 typ: LockType::Read,
             }));
@@ -3159,7 +3170,7 @@ mod tests {
     }
 
     // ADR-032 phantom prevention: a delete bumps the covered leaf's membership
-    // version, so an earlier scan fails re-validation.
+    // generation, so an earlier scan fails re-validation.
     #[tokio::test]
     async fn scan_detects_racing_delete() {
         let (tm, tctx) = new_algo().await;
@@ -3235,16 +3246,16 @@ mod tests {
             );
             if !insert {
                 let observed = tctx
-                    .tlogger
+                    .tx_records
                     .get_at(handle.id(), Requirement::ANY)
                     .await
                     .unwrap();
-                let log = observed.value().unwrap();
+                let record = observed.value().unwrap();
                 for token in [
                     NodeToken::from_bytes([0; 16]),
                     NodeToken::from_bytes([1; 16]),
                 ] {
-                    assert!(log.locks.contains(&TxLock::Membership {
+                    assert!(record.locks.contains(&TxLock::Membership {
                         leaf: LeafRef::node(test_collection(), token),
                         typ: LockType::Read,
                     }));
@@ -3264,8 +3275,8 @@ mod tests {
     }
 
     // ADR-032 says a split is caught by the covered-leaf-set change, not by the
-    // membership version, which a split never bumps. The locked shortcut compares
-    // the exact observed leaf state instead of that version, and a split rewrites
+    // membership generation, which a split never bumps. The locked shortcut compares
+    // the exact observed leaf state instead of that generation, and a split rewrites
     // the leaf it shrinks. So a create in the leaf a split produced — a leaf no
     // coverage entry names — still forces logical re-resolution of the page.
     #[tokio::test]
@@ -3327,7 +3338,7 @@ mod tests {
             .await
             .unwrap();
 
-        // A peer then creates `z` in S2. It bumps only S2's membership version,
+        // A peer then creates `z` in S2. It bumps only S2's membership generation,
         // which no coverage entry of the earlier scan carries.
         let (s2, s2_ver) = tctx
             .nodes
@@ -3375,8 +3386,8 @@ mod tests {
         );
 
         // Append a key past the current maximum: it lands in the last covered
-        // leaf S1, bumping its version.
-        let (s1, ver) = tctx
+        // leaf S1, bumping its membership generation.
+        let (s1, s1_observation) = tctx
             .nodes
             .load_node(
                 &test_collection(),
@@ -3394,7 +3405,12 @@ mod tests {
         new_s1.set_membership_writer(membership_writer.clone());
         new_s1.remove_membership_holder(&membership_writer);
         tctx.nodes
-            .store_node(&test_collection(), &s1_token, &new_s1, Some(&ver))
+            .store_node(
+                &test_collection(),
+                &s1_token,
+                &new_s1,
+                Some(&s1_observation),
+            )
             .await
             .unwrap();
 

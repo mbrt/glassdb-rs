@@ -64,7 +64,7 @@ impl FusedIterator for KeyIter {}
 pub struct CollectionEntry {
     /// The raw child name.
     pub name: Vec<u8>,
-    /// A handle bound to the listed incarnation.
+    /// A handle bound to the listed collection ID.
     pub collection: Collection,
 }
 
@@ -78,7 +78,7 @@ impl CollectionEntry {
 ///
 /// The child directory is materialized before this owned iterator is returned,
 /// so iteration performs no I/O and cannot fail. Children are yielded in
-/// raw-name order, and every handle remains bound to the listed incarnation.
+/// raw-name order, and every handle remains bound to the listed collection ID.
 pub struct CollectionIter(MaterializedIter<CollectionEntry>);
 
 impl CollectionIter {

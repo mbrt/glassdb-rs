@@ -87,10 +87,10 @@ async fn unlimited_object_writes_do_not_back_off() {
     let backend = DelayBackend::new(Arc::new(MemoryBackend::new()), options).unwrap();
 
     let outcome = tokio::time::timeout(Duration::from_millis(100), async {
-        let mut version = backend.write_if_not_exists("same", vec![0]).await.unwrap();
+        let mut revision = backend.write_if_not_exists("same", vec![0]).await.unwrap();
         for value in 1..=3 {
-            version = backend
-                .write_if("same", vec![value], &version)
+            revision = backend
+                .write_if("same", vec![value], &revision)
                 .await
                 .unwrap();
         }

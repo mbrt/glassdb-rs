@@ -172,7 +172,7 @@ struct OpsPerTx {
     obj_writes_per_tx: f64,
     obj_lists_per_tx: f64,
     total_ops_per_tx: f64,
-    retries_per_tx: f64,
+    replays_per_tx: f64,
 }
 
 /// Coordinator and direct-path counters for the whole mixed cell.
@@ -238,7 +238,7 @@ struct RawOps {
     writes: u64,
     lists: u64,
     txn: u64,
-    retries: u64,
+    replays: u64,
 }
 
 impl RawOps {
@@ -248,7 +248,7 @@ impl RawOps {
             writes: delta.backend.obj_writes,
             lists: delta.backend.obj_lists,
             txn: delta.transactions.completed,
-            retries: delta.transactions.retries,
+            replays: delta.transactions.replays,
         }
     }
 
@@ -258,7 +258,7 @@ impl RawOps {
             writes: self.writes + other.writes,
             lists: self.lists + other.lists,
             txn: self.txn + other.txn,
-            retries: self.retries + other.retries,
+            replays: self.replays + other.replays,
         }
     }
 
@@ -271,7 +271,7 @@ impl RawOps {
             obj_writes_per_tx: self.writes as f64 / denominator,
             obj_lists_per_tx: self.lists as f64 / denominator,
             total_ops_per_tx: (self.reads + self.writes + self.lists) as f64 / denominator,
-            retries_per_tx: self.retries as f64 / denominator,
+            replays_per_tx: self.replays as f64 / denominator,
         }
     }
 }
@@ -358,7 +358,7 @@ mod tests {
             Stats {
                 transactions: TransactionStats {
                     completed: 3,
-                    retries: 2,
+                    replays: 2,
                     ..Default::default()
                 },
                 backend: BackendStats {
@@ -380,7 +380,7 @@ mod tests {
             Stats {
                 transactions: TransactionStats {
                     completed: 2,
-                    retries: 1,
+                    replays: 1,
                     ..Default::default()
                 },
                 backend: BackendStats {
@@ -425,7 +425,7 @@ mod tests {
         "objListsPerTx": 0.6666666666666666,
         "objReadsPerTx": 3.0,
         "objWritesPerTx": 2.0,
-        "retriesPerTx": 1.0,
+        "replaysPerTx": 1.0,
         "totalOpsPerTx": 5.666666666666667,
         "txn": 3
       },
@@ -475,7 +475,7 @@ mod tests {
         "objListsPerTx": 0.0,
         "objReadsPerTx": 0.0,
         "objWritesPerTx": 0.0,
-        "retriesPerTx": 0.0,
+        "replaysPerTx": 0.0,
         "totalOpsPerTx": 0.0,
         "txn": 0
       },

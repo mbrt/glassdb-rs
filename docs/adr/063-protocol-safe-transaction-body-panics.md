@@ -24,11 +24,11 @@ inconsistent and peers blocked until lease recovery.
 ## Decision
 
 Body panics propagate immediately with their original payload. They are not
-read-validated or retried, including when the body observed a stale snapshot.
+read-validated or replayed, including when the body observed a stale snapshot.
 Snapshot transparency applies only to normal returned values and errors.
 
 Cancellation and unwinding share one armed retirement guard for each active
-engine attempt. The guard is disarmed only after owner finalization succeeds.
+transaction identity. The guard is disarmed only after owner finalization succeeds.
 Otherwise its drop synchronously hands the identity to the engine, clears
 process-local lock ownership, and admits waited recovery that either settles
 the owner abort or leaves a durable recovery fence. Physical locks and prepared
@@ -36,7 +36,7 @@ objects are not eagerly reclaimed; helpers and garbage collection recover them
 from durable protocol state. Cleanup failures are diagnostic and never replace
 the panic.
 
-The guarantee covers framework-owned attempt resources. Detached work and
+The guarantee covers framework-owned identity resources. Detached work and
 external side effects started by a body remain the caller's responsibility.
 Repository-owned conditions derived from transaction reads continue to return
 errors so they remain eligible for validation and replay. With `panic=abort`,

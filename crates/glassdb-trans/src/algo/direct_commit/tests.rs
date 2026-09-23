@@ -10,17 +10,18 @@ use super::super::tests::{
 use super::super::*;
 use super::*;
 use crate::key_state_resolver::KeyStateResolver;
-use crate::leaf_coord::{LeafResolver, MemberOutcome, ReloadCause, ResolveCtx, Step};
+use crate::leaf_coord::{MemberOutcome, MemberPolicy, ReloadCause, ResolveCtx, Step};
 use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend};
 use glassdb_backend::{Backend, memory::MemoryBackend};
 use glassdb_data::{CollectionAddress, CollectionId, NodeToken};
+use glassdb_storage::transaction::{TxCommitStatus, TxRecord};
 use glassdb_storage::{
     CollectionRecord, CurrentState, IndexNode, LeafBody, LeafEntry, Node, NodeLocks,
 };
 
-/// Evaluates one resolver and retains its proposed decision.
+/// Evaluates one policy and retains its proposed decision.
 async fn resolve_step(
-    resolver: &dyn LeafResolver,
+    policy: &dyn MemberPolicy,
     tctx: &Tctx,
     cause: ReloadCause,
     staged: &BTreeMap<Vec<u8>, LeafEntry>,
@@ -33,23 +34,23 @@ async fn resolve_step(
         requirement: Requirement::ANY,
         cause,
     };
-    resolver.resolve(&ctx, staged, locks).await.unwrap()
+    policy.resolve(&ctx, staged, locks).await.unwrap()
 }
 
 /// Classifies a direct-commit outcome for a chosen leaf state and reload cause.
 async fn resolve_outcome(
-    resolver: &dyn LeafResolver,
+    policy: &dyn MemberPolicy,
     tctx: &Tctx,
     cause: ReloadCause,
     staged: &BTreeMap<Vec<u8>, LeafEntry>,
     locks: &NodeLocks,
 ) -> MemberOutcome {
-    match resolve_step(resolver, tctx, cause, staged, locks).await {
+    match resolve_step(policy, tctx, cause, staged, locks).await {
         Step::Skip { outcome } | Step::Stage { outcome, .. } => outcome,
     }
 }
 
-fn put_resolver(
+fn put_policy(
     tm: &Algo,
     id: TxId,
     key: LogicalKey,
@@ -79,7 +80,7 @@ fn put_resolver(
     )
 }
 
-async fn membership_version(tctx: &Tctx) -> u64 {
+async fn membership_generation(tctx: &Tctx) -> u64 {
     tctx.nodes
         .load_leaf(
             &test_root_path(),
@@ -88,19 +89,19 @@ async fn membership_version(tctx: &Tctx) -> u64 {
         .await
         .unwrap()
         .locks()
-        .membership_version()
+        .membership_generation()
 }
 
 // Single-rw commit (ADR-030): a lone read-modify-write whose read was
-// superseded by *another instance* is caught with a transparent retry, never
-// a surfaced error, and never commits its stale value. This client's cached
+// superseded by *another instance* is caught with a transparent body replay, never
+// a surfaced error, and never commits its stale value. This database instance's cached
 // snapshot predates the peer's create, so the key reads as absent — an
-// unsupported shape rather than a certified stale read, which is why the
-// locked path takes over instead of replaying the body (ADR-053). It resolves
+// unsupported shape rather than a certified invalidated read, which is why the
+// locked commit takes over instead of replaying the body (ADR-053). It resolves
 // as `Wounded` or `Retry` depending on whether the snapshot survived to the
-// commit resolver evaluation; both converge on a fresh read.
+// direct-commit policy evaluation; both converge on a fresh read.
 #[tokio::test]
-async fn single_rw_stale_read_renews_and_converges() {
+async fn single_rw_invalidated_read_renews_and_converges() {
     let (tm, tctx) = new_algo().await;
     let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
     let keyp = logical_key(b"k");
@@ -108,7 +109,7 @@ async fn single_rw_stale_read_renews_and_converges() {
     commit_writes(&tm2, vec![wa(&keyp, b"v1")]).await;
     let ra = do_read(&tctx, &keyp).await;
 
-    // Another client overwrites the key, making `ra` stale.
+    // Another database instance overwrites the key, making `ra` stale.
     let h2 = commit_writes(&tm2, vec![wa(&keyp, b"v2")]).await;
 
     let mut h = begin_accesses(
@@ -119,13 +120,13 @@ async fn single_rw_stale_read_renews_and_converges() {
     tm.end(&mut h).await.unwrap();
 
     // The stale write never committed: v2 is still current (the discarded
-    // attempt's object is unreferenced, so help-forward cannot promote it).
+    // identity's record is unreferenced, so help-forward cannot promote it).
     assert!(
         do_read(&tctx, &keyp).await.validates(Some(h2.id()), 0),
         "the stale write did not commit; v2 is still current"
     );
 
-    // A fresh read + commit converges (the re-run observes v2 and commits).
+    // A fresh read + commit converges (the replay observes v2 and commits).
     let ra2 = do_read(&tctx, &keyp).await;
     let h3 = commit_access(
         &tm,
@@ -134,11 +135,11 @@ async fn single_rw_stale_read_renews_and_converges() {
     .await;
     assert!(
         do_read(&tctx, &keyp).await.validates(Some(h3.id()), 0),
-        "the renewed attempt commits"
+        "the renewed identity commits"
     );
 }
 
-/// Controls a hook that gates the coordinator's next conditional write.
+/// Controls a hook that gates the coordinator's next CAS.
 struct Gate {
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
@@ -246,7 +247,7 @@ fn leaf_stores(log: &OpLog, path: &str) -> usize {
         .count()
 }
 
-// ADR-028: the logless direct commit is coordinated by the same leaf coordinator
+// ADR-028: direct commit is coordinated by the same leaf coordinator
 // as ordinary lock acquisition, so a direct commit and a disjoint-key
 // acquire contending one leaf batch into a single CAS round instead of
 // racing two separate loads+CASes. The commit publishes its value and the
@@ -357,7 +358,7 @@ async fn direct_commit_batched_in_doubt_recovers() {
         tm.commit(&mut ha),
     );
 
-    // One uncertain CAS must carry both members. Recovery must find the
+    // One in-doubt CAS must carry both members. Recovery must find the
     // installed value and hold without applying another mutation.
     let acquire = acquire.unwrap();
     assert_eq!(committed.unwrap(), BodyDecision::ReturnOutcome);
@@ -379,20 +380,20 @@ async fn direct_commit_batched_in_doubt_recovers() {
 }
 
 // A value the inline per-value budget rejects, so its transaction takes the
-// regular locked path instead of ADR-051's logless one (ADR-053).
-fn logged_value() -> Vec<u8> {
+// locked commit instead of ADR-051's direct one (ADR-053).
+fn external_value() -> Vec<u8> {
     vec![b'v'; glassdb_storage::InlinePolicy::default().max_value_bytes + 1]
 }
 
 // ADR-053: a single-key read-modify-write whose value misses the inline
-// budget has no logged fast path to fall to, so it commits through the
-// regular locked protocol: one committed `_t/` object write, one leaf lock
+// budget has no direct commit to fall to, so it commits through locked commit:
+// one committed transaction-record write, one leaf lock
 // CAS, one leaf write-back CAS (run synchronously here because there is no
 // background executor), and no separate membership write — and the new
 // value is durable and readable. With split deferred the leaf is the
-// collection root `_r`, so both leaf CAS's land there (ADR-031).
+// tree root `_r`, so both leaf CAS's land there (ADR-031).
 #[tokio::test]
-async fn an_overwrite_over_the_inline_budget_takes_the_locked_path() {
+async fn an_overwrite_over_the_inline_budget_uses_a_locked_commit() {
     let (tm, tctx, log) = new_recording_algo().await;
     let keyp = logical_key(b"k");
 
@@ -403,7 +404,7 @@ async fn an_overwrite_over_the_inline_budget_takes_the_locked_path() {
     tctx.locker.stats_and_reset();
     let mut h = begin_accesses(
         &tm,
-        AccessSet::new(vec![r], vec![wa(&keyp, &logged_value())], Vec::new()),
+        AccessSet::new(vec![r], vec![wa(&keyp, &external_value())], Vec::new()),
     );
     let tid = h.id().clone();
     tm.commit(&mut h).await.unwrap();
@@ -416,27 +417,27 @@ async fn an_overwrite_over_the_inline_budget_takes_the_locked_path() {
     let c = write_counts(&log);
     assert_eq!(
         c.leaf, 2,
-        "locked path: one lock CAS plus one write-back CAS, no membership: {c:?}"
+        "locked commit: one lock CAS plus one write-back CAS, no membership: {c:?}"
     );
-    assert_eq!(c.tx, 1, "one committed-object write: {c:?}");
+    assert_eq!(c.tx, 1, "one committed transaction-record write: {c:?}");
 
     // The commit landed: the leaf points at us with no live lock, a
-    // committed `_t/` object exists, and the value reads back as ours.
+    // committed transaction record exists, and the value reads back as ours.
     let e = entry(&tctx, b"k").await.unwrap();
     assert_eq!(e.current.writer(), Some(&tid));
     assert!(e.lock_holders().is_empty());
     let status = tctx
-        .tlogger
+        .tx_records
         .commit_status_at(&tid, Requirement::ANY)
         .await
         .unwrap();
-    assert_eq!(status.status, TxCommitStatus::Ok);
+    assert_eq!(status.status, TxCommitStatus::Committed);
     let r = do_read(&tctx, &keyp).await;
     assert!(r.validates(Some(&tid), 0));
 }
 
 #[tokio::test(start_paused = true)]
-async fn single_rw_observing_a_gate_uses_the_full_locked_path() {
+async fn single_rw_observing_a_gate_uses_a_locked_commit() {
     let (tm, tctx) = new_algo().await;
     let keyp = logical_key(b"k");
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
@@ -444,7 +445,7 @@ async fn single_rw_observing_a_gate_uses_the_full_locked_path() {
 
     let gate = TxId::with_priority(0, b"gate");
     tctx.tmon.begin_tx(&gate);
-    let (mut root, version) = tctx
+    let (mut root, root_observation) = tctx
         .nodes
         .load_root(&test_collection(), Requirement::ANY)
         .await
@@ -452,7 +453,7 @@ async fn single_rw_observing_a_gate_uses_the_full_locked_path() {
     root.set_structural_gate(gate.clone());
     assert!(
         tctx.nodes
-            .store_root(&test_collection(), &root, &version)
+            .store_root(&test_collection(), &root, &root_observation)
             .await
             .unwrap()
     );
@@ -472,7 +473,7 @@ async fn single_rw_observing_a_gate_uses_the_full_locked_path() {
     assert!(!committing.is_finished());
 
     tctx.tmon
-        .commit_tx(TxLog::new(gate, TxCommitStatus::Ok))
+        .commit_tx(TxRecord::new(gate, TxCommitStatus::Committed))
         .await
         .unwrap();
     let (mut handle, result) = committing.await.unwrap();
@@ -520,9 +521,9 @@ async fn single_rw_commit_reuses_cached_leaf() {
 }
 
 // A blind single-key put over an existing key (no read) takes the same
-// locked path when its value misses the inline budget.
+// locked commit when its value misses the inline budget.
 #[tokio::test]
-async fn a_blind_put_over_the_inline_budget_takes_the_locked_path() {
+async fn a_blind_put_over_the_inline_budget_uses_a_locked_commit() {
     let (tm, tctx, log) = new_recording_algo().await;
     let keyp = logical_key(b"k");
 
@@ -531,7 +532,7 @@ async fn a_blind_put_over_the_inline_budget_takes_the_locked_path() {
     log.lock().unwrap().clear();
     let mut h = begin_accesses(
         &tm,
-        AccessSet::new(Vec::new(), vec![wa(&keyp, &logged_value())], Vec::new()),
+        AccessSet::new(Vec::new(), vec![wa(&keyp, &external_value())], Vec::new()),
     );
     let tid = h.id().clone();
     tm.commit(&mut h).await.unwrap();
@@ -540,42 +541,42 @@ async fn a_blind_put_over_the_inline_budget_takes_the_locked_path() {
     let c = write_counts(&log);
     assert_eq!(
         c.leaf, 2,
-        "locked path: one lock CAS plus one write-back CAS, no membership: {c:?}"
+        "locked commit: one lock CAS plus one write-back CAS, no membership: {c:?}"
     );
-    assert_eq!(c.tx, 1, "one committed-object write: {c:?}");
+    assert_eq!(c.tx, 1, "one committed transaction-record write: {c:?}");
     assert_eq!(
         entry(&tctx, b"k").await.unwrap().current.writer(),
         Some(&tid)
     );
 }
 
-// ADR-020 regression: the locked path leaves a write lock held by the
-// *committed* writer until its asynchronous write-back publishes the pointer
+// ADR-020 regression: locked commit leaves a write lock held by the
+// *committed* writer until its asynchronous write-back publishes the current state
 // and releases it. A single-key writer arriving in that window must treat the
 // committed holder as effectively unlocked — help-forwarding it as the
-// predecessor — and stay on the lock-free direct path, rather than bailing to
-// the locked path on the mere presence of the lock (the measured regression).
-// A stale read replays instead.
+// predecessor — and stay on direct commit, rather than bailing to
+// locked commit on the mere presence of the lock (the measured regression).
+// An invalidated read replays instead.
 #[tokio::test]
-async fn a_committed_holder_keeps_the_next_writer_on_the_direct_path() {
+async fn a_committed_holder_keeps_the_next_writer_on_direct_commit() {
     let (tm, tctx) = new_algo().await;
     let keyp = logical_key(b"k");
     let leaf_path = test_root_path();
     let raw = b"k".to_vec();
 
-    // H0 publishes v1; H1 overwrites through the locked path (its value
-    // misses the inline budget), so it has a committed transaction object.
+    // H0 publishes v1; H1 overwrites through locked commit (its value
+    // misses the inline budget), so it has a committed transaction record.
     let h0 = commit_writes(&tm, vec![wa(&keyp, b"v1")])
         .await
         .id()
         .clone();
-    let h1 = commit_writes(&tm, vec![wa(&keyp, &logged_value())])
+    let h1 = commit_writes(&tm, vec![wa(&keyp, &external_value())])
         .await
         .id()
         .clone();
 
     // Recreate the commit window before write-back: the lock is still held by
-    // the committed H1 while the pointer lags at its predecessor H0.
+    // the committed H1 while the current state lags at its predecessor H0.
     let loaded = tctx
         .nodes
         .load_leaf(
@@ -596,7 +597,7 @@ async fn a_committed_holder_keeps_the_next_writer_on_the_direct_path() {
     assert!(tctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 
     // The window is observably at the committed holder H1 (v2), not the
-    // lagging pointer H0: the shared resolver already help-forwards it.
+    // lagging current state H0: the shared resolver already help-forwards it.
     let r = do_read(&tctx, &keyp).await;
     assert!(r.validates(Some(&h1), 0));
 
@@ -614,7 +615,7 @@ async fn a_committed_holder_keeps_the_next_writer_on_the_direct_path() {
     assert_eq!(
         tctx.locker.stats_and_reset().calls,
         0,
-        "the committed holder did not push the writer onto the locked path"
+        "the committed holder did not push the writer onto locked commit"
     );
     let e = entry(&tctx, b"k").await.unwrap();
     assert_eq!(e.current.writer(), Some(&h2));
@@ -623,7 +624,7 @@ async fn a_committed_holder_keeps_the_next_writer_on_the_direct_path() {
 }
 
 // ADR-051: an eligible small overwrite commits in a single conditional leaf
-// CAS that publishes the value itself — no lock, no transaction object, and
+// CAS that publishes the value itself — no lock, no transaction record, and
 // nothing to write back — and the value reads back from the leaf alone.
 #[tokio::test]
 async fn direct_commit_overwrites_in_one_leaf_cas() {
@@ -644,7 +645,7 @@ async fn direct_commit_overwrites_in_one_leaf_cas() {
 
     let c = write_counts(&log);
     assert_eq!(c.leaf, 1, "the commit is one leaf CAS: {c:?}");
-    assert_eq!(c.tx, 0, "the transaction has no object at all: {c:?}");
+    assert_eq!(c.tx, 0, "the transaction has no record at all: {c:?}");
 
     let e = entry(&tctx, b"k").await.unwrap();
     assert_eq!(
@@ -656,7 +657,7 @@ async fn direct_commit_overwrites_in_one_leaf_cas() {
     );
     assert!(e.lock_holders().is_empty(), "no lock was ever installed");
     let value = read_outcome(&tctx, &keyp).await.value.unwrap();
-    assert_eq!(value.version.writer, tid);
+    assert_eq!(value.writer, tid);
 }
 
 // ADR-051 regression: a direct commit lands on an entry whose write lock is
@@ -675,12 +676,12 @@ async fn direct_commit_replaces_a_committed_holder() {
         .await
         .id()
         .clone();
-    let h1 = commit_writes(&tm, vec![wa(&keyp, &logged_value())])
+    let h1 = commit_writes(&tm, vec![wa(&keyp, &external_value())])
         .await
         .id()
         .clone();
 
-    // The locked path's commit window: the lock is still held by the committed
+    // Locked commit's commit window: the lock is still held by the committed
     // H1 while the current state lags at its predecessor H0.
     let loaded = tctx
         .nodes
@@ -723,24 +724,24 @@ async fn direct_commit_replaces_a_committed_holder() {
     );
     let outcome = read_outcome(&tctx, &keyp).await;
     let value = outcome.value.unwrap();
-    assert_eq!(value.version.writer, h2);
+    assert_eq!(value.writer, h2);
     assert_eq!(&*value.value, b"v3");
 }
 
-// ADR-051 regression: every reason a resolver declines to publish the commit
+// ADR-051 regression: every reason a policy declines to publish the commit
 // marker must be classified against the round's in-doubt evidence, not just
-// the lost-race one. A structural gate or a collection-delete fence that
-// appears *after* an uncertain CAS is no proof that the CAS did not land, so
-// reporting `Moved` there would let the logged protocol re-run a body whose
-// logless commit may already be durable (and since superseded, invisible).
+// the lost-race one. A structural gate or a drop intent that
+// appears *after* an in-doubt CAS is no proof that the CAS did not land, so
+// reporting `Moved` there would let locked commit replay a body whose direct
+// commit may already be durable (and since superseded, invisible).
 #[tokio::test]
-async fn direct_commit_blocked_after_uncertain_cas_stays_in_doubt() {
+async fn direct_commit_blocked_after_in_doubt_cas_stays_in_doubt() {
     let (tm, tctx) = new_algo().await;
     let keyp = logical_key(b"k");
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
 
     let seed = entry(&tctx, b"k").await.unwrap();
-    let resolver = put_resolver(
+    let policy = put_policy(
         &tm,
         TxId::with_priority(2, b"direct"),
         keyp.clone(),
@@ -752,18 +753,18 @@ async fn direct_commit_blocked_after_uncertain_cas_stays_in_doubt() {
     let mut gated = NodeLocks::default();
     gated.set_structural_gate(TxId::with_priority(1, b"splitter"));
     let mut fenced = NodeLocks::default();
-    fenced.set_delete_intent(TxId::with_priority(1, b"dropper"));
+    fenced.set_drop_intent(TxId::with_priority(1, b"dropper"));
 
-    for (what, locks) in [("a structural gate", &gated), ("a delete fence", &fenced)] {
-        // Nothing was written yet, so the logged path may take over.
-        let outcome = resolve_outcome(&resolver, &tctx, ReloadCause::Fresh, &staged, locks).await;
+    for (what, locks) in [("a structural gate", &gated), ("a drop intent", &fenced)] {
+        // Nothing was written yet, so locked commit may take over.
+        let outcome = resolve_outcome(&policy, &tctx, ReloadCause::Fresh, &staged, locks).await;
         assert!(
             matches!(outcome, MemberOutcome::Moved),
             "{what} on a first evaluation proves nothing was written, got {outcome:?}"
         );
 
         let outcome = resolve_outcome(
-            &resolver,
+            &policy,
             &tctx,
             ReloadCause::Reloaded { in_doubt: true },
             &staged,
@@ -772,7 +773,7 @@ async fn direct_commit_blocked_after_uncertain_cas_stays_in_doubt() {
         .await;
         assert!(
             matches!(outcome, MemberOutcome::InDoubt(_)),
-            "{what} cannot disprove a landed uncertain CAS, got {outcome:?}"
+            "{what} cannot disprove a landed in-doubt CAS, got {outcome:?}"
         );
     }
 }
@@ -782,7 +783,7 @@ async fn direct_membership_change_neither_waits_for_nor_wounds_a_live_holder() {
     let (tm, tctx) = new_algo().await;
     let holder = TxId::with_priority(9, b"membership-holder");
     tctx.tmon.begin_tx(&holder);
-    let direct = put_resolver(
+    let direct = put_policy(
         &tm,
         TxId::with_priority(1, b"direct"),
         logical_key(b"new"),
@@ -798,14 +799,14 @@ async fn direct_membership_change_neither_waits_for_nor_wounds_a_live_holder() {
     assert_eq!(
         tctx.tmon.tx_status(&holder).await.unwrap(),
         TxCommitStatus::Pending,
-        "the direct path delegates waiting and wounding to the locked protocol"
+        "direct commit delegates waiting and wounding to locked commit"
     );
 }
 
 #[tokio::test]
 async fn direct_commit_replays_an_absence_read_from_an_older_generation() {
     let (tm, tctx) = new_algo().await;
-    let direct = put_resolver(
+    let direct = put_policy(
         &tm,
         TxId::with_priority(1, b"direct"),
         logical_key(b"missing"),
@@ -813,7 +814,7 @@ async fn direct_commit_replays_an_absence_read_from_an_older_generation() {
         b"value",
     );
     let mut locks = NodeLocks::default();
-    locks.advance_membership_version();
+    locks.advance_membership_generation();
 
     assert!(matches!(
         resolve_step(&direct, &tctx, ReloadCause::Fresh, &BTreeMap::new(), &locks,).await,
@@ -824,20 +825,20 @@ async fn direct_commit_replays_an_absence_read_from_an_older_generation() {
 }
 
 // ADR-051 regression (fuzz `history` crash-3ddc66ba): a blind put is
-// last-writer-wins on a first evaluation, but after its own uncertain CAS the entry
+// last-writer-wins on a first evaluation, but after its own in-doubt CAS the entry
 // may already hold a commit that read the very value that CAS published.
 // Republishing then rolls the key back behind a commit whose writer was told it
 // succeeded, losing that update. Only an entry still naming the writer the
-// uncertain CAS built on proves nothing landed.
+// in-doubt CAS built on proves nothing landed.
 #[tokio::test]
-async fn a_blind_put_after_an_uncertain_cas_never_republishes_over_a_newer_writer() {
+async fn a_blind_put_after_an_in_doubt_cas_never_republishes_over_a_newer_writer() {
     let (tm, tctx) = new_algo().await;
     let keyp = logical_key(b"k");
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
     let seed = entry(&tctx, b"k").await.unwrap();
     let locks = NodeLocks::default();
 
-    let blind = put_resolver(
+    let blind = put_policy(
         &tm,
         TxId::with_priority(9, b"blind"),
         keyp.clone(),
@@ -847,7 +848,7 @@ async fn a_blind_put_after_an_uncertain_cas_never_republishes_over_a_newer_write
     let staged = BTreeMap::from([(b"k".to_vec(), seed)]);
 
     // The first evaluation proposes publication over the seeded writer. Its CAS
-    // comes back uncertain.
+    // comes back in doubt.
     assert!(matches!(
         resolve_step(&blind, &tctx, ReloadCause::Fresh, &staged, &locks).await,
         Step::Stage {
@@ -856,7 +857,7 @@ async fn a_blind_put_after_an_uncertain_cas_never_republishes_over_a_newer_write
         }
     ));
 
-    // The entry still names that writer, so the uncertain CAS provably did not
+    // The entry still names that writer, so the in-doubt CAS provably did not
     // land and the publication is retried rather than surfaced as in-doubt.
     assert!(matches!(
         resolve_step(
@@ -890,7 +891,7 @@ async fn a_blind_put_after_an_uncertain_cas_never_republishes_over_a_newer_write
     .await;
     assert!(
         matches!(outcome, MemberOutcome::InDoubt(_)),
-        "a newer writer cannot disprove a landed uncertain CAS, got {outcome:?}"
+        "a newer writer cannot disprove a landed in-doubt CAS, got {outcome:?}"
     );
 }
 
@@ -906,7 +907,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
         Vec::new(),
     ))
     .unwrap();
-    let resolver = DirectCommitOperation::new(
+    let policy = DirectCommitOperation::new(
         id.clone(),
         test_root_path(),
         member,
@@ -927,7 +928,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
     ]);
     assert!(matches!(
         resolve_step(
-            &resolver,
+            &policy,
             &tctx,
             ReloadCause::Fresh,
             &predecessors,
@@ -952,7 +953,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
     ]);
     assert!(matches!(
         resolve_step(
-            &resolver,
+            &policy,
             &tctx,
             ReloadCause::Reloaded { in_doubt: true },
             &recovered,
@@ -963,7 +964,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
             outcome: MemberOutcome::Landed
         }
     ));
-    assert!(resolver.proven_landed());
+    assert!(policy.proven_landed());
 }
 
 #[tokio::test]
@@ -976,7 +977,7 @@ async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
         Vec::new(),
     ))
     .unwrap();
-    let resolver = DirectCommitOperation::new(
+    let policy = DirectCommitOperation::new(
         id,
         test_root_path(),
         member,
@@ -986,7 +987,7 @@ async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
     let empty = BTreeMap::new();
     assert!(matches!(
         resolve_step(
-            &resolver,
+            &policy,
             &tctx,
             ReloadCause::Fresh,
             &empty,
@@ -997,7 +998,7 @@ async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
     ));
     assert!(matches!(
         resolve_step(
-            &resolver,
+            &policy,
             &tctx,
             ReloadCause::Reloaded { in_doubt: true },
             &empty,
@@ -1020,7 +1021,7 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
         Vec::new(),
     ))
     .unwrap();
-    let resolver = DirectCommitOperation::new(
+    let policy = DirectCommitOperation::new(
         id,
         test_root_path(),
         member,
@@ -1036,7 +1037,7 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
     )]);
     assert!(matches!(
         resolve_step(
-            &resolver,
+            &policy,
             &tctx,
             ReloadCause::Fresh,
             &unchanged,
@@ -1047,7 +1048,7 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
     ));
     assert!(matches!(
         resolve_step(
-            &resolver,
+            &policy,
             &tctx,
             ReloadCause::Reloaded { in_doubt: true },
             &unchanged,
@@ -1062,9 +1063,9 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
 }
 
 // ADR-053: only a *superseded read* certifies the body-replay case, and an
-// uncertain CAS still outranks it. Every other way a resolver declines is either
-// state the direct path cannot arbitrate or evidence that proves nothing, so
-// it reports `Moved` and the locked protocol takes over. Classifying too
+// in-doubt CAS still outranks it. Every other way a policy declines is either
+// state direct commit cannot arbitrate or evidence that proves nothing, so
+// it reports `Moved` and locked commit takes over. Classifying too
 // broadly would spin the body forever against a holder or a closed budget.
 #[tokio::test]
 async fn direct_commit_replays_only_a_certified_superseded_read() {
@@ -1076,12 +1077,12 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     let locks = NodeLocks::default();
     let split_hints = tm.direct_commit.split_hints.clone();
 
-    let direct = |read_version: Option<TxId>| {
-        put_resolver(
+    let direct = |read_writer: Option<TxId>| {
+        put_policy(
             &tm,
             TxId::with_priority(9, b"direct"),
             keyp.clone(),
-            read_version.map(Some),
+            read_writer.map(Some),
             b"v2",
         )
     };
@@ -1105,7 +1106,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     .await;
     assert!(
         matches!(outcome, MemberOutcome::InDoubt(_)),
-        "an uncertain CAS is never downgraded to a replay, got {outcome:?}"
+        "an in-doubt CAS is never downgraded to a replay, got {outcome:?}"
     );
 
     // A live pending holder is a genuine conflict only wound-wait resolves,
@@ -1124,7 +1125,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     .await;
     assert!(
         matches!(outcome, MemberOutcome::Moved),
-        "a live holder needs the locked protocol, not a replay, got {outcome:?}"
+        "a live holder needs locked commit, not a replay, got {outcome:?}"
     );
 
     // A key read as deleted names the very writer that deleted it. ADR-061 can
@@ -1146,7 +1147,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
         "a put over a tombstone is a direct create, got {outcome:?}"
     );
 
-    // Aggregate inline admission is owned by the direct resolver. Existing
+    // Aggregate inline admission is owned by the direct-commit policy. Existing
     // inline values consume the leaf budget, while this key's prior state
     // is replaced rather than double-counted.
     let mut budgeted = direct(Some(current.clone()));
@@ -1188,7 +1189,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     assert_eq!(
         split_hints.pending_inline_pressure(),
         1,
-        "an unproved uncertain attempt returns before creating new pressure"
+        "an unproved in-doubt outcome returns before creating new pressure"
     );
 
     let mut impossible = direct(Some(current.clone()));
@@ -1208,9 +1209,9 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
         "a value no leaf can admit does not request a split"
     );
 
-    // The round-level classifications: a same-key claim proves this member
+    // The round-level classifications: a same-key reservation proves this member
     // staged nothing, while a spent CAS budget proves nothing about an
-    // earlier attempt of the same round. And a blind overwrite has no
+    // earlier evaluation of the same round. And a blind overwrite has no
     // read-dependent computation to reevaluate.
     let rmw = direct(Some(current));
     assert!(matches!(rmw.excluded_outcome(false), MemberOutcome::Replay));
@@ -1224,22 +1225,22 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     );
     assert!(
         matches!(direct(None).excluded_outcome(false), MemberOutcome::Moved),
-        "a blind overwrite takes the locked protocol instead of replaying"
+        "a blind overwrite uses locked commit instead of replaying the body"
     );
 }
 
-// ADR-053: a read-modify-write whose observed version is superseded before
+// ADR-053: a read-modify-write whose observed writer is superseded before
 // anything is published reevaluates its body under the same id. Nothing was
-// staged, so the attempt neither renews nor takes a lock — publishing one
-// would make the key's next direct attempt ineligible for no reason.
+// staged, so the identity neither renews nor takes a lock — publishing one
+// would make the key's next direct commit ineligible for no reason.
 #[tokio::test]
 async fn direct_commit_superseded_read_replays_in_place() {
     let (tm, tctx) = new_algo().await;
     let keyp = logical_key(b"k");
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
 
-    // Read v1, then let a later commit supersede it. Both versions are this
-    // client's own, so its snapshot sees the winner rather than a stale leaf.
+    // Read v1, then let a later commit supersede it. Both values are this
+    // database instance's own, so its snapshot sees the winner rather than a stale leaf.
     let stale = do_read(&tctx, &keyp).await;
     let winner = commit_writes(&tm, vec![wa(&keyp, b"v2")])
         .await
@@ -1253,22 +1254,22 @@ async fn direct_commit_superseded_read_replays_in_place() {
     assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
     tm.end(&mut h).await.unwrap();
     let status = tctx
-        .tlogger
+        .tx_records
         .commit_status_at(h.id(), Requirement::ANY)
         .await
         .unwrap();
     assert_eq!(
         status.status,
         TxCommitStatus::Unknown,
-        "ending a replayed attempt writes no transaction object"
+        "a commit pass that asks for a body replay leaves no transaction record"
     );
 
-    // The stale value never committed and the key kept its logless shape.
+    // The stale value never committed and the key kept its direct shape.
     let e = entry(&tctx, b"k").await.unwrap();
     assert_eq!(e.current.writer(), Some(&winner));
     assert!(
         e.lock_holders().is_empty(),
-        "a replayed attempt publishes no holder"
+        "a commit pass that asks for a body replay publishes no holder"
     );
 
     // Reevaluating against the winner commits directly.
@@ -1289,10 +1290,10 @@ async fn direct_commit_superseded_read_replays_in_place() {
 }
 
 // ADR-053 regression: two eligible read-modify-writes on one key share a
-// coordinator round, where only one may stage its logless commit. The loser
+// coordinator round, where only one may stage its direct commit. The loser
 // must reevaluate its body under the same id rather than publish a holder —
-// creating one would make every subsequent direct attempt on the key
-// ineligible, turning a local scheduling loss into a lasting logged phase.
+// creating one would make every subsequent direct commit on the key
+// ineligible, turning a local scheduling loss into a lasting locked phase.
 #[tokio::test]
 async fn direct_commit_same_key_round_loser_replays_its_body() {
     let (tm, tctx, log) = new_recording_algo_big_cache().await;
@@ -1304,7 +1305,7 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
     commit_writes(&tm, vec![wa(&kap, b"v1")]).await;
     commit_writes(&tm, vec![wa(&kbp, b"vb1")]).await;
 
-    // Both attempts read the same current version, so both are eligible.
+    // Both transactions read the same current writer, so both are eligible.
     let ra1 = do_read(&tctx, &kap).await;
     let ra2 = do_read(&tctx, &kap).await;
     let rmw = |read| {
@@ -1332,7 +1333,7 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
     assert_eq!(leaf_stores(&log, &test_root_path().to_string()), 1);
     assert!(entry(&tctx, &kb).await.unwrap().is_locked_by(&driver));
 
-    // Which member wins the round's claim depends on id order; that exactly
+    // Which member wins the round's reservation depends on id order; that exactly
     // one does is the property under test.
     let (winner, mut replayed) = match (&r1, &r2) {
         (Ok(BodyDecision::ReturnOutcome), Ok(BodyDecision::ReplayBody)) => (h1.id().clone(), h2),
@@ -1358,14 +1359,14 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
     );
     tm.end(&mut replayed).await.unwrap();
     let status = tctx
-        .tlogger
+        .tx_records
         .commit_status_at(replayed.id(), Requirement::ANY)
         .await
         .unwrap();
     assert_eq!(
         status.status,
         TxCommitStatus::Unknown,
-        "ending the replayed attempt writes no transaction object"
+        "the commit pass that asked for a body replay leaves no transaction record"
     );
 
     // Reevaluating the body against the winner converges without locking.
@@ -1376,12 +1377,12 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
     assert_eq!(
         entry(&tctx, &ka).await.unwrap().current.writer(),
         Some(h.id()),
-        "the replayed body commits directly on its next attempt"
+        "the replayed body commits directly on its next commit pass"
     );
 }
 
 // ADR-061: a create publishes its inline value and membership generation in
-// the same logless leaf CAS.
+// the same direct leaf CAS.
 #[tokio::test]
 async fn direct_create_uses_one_leaf_cas() {
     let (tm, tctx, log) = new_recording_algo().await;
@@ -1401,7 +1402,7 @@ async fn direct_create_uses_one_leaf_cas() {
     assert_eq!(tctx.locker.stats_and_reset().calls, 0);
     let c = write_counts(&log);
     assert_eq!(c.leaf, 1, "the create is one leaf CAS: {c:?}");
-    assert_eq!(c.tx, 0, "the create has no transaction object: {c:?}");
+    assert_eq!(c.tx, 0, "the create has no transaction record: {c:?}");
     assert_eq!(
         entry(&tctx, b"new").await.unwrap().current,
         CurrentState::Inline {
@@ -1411,7 +1412,7 @@ async fn direct_create_uses_one_leaf_cas() {
     );
 }
 
-// ADR-061: a delete's tombstone is its authoritative logless commit marker.
+// ADR-061: a delete's tombstone is its authoritative direct commit marker.
 #[tokio::test]
 async fn direct_delete_uses_one_leaf_cas() {
     let (tm, tctx, log) = new_recording_algo().await;
@@ -1430,14 +1431,14 @@ async fn direct_delete_uses_one_leaf_cas() {
     assert_eq!(tctx.locker.stats_and_reset().calls, 0);
     let c = write_counts(&log);
     assert_eq!(c.leaf, 1, "the delete is one leaf CAS: {c:?}");
-    assert_eq!(c.tx, 0, "the delete has no transaction object: {c:?}");
+    assert_eq!(c.tx, 0, "the delete has no transaction record: {c:?}");
     assert_eq!(
         entry(&tctx, b"k").await.unwrap().current,
         CurrentState::Tombstone { writer: tid }
     );
 }
 
-// ADR-061: a same-leaf multi-key write is one atomic logless member.
+// ADR-061: a same-leaf multi-key write is one atomic direct member.
 #[tokio::test]
 async fn direct_multi_key_put_uses_one_leaf_cas() {
     let (tm, tctx, log) = new_recording_algo().await;
@@ -1456,7 +1457,7 @@ async fn direct_multi_key_put_uses_one_leaf_cas() {
 
     let c = write_counts(&log);
     assert_eq!(c.leaf, 1, "the multi-key write is one leaf CAS: {c:?}");
-    assert_eq!(c.tx, 0, "the member has no transaction object: {c:?}");
+    assert_eq!(c.tx, 0, "the member has no transaction record: {c:?}");
     let writer = h.id().clone();
     for (key, logical_key) in [(b"a".as_slice(), &ka), (b"b".as_slice(), &kb)] {
         assert_eq!(
@@ -1502,7 +1503,7 @@ async fn direct_blind_puts_cover_two_eight_and_thirty_two_keys() {
 
         let counts = write_counts(&log);
         assert_eq!(counts.leaf, 1, "{count}-key member uses one CAS");
-        assert_eq!(counts.tx, 0, "{count}-key member stays logless");
+        assert_eq!(counts.tx, 0, "{count}-key member stays direct");
         for key in &keys {
             assert_eq!(
                 entry(&tctx, key.key()).await.unwrap().current.writer(),
@@ -1543,8 +1544,8 @@ async fn multi_key_aggregate_rejection_is_atomic_and_does_not_hint() {
     tm.end(&mut h).await.unwrap();
 
     let counts = write_counts(&log);
-    assert_eq!(counts.tx, 1, "the whole member uses one transaction log");
-    assert!(counts.leaf >= 2, "the whole member uses the locked path");
+    assert_eq!(counts.tx, 1, "the whole member uses one transaction record");
+    assert!(counts.leaf >= 2, "the whole member uses locked commit");
     assert_eq!(
         tm.direct_commit_stats_and_reset(),
         DirectCommitStats {
@@ -1589,7 +1590,7 @@ async fn cross_key_aggregate_rejection_does_not_hint() {
         writes: 1,
         has_reads: true,
     };
-    let resolver = DirectCommitOperation::new(
+    let policy = DirectCommitOperation::new(
         TxId::with_priority(1, b"direct"),
         test_root_path(),
         member,
@@ -1609,7 +1610,7 @@ async fn cross_key_aggregate_rejection_does_not_hint() {
 
     assert!(matches!(
         resolve_step(
-            &resolver,
+            &policy,
             &tctx,
             ReloadCause::Fresh,
             &staged,
@@ -1635,7 +1636,7 @@ async fn direct_mixed_member_is_atomic_and_advances_membership_once() {
     let kd = logical_key(b"d");
 
     commit_writes(&tm, vec![wa(&ka, b"a1"), wa(&kc, b"c1")]).await;
-    let before = membership_version(&tctx).await;
+    let before = membership_generation(&tctx).await;
     log.lock().unwrap().clear();
     tctx.locker.stats_and_reset();
     tm.direct_commit_stats_and_reset();
@@ -1655,7 +1656,7 @@ async fn direct_mixed_member_is_atomic_and_advances_membership_once() {
     assert_eq!(tctx.locker.stats_and_reset().calls, 0);
     assert_eq!(write_counts(&log).leaf, 1);
     assert_eq!(write_counts(&log).tx, 0);
-    assert_eq!(membership_version(&tctx).await, before.wrapping_add(1));
+    assert_eq!(membership_generation(&tctx).await, before.wrapping_add(1));
     assert_eq!(
         tm.direct_commit_stats_and_reset(),
         DirectCommitStats {
@@ -1694,10 +1695,10 @@ async fn direct_mixed_member_is_atomic_and_advances_membership_once() {
         assert_eq!(entry(&tctx, key).await.unwrap().current, current);
     }
 
-    let stable = membership_version(&tctx).await;
+    let stable = membership_generation(&tctx).await;
     commit_writes(&tm, vec![wa(&ka, b"a3"), wdel(&kc), wdel(&kd)]).await;
     assert_eq!(
-        membership_version(&tctx).await,
+        membership_generation(&tctx).await,
         stable,
         "overwrite and already-absent deletes preserve membership"
     );
@@ -1759,7 +1760,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     let direct = tm.direct_commit.clone();
     let direct_id = TxId::with_priority(3, b"direct");
     let candidate = tokio::spawn(async move {
-        let mut state = AttemptState::new();
+        let mut state = HandleState::new();
         direct
             .try_commit(
                 &direct_id,
@@ -1792,7 +1793,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     );
 
     // Arm the next write before releasing L0. The coordinator reloads the
-    // moved key, reports one reroute, and the direct path stages its next CAS
+    // moved key, reports one reroute, and direct commit stages its next CAS
     // on L1, where the second barrier catches it.
     gate.arm();
     gate.release();
@@ -1820,7 +1821,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     );
     gate.release();
 
-    assert_eq!(candidate.await.unwrap().unwrap(), DirectAttempt::Locked);
+    assert_eq!(candidate.await.unwrap().unwrap(), DirectOutcome::Locked);
     assert_eq!(
         tm.direct_commit_stats_and_reset(),
         DirectCommitStats {
@@ -1831,12 +1832,12 @@ async fn direct_commit_reroutes_once_then_falls_back() {
 }
 
 // The complete dependency set, not just the writes, must have one physical CAS
-// target. Distinct collection roots are a deterministic two-leaf fixture.
+// target. Distinct tree roots are a deterministic two-leaf fixture.
 #[tokio::test]
-async fn cross_leaf_member_uses_the_logged_protocol() {
+async fn cross_leaf_member_uses_a_locked_commit() {
     let (tm, tctx, log) = new_recording_algo().await;
     let other = CollectionAddress::new(
-        test_collection().db_root(),
+        test_collection().db_prefix(),
         CollectionId::from_slice(&[9; 16]).unwrap(),
     );
     tctx.records
@@ -1890,7 +1891,7 @@ async fn direct_cross_key_read_modify_write_uses_one_leaf_cas() {
 
     let c = write_counts(&log);
     assert_eq!(c.leaf, 1, "the cross-key RMW is one leaf CAS: {c:?}");
-    assert_eq!(c.tx, 0, "the cross-key RMW is logless: {c:?}");
+    assert_eq!(c.tx, 0, "the cross-key RMW is direct: {c:?}");
     assert_eq!(
         entry(&tctx, b"b").await.unwrap().current,
         CurrentState::Inline {
@@ -1906,37 +1907,39 @@ async fn direct_publication_reports_external_predecessors_only() {
     let key = logical_key(b"k");
     let large = vec![b'x'; InlinePolicy::default().max_value_bytes + 1];
     commit_writes(&tm, vec![wa(&key, &large)]).await;
-    let logged = entry(&tctx, b"k").await.unwrap();
-    assert!(matches!(logged.current, CurrentState::External { .. }));
-    let writer = logged.current.writer().unwrap().clone();
+    let external = entry(&tctx, b"k").await.unwrap();
+    assert!(matches!(external.current, CurrentState::External { .. }));
+    let writer = external.current.writer().unwrap().clone();
     commit_writes(&tm, vec![wa(&key, b"inline")]).await;
-    assert_eq!(tm.cleanup_hints.pending(), vec![writer.clone()]);
+    assert_eq!(tm.gc_hints.pending(), vec![writer.clone()]);
     commit_writes(&tm, vec![wa(&key, b"next")]).await;
     commit_writes(&tm, vec![wdel(&key)]).await;
     commit_writes(&tm, vec![wa(&key, b"after-delete")]).await;
-    assert_eq!(tm.cleanup_hints.pending(), vec![writer]);
+    assert_eq!(tm.gc_hints.pending(), vec![writer]);
 }
 
 #[tokio::test]
-async fn an_absence_read_uses_locked_cleanup_for_a_finalized_membership_writer() {
+async fn an_absence_read_uses_locked_write_back_for_a_membership_writer_with_final_status() {
     let (tm, tctx) = new_algo().await;
     let holder = TxId::with_priority(1, b"membership-holder");
     tctx.tmon.begin_tx(&holder);
     tctx.tmon
-        .commit_tx(TxLog::new(holder.clone(), TxCommitStatus::Ok))
+        .commit_tx(TxRecord::new(holder.clone(), TxCommitStatus::Committed))
         .await
         .unwrap();
     let mut locks = NodeLocks::default();
     locks.set_membership_writer(holder);
-    let mut direct = put_resolver(
+    let mut direct = put_policy(
         &tm,
         TxId::with_priority(2, b"direct"),
         logical_key(b"missing"),
         Some(None),
         b"value",
     );
-    Arc::make_mut(&mut direct.member.keys)[0].read =
-        Some(ReadPredicate::new(None, Some(locks.membership_version())));
+    Arc::make_mut(&mut direct.member.keys)[0].read = Some(ReadPredicate::new(
+        None,
+        Some(locks.membership_generation()),
+    ));
     assert!(
         matches!(
             resolve_step(&direct, &tctx, ReloadCause::Fresh, &BTreeMap::new(), &locks).await,
@@ -1944,6 +1947,6 @@ async fn an_absence_read_uses_locked_cleanup_for_a_finalized_membership_writer()
                 outcome: MemberOutcome::Moved
             }
         ),
-        "the locked path must persist cleanup; replay alone sees the same generation"
+        "locked commit must persist cleanup; replay alone sees the same generation"
     );
 }

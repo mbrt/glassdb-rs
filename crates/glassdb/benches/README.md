@@ -33,28 +33,29 @@ random latency variance, but do not make task scheduling deterministic.
 Local sweeps of 1×, 2×, 5×, 10×, 20× and 40× favored 5× for these short cases.
 Higher speeds increased the read-to-write delay ratio; 20× and 40× also brought
 reclamation past the default 45-model-second GC horizon into the timed runs.
-Except for fresh-client reads, fixtures warm caches before the warmup. A 250 ms
-warmup retained the measured PR effects while keeping the eight-case runtime close to the former
-undelayed harness. Clock and warmup changes require checking request counts,
-background work, measurement variance, and total process time together.
+Except for fresh-instance reads, fixtures warm caches before the warmup. A 250
+ms warmup retained the measured PR effects while keeping the eight-case runtime
+close to the former undelayed harness. Clock and warmup changes require checking
+request counts, background work, measurement variance, and total process time
+together.
 
 | Case | Condition | Transactions per iteration |
 | --- | --- | ---: |
-| `warm_read` | One key, 256-byte value, warmed client caches | 1 |
-| `warm_read_external` | One key, 1,025-byte value stored in a transaction log, warmed client caches | 1 |
-| `fresh_client_read` | Same contents; reopen client and collection before each read | 1 |
+| `warm_read` | One key, 256-byte value, warmed database-instance caches | 1 |
+| `warm_read_external` | One key, 1,025-byte value stored in a transaction record, warmed database-instance caches | 1 |
+| `fresh_client_read` | Same contents; reopen the database and collection before each read | 1 |
 | `rmw_inline_1024` | One key; 1,024-byte value at the default inline limit | 1 |
 | `rmw_external_1025` | One key; 1,025-byte value above that limit | 1 |
 | `rmw_five_leaves` | One key in each of five collections; 256-byte values | 1 |
 | `read_long_keys_large_collection` | 1,024 keys of 256 bytes; 256-byte values; warmed caches | 1 |
 | `rmw_shared_leaf_three_transactions` | Three concurrent updates to distinct keys in one leaf through one Database | 3 |
 
-Seeding uses a separate client that shuts down before measurement. The large
-collection must complete at least one split and remain quiet for 1.2 seconds
-before the measurement client opens. Its split count is recorded. Updates
-reuse the same keys and retain value length, so timed loops do not grow the
-tree. Fresh-client setup and collection opening are excluded from read timing;
-this is not an end-to-end database startup measurement.
+Seeding uses a separate database instance that shuts down before measurement.
+The large collection must complete at least one split and remain quiet for 1.2
+seconds before the measurement database instance opens. Its split count is
+recorded. Updates reuse the same keys and retain value length, so timed loops do
+not grow the tree. Fresh-instance setup and collection opening are excluded from
+read timing; this is not an end-to-end database startup measurement.
 
 Criterion measures mean time per iteration. For the concurrent case, this is
 completion time for all three transactions, not individual transaction latency.
@@ -73,22 +74,23 @@ There is no separate short cost pass. Requests, successful read-body bytes,
 attempted write-body bytes, and coordinator counters are normalized by the
 number of completed transactions. Successful read and attempted write bodies
 are counted in the measured backend. Other counters are captured outside each
-sample's timer (each read's timer for fresh-client reads).
+sample's timer (each read's timer for fresh-instance reads).
 The engine counts DELETE requests as writes; they add no write-body bytes.
 
-Workload, shutdown, and combined windows are separate. Fresh-client reads
-close their client after each measured read; other cases close after the benchmark.
-Setup calls are excluded; background work that overlaps a measured window is
-included, even if setup started it. Shutdown drains managed work but cancels GC
-and split loops, so combined cost is not full lifecycle or reclamation cost.
-Body bytes exclude paths, headers, LIST response bodies, and transport overhead.
+Workload, shutdown, and combined windows are separate. Fresh-instance reads
+close their database instance after each measured read; other cases close after
+the benchmark. Setup calls are excluded; background work that overlaps a
+measured window is included, even if setup started it. Shutdown drains managed
+work but cancels GC and split loops, so combined cost is not full lifecycle or
+reclamation cost. Body bytes exclude paths, headers, LIST response bodies, and
+transport overhead.
 
 There is no combined score or automatic performance gate. Timing results
 depend on the host. Real-provider costs require separate measurements.
 Exact protocol guarantees belong in integration/simulation tests, not timing
 assertions. Fixture preparation, transaction completion, and zero backend reads
 for warmed inline writes are checked by the benchmark harness. The inline-write
-and transaction-log cache checks use separate, undelayed memory backends.
+and transaction-record cache checks use separate, undelayed memory backends.
 The inline-write check freezes model time to exclude GC deadlines. `make test-bench`
 runs all benchmark targets in test mode, including these checks.
 

@@ -27,9 +27,9 @@ does not give. The third proposal removed both. Its shape was:
   events as immutable session deltas.
 - **Materialized checkpoints.** Background compilers applied deltas to an
   immutable, structurally shared tree that held values, key membership, and the
-  collection catalog. Any process could compile; a conditional write on the
-  checkpoint head chose the winner. A read bound one certified checkpoint and
-  could then run with no backend operation at all.
+  collection catalog. Any process could compile; a CAS on the checkpoint head
+  chose the winner. A read bound one certified checkpoint and could then run
+  with no backend operation at all.
 - **Demand activation.** Every database supported snapshots, but a one-way
   durable latch started the maintenance work only when an application first used
   a snapshot operation. A database that never used one stayed dormant.
@@ -49,7 +49,7 @@ Do not implement demand-activated dependency checkpoints. The reasons are:
 - **The recovery step is unproved, and it is the centre of the design.** A
   rebase may exclude a session that does not answer only with a proof that every
   data leaf, catalog root, absence condition, and deletion route is covered, and
-  with a proof that each logged transaction lies wholly before or after the cut.
+  with a proof that each locked transaction lies wholly before or after the cut.
   The design states both as conditions for a future prototype, not as results.
   Until they exist, one crashed writer can hold snapshot progress and its
   retained state for an unbounded time.
@@ -63,9 +63,9 @@ Do not implement demand-activated dependency checkpoints. The reasons are:
   it.** It adds a second immutable tree beside the coordination tree, event
   capture in the commit path, background export and compilation, cooperative
   work claims, a second garbage collector, durable session records with
-  keep-alives, and pre-cut bytes carried inside the authoritative conditional
-  write. Each part needs its own correctness argument, and the demand latch only
-  postpones the cost; it never removes it after first use.
+  keep-alives, and pre-cut bytes carried inside the authoritative CAS. Each part
+  needs its own correctness argument, and the demand latch only postpones the
+  cost; it never removes it after first use.
 - **The contract is hard to state.** A cut that is dependency-closed but not
   real-time ordered can omit a transaction that finished before another one it
   contains. Callers must understand that rule to use the API correctly.

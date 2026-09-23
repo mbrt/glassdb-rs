@@ -3,21 +3,21 @@ use std::fmt;
 use crate::base64;
 use crate::collection_id::CollectionId;
 
-use super::{CollectionAddress, DbRoot, NodeToken, ObjectPath, PathError};
+use super::{CollectionAddress, DbPrefix, NodeToken, ObjectPath, PathError};
 
 const COLLECTION_RECORD_MARKER: &str = "_i";
 const NODE_MARKER: &str = "_n";
 const TREE_ROOT_MARKER: &str = "_r";
 
-pub(super) fn collection_prefix(db_root: &str, id: CollectionId) -> String {
-    format!("{db_root}/_c/{}", base64::encode(id.as_bytes()))
+pub(super) fn collection_prefix(db_prefix: &str, id: CollectionId) -> String {
+    format!("{db_prefix}/_c/{}", base64::encode(id.as_bytes()))
 }
 
 pub(super) fn parse_collection_prefix(prefix: &str) -> Result<(&str, CollectionId), PathError> {
-    let Some((db_root, encoded)) = prefix.split_once("/_c/") else {
+    let Some((db_prefix, encoded)) = prefix.split_once("/_c/") else {
         return Err(PathError::Parse(prefix.to_string()));
     };
-    if db_root.is_empty() || encoded.is_empty() || encoded.contains('/') {
+    if db_prefix.is_empty() || encoded.is_empty() || encoded.contains('/') {
         return Err(PathError::Parse(prefix.to_string()));
     }
     let bytes = base64::decode(encoded)?;
@@ -26,7 +26,7 @@ pub(super) fn parse_collection_prefix(prefix: &str) -> Result<(&str, CollectionI
     }
     let id =
         CollectionId::from_slice(&bytes).ok_or_else(|| PathError::Parse(prefix.to_string()))?;
-    Ok((db_root, id))
+    Ok((db_prefix, id))
 }
 
 pub(super) fn parse_object(path: &str) -> Option<Result<ObjectPath, PathError>> {
@@ -91,9 +91,9 @@ pub(super) fn nodes_prefix(prefix: &str) -> String {
 }
 
 fn parse_collection(prefix: &str) -> Result<CollectionAddress, PathError> {
-    let (db_root, id) = parse_collection_prefix(prefix)?;
-    DbRoot::try_from(db_root)?;
-    Ok(CollectionAddress::new(db_root, id))
+    let (db_prefix, id) = parse_collection_prefix(prefix)?;
+    DbPrefix::try_from(db_prefix)?;
+    Ok(CollectionAddress::new(db_prefix, id))
 }
 
 fn write_collection_prefix(
@@ -103,7 +103,7 @@ fn write_collection_prefix(
     write!(
         f,
         "{}/_c/{}",
-        collection.db_root(),
+        collection.db_prefix(),
         base64::encode(collection.id().as_bytes())
     )
 }

@@ -11,7 +11,7 @@
 //!
 //! Alongside the criterion timing, each (workload, backend) pair prints the
 //! per-operation backend counters derived from [`glassdb::Stats`] (the analog
-//! of Go's `benchStats` custom metrics: retries/op, w/op, r/op, metaw/op,
+//! of Go's `benchStats` custom metrics: replays/op, w/op, r/op, metaw/op,
 //! metar/op).
 
 use std::sync::Arc;
@@ -157,8 +157,8 @@ async fn report_stats<F: AsyncFnMut()>(label: &str, db: &Database, mut body: F) 
     let s = db.stats() - start;
     let n = STATS_ITERS.max(1) as f64;
     println!(
-        "  stats {label}: retries/op={:.3} w/op={:.2} r/op={:.2} direct-candidates/op={:.2} direct-landed/op={:.2} locks/op={:.2}",
-        s.transactions.retries as f64 / n,
+        "  stats {label}: replays/op={:.3} w/op={:.2} r/op={:.2} direct-candidates/op={:.2} direct-landed/op={:.2} locks/op={:.2}",
+        s.transactions.replays as f64 / n,
         s.backend.obj_writes as f64 / n,
         s.backend.obj_reads as f64 / n,
         s.direct_commit.candidates as f64 / n,

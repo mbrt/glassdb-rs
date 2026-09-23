@@ -13,13 +13,13 @@ This ADR's shared structure-R protocol is superseded by
 [ADR-044](044-cas-fenced-structural-gate.md). Its split linearization,
 right-link, membership-lock, structural recovery, and hard-cap decisions remain.
 
-[ADR-061](061-atomic-logless-single-leaf-commits.md) adds a logless exception to
+[ADR-061](061-atomic-logless-single-leaf-commits.md) adds a direct exception to
 the requirement that creates and deletes install membership-W: a direct member
 instead observes the membership domain clear and advances its generation in
-the commit CAS. The regular locked protocol is unchanged.
+the commit CAS. The regular locked commit is unchanged.
 
 [ADR-062](062-splitter-driven-tombstone-reclamation.md) additionally makes the
-membership version the validation generation for unmarked point absence.
+membership generation the validation generation for unmarked point absence.
 
 Supersedes the **"escalate to per-leaf read locks"** membership clause of
 [ADR-031](031-dynamic-range-sharding.md). It **refines** — does not replace —
@@ -41,7 +41,7 @@ Two problems surface under real contention.
   hottest leaf, the one that most needs to split, is the least likely to. The
   append-only hotspot ADR-031 itself flags makes this concrete: growth stalls
   exactly where it is needed.
-- **The object version conflates concerns.** A node's backend version bumps on
+- **The object revision conflates concerns.** A node's backend revision bumps on
   _any_ write — value overwrite, membership change, or structural split alike —
   so any coordination keyed on it over-conflicts (a listing is disturbed by
   unrelated value writes; a split is indistinguishable from a create). Structure,
@@ -55,10 +55,10 @@ scans ([ADR-033](033-transactional-key-iteration.md)) are phantom-safe without
 conflicting with value writes.
 
 **One constraint bounds the split design.** Cross-object atomicity in this engine
-comes from per-key transaction pointers that readers resolve by status
+comes from per-key external values that readers resolve by status
 ([ADR-020](020-commit-write-back-protocol.md)); structural fields (high-key,
 right-sibling, separators, child pointers) have no such status-resolved pointer,
-and the transaction log records only key writes. A split therefore **cannot** be
+and the transaction record holds only key writes. A split therefore **cannot** be
 made atomically visible across its objects without introducing structural MVCC.
 Rather than do that, this ADR keeps ADR-031's per-CAS linearization and adds
 locking only for coordination and priority.
@@ -69,7 +69,7 @@ locking only for coordination and priority.
 
 Two node-level locks live in the node object beside the ADR-017 per-key entry
 locks — for a leaf, the _same_ object, so leaf-level locking adds no round-trip.
-They are the S2PL / escalation layer. Only the **read-only** fast paths (a
+They are the S2PL / escalation layer. Only **optimistic validation** paths (a
 read-only scan, a single-key read) take no node lock; every _mutating_ path —
 including the single read-write fast path — participates in the structure
 protocol (see *Every node-mutating path participates* below).
@@ -130,9 +130,9 @@ wound-wait. This removes the need to _transfer_ a scanner's lock across a split 
 the two cannot overlap. (A non-escalated OCC scan holds nothing; a split that
 races it changes the covered leaf set, which OCC validation detects and retries.)
 
-### Membership version: the OCC fast-path token
+### Membership generation: the OCC fast-path token
 
-Each leaf carries a monotonic **membership version**, bumped only by
+Each leaf carries a monotonic **membership generation**, bumped only by
 membership-**write** activity — a create/delete membership-W lock install,
 release, or write-back. Scanner membership-**R** acquisition and release do
 **not** bump it; otherwise concurrent escalated scanners would needlessly
@@ -140,27 +140,27 @@ invalidate each other's optimistic scans. It is an _optimization_, not the
 authority.
 
 A read-only or not-yet-escalated scan validates optimistically. The
-version-equality shortcut is sound only under this condition: OCC may pass on a
-covered leaf iff **(a)** its membership version is unchanged since the scan,
+generation-equality shortcut is sound only under this condition: OCC may pass on a
+covered leaf iff **(a)** its membership generation is unchanged since the scan,
 _and_ **(b)** every pending membership-W holder the scan observed in that leaf is
 still non-committed at validation. Condition (a) catches any membership activity
-_begun_ after the scan (a lock install bumps the version); condition (b) catches
+_begun_ after the scan (a lock install bumps the generation); condition (b) catches
 a create/delete that was _already pending_ at scan time and then committed (a
-commit flips only the transaction object, so it does not bump the version). When
+commit flips only the transaction record, so it does not bump the generation). When
 no pending membership holders were seen — the common case — (a) alone suffices
 and validation is a single integer compare; otherwise the scan records those
 holders as status dependencies and rechecks them, or escalates.
 
 The **authoritative** membership is always the status-aware resolved key set
 ([ADR-020] help-forwarding, which honours tx status and excludes the
-transaction's own pending writes); the version only lets an uncontended scan skip
+transaction's own pending writes); the generation only lets an uncontended scan skip
 recomputing it. A materialized digest of the key set is a hint under the same
 (a)+(b) condition, never authoritative — a leaf field that bumped only at
 write-back would lag a committed-but-unpublished create and miss the phantom;
 one that bumped at lock acquisition would make a transaction's own staged create
-invalidate its own scan. Splits do **not** bump the membership version (they
+invalidate its own scan. Splits do **not** bump the membership generation (they
 relocate keys without changing the collection's key set); a split is caught,
-when relevant, by the covered-leaf-set change, not the version.
+when relevant, by the covered-leaf-set change, not the generation.
 
 ### Splits: shrink-CAS linearization, structure lock for coordination
 
@@ -170,7 +170,7 @@ node's structure-W at a time** — never a child-to-parent chain:
 
 1. Acquire the **structure-W** lock on the node to split (wound-wait, ADR-002).
    This excludes concurrent splits/merges and escalated scans on that node and
-   lets the split wound/help competing mutations by priority.
+   lets the split wound/help-forward competing mutations by priority.
 2. Create the right sibling (`write_if_not_exists`), then **shrink the source in
    one CAS — the linearization point**, right-linking it to the sibling.
 3. **Release the source structure-W immediately.** The split is now linearized;
@@ -189,7 +189,7 @@ during recovery, several created-node tokens) still follow the global
 sorted-by-path order of ADR-020.
 
 **Non-root index splits** are the same three-step shape one level up: an over-full
-interior node is split under its own structure-W (steps 1–3), and its separator is
+index node is split under its own structure-W (steps 1–3), and its separator is
 inserted into *its* parent as a follow-on (step 4), which may itself overflow and
 recurse — each level acquired and released independently. Only the root cannot
 move; it splits in place, rewriting `_i` under `_i`'s structure-W.
@@ -227,7 +227,7 @@ and stop retrying); for _committed-but-unpublished_ holders it cannot wound (a
 committed transaction is not abortable), so it **help-forwards their write-back to
 completion** (a bounded set) and then proceeds; and any _new_ CAS to the node
 observes the held structure-W and backs off. There is thus no unprioritized CAS
-traffic left to race the shrink. Only the **read-only** fast paths (a read-only
+traffic left to race the shrink. Only **optimistic validation** paths (a read-only
 scan, a single-key read) touch a node without any structure lock, and they never
 CAS it.
 
@@ -241,13 +241,13 @@ therefore cannot key off transaction status; it must read the **structural
 state**. The lifecycle:
 
 1. **Write-ahead.** Before creating any node, the split writes a **structural log
-   record** containing: the source (or root) token and its current version, each
+   record** containing: the source (or root) token and its current revision, each
    created-node token, and the intended separator/link (the split key and which
    side moves). The record precedes object creation so no created object can exist
    without a record pointing at it.
 2. **Create** the sibling(s) (`write_if_not_exists`, idempotent).
-3. **Shrink CAS** on the source — the linearization point — version-guarded by the
-   version recorded in step 1.
+3. **Shrink CAS** on the source — the linearization point — revision-guarded by the
+   revision recorded in step 1.
 4. **Publish** the parent separator (the follow-on of the *Splits* section).
 5. **Finalize.** Once the parent link is published, the record is marked complete
    and may be deleted.
@@ -256,11 +256,11 @@ state**. The lifecycle:
 state, not status, by proving **tree-reachability of the created node(s)** — not
 by a direct `source.right == sibling` equality (unstable: a later `L → M → R`
 split leaves `L.right = M`, yet `R` is still reachable through the chain) and not
-by the source's object version (unreliable: lock reclamation or another permitted
+by the source's object revision (unreliable: lock reclamation or another permitted
 rewrite bumps it without touching the link). Right-links are only ever *added*
 (merge is deferred), so reachability is monotonic and the search is well-defined:
 
-- **Leaf / interior split.** Search for the created sibling's token by descending
+- **Leaf / index split.** Search for the created sibling's token by descending
   from `_i` to the recorded separator key and following right-links across the
   covered range. **Reachable** (found via a parent separator or anywhere on the
   right-link chain) ⟹ the shrink CAS landed ⟹ **roll forward**: idempotently
@@ -282,11 +282,11 @@ idempotent, and deletion is gated on proven unreachability, replaying recovery i
 safe.
 
 While a record is live its created tokens count as **reachable** for the GC
-reverse-reference check ([ADR-022](022-garbage-collection-mark-sweep.md)), so GC
-never races a split; once the record is finalized, ordinary reachability
+GC check ([ADR-022](022-garbage-collection-mark-sweep.md)), so GC never races a
+split; once the record has final status, ordinary reachability
 (parent/right-link) governs. This structural record + forward/abort resolution
 replaces ADR-031's split-active registry and reachability sweep, and is the
-log-schema extension the current key-writes-only log needs.
+log-schema extension the current key-writes-only record needs.
 
 ### Progress under load: assumptions and a hard cap
 
@@ -341,11 +341,11 @@ is a tuning question tracked in the design doc.
   overwrite; a scan's structure-R makes splits and escalated scans mutually
   exclusive, so no scanner lock is transferred across a split.
 - **Membership is a resolved property**, validated by status-aware resolution;
-  the membership version is a sound fast path only under the (a)+(b) condition.
+  the membership generation is a sound fast path only under the (a)+(b) condition.
 - **Recovery** gains a structural-log entry for created node tokens (a log-schema
   extension) in place of ADR-031's split-active registry.
 - **Costs.** A structure-read holder on every mutation (foreground _and_
-  write-back/help-forward/GC) grows the leaf's holder list, its logged lock set,
+  write-back/help-forward/GC) grows the leaf's holder list, its locked lock set,
   and CAS-rewrite size, and structure-R is now held through write-back rather than
   released at commit; wounding a mutation aborts its whole (possibly multi-leaf)
   transaction. The split's exclusive interval is bounded to **one node at a time**
@@ -354,6 +354,6 @@ is a tuning question tracked in the design doc.
   splits under a shared parent still serialize on that parent's structure-W during
   the follow-on. Accepted for serializability and progress.
 - **Format.** Nodes gain the structure/membership lock fields and the membership
-  version in their golden-anchored encoding; the transaction log gains structural
+  generation in their golden-anchored encoding; the transaction record gains structural
   (created-node) entries; golden vectors and DST oracles regenerate (greenfield,
   as ADR-031).

@@ -1,10 +1,10 @@
-# ADR-035: Paginated listing and sharded transaction logs
+# ADR-035: Paginated listing and prefix-partitioned transaction records
 
 ## Status
 
 Accepted — implemented.
 
-Refines the transaction-object path of
+Refines the transaction-record path of
 [ADR-019](019-unified-transaction-object.md), the candidate discovery of
 [ADR-022](022-garbage-collection-mark-sweep.md), and the `list` method of
 [ADR-023](023-slimmed-backend-trait.md). Their transaction lifecycle, value
@@ -12,7 +12,7 @@ safety, horizon, and reclamation decisions are unchanged.
 
 [ADR-034](034-separate-structural-log-namespace.md) remains authoritative for
 structural records: they stay in the independent `_s` namespace and recovery
-loop and are not transaction-log records or GC candidates.
+loop and are not transaction records or GC candidates.
 
 [ADR-070](070-demand-driven-garbage-collection.md) supersedes the two-character
 transaction directory with a hierarchy that permits broad and narrow scans,
@@ -24,7 +24,7 @@ implemented. The paginated backend contract remains unchanged.
 `Backend::list` returns every immediate child of a directory in one `Vec`. The
 S3 and GCS backends consume every provider page before returning, and GC then
 sorts the complete flat `_t/` result merely to select a small local page. A
-database with many transaction objects therefore pays unbounded transfer,
+database with many transaction records therefore pays unbounded transfer,
 latency, and memory on every nominally paged GC cycle.
 
 A lexicographic `start_after` cursor is not portable: S3 directory buckets
@@ -75,7 +75,7 @@ S3 maps `cursor` to `ContinuationToken` and `limit` to `MaxKeys`; GCS maps them
 to `pageToken` and `maxResults`. Both omit the delimiter. This subset also
 supports S3 directory buckets, whose listing prefixes must end in `/`.
 
-### Transaction logs use 4,096 deterministic shards
+### Transaction records use 4,096 deterministic prefixes
 
 Transaction records move from `{db}/_t/{encoded-txid}` to:
 
@@ -85,44 +85,44 @@ Transaction records move from `{db}/_t/{encoded-txid}` to:
 
 `encoded-txid` is the existing order-preserving base64 encoding of the raw
 transaction ID, and `ss` is its first two characters. The 64-character alphabet
-yields 4,096 shards selected by the first 12 random bits of a production
-transaction ID. Keeping the full encoding as the filename makes shard
+yields 4,096 prefixes selected by the first 12 random bits of a production
+transaction ID. Keeping the full encoding as the filename makes prefix
 derivation reversible.
 
 Structural records remain at `{db}/_s/{record-id}` as decided by ADR-034. They
 are neither placed in `_t` nor sharded by this ADR.
 
-This changes the unreleased v2 layout in place. There is no flat-to-sharded
-migration or compatibility fallback.
+This changes the unreleased v2 layout in place. There is no
+flat-to-prefix-partitioned migration or compatibility fallback.
 
-### GC makes shuffled passes over the transaction shards
+### GC makes shuffled passes over the transaction prefixes
 
-GC knows the finite set of 4,096 shard prefixes. At the start of a pass it
-shuffles them, then traverses each shard using the opaque cursor returned for
-that prefix. One cycle skips empty pages and completed shards until it obtains
-one non-empty page or exhausts a bounded list-request budget. It processes at
-most that page of listed transaction candidates.
+GC knows the finite set of 4,096 transaction-prefix paths. At the start of a
+pass it shuffles them, then traverses each prefix using the opaque cursor
+returned for that prefix. One cycle skips empty pages and completed prefixes
+until it obtains one non-empty page or exhausts a bounded list-request budget.
+It processes at most that page of listed transaction candidates.
 
-The shuffled order, current shard, and cursor are disposable in-memory state.
-Completing all shards starts a newly shuffled pass; a process restart also
-starts a new shuffle. An invalid cursor restarts only its current shard.
+The shuffled order, current prefix, and cursor are disposable in-memory state.
+Completing all prefixes starts a newly shuffled pass; a process restart also
+starts a new shuffle. An invalid cursor restarts only its current prefix.
 Shuffling uses the deterministic entropy seam so simulation replay remains
 stable.
 
 The page size and per-cycle request budget bound useful work and the fixed cost
-of skipping sparse shards. Backend transport retries remain governed by the
-backend retry policy. Write-back hints remain the primary source of timely GC
-candidates; the sharded traversal remains the completeness mechanism.
+of skipping sparse prefixes. Backend transport retries remain governed by the
+backend retry policy. GC hints remain the primary source of timely GC
+candidates; the prefix traversal remains the completeness mechanism.
 
 Once listed, a transaction follows ADR-022's existing policy, including the
 ADR-032 implementation refinements: GC re-resolves recorded keys through the
-current B-link topology and routes recorded node-lock cleanup and other
+current B-link topology and routes recorded node-lock reclamation and other
 reclamation mutations through the coordinator. This ADR changes discovery, not
 the liveness proof.
 
 ADR-034's `_s` recovery loop consumes the paginated backend contract on its own
 schedule. It may drain its short-lived, low-cardinality prefix and does not
-share GC's shard order, cursor, or request budget.
+share GC's prefix order, cursor, or request budget.
 
 ## Consequences
 
@@ -131,15 +131,15 @@ share GC's shard order, cursor, or request budget.
 - The contract is portable to S3 directory buckets. The cost is losing
   lexicographic positioning, stable result order, and immediate-child directory
   entries; current engine callers require none of them.
-- Four thousand ninety-six shards impose a fixed sparse-database request tax.
+- Four thousand ninety-six prefixes impose a fixed sparse-database request tax.
   Shuffling prevents fixed restart bias, while the per-cycle request budget
   prevents that tax from becoming a request burst.
 - In-memory traversal state is deliberately disposable. Restart may repeat work
   but requires no durable GC cursor.
 - `Backend` implementations and middleware must adopt page/cursor forwarding
   and the new `InvalidCursor` error. This is a breaking trait change.
-- The sharded `_t` path is a format change for development databases. Because
-  v2 has not shipped, they are recreated rather than migrated.
+- The prefix-partitioned `_t` path is a format change for development databases.
+  Because v2 has not shipped, they are recreated rather than migrated.
 - A traversal may miss a concurrent object until a later pass or see an object
-  more than once. ADR-022's authoritative reverse check makes duplicate or
+  more than once. ADR-022's authoritative GC check makes duplicate or
   delayed candidates safe.

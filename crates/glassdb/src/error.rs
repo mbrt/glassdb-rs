@@ -14,13 +14,13 @@ use glassdb_trans::TransError;
 #[non_exhaustive]
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
-    /// The requested object does not exist.
-    #[error("object not found")]
+    /// The requested key or collection does not exist.
+    #[error("not found")]
     NotFound,
     /// The requested collection name is already bound.
     #[error("collection already exists")]
     AlreadyExists,
-    /// The collection handle names an incarnation that has been deleted.
+    /// The collection handle names a collection that was dropped.
     #[error("stale collection handle")]
     StaleCollection,
     /// The collection still has direct child collections.
@@ -32,13 +32,13 @@ pub enum Error {
     /// A conditional operation's precondition failed.
     #[error("precondition failed")]
     Precondition,
-    /// The transaction was already committed or aborted remotely.
-    #[error("transaction was already finalized")]
+    /// The transaction already has a final status.
+    #[error("transaction already has a final status")]
     AlreadyFinalized,
     /// The transaction's outcome is unknown (in doubt): a storage operation
     /// could not be confirmed, so it may or may not have been applied. The
-    /// engine deliberately does *not* retry such a transaction transparently,
-    /// because a retry could double-apply a write that actually landed. The
+    /// engine deliberately does *not* replay such a transaction transparently,
+    /// because a body replay could double-apply a write that actually landed. The
     /// caller decides whether to retry (with its own idempotency) or accept the
     /// uncertainty.
     #[error("transaction outcome unknown (in doubt): {0}")]

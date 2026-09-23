@@ -22,8 +22,8 @@ pub struct TransactionStats {
     pub reads: u64,
     /// Number of writes.
     pub writes: u64,
-    /// Number of retried transactions.
-    pub retries: u64,
+    /// Number of body replays.
+    pub replays: u64,
 }
 
 impl AddAssign for TransactionStats {
@@ -32,7 +32,7 @@ impl AddAssign for TransactionStats {
         self.elapsed += rhs.elapsed;
         self.reads += rhs.reads;
         self.writes += rhs.writes;
-        self.retries += rhs.retries;
+        self.replays += rhs.replays;
     }
 }
 
@@ -45,7 +45,7 @@ impl Sub for TransactionStats {
             elapsed: self.elapsed.saturating_sub(rhs.elapsed),
             reads: self.reads.saturating_sub(rhs.reads),
             writes: self.writes.saturating_sub(rhs.writes),
-            retries: self.retries.saturating_sub(rhs.retries),
+            replays: self.replays.saturating_sub(rhs.replays),
         }
     }
 }
@@ -68,7 +68,7 @@ pub struct Stats {
     pub locker: LockerStats,
     /// Shared leaf-coordinator activity.
     pub coordinator: LeafCoordinatorStats,
-    /// Logless direct-commit coverage.
+    /// Direct-commit coverage.
     pub direct_commit: DirectCommitStats,
     /// Background tree-split activity.
     pub splitter: SplitterStats,
@@ -121,7 +121,7 @@ mod tests {
                 elapsed: Duration::from_secs(3),
                 reads: 7,
                 writes: 5,
-                retries: 1,
+                replays: 1,
             },
             backend: BackendStats {
                 obj_reads: 12,
@@ -168,7 +168,7 @@ mod tests {
                 elapsed: Duration::from_secs(8),
                 reads: 18,
                 writes: 9,
-                retries: 3,
+                replays: 3,
             },
             backend: BackendStats {
                 obj_reads: 19,
@@ -217,7 +217,7 @@ mod tests {
                     elapsed: Duration::from_secs(5),
                     reads: 11,
                     writes: 4,
-                    retries: 2,
+                    replays: 2,
                 },
                 backend: BackendStats {
                     obj_reads: 7,

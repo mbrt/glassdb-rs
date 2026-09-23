@@ -50,8 +50,8 @@ object:
 - A release / write-back member always merges (it cannot exclusively conflict),
   and the worker applies it in the single merged round: remove the
   transaction's holder from its keys, and for write-back set its committed
-  pointer. This is the same per-object mutation the direct methods do today,
-  moved inside the batched round.
+  external value. This is the same per-object mutation the direct methods do
+  today, moved inside the batched round.
 - The per-transaction outcome for a release is trivial (done), so it needs no
   `membership` / `Wait` channel — only the acquisition members do.
 

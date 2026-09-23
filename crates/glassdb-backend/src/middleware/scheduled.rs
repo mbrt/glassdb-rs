@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use glassdb_concurr::rt;
 
-use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Version};
+use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Revision};
 
 /// Produces deterministic delays from a byte sequence. Each call to the
 /// scheduler consumes one byte and yields `byte * tick`; once the sequence is
@@ -79,7 +79,7 @@ impl Backend for ScheduledBackend {
     async fn read_if_modified(
         &self,
         path: &str,
-        expected: &Version,
+        expected: &Revision,
     ) -> Result<ReadReply, BackendError> {
         self.wait().await;
         self.inner.read_if_modified(path, expected).await
@@ -89,8 +89,8 @@ impl Backend for ScheduledBackend {
         &self,
         path: &str,
         value: Vec<u8>,
-        expected: &Version,
-    ) -> Result<Version, BackendError> {
+        expected: &Revision,
+    ) -> Result<Revision, BackendError> {
         self.wait().await;
         self.inner.write_if(path, value, expected).await
     }
@@ -99,12 +99,12 @@ impl Backend for ScheduledBackend {
         &self,
         path: &str,
         value: Vec<u8>,
-    ) -> Result<Version, BackendError> {
+    ) -> Result<Revision, BackendError> {
         self.wait().await;
         self.inner.write_if_not_exists(path, value).await
     }
 
-    async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+    async fn delete_if(&self, path: &str, expected: &Revision) -> Result<(), BackendError> {
         self.wait().await;
         self.inner.delete_if(path, expected).await
     }

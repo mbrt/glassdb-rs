@@ -62,7 +62,7 @@ async fn handled_size_error_does_not_replace_a_staged_value() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn size_error_based_on_a_stale_read_retries_the_body() {
+async fn size_error_based_on_an_invalidated_read_replays_the_body() {
     let db = Database::builder("limits", MemoryBackend::new())
         .transaction_limits(TransactionLimits {
             max_value_bytes: 1,
@@ -87,7 +87,7 @@ async fn size_error_based_on_a_stale_read_retries_the_body() {
     .await
     .unwrap();
     assert_eq!(c.read(b"k").await.unwrap().as_deref(), Some(&b"2"[..]));
-    assert!(db.stats().transactions.retries > 0);
+    assert!(db.stats().transactions.replays > 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -403,7 +403,7 @@ async fn failed_write_admission_does_not_consume_bytes() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn write_byte_budget_is_reset_when_the_body_retries() {
+async fn write_byte_budget_is_reset_when_the_body_replays() {
     let db = Database::builder("limits", MemoryBackend::new())
         .transaction_limits(TransactionLimits {
             max_write_bytes: 2,
@@ -425,7 +425,7 @@ async fn write_byte_budget_is_reset_when_the_body_retries() {
     .await
     .unwrap();
     assert_eq!(c.read(b"k").await.unwrap().as_deref(), Some(&b"2"[..]));
-    assert!(db.stats().transactions.retries > 0);
+    assert!(db.stats().transactions.replays > 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -482,7 +482,7 @@ async fn staged_drops_do_not_refund_collection_reservations() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn body_retry_can_reuse_a_collection_reservation_at_capacity() {
+async fn body_replay_can_reuse_a_collection_reservation_at_capacity() {
     let db = Database::builder("limits", MemoryBackend::new())
         .transaction_limits(TransactionLimits {
             max_collection_reservations: 1,
@@ -506,11 +506,11 @@ async fn body_retry_can_reuse_a_collection_reservation_at_capacity() {
         .await
         .unwrap();
     assert_eq!(child.read(b"k").await.unwrap().as_deref(), Some(&b"1"[..]));
-    assert!(db.stats().transactions.retries > 0);
+    assert!(db.stats().transactions.replays > 0);
 }
 
 #[tokio::test(start_paused = true)]
-async fn body_retry_cannot_accumulate_new_collection_reservations() {
+async fn body_replay_cannot_accumulate_new_collection_reservations() {
     let db = Database::builder("limits", MemoryBackend::new())
         .transaction_limits(TransactionLimits {
             max_collection_reservations: 1,
@@ -539,7 +539,7 @@ async fn body_retry_cannot_accumulate_new_collection_reservations() {
     expect_limit(result, "collection reservations", 1);
     assert!(!c.collection_exists(b"first").await.unwrap());
     assert!(!c.collection_exists(b"second").await.unwrap());
-    assert!(db.stats().transactions.retries > 0);
+    assert!(db.stats().transactions.replays > 0);
 }
 
 #[tokio::test(start_paused = true)]

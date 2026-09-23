@@ -62,7 +62,7 @@ impl SlowMutationController {
         }
     }
 
-    fn claim(&self) -> Option<Duration> {
+    fn next_delay(&self) -> Option<Duration> {
         let ordinal = self.seen.fetch_add(1, Ordering::SeqCst);
         if ordinal != self.plan.ordinal || self.injected.swap(true, Ordering::SeqCst) {
             return None;
@@ -87,7 +87,9 @@ fn delay_selected(
     controller: &Arc<SlowMutationController>,
     operation: &BackendOp<'_>,
 ) -> HookFuture {
-    let duration = is_mutation(operation).then(|| controller.claim()).flatten();
+    let duration = is_mutation(operation)
+        .then(|| controller.next_delay())
+        .flatten();
     Box::pin(async move {
         if let Some(duration) = duration {
             rt::sleep(duration).await;
@@ -134,7 +136,7 @@ pub(super) fn with_tape(
 mod sim_tests {
     use std::num::NonZeroUsize;
 
-    use glassdb_backend::{BackendError, Version, memory::MemoryBackend};
+    use glassdb_backend::{BackendError, Revision, memory::MemoryBackend};
     use glassdb_concurr::exec;
 
     use super::*;
@@ -215,7 +217,7 @@ mod sim_tests {
             );
 
             slow.read("p").await.unwrap();
-            slow.read_if_modified("p", &Version::new("different"))
+            slow.read_if_modified("p", &Revision::new("different"))
                 .await
                 .unwrap();
             slow.list("", None, NonZeroUsize::new(10).unwrap())

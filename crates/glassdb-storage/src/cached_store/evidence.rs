@@ -14,15 +14,15 @@ use glassdb_data::ObjectPath;
 use super::ObjectKey;
 use crate::timeline::{CurrentnessBarrier, Requirement, SequencePoint};
 
-/// The cached store's opaque content-CAS token, wrapping the backend version.
+/// The cached store's opaque content revision, wrapping the backend revision.
 ///
 /// Higher layers may retain, compare, and pass a revision (and, where recovery
-/// requires it, serialize the underlying backend version), but do not interpret
+/// requires it, serialize the underlying backend revision), but do not interpret
 /// or manufacture one.
-/// Keep the backend version private. Do not add public constructors, `Default`,
+/// Keep the backend revision private. Do not add public constructors, `Default`,
 /// conversions, or mutable backend access.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Revision(backend::Version);
+pub struct Revision(backend::Revision);
 
 impl Revision {
     /// Returns the provider token for durable recovery metadata.
@@ -34,17 +34,17 @@ impl Revision {
     ///
     /// The token must come from a backend result or that state's persistent
     /// cache entry. It supplies no currentness evidence by itself.
-    pub(super) fn from_backend(version: backend::Version) -> Self {
-        Self(version)
+    pub(super) fn from_backend(revision: backend::Revision) -> Self {
+        Self(revision)
     }
 
     /// Borrows the token for a conditional backend operation.
-    pub(super) fn version(&self) -> &backend::Version {
+    pub(super) fn backend(&self) -> &backend::Revision {
         &self.0
     }
 }
 
-/// The outcome of a conditional mutation (create or compare-and-swap).
+/// The outcome of a CAS (a conditional create or replace).
 #[derive(Debug)]
 pub enum CasResult<V> {
     /// The mutation definitively took effect; the receipt retains its precondition
@@ -53,7 +53,7 @@ pub enum CasResult<V> {
     Applied(CasReceipt<V>),
     /// The precondition failed: the starting revision or cached absence was
     /// obsolete. The exact starting entry has been invalidated.
-    Conflict,
+    Rejected,
 }
 
 impl<V> CasResult<V> {
@@ -62,20 +62,20 @@ impl<V> CasResult<V> {
         matches!(self, CasResult::Applied(_))
     }
 
-    /// Returns the successful mutation's receipt, or `None` on conflict.
+    /// Returns the successful mutation's receipt, or `None` when the mutation was rejected.
     pub fn into_receipt(self) -> Option<CasReceipt<V>> {
         match self {
             CasResult::Applied(receipt) => Some(receipt),
-            CasResult::Conflict => None,
+            CasResult::Rejected => None,
         }
     }
 }
 
-/// Proof of a successful conditional create or compare-and-swap.
+/// Proof of one applied CAS.
 ///
 /// Only the storage mutation implementation may construct a receipt, after a
-/// definitive backend success. Reads, conflicts, plans with no staged changes, and in-doubt
-/// results must not be converted into receipts. Batch-member participation is
+/// definitive backend success. Reads, rejections, plans with no staged changes, and in-doubt
+/// results must not be converted into receipts. Round-member participation is
 /// separate from this storage proof and belongs to the coordinator.
 ///
 /// The expected revision identifies the precondition; `None` means absence for
@@ -164,7 +164,7 @@ impl Evidence {
 ///
 /// Keep the state, revision, path, and evidence together. Do not add public
 /// constructors, payload transformations, sequence-point accessors, or
-/// conversions to requirements or barriers. The invocation watermark cannot
+/// conversions to requirements or barriers. The invocation point cannot
 /// prove that another operation follows the completed observation.
 /// Raw evidence access is restricted to the parent `cached_store` implementation.
 /// Other storage modules must use the currentness-check interface.
@@ -221,7 +221,7 @@ impl<V> Observation<V> {
     ///
     /// Observations of one state normally share the same evidence cell, so
     /// pointer identity is the fast path. But a cache eviction and reload mint a
-    /// fresh evidence cell for the very same committed version, so two
+    /// fresh evidence cell for the very same committed revision, so two
     /// observations of the same path and revision are still the same state.
     pub fn same_state(&self, other: &Self) -> bool {
         if self.evidence.is_shared_with(&other.evidence) {

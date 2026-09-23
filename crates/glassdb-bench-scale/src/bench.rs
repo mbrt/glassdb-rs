@@ -82,8 +82,8 @@ impl Bench {
 
     /// Times one logical GlassDB operation and records it on success.
     ///
-    /// An unknown transaction outcome is replayed as part of the same sample,
-    /// so the latency includes every attempt. This benchmark-only policy can
+    /// An in-doubt transaction outcome is retried as part of the same sample,
+    /// so the latency includes every retry. This benchmark-only policy can
     /// double-apply a non-idempotent mutation and must not be copied into
     /// application code. Every definitive error is propagated unchanged.
     pub async fn measure<F, Fut>(&self, mut f: F) -> Result<(), Error>
@@ -303,7 +303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_doubt_replay_is_one_logical_sample() {
+    async fn in_doubt_retry_is_one_logical_sample() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let attempts = AtomicUsize::new(0);
@@ -329,7 +329,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn definitive_error_is_not_replayed() {
+    async fn definitive_error_is_not_retried() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let attempts = AtomicUsize::new(0);

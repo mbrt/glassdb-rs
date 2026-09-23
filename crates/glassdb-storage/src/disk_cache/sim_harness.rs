@@ -12,7 +12,7 @@ use glassdb_data::DatabaseId;
 use sha2::{Digest, Sha256};
 
 use super::sim_media::{MediaFaultProfile, SimMedia};
-use super::{PathFence, PersistentCache, PersistentCacheConfig, SequencePoint};
+use super::{PathChanges, PersistentCache, PersistentCacheConfig, SequencePoint};
 
 const CAPACITY_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_COMMANDS: usize = 48;
@@ -167,7 +167,7 @@ impl HarnessState {
 
     fn handle_replace(&mut self, command: Command) {
         if let Some(current) = self.cache.as_ref()
-            && let Some(guard) = current.begin_fence(Arc::new(PathFence::default()))
+            && let Some(change) = current.begin_change(Arc::new(PathChanges::default()))
         {
             let sequence_point = self.next_sequence_point;
             self.next_sequence_point = self.next_sequence_point.saturating_add(1);
@@ -187,7 +187,7 @@ impl HarnessState {
                 revision,
                 body,
                 SequencePoint::from_raw(sequence_point),
-                guard,
+                change,
             );
         }
         self.push_state(command.kind);
@@ -228,9 +228,9 @@ impl HarnessState {
 
     fn handle_invalidate(&mut self, command: Command) {
         if let Some(current) = self.cache.as_ref()
-            && let Some(guard) = current.begin_fence(Arc::new(PathFence::default()))
+            && let Some(change) = current.begin_change(Arc::new(PathChanges::default()))
         {
-            current.invalidate(path(command.path), guard);
+            current.invalidate(path(command.path), change);
         }
         self.push_state(command.kind);
     }

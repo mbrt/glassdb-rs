@@ -24,7 +24,7 @@ use rand::Rng;
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::middleware::{DelayBackend, gcs_delays};
-use glassdb_backend::{Backend, BackendError, Version};
+use glassdb_backend::{Backend, BackendError, Revision};
 use glassdb_bench_scale::bench::Bench;
 const TEST_ROOT: &str = "backend-bench";
 
@@ -137,20 +137,20 @@ async fn replace_or_create(
     backend: &dyn Backend,
     path: &str,
     value: Vec<u8>,
-) -> Result<Version, BackendError> {
+) -> Result<Revision, BackendError> {
     loop {
         match backend.read(path).await {
             Ok(current) => match backend
-                .write_if(path, value.clone(), &current.version)
+                .write_if(path, value.clone(), &current.revision)
                 .await
             {
-                Ok(version) => return Ok(version),
+                Ok(revision) => return Ok(revision),
                 Err(BackendError::Precondition | BackendError::NotFound) => continue,
                 Err(err) => return Err(err),
             },
             Err(BackendError::NotFound) => {
                 match backend.write_if_not_exists(path, value.clone()).await {
-                    Ok(version) => return Ok(version),
+                    Ok(revision) => return Ok(revision),
                     Err(BackendError::Precondition) => continue,
                     Err(err) => return Err(err),
                 }
@@ -163,15 +163,15 @@ async fn replace_or_create(
 fn run_write_same(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
     Box::pin(async move {
         let p = format!("{TEST_ROOT}/write-same");
-        let mut version = replace_or_create(b.as_ref(), &p, random_data(1024)).await?;
+        let mut revision = replace_or_create(b.as_ref(), &p, random_data(1024)).await?;
         let mut count = 0u64;
         while !bench.is_finished() {
             // Vary the content so each overwrite is a genuine state change,
-            // including on providers whose CAS token is content-derived.
+            // including on providers whose revision is content-derived.
             let data = random_data(1024);
             bench
                 .measure_once(|| async {
-                    version = b.write_if(&p, data, &version).await?;
+                    revision = b.write_if(&p, data, &revision).await?;
                     Ok(())
                 })
                 .await?;
@@ -187,9 +187,9 @@ fn run_write_fail_pre(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
         let data = random_data(1024);
         let p = format!("{TEST_ROOT}/write-same");
         replace_or_create(b.as_ref(), &p, data.clone()).await?;
-        // A clearly-bogus version so the conditional write always fails its
+        // A clearly-bogus revision so the CAS always fails its
         // precondition; the error is ignored, the latency is what we measure.
-        let expected = Version::new("0/0");
+        let expected = Revision::new("0/0");
         while !bench.is_finished() {
             bench
                 .measure_once(|| async {
@@ -223,16 +223,16 @@ fn run_read_unchanged(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
     Box::pin(async move {
         let data = random_data(1024);
         let p = format!("{TEST_ROOT}/read");
-        // The version returned by the write is the object's current CAS token;
-        // a conditional read against it short-circuits (304 / Precondition).
-        let version = replace_or_create(b.as_ref(), &p, data).await?;
+        // The write returns the object's current revision; a conditional read
+        // against it short-circuits (304 / Precondition).
+        let revision = replace_or_create(b.as_ref(), &p, data).await?;
         while !bench.is_finished() {
             bench
                 .measure_once(|| async {
                     // The object is unchanged, so the backend returns a
                     // precondition error; that is the fast path we are timing,
                     // not a failure.
-                    match b.read_if_modified(&p, &version).await {
+                    match b.read_if_modified(&p, &revision).await {
                         Ok(_) | Err(BackendError::Precondition) => Ok(()),
                         Err(e) => Err(e),
                     }

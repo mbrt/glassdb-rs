@@ -8,7 +8,7 @@
 //! never a key-space enumeration.
 //!
 //! Every split is a sequence of independent, idempotent compare-and-swaps under
-//! a one-node structure-write lock. Before joining collection topology in
+//! a one-node structural gate. Before joining collection topology in
 //! `_i`, it writes a `Preparing` intent below its topology participant's `_s`
 //! prefix.
 //! After taking the source gate it conditionally advances that intent to
@@ -29,17 +29,17 @@
 //!    right-link hop; recurse when the parent itself overflows. Purely an
 //!    optimization — correctness never depends on it landing.
 //!
-//! A leaf split, including a root-leaf split, acquires structure-write through
+//! A leaf split, including a root-leaf split, acquires a structural gate through
 //! the shared [`LeafCoordinator`], in the same batched CAS stream as data
 //! mutations on that leaf. Interior indexes use direct structural CASes.
-//! The source shrink (or root rewrite) releases structure-write inline, so no
+//! The source shrink (or root rewrite) releases the structural gate inline, so no
 //! unlocked post-split state is exposed before a separate release CAS.
 //! Once a leaf is quiescent behind that gate, holder-free tombstones are
 //! removed before the final reason check. The compacted leaf either cancels the
 //! split in one CAS or supplies the ordinary recoverable split outputs
 //! (ADR-062).
 //!
-//! The collection root `_r` cannot move (its address is fixed), so when it
+//! The tree root `_r` cannot move (its address is fixed), so when it
 //! overflows it splits **in place**: two children are created and the root is
 //! rewritten into a two-entry index over them, growing the tree's height while
 //! leaving the independent collection record untouched.
@@ -54,8 +54,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use glassdb_concurr::{Background, RetryConfig, ScanCadence, rt};
-use glassdb_data::{CollectionAddress, DbRoot, NodeToken, ObjectPath, TxId};
-use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxLog};
+use glassdb_data::{CollectionAddress, DbPrefix, NodeToken, ObjectPath, TxId};
+use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxRecord};
 use glassdb_storage::{
     CollectionStore, CurrentnessBarrier, IndexNode, InlinePolicy, LeafBody, LeafEntry,
     LeafObservation, LockType, Node, NodeStore, Requirement, SplitPolicy, StorageError,
@@ -74,7 +74,7 @@ use crate::node_locking::{
 };
 
 use recovery::{
-    PreparedIntent, PreparedIntentCleanup, ReadyIntent, ReadyIntentCompletion,
+    PreparedIntent, PreparedIntentCancellation, ReadyIntent, ReadyIntentCompletion,
     ReadyIntentTransition, RecoveryAction, RecoveryStep, StructuralRecovery,
 };
 
@@ -281,7 +281,7 @@ impl StructuralNodeAccess {
                 node.set_leaf(LeafBody::from_entries(entries.into_values()))?;
             }
             node.set_locks(locks);
-            // The CAS receipt is the gated state itself. A re-read reports
+            // The CAS receipt holds the gated state itself. A re-read reports
             // whatever revision this database knows of by then, which the caller
             // would then pair with the body it gated.
             if let Some(gated) = self.store_structural_node(&node, &observation).await? {
@@ -346,7 +346,7 @@ impl StructuralNodeAccess {
     async fn finalize_split(&self, id: &TxId) {
         if let Err(error) = self
             .mon
-            .commit_tx(TxLog::new(id.clone(), TxCommitStatus::Ok))
+            .commit_tx(TxRecord::new(id.clone(), TxCommitStatus::Committed))
             .await
         {
             tracing::debug!(
@@ -475,7 +475,7 @@ impl SeparatorPublisher {
                 ObjectPath::Node { token, .. } => Some(token.clone()),
                 _ => return Err(TransError::other("router returned a non-node parent path")),
             };
-            let Some((lock_id, locked_parent, locked_version)) = self
+            let Some((lock_id, locked_parent, observation)) = self
                 .structure
                 .begin_gated_split(&separator.collection, parent_token.as_ref())
                 .await?
@@ -487,7 +487,7 @@ impl SeparatorPublisher {
                     separator,
                     &parent.path,
                     &locked_parent,
-                    &locked_version,
+                    &observation,
                     &lock_id,
                     publication.start,
                 )
@@ -521,7 +521,7 @@ impl SeparatorPublisher {
         separator: &PendingSeparator,
         parent_path: &ObjectPath,
         parent: &Node,
-        version: &LeafObservation,
+        observation: &LeafObservation,
         lock_id: &TxId,
         barrier: CurrentnessBarrier,
     ) -> Result<Option<SeparatorPublicationOutcome>, TransError> {
@@ -564,7 +564,7 @@ impl SeparatorPublisher {
         updated.remove_structural_gate(lock_id);
         if self
             .structure
-            .store_structural_node(&updated, version)
+            .store_structural_node(&updated, observation)
             .await?
             .is_none()
         {
@@ -588,7 +588,7 @@ impl SeparatorPublisher {
     /// A split publishes its separator into the parent as a follow-on step, so
     /// the index can lag behind the leaf chain until a later sweep reconciles it
     /// (ADR-031). `parent` is the caller's own observed index, so the result
-    /// reconciles against the version the caller goes on to write.
+    /// reconciles against the revision the caller goes on to write.
     async fn missing_separators(
         &self,
         collection: &CollectionAddress,
@@ -902,7 +902,7 @@ impl<'a> StructuralSplitAttempt<'a> {
             .recovery
             .prepare_intent(self.collection, self.target.source_token(), participant)
             .await?;
-        let cleanup = prepared.cleanup_witness();
+        let cancellation = prepared.cancellation_witness();
         let outcome = match topology {
             StructuralSplitTopology::Owned => {
                 match self
@@ -916,7 +916,7 @@ impl<'a> StructuralSplitAttempt<'a> {
             }
             StructuralSplitTopology::Joined(_) => self.coordinate(prepared).await,
         };
-        self.finish(outcome, &cleanup, topology).await
+        self.finish(outcome, &cancellation, topology).await
     }
 
     async fn coordinate(&self, prepared: PreparedIntent) -> SplitAttemptOutcome {
@@ -943,7 +943,7 @@ impl<'a> StructuralSplitAttempt<'a> {
     async fn finish(
         &self,
         outcome: SplitAttemptOutcome,
-        prepared: &PreparedIntentCleanup,
+        prepared: &PreparedIntentCancellation,
         topology: StructuralSplitTopology<'_>,
     ) -> Result<(), TransError> {
         let SplitAttemptOutcome { result, state } = outcome;
@@ -1205,7 +1205,7 @@ pub struct Splitter {
     structural_nodes: StructuralNodeAccess,
     timeline: Timeline,
     // The candidate feed this splitter drains. The coordinator receives a
-    // clone for stored-leaf capacity; direct resolvers receive lightweight hint
+    // clone for stored-leaf capacity; direct-commit policies receive lightweight hint
     // sinks for inline-pressure observations.
     candidates: SplitCandidates,
     publisher: SeparatorPublisher,
@@ -1215,7 +1215,7 @@ pub struct Splitter {
     // Paces collection-record and node CAS retries. Transaction-status polling remains
     // entirely owned by Monitor.
     retry: RetryConfig,
-    cleanup_hints: GcHints,
+    gc_hints: GcHints,
     stats: Arc<Stats>,
 }
 
@@ -1232,10 +1232,10 @@ impl Splitter {
         mon: Monitor,
         key_state: KeyStateResolver,
         retry: RetryConfig,
-        db_root: DbRoot,
+        db_prefix: DbPrefix,
         policy: SplitPolicy,
         inline: InlinePolicy,
-        cleanup_hints: GcHints,
+        gc_hints: GcHints,
     ) -> (LeafCoordinator, Self) {
         let candidates = SplitCandidates::with_policies(policy, inline);
         let coord = LeafCoordinator::with_hinter(
@@ -1254,11 +1254,11 @@ impl Splitter {
             timeline,
             mon,
             key_state,
-            db_root,
+            db_prefix,
             coord.clone(),
             candidates,
             retry,
-            cleanup_hints,
+            gc_hints,
         );
         (coord, splitter)
     }
@@ -1308,11 +1308,11 @@ impl Splitter {
         timeline: Timeline,
         mon: Monitor,
         key_state: KeyStateResolver,
-        db_root: DbRoot,
+        db_prefix: DbPrefix,
         coord: LeafCoordinator,
         candidates: SplitCandidates,
         retry: RetryConfig,
-        cleanup_hints: GcHints,
+        gc_hints: GcHints,
     ) -> Self {
         let router = TreeRouter::new(nodes.clone(), std::num::NonZeroUsize::MIN);
         let structural_nodes =
@@ -1332,7 +1332,7 @@ impl Splitter {
             structural_nodes.clone(),
             publisher.clone(),
             timeline.clone(),
-            db_root,
+            db_prefix,
             retry,
         );
         Splitter {
@@ -1348,7 +1348,7 @@ impl Splitter {
             recovery,
             recovery_wake: Arc::new(Notify::new()),
             retry,
-            cleanup_hints,
+            gc_hints,
             stats: Arc::new(Stats::default()),
         }
     }
@@ -1618,7 +1618,7 @@ impl Splitter {
             .begin_persisted_tx(
                 id,
                 TxRecoveryManifest {
-                    locks: vec![TxLock::Topology {
+                    locks: vec![TxLock::TopologyParticipant {
                         collection: collection.clone(),
                     }],
                     ..TxRecoveryManifest::default()
@@ -1641,9 +1641,9 @@ impl Splitter {
             }
             _ => return Err(TransError::other("split candidate is not a tree node")),
         };
-        // Recovery can publish separators after the topology participant has
-        // finalized. A fresh structural identity prevents ordinary lock
-        // helping from mistaking this in-flight recursive split for stale work.
+        // Recovery can publish separators after the topology participant has a
+        // final status. A fresh structural identity prevents help-forward from
+        // mistaking this in-flight recursive split for stale work.
         let worker = self.candidates.new_id();
         StructuralSplitAttempt::new(self, collection, target, worker, reason)
             .run(StructuralSplitTopology::Joined(topology_participant))
@@ -1664,7 +1664,7 @@ impl Splitter {
             .await
     }
 
-    /// Releases a structure-write holder after its node mutation has landed.
+    /// Releases a structural gate after its node mutation has landed.
     async fn release_structural_gate(
         &self,
         collection: &CollectionAddress,
@@ -1738,7 +1738,7 @@ impl Splitter {
         if split_avoided {
             self.stats.splits_avoided.fetch_add(1, Ordering::Relaxed);
         }
-        self.cleanup_hints.schedule_all(writers.iter().cloned());
+        self.gc_hints.schedule_all(writers.iter().cloned());
     }
 
     /// Persists compaction and opens the gate in the same CAS when it made the
@@ -1880,7 +1880,7 @@ impl Splitter {
         }
     }
 
-    /// Rewrites the fixed collection root against the observation in its Ready
+    /// Rewrites the fixed tree root against the observation in its Ready
     /// intent.
     async fn store_split_root(
         &self,
@@ -1934,7 +1934,7 @@ impl Splitter {
         })
     }
 
-    /// Publishes statistics, follow-up candidates, and cleanup hints after the
+    /// Publishes statistics, follow-up candidates, and GC hints after the
     /// source/root linearization is acknowledged.
     fn record_completed_split(
         &self,
@@ -2070,7 +2070,7 @@ impl Splitter {
                         rt::sleep(backoff.next_delay()).await;
                         continue;
                     }
-                    TxCommitStatus::Ok => Err(TransError::StaleCollection),
+                    TxCommitStatus::Committed => Err(TransError::StaleCollection),
                     TxCommitStatus::Pending | TxCommitStatus::Unknown => Err(TransError::Retry),
                 };
             }
@@ -2160,18 +2160,18 @@ impl Splitter {
     }
 
     /// Finalizes the split's ephemeral wound-wait identity without creating a
-    /// transaction object. Structural state, not transaction status, records
+    /// transaction record. Structural state, not transaction status, records
     /// the split's durable outcome.
     async fn finalize_split(&self, id: &TxId) {
         self.structural_nodes.finalize_split(id).await;
     }
 
     async fn finalize_topology_split(&self, collection: &CollectionAddress, id: &TxId) {
-        let mut log = TxLog::new(id.clone(), TxCommitStatus::Ok);
-        log.locks.push(TxLock::Topology {
+        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+        record.locks.push(TxLock::TopologyParticipant {
             collection: collection.clone(),
         });
-        if let Err(e) = self.mon.commit_tx(log).await {
+        if let Err(e) = self.mon.commit_tx(record).await {
             tracing::debug!(
                 target: "glassdb::splitter",
                 error = %e,
@@ -2264,7 +2264,7 @@ impl Splitter {
 
 #[async_trait]
 impl TopologySettler for Splitter {
-    /// Completes structural recovery before releasing one finalized topology participant.
+    /// Completes structural recovery before releasing one topology participant with a final status.
     async fn settle_topology_participant(
         &self,
         collection: &CollectionAddress,
@@ -2336,8 +2336,8 @@ mod tests {
         CollectionAddress::from_physical_prefix(prefix).unwrap()
     }
 
-    fn db_root(value: &str) -> DbRoot {
-        DbRoot::try_from(value).unwrap()
+    fn db_prefix(value: &str) -> DbPrefix {
+        DbPrefix::try_from(value).unwrap()
     }
 
     fn test_token(value: &str) -> NodeToken {
@@ -2506,7 +2506,7 @@ mod tests {
         ) -> Result<Observation<StructuralIntent>, StorageError> {
             self.intent_store
                 .write(
-                    &db_root("db"),
+                    &db_prefix("db"),
                     &StructuralIntentId::from(test_token(intent_id)),
                     &canonical_intent(intent),
                 )
@@ -2520,7 +2520,7 @@ mod tests {
         ) -> Result<Vec<(StructuralIntentId, Observation<StructuralIntent>)>, StorageError>
         {
             self.intent_store
-                .discover(&db_root(root), requirement)
+                .discover(&db_prefix(root), requirement)
                 .await
         }
     }
@@ -2532,7 +2532,7 @@ mod tests {
     fn store_with_backend(backend: Arc<dyn Backend>) -> TestStore {
         let mut config = EngineConfig::default();
         config.set_cache_size(1 << 20);
-        let foundation = AssemblyFixture::new(backend, db_root("db"), &config);
+        let foundation = AssemblyFixture::new(backend, db_prefix("db"), &config);
         TestStore {
             records: foundation.records.clone(),
             nodes: foundation.nodes.clone(),
@@ -2590,14 +2590,14 @@ mod tests {
         store: &TestStore,
         bg: &Arc<Background>,
         candidates: SplitCandidates,
-        cleanup_hints: GcHints,
+        gc_hints: GcHints,
     ) -> Splitter {
         let mon = store.foundation.monitor_for(
             bg,
             RetryConfig::default(),
             crate::monitor::ProtocolTiming::default(),
         );
-        splitter_with_monitor_and_hints(store, bg, mon, candidates, cleanup_hints)
+        splitter_with_monitor_and_hints(store, bg, mon, candidates, gc_hints)
     }
 
     fn splitter_with_monitor(
@@ -2614,7 +2614,7 @@ mod tests {
         bg: &Arc<Background>,
         mon: Monitor,
         candidates: SplitCandidates,
-        cleanup_hints: GcHints,
+        gc_hints: GcHints,
     ) -> Splitter {
         let key_state = KeyStateResolver::new(mon.clone());
         let coord = LeafCoordinator::with_hinter(
@@ -2633,11 +2633,11 @@ mod tests {
             store.timeline.clone(),
             mon,
             key_state,
-            db_root("db"),
+            db_prefix("db"),
             coord,
             candidates,
             RetryConfig::default(),
-            cleanup_hints,
+            gc_hints,
         )
     }
 
@@ -2670,15 +2670,15 @@ mod tests {
 
     /// A recorded source revision that no stored node carries, so recovery
     /// reads the worker that recorded it as unable to publish.
-    fn superseded_source_version() -> String {
-        "superseded-source-version".to_string()
+    fn superseded_source_revision() -> String {
+        "superseded-source-revision".to_string()
     }
 
     fn nonroot_intent(source: &str, right: &str, split_key: &[u8]) -> StructuralIntent {
         StructuralIntent {
             collection: collection(),
             source_token: Some(test_token(source)),
-            source_version: superseded_source_version(),
+            source_revision: superseded_source_revision(),
             created_tokens: vec![test_token(right)],
             split_key: split_key.to_vec(),
             participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
@@ -2719,7 +2719,7 @@ mod tests {
             retained,
         ]));
         let mut locks = node.locks().clone();
-        locks.advance_membership_version();
+        locks.advance_membership_generation();
         node.set_locks(locks);
 
         assert_eq!(
@@ -2733,7 +2733,7 @@ mod tests {
             leaf.lookup(b"locked").unwrap().current.writer(),
             Some(&retained_writer)
         );
-        assert_eq!(node.membership_version(), 1);
+        assert_eq!(node.membership_generation(), 1);
     }
 
     #[tokio::test]
@@ -2747,15 +2747,15 @@ mod tests {
             tombstone(b"c", second.clone()),
         ]));
         let mut locks = root.locks().clone();
-        locks.advance_membership_version();
-        locks.advance_membership_version();
+        locks.advance_membership_generation();
+        locks.advance_membership_generation();
         root.set_locks(locks);
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
         let candidates = SplitCandidates::with_policy(tiny());
         candidates.observe_leaf(&root_path(), root.as_leaf().unwrap());
-        let cleanup_hints = GcHints::default();
-        let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, cleanup_hints.clone());
+        let gc_hints = GcHints::default();
+        let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, gc_hints.clone());
 
         sp.run_once().await;
 
@@ -2766,7 +2766,7 @@ mod tests {
         let leaf = root.as_leaf().expect("compaction avoided height growth");
         assert_eq!(leaf.len(), 1);
         assert!(leaf.lookup(b"a").unwrap().exists());
-        assert_eq!(root.membership_version(), 2);
+        assert_eq!(root.membership_generation(), 2);
         assert!(
             s.list_nodes(COLL, Requirement::after(s.timeline.currentness_barrier()))
                 .await
@@ -2782,7 +2782,7 @@ mod tests {
                 ..SplitterStats::default()
             }
         );
-        assert_eq!(cleanup_hints.pending(), vec![first, second]);
+        assert_eq!(gc_hints.pending(), vec![first, second]);
     }
 
     #[tokio::test]
@@ -2875,8 +2875,8 @@ mod tests {
         let bg = Arc::new(Background::new());
         let candidates = SplitCandidates::with_policy(tiny());
         candidates.observe_leaf(&root_path(), root.as_leaf().unwrap());
-        let cleanup_hints = GcHints::default();
-        let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, cleanup_hints.clone());
+        let gc_hints = GcHints::default();
+        let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, gc_hints.clone());
 
         sp.run_once().await;
 
@@ -2889,7 +2889,7 @@ mod tests {
                 ..SplitterStats::default()
             }
         );
-        assert!(cleanup_hints.pending().is_empty());
+        assert!(gc_hints.pending().is_empty());
         let (root, _) = s
             .load_root(COLL, Requirement::after(s.timeline.currentness_barrier()))
             .await
@@ -2908,8 +2908,8 @@ mod tests {
             tombstone(b"d", writer.clone()),
         ]));
         let mut locks = source.locks().clone();
-        locks.advance_membership_version();
-        locks.advance_membership_version();
+        locks.advance_membership_generation();
+        locks.advance_membership_generation();
         source.set_locks(locks);
         s.store_node(COLL, "L", &source, None).await.unwrap();
         s.create_root(
@@ -2921,8 +2921,8 @@ mod tests {
         let bg = Arc::new(Background::new());
         let candidates = SplitCandidates::with_policy(tiny());
         candidates.observe_leaf(&node_path("L"), source.as_leaf().unwrap());
-        let cleanup_hints = GcHints::default();
-        let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, cleanup_hints.clone());
+        let gc_hints = GcHints::default();
+        let sp = splitter_with_candidates_and_hints(&s, &bg, candidates, gc_hints.clone());
 
         sp.run_once().await;
 
@@ -2936,7 +2936,7 @@ mod tests {
         assert_eq!(leaves.len(), 2);
         assert!(leaves.iter().all(|leaf| {
             let node = leaf.node().unwrap();
-            node.membership_version() == 2
+            node.membership_generation() == 2
                 && node
                     .as_leaf()
                     .unwrap()
@@ -2952,7 +2952,7 @@ mod tests {
                 ..SplitterStats::default()
             }
         );
-        assert_eq!(cleanup_hints.pending(), vec![writer]);
+        assert_eq!(gc_hints.pending(), vec![writer]);
     }
 
     // ADR-051: an inline value may be a key's only copy, so a split has to move
@@ -3079,7 +3079,7 @@ mod tests {
             .unwrap()
             .is_empty()
         );
-        let transaction_prefix = format!("{}/_t/", db_root("db"));
+        let transaction_prefix = format!("{}/_t/", db_prefix("db"));
         assert_eq!(
             s.objects
                 .list(
@@ -3382,7 +3382,7 @@ mod tests {
                     &StructuralIntent {
                         collection: collection(),
                         source_token: Some(test_token("L6")),
-                        source_version: superseded_source_version(),
+                        source_revision: superseded_source_revision(),
                         created_tokens: vec![test_token("L7")],
                         split_key: b"h".to_vec(),
                         participant_id: participant.clone(),
@@ -3906,7 +3906,7 @@ mod tests {
         let (sp, _) = splitter_and_monitor(&s, &bg, tiny());
         let holder = TxId::with_priority(1, b"committed");
         let other_bg = Arc::new(Background::new());
-        let other_transactions = other.foundation.tlogger.clone();
+        let other_transactions = other.foundation.tx_records.clone();
         let other_mon = other.foundation.monitor_for(
             &other_bg,
             RetryConfig::default(),
@@ -3936,8 +3936,8 @@ mod tests {
             std::num::NonZeroUsize::MIN,
         );
         other_mon.begin_tx(&holder);
-        let mut log = TxLog::new(holder.clone(), TxCommitStatus::Ok);
-        log.writes.push(TxWrite {
+        let mut record = TxRecord::new(holder.clone(), TxCommitStatus::Committed);
+        record.writes.push(TxWrite {
             key: LogicalKey::new(collection(), b"d"),
             value: Arc::from(b"new-d".as_slice()),
             deleted: false,
@@ -3972,10 +3972,10 @@ mod tests {
             .await
             .unwrap()
         else {
-            panic!("entry lock must be acquired before the split");
+            panic!("key lock must be acquired before the split");
         };
-        log.locks = locked.locked_paths();
-        other_mon.commit_tx(log).await.unwrap();
+        record.locks = locked.locked_paths();
+        other_mon.commit_tx(record).await.unwrap();
 
         let held = other
             .nodes
@@ -4329,7 +4329,7 @@ mod tests {
         assert_eq!(recovered_coordination.topology_participants().count(), 0);
     }
 
-    /// Controls a hook that rejects conditional writes to the collection root.
+    /// Controls a hook that rejects CASes of the tree root.
     struct RootWriteBlocker {
         blocked: std::sync::atomic::AtomicBool,
     }

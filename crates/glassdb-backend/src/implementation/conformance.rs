@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 
 use glassdb_concurr::join_all_bounded;
 
-use crate::{Backend, BackendError, ListCursor, ListLimit, ReadReply, Version};
+use crate::{Backend, BackendError, ListCursor, ListLimit, ReadReply, Revision};
 
 const LIST_PREFIX: &str = "__glassdb_list_conformance__/target/";
 const EMPTY_PREFIX: &str = "__glassdb_list_conformance__/empty/";
@@ -106,7 +106,7 @@ pub async fn assert_list_conformance(backend: &dyn Backend) {
 }
 
 async fn assert_object_lifecycle(backend: &dyn Backend, path: &str, contents: Vec<u8>) {
-    let unset = Version::default();
+    let unset = Revision::default();
     assert_absent(backend, path, &unset).await;
     let result = backend.write_if(path, b"unset".to_vec(), &unset).await;
     assert!(
@@ -114,7 +114,7 @@ async fn assert_object_lifecycle(backend: &dyn Backend, path: &str, contents: Ve
             result,
             Err(BackendError::NotFound | BackendError::Precondition)
         ),
-        "unset-version write to absent {path:?}: expected NotFound or Precondition, got {result:?}"
+        "unset-revision write to absent {path:?}: expected NotFound or Precondition, got {result:?}"
     );
     assert_absent(backend, path, &unset).await;
     let initial = success(
@@ -130,10 +130,10 @@ async fn assert_object_lifecycle(backend: &dyn Backend, path: &str, contents: Ve
     );
     assert_reply(
         path,
-        "unset-version read",
+        "unset-revision read",
         success(
             path,
-            "unset-version read",
+            "unset-revision read",
             backend.read_if_modified(path, &unset).await,
         ),
         &contents,
@@ -150,19 +150,19 @@ async fn assert_object_lifecycle(backend: &dyn Backend, path: &str, contents: Ve
     }
     assert_precondition(
         path,
-        "unset-version write",
+        "unset-revision write",
         backend.write_if(path, b"unset".to_vec(), &unset).await,
     );
     assert_object(backend, path, &contents, &initial).await;
     assert_precondition(
         path,
-        "unset-version delete",
+        "unset-revision delete",
         backend.delete_if(path, &unset).await,
     );
     assert_object(backend, path, &contents, &initial).await;
 
     // Equivalent content may keep its token, as it does with content-based
-    // versions. Only a change in content must invalidate the previous token.
+    // revisions. Only a change in content must invalidate the previous token.
     let same = success(
         path,
         "same-content write",
@@ -179,7 +179,7 @@ async fn assert_object_lifecycle(backend: &dyn Backend, path: &str, contents: Ve
     );
     assert_ne!(
         same, changed,
-        "write {path:?}: different contents retained the version"
+        "write {path:?}: different contents retained the revision"
     );
     assert_object(backend, path, changed_contents, &changed).await;
     assert_reply(
@@ -236,18 +236,18 @@ async fn assert_object_lifecycle(backend: &dyn Backend, path: &str, contents: Ve
     );
     assert_ne!(
         changed, recreated,
-        "recreate {path:?}: different contents retained the version"
+        "recreate {path:?}: different contents retained the revision"
     );
     assert_object(backend, path, &contents, &recreated).await;
     assert_precondition(
         path,
-        "delete with old version after recreation",
+        "delete with old revision after recreation",
         backend.delete_if(path, &changed).await,
     );
     assert_object(backend, path, &contents, &recreated).await;
     assert_precondition(
         path,
-        "write with old version after recreation",
+        "write with old revision after recreation",
         backend.write_if(path, b"stale".to_vec(), &changed).await,
     );
     assert_object(backend, path, &contents, &recreated).await;
@@ -284,7 +284,7 @@ async fn assert_competing_writes(backend: &dyn Backend, create: bool) {
         values.iter().map(|contents| async {
             match &expected {
                 None => backend.write_if_not_exists(path, contents.to_vec()).await,
-                Some(version) => backend.write_if(path, contents.to_vec(), version).await,
+                Some(revision) => backend.write_if(path, contents.to_vec(), revision).await,
             }
         }),
         NonZeroUsize::new(2).unwrap(),
@@ -293,12 +293,12 @@ async fn assert_competing_writes(backend: &dyn Backend, create: bool) {
     let mut winner = None;
     for (contents, outcome) in values.into_iter().zip(outcomes) {
         match outcome {
-            Ok(version) => {
+            Ok(revision) => {
                 assert!(
                     winner.is_none(),
                     "competing writes {path:?}: both mutations succeeded"
                 );
-                winner = Some((contents, version));
+                winner = Some((contents, revision));
             }
             Err(BackendError::Precondition) => {}
             error => {
@@ -306,9 +306,9 @@ async fn assert_competing_writes(backend: &dyn Backend, create: bool) {
             }
         }
     }
-    let (contents, version) =
+    let (contents, revision) =
         winner.unwrap_or_else(|| panic!("competing writes {path:?}: neither mutation succeeded"));
-    assert_object(backend, path, contents, &version).await;
+    assert_object(backend, path, contents, &revision).await;
 }
 
 async fn assert_write_delete_contest(backend: &dyn Backend) {
@@ -335,8 +335,8 @@ async fn assert_write_delete_contest(backend: &dyn Backend) {
     )
     .await;
     match outcomes.as_slice() {
-        [Ok(Some(version)), Err(BackendError::Precondition)] => {
-            assert_object(backend, path, contents, version).await;
+        [Ok(Some(revision)), Err(BackendError::Precondition)] => {
+            assert_object(backend, path, contents, revision).await;
         }
         [
             Err(BackendError::NotFound | BackendError::Precondition),
@@ -390,7 +390,7 @@ async fn assert_listing(
     }
 }
 
-async fn assert_absent(backend: &dyn Backend, path: &str, expected: &Version) {
+async fn assert_absent(backend: &dyn Backend, path: &str, expected: &Revision) {
     let result = backend.read(path).await;
     assert!(
         matches!(result, Err(BackendError::NotFound)),
@@ -403,24 +403,30 @@ async fn assert_absent(backend: &dyn Backend, path: &str, expected: &Version) {
     );
 }
 
-async fn assert_object(backend: &dyn Backend, path: &str, contents: &[u8], version: &Version) {
+async fn assert_object(backend: &dyn Backend, path: &str, contents: &[u8], revision: &Revision) {
     let reply = success(path, "read", backend.read(path).await);
-    assert_reply(path, "read", reply, contents, version);
+    assert_reply(path, "read", reply, contents, revision);
 }
 
 #[track_caller]
-fn assert_reply(path: &str, operation: &str, reply: ReadReply, contents: &[u8], version: &Version) {
+fn assert_reply(
+    path: &str,
+    operation: &str,
+    reply: ReadReply,
+    contents: &[u8],
+    revision: &Revision,
+) {
     assert_eq!(
         reply.contents, contents,
         "{operation} {path:?}: contents differed"
     );
     assert!(
-        !reply.version.is_unset(),
-        "{operation} {path:?}: version is unset"
+        !reply.revision.is_unset(),
+        "{operation} {path:?}: revision is unset"
     );
     assert_eq!(
-        &reply.version, version,
-        "{operation} {path:?}: version differed"
+        &reply.revision, revision,
+        "{operation} {path:?}: revision differed"
     );
 }
 
@@ -457,7 +463,7 @@ mod tests {
         async fn read_if_modified(
             &self,
             path: &str,
-            expected: &Version,
+            expected: &Revision,
         ) -> Result<ReadReply, BackendError> {
             self.0.read_if_modified(path, expected).await
         }
@@ -466,8 +472,8 @@ mod tests {
             &self,
             path: &str,
             value: Vec<u8>,
-            expected: &Version,
-        ) -> Result<Version, BackendError> {
+            expected: &Revision,
+        ) -> Result<Revision, BackendError> {
             self.0.write_if(path, value, expected).await
         }
 
@@ -475,11 +481,11 @@ mod tests {
             &self,
             path: &str,
             value: Vec<u8>,
-        ) -> Result<Version, BackendError> {
+        ) -> Result<Revision, BackendError> {
             self.0.write_if_not_exists(path, value).await
         }
 
-        async fn delete_if(&self, path: &str, expected: &Version) -> Result<(), BackendError> {
+        async fn delete_if(&self, path: &str, expected: &Revision) -> Result<(), BackendError> {
             self.0.delete_if(path, expected).await
         }
 

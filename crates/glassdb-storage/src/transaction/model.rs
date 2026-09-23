@@ -12,7 +12,7 @@ use crate::lock::LockType;
 pub enum TxCommitStatus {
     #[default]
     Unknown,
-    Ok,
+    Committed,
     Aborted,
     Pending,
     Wounded,
@@ -23,17 +23,17 @@ impl TxCommitStatus {
     pub fn is_final(self) -> bool {
         matches!(
             self,
-            TxCommitStatus::Ok | TxCommitStatus::Aborted | TxCommitStatus::Wounded
+            TxCommitStatus::Committed | TxCommitStatus::Aborted | TxCommitStatus::Wounded
         )
     }
 
     /// Reports whether the persisted status can no longer change.
     pub fn is_immutable(self) -> bool {
-        matches!(self, TxCommitStatus::Ok | TxCommitStatus::Aborted)
+        matches!(self, TxCommitStatus::Committed | TxCommitStatus::Aborted)
     }
 }
 
-/// The normalized durable state of a transaction-log record.
+/// The normalized durable state of a transaction record.
 ///
 /// Missing records are represented explicitly; [`TxCommitStatus::Unknown`] is
 /// never a persisted state.
@@ -64,7 +64,7 @@ impl TxRecordState {
             None => Ok(TxRecordState::Missing),
             Some(TxCommitStatus::Pending) => Ok(TxRecordState::Pending),
             Some(TxCommitStatus::Wounded) => Ok(TxRecordState::Wounded),
-            Some(TxCommitStatus::Ok) => Ok(TxRecordState::Committed),
+            Some(TxCommitStatus::Committed) => Ok(TxRecordState::Committed),
             Some(TxCommitStatus::Aborted) => Ok(TxRecordState::Aborted),
             Some(TxCommitStatus::Unknown) => Err(StorageError::other(
                 "unknown is not a persisted transaction status",
@@ -73,8 +73,8 @@ impl TxRecordState {
     }
 
     /// Returns the normalized state represented by an exact observation.
-    pub fn try_from_observation(observed: &Observation<TxLog>) -> Result<Self, StorageError> {
-        Self::try_from_status(observed.value().map(|log| log.status))
+    pub fn try_from_observation(observed: &Observation<TxRecord>) -> Result<Self, StorageError> {
+        Self::try_from_status(observed.value().map(|record| record.status))
     }
 
     /// Relates this state to a desired durable state using the transaction
@@ -104,9 +104,9 @@ impl TxRecordState {
     }
 }
 
-/// The full contents of a transaction log entry.
+/// The full contents of a transaction record.
 #[derive(Debug, Clone)]
-pub struct TxLog {
+pub struct TxRecord {
     pub id: TxId,
     /// `None` means "use the current time when persisting".
     pub timestamp: Option<SystemTime>,
@@ -117,10 +117,10 @@ pub struct TxLog {
     pub prepared_collections: Vec<CollectionAddress>,
 }
 
-impl TxLog {
-    /// Creates an empty log for the given transaction.
+impl TxRecord {
+    /// Creates an empty record for the given transaction.
     pub fn new(id: TxId, status: TxCommitStatus) -> Self {
-        TxLog {
+        TxRecord {
             id,
             timestamp: None,
             status,
@@ -157,10 +157,10 @@ pub struct TxWrite {
     pub prev_writer: TxId,
 }
 
-/// A transaction lock backreference.
+/// One recovery-manifest entry for a transaction lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxLock {
-    Entry {
+    Key {
         key: LogicalKey,
         typ: LockType,
     },
@@ -172,19 +172,19 @@ pub enum TxLock {
         collection: CollectionAddress,
         typ: LockType,
     },
-    Topology {
+    TopologyParticipant {
         collection: CollectionAddress,
     },
 }
 
 impl TxLock {
-    /// Returns the lock type recorded for this backreference.
+    /// Returns the lock type recorded for this recovery-manifest entry.
     pub fn typ(&self) -> LockType {
         match self {
-            TxLock::Entry { typ, .. }
+            TxLock::Key { typ, .. }
             | TxLock::Membership { typ, .. }
             | TxLock::Directory { typ, .. } => *typ,
-            TxLock::Topology { .. } => LockType::Write,
+            TxLock::TopologyParticipant { .. } => LockType::Write,
         }
     }
 }
