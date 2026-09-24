@@ -298,10 +298,10 @@ impl Backend for GcsBackend {
         }
         // A single conditional media GET: the body transfers only when the
         // generation differs; an unchanged object answers `304 Not Modified`.
-        let rb = self.http.get(self.object_url(path)).query(&[
-            ("alt", "media"),
-            ("ifGenerationNotMatch", expected.token.as_ref()),
-        ]);
+        let rb = self
+            .http
+            .get(self.object_url(path))
+            .query(&[("alt", "media"), ("ifGenerationNotMatch", expected.token())]);
         let resp = self.send(rb).await?;
         let status = resp.status();
         if status == StatusCode::NOT_MODIFIED {
@@ -420,10 +420,10 @@ struct ListResponse {
 /// token cannot match any stored object, so it is reported as a failed
 /// precondition.
 fn parse_token(v: &Revision) -> Result<String, BackendError> {
-    if v.token.is_empty() {
+    if v.is_unset() {
         return Err(BackendError::Precondition);
     }
-    Ok(v.token.to_string())
+    Ok(v.token().to_string())
 }
 
 /// A structured diagnostic for a GCS request that returned an unsuccessful HTTP

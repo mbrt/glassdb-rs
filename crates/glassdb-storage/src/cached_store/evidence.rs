@@ -27,7 +27,7 @@ pub struct Revision(backend::Revision);
 impl Revision {
     /// Returns the provider token for durable recovery metadata.
     pub fn serialize(&self) -> &str {
-        &self.0.token
+        self.0.token()
     }
 
     /// Retains the token of an exact backend state.

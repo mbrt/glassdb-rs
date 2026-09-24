@@ -116,7 +116,7 @@ impl BackendError {
 /// have different tokens, but equivalent contents may retain the same token.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Revision {
-    pub token: Arc<str>,
+    token: Arc<str>,
 }
 
 impl Revision {
@@ -129,6 +129,11 @@ impl Revision {
         Revision {
             token: token.into(),
         }
+    }
+
+    /// Returns the provider token, for conditional requests and durable metadata.
+    pub fn token(&self) -> &str {
+        &self.token
     }
 
     /// Reports whether the revision is unset.

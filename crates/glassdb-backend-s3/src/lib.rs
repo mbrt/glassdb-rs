@@ -328,7 +328,7 @@ impl Backend for S3Backend {
                 .get_object()
                 .bucket(&self.bucket)
                 .key(path)
-                .if_none_match(expected.token.as_ref())
+                .if_none_match(expected.token())
                 .customize()
                 .config_override(self.overrides())
                 .send(),
@@ -359,7 +359,7 @@ impl Backend for S3Backend {
             path,
             value,
             PutConds {
-                if_match: Some(expected.token.to_string()),
+                if_match: Some(expected.token().to_string()),
                 if_none_match: false,
             },
         )
@@ -392,7 +392,7 @@ impl Backend for S3Backend {
             .delete_object()
             .bucket(&self.bucket)
             .key(path)
-            .if_match(expected.token.to_string())
+            .if_match(expected.token())
             .customize()
             .config_override(retry)
             .send()
