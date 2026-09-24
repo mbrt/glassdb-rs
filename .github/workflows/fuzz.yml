@@ -133,4 +133,7 @@ jobs:
         fi
         git commit -m "ci(fuzz): update minimized corpus"
         gh auth setup-git
+        # Other commits can land on main while fuzzing runs.
+        git fetch origin main
+        git rebase --autostash origin/main
         git push origin HEAD:main
