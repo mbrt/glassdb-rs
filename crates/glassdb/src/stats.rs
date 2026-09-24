@@ -8,7 +8,7 @@ use std::time::Duration;
 use glassdb_backend::BackendStats;
 use glassdb_storage::CacheStats;
 use glassdb_trans::{
-    DirectCommitStats, GcStats, LeafCoordinatorStats, LockerStats, MonitorStats, SplitterStats,
+    DirectCommitStats, GcStats, LeafCoordinatorStats, LockerStats, MonitorStats, RestructurerStats,
 };
 
 /// Transaction activity for one snapshot or accumulated interval.
@@ -70,8 +70,10 @@ pub struct Stats {
     pub coordinator: LeafCoordinatorStats,
     /// Direct-commit coverage.
     pub direct_commit: DirectCommitStats,
-    /// Background tree-split activity.
-    pub splitter: SplitterStats,
+    /// Background split and merge activity.
+    // TODO: rename to `restructurer`. The CI benchmark harness builds against
+    // main and this branch, and reads this field under its old name.
+    pub splitter: RestructurerStats,
     /// Garbage collection activity.
     pub gc: GcStats,
 }
@@ -148,12 +150,13 @@ mod tests {
                 landed: 5,
             },
             gc: GcStats::default(),
-            splitter: SplitterStats {
+            splitter: RestructurerStats {
                 candidates: 3,
                 completed: 2,
                 deferred: 1,
                 tombstones_reclaimed: 4,
                 splits_avoided: 1,
+                merges: 2,
                 inline_pressure: InlinePressureStats {
                     candidates: 2,
                     completed: 1,
@@ -195,12 +198,13 @@ mod tests {
                 landed: 8,
             },
             gc: GcStats::default(),
-            splitter: SplitterStats {
+            splitter: RestructurerStats {
                 candidates: 5,
                 completed: 3,
                 deferred: 1,
                 tombstones_reclaimed: 9,
                 splits_avoided: 3,
+                merges: 5,
                 inline_pressure: InlinePressureStats {
                     candidates: 5,
                     completed: 2,
@@ -244,12 +248,13 @@ mod tests {
                     landed: 3,
                 },
                 gc: GcStats::default(),
-                splitter: SplitterStats {
+                splitter: RestructurerStats {
                     candidates: 2,
                     completed: 1,
                     deferred: 0,
                     tombstones_reclaimed: 5,
                     splits_avoided: 2,
+                    merges: 3,
                     inline_pressure: InlinePressureStats {
                         candidates: 3,
                         completed: 1,

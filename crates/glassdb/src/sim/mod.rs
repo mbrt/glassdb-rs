@@ -15,14 +15,19 @@
 //! - [`RmwWorkload`] stresses shared-key serializability and in-doubt increments.
 //! - [`CycleWorkload`] detects isolation failures with non-commuting ring updates.
 //! - [`MembershipWorkload`] exercises key membership, splits, and listing.
+//!   [`MergingMembershipWorkload`] runs it with merges of underfull nodes too.
 //! - [`ApiWorkload`] checks transaction-local key operations, collection
 //!   lifecycle, nested paths, and aborts.
 //! - [`HistoryWorkload`] checks complete point/group-read, write, and
 //!   membership-scan and shared collection histories against an
 //!   implementation-independent sequential specification. Its clients continue
 //!   after admissible public errors while retaining in-doubt outcomes.
+//!
+//! [`Covered`] runs a workload and also requires splits or merges, so that
+//! hand-written runs cannot stop exercising structural changes unnoticed.
 
 mod api;
+mod coverage;
 mod cycle;
 mod harness;
 mod history;
@@ -31,9 +36,10 @@ mod rmw;
 mod slow_backend;
 
 pub use api::{ApiAcct, ApiAction, ApiTransaction, ApiWorkload};
+pub use coverage::{Covered, CoveredState, StructuralCoverage};
 pub use cycle::CycleWorkload;
 pub use glassdb_storage::sim::{MediaFaultProfile, MediaPause, SimMedia};
-use glassdb_storage::{PersistentCacheConfig, SplitPolicy};
+use glassdb_storage::{NodeSizePolicy, PersistentCacheConfig};
 pub use harness::{
     FaultConfig, SimWorkload, run_and_assert, run_and_assert_with_faults, run_and_record,
     run_and_record_with_faults,
@@ -44,7 +50,7 @@ pub use harness::{
     replay_input,
 };
 pub use history::{HistoryCollectionOp, HistoryInstruction, HistoryTransaction, HistoryWorkload};
-pub use membership::{MembOp, MembershipAcct, MembershipWorkload};
+pub use membership::{MembOp, MembershipAcct, MembershipWorkload, MergingMembershipWorkload};
 pub use rmw::{RMW_KEY_COUNT, RmwAcct, RmwOp, RmwWorkload};
 
 use crate::db::DatabaseBuilder;
@@ -81,13 +87,32 @@ pub(super) fn key_name(key: usize) -> Vec<u8> {
     format!("k{key}").into_bytes()
 }
 
-pub(super) fn tiny_split_policy() -> SplitPolicy {
-    SplitPolicy::builder()
+/// Splits a leaf above two entries, so that a few keys grow the tree. A leaf
+/// with at most one live entry is underfull, so that deletes can merge nearly
+/// empty leaves (ADR-073).
+pub(super) fn tiny_node_size_policy() -> NodeSizePolicy {
+    NodeSizePolicy::builder()
         .leaf_max_entries(2)
+        .leaf_min_entries(2)
         .node_soft_max_bytes(1 << 20)
         .index_max_children(2)
+        .index_min_children(2)
         .build()
-        .expect("tiny simulation split policy is valid")
+        .expect("tiny simulation node size policy is valid")
+}
+
+/// Splits a leaf above four entries, so that the merge vetoes admit merged
+/// leaves with two entries (ADR-073). Every leaf below the split limit is
+/// underfull, so a few deletes drive merges.
+pub(super) fn merging_node_size_policy() -> NodeSizePolicy {
+    NodeSizePolicy::builder()
+        .leaf_max_entries(4)
+        .leaf_min_entries(4)
+        .node_soft_max_bytes(1 << 20)
+        .index_max_children(4)
+        .index_min_children(4)
+        .build()
+        .expect("merging simulation node size policy is valid")
 }
 
 pub(super) fn assert_valid_listing(keys: &[Vec<u8>], universe_size: usize) {

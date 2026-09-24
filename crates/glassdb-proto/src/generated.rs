@@ -285,6 +285,19 @@ pub struct Node {
     /// decides whether this drop intent is obsolete or makes the node stale.
     #[prost(bytes = "vec", tag = "8")]
     pub drop_intent: ::prost::alloc::vec::Vec<u8>,
+    /// Set after a merge moved this node's range and entries into its right
+    /// sibling (ADR-073). A drained node covers no key and never changes again.
+    #[prost(bool, tag = "9")]
+    pub drained: bool,
+    /// The structural intent ID of a merge into this node that can still land
+    /// or be abandoned (ADR-073). Empty means none.
+    #[prost(string, tag = "10")]
+    pub merge_reservation: ::prost::alloc::string::String,
+    /// Inclusive lower bound of the key range this node covers. Empty means the
+    /// first node at its level. A copy with a low key above a routed key is
+    /// older than a merge (ADR-073).
+    #[prost(bytes = "vec", tag = "11")]
+    pub low_key: ::prost::alloc::vec::Vec<u8>,
     #[prost(oneof = "node::Body", tags = "3, 4")]
     pub body: ::core::option::Option<node::Body>,
 }
@@ -300,9 +313,9 @@ pub mod node {
         Index(super::IndexNode),
     }
 }
-/// A structural intent for one split. It lives at
-/// `{db}/_s/<participant_id>/<intent_id>` until the created nodes are reachable
-/// or reclaimed.
+/// A structural intent for one split or merge. It lives at
+/// `{db}/_s/<participant_id>/<intent_id>` until the structural change is
+/// complete or abandoned.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StructuralIntent {
     #[prost(string, tag = "1")]
@@ -322,6 +335,10 @@ pub struct StructuralIntent {
     pub participant_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(enumeration = "structural_intent::Phase", tag = "8")]
     pub phase: i32,
+    /// Present when the source merges into its right sibling (ADR-073). A merge
+    /// creates no node and has no split key.
+    #[prost(message, optional, tag = "9")]
+    pub merge: ::core::option::Option<MergeIntent>,
 }
 /// Nested message and enum types in `StructuralIntent`.
 pub mod structural_intent {
@@ -352,6 +369,20 @@ pub mod structural_intent {
         }
     }
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MergeIntent {
+    /// The node that receives the source's entries. Empty until Ready.
+    #[prost(string, tag = "1")]
+    pub target_token: ::prost::alloc::string::String,
+    /// The source's high key at Ready: the low bound of the target before the
+    /// merge.
+    #[prost(bytes = "vec", tag = "2")]
+    pub boundary: ::prost::alloc::vec::Vec<u8>,
+    /// The membership generation of the target at Ready. The absorb lands only
+    /// while the target has this generation.
+    #[prost(uint64, tag = "3")]
+    pub target_generation: u64,
+}
 /// An index node body: an ordered list of separator entries. Routing selects the
 /// last child whose separator_key is <= the key.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -381,12 +412,12 @@ pub struct DatabaseMetadata {
     /// mandatory for the v2 format.
     #[prost(bytes = "vec", tag = "2")]
     pub database_id: ::prost::alloc::vec::Vec<u8>,
-    /// Hard coordination limits. Both fields are mandatory in v4.
+    /// Hard coordination limits. Both fields are mandatory since v4.
     #[prost(uint64, optional, tag = "3")]
     pub node_max_bytes: ::core::option::Option<u64>,
     #[prost(uint64, optional, tag = "4")]
     pub split_headroom_bytes: ::core::option::Option<u64>,
-    /// Shared transaction timing. Both fields are mandatory in v4.
+    /// Shared transaction timing. Both fields are mandatory since v4.
     #[prost(uint64, optional, tag = "5")]
     pub pending_timeout_nanos: ::core::option::Option<u64>,
     #[prost(uint64, optional, tag = "6")]

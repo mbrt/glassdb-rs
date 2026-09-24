@@ -168,6 +168,11 @@ impl NodeStore {
         }
     }
 
+    /// Captures a currentness barrier after the node observations made so far.
+    pub(crate) fn currentness_barrier(&self) -> crate::CurrentnessBarrier {
+        self.nodes.currentness_barrier()
+    }
+
     /// Checks whether a retained leaf observation satisfies `requirement`.
     pub async fn check_leaf_current(
         &self,

@@ -9,7 +9,7 @@ use std::time::Duration;
 use glassdb_backend::Backend;
 use glassdb_concurr::rt;
 use glassdb_data::{DatabaseId, DbPrefix};
-use glassdb_storage::{InlinePolicy, PersistentCacheConfig, PersistentCacheMedia, SplitPolicy};
+use glassdb_storage::{InlinePolicy, NodeSizePolicy, PersistentCacheConfig, PersistentCacheMedia};
 use glassdb_trans::{
     AccessSet, BodyDecision, CatalogAccesses, Engine, EngineConfig, EngineTransaction, GcLimits,
     ProtocolTiming, TransError,
@@ -34,7 +34,7 @@ pub struct DatabaseBuilder {
     name: String,
     backend: Arc<dyn Backend>,
     engine_config: EngineConfig,
-    split_policy: SplitPolicy,
+    node_size_policy: NodeSizePolicy,
     protocol_timing: ProtocolTiming,
     transaction_limits: TransactionLimits,
 }
@@ -105,12 +105,13 @@ impl DatabaseBuilder {
         self
     }
 
-    /// Sets local split thresholds and proposes hard limits for a new database.
+    /// Sets local split and merge thresholds and proposes hard limits for a new
+    /// database.
     /// Existing databases load their hard limits from metadata, ignoring the
     /// proposed hard cap and reserved headroom. Soft thresholds remain local.
     /// Creation fails if the hard limits cannot admit even an empty key.
-    pub fn split_policy(mut self, policy: SplitPolicy) -> Self {
-        self.split_policy = policy;
+    pub fn node_size_policy(mut self, policy: NodeSizePolicy) -> Self {
+        self.node_size_policy = policy;
         self
     }
 
@@ -143,7 +144,7 @@ impl DatabaseBuilder {
             name,
             backend: b,
             mut engine_config,
-            split_policy,
+            node_size_policy,
             protocol_timing,
             transaction_limits,
         } = self;
@@ -152,9 +153,9 @@ impl DatabaseBuilder {
             .map_err(|error| Error::InvalidInput(error.to_string()))?;
         let backend = Arc::new(glassdb_backend::StatsBackend::new(b));
         let metadata =
-            check_or_create_db_meta(&backend, &name, split_policy, protocol_timing).await?;
+            check_or_create_db_meta(&backend, &name, node_size_policy, protocol_timing).await?;
         let database_id = metadata.id;
-        engine_config.set_split_policy(metadata.split_policy(split_policy)?);
+        engine_config.set_node_size_policy(metadata.node_size_policy(node_size_policy)?);
         engine_config.set_protocol_timing(metadata.timing);
         let engine = Engine::open(&name, database_id, backend, engine_config)
             .await
@@ -186,7 +187,7 @@ impl DatabaseBuilder {
             name: name.into(),
             backend,
             engine_config: EngineConfig::default(),
-            split_policy: SplitPolicy::default(),
+            node_size_policy: NodeSizePolicy::default(),
             protocol_timing: ProtocolTiming::default(),
             transaction_limits: TransactionLimits::default(),
         }
@@ -379,7 +380,7 @@ impl Database {
             locker: engine.locker,
             coordinator: engine.coordinator,
             direct_commit: engine.direct_commit,
-            splitter: engine.splitter,
+            splitter: engine.restructurer,
             gc: engine.gc,
             ..Default::default()
         };

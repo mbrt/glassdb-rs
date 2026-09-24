@@ -29,6 +29,11 @@ starts at fixed `_r`; its topology and split protocol are unchanged.
 processing by compacting quiescent tombstones before deciding whether the leaf
 must divide. The B-link split protocol and lack of merging remain unchanged.
 
+[ADR-073](073-merge-nodes-into-right-sibling.md) adds merges of underfull nodes
+into their right sibling, one maintenance policy for splits and merges, and
+parent reconciliation in place of separator publication. The tree height still
+never decreases.
+
 [ADR-047]: 047-transactional-collection-management.md
 
 ## Context

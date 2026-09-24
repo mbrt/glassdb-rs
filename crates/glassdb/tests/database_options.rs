@@ -6,11 +6,11 @@ use std::time::Duration;
 use glassdb::backend::{BackendError, ListLimit};
 use glassdb::memory::MemoryBackend;
 use glassdb::middleware::{BackendOp, HookBackend};
-use glassdb::{Backend, Database, Error, InlinePolicy, ProtocolTiming, SplitPolicy};
+use glassdb::{Backend, Database, Error, InlinePolicy, NodeSizePolicy, ProtocolTiming};
 use glassdb_storage::transaction::TxCommitStatus;
 
-fn small_policy() -> SplitPolicy {
-    SplitPolicy::builder()
+fn small_policy() -> NodeSizePolicy {
+    NodeSizePolicy::builder()
         .node_max_bytes(512)
         .split_headroom_bytes(128)
         .node_soft_max_bytes(256)
@@ -31,7 +31,7 @@ async fn reopening_cannot_lower_the_limits_of_existing_data() {
     creator.shutdown().await;
 
     let reopened = Database::builder("limits", backend)
-        .split_policy(small_policy())
+        .node_size_policy(small_policy())
         .open()
         .await
         .unwrap();
@@ -53,7 +53,7 @@ async fn reopening_cannot_lower_the_limits_of_existing_data() {
 async fn reopening_with_defaults_retains_custom_key_and_directory_limits() {
     let backend = Arc::new(MemoryBackend::new());
     let creator = Database::builder("limits", backend.clone())
-        .split_policy(small_policy())
+        .node_size_policy(small_policy())
         .open()
         .await
         .unwrap();
@@ -144,14 +144,14 @@ async fn invalid_creation_timing_does_not_initialize_storage() {
 #[tokio::test]
 async fn unusable_creation_limits_do_not_initialize_storage() {
     for (hard, headroom) in [(0, 0), (1, 0), (512, 512)] {
-        let policy = SplitPolicy::builder()
+        let policy = NodeSizePolicy::builder()
             .node_max_bytes(hard)
             .split_headroom_bytes(headroom)
             .build()
             .unwrap();
         let backend = Arc::new(MemoryBackend::new());
         let result = Database::builder("invalid", backend.clone())
-            .split_policy(policy)
+            .node_size_policy(policy)
             .open()
             .await;
         assert!(matches!(result, Err(Error::InvalidInput(_))));
@@ -175,8 +175,8 @@ async fn opening_ignores_invalid_creation_proposals() {
     creator.shutdown().await;
 
     let reopened = Database::builder("existing", backend)
-        .split_policy(
-            SplitPolicy::builder()
+        .node_size_policy(
+            NodeSizePolicy::builder()
                 .node_max_bytes(0)
                 .split_headroom_bytes(0)
                 .build()
@@ -234,7 +234,7 @@ async fn inline_options_remain_local_to_each_client() {
 #[tokio::test(start_paused = true)]
 async fn capacity_splits_do_not_depend_on_local_soft_thresholds() {
     for soft_bytes in [384, usize::MAX] {
-        let policy = SplitPolicy::builder()
+        let policy = NodeSizePolicy::builder()
             .node_max_bytes(512)
             .split_headroom_bytes(128)
             .leaf_max_entries(usize::MAX)
@@ -243,7 +243,7 @@ async fn capacity_splits_do_not_depend_on_local_soft_thresholds() {
             .build()
             .unwrap();
         let db = Database::builder("capacity", MemoryBackend::new())
-            .split_policy(policy)
+            .node_size_policy(policy)
             .inline_policy(InlinePolicy::none())
             .open()
             .await
@@ -274,7 +274,12 @@ async fn reopening_keeps_soft_split_thresholds_local() {
     let creator = Database::open("local", backend.clone()).await.unwrap();
     creator.shutdown().await;
     let reopened = Database::builder("local", backend)
-        .split_policy(SplitPolicy::builder().leaf_max_entries(1).build().unwrap())
+        .node_size_policy(
+            NodeSizePolicy::builder()
+                .leaf_max_entries(1)
+                .build()
+                .unwrap(),
+        )
         .open()
         .await
         .unwrap();

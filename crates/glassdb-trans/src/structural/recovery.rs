@@ -8,18 +8,20 @@ use glassdb_concurr::{RetryConfig, rt};
 use glassdb_data::{CollectionAddress, DbPrefix, NodeToken, ObjectPath, StructuralIntentId, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
-    CollectionStore, CurrentnessBarrier, LeafObservation, LockType, Node, NodeStore, Observation,
-    Requirement, StorageError, StructuralIntent, StructuralIntentPhase, StructuralIntentStore,
-    Timeline, TreeRouter,
+    CollectionStore, CurrentnessBarrier, LeafObservation, LockType, MergeTarget, Node, NodeStore,
+    Observation, Requirement, StorageError, StructuralChange, StructuralIntent,
+    StructuralIntentPhase, StructuralIntentStore, Timeline, TreeRouter,
 };
 
 use crate::error::TransError;
 use crate::monitor::Monitor;
 
-use super::{
-    PARENT_RETRIES, ParentSplitContinuation, SeparatorPublication, SeparatorPublicationOutcome,
-    SeparatorPublisher, SplitReason, StructuralNodeAccess,
+use super::PARENT_RETRIES;
+use super::nodes::StructuralNodeAccess;
+use super::reconcile::{
+    ParentReconciler, ParentReconciliation, ParentSplitContinuation, ReconciliationOutcome,
 };
+use super::split::SplitReason;
 
 /// Owns the durable structural-intent lifecycle and recovery policy.
 #[derive(Clone)]
@@ -30,15 +32,29 @@ pub(super) struct StructuralRecovery {
     router: TreeRouter,
     mon: Monitor,
     structural_nodes: StructuralNodeAccess,
-    publisher: SeparatorPublisher,
+    reconciler: ParentReconciler,
     timeline: Timeline,
     db_prefix: DbPrefix,
     retry: RetryConfig,
     scan_cursor: Arc<Mutex<Option<glassdb_backend::ListCursor>>>,
 }
 
+/// The kind of structural change that a new intent reserves.
+#[derive(Clone, Copy)]
+pub(super) enum ChangeKind {
+    Split,
+    Merge,
+}
+
+/// The fields that the Ready transition adds to a prepared intent.
+pub(super) enum ReadyChange {
+    Split { split_key: Vec<u8> },
+    Merge(MergeTarget),
+}
+
 /// Proves that one structural intent is still in its cancellable state.
 pub(super) struct PreparedIntent {
+    id: StructuralIntentId,
     observed: Observation<StructuralIntent>,
     intent: StructuralIntent,
 }
@@ -50,6 +66,7 @@ pub(super) struct PreparedIntentCancellation {
 
 /// Proves that a structural intent may require durable recovery.
 pub(super) struct ReadyIntent {
+    id: StructuralIntentId,
     expected: Observation<StructuralIntent>,
     intent: StructuralIntent,
     observed: Option<Observation<StructuralIntent>>,
@@ -148,8 +165,8 @@ struct IntentRecovery {
 
 enum IntentRecoveryPhase {
     Classify(CurrentnessBarrier),
-    Publish {
-        publication: SeparatorPublication,
+    Reconcile {
+        reconciliation: ParentReconciliation,
         participant: TxId,
     },
     Delete,
@@ -202,42 +219,62 @@ impl PreparedIntent {
 
     /// Returns the two child tokens reserved for a root split.
     pub(super) fn root_children(&self) -> Option<(&NodeToken, &NodeToken)> {
-        self.intent.is_root().then(|| {
-            (
-                &self.intent.created_tokens[0],
-                &self.intent.created_tokens[1],
-            )
-        })
+        match (&self.intent.change, self.intent.is_root()) {
+            (StructuralChange::Split { created_tokens, .. }, true) => {
+                Some((&created_tokens[0], &created_tokens[1]))
+            }
+            _ => None,
+        }
     }
 
     /// Returns the sibling token reserved for a non-root split.
     pub(super) fn nonroot_sibling(&self) -> Option<&NodeToken> {
-        (!self.intent.is_root()).then(|| &self.intent.created_tokens[0])
+        match (&self.intent.change, self.intent.is_root()) {
+            (StructuralChange::Split { created_tokens, .. }, false) => Some(&created_tokens[0]),
+            _ => None,
+        }
     }
 
-    fn from_observation(observed: Observation<StructuralIntent>) -> Result<Self, TransError> {
+    fn from_observation(
+        id: StructuralIntentId,
+        observed: Observation<StructuralIntent>,
+    ) -> Result<Self, TransError> {
         let intent = observed
             .value()
             .filter(|intent| {
                 intent.phase == StructuralIntentPhase::Preparing
-                    && if intent.is_root() {
-                        intent.created_tokens.len() == 2
-                    } else {
-                        intent.source_token.is_some() && intent.created_tokens.len() == 1
+                    && match &intent.change {
+                        StructuralChange::Split { created_tokens, .. } => {
+                            created_tokens.len() == if intent.is_root() { 2 } else { 1 }
+                        }
+                        StructuralChange::Merge { .. } => !intent.is_root(),
                     }
             })
             .ok_or_else(|| TransError::other("invalid prepared structural intent"))?
             .as_ref()
             .clone();
-        Ok(Self { observed, intent })
+        Ok(Self {
+            id,
+            observed,
+            intent,
+        })
     }
 
-    fn into_ready(self, source_revision: String, split_key: Vec<u8>) -> ReadyIntent {
+    fn into_ready(self, source_revision: String, ready: ReadyChange) -> ReadyIntent {
         let mut intent = self.intent;
         intent.source_revision = source_revision;
-        intent.split_key = split_key;
+        match (&mut intent.change, ready) {
+            (StructuralChange::Split { split_key, .. }, ReadyChange::Split { split_key: key }) => {
+                *split_key = key;
+            }
+            (StructuralChange::Merge { target }, ReadyChange::Merge(ready_target)) => {
+                *target = Some(ready_target);
+            }
+            _ => unreachable!("the Ready fields always match the prepared change"),
+        }
         intent.phase = StructuralIntentPhase::Ready;
         ReadyIntent {
+            id: self.id,
             expected: self.observed,
             intent,
             observed: None,
@@ -246,6 +283,11 @@ impl PreparedIntent {
 }
 
 impl ReadyIntent {
+    /// Returns the identity of this intent.
+    pub(super) fn id(&self) -> &StructuralIntentId {
+        &self.id
+    }
+
     /// Returns the topology participant that owns this intent.
     pub(super) fn participant(&self) -> &TxId {
         &self.intent.participant_id
@@ -304,7 +346,7 @@ impl StructuralRecovery {
         router: TreeRouter,
         mon: Monitor,
         structural_nodes: StructuralNodeAccess,
-        publisher: SeparatorPublisher,
+        reconciler: ParentReconciler,
         timeline: Timeline,
         db_prefix: DbPrefix,
         retry: RetryConfig,
@@ -316,7 +358,7 @@ impl StructuralRecovery {
             router,
             mon,
             structural_nodes,
-            publisher,
+            reconciler,
             timeline,
             db_prefix,
             retry,
@@ -329,18 +371,32 @@ impl StructuralRecovery {
         &self,
         collection: &CollectionAddress,
         source_token: Option<&NodeToken>,
+        kind: ChangeKind,
         participant: &TxId,
     ) -> Result<PreparedIntent, TransError> {
-        let created_tokens = if source_token.is_none() {
-            vec![NodeToken::new_random(), NodeToken::new_random()]
-        } else {
-            vec![NodeToken::new_random()]
+        let (intent_id, change) = match kind {
+            ChangeKind::Split => {
+                let created_tokens = if source_token.is_none() {
+                    vec![NodeToken::new_random(), NodeToken::new_random()]
+                } else {
+                    vec![NodeToken::new_random()]
+                };
+                let intent_id = StructuralIntentId::from(
+                    created_tokens
+                        .last()
+                        .expect("a split always reserves at least one token"),
+                );
+                let change = StructuralChange::Split {
+                    created_tokens,
+                    split_key: Vec::new(),
+                };
+                (intent_id, change)
+            }
+            ChangeKind::Merge => (
+                StructuralIntentId::from(NodeToken::new_random()),
+                StructuralChange::Merge { target: None },
+            ),
         };
-        let intent_id = StructuralIntentId::from(
-            created_tokens
-                .last()
-                .expect("a split always reserves at least one token"),
-        );
         let observed = self
             .intent_store
             .write(
@@ -350,14 +406,13 @@ impl StructuralRecovery {
                     collection: collection.clone(),
                     source_token: source_token.cloned(),
                     source_revision: String::new(),
-                    created_tokens,
-                    split_key: Vec::new(),
+                    change,
                     participant_id: participant.clone(),
                     phase: StructuralIntentPhase::Preparing,
                 },
             )
             .await?;
-        PreparedIntent::from_observation(observed)
+        PreparedIntent::from_observation(intent_id, observed)
     }
 
     /// Advances a prepared intent while the source structural gate is held.
@@ -366,19 +421,19 @@ impl StructuralRecovery {
         prepared: PreparedIntent,
         worker: &TxId,
         observation: &LeafObservation,
-        split_key: Vec<u8>,
+        change: ReadyChange,
     ) -> ReadyIntentTransition {
         let source_revision = match observation.revision() {
             Some(revision) => revision.serialize().to_string(),
             None => {
                 return ReadyIntentTransition::RetryCleanly(TransError::other(
-                    "split source is absent",
+                    "structural source is absent",
                 ));
             }
         };
         let collection = prepared.intent.collection.clone();
         let source_token = prepared.intent.source_token.clone();
-        let mut ready = prepared.into_ready(source_revision, split_key);
+        let mut ready = prepared.into_ready(source_revision, change);
         match self
             .intent_store
             .update(&ready.expected, &ready.intent)
@@ -559,7 +614,7 @@ impl StructuralRecovery {
                 }) => {
                     sweep.failed |= !matches!(error, TransError::Retry);
                     tracing::debug!(
-                        target: "glassdb::splitter",
+                        target: "glassdb::restructurer",
                         intent = ?intent,
                         participant = ?participant,
                         error = %error,
@@ -805,17 +860,17 @@ impl StructuralRecovery {
                 IntentRecoveryPhase::Classify(barrier) => {
                     recovery.phase = self.classify_intent(&recovery.observed, *barrier).await?;
                 }
-                IntentRecoveryPhase::Publish {
-                    publication,
+                IntentRecoveryPhase::Reconcile {
+                    reconciliation,
                     participant,
-                } => match self.publisher.publish(publication).await? {
-                    SeparatorPublicationOutcome::Published => {
+                } => match self.reconciler.reconcile(reconciliation).await? {
+                    ReconciliationOutcome::Reconciled => {
                         recovery.phase = IntentRecoveryPhase::Delete;
                     }
-                    SeparatorPublicationOutcome::ParentRequiresSplit(action) => {
+                    ReconciliationOutcome::ParentRequiresSplit(action) => {
                         let path = action.path;
                         let participant = participant.clone();
-                        if action.continuation == ParentSplitContinuation::CompletePublication {
+                        if action.continuation == ParentSplitContinuation::CompleteReconciliation {
                             recovery.phase = IntentRecoveryPhase::Delete;
                         }
                         return Ok(IntentRecoveryStep::SplitParent {
@@ -948,11 +1003,9 @@ impl StructuralRecovery {
         // The batch barrier follows every Ready observation in this batch.
         // Each worker made its gated source durable before writing Ready, so
         // this bound excludes source evidence from before that gate.
-        let collection = &intent.collection;
-        let created_tokens = &intent.created_tokens;
         if !self
             .fence_source_writer(
-                collection,
+                &intent.collection,
                 intent.source_token.as_ref(),
                 &intent.source_revision,
                 barrier,
@@ -961,62 +1014,75 @@ impl StructuralRecovery {
         {
             return Err(TransError::Retry);
         }
+        match &intent.change {
+            StructuralChange::Split {
+                created_tokens,
+                split_key,
+            } => {
+                self.classify_split(&intent, created_tokens, split_key, barrier)
+                    .await
+            }
+            StructuralChange::Merge {
+                target: Some(target),
+            } => {
+                let ObjectPath::StructuralIntent { intent_id, .. } = observed.path() else {
+                    return Err(TransError::other(
+                        "structural intent observation has no intent path",
+                    ));
+                };
+                self.classify_merge(&intent, intent_id, target, barrier)
+                    .await
+            }
+            StructuralChange::Merge { target: None } => {
+                Err(TransError::other("Ready merge intent records no target"))
+            }
+        }
+    }
 
-        let reachable = if intent.is_root() {
+    /// Rolls a fenced split forward if it linked all its created nodes, and
+    /// deletes the created nodes that it did not link otherwise.
+    async fn classify_split(
+        &self,
+        intent: &StructuralIntent,
+        created_tokens: &[NodeToken],
+        split_key: &[u8],
+        barrier: CurrentnessBarrier,
+    ) -> Result<IntentRecoveryPhase, TransError> {
+        let collection = &intent.collection;
+        let test_keys: Vec<&[u8]> = if intent.is_root() {
             if created_tokens.len() != 2 {
                 return Err(TransError::InvalidInput(
                     "root split intent does not have two children".into(),
                 ));
             }
-            vec![
-                self.router
-                    .token_reachable_at_key(
-                        collection,
-                        &[],
-                        &created_tokens[0],
-                        Requirement::after(barrier),
-                    )
-                    .await?,
-                self.router
-                    .token_reachable_at_key(
-                        collection,
-                        &intent.split_key,
-                        &created_tokens[1],
-                        Requirement::after(barrier),
-                    )
-                    .await?,
-            ]
+            vec![&[], split_key]
         } else {
             if created_tokens.len() != 1 {
                 return Err(TransError::InvalidInput(
                     "non-root split intent does not have one sibling".into(),
                 ));
             }
-            vec![
-                self.router
-                    .token_reachable_at_key(
-                        collection,
-                        &intent.split_key,
-                        &created_tokens[0],
-                        Requirement::after(barrier),
-                    )
-                    .await?,
-            ]
+            vec![split_key]
         };
-        let applied = reachable.iter().all(|reachable| *reachable);
+        let mut linked = Vec::with_capacity(created_tokens.len());
+        for (token, test_key) in created_tokens.iter().zip(test_keys) {
+            linked.push(
+                self.created_node_linked(collection, token, test_key, barrier)
+                    .await?,
+            );
+        }
+        let applied = linked.iter().all(|linked| *linked);
         if applied && !intent.is_root() {
-            return Ok(IntentRecoveryPhase::Publish {
-                publication: self.publisher.begin_publication(
-                    collection,
-                    &intent.split_key,
-                    &created_tokens[0],
-                ),
+            return Ok(IntentRecoveryPhase::Reconcile {
+                reconciliation: self
+                    .reconciler
+                    .begin(collection, split_key, &created_tokens[0]),
                 participant: intent.participant_id.clone(),
             });
         }
         if !applied {
-            for (token, reachable) in created_tokens.iter().zip(reachable) {
-                if !reachable {
+            for (token, linked) in created_tokens.iter().zip(linked) {
+                if !linked {
                     match self
                         .nodes
                         .load_node_state(collection, token, Requirement::after(barrier))
@@ -1032,15 +1098,83 @@ impl StructuralRecovery {
         Ok(IntentRecoveryPhase::Delete)
     }
 
+    /// Rolls a fenced merge forward if its drain landed, and makes sure that
+    /// it never takes effect otherwise (ADR-073).
+    async fn classify_merge(
+        &self,
+        intent: &StructuralIntent,
+        intent_id: &StructuralIntentId,
+        target: &MergeTarget,
+        barrier: CurrentnessBarrier,
+    ) -> Result<IntentRecoveryPhase, TransError> {
+        let collection = &intent.collection;
+        let source = intent
+            .source_token
+            .as_ref()
+            .ok_or_else(|| TransError::InvalidInput("merge intent has no source".into()))?;
+        let requirement = Requirement::after(barrier);
+        let drained = match self.nodes.load_node(collection, source, requirement).await {
+            Ok((node, _)) => {
+                node.is_drained() && node.right_sibling() == Some(target.token.as_str())
+            }
+            Err(StorageError::NotFound) => false,
+            Err(error) => return Err(error.into()),
+        };
+        if !drained {
+            self.structural_nodes
+                .abandon_merge(collection, target, intent_id, requirement)
+                .await?;
+            return Ok(IntentRecoveryPhase::Delete);
+        }
+        self.structural_nodes
+            .remove_merge_reservation(collection, &target.token, intent_id, requirement)
+            .await?;
+        Ok(IntentRecoveryPhase::Reconcile {
+            reconciliation: self
+                .reconciler
+                .begin(collection, &target.boundary, &target.token),
+            participant: intent.participant_id.clone(),
+        })
+    }
+
+    /// Reports whether a split linked its created node `token` into the tree.
+    /// `test_key` is the lowest key that the split gave to the node.
+    async fn created_node_linked(
+        &self,
+        collection: &CollectionAddress,
+        token: &NodeToken,
+        test_key: &[u8],
+        barrier: CurrentnessBarrier,
+    ) -> Result<bool, TransError> {
+        let requirement = Requirement::after(barrier);
+        let node = match self.nodes.load_node(collection, token, requirement).await {
+            Ok((node, _)) => node,
+            Err(StorageError::NotFound) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        // A merge can move `test_key` out of a linked node, so reachability
+        // alone does not prove the link. A node that was never linked gets no
+        // traffic and no structural change, so it can lose `test_key` only
+        // after it was linked (ADR-073).
+        if node.is_drained() || node.high_key().is_some_and(|high| high <= test_key) {
+            return Ok(true);
+        }
+        Ok(self
+            .router
+            .token_reachable_at_key(collection, test_key, token, requirement)
+            .await?)
+    }
+
     /// Fences the worker that recorded `source_revision` before classifying
-    /// created-node reachability.
+    /// the structural change.
     ///
-    /// That revision is the whole question. A worker publishes its split with
-    /// one CAS expecting it and never re-reads the source in between, so while
-    /// the source still carries it the publish can still land, and once it does
-    /// not the publish can never land again. The structural gate answers a
-    /// weaker question: it cannot tell this intent's worker from a later one
-    /// that gated the same source after this intent was abandoned.
+    /// That revision is the whole question. A worker publishes its split or
+    /// drain with one CAS expecting it and never re-reads the source in
+    /// between, so while the source still carries it the publish can still
+    /// land, and once it does not the publish can never land again. The
+    /// structural gate answers a weaker question: it cannot tell this intent's
+    /// worker from a later one that gated the same source after this intent
+    /// was abandoned.
     async fn fence_source_writer(
         &self,
         collection: &CollectionAddress,
@@ -1065,7 +1199,9 @@ impl StructuralRecovery {
                 .then(|| gate.holders().first())
                 .flatten()
                 .ok_or_else(|| {
-                    TransError::other("split source is at its recorded revision without a gate")
+                    TransError::other(
+                        "structural source is at its recorded revision without a gate",
+                    )
                 })?;
             if self.mon.tx_status(holder).await? == TxCommitStatus::Pending {
                 return Ok(false);

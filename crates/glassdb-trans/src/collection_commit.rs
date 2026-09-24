@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use glassdb_data::{CollectionAddress, CollectionId, TxId};
 use glassdb_storage::transaction::{TxCollectionChange, TxCollectionOp, TxLock};
-use glassdb_storage::{CurrentnessBarrier, Requirement, SplitPolicy};
+use glassdb_storage::{CurrentnessBarrier, NodeSizePolicy, Requirement};
 
 use crate::collection_catalog::CollectionCatalog;
 use crate::collections::{CatalogAccesses, CollectionLifecycle, CollectionOp};
@@ -74,7 +74,7 @@ pub(crate) struct CollectionCommit {
     catalog: CollectionCatalog,
     lifecycle: CollectionLifecycle,
     monitor: Monitor,
-    split_policy: SplitPolicy,
+    node_size_policy: NodeSizePolicy,
 }
 
 impl CollectionHandleState {
@@ -180,13 +180,13 @@ impl CollectionCommit {
         catalog: CollectionCatalog,
         lifecycle: CollectionLifecycle,
         monitor: Monitor,
-        split_policy: SplitPolicy,
+        node_size_policy: NodeSizePolicy,
     ) -> Self {
         Self {
             catalog,
             lifecycle,
             monitor,
-            split_policy,
+            node_size_policy,
         }
     }
 
@@ -263,7 +263,7 @@ impl CollectionCommit {
                 &handle.accesses.reads,
                 &handle.accesses.changes,
                 barrier,
-                &self.split_policy,
+                &self.node_size_policy,
             )
             .await
     }
@@ -276,7 +276,7 @@ impl CollectionCommit {
     ) -> Result<bool, TransError> {
         let reads = handle.accesses.clone().into_read_only();
         self.catalog
-            .validate(None, &reads.reads, &[], barrier, &self.split_policy)
+            .validate(None, &reads.reads, &[], barrier, &self.node_size_policy)
             .await
     }
 

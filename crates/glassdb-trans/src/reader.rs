@@ -308,10 +308,10 @@ mod tests {
                 _ => {
                     use crate::access::{AccessSet, WriteAccess};
                     use crate::collection_coordination::CollectionStateResolver;
-                    use crate::leaf_coord::{LeafCoordinator, SplitHinter};
+                    use crate::leaf_coord::{LeafCoordinator, StructuralHinter};
                     use crate::tlocker::{LockOutcome, Locker};
-                    struct NoSplitHints;
-                    impl SplitHinter for NoSplitHints {
+                    struct NoStructuralHints;
+                    impl StructuralHinter for NoStructuralHints {
                         fn observe_leaf(&self, _: &glassdb_data::ObjectPath, _: &LeafBody) {}
 
                         fn capacity_rejected(&self, _path: &glassdb_data::ObjectPath) {}
@@ -321,8 +321,8 @@ mod tests {
                         KeyStateResolver::new(local.monitor.clone()),
                         local.monitor.clone(),
                         RetryConfig::default(),
-                        glassdb_storage::SplitPolicy::default(),
-                        Arc::new(NoSplitHints),
+                        glassdb_storage::NodeSizePolicy::default(),
+                        Arc::new(NoStructuralHints),
                     );
                     let state = CollectionStateResolver::new(
                         local.records.clone(),

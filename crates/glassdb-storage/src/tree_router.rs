@@ -76,6 +76,17 @@ struct RoutedItem<T> {
     payload: T,
     stage: RouteStage,
     right_hops: usize,
+    /// Set while the item reads its next node again because a copy of it was
+    /// older than a merge (ADR-073).
+    refresh: Option<Requirement>,
+}
+
+impl<T> RoutedItem<T> {
+    fn requirement(&self, interior: Requirement, leaf: Requirement) -> Requirement {
+        let stage = route_requirement(self.stage, interior, leaf);
+        self.refresh
+            .map_or(stage, |refresh| stage.stricter(refresh))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -100,7 +111,7 @@ impl<T> PendingPath<T> {
     fn requirement(&self, interior: Requirement, leaf: Requirement) -> Requirement {
         self.items
             .iter()
-            .map(|item| route_requirement(item.stage, interior, leaf))
+            .map(|item| item.requirement(interior, leaf))
             .fold(Requirement::ANY, Requirement::stricter)
     }
 }
@@ -119,6 +130,7 @@ struct RoutingError {
 type PathLoad = (ObjectPath, Result<LeafObservation, StorageError>);
 
 struct BatchRouting<T> {
+    nodes: NodeStore,
     interior: Requirement,
     leaf: Requirement,
     pending: BTreeMap<ObjectPath, PendingPath<T>>,
@@ -129,11 +141,13 @@ struct BatchRouting<T> {
 
 impl<T> BatchRouting<T> {
     fn new(
+        nodes: NodeStore,
         items: impl IntoIterator<Item = (LogicalKey, T)>,
         interior: Requirement,
         leaf: Requirement,
     ) -> Self {
         let mut routing = Self {
+            nodes,
             interior,
             leaf,
             pending: BTreeMap::new(),
@@ -154,6 +168,7 @@ impl<T> BatchRouting<T> {
                     payload,
                     stage: RouteStage::Interior,
                     right_hops: 0,
+                    refresh: None,
                 },
             );
         }
@@ -281,11 +296,27 @@ impl<T> BatchRouting<T> {
             );
             return None;
         }
-        let required = route_requirement(item.stage, self.interior, self.leaf);
+        let required = item.requirement(self.interior, self.leaf);
         if !observation.satisfies(required) {
             self.enqueue(path.clone(), item);
             return None;
         }
+        if node.is_below_range(&item.raw_key) {
+            if item.refresh.is_some() {
+                self.record_error(
+                    item.ordinal,
+                    path.clone(),
+                    StorageError::other("routing reached a node whose range starts above the key"),
+                );
+                return None;
+            }
+            // Same rule as a keyed descent: only a merge that landed creates
+            // this route, so a read after this barrier holds its low key.
+            item.refresh = Some(Requirement::after(self.nodes.currentness_barrier()));
+            self.enqueue(path.clone(), item);
+            return None;
+        }
+        item.refresh = None;
 
         if !node.covers(&item.raw_key) {
             let Some(token) = node.right_sibling() else {
@@ -416,6 +447,7 @@ impl<'a> DescentCursor<'a> {
     /// Moves right until the current node covers `key`.
     async fn normalize_at(&mut self, key: &[u8]) -> Result<(), StorageError> {
         for _ in 0..MAX_SELF_CORRECTING_HOPS {
+            self.refresh_if_older_than_merge(key).await?;
             if self.current.node().covers(key) {
                 return Ok(());
             }
@@ -479,6 +511,30 @@ impl<'a> DescentCursor<'a> {
 
     /// Reloads the exact current path at a new freshness requirement.
     async fn reload_current(&mut self, requirement: Requirement) -> Result<(), StorageError> {
+        self.load_current(requirement).await?;
+        self.requirement = requirement;
+        Ok(())
+    }
+
+    /// Reads the current node again when its copy is older than a merge that
+    /// moved `key` into it (ADR-073).
+    async fn refresh_if_older_than_merge(&mut self, key: &[u8]) -> Result<(), StorageError> {
+        if !self.current.node().is_below_range(key) {
+            return Ok(());
+        }
+        // The route that reached this node exists only after the merge landed,
+        // so any read after this barrier holds the lowered low key.
+        let fresh = Requirement::after(self.router.nodes.currentness_barrier());
+        self.load_current(self.requirement.stricter(fresh)).await?;
+        if self.current.node().is_below_range(key) {
+            return Err(StorageError::other(
+                "routing reached a node whose range starts above the key",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn load_current(&mut self, requirement: Requirement) -> Result<(), StorageError> {
         let path = self.current.path.clone();
         let observation = self
             .router
@@ -489,7 +545,6 @@ impl<'a> DescentCursor<'a> {
             return Err(StorageError::other("tree node vanished during descent"));
         }
         self.current = Located { path, observation };
-        self.requirement = requirement;
         Ok(())
     }
 }
@@ -521,18 +576,19 @@ impl DescentStop for ReachTarget {
 }
 
 struct FindParent {
+    target: ObjectPath,
     parent: Option<Located>,
 }
 
 impl DescentStop for FindParent {
     type Output = Option<RoutedLeaf>;
 
-    fn stop_at(&mut self, _current: &Located) -> Option<Self::Output> {
-        None
+    fn stop_at(&mut self, current: &Located) -> Option<Self::Output> {
+        (current.path == self.target).then(|| self.parent.take().map(Located::into_locator))
     }
 
     fn finish_at_leaf(self) -> Self::Output {
-        self.parent.map(Located::into_locator)
+        None
     }
 
     fn descended_from(&mut self, index: Located) {
@@ -560,17 +616,55 @@ impl<'a> LeafChain<'a> {
         }
     }
 
+    /// Returns the first live leaf on the right-link chain of `leaf`.
     async fn successor(&self, leaf: &RoutedLeaf) -> Result<Option<RoutedLeaf>, StorageError> {
-        let Some(token) = leaf.node().and_then(Node::right_sibling) else {
+        let Some(node) = leaf.node() else {
             return Ok(None);
         };
-        let token = node_token(token)?;
-        Ok(Some(
-            self.router
-                .load_child(self.collection, &token, self.requirement)
-                .await?
-                .into_locator(),
+        let mut right = node.right_sibling().map(node_token).transpose()?;
+        for _ in 0..MAX_SELF_CORRECTING_HOPS {
+            let Some(token) = right else {
+                return Ok(None);
+            };
+            let next = self.load_linked(&token, node.high_key()).await?;
+            if !next.node().is_drained() {
+                return Ok(Some(next.into_locator()));
+            }
+            right = next.node().right_sibling().map(node_token).transpose()?;
+        }
+        Err(StorageError::other(
+            "leaf chain exceeded the right-link hop bound",
         ))
+    }
+
+    /// Loads a linked node that must cover `first_key` or keys after it. A
+    /// copy older than a merge into the node is read again (ADR-073).
+    async fn load_linked(
+        &self,
+        token: &NodeToken,
+        first_key: Option<&[u8]>,
+    ) -> Result<Located, StorageError> {
+        let linked = self
+            .router
+            .load_child(self.collection, token, self.requirement)
+            .await?;
+        let Some(first_key) = first_key else {
+            return Ok(linked);
+        };
+        if !linked.node().is_below_range(first_key) {
+            return Ok(linked);
+        }
+        let fresh = Requirement::after(self.router.nodes.currentness_barrier());
+        let linked = self
+            .router
+            .load_child(self.collection, token, self.requirement.stricter(fresh))
+            .await?;
+        if linked.node().is_below_range(first_key) {
+            return Err(StorageError::other(
+                "a leaf chain reached a node whose range starts above the previous leaf",
+            ));
+        }
+        Ok(linked)
     }
 
     async fn collect_through(
@@ -786,7 +880,7 @@ impl TreeRouter {
         interior: Requirement,
         leaf: Requirement,
     ) -> Result<Vec<RoutedLeafGroup<T>>, StorageError> {
-        let mut routing = BatchRouting::new(items, interior, leaf);
+        let mut routing = BatchRouting::new(self.nodes.clone(), items, interior, leaf);
         let mut in_flight = FuturesUnordered::<BoxFuture<'static, PathLoad>>::new();
 
         while routing.has_work() {
@@ -845,22 +939,28 @@ impl TreeRouter {
         }
     }
 
-    /// Finds the deepest index node that covers `key` — the parent of the leaf
-    /// level on the descent toward `key`, into which a leaf split publishes its
-    /// separator (ADR-031). Descends from the root (self-correcting through
-    /// right-links) and returns the last index visited before reaching a leaf.
-    /// Returns `None` when the collection does not exist or its root is still a
-    /// single leaf (no index level yet).
-    pub async fn parent_index_for(
+    /// Finds the index node from which the descent toward `key` reaches the
+    /// node named `target`, directly or through right links: the parent that a
+    /// parent reconciliation for `key` changes (ADR-073). Returns `None` when
+    /// the descent does not reach `target`.
+    pub async fn parent_of(
         &self,
         collection: &CollectionAddress,
         key: &[u8],
+        target: &NodeToken,
         requirement: Requirement,
     ) -> Result<Option<RoutedLeaf>, StorageError> {
         let Some(cursor) = self.start_descent(collection, requirement).await? else {
             return Ok(None);
         };
-        cursor.run_until(key, FindParent { parent: None }).await
+        let stop = FindParent {
+            target: ObjectPath::Node {
+                collection: collection.clone(),
+                token: target.clone(),
+            },
+            parent: None,
+        };
+        cursor.run_until(key, stop).await
     }
 
     /// Returns the observed node named `token`, without descending to it.
@@ -1223,7 +1323,7 @@ mod tests {
         assert!(loc.node().unwrap().as_leaf().unwrap().exists(b"only"));
         assert!(
             router
-                .parent_index_for(&collection(), b"only", requirement)
+                .parent_of(&collection(), b"only", &token(9), requirement)
                 .await
                 .unwrap()
                 .is_none()
@@ -1264,7 +1364,7 @@ mod tests {
         );
         assert!(
             router
-                .parent_index_for(&collection(), b"k", requirement)
+                .parent_of(&collection(), b"k", &token(9), requirement)
                 .await
                 .unwrap()
                 .is_none()
@@ -1507,12 +1607,19 @@ mod tests {
                 .unwrap()
         );
         let parent = router
-            .parent_index_for(&collection(), b"pear", Requirement::ANY)
+            .parent_of(&collection(), b"pear", &token(1), Requirement::ANY)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(parent.path, node_path(3));
         assert!(matches!(parent.node().unwrap().body(), NodeBody::Index(_)));
+        // The parent of an index node is one level higher.
+        let parent = router
+            .parent_of(&collection(), b"pear", &token(3), Requirement::ANY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.path, root_path());
         assert!(take_reads(&log).is_empty());
     }
 
@@ -1637,7 +1744,7 @@ mod tests {
         );
         assert!(matches!(
             router
-                .parent_index_for(&collection(), b"pear", Requirement::ANY)
+                .parent_of(&collection(), b"pear", &token(8), Requirement::ANY)
                 .await,
             Err(StorageError::NotFound)
         ));
@@ -2140,6 +2247,244 @@ mod tests {
             .expect_err("a cycle must not route");
         assert!(
             routing.to_string().contains("right-link hop bound"),
+            "unexpected routing error: {routing}"
+        );
+    }
+
+    // Seeds P (apple) -> L (grape) -> R (pear) under one root, split at "f"
+    // and "m", as they are before L merges into R.
+    async fn seed_merge_neighbors(s: &NodeStore) {
+        store_leaf(s, 0, &[b"apple"], Some(b"f"), Some(2)).await;
+        for (byte, node) in [
+            (
+                2,
+                leaf(&[b"grape"], Some(b"m"), Some(&token(1))).with_low_key(b"f".to_vec()),
+            ),
+            (1, leaf(&[b"pear"], None, None).with_low_key(b"m".to_vec())),
+        ] {
+            s.store_node(&collection(), &token(byte), &node, None)
+                .await
+                .unwrap();
+        }
+        s.create_root(
+            &collection(),
+            &Node::index(IndexNode::from_children([
+                (Vec::new(), token(0).to_string()),
+                (b"f".to_vec(), token(2).to_string()),
+                (b"m".to_vec(), token(1).to_string()),
+            ])),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Lands the merge of L into R: the absorb gives R the entries and the low
+    // key of L, then the drain empties L.
+    async fn merge_middle_leaf_into_right(s: &TestStore) {
+        let fresh = Requirement::after(s.timeline.currentness_barrier());
+        let (_, target) = s.load_node(&collection(), &token(1), fresh).await.unwrap();
+        let absorbed = leaf(&[b"grape", b"pear"], None, None).with_low_key(b"f".to_vec());
+        assert!(
+            s.store_node(&collection(), &token(1), &absorbed, Some(&target))
+                .await
+                .unwrap()
+        );
+        let (mut source, observed) = s.load_node(&collection(), &token(2), fresh).await.unwrap();
+        source.drain(token(1).as_ref());
+        assert!(
+            s.store_node(&collection(), &token(2), &source, Some(&observed))
+                .await
+                .unwrap()
+        );
+    }
+
+    // Returns a router that cached the root and R before L merged into R.
+    async fn router_with_stale_merge_target() -> TreeRouter {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let writer = store_over(backend.clone());
+        seed_merge_neighbors(&writer).await;
+        let reader = store_over(backend);
+        let router = TreeRouter::new(reader.nodes.clone(), std::num::NonZeroUsize::MIN);
+        router
+            .route_key(&collection(), b"pear", Requirement::ANY)
+            .await
+            .unwrap();
+        merge_middle_leaf_into_right(&writer).await;
+        router
+    }
+
+    #[tokio::test]
+    async fn routes_and_leaf_chains_skip_drained_nodes() {
+        let s = store();
+        seed_merge_neighbors(&s).await;
+        merge_middle_leaf_into_right(&s).await;
+        let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+        let fresh = Requirement::after(s.timeline.currentness_barrier());
+
+        let loc = router
+            .route_key(&collection(), b"grape", fresh)
+            .await
+            .unwrap();
+        assert_eq!(loc.path, node_path(1));
+        let leaves = router.leaves(&collection(), fresh).await.unwrap();
+        assert_eq!(
+            leaves.iter().map(|leaf| &leaf.path).collect::<Vec<_>>(),
+            [&node_path(0), &node_path(1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_route_reads_a_stale_merge_target_again() {
+        let router = router_with_stale_merge_target().await;
+
+        let loc = router
+            .route_key(&collection(), b"grape", Requirement::ANY)
+            .await
+            .unwrap();
+        assert_eq!(loc.path, node_path(1));
+        assert!(loc.node().unwrap().as_leaf().unwrap().exists(b"grape"));
+    }
+
+    #[tokio::test]
+    async fn batch_routing_reads_a_stale_merge_target_again() {
+        let router = router_with_stale_merge_target().await;
+
+        let groups = router
+            .route_keys_with_requirements(
+                [
+                    (LogicalKey::new(collection(), b"grape"), 'g'),
+                    (LogicalKey::new(collection(), b"pear"), 'p'),
+                ],
+                Requirement::ANY,
+                Requirement::ANY,
+            )
+            .await
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].path(), &node_path(1));
+        assert_eq!(
+            groups[0].keys,
+            vec![(b"grape".to_vec(), 'g'), (b"pear".to_vec(), 'p')]
+        );
+        assert!(
+            groups[0]
+                .node()
+                .unwrap()
+                .as_leaf()
+                .unwrap()
+                .exists(b"grape")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leaf_chain_reads_a_stale_merge_target_again() {
+        let router = router_with_stale_merge_target().await;
+
+        let first = router
+            .first_leaf_at(&collection(), b"apple", Requirement::ANY)
+            .await
+            .unwrap()
+            .unwrap();
+        let next = router
+            .next_leaf(&collection(), &first, Requirement::ANY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.path, node_path(1));
+        assert!(next.node().unwrap().as_leaf().unwrap().exists(b"grape"));
+    }
+
+    #[tokio::test]
+    async fn a_reconciled_parent_entry_reads_a_stale_index_target_again() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let writer = store_over(backend.clone());
+        store_leaf(&writer, 0, &[b"apple"], Some(b"m"), Some(1)).await;
+        writer
+            .store_node(
+                &collection(),
+                &token(1),
+                &leaf(&[b"pear"], None, None).with_low_key(b"m".to_vec()),
+                None,
+            )
+            .await
+            .unwrap();
+        let target = Node::index(IndexNode::from_children([(
+            b"m".to_vec(),
+            token(1).to_string(),
+        )]))
+        .with_low_key(b"m".to_vec());
+        writer
+            .store_node(&collection(), &token(3), &target, None)
+            .await
+            .unwrap();
+        let reader = store_over(backend);
+        reader
+            .load_node_state(&collection(), &token(3), Requirement::ANY)
+            .await
+            .unwrap();
+
+        // The index merge moved the whole range into the target, and the
+        // reconciled root names only the target.
+        let fresh = Requirement::after(writer.timeline.currentness_barrier());
+        let (_, observed) = writer
+            .load_node(&collection(), &token(3), fresh)
+            .await
+            .unwrap();
+        let absorbed = Node::index(IndexNode::from_children([
+            (Vec::new(), token(0).to_string()),
+            (b"m".to_vec(), token(1).to_string()),
+        ]));
+        assert!(
+            writer
+                .store_node(&collection(), &token(3), &absorbed, Some(&observed))
+                .await
+                .unwrap()
+        );
+        writer
+            .create_root(
+                &collection(),
+                &Node::index(IndexNode::from_children([(
+                    Vec::new(),
+                    token(3).to_string(),
+                )])),
+            )
+            .await
+            .unwrap();
+
+        let loc = TreeRouter::new(reader.nodes.clone(), std::num::NonZeroUsize::MIN)
+            .route_key(&collection(), b"apple", Requirement::ANY)
+            .await
+            .unwrap();
+        assert_eq!(loc.path, node_path(0));
+    }
+
+    #[tokio::test]
+    async fn a_current_node_above_the_key_fails_routing() {
+        let s = store();
+        s.store_node(
+            &collection(),
+            &token(1),
+            &leaf(&[b"pear"], None, None).with_low_key(b"m".to_vec()),
+            None,
+        )
+        .await
+        .unwrap();
+        s.create_root(
+            &collection(),
+            &Node::index(IndexNode::from_children([(
+                Vec::new(),
+                token(1).to_string(),
+            )])),
+        )
+        .await
+        .unwrap();
+
+        let routing = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
+            .route_key(&collection(), b"apple", Requirement::ANY)
+            .await
+            .expect_err("a node above the key must not route it");
+        assert!(
+            routing.to_string().contains("starts above the key"),
             "unexpected routing error: {routing}"
         );
     }

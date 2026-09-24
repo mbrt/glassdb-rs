@@ -8,13 +8,14 @@ mod scheduling;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
 use glassdb_backend::memory::MemoryBackend;
-use glassdb_backend::middleware::{OpLog, RecordingBackend};
+use glassdb_backend::middleware::{FaultOptions, OpLog, RecordingBackend};
 use glassdb_concurr::{Tape, rt};
-use glassdb_storage::{InlinePolicy, SplitPolicy};
+use glassdb_storage::{InlinePolicy, NodeSizePolicy};
 use tokio_util::sync::CancellationToken;
 
 use crate::{Database, Error, PersistentCacheConfig, ProtocolTiming};
@@ -34,17 +35,26 @@ const SLOW_MUTATION_SEED: u64 = 0x510A_7E00_5EED_BA5E;
 const CACHE_CAPACITY_BYTES: u64 = 2 * 1024 * 1024;
 const CACHE_MEDIA_SEED: u64 = 0xCA43_5EED_D15C_0048;
 
+/// Upper bound on the latency of each request and each reply without transport
+/// failures. It stays far below the pending timeout of
+/// [`ProtocolTiming::simulation`], so that latency alone does not expire the
+/// leases of live transactions.
+const FAULTLESS_MAX_DELAY: Duration = Duration::from_millis(10);
+
 /// Controls transport failures, instance crashes, and slow backend mutations in
-/// the deterministic simulation harness.
+/// the deterministic simulation harness. The instance transports also add
+/// latency without failures, so that the timers of background work elapse while
+/// the clients run.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FaultConfig {
     failures: bool,
     slow_mutations: bool,
     intensity: u8,
+    zero_latency: bool,
 }
 
 impl FaultConfig {
-    /// Disables every injector.
+    /// Disables every fault injector. The transports still add latency.
     pub fn none() -> Self {
         Self::default()
     }
@@ -53,17 +63,16 @@ impl FaultConfig {
     pub fn failures(intensity: u8) -> Self {
         FaultConfig {
             failures: true,
-            slow_mutations: false,
             intensity,
+            ..Self::default()
         }
     }
 
     /// Enables one slow conditional mutation and no uncertain failures.
     pub fn slow_mutations() -> Self {
         FaultConfig {
-            failures: false,
             slow_mutations: true,
-            intensity: 0,
+            ..Self::default()
         }
     }
 
@@ -73,6 +82,7 @@ impl FaultConfig {
             failures: true,
             slow_mutations: true,
             intensity,
+            ..Self::default()
         }
     }
 
@@ -82,6 +92,21 @@ impl FaultConfig {
 
     fn slow_mutations_enabled(self) -> bool {
         self.slow_mutations
+    }
+
+    /// The behavior of each instance transport while the clients run.
+    fn transport_options(self) -> FaultOptions {
+        if self.failures {
+            return FaultOptions::from_intensity(self.intensity);
+        }
+        let delay_prob = if self.zero_latency { 0 } else { u8::MAX };
+        FaultOptions {
+            delay_prob,
+            reply_delay_prob: delay_prob,
+            fault_prob: 0,
+            lost_ack_prob: 0,
+            max_delay: FAULTLESS_MAX_DELAY,
+        }
     }
 }
 
@@ -97,16 +122,16 @@ impl<'a> Arbitrary<'a> for FaultConfig {
         })
     }
 }
-/// Opens a simulation database with the given split policy and optional
+/// Opens a simulation database with the given node size policy and optional
 /// persistent-cache media.
 pub(crate) async fn open_det_db(
     backend: &Arc<dyn Backend>,
-    split_policy: SplitPolicy,
+    node_size_policy: NodeSizePolicy,
     inline_policy: InlinePolicy,
     media: Option<SimMedia>,
 ) -> Result<Database, Error> {
     let builder = Database::builder(DB_NAME, backend.clone())
-        .split_policy(split_policy)
+        .node_size_policy(node_size_policy)
         .inline_policy(inline_policy)
         .protocol_timing(ProtocolTiming::simulation());
     let builder = if let Some(media) = media {
@@ -260,7 +285,7 @@ pub trait SimWorkload: Clone + Default + 'static {
     /// Opens a database for this workload over `backend` and optional simulated
     /// cache media. The harness calls this for the seed/verify database and for
     /// every instance (and restart), so the workload — not the harness — chooses
-    /// the split soft-cap policy. The default uses production caps; override to
+    /// the node size policy. The default uses production caps; override to
     /// exercise B-link splits with few keys. Implementations must go through
     /// [`open_det_db`] to preserve the deterministic clock required for
     /// byte-identical replay.
@@ -270,7 +295,7 @@ pub trait SimWorkload: Clone + Default + 'static {
     ) -> impl Future<Output = Result<Database, Error>> {
         open_det_db(
             backend,
-            SplitPolicy::default(),
+            NodeSizePolicy::default(),
             InlinePolicy::default(),
             media,
         )
@@ -352,8 +377,9 @@ impl<W: SimWorkload> RunPlan<W> {
             media_tape,
         } = self;
 
-        // The fault tape guides each instance's transport failures, crash timing,
-        // outage windows, and the independent one-shot slow mutation. With an empty
+        // The fault tape guides each instance's transport latency and failures,
+        // crash timing, outage windows, and the independent one-shot slow
+        // mutation. With an empty
         // tape all decisions fall back to the seed (PCT/seed-breadth runs).
         let fault_streams = deinterleave::<FAULT_STREAMS>(&fault_tape);
 
@@ -393,19 +419,16 @@ impl<W: SimWorkload> RunPlan<W> {
         } else {
             backbone.clone()
         };
-        let transports = if faults.failures_enabled() {
-            let schedules = (0..ninstances)
-                .map(|instance| {
-                    (
-                        fault_streams[INSTANCE_STREAM_BASE + instance].clone(),
-                        instance_seed(seed, instance),
-                    )
-                })
-                .collect();
-            FaultTransports::faulting(&client_backbone, faults.intensity, schedules)
-        } else {
-            FaultTransports::faultless(&client_backbone, ninstances)
-        };
+        let schedules = (0..ninstances)
+            .map(|instance| {
+                (
+                    fault_streams[INSTANCE_STREAM_BASE + instance].clone(),
+                    instance_seed(seed, instance),
+                )
+            })
+            .collect();
+        let transports =
+            FaultTransports::new(&client_backbone, faults.transport_options(), schedules);
 
         RunContext {
             workload,
@@ -647,7 +670,12 @@ mod sim_tests {
                         SharedInstanceWorkload {
                             clients: (0..4).map(|id| vec![id]).collect(),
                         },
-                        FaultConfig::none(),
+                        // A coordinator round takes only the writes that arrive
+                        // together, and random latency spreads them apart.
+                        FaultConfig {
+                            zero_latency: true,
+                            ..FaultConfig::none()
+                        },
                         1,
                         Vec::new(),
                         media_tape,

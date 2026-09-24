@@ -5,7 +5,7 @@ use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::RecordingBackend;
 use glassdb::backend::{Backend, ListLimit};
 use glassdb::{
-    Collection, CollectionPath, Database, Error, MAX_COLLECTION_NAME_BYTES, SplitPolicy,
+    Collection, CollectionPath, Database, Error, MAX_COLLECTION_NAME_BYTES, NodeSizePolicy,
 };
 
 #[tokio::test]
@@ -280,8 +280,8 @@ async fn names_are_validated_before_io() {
 #[tokio::test]
 async fn collection_directories_respect_the_record_size_limit() {
     let db = Database::builder("example", MemoryBackend::new())
-        .split_policy(
-            SplitPolicy::builder()
+        .node_size_policy(
+            NodeSizePolicy::builder()
                 .node_max_bytes(256)
                 .split_headroom_bytes(64)
                 .build()

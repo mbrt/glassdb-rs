@@ -388,7 +388,7 @@ One leaf observation and the ordered logical keys associated with it by one rout
 _Avoid_: Leaf group, owning leaf group, point-leaf plan
 
 **Separator**:
-A logical key in a parent index node that bounds one child's range: keys at or above it route to that child. A child split publishes a new separator into its parent, and a child merge removes one.
+A logical key in a parent index node that bounds one child's range: keys at or above it route to that child. Parent reconciliation adds a separator after a child split, and removes one after a child merge.
 _Avoid_: Index key, boundary key
 
 ## Leaf coordination
@@ -429,6 +429,10 @@ _Avoid_: Retired node, redirect node
 **Merge reservation**:
 A durable mark on the node that receives a merge, which names the structural intent of that merge. It allows no other structural change to that node, and only that merge or its recovery can remove it.
 _Avoid_: Merge gate, merge lock
+
+**Parent reconciliation**:
+The step after a split or a merge that makes the separators of one parent index node agree with the sibling links of its children around one key.
+_Avoid_: Separator publication, parent repoint
 
 **Topology participant**:
 A transaction identity that a collection record lists while it can make structural changes to the collection tree.

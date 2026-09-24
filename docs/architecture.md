@@ -115,9 +115,10 @@ boundary.
 Database metadata owns hard coordination limits and transaction timing. Creation
 writes them with the database ID; each open loads them before starting the engine.
 A concurrent creator uses the winning metadata. Recovery, refresh, and GC use
-the stored timing. Soft split thresholds remain local to each database instance.
+the stored timing. Soft split and underfull thresholds remain local to each
+database instance.
 Capacity rejections request splits independently of those thresholds, including
-parent splits during separator publication and recovery. A capacity hint requests
+parent splits during parent reconciliation and recovery. A capacity hint requests
 one split of a divisible node; the blocked operation then retries admission.
 Earlier formats require recreation; see
 [ADR-072](adr/072-persisted-database-settings.md).
@@ -151,9 +152,9 @@ acquisition flows through **one leaf coordinator**. It loads the object once per
 attempt, builds a mutation plan in wound-wait order, and persists staged changes
 with one CAS (ADR-028/029). The coordinator is a transaction-aware shared
 mutation engine: it owns identity, ordering, admission, and recovery across a
-heterogeneous round, while `Algo`, the `Locker`, and the `Splitter` supply each
-operation's target, member policy, and typed result. The operation types stay
-with their policy owners: the coordinator reads a member outcome only for
+heterogeneous round, while `Algo`, the `Locker`, and the `Restructurer` supply
+each operation's target, member policy, and typed result. The operation types
+stay with their policy owners: the coordinator reads a member outcome only for
 admission, exclusion, and delivery, never for operation-specific policy.
 
 Independent point-access phases use one transaction-local parallelism value.
@@ -185,7 +186,7 @@ flowchart TD
     Direct["DirectCommit<br/>direct same-leaf publication"]
     Monitor["Monitor<br/>transaction-record lifecycle<br/>wound · wait · refresh"]
     Hints["GcHints<br/>bounded nonblocking reports<br/>wake · de-duplicate"]
-    Splitter["Splitter<br/>split scheduling · planning · node writes<br/>recursive parent split execution"]
+    Restructurer["Restructurer<br/>candidate scheduling · split and merge modules<br/>shared change lifecycle · recursive parent split execution"]
     Recovery["StructuralRecovery<br/>structural-intent lifecycle<br/>classification · fencing · resumption · settlement"]
     Coord["LeafCoordinator — mutation engine<br/>identity · order · admission<br/>load · plan · CAS per attempt<br/>per-member in-doubt recovery"]
     Gc["Gc<br/>candidate retries · bounded parallel checks<br/>adaptive scans · GC checks<br/>reclamation · local diagnostics"]
@@ -195,7 +196,7 @@ flowchart TD
     Engine -->|"owns · reads · scans · snapshots"| Reader
     Engine -.->|"owns and wires"| Locker
     Engine -.->|"owns and wires"| Monitor
-    Engine -.->|"owns and wires"| Splitter
+    Engine -.->|"owns and wires"| Restructurer
     Engine -.->|"owns and wires"| Coord
     Engine -.->|"owns and starts"| Gc
     Algo -->|"validate"| Reader
@@ -208,13 +209,13 @@ flowchart TD
     Algo -->|"direct candidate"| Direct
     Algo -->|"GC hints"| Hints
     Direct -->|"GC hints"| Hints
-    Splitter -->|"GC hints"| Hints
-    Splitter -->|"start · resume"| Recovery
-    Recovery -->|"parent split request"| Splitter
+    Restructurer -->|"GC hints"| Hints
+    Restructurer -->|"start · resume"| Recovery
+    Recovery -->|"parent split request"| Restructurer
     Hints -->|"candidates · wake"| Gc
     Locker -->|"acquire · write-back · release"| Coord
     Direct -->|"direct LeafOperation"| Coord
-    Splitter -->|"leaf structural-gate operation"| Coord
+    Restructurer -->|"leaf structural-gate operation"| Coord
     Recovery -->|"source fencing · clean gate release"| Coord
     Gc -->|"reclaim through unlock"| Locker
   end
@@ -229,7 +230,7 @@ flowchart TD
   Reader -->|"typed reads"| Stores
   Monitor -->|"transaction records"| Stores
   Coord -->|"node CAS"| Stores
-  Splitter -->|"post-gate node writes"| Stores
+  Restructurer -->|"post-gate node writes"| Stores
   Recovery -->|"structural intents · recovery reads and cleanup"| Stores
   Gc -->|"paged scans · GC checks"| Stores
   Stores --> Backend
@@ -288,25 +289,45 @@ out of both the B-link `NodeStore` and the semantic catalog.
 
 Routing traversal is centralized in `TreeRouter`, but use of that mechanism is
 intentionally distributed. Key resolution, the key-lock view, GC, and the
-`Splitter` each own a cheap handle for their distinct read, lock, reclamation,
-or structural workflow. A handle shares the same decoded object cache without
-gaining structural-intent capabilities or maintaining independent topology
-state. This does not invent a single semantic owner for those different routing
-responsibilities.
+`Restructurer` each own a cheap handle for their distinct read, lock,
+reclamation, or structural workflow. A handle shares the same decoded object
+cache without gaining structural-intent capabilities or maintaining independent
+topology state. This does not invent a single semantic owner for those
+different routing responsibilities.
 
 `StructuralRecovery` owns each structural intent from its prepared write to
-clean deletion or durable recovery. It exposes opaque witnesses to split
-coordination, and one resumable action that classifies phases, fences source
-writers, checks reachability, cleans unreachable nodes, and settles topology
-participants with a final status. `Splitter` only executes a requested recursive
-parent split and supplies its result back to the action; it does not inspect
-durable phases.
+clean deletion or durable recovery. It exposes opaque witnesses to structural
+change coordination, and one resumable action that classifies phases, fences
+source writers, checks reachability, cleans unreachable nodes, and settles
+topology participants with a final status. `Restructurer` only executes a
+requested recursive parent split and supplies its result back to the action; it
+does not inspect durable phases.
+
+Splits and merges share one structural-change lifecycle and one parent
+reconciliation step. The `Restructurer` only schedules: it gives each candidate
+to the split or the merge module, which plans and coordinates that kind of
+change over a shared change context. A merge drains an underfull node into its
+right sibling ([ADR-073](adr/073-merge-nodes-into-right-sibling.md)). The
+drained node stays until its collection is dropped, so stale routes pass it
+through its right link. Until the drain lands, a merge reservation on the target
+keeps the target's copies of the drained entries, and only the merge intent can
+remove it.
+
+Committed leaf writes, parent reconciliation, and capacity rejections queue
+split and merge candidates. A new candidate wakes the restructurer after a
+short coalescing delay, so that one sweep takes a burst of writes. A deferred
+candidate does not wake the restructurer: it waits for the next sweep, at the
+latest a fixed interval later, so that a busy node does not cause a tight retry
+loop. A merge defers while a live transaction holds a lock on its source or its
+target.
 
 Recovery fences a source writer against the source revision that the intent's
 Ready transition recorded, not against the structural gate the source carries
-now. A worker publishes its split with one compare-and-swap expecting that
-revision, so the revision alone says whether the worker can still land, and a
-later split of the same source cannot shield an abandoned intent. Structural
+now. A worker publishes its split shrink or merge drain with one
+compare-and-swap expecting that revision, so the revision alone says whether the
+worker can still land, and a later structural change of the same source cannot
+shield an abandoned intent. Each gate installation advances the membership
+generation, so the recorded revision never comes back. Structural
 recovery runs on its own background cadence over an independent namespace, and
 does not consume the transaction GC candidate queue.
 
@@ -326,8 +347,8 @@ does not consume the transaction GC candidate queue.
 | `CollectionStateResolver` | collection-state mechanism | resolved record loads, foreign-holder reconciliation, committed directory write-back assistance | key routing, B-link topology, catalog semantics |
 | `CollectionCatalog`   | collection semantics | logical snapshots, read-your-writes validation, capacity and precondition checks | locking policy, CAS, wound-wait |
 | `LeafCoordinator`     | shared mutation engine | one round per object: batching, oldest-first mutation planning, routing and capacity admission, exclusion of overlapping direct members, one CAS per attempt, per-member in-doubt state, reload-recover, vestigial-entry pruning | operation-specific results, cross-leaf strategy, transaction lifecycle, commit orchestration, GC selection |
-| `Splitter`            | structural mechanism | scheduling, topology registration and finalization, source preparation and compaction, split planning, node writes, separator publication | durable intent phases, recovery classification, participant settlement |
-| `StructuralRecovery`  | durable recovery mechanism | intent creation and phase change, clean deletion, discovery, fencing, reachability classification, orphan cleanup, participant settlement | split candidates and reasons, tombstone compaction, node split planning |
+| `Restructurer`        | structural mechanism | scheduling, topology registration and finalization, source preparation and compaction, split and merge planning, node writes, parent reconciliation | durable intent phases, recovery classification, participant settlement |
+| `StructuralRecovery`  | durable recovery mechanism | intent creation and phase change, clean deletion, discovery, fencing, landing classification, merge abandonment, orphan cleanup, participant settlement | maintenance candidates and causes, tombstone compaction, split and merge planning |
 | `KeyResolver`         | key/range resolution | routing, scan composition, and logical point validation | commit and lock policy, collection-record coordination |
 | `KeyStateResolver`    | loaded key-state mechanism | transaction-dependent interpretation of already-loaded key and node state | routing, scan composition, commit policy |
 | `Reader`              | read mechanism   | value materialization                                                                                                 | commit and lock policy             |
@@ -596,12 +617,14 @@ value is never demoted, because it may have no transaction record.
 
 An unmarked point absence records the routed leaf's membership generation. If
 the physical leaf changes, validation requires both continued absence and the
-same generation; a tombstone read instead records its exact writer. The splitter
-preserves this generation across structural changes and, under its structural
-gate, removes holder-free tombstones before its final split decision
+same generation; a tombstone read instead records its exact writer. A
+structural change never returns a leaf to an earlier generation. Under its
+structural gate, the restructurer removes holder-free tombstones before its final
+split decision
 ([ADR-062](adr/062-splitter-driven-tombstone-reclamation.md)). If compaction
 removes the pressure, it persists the smaller leaf and cancels the split;
-otherwise the recoverable split partitions the compacted state.
+otherwise the recoverable split partitions the compacted state. A merge compacts
+both its source and its target.
 
 Lock acquisition is a compare-and-swap on the leaf *object*: read the current
 leaf observation, compute the new lock state for every requested key routed to
@@ -612,10 +635,10 @@ batch through the leaf coordinator into one owner-driven CAS (ADR-025/026/028)
 rather than racing separate ones.
 
 A create that reaches the reserved leaf-content limit retries after releasing
-its partial locks, so the background splitter can make room. The capacity result
-starts one bounded capacity-wait episode: leaf revisions, reroutes, and other
-full leaves do not reset it, because acquisition still lacks capacity. This
-keeps ordinary asynchronous splits retryable without turning an impossible
+its partial locks, so the background restructurer can make room. The capacity
+result starts one bounded capacity-wait episode: leaf revisions, reroutes, and
+other full leaves do not reset it, because acquisition still lacks capacity.
+This keeps ordinary asynchronous splits retryable without turning an impossible
 split, continuous churn, or a grandfathered unsafe entry into an unbounded
 foreground wait.
 
@@ -1060,7 +1083,10 @@ presence — is authoritative for logical existence.
 For a small collection, `_r` is the only leaf. When it splits, `_r` becomes an
 index whose children are leaves over contiguous raw-key ranges. Each level has
 right-sibling links, so a traversal from cached index state can move right after
-a concurrent split and remain correct.
+a concurrent split and remain correct. An underfull node merges into its right
+sibling and stays as a drained node with a right link. Each node stores its low
+key, so a route that finds a cached copy of a merge target from before the merge
+reads it again. `_r` never merges, so the tree height never decreases.
 
 ```mermaid
 flowchart LR
@@ -1114,7 +1140,7 @@ implements a candidate-driven **reverse mark-sweep**
   bound. Collection and node identities are not reused, creation precedes commit
   or link publication, and published nodes remain until collection reclamation,
   so cached absence cannot hide a later live route.
-- **Candidate feed.** `Algo`, `DirectCommit`, and `Splitter` report GC
+- **Candidate feed.** `Algo`, `DirectCommit`, and `Restructurer` report GC
   candidates through `GcHints`. Reports use bounded in-memory work and never
   wait for queue space, backend requests, or GC completion; a busy or full queue
   drops a report and counts the loss. Hints wake GC without causing a LIST.

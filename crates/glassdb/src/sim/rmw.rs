@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use arbitrary::{Arbitrary, Unstructured};
 
-use crate::{Collection, CollectionPath, Database, Error, InlinePolicy, SplitPolicy};
+use crate::{Collection, CollectionPath, Database, Error, InlinePolicy, NodeSizePolicy};
 
 use super::SimMedia;
 use super::harness::{SimWorkload, open_det_db};
@@ -240,7 +240,7 @@ impl SimWorkload for RmwWorkload {
         // work without adding a second lifecycle oracle or workload.
         open_det_db(
             backend,
-            SplitPolicy::default(),
+            NodeSizePolicy::default(),
             InlinePolicy {
                 max_value_bytes: 8,
                 max_leaf_bytes: 16,
@@ -309,7 +309,7 @@ mod sim_tests {
             let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
             let db = open_det_db(
                 &backend,
-                SplitPolicy::default(),
+                NodeSizePolicy::default(),
                 InlinePolicy::default(),
                 None,
             )

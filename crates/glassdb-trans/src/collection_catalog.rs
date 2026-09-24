@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use glassdb_data::{CollectionAddress, TxId};
 use glassdb_storage::{
-    CollectionRecord, CurrentnessBarrier, Requirement, SplitPolicy, StorageError,
+    CollectionRecord, CurrentnessBarrier, NodeSizePolicy, Requirement, StorageError,
 };
 
 use crate::collection_coordination::CollectionStateResolver;
@@ -50,7 +50,7 @@ impl CollectionCatalog {
         reads: &[DirectoryRead],
         changes: &[CollectionChange],
         barrier: CurrentnessBarrier,
-        split_policy: &SplitPolicy,
+        node_size_policy: &NodeSizePolicy,
     ) -> Result<bool, TransError> {
         let mut records = BTreeMap::<CollectionAddress, CollectionRecord>::new();
         let mut dropped = BTreeSet::new();
@@ -124,7 +124,7 @@ impl CollectionCatalog {
             }
         }
         for parent in changes.iter().map(|change| &change.parent) {
-            if !Self::directory_fits(&records[parent], split_policy) {
+            if !Self::directory_fits(&records[parent], node_size_policy) {
                 return Err(TransError::InvalidInput(
                     "subcollection directory exceeds the collection-record size limit".into(),
                 ));
@@ -133,7 +133,7 @@ impl CollectionCatalog {
         Ok(true)
     }
 
-    fn directory_fits(record: &CollectionRecord, policy: &SplitPolicy) -> bool {
+    fn directory_fits(record: &CollectionRecord, policy: &NodeSizePolicy) -> bool {
         record.content_encoded_len() <= policy.content_limit()
             && record.encoded_len() <= policy.node_max_bytes()
     }

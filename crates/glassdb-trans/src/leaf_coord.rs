@@ -21,9 +21,9 @@
 //! delivers each member's outcome (ADR-029). Each policy owner packages its
 //! mutation decision and typed result in a `LeafOperation`:
 //! [`Locker`](crate::tlocker::Locker) supplies acquire / write-back / release,
-//! direct commit supplies atomic direct publication, and the splitter supplies
-//! leaf structural-gate acquisition. Cross-leaf strategy stays with the
-//! `Locker`, not in the engine.
+//! direct commit supplies atomic direct publication, and the restructurer
+//! supplies leaf structural-gate acquisition. Cross-leaf strategy stays with
+//! the `Locker`, not in the engine.
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,7 +38,7 @@ use glassdb_concurr::{
 use glassdb_data::{ObjectPath, TxId};
 use glassdb_storage::{
     CasReceipt, CasResult, CurrentnessBarrier, LeafBody, LeafEdit, LeafEntry, LeafObservation,
-    LeafObservationCheck, LockType, Node, NodeLocks, NodeStore, Requirement, SplitPolicy,
+    LeafObservationCheck, LockType, Node, NodeLocks, NodeSizePolicy, NodeStore, Requirement,
     StorageError,
 };
 
@@ -212,9 +212,9 @@ pub(crate) enum StageAdmission {
         /// Whether the publication creates at least one live user key and must
         /// therefore preserve the content headroom used by structural work.
         adds_key: bool,
-        /// Whether a rejected publication should notify the splitter. ADR-061
-        /// suppresses this for multi-key direct members because splitting can
-        /// destroy their eligibility.
+        /// Whether a rejected publication should notify the restructurer.
+        /// ADR-061 suppresses this for multi-key direct members because
+        /// splitting can destroy their eligibility.
         pressure_hint: bool,
     },
     /// The stage adds at least one user key and must fit below the content limit
@@ -441,11 +441,12 @@ impl MergeRequest for CasReq {
 }
 
 /// Sink for stored-leaf observations and capacity rejections, so a background
-/// growth policy can decide whether to split (ADR-031). The coordinator depends
-/// only on this seam. The splitter supplies the implementation.
-pub trait SplitHinter: Send + Sync {
+/// maintenance policy can decide whether to split (ADR-031) or merge (ADR-073).
+/// The coordinator depends only on this seam. The restructurer supplies the
+/// implementation.
+pub trait StructuralHinter: Send + Sync {
     /// Notes that `path`'s leaf was just stored holding `leaf`. Best-effort: a
-    /// spurious call only costs the splitter a reload and re-check, so the
+    /// spurious call only costs the restructurer a reload and re-check, so the
     /// coordinator never blocks on it.
     fn observe_leaf(&self, path: &ObjectPath, leaf: &LeafBody);
 
@@ -462,9 +463,9 @@ struct CoordCore {
     retry: RetryConfig,
     stats: Stats,
     // Where stored over-cap leaves are reported: the background
-    // [`Splitter`](crate::split::Splitter)'s queue when one is wired.
-    hinter: Arc<dyn SplitHinter>,
-    policy: SplitPolicy,
+    // [`Restructurer`](crate::structural::Restructurer)'s queue when one is wired.
+    hinter: Arc<dyn StructuralHinter>,
+    policy: NodeSizePolicy,
 }
 
 struct CoordState {
@@ -791,8 +792,8 @@ impl CasWorker {
         edit.set_entries(new_leaf.clone());
         edit.set_locks(plan.locks.clone());
         match self.core.nodes.commit_leaf(edit).await {
-            // Hint the background splitter if this write left the leaf
-            // over the soft cap (ADR-031); the splitter reloads and
+            // Hint the background restructurer if this write left the leaf
+            // over the soft cap (ADR-031); the restructurer reloads and
             // re-checks, so a spurious hint only costs one load.
             Ok(CasResult::Applied(receipt)) => {
                 self.core.hinter.observe_leaf(path, &new_leaf);
@@ -987,15 +988,15 @@ pub struct LeafCoordinator {
 
 impl LeafCoordinator {
     /// Creates a coordinator that reports capacity observations to `hinter` —
-    /// normally the background [`Splitter`](crate::split::Splitter)'s queue.
+    /// normally the background [`Restructurer`](crate::structural::Restructurer)'s queue.
     /// `policy` governs the coordinator's hard node-size limit.
     pub fn with_hinter(
         nodes: NodeStore,
         key_state: KeyStateResolver,
         tmon: Monitor,
         retry: RetryConfig,
-        policy: SplitPolicy,
-        hinter: Arc<dyn SplitHinter>,
+        policy: NodeSizePolicy,
+        hinter: Arc<dyn StructuralHinter>,
     ) -> Self {
         let core = Arc::new(CoordCore {
             tmon,
@@ -1144,9 +1145,9 @@ mod tests {
         NodeToken::from_bytes([0; 16])
     }
 
-    struct NoSplitHints;
+    struct NoStructuralHints;
 
-    impl SplitHinter for NoSplitHints {
+    impl StructuralHinter for NoStructuralHints {
         fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {}
 
         fn capacity_rejected(&self, _path: &ObjectPath) {}
@@ -1173,13 +1174,18 @@ mod tests {
     async fn coord_over(
         backend: Arc<dyn Backend>,
     ) -> (LeafCoordinator, NodeStore, Timeline, Arc<Background>) {
-        coord_over_with(backend, SplitPolicy::default(), Arc::new(NoSplitHints)).await
+        coord_over_with(
+            backend,
+            NodeSizePolicy::default(),
+            Arc::new(NoStructuralHints),
+        )
+        .await
     }
 
     async fn coord_over_with(
         backend: Arc<dyn Backend>,
-        policy: SplitPolicy,
-        hinter: Arc<dyn SplitHinter>,
+        policy: NodeSizePolicy,
+        hinter: Arc<dyn StructuralHinter>,
     ) -> (LeafCoordinator, NodeStore, Timeline, Arc<Background>) {
         coord_over_retry(backend, policy, hinter, RetryConfig::default()).await
     }
@@ -1191,8 +1197,8 @@ mod tests {
     ) -> (LeafCoordinator, NodeStore, Timeline, Arc<Background>) {
         coord_over_retry(
             backend,
-            SplitPolicy::default(),
-            Arc::new(NoSplitHints),
+            NodeSizePolicy::default(),
+            Arc::new(NoStructuralHints),
             RetryConfig {
                 initial_interval: Duration::from_nanos(1),
                 max_interval: Duration::from_nanos(1),
@@ -1203,8 +1209,8 @@ mod tests {
 
     async fn coord_over_retry(
         backend: Arc<dyn Backend>,
-        policy: SplitPolicy,
-        hinter: Arc<dyn SplitHinter>,
+        policy: NodeSizePolicy,
+        hinter: Arc<dyn StructuralHinter>,
         retry: RetryConfig,
     ) -> (LeafCoordinator, NodeStore, Timeline, Arc<Background>) {
         let seed_timeline = Timeline::new();
@@ -2075,7 +2081,7 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
     }
 
-    impl SplitHinter for HintCounter {
+    impl StructuralHinter for HintCounter {
         fn capacity_rejected(&self, _path: &ObjectPath) {
             self.calls.fetch_add(1, Ordering::SeqCst);
         }
@@ -3350,7 +3356,7 @@ mod tests {
         assert!(full_node.content_encoded_len() > content_limit);
 
         let node_max_bytes = full_node.encoded_len() + 64;
-        let policy = SplitPolicy::builder()
+        let policy = NodeSizePolicy::builder()
             .node_max_bytes(node_max_bytes)
             .split_headroom_bytes(node_max_bytes - content_limit)
             .build()
@@ -3485,7 +3491,7 @@ mod tests {
 
     // A policy whose hard cap admits an external value for `key` but not the
     // same entry carrying `value` inline.
-    fn policy_rejecting_inline(key: &[u8], tx: &TxId, value: &[u8]) -> SplitPolicy {
+    fn policy_rejecting_inline(key: &[u8], tx: &TxId, value: &[u8]) -> NodeSizePolicy {
         let external =
             LeafEntry::new(key).with_current(CurrentState::External { writer: tx.clone() });
         let inline = LeafEntry::new(key).with_current(CurrentState::Inline {
@@ -3498,7 +3504,7 @@ mod tests {
             inline_len > external_len,
             "the inline payload must add bytes"
         );
-        SplitPolicy::builder()
+        NodeSizePolicy::builder()
             .node_max_bytes(external_len)
             .split_headroom_bytes(0)
             .build()
@@ -3514,7 +3520,7 @@ mod tests {
         let policy = policy_rejecting_inline(b"k", &tx, value);
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (coord, _nodes, _timeline, _bg) =
-            coord_over_with(backend.clone(), policy, Arc::new(NoSplitHints)).await;
+            coord_over_with(backend.clone(), policy, Arc::new(NoStructuralHints)).await;
 
         let outcome = coord
             .submit_leaf(
@@ -3552,7 +3558,7 @@ mod tests {
             value: Arc::from(value.as_slice()),
         });
         let entry_len = Node::leaf(LeafBody::from_entries([inline.clone()])).content_encoded_len();
-        let policy = SplitPolicy::builder()
+        let policy = NodeSizePolicy::builder()
             .node_max_bytes(entry_len * 2 + 64)
             .split_headroom_bytes(65)
             .build()
@@ -3670,7 +3676,7 @@ mod tests {
         let small_len = Node::leaf(LeafBody::from_entries([small])).encoded_len();
         let large_len = Node::leaf(LeafBody::from_entries([large])).encoded_len();
         assert!(large_len > small_len);
-        let policy = SplitPolicy::builder()
+        let policy = NodeSizePolicy::builder()
             .node_max_bytes(small_len)
             .split_headroom_bytes(0)
             .build()
@@ -3681,7 +3687,7 @@ mod tests {
         let hooked = Arc::new(HookBackend::new(gated as Arc<dyn Backend>));
         let backend: Arc<dyn Backend> = hooked.clone();
         let (coord, _nodes, _timeline, _bg) =
-            coord_over_with(backend, policy, Arc::new(NoSplitHints)).await;
+            coord_over_with(backend, policy, Arc::new(NoStructuralHints)).await;
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         hooked.set_before({
             let calls = calls.clone();
@@ -3773,7 +3779,7 @@ mod tests {
         });
         let small_len = Node::leaf(LeafBody::from_entries([small])).encoded_len();
         assert!(Node::leaf(LeafBody::from_entries([large])).encoded_len() > small_len);
-        let policy = SplitPolicy::builder()
+        let policy = NodeSizePolicy::builder()
             .node_max_bytes(small_len)
             .split_headroom_bytes(0)
             .build()
@@ -3801,7 +3807,7 @@ mod tests {
         });
         let backend: Arc<dyn Backend> = hooked;
         let (coord, _nodes, _timeline, _bg) =
-            coord_over_with(backend, policy, Arc::new(NoSplitHints)).await;
+            coord_over_with(backend, policy, Arc::new(NoStructuralHints)).await;
 
         let outcome = coord
             .submit_leaf(

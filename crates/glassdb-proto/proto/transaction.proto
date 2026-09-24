@@ -151,11 +151,21 @@ message Node {
     // The transaction identity that drops the collection. Its final status
     // decides whether this drop intent is obsolete or makes the node stale.
     bytes drop_intent = 8;
+    // Set after a merge moved this node's range and entries into its right
+    // sibling (ADR-073). A drained node covers no key and never changes again.
+    bool drained = 9;
+    // The structural intent ID of a merge into this node that can still land
+    // or be abandoned (ADR-073). Empty means none.
+    string merge_reservation = 10;
+    // Inclusive lower bound of the key range this node covers. Empty means the
+    // first node at its level. A copy with a low key above a routed key is
+    // older than a merge (ADR-073).
+    bytes low_key = 11;
 }
 
-// A structural intent for one split. It lives at
-// `{db}/_s/<participant_id>/<intent_id>` until the created nodes are reachable
-// or reclaimed.
+// A structural intent for one split or merge. It lives at
+// `{db}/_s/<participant_id>/<intent_id>` until the structural change is
+// complete or abandoned.
 message StructuralIntent {
     enum Phase {
         PREPARING = 0;
@@ -171,6 +181,20 @@ message StructuralIntent {
     // The topology participant that owns this intent.
     bytes participant_id = 7;
     Phase phase = 8;
+    // Present when the source merges into its right sibling (ADR-073). A merge
+    // creates no node and has no split key.
+    MergeIntent merge = 9;
+}
+
+message MergeIntent {
+    // The node that receives the source's entries. Empty until Ready.
+    string target_token = 1;
+    // The source's high key at Ready: the low bound of the target before the
+    // merge.
+    bytes boundary = 2;
+    // The membership generation of the target at Ready. The absorb lands only
+    // while the target has this generation.
+    uint64 target_generation = 3;
 }
 
 // An index node body: an ordered list of separator entries. Routing selects the
@@ -196,10 +220,10 @@ message DatabaseMetadata {
     // Persistent random ID for this logical database. Exactly 16 bytes and
     // mandatory for the v2 format.
     bytes database_id = 2;
-    // Hard coordination limits. Both fields are mandatory in v4.
+    // Hard coordination limits. Both fields are mandatory since v4.
     optional uint64 node_max_bytes = 3;
     optional uint64 split_headroom_bytes = 4;
-    // Shared transaction timing. Both fields are mandatory in v4.
+    // Shared transaction timing. Both fields are mandatory since v4.
     optional uint64 pending_timeout_nanos = 5;
     optional uint64 max_clock_skew_nanos = 6;
 }

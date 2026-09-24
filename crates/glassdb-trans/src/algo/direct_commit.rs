@@ -19,7 +19,7 @@ use crate::leaf_coord::{
     CoordinatedOutcome, LeafCoordinator, LeafOperation, MemberOutcome, MemberPolicy, ReloadCause,
     ResolveCtx, StageAdmission, Step,
 };
-use crate::split::SplitHintSink;
+use crate::structural::StructuralHintSink;
 
 /// Direct same-leaf commit coverage for one snapshot or accumulated interval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -60,7 +60,7 @@ pub(super) struct DirectCommit {
     router: TreeRouter,
     coord: LeafCoordinator,
     inline_policy: InlinePolicy,
-    split_hints: SplitHintSink,
+    structural_hints: StructuralHintSink,
     gc_hints: GcHints,
     counters: Arc<DirectCommitCounters>,
 }
@@ -71,14 +71,14 @@ impl DirectCommit {
         router: TreeRouter,
         coord: LeafCoordinator,
         inline_policy: InlinePolicy,
-        split_hints: SplitHintSink,
+        structural_hints: StructuralHintSink,
         gc_hints: GcHints,
     ) -> Self {
         DirectCommit {
             router,
             coord,
             inline_policy,
-            split_hints,
+            structural_hints,
             gc_hints,
             counters: Arc::new(DirectCommitCounters::default()),
         }
@@ -135,7 +135,7 @@ impl DirectCommit {
                 leaf_path.clone(),
                 member.clone(),
                 self.inline_policy,
-                self.split_hints.clone(),
+                self.structural_hints.clone(),
             );
             let outcome = self.coord.coordinate(operation).await?;
             match outcome {
@@ -217,7 +217,7 @@ struct DirectCommitOperation {
     leaf_path: ObjectPath,
     member: DirectMember,
     inline: InlinePolicy,
-    split_hints: SplitHintSink,
+    structural_hints: StructuralHintSink,
     /// Output states replaced by the last proposed publication. The outer
     /// option distinguishes "not staged" from a staged create over absence.
     staged_over: Mutex<Option<BTreeMap<Vec<u8>, CurrentState>>>,
@@ -232,14 +232,14 @@ impl DirectCommitOperation {
         leaf_path: ObjectPath,
         member: DirectMember,
         inline: InlinePolicy,
-        split_hints: SplitHintSink,
+        structural_hints: StructuralHintSink,
     ) -> Self {
         Self {
             id,
             leaf_path,
             member,
             inline,
-            split_hints,
+            structural_hints,
             staged_over: Mutex::new(None),
             landed_proven: AtomicBool::new(false),
         }
@@ -470,7 +470,7 @@ impl DirectCommitOperation {
         if !self.inline.admits_value(value_len) {
             return;
         }
-        self.split_hints
+        self.structural_hints
             .observe_inline_pressure(&self.leaf_path, &key.raw_key, value_len);
     }
 

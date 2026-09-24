@@ -149,8 +149,9 @@ reserved nodes as unreachable; a late create can then leave an orphan, as
 permitted by ADR-043. Do not use that exception to skip checks for a live
 reference or for completion of participant departure.
 
-Cached index-node routing uses right links to correct stale split routes. The
-terminal leaf must meet the caller's requirement. If a root or child is absent,
+Cached index-node routing uses right links to correct stale split routes, and
+low keys to detect stale copies of a merge target. The terminal leaf must meet
+the caller's requirement. If a root or child is absent,
 there is no terminal leaf to check: the caller still needs the publication and
 lifecycle proof for a negative route.
 
@@ -170,7 +171,9 @@ that knows this ordering:
 | GC eligibility | Before reading candidate status. |
 | GC checks | After eligibility checks finish; the earlier status barrier cannot replace this one. |
 | Structural recovery | After observing all intents in a discovery batch, before checking their sources and reachability. Later discoveries need a new barrier. |
-| Separator publication | After observing the split, before routing and reading its child chain. Carry this barrier through reconciliation. |
+| Parent reconciliation | After observing the split or merge, before routing and reading its child chain. Carry this barrier through reconciliation. |
+| Merge check | After gating the source, before reading the target for the final merge decision. |
+| Stale merge-target copy | After observing the route that reached a copy with a low key above the key, before reading that node again. |
 | Missing-object retries | After observing the missing object, before rechecking dependent state. |
 
 Transaction validation uses one barrier for every point read, scan, collection

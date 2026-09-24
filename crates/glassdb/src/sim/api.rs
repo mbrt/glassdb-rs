@@ -18,7 +18,7 @@ mod oracle;
 pub use model::ApiAcct;
 
 use super::harness::{SimWorkload, open_det_db};
-use super::{CLIENT_COUNT, SimMedia, tiny_split_policy};
+use super::{CLIENT_COUNT, SimMedia, tiny_node_size_policy};
 use executor::StepResult;
 // ===========================================================================
 // Transaction API workload (inspired by FoundationDB FuzzApiCorrectness).
@@ -150,7 +150,7 @@ impl SimWorkload for ApiWorkload {
     ) -> Result<Database, Error> {
         open_det_db(
             backend,
-            tiny_split_policy(),
+            tiny_node_size_policy(),
             glassdb_storage::InlinePolicy::default(),
             media,
         )

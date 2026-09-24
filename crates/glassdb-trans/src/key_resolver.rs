@@ -147,6 +147,9 @@ impl KeyResolver {
                     .collect();
                 let mut keys = Vec::new();
                 let mut covered = Vec::new();
+                // Entries below the end of the previous live leaf belong to it:
+                // a merge target holds copies of them until the drain (ADR-073).
+                let mut floor: Option<Vec<u8>> = None;
 
                 loop {
                     let coverage = self
@@ -160,6 +163,11 @@ impl KeyResolver {
                         .ok_or_else(|| StorageError::other("leaf scan reached a non-leaf node"))?;
                     let mut candidates: BTreeSet<Vec<u8>> = leaf
                         .entries()
+                        .filter(|entry| {
+                            floor
+                                .as_deref()
+                                .is_none_or(|floor| entry.key.as_slice() >= floor)
+                        })
                         .filter(|entry| Self::in_scan_window(range, &entry.key, cap))
                         .map(|entry| entry.key.clone())
                         .collect();
@@ -223,6 +231,7 @@ impl KeyResolver {
                     else {
                         break;
                     };
+                    floor = node.high_key().map(<[u8]>::to_vec);
                     loc = next;
                 }
 
@@ -501,10 +510,11 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::{CollectionId, DbPrefix, ObjectPath};
+    use glassdb_data::{CollectionId, DbPrefix, NodeToken, ObjectPath};
     use glassdb_storage::transaction::{TxCommitStatus, TxRecordStore};
     use glassdb_storage::{
-        CachedStore, CurrentState, LeafBody, LeafEntry, Node, NodeStore, Timeline, TreeRouter,
+        CachedStore, CurrentState, IndexNode, LeafBody, LeafEntry, Node, NodeStore, Timeline,
+        TreeRouter,
     };
 
     use crate::monitor::Monitor;
@@ -988,6 +998,61 @@ mod tests {
             0,
             "an inline value needs no transaction record"
         );
+    }
+
+    // Between the absorb and the drain of a merge (ADR-073), R holds copies of
+    // L's entries while L still covers them. A scan returns those keys once.
+    #[tokio::test]
+    async fn a_scan_ignores_merge_target_copies_of_the_previous_leaf() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let writer = TxId::with_priority(1, b"inline");
+        let inline = |key: &[u8]| {
+            LeafEntry::new(key).with_current(CurrentState::Inline {
+                writer: writer.clone(),
+                value: Arc::from(b"v".as_slice()),
+            })
+        };
+        let source = NodeToken::from_bytes([1; 16]);
+        let target = NodeToken::from_bytes([2; 16]);
+        let nodes = NodeStore::new(
+            CachedStore::new(backend.clone(), 1 << 20, Timeline::new(), None),
+            std::num::NonZeroUsize::MIN,
+        );
+        let merging = [
+            (
+                &source,
+                Node::leaf(LeafBody::from_entries([inline(b"grape")]))
+                    .with_high_key(Some(b"m".to_vec()))
+                    .with_right_sibling(Some(target.to_string())),
+            ),
+            (
+                &target,
+                Node::leaf(LeafBody::from_entries([inline(b"grape"), inline(b"pear")])),
+            ),
+        ];
+        for (token, node) in merging {
+            nodes
+                .store_node(&collection(), token, &node, None)
+                .await
+                .unwrap();
+        }
+        nodes
+            .create_root(
+                &collection(),
+                &Node::index(IndexNode::from_children([
+                    (Vec::new(), source.to_string()),
+                    (b"m".to_vec(), target.to_string()),
+                ])),
+            )
+            .await
+            .unwrap();
+        let (resolver, _mon, _timeline, _bg) = resolver_over(backend).await;
+
+        let scan = resolver
+            .scan_keys(&collection(), &ScanRange::all(), &[], None, None)
+            .await
+            .unwrap();
+        assert_eq!(scan.keys(), [b"grape".to_vec(), b"pear".to_vec()]);
     }
 
     // A tombstone is equally authoritative: absence is decided from the leaf.

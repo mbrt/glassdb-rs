@@ -20,6 +20,10 @@ before the final split decision. Their topology and pressure policies remain.
 
 This is a protocol-incompatible change and establishes database protocol v3.
 
+[ADR-073](073-merge-nodes-into-right-sibling.md) makes each merge compact the
+holder-free tombstones of its source and target, makes underfull leaves merge
+candidates, and advances the membership generation at each gate installation.
+
 ## Context
 
 A tombstone is currently permanent until a later write replaces it. The

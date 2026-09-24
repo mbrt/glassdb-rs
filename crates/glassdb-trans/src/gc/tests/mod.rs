@@ -3,7 +3,7 @@ use crate::collection_coordination::CollectionStateResolver;
 use crate::collections::TopologySettler;
 use crate::engine::{AssemblyFixture, EngineConfig};
 use crate::key_state_resolver::KeyStateResolver;
-use crate::leaf_coord::{LeafCoordinator, SplitHinter};
+use crate::leaf_coord::{LeafCoordinator, StructuralHinter};
 use crate::monitor::Monitor;
 use crate::tlocker::LockOutcome;
 use async_trait::async_trait;
@@ -26,9 +26,9 @@ use std::time::{Duration, SystemTime};
 
 struct UnexpectedTopologySettler;
 
-struct NoSplitHints;
+struct NoStructuralHints;
 
-impl SplitHinter for NoSplitHints {
+impl StructuralHinter for NoStructuralHints {
     fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {}
 
     fn capacity_rejected(&self, _path: &ObjectPath) {}
@@ -265,8 +265,8 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
         key_state,
         mon.clone(),
         RetryConfig::default(),
-        glassdb_storage::SplitPolicy::default(),
-        Arc::new(NoSplitHints),
+        glassdb_storage::NodeSizePolicy::default(),
+        Arc::new(NoStructuralHints),
     );
     let router = TreeRouter::new(nodes.clone(), std::num::NonZeroUsize::MIN);
     let locker = Locker::new(
@@ -1481,8 +1481,8 @@ async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
         KeyStateResolver::new(owner.monitor.clone()),
         owner.monitor.clone(),
         RetryConfig::default(),
-        glassdb_storage::SplitPolicy::default(),
-        Arc::new(NoSplitHints),
+        glassdb_storage::NodeSizePolicy::default(),
+        Arc::new(NoStructuralHints),
     );
     let router = TreeRouter::new(owner.nodes.clone(), std::num::NonZeroUsize::MIN);
     let locker = Locker::new(
@@ -2377,7 +2377,7 @@ enum TopologyReclamation {
 async fn reclaim_topology(committed: bool, case: TopologyReclamation) {
     use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
     use glassdb_data::{NodeToken, StructuralIntentId};
-    use glassdb_storage::{StructuralIntent, StructuralIntentPhase};
+    use glassdb_storage::{StructuralChange, StructuralIntent, StructuralIntentPhase};
 
     let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
     let recorded = RecordingBackend::new(hooks.clone());
@@ -2423,8 +2423,10 @@ async fn reclaim_topology(committed: bool, case: TopologyReclamation) {
                 collection: collection(),
                 source_token: None,
                 source_revision: String::new(),
-                created_tokens: vec![left, right],
-                split_key: Vec::new(),
+                change: StructuralChange::Split {
+                    created_tokens: vec![left, right],
+                    split_key: Vec::new(),
+                },
                 participant_id: id.clone(),
                 phase: StructuralIntentPhase::Preparing,
             },

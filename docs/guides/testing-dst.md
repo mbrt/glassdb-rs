@@ -71,6 +71,13 @@ and minimize and the exact-history checker stays affordable. This fixed pairing
 does not cover three clients sharing one instance, or three independent
 instances.
 
+Virtual time advances only while every task waits. Each instance transport
+therefore adds a short latency to every request and reply, also in runs without
+faults, so that the timers of background work (restructurer sweeps,
+structural recovery, GC) elapse while the clients run. The fault tape and the
+seed select each latency. A workload that exists to exercise splits or merges
+uses `Covered`, which fails a run without faults that makes no such change.
+
 Each instance also bounds its foreground client work in virtual time. On expiry
 it interrupts the client tasks and leaves unfinished operations in doubt. The
 bound never applies to verification: a fresh instance still checks completed and

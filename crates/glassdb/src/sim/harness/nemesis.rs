@@ -20,21 +20,13 @@ pub(super) struct FaultTransports {
 }
 
 impl FaultTransports {
-    /// Gives each instance a direct view of a faultless backbone.
-    pub(super) fn faultless(backbone: &Arc<dyn Backend>, instances: usize) -> Self {
-        Self {
-            injected: Vec::new(),
-            instance_backends: (0..instances).map(|_| backbone.clone()).collect(),
-        }
-    }
-
-    /// Builds active fault transports from harness-selected tape/seed pairs.
-    pub(super) fn faulting(
+    /// Builds active transports from harness-selected options and tape/seed
+    /// pairs.
+    pub(super) fn new(
         backbone: &Arc<dyn Backend>,
-        intensity: u8,
+        options: FaultOptions,
         schedules: Vec<(Vec<u8>, u64)>,
     ) -> Self {
-        let options = FaultOptions::from_intensity(intensity);
         let mut injected = Vec::with_capacity(schedules.len());
         let mut instance_backends = Vec::with_capacity(schedules.len());
         for (tape, seed) in schedules {

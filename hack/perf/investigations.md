@@ -28,7 +28,7 @@ accepts a typed
 [`ShardOperation`](../../crates/glassdb-trans/src/shard_coord.rs).
 [`StructuralGateOperation`](../../crates/glassdb-trans/src/node_locking.rs) uses
 this interface for root and non-root leaf paths. Before this change,
-[`StructuralNodeAccess::acquire_structural_gate`](../../crates/glassdb-trans/src/split.rs)
+[`StructuralNodeAccess::acquire_structural_gate`](../../crates/glassdb-trans/src/structural/nodes.rs)
 selected the path from `Option<&NodeToken>`:
 
 - a non-root leaf uses the coordinator;
