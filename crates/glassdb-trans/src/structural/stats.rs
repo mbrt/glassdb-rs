@@ -21,7 +21,7 @@ pub(super) struct Stats {
 /// Background split and merge activity for one snapshot or accumulated
 /// interval.
 ///
-/// `completed` counts locally observed source/root linearizations. A split may
+/// `splits` counts locally observed source/root linearizations. A split may
 /// also be `deferred` if a later publication or cleanup step needs another
 /// sweep, so the fields are not mutually exclusive outcomes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -29,9 +29,7 @@ pub struct RestructurerStats {
     /// Deduplicated candidates processed for any split or merge cause.
     pub candidates: u64,
     /// Locally observed source/root split linearizations for any cause.
-    // TODO: rename to `splits`. The CI benchmark harness builds against main
-    // and this branch, and reads this field under its old name.
-    pub completed: u64,
+    pub splits: u64,
     /// Retryable candidate attempts requeued for any cause.
     pub deferred: u64,
     /// Holder-free tombstone entries removed by acknowledged leaf rewrites.
@@ -63,7 +61,7 @@ impl Stats {
         let take = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed);
         RestructurerStats {
             candidates: take(&self.candidates),
-            completed: take(&self.splits),
+            splits: take(&self.splits),
             deferred: take(&self.deferred),
             tombstones_reclaimed: take(&self.tombstones_reclaimed),
             splits_avoided: take(&self.splits_avoided),
@@ -103,7 +101,7 @@ impl Sub for InlinePressureStats {
 impl AddAssign for RestructurerStats {
     fn add_assign(&mut self, rhs: Self) {
         self.candidates += rhs.candidates;
-        self.completed += rhs.completed;
+        self.splits += rhs.splits;
         self.deferred += rhs.deferred;
         self.tombstones_reclaimed += rhs.tombstones_reclaimed;
         self.splits_avoided += rhs.splits_avoided;
@@ -118,7 +116,7 @@ impl Sub for RestructurerStats {
     fn sub(self, rhs: Self) -> Self::Output {
         Self {
             candidates: self.candidates.saturating_sub(rhs.candidates),
-            completed: self.completed.saturating_sub(rhs.completed),
+            splits: self.splits.saturating_sub(rhs.splits),
             deferred: self.deferred.saturating_sub(rhs.deferred),
             tombstones_reclaimed: self
                 .tombstones_reclaimed

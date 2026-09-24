@@ -74,8 +74,8 @@ impl<W: SimWorkload> SimWorkload for Covered<W> {
         state: &CoveredState<W::State>,
     ) -> Result<(), Error> {
         let result = W::run_op(db, op, &state.inner).await;
-        let stats = db.stats().splitter;
-        if stats.completed > 0 {
+        let stats = db.stats().restructurer;
+        if stats.splits > 0 {
             state.split.store(true, Ordering::Relaxed);
         }
         if stats.merges > 0 {

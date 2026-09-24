@@ -339,13 +339,13 @@ fn protocol_stats(stats: Stats) -> ProtocolStats {
         lock_calls: stats.locker.calls,
         direct_candidates: stats.direct_commit.candidates,
         direct_landed: stats.direct_commit.landed,
-        split_candidates: stats.splitter.candidates,
-        split_completed: stats.splitter.completed,
-        split_deferred: stats.splitter.deferred,
-        pressure_candidates: stats.splitter.inline_pressure.candidates,
-        pressure_completed: stats.splitter.inline_pressure.completed,
-        pressure_deferred: stats.splitter.inline_pressure.deferred,
-        pressure_discarded: stats.splitter.inline_pressure.discarded,
+        split_candidates: stats.restructurer.candidates,
+        split_completed: stats.restructurer.splits,
+        split_deferred: stats.restructurer.deferred,
+        pressure_candidates: stats.restructurer.inline_pressure.candidates,
+        pressure_completed: stats.restructurer.inline_pressure.completed,
+        pressure_deferred: stats.restructurer.inline_pressure.deferred,
+        pressure_discarded: stats.restructurer.inline_pressure.discarded,
     }
 }
 

@@ -263,7 +263,7 @@ async fn capacity_splits_do_not_depend_on_local_soft_thresholds() {
                 Some(b"value".to_vec())
             );
         }
-        assert!(db.stats().splitter.completed > 0);
+        assert!(db.stats().restructurer.splits > 0);
         db.shutdown().await;
     }
 }
@@ -287,7 +287,7 @@ async fn reopening_keeps_soft_split_thresholds_local() {
     root.write(b"first", b"one").await.unwrap();
     root.write(b"second", b"two").await.unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
-    assert_eq!(reopened.stats().splitter.completed, 1);
+    assert_eq!(reopened.stats().restructurer.splits, 1);
     assert_eq!(root.read(b"first").await.unwrap(), Some(b"one".to_vec()));
     assert_eq!(root.read(b"second").await.unwrap(), Some(b"two".to_vec()));
     reopened.shutdown().await;

@@ -71,9 +71,7 @@ pub struct Stats {
     /// Direct-commit coverage.
     pub direct_commit: DirectCommitStats,
     /// Background split and merge activity.
-    // TODO: rename to `restructurer`. The CI benchmark harness builds against
-    // main and this branch, and reads this field under its old name.
-    pub splitter: RestructurerStats,
+    pub restructurer: RestructurerStats,
     /// Garbage collection activity.
     pub gc: GcStats,
 }
@@ -87,7 +85,7 @@ impl AddAssign for Stats {
         self.locker += rhs.locker;
         self.coordinator += rhs.coordinator;
         self.direct_commit += rhs.direct_commit;
-        self.splitter += rhs.splitter;
+        self.restructurer += rhs.restructurer;
         self.gc += rhs.gc;
     }
 }
@@ -104,7 +102,7 @@ impl Sub for Stats {
             locker: self.locker - other.locker,
             coordinator: self.coordinator - other.coordinator,
             direct_commit: self.direct_commit - other.direct_commit,
-            splitter: self.splitter - other.splitter,
+            restructurer: self.restructurer - other.restructurer,
             gc: self.gc - other.gc,
         }
     }
@@ -150,9 +148,9 @@ mod tests {
                 landed: 5,
             },
             gc: GcStats::default(),
-            splitter: RestructurerStats {
+            restructurer: RestructurerStats {
                 candidates: 3,
-                completed: 2,
+                splits: 2,
                 deferred: 1,
                 tombstones_reclaimed: 4,
                 splits_avoided: 1,
@@ -198,9 +196,9 @@ mod tests {
                 landed: 8,
             },
             gc: GcStats::default(),
-            splitter: RestructurerStats {
+            restructurer: RestructurerStats {
                 candidates: 5,
-                completed: 3,
+                splits: 3,
                 deferred: 1,
                 tombstones_reclaimed: 9,
                 splits_avoided: 3,
@@ -248,9 +246,9 @@ mod tests {
                     landed: 3,
                 },
                 gc: GcStats::default(),
-                splitter: RestructurerStats {
+                restructurer: RestructurerStats {
                     candidates: 2,
-                    completed: 1,
+                    splits: 1,
                     deferred: 0,
                     tombstones_reclaimed: 5,
                     splits_avoided: 2,
