@@ -130,29 +130,30 @@ struct RoutingError {
 type PathLoad = (ObjectPath, Result<LeafObservation, StorageError>);
 
 struct BatchRouting<T> {
-    nodes: NodeStore,
     interior: Requirement,
     leaf: Requirement,
     pending: BTreeMap<ObjectPath, PendingPath<T>>,
     active: BTreeMap<ObjectPath, PendingPath<T>>,
     completed: BTreeMap<ObjectPath, CompletedPath<T>>,
+    /// Items that reached a copy older than a merge (ADR-073). They read the
+    /// node again only after a currentness barrier from the caller.
+    stale: Vec<(ObjectPath, RoutedItem<T>)>,
     first_error: Option<RoutingError>,
 }
 
 impl<T> BatchRouting<T> {
     fn new(
-        nodes: NodeStore,
         items: impl IntoIterator<Item = (LogicalKey, T)>,
         interior: Requirement,
         leaf: Requirement,
     ) -> Self {
         let mut routing = Self {
-            nodes,
             interior,
             leaf,
             pending: BTreeMap::new(),
             active: BTreeMap::new(),
             completed: BTreeMap::new(),
+            stale: Vec::new(),
             first_error: None,
         };
         for (ordinal, (key, payload)) in items.into_iter().enumerate() {
@@ -176,7 +177,20 @@ impl<T> BatchRouting<T> {
     }
 
     fn has_work(&self) -> bool {
-        !self.pending.is_empty() || !self.active.is_empty()
+        !self.pending.is_empty() || !self.active.is_empty() || self.has_stale_copies()
+    }
+
+    fn has_stale_copies(&self) -> bool {
+        !self.stale.is_empty()
+    }
+
+    /// Reads the nodes of stale copies again after ``, captured after
+    /// their routes were observed.
+    fn reload_stale(&mut self, requirement: Requirement) {
+        for (path, mut item) in std::mem::take(&mut self.stale) {
+            item.refresh = Some(requirement);
+            self.enqueue(path, item);
+        }
     }
 
     fn admit(&mut self) -> Option<(ObjectPath, Requirement)> {
@@ -220,6 +234,7 @@ impl<T> BatchRouting<T> {
     fn finish(self) -> Result<Vec<RoutedLeafGroup<T>>, StorageError> {
         debug_assert!(self.pending.is_empty());
         debug_assert!(self.active.is_empty());
+        debug_assert!(self.stale.is_empty());
         if let Some(error) = self.first_error {
             return Err(error.error);
         }
@@ -310,10 +325,7 @@ impl<T> BatchRouting<T> {
                 );
                 return None;
             }
-            // Same rule as a keyed descent: only a merge that landed creates
-            // this route, so a read after this barrier holds its low key.
-            item.refresh = Some(Requirement::after(self.nodes.currentness_barrier()));
-            self.enqueue(path.clone(), item);
+            self.stale.push((path.clone(), item));
             return None;
         }
         item.refresh = None;
@@ -880,7 +892,7 @@ impl TreeRouter {
         interior: Requirement,
         leaf: Requirement,
     ) -> Result<Vec<RoutedLeafGroup<T>>, StorageError> {
-        let mut routing = BatchRouting::new(self.nodes.clone(), items, interior, leaf);
+        let mut routing = BatchRouting::new(items, interior, leaf);
         let mut in_flight = FuturesUnordered::<BoxFuture<'static, PathLoad>>::new();
 
         while routing.has_work() {
@@ -902,6 +914,12 @@ impl TreeRouter {
                 .await
                 .expect("routing work keeps an active path load");
             routing.complete(path, result);
+            if routing.has_stale_copies() {
+                // Only a merge that landed creates the routes to these copies,
+                // so a read after this barrier holds their lowered low keys.
+                let fresh = Requirement::after(self.nodes.currentness_barrier());
+                routing.reload_stale(fresh);
+            }
         }
         routing.finish()
     }
