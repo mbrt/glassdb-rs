@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "glassdb"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arbitrary",
  "futures",
@@ -304,7 +304,7 @@ dependencies = [
 
 [[package]]
 name = "glassdb-backend"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "glassdb-concurr",
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "glassdb-concurr"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "glassdb-data"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "glassdb-concurr",
 ]
@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "glassdb-proto"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "glassdb-storage"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "glassdb-trans"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures",
