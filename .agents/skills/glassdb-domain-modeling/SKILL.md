@@ -13,13 +13,13 @@ Use `CONTEXT.md` at the root of the repository as the canonical GlassDB glossary
 
 ## Language
 
-## Challenge against the glossary
+### Challenge against the glossary
 
-When the user uses a term that conflicts with the existing language in `CONTEXT.md`, call it out immediately. "Your glossary defines 'cancellation' as X, but you seem to mean Y. Which is it?"
+When the user uses a term that conflicts with the existing language in `CONTEXT.md`, call it out immediately. For example: "Your glossary defines 'transaction cancellation' as dropping the transaction future, but you seem to mean an explicit abort. Which is it?"
 
 ### Sharpen fuzzy language
 
-When the user uses vague or overloaded terms, propose a precise canonical term. "You're saying 'account': do you mean the Customer or the User? Those are different things."
+When the user uses vague or overloaded terms, propose a precise canonical term. For example: "You're saying 'retry': do you mean a body replay or an identity renewal? A body replay discards the access set, and an identity renewal keeps it."
 
 ### Discuss concrete scenarios
 
@@ -27,7 +27,7 @@ When domain relationships are being discussed, stress-test them with specific sc
 
 ### Cross-reference with code
 
-When the user states how something works, check whether the code agrees. If you find a contradiction, surface it: "Your code cancels entire Orders, but you just said partial cancellation is possible. Which is right?"
+When the user states how something works, check whether the code agrees. If you find a contradiction, surface it. For example: "You said that dropping a collection also drops its child collections, but the code rejects a drop while child collections exist. Which is right?"
 
 When the code terminology is inconsistent within itself or with the glossary, call it out with the goal of achieving a single, consistent model.
 

@@ -24,8 +24,8 @@ Use these terms exactly: don't substitute "component," "service," "API," or "bou
 
 ## Deep vs shallow
 
-- **Deep module** = small interface + lots of implementation:
-- **Shallow module** = large interface + little implementation (avoid):
+- **Deep module** = small interface + lots of implementation
+- **Shallow module** = large interface + little implementation (avoid)
 
 When designing an interface, ask:
 
@@ -59,21 +59,20 @@ Good interfaces make testing natural. Avoid exposing internals just to make test
 ## Rejected framings
 
 - **Depth as ratio of implementation-lines to interface-lines** (Ousterhout): rewards padding the implementation. We use depth-as-leverage instead.
-- **"Interface" as the TypeScript `interface` keyword or a class's public methods**: too narrow: interface here includes every fact a caller must know.
+- **"Interface" as a Rust `trait` or a type's `pub` items**: too narrow: interface here includes every fact a caller must know.
 - **"Boundary"**: overloaded with DDD's bounded context. Say **seam** or **interface**.
 
 ## Going deeper
 
 When refactoring to make modules deeper, consider:
 
-- **One adapter means a hypothetical seam. Two adapters means a real one.** Don't introduce a port unless at least two adapters are justified (typically production + test). A single-adapter seam is just indirection.
-- **Internal seams vs external seams.** A deep module can have internal seams (private to its implementation, used by its own tests) as well as the external seam at its interface. Don't expose internal seams through the interface just because tests use them.
+- Don't expose internal seams through the interface just because tests use them.
 - Explore alternative interfaces through parallel design. Based on "Design It Twice" (Ousterhout): your first idea is unlikely to be the best.
 
-Before spawning sub-agents, write a user-facing explanation of the problem space for the chosen candidate:
+Before spawning sub-agents for parallel design, write a user-facing explanation of the problem space:
 
 - The constraints any new interface would need to satisfy
-- The dependencies it would rely on, and which category they fall into (see DEEPENING.md)
+- The dependencies it would rely on
 - A rough illustrative code sketch to ground the constraints, not a proposal, just a way to make the constraints concrete
 
 ### Testing strategy: replace, don't layer

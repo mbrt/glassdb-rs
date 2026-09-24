@@ -43,11 +43,12 @@ See [interface-design.md](./interface-design.md) for guidance on well-structured
 
 ## Refactor
 
-Identify refactoring opportunities proactively, when:
+Identify refactoring opportunities when:
 
 - Interfaces expand beyond their original intent
 - Behavior leaks across modules
 - There are deepening opportunities
-- Strive to reduce complexity and number of lines of code (excluding tests)
+
+A good refactor reduces complexity and the number of lines of code (excluding tests).
 
 See [interface-design.md](./interface-design.md) for guidance on designing interfaces and seams.

@@ -3,7 +3,7 @@ name: glassdb-grill
 description: Stress-test a plan or design through a docs-aware interview. Use when the user wants to stress-test their thinking, or you need to uncover hidden assumptions, conflicts, or gaps in a plan or design.
 ---
 
-Interview the user relentlessly until you reach a shared understanding. Map this as a **design tree**: every decision branches into the decisions that hang off it.
+Interview the user until you reach a shared understanding. Map this as a **design tree**: every decision branches into the decisions that hang off it.
 
 ## Workflow
 
