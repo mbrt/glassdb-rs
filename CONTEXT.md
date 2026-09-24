@@ -372,7 +372,7 @@ The part of a leaf that holds the current state and key locks of one logical key
 The set of logical keys in one leaf whose current state is an inline or external value.
 
 **Membership generation**:
-A leaf counter that changes when a transaction changes, or can change, the key membership of the leaf.
+A leaf counter that changes when a transaction or a structural change changes, or can change, the key membership of the leaf.
 _Avoid_: Membership version
 
 **Routing**:
@@ -388,7 +388,7 @@ One leaf observation and the ordered logical keys associated with it by one rout
 _Avoid_: Leaf group, owning leaf group, point-leaf plan
 
 **Separator**:
-A logical key in a parent index node that bounds one child's range: keys at or above it route to that child. A child split publishes a new separator into its parent.
+A logical key in a parent index node that bounds one child's range: keys at or above it route to that child. A child split publishes a new separator into its parent, and a child merge removes one.
 _Avoid_: Index key, boundary key
 
 ## Leaf coordination
@@ -412,11 +412,23 @@ The nodes, separators, and sibling links of one collection tree.
 _Avoid_: Tree shape
 
 **Structural change**:
-A change of the topology of one collection tree, such as a split.
+A change of the topology of one collection tree, such as a split or a merge.
 _Avoid_: Topology change
 
 **Split**:
 A structural change that moves the upper part of one node's key range into a new sibling node. A tree root instead splits in place into two new children.
+
+**Merge**:
+A structural change that moves the key range and all entries of one node into its right sibling. A tree root never merges.
+_Avoid_: Coalesce, join
+
+**Drained node**:
+A node after its merge. It owns no key range, and only links to the node that received its entries.
+_Avoid_: Retired node, redirect node
+
+**Merge reservation**:
+A durable mark on the node that receives a merge, which names the structural intent of that merge. It allows no other structural change to that node, and only that merge or its recovery can remove it.
+_Avoid_: Merge gate, merge lock
 
 **Topology participant**:
 A transaction identity that a collection record lists while it can make structural changes to the collection tree.
