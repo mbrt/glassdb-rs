@@ -3,9 +3,10 @@
 
 mod support;
 
-use glassdb_backend::{Backend, BackendError, ListLimit};
+use glassdb_backend::{Backend, BackendError, ListLimit, ReadReply};
 
 use self::support::FakeGcs;
+use crate::MAX_THROTTLE_RETRIES;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backend_conformance() {
@@ -37,8 +38,9 @@ async fn write_produces_fresh_revision_each_time() {
 
 // In-doubt contract (ADR-009): a conditional write whose outcome is in doubt
 // must NOT be reported as a confident error the engine would retry into a
-// double-apply. GCS applies conditional writes atomically and this backend does
-// not retry them, so a clean precondition is a genuine rejection; but a `5xx`
+// double-apply. GCS applies conditional writes atomically and this backend
+// retries them only when throttled, so a clean precondition is a genuine
+// rejection; but a `5xx`
 // (or a transport error) leaves the write in doubt — it may have landed before
 // the failure — and must surface as `Unavailable`. These tests would see
 // `Other` against the pre-fix code, which mapped any non-precondition status to
@@ -114,6 +116,63 @@ async fn read_server_error_surfaces_unavailable() {
     // object — the failure never destroyed any data.
     let r = b.read("k").await.unwrap();
     assert_eq!(r.contents, b"v");
+}
+
+// Throttling: GCS rejects a request with `429` before it applies it, so the
+// backend sends it again in place, also for conditional mutations. These tests
+// would see `Other` against the pre-fix code, which failed the transaction on
+// the first `429`.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_throttled_write_applies_once_when_the_throttle_clears() {
+    let fake = FakeGcs::start().await;
+    let b = fake.backend();
+    let v0 = b.write_if_not_exists("k", b"a".to_vec()).await.unwrap();
+
+    fake.set_throttle(2);
+    let v1 = b.write_if("k", b"b".to_vec(), &v0).await.unwrap();
+    assert_eq!(fake.throttle_remaining(), 0);
+
+    let r = b.read("k").await.unwrap();
+    assert_eq!(
+        r,
+        ReadReply {
+            contents: b"b".to_vec(),
+            revision: v1,
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_throttled_read_succeeds_when_the_throttle_clears() {
+    let fake = FakeGcs::start().await;
+    let b = fake.backend();
+    b.write_if_not_exists("k", b"v".to_vec()).await.unwrap();
+
+    fake.set_throttle(2);
+    let r = b.read("k").await.unwrap();
+    assert_eq!(r.contents, b"v");
+    assert_eq!(fake.throttle_remaining(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_throttle_that_outlasts_the_retries_keeps_the_request_safety() {
+    let fake = FakeGcs::start().await;
+    let b = fake.backend();
+    let v0 = b.write_if_not_exists("k", b"a".to_vec()).await.unwrap();
+    let sends = i64::from(MAX_THROTTLE_RETRIES) + 1;
+
+    // A read is idempotent, so the engine can retry it in place.
+    fake.set_throttle(sends);
+    let err = b.read("k").await.unwrap_err();
+    assert!(matches!(err, BackendError::Unavailable(_)), "got {err:?}");
+
+    // The write did not apply, so its failure is definitive, not in doubt.
+    fake.set_throttle(sends);
+    let err = b.write_if("k", b"b".to_vec(), &v0).await.unwrap_err();
+    assert!(matches!(err, BackendError::Other { .. }), "got {err:?}");
+    assert_eq!(fake.throttle_remaining(), 0);
+    assert_eq!(b.read("k").await.unwrap().contents, b"a");
 }
 
 #[test]
