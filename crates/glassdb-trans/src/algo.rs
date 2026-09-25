@@ -1283,6 +1283,7 @@ mod tests {
     use crate::key_state_resolver::KeyStateResolver;
     use crate::monitor::{ProtocolTiming, TxRecoveryManifest};
     use crate::reader::Reader;
+    use crate::structural::LeafChanges;
     use glassdb_backend::middleware::{
         BackendOp, HookBackend, HookFuture, OpLog, OpRecord, RecordingBackend,
     };
@@ -1367,6 +1368,14 @@ mod tests {
         .await
     }
 
+    /// Creates an algo where sizes and inline pressure decide leaf changes.
+    pub(super) async fn new_algo_with_size_leaf_changes() -> (Algo, Tctx) {
+        let mut config = EngineConfig::default();
+        config.set_cache_size(1024);
+        config.set_leaf_changes(LeafChanges::Size);
+        new_algo_with_config(Arc::new(MemoryBackend::new()), config, false).await
+    }
+
     async fn new_algo_from_backend_with_cache_policy_and_retirement(
         b: Arc<dyn Backend>,
         cache_bytes: usize,
@@ -1376,6 +1385,14 @@ mod tests {
         let mut config = EngineConfig::default();
         config.set_cache_size(cache_bytes);
         config.set_node_size_policy(node_size_policy);
+        new_algo_with_config(b, config, managed_retirement).await
+    }
+
+    async fn new_algo_with_config(
+        b: Arc<dyn Backend>,
+        mut config: EngineConfig,
+        managed_retirement: bool,
+    ) -> (Algo, Tctx) {
         config.set_protocol_timing(ProtocolTiming::simulation());
         let foundation = AssemblyFixture::new(b.clone(), test_db_prefix(), &config);
 

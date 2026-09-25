@@ -136,6 +136,11 @@ impl WorkerCtx {
             affinity_pct,
         }
     }
+
+    /// Stops every worker after its current transaction.
+    pub(super) fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Spawns every shape's workers across the cell's databases.

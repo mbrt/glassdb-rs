@@ -37,6 +37,6 @@ pub use leaf_coord::LeafCoordinatorStats;
 pub use monitor::{MonitorStats, ProtocolTiming};
 pub use reader::{ReadOutcome, ReadValue};
 pub use structural::{
-    AvoidableTimeStats, InlinePressureStats, MergeTime, RestructurerStats, SplitTime,
+    AvoidableTimeStats, InlinePressureStats, LeafChanges, MergeTime, RestructurerStats, SplitTime,
 };
 pub use tlocker::LockerStats;

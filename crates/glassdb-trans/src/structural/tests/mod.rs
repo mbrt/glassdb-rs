@@ -2,6 +2,7 @@ use super::*;
 
 use super::candidates::SWEEP_INTERVAL;
 use super::change::ChangeAttemptResult;
+use super::merge::MergeReason;
 use super::reclamation::reclaim_holder_free_tombstones;
 use super::reconcile::{
     DEFERRED_RECONCILIATION_CAP, ParentReconciler, PendingReconciliation, ReconciliationOutcome,

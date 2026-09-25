@@ -7,9 +7,9 @@ use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
 use glassdb_concurr::rt;
 
-use crate::{CollectionPath, Database, Error, KeyScan};
+use crate::{CollectionPath, Database, Error, KeyScan, LeafChanges};
 
-use super::harness::{SimWorkload, open_det_db};
+use super::harness::{SimWorkload, det_db_builder, open_det_db};
 use super::{
     CLIENT_COUNT, MAX_OPS_PER_CLIENT, SimMedia, assert_valid_listing, key_name,
     merging_node_size_policy, tiny_node_size_policy,
@@ -322,7 +322,8 @@ impl SimWorkload for MembershipWorkload {
 
 /// The membership workload with a node size policy that admits more merges
 /// (ADR-073): deletes make leaves underfull, so they merge concurrently with
-/// puts, splits, and scans. The oracle is the same.
+/// puts, splits, and scans. The oracle is the same. The size rule decides the
+/// leaf changes, because the scans of a short run seldom pay for a merge.
 #[derive(Debug, Clone, Default)]
 pub struct MergingMembershipWorkload(pub MembershipWorkload);
 
@@ -342,12 +343,14 @@ impl SimWorkload for MergingMembershipWorkload {
         backend: &Arc<dyn Backend>,
         media: Option<SimMedia>,
     ) -> Result<Database, Error> {
-        open_det_db(
+        det_db_builder(
             backend,
             merging_node_size_policy(),
             glassdb_storage::InlinePolicy::default(),
             media,
         )
+        .leaf_changes(LeafChanges::Size)
+        .open()
         .await
     }
 

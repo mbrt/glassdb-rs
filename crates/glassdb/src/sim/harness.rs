@@ -18,7 +18,7 @@ use glassdb_concurr::{Tape, rt};
 use glassdb_storage::{InlinePolicy, NodeSizePolicy};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Database, Error, PersistentCacheConfig, ProtocolTiming};
+use crate::{Database, DatabaseBuilder, Error, PersistentCacheConfig, ProtocolTiming};
 
 use self::client::ClientRunner;
 use self::nemesis::{FaultTransports, NemesisRunner};
@@ -130,11 +130,24 @@ pub(crate) async fn open_det_db(
     inline_policy: InlinePolicy,
     media: Option<SimMedia>,
 ) -> Result<Database, Error> {
+    det_db_builder(backend, node_size_policy, inline_policy, media)
+        .open()
+        .await
+}
+
+/// Configures a simulation database with the given node size policy and
+/// optional persistent-cache media.
+pub(crate) fn det_db_builder(
+    backend: &Arc<dyn Backend>,
+    node_size_policy: NodeSizePolicy,
+    inline_policy: InlinePolicy,
+    media: Option<SimMedia>,
+) -> DatabaseBuilder {
     let builder = Database::builder(DB_NAME, backend.clone())
         .node_size_policy(node_size_policy)
         .inline_policy(inline_policy)
         .protocol_timing(ProtocolTiming::simulation());
-    let builder = if let Some(media) = media {
+    if let Some(media) = media {
         builder.simulated_persistent_cache(
             PersistentCacheConfig {
                 directory: PathBuf::from("simulated-fuzz-cache"),
@@ -144,8 +157,7 @@ pub(crate) async fn open_det_db(
         )
     } else {
         builder
-    };
-    builder.open().await
+    }
 }
 /// Deinterleaves a fault tape into `N` independent byte streams (byte `i` goes to
 /// stream `i % N`). Keeping the streams disjoint means a single mutated byte maps

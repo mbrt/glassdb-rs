@@ -10,6 +10,7 @@
 //! canonical encoding. It contains no conflict policy and performs no I/O.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use glassdb_data::{ID_BYTES, TxId};
@@ -295,6 +296,37 @@ impl LeafBody {
         // `split_off` keeps keys < split_key in `self` and returns keys >=.
         let upper = self.entries.split_off(&split_key);
         (LeafBody { entries: upper }, split_key)
+    }
+
+    /// Splits the leaf at `split_key` like [`LeafBody::split_off_median`], and
+    /// returns the upper half. Returns none, and keeps the leaf, when one half
+    /// would be empty.
+    pub fn split_off_at(&mut self, split_key: &[u8]) -> Option<LeafBody> {
+        if !self.divides_at(split_key) {
+            return None;
+        }
+        let upper = self.entries.split_off(split_key);
+        Some(LeafBody { entries: upper })
+    }
+
+    /// Reports whether a split at `split_key` leaves entries in both halves.
+    pub fn divides_at(&self, split_key: &[u8]) -> bool {
+        let lower = (Bound::Unbounded, Bound::Excluded(split_key));
+        let upper = (Bound::Included(split_key), Bound::Unbounded);
+        self.entries.range::<[u8], _>(lower).next().is_some()
+            && self.entries.range::<[u8], _>(upper).next().is_some()
+    }
+
+    /// Returns the split key of [`LeafBody::split_off_median`], or none when
+    /// the leaf has fewer than two entries.
+    pub fn median_key(&self) -> Option<&[u8]> {
+        if self.entries.len() < 2 {
+            return None;
+        }
+        self.entries
+            .keys()
+            .nth(self.entries.len() / 2)
+            .map(Vec::as_slice)
     }
 
     /// Encodes the leaf to its canonical protobuf body (the CAS unit).
@@ -885,6 +917,28 @@ mod tests {
         assert_eq!(split_key, b"b");
         assert_eq!(lower.len(), 1);
         assert_eq!(upper.len(), 2);
+    }
+
+    #[test]
+    fn split_off_at_keeps_a_leaf_that_a_half_would_leave_empty() {
+        let mut lower = LeafBody::from_entries([entry(b"a"), entry(b"b"), entry(b"c")]);
+        assert!(lower.split_off_at(b"a").is_none());
+        assert!(lower.split_off_at(b"d").is_none());
+        assert_eq!(lower.len(), 3);
+
+        let upper = lower.split_off_at(b"bb").unwrap();
+        let lower_keys: Vec<&[u8]> = lower.entries().map(|e| e.key.as_slice()).collect();
+        assert_eq!(lower_keys, vec![b"a".as_slice(), b"b"]);
+        let upper_keys: Vec<&[u8]> = upper.entries().map(|e| e.key.as_slice()).collect();
+        assert_eq!(upper_keys, vec![b"c".as_slice()]);
+    }
+
+    #[test]
+    fn the_median_key_is_the_split_key_of_a_divisible_leaf() {
+        let leaf = LeafBody::from_entries([entry(b"a"), entry(b"b"), entry(b"c")]);
+        assert_eq!(leaf.median_key(), Some(b"b".as_slice()));
+        assert_eq!(leaf.clone().split_off_median().1, b"b");
+        assert_eq!(LeafBody::from_entries([entry(b"a")]).median_key(), None);
     }
 
     // Golden vector: a fixed leaf must always encode to these exact bytes.

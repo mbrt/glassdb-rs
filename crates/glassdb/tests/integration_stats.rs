@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use glassdb::middleware::HookBackend;
-use glassdb::{Backend, Collection, Database, Error, InlinePolicy, KeyScan, NodeSizePolicy};
+use glassdb::{
+    Backend, Collection, Database, Error, InlinePolicy, KeyScan, LeafChanges, NodeSizePolicy,
+};
 
 pub mod integration_support;
 
@@ -224,12 +226,13 @@ async fn stats_report_direct_commit_coverage() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn aggregate_inline_pressure_splits_for_a_later_direct_commit() {
+async fn aggregate_inline_pressure_splits_for_a_later_direct_commit_when_sizes_decide() {
     let db = Database::builder("example", mem())
         .inline_policy(InlinePolicy {
             max_value_bytes: 8,
             max_leaf_bytes: 8,
         })
+        .leaf_changes(LeafChanges::Size)
         .open()
         .await
         .unwrap();
@@ -284,6 +287,51 @@ async fn aggregate_inline_pressure_splits_for_a_later_direct_commit() {
     );
     assert_eq!(read_int(&coll.read(b"a").await.unwrap().unwrap()), 1);
     assert_eq!(read_int(&coll.read(b"b").await.unwrap().unwrap()), 2);
+    db.shutdown().await;
+}
+
+// ADR-074: one aggregate inline rejection only adds its locked commit penalty
+// to the split-side time of the leaf. The leaf splits when the penalties of one
+// window pay for a split.
+#[tokio::test(start_paused = true)]
+async fn repeated_inline_pressure_splits_when_its_time_pays_for_a_split() {
+    let db = Database::builder("example", slow_mem())
+        .inline_policy(InlinePolicy {
+            max_value_bytes: 8,
+            max_leaf_bytes: 8,
+        })
+        .leaf_changes(LeafChanges::AvoidableTime {
+            split_threshold: 0.1,
+            merge_threshold: 1.0,
+        })
+        .open()
+        .await
+        .unwrap();
+    let coll = create_top(&db, b"inline-pressure").await;
+    coll.write(b"a", &write_int(0)).await.unwrap();
+    coll.write(b"b", &write_int(0)).await.unwrap();
+    rmw(&db, &coll, b"a", 1).await.unwrap();
+
+    rmw(&db, &coll, b"b", 1).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(db.stats().restructurer.splits, 0);
+
+    let mut rejections = 0;
+    while db.stats().restructurer.splits == 0 && rejections < 20 {
+        let before = db.stats();
+        rmw(&db, &coll, b"b", 1).await.unwrap();
+        rejections += (db.stats() - before).direct_commit.candidates
+            - (db.stats() - before).direct_commit.landed;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let stats = db.stats();
+    assert_eq!(stats.restructurer.splits, 1, "rejections: {rejections}");
+    assert!(rejections > 1, "rejections: {rejections}");
+    assert_eq!(stats.restructurer.inline_pressure.candidates, 0);
+    let before_retry = db.stats();
+    rmw(&db, &coll, b"b", 1).await.unwrap();
+    assert_eq!((db.stats() - before_retry).direct_commit.landed, 1);
     db.shutdown().await;
 }
 

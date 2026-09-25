@@ -12,7 +12,7 @@ use glassdb_data::{DatabaseId, DbPrefix};
 use glassdb_storage::{InlinePolicy, NodeSizePolicy, PersistentCacheConfig, PersistentCacheMedia};
 use glassdb_trans::{
     AccessSet, BodyDecision, CatalogAccesses, Engine, EngineConfig, EngineTransaction, GcLimits,
-    ProtocolTiming, TransError,
+    LeafChanges, ProtocolTiming, TransError,
 };
 use tokio::sync::Notify;
 
@@ -122,6 +122,18 @@ impl DatabaseBuilder {
     /// (ADR-056).
     pub fn inline_policy(mut self, policy: InlinePolicy) -> Self {
         self.engine_config.set_inline_policy(policy);
+        self
+    }
+
+    /// Sets what decides the splits and merges of leaves below the hard cap.
+    /// Defaults to [`LeafChanges::avoidable_time`] (ADR-074). The rule is local
+    /// to each database instance.
+    ///
+    /// # Panics
+    ///
+    /// When the database opens, if a threshold is negative or not finite.
+    pub fn leaf_changes(mut self, rule: LeafChanges) -> Self {
+        self.engine_config.set_leaf_changes(rule);
         self
     }
 

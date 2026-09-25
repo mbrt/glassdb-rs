@@ -1,6 +1,7 @@
 //! Background structural changes of the B-link coordination tree: splits of
-//! over-full nodes (ADR-031) and merges of underfull nodes into their right
-//! sibling (ADR-073).
+//! over-full nodes (ADR-031), merges of underfull nodes into their right
+//! sibling (ADR-073), and the leaf splits and merges that avoidable time pays
+//! for (ADR-074).
 //!
 //! The [`Restructurer`] schedules the work. It drains the candidate feed, and
 //! gives each candidate to the split or the merge module, which re-checks it
@@ -42,6 +43,7 @@ use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::LeafCoordinator;
 use crate::monitor::Monitor;
 
+use avoidable::ChangeKind;
 use candidates::{CandidateCause, MaintenanceCandidate, MaintenanceCandidates};
 use change::{ChangeLifecycle, PlannedChange, StructuralTopology};
 use merge::Merger;
@@ -50,11 +52,11 @@ use reclamation::ReclamationReporter;
 use reconcile::ParentReconciler;
 use recovery::{RecoveryAction, RecoveryStep, StructuralRecovery};
 use split::Splitter;
-use stats::Stats;
+use stats::{LandedChanges, Stats};
 use topology::TopologyMembership;
 
 pub(crate) use avoidable::TypicalTime;
-pub use avoidable::{AvoidableTimeStats, MergeTime, SplitTime};
+pub use avoidable::{AvoidableTimeStats, LeafChanges, MergeTime, SplitTime};
 pub use candidates::StructuralHintSink;
 pub use stats::{InlinePressureStats, RestructurerStats};
 
@@ -106,9 +108,10 @@ impl Restructurer {
         db_prefix: DbPrefix,
         policy: NodeSizePolicy,
         inline: InlinePolicy,
+        leaf_changes: LeafChanges,
         gc_hints: GcHints,
     ) -> (LeafCoordinator, Self) {
-        let candidates = MaintenanceCandidates::with_policies(policy, inline);
+        let candidates = MaintenanceCandidates::with_policies(policy, inline, leaf_changes);
         let coord = LeafCoordinator::with_hinter(
             nodes.clone(),
             key_state.clone(),
@@ -234,8 +237,7 @@ impl Restructurer {
             router,
             timeline,
             mon.clone(),
-            *candidates.policy(),
-            *candidates.inline(),
+            candidates.clone(),
             stats.clone(),
             reclamation.clone(),
         );
@@ -277,7 +279,13 @@ impl Restructurer {
                     .inline_pressure_candidates
                     .fetch_add(1, Ordering::Relaxed);
             }
-            if let Err(e) = self.process_candidate(&candidate).await {
+            let landed = stats.landed();
+            let started = rt::Instant::now();
+            let result = self.process_candidate(&candidate).await;
+            if result.is_ok() {
+                self.record_change_time(&candidate.cause, landed, started.elapsed());
+            }
+            if let Err(e) = result {
                 tracing::debug!(
                     target: "glassdb::restructurer",
                     path = %candidate.path,
@@ -334,7 +342,7 @@ impl Restructurer {
                     .run(change, id, StructuralTopology::Owned)
                     .await
             }
-            CandidateCause::Underfull => {
+            CandidateCause::Merge(reason) => {
                 let ObjectPath::Node {
                     collection,
                     id: source,
@@ -342,14 +350,37 @@ impl Restructurer {
                 else {
                     return Ok(());
                 };
-                if !self.merger.is_actionable(collection, source).await? {
+                if !self
+                    .merger
+                    .is_actionable(collection, source, *reason)
+                    .await?
+                {
                     return Ok(());
                 }
-                let change = PlannedChange::Merge { collection, source };
+                let change = PlannedChange::Merge {
+                    collection,
+                    source,
+                    reason: *reason,
+                };
                 self.changes
                     .run(change, id, StructuralTopology::Owned)
                     .await
             }
+        }
+    }
+
+    /// Records `took` as the time of the change that a candidate with `cause`
+    /// asked for, when a change of that kind landed since `before`. The
+    /// recovery loop can also land a change of that kind in this time, but
+    /// rarely.
+    fn record_change_time(&self, cause: &CandidateCause, before: LandedChanges, took: Duration) {
+        let after = self.stats.landed();
+        let (kind, landed) = match cause {
+            CandidateCause::Split(_) => (ChangeKind::Split, after.splits > before.splits),
+            CandidateCause::Merge(_) => (ChangeKind::Merge, after.merges > before.merges),
+        };
+        if landed {
+            self.candidates.avoidable().record_change(kind, took);
         }
     }
 

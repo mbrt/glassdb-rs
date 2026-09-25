@@ -55,7 +55,7 @@ use glassdb_storage::{
 
 use crate::error::TransError;
 
-use super::candidates::{CandidateCause, MaintenanceCandidate, MaintenanceCandidates};
+use super::candidates::MaintenanceCandidates;
 use super::change::{Applied, ParentRoute, Prepared};
 use super::reclamation::{ReclamationReporter, reclaim_holder_free_tombstones};
 use super::recovery::{PreparedIntent, ReadyChange};
@@ -67,8 +67,7 @@ pub(super) struct Splitter {
     nodes: NodeStore,
     router: TreeRouter,
     timeline: Timeline,
-    // Supplies the size policies, and receives the split outputs that are
-    // still over their soft cap.
+    // Supplies the size policies, and receives the split outputs.
     candidates: MaintenanceCandidates,
     stats: Arc<Stats>,
     reclamation: ReclamationReporter,
@@ -79,7 +78,17 @@ pub(super) struct Splitter {
 pub(super) enum SplitReason {
     SoftCap,
     Capacity,
-    InlinePressure { key: Vec<u8>, value_len: usize },
+    InlinePressure {
+        key: Vec<u8>,
+        value_len: usize,
+    },
+    /// Avoidable time pays for a split of the leaf (ADR-074). The split is at
+    /// the key for which the time was measured, or at the median without one.
+    /// The leaf can change before the split, so a measured median can differ
+    /// from the median at the split.
+    Demand {
+        at: Option<Vec<u8>>,
+    },
 }
 
 /// Whether a node still needs the split that its reason asked for.
@@ -206,6 +215,17 @@ impl Splitter {
                     SplitNeed::NotActionable
                 }
             }
+            SplitReason::Demand { at } => {
+                let divisible = node.as_leaf().is_some_and(|leaf| match at {
+                    Some(key) => leaf.divides_at(key),
+                    None => leaf.len() >= 2,
+                });
+                if divisible {
+                    SplitNeed::Split
+                } else {
+                    SplitNeed::NotActionable
+                }
+            }
             SplitReason::InlinePressure { key, value_len } => {
                 let Some(leaf) = node.as_leaf() else {
                     return SplitNeed::Reroute;
@@ -259,9 +279,9 @@ impl Splitter {
         }
         match target {
             SplitTarget::NonRoot(id) => {
-                self.plan_nonroot_split(id, prepared, node, worker, reclaimed)
+                self.plan_nonroot_split(id, reason, prepared, node, worker, reclaimed)
             }
-            SplitTarget::Root => self.plan_root_split(prepared, &node, worker, reclaimed),
+            SplitTarget::Root => self.plan_root_split(reason, prepared, &node, worker, reclaimed),
         }
     }
 
@@ -352,6 +372,7 @@ impl Splitter {
     fn plan_nonroot_split(
         &self,
         source_id: &NodeId,
+        reason: &SplitReason,
         prepared: &PreparedIntent,
         mut source: Node,
         worker: &TxId,
@@ -360,7 +381,7 @@ impl Splitter {
         let right_id = prepared
             .nonroot_sibling()
             .expect("a prepared non-root intent always reserves one sibling");
-        let Some((right, split_key)) = source.split(right_id) else {
+        let Some((right, split_key)) = reason.divide(&mut source, right_id) else {
             return Prepared::Cancel(Ok(()));
         };
         source.remove_structural_gate(worker);
@@ -382,6 +403,7 @@ impl Splitter {
     /// Builds both root children and the replacement root index.
     fn plan_root_split(
         &self,
+        reason: &SplitReason,
         prepared: &PreparedIntent,
         node: &Node,
         worker: &TxId,
@@ -390,7 +412,7 @@ impl Splitter {
         let (left_id, right_id) = prepared
             .root_children()
             .expect("a prepared root intent always reserves two children");
-        let (left, right, split_key) = split_into_children(node, right_id, worker);
+        let (left, right, split_key) = split_into_children(reason, node, right_id, worker);
         let index = Node::index(IndexNode::from_children([
             (Vec::new(), left_id),
             (split_key.clone(), right_id),
@@ -440,31 +462,19 @@ impl Splitter {
         outputs: [(&NodeId, &Node); 2],
     ) {
         self.reclamation.record(reclaimed, false);
-        self.stats.splits.fetch_add(1, Ordering::Relaxed);
+        self.stats.record_split();
         for (id, node) in outputs {
-            self.enqueue_if_over_soft_cap(collection, id, node);
+            let path = ObjectPath::Node {
+                collection: collection.clone(),
+                id: *id,
+            };
+            self.candidates.observe_split_output(path, node);
         }
         if reason.is_inline_pressure() {
             self.stats
                 .inline_pressure_completed
                 .fetch_add(1, Ordering::Relaxed);
         }
-    }
-
-    /// Carries an oversized split output into a later sweep so one hint can
-    /// drive the whole split cascade.
-    fn enqueue_if_over_soft_cap(&self, collection: &CollectionAddress, id: &NodeId, node: &Node) {
-        if !node.over_soft_cap(self.candidates.policy()) {
-            return;
-        }
-        self.candidates.push(MaintenanceCandidate {
-            path: ObjectPath::Node {
-                collection: collection.clone(),
-                id: *id,
-            },
-            priority: self.candidates.new_id(),
-            cause: CandidateCause::Split(SplitReason::SoftCap),
-        });
     }
 }
 
@@ -474,11 +484,21 @@ impl SplitReason {
             SplitReason::SoftCap => 0,
             SplitReason::InlinePressure { .. } => 1,
             SplitReason::Capacity => 2,
+            SplitReason::Demand { .. } => 3,
         }
     }
 
     pub(super) fn is_inline_pressure(&self) -> bool {
         matches!(self, SplitReason::InlinePressure { .. })
+    }
+
+    /// Divides `node` like [`Node::split`], at the key that the reason asks
+    /// for, if any.
+    fn divide(&self, node: &mut Node, right_id: NodeId) -> Option<(Node, Vec<u8>)> {
+        match self {
+            SplitReason::Demand { at: Some(key) } => node.split_leaf_at(right_id, key),
+            _ => node.split(right_id),
+        }
     }
 }
 
@@ -495,14 +515,15 @@ impl<'a> SplitTarget<'a> {
 /// an in-place root split, returning `(left, right, split_key)`. `left` links to
 /// `right_id`; `right` inherits `node`'s former bounds.
 fn split_into_children(
+    reason: &SplitReason,
     node: &Node,
     right_id: NodeId,
     structure_holder: &TxId,
 ) -> (Node, Node, Vec<u8>) {
     let mut source = node.clone();
-    let (right, split_key) = source
-        .split(right_id)
-        .expect("a split source has at least two entries/children");
+    let (right, split_key) = reason
+        .divide(&mut source, right_id)
+        .expect("a split source has entries or children in both halves");
     source.remove_structural_gate(structure_holder);
     (source, right, split_key)
 }

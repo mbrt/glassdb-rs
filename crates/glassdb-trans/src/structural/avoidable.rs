@@ -1,18 +1,46 @@
-//! The avoidable time of the leaves of one database instance (ADR-074).
+//! The avoidable time of the leaves of one database instance, and the rule
+//! that decides leaf splits and merges from it (ADR-074).
 //!
 //! Transactions report the time that one split of a leaf, or one merge of two
-//! adjacent leaves, would remove.
+//! adjacent leaves, would remove. The sums of one window decide a change as
+//! soon as they pay for it.
 
+use std::collections::BTreeMap;
 use std::ops::{AddAssign, Sub};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use glassdb_concurr::rt;
 use glassdb_data::ObjectPath;
 
 use crate::leaf_coord::LeafDelay;
 
+/// The length of one window of avoidable time.
+const WINDOW: Duration = Duration::from_secs(1);
+
+/// The time of one split or merge until this database instance measures one.
+const DEFAULT_CHANGE_TIME: Duration = Duration::from_millis(500);
+
 /// The weight of a new measurement in a typical time is one part in this many.
 const TYPICAL_TIME_WEIGHT: u32 = 8;
+
+/// What decides the splits and merges of leaves below the hard cap. Index
+/// nodes split and merge on size with every rule.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LeafChanges {
+    /// Avoidable time decides (ADR-074). A leaf splits when its split-side
+    /// time in one window is more than `split_threshold` typical splits. Two
+    /// adjacent leaves merge when their merge-side time in one window is more
+    /// than `merge_threshold` typical merges, plus the split-side time of both.
+    /// Leaves over a soft cap also split.
+    AvoidableTime {
+        split_threshold: f64,
+        merge_threshold: f64,
+    },
+    /// Soft caps, underfull thresholds, and inline pressure decide (ADR-031,
+    /// ADR-056, ADR-073).
+    Size,
+}
 
 /// Avoidable time that one split of its leaf can remove.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -47,16 +75,69 @@ pub struct AvoidableTimeStats {
     pub merge: MergeTime,
 }
 
-/// Collects the avoidable time of one database instance.
-#[derive(Debug, Default)]
+/// Collects the avoidable time of one database instance, and decides which
+/// leaves pay for a change.
+#[derive(Debug)]
 pub(super) struct AvoidableTime {
-    totals: Mutex<AvoidableTimeStats>,
+    // None when the size causes decide: then only the totals are kept.
+    thresholds: Option<Thresholds>,
+    state: Mutex<State>,
+    split_time: TypicalTime,
+    merge_time: TypicalTime,
+}
+
+/// The kind of a structural change of a leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChangeKind {
+    Split,
+    Merge,
 }
 
 /// The moving average of the time of one operation.
 #[derive(Debug, Default)]
 pub(crate) struct TypicalTime {
     average: Mutex<Option<Duration>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Thresholds {
+    split: f64,
+    merge: f64,
+}
+
+#[derive(Debug)]
+struct State {
+    window_started: rt::Instant,
+    leaves: BTreeMap<ObjectPath, WindowSum<SplitTime>>,
+    pairs: BTreeMap<(ObjectPath, ObjectPath), WindowSum<MergeTime>>,
+    changes: Vec<(ObjectPath, ChangeKind)>,
+    changes_last_window: Vec<(ObjectPath, ChangeKind)>,
+    totals: AvoidableTimeStats,
+}
+
+/// The time of one leaf or pair in the current window.
+#[derive(Debug, Default)]
+struct WindowSum<T> {
+    time: T,
+    // One change for each leaf or pair in a window is enough: the candidate
+    // queue retries a change that does not land.
+    requested: bool,
+}
+
+impl LeafChanges {
+    /// Returns the avoidable time rule with the thresholds of ADR-074.
+    pub fn avoidable_time() -> Self {
+        Self::AvoidableTime {
+            split_threshold: 1.0,
+            merge_threshold: 1.0,
+        }
+    }
+}
+
+impl Default for LeafChanges {
+    fn default() -> Self {
+        Self::avoidable_time()
+    }
 }
 
 impl SplitTime {
@@ -161,39 +242,175 @@ impl TypicalTime {
 }
 
 impl AvoidableTime {
-    /// Adds split-side time of the leaf at `path`. Only the totals keep it,
-    /// until a policy decides with the time of each leaf.
-    pub(super) fn add_split_time(&self, _path: &ObjectPath, time: SplitTime) {
-        self.totals.lock().unwrap().split += time;
+    /// Creates a collector for `rule`.
+    ///
+    /// # Panics
+    ///
+    /// If a threshold of `rule` is negative or not finite.
+    pub(super) fn new(rule: LeafChanges) -> Self {
+        let thresholds = match rule {
+            LeafChanges::AvoidableTime {
+                split_threshold,
+                merge_threshold,
+            } => Some(Thresholds {
+                split: checked_multiple(split_threshold),
+                merge: checked_multiple(merge_threshold),
+            }),
+            LeafChanges::Size => None,
+        };
+        Self {
+            thresholds,
+            state: Mutex::new(State {
+                window_started: rt::Instant::now(),
+                leaves: BTreeMap::new(),
+                pairs: BTreeMap::new(),
+                changes: Vec::new(),
+                changes_last_window: Vec::new(),
+                totals: AvoidableTimeStats::default(),
+            }),
+            split_time: TypicalTime::default(),
+            merge_time: TypicalTime::default(),
+        }
+    }
+
+    /// Reports whether avoidable time decides the leaf changes.
+    pub(super) fn decides(&self) -> bool {
+        self.thresholds.is_some()
+    }
+
+    /// Adds split-side time of the leaf at `path`. Returns true once in a
+    /// window, when the time of the leaf in the window pays for one split.
+    pub(super) fn add_split_time(&self, path: &ObjectPath, time: SplitTime) -> bool {
+        if time.total().is_zero() {
+            return false;
+        }
+        let mut state = self.state.lock().unwrap();
+        state.totals.split += time;
+        let Some(thresholds) = self.thresholds else {
+            return false;
+        };
+        state.roll(rt::Instant::now());
+        let held = state.changed_recently(path, ChangeKind::Merge);
+        let split_time = self.typical(&self.split_time).mul_f64(thresholds.split);
+        let leaf = state.leaves.entry(path.clone()).or_default();
+        leaf.time += time;
+        let pays = !held && !leaf.requested && leaf.time.total() > split_time;
+        leaf.requested |= pays;
+        pays
     }
 
     /// Adds merge-side time of the adjacent leaves at `left` and `right`.
-    pub(super) fn add_merge_time(&self, _left: &ObjectPath, _right: &ObjectPath, time: MergeTime) {
-        self.totals.lock().unwrap().merge += time;
+    /// Returns true once in a window, when the time of the two leaves in the
+    /// window pays for one merge and for the split-side time of both leaves.
+    pub(super) fn add_merge_time(
+        &self,
+        left: &ObjectPath,
+        right: &ObjectPath,
+        time: MergeTime,
+    ) -> bool {
+        if time.total().is_zero() {
+            return false;
+        }
+        let mut state = self.state.lock().unwrap();
+        state.totals.merge += time;
+        let Some(thresholds) = self.thresholds else {
+            return false;
+        };
+        state.roll(rt::Instant::now());
+        let held = [left, right].into_iter().any(|path| {
+            state.changed_recently(path, ChangeKind::Split)
+                || state.leaves.get(path).is_some_and(|leaf| leaf.requested)
+        });
+        let split_side = |path: &ObjectPath| {
+            state
+                .leaves
+                .get(path)
+                .map_or(Duration::ZERO, |leaf| leaf.time.total())
+        };
+        let keep = self.typical(&self.merge_time).mul_f64(thresholds.merge)
+            + split_side(left)
+            + split_side(right);
+        let pair = state
+            .pairs
+            .entry((left.clone(), right.clone()))
+            .or_default();
+        pair.time += time;
+        let pays = !held && !pair.requested && pair.time.total() > keep;
+        pair.requested |= pays;
+        pays
+    }
+
+    /// Records that a structural change of `kind` that landed wrote the leaf
+    /// at `path`.
+    pub(super) fn record_changed(&self, path: ObjectPath, kind: ChangeKind) {
+        if self.thresholds.is_none() {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        state.roll(rt::Instant::now());
+        // Time from before the change measured a topology that is gone. If it
+        // stays, the same time can pay for the same change again.
+        state.leaves.remove(&path);
+        state
+            .pairs
+            .retain(|(left, right), _| *left != path && *right != path);
+        state.changes.push((path, kind));
+    }
+
+    /// Records the time of one structural change that landed.
+    pub(super) fn record_change(&self, kind: ChangeKind, took: Duration) {
+        match kind {
+            ChangeKind::Split => self.split_time.record(took),
+            ChangeKind::Merge => self.merge_time.record(took),
+        }
     }
 
     /// Returns and resets the totals since the last call.
     pub(super) fn take_stats(&self) -> AvoidableTimeStats {
-        std::mem::take(&mut *self.totals.lock().unwrap())
+        std::mem::take(&mut self.state.lock().unwrap().totals)
     }
+
+    fn typical(&self, time: &TypicalTime) -> Duration {
+        time.get().unwrap_or(DEFAULT_CHANGE_TIME)
+    }
+}
+
+impl State {
+    /// Starts a new window when the current one has ended. A leaf that
+    /// changed in the window before stays held down for one more window.
+    fn roll(&mut self, now: rt::Instant) {
+        let elapsed = now.saturating_duration_since(self.window_started);
+        if elapsed < WINDOW {
+            return;
+        }
+        self.window_started = now;
+        self.leaves.clear();
+        self.pairs.clear();
+        let changes = std::mem::take(&mut self.changes);
+        self.changes_last_window = if elapsed < 2 * WINDOW {
+            changes
+        } else {
+            Vec::new()
+        };
+    }
+
+    /// Reports whether a change of `kind` wrote the leaf at `path` in this
+    /// window or the last one.
+    fn changed_recently(&self, path: &ObjectPath, kind: ChangeKind) -> bool {
+        self.changes
+            .iter()
+            .chain(&self.changes_last_window)
+            .any(|(changed, changed_kind)| changed == path && *changed_kind == kind)
+    }
+}
+
+fn checked_multiple(multiple: f64) -> f64 {
+    assert!(
+        multiple.is_finite() && multiple >= 0.0,
+        "a threshold multiple must be finite and not negative, got {multiple}"
+    );
+    multiple
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use super::TypicalTime;
-
-    #[test]
-    fn typical_time_moves_one_eighth_toward_each_measurement() {
-        let typical = TypicalTime::default();
-        assert_eq!(typical.get(), None);
-
-        typical.record(Duration::from_millis(80));
-        typical.record(Duration::from_millis(160));
-        assert_eq!(typical.get(), Some(Duration::from_millis(90)));
-
-        typical.record(Duration::from_millis(10));
-        assert_eq!(typical.get(), Some(Duration::from_millis(80)));
-    }
-}
+mod tests;

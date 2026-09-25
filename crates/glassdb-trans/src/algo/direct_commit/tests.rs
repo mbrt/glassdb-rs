@@ -4,8 +4,9 @@ use std::collections::BTreeMap;
 
 use super::super::tests::{
     Tctx, begin_accesses, commit_access, commit_writes, do_read, entry, leaf_reads, logical_key,
-    new_algo, new_algo_from_backend, new_recording_algo, new_recording_algo_big_cache,
-    read_outcome, test_collection, test_node_id, test_root_path, wa, wdel, write_counts,
+    new_algo, new_algo_from_backend, new_algo_with_size_leaf_changes, new_recording_algo,
+    new_recording_algo_big_cache, read_outcome, test_collection, test_node_id, test_root_path, wa,
+    wdel, write_counts,
 };
 use super::super::*;
 use super::*;
@@ -1061,7 +1062,8 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
 // broadly would spin the body forever against a holder or a closed budget.
 #[tokio::test]
 async fn direct_commit_replays_only_a_certified_superseded_read() {
-    let (tm, tctx) = new_algo().await;
+    // Only the size causes turn aggregate inline pressure into a candidate.
+    let (tm, tctx) = new_algo_with_size_leaf_changes().await;
     let keyp = logical_key(b"k");
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
     let seed = entry(&tctx, b"k").await.unwrap();

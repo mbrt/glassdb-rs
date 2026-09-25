@@ -25,7 +25,8 @@ use tokio::runtime::Runtime;
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::middleware::{DelayBackend, DelayOptions, gcs_delays, s3_delays};
 use glassdb::{
-    Backend, Collection, CollectionPath, Database, Error, InlinePolicy, Stats, Transaction,
+    Backend, Collection, CollectionPath, Database, Error, InlinePolicy, LeafChanges, Stats,
+    Transaction,
 };
 
 // Number of iterations used for the one-off stats summary printed per backend.
@@ -97,6 +98,17 @@ async fn read_int_or_zero(tx: &Transaction, coll: &Collection, key: &[u8]) -> Re
 
 async fn open_db(backend: Arc<dyn Backend>) -> Database {
     Database::open("bench", backend).await.expect("open db")
+}
+
+/// Opens a database whose leaves change only for their sizes, so that the
+/// contention of a benchmark stays in one leaf. Avoidable time would split
+/// the leaf between contending writers (ADR-074).
+async fn open_sized_db(backend: Arc<dyn Backend>) -> Database {
+    Database::builder("bench", backend)
+        .leaf_changes(LeafChanges::Size)
+        .open()
+        .await
+        .expect("open db")
 }
 
 async fn open_coll(backend: Arc<dyn Backend>, name: &[u8]) -> (Database, Collection) {
@@ -715,9 +727,15 @@ fn bench_direct_commit_leaf_contention(c: &mut Criterion, rt: &Runtime) {
                     "direct-contended-{}-{count}-{backend_name}",
                     workload.label()
                 );
-                let (background_db, background_coll) =
-                    rt.block_on(open_coll(backend.clone(), collection_name.as_bytes()));
-                let measured_db = rt.block_on(open_db(backend));
+                let background_db = rt.block_on(open_sized_db(backend.clone()));
+                let background_coll = rt
+                    .block_on(
+                        background_db
+                            .root_collection()
+                            .create_collection_if_absent(collection_name.as_bytes()),
+                    )
+                    .expect("create contended collection");
+                let measured_db = rt.block_on(open_sized_db(backend));
                 let measured_coll =
                     rt.block_on(measured_db.open_collection(
                         &CollectionPath::new(collection_name.as_bytes()).unwrap(),

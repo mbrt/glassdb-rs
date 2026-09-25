@@ -7,6 +7,7 @@ use glassdb_backend::Backend;
 use glassdb_bench_scale::run::{SplitSettlement, shutdown_databases_until, wait_for_split_quiet};
 use tokio::runtime::Handle;
 
+use super::super::policy::PolicySpec;
 use super::result;
 use super::{key_bytes, value};
 
@@ -15,6 +16,7 @@ const COLLECTION_PREFIX: &str = "mix";
 /// Inputs that determine a cell's storage setup and cleanup bounds.
 pub(super) struct CellConfig {
     pub(super) databases: usize,
+    pub(super) policy: PolicySpec,
     pub(super) pool_size: usize,
     pub(super) split_quiet: Duration,
     pub(super) split_settle_timeout: Duration,
@@ -32,6 +34,11 @@ impl PreparedCell {
     /// Returns the measurement clients in their stable home-collection order.
     pub(super) fn databases(&self) -> &[Database] {
         &self.databases
+    }
+
+    /// Returns each client's handles to every target collection.
+    pub(super) fn collections(&self) -> &[Arc<[Collection]>] {
+        &self.collections
     }
 
     /// Starts the measured phase by capturing client counter baselines.
@@ -119,7 +126,12 @@ pub(super) fn prepare_cell(
         &config,
     )?;
     let databases: Vec<_> = (0..config.databases)
-        .map(|_| open_db(handle, database_name, backend.clone()))
+        .map(|_| {
+            let builder = config
+                .policy
+                .apply(Database::builder(database_name, backend.clone()));
+            handle.block_on(builder.open()).expect("open db")
+        })
         .collect();
     let collections = handle.block_on(open_collections(&databases, &collection_paths))?;
     Ok(PreparedCell {
@@ -223,6 +235,7 @@ mod tests {
             "mixedsetuptest",
             CellConfig {
                 databases: 2,
+                policy: PolicySpec::Engine,
                 pool_size: 3,
                 split_quiet: Duration::from_millis(20),
                 split_settle_timeout: Duration::from_secs(1),

@@ -68,8 +68,9 @@ pub use glassdb_storage::{
     PersistentCacheConfig,
 };
 pub use glassdb_trans::{
-    AvoidableTimeStats, DirectCommitStats, GcLimits, InlinePressureStats, LeafCoordinatorStats,
-    LockerStats, MergeTime, MonitorStats, ProtocolTiming, RestructurerStats, SplitTime,
+    AvoidableTimeStats, DirectCommitStats, GcLimits, InlinePressureStats, LeafChanges,
+    LeafCoordinatorStats, LockerStats, MergeTime, MonitorStats, ProtocolTiming, RestructurerStats,
+    SplitTime,
 };
 
 // Re-export the backend abstraction so callers can construct a Database without

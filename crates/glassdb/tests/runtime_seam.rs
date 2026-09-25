@@ -72,7 +72,10 @@ const EXEMPT_SEAM_GLOBS: &[&str] = &[
 // The source scanner recognizes inline `#[cfg(test)] mod tests` blocks, but an
 // out-of-line test module has no distinguishing syntax in its own file. Keep
 // this list exact so a production file named `tests.rs` cannot evade the guard.
-const OUT_OF_LINE_TEST_MODULES: &[&str] = &["crates/glassdb-trans/src/algo/direct_commit/tests.rs"];
+const OUT_OF_LINE_TEST_MODULES: &[&str] = &[
+    "crates/glassdb-trans/src/algo/direct_commit/tests.rs",
+    "crates/glassdb-trans/src/structural/avoidable/tests.rs",
+];
 
 fn is_exempt_seam_file(path: &Path) -> bool {
     EXEMPT_SEAM_GLOBS.iter().any(|glob| {

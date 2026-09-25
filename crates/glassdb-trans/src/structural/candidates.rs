@@ -11,7 +11,8 @@ use tokio::sync::Notify;
 
 use crate::leaf_coord::{LeafDelay, StructuralHinter};
 
-use super::avoidable::{AvoidableTime, MergeTime, SplitTime};
+use super::avoidable::{AvoidableTime, ChangeKind, LeafChanges, MergeTime, SplitTime};
+use super::merge::MergeReason;
 use super::split::SplitReason;
 
 /// Interval of the sweep when no new candidate arrives. Such a sweep retries
@@ -30,11 +31,11 @@ const CANDIDATE_QUEUE_CAP: usize = 4096;
 
 /// The feed of nodes that may need a split (ADR-031) or a merge (ADR-073),
 /// owned by the [`Restructurer`](super::Restructurer). The coordinator observes
-/// stored leaves through [`StructuralHinter`], direct-commit admission reports
-/// inline pressure through [`StructuralHintSink`], and parent reconciliation
-/// reports underfull parents. The restructurer drains and re-checks every
-/// cause. Cloneable so the producers and restructurer share one queue and
-/// policy.
+/// stored leaves and their avoidable time through [`StructuralHinter`],
+/// direct-commit admission reports inline pressure and cross-leaf misses
+/// through [`StructuralHintSink`], and parent reconciliation reports underfull
+/// parents. The restructurer drains and re-checks every cause. Cloneable so
+/// the producers and restructurer share one queue and policy.
 #[derive(Clone)]
 pub(super) struct MaintenanceCandidates {
     policy: NodeSizePolicy,
@@ -64,16 +65,16 @@ pub(super) struct MaintenanceCandidate {
 #[derive(Clone)]
 pub(super) enum CandidateCause {
     Split(SplitReason),
-    /// The node is below an underfull threshold, so it can merge into its
-    /// right sibling (ADR-073).
-    Underfull,
+    /// The node can merge into its right sibling (ADR-073).
+    Merge(MergeReason),
 }
 
 impl StructuralHintSink {
     /// Records recoverable aggregate inline pressure for authoritative
-    /// revalidation by the restructurer.
+    /// revalidation by the restructurer. When avoidable time decides, the time
+    /// of the pressure counts instead.
     pub(crate) fn observe_inline_pressure(&self, path: &ObjectPath, key: &[u8], value_len: usize) {
-        if !self.candidates.inline.admits_value(value_len) {
+        if self.candidates.avoidable.decides() || !self.candidates.inline.admits_value(value_len) {
             return;
         }
         self.candidates.push(MaintenanceCandidate {
@@ -93,7 +94,8 @@ impl StructuralHintSink {
             inline_pressure: time,
             ..SplitTime::default()
         };
-        self.candidates.avoidable.add_split_time(path, split);
+        // Either half of a median split carries about half of the inline bytes.
+        self.candidates.add_split_time(path, split, None);
     }
 
     /// Notes that a direct commit candidate with keys in the adjacent leaves
@@ -103,7 +105,7 @@ impl StructuralHintSink {
             adjacent_miss: time,
             ..MergeTime::default()
         };
-        self.candidates.avoidable.add_merge_time(left, right, merge);
+        self.candidates.add_merge_time(left, right, merge);
     }
 
     /// Notes that a scan that continued from `left` used `time` to read the
@@ -113,7 +115,7 @@ impl StructuralHintSink {
             scan_crossing: time,
             ..MergeTime::default()
         };
-        self.candidates.avoidable.add_merge_time(left, right, merge);
+        self.candidates.add_merge_time(left, right, merge);
     }
 
     #[cfg(test)]
@@ -139,27 +141,32 @@ impl CandidateCause {
     fn class(&self) -> u8 {
         match self {
             CandidateCause::Split(reason) => reason.class(),
-            CandidateCause::Underfull => 3,
+            CandidateCause::Merge(reason) => reason.class(),
         }
     }
 }
 
 impl MaintenanceCandidates {
-    /// Creates an empty candidate feed with the supplied node size policy.
+    /// Creates an empty candidate feed with the supplied node size policy,
+    /// where sizes and inline pressure decide leaf changes.
     #[cfg(test)]
     pub(super) fn with_policy(policy: NodeSizePolicy) -> Self {
-        Self::with_policies(policy, InlinePolicy::default())
+        Self::with_policies(policy, InlinePolicy::default(), LeafChanges::Size)
     }
 
     /// Creates an empty candidate feed with co-wired node size and inline
-    /// policies.
-    pub(super) fn with_policies(policy: NodeSizePolicy, inline: InlinePolicy) -> Self {
+    /// policies, where `leaf_changes` decides the leaf changes.
+    pub(super) fn with_policies(
+        policy: NodeSizePolicy,
+        inline: InlinePolicy,
+        leaf_changes: LeafChanges,
+    ) -> Self {
         MaintenanceCandidates {
             policy,
             inline,
             queue: Arc::new(Mutex::new(VecDeque::new())),
             queued: Arc::new(Notify::new()),
-            avoidable: Arc::new(AvoidableTime::default()),
+            avoidable: Arc::new(AvoidableTime::new(leaf_changes)),
         }
     }
 
@@ -208,7 +215,7 @@ impl MaintenanceCandidates {
             }
         }
         let mut candidates: Vec<_> = by_path.into_values().collect();
-        candidates.sort_by_key(|candidate| matches!(candidate.cause, CandidateCause::Underfull));
+        candidates.sort_by_key(|candidate| matches!(candidate.cause, CandidateCause::Merge(_)));
         candidates
     }
 
@@ -222,7 +229,24 @@ impl MaintenanceCandidates {
             self.push(MaintenanceCandidate {
                 path: path.clone(),
                 priority: self.new_id(),
-                cause: CandidateCause::Underfull,
+                cause: CandidateCause::Merge(MergeReason::Underfull),
+            });
+        }
+    }
+
+    /// Records that a split that landed wrote `node` at `path`. Nodes over a
+    /// soft cap split again in a later sweep, so that one hint can drive the
+    /// whole split cascade.
+    pub(super) fn observe_split_output(&self, path: ObjectPath, node: &Node) {
+        if node.as_leaf().is_some() {
+            self.avoidable
+                .record_changed(path.clone(), ChangeKind::Split);
+        }
+        if node.over_soft_cap(&self.policy) {
+            self.push(MaintenanceCandidate {
+                path,
+                priority: self.new_id(),
+                cause: CandidateCause::Split(SplitReason::SoftCap),
             });
         }
     }
@@ -243,6 +267,32 @@ impl MaintenanceCandidates {
     /// Mints an operation id at normal transaction priority.
     pub(super) fn new_id(&self) -> TxId {
         TxId::new_at(rt::system_now())
+    }
+
+    /// Adds split-side time of the leaf at `path`, and queues its split at
+    /// `at` when the time pays for one.
+    fn add_split_time(&self, path: &ObjectPath, time: SplitTime, at: Option<&[u8]>) {
+        if self.avoidable.add_split_time(path, time) {
+            self.push(MaintenanceCandidate {
+                path: path.clone(),
+                priority: self.new_id(),
+                cause: CandidateCause::Split(SplitReason::Demand {
+                    at: at.map(<[u8]>::to_vec),
+                }),
+            });
+        }
+    }
+
+    /// Adds merge-side time of the adjacent leaves at `left` and `right`, and
+    /// queues their merge when the time pays for one.
+    fn add_merge_time(&self, left: &ObjectPath, right: &ObjectPath, time: MergeTime) {
+        if self.avoidable.add_merge_time(left, right, time) {
+            self.push(MaintenanceCandidate {
+                path: left.clone(),
+                priority: self.new_id(),
+                cause: CandidateCause::Merge(MergeReason::Demand),
+            });
+        }
     }
 
     /// Adds one candidate while keeping the best-effort feed bounded.
@@ -283,20 +333,21 @@ impl StructuralHinter for MaintenanceCandidates {
     /// node needs at least two entries to be divisible, so a single hot key is
     /// never enqueued however large. The byte size is a hint the restructurer
     /// re-checks authoritatively against the full node (which adds a little
-    /// framing), so this need not account for it. A non-root leaf with few
-    /// live entries is a merge candidate instead. The oldest hint is dropped
-    /// when the queue is full.
+    /// framing), so this need not account for it. When sizes decide, a
+    /// non-root leaf with few live entries is a merge candidate instead. The
+    /// oldest hint is dropped when the queue is full.
     fn observe_leaf(&self, path: &ObjectPath, entries: &LeafBody) {
         let over_cap = entries.len() >= 2
             && (entries.len() > self.policy.leaf_max_entries()
                 || entries.encoded_len() > self.policy.node_soft_max_bytes());
         let cause = if over_cap {
             CandidateCause::Split(SplitReason::SoftCap)
-        } else if matches!(path, ObjectPath::Node { .. })
+        } else if !self.avoidable.decides()
+            && matches!(path, ObjectPath::Node { .. })
             && entries.entries().filter(|entry| entry.exists()).count()
                 < self.policy.leaf_min_entries()
         {
-            CandidateCause::Underfull
+            CandidateCause::Merge(MergeReason::Underfull)
         } else {
             return;
         };
@@ -315,8 +366,7 @@ impl StructuralHinter for MaintenanceCandidates {
         });
     }
 
-    fn leaf_delay(&self, path: &ObjectPath, delay: LeafDelay, time: Duration) {
-        self.avoidable
-            .add_split_time(path, SplitTime::of_delay(delay, time));
+    fn leaf_delay(&self, path: &ObjectPath, delay: LeafDelay, time: Duration, split_key: &[u8]) {
+        self.add_split_time(path, SplitTime::of_delay(delay, time), Some(split_key));
     }
 }

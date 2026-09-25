@@ -1,11 +1,18 @@
-//! Fixed leaf topologies under workloads with different leaf locality.
+//! Leaf topologies under workloads with different leaf locality.
 //!
-//! The scenario compares signals that could drive merges and splits. For each
-//! `--leaf-sizes` value, it seeds one collection with that leaf entry limit.
-//! Median splits leave each leaf with between half and all of the limit.
-//! Setup then rewrites every key in its own transaction, so that leaves carry
-//! their values inline. Merges stay disabled in setup and measurement, and no
-//! workload adds keys, so every cell on one topology measures the same tree.
+//! The scenario compares signals that could drive merges and splits, and the
+//! topology policies that decide with them. For each `--leaf-sizes` value, it
+//! seeds one collection with that leaf entry limit. Median splits leave each
+//! leaf with between half and all of the limit. Setup then rewrites every key
+//! in its own transaction, so that leaves carry their values inline. Merges
+//! stay disabled in setup.
+//!
+//! The `fixed` policy measures the seeded tree itself. No workload adds keys,
+//! so every `fixed` cell on one topology measures the same tree. Every other
+//! policy of `--policies` measures its own copy of the seeded tree, after
+//! `--adapt` of unmeasured work lets the policy change the copy. These cells
+//! use the default node size policy, so that merges can make leaves larger
+//! than the seeded ones.
 //!
 //! Each cell runs one workload over `--databases` client Databases:
 //!
@@ -28,7 +35,9 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime};
 
 use clap::Args;
-use glassdb::{Collection, Database, Error as GError, InlinePolicy, NodeSizePolicy, Stats};
+use glassdb::{
+    Collection, Database, Error as GError, InlinePolicy, KeyScan, NodeSizePolicy, Stats,
+};
 use glassdb_backend::{Backend, BackendError, ListLimit};
 use glassdb_bench_scale::bench::{Bench, samples_for_rel_ci};
 use glassdb_bench_scale::run::{
@@ -39,7 +48,8 @@ use glassdb_data::ObjectPath;
 use tokio::runtime::Handle;
 use tokio::time::Instant;
 
-use super::backend;
+use super::backend::{self, CopyableBackend};
+use super::policy::PolicySpec;
 use super::{Execution, cooldown};
 pub(super) use result::RunResult;
 use result::{CellResult, TopologyResult};
@@ -106,6 +116,14 @@ pub(super) struct Options {
     /// Maximum wall time allowed for setup splits to become quiet.
     #[arg(long, default_value = "60s", value_parser = glassdb_bench_scale::parse_duration)]
     split_settle_timeout: Duration,
+    /// Topology policies of the measurement clients. Every policy except
+    /// `fixed` needs the memory backend, to copy the seeded tree.
+    #[arg(long, value_delimiter = ',', default_value = "fixed", value_parser = PolicySpec::parse)]
+    policies: Vec<PolicySpec>,
+    /// Unmeasured wall time of the workload before measurement, for every
+    /// policy except `fixed`.
+    #[arg(long, default_value = "10s", value_parser = glassdb_bench_scale::parse_duration)]
+    adapt: Duration,
 }
 
 impl Options {
@@ -116,6 +134,9 @@ impl Options {
         }
         if self.databases.is_empty() || self.databases.contains(&0) {
             return Err("--databases must contain values >= 1".into());
+        }
+        if self.policies.is_empty() {
+            return Err("--policies must contain at least one policy".into());
         }
         if self.workers == 0
             || self.multi_keys == 0
@@ -182,14 +203,23 @@ impl Options {
 struct Policies {
     size: NodeSizePolicy,
     inline: InlinePolicy,
+    topology: PolicySpec,
 }
 
-/// One measured combination of topology, workload, and client count.
+/// One measured combination of topology, workload, client count, and policy.
 #[derive(Clone, Copy)]
 struct Cell {
     leaf_size: usize,
     workload: Workload,
     databases: usize,
+    policy: PolicySpec,
+}
+
+/// The changes of the tree of one cell before its measurement.
+#[derive(Clone, Copy, Default)]
+struct Adaptation {
+    splits: u64,
+    merges: u64,
 }
 
 pub(super) fn run(
@@ -209,7 +239,7 @@ pub(super) fn run(
             let name = format!("perfbenchtopology{invocation}r{run}l{leaf_size}");
             let (topology, measured) = run_topology(
                 handle,
-                factory.backend(),
+                &factory.copyable_backend(),
                 &name,
                 leaf_size,
                 &workloads,
@@ -224,41 +254,80 @@ pub(super) fn run(
     Ok(runs)
 }
 
-/// Seeds one topology on `backend` and measures every workload and client
-/// count on it.
+/// Seeds one topology on `store` and measures every workload, client count,
+/// and policy on it.
 fn run_topology(
     handle: &Handle,
-    backend: Arc<dyn Backend>,
+    store: &CopyableBackend,
     name: &str,
     leaf_size: usize,
     workloads: &[Workload],
     options: &Options,
     execution: Execution,
 ) -> Result<(TopologyResult, Vec<CellResult>), Box<dyn Error>> {
-    let policies = Policies {
+    // The soft caps build the seeded tree.
+    let seeding = Policies {
         size: fixed_policy(leaf_size)?,
         inline: options.inline_policy(),
+        topology: PolicySpec::Size,
     };
-    let topology = seed_topology(handle, &backend, name, policies, options, execution)?;
+    let backend = store.backend();
+    let topology = seed_topology(handle, &backend, name, seeding, options, execution)?;
     eprintln!("{}", topology.summary());
     let mut cells = Vec::new();
     for &workload in workloads {
         for &database_limit in &options.databases {
-            let cell = Cell {
-                leaf_size,
-                workload,
-                databases: database_limit.min(options.workers),
-            };
-            eprintln!(
-                "topology: leaf-size={leaf_size} workload={} databases={}",
-                workload.label(),
-                cell.databases
-            );
-            let result = run_cell(handle, &backend, name, policies, cell, options, execution)?;
-            if let Some(warning) = result.restructure_warning() {
-                eprintln!("{warning}");
+            for &policy in &options.policies {
+                let cell = Cell {
+                    leaf_size,
+                    workload,
+                    databases: database_limit.min(options.workers),
+                    policy,
+                };
+                eprintln!(
+                    "topology: leaf-size={leaf_size} workload={} databases={} policy={}",
+                    workload.label(),
+                    cell.databases,
+                    policy.label()
+                );
+                let result = if policy == PolicySpec::Fixed {
+                    let policies = Policies {
+                        topology: policy,
+                        ..seeding
+                    };
+                    run_cell(
+                        handle, &backend, name, policies, cell, options, execution, None,
+                    )?
+                } else {
+                    let copy = store.copy()?;
+                    let policies = Policies {
+                        size: NodeSizePolicy::default(),
+                        topology: policy,
+                        ..seeding
+                    };
+                    let result = run_cell(
+                        handle,
+                        &copy.backend(),
+                        name,
+                        policies,
+                        cell,
+                        options,
+                        execution,
+                        Some(options.adapt),
+                    )?;
+                    let leaves = handle.block_on(count_leaves(
+                        &copy.backend(),
+                        name,
+                        policies,
+                        options.num_keys,
+                    ))?;
+                    result.with_final_leaves(leaves)
+                };
+                if let Some(warning) = result.restructure_warning() {
+                    eprintln!("{warning}");
+                }
+                cells.push(result);
             }
-            cells.push(result);
         }
     }
     Ok((topology, cells))
@@ -279,11 +348,10 @@ async fn open_database(
     name: &str,
     policies: Policies,
 ) -> Result<Database, GError> {
-    Database::builder(name, backend.clone())
+    let builder = Database::builder(name, backend.clone())
         .node_size_policy(policies.size)
-        .inline_policy(policies.inline)
-        .open()
-        .await
+        .inline_policy(policies.inline);
+    policies.topology.apply(builder).open().await
 }
 
 /// Seeds the collection, publishes its values inline, and waits until the
@@ -350,9 +418,9 @@ fn seed_topology(
     ))
 }
 
-/// Counts the standalone tree nodes of every collection in the database. Only
-/// the seeded collection is large enough to have any, and with at most one
-/// index level these are exactly its leaves.
+/// Counts the standalone tree nodes of every collection in the database: the
+/// leaves and index nodes below the tree roots. Only the seeded collection is
+/// large enough to have any.
 async fn count_nodes(backend: &dyn Backend, database_name: &str) -> Result<usize, BackendError> {
     let prefix = format!("{database_name}/");
     let limit = ListLimit::new(1000).expect("list limit is nonzero");
@@ -377,7 +445,30 @@ async fn count_nodes(backend: &dyn Backend, database_name: &str) -> Result<usize
     }
 }
 
-/// Opens fresh clients on the seeded topology and measures one workload.
+/// Counts the leaves that a scan of every key reads. Unlike the stored nodes,
+/// it skips the nodes that merges drained.
+async fn count_leaves(
+    backend: &Arc<dyn Backend>,
+    name: &str,
+    policies: Policies,
+    num_keys: usize,
+) -> Result<u64, GError> {
+    let policies = Policies {
+        topology: PolicySpec::Fixed,
+        ..policies
+    };
+    let database = open_database(backend, name, policies).await?;
+    let collection = database.open_collection(COLLECTION).await?;
+    let before = database.stats();
+    collection.scan_keys(KeyScan::all().limit(num_keys)).await?;
+    let crossings = (database.stats() - before).transactions.scan_leaf_crossings;
+    database.shutdown().await;
+    Ok(crossings + 1)
+}
+
+/// Opens fresh clients on the seeded topology and measures one workload,
+/// after `adapt` of unmeasured work, if set.
+#[allow(clippy::too_many_arguments)]
 fn run_cell(
     handle: &Handle,
     backend: &Arc<dyn Backend>,
@@ -386,10 +477,28 @@ fn run_cell(
     cell: Cell,
     options: &Options,
     execution: Execution,
+    adapt: Option<Duration>,
 ) -> Result<CellResult, Box<dyn Error>> {
     let (databases, collections) = handle.block_on(open_clients(backend, name, policies, cell))?;
     // Collection binding is setup. Bracket stats only after every client opened it.
+    let opened: Vec<Stats> = databases.iter().map(Database::stats).collect();
+    if let Some(adapt) = adapt {
+        handle.block_on(run_unmeasured(
+            &databases,
+            &collections,
+            cell,
+            options,
+            adapt,
+            execution,
+        ))?;
+    }
     let baselines: Vec<Stats> = databases.iter().map(Database::stats).collect();
+    let mut adaptation = Adaptation::default();
+    for (baseline, opened) in baselines.iter().zip(opened) {
+        let delta = *baseline - opened;
+        adaptation.splits += delta.restructurer.splits;
+        adaptation.merges += delta.restructurer.merges;
+    }
     let bench = Arc::new(Bench::new(options.max_duration));
     let stop = Arc::new(AtomicBool::new(false));
     let target = samples_for_rel_ci(options.target_ci);
@@ -438,8 +547,36 @@ fn run_cell(
         options.workers,
         bench.results(),
         converged || target == 0,
+        adaptation,
         delta,
     ))
+}
+
+/// Runs the workload of `cell` for `duration` without measuring it.
+async fn run_unmeasured(
+    databases: &[Database],
+    collections: &[Collection],
+    cell: Cell,
+    options: &Options,
+    duration: Duration,
+    execution: Execution,
+) -> Result<(), GError> {
+    // The bench never starts, so it never finishes, and only `stop` ends the
+    // workers.
+    let bench = Arc::new(Bench::new(duration));
+    let stop = Arc::new(AtomicBool::new(false));
+    let handles = workload::spawn_workers(
+        databases,
+        collections,
+        options.workers,
+        cell.workload,
+        options.key_space(),
+        &bench,
+        &stop,
+    );
+    tokio::time::sleep(duration).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    join_tasks_until(handles, Instant::now() + execution.drain_timeout).await
 }
 
 async fn open_clients(
@@ -551,7 +688,7 @@ mod tests {
         };
         let (topology, cells) = run_topology(
             runtime.handle(),
-            Arc::new(MemoryBackend::new()),
+            &CopyableBackend::memory(MemoryBackend::new(), None),
             "topologytest",
             8,
             &workloads,
@@ -586,6 +723,53 @@ mod tests {
                 0
             ))
         );
+        Ok(())
+    }
+
+    // A policy cell changes only its own copy, so a later `fixed` cell still
+    // measures the seeded tree.
+    #[test]
+    fn policy_cells_change_a_copy_of_the_seeded_topology() -> Result<(), Box<dyn Error>> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let options = options(&[
+            "--workers=2",
+            "--databases=1",
+            "--workloads=single",
+            "--policies=size,fixed",
+            "--adapt=3s",
+        ]);
+        let workloads = options.workloads()?;
+        let execution = Execution {
+            runs: 1,
+            run_cooldown: Duration::ZERO,
+            drain_timeout: Duration::from_secs(10),
+        };
+        let store = CopyableBackend::memory(MemoryBackend::new(), None);
+        let (topology, cells) = run_topology(
+            runtime.handle(),
+            &store,
+            "topologytest",
+            8,
+            &workloads,
+            &options,
+            execution,
+        )?;
+
+        let seeded = serde_json::to_value(&topology)?["nodes"].as_u64().unwrap();
+        let cells = serde_json::to_value(&cells)?;
+        let size = &cells[0];
+        let fixed = &cells[1];
+        assert_eq!(size["policy"], "size");
+        // The size policy merges leaves below the default underfull threshold.
+        assert!(size["adaptMerges"].as_u64().unwrap() > 0, "{size}");
+        assert!(size["finalLeaves"].as_u64().unwrap() < seeded, "{size}");
+        assert_eq!(fixed["policy"], "fixed");
+        assert_eq!(fixed["measuredMerges"], 0);
+        assert!(fixed.get("finalLeaves").is_none());
+        let nodes = runtime.block_on(count_nodes(store.backend().as_ref(), "topologytest"))?;
+        assert_eq!(nodes as u64, seeded);
         Ok(())
     }
 }
