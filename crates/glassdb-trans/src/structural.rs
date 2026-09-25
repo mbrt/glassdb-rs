@@ -43,31 +43,13 @@ use recovery::{RecoveryAction, RecoveryStep};
 pub use candidates::StructuralHintSink;
 pub use stats::{InlinePressureStats, RestructurerStats};
 
-/// Interval of the sweep when no new candidate arrives. Such a sweep retries
-/// requeued candidates.
-const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Delay between a new candidate and its sweep. Writes queue candidates in
-/// bursts, so that one sweep takes a burst, and continuous writes cause at most
-/// one sweep for each delay.
-const CANDIDATE_COALESCING_DELAY: Duration = Duration::from_millis(50);
-
 /// Back off empty structural-intent listings independently of candidates.
 const STRUCTURAL_RECOVERY_IDLE_INTERVAL: Duration = Duration::from_secs(600);
 
-/// Upper bound on the buffered candidate queue. Candidates are only hints: the
-/// restructurer reloads and re-checks each one, so dropping the oldest when
-/// full merely delays a structural change, never causes an unsafe one.
-const CANDIDATE_QUEUE_CAP: usize = 4096;
-
-/// Bounded attempts to insert a separator into a contended parent before
-/// re-queuing it for a later sweep. Descent works meanwhile through right-links.
-const PARENT_RETRIES: usize = 8;
-
-/// Safety bound on the child right-link hops walked by a parent
-/// reconciliation, so a malformed or concurrently-mutated chain can never spin
-/// the restructurer. A well-formed chain up to a key is far shorter than this.
-const MAX_RECONCILE_HOPS: usize = 4096;
+/// Bounded compare-and-swap attempts on one contended structural node. When
+/// they run out, the caller stops its step, and a later sweep or recovery
+/// attempt tries again.
+const NODE_CAS_ATTEMPTS: usize = 8;
 
 /// Background executor that halves over-full B-link nodes (ADR-031) and merges
 /// underfull nodes into their right sibling (ADR-073). Holds no

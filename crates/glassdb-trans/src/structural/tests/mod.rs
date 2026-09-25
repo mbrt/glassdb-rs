@@ -1,8 +1,11 @@
 use super::*;
 
+use super::candidates::SWEEP_INTERVAL;
 use super::change::{ChangeAttemptResult, reclaim_holder_free_tombstones};
 use super::merge::merge_candidate;
-use super::reconcile::{ParentReconciler, PendingReconciliation, ReconciliationOutcome};
+use super::reconcile::{
+    DEFERRED_RECONCILIATION_CAP, ParentReconciler, PendingReconciliation, ReconciliationOutcome,
+};
 use super::recovery::ChangeKind;
 use super::split::{SplitNeed, SplitReason, SplitTarget, split_need, split_path};
 use crate::engine::{AssemblyFixture, EngineConfig};

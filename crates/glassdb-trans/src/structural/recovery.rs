@@ -16,7 +16,7 @@ use glassdb_storage::{
 use crate::error::TransError;
 use crate::monitor::Monitor;
 
-use super::PARENT_RETRIES;
+use super::NODE_CAS_ATTEMPTS;
 use super::nodes::StructuralNodeAccess;
 use super::reconcile::{
     ParentReconciler, ParentReconciliation, ParentSplitContinuation, ReconciliationOutcome,
@@ -1182,7 +1182,7 @@ impl StructuralRecovery {
         source_revision: &str,
         barrier: CurrentnessBarrier,
     ) -> Result<bool, TransError> {
-        for _ in 0..PARENT_RETRIES {
+        for _ in 0..NODE_CAS_ATTEMPTS {
             let Some((node, observed)) = self.load_source(collection, token, barrier).await? else {
                 return Ok(true);
             };

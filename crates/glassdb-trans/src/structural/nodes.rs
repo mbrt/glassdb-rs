@@ -18,7 +18,7 @@ use crate::node_locking::{
     StructuralGateOutcome,
 };
 
-use super::PARENT_RETRIES;
+use super::NODE_CAS_ATTEMPTS;
 
 /// Shares structural-node mutation primitives between structural changes,
 /// parent reconciliation, and recovery.
@@ -121,7 +121,7 @@ impl StructuralNodeAccess {
         token: Option<&NodeToken>,
         id: &TxId,
     ) -> Result<(), TransError> {
-        for _ in 0..PARENT_RETRIES {
+        for _ in 0..NODE_CAS_ATTEMPTS {
             let (mut node, observation) = match token {
                 Some(token) => {
                     self.nodes
@@ -272,7 +272,7 @@ impl StructuralNodeAccess {
         id: &TxId,
         acquisition: GateAcquisition,
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
-        for _ in 0..PARENT_RETRIES {
+        for _ in 0..NODE_CAS_ATTEMPTS {
             let (mut node, observation) = match token {
                 Some(token) => {
                     self.nodes
@@ -340,7 +340,7 @@ impl StructuralNodeAccess {
         requirement: Requirement,
         mut change: impl FnMut(&mut Node) -> bool,
     ) -> Result<(), TransError> {
-        for _ in 0..PARENT_RETRIES {
+        for _ in 0..NODE_CAS_ATTEMPTS {
             let (mut node, observation) =
                 match self.nodes.load_node(collection, token, requirement).await {
                     Ok(loaded) => loaded,

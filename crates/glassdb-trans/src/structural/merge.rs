@@ -16,13 +16,18 @@ use glassdb_storage::{
 use crate::error::TransError;
 use crate::node_locking::GateAcquisition;
 
+use super::NODE_CAS_ATTEMPTS;
 use super::change::{
     ChangeAttemptOutcome, ChangeContext, PlannedChange, StructuralChangeAttempt,
     StructuralTopology, reclaim_holder_free_tombstones,
 };
 use super::nodes::node_token;
 use super::recovery::{PreparedIntent, ReadyChange, ReadyIntent};
-use super::{MAX_RECONCILE_HOPS, PARENT_RETRIES};
+
+/// Safety bound on the right-link hops that the search for a merge target
+/// walks past drained nodes, so a malformed chain can never spin the
+/// restructurer.
+const MAX_TARGET_SEARCH_HOPS: usize = 4096;
 
 /// A merge target and the state that the merge decision used.
 struct TargetState {
@@ -250,7 +255,7 @@ async fn merge_target(
     requirement: Requirement,
 ) -> Result<Option<TargetState>, TransError> {
     let mut next = left.right_sibling().map(node_token).transpose()?;
-    for _ in 0..MAX_RECONCILE_HOPS {
+    for _ in 0..MAX_TARGET_SEARCH_HOPS {
         let Some(token) = next else {
             return Ok(None);
         };
@@ -335,7 +340,7 @@ async fn absorb(
 ) -> Result<Option<Vec<TxId>>, TransError> {
     let policy = ctx.candidates.policy();
     let mut current = (target.node, target.observation);
-    for attempt in 0..PARENT_RETRIES {
+    for attempt in 0..NODE_CAS_ATTEMPTS {
         if attempt > 0 {
             current = ctx
                 .nodes

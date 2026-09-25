@@ -14,7 +14,20 @@ use crate::error::TransError;
 use super::candidates::MaintenanceCandidates;
 use super::nodes::{StructuralNodeAccess, node_token};
 use super::split::SplitReason;
-use super::{CANDIDATE_QUEUE_CAP, MAX_RECONCILE_HOPS, PARENT_RETRIES};
+
+/// Upper bound on the deferred reconciliation queue. Dropping the oldest when
+/// full is safe: its parent still routes correctly through right links, only
+/// with extra hops.
+pub(super) const DEFERRED_RECONCILIATION_CAP: usize = 4096;
+
+/// Bounded attempts to reconcile a contended parent before deferring it to a
+/// later sweep. Descent works meanwhile through right links.
+const PARENT_RETRIES: usize = 8;
+
+/// Safety bound on the child right-link hops walked by a parent
+/// reconciliation, so a malformed or concurrently-mutated chain can never spin
+/// the restructurer. A well-formed chain up to a key is far shorter than this.
+const MAX_RECONCILE_HOPS: usize = 4096;
 
 /// A parent reconciliation that could not change its parent on the first try
 /// (a lost CAS): re-driven by a later [`Restructurer`](super::Restructurer)
@@ -82,7 +95,7 @@ impl ParentReconciler {
     /// dropped when full because descent remains correct through right-links.
     pub(super) fn defer(&self, reconciliation: PendingReconciliation) {
         let mut pending = self.pending.lock().unwrap();
-        if pending.len() >= CANDIDATE_QUEUE_CAP {
+        if pending.len() >= DEFERRED_RECONCILIATION_CAP {
             pending.pop_front();
         }
         pending.push_back(reconciliation);

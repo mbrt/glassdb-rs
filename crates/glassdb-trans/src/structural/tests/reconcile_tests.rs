@@ -5,7 +5,7 @@ fn reconciliation_queue_is_bounded_and_drops_the_oldest() {
     let s = store();
     let bg = Arc::new(Background::new());
     let reconciler = restructurer(&s, &bg, tiny()).ctx.reconciler;
-    for ordinal in 0..=CANDIDATE_QUEUE_CAP {
+    for ordinal in 0..=DEFERRED_RECONCILIATION_CAP {
         reconciler.defer(PendingReconciliation {
             collection: collection(),
             key: ordinal.to_be_bytes().to_vec(),
@@ -14,7 +14,7 @@ fn reconciliation_queue_is_bounded_and_drops_the_oldest() {
     }
 
     let pending = reconciler.drain_pending();
-    assert_eq!(pending.len(), CANDIDATE_QUEUE_CAP);
+    assert_eq!(pending.len(), DEFERRED_RECONCILIATION_CAP);
     assert_eq!(pending[0].key, 1usize.to_be_bytes());
 }
 

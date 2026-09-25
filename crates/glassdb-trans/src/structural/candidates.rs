@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use glassdb_concurr::rt;
 use glassdb_data::{ObjectPath, TxId};
@@ -11,7 +12,20 @@ use tokio::sync::Notify;
 use crate::leaf_coord::StructuralHinter;
 
 use super::split::SplitReason;
-use super::{CANDIDATE_COALESCING_DELAY, CANDIDATE_QUEUE_CAP, SWEEP_INTERVAL};
+
+/// Interval of the sweep when no new candidate arrives. Such a sweep retries
+/// requeued candidates.
+pub(super) const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Delay between a new candidate and its sweep. Writes queue candidates in
+/// bursts, so that one sweep takes a burst, and continuous writes cause at most
+/// one sweep for each delay.
+const CANDIDATE_COALESCING_DELAY: Duration = Duration::from_millis(50);
+
+/// Upper bound on the buffered candidate queue. Candidates are only hints: the
+/// restructurer reloads and re-checks each one, so dropping the oldest when
+/// full merely delays a structural change, never causes an unsafe one.
+const CANDIDATE_QUEUE_CAP: usize = 4096;
 
 /// The feed of nodes that may need a split (ADR-031) or a merge (ADR-073),
 /// owned by the [`Restructurer`](super::Restructurer). The coordinator observes
