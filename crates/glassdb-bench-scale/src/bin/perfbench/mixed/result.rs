@@ -370,10 +370,12 @@ mod tests {
                     submissions: 12,
                     rounds: 4,
                     cas_retries: 2,
+                    ..Default::default()
                 },
                 direct_commit: DirectCommitStats {
                     candidates: 5,
                     landed: 3,
+                    ..Default::default()
                 },
                 ..Default::default()
             },
@@ -391,11 +393,12 @@ mod tests {
                 coordinator: LeafCoordinatorStats {
                     submissions: 3,
                     rounds: 1,
-                    cas_retries: 0,
+                    ..Default::default()
                 },
                 direct_commit: DirectCommitStats {
                     candidates: 1,
                     landed: 1,
+                    ..Default::default()
                 },
                 ..Default::default()
             },

@@ -43,7 +43,7 @@ use tokio::runtime::Handle;
 
 use glassdb_backend::Backend;
 use glassdb_bench_scale::bench::samples_for_rel_ci;
-use glassdb_bench_scale::run::join_tasks_until;
+use glassdb_bench_scale::run::{DriveOutcome, drive_to_significance, join_tasks_until};
 
 use super::backend;
 use super::{Execution, cooldown};
@@ -51,7 +51,6 @@ use options::CellDimension;
 pub(super) use options::Options;
 pub(super) use result::RunResult;
 use result::{CellMetadata, CellResult};
-use workload::DriveOutcome;
 
 /// Fixed opaque value written on every put.
 fn value() -> Vec<u8> {
@@ -142,8 +141,8 @@ fn run_cell(
     let (drive, run, deadline) = handle.block_on(async {
         let handles =
             workload::spawn_workers(active.databases(), active.collections(), &plans, &ctx);
-        let drive = workload::drive_to_significance(
-            &plans,
+        let drive = drive_to_significance(
+            &workload::benches(&plans),
             &stop,
             target,
             options.duration,

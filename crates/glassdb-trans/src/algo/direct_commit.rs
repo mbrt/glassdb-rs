@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use glassdb_data::{LogicalKey, ObjectPath, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
-    CurrentState, InlinePolicy, LeafEntry, NodeLocks, Requirement, StorageError, TreeRouter,
+    CurrentState, InlinePolicy, LeafEntry, Node, NodeLocks, Requirement, RoutedLeafGroup,
+    StorageError, TreeRouter,
 };
 
 use super::handle_state::HandleState;
@@ -28,12 +29,22 @@ pub struct DirectCommitStats {
     pub candidates: u64,
     /// Candidates that committed directly.
     pub landed: u64,
+    /// Fallbacks to a locked commit because the point accesses of an otherwise
+    /// eligible attempt route to two leaves, where the right link of one leaf
+    /// names the other. A reroute after a concurrent split can also cause one.
+    pub cross_leaf_adjacent: u64,
+    /// Fallbacks to a locked commit because the point accesses of an otherwise
+    /// eligible attempt route to more than two leaves, or to two leaves that
+    /// are not adjacent.
+    pub cross_leaf_scattered: u64,
 }
 
 impl AddAssign for DirectCommitStats {
     fn add_assign(&mut self, rhs: Self) {
         self.candidates += rhs.candidates;
         self.landed += rhs.landed;
+        self.cross_leaf_adjacent += rhs.cross_leaf_adjacent;
+        self.cross_leaf_scattered += rhs.cross_leaf_scattered;
     }
 }
 
@@ -44,6 +55,12 @@ impl Sub for DirectCommitStats {
         Self {
             candidates: self.candidates.saturating_sub(rhs.candidates),
             landed: self.landed.saturating_sub(rhs.landed),
+            cross_leaf_adjacent: self
+                .cross_leaf_adjacent
+                .saturating_sub(rhs.cross_leaf_adjacent),
+            cross_leaf_scattered: self
+                .cross_leaf_scattered
+                .saturating_sub(rhs.cross_leaf_scattered),
         }
     }
 }
@@ -52,6 +69,15 @@ impl Sub for DirectCommitStats {
 struct DirectCommitCounters {
     candidates: AtomicU64,
     landed: AtomicU64,
+    cross_leaf_adjacent: AtomicU64,
+    cross_leaf_scattered: AtomicU64,
+}
+
+/// The leaves to which the point accesses of one direct member route.
+enum MemberPlacement {
+    OneLeaf(ObjectPath),
+    AdjacentLeaves,
+    ScatteredLeaves,
 }
 
 /// Owns the direct same-leaf commit subprotocol.
@@ -89,6 +115,11 @@ impl DirectCommit {
         DirectCommitStats {
             candidates: self.counters.candidates.swap(0, Ordering::Relaxed),
             landed: self.counters.landed.swap(0, Ordering::Relaxed),
+            cross_leaf_adjacent: self.counters.cross_leaf_adjacent.swap(0, Ordering::Relaxed),
+            cross_leaf_scattered: self
+                .counters
+                .cross_leaf_scattered
+                .swap(0, Ordering::Relaxed),
         }
     }
 
@@ -120,7 +151,7 @@ impl DirectCommit {
         {
             return Ok(DirectOutcome::Locked);
         }
-        let Some(mut leaf_path) = self.route_member(&member).await? else {
+        let Some(mut leaf_path) = self.single_leaf(self.route_member(&member).await?) else {
             return Ok(DirectOutcome::Locked);
         };
         self.counters.candidates.fetch_add(1, Ordering::Relaxed);
@@ -150,7 +181,7 @@ impl DirectCommit {
                 }
                 DirectMutationOutcome::Replay => return Ok(DirectOutcome::Replay),
                 DirectMutationOutcome::Reroute if !rerouted => {
-                    let Some(path) = self.route_member(&member).await? else {
+                    let Some(path) = self.single_leaf(self.route_member(&member).await?) else {
                         return Ok(DirectOutcome::Locked);
                     };
                     leaf_path = path;
@@ -163,8 +194,8 @@ impl DirectCommit {
         }
     }
 
-    /// Selects one candidate leaf for all dependencies in `member`.
-    async fn route_member(&self, member: &DirectMember) -> Result<Option<ObjectPath>, TransError> {
+    /// Finds the leaves to which the dependencies of `member` route.
+    async fn route_member(&self, member: &DirectMember) -> Result<MemberPlacement, TransError> {
         let keys = member
             .keys
             .iter()
@@ -175,10 +206,41 @@ impl DirectCommit {
             .route_keys_with_requirements(keys, Requirement::ANY, Requirement::ANY)
             .await?;
         Ok(match groups.as_slice() {
-            [group] => Some(group.path().clone()),
-            _ => None,
+            [group] => MemberPlacement::OneLeaf(group.path().clone()),
+            [a, b] if links_right_to(a, b) || links_right_to(b, a) => {
+                MemberPlacement::AdjacentLeaves
+            }
+            _ => MemberPlacement::ScatteredLeaves,
         })
     }
+
+    /// Returns the leaf of a one-leaf `placement`, and counts any other
+    /// placement as a cross-leaf fallback.
+    fn single_leaf(&self, placement: MemberPlacement) -> Option<ObjectPath> {
+        let counter = match placement {
+            MemberPlacement::OneLeaf(path) => return Some(path),
+            MemberPlacement::AdjacentLeaves => &self.counters.cross_leaf_adjacent,
+            MemberPlacement::ScatteredLeaves => &self.counters.cross_leaf_scattered,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+}
+
+/// Reports whether the right link of the leaf of `left` names the leaf of
+/// `right`.
+fn links_right_to(left: &RoutedLeafGroup<()>, right: &RoutedLeafGroup<()>) -> bool {
+    let (
+        ObjectPath::Node {
+            collection: left_collection,
+            ..
+        },
+        ObjectPath::Node { collection, id },
+    ) = (left.path(), right.path())
+    else {
+        return false;
+    };
+    left_collection == collection && left.node().and_then(Node::right_sibling) == Some(*id)
 }
 
 /// One normalized point dependency and its optional final mutation.
