@@ -3,17 +3,12 @@
 //! packages.
 
 pub mod base64;
-mod collection_id;
-mod database_id;
 mod entropy;
+mod ids;
 mod paths;
-mod txid;
 
-pub use collection_id::{CollectionId, MAX_COLLECTION_NAME_BYTES};
-pub use database_id::{DATABASE_ID_BYTES, DatabaseId};
 pub use entropy::shuffle;
-pub use paths::{
-    CollectionAddress, DbPrefix, LeafRef, LogicalKey, NodeToken, ObjectPath, PathError,
-    StructuralIntentId,
+pub use ids::{
+    CollectionId, DatabaseId, ID_BYTES, MAX_COLLECTION_NAME_BYTES, NodeId, StructuralIntentId, TxId,
 };
-pub use txid::TxId;
+pub use paths::{CollectionAddress, DbPrefix, LeafRef, LogicalKey, ObjectPath, PathError};

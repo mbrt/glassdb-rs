@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use glassdb_data::{CollectionAddress, NodeToken, ObjectPath, TxId};
+use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 use glassdb_storage::{
     CurrentnessBarrier, IndexNode, LeafObservation, Node, Requirement, StorageError, Timeline,
     TreeRouter,
@@ -12,7 +12,7 @@ use glassdb_storage::{
 use crate::error::TransError;
 
 use super::candidates::MaintenanceCandidates;
-use super::nodes::{StructuralNodeAccess, node_token};
+use super::nodes::StructuralNodeAccess;
 use super::split::SplitReason;
 
 /// Upper bound on the deferred reconciliation queue. Dropping the oldest when
@@ -38,7 +38,7 @@ const MAX_RECONCILE_HOPS: usize = 4096;
 pub(super) struct PendingReconciliation {
     pub(super) collection: CollectionAddress,
     pub(super) key: Vec<u8>,
-    pub(super) target: NodeToken,
+    pub(super) target: NodeId,
 }
 
 pub(super) struct ParentReconciliation {
@@ -112,13 +112,13 @@ impl ParentReconciler {
         &self,
         collection: &CollectionAddress,
         key: &[u8],
-        target: &NodeToken,
+        target: &NodeId,
     ) -> ParentReconciliation {
         ParentReconciliation {
             pending: PendingReconciliation {
                 collection: collection.clone(),
                 key: key.to_vec(),
-                target: target.clone(),
+                target: *target,
             },
             start: self.timeline.currentness_barrier(),
             retries_remaining: PARENT_RETRIES,
@@ -146,14 +146,14 @@ impl ParentReconciler {
             else {
                 return Ok(ReconciliationOutcome::Reconciled);
             };
-            let parent_token = match &parent.path {
+            let parent_id = match &parent.path {
                 ObjectPath::TreeRoot { .. } => None,
-                ObjectPath::Node { token, .. } => Some(token.clone()),
+                ObjectPath::Node { id, .. } => Some(*id),
                 _ => return Err(TransError::other("router returned a non-node parent path")),
             };
             let Some((lock_id, locked_parent, observation)) = self
                 .structure
-                .begin_gated_worker(&pending.collection, parent_token.as_ref())
+                .begin_gated_worker(&pending.collection, parent_id.as_ref())
                 .await?
             else {
                 continue;
@@ -170,7 +170,7 @@ impl ParentReconciler {
                 .await;
             let released = self
                 .structure
-                .finish_gated_worker(&pending.collection, parent_token.as_ref(), &lock_id)
+                .finish_gated_worker(&pending.collection, parent_id.as_ref(), &lock_id)
                 .await;
             match reconciled? {
                 Some(outcome) => {
@@ -196,7 +196,7 @@ impl ParentReconciler {
         index: &IndexNode,
         key: &[u8],
         barrier: CurrentnessBarrier,
-    ) -> Result<Vec<(NodeToken, Node)>, TransError> {
+    ) -> Result<Vec<(NodeId, Node)>, TransError> {
         // The structural change was observed before reconciliation began. A
         // parent's watermark cannot establish that the child reads follow that
         // completed work.
@@ -204,16 +204,16 @@ impl ParentReconciler {
         let Some(first) = index.child_before(key) else {
             return Ok(Vec::new());
         };
-        let mut token = node_token(first)?;
+        let mut id = first;
         let mut chain = Vec::new();
         for _ in 0..MAX_RECONCILE_HOPS {
-            let child = self.router.leaf_at(collection, &token, requirement).await?;
+            let child = self.router.leaf_at(collection, &id, requirement).await?;
             let node = child.node().ok_or(StorageError::NotFound)?.clone();
-            let right = node.right_sibling().map(node_token).transpose()?;
+            let right = node.right_sibling();
             let covers = node.covers(key);
-            chain.push((token, node));
+            chain.push((id, node));
             match right {
-                Some(right) if !covers => token = right,
+                Some(right) if !covers => id = right,
                 _ => return Ok(chain),
             }
         }
@@ -242,10 +242,7 @@ impl ParentReconciler {
         let chain = self
             .child_chain(&pending.collection, index, &pending.key, barrier)
             .await?;
-        let path: Vec<(&str, &Node)> = chain
-            .iter()
-            .map(|(token, node)| (token.as_str(), node))
-            .collect();
+        let path: Vec<(NodeId, &Node)> = chain.iter().map(|(id, node)| (*id, node)).collect();
         let mut new_index = index.clone();
         new_index.reconcile(&path);
         if new_index == *index {

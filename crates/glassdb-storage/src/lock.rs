@@ -28,7 +28,12 @@ struct HolderSet {
 
 impl HolderSet {
     fn from_wire(locked_by: Vec<Vec<u8>>) -> Result<Self, LockStateError> {
-        Self::from_holders(locked_by.into_iter().map(TxId::from_bytes).collect())
+        let holders = locked_by
+            .iter()
+            .map(|id| TxId::try_from(id.as_slice()))
+            .collect::<Result<_, _>>()
+            .map_err(|_| LockStateError::InvalidHolder)?;
+        Self::from_holders(holders)
     }
 
     fn from_holders(mut holders: Vec<TxId>) -> Result<Self, LockStateError> {
@@ -382,6 +387,7 @@ impl ExclusiveGate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LockStateError {
     DuplicateHolder,
+    InvalidHolder,
     InvalidShape,
 }
 

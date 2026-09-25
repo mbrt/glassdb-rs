@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use glassdb_concurr::rt;
-use glassdb_data::{CollectionAddress, NodeToken, ObjectPath, StructuralIntentId, TxId};
+use glassdb_data::{CollectionAddress, NodeId, ObjectPath, StructuralIntentId, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxRecord};
 use glassdb_storage::{
     LeafBody, LeafObservation, LockType, MergeTarget, Node, NodeStore, Requirement, StorageError,
@@ -60,12 +60,12 @@ impl StructuralNodeAccess {
     pub(super) async fn begin_gated_worker(
         &self,
         collection: &CollectionAddress,
-        token: Option<&NodeToken>,
+        node_id: Option<&NodeId>,
     ) -> Result<Option<(TxId, Node, LeafObservation)>, TransError> {
         let id = TxId::new_at(rt::system_now());
         self.begin_worker(&id);
         match self
-            .acquire_structural_gate(collection, token, &id, GateAcquisition::WoundWait)
+            .acquire_structural_gate(collection, node_id, &id, GateAcquisition::WoundWait)
             .await
         {
             Ok(Some((node, observation))) => Ok(Some((id, node, observation))),
@@ -86,14 +86,14 @@ impl StructuralNodeAccess {
     pub(super) async fn acquire_structural_gate(
         &self,
         collection: &CollectionAddress,
-        token: Option<&NodeToken>,
+        node_id: Option<&NodeId>,
         id: &TxId,
         acquisition: GateAcquisition,
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
-        let path = match token {
-            Some(token) => ObjectPath::Node {
+        let path = match node_id {
+            Some(node_id) => ObjectPath::Node {
                 collection: collection.clone(),
-                token: token.clone(),
+                id: *node_id,
             },
             None => ObjectPath::TreeRoot {
                 collection: collection.clone(),
@@ -103,7 +103,7 @@ impl StructuralNodeAccess {
         // Publication still requires the gated observation and a source CAS.
         let (node, _) = match self.nodes.load_node_at(&path, Requirement::ANY).await {
             Ok(loaded) => loaded,
-            Err(StorageError::NotFound) if token.is_none() => return Ok(None),
+            Err(StorageError::NotFound) if node_id.is_none() => return Ok(None),
             Err(error) => return Err(error.into()),
         };
         if node.as_leaf().is_some() {
@@ -111,7 +111,7 @@ impl StructuralNodeAccess {
                 .acquire_leaf_structural_gate(&path, id, acquisition)
                 .await;
         }
-        self.acquire_structural_gate_direct(collection, token, id, acquisition)
+        self.acquire_structural_gate_direct(collection, node_id, id, acquisition)
             .await
     }
 
@@ -124,14 +124,14 @@ impl StructuralNodeAccess {
     pub(super) async fn release_structural_gate(
         &self,
         collection: &CollectionAddress,
-        token: Option<&NodeToken>,
+        node_id: Option<&NodeId>,
         id: &TxId,
     ) -> Result<(), TransError> {
         for _ in 0..NODE_CAS_ATTEMPTS {
-            let (mut node, observation) = match token {
-                Some(token) => {
+            let (mut node, observation) = match node_id {
+                Some(node_id) => {
                     self.nodes
-                        .load_node(collection, token, Requirement::ANY)
+                        .load_node(collection, node_id, Requirement::ANY)
                         .await?
                 }
                 None => {
@@ -179,7 +179,7 @@ impl StructuralNodeAccess {
         intent: &StructuralIntentId,
         requirement: Requirement,
     ) -> Result<(), TransError> {
-        self.update_node(collection, &target.token, requirement, |node| {
+        self.update_node(collection, &target.node_id, requirement, |node| {
             if node.abandon_merge(intent, &target.boundary) {
                 return true;
             }
@@ -194,15 +194,15 @@ impl StructuralNodeAccess {
         .await
     }
 
-    /// Removes the merge reservation of `intent` from node `token`, if present.
+    /// Removes the merge reservation of `intent` from node `node_id`, if present.
     pub(super) async fn remove_merge_reservation(
         &self,
         collection: &CollectionAddress,
-        token: &NodeToken,
+        node_id: &NodeId,
         intent: &StructuralIntentId,
         requirement: Requirement,
     ) -> Result<(), TransError> {
-        self.update_node(collection, token, requirement, |node| {
+        self.update_node(collection, node_id, requirement, |node| {
             node.remove_merge_reservation(intent)
         })
         .await
@@ -214,7 +214,7 @@ impl StructuralNodeAccess {
     pub(super) async fn finalize_worker(&self, id: &TxId) {
         if let Err(error) = self
             .mon
-            .commit_tx(TxRecord::new(id.clone(), TxCommitStatus::Committed))
+            .commit_tx(TxRecord::new(*id, TxCommitStatus::Committed))
             .await
         {
             tracing::debug!(
@@ -230,10 +230,10 @@ impl StructuralNodeAccess {
     pub(super) async fn finish_gated_worker(
         &self,
         collection: &CollectionAddress,
-        token: Option<&NodeToken>,
+        node_id: Option<&NodeId>,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let release = self.release_structural_gate(collection, token, id).await;
+        let release = self.release_structural_gate(collection, node_id, id).await;
         self.finalize_worker(id).await;
         release
     }
@@ -246,11 +246,7 @@ impl StructuralNodeAccess {
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
         let outcome = self
             .coord
-            .coordinate(StructuralGateOperation::new(
-                id.clone(),
-                path.clone(),
-                acquisition,
-            ))
+            .coordinate(StructuralGateOperation::new(*id, path.clone(), acquisition))
             .await?;
         let StructuralGateOutcome::Acquired(observation) = outcome else {
             return Ok(None);
@@ -274,15 +270,15 @@ impl StructuralNodeAccess {
     async fn acquire_structural_gate_direct(
         &self,
         collection: &CollectionAddress,
-        token: Option<&NodeToken>,
+        node_id: Option<&NodeId>,
         id: &TxId,
         acquisition: GateAcquisition,
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
         for _ in 0..NODE_CAS_ATTEMPTS {
-            let (mut node, observation) = match token {
-                Some(token) => {
+            let (mut node, observation) = match node_id {
+                Some(node_id) => {
                     self.nodes
-                        .load_node(collection, token, Requirement::ANY)
+                        .load_node(collection, node_id, Requirement::ANY)
                         .await?
                 }
                 None => match self.nodes.load_root(collection, Requirement::ANY).await {
@@ -336,19 +332,19 @@ impl StructuralNodeAccess {
         Ok(None)
     }
 
-    /// Applies `change` to node `token` read at `requirement`, retrying on a
+    /// Applies `change` to node `node_id` read at `requirement`, retrying on a
     /// lost CAS. `change` returns `false` when the node needs no change. A
     /// missing node needs no change.
     async fn update_node(
         &self,
         collection: &CollectionAddress,
-        token: &NodeToken,
+        node_id: &NodeId,
         requirement: Requirement,
         mut change: impl FnMut(&mut Node) -> bool,
     ) -> Result<(), TransError> {
         for _ in 0..NODE_CAS_ATTEMPTS {
             let (mut node, observation) =
-                match self.nodes.load_node(collection, token, requirement).await {
+                match self.nodes.load_node(collection, node_id, requirement).await {
                     Ok(loaded) => loaded,
                     Err(StorageError::NotFound) => return Ok(()),
                     Err(error) => return Err(error.into()),
@@ -366,8 +362,4 @@ impl StructuralNodeAccess {
         }
         Err(TransError::Retry)
     }
-}
-
-pub(super) fn node_token(token: &str) -> Result<NodeToken, TransError> {
-    NodeToken::try_from(token).map_err(|error| TransError::with_source("parsing node token", error))
 }

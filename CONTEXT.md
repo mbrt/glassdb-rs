@@ -357,6 +357,10 @@ _Avoid_: Data node
 The node at the fixed path of one collection tree, where every routing starts. It is separate from the collection record.
 _Avoid_: Root (alone), collection root
 
+**Node ID**:
+The identity of one node other than the tree root within its collection tree. Index nodes and sibling links refer to other nodes by their node IDs.
+_Avoid_: Node token
+
 **Index node**:
 A node that routes key ranges to child nodes through separators.
 _Avoid_: Interior node

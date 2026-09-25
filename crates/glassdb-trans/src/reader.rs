@@ -25,7 +25,7 @@ const READ_UNAVAILABLE_RETRIES: usize = 5;
 /// The result of reading a key: the raw value and its writer. The writer is the
 /// *effective writer* the read resolved through, which optimistic validation
 /// checks at commit.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ReadValue {
     pub value: Arc<[u8]>,
     pub writer: TxId,
@@ -132,7 +132,7 @@ impl Reader {
             let Some(writer) = resolved.writer else {
                 return Ok(ReadOutcome::new(None, ReadEvidence::new(None, leaf)));
             };
-            let last_writer = Some(writer.clone());
+            let last_writer = Some(writer);
             // An inline value or tombstone in the leaf is the writer's own
             // authoritative evidence, so the transaction record adds nothing
             // (ADR-051).
@@ -205,6 +205,10 @@ mod tests {
     use glassdb_storage::{CurrentState, LeafBody, LeafEntry, Node, TreeRouter};
     use std::num::NonZeroUsize;
 
+    fn tx_id(prefix: &[u8]) -> TxId {
+        TxId::with_priority(0, prefix)
+    }
+
     #[tokio::test]
     async fn reclaimed_transaction_bodies_refresh_cached_writers_and_holders() {
         for (held, operation) in [(false, 0), (true, 0), (true, 1), (true, 2), (true, 3)] {
@@ -221,22 +225,19 @@ mod tests {
             );
             let collection = CollectionAddress::root("db");
             let key = LogicalKey::new(collection.clone(), b"key");
-            let old = TxId::from_bytes(vec![1]);
-            let mut record = TxRecord::new(old.clone(), TxCommitStatus::Committed);
+            let old = tx_id(&[1]);
+            let mut record = TxRecord::new(old, TxCommitStatus::Committed);
             record.writes.push(TxWrite {
                 key: key.clone(),
                 value: Arc::from(&b"old"[..]),
                 deleted: false,
-                prev_writer: TxId::default(),
             });
             let local_record = local.tx_records.set(&record).await.unwrap();
             let mut entry = LeafEntry::new(b"key");
             if held {
-                entry.replace_write_lock(old.clone());
+                entry.replace_write_lock(old);
             } else {
-                entry.current = CurrentState::External {
-                    writer: old.clone(),
-                };
+                entry.current = CurrentState::External { writer: old };
             }
             local
                 .nodes
@@ -262,7 +263,7 @@ mod tests {
                 .unwrap();
             let updated = Node::leaf(LeafBody::from_entries([LeafEntry::new(b"key")
                 .with_current(CurrentState::Inline {
-                    writer: TxId::from_bytes(vec![2]),
+                    writer: tx_id(&[2]),
                     value: Arc::from(&b"new"[..]),
                 })]));
             peer.nodes
@@ -303,7 +304,7 @@ mod tests {
                         .effective_point_states(std::slice::from_ref(&key), None, Requirement::ANY)
                         .await
                         .unwrap();
-                    assert_eq!(states[0].writer, Some(TxId::from_bytes(vec![2])));
+                    assert_eq!(states[0].writer, Some(tx_id(&[2])));
                 }
                 _ => {
                     use crate::access::{AccessSet, WriteAccess};
@@ -339,7 +340,7 @@ mod tests {
                         RetryConfig::default(),
                         NonZeroUsize::MIN,
                     );
-                    let writer = TxId::from_bytes(vec![3]);
+                    let writer = tx_id(&[3]);
                     local.monitor.begin_tx(&writer);
                     let accesses = AccessSet::new(
                         Vec::new(),

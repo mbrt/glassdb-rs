@@ -223,8 +223,8 @@ impl CollectionLocker {
                 continue;
             }
             match desired {
-                LockType::Read => record.add_directory_reader(id.clone()),
-                LockType::Write => record.set_directory_writer(id.clone()),
+                LockType::Read => record.add_directory_reader(*id),
+                LockType::Write => record.set_directory_writer(*id),
                 _ => {
                     return Err(TransError::other(
                         "invalid collection-directory lock request",
@@ -506,6 +506,10 @@ mod tests {
     use super::*;
     use crate::monitor::ProtocolTiming;
 
+    fn tx_id(prefix: &[u8]) -> TxId {
+        TxId::with_priority(0, prefix)
+    }
+
     fn new_locker() -> (CollectionLocker, CollectionStore, Arc<Background>) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(
@@ -548,7 +552,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let id = TxId::from_bytes(vec![1]);
+        let id = tx_id(&[1]);
 
         locker.acquire(&parent, &id, LockType::Read).await.unwrap();
         locker.acquire(&parent, &id, LockType::Write).await.unwrap();
@@ -579,10 +583,10 @@ mod tests {
             &EngineConfig::default(),
         );
         let parent = CollectionAddress::root("db");
-        let old = TxId::from_bytes(vec![1]);
+        let old = tx_id(&[1]);
         let local_record = local
             .tx_records
-            .set(&TxRecord::new(old.clone(), TxCommitStatus::Committed))
+            .set(&TxRecord::new(old, TxCommitStatus::Committed))
             .await
             .unwrap();
         assert_eq!(
@@ -590,7 +594,7 @@ mod tests {
             TxCommitStatus::Committed
         );
         let mut record = CollectionRecord::new();
-        record.set_directory_writer(old.clone());
+        record.set_directory_writer(old);
         local.records.create_record(&parent, &record).await.unwrap();
         let (mut record, observed) = peer
             .records
@@ -598,7 +602,7 @@ mod tests {
             .await
             .unwrap();
         record.remove_directory_holder(&old);
-        let child = CollectionId::from_slice(&[1; 16]).unwrap();
+        let child = CollectionId::from_bytes([1; 16]);
         record.add_child(b"child".to_vec(), child).unwrap();
         peer.records.store_record(&record, &observed).await.unwrap();
         let observed = peer

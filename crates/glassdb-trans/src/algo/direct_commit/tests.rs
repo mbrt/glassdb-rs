@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use super::super::tests::{
     Tctx, begin_accesses, commit_access, commit_writes, do_read, entry, leaf_reads, logical_key,
     new_algo, new_algo_from_backend, new_recording_algo, new_recording_algo_big_cache,
-    read_outcome, test_collection, test_root_path, wa, wdel, write_counts,
+    read_outcome, test_collection, test_node_id, test_root_path, wa, wdel, write_counts,
 };
 use super::super::*;
 use super::*;
@@ -13,7 +13,7 @@ use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{MemberOutcome, MemberPolicy, ReloadCause, ResolveCtx, Step};
 use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend};
 use glassdb_backend::{Backend, memory::MemoryBackend};
-use glassdb_data::{CollectionAddress, CollectionId, NodeToken};
+use glassdb_data::{CollectionAddress, CollectionId};
 use glassdb_storage::transaction::{TxCommitStatus, TxRecord};
 use glassdb_storage::{
     CollectionRecord, CurrentState, IndexNode, LeafBody, LeafEntry, Node, NodeLocks,
@@ -280,7 +280,7 @@ async fn direct_commit_merges_with_disjoint_acquire() {
         &tm,
         AccessSet::new(Vec::new(), vec![wa(&kap, b"v2")], Vec::new()),
     );
-    let txa = ha.id().clone();
+    let txa = *ha.id();
     let (acquire, committed) = tokio::join!(
         tctx.locker
             .keys()
@@ -348,7 +348,7 @@ async fn direct_commit_batched_in_doubt_recovers() {
         &tm,
         AccessSet::new(Vec::new(), vec![wa(&kap, b"v2")], Vec::new()),
     );
-    let txa = ha.id().clone();
+    let txa = *ha.id();
     let data_b = AccessSet::new(Vec::new(), vec![wa(&kbp, b"vb2")], Vec::new());
     let requirement = Requirement::after(tctx.timeline.currentness_barrier());
     let (acquire, committed) = tokio::join!(
@@ -406,7 +406,7 @@ async fn an_overwrite_over_the_inline_budget_uses_a_locked_commit() {
         &tm,
         AccessSet::new(vec![r], vec![wa(&keyp, &external_value())], Vec::new()),
     );
-    let tid = h.id().clone();
+    let tid = *h.id();
     tm.commit(&mut h).await.unwrap();
     tm.end(&mut h).await.unwrap();
 
@@ -450,7 +450,7 @@ async fn single_rw_observing_a_gate_uses_a_locked_commit() {
         .load_root(&test_collection(), Requirement::ANY)
         .await
         .unwrap();
-    root.set_structural_gate(gate.clone());
+    root.set_structural_gate(gate);
     assert!(
         tctx.nodes
             .store_root(&test_collection(), &root, &root_observation)
@@ -463,7 +463,7 @@ async fn single_rw_observing_a_gate_uses_a_locked_commit() {
         &tm,
         AccessSet::new(vec![read], vec![wa(&keyp, b"v2")], Vec::new()),
     );
-    let parallel_id = handle.id().clone();
+    let parallel_id = *handle.id();
     let committing_tm = tm.clone();
     let committing = tokio::spawn(async move {
         let result = committing_tm.commit(&mut handle).await;
@@ -534,7 +534,7 @@ async fn a_blind_put_over_the_inline_budget_uses_a_locked_commit() {
         &tm,
         AccessSet::new(Vec::new(), vec![wa(&keyp, &external_value())], Vec::new()),
     );
-    let tid = h.id().clone();
+    let tid = *h.id();
     tm.commit(&mut h).await.unwrap();
     tm.end(&mut h).await.unwrap();
 
@@ -566,14 +566,10 @@ async fn a_committed_holder_keeps_the_next_writer_on_direct_commit() {
 
     // H0 publishes v1; H1 overwrites through locked commit (its value
     // misses the inline budget), so it has a committed transaction record.
-    let h0 = commit_writes(&tm, vec![wa(&keyp, b"v1")])
+    let h0 = *commit_writes(&tm, vec![wa(&keyp, b"v1")]).await.id();
+    let h1 = *commit_writes(&tm, vec![wa(&keyp, &external_value())])
         .await
-        .id()
-        .clone();
-    let h1 = commit_writes(&tm, vec![wa(&keyp, &external_value())])
-        .await
-        .id()
-        .clone();
+        .id();
 
     // Recreate the commit window before write-back: the lock is still held by
     // the committed H1 while the current state lags at its predecessor H0.
@@ -587,8 +583,8 @@ async fn a_committed_holder_keeps_the_next_writer_on_direct_commit() {
         .unwrap();
     let windowed = LeafBody::from_entries(loaded.entries().entries().cloned().map(|mut e| {
         if e.key == raw {
-            e.replace_write_lock(h1.clone());
-            e.current = CurrentState::External { writer: h0.clone() };
+            e.replace_write_lock(h1);
+            e.current = CurrentState::External { writer: h0 };
         }
         e
     }));
@@ -608,7 +604,7 @@ async fn a_committed_holder_keeps_the_next_writer_on_direct_commit() {
         &tm,
         AccessSet::new(vec![r], vec![wa(&keyp, b"v3")], Vec::new()),
     );
-    let h2 = h.id().clone();
+    let h2 = *h.id();
     tm.commit(&mut h).await.unwrap();
     tm.end(&mut h).await.unwrap();
 
@@ -639,7 +635,7 @@ async fn direct_commit_overwrites_in_one_leaf_cas() {
         &tm,
         AccessSet::new(vec![r], vec![wa(&keyp, b"v2")], Vec::new()),
     );
-    let tid = h.id().clone();
+    let tid = *h.id();
     tm.commit(&mut h).await.unwrap();
     tm.end(&mut h).await.unwrap();
 
@@ -651,7 +647,7 @@ async fn direct_commit_overwrites_in_one_leaf_cas() {
     assert_eq!(
         e.current,
         CurrentState::Inline {
-            writer: tid.clone(),
+            writer: tid,
             value: Arc::from(b"v2".as_slice()),
         }
     );
@@ -672,14 +668,10 @@ async fn direct_commit_replaces_a_committed_holder() {
     let leaf_path = test_root_path();
     let raw = b"k".to_vec();
 
-    let h0 = commit_writes(&tm, vec![wa(&keyp, b"v1")])
+    let h0 = *commit_writes(&tm, vec![wa(&keyp, b"v1")]).await.id();
+    let h1 = *commit_writes(&tm, vec![wa(&keyp, &external_value())])
         .await
-        .id()
-        .clone();
-    let h1 = commit_writes(&tm, vec![wa(&keyp, &external_value())])
-        .await
-        .id()
-        .clone();
+        .id();
 
     // Locked commit's commit window: the lock is still held by the committed
     // H1 while the current state lags at its predecessor H0.
@@ -693,8 +685,8 @@ async fn direct_commit_replaces_a_committed_holder() {
         .unwrap();
     let windowed = LeafBody::from_entries(loaded.entries().entries().cloned().map(|mut e| {
         if e.key == raw {
-            e.replace_write_lock(h1.clone());
-            e.current = CurrentState::External { writer: h0.clone() };
+            e.replace_write_lock(h1);
+            e.current = CurrentState::External { writer: h0 };
         }
         e
     }));
@@ -706,7 +698,7 @@ async fn direct_commit_replaces_a_committed_holder() {
         &tm,
         AccessSet::new(Vec::new(), vec![wa(&keyp, b"v3")], Vec::new()),
     );
-    let h2 = h.id().clone();
+    let h2 = *h.id();
     tm.commit(&mut h).await.unwrap();
     tm.end(&mut h).await.unwrap();
 
@@ -714,7 +706,7 @@ async fn direct_commit_replaces_a_committed_holder() {
     assert_eq!(
         e.current,
         CurrentState::Inline {
-            writer: h2.clone(),
+            writer: h2,
             value: Arc::from(b"v3".as_slice()),
         }
     );
@@ -791,7 +783,7 @@ async fn direct_membership_change_neither_waits_for_nor_wounds_a_live_holder() {
         b"value",
     );
     let mut locks = NodeLocks::default();
-    locks.set_membership_writer(holder.clone());
+    locks.set_membership_writer(holder);
 
     let outcome =
         resolve_outcome(&direct, &tctx, ReloadCause::Fresh, &BTreeMap::new(), &locks).await;
@@ -908,7 +900,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
     ))
     .unwrap();
     let policy = DirectCommitOperation::new(
-        id.clone(),
+        id,
         test_root_path(),
         member,
         InlinePolicy::default(),
@@ -948,7 +940,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
         ),
         (
             b"b".to_vec(),
-            LeafEntry::new(b"b").with_current(CurrentState::Tombstone { writer: id.clone() }),
+            LeafEntry::new(b"b").with_current(CurrentState::Tombstone { writer: id }),
         ),
     ]);
     assert!(matches!(
@@ -1116,7 +1108,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     let mut held = seed.clone();
     held.replace_write_lock(holder);
     let outcome = resolve_outcome(
-        &direct(Some(current.clone())),
+        &direct(Some(current)),
         &tctx,
         ReloadCause::Fresh,
         &BTreeMap::from([(b"k".to_vec(), held)]),
@@ -1131,9 +1123,9 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     // A key read as deleted names the very writer that deleted it. ADR-061 can
     // now create directly over that tombstone.
     let deleter = TxId::with_priority(1, b"deleter");
-    let buried = seed.clone().with_current(CurrentState::Tombstone {
-        writer: deleter.clone(),
-    });
+    let buried = seed
+        .clone()
+        .with_current(CurrentState::Tombstone { writer: deleter });
     let outcome = resolve_outcome(
         &direct(Some(deleter)),
         &tctx,
@@ -1150,7 +1142,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     // Aggregate inline admission is owned by the direct-commit policy. Existing
     // inline values consume the leaf budget, while this key's prior state
     // is replaced rather than double-counted.
-    let mut budgeted = direct(Some(current.clone()));
+    let mut budgeted = direct(Some(current));
     budgeted.inline = InlinePolicy {
         max_value_bytes: 64,
         max_leaf_bytes: 5,
@@ -1192,7 +1184,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
         "an unproved in-doubt outcome returns before creating new pressure"
     );
 
-    let mut impossible = direct(Some(current.clone()));
+    let mut impossible = direct(Some(current));
     impossible.inline = InlinePolicy {
         max_value_bytes: 64,
         max_leaf_bytes: 1,
@@ -1242,10 +1234,7 @@ async fn direct_commit_superseded_read_replays_in_place() {
     // Read v1, then let a later commit supersede it. Both values are this
     // database instance's own, so its snapshot sees the winner rather than a stale leaf.
     let stale = do_read(&tctx, &keyp).await;
-    let winner = commit_writes(&tm, vec![wa(&keyp, b"v2")])
-        .await
-        .id()
-        .clone();
+    let winner = *commit_writes(&tm, vec![wa(&keyp, b"v2")]).await.id();
 
     let mut h = begin_accesses(
         &tm,
@@ -1282,7 +1271,7 @@ async fn direct_commit_superseded_read_replays_in_place() {
     assert_eq!(
         entry(&tctx, b"k").await.unwrap().current,
         CurrentState::Inline {
-            writer: replayed.id().clone(),
+            writer: *replayed.id(),
             value: Arc::from(b"v3".as_slice()),
         },
         "the replayed body commits in one leaf CAS"
@@ -1336,8 +1325,8 @@ async fn direct_commit_same_key_round_loser_replays_its_body() {
     // Which member wins the round's reservation depends on id order; that exactly
     // one does is the property under test.
     let (winner, mut replayed) = match (&r1, &r2) {
-        (Ok(BodyDecision::ReturnOutcome), Ok(BodyDecision::ReplayBody)) => (h1.id().clone(), h2),
-        (Ok(BodyDecision::ReplayBody), Ok(BodyDecision::ReturnOutcome)) => (h2.id().clone(), h1),
+        (Ok(BodyDecision::ReturnOutcome), Ok(BodyDecision::ReplayBody)) => (*h1.id(), h2),
+        (Ok(BodyDecision::ReplayBody), Ok(BodyDecision::ReturnOutcome)) => (*h2.id(), h1),
         other => panic!("expected one commit and one replay, got {other:?}"),
     };
 
@@ -1395,7 +1384,7 @@ async fn direct_create_uses_one_leaf_cas() {
         &tm,
         AccessSet::new(vec![absent], vec![wa(&keyp, b"v")], Vec::new()),
     );
-    let tid = h.id().clone();
+    let tid = *h.id();
     tm.commit(&mut h).await.unwrap();
     tm.end(&mut h).await.unwrap();
 
@@ -1424,7 +1413,7 @@ async fn direct_delete_uses_one_leaf_cas() {
     log.lock().unwrap().clear();
     tctx.locker.stats_and_reset();
     let mut h = begin_accesses(&tm, AccessSet::new(vec![r], vec![wdel(&keyp)], Vec::new()));
-    let tid = h.id().clone();
+    let tid = *h.id();
     tm.commit(&mut h).await.unwrap();
     tm.end(&mut h).await.unwrap();
 
@@ -1458,12 +1447,12 @@ async fn direct_multi_key_put_uses_one_leaf_cas() {
     let c = write_counts(&log);
     assert_eq!(c.leaf, 1, "the multi-key write is one leaf CAS: {c:?}");
     assert_eq!(c.tx, 0, "the member has no transaction record: {c:?}");
-    let writer = h.id().clone();
+    let writer = *h.id();
     for (key, logical_key) in [(b"a".as_slice(), &ka), (b"b".as_slice(), &kb)] {
         assert_eq!(
             entry(&tctx, key).await.unwrap().current,
             CurrentState::Inline {
-                writer: writer.clone(),
+                writer,
                 value: Arc::from(b"v2".as_slice()),
             }
         );
@@ -1497,7 +1486,7 @@ async fn direct_blind_puts_cover_two_eight_and_thirty_two_keys() {
                 Vec::new(),
             ),
         );
-        let tid = h.id().clone();
+        let tid = *h.id();
         tm.commit(&mut h).await.unwrap();
         tm.end(&mut h).await.unwrap();
 
@@ -1539,7 +1528,7 @@ async fn multi_key_aggregate_rejection_is_atomic_and_does_not_hint() {
             Vec::new(),
         ),
     );
-    let tid = h.id().clone();
+    let tid = *h.id();
     tm.commit(&mut h).await.unwrap();
     tm.end(&mut h).await.unwrap();
 
@@ -1560,9 +1549,7 @@ async fn multi_key_aggregate_rejection_is_atomic_and_does_not_hint() {
     for key in &keys {
         assert_eq!(
             entry(&tctx, key.key()).await.unwrap().current,
-            CurrentState::External {
-                writer: tid.clone(),
-            },
+            CurrentState::External { writer: tid },
             "no output was published directly before fallback"
         );
     }
@@ -1579,7 +1566,7 @@ async fn cross_key_aggregate_rejection_does_not_hint() {
             DirectKey {
                 raw_key: source.key().to_vec(),
                 key: source.clone(),
-                read: Some(ReadPredicate::new(Some(predecessor.clone()), None)),
+                read: Some(ReadPredicate::new(Some(predecessor), None)),
                 write: None,
             },
             DirectKey {
@@ -1655,7 +1642,7 @@ async fn direct_mixed_member_is_atomic_and_advances_membership_once() {
             Vec::new(),
         ),
     );
-    let tid = h.id().clone();
+    let tid = *h.id();
     tm.commit(&mut h).await.unwrap();
     tm.end(&mut h).await.unwrap();
 
@@ -1674,29 +1661,19 @@ async fn direct_mixed_member_is_atomic_and_advances_membership_once() {
         (
             b"a".as_slice(),
             CurrentState::Inline {
-                writer: tid.clone(),
+                writer: tid,
                 value: Arc::from(b"a2".as_slice()),
             },
         ),
         (
             b"b".as_slice(),
             CurrentState::Inline {
-                writer: tid.clone(),
+                writer: tid,
                 value: Arc::from(b"b1".as_slice()),
             },
         ),
-        (
-            b"c".as_slice(),
-            CurrentState::Tombstone {
-                writer: tid.clone(),
-            },
-        ),
-        (
-            b"d".as_slice(),
-            CurrentState::Tombstone {
-                writer: tid.clone(),
-            },
-        ),
+        (b"c".as_slice(), CurrentState::Tombstone { writer: tid }),
+        (b"d".as_slice(), CurrentState::Tombstone { writer: tid }),
     ] {
         assert_eq!(entry(&tctx, key).await.unwrap().current, current);
     }
@@ -1719,14 +1696,14 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     let (backend, gate) = Gate::wrap_writes(mem.clone());
     let (tm, tctx) = new_algo_from_backend(backend.clone()).await;
 
-    let l0 = NodeToken::from_bytes([0; 16]);
-    let l1 = NodeToken::from_bytes([1; 16]);
-    let l2 = NodeToken::from_bytes([2; 16]);
+    let l0 = test_node_id(0);
+    let l1 = test_node_id(1);
+    let l2 = test_node_id(2);
     let seed = TxId::with_priority(1, b"seed");
     let seeded_l0 = || {
         Node::leaf(LeafBody::from_entries([LeafEntry::new(b"a").with_current(
             CurrentState::Inline {
-                writer: seed.clone(),
+                writer: seed,
                 value: Arc::from(b"a0".as_slice()),
             },
         )]))
@@ -1749,7 +1726,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
         tctx.nodes
             .store_root(
                 &test_collection(),
-                &Node::index(IndexNode::from_children([(Vec::new(), l0.to_string(),)])),
+                &Node::index(IndexNode::from_children([(Vec::new(), l0,)])),
                 root.observation(),
             )
             .await
@@ -1790,7 +1767,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
         .unwrap();
     let bounded_l0 = seeded_l0()
         .with_high_key(Some(b"m".to_vec()))
-        .with_right_sibling(Some(l1.to_string()));
+        .with_right_sibling(Some(l1));
     assert!(
         peer.nodes
             .store_node(&test_collection(), &l0, &bounded_l0, Some(&observed_l0),)
@@ -1818,7 +1795,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
         .unwrap();
     let bounded_l1 = Node::leaf(LeafBody::new())
         .with_high_key(Some(b"y".to_vec()))
-        .with_right_sibling(Some(l2.to_string()));
+        .with_right_sibling(Some(l2));
     assert!(
         peer.nodes
             .store_node(&test_collection(), &l1, &bounded_l1, Some(&observed_l1))
@@ -1844,7 +1821,7 @@ async fn cross_leaf_member_uses_a_locked_commit() {
     let (tm, tctx, log) = new_recording_algo().await;
     let other = CollectionAddress::new(
         test_collection().db_prefix(),
-        CollectionId::from_slice(&[9; 16]).unwrap(),
+        CollectionId::from_bytes([9; 16]),
     );
     tctx.records
         .create_record(&other, &CollectionRecord::new())
@@ -1901,7 +1878,7 @@ async fn direct_cross_key_read_modify_write_uses_one_leaf_cas() {
     assert_eq!(
         entry(&tctx, b"b").await.unwrap().current,
         CurrentState::Inline {
-            writer: h.id().clone(),
+            writer: *h.id(),
             value: Arc::from(b"v2".as_slice()),
         }
     );
@@ -1915,9 +1892,9 @@ async fn direct_publication_reports_external_predecessors_only() {
     commit_writes(&tm, vec![wa(&key, &large)]).await;
     let external = entry(&tctx, b"k").await.unwrap();
     assert!(matches!(external.current, CurrentState::External { .. }));
-    let writer = external.current.writer().unwrap().clone();
+    let writer = *external.current.writer().unwrap();
     commit_writes(&tm, vec![wa(&key, b"inline")]).await;
-    assert_eq!(tm.gc_hints.pending(), vec![writer.clone()]);
+    assert_eq!(tm.gc_hints.pending(), vec![writer]);
     commit_writes(&tm, vec![wa(&key, b"next")]).await;
     commit_writes(&tm, vec![wdel(&key)]).await;
     commit_writes(&tm, vec![wa(&key, b"after-delete")]).await;
@@ -1930,7 +1907,7 @@ async fn an_absence_read_uses_locked_write_back_for_a_membership_writer_with_fin
     let holder = TxId::with_priority(1, b"membership-holder");
     tctx.tmon.begin_tx(&holder);
     tctx.tmon
-        .commit_tx(TxRecord::new(holder.clone(), TxCommitStatus::Committed))
+        .commit_tx(TxRecord::new(holder, TxCommitStatus::Committed))
         .await
         .unwrap();
     let mut locks = NodeLocks::default();

@@ -187,16 +187,13 @@ mod tests {
     async fn snapshot_helps_a_committed_directory_holder() {
         let (catalog, records, monitor, _background) = new_catalog();
         let parent = CollectionAddress::root("db");
-        let child = CollectionAddress::new(
-            "db",
-            CollectionId::from_slice(&[1; 16]).expect("fixed ID has the required width"),
-        );
-        let id = TxId::from_bytes(vec![1]);
+        let child = CollectionAddress::new("db", CollectionId::from_bytes([1; 16]));
+        let id = TxId::with_priority(0, &[1]);
         let mut record = CollectionRecord::new();
-        record.set_directory_writer(id.clone());
+        record.set_directory_writer(id);
         assert!(records.create_record(&parent, &record).await.unwrap());
         monitor.begin_tx(&id);
-        let mut tx_record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+        let mut tx_record = TxRecord::new(id, TxCommitStatus::Committed);
         tx_record.locks.push(TxLock::Directory {
             collection: parent.clone(),
             typ: LockType::Write,

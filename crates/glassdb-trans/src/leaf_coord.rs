@@ -2,7 +2,7 @@
 //! mutation engine through which every leaf entry mutation flows.
 //!
 //! The only coordination primitive is a content compare-and-swap on a B-link
-//! leaf: a node (`{prefix}/_n/<token>`) or the tree root (`{prefix}/_r`,
+//! leaf: a node (`{prefix}/_n/<node-id>`) or the tree root (`{prefix}/_r`,
 //! the root leaf while the collection is small, ADR-031). Concurrent
 //! transactions contending one object are **deduplicated** (ADR-025/026): each
 //! per-object mutation is submitted to a [`Dedup`] keyed on the object path, so
@@ -422,7 +422,7 @@ impl MergeRequest for CasReq {
         // to keeping contenders in separate batches.
         let mut members = self.members.clone();
         for (tx, m) in &other.members {
-            members.insert(tx.clone(), m.clone());
+            members.insert(*tx, m.clone());
         }
         Some(CasReq {
             path: self.path.clone(),
@@ -595,7 +595,7 @@ impl CasWorker {
                 .any(|&key| !edit.covers(key));
             if needs_reroute {
                 plan.members.push(PlannedMember {
-                    id: tx.clone(),
+                    id: *tx,
                     outcome: member.policy.reroute_outcome(member_in_doubt),
                     participation: Participation::Skipped,
                 });
@@ -608,7 +608,7 @@ impl CasWorker {
                 .any(|&key| protected_markers.contains(key));
             if protected_marker_conflict {
                 plan.members.push(PlannedMember {
-                    id: tx.clone(),
+                    id: *tx,
                     outcome: member.policy.excluded_outcome(member_in_doubt),
                     participation: Participation::Skipped,
                 });
@@ -657,14 +657,14 @@ impl CasWorker {
                             );
                             plan.locks = proposed.locks;
                             plan.members.push(PlannedMember {
-                                id: tx.clone(),
+                                id: *tx,
                                 outcome: proposed.outcome,
                                 participation: Participation::Staged,
                             });
                         }
                         CapacityDecision::Rejected(outcome) => {
                             plan.members.push(PlannedMember {
-                                id: tx.clone(),
+                                id: *tx,
                                 outcome,
                                 participation: Participation::Skipped,
                             });
@@ -682,7 +682,7 @@ impl CasWorker {
                         );
                     }
                     plan.members.push(PlannedMember {
-                        id: tx.clone(),
+                        id: *tx,
                         outcome,
                         participation: Participation::Skipped,
                     })
@@ -1076,7 +1076,7 @@ impl LeafCoordinator {
         let slot: OutcomeSlot = Arc::new(Mutex::new(None));
         let mut members = BTreeMap::new();
         members.insert(
-            id.clone(),
+            *id,
             LeafMember {
                 policy,
                 slot: slot.clone(),
@@ -1132,7 +1132,7 @@ mod tests {
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
     };
     use glassdb_concurr::Background;
-    use glassdb_data::{CollectionAddress, DbPrefix, NodeToken, ObjectPath};
+    use glassdb_data::{CollectionAddress, DbPrefix, NodeId, ObjectPath};
     use glassdb_storage::{CachedStore, CurrentState, LeafBody, LockType, Node, Timeline};
 
     const COLL: &str = "coordp";
@@ -1141,8 +1141,12 @@ mod tests {
         CollectionAddress::root(COLL)
     }
 
-    fn leaf_token() -> NodeToken {
-        NodeToken::from_bytes([0; 16])
+    fn node_id(byte: u8) -> NodeId {
+        NodeId::from_bytes([byte; 16])
+    }
+
+    fn leaf_id() -> NodeId {
+        node_id(0)
     }
 
     struct NoStructuralHints;
@@ -1154,12 +1158,12 @@ mod tests {
     }
 
     // Every coordination round in these tests targets one leaf object. A
-    // standalone node `_n/<token>` is the cleanest stand-in: it carries only key
+    // standalone node `_n/<node-id>` is the cleanest stand-in: it carries only key
     // entries (no collection metadata), exactly what leaf mutation planning operates on.
     fn leaf_path() -> ObjectPath {
         ObjectPath::Node {
             collection: collection(),
-            token: leaf_token(),
+            id: leaf_id(),
         }
     }
 
@@ -1221,7 +1225,7 @@ mod tests {
         let _ = seed_store
             .store_node(
                 &collection(),
-                &leaf_token(),
+                &leaf_id(),
                 &Node::leaf(LeafBody::new()),
                 None,
             )
@@ -1254,15 +1258,13 @@ mod tests {
     fn entry(key: &[u8], typ: LockType, holder: Option<&TxId>, writer: Option<&TxId>) -> LeafEntry {
         let mut entry =
             LeafEntry::new(key).with_current(writer.map_or(CurrentState::Absent, |writer| {
-                CurrentState::External {
-                    writer: writer.clone(),
-                }
+                CurrentState::External { writer: *writer }
             }));
         match (typ, holder) {
             (LockType::None | LockType::Unknown, None) => {}
-            (LockType::Read, Some(holder)) => entry.acquire_read_lock(holder.clone()),
-            (LockType::Write, Some(holder)) => entry.replace_write_lock(holder.clone()),
-            (LockType::Create, Some(holder)) => entry.replace_create_lock(holder.clone()),
+            (LockType::Read, Some(holder)) => entry.acquire_read_lock(*holder),
+            (LockType::Write, Some(holder)) => entry.replace_write_lock(*holder),
+            (LockType::Create, Some(holder)) => entry.replace_create_lock(*holder),
             _ => panic!("test entry requires a valid lock shape"),
         }
         entry
@@ -1274,7 +1276,7 @@ mod tests {
         let _ = store
             .store_node(
                 &collection(),
-                &leaf_token(),
+                &leaf_id(),
                 &Node::leaf(LeafBody::new()),
                 None,
             )
@@ -1289,12 +1291,12 @@ mod tests {
 
     async fn replace_leaf_node(store: &NodeStore, node: &Node) {
         let observed = store
-            .load_node_state(&collection(), &leaf_token(), Requirement::ANY)
+            .load_node_state(&collection(), &leaf_id(), Requirement::ANY)
             .await
             .unwrap();
         assert!(
             store
-                .store_node(&collection(), &leaf_token(), node, Some(&observed))
+                .store_node(&collection(), &leaf_id(), node, Some(&observed))
                 .await
                 .unwrap()
         );
@@ -1348,9 +1350,9 @@ mod tests {
                 .cloned()
                 .unwrap_or_else(|| entry(&self.key, LockType::None, None, None));
             if self.admission == StageAdmission::AddsKey {
-                e.replace_create_lock(self.tx.clone());
+                e.replace_create_lock(self.tx);
             } else {
-                e.replace_write_lock(self.tx.clone());
+                e.replace_write_lock(self.tx);
             }
             Ok(Step::Stage {
                 entries: vec![(self.key.clone(), e)],
@@ -1458,7 +1460,7 @@ mod tests {
             self.trace
                 .lock()
                 .unwrap()
-                .push((self.tx.clone(), staged.keys().cloned().collect()));
+                .push((self.tx, staged.keys().cloned().collect()));
             Ok(Step::Stage {
                 entries: vec![(
                     self.key.clone(),
@@ -1498,7 +1500,7 @@ mod tests {
             self.requirements.lock().unwrap().push(ctx.requirement);
             if self.stage_until_present && !staged.contains_key(b"driver".as_slice()) {
                 return StageLock {
-                    tx: self.tx.clone(),
+                    tx: self.tx,
                     key: b"driver".to_vec(),
                     admission: StageAdmission::ExistingKeys,
                 }
@@ -1597,14 +1599,13 @@ mod tests {
         if retry {
             hooks.set_before({
                 let memory = memory.clone();
-                let driver_id = driver_id.clone();
                 let first = std::sync::atomic::AtomicBool::new(true);
                 move |op| {
                     let conflict = matches!(op, BackendOp::WriteIf { .. })
                         && op.path() == leaf().to_string()
                         && first.swap(false, Ordering::SeqCst);
                     let peer = cold_store(memory.clone());
-                    let driver_id = driver_id.clone();
+                    let driver_id = driver_id;
                     Box::pin(async move {
                         if conflict {
                             store_leaf_entries(
@@ -1629,7 +1630,7 @@ mod tests {
                         &leaf(),
                         &driver_id,
                         Arc::new(RequirementProbe {
-                            tx: driver_id.clone(),
+                            tx: driver_id,
                             stage_until_present: retry,
                             dependency: None,
                             requirements: Arc::default(),
@@ -1655,7 +1656,7 @@ mod tests {
             assert!(peer.commit_leaf(edit).await.unwrap().is_applied());
         }
         if matches!(change, JoinedLeafChange::Index) {
-            let child = NodeToken::from_bytes([2; 16]);
+            let child = node_id(2);
             assert!(
                 peer.store_node(&collection(), &child, &Node::leaf(LeafBody::new()), None)
                     .await
@@ -1665,7 +1666,7 @@ mod tests {
                 &peer,
                 &Node::index(glassdb_storage::IndexNode::from_children([(
                     Vec::new(),
-                    child.to_string(),
+                    child,
                 )])),
             )
             .await;
@@ -1683,7 +1684,7 @@ mod tests {
                         &leaf(),
                         &tx,
                         Arc::new(RequirementProbe {
-                            tx: tx.clone(),
+                            tx,
                             stage_until_present: false,
                             dependency: None,
                             requirements,
@@ -1831,7 +1832,7 @@ mod tests {
                         &leaf(),
                         &tx,
                         Arc::new(RequirementProbe {
-                            tx: tx.clone(),
+                            tx,
                             stage_until_present: false,
                             dependency: None,
                             requirements,
@@ -1864,10 +1865,10 @@ mod tests {
         let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let hooks = HookBackend::new(memory.clone());
         let (coord, _, timeline, _bg) = coord_over(hooks.clone()).await;
-        let token = NodeToken::from_bytes([7; 16]);
+        let id = node_id(7);
         let path = ObjectPath::Node {
             collection: collection(),
-            token: token.clone(),
+            id,
         };
         let (entered, release) = park_read_reply(&hooks, path.clone(), 1);
         let driver = tokio::spawn({
@@ -1887,7 +1888,7 @@ mod tests {
         entered.notified().await;
         assert!(
             cold_store(memory)
-                .store_node(&collection(), &token, &Node::leaf(LeafBody::new()), None)
+                .store_node(&collection(), &id, &Node::leaf(LeafBody::new()), None)
                 .await
                 .unwrap()
         );
@@ -1903,7 +1904,7 @@ mod tests {
                         &path,
                         &tx,
                         Arc::new(RequirementProbe {
-                            tx: tx.clone(),
+                            tx,
                             stage_until_present: false,
                             dependency: None,
                             requirements,
@@ -1939,14 +1940,19 @@ mod tests {
         let recorder = RecordingBackend::new(hooks.clone());
         let operations = recorder.log();
         let (coord, nodes, timeline, _bg) = coord_over(Arc::new(recorder)).await;
-        let token = NodeToken::from_bytes([1; 16]);
+        let dependency_id = node_id(1);
         let dependency = ObjectPath::Node {
             collection: collection(),
-            token: token.clone(),
+            id: dependency_id,
         };
         assert!(
             nodes
-                .store_node(&collection(), &token, &Node::leaf(LeafBody::new()), None)
+                .store_node(
+                    &collection(),
+                    &dependency_id,
+                    &Node::leaf(LeafBody::new()),
+                    None
+                )
                 .await
                 .unwrap()
         );
@@ -1962,7 +1968,7 @@ mod tests {
                         &tx,
                         Arc::new(StageLock {
                             key: b"driver".to_vec(),
-                            tx: tx.clone(),
+                            tx,
                             admission: StageAdmission::ExistingKeys,
                         }),
                         Requirement::ANY,
@@ -1997,7 +2003,7 @@ mod tests {
                         &leaf(),
                         &tx,
                         Arc::new(RequirementProbe {
-                            tx: tx.clone(),
+                            tx,
                             stage_until_present: false,
                             dependency: Some((nodes, dependency)),
                             requirements,
@@ -2102,7 +2108,7 @@ mod tests {
         let landed = coord
             .coordinate(StageLock {
                 key: b"k".to_vec(),
-                tx: tx.clone(),
+                tx,
                 admission: StageAdmission::ExistingKeys,
             })
             .await
@@ -2159,7 +2165,7 @@ mod tests {
                 &tx,
                 Arc::new(StageLock {
                     key: b"k".to_vec(),
-                    tx: tx.clone(),
+                    tx,
                     admission: StageAdmission::ExistingKeys,
                 }),
                 Requirement::ANY,
@@ -2207,7 +2213,7 @@ mod tests {
             None,
         )]))
         .with_high_key(Some(b"m".to_vec()))
-        .with_right_sibling(Some("R".to_string()));
+        .with_right_sibling(Some(node_id(1)));
         replace_leaf_node(&store, &node).await;
 
         let tx = TxId::with_priority(1, b"t");
@@ -2217,7 +2223,7 @@ mod tests {
                 &tx,
                 Arc::new(StageLock {
                     key: b"z".to_vec(),
-                    tx: tx.clone(),
+                    tx,
                     admission: StageAdmission::ExistingKeys,
                 }),
                 Requirement::ANY,
@@ -2263,7 +2269,7 @@ mod tests {
                 &tx,
                 Arc::new(StageLock {
                     key: b"a".to_vec(),
-                    tx: tx.clone(),
+                    tx,
                     admission: StageAdmission::ExistingKeys,
                 }),
                 Requirement::ANY,
@@ -2351,7 +2357,7 @@ mod tests {
                 &tx,
                 Arc::new(StageLock {
                     key: b"k".to_vec(),
-                    tx: tx.clone(),
+                    tx,
                     admission: StageAdmission::ExistingKeys,
                 }),
                 requirement,
@@ -2408,7 +2414,7 @@ mod tests {
                 &tx,
                 Arc::new(StageLock {
                     key: b"lock".to_vec(),
-                    tx: tx.clone(),
+                    tx,
                     admission: StageAdmission::ExistingKeys,
                 }),
                 Requirement::ANY,
@@ -2505,14 +2511,14 @@ mod tests {
         // The older member submits first, becomes the dedup driver, and parks in
         // the gated load; the younger then queues into that open batch.
         gate.arm();
-        let (c1, t1, tr1) = (coord.clone(), old.clone(), trace.clone());
+        let (c1, t1, tr1) = (coord.clone(), old, trace.clone());
         let driver = tokio::spawn(async move {
             c1.submit_leaf(
                 &leaf(),
                 &t1,
                 Arc::new(Recorder {
                     key: b"a".to_vec(),
-                    tx: t1.clone(),
+                    tx: t1,
                     trace: tr1,
                 }),
                 Requirement::ANY,
@@ -2521,14 +2527,14 @@ mod tests {
         });
         rt::sleep(Duration::from_secs(1)).await;
 
-        let (c2, t2, tr2) = (coord.clone(), young.clone(), trace.clone());
+        let (c2, t2, tr2) = (coord.clone(), young, trace.clone());
         let joiner = tokio::spawn(async move {
             c2.submit_leaf(
                 &leaf(),
                 &t2,
                 Arc::new(Recorder {
                     key: b"b".to_vec(),
-                    tx: t2.clone(),
+                    tx: t2,
                     trace: tr2,
                 }),
                 Requirement::ANY,
@@ -2583,7 +2589,7 @@ mod tests {
         // The older member drives the round and parks in the gated load; the
         // younger one queues into that still-open batch.
         gate.arm();
-        let (c1, t1) = (coord.clone(), first.clone());
+        let (c1, t1) = (coord.clone(), first);
         let driver = tokio::spawn(async move {
             c1.submit_leaf(
                 &leaf(),
@@ -2594,7 +2600,7 @@ mod tests {
             .await
         });
         rt::sleep(Duration::from_secs(1)).await;
-        let (c2, t2) = (coord.clone(), second.clone());
+        let (c2, t2) = (coord.clone(), second);
         let joiner = tokio::spawn(async move {
             c2.submit_leaf(
                 &leaf(),
@@ -2653,7 +2659,7 @@ mod tests {
         fn new(key: &[u8], tx: &TxId, value: &[u8]) -> Self {
             Self {
                 key: key.to_vec(),
-                tx: tx.clone(),
+                tx: *tx,
                 value: Arc::from(value),
                 replayable: false,
             }
@@ -2676,7 +2682,7 @@ mod tests {
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             let e = LeafEntry::new(self.key.clone()).with_current(CurrentState::Inline {
-                writer: self.tx.clone(),
+                writer: self.tx,
                 value: self.value.clone(),
             });
             Ok(Step::Stage {
@@ -2728,7 +2734,7 @@ mod tests {
         fn direct(keys: &[&[u8]], tx: &TxId) -> Self {
             Self {
                 keys: keys.iter().map(|key| key.to_vec()).collect(),
-                tx: tx.clone(),
+                tx: *tx,
                 direct: true,
                 already_landed: false,
             }
@@ -2737,7 +2743,7 @@ mod tests {
         fn publisher(keys: &[&[u8]], tx: &TxId) -> Self {
             Self {
                 keys: keys.iter().map(|key| key.to_vec()).collect(),
-                tx: tx.clone(),
+                tx: *tx,
                 direct: false,
                 already_landed: false,
             }
@@ -2769,8 +2775,8 @@ mod tests {
                 .iter()
                 .map(|key| {
                     let entry = LeafEntry::new(key.clone()).with_current(CurrentState::Inline {
-                        writer: self.tx.clone(),
-                        value: Arc::from(self.tx.as_bytes()),
+                        writer: self.tx,
+                        value: Arc::from(self.tx.as_bytes().as_slice()),
                     });
                     (key.clone(), entry)
                 })
@@ -2827,7 +2833,7 @@ mod tests {
         log.lock().unwrap().clear();
 
         gate.arm();
-        let (c1, t1) = (coord.clone(), first.clone());
+        let (c1, t1) = (coord.clone(), first);
         let driver = tokio::spawn(async move {
             c1.submit_leaf(
                 &leaf(),
@@ -2838,7 +2844,7 @@ mod tests {
             .await
         });
         rt::sleep(Duration::from_secs(1)).await;
-        let (c2, t2) = (coord.clone(), second.clone());
+        let (c2, t2) = (coord.clone(), second);
         let joiner = tokio::spawn(async move {
             c2.submit_leaf(
                 &leaf(),
@@ -2895,7 +2901,7 @@ mod tests {
         log.lock().unwrap().clear();
 
         gate.arm();
-        let (c1, t1) = (coord.clone(), first.clone());
+        let (c1, t1) = (coord.clone(), first);
         let driver = tokio::spawn(async move {
             c1.submit_leaf(
                 &leaf(),
@@ -2906,7 +2912,7 @@ mod tests {
             .await
         });
         rt::sleep(Duration::from_secs(1)).await;
-        let (c2, t2) = (coord.clone(), second.clone());
+        let (c2, t2) = (coord.clone(), second);
         let joiner = tokio::spawn(async move {
             c2.submit_leaf(
                 &leaf(),
@@ -2951,7 +2957,7 @@ mod tests {
                 .into_iter()
                 .map(|key| {
                     LeafEntry::new(key).with_current(CurrentState::Inline {
-                        writer: first.clone(),
+                        writer: first,
                         value: Arc::from(b"landed".as_slice()),
                     })
                 })
@@ -2960,7 +2966,7 @@ mod tests {
         .await;
 
         gate.arm();
-        let (c1, t1) = (coord.clone(), first.clone());
+        let (c1, t1) = (coord.clone(), first);
         let driver = tokio::spawn(async move {
             c1.submit_leaf(
                 &leaf(),
@@ -2971,7 +2977,7 @@ mod tests {
             .await
         });
         rt::sleep(Duration::from_secs(1)).await;
-        let (c2, t2) = (coord.clone(), second.clone());
+        let (c2, t2) = (coord.clone(), second);
         let joiner = tokio::spawn(async move {
             c2.submit_leaf(
                 &leaf(),
@@ -3091,7 +3097,7 @@ mod tests {
         // younger one queues into that still-open batch, where its key is
         // already reserved.
         gate.arm();
-        let (c1, t1) = (coord.clone(), first.clone());
+        let (c1, t1) = (coord.clone(), first);
         let driver = tokio::spawn(async move {
             c1.submit_leaf(
                 &leaf(),
@@ -3102,7 +3108,7 @@ mod tests {
             .await
         });
         rt::sleep(Duration::from_secs(1)).await;
-        let (c2, t2) = (coord.clone(), second.clone());
+        let (c2, t2) = (coord.clone(), second);
         let joiner = tokio::spawn(async move {
             c2.submit_leaf(
                 &leaf(),
@@ -3154,7 +3160,7 @@ mod tests {
         let second = TxId::with_priority(2, b"second");
 
         gate.arm();
-        let (c1, t1) = (coord.clone(), first.clone());
+        let (c1, t1) = (coord.clone(), first);
         let driver = tokio::spawn(async move {
             c1.submit_leaf(
                 &leaf(),
@@ -3165,7 +3171,7 @@ mod tests {
             .await
         });
         rt::sleep(Duration::from_secs(1)).await;
-        let (c2, t2) = (coord.clone(), second.clone());
+        let (c2, t2) = (coord.clone(), second);
         let joiner = tokio::spawn(async move {
             c2.submit_leaf(
                 &leaf(),
@@ -3214,7 +3220,7 @@ mod tests {
         let second = TxId::with_priority(2, b"second");
 
         gate.arm();
-        let (c1, t1) = (coord.clone(), first.clone());
+        let (c1, t1) = (coord.clone(), first);
         let driver = tokio::spawn(async move {
             c1.submit_leaf(
                 &leaf(),
@@ -3225,7 +3231,7 @@ mod tests {
             .await
         });
         rt::sleep(Duration::from_secs(1)).await;
-        let (c2, t2) = (coord.clone(), second.clone());
+        let (c2, t2) = (coord.clone(), second);
         let joiner = tokio::spawn(async move {
             c2.submit_leaf(
                 &leaf(),
@@ -3282,14 +3288,14 @@ mod tests {
         // The acquire submits first, becomes the dedup driver, and parks in the
         // gated load; the release for the same id then arrives for the same leaf.
         gate.arm();
-        let (c1, t1) = (coord.clone(), tx.clone());
+        let (c1, t1) = (coord.clone(), tx);
         let acquire = tokio::spawn(async move {
             c1.submit_leaf(
                 &leaf(),
                 &t1,
                 Arc::new(StageLock {
                     key: b"k".to_vec(),
-                    tx: t1.clone(),
+                    tx: t1,
                     admission: StageAdmission::ExistingKeys,
                 }),
                 Requirement::ANY,
@@ -3298,7 +3304,7 @@ mod tests {
         });
         rt::sleep(Duration::from_secs(1)).await;
 
-        let (c2, t2) = (coord.clone(), tx.clone());
+        let (c2, t2) = (coord.clone(), tx);
         let release = tokio::spawn(async move {
             c2.submit_leaf(&leaf(), &t2, Arc::new(SkipRelease), Requirement::ANY)
                 .await
@@ -3343,7 +3349,7 @@ mod tests {
         let young = TxId::with_priority(2, b"young");
         let seed = entry(b"a", LockType::None, None, Some(&writer));
         let mut overwritten = seed.clone();
-        overwritten.replace_write_lock(old.clone());
+        overwritten.replace_write_lock(old);
         let created = entry(b"z", LockType::Create, Some(&young), None);
 
         let base_len = Node::leaf(LeafBody::from_entries([seed.clone()])).content_encoded_len();
@@ -3368,14 +3374,14 @@ mod tests {
         log.lock().unwrap().clear();
 
         gate.arm();
-        let (c1, t1) = (coord.clone(), old.clone());
+        let (c1, t1) = (coord.clone(), old);
         let overwrite = tokio::spawn(async move {
             c1.submit_leaf(
                 &leaf(),
                 &t1,
                 Arc::new(StageLock {
                     key: b"a".to_vec(),
-                    tx: t1.clone(),
+                    tx: t1,
                     admission: StageAdmission::ExistingKeys,
                 }),
                 Requirement::ANY,
@@ -3384,14 +3390,14 @@ mod tests {
         });
         rt::sleep(Duration::from_secs(1)).await;
 
-        let (c2, t2) = (coord.clone(), young.clone());
+        let (c2, t2) = (coord.clone(), young);
         let create = tokio::spawn(async move {
             c2.submit_leaf(
                 &leaf(),
                 &t2,
                 Arc::new(StageLock {
                     key: b"z".to_vec(),
-                    tx: t2.clone(),
+                    tx: t2,
                     admission: StageAdmission::AddsKey,
                 }),
                 Requirement::ANY,
@@ -3447,7 +3453,7 @@ mod tests {
         fn direct(key: &[u8], tx: &TxId, value: &[u8]) -> Self {
             Self {
                 key: key.to_vec(),
-                tx: tx.clone(),
+                tx: *tx,
                 value: Arc::from(value),
             }
         }
@@ -3462,7 +3468,7 @@ mod tests {
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             let e = LeafEntry::new(self.key.clone()).with_current(CurrentState::Inline {
-                writer: self.tx.clone(),
+                writer: self.tx,
                 value: self.value.clone(),
             });
             Ok(Step::Stage {
@@ -3492,10 +3498,9 @@ mod tests {
     // A policy whose hard cap admits an external value for `key` but not the
     // same entry carrying `value` inline.
     fn policy_rejecting_inline(key: &[u8], tx: &TxId, value: &[u8]) -> NodeSizePolicy {
-        let external =
-            LeafEntry::new(key).with_current(CurrentState::External { writer: tx.clone() });
+        let external = LeafEntry::new(key).with_current(CurrentState::External { writer: *tx });
         let inline = LeafEntry::new(key).with_current(CurrentState::Inline {
-            writer: tx.clone(),
+            writer: *tx,
             value: Arc::from(value),
         });
         let external_len = Node::leaf(LeafBody::from_entries([external])).encoded_len();
@@ -3554,7 +3559,7 @@ mod tests {
         let tx = TxId::with_priority(1, b"t");
         let value = b"inline";
         let inline = LeafEntry::new(b"k").with_current(CurrentState::Inline {
-            writer: tx.clone(),
+            writer: tx,
             value: Arc::from(value.as_slice()),
         });
         let entry_len = Node::leaf(LeafBody::from_entries([inline.clone()])).content_encoded_len();
@@ -3569,7 +3574,7 @@ mod tests {
         assert!(
             !policy.entry_fits_split_budget(&LeafEntry::new(b"k").with_current(
                 CurrentState::Inline {
-                    writer: tx.clone(),
+                    writer: tx,
                     value: Arc::from(value.as_slice()),
                 },
             ))
@@ -3633,7 +3638,7 @@ mod tests {
                 Arc::from(vec![b'x'; 128])
             };
             let entry = LeafEntry::new(self.key.clone()).with_current(CurrentState::Inline {
-                writer: self.tx.clone(),
+                writer: self.tx,
                 value,
             });
             Ok(Step::Stage {
@@ -3666,11 +3671,11 @@ mod tests {
         let tx = TxId::with_priority(1, b"t");
         let skipped = TxId::with_priority(2, b"skipped");
         let small = LeafEntry::new(b"k").with_current(CurrentState::Inline {
-            writer: tx.clone(),
+            writer: tx,
             value: Arc::from(b"x".as_slice()),
         });
         let large = LeafEntry::new(b"k").with_current(CurrentState::Inline {
-            writer: tx.clone(),
+            writer: tx,
             value: Arc::from(vec![b'x'; 128]),
         });
         let small_len = Node::leaf(LeafBody::from_entries([small])).encoded_len();
@@ -3709,7 +3714,7 @@ mod tests {
         });
 
         gate.arm();
-        let (driver_coord, driver_tx) = (coord.clone(), tx.clone());
+        let (driver_coord, driver_tx) = (coord.clone(), tx);
         let driver = tokio::spawn(async move {
             driver_coord
                 .submit_leaf(
@@ -3717,7 +3722,7 @@ mod tests {
                     &driver_tx,
                     Arc::new(CapacityAfterInDoubt {
                         key: b"k".to_vec(),
-                        tx: driver_tx.clone(),
+                        tx: driver_tx,
                         evaluations: std::sync::atomic::AtomicUsize::new(0),
                         recovers_non_landing: false,
                     }),
@@ -3726,7 +3731,7 @@ mod tests {
                 .await
         });
         rt::sleep(Duration::from_secs(1)).await;
-        let (joiner_coord, joiner_tx) = (coord.clone(), skipped.clone());
+        let (joiner_coord, joiner_tx) = (coord.clone(), skipped);
         let joiner = tokio::spawn(async move {
             joiner_coord
                 .submit_leaf(
@@ -3770,11 +3775,11 @@ mod tests {
     async fn proven_non_landing_clears_uncertainty_before_capacity_rejection() {
         let tx = TxId::with_priority(1, b"t");
         let small = LeafEntry::new(b"k").with_current(CurrentState::Inline {
-            writer: tx.clone(),
+            writer: tx,
             value: Arc::from(b"x".as_slice()),
         });
         let large = LeafEntry::new(b"k").with_current(CurrentState::Inline {
-            writer: tx.clone(),
+            writer: tx,
             value: Arc::from(vec![b'x'; 128]),
         });
         let small_len = Node::leaf(LeafBody::from_entries([small])).encoded_len();
@@ -3815,7 +3820,7 @@ mod tests {
                 &tx,
                 Arc::new(CapacityAfterInDoubt {
                     key: b"k".to_vec(),
-                    tx: tx.clone(),
+                    tx,
                     evaluations: std::sync::atomic::AtomicUsize::new(0),
                     recovers_non_landing: true,
                 }),
@@ -3973,8 +3978,7 @@ mod tests {
         let retrying = TxId::with_priority(3, b"retrying");
         let seen_in_doubt = Arc::new(Mutex::new(None));
         gate.arm();
-        let (driver_coord, driver_tx, driver_seen) =
-            (coord.clone(), tx.clone(), seen_in_doubt.clone());
+        let (driver_coord, driver_tx, driver_seen) = (coord.clone(), tx, seen_in_doubt.clone());
         let driver = tokio::spawn(async move {
             driver_coord
                 .submit_leaf(
@@ -3982,7 +3986,7 @@ mod tests {
                     &driver_tx,
                     Arc::new(StickyCommitProbe {
                         key: b"k".to_vec(),
-                        tx: driver_tx.clone(),
+                        tx: driver_tx,
                         evaluations: std::sync::atomic::AtomicUsize::new(0),
                         seen_in_doubt: driver_seen,
                     }),
@@ -3991,7 +3995,7 @@ mod tests {
                 .await
         });
         rt::sleep(Duration::from_secs(1)).await;
-        let (joiner_coord, joiner_tx) = (coord.clone(), retrying.clone());
+        let (joiner_coord, joiner_tx) = (coord.clone(), retrying);
         let joiner = tokio::spawn(async move {
             joiner_coord
                 .submit_leaf(
@@ -3999,7 +4003,7 @@ mod tests {
                     &joiner_tx,
                     Arc::new(AlwaysStageProbe {
                         key: b"peer".to_vec(),
-                        tx: joiner_tx.clone(),
+                        tx: joiner_tx,
                     }),
                     Requirement::ANY,
                 )
@@ -4126,7 +4130,7 @@ mod tests {
         let seen_in_doubt = Arc::new(Mutex::new(None));
         gate.arm();
         let (driver_coord, driver_tx, driver_seen) =
-            (coord.clone(), in_doubt.clone(), seen_in_doubt.clone());
+            (coord.clone(), in_doubt, seen_in_doubt.clone());
         let driver = tokio::spawn(async move {
             driver_coord
                 .submit_leaf(
@@ -4134,7 +4138,7 @@ mod tests {
                     &driver_tx,
                     Arc::new(StickyCommitProbe {
                         key: b"in-doubt".to_vec(),
-                        tx: driver_tx.clone(),
+                        tx: driver_tx,
                         evaluations: std::sync::atomic::AtomicUsize::new(0),
                         seen_in_doubt: driver_seen,
                     }),
@@ -4143,7 +4147,7 @@ mod tests {
                 .await
         });
         rt::sleep(Duration::from_secs(1)).await;
-        let (joiner_coord, joiner_tx) = (coord.clone(), retrying.clone());
+        let (joiner_coord, joiner_tx) = (coord.clone(), retrying);
         let joiner = tokio::spawn(async move {
             joiner_coord
                 .submit_leaf(
@@ -4151,7 +4155,7 @@ mod tests {
                     &joiner_tx,
                     Arc::new(AlwaysStageProbe {
                         key: b"retrying".to_vec(),
-                        tx: joiner_tx.clone(),
+                        tx: joiner_tx,
                     }),
                     Requirement::ANY,
                 )

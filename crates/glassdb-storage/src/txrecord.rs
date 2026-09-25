@@ -61,20 +61,23 @@ mod tests {
     use crate::lock::LockType;
     use crate::transaction::{TxCommitStatus, TxLock, TxWrite};
 
+    fn tx_id(prefix: &[u8]) -> TxId {
+        TxId::with_priority(0, prefix)
+    }
+
     fn key(key: &[u8]) -> LogicalKey {
         LogicalKey::new(CollectionAddress::root("db"), key)
     }
 
     fn committed_record() -> TxRecord {
         TxRecord {
-            id: TxId::from_bytes(vec![1, 2, 3, 4]),
+            id: tx_id(&[1, 2, 3, 4]),
             timestamp: Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
             status: TxCommitStatus::Committed,
             writes: vec![TxWrite {
                 key: key(b"hello"),
                 value: Arc::from(&b"world"[..]),
                 deleted: false,
-                prev_writer: TxId::default(),
             }],
             locks: Vec::new(),
             collection_changes: Vec::new(),
@@ -94,7 +97,7 @@ mod tests {
     #[test]
     fn pending_round_trip_carries_lease_and_locks() {
         let record = TxRecord {
-            id: TxId::from_bytes(vec![9]),
+            id: tx_id(&[9]),
             timestamp: Some(UNIX_EPOCH + Duration::from_secs(42)),
             status: TxCommitStatus::Pending,
             writes: Vec::new(),
@@ -116,7 +119,7 @@ mod tests {
     #[test]
     fn aborted_round_trip() {
         let record = TxRecord {
-            id: TxId::from_bytes(vec![7]),
+            id: tx_id(&[7]),
             timestamp: Some(UNIX_EPOCH + Duration::from_secs(1)),
             status: TxCommitStatus::Aborted,
             writes: Vec::new(),
@@ -131,7 +134,7 @@ mod tests {
     #[test]
     fn wounded_round_trip() {
         let record = TxRecord {
-            id: TxId::from_bytes(vec![8]),
+            id: tx_id(&[8]),
             timestamp: Some(UNIX_EPOCH + Duration::from_secs(2)),
             status: TxCommitStatus::Wounded,
             writes: Vec::new(),

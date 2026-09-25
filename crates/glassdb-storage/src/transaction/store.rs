@@ -74,7 +74,7 @@ impl TxRecordStore {
     ) -> Result<TxStatus, StorageError> {
         let path = ObjectKey::from(ObjectPath::Transaction {
             db_prefix: self.db_prefix.clone(),
-            id: id.clone(),
+            id: *id,
         });
         let observation = match self.cached_final(&path)? {
             Some(observation) => observation,
@@ -94,7 +94,7 @@ impl TxRecordStore {
     ) -> Result<Observation<TxRecord>, StorageError> {
         let path = ObjectKey::from(ObjectPath::Transaction {
             db_prefix: self.db_prefix.clone(),
-            id: id.clone(),
+            id: *id,
         });
         let observation = match self.cached_final(&path)? {
             Some(observation) => observation,
@@ -115,7 +115,7 @@ impl TxRecordStore {
         persisted.timestamp = Some(ts);
         let path = ObjectPath::Transaction {
             db_prefix: self.db_prefix.clone(),
-            id: l.id.clone(),
+            id: l.id,
         };
         match self.records.create(path, None, Arc::new(persisted)).await? {
             CasResult::Applied(receipt) => Ok(receipt.into_installed()),
@@ -182,7 +182,7 @@ impl TxRecordStore {
             .iter()
             .filter_map(|path| match path.object_path() {
                 ObjectPath::Transaction { db_prefix, id } if db_prefix == &self.db_prefix => {
-                    Some(id.clone())
+                    Some(*id)
                 }
                 _ => None,
             })
@@ -263,6 +263,10 @@ mod tests {
     use glassdb_data::{CollectionAddress, CollectionId, LeafRef, LogicalKey};
     use tokio::sync::Notify;
 
+    fn tx_id(prefix: &[u8]) -> TxId {
+        TxId::with_priority(0, prefix)
+    }
+
     fn db_prefix() -> DbPrefix {
         DbPrefix::try_from("db").unwrap()
     }
@@ -275,7 +279,7 @@ mod tests {
     }
 
     fn test_collection(db_prefix: &str, byte: u8) -> CollectionAddress {
-        CollectionAddress::new(db_prefix, CollectionId::from_slice(&[byte; 16]).unwrap())
+        CollectionAddress::new(db_prefix, CollectionId::from_bytes([byte; 16]))
     }
 
     fn new_recording_tx_record_store() -> (TxRecordStore, OpLog) {
@@ -295,14 +299,14 @@ mod tests {
     #[tokio::test]
     async fn mutations_reject_transaction_identity_mismatches_before_backend_io() {
         let (logger, operations) = new_recording_tx_record_store();
-        let id = TxId::from_bytes(vec![1, 2, 3, 4]);
+        let id = tx_id(&[1, 2, 3, 4]);
         let observed = logger
             .set(&TxRecord::new(id, TxCommitStatus::Pending))
             .await
             .unwrap();
         assert_operations(&operations, &["write_if_not_exists"]);
 
-        let different_id = TxId::from_bytes(vec![4, 3, 2, 1]);
+        let different_id = tx_id(&[4, 3, 2, 1]);
         assert!(
             logger
                 .set_if(
@@ -314,13 +318,11 @@ mod tests {
         );
         assert_operations(&operations, &[]);
 
-        let mut wrong_database =
-            TxRecord::new(TxId::from_bytes(vec![5, 6, 7, 8]), TxCommitStatus::Pending);
+        let mut wrong_database = TxRecord::new(tx_id(&[5, 6, 7, 8]), TxCommitStatus::Pending);
         wrong_database.writes.push(TxWrite {
             key: LogicalKey::new(test_collection("other", 1), b"key"),
             value: Arc::from(&b"value"[..]),
             deleted: false,
-            prev_writer: TxId::default(),
         });
         assert!(logger.set(&wrong_database).await.is_err());
         assert_operations(&operations, &[]);
@@ -336,7 +338,7 @@ mod tests {
             (3, TxCommitStatus::Aborted),
             (7, TxCommitStatus::Wounded),
         ] {
-            let id = TxId::from_bytes(vec![9, suffix]);
+            let id = tx_id(&[9, suffix]);
             let observed = logger.set(&TxRecord::new(id, status)).await.unwrap();
             assert_operations(&operations, &["write_if_not_exists"]);
             if status.is_immutable() {
@@ -345,18 +347,15 @@ mod tests {
             }
         }
 
-        let committed_id = TxId::from_bytes(vec![9, 4]);
+        let committed_id = tx_id(&[9, 4]);
         let pending = logger
-            .set(&TxRecord::new(
-                committed_id.clone(),
-                TxCommitStatus::Pending,
-            ))
+            .set(&TxRecord::new(committed_id, TxCommitStatus::Pending))
             .await
             .unwrap();
         assert_operations(&operations, &["write_if_not_exists"]);
         let refreshed = logger
             .set_if(
-                &TxRecord::new(committed_id.clone(), TxCommitStatus::Pending),
+                &TxRecord::new(committed_id, TxCommitStatus::Pending),
                 &pending,
             )
             .await
@@ -373,9 +372,9 @@ mod tests {
         logger.delete(&committed).await.unwrap();
         assert_operations(&operations, &["delete_if"]);
 
-        let aborted_id = TxId::from_bytes(vec![9, 5]);
+        let aborted_id = tx_id(&[9, 5]);
         let pending = logger
-            .set(&TxRecord::new(aborted_id.clone(), TxCommitStatus::Pending))
+            .set(&TxRecord::new(aborted_id, TxCommitStatus::Pending))
             .await
             .unwrap();
         assert_operations(&operations, &["write_if_not_exists"]);
@@ -388,15 +387,15 @@ mod tests {
             .unwrap();
         assert_operations(&operations, &["write_if"]);
 
-        let wounded_id = TxId::from_bytes(vec![9, 6]);
+        let wounded_id = tx_id(&[9, 6]);
         let pending = logger
-            .set(&TxRecord::new(wounded_id.clone(), TxCommitStatus::Pending))
+            .set(&TxRecord::new(wounded_id, TxCommitStatus::Pending))
             .await
             .unwrap();
         assert_operations(&operations, &["write_if_not_exists"]);
         let wounded = logger
             .set_if(
-                &TxRecord::new(wounded_id.clone(), TxCommitStatus::Wounded),
+                &TxRecord::new(wounded_id, TxCommitStatus::Wounded),
                 &pending,
             )
             .await
@@ -419,11 +418,8 @@ mod tests {
         let (logger, operations) = new_recording_tx_record_store();
 
         for (suffix, current) in [(1, TxCommitStatus::Committed), (2, TxCommitStatus::Aborted)] {
-            let id = TxId::from_bytes(vec![10, suffix]);
-            let observed = logger
-                .set(&TxRecord::new(id.clone(), current))
-                .await
-                .unwrap();
+            let id = tx_id(&[10, suffix]);
+            let observed = logger.set(&TxRecord::new(id, current)).await.unwrap();
             assert_operations(&operations, &["write_if_not_exists"]);
             for next in [
                 TxCommitStatus::Pending,
@@ -432,9 +428,7 @@ mod tests {
                 TxCommitStatus::Wounded,
             ] {
                 assert!(matches!(
-                    logger
-                        .set_if(&TxRecord::new(id.clone(), next), &observed)
-                        .await,
+                    logger.set_if(&TxRecord::new(id, next), &observed).await,
                     Err(StorageError::Precondition)
                 ));
                 assert_operations(&operations, &[]);
@@ -450,9 +444,9 @@ mod tests {
             assert_operations(&operations, &[]);
         }
 
-        let pending_id = TxId::from_bytes(vec![10, 3]);
+        let pending_id = tx_id(&[10, 3]);
         let pending = logger
-            .set(&TxRecord::new(pending_id.clone(), TxCommitStatus::Pending))
+            .set(&TxRecord::new(pending_id, TxCommitStatus::Pending))
             .await
             .unwrap();
         assert_operations(&operations, &["write_if_not_exists"]);
@@ -462,9 +456,9 @@ mod tests {
         ));
         assert_operations(&operations, &[]);
 
-        let wounded_id = TxId::from_bytes(vec![10, 4]);
+        let wounded_id = tx_id(&[10, 4]);
         let wounded = logger
-            .set(&TxRecord::new(wounded_id.clone(), TxCommitStatus::Wounded))
+            .set(&TxRecord::new(wounded_id, TxCommitStatus::Wounded))
             .await
             .unwrap();
         assert_operations(&operations, &["write_if_not_exists"]);
@@ -480,7 +474,7 @@ mod tests {
         ] {
             assert!(matches!(
                 logger
-                    .set_if(&TxRecord::new(wounded_id.clone(), next), &wounded)
+                    .set_if(&TxRecord::new(wounded_id, next), &wounded)
                     .await,
                 Err(StorageError::Precondition)
             ));
@@ -509,10 +503,7 @@ mod tests {
 
         assert!(matches!(
             logger
-                .set(&TxRecord::new(
-                    TxId::from_bytes(vec![10, 4]),
-                    TxCommitStatus::Unknown,
-                ))
+                .set(&TxRecord::new(tx_id(&[10, 4]), TxCommitStatus::Unknown,))
                 .await,
             Err(StorageError::Other { .. })
         ));
@@ -522,19 +513,18 @@ mod tests {
     #[tokio::test]
     async fn round_trip() {
         let t = new_tx_record_store();
-        let id = TxId::from_bytes(vec![1, 2, 3, 4]);
+        let id = tx_id(&[1, 2, 3, 4]);
         let collection = test_collection("db", 1);
         let child = test_collection("db", 2);
         let key = LogicalKey::new(collection.clone(), b"hello");
         let record = TxRecord {
-            id: id.clone(),
+            id,
             timestamp: Some(UNIX_EPOCH + Duration::from_millis(1_700_000_000_000)),
             status: TxCommitStatus::Committed,
             writes: vec![TxWrite {
                 key: key.clone(),
                 value: Arc::from(&b"world"[..]),
                 deleted: false,
-                prev_writer: TxId::from_bytes(vec![9]),
             }],
             locks: vec![
                 TxLock::Membership {
@@ -593,7 +583,7 @@ mod tests {
     async fn commit_status_unknown_when_absent() {
         let t = new_tx_record_store();
         let status = t
-            .commit_status_at(&TxId::from_bytes(vec![7]), Requirement::ANY)
+            .commit_status_at(&tx_id(&[7]), Requirement::ANY)
             .await
             .unwrap();
         assert_eq!(status.status, TxCommitStatus::Unknown);
@@ -605,10 +595,10 @@ mod tests {
     // create completes, the reader rechecks and reuses the published object.
     #[tokio::test]
     async fn commit_status_waits_for_in_flight_create() {
-        let id = TxId::from_bytes(vec![1, 2, 3, 4]);
+        let id = tx_id(&[1, 2, 3, 4]);
         let transaction_path = ObjectPath::Transaction {
             db_prefix: db_prefix(),
-            id: id.clone(),
+            id,
         }
         .to_string();
         let create_started = Arc::new(Notify::new());
@@ -647,7 +637,7 @@ mod tests {
 
         let objects = CachedStore::new(backend, 1 << 20, Timeline::new(), None);
         let logger = TxRecordStore::new(objects, db_prefix());
-        let record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+        let record = TxRecord::new(id, TxCommitStatus::Committed);
 
         let creating = tokio::spawn({
             let logger = logger.clone();
@@ -686,15 +676,14 @@ mod tests {
     #[tokio::test]
     async fn get_returns_record_and_revision() {
         let t = new_tx_record_store();
-        let id = TxId::from_bytes(vec![1, 2, 3, 4]);
+        let id = tx_id(&[1, 2, 3, 4]);
         let key = LogicalKey::new(test_collection("db", 1), b"hello");
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(id, TxCommitStatus::Committed);
         record.timestamp = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
         record.writes = vec![TxWrite {
             key,
             value: Arc::from(&b"world"[..]),
             deleted: false,
-            prev_writer: TxId::default(),
         }];
         let stored_v = t.set(&record).await.unwrap();
 
@@ -722,11 +711,8 @@ mod tests {
                 CachedStore::new(backend, 1 << 20, Timeline::new(), None),
                 db_prefix(),
             );
-            let id = TxId::from_bytes(vec![4, 3, 2, 4]);
-            logger
-                .set(&TxRecord::new(id.clone(), status))
-                .await
-                .unwrap();
+            let id = tx_id(&[4, 3, 2, 4]);
+            logger.set(&TxRecord::new(id, status)).await.unwrap();
             let observed = peer.get_at(&id, Requirement::ANY).await.unwrap();
             peer.delete(&observed).await.unwrap();
             operations.lock().unwrap().clear();
@@ -753,9 +739,9 @@ mod tests {
         let timeline = Timeline::new();
         let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone(), None);
         let logger = TxRecordStore::new(objects, db_prefix());
-        let id = TxId::from_bytes(vec![4, 3, 2, 2]);
+        let id = tx_id(&[4, 3, 2, 2]);
         logger
-            .set(&TxRecord::new(id.clone(), TxCommitStatus::Pending))
+            .set(&TxRecord::new(id, TxCommitStatus::Pending))
             .await
             .unwrap();
         operations.lock().unwrap().clear();
@@ -785,9 +771,9 @@ mod tests {
         let timeline = Timeline::new();
         let objects = CachedStore::new(Arc::new(backend), 1 << 20, timeline.clone(), None);
         let logger = TxRecordStore::new(objects, db_prefix());
-        let id = TxId::from_bytes(vec![4, 3, 2, 3]);
+        let id = tx_id(&[4, 3, 2, 3]);
         logger
-            .set(&TxRecord::new(id.clone(), TxCommitStatus::Wounded))
+            .set(&TxRecord::new(id, TxCommitStatus::Wounded))
             .await
             .unwrap();
         operations.lock().unwrap().clear();
@@ -813,13 +799,9 @@ mod tests {
     #[tokio::test]
     async fn list_transaction_ids_pages_one_transaction_prefix() {
         let t = new_tx_record_store();
-        let ids = [
-            TxId::from_bytes(vec![1, 2]),
-            TxId::from_bytes(vec![1, 3]),
-            TxId::from_bytes(vec![1, 4]),
-        ];
+        let ids = [tx_id(&[1, 2]), tx_id(&[1, 3]), tx_id(&[1, 4])];
         for id in &ids {
-            t.set(&TxRecord::new(id.clone(), TxCommitStatus::Aborted))
+            t.set(&TxRecord::new(*id, TxCommitStatus::Aborted))
                 .await
                 .unwrap();
         }
@@ -851,13 +833,13 @@ mod tests {
     async fn recursive_scans_page_only_the_selected_scope() {
         let t = new_tx_record_store();
         let ids = [
-            TxId::from_bytes(vec![1, 2]),
-            TxId::from_bytes(vec![1, 3]),
-            TxId::from_bytes(vec![2, 0]),
-            TxId::from_bytes(vec![80, 3]),
+            tx_id(&[1, 2]),
+            tx_id(&[1, 3]),
+            tx_id(&[2, 0]),
+            tx_id(&[80, 3]),
         ];
         for id in &ids {
-            t.set(&TxRecord::new(id.clone(), TxCommitStatus::Aborted))
+            t.set(&TxRecord::new(*id, TxCommitStatus::Aborted))
                 .await
                 .unwrap();
         }

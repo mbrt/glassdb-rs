@@ -332,16 +332,17 @@ impl Restructurer {
                     .await
             }
             CandidateCause::Underfull => {
-                let ObjectPath::Node { collection, token } = &candidate.path else {
+                let ObjectPath::Node {
+                    collection,
+                    id: source,
+                } = &candidate.path
+                else {
                     return Ok(());
                 };
-                if !self.merger.is_actionable(collection, token).await? {
+                if !self.merger.is_actionable(collection, source).await? {
                     return Ok(());
                 }
-                let change = PlannedChange::Merge {
-                    collection,
-                    source: token,
-                };
+                let change = PlannedChange::Merge { collection, source };
                 self.changes
                     .run(change, id, StructuralTopology::Owned)
                     .await

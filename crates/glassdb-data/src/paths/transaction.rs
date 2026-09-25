@@ -1,9 +1,9 @@
 use std::fmt;
 
 use crate::base64;
-use crate::txid::TxId;
+use crate::ids::TxId;
 
-use super::{DbPrefix, ObjectPath, PathError};
+use super::{DbPrefix, ObjectPath, PathError, parse_id};
 
 const TRANSACTION_MARKER: &str = "_t";
 
@@ -73,22 +73,14 @@ pub(super) fn scan_prefix(prefix: &str, depth: u8, index: usize) -> Result<Strin
 }
 
 fn decode_parts(source: &str, a: &str, b: &str, encoded: &str) -> Result<TxId, PathError> {
-    let symbols = prefix_symbols(encoded).as_bytes();
-    if a.len() != 1
-        || b.len() != 1
-        || encoded.is_empty()
-        || a.as_bytes() != &symbols[..1]
-        || b.as_bytes() != &symbols[1..]
-    {
+    let id = parse_id("transaction ID", encoded)?;
+    let symbols = prefix_symbols(encoded);
+    if a != &symbols[..1] || b != &symbols[1..] {
         return Err(PathError::Parse(source.to_string()));
     }
-    let bytes = base64::decode(encoded)?;
-    if base64::encode(&bytes) != encoded {
-        return Err(PathError::Parse(source.to_string()));
-    }
-    Ok(TxId::from_bytes(bytes))
+    Ok(id)
 }
 
 fn prefix_symbols(encoded: &str) -> &str {
-    encoded.get(..2).unwrap_or("00")
+    &encoded[..2]
 }

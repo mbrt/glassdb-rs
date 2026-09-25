@@ -3,9 +3,10 @@
 use glassdb_proto as pb;
 use prost::Message;
 
-use glassdb_data::{CollectionAddress, NodeToken, TxId};
+use glassdb_data::{CollectionAddress, DbPrefix, NodeId, TxId};
 
 use crate::error::StorageError;
+use crate::wire_id::{decode_id, decode_optional_id};
 
 /// Whether a structural intent has captured the source revision needed by
 /// recovery.
@@ -23,7 +24,7 @@ pub enum StructuralIntentPhase {
 pub enum StructuralChange {
     /// Moves the upper half of the source into newly created nodes.
     Split {
-        created_tokens: Vec<NodeToken>,
+        created_node_ids: Vec<NodeId>,
         split_key: Vec<u8>,
     },
     /// Moves the range and entries of the source into its right sibling
@@ -34,7 +35,7 @@ pub enum StructuralChange {
 /// The node that receives a merge, as recorded at the Ready transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeTarget {
-    pub token: NodeToken,
+    pub node_id: NodeId,
     /// The source's high key: the low bound of the target before the merge.
     pub boundary: Vec<u8>,
     /// The membership generation of the target at Ready. The absorb lands only
@@ -51,7 +52,7 @@ pub struct MergeTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuralIntent {
     pub collection: CollectionAddress,
-    pub source_token: Option<NodeToken>,
+    pub source_node_id: Option<NodeId>,
     pub source_revision: String,
     pub change: StructuralChange,
     pub participant_id: TxId,
@@ -61,7 +62,7 @@ pub struct StructuralIntent {
 impl StructuralIntent {
     /// Reports whether this intent splits the tree root.
     pub fn is_root(&self) -> bool {
-        self.source_token.is_none()
+        self.source_node_id.is_none()
     }
 
     /// Encodes this structural intent for storage under `_s`.
@@ -69,20 +70,23 @@ impl StructuralIntent {
         self.to_proto().encode_to_vec()
     }
 
-    /// Decodes a structural intent stored under `_s`.
-    pub fn decode(buf: &[u8]) -> Result<Self, StorageError> {
+    /// Decodes a structural intent stored under `_s` of `db_prefix`.
+    pub fn decode(db_prefix: &DbPrefix, buf: &[u8]) -> Result<Self, StorageError> {
         let raw = pb::StructuralIntent::decode(buf)
             .map_err(|e| StorageError::with_source("unmarshalling structural intent", e))?;
-        Self::from_proto(raw)
+        Self::from_proto(db_prefix, raw)
     }
 
     fn to_proto(&self) -> pb::StructuralIntent {
-        let (created_tokens, split_key, merge) = match &self.change {
+        let (created_node_ids, split_key, merge) = match &self.change {
             StructuralChange::Split {
-                created_tokens,
+                created_node_ids,
                 split_key,
             } => (
-                created_tokens.iter().map(ToString::to_string).collect(),
+                created_node_ids
+                    .iter()
+                    .map(|id| id.as_bytes().to_vec())
+                    .collect(),
                 split_key.clone(),
                 None,
             ),
@@ -90,9 +94,10 @@ impl StructuralIntent {
                 Vec::new(),
                 Vec::new(),
                 Some(pb::MergeIntent {
-                    target_token: target
+                    target_node_id: target
                         .as_ref()
-                        .map_or_else(String::new, |target| target.token.to_string()),
+                        .map(|target| target.node_id.as_bytes().to_vec())
+                        .unwrap_or_default(),
                     boundary: target
                         .as_ref()
                         .map(|target| target.boundary.clone())
@@ -102,13 +107,13 @@ impl StructuralIntent {
             ),
         };
         pb::StructuralIntent {
-            prefix: self.collection.physical_prefix(),
-            source_token: self
-                .source_token
-                .as_ref()
-                .map_or_else(String::new, ToString::to_string),
+            collection_id: self.collection.id().as_bytes().to_vec(),
+            source_node_id: self
+                .source_node_id
+                .map(|id| id.as_bytes().to_vec())
+                .unwrap_or_default(),
             source_revision: self.source_revision.clone(),
-            created_tokens,
+            created_node_ids,
             split_key,
             is_root: self.is_root(),
             participant_id: self.participant_id.as_bytes().to_vec(),
@@ -120,13 +125,11 @@ impl StructuralIntent {
         }
     }
 
-    fn from_proto(raw: pb::StructuralIntent) -> Result<Self, StorageError> {
-        let participant_id = TxId::from_bytes(raw.participant_id);
-        if participant_id.is_unset() {
-            return Err(StorageError::other(
-                "structural intent has no topology participant",
-            ));
-        }
+    fn from_proto(db_prefix: &DbPrefix, raw: pb::StructuralIntent) -> Result<Self, StorageError> {
+        let participant_id = decode_id(
+            &raw.participant_id,
+            "structural intent has an invalid topology participant",
+        )?;
         let phase = match pb::structural_intent::Phase::try_from(raw.phase) {
             Ok(pb::structural_intent::Phase::Preparing) => StructuralIntentPhase::Preparing,
             Ok(pb::structural_intent::Phase::Ready) => StructuralIntentPhase::Ready,
@@ -136,17 +139,16 @@ impl StructuralIntent {
                 ));
             }
         };
-        let collection = CollectionAddress::from_physical_prefix(&raw.prefix).map_err(|error| {
-            StorageError::with_source("parsing structural-intent collection", error)
-        })?;
-        let source_token = if raw.source_token.is_empty() {
-            None
-        } else {
-            Some(NodeToken::try_from(raw.source_token).map_err(|error| {
-                StorageError::with_source("parsing structural-intent source token", error)
-            })?)
-        };
-        if raw.is_root != source_token.is_none() {
+        let collection_id = decode_id(
+            &raw.collection_id,
+            "structural intent has an invalid collection ID",
+        )?;
+        let collection = CollectionAddress::from_db_prefix(db_prefix.clone(), collection_id);
+        let source_node_id = decode_optional_id(
+            &raw.source_node_id,
+            "structural intent has an invalid source node ID",
+        )?;
+        if raw.is_root != source_node_id.is_none() {
             return Err(StorageError::other(
                 "structural intent has inconsistent root metadata",
             ));
@@ -155,28 +157,21 @@ impl StructuralIntent {
             Some(merge) => Self::merge_from_proto(
                 merge,
                 phase,
-                source_token.is_none(),
-                raw.created_tokens.is_empty() && raw.split_key.is_empty(),
+                source_node_id.is_none(),
+                raw.created_node_ids.is_empty() && raw.split_key.is_empty(),
             )?,
             None => StructuralChange::Split {
-                created_tokens: raw
-                    .created_tokens
-                    .into_iter()
-                    .map(|token| {
-                        NodeToken::try_from(token).map_err(|error| {
-                            StorageError::with_source(
-                                "parsing structural-intent created token",
-                                error,
-                            )
-                        })
-                    })
+                created_node_ids: raw
+                    .created_node_ids
+                    .iter()
+                    .map(|id| decode_id(id, "structural intent has an invalid created node ID"))
                     .collect::<Result<Vec<_>, _>>()?,
                 split_key: raw.split_key,
             },
         };
         Ok(StructuralIntent {
             collection,
-            source_token,
+            source_node_id,
             source_revision: raw.source_revision,
             change,
             participant_id,
@@ -196,7 +191,7 @@ impl StructuralIntent {
             ));
         }
         let ready = phase == StructuralIntentPhase::Ready;
-        if raw.target_token.is_empty() == ready
+        if raw.target_node_id.is_empty() == ready
             || raw.boundary.is_empty() == ready
             || (!ready && raw.target_generation != 0)
         {
@@ -206,9 +201,10 @@ impl StructuralIntent {
         }
         let target = if ready {
             Some(MergeTarget {
-                token: NodeToken::try_from(raw.target_token).map_err(|error| {
-                    StorageError::with_source("parsing merge-intent target token", error)
-                })?,
+                node_id: decode_id(
+                    &raw.target_node_id,
+                    "structural intent has an invalid merge target node ID",
+                )?,
                 boundary: raw.boundary,
                 generation: raw.target_generation,
             })
@@ -221,102 +217,123 @@ impl StructuralIntent {
 
 #[cfg(test)]
 mod tests {
+    use glassdb_data::CollectionId;
+
     use super::*;
-    use glassdb_data::{CollectionId, DbPrefix};
+
+    fn tx_id(prefix: &[u8]) -> TxId {
+        TxId::with_priority(0, prefix)
+    }
+
+    fn db_prefix() -> DbPrefix {
+        DbPrefix::try_from("db").unwrap()
+    }
 
     fn collection() -> CollectionAddress {
-        CollectionAddress::from_db_prefix(DbPrefix::try_from("db").unwrap(), CollectionId::root())
+        CollectionAddress::from_db_prefix(db_prefix(), CollectionId::root())
+    }
+
+    fn node_id(byte: u8) -> NodeId {
+        NodeId::from_bytes([byte; 16])
+    }
+
+    fn decode(raw: &pb::StructuralIntent) -> Result<StructuralIntent, StorageError> {
+        StructuralIntent::decode(&db_prefix(), &raw.encode_to_vec())
+    }
+
+    fn round_trip(intent: &StructuralIntent) -> StructuralIntent {
+        StructuralIntent::decode(&db_prefix(), &intent.encode()).unwrap()
     }
 
     #[test]
     fn intent_round_trips() {
         let intent = StructuralIntent {
             collection: collection(),
-            source_token: Some(NodeToken::from_bytes([1; 16])),
+            source_node_id: Some(node_id(1)),
             source_revision: "v7".to_string(),
             change: StructuralChange::Split {
-                created_tokens: vec![NodeToken::from_bytes([2; 16])],
+                created_node_ids: vec![node_id(2)],
                 split_key: b"m".to_vec(),
             },
-            participant_id: TxId::from_bytes(b"participant".to_vec()),
+            participant_id: tx_id(b"participant"),
             phase: StructuralIntentPhase::Ready,
         };
-        assert_eq!(StructuralIntent::decode(&intent.encode()).unwrap(), intent);
+        assert_eq!(round_trip(&intent), intent);
     }
 
     #[test]
     fn root_intent_round_trips() {
         let intent = StructuralIntent {
             collection: collection(),
-            source_token: None,
+            source_node_id: None,
             source_revision: "v1".to_string(),
             change: StructuralChange::Split {
-                created_tokens: vec![
-                    NodeToken::from_bytes([1; 16]),
-                    NodeToken::from_bytes([2; 16]),
-                ],
+                created_node_ids: vec![node_id(1), node_id(2)],
                 split_key: Vec::new(),
             },
-            participant_id: TxId::from_bytes(b"participant".to_vec()),
+            participant_id: tx_id(b"participant"),
             phase: StructuralIntentPhase::Preparing,
         };
-        assert_eq!(StructuralIntent::decode(&intent.encode()).unwrap(), intent);
+        assert_eq!(round_trip(&intent), intent);
     }
 
     #[test]
     fn merge_intents_round_trip_in_both_phases() {
         let mut intent = StructuralIntent {
             collection: collection(),
-            source_token: Some(NodeToken::from_bytes([1; 16])),
+            source_node_id: Some(node_id(1)),
             source_revision: String::new(),
             change: StructuralChange::Merge { target: None },
-            participant_id: TxId::from_bytes(b"participant".to_vec()),
+            participant_id: tx_id(b"participant"),
             phase: StructuralIntentPhase::Preparing,
         };
-        assert_eq!(StructuralIntent::decode(&intent.encode()).unwrap(), intent);
+        assert_eq!(round_trip(&intent), intent);
 
         intent.source_revision = "v3".to_string();
         intent.change = StructuralChange::Merge {
             target: Some(MergeTarget {
-                token: NodeToken::from_bytes([2; 16]),
+                node_id: node_id(2),
                 boundary: b"m".to_vec(),
                 generation: 4,
             }),
         };
         intent.phase = StructuralIntentPhase::Ready;
-        assert_eq!(StructuralIntent::decode(&intent.encode()).unwrap(), intent);
+        assert_eq!(round_trip(&intent), intent);
     }
 
     #[test]
     fn decode_rejects_inconsistent_merge_intents() {
         let valid = pb::StructuralIntent {
-            prefix: collection().physical_prefix(),
-            source_token: NodeToken::from_bytes([1; 16]).to_string(),
-            participant_id: b"participant".to_vec(),
+            collection_id: vec![0; 16],
+            source_node_id: vec![1; 16],
+            participant_id: vec![3; 16],
             phase: pb::structural_intent::Phase::Ready.into(),
             merge: Some(pb::MergeIntent {
-                target_token: NodeToken::from_bytes([2; 16]).to_string(),
+                target_node_id: vec![2; 16],
                 boundary: b"m".to_vec(),
                 target_generation: 4,
             }),
             ..pb::StructuralIntent::default()
         };
-        assert!(StructuralIntent::decode(&valid.encode_to_vec()).is_ok());
+        assert!(decode(&valid).is_ok());
 
         type IntentEdit = fn(&mut pb::StructuralIntent);
-        let cases: [(&str, IntentEdit); 6] = [
+        let cases: [(&str, IntentEdit); 7] = [
             ("root source", |raw| {
-                raw.source_token.clear();
+                raw.source_node_id.clear();
                 raw.is_root = true;
             }),
-            ("created token", |raw| {
-                raw.created_tokens = vec![NodeToken::from_bytes([3; 16]).to_string()];
+            ("created node", |raw| {
+                raw.created_node_ids = vec![vec![3; 16]];
             }),
             ("Ready without target", |raw| {
                 raw.merge = Some(pb::MergeIntent::default());
             }),
             ("Ready without boundary", |raw| {
                 raw.merge.as_mut().unwrap().boundary.clear();
+            }),
+            ("Ready with a malformed target", |raw| {
+                raw.merge.as_mut().unwrap().target_node_id = vec![2; 15];
             }),
             ("Preparing with target", |raw| {
                 raw.phase = pb::structural_intent::Phase::Preparing.into();
@@ -332,68 +349,115 @@ mod tests {
         for (name, edit) in cases {
             let mut raw = valid.clone();
             edit(&mut raw);
-            assert!(
-                StructuralIntent::decode(&raw.encode_to_vec()).is_err(),
-                "{name}"
-            );
+            assert!(decode(&raw).is_err(), "{name}");
         }
+    }
+
+    #[test]
+    fn decode_rejects_ids_that_are_not_16_bytes() {
+        let valid = pb::StructuralIntent {
+            collection_id: vec![0; 16],
+            source_node_id: vec![1; 16],
+            created_node_ids: vec![vec![2; 16]],
+            split_key: b"m".to_vec(),
+            participant_id: vec![3; 16],
+            ..pb::StructuralIntent::default()
+        };
+        assert!(decode(&valid).is_ok());
+
+        // IDs of the older string format have 22 bytes.
+        for id in [vec![1; 15], vec![1; 17], b"0000000000000000000000".to_vec()] {
+            let mut collection = valid.clone();
+            collection.collection_id = id.clone();
+            let mut source = valid.clone();
+            source.source_node_id = id.clone();
+            let mut created = valid.clone();
+            created.created_node_ids = vec![id.clone()];
+            let mut participant = valid.clone();
+            participant.participant_id = id;
+            for raw in [collection, source, created, participant] {
+                assert!(decode(&raw).is_err(), "{raw:?}");
+            }
+        }
+
+        // An empty source ID names the tree root, but no other ID can be empty.
+        let mut collection = valid.clone();
+        collection.collection_id.clear();
+        let mut created = valid.clone();
+        created.created_node_ids = vec![Vec::new()];
+        let mut participant = valid;
+        participant.participant_id.clear();
+        for raw in [collection, created, participant] {
+            assert!(decode(&raw).is_err(), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn golden_split_intent_encoding() {
+        let intent = StructuralIntent {
+            collection: collection(),
+            source_node_id: Some(NodeId::from_bytes([1; 16])),
+            source_revision: "v7".to_string(),
+            change: StructuralChange::Split {
+                created_node_ids: vec![NodeId::from_bytes([2; 16])],
+                split_key: b"m".to_vec(),
+            },
+            participant_id: TxId::from_bytes([3; 16]),
+            phase: StructuralIntentPhase::Ready,
+        };
+        let bytes = [
+            b"\x0a\x10".as_slice(),
+            &[0; 16],
+            b"\x12\x10",
+            &[1; 16],
+            b"\x1a\x02v7\x22\x10",
+            &[2; 16],
+            b"\x2a\x01m\x3a\x10",
+            &[3; 16],
+            b"\x40\x01",
+        ]
+        .concat();
+
+        assert_eq!(intent.encode(), bytes);
+        assert_eq!(
+            StructuralIntent::decode(&db_prefix(), &bytes).unwrap(),
+            intent
+        );
     }
 
     #[test]
     fn golden_merge_intent_encoding() {
         let intent = StructuralIntent {
             collection: collection(),
-            source_token: Some(NodeToken::from_bytes([0; 16])),
+            source_node_id: Some(NodeId::from_bytes([1; 16])),
             source_revision: "v1".to_string(),
             change: StructuralChange::Merge {
                 target: Some(MergeTarget {
-                    token: NodeToken::from_bytes([0; 16]),
+                    node_id: NodeId::from_bytes([2; 16]),
                     boundary: b"m".to_vec(),
                     generation: 5,
                 }),
             },
-            participant_id: TxId::from_bytes(b"participant".to_vec()),
+            participant_id: TxId::from_bytes([3; 16]),
             phase: StructuralIntentPhase::Ready,
         };
         let bytes = [
-            b"\x0a\x1c".as_slice(),
-            b"db/_c/0000000000000000000000",
-            b"\x12\x16",
-            b"0000000000000000000000",
-            b"\x1a\x02v1\x3a\x0bparticipant\x40\x01\x4a\x1d\x0a\x16",
-            b"0000000000000000000000",
+            b"\x0a\x10".as_slice(),
+            &[0; 16],
+            b"\x12\x10",
+            &[1; 16],
+            b"\x1a\x02v1\x3a\x10",
+            &[3; 16],
+            b"\x40\x01\x4a\x17\x0a\x10",
+            &[2; 16],
             b"\x12\x01m\x18\x05",
         ]
         .concat();
 
         assert_eq!(intent.encode(), bytes);
-        assert_eq!(StructuralIntent::decode(&bytes).unwrap(), intent);
-    }
-
-    #[test]
-    fn pre_rename_structural_intent_bytes_remain_compatible() {
-        // The vocabulary change must not change the persisted protobuf wire format.
-        let intent = StructuralIntent {
-            collection: collection(),
-            source_token: None,
-            source_revision: "v1".to_string(),
-            change: StructuralChange::Split {
-                created_tokens: vec![NodeToken::from_bytes([0; 16])],
-                split_key: Vec::new(),
-            },
-            participant_id: TxId::from_bytes(b"participant".to_vec()),
-            phase: StructuralIntentPhase::Preparing,
-        };
-        let bytes = [
-            b"\x0a\x1c".as_slice(),
-            b"db/_c/0000000000000000000000",
-            b"\x1a\x02v1\x22\x16",
-            b"0000000000000000000000",
-            b"\x30\x01\x3a\x0bparticipant",
-        ]
-        .concat();
-
-        assert_eq!(intent.encode(), bytes);
-        assert_eq!(StructuralIntent::decode(&bytes).unwrap(), intent);
+        assert_eq!(
+            StructuralIntent::decode(&db_prefix(), &bytes).unwrap(),
+            intent
+        );
     }
 }

@@ -3,8 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glassdb_data::{
-    CollectionAddress, CollectionId, LeafRef, LogicalKey, MAX_COLLECTION_NAME_BYTES, NodeToken,
-    ObjectPath, TxId,
+    CollectionAddress, ID_BYTES, LeafRef, LogicalKey, MAX_COLLECTION_NAME_BYTES, ObjectPath, TxId,
 };
 use glassdb_proto as pb;
 use prost::Message;
@@ -13,6 +12,7 @@ use super::{TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxRecord
 use crate::cached_store::Codec;
 use crate::error::StorageError;
 use crate::lock::{LockType, lock_type_from_proto as parse_lock_type, lock_type_to_proto};
+use crate::wire_id::decode_id;
 
 /// Canonical protobuf codec for transaction-record objects.
 pub(crate) struct TxRecordCodec;
@@ -30,9 +30,6 @@ impl TxRecordCodec {
         let timestamp = record
             .timestamp
             .ok_or_else(|| StorageError::other("transaction record has no persisted timestamp"))?;
-        if record.id.is_unset() {
-            return Err(StorageError::other("empty transaction identity"));
-        }
         validate_database_membership(record, expected_db_prefix)?;
 
         let mut collection_writes: BTreeMap<CollectionAddress, pb::CollectionWrites> =
@@ -87,7 +84,7 @@ impl TxRecordCodec {
             decode_prepared_collections(db_prefix, &encoded.prepared_collection_ids)?;
 
         Ok(TxRecord {
-            id: id.clone(),
+            id: *id,
             timestamp: encoded.timestamp.map(proto_ts_to_system),
             status,
             writes,
@@ -133,18 +130,14 @@ impl Codec for TxRecordCodec {
         record
             .writes
             .iter()
-            .map(|write| {
-                write.key.key().len() + write.value.len() + write.prev_writer.as_bytes().len()
-            })
+            .map(|write| write.key.key().len() + write.value.len())
             .sum::<usize>()
             + record
                 .locks
                 .iter()
                 .map(|lock| match lock {
                     TxLock::Key { key, .. } => key.key().len(),
-                    TxLock::Membership { leaf, .. } => {
-                        leaf.node_token().map_or(0, |token| token.as_str().len())
-                    }
+                    TxLock::Membership { leaf, .. } => leaf.node_id().map_or(0, |_| ID_BYTES),
                     TxLock::Directory { .. } | TxLock::TopologyParticipant { .. } => 0,
                 })
                 .sum::<usize>()
@@ -232,7 +225,6 @@ fn decode_writes(collection: &CollectionAddress, encoded: &[pb::Write]) -> Vec<T
             key: LogicalKey::new(collection.clone(), &write.key),
             value: write_value(write),
             deleted: write_deleted(write),
-            prev_writer: TxId::from_bytes(write.prev_tid.clone()),
         })
         .collect()
 }
@@ -256,11 +248,12 @@ fn decode_membership_locks(
         .map(|lock| {
             let leaf = match lock.target.as_ref() {
                 Some(pb::membership_lock::Target::Root(true)) => LeafRef::root(collection.clone()),
-                Some(pb::membership_lock::Target::Node(token)) if !token.is_empty() => {
-                    let token = NodeToken::try_from(token.as_str()).map_err(|error| {
-                        StorageError::with_source("parsing membership-lock node token", error)
-                    })?;
-                    LeafRef::node(collection.clone(), token)
+                Some(pb::membership_lock::Target::Node(id)) => {
+                    let id = decode_id(
+                        id,
+                        "transaction record has an invalid membership-lock node ID",
+                    )?;
+                    LeafRef::node(collection.clone(), id)
                 }
                 _ => {
                     return Err(StorageError::other(
@@ -354,7 +347,6 @@ fn append_write(
     };
     let encoded = pb::Write {
         key: write.key.key().to_vec(),
-        prev_tid: write.prev_writer.as_bytes().to_vec(),
         val_delete: Some(val_delete),
     };
     let collection = write.key.collection();
@@ -394,8 +386,8 @@ fn append_lock(
             lock_type: lock_type_to_proto(*typ) as i32,
         }),
         TxLock::Membership { leaf, typ } => {
-            let target = match leaf.node_token() {
-                Some(token) => pb::membership_lock::Target::Node(token.to_string()),
+            let target = match leaf.node_id() {
+                Some(id) => pb::membership_lock::Target::Node(id.as_bytes().to_vec()),
                 None => pb::membership_lock::Target::Root(true),
             };
             locks.membership_locks.push(pb::MembershipLock {
@@ -416,8 +408,10 @@ fn decode_collection_id(
     db_prefix: &str,
     collection_id: &[u8],
 ) -> Result<CollectionAddress, StorageError> {
-    let id = CollectionId::from_slice(collection_id)
-        .ok_or_else(|| StorageError::other("transaction record has an invalid collection ID"))?;
+    let id = decode_id(
+        collection_id,
+        "transaction record has an invalid collection ID",
+    )?;
     Ok(CollectionAddress::new(db_prefix, id))
 }
 
@@ -491,14 +485,20 @@ fn proto_ts_to_system(timestamp: prost_types::Timestamp) -> SystemTime {
 
 #[cfg(test)]
 mod tests {
+    use glassdb_data::{CollectionId, NodeId};
+
     use super::*;
 
+    fn tx_id(prefix: &[u8]) -> TxId {
+        TxId::with_priority(0, prefix)
+    }
+
     fn collection(db_prefix: &str, byte: u8) -> CollectionAddress {
-        CollectionAddress::new(db_prefix, CollectionId::from_slice(&[byte; 16]).unwrap())
+        CollectionAddress::new(db_prefix, CollectionId::from_bytes([byte; 16]))
     }
 
     fn record_with_status(status: TxCommitStatus) -> TxRecord {
-        let mut record = TxRecord::new(TxId::from_bytes(vec![1, 2, 3, 4]), status);
+        let mut record = TxRecord::new(tx_id(&[1, 2, 3, 4]), status);
         record.timestamp = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
         record
     }
@@ -508,7 +508,7 @@ mod tests {
         let created = collection(db_prefix, 2);
         let dropped = collection(db_prefix, 3);
         TxRecord {
-            id: TxId::from_bytes(vec![1, 2, 3, 4]),
+            id: tx_id(&[1, 2, 3, 4]),
             timestamp: Some(UNIX_EPOCH + Duration::from_secs(42)),
             status: TxCommitStatus::Pending,
             writes: vec![
@@ -516,13 +516,11 @@ mod tests {
                     key: LogicalKey::new(parent.clone(), b"value"),
                     value: Arc::from(&b"contents"[..]),
                     deleted: false,
-                    prev_writer: TxId::from_bytes(vec![9]),
                 },
                 TxWrite {
                     key: LogicalKey::new(parent.clone(), b"deleted"),
                     value: Arc::from(&[][..]),
                     deleted: true,
-                    prev_writer: TxId::from_bytes(vec![8]),
                 },
             ],
             locks: vec![
@@ -535,7 +533,7 @@ mod tests {
                     typ: LockType::Read,
                 },
                 TxLock::Membership {
-                    leaf: LeafRef::node(parent.clone(), NodeToken::from_bytes([7; 16])),
+                    leaf: LeafRef::node(parent.clone(), NodeId::from_bytes([7; 16])),
                     typ: LockType::Create,
                 },
                 TxLock::Directory {
@@ -589,7 +587,7 @@ mod tests {
     fn assert_rejected(encoded: pb::TransactionRecord) {
         let bytes = encoded.encode_to_vec();
         assert!(
-            TxRecordCodec::decode("db", &TxId::from_bytes(vec![1]), &bytes).is_err(),
+            TxRecordCodec::decode("db", &tx_id(&[1]), &bytes).is_err(),
             "malformed transaction record unexpectedly decoded"
         );
     }
@@ -619,7 +617,7 @@ mod tests {
             encoded.status = status;
             let bytes = encoded.encode_to_vec();
             assert!(TxRecordCodec::decode_status(&bytes).is_err());
-            assert!(TxRecordCodec::decode("db", &TxId::from_bytes(vec![1]), &bytes).is_err());
+            assert!(TxRecordCodec::decode("db", &tx_id(&[1]), &bytes).is_err());
         }
     }
 
@@ -677,13 +675,11 @@ mod tests {
                 key: LogicalKey::new(collection("first", 1), b"a"),
                 value: Arc::from(&b"a"[..]),
                 deleted: false,
-                prev_writer: TxId::default(),
             },
             TxWrite {
                 key: LogicalKey::new(collection("second", 1), b"b"),
                 value: Arc::from(&b"b"[..]),
                 deleted: false,
-                prev_writer: TxId::default(),
             },
         ];
 
@@ -693,7 +689,7 @@ mod tests {
     #[test]
     fn malformed_protobuf_and_status_are_rejected() {
         assert!(TxRecordCodec::decode_status(&[0xff]).is_err());
-        assert!(TxRecordCodec::decode("db", &TxId::from_bytes(vec![1]), &[0xff]).is_err());
+        assert!(TxRecordCodec::decode("db", &tx_id(&[1]), &[0xff]).is_err());
 
         let mut encoded = encoded_record();
         encoded.status = pb::transaction_record::Status::Default as i32;
@@ -714,7 +710,7 @@ mod tests {
             TxRecordCodec::decode_status(&bytes).unwrap(),
             TxCommitStatus::Committed
         );
-        assert!(TxRecordCodec::decode("db", &TxId::from_bytes(vec![1]), &bytes).is_err());
+        assert!(TxRecordCodec::decode("db", &tx_id(&[1]), &bytes).is_err());
     }
 
     #[test]
@@ -749,7 +745,11 @@ mod tests {
         for target in [
             None,
             Some(pb::membership_lock::Target::Root(false)),
-            Some(pb::membership_lock::Target::Node(String::new())),
+            Some(pb::membership_lock::Target::Node(Vec::new())),
+            Some(pb::membership_lock::Target::Node(vec![7; 15])),
+            Some(pb::membership_lock::Target::Node(
+                b"0000000000000000000000".to_vec(),
+            )),
         ] {
             let mut encoded = encoded_record();
             encoded.writes.push(pb::CollectionWrites {

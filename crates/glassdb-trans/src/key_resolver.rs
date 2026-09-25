@@ -510,7 +510,7 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::{CollectionId, DbPrefix, NodeToken, ObjectPath};
+    use glassdb_data::{CollectionId, DbPrefix, NodeId, ObjectPath};
     use glassdb_storage::transaction::{TxCommitStatus, TxRecordStore};
     use glassdb_storage::{
         CachedStore, CurrentState, IndexNode, LeafBody, LeafEntry, Node, NodeStore, Timeline,
@@ -536,7 +536,7 @@ mod tests {
     }
 
     fn missing_collection() -> CollectionAddress {
-        CollectionAddress::new(DB, CollectionId::from_slice(&[1; 16]).unwrap())
+        CollectionAddress::new(DB, CollectionId::from_bytes([1; 16]))
     }
 
     // A resolver over `backend` with its own fresh cache, so it starts cold,
@@ -629,13 +629,9 @@ mod tests {
             .map(|e| (e.key.clone(), e))
             .collect();
         let current = if deleted {
-            CurrentState::Tombstone {
-                writer: writer.clone(),
-            }
+            CurrentState::Tombstone { writer: *writer }
         } else {
-            CurrentState::External {
-                writer: writer.clone(),
-            }
+            CurrentState::External { writer: *writer }
         };
         entries.insert(key.to_vec(), LeafEntry::new(key).with_current(current));
         let new_leaf = LeafBody::from_entries(entries.into_values());
@@ -651,7 +647,7 @@ mod tests {
             store,
             key,
             LeafEntry::new(key).with_current(CurrentState::Inline {
-                writer: writer.clone(),
+                writer: *writer,
                 value: Arc::from(value),
             }),
         )
@@ -669,7 +665,7 @@ mod tests {
             .await
             .unwrap();
         let mut entry = existing.entries().lookup(key).cloned().unwrap();
-        entry.replace_write_lock(holder.clone());
+        entry.replace_write_lock(*holder);
         seed_entry(store, key, entry).await;
     }
 
@@ -701,12 +697,11 @@ mod tests {
     async fn commit_value(mon: &Monitor, key: &[u8], writer: &TxId, deleted: bool) {
         use glassdb_storage::transaction::{TxRecord, TxWrite};
         mon.begin_tx(writer);
-        let mut record = TxRecord::new(writer.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(*writer, TxCommitStatus::Committed);
         record.writes = vec![TxWrite {
             key: logical_key(key),
             value: Arc::from(b"v".as_slice()),
             deleted,
-            prev_writer: TxId::default(),
         }];
         mon.commit_tx(record).await.unwrap();
     }
@@ -731,7 +726,7 @@ mod tests {
             .map(|e| (e.key.clone(), e))
             .collect();
         let mut entry = LeafEntry::new(key);
-        entry.replace_write_lock(holder.clone());
+        entry.replace_write_lock(*holder);
         entries.insert(key.to_vec(), entry);
         let new_leaf = LeafBody::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
@@ -852,7 +847,7 @@ mod tests {
             .effective_point_states(std::slice::from_ref(&key), None, requirement)
             .await
             .unwrap();
-        assert_eq!(foreign[0].writer, Some(holder.clone()));
+        assert_eq!(foreign[0].writer, Some(holder));
 
         let own = resolver
             .effective_point_states(std::slice::from_ref(&key), Some(&holder), requirement)
@@ -892,7 +887,7 @@ mod tests {
             .resolve_key(&key_path, Requirement::ANY)
             .await
             .unwrap();
-        assert_eq!(resolved.writer, Some(writer.clone()), "still resolves");
+        assert_eq!(resolved.writer, Some(writer), "still resolves");
         assert_eq!(
             count_leaf_reads(&log),
             0,
@@ -1008,12 +1003,12 @@ mod tests {
         let writer = TxId::with_priority(1, b"inline");
         let inline = |key: &[u8]| {
             LeafEntry::new(key).with_current(CurrentState::Inline {
-                writer: writer.clone(),
+                writer,
                 value: Arc::from(b"v".as_slice()),
             })
         };
-        let source = NodeToken::from_bytes([1; 16]);
-        let target = NodeToken::from_bytes([2; 16]);
+        let source = NodeId::from_bytes([1; 16]);
+        let target = NodeId::from_bytes([2; 16]);
         let nodes = NodeStore::new(
             CachedStore::new(backend.clone(), 1 << 20, Timeline::new(), None),
             std::num::NonZeroUsize::MIN,
@@ -1023,16 +1018,16 @@ mod tests {
                 &source,
                 Node::leaf(LeafBody::from_entries([inline(b"grape")]))
                     .with_high_key(Some(b"m".to_vec()))
-                    .with_right_sibling(Some(target.to_string())),
+                    .with_right_sibling(Some(target)),
             ),
             (
                 &target,
                 Node::leaf(LeafBody::from_entries([inline(b"grape"), inline(b"pear")])),
             ),
         ];
-        for (token, node) in merging {
+        for (node_id, node) in merging {
             nodes
-                .store_node(&collection(), token, &node, None)
+                .store_node(&collection(), node_id, &node, None)
                 .await
                 .unwrap();
         }
@@ -1040,8 +1035,8 @@ mod tests {
             .create_root(
                 &collection(),
                 &Node::index(IndexNode::from_children([
-                    (Vec::new(), source.to_string()),
-                    (b"m".to_vec(), target.to_string()),
+                    (Vec::new(), source),
+                    (b"m".to_vec(), target),
                 ])),
             )
             .await

@@ -38,13 +38,13 @@ fn as_l0(node: Node) -> Node {
 // Makes `node` the left neighbor of `right`, which starts at `high`.
 fn as_l0_of(node: Node, high: &[u8], right: &str) -> Node {
     node.with_high_key(Some(high.to_vec()))
-        .with_right_sibling(Some(test_token(right).to_string()))
+        .with_right_sibling(Some(test_node_id(right)))
 }
 
-async fn current_node(s: &TestStore, token: &str) -> Node {
+async fn current_node(s: &TestStore, name: &str) -> Node {
     s.load_node(
         COLL,
-        token,
+        name,
         Requirement::after(s.timeline.currentness_barrier()),
     )
     .await
@@ -86,7 +86,7 @@ async fn assert_not_merged(s: &TestStore, left: &[&[u8]], right: &[&[u8]]) {
 async fn assert_merged(s: &TestStore) {
     let left = current_node(s, "L0").await;
     assert!(left.is_drained());
-    assert_eq!(left.right_sibling(), Some(test_token("L1").as_str()));
+    assert_eq!(left.right_sibling(), Some(test_node_id("L1")));
     let right = current_node(s, "L1").await;
     assert_eq!(right.low_key(), b"");
     assert_eq!(keys(&right), [b"a", b"b", b"m", b"n"]);
@@ -158,9 +158,9 @@ async fn merge_compacts_the_cold_tombstones_of_its_target() {
     let right = LeafBody::from_entries([
         live(b"m"),
         live(b"n"),
-        tombstone(b"o", deleted[0].clone()),
-        tombstone(b"p", deleted[1].clone()),
-        tombstone(b"q", deleted[2].clone()),
+        tombstone(b"o", deleted[0]),
+        tombstone(b"p", deleted[1]),
+        tombstone(b"q", deleted[2]),
     ]);
     seed_leaves(&s, leaf_node(&[b"a", b"b"], None, None), Node::leaf(right)).await;
     let bg = Arc::new(Background::new());
@@ -239,7 +239,7 @@ async fn merge_stays_among_the_children_of_one_parent() {
         "P0",
         &Node::index(test_index(&[(b"", "L0")]))
             .with_high_key(Some(b"m".to_vec()))
-            .with_right_sibling(Some(test_token("P1").to_string())),
+            .with_right_sibling(Some(test_node_id("P1"))),
         None,
     )
     .await
@@ -291,8 +291,8 @@ async fn merges_cascade_through_underfull_parents() {
             Node::index(test_index(&[(b"m", "L1")])).with_low_key(b"m".to_vec()),
         ),
     ];
-    for (token, node) in &nodes {
-        assert!(s.store_node(COLL, token, node, None).await.unwrap());
+    for (name, node) in &nodes {
+        assert!(s.store_node(COLL, name, node, None).await.unwrap());
     }
     s.create_root(COLL, &Node::index(test_index(&[(b"", "P0"), (b"m", "P1")])))
         .await
@@ -315,7 +315,7 @@ async fn merges_cascade_through_underfull_parents() {
 
     let parent = current_node(&s, "P0").await;
     assert!(parent.is_drained());
-    assert_eq!(parent.right_sibling(), Some(test_token("P1").as_str()));
+    assert_eq!(parent.right_sibling(), Some(test_node_id("P1")));
     let (root, _) = s
         .load_root(COLL, Requirement::after(s.timeline.currentness_barrier()))
         .await
@@ -458,13 +458,12 @@ async fn polite_gate_leaves_a_late_holder_pending() {
     let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
     hook.set_before({
         let peer = peer.clone();
-        let younger = younger.clone();
         move |op| {
             let lock = matches!(op, BackendOp::WriteIfNotExists { .. })
                 && op.path().starts_with(&prefix)
                 && armed.swap(false, Ordering::SeqCst);
             let peer = peer.clone();
-            let younger = younger.clone();
+            let younger = younger;
             Box::pin(async move {
                 if lock {
                     let (_, observation) = peer
@@ -546,7 +545,7 @@ async fn a_merge_that_loses_its_drain_abandons_the_absorb() {
                             .unwrap();
                         match loss {
                             DrainLoss::GateRevoked => {
-                                let worker = left.structural_gate().holders()[0].clone();
+                                let worker = left.structural_gate().holders()[0];
                                 assert!(left.remove_structural_gate(&worker));
                             }
                             DrainLoss::SourceChangedUnderGate => {
@@ -647,7 +646,7 @@ async fn seed_interrupted_merge(s: &TestStore, sp: &Restructurer, crash: MergeCr
     let fresh = || Requirement::after(s.timeline.currentness_barrier());
     let worker = TxId::with_priority(1, b"merge-worker");
     let (mut left, observed) = s.load_node(COLL, "L0", fresh()).await.unwrap();
-    left.set_structural_gate(worker.clone());
+    left.set_structural_gate(worker);
     assert!(
         s.store_node(COLL, "L0", &left, Some(&observed))
             .await
@@ -656,21 +655,21 @@ async fn seed_interrupted_merge(s: &TestStore, sp: &Restructurer, crash: MergeCr
     let (left, gated) = s.load_node(COLL, "L0", fresh()).await.unwrap();
     let (mut right, observed) = s.load_node(COLL, "L1", fresh()).await.unwrap();
     let generation = right.membership_generation();
-    let intent_id = StructuralIntentId::from(test_token("M"));
+    let intent_id = test_intent_id("M");
     s.write_structural_intent(
         "M",
         &StructuralIntent {
             collection: collection(),
-            source_token: Some(test_token("L0")),
+            source_node_id: Some(test_node_id("L0")),
             source_revision: gated.revision().unwrap().serialize().to_string(),
             change: StructuralChange::Merge {
                 target: Some(MergeTarget {
-                    token: test_token("L1"),
+                    node_id: test_node_id("L1"),
                     boundary: b"m".to_vec(),
                     generation,
                 }),
             },
-            participant_id: worker.clone(),
+            participant_id: worker,
             phase: StructuralIntentPhase::Ready,
         },
     )
@@ -685,7 +684,7 @@ async fn seed_interrupted_merge(s: &TestStore, sp: &Restructurer, crash: MergeCr
         return generation;
     }
 
-    right.absorb(&left, intent_id.clone()).unwrap();
+    right.absorb(&left, intent_id).unwrap();
     assert!(
         s.store_node(COLL, "L1", &right, Some(&observed))
             .await
@@ -696,7 +695,7 @@ async fn seed_interrupted_merge(s: &TestStore, sp: &Restructurer, crash: MergeCr
     }
 
     let mut drained = left;
-    drained.drain(test_token("L1").as_str());
+    drained.drain(test_node_id("L1"));
     assert!(
         s.store_node(COLL, "L0", &drained, Some(&gated))
             .await
@@ -806,7 +805,7 @@ async fn recovery_fences_a_late_absorb() {
     entered.notified().await;
 
     let left = current_node(&peer, "L0").await;
-    let worker = left.structural_gate().holders()[0].clone();
+    let worker = left.structural_gate().holders()[0];
     assert_eq!(
         recovering.mon.preempt_tx(&worker).await.unwrap(),
         TxFinalStatus::Aborted

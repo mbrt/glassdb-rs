@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn collection_absence_distinguishes_the_root_collection_from_child_collections() {
         let root = CollectionAddress::root("db");
-        let child = CollectionAddress::new("db", CollectionId::from_slice(&[1; 16]).unwrap());
+        let child = CollectionAddress::new("db", CollectionId::from_bytes([1; 16]));
 
         assert!(matches!(
             StorageError::NotFound.classify_collection_absence(&root),

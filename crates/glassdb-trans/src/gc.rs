@@ -154,7 +154,7 @@ impl Candidates {
                 self.scans.count += 1;
                 match candidate.state {
                     CandidateState::Ready => {
-                        self.hints.ready.remove(&(candidate.due, tid.clone()));
+                        self.hints.ready.remove(&(candidate.due, tid));
                         self.scans.ready.insert((candidate.due, tid));
                     }
                     CandidateState::Running => {
@@ -186,10 +186,10 @@ impl Candidates {
         };
         let due = now + delay;
         let state = if delay.is_zero() {
-            self.queue_mut(from_scan).ready.insert((due, tid.clone()));
+            self.queue_mut(from_scan).ready.insert((due, tid));
             CandidateState::Ready
         } else {
-            self.deferred.insert((due, tid.clone()));
+            self.deferred.insert((due, tid));
             CandidateState::Deferred
         };
         self.entries.insert(
@@ -244,7 +244,7 @@ impl Candidates {
         candidate.reported_again = false;
         candidate.due = due;
         self.queue_mut(candidate.from_scan).count += 1;
-        self.deferred.insert((due, tid.clone()));
+        self.deferred.insert((due, tid));
         self.entries.insert(tid, candidate);
     }
 

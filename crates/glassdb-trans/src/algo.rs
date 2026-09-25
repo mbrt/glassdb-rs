@@ -98,7 +98,7 @@ impl IdentityRetirement {
         };
         let mon = self.mon.clone();
         let gc_hints = self.gc_hints.clone();
-        let tx_id = tx_id.clone();
+        let tx_id = *tx_id;
         bg.spawn_waited(async move {
             if mon.abort_owned_tx(&tx_id).await.is_ok() {
                 gc_hints.schedule(tx_id);
@@ -214,7 +214,7 @@ impl Handle {
         let id = self.id.renew();
         self.collections.renew();
         self.state.renew();
-        self.id = id.clone();
+        self.id = id;
         self.retirement.arm(id);
     }
 }
@@ -404,7 +404,7 @@ impl Algo {
                 self.collection_reservation_limit,
             ),
             state: HandleState::new(),
-            retirement: IdentityRetirementGuard::new(self.retirement.clone(), id.clone()),
+            retirement: IdentityRetirementGuard::new(self.retirement.clone(), id),
             id,
             backoff: self.acquisition_retry.backoff(),
         }
@@ -567,7 +567,7 @@ impl Algo {
         }
         match self.mon.abort_owned_tx(&tx.id).await? {
             OwnerAbortOutcome::Acknowledged => {
-                self.gc_hints.schedule(tx.id.clone());
+                self.gc_hints.schedule(tx.id);
                 self.collection_commit.abort(&tx.id, &tx.collections).await
             }
             // A dropped or otherwise unresolved owner operation was pinned as
@@ -575,7 +575,7 @@ impl Algo {
             // cleanup; local rollback must not race an effect that may land
             // after this future returns.
             OwnerAbortOutcome::Pinned => {
-                self.gc_hints.schedule(tx.id.clone());
+                self.gc_hints.schedule(tx.id);
                 Ok(())
             }
             // The commit point won before cleanup observed its result. Its
@@ -608,7 +608,7 @@ impl Algo {
     }
 
     async fn renew_after_wound(&self, tx: &mut Handle) {
-        let retired_id = tx.id.clone();
+        let retired_id = tx.id;
         if let Err(error) = self.end(tx).await {
             tracing::debug!(
                 transaction = %retired_id,
@@ -914,7 +914,7 @@ impl Algo {
             Some(bg) => {
                 let locker = self.locker.clone();
                 let gc_hints = self.gc_hints.clone();
-                let id = id.clone();
+                let id = *id;
                 // Cancelling a dedup driver may need to spawn a successor for
                 // merged callers, so shutdown drains this finite pass.
                 bg.spawn_waited(async move {
@@ -1232,7 +1232,7 @@ impl Algo {
         locks: Vec<TxLock>,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(*id, TxCommitStatus::Committed);
         for w in accesses.final_writes() {
             let (value, deleted): (Arc<[u8]>, bool) = match w.operation() {
                 WriteOp::Put(value) => (value.clone(), false),
@@ -1242,7 +1242,6 @@ impl Algo {
                 key: w.key().clone(),
                 value,
                 deleted,
-                prev_writer: TxId::default(),
             });
         }
         collections.committed_manifest(locks).apply_to(&mut record);
@@ -1273,7 +1272,7 @@ mod tests {
     use glassdb_backend::{Backend, StatsBackend, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
     use glassdb_data::{
-        CollectionAddress, CollectionId, DatabaseId, DbPrefix, LeafRef, NodeToken, ObjectPath,
+        CollectionAddress, CollectionId, DatabaseId, DbPrefix, LeafRef, NodeId, ObjectPath,
     };
     use glassdb_storage::transaction::{TxCommitStatus, TxRecordStore};
     use glassdb_storage::{
@@ -1290,6 +1289,10 @@ mod tests {
 
     fn test_db_prefix() -> DbPrefix {
         DbPrefix::try_from(TEST_DB).unwrap()
+    }
+
+    pub(super) fn test_node_id(byte: u8) -> NodeId {
+        NodeId::from_bytes([byte; 16])
     }
 
     pub(super) fn test_root_path() -> ObjectPath {
@@ -1482,7 +1485,7 @@ mod tests {
         let key = logical_key(b"interrupted");
         let accesses = AccessSet::new(Vec::new(), vec![wa(&key, b"uncommitted")], Vec::new());
         let interrupted_handle = begin_accesses(&algo, accesses.clone());
-        let interrupted = interrupted_handle.id().clone();
+        let interrupted = *interrupted_handle.id();
         tctx.tmon.begin_tx(&interrupted);
         let outcome = tctx
             .locker
@@ -1519,7 +1522,7 @@ mod tests {
             AccessSet::new(Vec::new(), vec![wa(&keyp, val)], Vec::new()),
         );
         tm.commit(&mut h).await.unwrap();
-        let tid = h.id().clone();
+        let tid = *h.id();
         tm.end(&mut h).await.unwrap();
 
         let status = tctx
@@ -1563,7 +1566,7 @@ mod tests {
             AccessSet::new(vec![r], vec![wa(&writep, &external)], Vec::new()),
         );
         tm.commit(&mut h).await.unwrap();
-        let tid = h.id().clone();
+        let tid = *h.id();
         tm.end(&mut h).await.unwrap();
 
         let record = tctx
@@ -1590,14 +1593,8 @@ mod tests {
     #[tokio::test]
     async fn committed_manifest_preserves_prepared_roots_from_earlier_body_runs() {
         let (tm, tctx) = new_algo().await;
-        let earlier = CollectionAddress::new(
-            TEST_DB,
-            CollectionId::from_slice(&[1; 16]).expect("fixed ID has the required width"),
-        );
-        let active = CollectionAddress::new(
-            TEST_DB,
-            CollectionId::from_slice(&[2; 16]).expect("fixed ID has the required width"),
-        );
+        let earlier = CollectionAddress::new(TEST_DB, CollectionId::from_bytes([1; 16]));
+        let active = CollectionAddress::new(TEST_DB, CollectionId::from_bytes([2; 16]));
         let earlier_accesses = CatalogAccesses {
             reads: Vec::new(),
             changes: vec![CollectionChange {
@@ -1628,7 +1625,7 @@ mod tests {
             .prepare(&mut handle.collections)
             .await
             .unwrap();
-        let id = handle.id().clone();
+        let id = *handle.id();
         tm.mon.begin_tx(&id);
 
         tm.commit_writes(&AccessSet::default(), &handle.collections, Vec::new(), &id)
@@ -1645,10 +1642,7 @@ mod tests {
     #[tokio::test]
     async fn pending_collection_manifest_update_preserves_existing_locks() {
         let (tm, tctx) = new_algo().await;
-        let created = CollectionAddress::new(
-            TEST_DB,
-            CollectionId::from_slice(&[3; 16]).expect("fixed ID has the required width"),
-        );
+        let created = CollectionAddress::new(TEST_DB, CollectionId::from_bytes([3; 16]));
         let handle = tm.begin(
             AccessSet::default(),
             CatalogAccesses {
@@ -1662,7 +1656,7 @@ mod tests {
                 }],
             },
         );
-        let id = handle.id().clone();
+        let id = *handle.id();
         let lock = TxLock::TopologyParticipant {
             collection: test_collection(),
         };
@@ -1694,10 +1688,7 @@ mod tests {
     #[tokio::test]
     async fn end_preserves_prepared_collection_when_commit_won() {
         let (tm, tctx) = new_algo().await;
-        let prepared = CollectionAddress::new(
-            TEST_DB,
-            CollectionId::from_slice(&[3; 16]).expect("fixed ID has the required width"),
-        );
+        let prepared = CollectionAddress::new(TEST_DB, CollectionId::from_bytes([3; 16]));
         let mut handle = tm.begin(
             AccessSet::default(),
             CatalogAccesses {
@@ -1715,7 +1706,7 @@ mod tests {
             .prepare(&mut handle.collections)
             .await
             .unwrap();
-        let id = handle.id().clone();
+        let id = *handle.id();
         tm.mon.begin_tx(&id);
         assert!(handle.engage());
         tm.commit_writes(&AccessSet::default(), &handle.collections, Vec::new(), &id)
@@ -1737,10 +1728,7 @@ mod tests {
     #[tokio::test]
     async fn a_replayed_body_clears_a_discarded_partial_drop() {
         let (tm, tctx) = new_algo().await;
-        let dropped = CollectionAddress::new(
-            TEST_DB,
-            CollectionId::from_slice(&[3; 16]).expect("fixed ID has the required width"),
-        );
+        let dropped = CollectionAddress::new(TEST_DB, CollectionId::from_bytes([3; 16]));
         assert!(
             tctx.records
                 .create_record(&dropped, &CollectionRecord::new())
@@ -1766,7 +1754,7 @@ mod tests {
                 }],
             },
         );
-        let id = handle.id().clone();
+        let id = *handle.id();
         tm.mon.begin_tx(&id);
         assert!(handle.engage());
         tm.collection_commit
@@ -1867,7 +1855,7 @@ mod tests {
             &tm,
             AccessSet::new(Vec::new(), vec![wa(&keyp, &value)], Vec::new()),
         );
-        let old_id = h.id().clone();
+        let old_id = *h.id();
         assert!(h.engage());
         tctx.tmon.begin_tx(&old_id);
         tctx.tmon.preempt_tx(&old_id).await.unwrap();
@@ -1914,7 +1902,7 @@ mod tests {
             &tm,
             AccessSet::new(Vec::new(), vec![wa(&keyp, b"a")], Vec::new()),
         );
-        let id_before = h.id().clone();
+        let id_before = *h.id();
         let tm2 = tm.clone();
         let committing = tokio::spawn(async move {
             let res = tm2.commit(&mut h).await;
@@ -1940,7 +1928,7 @@ mod tests {
             res.expect("renewed identity commits once the holder releases"),
             BodyDecision::ReturnOutcome
         );
-        let renewed_id = h.id().clone();
+        let renewed_id = *h.id();
         assert_ne!(renewed_id, id_before);
         assert!(!renewed_id.older(&id_before));
         assert!(!id_before.older(&renewed_id));
@@ -2121,7 +2109,7 @@ mod tests {
             &algo,
             AccessSet::new(vec![stale], vec![wa(&key, &external)], Vec::new()),
         );
-        let old_id = handle.id().clone();
+        let old_id = *handle.id();
         assert_eq!(
             algo.commit(&mut handle).await.unwrap(),
             BodyDecision::ReplayBody,
@@ -2188,7 +2176,7 @@ mod tests {
             ),
             CatalogAccesses::default(),
         );
-        let id_before = h.id().clone();
+        let id_before = *h.id();
         let outcome = engine
             .commit(&mut h)
             .await
@@ -2287,7 +2275,7 @@ mod tests {
     // write and make commit-path counts depend on random transaction entropy.
     #[test]
     fn write_counts_parses_transaction_prefix_named_like_node() {
-        let id = TxId::from_bytes(vec![0x97, 0x30]);
+        let id = TxId::with_priority(0, &[0x97, 0x30]);
         let path = ObjectPath::Transaction {
             db_prefix: test_db_prefix(),
             id,
@@ -2469,10 +2457,9 @@ mod tests {
             .await
             .unwrap();
         let mut edit = loaded.into_edit();
-        edit.set_entries(LeafBody::from_entries([LeafEntry::new(b"deleted")
-            .with_current(CurrentState::Tombstone {
-                writer: writer.clone(),
-            })]));
+        edit.set_entries(LeafBody::from_entries([
+            LeafEntry::new(b"deleted").with_current(CurrentState::Tombstone { writer })
+        ]));
         assert!(tctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 
         let read = do_read(&tctx, &key).await;
@@ -2513,10 +2500,7 @@ mod tests {
     async fn point_read_re_resolves_writer_at_validation_barrier() {
         let (tm, tctx) = new_algo().await;
         let keyp = logical_key(b"k");
-        let previous = commit_writes(&tm, vec![wa(&keyp, b"v1")])
-            .await
-            .id()
-            .clone();
+        let previous = *commit_writes(&tm, vec![wa(&keyp, b"v1")]).await.id();
 
         let holder = TxId::with_priority(1, b"holder");
         tctx.tmon.begin_tx(&holder);
@@ -2545,13 +2529,12 @@ mod tests {
         // Finalize only the transaction record. The leaf still contains the
         // same pending lock, so leaf validation alone cannot detect that the
         // effective writer moved.
-        let mut record = TxRecord::new(holder.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(holder, TxCommitStatus::Committed);
         record.locks = locked.locked_paths();
         record.writes.push(TxWrite {
             key: keyp,
             value: Arc::from(b"v2".as_slice()),
             deleted: false,
-            prev_writer: previous,
         });
         tctx.tmon.commit_tx(record).await.unwrap();
 
@@ -2573,10 +2556,7 @@ mod tests {
     async fn point_read_accepts_aborted_holder_at_validation_barrier() {
         let (tm, tctx) = new_algo().await;
         let keyp = logical_key(b"k");
-        let previous = commit_writes(&tm, vec![wa(&keyp, b"v1")])
-            .await
-            .id()
-            .clone();
+        let previous = *commit_writes(&tm, vec![wa(&keyp, b"v1")]).await.id();
 
         let holder = TxId::with_priority(1, b"holder");
         tctx.tmon.begin_tx(&holder);
@@ -2851,7 +2831,7 @@ mod tests {
         let keyp = logical_key(b"k");
 
         commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
-        let deleted_by = commit_writes(&tm, vec![wdel(&keyp)]).await.id().clone();
+        let deleted_by = *commit_writes(&tm, vec![wdel(&keyp)]).await.id();
 
         // A read now resolves to not-found.
         let r = do_read(&tctx, &keyp).await;
@@ -3078,13 +3058,12 @@ mod tests {
 
         // Commit only the transaction record: membership_generation is unchanged
         // until write-back, so the dependency is what must reject validation.
-        let mut record = TxRecord::new(holder.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(holder, TxCommitStatus::Committed);
         record.locks = locked.locked_paths();
         record.writes.push(TxWrite {
             key: key_path,
             value: Arc::from(b"value".as_slice()),
             deleted: false,
-            prev_writer: TxId::default(),
         });
         tctx.tmon.commit_tx(record).await.unwrap();
 
@@ -3167,12 +3146,9 @@ mod tests {
             .await
             .unwrap();
         let record = record.value().unwrap();
-        for token in [
-            NodeToken::from_bytes([0; 16]),
-            NodeToken::from_bytes([1; 16]),
-        ] {
+        for node_id in [test_node_id(0), test_node_id(1)] {
             assert!(record.locks.contains(&TxLock::Membership {
-                leaf: LeafRef::node(test_collection(), token),
+                leaf: LeafRef::node(test_collection(), node_id),
                 typ: LockType::Read,
             }));
         }
@@ -3261,12 +3237,9 @@ mod tests {
                     .await
                     .unwrap();
                 let record = observed.value().unwrap();
-                for token in [
-                    NodeToken::from_bytes([0; 16]),
-                    NodeToken::from_bytes([1; 16]),
-                ] {
+                for node_id in [test_node_id(0), test_node_id(1)] {
                     assert!(record.locks.contains(&TxLock::Membership {
-                        leaf: LeafRef::node(test_collection(), token),
+                        leaf: LeafRef::node(test_collection(), node_id),
                         typ: LockType::Read,
                     }));
                 }
@@ -3293,8 +3266,8 @@ mod tests {
     async fn locked_scan_detects_a_create_in_a_leaf_a_peer_split_produced() {
         use glassdb_storage::Node;
         let (tm, tctx) = new_algo().await;
-        let (_, s1_token) = seed_two_leaf_tree(&tctx).await;
-        let s2_token = NodeToken::from_bytes([2; 16]);
+        let (_, s1_id) = seed_two_leaf_tree(&tctx).await;
+        let s2_id = test_node_id(2);
         let seed = TxId::with_priority(1, b"seed");
 
         // The write makes commit validate the scan while holding its own locks.
@@ -3313,15 +3286,12 @@ mod tests {
         // S1 keeps its path, so it stays in this transaction's lock cover; only
         // its state changes. The parent separator may lag (ADR-031), because the
         // right-link carries the scan to S2 either way.
-        let entry = |key: &[u8]| {
-            LeafEntry::new(key).with_current(CurrentState::External {
-                writer: seed.clone(),
-            })
-        };
+        let entry =
+            |key: &[u8]| LeafEntry::new(key).with_current(CurrentState::External { writer: seed });
         tctx.nodes
             .store_node(
                 &test_collection(),
-                &s2_token,
+                &s2_id,
                 &Node::leaf(LeafBody::from_entries([entry(b"p")])),
                 None,
             )
@@ -3331,7 +3301,7 @@ mod tests {
             .nodes
             .load_node(
                 &test_collection(),
-                &s1_token,
+                &s1_id,
                 Requirement::after(tctx.timeline.currentness_barrier()),
             )
             .await
@@ -3339,10 +3309,10 @@ mod tests {
         tctx.nodes
             .store_node(
                 &test_collection(),
-                &s1_token,
+                &s1_id,
                 &Node::leaf(LeafBody::from_entries([entry(b"m")]))
                     .with_high_key(Some(b"p".to_vec()))
-                    .with_right_sibling(Some(s2_token.to_string())),
+                    .with_right_sibling(Some(s2_id)),
                 Some(&s1_ver),
             )
             .await
@@ -3354,21 +3324,19 @@ mod tests {
             .nodes
             .load_node(
                 &test_collection(),
-                &s2_token,
+                &s2_id,
                 Requirement::after(tctx.timeline.currentness_barrier()),
             )
             .await
             .unwrap();
         let mut entries: Vec<LeafEntry> = s2.as_leaf().unwrap().entries().cloned().collect();
         let creator = TxId::with_priority(2, b"phantom");
-        entries.push(LeafEntry::new(b"z").with_current(CurrentState::External {
-            writer: creator.clone(),
-        }));
+        entries.push(LeafEntry::new(b"z").with_current(CurrentState::External { writer: creator }));
         let mut new_s2 = Node::leaf(LeafBody::from_entries(entries));
-        new_s2.set_membership_writer(creator.clone());
+        new_s2.set_membership_writer(creator);
         new_s2.remove_membership_holder(&creator);
         tctx.nodes
-            .store_node(&test_collection(), &s2_token, &new_s2, Some(&s2_ver))
+            .store_node(&test_collection(), &s2_id, &new_s2, Some(&s2_ver))
             .await
             .unwrap();
 
@@ -3387,7 +3355,7 @@ mod tests {
     #[tokio::test]
     async fn scan_detects_boundary_membership_change() {
         let (tm, tctx) = new_algo().await;
-        let (_, s1_token) = seed_two_leaf_tree(&tctx).await;
+        let (_, s1_id) = seed_two_leaf_tree(&tctx).await;
 
         let (accesses, keys) = scan_accesses(&tctx).await;
         assert_eq!(
@@ -3401,7 +3369,7 @@ mod tests {
             .nodes
             .load_node(
                 &test_collection(),
-                &s1_token,
+                &s1_id,
                 Requirement::after(tctx.timeline.currentness_barrier()),
             )
             .await
@@ -3412,15 +3380,10 @@ mod tests {
         }));
         let mut new_s1 = Node::leaf(LeafBody::from_entries(entries));
         let membership_writer = TxId::with_priority(2, b"membership");
-        new_s1.set_membership_writer(membership_writer.clone());
+        new_s1.set_membership_writer(membership_writer);
         new_s1.remove_membership_holder(&membership_writer);
         tctx.nodes
-            .store_node(
-                &test_collection(),
-                &s1_token,
-                &new_s1,
-                Some(&s1_observation),
-            )
+            .store_node(&test_collection(), &s1_id, &new_s1, Some(&s1_observation))
             .await
             .unwrap();
 
@@ -3433,26 +3396,26 @@ mod tests {
 
     // Replaces the test collection's root leaf with a two-level tree: an index
     // root over S0(a,c | high "m") -> S1(m,p), chained by right-sibling.
-    // Returns both leaf tokens.
-    async fn seed_two_leaf_tree(tctx: &Tctx) -> (NodeToken, NodeToken) {
+    // Returns both leaf IDs.
+    async fn seed_two_leaf_tree(tctx: &Tctx) -> (NodeId, NodeId) {
         use glassdb_storage::{IndexNode, Node};
-        let s0_token = NodeToken::from_bytes([0; 16]);
-        let s1_token = NodeToken::from_bytes([1; 16]);
+        let s0_id = test_node_id(0);
+        let s1_id = test_node_id(1);
 
-        let leaf = |ks: &[&[u8]], high: Option<&[u8]>, right: Option<&str>| {
+        let leaf = |ks: &[&[u8]], high: Option<&[u8]>, right: Option<NodeId>| {
             Node::leaf(LeafBody::from_entries(ks.iter().map(|k| {
                 LeafEntry::new(*k).with_current(CurrentState::External {
                     writer: TxId::with_priority(1, b"seed"),
                 })
             })))
             .with_high_key(high.map(<[u8]>::to_vec))
-            .with_right_sibling(right.map(str::to_string))
+            .with_right_sibling(right)
         };
         tctx.nodes
             .store_node(
                 &test_collection(),
-                &s0_token,
-                &leaf(&[b"a", b"c"], Some(b"m"), Some(s1_token.as_str())),
+                &s0_id,
+                &leaf(&[b"a", b"c"], Some(b"m"), Some(s1_id)),
                 None,
             )
             .await
@@ -3460,15 +3423,15 @@ mod tests {
         tctx.nodes
             .store_node(
                 &test_collection(),
-                &s1_token,
+                &s1_id,
                 &leaf(&[b"m", b"p"], None, None),
                 None,
             )
             .await
             .unwrap();
         let root = Node::index(IndexNode::from_children([
-            (b"".to_vec(), s0_token.to_string()),
-            (b"m".to_vec(), s1_token.to_string()),
+            (b"".to_vec(), s0_id),
+            (b"m".to_vec(), s1_id),
         ]));
         let cur = tctx
             .nodes
@@ -3482,7 +3445,7 @@ mod tests {
             .store_root(&test_collection(), &root, cur.observation())
             .await
             .unwrap();
-        (s0_token, s1_token)
+        (s0_id, s1_id)
     }
 
     // Rewrites the test collection's root `_r` (a single leaf holding `a`,`m`)
@@ -3491,8 +3454,8 @@ mod tests {
     // linearization point, mirroring the in-place root split (ADR-031).
     async fn split_root_in_place(tctx: &Tctx) {
         use glassdb_storage::{IndexNode, Node};
-        let s0_token = NodeToken::from_bytes([0; 16]);
-        let s1_token = NodeToken::from_bytes([1; 16]);
+        let s0_id = test_node_id(0);
+        let s1_id = test_node_id(1);
 
         let loaded = tctx
             .nodes
@@ -3509,20 +3472,20 @@ mod tests {
 
         let s0 = Node::leaf(LeafBody::from_entries(lower))
             .with_high_key(Some(b"m".to_vec()))
-            .with_right_sibling(Some(s1_token.to_string()));
+            .with_right_sibling(Some(s1_id));
         tctx.nodes
-            .store_node(&test_collection(), &s0_token, &s0, None)
+            .store_node(&test_collection(), &s0_id, &s0, None)
             .await
             .unwrap();
         let s1 = Node::leaf(LeafBody::from_entries(upper));
         tctx.nodes
-            .store_node(&test_collection(), &s1_token, &s1, None)
+            .store_node(&test_collection(), &s1_id, &s1, None)
             .await
             .unwrap();
 
         let root = Node::index(IndexNode::from_children([
-            (b"".to_vec(), s0_token.to_string()),
-            (b"m".to_vec(), s1_token.to_string()),
+            (b"".to_vec(), s0_id),
+            (b"m".to_vec(), s1_id),
         ]));
         assert!(
             tctx.nodes

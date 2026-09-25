@@ -16,7 +16,7 @@
 //! racing late node creation:
 //!
 //! 0. Advance the structural intent with the source observation and split key;
-//!    its created-node tokens were reserved while `Preparing`.
+//!    its created-node IDs were reserved while `Preparing`.
 //! 1. Create the right sibling (`write_if_not_exists`) holding the upper half
 //!    and inheriting the source's former high-key and right-sibling.
 //! 2. **Shrink the source in one CAS** — drop the upper half, set high-key to
@@ -47,7 +47,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use glassdb_data::{CollectionAddress, NodeToken, ObjectPath, TxId};
+use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 use glassdb_storage::{
     IndexNode, LeafEntry, LeafObservation, Node, NodeStore, Requirement, StorageError, Timeline,
     TreeRouter,
@@ -93,23 +93,23 @@ pub(super) enum SplitNeed {
 #[derive(Clone, Copy)]
 pub(super) enum SplitTarget<'a> {
     Root,
-    NonRoot(&'a NodeToken),
+    NonRoot(&'a NodeId),
 }
 
 /// The node writes of one split. The source gate protects them until the
 /// source shrink or the root rewrite lands.
 pub(super) enum SplitPlan {
     NonRoot {
-        source_token: NodeToken,
+        source_id: NodeId,
         source: Node,
-        right_token: NodeToken,
+        right_id: NodeId,
         right: Node,
         split_key: Vec<u8>,
         reclaimed: Vec<TxId>,
     },
     Root {
-        left_token: NodeToken,
-        right_token: NodeToken,
+        left_id: NodeId,
+        right_id: NodeId,
         left: Node,
         right: Node,
         index: Node,
@@ -258,8 +258,8 @@ impl Splitter {
             need => return self.cancel(reason, need),
         }
         match target {
-            SplitTarget::NonRoot(token) => {
-                self.plan_nonroot_split(token, prepared, node, worker, reclaimed)
+            SplitTarget::NonRoot(id) => {
+                self.plan_nonroot_split(id, prepared, node, worker, reclaimed)
             }
             SplitTarget::Root => self.plan_root_split(prepared, &node, worker, reclaimed),
         }
@@ -275,17 +275,17 @@ impl Splitter {
     ) -> Result<Applied, TransError> {
         match plan {
             SplitPlan::NonRoot {
-                source_token,
+                source_id,
                 source,
-                right_token,
+                right_id,
                 right,
                 split_key,
                 reclaimed,
             } => {
-                self.create_node(collection, &right_token, &right).await?;
+                self.create_node(collection, &right_id, &right).await?;
                 if !self
                     .nodes
-                    .store_node(collection, &source_token, &source, Some(observation))
+                    .store_node(collection, &source_id, &source, Some(observation))
                     .await?
                 {
                     return Err(TransError::Retry);
@@ -294,23 +294,23 @@ impl Splitter {
                     collection,
                     reason,
                     &reclaimed,
-                    [(&source_token, &source), (&right_token, &right)],
+                    [(&source_id, &source), (&right_id, &right)],
                 );
                 Ok(Applied::Landed(Some(ParentRoute {
                     key: split_key,
-                    target: right_token,
+                    target: right_id,
                 })))
             }
             SplitPlan::Root {
-                left_token,
-                right_token,
+                left_id,
+                right_id,
                 left,
                 right,
                 index,
                 reclaimed,
             } => {
-                self.create_node(collection, &left_token, &left).await?;
-                self.create_node(collection, &right_token, &right).await?;
+                self.create_node(collection, &left_id, &left).await?;
+                self.create_node(collection, &right_id, &right).await?;
                 if self
                     .nodes
                     .store_node_at(observation.path(), &index, observation)
@@ -323,7 +323,7 @@ impl Splitter {
                     collection,
                     reason,
                     &reclaimed,
-                    [(&left_token, &left), (&right_token, &right)],
+                    [(&left_id, &left), (&right_id, &right)],
                 );
                 Ok(Applied::Landed(None))
             }
@@ -351,17 +351,16 @@ impl Splitter {
     /// Splits a non-root source into itself and the reserved right sibling.
     fn plan_nonroot_split(
         &self,
-        source_token: &NodeToken,
+        source_id: &NodeId,
         prepared: &PreparedIntent,
         mut source: Node,
         worker: &TxId,
         reclaimed: Vec<TxId>,
     ) -> Prepared<SplitPlan> {
-        let right_token = prepared
+        let right_id = prepared
             .nonroot_sibling()
-            .expect("a prepared non-root intent always reserves one sibling")
-            .clone();
-        let Some((right, split_key)) = source.split(right_token.as_str()) else {
+            .expect("a prepared non-root intent always reserves one sibling");
+        let Some((right, split_key)) = source.split(right_id) else {
             return Prepared::Cancel(Ok(()));
         };
         source.remove_structural_gate(worker);
@@ -370,9 +369,9 @@ impl Splitter {
                 split_key: split_key.clone(),
             },
             plan: SplitPlan::NonRoot {
-                source_token: source_token.clone(),
+                source_id: *source_id,
                 source,
-                right_token,
+                right_id,
                 right,
                 split_key,
                 reclaimed,
@@ -388,13 +387,13 @@ impl Splitter {
         worker: &TxId,
         reclaimed: Vec<TxId>,
     ) -> Prepared<SplitPlan> {
-        let (left_token, right_token) = prepared
+        let (left_id, right_id) = prepared
             .root_children()
             .expect("a prepared root intent always reserves two children");
-        let (left, right, split_key) = split_into_children(node, right_token.as_str(), worker);
+        let (left, right, split_key) = split_into_children(node, right_id, worker);
         let index = Node::index(IndexNode::from_children([
-            (Vec::new(), left_token.to_string()),
-            (split_key.clone(), right_token.to_string()),
+            (Vec::new(), left_id),
+            (split_key.clone(), right_id),
         ]));
         let policy = self.candidates.policy();
         if index.content_encoded_len() > policy.content_limit()
@@ -407,8 +406,8 @@ impl Splitter {
         Prepared::Ready {
             change: ReadyChange::Split { split_key },
             plan: SplitPlan::Root {
-                left_token: left_token.clone(),
-                right_token: right_token.clone(),
+                left_id,
+                right_id,
                 left,
                 right,
                 index,
@@ -421,10 +420,10 @@ impl Splitter {
     async fn create_node(
         &self,
         collection: &CollectionAddress,
-        token: &NodeToken,
+        id: &NodeId,
         node: &Node,
     ) -> Result<(), TransError> {
-        if self.nodes.store_node(collection, token, node, None).await? {
+        if self.nodes.store_node(collection, id, node, None).await? {
             Ok(())
         } else {
             Err(TransError::Retry)
@@ -438,12 +437,12 @@ impl Splitter {
         collection: &CollectionAddress,
         reason: &SplitReason,
         reclaimed: &[TxId],
-        outputs: [(&NodeToken, &Node); 2],
+        outputs: [(&NodeId, &Node); 2],
     ) {
         self.reclamation.record(reclaimed, false);
         self.stats.splits.fetch_add(1, Ordering::Relaxed);
-        for (token, node) in outputs {
-            self.enqueue_if_over_soft_cap(collection, token, node);
+        for (id, node) in outputs {
+            self.enqueue_if_over_soft_cap(collection, id, node);
         }
         if reason.is_inline_pressure() {
             self.stats
@@ -454,19 +453,14 @@ impl Splitter {
 
     /// Carries an oversized split output into a later sweep so one hint can
     /// drive the whole split cascade.
-    fn enqueue_if_over_soft_cap(
-        &self,
-        collection: &CollectionAddress,
-        token: &NodeToken,
-        node: &Node,
-    ) {
+    fn enqueue_if_over_soft_cap(&self, collection: &CollectionAddress, id: &NodeId, node: &Node) {
         if !node.over_soft_cap(self.candidates.policy()) {
             return;
         }
         self.candidates.push(MaintenanceCandidate {
             path: ObjectPath::Node {
                 collection: collection.clone(),
-                token: token.clone(),
+                id: *id,
             },
             priority: self.candidates.new_id(),
             cause: CandidateCause::Split(SplitReason::SoftCap),
@@ -489,25 +483,25 @@ impl SplitReason {
 }
 
 impl<'a> SplitTarget<'a> {
-    pub(super) fn source_token(self) -> Option<&'a NodeToken> {
+    pub(super) fn source_node_id(self) -> Option<&'a NodeId> {
         match self {
             Self::Root => None,
-            Self::NonRoot(token) => Some(token),
+            Self::NonRoot(id) => Some(id),
         }
     }
 }
 
 /// Splits `node` (a root leaf or root index) into a lower and an upper child for
 /// an in-place root split, returning `(left, right, split_key)`. `left` links to
-/// `right_token`; `right` inherits `node`'s former bounds.
+/// `right_id`; `right` inherits `node`'s former bounds.
 fn split_into_children(
     node: &Node,
-    right_token: &str,
+    right_id: NodeId,
     structure_holder: &TxId,
 ) -> (Node, Node, Vec<u8>) {
     let mut source = node.clone();
     let (right, split_key) = source
-        .split(right_token)
+        .split(right_id)
         .expect("a split source has at least two entries/children");
     source.remove_structural_gate(structure_holder);
     (source, right, split_key)

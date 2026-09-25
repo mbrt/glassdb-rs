@@ -27,7 +27,10 @@ impl Codec for StructuralIntent {
     type Value = StructuralIntent;
 
     fn decode(path: &ObjectPath, body: &[u8]) -> Result<Self::Value, StorageError> {
-        let intent = StructuralIntent::decode(body)?;
+        let ObjectPath::StructuralIntent { db_prefix, .. } = path else {
+            return Err(non_structural_path());
+        };
+        let intent = StructuralIntent::decode(db_prefix, body)?;
         validate_structural_intent_path(path, &intent)?;
         Ok(intent)
     }
@@ -67,8 +70,8 @@ impl StructuralIntentStore {
     ) -> Result<Observation<StructuralIntent>, StorageError> {
         let path = ObjectPath::StructuralIntent {
             db_prefix: db_prefix.clone(),
-            participant: intent.participant_id.clone(),
-            intent_id: intent_id.clone(),
+            participant: intent.participant_id,
+            intent_id: *intent_id,
         };
         match self
             .structural_intents
@@ -190,7 +193,7 @@ impl StructuralIntentStore {
                     "structural listing returned a non-structural path",
                 ));
             };
-            let intent_id = intent_id.clone();
+            let intent_id = *intent_id;
             let mut observed = self
                 .structural_intents
                 .read(path.clone(), Requirement::ANY)
@@ -215,17 +218,29 @@ fn validate_structural_intent_path(
     path: &ObjectPath,
     intent: &StructuralIntent,
 ) -> Result<(), StorageError> {
-    let ObjectPath::StructuralIntent { participant, .. } = path else {
-        return Err(StorageError::other(
-            "structural intent has a non-structural path",
-        ));
+    let ObjectPath::StructuralIntent {
+        db_prefix,
+        participant,
+        ..
+    } = path
+    else {
+        return Err(non_structural_path());
     };
     if participant != &intent.participant_id {
         return Err(StorageError::other(
             "structural-intent path does not match its participant",
         ));
     }
+    if db_prefix != intent.collection.db_prefix_component() {
+        return Err(StorageError::other(
+            "structural-intent path does not match its database prefix",
+        ));
+    }
     Ok(())
+}
+
+fn non_structural_path() -> StorageError {
+    StorageError::other("structural intent has a non-structural path")
 }
 
 #[cfg(test)]
@@ -237,7 +252,11 @@ mod tests {
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{BackendOp, HookBackend, RecordingBackend};
-    use glassdb_data::{CollectionAddress, NodeToken};
+    use glassdb_data::{CollectionAddress, NodeId};
+
+    fn tx_id(prefix: &[u8]) -> TxId {
+        TxId::with_priority(0, prefix)
+    }
 
     struct TestStore {
         structural_intents: StructuralIntentStore,
@@ -262,8 +281,8 @@ mod tests {
         }
     }
 
-    fn token(byte: u8) -> NodeToken {
-        NodeToken::from_bytes([byte; 16])
+    fn node_id(byte: u8) -> NodeId {
+        NodeId::from_bytes([byte; 16])
     }
 
     fn db_prefix() -> DbPrefix {
@@ -271,19 +290,19 @@ mod tests {
     }
 
     fn intent_id(byte: u8) -> StructuralIntentId {
-        StructuralIntentId::from(token(byte))
+        StructuralIntentId::from_bytes([byte; 16])
     }
 
     fn intent(participant: &TxId, phase: StructuralIntentPhase) -> StructuralIntent {
         StructuralIntent {
             collection: CollectionAddress::root("db"),
-            source_token: Some(token(200)),
+            source_node_id: Some(node_id(200)),
             source_revision: "v1".to_string(),
             change: StructuralChange::Split {
-                created_tokens: vec![token(201)],
+                created_node_ids: vec![node_id(201)],
                 split_key: b"split".to_vec(),
             },
-            participant_id: participant.clone(),
+            participant_id: *participant,
             phase,
         }
     }
@@ -292,21 +311,53 @@ mod tests {
     fn structural_codec_rejects_a_different_path_participant() {
         let path = ObjectPath::StructuralIntent {
             db_prefix: db_prefix(),
-            participant: TxId::from_bytes(b"path-participant".to_vec()),
+            participant: tx_id(b"path-participant"),
             intent_id: intent_id(1),
         };
         let intent = intent(
-            &TxId::from_bytes(b"body-participant".to_vec()),
+            &tx_id(b"body-participant"),
             StructuralIntentPhase::Preparing,
         );
 
         assert!(<StructuralIntent as Codec>::encode(&path, &intent).is_err());
     }
 
+    #[test]
+    fn structural_codec_rejects_a_different_path_database() {
+        let participant = tx_id(b"participant");
+        let path = ObjectPath::StructuralIntent {
+            db_prefix: DbPrefix::try_from("other").unwrap(),
+            participant,
+            intent_id: intent_id(1),
+        };
+        let intent = intent(&participant, StructuralIntentPhase::Preparing);
+
+        let error = <StructuralIntent as Codec>::encode(&path, &intent).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "structural-intent path does not match its database prefix"
+        );
+    }
+
+    #[test]
+    fn structural_codec_takes_the_database_prefix_from_the_path() {
+        let participant = tx_id(b"participant");
+        let intent = intent(&participant, StructuralIntentPhase::Ready);
+        let moved = ObjectPath::StructuralIntent {
+            db_prefix: DbPrefix::try_from("moved").unwrap(),
+            participant,
+            intent_id: intent_id(1),
+        };
+
+        let decoded = <StructuralIntent as Codec>::decode(&moved, &intent.encode()).unwrap();
+        assert_eq!(decoded.collection.db_prefix(), "moved");
+        assert_eq!(decoded.collection.id(), intent.collection.id());
+    }
+
     #[tokio::test]
     async fn structural_intent_lifecycle_rejects_a_stale_update_and_deletes() {
         let store = store_over(Arc::new(MemoryBackend::new()));
-        let participant = TxId::from_bytes(b"participant".to_vec());
+        let participant = tx_id(b"participant");
         let preparing = intent(&participant, StructuralIntentPhase::Preparing);
         let created = store
             .write(&db_prefix(), &intent_id(1), &preparing)
@@ -333,11 +384,11 @@ mod tests {
     #[tokio::test]
     async fn structural_intent_discovery_drains_backend_pages() {
         let store = store_over(Arc::new(MemoryBackend::new()));
-        let participant = TxId::from_bytes(b"participant".to_vec());
+        let participant = tx_id(b"participant");
         for i in 0..=STRUCTURAL_LIST_PAGE_SIZE {
             let mut intent = intent(&participant, StructuralIntentPhase::Ready);
             intent.change = StructuralChange::Split {
-                created_tokens: vec![token(i as u8)],
+                created_node_ids: vec![node_id(i as u8)],
                 split_key: vec![i as u8],
             };
             store
@@ -359,8 +410,8 @@ mod tests {
     #[tokio::test]
     async fn structural_intent_discovery_is_scoped_to_one_participant() {
         let store = store_over(Arc::new(MemoryBackend::new()));
-        let first = TxId::from_bytes(b"first".to_vec());
-        let second = TxId::from_bytes(b"second".to_vec());
+        let first = tx_id(b"first");
+        let second = tx_id(b"second");
         for participant in [&first, &second] {
             store
                 .write(
@@ -425,7 +476,7 @@ mod tests {
                 let recorder = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
                 let operations = recorder.log();
                 let store = store_over(recorder);
-                let participant = TxId::from_bytes(b"participant".to_vec());
+                let participant = tx_id(b"participant");
                 let body = intent(&participant, phase);
                 store
                     .write(&db_prefix(), &intent_id(1), &body)
@@ -457,10 +508,10 @@ mod tests {
             let timeline = Timeline::new();
             let objects = CachedStore::new(recorder, 1 << 20, timeline.clone(), None);
             let store = StructuralIntentStore::new(objects.clone());
-            let participant = TxId::from_bytes(b"participant".to_vec());
+            let participant = tx_id(b"participant");
             let path = ObjectPath::StructuralIntent {
                 db_prefix: db_prefix(),
-                participant: participant.clone(),
+                participant,
                 intent_id: intent_id(1),
             };
             // Seed absence through the cache interface before a peer creates
@@ -518,7 +569,7 @@ mod tests {
             let operations = recorder.log();
             let local = store_over(recorder);
             let peer = store_over(memory.clone());
-            let participant = TxId::from_bytes(b"participant".to_vec());
+            let participant = tx_id(b"participant");
             let preparing = intent(&participant, StructuralIntentPhase::Preparing);
             local
                 .write(&db_prefix(), &intent_id(1), &preparing)

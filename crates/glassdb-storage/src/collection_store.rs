@@ -14,6 +14,7 @@ use prost::Message;
 use crate::cached_store::{CachedStore, CasResult, Codec, Observation, Requirement};
 use crate::error::StorageError;
 use crate::lock::SharedExclusiveLock;
+use crate::wire_id::{decode_id, decode_optional_id};
 
 /// A decoded collection record.
 ///
@@ -193,9 +194,10 @@ impl CollectionRecord {
                     "collection record contains an invalid child name",
                 ));
             }
-            let id = CollectionId::from_slice(&child.collection_id).ok_or_else(|| {
-                StorageError::other("collection record contains an invalid child ID")
-            })?;
+            let id: CollectionId = decode_id(
+                &child.collection_id,
+                "collection record contains an invalid child ID",
+            )?;
             if id.is_root() {
                 return Err(StorageError::other(
                     "collection record binds a child to the reserved root ID",
@@ -213,14 +215,15 @@ impl CollectionRecord {
                 StorageError::other("collection record has an invalid directory lock")
             })?,
             directory_generation: raw.directory_generation,
-            topology_freeze: (!raw.topology_freeze.is_empty())
-                .then(|| TxId::from_bytes(raw.topology_freeze)),
+            topology_freeze: decode_optional_id(
+                &raw.topology_freeze,
+                "collection record has an invalid topology freeze",
+            )?,
             topology_participants: raw
                 .topology_participants
-                .into_iter()
-                .filter(|id| !id.is_empty())
-                .map(TxId::from_bytes)
-                .collect(),
+                .iter()
+                .map(|id| decode_id(id, "collection record has an invalid topology participant"))
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -392,8 +395,12 @@ mod tests {
 
     use crate::{LeafBody, Node, NodeStore, Timeline};
 
+    fn tx_id(prefix: &[u8]) -> TxId {
+        TxId::with_priority(0, prefix)
+    }
+
     fn collection_id(byte: u8) -> CollectionId {
-        CollectionId::from_slice(&[byte; 16]).unwrap()
+        CollectionId::from_bytes([byte; 16])
     }
 
     #[test]
@@ -412,14 +419,14 @@ mod tests {
 
     #[test]
     fn lifecycle_coordination_round_trips() {
-        let directory_reader = TxId::from_bytes(vec![1]);
-        let freeze = TxId::from_bytes(vec![2]);
-        let participant = TxId::from_bytes(vec![3]);
+        let directory_reader = tx_id(&[1]);
+        let freeze = tx_id(&[2]);
+        let participant = tx_id(&[3]);
         let mut record = CollectionRecord::new();
-        record.add_directory_reader(directory_reader.clone());
+        record.add_directory_reader(directory_reader);
         record.advance_directory_generation();
-        assert!(record.set_topology_freeze(freeze.clone()));
-        assert!(record.add_topology_participant(freeze.clone()));
+        assert!(record.set_topology_freeze(freeze));
+        assert!(record.add_topology_participant(freeze));
 
         let decoded = CollectionRecord::decode(&record.encode()).unwrap();
         assert_eq!(decoded.directory_generation(), 1);
@@ -431,7 +438,7 @@ mod tests {
                 .any(|holder| holder == &freeze)
         );
         let mut unfrozen = CollectionRecord::new();
-        assert!(unfrozen.add_topology_participant(participant.clone()));
+        assert!(unfrozen.add_topology_participant(participant));
         assert!(
             unfrozen
                 .topology_participants()
@@ -444,11 +451,15 @@ mod tests {
         for lock in [
             pb::NodeLock {
                 lock_type: pb::lock::LockType::Create as i32,
-                locked_by: vec![vec![1]],
+                locked_by: vec![vec![1; 16]],
             },
             pb::NodeLock {
                 lock_type: pb::lock::LockType::Read as i32,
-                locked_by: vec![vec![2], vec![1], vec![1]],
+                locked_by: vec![vec![2; 16], vec![1; 16], vec![1; 16]],
+            },
+            pb::NodeLock {
+                lock_type: pb::lock::LockType::Write as i32,
+                locked_by: vec![vec![1; 15]],
             },
         ] {
             let raw = pb::CollectionRecord {
@@ -460,6 +471,32 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 "collection record has an invalid directory lock"
+            );
+        }
+    }
+
+    #[test]
+    fn decoding_rejects_topology_ids_that_are_not_16_bytes() {
+        for bad in [vec![1; 15], vec![1; 17]] {
+            let freeze = pb::CollectionRecord {
+                topology_freeze: bad.clone(),
+                ..pb::CollectionRecord::default()
+            };
+            let error = CollectionRecord::decode(&freeze.encode_to_vec()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "collection record has an invalid topology freeze"
+            );
+        }
+        for bad in [Vec::new(), vec![1; 15], vec![1; 17]] {
+            let participant = pb::CollectionRecord {
+                topology_participants: vec![vec![2; 16], bad],
+                ..pb::CollectionRecord::default()
+            };
+            let error = CollectionRecord::decode(&participant.encode_to_vec()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "collection record has an invalid topology participant"
             );
         }
     }
@@ -595,7 +632,7 @@ mod tests {
             .await
             .unwrap();
 
-        let child = CollectionId::from_slice(&[1; 16]).unwrap();
+        let child = CollectionId::from_bytes([1; 16]);
         assert!(record.add_child(b"child".to_vec(), child).unwrap());
         assert!(records.store_record(&record, &record_before).await.unwrap());
         let (_, record_after) = records
@@ -619,7 +656,7 @@ mod tests {
             "metadata mutation must not advance the data-root revision"
         );
 
-        root.add_membership_reader(TxId::from_bytes(vec![1]));
+        root.add_membership_reader(tx_id(&[1]));
         assert!(
             nodes
                 .store_root(&collection, &root, &root_after_record_write)
