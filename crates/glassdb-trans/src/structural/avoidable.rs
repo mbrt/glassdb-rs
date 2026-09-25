@@ -80,11 +80,6 @@ struct State {
     window_started: rt::Instant,
     leaves: BTreeMap<ObjectPath, LeafWindow>,
     pairs: BTreeMap<(ObjectPath, ObjectPath), MergeTime>,
-    /// The key of the last split that removes split time of each leaf in the
-    /// current window.
-    split_keys: BTreeMap<ObjectPath, Vec<u8>>,
-    /// The split keys of the window that a policy decides on.
-    decided_split_keys: BTreeMap<ObjectPath, Vec<u8>>,
     changes: Vec<(ObjectPath, ChangeKind)>,
     changes_last_window: Vec<(ObjectPath, ChangeKind)>,
     totals: AvoidableTimeStats,
@@ -217,9 +212,10 @@ impl AvoidableTime {
         let mut state = self.state.lock().unwrap();
         state.totals.split += time;
         if self.windows {
-            state.leaf(path).avoidable += time;
+            let leaf = state.leaf(path);
+            leaf.avoidable += time;
             if let Some(at) = at {
-                state.split_keys.insert(path.clone(), at.to_vec());
+                leaf.split_key = Some(at.to_vec());
             }
         }
     }
@@ -256,7 +252,6 @@ impl AvoidableTime {
         // Time from before the change measured a topology that is gone. If it
         // stays, the policy can do the same change again for the same time.
         state.leaves.remove(&path);
-        state.split_keys.remove(&path);
         state
             .pairs
             .retain(|(left, right), _| *left != path && *right != path);
@@ -298,7 +293,6 @@ impl AvoidableTime {
                 avoidable,
             })
             .collect();
-        state.decided_split_keys = std::mem::take(&mut state.split_keys);
         drop(state);
         TopologyWindow {
             elapsed,
@@ -308,18 +302,6 @@ impl AvoidableTime {
             leaves,
             pairs,
         }
-    }
-
-    /// Returns the key of the split that removes the split time of the leaf
-    /// at `path` in the last window that [`AvoidableTime::take_window`] took,
-    /// if the time was measured for one.
-    pub(super) fn split_key(&self, path: &ObjectPath) -> Option<Vec<u8>> {
-        self.state
-            .lock()
-            .unwrap()
-            .decided_split_keys
-            .get(path)
-            .cloned()
     }
 
     /// Returns and resets the totals since the last call.
@@ -334,8 +316,6 @@ impl AvoidableTime {
                 window_started: rt::Instant::now(),
                 leaves: BTreeMap::new(),
                 pairs: BTreeMap::new(),
-                split_keys: BTreeMap::new(),
-                decided_split_keys: BTreeMap::new(),
                 changes: Vec::new(),
                 changes_last_window: Vec::new(),
                 totals: AvoidableTimeStats::default(),
@@ -412,21 +392,20 @@ mod tests {
     }
 
     #[test]
-    fn a_window_keeps_the_last_split_key_of_each_leaf_that_no_change_wrote() {
+    fn a_window_keeps_the_last_split_key_of_each_leaf_since_its_last_change() {
         let avoidable = AvoidableTime::with_windows();
         avoidable.add_split_time(&node(1), lost_cas(100), Some(b"a"));
         avoidable.add_split_time(&node(1), lost_cas(100), Some(b"b"));
         avoidable.add_split_time(&node(1), lost_cas(100), None);
         avoidable.add_split_time(&node(2), lost_cas(100), Some(b"c"));
         avoidable.record_changed(node(2), ChangeKind::Split);
-        assert_eq!(avoidable.split_key(&node(1)), None);
+        avoidable.add_split_time(&node(2), lost_cas(100), None);
 
-        avoidable.take_window(NodeSizePolicy::default());
-        assert_eq!(avoidable.split_key(&node(1)), Some(b"b".to_vec()));
-        assert_eq!(avoidable.split_key(&node(2)), None);
+        let window = avoidable.take_window(NodeSizePolicy::default());
 
-        avoidable.take_window(NodeSizePolicy::default());
-        assert_eq!(avoidable.split_key(&node(1)), None);
+        let split_key = |byte| window.leaves[&LeafId::new(node(byte))].split_key.clone();
+        assert_eq!(split_key(1), Some(b"b".to_vec()));
+        assert_eq!(split_key(2), None);
     }
 
     #[test]

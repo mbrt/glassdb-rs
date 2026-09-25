@@ -59,6 +59,11 @@ pub struct TopologyWindow {
 pub struct LeafWindow {
     /// The avoidable time that one split of the leaf can remove.
     pub avoidable: SplitTime,
+    /// The split key of the last leaf delay in this window, if any. A split
+    /// there puts the delayed keys and the other keys in different halves.
+    /// The inline pressure of the leaf has no split key, because a split at
+    /// the median removes it.
+    pub split_key: Option<Vec<u8>>,
     /// The last size that this instance wrote or split, if any in this window.
     pub size: Option<LeafSize>,
     /// Whether a split that landed wrote the leaf in this window or the last
@@ -96,8 +101,11 @@ pub struct LeafId(ObjectPath);
 /// One change of one leaf that a policy asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TopologyChange {
-    /// Split the leaf in two.
+    /// Split the leaf in two at its median.
     Split(LeafId),
+    /// Split the leaf in two at the key. The engine skips the split if one
+    /// half would be empty.
+    SplitAt(LeafId, Vec<u8>),
     /// Merge the leaf into its right sibling.
     Merge(LeafId),
 }
@@ -105,9 +113,10 @@ pub enum TopologyChange {
 /// Splits a leaf when its split-side time in one window is more than the
 /// typical split time, and merges two adjacent leaves when their merge-side
 /// time is more than the typical merge time plus the split-side time of both
-/// leaves (ADR-074). Leaves over a soft cap also split. A leaf that a split
-/// wrote in this window or the last one does not merge, and a leaf that a
-/// merge wrote does not split on avoidable time.
+/// leaves (ADR-074). A split for split-side time is at the split key of the
+/// leaf. Leaves over a soft cap also split, at the median. A leaf that a
+/// split wrote in this window or the last one does not merge, and a leaf that
+/// a merge wrote does not split on avoidable time.
 #[derive(Debug, Clone, Copy)]
 pub struct AvoidableTimePolicy {
     split_threshold: f64,
@@ -225,10 +234,13 @@ impl TopologyPolicy for AvoidableTimePolicy {
                 .size
                 .is_some_and(|size| size.over_soft_cap(&window.node_size));
             let pays = !leaf.merged_recently && leaf.avoidable.total() > split_time;
-            if over_cap || pays {
-                changes.push(TopologyChange::Split(id.clone()));
-                held.insert(id);
-            }
+            let change = match &leaf.split_key {
+                Some(key) if pays => TopologyChange::SplitAt(id.clone(), key.clone()),
+                _ if pays || over_cap => TopologyChange::Split(id.clone()),
+                _ => continue,
+            };
+            changes.push(change);
+            held.insert(id);
         }
         let split_side = |id: &LeafId| {
             window

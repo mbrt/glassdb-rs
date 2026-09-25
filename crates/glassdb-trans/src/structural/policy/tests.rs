@@ -89,6 +89,31 @@ fn a_leaf_splits_when_its_split_side_time_is_more_than_a_split() {
     );
 }
 
+// The split key separates the keys that paid for the split. A soft cap asks
+// for balanced halves.
+#[test]
+fn a_split_for_split_side_time_is_at_the_split_key_and_a_soft_cap_split_at_the_median() {
+    let keyed = |window: LeafWindow| LeafWindow {
+        split_key: Some(b"k".to_vec()),
+        ..window
+    };
+    let window = window(
+        vec![
+            (leaf(1), keyed(lost_cas(501))),
+            (leaf(2), keyed(sized(9, 9))),
+        ],
+        vec![],
+    );
+
+    assert_eq!(
+        AvoidableTimePolicy::new().decide(&window),
+        vec![
+            TopologyChange::SplitAt(leaf(1), b"k".to_vec()),
+            TopologyChange::Split(leaf(2)),
+        ]
+    );
+}
+
 #[test]
 fn the_split_threshold_scales_the_split_time() {
     let window = window(vec![(leaf(1), lost_cas(900))], vec![]);

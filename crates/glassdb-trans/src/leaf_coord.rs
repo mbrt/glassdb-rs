@@ -624,8 +624,9 @@ impl CasFloor {
     }
 }
 
-/// The number of leaves whose last round keys stay known. Above it, all are
-/// forgotten, and the next waits on those leaves are not split causes.
+/// The number of leaves whose last round keys stay known. Above it, a known
+/// leaf is forgotten for each new one, and the next waits on the forgotten
+/// leaf are not split causes.
 const RECENT_ROUNDS_CAP: usize = 1024;
 
 /// The last round of each leaf, until the next round on the leaf starts. A
@@ -643,8 +644,11 @@ impl RecentRounds {
 
     fn put(&self, path: ObjectPath, round: PreviousRound) {
         let mut recent = self.rounds.lock().unwrap();
-        if recent.len() >= RECENT_ROUNDS_CAP {
-            recent.clear();
+        if recent.len() >= RECENT_ROUNDS_CAP
+            && !recent.contains_key(&path)
+            && let Some(forgotten) = recent.keys().next().cloned()
+        {
+            recent.remove(&forgotten);
         }
         recent.insert(path, round);
     }
