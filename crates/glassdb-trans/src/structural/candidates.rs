@@ -306,23 +306,30 @@ impl MaintenanceCandidates {
 }
 
 impl MaintenanceCandidate {
-    /// Coalesces same-path, same-cause observations without sacrificing the
-    /// oldest structural priority or the largest requested headroom.
+    /// Coalesces same-path, same-cause observations of `other`, which is newer,
+    /// without sacrificing the oldest structural priority or the largest
+    /// requested headroom. A demand split keeps the newest split key, because
+    /// the leaf changes after each measurement.
     fn coalesce(&mut self, other: MaintenanceCandidate) {
         if other.priority.older(&self.priority) {
             self.priority = other.priority;
         }
-        if let (
-            CandidateCause::Split(SplitReason::InlinePressure { key, value_len }),
-            CandidateCause::Split(SplitReason::InlinePressure {
-                key: other_key,
-                value_len: other_len,
-            }),
-        ) = (&mut self.cause, other.cause)
-            && other_len > *value_len
-        {
-            *key = other_key;
-            *value_len = other_len;
+        match (&mut self.cause, other.cause) {
+            (
+                CandidateCause::Split(SplitReason::InlinePressure { key, value_len }),
+                CandidateCause::Split(SplitReason::InlinePressure {
+                    key: other_key,
+                    value_len: other_len,
+                }),
+            ) if other_len > *value_len => {
+                *key = other_key;
+                *value_len = other_len;
+            }
+            (
+                CandidateCause::Split(SplitReason::Demand { at }),
+                CandidateCause::Split(SplitReason::Demand { at: Some(other_at) }),
+            ) => *at = Some(other_at),
+            _ => {}
         }
     }
 }

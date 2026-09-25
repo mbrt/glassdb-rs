@@ -135,10 +135,18 @@ type Owner = fn(u8) -> usize;
 const HALVES: Owner = |key| usize::from(key / 4);
 const INTERLEAVED: Owner = |key| usize::from(key % 2);
 
+/// The outcome of [`contend`].
+struct Contention {
+    /// The sum of the restructurer stats of both instances.
+    stats: RestructurerStats,
+    /// The leaf boundaries between the keys 3 and 4, which separate the
+    /// halves of [`HALVES`].
+    middle_crossings: u64,
+}
+
 // Opens two database instances with `rule` over one leaf of 8 keys, and
-// writes each key 200 times from the instance that `owner` gives. Returns the
-// sum of the restructurer stats of both instances.
-async fn contend(rule: LeafChanges, owner: Owner) -> RestructurerStats {
+// writes each key 200 times from the instance that `owner` gives.
+async fn contend(rule: LeafChanges, owner: Owner) -> Contention {
     let backend = slow_mem();
     let first = open(&backend, NodeSizePolicy::default(), rule).await;
     let second = open(&backend, NodeSizePolicy::default(), rule).await;
@@ -162,26 +170,47 @@ async fn contend(rule: LeafChanges, owner: Owner) -> RestructurerStats {
     stats += second.stats().restructurer;
     first.shutdown().await;
     second.shutdown().await;
-    stats
+    Contention {
+        stats,
+        middle_crossings: middle_crossings(&backend).await,
+    }
+}
+
+// A new instance reads the current leaves, and not the ones in the caches of
+// the writers.
+async fn middle_crossings(backend: &Arc<dyn Backend>) -> u64 {
+    let reader = open(backend, NodeSizePolicy::default(), LeafChanges::Size).await;
+    let coll = open_top(&reader, b"contended").await;
+    let before = reader.stats();
+    // A scan crosses into the next leaf when its end is the first key of that
+    // leaf, so the end is just after key 4.
+    coll.scan_keys(KeyScan::range(&[3], &[4, 0])).await.unwrap();
+    let crossings = (reader.stats() - before).transactions.scan_leaf_crossings;
+    reader.shutdown().await;
+    crossings
 }
 
 // Two database instances that write different halves of one leaf lose CASes
-// to each other, which one split can remove. The soft caps do not split the
-// leaf. The writers of one instance share rounds, so they alone cause no
-// avoidable time.
+// to each other, which one split between the halves can remove. The soft caps
+// do not split the leaf. The writers of one instance share rounds, so they
+// alone cause no avoidable time.
 #[tokio::test(start_paused = true)]
-async fn a_leaf_that_instances_contend_on_splits() {
-    let stats = contend(LeafChanges::default(), HALVES).await;
+async fn a_leaf_that_instances_contend_on_splits_between_them() {
+    let Contention {
+        stats,
+        middle_crossings,
+    } = contend(LeafChanges::default(), HALVES).await;
 
     assert!(stats.avoidable.split.lost_cas > Duration::ZERO);
     assert!(stats.splits >= 1, "{stats:?}");
+    assert_eq!(middle_crossings, 1);
 }
 
 // A split at the median leaves writers of both instances in each half, so the
 // CASes that they lose are not avoidable time.
 #[tokio::test(start_paused = true)]
 async fn a_leaf_that_instances_write_interleaved_keys_of_does_not_split() {
-    let stats = contend(LeafChanges::default(), INTERLEAVED).await;
+    let Contention { stats, .. } = contend(LeafChanges::default(), INTERLEAVED).await;
 
     assert_eq!(stats.avoidable.split.lost_cas, Duration::ZERO);
     assert_eq!(stats.splits, 0, "{stats:?}");
@@ -195,7 +224,7 @@ async fn the_split_threshold_scales_the_time_that_pays_for_a_split() {
         split_threshold: 1000.0,
         merge_threshold: 1.0,
     };
-    let stats = contend(rule, HALVES).await;
+    let Contention { stats, .. } = contend(rule, HALVES).await;
 
     assert!(stats.avoidable.split.lost_cas > Duration::ZERO);
     assert_eq!(stats.splits, 0);
