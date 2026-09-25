@@ -26,6 +26,7 @@ use prost::Message;
 use crate::error::StorageError;
 use crate::leaf::{LeafBody, LeafEntry};
 use crate::lock::{ExclusiveGate, LockType, SharedExclusiveLock};
+use crate::wire_id::{decode_id, decode_optional_id};
 use crate::wire_size::{length_delimited_field, nonempty_length_delimited_field};
 use glassdb_data::{ID_BYTES, NodeId, StructuralIntentId, TxId};
 
@@ -176,8 +177,7 @@ impl IndexNode {
             .entries
             .into_iter()
             .map(|entry| {
-                let child = NodeId::from_slice(&entry.child)
-                    .ok_or_else(|| StorageError::other("index node has an invalid child ID"))?;
+                let child = decode_id(&entry.child, "index node has an invalid child ID")?;
                 Ok((entry.separator_key, child))
             })
             .collect::<Result<_, StorageError>>()?;
@@ -1000,30 +1000,13 @@ impl Node {
             .map_err(|_| StorageError::other("node has an invalid structural gate"))?;
         let membership = SharedExclusiveLock::from_pb(raw.membership_lock)
             .map_err(|_| StorageError::other("node has invalid membership lock"))?;
-        let drop_intent = if raw.drop_intent.is_empty() {
-            None
-        } else {
-            Some(
-                TxId::from_slice(&raw.drop_intent)
-                    .ok_or_else(|| StorageError::other("node has an invalid drop intent"))?,
-            )
-        };
-        let right_sibling = if raw.right_sibling.is_empty() {
-            None
-        } else {
-            Some(
-                NodeId::from_slice(&raw.right_sibling)
-                    .ok_or_else(|| StorageError::other("node has an invalid right-sibling ID"))?,
-            )
-        };
-        let merge_reservation = if raw.merge_reservation.is_empty() {
-            None
-        } else {
-            Some(
-                StructuralIntentId::from_slice(&raw.merge_reservation)
-                    .ok_or_else(|| StorageError::other("node has an invalid merge reservation"))?,
-            )
-        };
+        let drop_intent = decode_optional_id(&raw.drop_intent, "node has an invalid drop intent")?;
+        let right_sibling =
+            decode_optional_id(&raw.right_sibling, "node has an invalid right-sibling ID")?;
+        let merge_reservation = decode_optional_id(
+            &raw.merge_reservation,
+            "node has an invalid merge reservation",
+        )?;
         let body_is_empty = match &body {
             NodeBody::Leaf(leaf) => leaf.is_empty(),
             NodeBody::Index(index) => index.is_empty(),

@@ -14,6 +14,7 @@ use prost::Message;
 use crate::cached_store::{CachedStore, CasResult, Codec, Observation, Requirement};
 use crate::error::StorageError;
 use crate::lock::SharedExclusiveLock;
+use crate::wire_id::{decode_id, decode_optional_id};
 
 /// A decoded collection record.
 ///
@@ -193,9 +194,10 @@ impl CollectionRecord {
                     "collection record contains an invalid child name",
                 ));
             }
-            let id = CollectionId::from_slice(&child.collection_id).ok_or_else(|| {
-                StorageError::other("collection record contains an invalid child ID")
-            })?;
+            let id: CollectionId = decode_id(
+                &child.collection_id,
+                "collection record contains an invalid child ID",
+            )?;
             if id.is_root() {
                 return Err(StorageError::other(
                     "collection record binds a child to the reserved root ID",
@@ -213,21 +215,14 @@ impl CollectionRecord {
                 StorageError::other("collection record has an invalid directory lock")
             })?,
             directory_generation: raw.directory_generation,
-            topology_freeze: if raw.topology_freeze.is_empty() {
-                None
-            } else {
-                Some(TxId::from_slice(&raw.topology_freeze).ok_or_else(|| {
-                    StorageError::other("collection record has an invalid topology freeze")
-                })?)
-            },
+            topology_freeze: decode_optional_id(
+                &raw.topology_freeze,
+                "collection record has an invalid topology freeze",
+            )?,
             topology_participants: raw
                 .topology_participants
                 .iter()
-                .map(|id| {
-                    TxId::from_slice(id).ok_or_else(|| {
-                        StorageError::other("collection record has an invalid topology participant")
-                    })
-                })
+                .map(|id| decode_id(id, "collection record has an invalid topology participant"))
                 .collect::<Result<_, _>>()?,
         })
     }
@@ -405,7 +400,7 @@ mod tests {
     }
 
     fn collection_id(byte: u8) -> CollectionId {
-        CollectionId::from_slice(&[byte; 16]).unwrap()
+        CollectionId::from_bytes([byte; 16])
     }
 
     #[test]
@@ -637,7 +632,7 @@ mod tests {
             .await
             .unwrap();
 
-        let child = CollectionId::from_slice(&[1; 16]).unwrap();
+        let child = CollectionId::from_bytes([1; 16]);
         assert!(record.add_child(b"child".to_vec(), child).unwrap());
         assert!(records.store_record(&record, &record_before).await.unwrap());
         let (_, record_after) = records

@@ -78,7 +78,6 @@ mod tests {
                 key: key(b"hello"),
                 value: Arc::from(&b"world"[..]),
                 deleted: false,
-                prev_writer: None,
             }],
             locks: Vec::new(),
             collection_changes: Vec::new(),

@@ -1317,7 +1317,6 @@ async fn split_help_forwards_a_committed_entry_holder_before_moving_its_entry() 
         key: LogicalKey::new(collection(), b"d"),
         value: Arc::from(b"new-d".as_slice()),
         deleted: false,
-        prev_writer: Some(tx_id(&[1])),
     });
 
     let entries: Vec<_> = [b"a".as_slice(), b"b", b"c", b"d"]

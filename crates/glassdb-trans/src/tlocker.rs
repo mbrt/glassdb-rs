@@ -2290,7 +2290,6 @@ mod tests {
             key: logical_key(key),
             value: Arc::from(&b"v1"[..]),
             deleted: false,
-            prev_writer: None,
         }];
         ctx.monitor.commit_tx(record).await.unwrap();
         locker.keys().write_back(&old, &old_locked).await;
@@ -2481,7 +2480,6 @@ mod tests {
                 key: logical_key(key),
                 value: Arc::from(&value[..]),
                 deleted: false,
-                prev_writer: None,
             })
             .collect();
         ctx.monitor.commit_tx(record).await.unwrap();
@@ -2657,7 +2655,6 @@ mod tests {
             key: logical_key(key),
             value: Arc::from(value),
             deleted: false,
-            prev_writer: None,
         }];
         ctx.monitor.commit_tx(record).await.unwrap();
 
@@ -2864,7 +2861,7 @@ mod tests {
     ) -> BTreeMap<ObjectPath, RoutedLockGroup> {
         let mut groups = BTreeMap::new();
         for index in 0..count {
-            let id = CollectionId::from_slice(&[index as u8 + 1; 16]).unwrap();
+            let id = CollectionId::from_bytes([index as u8 + 1; 16]);
             let collection = CollectionAddress::new("test", id);
             ctx.nodes
                 .create_root(&collection, &Node::leaf(LeafBody::new()))
@@ -2936,12 +2933,8 @@ mod tests {
         let mut locks = Vec::new();
         let mut changes = Vec::new();
         for index in 1..=5 {
-            let parent =
-                CollectionAddress::new("test", CollectionId::from_slice(&[index; 16]).unwrap());
-            let child = CollectionAddress::new(
-                "test",
-                CollectionId::from_slice(&[index + 10; 16]).unwrap(),
-            );
+            let parent = CollectionAddress::new("test", CollectionId::from_bytes([index; 16]));
+            let child = CollectionAddress::new("test", CollectionId::from_bytes([index + 10; 16]));
             let mut record = CollectionRecord::new();
             record.set_directory_writer(*id);
             assert!(
@@ -3109,10 +3102,7 @@ mod tests {
     #[tokio::test]
     async fn an_acquire_without_a_leaf_reports_a_dropped_collection_as_stale() {
         let (locker, ctx) = init_tl_test().await;
-        let dropped = CollectionAddress::new(
-            "test",
-            CollectionId::from_slice(&[7; 16]).expect("fixed ID has the required width"),
-        );
+        let dropped = CollectionAddress::new("test", CollectionId::from_bytes([7; 16]));
         ctx.nodes
             .create_root(&dropped, &Node::leaf(LeafBody::new()))
             .await
@@ -3224,7 +3214,6 @@ mod tests {
                 key: intent.key.clone(),
                 value: Arc::from(b"value".as_slice()),
                 deleted: false,
-                prev_writer: None,
             })
             .collect();
         let proofs = lock_ok(&locker, &tx, &groups).await;
@@ -3412,7 +3401,6 @@ mod tests {
             key: logical_key(key),
             value: Arc::from(&b"v"[..]),
             deleted: false,
-            prev_writer: None,
         }];
         ctx.monitor.commit_tx(record).await.unwrap();
         locked

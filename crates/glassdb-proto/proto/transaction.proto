@@ -30,8 +30,6 @@ message CollectionWrites {
 
 message Write {
     bytes key = 1;
-    // The ID of the last transaction writing to this key.
-    bytes prev_tid = 3;
 
     oneof val_delete {
         bytes value = 2;

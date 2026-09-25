@@ -602,7 +602,7 @@ mod tests {
             .await
             .unwrap();
         record.remove_directory_holder(&old);
-        let child = CollectionId::from_slice(&[1; 16]).unwrap();
+        let child = CollectionId::from_bytes([1; 16]);
         record.add_child(b"child".to_vec(), child).unwrap();
         peer.records.store_record(&record, &observed).await.unwrap();
         let observed = peer

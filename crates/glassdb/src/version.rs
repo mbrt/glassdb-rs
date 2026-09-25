@@ -84,7 +84,7 @@ async fn check_db_version(b: &impl Backend, name: &str) -> Result<DatabaseMetada
             meta.version
         )));
     }
-    let bytes: [u8; ID_BYTES] = meta.database_id.try_into().map_err(|_| {
+    let database_id = DatabaseId::try_from(meta.database_id.as_slice()).map_err(|_| {
         Error::internal(format!(
             "database metadata ID must contain exactly {ID_BYTES} bytes"
         ))
@@ -97,7 +97,7 @@ async fn check_db_version(b: &impl Backend, name: &str) -> Result<DatabaseMetada
         ));
     }
     let metadata = DatabaseMetadata {
-        id: DatabaseId::from_bytes(bytes),
+        id: database_id,
         timing: ProtocolTiming::new(pending_timeout, max_clock_skew),
         node_max_bytes: required_size(meta.node_max_bytes, "node_max_bytes")?,
         split_headroom_bytes: required_size(meta.split_headroom_bytes, "split_headroom_bytes")?,

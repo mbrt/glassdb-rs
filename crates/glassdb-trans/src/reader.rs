@@ -231,7 +231,6 @@ mod tests {
                 key: key.clone(),
                 value: Arc::from(&b"old"[..]),
                 deleted: false,
-                prev_writer: None,
             });
             let local_record = local.tx_records.set(&record).await.unwrap();
             let mut entry = LeafEntry::new(b"key");

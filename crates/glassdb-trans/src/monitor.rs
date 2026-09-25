@@ -2304,10 +2304,7 @@ mod tests {
     }
 
     fn collection_address(id: u8) -> CollectionAddress {
-        CollectionAddress::new(
-            "test",
-            CollectionId::from_slice(&[id; 16]).expect("fixed ID has the required width"),
-        )
+        CollectionAddress::new("test", CollectionId::from_bytes([id; 16]))
     }
 
     struct TestCtx {
@@ -3615,7 +3612,6 @@ mod tests {
                 key: key.clone(),
                 value: Arc::from(value),
                 deleted: false,
-                prev_writer: None,
             }
         }
     }

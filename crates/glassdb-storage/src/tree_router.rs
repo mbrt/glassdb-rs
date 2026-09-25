@@ -1860,7 +1860,7 @@ mod tests {
     ) -> Vec<CollectionAddress> {
         let mut collections = Vec::new();
         for index in 0..count {
-            let id = CollectionId::from_slice(&[index as u8 + 1; 16]).unwrap();
+            let id = CollectionId::from_bytes([index as u8 + 1; 16]);
             let collection = CollectionAddress::new("db", id);
             store
                 .create_root(
@@ -2042,7 +2042,7 @@ mod tests {
         let s = store();
         let router = TreeRouter::new(s.nodes.clone(), NonZeroUsize::new(2).unwrap());
         let root = CollectionAddress::root("db");
-        let child = CollectionAddress::new("db", CollectionId::from_slice(&[1; 16]).unwrap());
+        let child = CollectionAddress::new("db", CollectionId::from_bytes([1; 16]));
         let requirement = Requirement::after(s.timeline.currentness_barrier());
 
         let root_error = router

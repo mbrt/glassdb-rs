@@ -609,7 +609,7 @@ mod tests {
         );
         let owner_lifecycle = lifecycle(&owner);
         let peer_lifecycle = lifecycle(&peer);
-        let collection = CollectionAddress::new("db", CollectionId::from_slice(&[17; 16]).unwrap());
+        let collection = CollectionAddress::new("db", CollectionId::from_bytes([17; 16]));
         let mut change = CollectionChange {
             parent: CollectionAddress::root("db"),
             name: b"child".to_vec(),

@@ -3,9 +3,10 @@
 use glassdb_proto as pb;
 use prost::Message;
 
-use glassdb_data::{CollectionAddress, CollectionId, DbPrefix, NodeId, TxId};
+use glassdb_data::{CollectionAddress, DbPrefix, NodeId, TxId};
 
 use crate::error::StorageError;
+use crate::wire_id::{decode_id, decode_optional_id};
 
 /// Whether a structural intent has captured the source revision needed by
 /// recovery.
@@ -125,9 +126,10 @@ impl StructuralIntent {
     }
 
     fn from_proto(db_prefix: &DbPrefix, raw: pb::StructuralIntent) -> Result<Self, StorageError> {
-        let participant_id = TxId::from_slice(&raw.participant_id).ok_or_else(|| {
-            StorageError::other("structural intent has an invalid topology participant")
-        })?;
+        let participant_id = decode_id(
+            &raw.participant_id,
+            "structural intent has an invalid topology participant",
+        )?;
         let phase = match pb::structural_intent::Phase::try_from(raw.phase) {
             Ok(pb::structural_intent::Phase::Preparing) => StructuralIntentPhase::Preparing,
             Ok(pb::structural_intent::Phase::Ready) => StructuralIntentPhase::Ready,
@@ -137,14 +139,15 @@ impl StructuralIntent {
                 ));
             }
         };
-        let collection_id = CollectionId::from_slice(&raw.collection_id)
-            .ok_or_else(|| StorageError::other("structural intent has an invalid collection ID"))?;
+        let collection_id = decode_id(
+            &raw.collection_id,
+            "structural intent has an invalid collection ID",
+        )?;
         let collection = CollectionAddress::from_db_prefix(db_prefix.clone(), collection_id);
-        let source_node_id = if raw.source_node_id.is_empty() {
-            None
-        } else {
-            Some(parse_node_id(&raw.source_node_id, "source")?)
-        };
+        let source_node_id = decode_optional_id(
+            &raw.source_node_id,
+            "structural intent has an invalid source node ID",
+        )?;
         if raw.is_root != source_node_id.is_none() {
             return Err(StorageError::other(
                 "structural intent has inconsistent root metadata",
@@ -161,7 +164,7 @@ impl StructuralIntent {
                 created_node_ids: raw
                     .created_node_ids
                     .iter()
-                    .map(|id| parse_node_id(id, "created"))
+                    .map(|id| decode_id(id, "structural intent has an invalid created node ID"))
                     .collect::<Result<Vec<_>, _>>()?,
                 split_key: raw.split_key,
             },
@@ -198,7 +201,10 @@ impl StructuralIntent {
         }
         let target = if ready {
             Some(MergeTarget {
-                node_id: parse_node_id(&raw.target_node_id, "merge target")?,
+                node_id: decode_id(
+                    &raw.target_node_id,
+                    "structural intent has an invalid merge target node ID",
+                )?,
                 boundary: raw.boundary,
                 generation: raw.target_generation,
             })
@@ -209,14 +215,10 @@ impl StructuralIntent {
     }
 }
 
-fn parse_node_id(bytes: &[u8], role: &str) -> Result<NodeId, StorageError> {
-    NodeId::from_slice(bytes).ok_or_else(|| {
-        StorageError::other(format!("structural intent has an invalid {role} node ID"))
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    use glassdb_data::CollectionId;
+
     use super::*;
 
     fn tx_id(prefix: &[u8]) -> TxId {

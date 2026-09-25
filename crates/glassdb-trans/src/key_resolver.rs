@@ -536,7 +536,7 @@ mod tests {
     }
 
     fn missing_collection() -> CollectionAddress {
-        CollectionAddress::new(DB, CollectionId::from_slice(&[1; 16]).unwrap())
+        CollectionAddress::new(DB, CollectionId::from_bytes([1; 16]))
     }
 
     // A resolver over `backend` with its own fresh cache, so it starts cold,
@@ -702,7 +702,6 @@ mod tests {
             key: logical_key(key),
             value: Arc::from(b"v".as_slice()),
             deleted,
-            prev_writer: None,
         }];
         mon.commit_tx(record).await.unwrap();
     }

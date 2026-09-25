@@ -1,8 +1,7 @@
 use std::fmt;
 
 use crate::base64;
-use crate::collection_id::CollectionId;
-use crate::node_id::NodeId;
+use crate::ids::{CollectionId, NodeId};
 
 use super::{CollectionAddress, DbPrefix, ObjectPath, PathError, parse_id};
 
@@ -21,12 +20,7 @@ pub(super) fn parse_collection_prefix(prefix: &str) -> Result<(&str, CollectionI
     if db_prefix.is_empty() || encoded.is_empty() || encoded.contains('/') {
         return Err(PathError::Parse(prefix.to_string()));
     }
-    let bytes = base64::decode(encoded)?;
-    if base64::encode(&bytes) != encoded {
-        return Err(PathError::Parse(prefix.to_string()));
-    }
-    let id =
-        CollectionId::from_slice(&bytes).ok_or_else(|| PathError::Parse(prefix.to_string()))?;
+    let id = parse_id("collection ID", encoded)?;
     Ok((db_prefix, id))
 }
 
@@ -38,7 +32,7 @@ pub(super) fn parse_object(path: &str) -> Option<Result<ObjectPath, PathError>> 
             parse_collection(prefix).and_then(|collection| {
                 Ok(ObjectPath::Node {
                     collection,
-                    id: parse_id("node ID", id, NodeId::from_slice)?,
+                    id: parse_id("node ID", id)?,
                 })
             })
         });

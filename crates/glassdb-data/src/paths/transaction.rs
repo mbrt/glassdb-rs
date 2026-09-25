@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::base64;
-use crate::txid::TxId;
+use crate::ids::TxId;
 
 use super::{DbPrefix, ObjectPath, PathError, parse_id};
 
@@ -73,7 +73,7 @@ pub(super) fn scan_prefix(prefix: &str, depth: u8, index: usize) -> Result<Strin
 }
 
 fn decode_parts(source: &str, a: &str, b: &str, encoded: &str) -> Result<TxId, PathError> {
-    let id = parse_id("transaction ID", encoded, TxId::from_slice)?;
+    let id = parse_id("transaction ID", encoded)?;
     let symbols = prefix_symbols(encoded);
     if a != &symbols[..1] || b != &symbols[1..] {
         return Err(PathError::Parse(source.to_string()));

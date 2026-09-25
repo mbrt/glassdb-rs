@@ -341,7 +341,6 @@ mod tests {
                     key: key.clone(),
                     value: Arc::from(b"holder-value".as_slice()),
                     deleted,
-                    prev_writer: None,
                 });
             }
             self.transactions.set(&record).await.unwrap();
@@ -796,7 +795,6 @@ mod tests {
             key: key.clone(),
             value: Arc::from(b"v".as_slice()),
             deleted: false,
-            prev_writer: Some(predecessor),
         }];
         let entry = locked_entry(
             key.key(),

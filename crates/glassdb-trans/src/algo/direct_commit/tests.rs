@@ -1821,7 +1821,7 @@ async fn cross_leaf_member_uses_a_locked_commit() {
     let (tm, tctx, log) = new_recording_algo().await;
     let other = CollectionAddress::new(
         test_collection().db_prefix(),
-        CollectionId::from_slice(&[9; 16]).unwrap(),
+        CollectionId::from_bytes([9; 16]),
     );
     tctx.records
         .create_record(&other, &CollectionRecord::new())

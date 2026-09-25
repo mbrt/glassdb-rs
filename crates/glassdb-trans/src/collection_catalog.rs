@@ -187,10 +187,7 @@ mod tests {
     async fn snapshot_helps_a_committed_directory_holder() {
         let (catalog, records, monitor, _background) = new_catalog();
         let parent = CollectionAddress::root("db");
-        let child = CollectionAddress::new(
-            "db",
-            CollectionId::from_slice(&[1; 16]).expect("fixed ID has the required width"),
-        );
+        let child = CollectionAddress::new("db", CollectionId::from_bytes([1; 16]));
         let id = TxId::with_priority(0, &[1]);
         let mut record = CollectionRecord::new();
         record.set_directory_writer(id);

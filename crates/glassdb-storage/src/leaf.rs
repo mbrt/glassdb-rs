@@ -18,6 +18,7 @@ use prost::Message;
 
 use crate::error::StorageError;
 use crate::lock::{KeyLockState, LockType, lock_type_to_proto};
+use crate::wire_id::decode_id;
 use crate::wire_size::{
     length_delimited_field, nonempty_length_delimited_field, nonzero_varint_field,
     present_varint_field,
@@ -383,8 +384,10 @@ fn current_from_proto(raw: Option<pb::CurrentState>) -> Result<CurrentState, Sto
     // A current value without a valid writer or without a state tag is not a
     // state any mutation can produce: reject it rather than guess which half is
     // authoritative.
-    let writer = TxId::from_slice(&raw.writer)
-        .ok_or_else(|| StorageError::other("leaf entry current value has an invalid writer"))?;
+    let writer = decode_id(
+        &raw.writer,
+        "leaf entry current value has an invalid writer",
+    )?;
     match raw.state {
         Some(State::External(_)) => Ok(CurrentState::External { writer }),
         Some(State::Inline(value)) => Ok(CurrentState::Inline {

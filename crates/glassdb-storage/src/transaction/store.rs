@@ -279,7 +279,7 @@ mod tests {
     }
 
     fn test_collection(db_prefix: &str, byte: u8) -> CollectionAddress {
-        CollectionAddress::new(db_prefix, CollectionId::from_slice(&[byte; 16]).unwrap())
+        CollectionAddress::new(db_prefix, CollectionId::from_bytes([byte; 16]))
     }
 
     fn new_recording_tx_record_store() -> (TxRecordStore, OpLog) {
@@ -323,7 +323,6 @@ mod tests {
             key: LogicalKey::new(test_collection("other", 1), b"key"),
             value: Arc::from(&b"value"[..]),
             deleted: false,
-            prev_writer: None,
         });
         assert!(logger.set(&wrong_database).await.is_err());
         assert_operations(&operations, &[]);
@@ -526,7 +525,6 @@ mod tests {
                 key: key.clone(),
                 value: Arc::from(&b"world"[..]),
                 deleted: false,
-                prev_writer: Some(tx_id(&[9])),
             }],
             locks: vec![
                 TxLock::Membership {
@@ -686,7 +684,6 @@ mod tests {
             key,
             value: Arc::from(&b"world"[..]),
             deleted: false,
-            prev_writer: None,
         }];
         let stored_v = t.set(&record).await.unwrap();
 

@@ -65,9 +65,6 @@ pub struct CollectionWrites {
 pub struct Write {
     #[prost(bytes = "vec", tag = "1")]
     pub key: ::prost::alloc::vec::Vec<u8>,
-    /// The ID of the last transaction writing to this key.
-    #[prost(bytes = "vec", tag = "3")]
-    pub prev_tid: ::prost::alloc::vec::Vec<u8>,
     #[prost(oneof = "write::ValDelete", tags = "2, 4")]
     pub val_delete: ::core::option::Option<write::ValDelete>,
 }

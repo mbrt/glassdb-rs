@@ -25,12 +25,10 @@ mod tests {
                 writes: vec![
                     Write {
                         key: b"Hello".to_vec(),
-                        prev_tid: vec![1, 2, 3, 4],
                         val_delete: Some(write::ValDelete::Value(b"world!".to_vec())),
                     },
                     Write {
                         key: b"other".to_vec(),
-                        prev_tid: vec![],
                         val_delete: Some(write::ValDelete::Deleted(true)),
                     },
                 ],

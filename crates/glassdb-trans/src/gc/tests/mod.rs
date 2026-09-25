@@ -92,10 +92,8 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
         let db_prefix = DbPrefix::try_from("db").unwrap();
         let owner = AssemblyFixture::new(hooked.clone(), db_prefix.clone(), &config);
         let engine = engine_fixture(&owner, db_prefix, config, false);
-        let prepared = CollectionAddress::new(
-            "db",
-            glassdb_data::CollectionId::from_slice(&[7; 16]).unwrap(),
-        );
+        let prepared =
+            CollectionAddress::new("db", glassdb_data::CollectionId::from_bytes([7; 16]));
         let mut changes = vec![CollectionChange {
             parent: collection(),
             name: b"new".to_vec(),
@@ -109,7 +107,7 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
                 name: b"nested".to_vec(),
                 collection: CollectionAddress::new(
                     "db",
-                    glassdb_data::CollectionId::from_slice(&[8; 16]).unwrap(),
+                    glassdb_data::CollectionId::from_bytes([8; 16]),
                 ),
                 expected: None,
                 op: CollectionOp::Create,
@@ -378,7 +376,6 @@ fn committed(id: TxId, offset: Duration, writes: &[&[u8]], locks: &[&[u8]]) -> T
                 key: key_path(k),
                 value: Arc::from(&b"v"[..]),
                 deleted: false,
-                prev_writer: None,
             })
             .collect(),
         locks: locks.iter().map(|k| write_lock(k)).collect(),
@@ -506,10 +503,7 @@ async fn committed_superseded_by_a_direct_writer_is_collected() {
 async fn committed_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
     let ctx = new_ctx().await;
     let id = tx(1);
-    let prepared = CollectionAddress::new(
-        "db",
-        CollectionId::from_slice(&[7; 16]).expect("fixed ID has the required width"),
-    );
+    let prepared = CollectionAddress::new("db", CollectionId::from_bytes([7; 16]));
     ctx.records
         .create_record(&prepared, &CollectionRecord::new())
         .await
@@ -535,10 +529,7 @@ async fn committed_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
 async fn aborted_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
     let ctx = new_ctx().await;
     let id = tx(1);
-    let prepared = CollectionAddress::new(
-        "db",
-        CollectionId::from_slice(&[7; 16]).expect("fixed ID has the required width"),
-    );
+    let prepared = CollectionAddress::new("db", CollectionId::from_bytes([7; 16]));
     ctx.records
         .create_record(&prepared, &CollectionRecord::new())
         .await
@@ -571,10 +562,7 @@ async fn rejected_collection_reclamation_keeps_the_recovery_manifest() {
     let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
     let ctx = new_ctx_with(backend.clone()).await;
     let id = tx(1);
-    let prepared = CollectionAddress::new(
-        "db",
-        CollectionId::from_slice(&[7; 16]).expect("fixed ID has the required width"),
-    );
+    let prepared = CollectionAddress::new("db", CollectionId::from_bytes([7; 16]));
     ctx.records
         .create_record(&prepared, &CollectionRecord::new())
         .await
@@ -639,10 +627,7 @@ async fn rejected_collection_reclamation_keeps_the_recovery_manifest() {
 async fn committed_drop_is_recovered_while_the_record_stores_a_live_value() {
     let ctx = new_ctx().await;
     let id = tx(1);
-    let child = CollectionAddress::new(
-        "db",
-        CollectionId::from_slice(&[8; 16]).expect("fixed ID has the required width"),
-    );
+    let child = CollectionAddress::new("db", CollectionId::from_bytes([8; 16]));
 
     store_entry(&ctx, b"k", writer_entry(b"k", &id)).await;
     let (mut parent_record, parent_observed) = ctx
@@ -725,10 +710,7 @@ async fn committed_drop_is_recovered_while_the_record_stores_a_live_value() {
 async fn committed_references_in_a_reclaimed_collection_are_absent() {
     let ctx = new_ctx().await;
     let id = tx(1);
-    let missing = CollectionAddress::new(
-        "db",
-        CollectionId::from_slice(&[9; 16]).expect("fixed ID has the required width"),
-    );
+    let missing = CollectionAddress::new("db", CollectionId::from_bytes([9; 16]));
     let key = LogicalKey::new(missing, b"k");
     let mut record = TxRecord::new(id, TxCommitStatus::Committed);
     record.timestamp = Some(base() - PAST_HORIZON);
@@ -736,7 +718,6 @@ async fn committed_references_in_a_reclaimed_collection_are_absent() {
         key: key.clone(),
         value: Arc::from(&b"v"[..]),
         deleted: false,
-        prev_writer: None,
     });
     record.locks.push(TxLock::Key {
         key,
@@ -1833,7 +1814,7 @@ async fn committed_directory_gc_reuses_removal_after_cache_eviction() {
     for index in 0..=glassdb_concurr::shard::count() {
         let mut bytes = [0; 16];
         bytes[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-        let child = CollectionAddress::new("db", CollectionId::from_slice(&bytes).unwrap());
+        let child = CollectionAddress::new("db", CollectionId::from_bytes(bytes));
         assert!(
             ctx.records
                 .create_record(&child, &CollectionRecord::new())
@@ -1950,7 +1931,7 @@ async fn committed_directory_removal_does_not_prove_other_records_clear() {
         let operations = recorded.log();
         let backend: Arc<dyn Backend> = Arc::new(recorded);
         let ctx = new_ctx_with(backend.clone()).await;
-        let child = CollectionAddress::new("db", CollectionId::from_slice(&[84; 16]).unwrap());
+        let child = CollectionAddress::new("db", CollectionId::from_bytes([84; 16]));
         assert!(
             ctx.records
                 .create_record(&child, &CollectionRecord::new())
@@ -2130,7 +2111,7 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
         Arc::new(UnexpectedTopologySettler),
     );
     let id = tx(87);
-    let child = CollectionAddress::new("db", CollectionId::from_slice(&[87; 16]).unwrap());
+    let child = CollectionAddress::new("db", CollectionId::from_bytes([87; 16]));
     let mut change = CollectionChange {
         parent: collection(),
         name: b"child".to_vec(),
@@ -2671,7 +2652,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropR
         ),
         std::num::NonZeroUsize::MIN,
     );
-    let target = CollectionAddress::new("db", CollectionId::from_slice(&[37; 16]).unwrap());
+    let target = CollectionAddress::new("db", CollectionId::from_bytes([37; 16]));
     let mut change = CollectionChange {
         parent: collection(),
         name: b"child".to_vec(),

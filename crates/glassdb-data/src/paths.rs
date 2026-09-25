@@ -2,12 +2,8 @@
 
 use std::sync::Arc;
 
-use crate::ID_BYTES;
 use crate::base64;
-use crate::collection_id::CollectionId;
-use crate::node_id::NodeId;
-use crate::structural_intent_id::StructuralIntentId;
-use crate::txid::TxId;
+use crate::ids::{CollectionId, ID_BYTES, NodeId, StructuralIntentId, TxId};
 
 mod structural;
 mod transaction;
@@ -83,10 +79,9 @@ fn validate_db_prefix(value: &str) -> Result<(), PathError> {
 }
 
 /// Parses the path component of a fixed-width ID, such as a node ID.
-fn parse_id<T>(
+fn parse_id<T: for<'a> TryFrom<&'a [u8]>>(
     component: &'static str,
     value: &str,
-    from_slice: impl FnOnce(&[u8]) -> Option<T>,
 ) -> Result<T, PathError> {
     let invalid = || PathError::InvalidComponent {
         component,
@@ -100,7 +95,7 @@ fn parse_id<T>(
     if base64::encode(&decoded) != value {
         return Err(invalid());
     }
-    from_slice(&decoded).ok_or_else(invalid)
+    T::try_from(decoded.as_slice()).map_err(|_| invalid())
 }
 
 /// The physical address of one collection within a database.
@@ -391,7 +386,7 @@ mod tests {
     use super::*;
 
     fn collection_id(byte: u8) -> CollectionId {
-        CollectionId::from_slice(&[byte; ID_BYTES]).unwrap()
+        CollectionId::from_bytes([byte; ID_BYTES])
     }
 
     fn node_id(byte: u8) -> NodeId {
@@ -437,6 +432,7 @@ mod tests {
     #[test]
     fn id_path_components_require_canonical_128_bit_encodings() {
         let zero = "0000000000000000000000";
+        let collection_path = |id: &str| format!("db/_c/{id}/_i");
         let node_path = |id: &str| format!("db/_c/{zero}/_n/{id}");
         let intent_path = |id: &str| format!("db/_s/{zero}/{id}");
         let participant_path = |id: &str| format!("db/_s/{id}/{zero}");
@@ -446,6 +442,12 @@ mod tests {
         };
         let parse = |path: String| ObjectPath::try_from(path.as_str());
 
+        assert_eq!(
+            parse(collection_path(zero)).unwrap(),
+            ObjectPath::CollectionRecord {
+                collection: CollectionAddress::root("db"),
+            }
+        );
         assert_eq!(
             parse(node_path(zero)).unwrap(),
             ObjectPath::Node {
@@ -482,6 +484,7 @@ mod tests {
             noncanonical,
         ] {
             for path in [
+                collection_path(invalid),
                 node_path(invalid),
                 intent_path(invalid),
                 participant_path(invalid),
@@ -491,6 +494,7 @@ mod tests {
             }
         }
         for path in [
+            collection_path(noncanonical),
             node_path(noncanonical),
             intent_path(noncanonical),
             participant_path(noncanonical),
@@ -645,7 +649,7 @@ mod tests {
     fn family_structure_wins_over_embedded_markers() {
         assert!(matches!(
             ObjectPath::try_from("db/_c/_t/_i"),
-            Err(PathError::Parse(_))
+            Err(PathError::InvalidComponent { .. })
         ));
         assert!(matches!(
             ObjectPath::try_from("db/_c/0000000000000000000000/_n/_r"),

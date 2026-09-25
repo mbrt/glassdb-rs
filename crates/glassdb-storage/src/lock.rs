@@ -30,9 +30,9 @@ impl HolderSet {
     fn from_wire(locked_by: Vec<Vec<u8>>) -> Result<Self, LockStateError> {
         let holders = locked_by
             .iter()
-            .map(|id| TxId::from_slice(id))
-            .collect::<Option<_>>()
-            .ok_or(LockStateError::InvalidHolder)?;
+            .map(|id| TxId::try_from(id.as_slice()))
+            .collect::<Result<_, _>>()
+            .map_err(|_| LockStateError::InvalidHolder)?;
         Self::from_holders(holders)
     }
 

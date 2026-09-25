@@ -3,8 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glassdb_data::{
-    CollectionAddress, CollectionId, ID_BYTES, LeafRef, LogicalKey, MAX_COLLECTION_NAME_BYTES,
-    NodeId, ObjectPath, TxId,
+    CollectionAddress, ID_BYTES, LeafRef, LogicalKey, MAX_COLLECTION_NAME_BYTES, ObjectPath, TxId,
 };
 use glassdb_proto as pb;
 use prost::Message;
@@ -13,6 +12,7 @@ use super::{TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxRecord
 use crate::cached_store::Codec;
 use crate::error::StorageError;
 use crate::lock::{LockType, lock_type_from_proto as parse_lock_type, lock_type_to_proto};
+use crate::wire_id::decode_id;
 
 /// Canonical protobuf codec for transaction-record objects.
 pub(crate) struct TxRecordCodec;
@@ -130,11 +130,7 @@ impl Codec for TxRecordCodec {
         record
             .writes
             .iter()
-            .map(|write| {
-                write.key.key().len()
-                    + write.value.len()
-                    + write.prev_writer.map_or(0, |_| ID_BYTES)
-            })
+            .map(|write| write.key.key().len() + write.value.len())
             .sum::<usize>()
             + record
                 .locks
@@ -198,7 +194,7 @@ fn decode_collection_writes(
     let mut locks = Vec::new();
     for group in encoded {
         let collection = decode_collection_id(db_prefix, &group.collection_id)?;
-        writes.extend(decode_writes(&collection, &group.writes)?);
+        writes.extend(decode_writes(&collection, &group.writes));
         if let Some(group_locks) = &group.locks {
             locks.extend(decode_key_locks(&collection, &group_locks.key_locks));
             locks.extend(decode_membership_locks(
@@ -222,26 +218,13 @@ fn decode_collection_writes(
     Ok((writes, locks))
 }
 
-fn decode_writes(
-    collection: &CollectionAddress,
-    encoded: &[pb::Write],
-) -> Result<Vec<TxWrite>, StorageError> {
+fn decode_writes(collection: &CollectionAddress, encoded: &[pb::Write]) -> Vec<TxWrite> {
     encoded
         .iter()
-        .map(|write| {
-            let prev_writer = if write.prev_tid.is_empty() {
-                None
-            } else {
-                Some(TxId::from_slice(&write.prev_tid).ok_or_else(|| {
-                    StorageError::other("transaction record has an invalid previous writer")
-                })?)
-            };
-            Ok(TxWrite {
-                key: LogicalKey::new(collection.clone(), &write.key),
-                value: write_value(write),
-                deleted: write_deleted(write),
-                prev_writer,
-            })
+        .map(|write| TxWrite {
+            key: LogicalKey::new(collection.clone(), &write.key),
+            value: write_value(write),
+            deleted: write_deleted(write),
         })
         .collect()
 }
@@ -266,11 +249,10 @@ fn decode_membership_locks(
             let leaf = match lock.target.as_ref() {
                 Some(pb::membership_lock::Target::Root(true)) => LeafRef::root(collection.clone()),
                 Some(pb::membership_lock::Target::Node(id)) => {
-                    let id = NodeId::from_slice(id).ok_or_else(|| {
-                        StorageError::other(
-                            "transaction record has an invalid membership-lock node ID",
-                        )
-                    })?;
+                    let id = decode_id(
+                        id,
+                        "transaction record has an invalid membership-lock node ID",
+                    )?;
                     LeafRef::node(collection.clone(), id)
                 }
                 _ => {
@@ -365,10 +347,6 @@ fn append_write(
     };
     let encoded = pb::Write {
         key: write.key.key().to_vec(),
-        prev_tid: write
-            .prev_writer
-            .map(|id| id.as_bytes().to_vec())
-            .unwrap_or_default(),
         val_delete: Some(val_delete),
     };
     let collection = write.key.collection();
@@ -430,8 +408,10 @@ fn decode_collection_id(
     db_prefix: &str,
     collection_id: &[u8],
 ) -> Result<CollectionAddress, StorageError> {
-    let id = CollectionId::from_slice(collection_id)
-        .ok_or_else(|| StorageError::other("transaction record has an invalid collection ID"))?;
+    let id = decode_id(
+        collection_id,
+        "transaction record has an invalid collection ID",
+    )?;
     Ok(CollectionAddress::new(db_prefix, id))
 }
 
@@ -505,6 +485,8 @@ fn proto_ts_to_system(timestamp: prost_types::Timestamp) -> SystemTime {
 
 #[cfg(test)]
 mod tests {
+    use glassdb_data::{CollectionId, NodeId};
+
     use super::*;
 
     fn tx_id(prefix: &[u8]) -> TxId {
@@ -512,7 +494,7 @@ mod tests {
     }
 
     fn collection(db_prefix: &str, byte: u8) -> CollectionAddress {
-        CollectionAddress::new(db_prefix, CollectionId::from_slice(&[byte; 16]).unwrap())
+        CollectionAddress::new(db_prefix, CollectionId::from_bytes([byte; 16]))
     }
 
     fn record_with_status(status: TxCommitStatus) -> TxRecord {
@@ -534,13 +516,11 @@ mod tests {
                     key: LogicalKey::new(parent.clone(), b"value"),
                     value: Arc::from(&b"contents"[..]),
                     deleted: false,
-                    prev_writer: Some(tx_id(&[9])),
                 },
                 TxWrite {
                     key: LogicalKey::new(parent.clone(), b"deleted"),
                     value: Arc::from(&[][..]),
                     deleted: true,
-                    prev_writer: Some(tx_id(&[8])),
                 },
             ],
             locks: vec![
@@ -695,13 +675,11 @@ mod tests {
                 key: LogicalKey::new(collection("first", 1), b"a"),
                 value: Arc::from(&b"a"[..]),
                 deleted: false,
-                prev_writer: None,
             },
             TxWrite {
                 key: LogicalKey::new(collection("second", 1), b"b"),
                 value: Arc::from(&b"b"[..]),
                 deleted: false,
-                prev_writer: None,
             },
         ];
 
@@ -786,35 +764,6 @@ mod tests {
                 }),
             });
             assert_rejected(encoded);
-        }
-    }
-
-    #[test]
-    fn previous_writers_must_be_absent_or_16_bytes() {
-        let with_prev_tid = |prev_tid: Vec<u8>| {
-            let mut encoded = encoded_record();
-            encoded.writes.push(pb::CollectionWrites {
-                collection_id: vec![1; 16],
-                writes: vec![pb::Write {
-                    key: b"k".to_vec(),
-                    prev_tid,
-                    val_delete: Some(pb::write::ValDelete::Deleted(true)),
-                }],
-                locks: None,
-            });
-            encoded
-        };
-
-        for (prev_tid, want) in [
-            (Vec::new(), None),
-            (vec![9; 16], Some(TxId::from_bytes([9; 16]))),
-        ] {
-            let bytes = with_prev_tid(prev_tid).encode_to_vec();
-            let record = TxRecordCodec::decode("db", &tx_id(&[1]), &bytes).unwrap();
-            assert_eq!(record.writes[0].prev_writer, want);
-        }
-        for prev_tid in [vec![9; 15], vec![9; 17]] {
-            assert_rejected(with_prev_tid(prev_tid));
         }
     }
 

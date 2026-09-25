@@ -682,8 +682,8 @@ The record is serialized as a Protocol Buffer and contains:
   aborted but remains pinned until the owner acknowledges retirement as
   `Aborted`.
 - **Timestamp**: when the record was last updated.
-- **Writes**: the committed values, with their paths and previous writers. Lock
-  state lives in the leaf objects, not in the record.
+- **Writes**: the committed values, with their paths. Lock state lives in the
+  leaf objects, not in the record.
 
 The transaction record serves two critical purposes:
 

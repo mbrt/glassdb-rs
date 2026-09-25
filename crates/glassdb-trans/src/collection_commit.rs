@@ -348,10 +348,7 @@ mod tests {
     use crate::collections::CollectionChange;
 
     fn address(byte: u8) -> CollectionAddress {
-        CollectionAddress::new(
-            "db",
-            CollectionId::from_slice(&[byte; 16]).expect("fixed ID has the required width"),
-        )
+        CollectionAddress::new("db", CollectionId::from_bytes([byte; 16]))
     }
 
     fn create_change(collection: CollectionAddress) -> CollectionChange {

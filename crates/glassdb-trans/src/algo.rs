@@ -1242,7 +1242,6 @@ impl Algo {
                 key: w.key().clone(),
                 value,
                 deleted,
-                prev_writer: None,
             });
         }
         collections.committed_manifest(locks).apply_to(&mut record);
@@ -1594,14 +1593,8 @@ mod tests {
     #[tokio::test]
     async fn committed_manifest_preserves_prepared_roots_from_earlier_body_runs() {
         let (tm, tctx) = new_algo().await;
-        let earlier = CollectionAddress::new(
-            TEST_DB,
-            CollectionId::from_slice(&[1; 16]).expect("fixed ID has the required width"),
-        );
-        let active = CollectionAddress::new(
-            TEST_DB,
-            CollectionId::from_slice(&[2; 16]).expect("fixed ID has the required width"),
-        );
+        let earlier = CollectionAddress::new(TEST_DB, CollectionId::from_bytes([1; 16]));
+        let active = CollectionAddress::new(TEST_DB, CollectionId::from_bytes([2; 16]));
         let earlier_accesses = CatalogAccesses {
             reads: Vec::new(),
             changes: vec![CollectionChange {
@@ -1649,10 +1642,7 @@ mod tests {
     #[tokio::test]
     async fn pending_collection_manifest_update_preserves_existing_locks() {
         let (tm, tctx) = new_algo().await;
-        let created = CollectionAddress::new(
-            TEST_DB,
-            CollectionId::from_slice(&[3; 16]).expect("fixed ID has the required width"),
-        );
+        let created = CollectionAddress::new(TEST_DB, CollectionId::from_bytes([3; 16]));
         let handle = tm.begin(
             AccessSet::default(),
             CatalogAccesses {
@@ -1698,10 +1688,7 @@ mod tests {
     #[tokio::test]
     async fn end_preserves_prepared_collection_when_commit_won() {
         let (tm, tctx) = new_algo().await;
-        let prepared = CollectionAddress::new(
-            TEST_DB,
-            CollectionId::from_slice(&[3; 16]).expect("fixed ID has the required width"),
-        );
+        let prepared = CollectionAddress::new(TEST_DB, CollectionId::from_bytes([3; 16]));
         let mut handle = tm.begin(
             AccessSet::default(),
             CatalogAccesses {
@@ -1741,10 +1728,7 @@ mod tests {
     #[tokio::test]
     async fn a_replayed_body_clears_a_discarded_partial_drop() {
         let (tm, tctx) = new_algo().await;
-        let dropped = CollectionAddress::new(
-            TEST_DB,
-            CollectionId::from_slice(&[3; 16]).expect("fixed ID has the required width"),
-        );
+        let dropped = CollectionAddress::new(TEST_DB, CollectionId::from_bytes([3; 16]));
         assert!(
             tctx.records
                 .create_record(&dropped, &CollectionRecord::new())
@@ -2551,7 +2535,6 @@ mod tests {
             key: keyp,
             value: Arc::from(b"v2".as_slice()),
             deleted: false,
-            prev_writer: Some(previous),
         });
         tctx.tmon.commit_tx(record).await.unwrap();
 
@@ -3081,7 +3064,6 @@ mod tests {
             key: key_path,
             value: Arc::from(b"value".as_slice()),
             deleted: false,
-            prev_writer: None,
         });
         tctx.tmon.commit_tx(record).await.unwrap();
 
