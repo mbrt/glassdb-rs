@@ -380,7 +380,7 @@ impl Database {
             locker: engine.locker,
             coordinator: engine.coordinator,
             direct_commit: engine.direct_commit,
-            splitter: engine.restructurer,
+            restructurer: engine.restructurer,
             gc: engine.gc,
             ..Default::default()
         };

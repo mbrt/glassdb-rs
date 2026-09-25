@@ -120,7 +120,7 @@ impl Fixture {
             let mut quiet = Instant::now();
             let mut completed = 0;
             loop {
-                let current = db.stats().splitter.completed;
+                let current = db.stats().restructurer.splits;
                 if current != completed {
                     completed = current;
                     quiet = Instant::now();
@@ -135,7 +135,7 @@ impl Fixture {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-        let setup_splits = db.stats().splitter.completed;
+        let setup_splits = db.stats().restructurer.splits;
         db.shutdown().await;
         let mut fixture = Self {
             db,

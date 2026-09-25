@@ -245,7 +245,7 @@ async fn nonroot_split_partitions_the_compacted_leaf() {
         sp.stats_and_reset(),
         RestructurerStats {
             candidates: 1,
-            completed: 1,
+            splits: 1,
             tombstones_reclaimed: 1,
             ..RestructurerStats::default()
         }
@@ -921,7 +921,7 @@ async fn feed_drives_run_once() {
         sp.stats_and_reset(),
         RestructurerStats {
             candidates: 1,
-            completed: 1,
+            splits: 1,
             deferred: 0,
             ..RestructurerStats::default()
         }
@@ -1021,7 +1021,7 @@ async fn repeated_inline_pressure_performs_one_rerouted_median_split_each() {
         sp.stats_and_reset(),
         RestructurerStats {
             candidates: 1,
-            completed: 1,
+            splits: 1,
             inline_pressure: InlinePressureStats {
                 candidates: 1,
                 completed: 1,
@@ -1074,7 +1074,7 @@ async fn repeated_inline_pressure_performs_one_rerouted_median_split_each() {
         sp.stats_and_reset(),
         RestructurerStats {
             candidates: 1,
-            completed: 1,
+            splits: 1,
             inline_pressure: InlinePressureStats {
                 candidates: 1,
                 completed: 1,
@@ -1177,7 +1177,7 @@ async fn contended_candidate_is_requeued() {
         sp.stats_and_reset(),
         RestructurerStats {
             candidates: 1,
-            completed: 0,
+            splits: 0,
             deferred: 1,
             ..RestructurerStats::default()
         }
@@ -1205,7 +1205,7 @@ async fn contended_candidate_is_requeued() {
         sp.stats_and_reset(),
         RestructurerStats {
             candidates: 1,
-            completed: 1,
+            splits: 1,
             deferred: 0,
             ..RestructurerStats::default()
         }

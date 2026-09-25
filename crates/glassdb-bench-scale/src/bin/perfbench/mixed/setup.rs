@@ -192,11 +192,11 @@ async fn wait_for_split_quiet(
     timeout: Duration,
 ) -> Result<SplitSettlement, Box<dyn Error>> {
     let started = Instant::now();
-    let mut tracker = SplitQuietTracker::new(database.stats().splitter.completed, started);
+    let mut tracker = SplitQuietTracker::new(database.stats().restructurer.splits, started);
     let poll = (quiet / 4).clamp(Duration::from_millis(20), Duration::from_millis(250));
     loop {
         let now = Instant::now();
-        tracker.observe(database.stats().splitter.completed, now);
+        tracker.observe(database.stats().restructurer.splits, now);
         if tracker.is_quiet(now, quiet) {
             return Ok(SplitSettlement {
                 completed: tracker.completed,

@@ -130,16 +130,16 @@ async fn aggregate_inline_pressure_splits_for_a_later_direct_commit() {
     for _ in 0..5 {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         after_split = db.stats();
-        if after_split.splitter.inline_pressure.completed
-            > before_split.splitter.inline_pressure.completed
+        if after_split.restructurer.inline_pressure.completed
+            > before_split.restructurer.inline_pressure.completed
         {
             break;
         }
     }
     let split = after_split - before_split;
-    assert_eq!(split.splitter.inline_pressure.candidates, 1);
-    assert_eq!(split.splitter.inline_pressure.completed, 1);
-    assert_eq!(split.splitter.inline_pressure.discarded, 0);
+    assert_eq!(split.restructurer.inline_pressure.candidates, 1);
+    assert_eq!(split.restructurer.inline_pressure.completed, 1);
+    assert_eq!(split.restructurer.inline_pressure.discarded, 0);
 
     let before_retry = db.stats();
     rmw(&db, &coll, b"b", 1).await.unwrap();
