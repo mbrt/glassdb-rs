@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -172,6 +173,24 @@ pub struct DelayBackend {
     rlimit: Option<RateLimiter>,
     prefix_reads: Option<PrefixLimiter>,
     prefix_writes: Option<PrefixLimiter>,
+    object_throttle: ThrottleCounter,
+    prefix_throttle: ThrottleCounter,
+}
+
+/// Requests that waited for a simulated rate limit, and their total wait.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ThrottleWaits {
+    pub requests: u64,
+    pub wait: Duration,
+}
+
+/// Simulated throttling since the last reset, per rate limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ThrottleStats {
+    /// Writes delayed by the limit on writes to one object.
+    pub object: ThrottleWaits,
+    /// Requests delayed by the limit on requests to one prefix.
+    pub prefix: ThrottleWaits,
 }
 
 impl DelayBackend {
@@ -211,7 +230,17 @@ impl DelayBackend {
             rlimit,
             prefix_reads,
             prefix_writes,
+            object_throttle: ThrottleCounter::default(),
+            prefix_throttle: ThrottleCounter::default(),
         })
+    }
+
+    /// Returns the simulated throttling since the last call and resets it.
+    pub fn throttle_stats_and_reset(&self) -> ThrottleStats {
+        ThrottleStats {
+            object: self.object_throttle.take(),
+            prefix: self.prefix_throttle.take(),
+        }
     }
 
     async fn delay(&self, distribution: &Lognormal) {
@@ -222,21 +251,47 @@ impl DelayBackend {
     /// Blocks on the read prefix limiter (a no-op when it is disabled).
     async fn prefix_read_wait(&self, path: &str) {
         if let Some(l) = &self.prefix_reads {
-            l.wait(path).await;
+            self.prefix_throttle.record(l.wait(path).await);
         }
     }
 
     /// Blocks on the write prefix limiter (a no-op when it is disabled).
     async fn prefix_write_wait(&self, path: &str) {
         if let Some(l) = &self.prefix_writes {
-            l.wait(path).await;
+            self.prefix_throttle.record(l.wait(path).await);
         }
     }
 
     /// Blocks on the object limiter when one is enabled.
     async fn object_write_wait(&self, path: &str) {
         if let Some(l) = &self.rlimit {
-            l.wait(path).await;
+            self.object_throttle.record(l.wait(path).await);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ThrottleCounter {
+    requests: AtomicU64,
+    wait_nanos: AtomicU64,
+}
+
+impl ThrottleCounter {
+    fn record(&self, wait: Duration) {
+        if wait.is_zero() {
+            return;
+        }
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.wait_nanos.fetch_add(
+            u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn take(&self) -> ThrottleWaits {
+        ThrottleWaits {
+            requests: self.requests.swap(0, Ordering::Relaxed),
+            wait: Duration::from_nanos(self.wait_nanos.swap(0, Ordering::Relaxed)),
         }
     }
 }
@@ -354,15 +409,20 @@ impl RateLimiter {
         }
     }
 
-    /// Blocks until a write token is available for `key`.
-    async fn wait(&self, key: &str) {
+    /// Blocks until a write token is available for `key`, and returns how long
+    /// it waited.
+    async fn wait(&self, key: &str) -> Duration {
+        if self.try_acquire_token(key) {
+            return Duration::ZERO;
+        }
+        let started = Instant::now();
         let max = self.retry_delay.saturating_mul(10);
         let mut interval = self.retry_delay;
         loop {
-            if self.try_acquire_token(key) {
-                return;
-            }
             rt::sleep(interval).await;
+            if self.try_acquire_token(key) {
+                return started.elapsed();
+            }
             interval = std::cmp::min(interval.mul_f64(1.5), max);
         }
     }
@@ -450,14 +510,17 @@ impl PrefixLimiter {
         }))
     }
 
-    /// Blocks until a request token for `path`'s prefix is available. The
-    /// caller cancels by dropping the surrounding future.
-    async fn wait(&self, path: &str) {
-        let d = self.reserve(prefix_key(path, self.depth.get()), Instant::now());
+    /// Blocks until a request token for `path`'s prefix is available, and
+    /// returns how long it waited. The caller cancels by dropping the
+    /// surrounding future.
+    async fn wait(&self, path: &str) -> Duration {
+        let started = Instant::now();
+        let d = self.reserve(prefix_key(path, self.depth.get()), started);
         if d.is_zero() {
-            return;
+            return Duration::ZERO;
         }
         rt::sleep(d).await;
+        started.elapsed()
     }
 
     /// Takes a token for `key` and returns how long the caller must wait before
@@ -570,6 +633,72 @@ mod tests {
             l.reserve("bench", now);
         }
         assert_eq!(l.reserve("bench", now), Duration::from_millis(10));
+    }
+
+    // Only the object limit depends on how keys are grouped into objects, so
+    // each limit reports its own delays.
+    #[tokio::test(start_paused = true)]
+    async fn throttle_stats_report_the_delay_of_each_limit() {
+        let limited = RateLimit::PerSecond(NonZeroU32::new(1).unwrap());
+        let object_limit = WriteRateLimits {
+            same_obj_write_ps: limited,
+            same_obj_write_retry_delay: Duration::from_millis(100),
+            prefix_read_ps: RateLimit::Unlimited,
+            prefix_write_ps: RateLimit::Unlimited,
+            prefix_depth: 0,
+        };
+        let prefix_limit = WriteRateLimits {
+            same_obj_write_ps: RateLimit::Unlimited,
+            same_obj_write_retry_delay: Duration::ZERO,
+            prefix_read_ps: RateLimit::Unlimited,
+            prefix_write_ps: limited,
+            prefix_depth: 1,
+        };
+        // Each case gives the writes before the measured one, the pause before
+        // the measured write, and whether the object limit or the prefix limit
+        // delays it. The object limit admits a burst and delays only the next
+        // window.
+        let cases = [
+            ("object", object_limit, 2, Duration::from_secs(1), true),
+            ("prefix", prefix_limit, 0, Duration::ZERO, false),
+        ];
+        for (name, rate_limits, burst, pause, object) in cases {
+            let backend = DelayBackend::new(
+                Arc::new(crate::memory::MemoryBackend::new()),
+                DelayOptions {
+                    latency: ProviderLatencyProfile::zero(),
+                    rate_limits,
+                },
+            )
+            .unwrap();
+            let mut revision = backend.write_if_not_exists("db/k", vec![0]).await.unwrap();
+            for _ in 0..burst {
+                revision = backend.write_if("db/k", vec![1], &revision).await.unwrap();
+            }
+            advance(pause).await;
+            backend.throttle_stats_and_reset();
+
+            let start = tokio::time::Instant::now();
+            backend.write_if("db/k", vec![2], &revision).await.unwrap();
+            let delayed = ThrottleWaits {
+                requests: 1,
+                wait: start.elapsed(),
+            };
+
+            assert!(!delayed.wait.is_zero(), "{name}");
+            let expected = if object {
+                ThrottleStats {
+                    object: delayed,
+                    ..ThrottleStats::default()
+                }
+            } else {
+                ThrottleStats {
+                    prefix: delayed,
+                    ..ThrottleStats::default()
+                }
+            };
+            assert_eq!(backend.throttle_stats_and_reset(), expected, "{name}");
+        }
     }
 
     #[test]

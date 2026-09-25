@@ -16,8 +16,9 @@
 //! - `scan`: one read-only key scan of `--scan-keys` consecutive keys.
 //!
 //! Cells use the adaptive sampling of `mixed`. The report includes the lost
-//! leaf CAS, cross-leaf direct-commit, and leaf write time counters, so their
-//! correlation with throughput can be compared across leaf sizes.
+//! leaf CAS, cross-leaf direct-commit, and leaf write time counters, and the
+//! simulated throttling of a synthetic backend, so their correlation with
+//! throughput can be compared across leaf sizes.
 
 mod result;
 mod workload;
@@ -28,6 +29,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime};
 
 use clap::Args;
+use glassdb::middleware::{DelayBackend, ThrottleStats};
 use glassdb::{Collection, Database, Error as GError, InlinePolicy, NodeSizePolicy, Stats};
 use glassdb_backend::{Backend, BackendError, ListLimit};
 use glassdb_bench_scale::bench::{Bench, samples_for_rel_ci};
@@ -207,9 +209,10 @@ pub(super) fn run(
         let mut cells = Vec::new();
         for &leaf_size in &options.leaf_sizes {
             let name = format!("perfbenchtopology{invocation}r{run}l{leaf_size}");
+            let (backend, delays) = factory.delayed_backend();
             let (topology, measured) = run_topology(
                 handle,
-                factory.backend(),
+                Storage { backend, delays },
                 &name,
                 leaf_size,
                 &workloads,
@@ -224,11 +227,28 @@ pub(super) fn run(
     Ok(runs)
 }
 
-/// Seeds one topology on `backend` and measures every workload and client
+/// The backend of one topology, and its simulated delays when the backend is
+/// synthetic.
+struct Storage {
+    backend: Arc<dyn Backend>,
+    delays: Option<Arc<DelayBackend>>,
+}
+
+impl Storage {
+    /// Returns the simulated throttling since the last call, when the backend
+    /// is synthetic.
+    fn throttle_stats_and_reset(&self) -> Option<ThrottleStats> {
+        self.delays
+            .as_ref()
+            .map(|delays| delays.throttle_stats_and_reset())
+    }
+}
+
+/// Seeds one topology on `storage` and measures every workload and client
 /// count on it.
 fn run_topology(
     handle: &Handle,
-    backend: Arc<dyn Backend>,
+    storage: Storage,
     name: &str,
     leaf_size: usize,
     workloads: &[Workload],
@@ -239,7 +259,7 @@ fn run_topology(
         size: fixed_policy(leaf_size)?,
         inline: options.inline_policy(),
     };
-    let topology = seed_topology(handle, &backend, name, policies, options, execution)?;
+    let topology = seed_topology(handle, &storage.backend, name, policies, options, execution)?;
     eprintln!("{}", topology.summary());
     let mut cells = Vec::new();
     for &workload in workloads {
@@ -254,7 +274,7 @@ fn run_topology(
                 workload.label(),
                 cell.databases
             );
-            let result = run_cell(handle, &backend, name, policies, cell, options, execution)?;
+            let result = run_cell(handle, &storage, name, policies, cell, options, execution)?;
             if let Some(warning) = result.restructure_warning() {
                 eprintln!("{warning}");
             }
@@ -380,16 +400,18 @@ async fn count_nodes(backend: &dyn Backend, database_name: &str) -> Result<usize
 /// Opens fresh clients on the seeded topology and measures one workload.
 fn run_cell(
     handle: &Handle,
-    backend: &Arc<dyn Backend>,
+    storage: &Storage,
     name: &str,
     policies: Policies,
     cell: Cell,
     options: &Options,
     execution: Execution,
 ) -> Result<CellResult, Box<dyn Error>> {
-    let (databases, collections) = handle.block_on(open_clients(backend, name, policies, cell))?;
+    let (databases, collections) =
+        handle.block_on(open_clients(&storage.backend, name, policies, cell))?;
     // Collection binding is setup. Bracket stats only after every client opened it.
     let baselines: Vec<Stats> = databases.iter().map(Database::stats).collect();
+    storage.throttle_stats_and_reset();
     let bench = Arc::new(Bench::new(options.max_duration));
     let stop = Arc::new(AtomicBool::new(false));
     let target = samples_for_rel_ci(options.target_ci);
@@ -439,6 +461,7 @@ fn run_cell(
         bench.results(),
         converged || target == 0,
         delta,
+        storage.throttle_stats_and_reset(),
     ))
 }
 
@@ -551,7 +574,10 @@ mod tests {
         };
         let (topology, cells) = run_topology(
             runtime.handle(),
-            Arc::new(MemoryBackend::new()),
+            Storage {
+                backend: Arc::new(MemoryBackend::new()),
+                delays: None,
+            },
             "topologytest",
             8,
             &workloads,

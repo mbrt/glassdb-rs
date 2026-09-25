@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use glassdb::Stats;
+use glassdb::middleware::ThrottleStats;
 use glassdb_bench_scale::bench::Results;
 use glassdb_bench_scale::run::SplitSettlement;
 
@@ -93,13 +94,15 @@ pub(super) struct CellResult {
 }
 
 impl CellResult {
-    /// Summarizes the timing samples and the counter deltas of all clients.
+    /// Summarizes the timing samples, the counter deltas of all clients, and the
+    /// simulated throttling of a synthetic backend.
     pub(super) fn summarize(
         cell: Cell,
         workers: usize,
         results: Results,
         converged: bool,
         delta: Stats,
+        throttle: Option<ThrottleStats>,
     ) -> Self {
         let committed = results.samples.len();
         let secs = results.tot_duration.as_secs_f64();
@@ -129,7 +132,7 @@ impl CellResult {
             converged,
             measured_splits: delta.restructurer.splits,
             measured_merges: delta.restructurer.merges,
-            per_tx: PerTx::of(delta, committed),
+            per_tx: PerTx::of(delta, throttle, committed),
         }
     }
 
@@ -173,10 +176,16 @@ struct PerTx {
     scan_leaf_crossings: f64,
     leaf_writes: f64,
     leaf_write_ms: f64,
+    /// Simulated waits on the limit of writes to one object. Absent for real
+    /// backends.
+    object_throttle_ms: Option<f64>,
+    /// Simulated waits on the limit of requests to one prefix. Absent for real
+    /// backends.
+    prefix_throttle_ms: Option<f64>,
 }
 
 impl PerTx {
-    fn of(delta: Stats, committed: usize) -> Self {
+    fn of(delta: Stats, throttle: Option<ThrottleStats>, committed: usize) -> Self {
         let per_tx = |count: u64| count as f64 / committed.max(1) as f64;
         let per_tx_ms = |total: Duration| total.as_secs_f64() * 1e3 / committed.max(1) as f64;
         let backend = delta.backend;
@@ -202,6 +211,8 @@ impl PerTx {
             scan_leaf_crossings: per_tx(delta.transactions.scan_leaf_crossings),
             leaf_writes: per_tx(coordinator.leaf_writes),
             leaf_write_ms: per_tx_ms(coordinator.leaf_write_time),
+            object_throttle_ms: throttle.map(|throttle| per_tx_ms(throttle.object.wait)),
+            prefix_throttle_ms: throttle.map(|throttle| per_tx_ms(throttle.prefix.wait)),
         }
     }
 }

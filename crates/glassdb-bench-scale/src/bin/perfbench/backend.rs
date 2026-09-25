@@ -152,15 +152,29 @@ impl Options {
 impl Factory {
     /// Creates an independent middleware instance over the selected storage.
     pub(super) fn backend(&self) -> Arc<dyn Backend> {
+        self.delayed_backend().0
+    }
+
+    /// Creates an independent middleware instance over the selected storage,
+    /// and the simulated delays of that instance when the storage is
+    /// synthetic.
+    pub(super) fn delayed_backend(&self) -> (Arc<dyn Backend>, Option<Arc<DelayBackend>>) {
         match self {
-            Factory::Memory(delays) => Arc::new(
-                DelayBackend::new(Arc::new(MemoryBackend::new()), *delays)
-                    .expect("generated delay profile is valid"),
-            ),
-            Factory::Gcs { bucket } => Arc::new(glassdb::gcs::GcsBackend::new(bucket.clone())),
-            Factory::S3 { client, bucket, .. } => {
-                Arc::new(glassdb::s3::S3Backend::new(client.clone(), bucket.clone()))
+            Factory::Memory(delays) => {
+                let delayed = Arc::new(
+                    DelayBackend::new(Arc::new(MemoryBackend::new()), *delays)
+                        .expect("generated delay profile is valid"),
+                );
+                (delayed.clone(), Some(delayed))
             }
+            Factory::Gcs { bucket } => (
+                Arc::new(glassdb::gcs::GcsBackend::new(bucket.clone())),
+                None,
+            ),
+            Factory::S3 { client, bucket, .. } => (
+                Arc::new(glassdb::s3::S3Backend::new(client.clone(), bucket.clone())),
+                None,
+            ),
         }
     }
 }
