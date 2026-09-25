@@ -55,7 +55,7 @@ use glassdb_storage::{
 
 use crate::error::TransError;
 
-use super::candidates::{CandidateCause, MaintenanceCandidate, MaintenanceCandidates};
+use super::candidates::MaintenanceCandidates;
 use super::change::{Applied, ParentRoute, Prepared};
 use super::reclamation::{ReclamationReporter, reclaim_holder_free_tombstones};
 use super::recovery::{PreparedIntent, ReadyChange};
@@ -67,8 +67,7 @@ pub(super) struct Splitter {
     nodes: NodeStore,
     router: TreeRouter,
     timeline: Timeline,
-    // Supplies the size policies, and receives the split outputs that are
-    // still over their soft cap.
+    // Supplies the size policies, and receives the split outputs.
     candidates: MaintenanceCandidates,
     stats: Arc<Stats>,
     reclamation: ReclamationReporter,
@@ -79,7 +78,12 @@ pub(super) struct Splitter {
 pub(super) enum SplitReason {
     SoftCap,
     Capacity,
-    InlinePressure { key: Vec<u8>, value_len: usize },
+    InlinePressure {
+        key: Vec<u8>,
+        value_len: usize,
+    },
+    /// A topology policy decided that the leaf splits.
+    Demand,
 }
 
 /// Whether a node still needs the split that its reason asked for.
@@ -201,6 +205,13 @@ impl Splitter {
             }
             SplitReason::SoftCap => {
                 if node.over_soft_cap(self.candidates.policy()) {
+                    SplitNeed::Split
+                } else {
+                    SplitNeed::NotActionable
+                }
+            }
+            SplitReason::Demand => {
+                if node.as_leaf().is_some_and(|leaf| leaf.len() >= 2) {
                     SplitNeed::Split
                 } else {
                     SplitNeed::NotActionable
@@ -440,31 +451,19 @@ impl Splitter {
         outputs: [(&NodeId, &Node); 2],
     ) {
         self.reclamation.record(reclaimed, false);
-        self.stats.splits.fetch_add(1, Ordering::Relaxed);
+        self.stats.record_split();
         for (id, node) in outputs {
-            self.enqueue_if_over_soft_cap(collection, id, node);
+            let path = ObjectPath::Node {
+                collection: collection.clone(),
+                id: *id,
+            };
+            self.candidates.observe_split_output(path, node);
         }
         if reason.is_inline_pressure() {
             self.stats
                 .inline_pressure_completed
                 .fetch_add(1, Ordering::Relaxed);
         }
-    }
-
-    /// Carries an oversized split output into a later sweep so one hint can
-    /// drive the whole split cascade.
-    fn enqueue_if_over_soft_cap(&self, collection: &CollectionAddress, id: &NodeId, node: &Node) {
-        if !node.over_soft_cap(self.candidates.policy()) {
-            return;
-        }
-        self.candidates.push(MaintenanceCandidate {
-            path: ObjectPath::Node {
-                collection: collection.clone(),
-                id: *id,
-            },
-            priority: self.candidates.new_id(),
-            cause: CandidateCause::Split(SplitReason::SoftCap),
-        });
     }
 }
 
@@ -474,6 +473,7 @@ impl SplitReason {
             SplitReason::SoftCap => 0,
             SplitReason::InlinePressure { .. } => 1,
             SplitReason::Capacity => 2,
+            SplitReason::Demand => 3,
         }
     }
 

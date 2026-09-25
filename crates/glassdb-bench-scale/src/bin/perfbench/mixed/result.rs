@@ -29,6 +29,18 @@ pub(super) struct CellMetadata {
     workers_per_shape: usize,
     setup_splits: u64,
     split_settle_elapsed: Duration,
+    policy: String,
+    restructure: Restructure,
+}
+
+/// Splits and merges of the measurement clients.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct Restructure {
+    warmup_splits: u64,
+    warmup_merges: u64,
+    measured_splits: u64,
+    measured_merges: u64,
 }
 
 impl CellMetadata {
@@ -50,7 +62,33 @@ impl CellMetadata {
             workers_per_shape,
             setup_splits,
             split_settle_elapsed,
+            policy: "engine".into(),
+            restructure: Restructure::default(),
         }
+    }
+
+    /// Records the topology policy of the measurement clients, and their
+    /// changes of the tree before measurement.
+    pub(super) fn with_policy(self, policy: String, restructure: Restructure) -> Self {
+        Self {
+            policy,
+            restructure,
+            ..self
+        }
+    }
+}
+
+impl Restructure {
+    /// Adds the changes of one client during warmup.
+    pub(super) fn add_warmup(&mut self, delta: Stats) {
+        self.warmup_splits += delta.restructurer.splits;
+        self.warmup_merges += delta.restructurer.merges;
+    }
+
+    fn add_measured(mut self, delta: Stats) -> Self {
+        self.measured_splits += delta.restructurer.splits;
+        self.measured_merges += delta.restructurer.merges;
+        self
     }
 }
 
@@ -79,9 +117,24 @@ pub(super) struct CellResult {
     setup_splits: u64,
     split_settle_wall_ms: u64,
     failures: u64,
+    policy: String,
+    restructure: Restructure,
     shapes: Vec<ShapeResult>,
     aggregate_ops: OpsPerTx,
     aggregate_protocol: ProtocolPerTx,
+    avoidable_per_tx: AvoidablePerTx,
+}
+
+/// Avoidable time of ADR-074 in milliseconds per transaction, by cause.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AvoidablePerTx {
+    lost_cas_ms: f64,
+    queue_wait_ms: f64,
+    slow_cas_ms: f64,
+    inline_pressure_ms: f64,
+    adjacent_miss_ms: f64,
+    scan_crossing_ms: f64,
 }
 
 impl CellResult {
@@ -109,6 +162,14 @@ impl CellResult {
             .fold(RawProtocol::default(), |total, stats| {
                 total.add(RawProtocol::of(stats))
             });
+        let restructure = deltas
+            .iter()
+            .copied()
+            .fold(metadata.restructure, Restructure::add_measured);
+        let mut avoidable = glassdb::AvoidableTimeStats::default();
+        for delta in deltas {
+            avoidable += delta.restructurer.avoidable;
+        }
 
         Self {
             mode: metadata.mode.to_string(),
@@ -123,9 +184,12 @@ impl CellResult {
                 .try_into()
                 .unwrap_or(u64::MAX),
             failures: 0,
+            policy: metadata.policy,
+            restructure,
             shapes,
             aggregate_ops: raw_ops.per_tx(logical_txn),
             aggregate_protocol: raw_protocol.per_tx(logical_txn),
+            avoidable_per_tx: AvoidablePerTx::of(avoidable, logical_txn),
         }
     }
 }
@@ -324,6 +388,20 @@ impl RawProtocol {
     }
 }
 
+impl AvoidablePerTx {
+    fn of(avoidable: glassdb::AvoidableTimeStats, logical_txn: u64) -> Self {
+        let per_tx = |time: Duration| time.as_secs_f64() * 1e3 / logical_txn.max(1) as f64;
+        Self {
+            lost_cas_ms: per_tx(avoidable.split.lost_cas),
+            queue_wait_ms: per_tx(avoidable.split.queue_wait),
+            slow_cas_ms: per_tx(avoidable.split.slow_cas),
+            inline_pressure_ms: per_tx(avoidable.split.inline_pressure),
+            adjacent_miss_ms: per_tx(avoidable.merge.adjacent_miss),
+            scan_crossing_ms: per_tx(avoidable.merge.scan_crossing),
+        }
+    }
+}
+
 fn ratio(numerator: u64, denominator: u64) -> f64 {
     if denominator == 0 {
         0.0
@@ -334,7 +412,10 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use glassdb::{BackendStats, DirectCommitStats, LeafCoordinatorStats, TransactionStats};
+    use glassdb::{
+        AvoidableTimeStats, BackendStats, DirectCommitStats, LeafCoordinatorStats,
+        RestructurerStats, SplitTime, TransactionStats,
+    };
 
     use super::*;
 
@@ -377,6 +458,18 @@ mod tests {
                     landed: 3,
                     ..Default::default()
                 },
+                restructurer: RestructurerStats {
+                    splits: 1,
+                    merges: 2,
+                    avoidable: AvoidableTimeStats {
+                        split: SplitTime {
+                            lost_cas: Duration::from_millis(6),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             Stats {
@@ -403,8 +496,17 @@ mod tests {
                 ..Default::default()
             },
         ];
+        let mut warmup = Restructure::default();
+        warmup.add_warmup(Stats {
+            restructurer: RestructurerStats {
+                splits: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
         let cell = CellResult::summarize(
-            CellMetadata::new("hi", 25, 2, 2, 8, 4, Duration::from_millis(1500)),
+            CellMetadata::new("hi", 25, 2, 2, 8, 4, Duration::from_millis(1500))
+                .with_policy("avoidable".into(), warmup),
             measurements,
             &deltas,
             3,
@@ -441,10 +543,25 @@ mod tests {
         "directLandRate": 0.6666666666666666,
         "directLandedPerTx": 1.3333333333333333
       },
+      "avoidablePerTx": {
+        "adjacentMissMs": 0.0,
+        "inlinePressureMs": 0.0,
+        "lostCasMs": 2.0,
+        "queueWaitMs": 0.0,
+        "scanCrossingMs": 0.0,
+        "slowCasMs": 0.0
+      },
       "databaseLimit": 2,
       "databases": 2,
       "failures": 0,
       "mode": "hi",
+      "policy": "avoidable",
+      "restructure": {
+        "measuredMerges": 2,
+        "measuredSplits": 1,
+        "warmupMerges": 0,
+        "warmupSplits": 5
+      },
       "setupSplits": 4,
       "shapes": [
         {
@@ -491,10 +608,25 @@ mod tests {
         "directLandRate": 0.0,
         "directLandedPerTx": 0.0
       },
+      "avoidablePerTx": {
+        "adjacentMissMs": 0.0,
+        "inlinePressureMs": 0.0,
+        "lostCasMs": 0.0,
+        "queueWaitMs": 0.0,
+        "scanCrossingMs": 0.0,
+        "slowCasMs": 0.0
+      },
       "databaseLimit": 0,
       "databases": 0,
       "failures": 0,
       "mode": "lo",
+      "policy": "engine",
+      "restructure": {
+        "measuredMerges": 0,
+        "measuredSplits": 0,
+        "warmupMerges": 0,
+        "warmupSplits": 0
+      },
       "setupSplits": 0,
       "shapes": [],
       "splitSettleWallMs": 0,

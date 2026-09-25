@@ -12,7 +12,7 @@ use glassdb_data::{DatabaseId, DbPrefix};
 use glassdb_storage::{InlinePolicy, NodeSizePolicy, PersistentCacheConfig, PersistentCacheMedia};
 use glassdb_trans::{
     AccessSet, BodyDecision, CatalogAccesses, Engine, EngineConfig, EngineTransaction, GcLimits,
-    ProtocolTiming, TransError,
+    ProtocolTiming, TopologyPolicy, TransError,
 };
 use tokio::sync::Notify;
 
@@ -122,6 +122,16 @@ impl DatabaseBuilder {
     /// (ADR-056).
     pub fn inline_policy(mut self, policy: InlinePolicy) -> Self {
         self.engine_config.set_inline_policy(policy);
+        self
+    }
+
+    /// Sets the policy that decides the splits and merges of leaves from the
+    /// avoidable time and the sizes of each window (ADR-074). Without a
+    /// policy, soft caps, underfull thresholds, and inline pressure decide
+    /// them. The policy is local to each database instance. Leaves that the
+    /// hard cap rejects, and index nodes, split and merge without it.
+    pub fn topology_policy(mut self, policy: impl TopologyPolicy) -> Self {
+        self.engine_config.set_topology_policy(Arc::new(policy));
         self
     }
 

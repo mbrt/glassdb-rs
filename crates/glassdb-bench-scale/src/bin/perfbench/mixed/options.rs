@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use clap::Args;
 
+use super::super::policy::PolicySpec;
+
 #[derive(Clone, Args)]
 pub(crate) struct Options {
     /// Minimum measured window per cell. The cell keeps running all shapes
@@ -57,6 +59,14 @@ pub(crate) struct Options {
     /// Maximum wall time allowed for setup splits to become quiet.
     #[arg(long, default_value = "60s", value_parser = glassdb_bench_scale::parse_duration)]
     pub(super) split_settle_timeout: Duration,
+    /// Topology policies of the measurement clients to sweep. The setup
+    /// Database always uses the engine default.
+    #[arg(long, value_delimiter = ',', default_value = "engine", value_parser = PolicySpec::parse)]
+    policies: Vec<PolicySpec>,
+    /// Unmeasured wall time of all shapes before measurement, so that a
+    /// policy can change the tree first.
+    #[arg(long, default_value = "0s", value_parser = glassdb_bench_scale::parse_duration)]
+    pub(super) warmup: Duration,
 }
 
 impl Options {
@@ -69,13 +79,17 @@ impl Options {
             for &affinity_pct in &self.affinities {
                 for &database_limit in &self.databases {
                     for &workers_per_shape in &self.workers_per_shape {
-                        dimensions.push(CellDimension {
-                            mode,
-                            affinity_pct,
-                            database_limit,
-                            databases: database_limit.min(workers_per_shape),
-                            workers_per_shape,
-                        });
+                        for (policy_index, &policy) in self.policies.iter().enumerate() {
+                            dimensions.push(CellDimension {
+                                mode,
+                                affinity_pct,
+                                database_limit,
+                                databases: database_limit.min(workers_per_shape),
+                                workers_per_shape,
+                                policy,
+                                policy_index,
+                            });
+                        }
                     }
                 }
             }
@@ -92,6 +106,9 @@ impl Options {
         }
         if self.affinities.is_empty() || self.affinities.iter().any(|&a| a > 100) {
             return Err("--affinities must contain percentages from 0 through 100".into());
+        }
+        if self.policies.is_empty() {
+            return Err("--policies must contain at least one policy".into());
         }
         if self.split_quiet.is_zero() {
             return Err("--split-quiet must be greater than zero".into());
@@ -110,6 +127,9 @@ pub(super) struct CellDimension {
     pub(super) database_limit: usize,
     pub(super) databases: usize,
     pub(super) workers_per_shape: usize,
+    pub(super) policy: PolicySpec,
+    /// The position of `policy` in `--policies`, which names its databases.
+    pub(super) policy_index: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -166,12 +186,13 @@ mod tests {
             .into_iter()
             .map(|cell| {
                 format!(
-                    "{}:{}:limit{}:db{}:w{}",
+                    "{}:{}:limit{}:db{}:w{}:{}",
                     cell.mode.label(),
                     cell.affinity_pct,
                     cell.database_limit,
                     cell.databases,
-                    cell.workers_per_shape
+                    cell.workers_per_shape,
+                    cell.policy.label()
                 )
             })
             .collect::<Vec<_>>()
@@ -183,16 +204,16 @@ mod tests {
         let cases: &[(&[&str], &str)] = &[
             (
                 &["perfbench"],
-                "lo:0:limit4:db4:w8\n\
-                 lo:25:limit4:db4:w8\n\
-                 lo:50:limit4:db4:w8\n\
-                 lo:75:limit4:db4:w8\n\
-                 lo:100:limit4:db4:w8\n\
-                 hi:0:limit4:db4:w8\n\
-                 hi:25:limit4:db4:w8\n\
-                 hi:50:limit4:db4:w8\n\
-                 hi:75:limit4:db4:w8\n\
-                 hi:100:limit4:db4:w8",
+                "lo:0:limit4:db4:w8:engine\n\
+                 lo:25:limit4:db4:w8:engine\n\
+                 lo:50:limit4:db4:w8:engine\n\
+                 lo:75:limit4:db4:w8:engine\n\
+                 lo:100:limit4:db4:w8:engine\n\
+                 hi:0:limit4:db4:w8:engine\n\
+                 hi:25:limit4:db4:w8:engine\n\
+                 hi:50:limit4:db4:w8:engine\n\
+                 hi:75:limit4:db4:w8:engine\n\
+                 hi:100:limit4:db4:w8:engine",
             ),
             (
                 &[
@@ -205,15 +226,25 @@ mod tests {
                     "1,3",
                     "--workers-per-shape",
                     "1,5",
+                    "--policies",
+                    "engine,avoidable",
                 ],
-                "hi:100:limit1:db1:w1\n\
-                 hi:100:limit1:db1:w5\n\
-                 hi:100:limit3:db1:w1\n\
-                 hi:100:limit3:db3:w5\n\
-                 lo:100:limit1:db1:w1\n\
-                 lo:100:limit1:db1:w5\n\
-                 lo:100:limit3:db1:w1\n\
-                 lo:100:limit3:db3:w5",
+                "hi:100:limit1:db1:w1:engine\n\
+                 hi:100:limit1:db1:w1:avoidable\n\
+                 hi:100:limit1:db1:w5:engine\n\
+                 hi:100:limit1:db1:w5:avoidable\n\
+                 hi:100:limit3:db1:w1:engine\n\
+                 hi:100:limit3:db1:w1:avoidable\n\
+                 hi:100:limit3:db3:w5:engine\n\
+                 hi:100:limit3:db3:w5:avoidable\n\
+                 lo:100:limit1:db1:w1:engine\n\
+                 lo:100:limit1:db1:w1:avoidable\n\
+                 lo:100:limit1:db1:w5:engine\n\
+                 lo:100:limit1:db1:w5:avoidable\n\
+                 lo:100:limit3:db1:w1:engine\n\
+                 lo:100:limit3:db1:w1:avoidable\n\
+                 lo:100:limit3:db3:w5:engine\n\
+                 lo:100:limit3:db3:w5:avoidable",
             ),
         ];
 

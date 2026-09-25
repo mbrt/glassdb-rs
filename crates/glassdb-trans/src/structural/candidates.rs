@@ -12,6 +12,8 @@ use tokio::sync::Notify;
 use crate::leaf_coord::{LeafDelay, StructuralHinter};
 
 use super::avoidable::{AvoidableTime, MergeTime, SplitTime};
+use super::merge::MergeReason;
+use super::policy::TopologyChange;
 use super::split::SplitReason;
 
 /// Interval of the sweep when no new candidate arrives. Such a sweep retries
@@ -39,9 +41,19 @@ const CANDIDATE_QUEUE_CAP: usize = 4096;
 pub(super) struct MaintenanceCandidates {
     policy: NodeSizePolicy,
     inline: InlinePolicy,
+    leaf_changes: LeafChanges,
     queue: Arc<Mutex<VecDeque<MaintenanceCandidate>>>,
     queued: Arc<Notify>,
     avoidable: Arc<AvoidableTime>,
+}
+
+/// What decides the leaf changes that the hard cap does not force.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeafChanges {
+    /// Soft caps, underfull thresholds, and inline pressure.
+    SizeCauses,
+    /// A topology policy, one window at a time.
+    Policy,
 }
 
 /// Lightweight producer handle for structural hints decided outside the leaf
@@ -64,16 +76,18 @@ pub(super) struct MaintenanceCandidate {
 #[derive(Clone)]
 pub(super) enum CandidateCause {
     Split(SplitReason),
-    /// The node is below an underfull threshold, so it can merge into its
-    /// right sibling (ADR-073).
-    Underfull,
+    /// The node can merge into its right sibling (ADR-073).
+    Merge(MergeReason),
 }
 
 impl StructuralHintSink {
     /// Records recoverable aggregate inline pressure for authoritative
-    /// revalidation by the restructurer.
+    /// revalidation by the restructurer. A topology policy decides with the
+    /// time of the pressure instead.
     pub(crate) fn observe_inline_pressure(&self, path: &ObjectPath, key: &[u8], value_len: usize) {
-        if !self.candidates.inline.admits_value(value_len) {
+        if self.candidates.leaf_changes == LeafChanges::Policy
+            || !self.candidates.inline.admits_value(value_len)
+        {
             return;
         }
         self.candidates.push(MaintenanceCandidate {
@@ -139,7 +153,7 @@ impl CandidateCause {
     fn class(&self) -> u8 {
         match self {
             CandidateCause::Split(reason) => reason.class(),
-            CandidateCause::Underfull => 3,
+            CandidateCause::Merge(reason) => reason.class(),
         }
     }
 }
@@ -152,15 +166,15 @@ impl MaintenanceCandidates {
     }
 
     /// Creates an empty candidate feed with co-wired node size and inline
-    /// policies.
+    /// policies, where sizes and inline pressure decide leaf changes.
     pub(super) fn with_policies(policy: NodeSizePolicy, inline: InlinePolicy) -> Self {
-        MaintenanceCandidates {
-            policy,
-            inline,
-            queue: Arc::new(Mutex::new(VecDeque::new())),
-            queued: Arc::new(Notify::new()),
-            avoidable: Arc::new(AvoidableTime::default()),
-        }
+        Self::new(policy, inline, LeafChanges::SizeCauses)
+    }
+
+    /// Creates an empty candidate feed with co-wired node size and inline
+    /// policies, where a topology policy decides leaf changes.
+    pub(super) fn for_topology_policy(policy: NodeSizePolicy, inline: InlinePolicy) -> Self {
+        Self::new(policy, inline, LeafChanges::Policy)
     }
 
     /// The avoidable time that the producers of the feed report.
@@ -208,7 +222,7 @@ impl MaintenanceCandidates {
             }
         }
         let mut candidates: Vec<_> = by_path.into_values().collect();
-        candidates.sort_by_key(|candidate| matches!(candidate.cause, CandidateCause::Underfull));
+        candidates.sort_by_key(|candidate| matches!(candidate.cause, CandidateCause::Merge(_)));
         candidates
     }
 
@@ -222,9 +236,41 @@ impl MaintenanceCandidates {
             self.push(MaintenanceCandidate {
                 path: path.clone(),
                 priority: self.new_id(),
-                cause: CandidateCause::Underfull,
+                cause: CandidateCause::Merge(MergeReason::Underfull),
             });
         }
+    }
+
+    /// Records that a split that landed wrote `node` at `path`. A leaf waits
+    /// for the decision of the topology policy, if one decides leaf changes.
+    /// Other nodes over a soft cap split again in a later sweep, so that one
+    /// hint can drive the whole split cascade.
+    pub(super) fn observe_split_output(&self, path: ObjectPath, node: &Node) {
+        match node.as_leaf() {
+            Some(leaf) if self.leaf_changes == LeafChanges::Policy => {
+                self.avoidable.observe_size(&path, leaf);
+                self.avoidable.record_changed(path);
+            }
+            _ if node.over_soft_cap(&self.policy) => self.push(MaintenanceCandidate {
+                path,
+                priority: self.new_id(),
+                cause: CandidateCause::Split(SplitReason::SoftCap),
+            }),
+            _ => {}
+        }
+    }
+
+    /// Queues one leaf change that a topology policy decided.
+    pub(super) fn push_change(&self, change: TopologyChange) {
+        let (leaf, cause) = match change {
+            TopologyChange::Split(leaf) => (leaf, CandidateCause::Split(SplitReason::Demand)),
+            TopologyChange::Merge(leaf) => (leaf, CandidateCause::Merge(MergeReason::Demand)),
+        };
+        self.push(MaintenanceCandidate {
+            path: leaf.into_path(),
+            priority: self.new_id(),
+            cause,
+        });
     }
 
     /// Requeues a deferred candidate without changing its wound-wait priority.
@@ -243,6 +289,21 @@ impl MaintenanceCandidates {
     /// Mints an operation id at normal transaction priority.
     pub(super) fn new_id(&self) -> TxId {
         TxId::new_at(rt::system_now())
+    }
+
+    fn new(policy: NodeSizePolicy, inline: InlinePolicy, leaf_changes: LeafChanges) -> Self {
+        let avoidable = match leaf_changes {
+            LeafChanges::SizeCauses => AvoidableTime::totals_only(),
+            LeafChanges::Policy => AvoidableTime::with_windows(),
+        };
+        MaintenanceCandidates {
+            policy,
+            inline,
+            leaf_changes,
+            queue: Arc::new(Mutex::new(VecDeque::new())),
+            queued: Arc::new(Notify::new()),
+            avoidable: Arc::new(avoidable),
+        }
     }
 
     /// Adds one candidate while keeping the best-effort feed bounded.
@@ -285,8 +346,13 @@ impl StructuralHinter for MaintenanceCandidates {
     /// re-checks authoritatively against the full node (which adds a little
     /// framing), so this need not account for it. A non-root leaf with few
     /// live entries is a merge candidate instead. The oldest hint is dropped
-    /// when the queue is full.
+    /// when the queue is full. A topology policy decides with the size in its
+    /// next window instead.
     fn observe_leaf(&self, path: &ObjectPath, entries: &LeafBody) {
+        if self.leaf_changes == LeafChanges::Policy {
+            self.avoidable.observe_size(path, entries);
+            return;
+        }
         let over_cap = entries.len() >= 2
             && (entries.len() > self.policy.leaf_max_entries()
                 || entries.encoded_len() > self.policy.node_soft_max_bytes());
@@ -296,7 +362,7 @@ impl StructuralHinter for MaintenanceCandidates {
             && entries.entries().filter(|entry| entry.exists()).count()
                 < self.policy.leaf_min_entries()
         {
-            CandidateCause::Underfull
+            CandidateCause::Merge(MergeReason::Underfull)
         } else {
             return;
         };

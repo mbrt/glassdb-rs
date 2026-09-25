@@ -1,0 +1,281 @@
+//! The public seam where a topology policy decides the splits and merges of
+//! leaves from one window of measurements (ADR-074).
+//!
+//! The engine keeps the decisions that correctness or the tree shape needs:
+//! leaves that the hard cap rejects split, and index nodes split and merge on
+//! size. It also checks each decision of a policy again, and skips the ones
+//! that it cannot do safely.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::time::Duration;
+
+use glassdb_data::ObjectPath;
+use glassdb_storage::{LeafBody, NodeSizePolicy};
+
+use super::avoidable::{MergeTime, SplitTime};
+
+/// The window length of the policies in this module.
+const DEFAULT_WINDOW: Duration = Duration::from_secs(1);
+
+/// Decides the splits and merges of leaves from one window of measurements.
+///
+/// A policy has no state that the engine must keep: it gets all of the
+/// measurements of a window, and returns the changes that it wants. The engine
+/// checks each change again against current state. It skips a split of a leaf
+/// with less than two entries, and a merge that the merge rules of ADR-073 do
+/// not allow, except the underfull threshold.
+pub trait TopologyPolicy: Send + Sync + 'static {
+    /// Returns the length of one window.
+    fn window(&self) -> Duration {
+        DEFAULT_WINDOW
+    }
+
+    /// Returns the leaf changes that the measurements of `window` call for.
+    fn decide(&self, window: &TopologyWindow) -> Vec<TopologyChange>;
+}
+
+/// The measurements of one database instance in one window.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct TopologyWindow {
+    /// The time since the start of the window.
+    pub elapsed: Duration,
+    /// The typical time of one split of this database instance.
+    pub split_time: Duration,
+    /// The typical time of one merge of this database instance.
+    pub merge_time: Duration,
+    /// The node size policy of this database instance.
+    pub node_size: NodeSizePolicy,
+    /// The leaves with measurements in this window.
+    pub leaves: BTreeMap<LeafId, LeafWindow>,
+    /// The adjacent leaves with merge-side time in this window.
+    pub pairs: Vec<PairWindow>,
+}
+
+/// The measurements of one leaf in one window.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct LeafWindow {
+    /// The avoidable time that one split of the leaf can remove.
+    pub avoidable: SplitTime,
+    /// The last size that this instance wrote or split, if any in this window.
+    pub size: Option<LeafSize>,
+    /// Whether a structural change wrote the leaf in this window or the last
+    /// one. Part of its measurements can come from before the change.
+    pub changed: bool,
+}
+
+/// The measurements of two adjacent leaves in one window.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct PairWindow {
+    pub left: LeafId,
+    pub right: LeafId,
+    /// The avoidable time that one merge of the two leaves can remove.
+    pub avoidable: MergeTime,
+}
+
+/// The size of one leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LeafSize {
+    pub entries: usize,
+    /// The entries that are not tombstones.
+    pub live_entries: usize,
+    pub encoded_bytes: usize,
+}
+
+/// An opaque identity of one leaf of one collection.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LeafId(ObjectPath);
+
+/// One change of one leaf that a policy asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopologyChange {
+    /// Split the leaf in two.
+    Split(LeafId),
+    /// Merge the leaf into its right sibling.
+    Merge(LeafId),
+}
+
+/// Splits a leaf when its split-side time in one window is more than the
+/// typical split time, and merges two adjacent leaves when their merge-side
+/// time is more than the typical merge time plus the split-side time of both
+/// leaves (ADR-074). Leaves over a soft cap also split. A leaf that a change
+/// wrote in this window or the last one does not change.
+#[derive(Debug, Clone, Copy)]
+pub struct AvoidableTimePolicy {
+    split_threshold: f64,
+    merge_threshold: f64,
+}
+
+/// Decides on size alone, as the engine does without a policy: a leaf over a
+/// soft cap or with inline pressure splits, and a leaf with few live entries
+/// merges into its right sibling (ADR-031, ADR-056, ADR-073).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SizePolicy;
+
+/// Changes no leaf. Only the hard cap splits leaves.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FixedTopology;
+
+impl LeafSize {
+    /// Reports whether the leaf is divisible and over a soft cap of `policy`.
+    pub fn over_soft_cap(&self, policy: &NodeSizePolicy) -> bool {
+        self.entries >= 2
+            && (self.entries > policy.leaf_max_entries()
+                || self.encoded_bytes > policy.node_soft_max_bytes())
+    }
+
+    /// Reports whether the leaf has fewer live entries than `policy` allows.
+    pub fn underfull(&self, policy: &NodeSizePolicy) -> bool {
+        self.live_entries < policy.leaf_min_entries()
+    }
+
+    pub(super) fn of(leaf: &LeafBody) -> Self {
+        Self {
+            entries: leaf.len(),
+            live_entries: leaf.entries().filter(|entry| entry.exists()).count(),
+            encoded_bytes: leaf.encoded_len(),
+        }
+    }
+}
+
+impl LeafId {
+    /// Reports whether the leaf is the root of its tree, which cannot merge.
+    pub fn is_root(&self) -> bool {
+        matches!(self.0, ObjectPath::TreeRoot { .. })
+    }
+
+    pub(super) fn new(path: ObjectPath) -> Self {
+        Self(path)
+    }
+
+    pub(super) fn into_path(self) -> ObjectPath {
+        self.0
+    }
+}
+
+impl fmt::Display for LeafId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl AvoidableTimePolicy {
+    /// Creates the policy of ADR-074.
+    pub fn new() -> Self {
+        Self {
+            split_threshold: 1.0,
+            merge_threshold: 1.0,
+        }
+    }
+
+    /// Sets the multiple of the typical split time that the split-side time
+    /// of a leaf must be more than. Defaults to one.
+    ///
+    /// # Panics
+    ///
+    /// If `multiple` is negative or not finite.
+    pub fn split_threshold(mut self, multiple: f64) -> Self {
+        self.split_threshold = checked_multiple(multiple);
+        self
+    }
+
+    /// Sets the multiple of the typical merge time that the merge-side time of
+    /// two leaves must be more than, in addition to their split-side time.
+    /// Defaults to one.
+    ///
+    /// # Panics
+    ///
+    /// If `multiple` is negative or not finite.
+    pub fn merge_threshold(mut self, multiple: f64) -> Self {
+        self.merge_threshold = checked_multiple(multiple);
+        self
+    }
+}
+
+impl Default for AvoidableTimePolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TopologyPolicy for AvoidableTimePolicy {
+    fn decide(&self, window: &TopologyWindow) -> Vec<TopologyChange> {
+        let split_time = window.split_time.mul_f64(self.split_threshold);
+        let merge_time = window.merge_time.mul_f64(self.merge_threshold);
+        let mut changed: BTreeSet<&LeafId> = window
+            .leaves
+            .iter()
+            .filter(|(_, leaf)| leaf.changed)
+            .map(|(id, _)| id)
+            .collect();
+        let mut changes = Vec::new();
+        for (id, leaf) in &window.leaves {
+            let over_cap = leaf
+                .size
+                .is_some_and(|size| size.over_soft_cap(&window.node_size));
+            if !leaf.changed && (over_cap || leaf.avoidable.total() > split_time) {
+                changes.push(TopologyChange::Split(id.clone()));
+                changed.insert(id);
+            }
+        }
+        let split_side = |id: &LeafId| {
+            window
+                .leaves
+                .get(id)
+                .map_or(Duration::ZERO, |leaf| leaf.avoidable.total())
+        };
+        for pair in &window.pairs {
+            if changed.contains(&pair.left) || changed.contains(&pair.right) {
+                continue;
+            }
+            let keep = merge_time + split_side(&pair.left) + split_side(&pair.right);
+            if pair.avoidable.total() > keep {
+                changes.push(TopologyChange::Merge(pair.left.clone()));
+                changed.insert(&pair.left);
+                changed.insert(&pair.right);
+            }
+        }
+        changes
+    }
+}
+
+impl TopologyPolicy for SizePolicy {
+    fn decide(&self, window: &TopologyWindow) -> Vec<TopologyChange> {
+        let policy = &window.node_size;
+        window
+            .leaves
+            .iter()
+            .filter_map(|(id, leaf)| {
+                let over_cap = leaf.size.is_some_and(|size| size.over_soft_cap(policy));
+                if over_cap || !leaf.avoidable.inline_pressure.is_zero() {
+                    Some(TopologyChange::Split(id.clone()))
+                } else if !id.is_root() && leaf.size.is_some_and(|size| size.underfull(policy)) {
+                    Some(TopologyChange::Merge(id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+impl TopologyPolicy for FixedTopology {
+    fn decide(&self, _window: &TopologyWindow) -> Vec<TopologyChange> {
+        Vec::new()
+    }
+}
+
+fn checked_multiple(multiple: f64) -> f64 {
+    assert!(
+        multiple.is_finite() && multiple >= 0.0,
+        "a threshold multiple must be finite and not negative, got {multiple}"
+    );
+    multiple
+}
+
+#[cfg(test)]
+mod tests;

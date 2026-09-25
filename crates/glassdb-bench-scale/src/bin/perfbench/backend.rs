@@ -149,19 +149,64 @@ impl Options {
     }
 }
 
+/// Storage whose objects a scenario can copy into independent storage. Only
+/// the memory backend can copy its objects.
+pub(super) struct CopyableBackend {
+    backend: Arc<dyn Backend>,
+    memory: Option<(Arc<MemoryBackend>, Option<DelayOptions>)>,
+}
+
 impl Factory {
     /// Creates an independent middleware instance over the selected storage.
     pub(super) fn backend(&self) -> Arc<dyn Backend> {
+        self.copyable_backend().backend()
+    }
+
+    /// Creates an independent middleware instance over the selected storage,
+    /// which scenarios can copy when the storage is in memory.
+    pub(super) fn copyable_backend(&self) -> CopyableBackend {
         match self {
-            Factory::Memory(delays) => Arc::new(
-                DelayBackend::new(Arc::new(MemoryBackend::new()), *delays)
+            Factory::Memory(delays) => CopyableBackend::memory(MemoryBackend::new(), Some(*delays)),
+            Factory::Gcs { bucket } => CopyableBackend {
+                backend: Arc::new(glassdb::gcs::GcsBackend::new(bucket.clone())),
+                memory: None,
+            },
+            Factory::S3 { client, bucket, .. } => CopyableBackend {
+                backend: Arc::new(glassdb::s3::S3Backend::new(client.clone(), bucket.clone())),
+                memory: None,
+            },
+        }
+    }
+}
+
+impl CopyableBackend {
+    /// Wraps `memory` with `delays`, when set.
+    pub(super) fn memory(memory: MemoryBackend, delays: Option<DelayOptions>) -> Self {
+        let memory = Arc::new(memory);
+        let backend: Arc<dyn Backend> = match delays {
+            Some(delays) => Arc::new(
+                DelayBackend::new(memory.clone(), delays)
                     .expect("generated delay profile is valid"),
             ),
-            Factory::Gcs { bucket } => Arc::new(glassdb::gcs::GcsBackend::new(bucket.clone())),
-            Factory::S3 { client, bucket, .. } => {
-                Arc::new(glassdb::s3::S3Backend::new(client.clone(), bucket.clone()))
-            }
+            None => memory.clone(),
+        };
+        Self {
+            backend,
+            memory: Some((memory, delays)),
         }
+    }
+
+    pub(super) fn backend(&self) -> Arc<dyn Backend> {
+        self.backend.clone()
+    }
+
+    /// Returns independent storage with a copy of every object, and delays
+    /// with their own throttling state.
+    pub(super) fn copy(&self) -> Result<Self, Box<dyn Error>> {
+        let Some((memory, delays)) = &self.memory else {
+            return Err("only the memory backend can copy a seeded topology".into());
+        };
+        Ok(Self::memory(memory.snapshot(), *delays))
     }
 }
 

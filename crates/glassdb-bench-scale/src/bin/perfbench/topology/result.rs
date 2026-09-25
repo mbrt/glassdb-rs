@@ -8,7 +8,8 @@ use glassdb::Stats;
 use glassdb_bench_scale::bench::Results;
 use glassdb_bench_scale::run::SplitSettlement;
 
-use super::Cell;
+use super::super::policy::PolicySpec;
+use super::{Adaptation, Cell};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -76,6 +77,16 @@ pub(super) struct CellResult {
     workload: &'static str,
     databases: usize,
     workers: usize,
+    policy: String,
+    #[serde(skip)]
+    fixed: bool,
+    /// Splits and merges of the unmeasured work before measurement.
+    adapt_splits: u64,
+    adapt_merges: u64,
+    /// Leaves after measurement, when the cell measured its own copy of the
+    /// seeded tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_leaves: Option<u64>,
     committed: usize,
     tx_per_sec: f64,
     mean_ms: f64,
@@ -85,8 +96,8 @@ pub(super) struct CellResult {
     rel_ci: f64,
     /// Whether the cell reached `--target-ci` before `--max-duration`.
     converged: bool,
-    /// Splits and merges during measurement. Nonzero values mean the cell did
-    /// not measure the seeded topology alone.
+    /// Splits and merges during measurement. With the `fixed` policy, nonzero
+    /// values mean the cell did not measure the seeded topology alone.
     measured_splits: u64,
     measured_merges: u64,
     per_tx: PerTx,
@@ -99,6 +110,7 @@ impl CellResult {
         workers: usize,
         results: Results,
         converged: bool,
+        adaptation: Adaptation,
         delta: Stats,
     ) -> Self {
         let committed = results.samples.len();
@@ -116,6 +128,11 @@ impl CellResult {
             workload: cell.workload.label(),
             databases: cell.databases,
             workers,
+            policy: cell.policy.label(),
+            fixed: cell.policy == PolicySpec::Fixed,
+            adapt_splits: adaptation.splits,
+            adapt_merges: adaptation.merges,
+            final_leaves: None,
             committed,
             tx_per_sec: if secs > 0.0 {
                 committed as f64 / secs
@@ -133,10 +150,19 @@ impl CellResult {
         }
     }
 
-    /// Formats a warning when measurement changed the seeded tree, which makes
-    /// the cell incomparable with the other cells of its topology.
+    /// Records the leaves after measurement.
+    pub(super) fn with_final_leaves(self, leaves: u64) -> Self {
+        Self {
+            final_leaves: Some(leaves),
+            ..self
+        }
+    }
+
+    /// Formats a warning when measurement changed the seeded tree of a
+    /// `fixed` cell, which makes the cell incomparable with the other cells of
+    /// its topology.
     pub(super) fn restructure_warning(&self) -> Option<String> {
-        (self.measured_splits > 0 || self.measured_merges > 0).then(|| {
+        (self.fixed && (self.measured_splits > 0 || self.measured_merges > 0)).then(|| {
             format!(
                 "  warning: leaf-size={} workload={} databases={} restructured the tree \
                  ({} splits, {} merges)",

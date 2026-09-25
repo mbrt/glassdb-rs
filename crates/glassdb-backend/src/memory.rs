@@ -45,6 +45,18 @@ impl MemoryBackend {
             }),
         }
     }
+
+    /// Returns an independent backend with a copy of every object and its
+    /// revision.
+    pub fn snapshot(&self) -> Self {
+        let state = self.state.lock().unwrap();
+        MemoryBackend {
+            state: Mutex::new(State {
+                objects: state.objects.clone(),
+                next_gen: state.next_gen,
+            }),
+        }
+    }
 }
 
 impl Default for MemoryBackend {
@@ -212,5 +224,18 @@ mod tests {
             matches!(result, Err(BackendError::InvalidCursor)),
             "got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_keeps_revisions_and_then_changes_independently() {
+        let original = MemoryBackend::new();
+        let revision = original.write_if_not_exists("a", vec![1]).await.unwrap();
+        let copy = original.snapshot();
+
+        copy.write_if("a", vec![2], &revision).await.unwrap();
+        original.write_if("a", vec![3], &revision).await.unwrap();
+
+        assert_eq!(copy.read("a").await.unwrap().contents, vec![2]);
+        assert_eq!(original.read("a").await.unwrap().contents, vec![3]);
     }
 }

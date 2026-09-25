@@ -4,6 +4,7 @@ mod backend;
 mod contention;
 mod inline_pressure;
 mod mixed;
+mod policy;
 mod topology;
 
 #[cfg(target_env = "musl")]

@@ -22,6 +22,10 @@
 //! collection opening, and their backend operations are outside the measured
 //! interval.
 //!
+//! The measurement clients open with each topology policy of `--policies`.
+//! All shapes can run for `--warmup` before measurement, so that the policy
+//! changes the tree before it is measured.
+//!
 //! Each cell uses **sequential (adaptive) sampling**: all shapes run
 //! concurrently until every shape has committed enough transactions for its
 //! throughput 95% confidence interval to reach `--target-ci` (or `--max-duration`
@@ -37,10 +41,11 @@ mod workload;
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use tokio::runtime::Handle;
 
+use glassdb::{Database, Error as GError};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::bench::samples_for_rel_ci;
 use glassdb_bench_scale::run::{DriveOutcome, drive_to_significance, join_tasks_until};
@@ -50,7 +55,7 @@ use super::{Execution, cooldown};
 use options::CellDimension;
 pub(super) use options::Options;
 pub(super) use result::RunResult;
-use result::{CellMetadata, CellResult};
+use result::{CellMetadata, CellResult, Restructure};
 
 /// Fixed opaque value written on every put.
 fn value() -> Vec<u8> {
@@ -77,12 +82,13 @@ pub(super) fn run(
         for &dimension in &dimensions {
             eprintln!("{}", result::cell_started(run, dimension));
             let database_name = format!(
-                "perfbenchmixed{invocation}r{run}{}a{}d{}l{}w{}",
+                "perfbenchmixed{invocation}r{run}{}a{}d{}l{}w{}p{}",
                 dimension.mode.label(),
                 dimension.affinity_pct,
                 dimension.databases,
                 dimension.database_limit,
                 dimension.workers_per_shape,
+                dimension.policy_index,
             );
             cells.push(run_cell(
                 handle,
@@ -113,12 +119,42 @@ fn run_cell(
         database_name,
         setup::CellConfig {
             databases: dimension.databases,
+            policy: dimension.policy,
             pool_size,
             split_quiet: options.split_quiet,
             split_settle_timeout: options.split_settle_timeout,
             drain_timeout: execution.drain_timeout,
         },
     )?;
+    let ctx = |stop: &Arc<AtomicBool>| {
+        workload::WorkerCtx::new(
+            stop.clone(),
+            pool_size,
+            options.multi_keys,
+            dimension.affinity_pct,
+        )
+    };
+    let opened: Vec<_> = prepared.databases().iter().map(Database::stats).collect();
+    if !options.warmup.is_zero() {
+        let plans = workload::plans(
+            dimension.workers_per_shape,
+            prepared.databases().len(),
+            options.warmup,
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        handle.block_on(warm_up(
+            prepared.databases(),
+            prepared.collections(),
+            &plans,
+            &ctx(&stop),
+            options.warmup,
+            execution,
+        ))?;
+    }
+    let mut restructure = Restructure::default();
+    for (database, opened) in prepared.databases().iter().zip(opened) {
+        restructure.add_warmup(database.stats() - opened);
+    }
     let plans = workload::plans(
         dimension.workers_per_shape,
         prepared.databases().len(),
@@ -132,12 +168,7 @@ fn run_cell(
 
     let stop = Arc::new(AtomicBool::new(false));
     let target = samples_for_rel_ci(options.target_ci);
-    let ctx = workload::WorkerCtx::new(
-        stop.clone(),
-        pool_size,
-        options.multi_keys,
-        dimension.affinity_pct,
-    );
+    let ctx = ctx(&stop);
     let (drive, run, deadline) = handle.block_on(async {
         let handles =
             workload::spawn_workers(active.databases(), active.collections(), &plans, &ctx);
@@ -176,9 +207,31 @@ fn run_cell(
             dimension.workers_per_shape,
             completed.setup_splits,
             completed.split_settle_elapsed,
-        ),
+        )
+        .with_policy(dimension.policy.label(), restructure),
         workload::measurements(&plans),
         &completed.deltas,
         target,
     ))
+}
+
+/// Runs every shape for `duration` without measuring it.
+async fn warm_up(
+    databases: &[Database],
+    collections: &[Arc<[glassdb::Collection]>],
+    plans: &[workload::ShapePlan],
+    ctx: &workload::WorkerCtx,
+    duration: Duration,
+    execution: Execution,
+) -> Result<(), GError> {
+    // The benches never start, so they never finish, and only the stop flag
+    // of `ctx` ends the workers.
+    let handles = workload::spawn_workers(databases, collections, plans, ctx);
+    tokio::time::sleep(duration).await;
+    ctx.stop();
+    join_tasks_until(
+        handles,
+        tokio::time::Instant::now() + execution.drain_timeout,
+    )
+    .await
 }
