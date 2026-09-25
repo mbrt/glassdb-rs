@@ -107,7 +107,8 @@ impl StructuralHintSink {
             inline_pressure: time,
             ..SplitTime::default()
         };
-        self.candidates.avoidable.add_split_time(path, split);
+        // Either half of a median split carries about half of the inline bytes.
+        self.candidates.avoidable.add_split_time(path, split, None);
     }
 
     /// Notes that a direct commit candidate with keys in the adjacent leaves
@@ -263,12 +264,18 @@ impl MaintenanceCandidates {
 
     /// Queues one leaf change that a topology policy decided.
     pub(super) fn push_change(&self, change: TopologyChange) {
-        let (leaf, cause) = match change {
-            TopologyChange::Split(leaf) => (leaf, CandidateCause::Split(SplitReason::Demand)),
-            TopologyChange::Merge(leaf) => (leaf, CandidateCause::Merge(MergeReason::Demand)),
+        let (path, cause) = match change {
+            TopologyChange::Split(leaf) => {
+                let path = leaf.into_path();
+                let at = self.avoidable.split_key(&path);
+                (path, CandidateCause::Split(SplitReason::Demand { at }))
+            }
+            TopologyChange::Merge(leaf) => {
+                (leaf.into_path(), CandidateCause::Merge(MergeReason::Demand))
+            }
         };
         self.push(MaintenanceCandidate {
-            path: leaf.into_path(),
+            path,
             priority: self.new_id(),
             cause,
         });
@@ -382,8 +389,8 @@ impl StructuralHinter for MaintenanceCandidates {
         });
     }
 
-    fn leaf_delay(&self, path: &ObjectPath, delay: LeafDelay, time: Duration) {
+    fn leaf_delay(&self, path: &ObjectPath, delay: LeafDelay, time: Duration, split_key: &[u8]) {
         self.avoidable
-            .add_split_time(path, SplitTime::of_delay(delay, time));
+            .add_split_time(path, SplitTime::of_delay(delay, time), Some(split_key));
     }
 }

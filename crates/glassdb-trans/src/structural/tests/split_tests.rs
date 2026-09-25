@@ -399,6 +399,57 @@ async fn root_leaf_splits_in_place_into_an_index() {
     );
 }
 
+// ADR-074: avoidable time pays for the split that separates the keys that it
+// was measured for. The leaf can change before the split and move its median,
+// so the split is at the measured key, or not at all.
+#[tokio::test]
+async fn a_demand_split_divides_the_leaf_at_its_measured_key() {
+    let s = store();
+    let root = Node::leaf(LeafBody::from_entries(
+        [b"a".as_slice(), b"b", b"c", b"d"].iter().map(|k| live(k)),
+    ));
+    s.create_root(COLL, &root).await.unwrap();
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, NodeSizePolicy::default());
+    let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+    let leaf_keys = || async {
+        let leaves = router
+            .leaves(
+                &collection(),
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        leaves
+            .iter()
+            .map(|leaf| {
+                let keys = leaf.node().unwrap().as_leaf().unwrap().entries();
+                keys.map(|entry| entry.key.clone()).collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let above_every_key = SplitReason::Demand {
+        at: Some(b"e".to_vec()),
+    };
+    split_path(&sp, &root_path(), &above_every_key)
+        .await
+        .unwrap();
+    assert_eq!(leaf_keys().await.len(), 1, "a half would be empty");
+
+    let measured = SplitReason::Demand {
+        at: Some(b"b".to_vec()),
+    };
+    split_path(&sp, &root_path(), &measured).await.unwrap();
+    assert_eq!(
+        leaf_keys().await,
+        vec![
+            vec![b"a".to_vec()],
+            vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]
+        ]
+    );
+}
+
 // A standalone leaf over the cap half-splits: the upper half moves to a fresh
 // sibling, the source shrinks and links to it, and the parent index learns
 // the separator so later descents skip the right-link hop.

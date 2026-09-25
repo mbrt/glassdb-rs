@@ -6,7 +6,7 @@ use std::time::Duration;
 use glassdb::middleware::HookBackend;
 use glassdb::{
     AvoidableTimePolicy, Backend, Collection, Database, FixedTopology, KeyScan, NodeSizePolicy,
-    TopologyChange, TopologyPolicy, TopologyWindow,
+    RestructurerStats, TopologyChange, TopologyPolicy, TopologyWindow,
 };
 
 pub mod integration_support;
@@ -211,12 +211,15 @@ async fn the_root_leaf_does_not_merge() {
     db.shutdown().await;
 }
 
-// Two database instances that write different keys of one leaf lose CASes to
-// each other, which one split can remove. The soft caps do not split the leaf.
-// The writers of one instance share rounds, so they alone cause no avoidable
-// time.
-#[tokio::test(start_paused = true)]
-async fn the_avoidable_time_policy_splits_a_leaf_that_instances_contend_on() {
+type Owner = fn(u8) -> usize;
+
+const HALVES: Owner = |key| usize::from(key / 4);
+const INTERLEAVED: Owner = |key| usize::from(key % 2);
+
+// Opens two database instances with the avoidable time policy over one leaf
+// of 8 keys, and writes each key 200 times from the instance that `owner`
+// gives. Returns the sum of the restructurer stats of both instances.
+async fn contend(owner: Owner) -> RestructurerStats {
     let backend = slow_mem();
     let policy = AvoidableTimePolicy::new;
     let first = open(&backend, NodeSizePolicy::default(), policy()).await;
@@ -226,7 +229,7 @@ async fn the_avoidable_time_policy_splits_a_leaf_that_instances_contend_on() {
     let colls = [coll, open_top(&second, b"contended").await];
 
     let writers = (0u8..8).map(|key| {
-        let coll = colls[usize::from(key % 2)].clone();
+        let coll = colls[owner(key)].clone();
         tokio::spawn(async move {
             for round in 0..200 {
                 coll.write(&[key], &write_int(round)).await.unwrap();
@@ -239,8 +242,29 @@ async fn the_avoidable_time_policy_splits_a_leaf_that_instances_contend_on() {
 
     let mut stats = first.stats().restructurer;
     stats += second.stats().restructurer;
-    assert!(stats.avoidable.split.lost_cas > Duration::ZERO);
-    assert!(stats.splits >= 1, "{stats:?}");
     first.shutdown().await;
     second.shutdown().await;
+    stats
+}
+
+// Two database instances that write different halves of one leaf lose CASes
+// to each other, which one split can remove. The soft caps do not split the
+// leaf. The writers of one instance share rounds, so they alone cause no
+// avoidable time.
+#[tokio::test(start_paused = true)]
+async fn the_avoidable_time_policy_splits_a_leaf_that_instances_contend_on() {
+    let stats = contend(HALVES).await;
+
+    assert!(stats.avoidable.split.lost_cas > Duration::ZERO);
+    assert!(stats.splits >= 1, "{stats:?}");
+}
+
+// A split at the median leaves writers of both instances in each half, so the
+// CASes that they lose are not avoidable time.
+#[tokio::test(start_paused = true)]
+async fn a_leaf_that_instances_write_interleaved_keys_of_does_not_split() {
+    let stats = contend(INTERLEAVED).await;
+
+    assert_eq!(stats.avoidable.split.lost_cas, Duration::ZERO);
+    assert_eq!(stats.splits, 0, "{stats:?}");
 }

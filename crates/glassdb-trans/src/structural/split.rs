@@ -82,8 +82,13 @@ pub(super) enum SplitReason {
         key: Vec<u8>,
         value_len: usize,
     },
-    /// A topology policy decided that the leaf splits.
-    Demand,
+    /// A topology policy decided that the leaf splits (ADR-074). The split is
+    /// at the key for which the avoidable time of the leaf was measured, or at
+    /// the median without one. The leaf can change before the split, so a
+    /// measured median can differ from the median at the split.
+    Demand {
+        at: Option<Vec<u8>>,
+    },
 }
 
 /// Whether a node still needs the split that its reason asked for.
@@ -210,8 +215,12 @@ impl Splitter {
                     SplitNeed::NotActionable
                 }
             }
-            SplitReason::Demand => {
-                if node.as_leaf().is_some_and(|leaf| leaf.len() >= 2) {
+            SplitReason::Demand { at } => {
+                let divisible = node.as_leaf().is_some_and(|leaf| match at {
+                    Some(key) => leaf.divides_at(key),
+                    None => leaf.len() >= 2,
+                });
+                if divisible {
                     SplitNeed::Split
                 } else {
                     SplitNeed::NotActionable
@@ -270,9 +279,9 @@ impl Splitter {
         }
         match target {
             SplitTarget::NonRoot(id) => {
-                self.plan_nonroot_split(id, prepared, node, worker, reclaimed)
+                self.plan_nonroot_split(id, reason, prepared, node, worker, reclaimed)
             }
-            SplitTarget::Root => self.plan_root_split(prepared, &node, worker, reclaimed),
+            SplitTarget::Root => self.plan_root_split(reason, prepared, &node, worker, reclaimed),
         }
     }
 
@@ -363,6 +372,7 @@ impl Splitter {
     fn plan_nonroot_split(
         &self,
         source_id: &NodeId,
+        reason: &SplitReason,
         prepared: &PreparedIntent,
         mut source: Node,
         worker: &TxId,
@@ -371,7 +381,7 @@ impl Splitter {
         let right_id = prepared
             .nonroot_sibling()
             .expect("a prepared non-root intent always reserves one sibling");
-        let Some((right, split_key)) = source.split(right_id) else {
+        let Some((right, split_key)) = reason.divide(&mut source, right_id) else {
             return Prepared::Cancel(Ok(()));
         };
         source.remove_structural_gate(worker);
@@ -393,6 +403,7 @@ impl Splitter {
     /// Builds both root children and the replacement root index.
     fn plan_root_split(
         &self,
+        reason: &SplitReason,
         prepared: &PreparedIntent,
         node: &Node,
         worker: &TxId,
@@ -401,7 +412,7 @@ impl Splitter {
         let (left_id, right_id) = prepared
             .root_children()
             .expect("a prepared root intent always reserves two children");
-        let (left, right, split_key) = split_into_children(node, right_id, worker);
+        let (left, right, split_key) = split_into_children(reason, node, right_id, worker);
         let index = Node::index(IndexNode::from_children([
             (Vec::new(), left_id),
             (split_key.clone(), right_id),
@@ -473,12 +484,21 @@ impl SplitReason {
             SplitReason::SoftCap => 0,
             SplitReason::InlinePressure { .. } => 1,
             SplitReason::Capacity => 2,
-            SplitReason::Demand => 3,
+            SplitReason::Demand { .. } => 3,
         }
     }
 
     pub(super) fn is_inline_pressure(&self) -> bool {
         matches!(self, SplitReason::InlinePressure { .. })
+    }
+
+    /// Divides `node` like [`Node::split`], at the key that the reason asks
+    /// for, if any.
+    fn divide(&self, node: &mut Node, right_id: NodeId) -> Option<(Node, Vec<u8>)> {
+        match self {
+            SplitReason::Demand { at: Some(key) } => node.split_leaf_at(right_id, key),
+            _ => node.split(right_id),
+        }
     }
 }
 
@@ -495,14 +515,15 @@ impl<'a> SplitTarget<'a> {
 /// an in-place root split, returning `(left, right, split_key)`. `left` links to
 /// `right_id`; `right` inherits `node`'s former bounds.
 fn split_into_children(
+    reason: &SplitReason,
     node: &Node,
     right_id: NodeId,
     structure_holder: &TxId,
 ) -> (Node, Node, Vec<u8>) {
     let mut source = node.clone();
-    let (right, split_key) = source
-        .split(right_id)
-        .expect("a split source has at least two entries/children");
+    let (right, split_key) = reason
+        .divide(&mut source, right_id)
+        .expect("a split source has entries or children in both halves");
     source.remove_structural_gate(structure_holder);
     (source, right, split_key)
 }

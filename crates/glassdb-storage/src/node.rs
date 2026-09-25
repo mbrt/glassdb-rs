@@ -913,25 +913,17 @@ impl Node {
                 (NodeBody::Index(upper), separator)
             }
         };
-        // The right sibling takes over the upper range: the old high-key and the
-        // old right-sibling link now bound and follow it.
-        let right = Node {
-            low_key: split_key.clone(),
-            high_key: self.high_key.take(),
-            right_sibling: self.right_sibling.take(),
-            body: right_body,
-            locks: {
-                let mut locks = self.locks.clone();
-                locks.clear_holders();
-                locks
-            },
-            drained: false,
+        Some(self.link_right_sibling(right_id, right_body, split_key))
+    }
+
+    /// Divides a leaf at `split_key` like [`Node::split`]. Returns `None` when
+    /// the node is not a leaf, or when one half would be empty.
+    pub fn split_leaf_at(&mut self, right_id: NodeId, split_key: &[u8]) -> Option<(Node, Vec<u8>)> {
+        let NodeBody::Leaf(leaf) = &mut self.body else {
+            return None;
         };
-        // The retained lower half is now bounded by the split key and links to
-        // the new sibling.
-        self.high_key = Some(split_key.clone());
-        self.right_sibling = Some(right_id);
-        Some((right, split_key))
+        let upper = leaf.split_off_at(split_key)?;
+        Some(self.link_right_sibling(right_id, NodeBody::Leaf(upper), split_key.to_vec()))
     }
 
     /// Encodes the node to its canonical protobuf body (the CAS unit).
@@ -1030,6 +1022,35 @@ impl Node {
             },
             drained: raw.drained,
         })
+    }
+
+    /// Makes `right_body` the right sibling of the node, above `split_key`,
+    /// and returns it with the split key.
+    fn link_right_sibling(
+        &mut self,
+        right_id: NodeId,
+        right_body: NodeBody,
+        split_key: Vec<u8>,
+    ) -> (Node, Vec<u8>) {
+        // The right sibling takes over the upper range: the old high-key and the
+        // old right-sibling link now bound and follow it.
+        let right = Node {
+            low_key: split_key.clone(),
+            high_key: self.high_key.take(),
+            right_sibling: self.right_sibling.take(),
+            body: right_body,
+            locks: {
+                let mut locks = self.locks.clone();
+                locks.clear_holders();
+                locks
+            },
+            drained: false,
+        };
+        // The retained lower half is now bounded by the split key and links to
+        // the new sibling.
+        self.high_key = Some(split_key.clone());
+        self.right_sibling = Some(right_id);
+        (right, split_key)
     }
 }
 
@@ -1544,6 +1565,28 @@ mod tests {
         let (right, _) = src.split(id("newRight")).expect("splittable");
         assert_eq!(src.membership_generation(), 2);
         assert_eq!(right.membership_generation(), 2);
+    }
+
+    #[test]
+    fn leaf_split_at_a_key_divides_there_and_relinks() {
+        let leaf = LeafBody::from_entries([entry(b"a", 1), entry(b"b", 2), entry(b"c", 3)]);
+        let mut src = Node::leaf(leaf).with_right_sibling(Some(id("oldRight")));
+        assert!(src.clone().split_leaf_at(id("newRight"), b"a").is_none());
+
+        let (right, split_key) = src.split_leaf_at(id("newRight"), b"c").unwrap();
+        assert_eq!(split_key, b"c");
+        assert_eq!(src.as_leaf().unwrap().len(), 2);
+        assert_eq!(src.high_key(), Some(b"c".as_slice()));
+        assert_eq!(src.right_sibling(), Some(id("newRight")));
+        assert_eq!(right.low_key(), b"c");
+        assert_eq!(right.as_leaf().unwrap().len(), 1);
+        assert_eq!(right.right_sibling(), Some(id("oldRight")));
+
+        let mut index = Node::index(IndexNode::from_children([
+            (b"".to_vec(), id("L0")),
+            (b"m".to_vec(), id("L1")),
+        ]));
+        assert!(index.split_leaf_at(id("newRight"), b"m").is_none());
     }
 
     #[test]
