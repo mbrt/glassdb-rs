@@ -31,8 +31,8 @@ use glassdb_concurr::{Background, Backoff, RetryConfig, rt};
 use glassdb_data::{LogicalKey, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxRecord, TxWrite};
 use glassdb_storage::{
-    CurrentnessBarrier, InlinePolicy, LeafObservationCheck, LockType, NodeStore, Requirement,
-    SplitPolicy, StorageError, Timeline, TreeRouter,
+    CurrentnessBarrier, InlinePolicy, LeafObservationCheck, LockType, NodeSizePolicy, NodeStore,
+    Requirement, StorageError, Timeline, TreeRouter,
 };
 
 use crate::access::{AccessSet, LeafCoverage, ReadAccess, WriteOp};
@@ -43,7 +43,7 @@ use crate::gc::GcHints;
 use crate::key_resolver::KeyResolver;
 use crate::leaf_coord::LeafCoordinator;
 use crate::monitor::{Monitor, OwnerAbortOutcome};
-use crate::split::SplitHintSink;
+use crate::structural::StructuralHintSink;
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
 mod direct_commit;
@@ -327,7 +327,7 @@ pub struct Algo {
     // Factory for each transaction's same-identity acquisition schedule. Other
     // coordination loops own independent schedules from the same engine policy.
     acquisition_retry: RetryConfig,
-    split_policy: SplitPolicy,
+    node_size_policy: NodeSizePolicy,
     collection_reservation_limit: usize,
     collection_commit: CollectionCommit,
     retirement: Arc<IdentityRetirement>,
@@ -354,13 +354,18 @@ impl Algo {
         background: Option<Weak<Background>>,
         router: TreeRouter,
         resolver: KeyResolver,
-        split_policy: SplitPolicy,
+        node_size_policy: NodeSizePolicy,
         collection_reservation_limit: usize,
         inline_policy: InlinePolicy,
-        split_hints: SplitHintSink,
+        structural_hints: StructuralHintSink,
     ) -> Self {
-        let direct_commit =
-            DirectCommit::new(router, coord, inline_policy, split_hints, gc_hints.clone());
+        let direct_commit = DirectCommit::new(
+            router,
+            coord,
+            inline_policy,
+            structural_hints,
+            gc_hints.clone(),
+        );
         let retirement = Arc::new(IdentityRetirement {
             mon: mon.clone(),
             gc_hints: gc_hints.clone(),
@@ -375,7 +380,7 @@ impl Algo {
             gc_hints,
             timeline,
             acquisition_retry,
-            split_policy,
+            node_size_policy,
             collection_reservation_limit,
             collection_commit,
             retirement,
@@ -679,7 +684,7 @@ impl Algo {
     /// Rejects keys that can never fit before the transaction has side effects.
     fn validate_coordination_keys(&self, accesses: &AccessSet) -> Result<(), TransError> {
         for key in accesses.points().map(|point| point.key) {
-            if !self.split_policy.key_fits(key.key()) {
+            if !self.node_size_policy.key_fits(key.key()) {
                 return Err(TransError::InvalidInput(
                     "key exceeds the coordination node size limit".into(),
                 ));
@@ -1316,7 +1321,7 @@ mod tests {
         new_algo_from_backend_with_cache(b, 1024).await
     }
 
-    async fn new_algo_with_policy(policy: SplitPolicy) -> (Algo, Tctx) {
+    async fn new_algo_with_policy(policy: NodeSizePolicy) -> (Algo, Tctx) {
         new_algo_from_backend_with_cache_and_policy(Arc::new(MemoryBackend::new()), 1024, policy)
             .await
     }
@@ -1325,27 +1330,32 @@ mod tests {
         b: Arc<dyn Backend>,
         cache_bytes: usize,
     ) -> (Algo, Tctx) {
-        new_algo_from_backend_with_cache_and_policy(b, cache_bytes, SplitPolicy::default()).await
+        new_algo_from_backend_with_cache_and_policy(b, cache_bytes, NodeSizePolicy::default()).await
     }
 
     async fn new_algo_from_backend_with_cache_and_policy(
         b: Arc<dyn Backend>,
         cache_bytes: usize,
-        split_policy: SplitPolicy,
+        node_size_policy: NodeSizePolicy,
     ) -> (Algo, Tctx) {
-        new_algo_from_backend_with_cache_policy_and_retirement(b, cache_bytes, split_policy, false)
-            .await
+        new_algo_from_backend_with_cache_policy_and_retirement(
+            b,
+            cache_bytes,
+            node_size_policy,
+            false,
+        )
+        .await
     }
 
     async fn new_algo_from_backend_with_cache_policy_and_retirement(
         b: Arc<dyn Backend>,
         cache_bytes: usize,
-        split_policy: SplitPolicy,
+        node_size_policy: NodeSizePolicy,
         managed_retirement: bool,
     ) -> (Algo, Tctx) {
         let mut config = EngineConfig::default();
         config.set_cache_size(cache_bytes);
-        config.set_split_policy(split_policy);
+        config.set_node_size_policy(node_size_policy);
         config.set_protocol_timing(ProtocolTiming::simulation());
         let foundation = AssemblyFixture::new(b.clone(), test_db_prefix(), &config);
 
@@ -1465,7 +1475,7 @@ mod tests {
         let (algo, tctx) = new_algo_from_backend_with_cache_policy_and_retirement(
             backend.clone(),
             1024,
-            SplitPolicy::default(),
+            NodeSizePolicy::default(),
             true,
         )
         .await;
@@ -1940,11 +1950,11 @@ mod tests {
 
     // A database can contain an unsafe singleton written by an older database instance or
     // admitted under a former policy. If capacity remains unavailable while the
-    // splitter cannot relieve it, lock acquisition must report the bounded wait
+    // restructurer cannot relieve it, lock acquisition must report the bounded wait
     // instead of retrying forever.
     #[tokio::test(start_paused = true)]
     async fn leaf_capacity_retry_episode_is_bounded() {
-        let policy = SplitPolicy::builder()
+        let policy = NodeSizePolicy::builder()
             .node_soft_max_bytes(384)
             .node_max_bytes(512)
             .split_headroom_bytes(128)
@@ -3199,8 +3209,8 @@ mod tests {
         let (accesses, _keys) = scan_accesses(&tctx).await;
 
         // Grow the tree in place: rewrite `_r` from its single leaf into an index
-        // root pointing at two fresh leaves (the shape the background splitter
-        // produces), so the covered leaf set is no longer just `_r`.
+        // root pointing at two fresh leaves (the shape the background
+        // restructurer produces), so the covered leaf set is no longer just `_r`.
         split_root_in_place(&tctx).await;
 
         let mut stable = begin_accesses(&tm, accesses);

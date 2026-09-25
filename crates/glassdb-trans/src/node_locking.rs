@@ -2,8 +2,8 @@
 //!
 //! The leaf coordinator owns the shared transaction mutation protocol. This
 //! module owns the wound-wait transitions applied to membership locks and the
-//! full-node quiescing sequence required before a split closes the structural
-//! gate.
+//! full-node quiescing sequence required before a split or a merge closes the
+//! structural gate.
 
 use std::collections::BTreeMap;
 
@@ -26,14 +26,44 @@ pub(crate) struct NodeLockReconciler<'a> {
     key_state: &'a KeyStateResolver,
     monitor: &'a Monitor,
     id: &'a TxId,
+    acquisition: GateAcquisition,
+}
+
+/// How a structural operation treats live holders of the node it gates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GateAcquisition {
+    /// Wounds younger holders and waits for older ones (ADR-044).
+    WoundWait,
+    /// Neither waits nor wounds: any live holder stops the operation. Merges
+    /// are optional maintenance and must not abort transactions (ADR-073).
+    Polite,
+}
+
+/// What keeps a structural gate from being installed.
+pub(crate) enum GateBlocker {
+    /// A live holder that the operation must wait for.
+    Holder(TxId),
+    /// A merge reservation, which only its structural intent can remove
+    /// (ADR-073).
+    MergeReservation,
 }
 
 impl<'a> NodeLockReconciler<'a> {
     pub(crate) fn new(key_state: &'a KeyStateResolver, monitor: &'a Monitor, id: &'a TxId) -> Self {
+        Self::with_acquisition(key_state, monitor, id, GateAcquisition::WoundWait)
+    }
+
+    pub(crate) fn with_acquisition(
+        key_state: &'a KeyStateResolver,
+        monitor: &'a Monitor,
+        id: &'a TxId,
+        acquisition: GateAcquisition,
+    ) -> Self {
         Self {
             key_state,
             monitor,
             id,
+            acquisition,
         }
     }
 
@@ -64,10 +94,7 @@ impl<'a> NodeLockReconciler<'a> {
                 if self.monitor.tx_status(holder).await? == TxCommitStatus::Unknown {
                     return Ok(QuiescedEntries::Wait(holder.clone()));
                 }
-                if matches!(
-                    try_reclaim(self.monitor, self.id, holder).await?,
-                    Reclaim::Wait
-                ) {
+                if matches!(self.reclaim(holder).await?, Reclaim::Wait) {
                     return Ok(QuiescedEntries::Wait(holder.clone()));
                 }
             }
@@ -111,15 +138,18 @@ impl<'a> NodeLockReconciler<'a> {
 
     /// Closes the structural gate after quiescing membership holders.
     ///
-    /// Returns the live holder to wait for, or leaves both node-lock scopes free
-    /// of foreign holders with a final status, with a structural gate installed
+    /// Returns what blocks the gate, or leaves both node-lock scopes free of
+    /// foreign holders with a final status, with a structural gate installed
     /// for this operation.
     pub(crate) async fn acquire_structural_gate(
         &self,
         locks: &mut NodeLocks,
-    ) -> Result<Option<TxId>, TransError> {
+    ) -> Result<Option<GateBlocker>, TransError> {
         if let Some(holder) = self.reconcile_drop_intent(locks).await? {
-            return Ok(Some(holder));
+            return Ok(Some(GateBlocker::Holder(holder)));
+        }
+        if locks.merge_reservation().is_some() {
+            return Ok(Some(GateBlocker::MergeReservation));
         }
         if locks.structural_gate().contains(self.id) {
             self.prune_final_membership(locks).await?;
@@ -128,14 +158,11 @@ impl<'a> NodeLockReconciler<'a> {
         for holder in locks.structural_gate().holders().to_vec() {
             match self.monitor.tx_status(&holder).await? {
                 TxCommitStatus::Pending => {
-                    if matches!(
-                        try_reclaim(self.monitor, self.id, &holder).await?,
-                        Reclaim::Wait
-                    ) {
-                        return Ok(Some(holder));
+                    if matches!(self.reclaim(&holder).await?, Reclaim::Wait) {
+                        return Ok(Some(GateBlocker::Holder(holder)));
                     }
                 }
-                TxCommitStatus::Unknown => return Ok(Some(holder)),
+                TxCommitStatus::Unknown => return Ok(Some(GateBlocker::Holder(holder))),
                 TxCommitStatus::Committed | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
             }
             locks.remove_structural_gate(&holder);
@@ -147,14 +174,11 @@ impl<'a> NodeLockReconciler<'a> {
             }
             match self.monitor.tx_status(&holder).await? {
                 TxCommitStatus::Pending => {
-                    if matches!(
-                        try_reclaim(self.monitor, self.id, &holder).await?,
-                        Reclaim::Wait
-                    ) {
-                        return Ok(Some(holder));
+                    if matches!(self.reclaim(&holder).await?, Reclaim::Wait) {
+                        return Ok(Some(GateBlocker::Holder(holder)));
                     }
                 }
-                TxCommitStatus::Unknown => return Ok(Some(holder)),
+                TxCommitStatus::Unknown => return Ok(Some(GateBlocker::Holder(holder))),
                 TxCommitStatus::Committed | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
             }
             locks.remove_membership_holder(&holder);
@@ -179,7 +203,7 @@ impl<'a> NodeLockReconciler<'a> {
                 locks.remove_drop_intent(&holder);
                 Ok(None)
             }
-            TxCommitStatus::Pending => match try_reclaim(self.monitor, self.id, &holder).await? {
+            TxCommitStatus::Pending => match self.reclaim(&holder).await? {
                 Reclaim::Wounded => {
                     locks.remove_drop_intent(&holder);
                     Ok(None)
@@ -214,10 +238,7 @@ impl<'a> NodeLockReconciler<'a> {
                 }
                 match self.monitor.tx_status(&holder).await? {
                     TxCommitStatus::Pending => {
-                        if matches!(
-                            try_reclaim(self.monitor, self.id, &holder).await?,
-                            Reclaim::Wait
-                        ) {
+                        if matches!(self.reclaim(&holder).await?, Reclaim::Wait) {
                             return Ok(Some(holder));
                         }
                     }
@@ -255,12 +276,20 @@ impl<'a> NodeLockReconciler<'a> {
         }
         Ok(())
     }
+
+    async fn reclaim(&self, holder: &TxId) -> Result<Reclaim, TransError> {
+        match self.acquisition {
+            GateAcquisition::WoundWait => try_reclaim(self.monitor, self.id, holder).await,
+            GateAcquisition::Polite => Ok(Reclaim::Wait),
+        }
+    }
 }
 
 /// Acquires a leaf structural gate through the shared leaf-mutation engine.
 pub(crate) struct StructuralGateOperation {
     id: TxId,
     path: ObjectPath,
+    acquisition: GateAcquisition,
 }
 
 /// Result of one coordinated structural-gate acquisition attempt.
@@ -272,8 +301,12 @@ pub(crate) enum StructuralGateOutcome {
 }
 
 impl StructuralGateOperation {
-    pub(crate) fn new(id: TxId, path: ObjectPath) -> Self {
-        Self { id, path }
+    pub(crate) fn new(id: TxId, path: ObjectPath, acquisition: GateAcquisition) -> Self {
+        Self {
+            id,
+            path,
+            acquisition,
+        }
     }
 }
 
@@ -291,7 +324,12 @@ impl MemberPolicy for StructuralGateOperation {
             }
             _ => return Err(TransError::other("structural gate target is not a leaf")),
         };
-        let reconciler = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id);
+        let reconciler = NodeLockReconciler::with_acquisition(
+            ctx.key_state,
+            ctx.tmon,
+            &self.id,
+            self.acquisition,
+        );
         let entries = match reconciler
             .quiesce_entries(&collection, staged, ctx.requirement)
             .await?
@@ -304,10 +342,18 @@ impl MemberPolicy for StructuralGateOperation {
             }
         };
         let mut locks = staged_locks.clone();
-        if let Some(holder) = reconciler.acquire_structural_gate(&mut locks).await? {
-            return Ok(Step::Skip {
-                outcome: MemberOutcome::Wait(holder),
-            });
+        match reconciler.acquire_structural_gate(&mut locks).await? {
+            None => {}
+            Some(GateBlocker::Holder(holder)) => {
+                return Ok(Step::Skip {
+                    outcome: MemberOutcome::Wait(holder),
+                });
+            }
+            Some(GateBlocker::MergeReservation) => {
+                return Ok(Step::Skip {
+                    outcome: MemberOutcome::Conflict,
+                });
+            }
         }
         let entries = entries
             .into_iter()

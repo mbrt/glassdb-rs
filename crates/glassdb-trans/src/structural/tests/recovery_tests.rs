@@ -21,8 +21,8 @@ async fn recover_peer_participant(committed: bool, case: ParticipantReclamation)
         .unwrap();
     let local_bg = Arc::new(Background::new());
     let peer_bg = Arc::new(Background::new());
-    let recovering = splitter(&local, &local_bg, tiny());
-    let owner = splitter(&peer, &peer_bg, tiny());
+    let recovering = restructurer(&local, &local_bg, tiny());
+    let owner = restructurer(&peer, &peer_bg, tiny());
     let participant = if committed {
         // The split has completed its tree change, but failed intent deletion
         // leaves both the Ready intent and participant for background recovery.
@@ -43,8 +43,7 @@ async fn recover_peer_participant(committed: bool, case: ParticipantReclamation)
             }
         });
         assert!(
-            owner
-                .split_path(&root_path(), &SplitReason::SoftCap)
+            split_path(&owner, &root_path(), &SplitReason::SoftCap)
                 .await
                 .is_err()
         );
@@ -64,13 +63,23 @@ async fn recover_peer_participant(committed: bool, case: ParticipantReclamation)
         id
     } else {
         let id = TxId::with_priority(1, b"peer-participant");
-        owner.begin_topology_tx(&collection(), &id).await.unwrap();
         owner
-            .recovery
-            .prepare_intent(&collection(), None, &id)
+            .changes
+            .topology
+            .begin(&collection(), &id)
             .await
             .unwrap();
-        owner.join_topology(&collection(), &id).await.unwrap();
+        owner
+            .recovery
+            .prepare_intent(&collection(), None, ChangeKind::Split, &id)
+            .await
+            .unwrap();
+        owner
+            .changes
+            .topology
+            .join(&collection(), &id)
+            .await
+            .unwrap();
         assert_eq!(
             owner.mon.abort_owned_tx(&id).await.unwrap(),
             crate::monitor::OwnerAbortOutcome::Acknowledged
@@ -106,7 +115,9 @@ async fn recover_peer_participant(committed: bool, case: ParticipantReclamation)
                 Box::pin(async move {
                     if depart {
                         owner
-                            .leave_topology(&collection(), &participant)
+                            .changes
+                            .topology
+                            .leave(&collection(), &participant, Requirement::ANY)
                             .await
                             .map_err(|error| {
                                 glassdb_backend::BackendError::with_source("owner departure", error)
@@ -240,8 +251,8 @@ async fn recovery_retries_a_cached_preparing_intent_after_the_peer_publishes_rea
         .unwrap();
     let local_bg = Arc::new(Background::new());
     let peer_bg = Arc::new(Background::new());
-    let recovering = splitter(&local, &local_bg, tiny());
-    let owner = splitter(&peer, &peer_bg, tiny());
+    let recovering = restructurer(&local, &local_bg, tiny());
+    let owner = restructurer(&peer, &peer_bg, tiny());
     let prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
     // The recovering instance discovers Preparing before the owner advances
     // it. Failed intent deletion then leaves the completed split for recovery.
@@ -285,8 +296,7 @@ async fn recovery_retries_a_cached_preparing_intent_after_the_peer_publishes_rea
         }
     });
     assert!(
-        owner
-            .split_path(&root_path(), &SplitReason::SoftCap)
+        split_path(&owner, &root_path(), &SplitReason::SoftCap)
             .await
             .is_err()
     );
@@ -347,18 +357,24 @@ async fn settlement_cancels_a_prepared_split_before_node_creation() {
     ));
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
-    let sp = splitter(&s, &bg, tiny());
+    let sp = restructurer(&s, &bg, tiny());
     let participant = TxId::with_priority(1, b"participant");
 
-    sp.begin_topology_tx(&collection(), &participant)
+    sp.changes
+        .topology
+        .begin(&collection(), &participant)
         .await
         .unwrap();
     let intent = sp
         .recovery
-        .prepare_intent(&collection(), None, &participant)
+        .prepare_intent(&collection(), None, ChangeKind::Split, &participant)
         .await
         .unwrap();
-    sp.join_topology(&collection(), &participant).await.unwrap();
+    sp.changes
+        .topology
+        .join(&collection(), &participant)
+        .await
+        .unwrap();
     sp.mon.abort_owned_tx(&participant).await.unwrap();
 
     operations.lock().unwrap().clear();
@@ -412,12 +428,15 @@ async fn settlement_cancels_a_prepared_split_before_node_creation() {
     let worker = TxId::with_priority(2, b"worker");
     sp.mon.begin_tx(&worker);
     let reason = SplitReason::SoftCap;
-    let attempt = sp
-        .coordinate_root_split(&collection(), &worker, &reason, intent)
-        .await;
+    let change = PlannedChange::Split {
+        collection: &collection(),
+        target: SplitTarget::Root,
+        reason: &reason,
+    };
+    let attempt = sp.changes.coordinate(change, &worker, intent).await;
     assert!(matches!(attempt.result, Err(TransError::Retry)));
-    assert!(matches!(attempt.state, SplitAttemptResult::RetryCleanly));
-    sp.finalize_split(&worker).await;
+    assert!(matches!(attempt.state, ChangeAttemptResult::RetryCleanly));
+    sp.changes.structural_nodes.finalize_worker(&worker).await;
     assert!(
         s.list_nodes(COLL, Requirement::after(s.timeline.currentness_barrier()))
             .await
@@ -473,7 +492,7 @@ async fn structural_split_failure_transition_table() {
         ));
         s.create_root(COLL, &root).await.unwrap();
         let bg = Arc::new(Background::new());
-        let sp = splitter(&s, &bg, tiny());
+        let sp = restructurer(&s, &bg, tiny());
 
         let root_path = root_path().to_string();
         let nodes_prefix = ObjectPath::nodes_prefix(&collection());
@@ -558,7 +577,8 @@ async fn structural_split_failure_transition_table() {
         });
 
         assert!(
-            sp.split_path(
+            split_path(
+                &sp,
                 &ObjectPath::TreeRoot {
                     collection: collection(),
                 },
@@ -626,8 +646,8 @@ async fn startup_structural_recovery_reclaims_an_orphan_after_restart() {
 
     let second = store_with_backend(backend);
     let bg = Arc::new(Background::new());
-    let splitter = splitter(&second, &bg, tiny());
-    splitter.start();
+    let restructurer = restructurer(&second, &bg, tiny());
+    restructurer.start();
     for _ in 0..20 {
         if matches!(
             second
@@ -680,7 +700,7 @@ async fn startup_structural_recovery_reclaims_an_orphan_after_restart() {
 async fn structural_recovery_defers_while_the_source_writer_is_live() {
     let s = store();
     let bg = Arc::new(Background::new());
-    let sp = splitter(&s, &bg, tiny());
+    let sp = restructurer(&s, &bg, tiny());
     let id = TxId::with_priority(1, b"live-split");
     sp.mon.begin_tx(&id);
 
@@ -749,7 +769,7 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
     let s = store_with_backend(recorder);
     let peer = store_with_backend(backend);
     let bg = Arc::new(Background::new());
-    let sp = splitter(&s, &bg, tiny());
+    let sp = restructurer(&s, &bg, tiny());
     let id = TxId::with_priority(1, b"inflight-split");
     sp.mon.begin_tx(&id);
 
@@ -859,7 +879,9 @@ async fn stage_recovery_split(
     let (right, split_key) = source.split(sibling).unwrap();
     source.remove_structural_gate(worker);
     intent.source_revision = gated.revision().unwrap().serialize().to_string();
-    intent.split_key = split_key;
+    if let StructuralChange::Split { split_key: key, .. } = &mut intent.change {
+        *key = split_key;
+    }
     intent.phase = StructuralIntentPhase::Ready;
     assert!(
         s.intent_store
@@ -892,12 +914,18 @@ async fn check_recovery_batch_reuses_source_reads(explicit: bool) {
     .await
     .unwrap();
     let bg = Arc::new(Background::new());
-    let sp = splitter(&s, &bg, tiny());
+    let sp = restructurer(&s, &bg, tiny());
     let participant = TxId::with_priority(1, b"batch-participant");
-    sp.begin_topology_tx(&collection(), &participant)
+    sp.changes
+        .topology
+        .begin(&collection(), &participant)
         .await
         .unwrap();
-    sp.join_topology(&collection(), &participant).await.unwrap();
+    sp.changes
+        .topology
+        .join(&collection(), &participant)
+        .await
+        .unwrap();
 
     // Two failed attempts leave different Ready intents for the same source.
     // Releasing each gate prevents its recorded publication CAS from landing.
@@ -1012,12 +1040,18 @@ async fn later_participant_discovery_checks_sources_after_its_own_ready_intents(
         .await
         .unwrap();
         let bg = Arc::new(Background::new());
-        let sp = splitter(&s, &bg, tiny());
+        let sp = restructurer(&s, &bg, tiny());
         let participant = TxId::with_priority(1, b"later-discovery-participant");
-        sp.begin_topology_tx(&collection(), &participant)
+        sp.changes
+            .topology
+            .begin(&collection(), &participant)
             .await
             .unwrap();
-        sp.join_topology(&collection(), &participant).await.unwrap();
+        sp.changes
+            .topology
+            .join(&collection(), &participant)
+            .await
+            .unwrap();
         let first_worker = TxId::with_priority(1, b"first-worker");
         stage_recovery_split(&s, &participant, &first_worker, "R").await;
         let (mut source, observed) = s.load_node(COLL, "L", Requirement::ANY).await.unwrap();
@@ -1113,7 +1147,7 @@ async fn later_participant_discovery_checks_sources_after_its_own_ready_intents(
 async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
     let s = store();
     let bg = Arc::new(Background::new());
-    let sp = splitter(&s, &bg, tiny());
+    let sp = restructurer(&s, &bg, tiny());
     let abandoned = TxId::with_priority(1, b"abandoned-split");
     let newcomer = TxId::with_priority(2, b"later-split");
     sp.mon.begin_tx(&newcomer);
@@ -1178,8 +1212,9 @@ async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
 /// than the intent's while holding source state from before the split gated it.
 /// Recovery once classified at the intent's own watermark, accepted exactly
 /// such an entry, read a revision the worker never published from, judged the
-/// live root split unapplied, and deleted both children - which the splitter
-/// then published a root index over, leaving the tree pointing at absent nodes.
+/// live root split unapplied, and deleted both children - which the
+/// restructurer then published a root index over, leaving the tree pointing at
+/// absent nodes.
 ///
 /// The peer owns the live split and follows the worker's durable order:
 /// Preparing intent, gate, Ready intent carrying the gated revision, children.
@@ -1195,11 +1230,11 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
     );
     let backend: Arc<dyn Backend> = backend;
     let s = store_with_backend(backend.clone());
-    // The live splitter models a separately opened database, so it owns a
+    // The live restructurer models a separately opened database, so it owns a
     // distinct cache and timeline over the shared backend.
     let peer = store_with_backend(backend);
     let bg = Arc::new(Background::new());
-    let sp = splitter(&s, &bg, tiny());
+    let sp = restructurer(&s, &bg, tiny());
     let worker = TxId::with_priority(1, b"inflight-root-split");
     let participant = TxId::with_priority(1, b"root-split-participant");
     sp.mon.begin_tx(&worker);
@@ -1212,8 +1247,10 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
         collection: collection(),
         source_token: None,
         source_revision: String::new(),
-        created_tokens: vec![test_token("L"), test_token("R")],
-        split_key: b"m".to_vec(),
+        change: StructuralChange::Split {
+            created_tokens: vec![test_token("L"), test_token("R")],
+            split_key: b"m".to_vec(),
+        },
         participant_id: participant.clone(),
         phase: StructuralIntentPhase::Preparing,
     };
@@ -1324,14 +1361,16 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
     ]));
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
-    let sp = splitter(&s, &bg, tiny());
+    let sp = restructurer(&s, &bg, tiny());
 
     let intent = StructuralIntent {
         collection: collection(),
         source_token: Some(test_token("L")),
         source_revision: superseded_source_revision(),
-        created_tokens: vec![test_token("R")],
-        split_key: b"t".to_vec(),
+        change: StructuralChange::Split {
+            created_tokens: vec![test_token("R")],
+            split_key: b"t".to_vec(),
+        },
         participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
         phase: StructuralIntentPhase::Ready,
     };
@@ -1362,6 +1401,106 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
         "the recovered separator keeps every leaf reachable after the parent split"
     );
     for key in [b"a".as_slice(), b"m", b"t"] {
+        let leaf = router
+            .route_key(
+                &collection(),
+                key,
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        assert!(leaf.node().unwrap().as_leaf().unwrap().exists(key));
+    }
+    assert!(
+        s.discover_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+// L split at "t" into R. Later R merged into R2, and the parent names R2 for
+// "t". R is no longer reachable, but the drain proves that the split linked it.
+#[tokio::test]
+async fn recovery_keeps_a_landed_sibling_that_a_merge_drained() {
+    let s = store();
+    s.store_node(COLL, "L", &leaf_node(&[b"a"], Some(b"t"), Some("R")), None)
+        .await
+        .unwrap();
+    let mut drained = leaf_node(&[], Some(b"x"), None).with_low_key(b"t".to_vec());
+    drained.drain(test_token("R2").as_ref());
+    s.store_node(COLL, "R", &drained, None).await.unwrap();
+    s.store_node(
+        COLL,
+        "R2",
+        &leaf_node(&[b"t", b"x"], None, None).with_low_key(b"t".to_vec()),
+        None,
+    )
+    .await
+    .unwrap();
+    let root = Node::index(IndexNode::from_children([
+        (Vec::new(), "L".to_string()),
+        (b"t".to_vec(), "R2".to_string()),
+    ]));
+    s.create_root(COLL, &root).await.unwrap();
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, tiny());
+    s.write_structural_intent("R", &nonroot_intent("L", "R", b"t"))
+        .await
+        .unwrap();
+
+    assert!(sp.recover_structural_intents().await.unwrap());
+
+    let fresh = Requirement::after(s.timeline.currentness_barrier());
+    let (kept, _) = s.load_node(COLL, "R", fresh).await.unwrap();
+    assert!(kept.is_drained(), "recovery never deletes a drained node");
+    assert!(
+        s.discover_structural_intents("db", fresh)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+// L split at "t" into R. Later L merged into R, and R split at "n" into S. R
+// no longer covers "t", but only a linked node can lose its test key.
+#[tokio::test]
+async fn recovery_keeps_a_landed_sibling_that_moved_its_test_key_right() {
+    let s = store();
+    let mut drained = leaf_node(&[], Some(b"t"), None);
+    drained.drain(test_token("R").as_ref());
+    s.store_node(COLL, "L", &drained, None).await.unwrap();
+    s.store_node(
+        COLL,
+        "R",
+        &leaf_node(&[b"a", b"m"], Some(b"n"), Some("S")),
+        None,
+    )
+    .await
+    .unwrap();
+    s.store_node(
+        COLL,
+        "S",
+        &leaf_node(&[b"t", b"x"], None, None).with_low_key(b"n".to_vec()),
+        None,
+    )
+    .await
+    .unwrap();
+    let root = Node::index(IndexNode::from_children([
+        (Vec::new(), "R".to_string()),
+        (b"n".to_vec(), "S".to_string()),
+    ]));
+    s.create_root(COLL, &root).await.unwrap();
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, tiny());
+    s.write_structural_intent("R", &nonroot_intent("L", "R", b"t"))
+        .await
+        .unwrap();
+
+    assert!(sp.recover_structural_intents().await.unwrap());
+
+    let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
+    for key in [b"a".as_slice(), b"m", b"t", b"x"] {
         let leaf = router
             .route_key(
                 &collection(),
@@ -1458,7 +1597,7 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
     // distinct database-local path coordinator over the shared backend.
     let peer = store_with_backend(backend);
     let bg = Arc::new(Background::new());
-    let sp = splitter(&s, &bg, tiny());
+    let sp = restructurer(&s, &bg, tiny());
     let id = TxId::with_priority(1, b"racing-split");
 
     let mut original = leaf_node(&[b"a", b"b", b"m", b"n"], None, None);
@@ -1486,8 +1625,10 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
             .unwrap()
             .serialize()
             .to_string(),
-        created_tokens: vec![test_token("R")],
-        split_key,
+        change: StructuralChange::Split {
+            created_tokens: vec![test_token("R")],
+            split_key,
+        },
         participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
         phase: StructuralIntentPhase::Ready,
     };
@@ -1535,7 +1676,7 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
 
 async fn recovery_that_needs_a_parent_split(
     participant: &TxId,
-) -> (TestStore, Arc<Background>, Splitter, StructuralIntent) {
+) -> (TestStore, Arc<Background>, Restructurer, StructuralIntent) {
     let s = store();
     s.store_node(
         COLL,
@@ -1566,13 +1707,15 @@ async fn recovery_that_needs_a_parent_split(
     .await
     .unwrap();
     let bg = Arc::new(Background::new());
-    let sp = splitter(&s, &bg, tiny());
+    let sp = restructurer(&s, &bg, tiny());
     let intent = StructuralIntent {
         collection: collection(),
         source_token: Some(test_token("L")),
         source_revision: superseded_source_revision(),
-        created_tokens: vec![test_token("R")],
-        split_key: b"t".to_vec(),
+        change: StructuralChange::Split {
+            created_tokens: vec![test_token("R")],
+            split_key: b"t".to_vec(),
+        },
         participant_id: participant.clone(),
         phase: StructuralIntentPhase::Ready,
     };

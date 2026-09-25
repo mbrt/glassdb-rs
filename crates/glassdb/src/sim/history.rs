@@ -17,7 +17,7 @@ use glassdb_concurr::rt;
 use crate::{Collection, CollectionPath, Database, Error, InlinePolicy, KeyScan, Transaction};
 
 use super::harness::{SimWorkload, open_det_db};
-use super::{CLIENT_COUNT, SimMedia, key_name, tiny_split_policy};
+use super::{CLIENT_COUNT, SimMedia, key_name, tiny_node_size_policy};
 
 mod collections;
 
@@ -1224,7 +1224,12 @@ impl SimWorkload for HistoryWorkload {
         // Three preseeded keys exceed the two-entry leaf cap. The same public
         // histories therefore cross a B-link split without exposing topology
         // to the oracle.
-        open_det_db(backend, tiny_split_policy(), InlinePolicy::default(), media)
+        open_det_db(
+            backend,
+            tiny_node_size_policy(),
+            InlinePolicy::default(),
+            media,
+        )
     }
 
     async fn seed(&self, db: &Database) {

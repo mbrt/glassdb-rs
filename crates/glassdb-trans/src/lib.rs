@@ -16,7 +16,7 @@ mod leaf_coord;
 mod monitor;
 mod node_locking;
 mod reader;
-mod split;
+mod structural;
 mod tlocker;
 mod wound_wait;
 
@@ -36,5 +36,5 @@ pub use key_resolver::ScanResult;
 pub use leaf_coord::LeafCoordinatorStats;
 pub use monitor::{MonitorStats, ProtocolTiming};
 pub use reader::{ReadOutcome, ReadValue};
-pub use split::{InlinePressureStats, SplitterStats};
+pub use structural::{InlinePressureStats, RestructurerStats};
 pub use tlocker::LockerStats;

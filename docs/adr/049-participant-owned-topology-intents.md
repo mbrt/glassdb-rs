@@ -8,6 +8,9 @@ Refines the structural-record placement of
 [ADR-034](034-separate-structural-log-namespace.md) and the topology-freeze
 protocol of [ADR-047](047-transactional-collection-management.md).
 
+[ADR-073](073-merge-nodes-into-right-sibling.md) adds a merge variant of the
+structural intent.
+
 ## Context
 
 A collection root records active topology participants so lifecycle changes can

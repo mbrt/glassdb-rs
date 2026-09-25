@@ -5,14 +5,13 @@ use std::time::Duration;
 use glassdb_backend::Backend;
 use glassdb_data::{DATABASE_ID_BYTES, DatabaseId};
 use glassdb_proto as pb;
-use glassdb_storage::SplitPolicy;
+use glassdb_storage::NodeSizePolicy;
 use glassdb_trans::{Engine, ProtocolTiming};
 use prost::Message;
 
 use crate::error::Error;
 
-// Older clients would ignore stored timing and use their local settings.
-const DB_VERSION: &str = "v4";
+const DB_VERSION: &str = "v5";
 const DB_META_PATH: &str = "glassdb";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -24,9 +23,9 @@ pub(crate) struct DatabaseMetadata {
 }
 
 impl DatabaseMetadata {
-    /// Combines stored hard limits with local split thresholds.
-    pub(crate) fn split_policy(&self, local: SplitPolicy) -> Result<SplitPolicy, Error> {
-        let policy = SplitPolicy::builder()
+    /// Combines stored hard limits with local split and merge thresholds.
+    pub(crate) fn node_size_policy(&self, local: NodeSizePolicy) -> Result<NodeSizePolicy, Error> {
+        let policy = NodeSizePolicy::builder()
             .leaf_max_entries(local.leaf_max_entries())
             .node_soft_max_bytes(local.node_soft_max_bytes())
             .index_max_children(local.index_max_children())
@@ -45,7 +44,7 @@ impl DatabaseMetadata {
 pub(crate) async fn check_or_create_db_meta(
     b: &impl Backend,
     name: &str,
-    policy: SplitPolicy,
+    policy: NodeSizePolicy,
     timing: ProtocolTiming,
 ) -> Result<DatabaseMetadata, Error> {
     match check_db_version(b, name).await {
@@ -103,7 +102,7 @@ async fn check_db_version(b: &impl Backend, name: &str) -> Result<DatabaseMetada
         node_max_bytes: required_size(meta.node_max_bytes, "node_max_bytes")?,
         split_headroom_bytes: required_size(meta.split_headroom_bytes, "split_headroom_bytes")?,
     };
-    metadata.split_policy(SplitPolicy::default())?;
+    metadata.node_size_policy(NodeSizePolicy::default())?;
     Ok(metadata)
 }
 
@@ -139,7 +138,7 @@ fn required_duration(value: Option<u64>, field: &str) -> Result<Duration, Error>
         .ok_or_else(|| Error::internal(format!("database metadata missing {field}")))
 }
 
-fn validate_limits(policy: SplitPolicy) -> Result<(), Error> {
+fn validate_limits(policy: NodeSizePolicy) -> Result<(), Error> {
     if !policy.key_fits(b"") {
         return Err(Error::InvalidInput(
             "coordination limits cannot admit even an empty key".into(),
@@ -180,7 +179,7 @@ mod tests {
         let created = check_or_create_db_meta(
             &b,
             "mydb",
-            SplitPolicy::default(),
+            NodeSizePolicy::default(),
             ProtocolTiming::new(Duration::from_nanos(123_456_789), Duration::ZERO),
         )
         .await
@@ -189,7 +188,7 @@ mod tests {
         let reopened = check_or_create_db_meta(
             &b,
             "mydb",
-            SplitPolicy::default(),
+            NodeSizePolicy::default(),
             ProtocolTiming::default(),
         )
         .await
@@ -221,7 +220,7 @@ mod tests {
             check_or_create_db_meta(
                 &b,
                 "mydb",
-                SplitPolicy::default(),
+                NodeSizePolicy::default(),
                 ProtocolTiming::default()
             )
             .await
@@ -236,7 +235,7 @@ mod tests {
         let b = MemoryBackend::new();
         let p = format!("mydb/{DB_META_PATH}");
         let body = pb::DatabaseMetadata {
-            version: "v3".to_string(),
+            version: "v4".to_string(),
             database_id: DatabaseId::new_random().as_bytes().to_vec(),
             node_max_bytes: None,
             split_headroom_bytes: None,
@@ -249,13 +248,13 @@ mod tests {
         let err = check_or_create_db_meta(
             &b,
             "mydb",
-            SplitPolicy::default(),
+            NodeSizePolicy::default(),
             ProtocolTiming::default(),
         )
         .await
         .unwrap_err();
         assert!(
-            matches!(&err, Error::Internal { msg, .. } if msg.contains("v3") && msg.contains("v4")),
+            matches!(&err, Error::Internal { msg, .. } if msg.contains("v4") && msg.contains("v5")),
             "unexpected error: {err:?}"
         );
     }
@@ -279,7 +278,7 @@ mod tests {
             let err = check_or_create_db_meta(
                 &b,
                 name,
-                SplitPolicy::default(),
+                NodeSizePolicy::default(),
                 ProtocolTiming::default(),
             )
             .await
@@ -299,7 +298,7 @@ mod tests {
         let err = check_or_create_db_meta(
             &b,
             "mydb",
-            SplitPolicy::default(),
+            NodeSizePolicy::default(),
             ProtocolTiming::default(),
         )
         .await
@@ -387,7 +386,7 @@ mod tests {
             check_or_create_db_meta(
                 &loser_backend,
                 "race",
-                SplitPolicy::default(),
+                NodeSizePolicy::default(),
                 ProtocolTiming::default(),
             )
             .await
@@ -395,7 +394,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), reached.notified())
             .await
             .unwrap();
-        let policy = SplitPolicy::builder()
+        let policy = NodeSizePolicy::builder()
             .node_max_bytes(512)
             .split_headroom_bytes(128)
             .build()
@@ -431,8 +430,8 @@ mod tests {
             max_clock_skew_nanos: Some(30_000_000_000),
         }
         .encode_to_vec();
-        // field 1 (string), len 2, "v4"; field 2 (bytes), len 16, ID.
-        let mut expected = vec![0x0a, 0x02, 0x76, 0x34, 0x12, 0x10];
+        // field 1 (string), len 2, "v5"; field 2 (bytes), len 16, ID.
+        let mut expected = vec![0x0a, 0x02, 0x76, 0x35, 0x12, 0x10];
         expected.extend(id);
         expected.extend([0x18, 0x80, 0x80, 0x40, 0x20, 0x80, 0x80, 0x04]);
         expected.extend([0x28, 0x80, 0xac, 0xc7, 0xf0, 0x37]);

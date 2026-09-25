@@ -232,7 +232,7 @@ fn validate_structural_intent_path(
 mod tests {
     use super::*;
     use crate::Timeline;
-    use crate::structural_intent::StructuralIntentPhase;
+    use crate::structural_intent::{StructuralChange, StructuralIntentPhase};
 
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
@@ -279,8 +279,10 @@ mod tests {
             collection: CollectionAddress::root("db"),
             source_token: Some(token(200)),
             source_revision: "v1".to_string(),
-            created_tokens: vec![token(201)],
-            split_key: b"split".to_vec(),
+            change: StructuralChange::Split {
+                created_tokens: vec![token(201)],
+                split_key: b"split".to_vec(),
+            },
             participant_id: participant.clone(),
             phase,
         }
@@ -334,8 +336,10 @@ mod tests {
         let participant = TxId::from_bytes(b"participant".to_vec());
         for i in 0..=STRUCTURAL_LIST_PAGE_SIZE {
             let mut intent = intent(&participant, StructuralIntentPhase::Ready);
-            intent.created_tokens = vec![token(i as u8)];
-            intent.split_key = vec![i as u8];
+            intent.change = StructuralChange::Split {
+                created_tokens: vec![token(i as u8)],
+                split_key: vec![i as u8],
+            };
             store
                 .write(&db_prefix(), &intent_id(i as u8), &intent)
                 .await

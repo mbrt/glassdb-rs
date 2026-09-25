@@ -1,26 +1,30 @@
 //! Concurrent membership, split traversal, and phantom-safe listing workload.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
+use glassdb_concurr::rt;
 
 use crate::{CollectionPath, Database, Error, KeyScan};
 
 use super::harness::{SimWorkload, open_det_db};
 use super::{
-    CLIENT_COUNT, MAX_OPS_PER_CLIENT, SimMedia, assert_valid_listing, key_name, tiny_split_policy,
+    CLIENT_COUNT, MAX_OPS_PER_CLIENT, SimMedia, assert_valid_listing, key_name,
+    merging_node_size_policy, tiny_node_size_policy,
 };
 // ===========================================================================
 // Membership workload (ADR-031 dynamic range sharding).
 //
 // Clients concurrently create (put) and delete keys and list the collection,
-// with a tiny split policy so a handful of keys grows the B-link tree — forcing
-// leaf and root splits, right-link traversal, and cross-leaf sorted listing. The
-// oracle is twofold: every committed listing must be strictly sorted and drawn
-// from the key universe (a structural invariant that always holds, even under
-// faults and mid-split), and the final key set must match the per-key membership
-// accounting (exactly with faults off; within the in-doubt bound otherwise).
+// with a tiny node size policy so a handful of keys grows the B-link tree —
+// forcing leaf and root splits, right-link traversal, and cross-leaf sorted
+// listing. The oracle is twofold: every committed listing must be strictly
+// sorted and drawn from the key universe (a structural invariant that always
+// holds, even under faults and mid-split), and the final key set must match the
+// per-key membership accounting (exactly with faults off; within the in-doubt
+// bound otherwise).
 //
 // To keep the per-key membership accounting sound under concurrency, each client
 // owns a disjoint subset of the key universe (assigned by residue), so a key's
@@ -29,7 +33,7 @@ use super::{
 // create/delete races and phantom prevention are still exercised.
 // ===========================================================================
 
-/// Size of the membership key universe. With the tiny split policy below a
+/// Size of the membership key universe. With the tiny node size policy below a
 /// couple of live keys already overflow a leaf, so this is comfortably enough to
 /// drive multi-level splits.
 const MEMBERSHIP_KEYS: usize = 8;
@@ -56,7 +60,15 @@ pub enum MembOp {
     },
     /// Scan the common `k` prefix into a limited materialized page.
     PrefixPage(usize),
+    /// Wait without a transaction, so that background work can run without
+    /// contention. The fuzzer does not generate it.
+    Pause,
 }
+
+/// Duration of a [`MembOp::Pause`]. It is longer than the interval after which
+/// the restructurer retries a deferred candidate, so that a structural change
+/// that a concurrent transaction deferred can still land.
+const PAUSE: Duration = Duration::from_millis(1500);
 
 /// A membership workload: one op sequence per client. Each client owns a
 /// disjoint subset of `0..MEMBERSHIP_KEYS` (keys `k` with `k % nclients == i`),
@@ -196,7 +208,7 @@ impl SimWorkload for MembershipWorkload {
         // A tiny split soft cap so a handful of keys forces B-link splits.
         open_det_db(
             backend,
-            tiny_split_policy(),
+            tiny_node_size_policy(),
             glassdb_storage::InlinePolicy::default(),
             media,
         )
@@ -266,6 +278,10 @@ impl SimWorkload for MembershipWorkload {
                 assert!(page.keys().iter().all(|key| key.starts_with(b"k")));
                 Ok(())
             }
+            MembOp::Pause => {
+                rt::sleep(PAUSE).await;
+                Ok(())
+            }
         }
     }
 
@@ -301,5 +317,53 @@ impl SimWorkload for MembershipWorkload {
                 );
             }
         }
+    }
+}
+
+/// The membership workload with a node size policy that admits more merges
+/// (ADR-073): deletes make leaves underfull, so they merge concurrently with
+/// puts, splits, and scans. The oracle is the same.
+#[derive(Debug, Clone, Default)]
+pub struct MergingMembershipWorkload(pub MembershipWorkload);
+
+impl SimWorkload for MergingMembershipWorkload {
+    type Op = MembOp;
+    type State = Mutex<MembershipAcct>;
+
+    fn clients(&self) -> &[Vec<MembOp>] {
+        self.0.clients()
+    }
+
+    fn new_state(&self) -> Mutex<MembershipAcct> {
+        self.0.new_state()
+    }
+
+    async fn open_db(
+        backend: &Arc<dyn Backend>,
+        media: Option<SimMedia>,
+    ) -> Result<Database, Error> {
+        open_det_db(
+            backend,
+            merging_node_size_policy(),
+            glassdb_storage::InlinePolicy::default(),
+            media,
+        )
+        .await
+    }
+
+    async fn seed(&self, db: &Database) {
+        self.0.seed(db).await;
+    }
+
+    async fn run_op(
+        db: &Database,
+        op: &MembOp,
+        state: &Mutex<MembershipAcct>,
+    ) -> Result<(), Error> {
+        MembershipWorkload::run_op(db, op, state).await
+    }
+
+    async fn verify(&self, db: &Database, state: &Mutex<MembershipAcct>, allow_in_doubt: bool) {
+        self.0.verify(db, state, allow_in_doubt).await;
     }
 }

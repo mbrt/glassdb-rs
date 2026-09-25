@@ -18,7 +18,7 @@
 //! `glassdb-trans` `split` module.
 
 use std::collections::BTreeMap;
-use std::ops::Bound::{Included, Unbounded};
+use std::ops::Bound::{Excluded, Included, Unbounded};
 
 use glassdb_proto as pb;
 use prost::Message;
@@ -27,7 +27,7 @@ use crate::error::StorageError;
 use crate::leaf::{LeafBody, LeafEntry};
 use crate::lock::{ExclusiveGate, LockType, SharedExclusiveLock};
 use crate::wire_size::{length_delimited_field, nonempty_length_delimited_field};
-use glassdb_data::{NodeToken as ValidatedNodeToken, TxId};
+use glassdb_data::{NodeToken as ValidatedNodeToken, StructuralIntentId, TxId};
 
 const LEAF_ENTRIES_TAG: u32 = 1;
 const INDEX_ENTRIES_TAG: u32 = 1;
@@ -70,6 +70,52 @@ impl IndexNode {
             .next_back()
             .map(|(_, c)| c.as_str())
             .or_else(|| self.children.values().next().map(String::as_str))
+    }
+
+    /// Returns the token of the routed child for keys just below `key`: the
+    /// child whose separator is the greatest one below `key`. Falls back to the
+    /// leftmost child like [`child_for`](Self::child_for).
+    pub fn child_before(&self, key: &[u8]) -> Option<&str> {
+        self.children
+            .range::<[u8], _>((Unbounded, Excluded(key)))
+            .next_back()
+            .map(|(_, c)| c.as_str())
+            .or_else(|| self.children.values().next().map(String::as_str))
+    }
+
+    /// Makes the separators of one right-link path of children agree with that
+    /// path (ADR-073). `path` lists the children in link order, from the child
+    /// routed for keys just below a key through the child that covers the key.
+    pub fn reconcile(&mut self, path: &[(&str, &Node)]) {
+        let mut live = Vec::with_capacity(path.len());
+        for (position, (token, node)) in path.iter().enumerate() {
+            if !node.is_drained() {
+                live.push((*token, *node));
+                continue;
+            }
+            let Some((target, _)) = path[position + 1..].iter().find(|(_, n)| !n.is_drained())
+            else {
+                continue;
+            };
+            for child in self.children.values_mut().filter(|child| child == token) {
+                *child = target.to_string();
+            }
+        }
+        for pair in live.windows(2) {
+            let ((_, previous), (token, _)) = (pair[0], pair[1]);
+            if let Some(separator) = previous.high_key() {
+                self.children
+                    .entry(separator.to_vec())
+                    .or_insert_with(|| token.to_string());
+            }
+        }
+        // Two adjacent entries that name the same child route like the first one.
+        let mut previous: Option<NodeToken> = None;
+        self.children.retain(|_, child| {
+            let duplicate = previous.as_ref() == Some(child);
+            previous = Some(child.clone());
+            !duplicate
+        });
     }
 
     /// Iterates the `(separator, child)` pairs in canonical (separator-sorted)
@@ -141,12 +187,14 @@ impl IndexNode {
     }
 }
 
-/// Size admission limits and soft thresholds for coordination-node splits.
+/// Size admission limits and soft thresholds for coordination-node splits and
+/// merges.
 ///
 /// The hard cap and reserved headroom are shared database settings. Soft
-/// thresholds tune each database instance's background splitting (ADR-031, ADR-072).
+/// thresholds tune each database instance's background splits and merges
+/// (ADR-031, ADR-072, ADR-073).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SplitPolicy {
+pub struct NodeSizePolicy {
     /// Maximum leaf entries before it is a split candidate.
     leaf_max_entries: usize,
     /// Maximum encoded content bytes before either a leaf or index node is a
@@ -154,36 +202,42 @@ pub struct SplitPolicy {
     node_soft_max_bytes: usize,
     /// Maximum index children (fan-out) before it is a split candidate.
     index_max_children: usize,
+    /// Minimum live leaf entries below which a leaf is a merge candidate.
+    leaf_min_entries: usize,
+    /// Minimum index children below which an index is a merge candidate.
+    index_min_children: usize,
     /// Maximum encoded coordination-object size, including transient locks.
     node_max_bytes: usize,
     /// Bytes reserved for transient node-lock metadata at the hard cap.
     split_headroom_bytes: usize,
 }
 
-/// Builds a validated [`SplitPolicy`], starting from production defaults.
+/// Builds a validated [`NodeSizePolicy`], starting from production defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SplitPolicyBuilder {
+pub struct NodeSizePolicyBuilder {
     leaf_max_entries: usize,
     node_soft_max_bytes: usize,
     index_max_children: usize,
+    leaf_min_entries: usize,
+    index_min_children: usize,
     node_max_bytes: usize,
     split_headroom_bytes: usize,
 }
 
-/// A split policy whose reserved headroom exceeds its hard node cap.
+/// A node size policy whose reserved headroom exceeds its hard node cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error(
     "split headroom ({split_headroom_bytes} bytes) exceeds the node hard cap ({node_max_bytes} bytes)"
 )]
-pub struct InvalidSplitPolicy {
+pub struct InvalidNodeSizePolicy {
     node_max_bytes: usize,
     split_headroom_bytes: usize,
 }
 
-impl SplitPolicy {
+impl NodeSizePolicy {
     /// Starts building a policy from the production defaults.
-    pub fn builder() -> SplitPolicyBuilder {
-        SplitPolicyBuilder::default()
+    pub fn builder() -> NodeSizePolicyBuilder {
+        NodeSizePolicyBuilder::default()
     }
 
     /// Maximum leaf entries before a leaf is a split candidate.
@@ -199,6 +253,16 @@ impl SplitPolicy {
     /// Maximum index children before an index is a split candidate.
     pub fn index_max_children(&self) -> usize {
         self.index_max_children
+    }
+
+    /// Minimum live leaf entries below which a leaf is a merge candidate.
+    pub fn leaf_min_entries(&self) -> usize {
+        self.leaf_min_entries
+    }
+
+    /// Minimum index children below which an index is a merge candidate.
+    pub fn index_min_children(&self) -> usize {
+        self.index_min_children
     }
 
     /// Maximum encoded coordination-object size, including transient locks.
@@ -236,7 +300,7 @@ impl SplitPolicy {
     }
 }
 
-impl SplitPolicyBuilder {
+impl NodeSizePolicyBuilder {
     /// Sets the maximum leaf entry count before a split is requested.
     pub fn leaf_max_entries(mut self, value: usize) -> Self {
         self.leaf_max_entries = value;
@@ -255,6 +319,20 @@ impl SplitPolicyBuilder {
         self
     }
 
+    /// Sets the live leaf entry count below which a merge is requested. Zero
+    /// disables leaf merges.
+    pub fn leaf_min_entries(mut self, value: usize) -> Self {
+        self.leaf_min_entries = value;
+        self
+    }
+
+    /// Sets the index fan-out below which a merge is requested. Zero disables
+    /// index merges.
+    pub fn index_min_children(mut self, value: usize) -> Self {
+        self.index_min_children = value;
+        self
+    }
+
     /// Sets the hard encoded size cap for a coordination node.
     pub fn node_max_bytes(mut self, value: usize) -> Self {
         self.node_max_bytes = value;
@@ -268,42 +346,46 @@ impl SplitPolicyBuilder {
     }
 
     /// Validates the hard-cap relationship and returns the completed policy.
-    pub fn build(self) -> Result<SplitPolicy, InvalidSplitPolicy> {
+    pub fn build(self) -> Result<NodeSizePolicy, InvalidNodeSizePolicy> {
         if self.split_headroom_bytes > self.node_max_bytes {
-            return Err(InvalidSplitPolicy {
+            return Err(InvalidNodeSizePolicy {
                 node_max_bytes: self.node_max_bytes,
                 split_headroom_bytes: self.split_headroom_bytes,
             });
         }
-        Ok(SplitPolicy {
+        Ok(NodeSizePolicy {
             leaf_max_entries: self.leaf_max_entries,
             node_soft_max_bytes: self.node_soft_max_bytes,
             index_max_children: self.index_max_children,
+            leaf_min_entries: self.leaf_min_entries,
+            index_min_children: self.index_min_children,
             node_max_bytes: self.node_max_bytes,
             split_headroom_bytes: self.split_headroom_bytes,
         })
     }
 }
 
-impl Default for SplitPolicyBuilder {
+impl Default for NodeSizePolicyBuilder {
     fn default() -> Self {
         Self {
             leaf_max_entries: 256,
             node_soft_max_bytes: 256 * 1024,
             index_max_children: 256,
+            leaf_min_entries: 64,
+            index_min_children: 64,
             node_max_bytes: 1024 * 1024,
             split_headroom_bytes: 64 * 1024,
         }
     }
 }
 
-impl Default for SplitPolicy {
+impl Default for NodeSizePolicy {
     fn default() -> Self {
         // A ~256-entry leaf soft cap mirrors the old fixed keys-per-leaf target
         // (ADR-017), and keeps each object small for the backend.
-        SplitPolicyBuilder::default()
+        NodeSizePolicyBuilder::default()
             .build()
-            .expect("default split policy is valid")
+            .expect("default node size policy is valid")
     }
 }
 
@@ -318,6 +400,7 @@ pub struct NodeLocks {
     membership: SharedExclusiveLock,
     membership_generation: u64,
     drop_intent: Option<TxId>,
+    merge_reservation: Option<StructuralIntentId>,
 }
 
 impl NodeLocks {
@@ -365,12 +448,43 @@ impl NodeLocks {
 
     /// Closes the structural gate for one structural operation.
     pub fn set_structural_gate(&mut self, id: TxId) {
+        if self.structure.holders() == std::slice::from_ref(&id) {
+            return;
+        }
         self.structure.set_writer(id);
+        // The node state from before the gate must never come back, so that a
+        // late copy of this CAS cannot land after a recovery fence (ADR-073).
+        self.advance_membership_generation();
     }
 
     /// Opens the structural gate when held by `id`.
     pub fn remove_structural_gate(&mut self, id: &TxId) -> bool {
         self.structure.remove(id)
+    }
+
+    /// Returns the structural intent of a merge into this node that can still
+    /// land or be abandoned.
+    pub fn merge_reservation(&self) -> Option<&StructuralIntentId> {
+        self.merge_reservation.as_ref()
+    }
+
+    /// Installs the merge reservation of `intent`.
+    pub fn set_merge_reservation(&mut self, intent: StructuralIntentId) {
+        if self.merge_reservation.as_ref() == Some(&intent) {
+            return;
+        }
+        self.merge_reservation = Some(intent);
+        // Same fence as a structural gate installation.
+        self.advance_membership_generation();
+    }
+
+    /// Removes the merge reservation when it names `intent`.
+    pub fn remove_merge_reservation(&mut self, intent: &StructuralIntentId) -> bool {
+        if self.merge_reservation.as_ref() != Some(intent) {
+            return false;
+        }
+        self.merge_reservation = None;
+        true
     }
 
     /// Installs a shared membership holder without recording write activity.
@@ -412,6 +526,7 @@ impl NodeLocks {
     fn clear_holders(&mut self) {
         self.structure.clear();
         self.membership.clear();
+        self.merge_reservation = None;
     }
 }
 
@@ -429,12 +544,17 @@ pub enum NodeBody {
 /// make descent self-correcting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
+    /// Inclusive lower bound of the covered key range; empty for the first node
+    /// at its level.
+    low_key: Vec<u8>,
     /// Exclusive upper bound of the covered key range; `None` means +infinity.
     high_key: Option<Vec<u8>>,
     /// Right-sibling token at the same level; `None` means none (rightmost).
     right_sibling: Option<NodeToken>,
     body: NodeBody,
     locks: NodeLocks,
+    /// Set after a merge moved the range and entries into the right sibling.
+    drained: bool,
 }
 
 impl Node {
@@ -442,21 +562,32 @@ impl Node {
     /// right sibling) from `leaf` — the shape of a brand-new root.
     pub fn leaf(leaf: LeafBody) -> Self {
         Node {
+            low_key: Vec::new(),
             high_key: None,
             right_sibling: None,
             body: NodeBody::Leaf(leaf),
             locks: NodeLocks::default(),
+            drained: false,
         }
     }
 
     /// Creates an index node that covers the whole key space from `index`.
     pub fn index(index: IndexNode) -> Self {
         Node {
+            low_key: Vec::new(),
             high_key: None,
             right_sibling: None,
             body: NodeBody::Index(index),
             locks: NodeLocks::default(),
+            drained: false,
         }
+    }
+
+    /// Returns the node with the given inclusive lower range bound.
+    #[must_use]
+    pub fn with_low_key(mut self, low_key: Vec<u8>) -> Self {
+        self.low_key = low_key;
+        self
     }
 
     /// Returns the node with the given exclusive upper range bound.
@@ -473,6 +604,25 @@ impl Node {
         self
     }
 
+    /// The inclusive lower bound of the covered range; empty for the first node
+    /// at its level.
+    pub fn low_key(&self) -> &[u8] {
+        &self.low_key
+    }
+
+    /// Replaces the inclusive lower range bound. Only a merge changes the low
+    /// key of an existing node (ADR-073).
+    pub fn set_low_key(&mut self, low_key: Vec<u8>) {
+        self.low_key = low_key;
+    }
+
+    /// Reports whether this copy of the node is older than a merge that moved
+    /// `key` into it, because its low key is above `key`. A reader must read the
+    /// node again at a new currentness barrier (ADR-073).
+    pub fn is_below_range(&self, key: &[u8]) -> bool {
+        key < self.low_key.as_slice()
+    }
+
     /// The exclusive upper bound of the covered range, or `None` for +infinity.
     pub fn high_key(&self) -> Option<&[u8]> {
         self.high_key.as_deref()
@@ -487,6 +637,77 @@ impl Node {
     /// The node body.
     pub fn body(&self) -> &NodeBody {
         &self.body
+    }
+
+    /// Reports whether a merge moved this node's range and entries into its
+    /// right sibling.
+    pub fn is_drained(&self) -> bool {
+        self.drained
+    }
+
+    /// Empties the node and links it to the `target` that absorbed its entries,
+    /// keeping its level.
+    pub fn drain(&mut self, target: &str) {
+        self.body = match self.body {
+            NodeBody::Leaf(_) => NodeBody::Leaf(LeafBody::new()),
+            NodeBody::Index(_) => NodeBody::Index(IndexNode::default()),
+        };
+        self.right_sibling = Some(target.to_string());
+        self.locks.clear_holders();
+        self.drained = true;
+    }
+
+    /// Adds the range and entries of `left`, the gated left sibling, to this
+    /// node and reserves this node for the merge of `intent` (ADR-073). Fails
+    /// if the two nodes are at different levels.
+    pub fn absorb(&mut self, left: &Node, intent: StructuralIntentId) -> Result<(), StorageError> {
+        self.body = match (&self.body, &left.body) {
+            (NodeBody::Leaf(right), NodeBody::Leaf(left)) => NodeBody::Leaf(
+                LeafBody::from_entries(left.entries().chain(right.entries()).cloned()),
+            ),
+            (NodeBody::Index(right), NodeBody::Index(left)) => NodeBody::Index(IndexNode {
+                children: left
+                    .children
+                    .iter()
+                    .chain(&right.children)
+                    .map(|(separator, child)| (separator.clone(), child.clone()))
+                    .collect(),
+            }),
+            _ => return Err(StorageError::other("merge nodes are at different levels")),
+        };
+        self.low_key = left.low_key.clone();
+        self.locks.set_merge_reservation(intent);
+        // An absence read of the left range made while the left node was gated
+        // recorded its generation, and stays valid because nothing changed.
+        self.locks.membership_generation = self
+            .locks
+            .membership_generation
+            .max(left.locks.membership_generation);
+        Ok(())
+    }
+
+    /// Reverts the absorb of the merge of `intent`, after its drain can no
+    /// longer land: restores `boundary` as the low key and removes the entries
+    /// below it (ADR-073). Returns `false` and changes nothing if this node does
+    /// not hold the merge reservation of `intent`.
+    pub fn abandon_merge(&mut self, intent: &StructuralIntentId, boundary: &[u8]) -> bool {
+        if !self.locks.remove_merge_reservation(intent) {
+            return false;
+        }
+        match &mut self.body {
+            NodeBody::Leaf(leaf) => {
+                *leaf = LeafBody::from_entries(
+                    leaf.entries()
+                        .filter(|entry| entry.key.as_slice() >= boundary)
+                        .cloned(),
+                );
+            }
+            NodeBody::Index(index) => index
+                .children
+                .retain(|separator, _| separator.as_slice() >= boundary),
+        }
+        self.low_key = boundary.to_vec();
+        true
     }
 
     /// Replaces the leaf body while preserving bounds and node coordination.
@@ -534,7 +755,6 @@ impl Node {
         &self.locks
     }
 
-    /// Returns the mutable node-level coordination state.
     /// Replaces the node-level coordination state.
     pub fn set_locks(&mut self, locks: NodeLocks) {
         self.locks = locks;
@@ -548,6 +768,11 @@ impl Node {
     /// Opens the structural gate when held by `id`.
     pub fn remove_structural_gate(&mut self, id: &TxId) -> bool {
         self.locks.remove_structural_gate(id)
+    }
+
+    /// Removes the merge reservation when it names `intent`.
+    pub fn remove_merge_reservation(&mut self, intent: &StructuralIntentId) -> bool {
+        self.locks.remove_merge_reservation(intent)
     }
 
     /// Returns the leaf membership lock.
@@ -631,10 +856,14 @@ impl Node {
         }
     }
 
-    /// Reports whether the node still covers `key`, i.e. `key` is below the
-    /// high-key. A `false` result means a split has moved `key` to the right and
-    /// the descent must follow the right-sibling link (the B-link property).
+    /// Reports whether the node still covers `key`, i.e. the node is live and
+    /// `key` is below the high-key. A `false` result means a split or a merge
+    /// has moved `key` to the right and the descent must follow the
+    /// right-sibling link (the B-link property).
     pub fn covers(&self, key: &[u8]) -> bool {
+        if self.drained {
+            return false;
+        }
         match &self.high_key {
             None => true,
             Some(hk) => key < hk.as_slice(),
@@ -645,7 +874,7 @@ impl Node {
     /// background split candidate (ADR-031). A node with fewer than two
     /// entries/children can never be split, so it is never a candidate however
     /// large a single entry is (single-hot-key relief is out of scope).
-    pub fn over_soft_cap(&self, policy: &SplitPolicy) -> bool {
+    pub fn over_soft_cap(&self, policy: &NodeSizePolicy) -> bool {
         match &self.body {
             NodeBody::Leaf(leaf) => {
                 leaf.len() >= 2
@@ -690,6 +919,7 @@ impl Node {
         // The right sibling takes over the upper range: the old high-key and the
         // old right-sibling link now bound and follow it.
         let right = Node {
+            low_key: split_key.clone(),
             high_key: self.high_key.take(),
             right_sibling: self.right_sibling.take(),
             body: right_body,
@@ -698,6 +928,7 @@ impl Node {
                 locks.clear_holders();
                 locks
             },
+            drained: false,
         };
         // The retained lower half is now bounded by the split key and links to
         // the new sibling.
@@ -749,6 +980,14 @@ impl Node {
                 .as_ref()
                 .map(|id| id.as_bytes().to_vec())
                 .unwrap_or_default(),
+            drained: self.drained,
+            merge_reservation: self
+                .locks
+                .merge_reservation
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            low_key: self.low_key.clone(),
         }
     }
 
@@ -764,7 +1003,26 @@ impl Node {
         let membership = SharedExclusiveLock::from_pb(raw.membership_lock)
             .map_err(|_| StorageError::other("node has invalid membership lock"))?;
         let drop_intent = (!raw.drop_intent.is_empty()).then(|| TxId::from_bytes(raw.drop_intent));
+        let merge_reservation = if raw.merge_reservation.is_empty() {
+            None
+        } else {
+            Some(
+                StructuralIntentId::try_from(raw.merge_reservation).map_err(|error| {
+                    StorageError::with_source("parsing node merge reservation", error)
+                })?,
+            )
+        };
+        let body_is_empty = match &body {
+            NodeBody::Leaf(leaf) => leaf.is_empty(),
+            NodeBody::Index(index) => index.is_empty(),
+        };
+        if raw.drained && (!body_is_empty || raw.right_sibling.is_empty()) {
+            return Err(StorageError::other(
+                "drained node must have an empty body and a right sibling",
+            ));
+        }
         Ok(Node {
+            low_key: raw.low_key,
             high_key: (!raw.high_key.is_empty()).then_some(raw.high_key),
             right_sibling: (!raw.right_sibling.is_empty()).then_some(raw.right_sibling),
             body,
@@ -773,7 +1031,9 @@ impl Node {
                 membership,
                 membership_generation: raw.membership_generation,
                 drop_intent,
+                merge_reservation,
             },
+            drained: raw.drained,
         })
     }
 }
@@ -806,11 +1066,13 @@ mod tests {
             entry(b"apple", 1),
             entry(b"cat", 2),
         ]))
+        .with_low_key(b"a".to_vec())
         .with_high_key(Some(b"m".to_vec()))
         .with_right_sibling(Some("sibToken".to_string()));
 
         let decoded = Node::decode(&node.encode()).unwrap();
         assert_eq!(decoded, node);
+        assert_eq!(decoded.low_key(), b"a");
         assert_eq!(decoded.high_key(), Some(b"m".as_slice()));
         assert_eq!(decoded.right_sibling(), Some("sibToken"));
         assert!(decoded.as_leaf().is_some());
@@ -827,7 +1089,146 @@ mod tests {
         let decoded = Node::decode(&node.encode()).unwrap();
         assert_eq!(decoded.structural_gate().holders(), &[gate]);
         assert_eq!(decoded.membership_lock().holders(), &[writer]);
-        assert_eq!(decoded.membership_generation(), 1);
+        assert_eq!(decoded.membership_generation(), 2);
+    }
+
+    #[test]
+    fn round_trip_preserves_merge_fields() {
+        let intent = StructuralIntentId::from(ValidatedNodeToken::from_bytes([3; 16]));
+        let mut target = Node::leaf(LeafBody::from_entries([entry(b"a", 1)]));
+        let mut locks = target.locks().clone();
+        locks.set_merge_reservation(intent.clone());
+        target.set_locks(locks);
+        let decoded = Node::decode(&target.encode()).unwrap();
+        assert_eq!(decoded, target);
+        assert_eq!(decoded.locks().merge_reservation(), Some(&intent));
+
+        let mut source = Node::index(IndexNode::from_children([(b"".to_vec(), "L0".into())]))
+            .with_high_key(Some(b"m".to_vec()));
+        source.drain("target");
+        let decoded = Node::decode(&source.encode()).unwrap();
+        assert_eq!(decoded, source);
+        assert!(decoded.is_drained());
+    }
+
+    #[test]
+    fn drain_keeps_level_bounds_and_generation() {
+        let gate = TxId::from_bytes(vec![2]);
+        let mut source = Node::leaf(LeafBody::from_entries([entry(b"a", 1)]))
+            .with_high_key(Some(b"m".to_vec()))
+            .with_right_sibling(Some("drained".to_string()));
+        source.set_structural_gate(gate);
+        let generation = source.membership_generation();
+
+        source.drain("target");
+
+        assert!(source.as_leaf().is_some_and(LeafBody::is_empty));
+        assert_eq!(source.high_key(), Some(b"m".as_slice()));
+        assert_eq!(source.right_sibling(), Some("target"));
+        assert!(source.structural_gate().is_empty());
+        assert_eq!(source.membership_generation(), generation);
+        assert!(!source.covers(b"a"));
+        assert!(source.split("sibling").is_none());
+    }
+
+    #[test]
+    fn absorb_takes_the_left_range_and_abandon_restores_the_target() {
+        let intent = StructuralIntentId::from(ValidatedNodeToken::from_bytes([3; 16]));
+        let mut left = Node::leaf(LeafBody::from_entries([entry(b"b", 1)]))
+            .with_low_key(b"a".to_vec())
+            .with_high_key(Some(b"m".to_vec()));
+        for _ in 0..5 {
+            left.locks.advance_membership_generation();
+        }
+        let original = Node::leaf(LeafBody::from_entries([entry(b"n", 2)]))
+            .with_low_key(b"m".to_vec())
+            .with_high_key(Some(b"t".to_vec()));
+        let mut right = original.clone();
+
+        right.absorb(&left, intent.clone()).unwrap();
+
+        let keys: Vec<_> = right
+            .as_leaf()
+            .unwrap()
+            .entries()
+            .map(|e| e.key.clone())
+            .collect();
+        assert_eq!(keys, [b"b".to_vec(), b"n".to_vec()]);
+        assert_eq!(right.low_key(), b"a");
+        assert_eq!(right.high_key(), Some(b"t".as_slice()));
+        assert_eq!(right.locks().merge_reservation(), Some(&intent));
+        // max(g_L, g_R + 1): absence reads of the gated left range stay valid.
+        assert_eq!(right.membership_generation(), 5);
+
+        let other = StructuralIntentId::from(ValidatedNodeToken::from_bytes([4; 16]));
+        assert!(!right.clone().abandon_merge(&other, b"m"));
+        assert!(right.abandon_merge(&intent, b"m"));
+        assert_eq!(right.as_leaf(), original.as_leaf());
+        assert_eq!(right.low_key(), b"m");
+        assert_eq!(right.locks().merge_reservation(), None);
+        assert_eq!(right.membership_generation(), 5);
+    }
+
+    #[test]
+    fn absorb_joins_index_children_at_one_level() {
+        let intent = StructuralIntentId::from(ValidatedNodeToken::from_bytes([3; 16]));
+        let left = Node::index(IndexNode::from_children([(b"".to_vec(), "A".into())]))
+            .with_high_key(Some(b"m".to_vec()));
+        let mut right = Node::index(IndexNode::from_children([(b"m".to_vec(), "B".into())]))
+            .with_low_key(b"m".to_vec());
+
+        right.absorb(&left, intent.clone()).unwrap();
+        let children: Vec<_> = right.as_index().unwrap().children().collect();
+        assert_eq!(children, [(b"".as_slice(), "A"), (b"m".as_slice(), "B")]);
+        assert_eq!(right.as_index().unwrap().child_for(b"c"), Some("A"));
+        assert_eq!(right.membership_generation(), 1);
+
+        let error = Node::leaf(LeafBody::new())
+            .absorb(&left, intent)
+            .unwrap_err();
+        assert_eq!(error.to_string(), "merge nodes are at different levels");
+    }
+
+    #[test]
+    fn decode_rejects_drained_nodes_with_content_or_without_target() {
+        let with_entries = pb::Node {
+            right_sibling: "target".into(),
+            body: Some(pb::node::Body::Leaf(
+                LeafBody::from_entries([entry(b"a", 1)]).to_pb(),
+            )),
+            drained: true,
+            ..pb::Node::default()
+        };
+        let without_target = pb::Node {
+            drained: true,
+            ..pb::Node::default()
+        };
+        for raw in [with_entries, without_target] {
+            let error = Node::decode(&raw.encode_to_vec()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "drained node must have an empty body and a right sibling"
+            );
+        }
+    }
+
+    #[test]
+    fn installations_advance_the_generation_once() {
+        let gate = TxId::from_bytes(vec![2]);
+        let intent = StructuralIntentId::from(ValidatedNodeToken::from_bytes([3; 16]));
+        let mut locks = NodeLocks::default();
+
+        locks.set_structural_gate(gate.clone());
+        locks.set_structural_gate(gate.clone());
+        assert_eq!(locks.membership_generation(), 1);
+        locks.set_merge_reservation(intent.clone());
+        locks.set_merge_reservation(intent.clone());
+        assert_eq!(locks.membership_generation(), 2);
+
+        assert!(locks.remove_structural_gate(&gate));
+        assert!(locks.remove_merge_reservation(&intent));
+        assert!(!locks.remove_merge_reservation(&intent));
+        assert_eq!(locks.membership_generation(), 2);
     }
 
     #[test]
@@ -926,6 +1327,69 @@ mod tests {
         assert_eq!(idx.child_for(b"f"), Some("L1"));
         assert_eq!(idx.child_for(b"kiwi"), Some("L1"));
         assert_eq!(idx.child_for(b"mango"), Some("L2"));
+        // The child for keys just below a separator is the one before it.
+        assert_eq!(idx.child_before(b"f"), Some("L0"));
+        assert_eq!(idx.child_before(b"kiwi"), Some("L1"));
+        assert_eq!(idx.child_before(b""), Some("L0"));
+    }
+
+    fn linked(high_key: &[u8], right: &str) -> Node {
+        Node::leaf(LeafBody::new())
+            .with_high_key(Some(high_key.to_vec()))
+            .with_right_sibling(Some(right.to_string()))
+    }
+
+    fn drained(high_key: &[u8], target: &str) -> Node {
+        let mut node = linked(high_key, "unused");
+        node.drain(target);
+        node
+    }
+
+    fn index(children: &[(&[u8], &str)]) -> IndexNode {
+        IndexNode::from_children(
+            children
+                .iter()
+                .map(|(separator, child)| (separator.to_vec(), child.to_string())),
+        )
+    }
+
+    #[test]
+    fn reconcile_adds_the_separators_of_every_live_child_on_the_path() {
+        let (l0, l1, l4) = (
+            linked(b"m", "L1"),
+            linked(b"t", "L4"),
+            Node::leaf(LeafBody::new()),
+        );
+        let path = [("L0", &l0), ("L1", &l1), ("L4", &l4)];
+        let mut parent = index(&[(b"", "L0")]);
+
+        parent.reconcile(&path);
+        let reconciled = index(&[(b"", "L0"), (b"m", "L1"), (b"t", "L4")]);
+        assert_eq!(parent, reconciled);
+        parent.reconcile(&path);
+        assert_eq!(parent, reconciled, "reconciliation is idempotent");
+    }
+
+    #[test]
+    fn reconcile_routes_the_range_of_a_drained_child_to_its_merge_target() {
+        let (source, target) = (drained(b"m", "R"), linked(b"t", "S"));
+        let mut parent = index(&[(b"", "A"), (b"f", "L"), (b"m", "R"), (b"t", "S")]);
+
+        parent.reconcile(&[("L", &source), ("R", &target)]);
+        assert_eq!(parent, index(&[(b"", "A"), (b"f", "R"), (b"t", "S")]));
+    }
+
+    #[test]
+    fn reconcile_handles_a_merge_and_an_unpublished_split_on_one_path() {
+        let (source, target, split) = (
+            drained(b"m", "R"),
+            linked(b"t", "S"),
+            Node::leaf(LeafBody::new()),
+        );
+        let mut parent = index(&[(b"", "L"), (b"m", "R")]);
+
+        parent.reconcile(&[("L", &source), ("R", &target), ("S", &split)]);
+        assert_eq!(parent, index(&[(b"", "R"), (b"t", "S")]));
     }
 
     #[test]
@@ -939,11 +1403,14 @@ mod tests {
             entry(b"mango", 3),
             entry(b"pear", 4),
         ]))
+        .with_low_key(b"ant".to_vec())
         .with_high_key(Some(b"tiger".to_vec()))
         .with_right_sibling(Some("oldRight".to_string()));
 
         let (right, split_key) = src.split("newRight").expect("splittable");
         assert_eq!(split_key, b"mango");
+        assert_eq!(src.low_key(), b"ant");
+        assert_eq!(right.low_key(), b"mango");
 
         // Source keeps the lower half, bounded by the split key, linked to the
         // new sibling.
@@ -1030,7 +1497,7 @@ mod tests {
 
     #[test]
     fn over_soft_cap_respects_policy_and_min_size() {
-        let tiny = SplitPolicy::builder()
+        let tiny = NodeSizePolicy::builder()
             .leaf_max_entries(2)
             .node_soft_max_bytes(1 << 20)
             .index_max_children(2)
@@ -1060,7 +1527,7 @@ mod tests {
         assert!(three_index.over_soft_cap(&tiny));
 
         // A single oversized entry is never a candidate: it cannot be split.
-        let byte_policy = SplitPolicy::builder()
+        let byte_policy = NodeSizePolicy::builder()
             .leaf_max_entries(1000)
             .node_soft_max_bytes(1)
             .index_max_children(1000)
@@ -1070,7 +1537,7 @@ mod tests {
             !Node::leaf(LeafBody::from_entries([entry(b"solo", 1)])).over_soft_cap(&byte_policy)
         );
         for (kind, node) in [("leaf", two), ("index", two_index)] {
-            let at_limit = SplitPolicy::builder()
+            let at_limit = NodeSizePolicy::builder()
                 .leaf_max_entries(usize::MAX)
                 .node_soft_max_bytes(node.content_encoded_len())
                 .index_max_children(usize::MAX)
@@ -1082,7 +1549,7 @@ mod tests {
             );
             assert!(
                 node.over_soft_cap(
-                    &SplitPolicy::builder()
+                    &NodeSizePolicy::builder()
                         .leaf_max_entries(usize::MAX)
                         .node_soft_max_bytes(at_limit.node_soft_max_bytes() - 1)
                         .index_max_children(usize::MAX)
@@ -1096,14 +1563,14 @@ mod tests {
 
     #[test]
     fn exact_entry_split_budget_is_half_the_content_limit() {
-        let exact_headroom = SplitPolicy::builder()
+        let exact_headroom = NodeSizePolicy::builder()
             .node_max_bytes(128)
             .split_headroom_bytes(128)
             .build()
             .unwrap();
         assert_eq!(exact_headroom.content_limit(), 0);
         assert!(
-            SplitPolicy::builder()
+            NodeSizePolicy::builder()
                 .node_max_bytes(128)
                 .split_headroom_bytes(129)
                 .build()
@@ -1112,14 +1579,14 @@ mod tests {
 
         let entry = entry(b"boundary", 1);
         let entry_len = Node::leaf(LeafBody::from_entries([entry.clone()])).content_encoded_len();
-        let admitting = SplitPolicy::builder()
+        let admitting = NodeSizePolicy::builder()
             .node_max_bytes(entry_len * 2)
             .split_headroom_bytes(0)
             .build()
             .unwrap();
         assert!(admitting.entry_fits_split_budget(&entry));
 
-        let rejecting = SplitPolicy::builder()
+        let rejecting = NodeSizePolicy::builder()
             .node_max_bytes(entry_len * 2 - 1)
             .split_headroom_bytes(0)
             .build()
@@ -1154,7 +1621,7 @@ mod tests {
             .expect("test leaf size fits usize");
         let required_limit = leaf_requirement.max(parent.content_encoded_len());
         let headroom = 17;
-        let exact = SplitPolicy::builder()
+        let exact = NodeSizePolicy::builder()
             .node_max_bytes(
                 required_limit
                     .checked_add(headroom)
@@ -1167,14 +1634,14 @@ mod tests {
         assert!(exact.key_fits(&maximum_key));
 
         let parent_limit = parent.content_encoded_len();
-        let parent_exact = SplitPolicy::builder()
+        let parent_exact = NodeSizePolicy::builder()
             .node_max_bytes(parent_limit)
             .split_headroom_bytes(0)
             .build()
             .unwrap();
         assert!(parent_exact.parent_separator_fits(&maximum_key));
         assert!(
-            !SplitPolicy::builder()
+            !NodeSizePolicy::builder()
                 .node_max_bytes(parent_limit - 1)
                 .split_headroom_bytes(0)
                 .build()
@@ -1182,7 +1649,7 @@ mod tests {
                 .parent_separator_fits(&maximum_key)
         );
 
-        let one_byte_over = SplitPolicy::builder()
+        let one_byte_over = NodeSizePolicy::builder()
             .node_max_bytes(exact.node_max_bytes() - 1)
             .split_headroom_bytes(headroom)
             .build()
@@ -1205,6 +1672,20 @@ mod tests {
         // The high-key is an exclusive upper bound.
         assert!(!bounded.covers(b"m"));
         assert!(!bounded.covers(b"zebra"));
+
+        let mut drained = Node::leaf(LeafBody::new());
+        drained.drain("target");
+        assert!(!drained.covers(b""));
+        assert!(!drained.covers(b"anything"));
+    }
+
+    #[test]
+    fn a_key_below_the_low_key_marks_a_copy_older_than_a_merge() {
+        let node = Node::leaf(LeafBody::new()).with_low_key(b"f".to_vec());
+        assert!(node.is_below_range(b"a"));
+        assert!(!node.is_below_range(b"f"));
+        assert!(!node.is_below_range(b"z"));
+        assert!(!Node::leaf(LeafBody::new()).is_below_range(b""));
     }
 
     #[test]
@@ -1292,14 +1773,34 @@ mod tests {
         assert_eq!(got, want, "leaf node encoding drifted: {got:02x?}");
     }
 
+    // ADR-043 lets a late conditional write land when its expected revision comes
+    // back, and content-based revisions come back with the same bytes. Removing
+    // a gate or reservation must therefore never restore the earlier encoding.
     #[test]
-    fn released_node_lock_is_omitted_from_encoding() {
+    fn released_installations_never_restore_the_earlier_encoding() {
         let never_locked = Node::leaf(LeafBody::from_entries([entry(b"a", 1)]));
-        let mut released = never_locked.clone();
+        let mut advanced = never_locked.clone();
+        let mut locks = advanced.locks().clone();
+        locks.advance_membership_generation();
+        advanced.set_locks(locks);
+
         let holder = TxId::from_bytes(vec![0x11]);
-        released.set_structural_gate(holder.clone());
-        assert!(released.remove_structural_gate(&holder));
-        assert_eq!(released.encode(), never_locked.encode());
+        let mut released_gate = never_locked.clone();
+        released_gate.set_structural_gate(holder.clone());
+        assert!(released_gate.remove_structural_gate(&holder));
+
+        let intent = StructuralIntentId::from(ValidatedNodeToken::from_bytes([3; 16]));
+        let mut released_reservation = never_locked.clone();
+        let mut locks = released_reservation.locks().clone();
+        locks.set_merge_reservation(intent.clone());
+        assert!(locks.remove_merge_reservation(&intent));
+        released_reservation.set_locks(locks);
+
+        for released in [released_gate, released_reservation] {
+            assert_ne!(released.encode(), never_locked.encode());
+            // Only the generation remains of the released installation.
+            assert_eq!(released.encode(), advanced.encode());
+        }
     }
 
     // Golden vector for the ADR-032 node-lock fields. Changing their tags,
@@ -1316,10 +1817,40 @@ mod tests {
             0x1a, 0x19, 0x0a, 0x17, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a,
             0x04, 0x01, 0x02, 0x03, 0x04, 0x22, 0x06, 0x0a, 0x02, 0xaa, 0xbb, 0x10, 0x01, 0x2a,
             0x05, 0x08, 0x03, 0x12, 0x01, 0x11, 0x32, 0x05, 0x08, 0x03, 0x12, 0x01, 0x22, 0x38,
-            0x01,
+            0x02,
         ];
         assert_eq!(node.encoded_len(), got.len());
         assert_eq!(got, want, "node-lock encoding drifted: {got:02x?}");
+    }
+
+    // Golden vectors for the ADR-073 merge fields.
+    #[test]
+    fn golden_merge_fields_encoding() {
+        let mut drained = Node::leaf(LeafBody::new())
+            .with_low_key(b"a".to_vec())
+            .with_high_key(Some(b"m".to_vec()));
+        drained.drain("R");
+        let got = drained.encode();
+        let want = [
+            0x0a, 0x01, 0x6d, 0x12, 0x01, 0x52, 0x1a, 0x00, 0x48, 0x01, 0x5a, 0x01, 0x61,
+        ];
+        assert_eq!(drained.encoded_len(), got.len());
+        assert_eq!(got, want, "drained node encoding drifted: {got:02x?}");
+
+        let mut reserved = Node::leaf(LeafBody::new());
+        let mut locks = reserved.locks().clone();
+        locks.set_merge_reservation(StructuralIntentId::from(ValidatedNodeToken::from_bytes(
+            [0; 16],
+        )));
+        reserved.set_locks(locks);
+        let got = reserved.encode();
+        let want = [
+            [0x1a, 0x00, 0x38, 0x01, 0x52, 0x16].as_slice(),
+            b"0000000000000000000000",
+        ]
+        .concat();
+        assert_eq!(reserved.encoded_len(), got.len());
+        assert_eq!(got, want, "merge reservation encoding drifted: {got:02x?}");
     }
 
     #[test]

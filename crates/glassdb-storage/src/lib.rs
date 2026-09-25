@@ -47,13 +47,15 @@ pub use inline::InlinePolicy;
 pub use leaf::{CurrentState, LeafBody, LeafEntry};
 pub use lock::{ExclusiveGate, KeyLockState, LockType, SharedExclusiveLock};
 pub use node::{
-    IndexNode, InvalidSplitPolicy, Node, NodeBody, NodeLocks, NodeToken, SplitPolicy,
-    SplitPolicyBuilder,
+    IndexNode, InvalidNodeSizePolicy, Node, NodeBody, NodeLocks, NodeSizePolicy,
+    NodeSizePolicyBuilder, NodeToken,
 };
 pub use node_store::{
     LeafEdit, LeafObservation, LeafObservationCheck, LoadedLeaf, NodePage, NodeStore,
 };
-pub use structural_intent::{StructuralIntent, StructuralIntentPhase};
+pub use structural_intent::{
+    MergeTarget, StructuralChange, StructuralIntent, StructuralIntentPhase,
+};
 pub use structural_intent_store::{StructuralIntentPage, StructuralIntentStore};
 pub use timeline::{CurrentnessBarrier, Requirement, SequencePoint, Timeline};
 pub use tree_router::{RoutedLeaf, RoutedLeafGroup, TreeRouter};

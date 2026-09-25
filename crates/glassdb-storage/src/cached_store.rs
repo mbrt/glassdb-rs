@@ -614,6 +614,11 @@ impl<C: Codec> Clone for TypedCachedStore<C> {
 }
 
 impl<C: Codec> TypedCachedStore<C> {
+    /// Captures a currentness barrier on the timeline of the shared cache.
+    pub(crate) fn currentness_barrier(&self) -> crate::CurrentnessBarrier {
+        self.store.timeline.currentness_barrier()
+    }
+
     fn check_path(key: &ObjectKey) -> Result<(), StorageError> {
         if C::accepts(key.object_path()) {
             Ok(())

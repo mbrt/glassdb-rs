@@ -12,6 +12,10 @@ recovery, and hard-cap decisions remain unchanged.
 Also supersedes [ADR-033](033-transactional-key-iteration.md)'s requirement that
 an escalated scan hold structure-R; its membership-R predicate lock remains.
 
+[ADR-073](073-merge-nodes-into-right-sibling.md) adds a polite gate acquisition
+for merges and a merge reservation that transaction status cannot revoke. Each
+gate installation also advances the membership generation.
+
 ## Context
 
 ADR-032 gives splits priority over hot-node traffic by making every node

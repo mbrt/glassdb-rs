@@ -59,17 +59,17 @@ macro_rules! ensure_tx {
     };
 }
 
-// The split soft-cap policy, so callers can tune when a collection's B-link
-// tree splits (see [`DatabaseBuilder::split_policy`]), and the inline-value
-// budgets (see [`DatabaseBuilder::inline_policy`]).
+// The node size policy, so callers can tune when a collection's B-link tree
+// splits and merges nodes (see [`DatabaseBuilder::node_size_policy`]), and the
+// inline-value budgets (see [`DatabaseBuilder::inline_policy`]).
 pub use glassdb_data::MAX_COLLECTION_NAME_BYTES;
 pub use glassdb_storage::{
-    CacheStats, InlinePolicy, InvalidSplitPolicy, PersistentCacheConfig, SplitPolicy,
-    SplitPolicyBuilder,
+    CacheStats, InlinePolicy, InvalidNodeSizePolicy, NodeSizePolicy, NodeSizePolicyBuilder,
+    PersistentCacheConfig,
 };
 pub use glassdb_trans::{
     DirectCommitStats, GcLimits, InlinePressureStats, LeafCoordinatorStats, LockerStats,
-    MonitorStats, ProtocolTiming, SplitterStats,
+    MonitorStats, ProtocolTiming, RestructurerStats,
 };
 
 // Re-export the backend abstraction so callers can construct a Database without

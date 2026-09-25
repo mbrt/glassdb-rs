@@ -1435,7 +1435,7 @@ mod tests {
     use crate::collection_coordination::CollectionStateResolver;
     use crate::engine::{AssemblyFixture, EngineConfig};
     use crate::key_state_resolver::KeyStateResolver;
-    use crate::leaf_coord::SplitHinter;
+    use crate::leaf_coord::StructuralHinter;
     use crate::monitor::ProtocolTiming;
     use futures::future::poll_fn;
     use glassdb_backend::middleware::{
@@ -1446,7 +1446,8 @@ mod tests {
     use glassdb_data::{CollectionAddress, CollectionId, DbPrefix, ObjectPath};
     use glassdb_storage::transaction::TxCommitStatus;
     use glassdb_storage::{
-        CollectionRecord, LeafBody, LeafEntry, Node, NodeStore, SplitPolicy, Timeline, TreeRouter,
+        CollectionRecord, LeafBody, LeafEntry, Node, NodeSizePolicy, NodeStore, Timeline,
+        TreeRouter,
     };
     use std::future::Future;
     use std::num::NonZeroUsize;
@@ -1456,9 +1457,9 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Notify;
 
-    struct NoSplitHints;
+    struct NoStructuralHints;
 
-    impl SplitHinter for NoSplitHints {
+    impl StructuralHinter for NoStructuralHints {
         fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {}
 
         fn capacity_rejected(&self, _path: &ObjectPath) {}
@@ -1473,19 +1474,19 @@ mod tests {
     }
 
     async fn new_test_locker(b: Arc<dyn Backend>) -> (Locker, TlCtx) {
-        new_test_locker_with_policy(b, SplitPolicy::default()).await
+        new_test_locker_with_policy(b, NodeSizePolicy::default()).await
     }
 
     async fn new_test_locker_with_policy(
         b: Arc<dyn Backend>,
-        policy: SplitPolicy,
+        policy: NodeSizePolicy,
     ) -> (Locker, TlCtx) {
         new_test_locker_with_parallelism(b, policy, NonZeroUsize::MIN).await
     }
 
     async fn new_test_locker_with_parallelism(
         b: Arc<dyn Backend>,
-        policy: SplitPolicy,
+        policy: NodeSizePolicy,
         parallelism: NonZeroUsize,
     ) -> (Locker, TlCtx) {
         let mut config = EngineConfig::default();
@@ -1518,7 +1519,7 @@ mod tests {
             mon.clone(),
             RetryConfig::default(),
             policy,
-            Arc::new(NoSplitHints),
+            Arc::new(NoStructuralHints),
         );
         let locker = Locker::new(
             coord.clone(),
@@ -1965,7 +1966,7 @@ mod tests {
         node.set_membership_writer(tx.clone());
         let content_limit = node.content_encoded_len() - 1;
         let node_max_bytes = node.encoded_len() + 64;
-        let policy = SplitPolicy::builder()
+        let policy = NodeSizePolicy::builder()
             .node_max_bytes(node_max_bytes)
             .split_headroom_bytes(node_max_bytes - content_limit)
             .build()
@@ -2616,7 +2617,7 @@ mod tests {
         // only way this acquisition could fit.
         let mut demoted = LeafEntry::new(key).with_current(CurrentState::External { writer });
         demoted.acquire_read_lock(reader.clone());
-        let policy = SplitPolicy::builder()
+        let policy = NodeSizePolicy::builder()
             .node_max_bytes(Node::leaf(LeafBody::from_entries([demoted])).encoded_len())
             .split_headroom_bytes(0)
             .build()
@@ -2861,7 +2862,7 @@ mod tests {
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
         let gate = BatchGate::install(&backend, GateKind::Write);
         let (locker, ctx) =
-            new_test_locker_with_parallelism(backend, SplitPolicy::default(), parallelism).await;
+            new_test_locker_with_parallelism(backend, NodeSizePolicy::default(), parallelism).await;
         (locker, ctx, gate)
     }
 
@@ -3038,7 +3039,7 @@ mod tests {
         let gate = BatchGate::install(&backend, GateKind::Read);
         let (locker, ctx) = new_test_locker_with_parallelism(
             backend,
-            SplitPolicy::default(),
+            NodeSizePolicy::default(),
             NonZeroUsize::new(2).unwrap(),
         )
         .await;
@@ -3070,7 +3071,7 @@ mod tests {
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
         let (locker, ctx) = new_test_locker_with_parallelism(
             backend.clone(),
-            SplitPolicy::default(),
+            NodeSizePolicy::default(),
             NonZeroUsize::new(2).unwrap(),
         )
         .await;

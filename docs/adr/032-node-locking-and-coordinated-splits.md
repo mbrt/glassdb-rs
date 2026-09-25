@@ -21,6 +21,10 @@ the commit CAS. The regular locked commit is unchanged.
 [ADR-062](062-splitter-driven-tombstone-reclamation.md) additionally makes the
 membership generation the validation generation for unmarked point absence.
 
+[ADR-073](073-merge-nodes-into-right-sibling.md) refines structural recovery,
+because merges make reachability of a created node non-monotonic, and defines
+the membership generation of a merged leaf.
+
 Supersedes the **"escalate to per-leaf read locks"** membership clause of
 [ADR-031](031-dynamic-range-sharding.md). It **refines** — does not replace —
 ADR-031's split: the source-shrink CAS stays the split's linearization point and

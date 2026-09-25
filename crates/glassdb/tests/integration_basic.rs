@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use glassdb::{Database, Error, InlinePolicy, ProtocolTiming, SplitPolicy};
+use glassdb::{Database, Error, InlinePolicy, NodeSizePolicy, ProtocolTiming};
 use glassdb_data::TxId;
 use glassdb_storage::{CurrentState, LeafBody, LeafEntry, Node};
 
@@ -15,7 +15,7 @@ use integration_support::{
     read_int_from_tx, rmw, try_read_int, write_int,
 };
 
-fn split_unsafe_boundary_key(policy: &SplitPolicy, value: &[u8], fill: u8) -> Vec<u8> {
+fn split_unsafe_boundary_key(policy: &NodeSizePolicy, value: &[u8], fill: u8) -> Vec<u8> {
     let writer = TxId::with_priority(1, b"boundary");
     let mut boundary = None;
     for len in 1..policy.content_limit() {
@@ -75,13 +75,13 @@ async fn handled_explicit_abort_does_not_override_a_commit_outcome() {
 
 #[tokio::test]
 async fn individually_oversized_key_is_invalid_input() {
-    let policy = SplitPolicy::builder()
+    let policy = NodeSizePolicy::builder()
         .node_max_bytes(256)
         .split_headroom_bytes(64)
         .build()
         .unwrap();
     let db = Database::builder("example", mem())
-        .split_policy(policy)
+        .node_size_policy(policy)
         .open()
         .await
         .unwrap();
@@ -103,7 +103,7 @@ async fn individually_oversized_key_is_invalid_input() {
 
 #[tokio::test(start_paused = true)]
 async fn boundary_inline_falls_back_before_it_can_strand_a_leaf() {
-    let policy = SplitPolicy::builder()
+    let policy = NodeSizePolicy::builder()
         .node_soft_max_bytes(384)
         .node_max_bytes(512)
         .split_headroom_bytes(128)
@@ -127,7 +127,7 @@ async fn boundary_inline_falls_back_before_it_can_strand_a_leaf() {
     );
 
     let db = Database::builder("example", mem())
-        .split_policy(policy)
+        .node_size_policy(policy)
         .inline_policy(InlinePolicy {
             max_value_bytes: inline_value.len(),
             max_leaf_bytes: inline_value.len(),

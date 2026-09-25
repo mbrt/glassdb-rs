@@ -76,7 +76,7 @@ fn put_policy(
             has_reads,
         },
         InlinePolicy::default(),
-        tm.direct_commit.split_hints.clone(),
+        tm.direct_commit.structural_hints.clone(),
     )
 }
 
@@ -751,7 +751,7 @@ async fn direct_commit_blocked_after_in_doubt_cas_stays_in_doubt() {
     let staged = BTreeMap::from([(b"k".to_vec(), seed)]);
 
     let mut gated = NodeLocks::default();
-    gated.set_structural_gate(TxId::with_priority(1, b"splitter"));
+    gated.set_structural_gate(TxId::with_priority(1, b"restructurer"));
     let mut fenced = NodeLocks::default();
     fenced.set_drop_intent(TxId::with_priority(1, b"dropper"));
 
@@ -912,7 +912,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
         test_root_path(),
         member,
         InlinePolicy::default(),
-        tm.direct_commit.split_hints.clone(),
+        tm.direct_commit.structural_hints.clone(),
     );
     let pa = TxId::with_priority(1, b"pa");
     let pb = TxId::with_priority(1, b"pb");
@@ -982,7 +982,7 @@ async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
         test_root_path(),
         member,
         InlinePolicy::default(),
-        tm.direct_commit.split_hints.clone(),
+        tm.direct_commit.structural_hints.clone(),
     );
     let empty = BTreeMap::new();
     assert!(matches!(
@@ -1026,7 +1026,7 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
         test_root_path(),
         member,
         InlinePolicy::default(),
-        tm.direct_commit.split_hints.clone(),
+        tm.direct_commit.structural_hints.clone(),
     );
     let predecessor = TxId::with_priority(1, b"predecessor");
     let unchanged = BTreeMap::from([(
@@ -1075,7 +1075,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     let seed = entry(&tctx, b"k").await.unwrap();
     let current = seed.current.writer().cloned().unwrap();
     let locks = NodeLocks::default();
-    let split_hints = tm.direct_commit.split_hints.clone();
+    let structural_hints = tm.direct_commit.structural_hints.clone();
 
     let direct = |read_writer: Option<TxId>| {
         put_policy(
@@ -1172,7 +1172,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
             outcome: MemberOutcome::Moved
         }
     ));
-    assert_eq!(split_hints.pending_inline_pressure(), 1);
+    assert_eq!(structural_hints.pending_inline_pressure(), 1);
     assert!(matches!(
         resolve_step(
             &budgeted,
@@ -1187,7 +1187,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
         }
     ));
     assert_eq!(
-        split_hints.pending_inline_pressure(),
+        structural_hints.pending_inline_pressure(),
         1,
         "an unproved in-doubt outcome returns before creating new pressure"
     );
@@ -1204,7 +1204,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
         }
     ));
     assert_eq!(
-        split_hints.pending_inline_pressure(),
+        structural_hints.pending_inline_pressure(),
         1,
         "a value no leaf can admit does not request a split"
     );
@@ -1553,7 +1553,10 @@ async fn multi_key_aggregate_rejection_is_atomic_and_does_not_hint() {
             landed: 0,
         }
     );
-    assert_eq!(tm.direct_commit.split_hints.pending_inline_pressure(), 0);
+    assert_eq!(
+        tm.direct_commit.structural_hints.pending_inline_pressure(),
+        0
+    );
     for key in &keys {
         assert_eq!(
             entry(&tctx, key.key()).await.unwrap().current,
@@ -1598,7 +1601,7 @@ async fn cross_key_aggregate_rejection_does_not_hint() {
             max_value_bytes: 8,
             max_leaf_bytes: 8,
         },
-        tm.direct_commit.split_hints.clone(),
+        tm.direct_commit.structural_hints.clone(),
     );
     let staged = BTreeMap::from([(
         source.key().to_vec(),
@@ -1621,7 +1624,10 @@ async fn cross_key_aggregate_rejection_does_not_hint() {
             outcome: MemberOutcome::Moved
         }
     ));
-    assert_eq!(tm.direct_commit.split_hints.pending_inline_pressure(), 0);
+    assert_eq!(
+        tm.direct_commit.structural_hints.pending_inline_pressure(),
+        0
+    );
 }
 
 // One member can mix every ADR-061 output shape. Membership generation advances
@@ -1751,7 +1757,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     );
 
     // This independent cache mutates topology while the main coordinator's
-    // CAS is paused, as a splitter on another process could.
+    // CAS is paused, as a restructurer on another process could.
     let (_peer, peer) = new_algo_from_backend(mem.clone()).await;
 
     // Park the candidate's L0 CAS after it has grouped its keys and planned the

@@ -19,17 +19,49 @@ use crate::sim_support::{assert_slow_mutation_modes, fault_tape, tape};
 
 use glassdb::exec::{TapeScheduler, block_on_with};
 use glassdb::sim::{
-    FaultConfig, MembOp, MembershipWorkload, pct_sweep, run_and_assert, run_and_assert_with_faults,
+    Covered, FaultConfig, MembOp, MembershipWorkload, MergingMembershipWorkload,
+    StructuralCoverage, pct_sweep, run_and_assert, run_and_assert_with_faults,
 };
+
+const SPLITS: StructuralCoverage = StructuralCoverage {
+    splits: true,
+    merges: false,
+};
+
+/// Operations that give the structural changes caused by earlier operations the
+/// time to land while the clients still run. Most changes land during the
+/// scans. A merge defers while a transaction holds a lock on its nodes, so the
+/// pause lets a deferred change land.
+fn settle() -> Vec<MembOp> {
+    vec![
+        MembOp::List,
+        MembOp::RangePage {
+            start: 0,
+            end: 8,
+            limit: 3,
+        },
+        MembOp::PrefixPage(4),
+        MembOp::List,
+        MembOp::Pause,
+    ]
+}
+
+/// Appends [`settle`] to each client.
+fn with_settle(mut clients: Vec<Vec<MembOp>>) -> Vec<Vec<MembOp>> {
+    for client in &mut clients {
+        client.extend(settle());
+    }
+    clients
+}
 
 /// A contended membership workload over three clients, each owning a disjoint
 /// slice of the 8-key universe by residue (client `i` owns keys `k` with
 /// `k % 3 == i`): client 0 -> {0,3,6}, client 1 -> {1,4,7}, client 2 -> {2,5}.
 /// Puts, deletes, full listings, and bounded pages interleave so keys created by
 /// different clients share leaves and split concurrently with scans.
-fn contended_membership() -> MembershipWorkload {
-    MembershipWorkload {
-        clients: vec![
+fn contended_membership() -> Covered<MembershipWorkload> {
+    let workload = MembershipWorkload {
+        clients: with_settle(vec![
             vec![
                 MembOp::Put(0),
                 MembOp::Put(3),
@@ -57,7 +89,11 @@ fn contended_membership() -> MembershipWorkload {
                 MembOp::Delete(2),
                 MembOp::Put(5),
             ],
-        ],
+        ]),
+    };
+    Covered {
+        workload,
+        requires: SPLITS,
     }
 }
 
@@ -65,13 +101,52 @@ fn contended_membership() -> MembershipWorkload {
 /// residue-class keys, so the final live set is all eight keys — which, at a
 /// two-entry leaf cap, cannot fit in one leaf and forces the listing to scan
 /// across split leaves.
-fn fill_all_keys() -> MembershipWorkload {
-    MembershipWorkload {
-        clients: vec![
+fn fill_all_keys() -> Covered<MembershipWorkload> {
+    let workload = MembershipWorkload {
+        clients: with_settle(vec![
             vec![MembOp::Put(0), MembOp::Put(3), MembOp::Put(6), MembOp::List],
             vec![MembOp::Put(1), MembOp::Put(4), MembOp::Put(7), MembOp::List],
             vec![MembOp::Put(2), MembOp::Put(5), MembOp::List],
+        ]),
+    };
+    Covered {
+        workload,
+        requires: SPLITS,
+    }
+}
+
+/// Fills the key universe, lets the fill split leaves, and then deletes all keys
+/// except those of client 2, which only reads after the fill. Only a committed
+/// leaf write queues a merge candidate. Clients 0 and 1 share one instance, and
+/// each deletes its keys from right to left, so that their last delete writes
+/// to the leftmost leaf after all other deletes. That leaf then merges
+/// (ADR-073) while the clients settle.
+fn fill_then_shrink() -> Covered<MergingMembershipWorkload> {
+    let workload = MergingMembershipWorkload(MembershipWorkload {
+        clients: vec![
+            [
+                vec![MembOp::Put(0), MembOp::Put(3), MembOp::Put(6)],
+                settle(),
+                vec![MembOp::Delete(6), MembOp::Delete(3), MembOp::Delete(0)],
+                settle(),
+            ]
+            .concat(),
+            [
+                vec![MembOp::Put(1), MembOp::Put(4), MembOp::Put(7)],
+                settle(),
+                vec![MembOp::Delete(7), MembOp::Delete(4), MembOp::Delete(1)],
+                settle(),
+            ]
+            .concat(),
+            [vec![MembOp::Put(2), MembOp::Put(5)], settle(), settle()].concat(),
         ],
+    });
+    Covered {
+        workload,
+        requires: StructuralCoverage {
+            splits: true,
+            merges: true,
+        },
     }
 }
 
@@ -144,6 +219,44 @@ fn pct_seed_breadth_holds_membership() {
     // Seed-breadth sweep: many PCT schedules over the contended workload, with
     // and without faults. Any invariant violation panics inside the sweep.
     let workload = contended_membership();
+    pct_sweep(&workload, FaultConfig::failures(7), 0..32);
+    pct_sweep(&workload, FaultConfig::none(), 0..16);
+}
+
+#[test]
+fn membership_holds_while_nodes_merge() {
+    for seed in [0u64, 3, 99, 2024] {
+        let workload = fill_then_shrink();
+        block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
+            run_and_assert(workload).await
+        });
+    }
+}
+
+#[test]
+fn membership_holds_while_nodes_merge_under_faults_and_restarts() {
+    // Crashes and outages interrupt merges at every step, so structural
+    // recovery must finish or abandon them within the membership bound.
+    for (faults, seeds) in [
+        (FaultConfig::failures(9), [0u64, 3, 99, 2024].as_slice()),
+        (
+            FaultConfig::failures(200),
+            [0u64, 1, 7, 42, 99, 1234].as_slice(),
+        ),
+    ] {
+        for &seed in seeds {
+            let workload = fill_then_shrink();
+            let faults_tape = fault_tape(seed);
+            block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
+                run_and_assert_with_faults(workload, faults, seed, faults_tape).await
+            });
+        }
+    }
+}
+
+#[test]
+fn pct_seed_breadth_holds_membership_while_nodes_merge() {
+    let workload = fill_then_shrink();
     pct_sweep(&workload, FaultConfig::failures(7), 0..32);
     pct_sweep(&workload, FaultConfig::none(), 0..16);
 }

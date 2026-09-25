@@ -5,9 +5,9 @@
 
 Storage layer for [GlassDB](https://github.com/mbrt/glassdb-rs), a stateless ACID
 key/value store on top of object storage. It turns raw backend objects into
-decoded, byte-bounded records: B-link tree nodes and their split policy, the
-in-memory and persistent caches, leaf and root coordination state, transaction
-records, and structural intents for split recovery.
+decoded, byte-bounded records: B-link tree nodes and their node size policy,
+the in-memory and persistent caches, leaf and root coordination state,
+transaction records, and structural intents for split and merge recovery.
 
 > [!NOTE]
 > This is an internal crate of the GlassDB workspace. It is published only

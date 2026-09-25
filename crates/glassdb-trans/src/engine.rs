@@ -12,8 +12,8 @@ use glassdb_data::{
 use glassdb_storage::transaction::TxRecordStore;
 use glassdb_storage::{
     CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, LeafBody, Node,
-    NodeStore, PersistentCache, PersistentCacheConfig, PersistentCacheMedia, Requirement,
-    SplitPolicy, StorageError, StructuralIntentStore, Timeline, TreeRouter,
+    NodeSizePolicy, NodeStore, PersistentCache, PersistentCacheConfig, PersistentCacheMedia,
+    Requirement, StorageError, StructuralIntentStore, Timeline, TreeRouter,
 };
 
 use crate::access::{AccessSet, ScanMutation, ScanRange};
@@ -29,7 +29,7 @@ use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{LeafCoordinator, LeafCoordinatorStats};
 use crate::monitor::{Monitor, MonitorStats, ProtocolTiming};
 use crate::reader::{ReadOutcome, Reader};
-use crate::split::{Splitter, SplitterStats};
+use crate::structural::{Restructurer, RestructurerStats};
 use crate::tlocker::{Locker, LockerStats};
 
 /// Balances backend traffic and memory use for a default production database instance.
@@ -49,7 +49,7 @@ pub struct EngineConfig {
     cache_size: usize,
     persistent_cache: Option<PersistentCacheSetup>,
     retry: RetryConfig,
-    split_policy: SplitPolicy,
+    node_size_policy: NodeSizePolicy,
     inline_policy: InlinePolicy,
     protocol_timing: ProtocolTiming,
     transaction_leaf_parallelism: NonZeroUsize,
@@ -83,9 +83,9 @@ impl EngineConfig {
         self.retry.max_interval = interval;
     }
 
-    /// Sets the shared tree-splitting policy.
-    pub fn set_split_policy(&mut self, policy: SplitPolicy) {
-        self.split_policy = policy;
+    /// Sets the shared node size policy.
+    pub fn set_node_size_policy(&mut self, policy: NodeSizePolicy) {
+        self.node_size_policy = policy;
     }
 
     /// Sets the direct-commit inline-value policy.
@@ -125,7 +125,7 @@ impl Default for EngineConfig {
             cache_size: DEFAULT_CACHE_SIZE,
             persistent_cache: None,
             retry: RetryConfig::default(),
-            split_policy: SplitPolicy::default(),
+            node_size_policy: NodeSizePolicy::default(),
             inline_policy: InlinePolicy::default(),
             protocol_timing: ProtocolTiming::default(),
             transaction_leaf_parallelism: DEFAULT_TRANSACTION_LEAF_PARALLELISM,
@@ -166,8 +166,8 @@ pub struct EngineStats {
     pub coordinator: LeafCoordinatorStats,
     /// Direct-commit coverage.
     pub direct_commit: DirectCommitStats,
-    /// Background tree-split activity.
-    pub splitter: SplitterStats,
+    /// Background split and merge activity.
+    pub restructurer: RestructurerStats,
     /// Garbage collection activity.
     pub gc: GcStats,
 }
@@ -191,7 +191,7 @@ pub struct Engine {
     algo: Algo,
     coord: LeafCoordinator,
     locker: Locker,
-    splitter: Splitter,
+    restructurer: Restructurer,
     gc: Gc,
     // Subsystems hold weak references so this sole strong owner breaks task
     // capture cycles when the engine is dropped.
@@ -311,7 +311,7 @@ impl Engine {
             locker: self.locker.stats_and_reset(),
             coordinator: self.coord.stats_and_reset(),
             direct_commit: self.algo.direct_commit_stats_and_reset(),
-            splitter: self.splitter.stats_and_reset(),
+            restructurer: self.restructurer.stats_and_reset(),
             gc: self.gc.stats_and_reset(),
         }
     }
@@ -510,7 +510,7 @@ impl DormantEngine {
     /// Starts maintenance work and returns the live engine.
     fn start(self) -> Engine {
         self.engine.gc.start(&self.engine.background);
-        self.engine.splitter.start();
+        self.engine.restructurer.start();
         self.engine
     }
 
@@ -522,7 +522,7 @@ impl DormantEngine {
     ) -> Self {
         let EngineConfig {
             retry,
-            split_policy,
+            node_size_policy,
             inline_policy,
             transaction_leaf_parallelism,
             collection_reservation_limit,
@@ -559,7 +559,7 @@ impl DormantEngine {
         );
         let reader = Reader::new(resolver.clone(), timeline.clone(), retry);
         let gc_hints = GcHints::new(gc_limits);
-        let (coord, splitter) = Splitter::with_coordinator(
+        let (coord, restructurer) = Restructurer::with_coordinator(
             background_weak.clone(),
             records.clone(),
             nodes.clone(),
@@ -569,7 +569,7 @@ impl DormantEngine {
             key_state,
             retry,
             db_prefix,
-            split_policy,
+            node_size_policy,
             inline_policy,
             gc_hints.clone(),
         );
@@ -586,7 +586,7 @@ impl DormantEngine {
             nodes.clone(),
             monitor.clone(),
             retry,
-            Arc::new(splitter.clone()),
+            Arc::new(restructurer.clone()),
         );
         let gc = Gc::new(
             tx_records.clone(),
@@ -603,7 +603,7 @@ impl DormantEngine {
             collection_catalog.clone(),
             collection_lifecycle,
             monitor.clone(),
-            split_policy,
+            node_size_policy,
         );
         let algo = Algo::new(
             nodes,
@@ -617,10 +617,10 @@ impl DormantEngine {
             managed_retirement.then_some(background_weak),
             router,
             resolver.clone(),
-            split_policy,
+            node_size_policy,
             collection_reservation_limit,
             inline_policy,
-            splitter.hint_sink(),
+            restructurer.hint_sink(),
         );
         let engine = Engine {
             backend,
@@ -632,7 +632,7 @@ impl DormantEngine {
             algo,
             coord,
             locker,
-            splitter,
+            restructurer,
             gc,
             background,
         };
