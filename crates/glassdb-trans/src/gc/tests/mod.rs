@@ -11,7 +11,7 @@ use glassdb_backend as backend;
 use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend};
 use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
 use glassdb_concurr::RetryConfig;
-use glassdb_data::{CollectionAddress, CollectionId, DbPrefix, LogicalKey, NodeToken, ObjectPath};
+use glassdb_data::{CollectionAddress, CollectionId, DbPrefix, LogicalKey, NodeId, ObjectPath};
 use glassdb_storage::transaction::{
     TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxRecord, TxRecordStore, TxWrite,
 };
@@ -316,6 +316,10 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
 
 fn tx(n: u8) -> TxId {
     TxId::from_bytes(vec![n])
+}
+
+fn node_id(n: u8) -> NodeId {
+    NodeId::from_bytes([n; 16])
 }
 
 fn key_path(k: &[u8]) -> LogicalKey {
@@ -782,23 +786,23 @@ async fn replace_root(nodes: &NodeStore, node: &Node) {
     );
 }
 
-async fn replace_node(nodes: &NodeStore, token: &NodeToken, node: &Node) {
+async fn replace_node(nodes: &NodeStore, node_id: &NodeId, node: &Node) {
     let observed = nodes
-        .load_node_state(&collection(), token, Requirement::ANY)
+        .load_node_state(&collection(), node_id, Requirement::ANY)
         .await
         .unwrap();
     assert!(
         nodes
-            .store_node(&collection(), token, node, Some(&observed))
+            .store_node(&collection(), node_id, node, Some(&observed))
             .await
             .unwrap()
     );
 }
 
-fn node_path(token: &NodeToken) -> ObjectPath {
+fn node_path(node_id: &NodeId) -> ObjectPath {
     ObjectPath::Node {
         collection: collection(),
-        token: token.clone(),
+        id: *node_id,
     }
 }
 
@@ -827,8 +831,8 @@ async fn reference_checks_refresh_leaves_without_refreshing_indexes() {
         let recorder = Arc::new(RecordingBackend::new(memory.clone()));
         let operations = recorder.log();
         let ctx = new_ctx_with(recorder).await;
-        let leaf = NodeToken::from_bytes([1; 16]);
-        let index = NodeToken::from_bytes([2; 16]);
+        let leaf = node_id(1);
+        let index = node_id(2);
         assert!(
             ctx.nodes
                 .store_node(&collection(), &leaf, &Node::leaf(LeafBody::new()), None)
@@ -840,7 +844,7 @@ async fn reference_checks_refresh_leaves_without_refreshing_indexes() {
                 .store_node(
                     &collection(),
                     &index,
-                    &Node::index(IndexNode::from_children([(Vec::new(), leaf.to_string())])),
+                    &Node::index(IndexNode::from_children([(Vec::new(), leaf)])),
                     None
                 )
                 .await
@@ -848,7 +852,7 @@ async fn reference_checks_refresh_leaves_without_refreshing_indexes() {
         );
         replace_root(
             &ctx.nodes,
-            &Node::index(IndexNode::from_children([(Vec::new(), index.to_string())])),
+            &Node::index(IndexNode::from_children([(Vec::new(), index)])),
         )
         .await;
 
@@ -928,8 +932,8 @@ async fn reference_checks_follow_a_split_behind_a_cached_parent() {
         let recorder = Arc::new(RecordingBackend::new(memory.clone()));
         let operations = recorder.log();
         let ctx = new_ctx_with(recorder).await;
-        let left = NodeToken::from_bytes([1; 16]);
-        let right = NodeToken::from_bytes([2; 16]);
+        let left = node_id(1);
+        let right = node_id(2);
         assert!(
             ctx.nodes
                 .store_node(&collection(), &left, &Node::leaf(LeafBody::new()), None)
@@ -938,7 +942,7 @@ async fn reference_checks_follow_a_split_behind_a_cached_parent() {
         );
         replace_root(
             &ctx.nodes,
-            &Node::index(IndexNode::from_children([(Vec::new(), left.to_string())])),
+            &Node::index(IndexNode::from_children([(Vec::new(), left)])),
         )
         .await;
         let id = tx(1);
@@ -967,15 +971,15 @@ async fn reference_checks_follow_a_split_behind_a_cached_parent() {
             &left,
             &Node::leaf(LeafBody::new())
                 .with_high_key(Some(b"m".to_vec()))
-                .with_right_sibling(Some(right.to_string())),
+                .with_right_sibling(Some(right)),
         )
         .await;
         if publish_separator {
             replace_root(
                 &peer.nodes,
                 &Node::index(IndexNode::from_children([
-                    (Vec::new(), left.to_string()),
-                    (b"m".to_vec(), right.to_string()),
+                    (Vec::new(), left),
+                    (b"m".to_vec(), right),
                 ])),
             )
             .await;
@@ -1015,8 +1019,8 @@ async fn reference_checks_refresh_a_cached_leaf_that_became_an_index() {
         .set(&committed(id.clone(), PAST_HORIZON, &[b"pear"], &[]))
         .await
         .unwrap();
-    let left = NodeToken::from_bytes([1; 16]);
-    let right = NodeToken::from_bytes([2; 16]);
+    let left = node_id(1);
+    let right = node_id(2);
     let body = LeafBody::from_entries([writer_entry(b"pear", &id)]);
     replace_root(&peer.nodes, &Node::leaf(body.clone())).await;
     assert!(
@@ -1026,7 +1030,7 @@ async fn reference_checks_refresh_a_cached_leaf_that_became_an_index() {
                 &left,
                 &Node::leaf(LeafBody::new())
                     .with_high_key(Some(b"m".to_vec()))
-                    .with_right_sibling(Some(right.to_string())),
+                    .with_right_sibling(Some(right)),
                 None
             )
             .await
@@ -1041,8 +1045,8 @@ async fn reference_checks_refresh_a_cached_leaf_that_became_an_index() {
     replace_root(
         &peer.nodes,
         &Node::index(IndexNode::from_children([
-            (Vec::new(), left.to_string()),
-            (b"m".to_vec(), right.to_string()),
+            (Vec::new(), left),
+            (b"m".to_vec(), right),
         ])),
     )
     .await;
@@ -1103,9 +1107,9 @@ async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
         let recorder = Arc::new(RecordingBackend::new(hooks.clone()));
         let operations = recorder.log();
         let ctx = new_ctx_with(recorder).await;
-        let leaf = NodeToken::from_bytes([1; 16]);
-        let empty = NodeToken::from_bytes([2; 16]);
-        let index = NodeToken::from_bytes([3; 16]);
+        let leaf = node_id(1);
+        let empty = node_id(2);
+        let index = node_id(3);
         let current = CurrentState::Inline {
             writer: tx(90),
             value: Arc::from(b"old-value".as_slice()),
@@ -1114,32 +1118,32 @@ async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
             keys.iter()
                 .map(|key| LeafEntry::new(*key).with_current(current.clone())),
         );
-        for (token, node) in [
+        for (node_id, node) in [
             (&empty, Node::leaf(LeafBody::new())),
             (
                 &leaf,
                 Node::leaf(body)
                     .with_high_key(Some(b"m".to_vec()))
-                    .with_right_sibling(Some(empty.to_string())),
+                    .with_right_sibling(Some(empty)),
             ),
             (
                 &index,
                 Node::index(IndexNode::from_children([
-                    (Vec::new(), leaf.to_string()),
-                    (b"m".to_vec(), empty.to_string()),
+                    (Vec::new(), leaf),
+                    (b"m".to_vec(), empty),
                 ])),
             ),
         ] {
             assert!(
                 ctx.nodes
-                    .store_node(&collection(), token, &node, None)
+                    .store_node(&collection(), node_id, &node, None)
                     .await
                     .unwrap()
             );
         }
         replace_root(
             &ctx.nodes,
-            &Node::index(IndexNode::from_children([(Vec::new(), index.to_string())])),
+            &Node::index(IndexNode::from_children([(Vec::new(), index)])),
         )
         .await;
 
@@ -1156,9 +1160,9 @@ async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
         );
         let id = tx(82);
         let mut locks: Vec<_> = keys.iter().map(|key| write_lock(key)).collect();
-        for token in [&leaf, &empty] {
+        for node_id in [&leaf, &empty] {
             locks.push(TxLock::Membership {
-                leaf: LeafRef::node(collection(), token.clone()),
+                leaf: LeafRef::node(collection(), *node_id),
                 typ: LockType::Read,
             });
         }
@@ -1268,11 +1272,11 @@ async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
                 .unwrap()
         );
         assert!(operations.lock().unwrap().is_empty());
-        for token in [&leaf, &empty] {
+        for node_id in [&leaf, &empty] {
             let loaded = owner
                 .nodes
                 .load_leaf(
-                    &node_path(token),
+                    &node_path(node_id),
                     Requirement::after(owner.timeline.currentness_barrier()),
                 )
                 .await
@@ -1284,7 +1288,7 @@ async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
             }
             assert_eq!(
                 loaded.entries().entries().count(),
-                if token == &leaf { keys.len() } else { 0 }
+                if node_id == &leaf { keys.len() } else { 0 }
             );
         }
     }
@@ -1299,8 +1303,8 @@ async fn entry_release_follows_splits_without_refreshing_cached_indexes() {
         let recorder = Arc::new(RecordingBackend::new(memory.clone()));
         let operations = recorder.log();
         let ctx = new_ctx_with(recorder).await;
-        let left = NodeToken::from_bytes([1; 16]);
-        let right = NodeToken::from_bytes([2; 16]);
+        let left = node_id(1);
+        let right = node_id(2);
         let id = tx(82);
         let current = CurrentState::Inline {
             writer: tx(90),
@@ -1321,7 +1325,7 @@ async fn entry_release_follows_splits_without_refreshing_cached_indexes() {
             );
             replace_root(
                 &ctx.nodes,
-                &Node::index(IndexNode::from_children([(Vec::new(), left.to_string())])),
+                &Node::index(IndexNode::from_children([(Vec::new(), left)])),
             )
             .await;
         }
@@ -1361,7 +1365,7 @@ async fn entry_release_follows_splits_without_refreshing_cached_indexes() {
             LeafEntry::new(b"apple").with_current(current.clone())
         ]))
         .with_high_key(Some(b"pear".to_vec()))
-        .with_right_sibling(Some(right.to_string()));
+        .with_right_sibling(Some(right));
         if root_split {
             assert!(
                 owner
@@ -1377,8 +1381,8 @@ async fn entry_release_follows_splits_without_refreshing_cached_indexes() {
             replace_root(
                 &owner.nodes,
                 &Node::index(IndexNode::from_children([
-                    (Vec::new(), left.to_string()),
-                    (b"pear".to_vec(), right.to_string()),
+                    (Vec::new(), left),
+                    (b"pear".to_vec(), right),
                 ])),
             )
             .await;
@@ -2376,7 +2380,7 @@ enum TopologyReclamation {
 
 async fn reclaim_topology(committed: bool, case: TopologyReclamation) {
     use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
-    use glassdb_data::{NodeToken, StructuralIntentId};
+    use glassdb_data::StructuralIntentId;
     use glassdb_storage::{StructuralChange, StructuralIntent, StructuralIntentPhase};
 
     let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
@@ -2412,19 +2416,19 @@ async fn reclaim_topology(committed: bool, case: TopologyReclamation) {
         .await
         .unwrap();
     let operation = owner.monitor.begin_owner_operation(&id).unwrap();
-    let left = NodeToken::from_bytes([85; 16]);
-    let right = NodeToken::from_bytes([86; 16]);
+    let left = node_id(85);
+    let right = node_id(86);
     let prepared = owner
         .structural_intents
         .write(
             collection().db_prefix_component(),
-            &StructuralIntentId::from(&right),
+            &StructuralIntentId::from_bytes([87; 16]),
             &StructuralIntent {
                 collection: collection(),
-                source_token: None,
+                source_node_id: None,
                 source_revision: String::new(),
                 change: StructuralChange::Split {
-                    created_tokens: vec![left, right],
+                    created_node_ids: vec![left, right],
                     split_key: Vec::new(),
                 },
                 participant_id: id.clone(),
@@ -2641,7 +2645,6 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropR
     use crate::collection_coordination::CollectionLocker;
     use crate::collections::{CollectionChange, CollectionOp};
     use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
-    use glassdb_data::NodeToken;
     use glassdb_storage::IndexNode;
 
     let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
@@ -2687,11 +2690,11 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropR
         collection: target.clone(),
     }];
     if with_child {
-        let token = NodeToken::from_bytes([38; 16]);
+        let child = node_id(38);
         assert!(
             owner
                 .nodes
-                .store_node(&target, &token, &Node::leaf(LeafBody::new()), None)
+                .store_node(&target, &child, &Node::leaf(LeafBody::new()), None)
                 .await
                 .unwrap()
         );
@@ -2700,7 +2703,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropR
             .load_root(&target, Requirement::ANY)
             .await
             .unwrap();
-        let root = Node::index(IndexNode::from_children([(Vec::new(), token.to_string())]));
+        let root = Node::index(IndexNode::from_children([(Vec::new(), child)]));
         assert!(
             owner
                 .nodes
@@ -2710,7 +2713,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropR
         );
         node_paths.push(ObjectPath::Node {
             collection: target.clone(),
-            token,
+            id: child,
         });
     }
     let (mut parent, observed) = owner

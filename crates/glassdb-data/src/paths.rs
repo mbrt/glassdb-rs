@@ -2,15 +2,19 @@
 
 use std::sync::Arc;
 
+use crate::ID_BYTES;
 use crate::base64;
 use crate::collection_id::CollectionId;
+use crate::node_id::NodeId;
+use crate::structural_intent_id::StructuralIntentId;
 use crate::txid::TxId;
 
 mod structural;
 mod transaction;
 mod tree;
 
-const NODE_TOKEN_BYTES: usize = 16;
+/// Length of the unpadded base64 path component of an ID.
+const RANDOM_ID_ENCODED_LEN: usize = (ID_BYTES * 8).div_ceil(6);
 const DATABASE_METADATA_OBJECT: &str = "glassdb";
 
 /// A database's top-level physical object-path component.
@@ -65,145 +69,6 @@ impl std::fmt::Display for DbPrefix {
     }
 }
 
-/// The canonical random identity component of a non-root B-link node.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct NodeToken(Arc<str>);
-
-impl NodeToken {
-    /// Maximum number of bytes in the encoded path component.
-    pub const MAX_ENCODED_LEN: usize = 22;
-
-    /// Mints a fresh random node token.
-    ///
-    /// Random bytes precede encoding so object-store partitions see a
-    /// high-entropy prefix. The entropy source is simulation-aware.
-    pub fn new_random() -> Self {
-        let mut bytes = [0u8; NODE_TOKEN_BYTES];
-        glassdb_concurr::entropy::fill_bytes(&mut bytes);
-        Self::from_bytes(bytes)
-    }
-
-    /// Encodes an exact 128-bit node identity.
-    pub fn from_bytes(bytes: [u8; NODE_TOKEN_BYTES]) -> Self {
-        NodeToken(Arc::from(base64::encode(&bytes)))
-    }
-
-    /// Returns the canonical encoded path component.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<&str> for NodeToken {
-    type Error = PathError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        validate_random_component("node token", value, Self::MAX_ENCODED_LEN)?;
-        Ok(NodeToken(Arc::from(value)))
-    }
-}
-
-impl TryFrom<String> for NodeToken {
-    type Error = PathError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        validate_random_component("node token", &value, Self::MAX_ENCODED_LEN)?;
-        Ok(NodeToken(Arc::from(value)))
-    }
-}
-
-impl std::str::FromStr for NodeToken {
-    type Err = PathError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::try_from(value)
-    }
-}
-
-impl AsRef<str> for NodeToken {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl std::fmt::Display for NodeToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// The canonical random identity component of a structural intent.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct StructuralIntentId(Arc<str>);
-
-impl StructuralIntentId {
-    /// Maximum number of bytes in the encoded path component.
-    pub const MAX_ENCODED_LEN: usize = NodeToken::MAX_ENCODED_LEN;
-
-    /// Returns the canonical encoded path component.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<&str> for StructuralIntentId {
-    type Error = PathError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        validate_random_component(
-            "structural intent ID",
-            value,
-            StructuralIntentId::MAX_ENCODED_LEN,
-        )?;
-        Ok(StructuralIntentId(Arc::from(value)))
-    }
-}
-
-impl TryFrom<String> for StructuralIntentId {
-    type Error = PathError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        validate_random_component(
-            "structural intent ID",
-            &value,
-            StructuralIntentId::MAX_ENCODED_LEN,
-        )?;
-        Ok(StructuralIntentId(Arc::from(value)))
-    }
-}
-
-impl std::str::FromStr for StructuralIntentId {
-    type Err = PathError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::try_from(value)
-    }
-}
-
-impl From<NodeToken> for StructuralIntentId {
-    fn from(value: NodeToken) -> Self {
-        StructuralIntentId(value.0)
-    }
-}
-
-impl From<&NodeToken> for StructuralIntentId {
-    fn from(value: &NodeToken) -> Self {
-        StructuralIntentId(value.0.clone())
-    }
-}
-
-impl AsRef<str> for StructuralIntentId {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl std::fmt::Display for StructuralIntentId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 fn validate_db_prefix(value: &str) -> Result<(), PathError> {
     if value.is_empty()
         || value.len() > DbPrefix::MAX_ENCODED_LEN
@@ -217,25 +82,25 @@ fn validate_db_prefix(value: &str) -> Result<(), PathError> {
     Ok(())
 }
 
-fn validate_random_component(
+/// Parses the path component of a random 16-byte ID, such as a node ID.
+fn parse_random_id<T>(
     component: &'static str,
     value: &str,
-    encoded_len: usize,
-) -> Result<(), PathError> {
-    if value.len() != encoded_len {
-        return Err(PathError::InvalidComponent {
-            component,
-            value: value.to_string(),
-        });
+    from_slice: impl FnOnce(&[u8]) -> Option<T>,
+) -> Result<T, PathError> {
+    let invalid = || PathError::InvalidComponent {
+        component,
+        value: value.to_string(),
+    };
+    if value.len() != RANDOM_ID_ENCODED_LEN {
+        return Err(invalid());
     }
     let decoded = base64::decode(value)?;
-    if decoded.len() != NODE_TOKEN_BYTES || base64::encode(&decoded) != value {
-        return Err(PathError::InvalidComponent {
-            component,
-            value: value.to_string(),
-        });
+    // Only the canonical encoding is accepted, so that one ID has one path.
+    if base64::encode(&decoded) != value {
+        return Err(invalid());
     }
-    Ok(())
+    from_slice(&decoded).ok_or_else(invalid)
 }
 
 /// The physical address of one collection within a database.
@@ -327,7 +192,7 @@ pub enum LeafRef {
     Root(CollectionAddress),
     Node {
         collection: CollectionAddress,
-        token: NodeToken,
+        id: NodeId,
     },
 }
 
@@ -338,8 +203,8 @@ impl LeafRef {
     }
 
     /// Creates a standalone-node leaf reference.
-    pub fn node(collection: CollectionAddress, token: NodeToken) -> Self {
-        LeafRef::Node { collection, token }
+    pub fn node(collection: CollectionAddress, id: NodeId) -> Self {
+        LeafRef::Node { collection, id }
     }
 
     /// Returns the collection whose tree contains this leaf.
@@ -349,11 +214,11 @@ impl LeafRef {
         }
     }
 
-    /// Returns the standalone node token, or `None` for the tree root.
-    pub fn node_token(&self) -> Option<&NodeToken> {
+    /// Returns the standalone node ID, or `None` for the tree root.
+    pub fn node_id(&self) -> Option<NodeId> {
         match self {
             LeafRef::Root(_) => None,
-            LeafRef::Node { token, .. } => Some(token),
+            LeafRef::Node { id, .. } => Some(*id),
         }
     }
 
@@ -363,9 +228,9 @@ impl LeafRef {
             LeafRef::Root(collection) => ObjectPath::TreeRoot {
                 collection: collection.clone(),
             },
-            LeafRef::Node { collection, token } => ObjectPath::Node {
+            LeafRef::Node { collection, id } => ObjectPath::Node {
                 collection: collection.clone(),
-                token: token.clone(),
+                id: *id,
             },
         }
     }
@@ -385,7 +250,7 @@ pub enum ObjectPath {
     /// A standalone node in a collection's B-link tree.
     Node {
         collection: CollectionAddress,
-        token: NodeToken,
+        id: NodeId,
     },
     /// A participant-owned structural intent.
     StructuralIntent {
@@ -447,14 +312,12 @@ impl std::fmt::Display for ObjectPath {
                 transaction::write_object(f, db_prefix.as_str(), id)
             }
             ObjectPath::TreeRoot { collection } => tree::write_tree_root(f, collection),
-            ObjectPath::Node { collection, token } => {
-                tree::write_node(f, collection, token.as_str())
-            }
+            ObjectPath::Node { collection, id } => tree::write_node(f, collection, id),
             ObjectPath::StructuralIntent {
                 db_prefix,
                 participant,
                 intent_id,
-            } => structural::write_intent(f, db_prefix.as_str(), participant, intent_id.as_str()),
+            } => structural::write_intent(f, db_prefix.as_str(), participant, intent_id),
         }
     }
 }
@@ -528,7 +391,15 @@ mod tests {
     use super::*;
 
     fn collection_id(byte: u8) -> CollectionId {
-        CollectionId::from_slice(&[byte; 16]).unwrap()
+        CollectionId::from_slice(&[byte; ID_BYTES]).unwrap()
+    }
+
+    fn node_id(byte: u8) -> NodeId {
+        NodeId::from_bytes([byte; ID_BYTES])
+    }
+
+    fn intent_id(byte: u8) -> StructuralIntentId {
+        StructuralIntentId::from_bytes([byte; ID_BYTES])
     }
 
     #[test]
@@ -560,49 +431,104 @@ mod tests {
     }
 
     #[test]
-    fn random_identity_components_require_canonical_128_bit_encodings() {
-        let token = NodeToken::from_bytes([0; NODE_TOKEN_BYTES]);
-        assert_eq!(token.as_str(), "0000000000000000000000");
-        assert_eq!(token.as_str().len(), NodeToken::MAX_ENCODED_LEN);
-        assert_eq!(NodeToken::try_from(token.to_string()).unwrap(), token);
-        assert_eq!(token.as_str().parse::<NodeToken>().unwrap(), token);
+    fn random_id_path_components_require_canonical_128_bit_encodings() {
+        let node_path = |id: &str| format!("db/_c/0000000000000000000000/_n/{id}");
+        let participant = base64::encode(b"participant");
+        let intent_path = |id: &str| format!("db/_s/{participant}/{id}");
+        let parse = |path: String| ObjectPath::try_from(path.as_str());
 
-        let intent_id = StructuralIntentId::try_from(token.as_str()).unwrap();
-        assert_eq!(intent_id.as_str(), token.as_str());
-        assert_eq!(StructuralIntentId::from(&token), intent_id);
-        assert_eq!(StructuralIntentId::from(token.clone()), intent_id);
-
-        for invalid in ["", "000000000000000000000", "00000000000000000000000"] {
-            assert!(NodeToken::try_from(invalid).is_err());
-            assert!(StructuralIntentId::try_from(invalid).is_err());
-        }
-
-        let invalid_alphabet = "000000000000000000000!";
-        assert!(NodeToken::try_from(invalid_alphabet).is_err());
-        assert!(StructuralIntentId::try_from(invalid_alphabet).is_err());
+        let zero = "0000000000000000000000";
+        assert_eq!(
+            parse(node_path(zero)).unwrap(),
+            ObjectPath::Node {
+                collection: CollectionAddress::root("db"),
+                id: node_id(0),
+            }
+        );
+        assert_eq!(
+            parse(intent_path(zero)).unwrap(),
+            ObjectPath::StructuralIntent {
+                db_prefix: DbPrefix::try_from("db").unwrap(),
+                participant: TxId::from_bytes(b"participant".to_vec()),
+                intent_id: intent_id(0),
+            }
+        );
 
         let noncanonical = "0000000000000000000001";
         assert_eq!(
             base64::decode(noncanonical).unwrap(),
-            base64::decode(token.as_str()).unwrap()
+            base64::decode(zero).unwrap()
         );
-        assert!(matches!(
-            NodeToken::try_from(noncanonical),
-            Err(PathError::InvalidComponent { .. })
-        ));
-        assert!(matches!(
-            StructuralIntentId::try_from(noncanonical),
-            Err(PathError::InvalidComponent { .. })
-        ));
+        for invalid in [
+            "",
+            "000000000000000000000",
+            "00000000000000000000000",
+            "000000000000000000000!",
+            noncanonical,
+        ] {
+            assert!(parse(node_path(invalid)).is_err(), "{invalid:?}");
+            assert!(parse(intent_path(invalid)).is_err(), "{invalid:?}");
+        }
+        for path in [node_path(noncanonical), intent_path(noncanonical)] {
+            assert!(matches!(
+                parse(path),
+                Err(PathError::InvalidComponent { .. })
+            ));
+        }
     }
 
     #[test]
-    fn freshly_minted_node_tokens_round_trip() {
+    fn node_ids_sort_like_their_object_paths() {
+        let collection = CollectionAddress::root("db");
+        let mut ids = [
+            [0xff; ID_BYTES],
+            [0x00; ID_BYTES],
+            [0x80; ID_BYTES],
+            [0x7f; ID_BYTES],
+            [0x01; ID_BYTES],
+        ]
+        .map(NodeId::from_bytes);
+        let mut paths = ids.map(|id| {
+            ObjectPath::Node {
+                collection: collection.clone(),
+                id,
+            }
+            .to_string()
+        });
+        ids.sort();
+        paths.sort();
+        assert_eq!(
+            ids.map(|id| ObjectPath::Node {
+                collection: collection.clone(),
+                id,
+            }
+            .to_string()),
+            paths
+        );
+    }
+
+    #[test]
+    fn freshly_minted_ids_round_trip_through_object_paths() {
+        let collection = CollectionAddress::root("db");
+        let db_prefix = DbPrefix::try_from("db").unwrap();
+        let participant = TxId::from_bytes(b"participant".to_vec());
         for _ in 0..128 {
-            let token = NodeToken::new_random();
-            assert_eq!(token.as_str().len(), NodeToken::MAX_ENCODED_LEN);
-            assert_eq!(NodeToken::try_from(token.to_string()).unwrap(), token);
-            assert_eq!(base64::decode(token.as_str()).unwrap().len(), 16);
+            for path in [
+                ObjectPath::Node {
+                    collection: collection.clone(),
+                    id: NodeId::new_random(),
+                },
+                ObjectPath::StructuralIntent {
+                    db_prefix: db_prefix.clone(),
+                    participant: participant.clone(),
+                    intent_id: StructuralIntentId::new_random(),
+                },
+            ] {
+                assert_eq!(
+                    ObjectPath::try_from(path.to_string().as_str()).unwrap(),
+                    path
+                );
+            }
         }
     }
 
@@ -610,9 +536,9 @@ mod tests {
     fn every_object_path_variant_round_trips() {
         let db_prefix = DbPrefix::try_from("db").unwrap();
         let collection = CollectionAddress::root("db");
-        let token = NodeToken::from_bytes([7; NODE_TOKEN_BYTES]);
+        let id = node_id(7);
         let participant = TxId::from_bytes(b"participant".to_vec());
-        let intent_id = StructuralIntentId::from(NodeToken::from_bytes([9; NODE_TOKEN_BYTES]));
+        let intent_id = intent_id(9);
         let paths = [
             ObjectPath::DatabaseMetadata {
                 db_prefix: db_prefix.clone(),
@@ -627,7 +553,7 @@ mod tests {
             ObjectPath::TreeRoot {
                 collection: collection.clone(),
             },
-            ObjectPath::Node { collection, token },
+            ObjectPath::Node { collection, id },
             ObjectPath::StructuralIntent {
                 db_prefix,
                 participant,
@@ -711,7 +637,7 @@ mod tests {
     #[test]
     fn leaf_refs_map_to_canonical_object_paths() {
         let collection = CollectionAddress::new("db", collection_id(1));
-        let token = NodeToken::from_bytes([1; NODE_TOKEN_BYTES]);
+        let id = node_id(1);
         assert_eq!(
             LeafRef::root(collection.clone()).object_path(),
             ObjectPath::TreeRoot {
@@ -719,8 +645,8 @@ mod tests {
             }
         );
         assert_eq!(
-            LeafRef::node(collection.clone(), token.clone()).object_path(),
-            ObjectPath::Node { collection, token }
+            LeafRef::node(collection.clone(), id).object_path(),
+            ObjectPath::Node { collection, id }
         );
     }
 
@@ -734,9 +660,9 @@ mod tests {
         let db_prefix = DbPrefix::try_from("db").unwrap();
         let collection = CollectionAddress::root("db");
         let collection_prefix = "db/_c/0000000000000000000000";
-        let token = NodeToken::from_bytes([0; NODE_TOKEN_BYTES]);
+        let id = NodeId::from_bytes([0; ID_BYTES]);
         let participant = TxId::from_bytes(vec![1, 2, 3, 4]);
-        let intent_id = StructuralIntentId::from(token.clone());
+        let intent_id = StructuralIntentId::from_bytes([0; ID_BYTES]);
 
         assert_eq!(collection.physical_prefix(), collection_prefix);
         assert_eq!(
@@ -756,7 +682,7 @@ mod tests {
         assert_eq!(
             ObjectPath::Node {
                 collection: collection.clone(),
-                token,
+                id,
             }
             .to_string(),
             format!("{collection_prefix}/_n/0000000000000000000000")

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use glassdb_concurr::{RetryConfig, rt};
-use glassdb_data::{CollectionAddress, NodeToken, TxId};
+use glassdb_data::{CollectionAddress, NodeId, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
     CollectionRecord, CollectionStore, LeafBody, Node, NodeStore, Requirement, StorageError,
@@ -116,8 +116,8 @@ impl CollectionLifecycle {
             // Completed topology settlement fences abandoned publication;
             // late creates can only leave unreachable orphans.
             let nodes = self.nodes.list_nodes(collection, Requirement::ANY).await?;
-            for (token, _) in nodes {
-                self.fence_node(collection, &token, id).await?;
+            for (node_id, _) in nodes {
+                self.fence_node(collection, &node_id, id).await?;
             }
             self.fence_root(collection, id).await?;
         }
@@ -146,9 +146,9 @@ impl CollectionLifecycle {
                     .nodes
                     .scan_nodes(collection, cursor.as_ref(), Requirement::ANY)
                     .await?;
-                for (token, _) in page.nodes {
+                for (node_id, _) in page.nodes {
                     changed |= self
-                        .clear_node_fence(collection, &token, id, requirement)
+                        .clear_node_fence(collection, &node_id, id, requirement)
                         .await?;
                 }
                 match page.next {
@@ -262,14 +262,14 @@ impl CollectionLifecycle {
     async fn fence_node(
         &self,
         collection: &CollectionAddress,
-        token: &NodeToken,
+        node_id: &NodeId,
         id: &TxId,
     ) -> Result<(), TransError> {
         let mut backoff = self.retry.backoff();
         loop {
             let (mut node, observed) = match self
                 .nodes
-                .load_node(collection, token, Requirement::ANY)
+                .load_node(collection, node_id, Requirement::ANY)
                 .await
             {
                 Ok(node) => node,
@@ -295,7 +295,7 @@ impl CollectionLifecycle {
             node.set_drop_intent(id.clone());
             if self
                 .nodes
-                .store_node(collection, token, &node, Some(&observed))
+                .store_node(collection, node_id, &node, Some(&observed))
                 .await?
             {
                 return Ok(());
@@ -377,7 +377,7 @@ impl CollectionLifecycle {
     async fn clear_node_fence(
         &self,
         collection: &CollectionAddress,
-        token: &NodeToken,
+        node_id: &NodeId,
         id: &TxId,
         requirement: Requirement,
     ) -> Result<bool, TransError> {
@@ -385,7 +385,7 @@ impl CollectionLifecycle {
         loop {
             let (mut node, observed) = self
                 .nodes
-                .load_node(collection, token, read_requirement)
+                .load_node(collection, node_id, read_requirement)
                 .await?;
             if !node.remove_drop_intent(id) {
                 if observed.satisfies(requirement) {
@@ -398,7 +398,7 @@ impl CollectionLifecycle {
             }
             if self
                 .nodes
-                .store_node(collection, token, &node, Some(&observed))
+                .store_node(collection, node_id, &node, Some(&observed))
                 .await?
             {
                 return Ok(true);
@@ -467,7 +467,7 @@ mod tests {
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
     use glassdb_concurr::Background;
-    use glassdb_data::{CollectionId, DbPrefix, NodeToken, ObjectPath};
+    use glassdb_data::{CollectionId, DbPrefix, NodeId, ObjectPath};
     use glassdb_storage::transaction::{
         TxCollectionChange, TxCollectionOp, TxRecord, TxRecordStore,
     };
@@ -479,15 +479,11 @@ mod tests {
     use crate::monitor::TxRecoveryManifest;
 
     const COLLECTION: &str = "db/_c/0000000000000000000000";
-    const SOURCE_TOKEN: &str = "0000000000000000000000";
-    const RIGHT_TOKEN: &str = "0F410F410F410F410F410F";
+    const SOURCE: NodeId = NodeId::from_bytes([0; 16]);
+    const RIGHT: NodeId = NodeId::from_bytes([1; 16]);
 
     fn collection() -> CollectionAddress {
         CollectionAddress::from_physical_prefix(COLLECTION).unwrap()
-    }
-
-    fn node_token(value: &str) -> NodeToken {
-        NodeToken::try_from(value).unwrap()
     }
 
     struct UnexpectedTopologySettler;
@@ -513,7 +509,7 @@ mod tests {
         fn wrap(inner: Arc<dyn Backend>) -> (Arc<HookBackend>, Arc<Self>) {
             let source_path = ObjectPath::Node {
                 collection: collection(),
-                token: node_token(SOURCE_TOKEN),
+                id: SOURCE,
             }
             .to_string();
             let gate = Arc::new(Self {
@@ -643,11 +639,10 @@ mod tests {
             collection: collection.clone(),
         }];
         if with_child {
-            let token = node_token(SOURCE_TOKEN);
             assert!(
                 owner
                     .nodes
-                    .store_node(&collection, &token, &Node::leaf(LeafBody::new()), None)
+                    .store_node(&collection, &SOURCE, &Node::leaf(LeafBody::new()), None)
                     .await
                     .unwrap()
             );
@@ -656,10 +651,7 @@ mod tests {
                 .load_root(&collection, Requirement::ANY)
                 .await
                 .unwrap();
-            let root = Node::index(IndexNode::from_children([(
-                Vec::new(),
-                SOURCE_TOKEN.to_owned(),
-            )]));
+            let root = Node::index(IndexNode::from_children([(Vec::new(), SOURCE)]));
             assert!(
                 owner
                     .nodes
@@ -669,7 +661,7 @@ mod tests {
             );
             paths.push(ObjectPath::Node {
                 collection: collection.clone(),
-                token,
+                id: SOURCE,
             });
         }
         change.expected = Some(collection.id());
@@ -884,21 +876,21 @@ mod tests {
         assert!(
             primary
                 .nodes
-                .store_node(&collection(), &node_token(SOURCE_TOKEN), &source, None,)
+                .store_node(&collection(), &SOURCE, &source, None,)
                 .await
                 .unwrap()
         );
         let (mut shrunk, source_observation) = primary
             .nodes
-            .load_node(&collection(), &node_token(SOURCE_TOKEN), Requirement::ANY)
+            .load_node(&collection(), &SOURCE, Requirement::ANY)
             .await
             .unwrap();
-        let (right, _) = shrunk.split(RIGHT_TOKEN).unwrap();
+        let (right, _) = shrunk.split(RIGHT).unwrap();
         shrunk.remove_structural_gate(&split_id);
         assert!(
             primary
                 .nodes
-                .store_node(&collection(), &node_token(RIGHT_TOKEN), &right, None)
+                .store_node(&collection(), &RIGHT, &right, None)
                 .await
                 .unwrap()
         );
@@ -910,21 +902,12 @@ mod tests {
             let fencing = tokio::spawn({
                 let lifecycle = primary_lifecycle.clone();
                 let drop_id = drop_id.clone();
-                async move {
-                    lifecycle
-                        .fence_node(&collection(), &node_token(SOURCE_TOKEN), &drop_id)
-                        .await
-                }
+                async move { lifecycle.fence_node(&collection(), &SOURCE, &drop_id).await }
             });
             gate.wait_until_entered().await;
             let shrink_landed = peer
                 .nodes
-                .store_node(
-                    &collection(),
-                    &node_token(SOURCE_TOKEN),
-                    &shrunk,
-                    Some(&source_observation),
-                )
+                .store_node(&collection(), &SOURCE, &shrunk, Some(&source_observation))
                 .await
                 .unwrap();
             gate.release();
@@ -937,18 +920,13 @@ mod tests {
                 let source_observation = source_observation.clone();
                 async move {
                     nodes
-                        .store_node(
-                            &collection(),
-                            &node_token(SOURCE_TOKEN),
-                            &shrunk,
-                            Some(&source_observation),
-                        )
+                        .store_node(&collection(), &SOURCE, &shrunk, Some(&source_observation))
                         .await
                 }
             });
             gate.wait_until_entered().await;
             let fence_result = peer_lifecycle
-                .fence_node(&collection(), &node_token(SOURCE_TOKEN), &drop_id)
+                .fence_node(&collection(), &SOURCE, &drop_id)
                 .await;
             gate.release();
             let shrink_landed = shrinking.await.unwrap().unwrap();
@@ -960,14 +938,11 @@ mod tests {
         let verifier = store(backend);
         let (final_source, _) = verifier
             .nodes
-            .load_node(&collection(), &node_token(SOURCE_TOKEN), Requirement::ANY)
+            .load_node(&collection(), &SOURCE, Requirement::ANY)
             .await
             .unwrap();
         assert_eq!(final_source.drop_intent(), Some(&drop_id));
-        assert_eq!(
-            final_source.right_sibling(),
-            shrink_landed.then_some(RIGHT_TOKEN)
-        );
+        assert_eq!(final_source.right_sibling(), shrink_landed.then_some(RIGHT));
     }
 
     #[tokio::test]
@@ -1017,7 +992,7 @@ mod tests {
                 .nodes
                 .store_node(
                     &collection,
-                    &NodeToken::from_bytes(bytes),
+                    &NodeId::from_bytes(bytes),
                     &Node::leaf(LeafBody::new()),
                     None,
                 )

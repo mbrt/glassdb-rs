@@ -1,6 +1,6 @@
 //! Typed persistence for B-link tree nodes.
 //!
-//! Tree roots (`_r`) and standalone nodes (`_n/<token>`) are the coordination
+//! Tree roots (`_r`) and standalone nodes (`_n/<node-id>`) are the coordination
 //! units. Mutations use create-if-absent, revision-conditional replace,
 //! or exact-revision deletion (ADR-023/ADR-031/ADR-042), all through the decoded
 //! [`CachedStore`].
@@ -9,7 +9,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use glassdb_backend as backend;
-use glassdb_data::{CollectionAddress, NodeToken, ObjectPath};
+use glassdb_data::{CollectionAddress, NodeId, ObjectPath};
 
 use crate::cached_store::{
     CachedStore, CasResult, Codec, Observation, ObservationCheck, Requirement,
@@ -29,7 +29,7 @@ pub struct NodeStore {
 
 /// One bounded page of standalone node observations.
 pub struct NodePage {
-    pub nodes: Vec<(NodeToken, Observation<Node>)>,
+    pub nodes: Vec<(NodeId, Observation<Node>)>,
     pub next: Option<backend::ListCursor>,
 }
 
@@ -220,7 +220,7 @@ impl NodeStore {
         .await
     }
 
-    /// Loads an exact `_r` or `_n/<token>` node observation, including absence.
+    /// Loads an exact `_r` or `_n/<node-id>` node observation, including absence.
     pub async fn load_node_at_state(
         &self,
         path: &ObjectPath,
@@ -230,7 +230,7 @@ impl NodeStore {
         self.nodes.read(path, requirement).await
     }
 
-    /// Loads an existing node at an exact `_r` or `_n/<token>` path.
+    /// Loads an existing node at an exact `_r` or `_n/<node-id>` path.
     pub async fn load_node_at(
         &self,
         path: &ObjectPath,
@@ -248,7 +248,7 @@ impl NodeStore {
     pub async fn load_node_state(
         &self,
         collection: &CollectionAddress,
-        token: &NodeToken,
+        id: &NodeId,
         requirement: Requirement,
     ) -> Result<LeafObservation, StorageError> {
         let observed = self
@@ -256,7 +256,7 @@ impl NodeStore {
             .read(
                 ObjectPath::Node {
                     collection: collection.clone(),
-                    token: token.clone(),
+                    id: *id,
                 },
                 requirement,
             )
@@ -267,17 +267,17 @@ impl NodeStore {
         Ok(observed)
     }
 
-    /// Loads the non-root node named `token` (`{prefix}/_n/<token>`, ADR-031). A
+    /// Loads the non-root node named `id` (`{prefix}/_n/<node-id>`, ADR-031). A
     /// [`StorageError::NotFound`] means the node is missing — a dangling child or
     /// right-sibling reference, which a descent surfaces rather than silently
     /// skips.
     pub async fn load_node(
         &self,
         collection: &CollectionAddress,
-        token: &NodeToken,
+        id: &NodeId,
         requirement: Requirement,
     ) -> Result<(Node, LeafObservation), StorageError> {
-        let observation = self.load_node_state(collection, token, requirement).await?;
+        let observation = self.load_node_state(collection, id, requirement).await?;
         let node = observation
             .value()
             .expect("load_node_state rejects absence")
@@ -286,19 +286,19 @@ impl NodeStore {
         Ok((node, observation))
     }
 
-    /// Compare-and-swaps the non-root node named `token`. `expected = None` means
+    /// Compare-and-swaps the non-root node named `id`. `expected = None` means
     /// create-if-absent (a freshly split-out sibling). Returns `false` on a
     /// precondition miss, `true` on success.
     pub async fn store_node(
         &self,
         collection: &CollectionAddress,
-        token: &NodeToken,
+        id: &NodeId,
         node: &Node,
         expected: Option<&LeafObservation>,
     ) -> Result<bool, StorageError> {
         let path = ObjectPath::Node {
             collection: collection.clone(),
-            token: token.clone(),
+            id: *id,
         };
         let res = match expected {
             Some(observed) if observed.path() == &path => {
@@ -314,7 +314,7 @@ impl NodeStore {
         }
     }
 
-    /// Compare-and-swaps an exact `_r` or `_n/<token>` node path, reporting the
+    /// Compare-and-swaps an exact `_r` or `_n/<node-id>` node path, reporting the
     /// observation of the state it installed, or `None` on a lost CAS.
     ///
     /// Callers that go on to mutate the node need that observation rather than a
@@ -351,7 +351,7 @@ impl NodeStore {
         &self,
         collection: &CollectionAddress,
         requirement: Requirement,
-    ) -> Result<Vec<(NodeToken, Observation<Node>)>, StorageError> {
+    ) -> Result<Vec<(NodeId, Observation<Node>)>, StorageError> {
         let mut cursor = None;
         let mut nodes = Vec::new();
         loop {
@@ -385,7 +385,7 @@ impl NodeStore {
         for path in page.objects {
             let ObjectPath::Node {
                 collection: listed_collection,
-                token,
+                id,
             } = path.object_path()
             else {
                 return Err(StorageError::other("node listing returned a non-node path"));
@@ -395,10 +395,10 @@ impl NodeStore {
                     "node listing returned a different collection",
                 ));
             }
-            let token = token.clone();
+            let id = *id;
             let observed = self.nodes.read(path, requirement).await?;
             if observed.exists() {
-                nodes.push((token, observed));
+                nodes.push((id, observed));
             }
         }
         Ok(NodePage {
@@ -407,7 +407,7 @@ impl NodeStore {
         })
     }
 
-    /// Loads the leaf node at `_r` or `_n/<token>`.
+    /// Loads the leaf node at `_r` or `_n/<node-id>`.
     pub async fn load_leaf(
         &self,
         path: &ObjectPath,
@@ -562,24 +562,24 @@ mod tests {
         CollectionAddress::root("coll")
     }
 
-    fn token(byte: u8) -> NodeToken {
-        NodeToken::from_bytes([byte; 16])
+    fn node_id(byte: u8) -> NodeId {
+        NodeId::from_bytes([byte; 16])
     }
 
     fn node_path(byte: u8) -> ObjectPath {
         ObjectPath::Node {
             collection: collection(),
-            token: token(byte),
+            id: node_id(byte),
         }
     }
 
     // Use a separate store so the reader begins cold. Creating directly avoids
     // a seeding read, keeping the operation log limited to reader traffic.
-    async fn seed_empty_leaf(backend: &Arc<dyn Backend>, token: &NodeToken) {
+    async fn seed_empty_leaf(backend: &Arc<dyn Backend>, id: &NodeId) {
         let store = store_over(backend.clone());
         assert!(
             store
-                .store_node(&collection(), token, &Node::leaf(LeafBody::new()), None)
+                .store_node(&collection(), id, &Node::leaf(LeafBody::new()), None)
                 .await
                 .unwrap()
         );
@@ -591,7 +591,7 @@ mod tests {
         let log = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
         let path = node_path(1);
-        seed_empty_leaf(&backend, &token(1)).await;
+        seed_empty_leaf(&backend, &node_id(1)).await;
 
         let reader = store_over(backend);
         let first = reader
@@ -630,7 +630,7 @@ mod tests {
         let log = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
         let path = node_path(1);
-        seed_empty_leaf(&backend, &token(1)).await;
+        seed_empty_leaf(&backend, &node_id(1)).await;
 
         let reader = store_over(backend);
         reader
@@ -662,7 +662,7 @@ mod tests {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let log = recorder.log();
         let backend: Arc<dyn Backend> = Arc::new(recorder);
-        seed_empty_leaf(&backend, &token(7)).await;
+        seed_empty_leaf(&backend, &node_id(7)).await;
 
         let timeline = Timeline::new();
         // Separate caches model retained observations before and after
@@ -676,11 +676,11 @@ mod tests {
             NonZeroUsize::MIN,
         );
         let first = first_store
-            .load_node_state(&collection(), &token(7), Requirement::ANY)
+            .load_node_state(&collection(), &node_id(7), Requirement::ANY)
             .await
             .unwrap();
         let second = second_store
-            .load_node_state(&collection(), &token(7), Requirement::ANY)
+            .load_node_state(&collection(), &node_id(7), Requirement::ANY)
             .await
             .unwrap();
         assert_eq!(count(&log, "read"), 2);
@@ -705,10 +705,10 @@ mod tests {
     #[tokio::test]
     async fn batch_currentness_does_not_advance_a_changed_revision() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        seed_empty_leaf(&backend, &token(7)).await;
+        seed_empty_leaf(&backend, &node_id(7)).await;
         let reader = store_over(backend.clone());
         let old = reader
-            .load_node_state(&collection(), &token(7), Requirement::ANY)
+            .load_node_state(&collection(), &node_id(7), Requirement::ANY)
             .await
             .unwrap();
 
@@ -723,7 +723,7 @@ mod tests {
 
         let requirement = Requirement::after(reader.timeline.currentness_barrier());
         let current = reader
-            .load_node_state(&collection(), &token(7), requirement)
+            .load_node_state(&collection(), &node_id(7), requirement)
             .await
             .unwrap();
         assert!(!old.satisfies(requirement));
@@ -796,7 +796,12 @@ mod tests {
         let path = node_path(1);
         assert!(
             store
-                .store_node(&collection(), &token(1), &Node::leaf(LeafBody::new()), None,)
+                .store_node(
+                    &collection(),
+                    &node_id(1),
+                    &Node::leaf(LeafBody::new()),
+                    None,
+                )
                 .await
                 .unwrap()
         );
@@ -837,10 +842,10 @@ mod tests {
         let path = node_path(1);
         let original = Node::leaf(LeafBody::new())
             .with_high_key(Some(b"m".to_vec()))
-            .with_right_sibling(Some("right".to_string()));
+            .with_right_sibling(Some(node_id(9)));
         assert!(
             store
-                .store_node(&collection(), &token(1), &original, None)
+                .store_node(&collection(), &node_id(1), &original, None)
                 .await
                 .unwrap()
         );
@@ -861,7 +866,7 @@ mod tests {
         assert_eq!(committed.entries(), &entries);
         assert_eq!(committed.locks(), &locks);
         assert_eq!(committed.node().high_key(), Some(b"m".as_slice()));
-        assert_eq!(committed.node().right_sibling(), Some("right"));
+        assert_eq!(committed.node().right_sibling(), Some(node_id(9)));
         assert_eq!(committed.node().membership_lock().holders(), &[holder]);
     }
 
@@ -870,10 +875,10 @@ mod tests {
         let store = store_over(Arc::new(MemoryBackend::new()));
         let left_path = node_path(1);
         let right_path = node_path(2);
-        for token in [token(1), token(2)] {
+        for id in [node_id(1), node_id(2)] {
             assert!(
                 store
-                    .store_node(&collection(), &token, &Node::leaf(LeafBody::new()), None)
+                    .store_node(&collection(), &id, &Node::leaf(LeafBody::new()), None)
                     .await
                     .unwrap()
             );
@@ -905,7 +910,12 @@ mod tests {
         let path = node_path(1);
         assert!(
             store
-                .store_node(&collection(), &token(1), &Node::leaf(LeafBody::new()), None,)
+                .store_node(
+                    &collection(),
+                    &node_id(1),
+                    &Node::leaf(LeafBody::new()),
+                    None,
+                )
                 .await
                 .unwrap()
         );
@@ -941,12 +951,12 @@ mod tests {
         let log = recorder.log();
         let store = store_over(Arc::new(recorder));
         let expected: Vec<_> = (0..=NODE_LIST_PAGE_SIZE)
-            .map(|index| token(index as u8))
+            .map(|index| node_id(index as u8))
             .collect();
-        for token in &expected {
+        for id in &expected {
             assert!(
                 store
-                    .store_node(&collection(), token, &Node::leaf(LeafBody::new()), None)
+                    .store_node(&collection(), id, &Node::leaf(LeafBody::new()), None)
                     .await
                     .unwrap()
             );
@@ -959,8 +969,8 @@ mod tests {
 
         assert_eq!(count(&log, "list"), 2);
         assert_eq!(listed.len(), expected.len());
-        for token in expected {
-            assert!(listed.iter().any(|(listed, _)| listed == &token));
+        for id in expected {
+            assert!(listed.iter().any(|(listed, _)| listed == &id));
         }
     }
 }

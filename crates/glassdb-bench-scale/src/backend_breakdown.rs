@@ -300,7 +300,7 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use glassdb_backend::memory::MemoryBackend;
-    use glassdb_data::{CollectionAddress, DbPrefix, NodeToken, StructuralIntentId, TxId};
+    use glassdb_data::{CollectionAddress, DbPrefix, NodeId, StructuralIntentId, TxId};
 
     use super::*;
 
@@ -331,7 +331,7 @@ mod tests {
             (
                 ObjectPath::Node {
                     collection: collection.clone(),
-                    token: NodeToken::from_bytes([1; 16]),
+                    id: NodeId::from_bytes([1; 16]),
                 },
                 ObjectRole::Node,
             ),
@@ -346,7 +346,7 @@ mod tests {
                 ObjectPath::StructuralIntent {
                     db_prefix,
                     participant,
-                    intent_id: StructuralIntentId::from(NodeToken::from_bytes([2; 16])),
+                    intent_id: StructuralIntentId::from_bytes([2; 16]),
                 },
                 ObjectRole::StructuralIntent,
             ),

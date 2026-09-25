@@ -510,7 +510,7 @@ mod tests {
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::{CollectionId, DbPrefix, NodeToken, ObjectPath};
+    use glassdb_data::{CollectionId, DbPrefix, NodeId, ObjectPath};
     use glassdb_storage::transaction::{TxCommitStatus, TxRecordStore};
     use glassdb_storage::{
         CachedStore, CurrentState, IndexNode, LeafBody, LeafEntry, Node, NodeStore, Timeline,
@@ -1012,8 +1012,8 @@ mod tests {
                 value: Arc::from(b"v".as_slice()),
             })
         };
-        let source = NodeToken::from_bytes([1; 16]);
-        let target = NodeToken::from_bytes([2; 16]);
+        let source = NodeId::from_bytes([1; 16]);
+        let target = NodeId::from_bytes([2; 16]);
         let nodes = NodeStore::new(
             CachedStore::new(backend.clone(), 1 << 20, Timeline::new(), None),
             std::num::NonZeroUsize::MIN,
@@ -1023,16 +1023,16 @@ mod tests {
                 &source,
                 Node::leaf(LeafBody::from_entries([inline(b"grape")]))
                     .with_high_key(Some(b"m".to_vec()))
-                    .with_right_sibling(Some(target.to_string())),
+                    .with_right_sibling(Some(target)),
             ),
             (
                 &target,
                 Node::leaf(LeafBody::from_entries([inline(b"grape"), inline(b"pear")])),
             ),
         ];
-        for (token, node) in merging {
+        for (node_id, node) in merging {
             nodes
-                .store_node(&collection(), token, &node, None)
+                .store_node(&collection(), node_id, &node, None)
                 .await
                 .unwrap();
         }
@@ -1040,8 +1040,8 @@ mod tests {
             .create_root(
                 &collection(),
                 &Node::index(IndexNode::from_children([
-                    (Vec::new(), source.to_string()),
-                    (b"m".to_vec(), target.to_string()),
+                    (Vec::new(), source),
+                    (b"m".to_vec(), target),
                 ])),
             )
             .await

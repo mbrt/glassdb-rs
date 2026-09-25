@@ -68,8 +68,8 @@ message MembershipLock {
     oneof target {
         // The fixed tree root object (`_r`). Always encoded as true.
         bool root = 1;
-        // The opaque token of a standalone node object (`_n/<token>`).
-        string node = 2;
+        // The node ID of a standalone node object (`_n/<node-id>`).
+        bytes node = 2;
     }
     Lock.LockType lock_type = 3;
 }
@@ -136,9 +136,9 @@ message Node {
     // Exclusive upper bound of the key range this node covers. Empty means
     // +infinity: the rightmost node at its level.
     bytes high_key = 1;
-    // Identity token of the right-sibling node at the same level. Empty means
-    // none: the rightmost node at its level.
-    string right_sibling = 2;
+    // Node ID of the right-sibling node at the same level. Empty means none:
+    // the rightmost node at its level.
+    bytes right_sibling = 2;
     oneof body {
         // A leaf node: the per-key coordination entries for its range.
         LeafBody leaf = 3;
@@ -156,7 +156,7 @@ message Node {
     bool drained = 9;
     // The structural intent ID of a merge into this node that can still land
     // or be abandoned (ADR-073). Empty means none.
-    string merge_reservation = 10;
+    bytes merge_reservation = 10;
     // Inclusive lower bound of the key range this node covers. Empty means the
     // first node at its level. A copy with a low key above a routed key is
     // older than a merge (ADR-073).
@@ -172,10 +172,13 @@ message StructuralIntent {
         READY = 1;
     }
 
-    string prefix = 1;
-    string source_token = 2;
+    // Stable collection ID. The database prefix comes from the intent's
+    // physical path and is deliberately omitted.
+    bytes collection_id = 1;
+    // Node ID of the source. Empty when the source is the tree root.
+    bytes source_node_id = 2;
     string source_revision = 3;
-    repeated string created_tokens = 4;
+    repeated bytes created_node_ids = 4;
     bytes split_key = 5;
     bool is_root = 6;
     // The topology participant that owns this intent.
@@ -187,8 +190,9 @@ message StructuralIntent {
 }
 
 message MergeIntent {
-    // The node that receives the source's entries. Empty until Ready.
-    string target_token = 1;
+    // Node ID of the node that receives the source's entries. Empty until
+    // Ready.
+    bytes target_node_id = 1;
     // The source's high key at Ready: the low bound of the target before the
     // merge.
     bytes boundary = 2;
@@ -207,8 +211,8 @@ message IndexEntry {
     // Inclusive lower bound of the child's key range; sorted so the encoding is
     // canonical.
     bytes separator_key = 1;
-    // Identity token of the child node.
-    string child = 2;
+    // Node ID of the child node.
+    bytes child = 2;
 }
 
 // Database-level metadata, written once at `{name}/glassdb` when a database is

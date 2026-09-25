@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use glassdb_concurr::rt;
-use glassdb_data::{CollectionAddress, NodeToken, ObjectPath, TxId};
+use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 use glassdb_storage::{LeafObservation, Node, Requirement};
 use tokio::sync::Notify;
 
@@ -54,7 +54,7 @@ pub(super) enum PlannedChange<'a> {
     },
     Merge {
         collection: &'a CollectionAddress,
-        source: &'a NodeToken,
+        source: &'a NodeId,
     },
 }
 
@@ -91,7 +91,7 @@ pub(super) enum Applied {
 /// created in the right-link chain (ADR-073).
 pub(super) struct ParentRoute {
     pub(super) key: Vec<u8>,
-    pub(super) target: NodeToken,
+    pub(super) target: NodeId,
 }
 
 /// Preserves the operation result independently from structural cleanup state.
@@ -187,7 +187,7 @@ impl ChangeLifecycle {
         &self,
         collection: &CollectionAddress,
         key: &[u8],
-        target: &NodeToken,
+        target: &NodeId,
         topology_participant: Option<&TxId>,
     ) -> Result<(), TransError> {
         let topology = match topology_participant {
@@ -232,7 +232,7 @@ impl<'a> PlannedChange<'a> {
     pub(super) fn split(path: &'a ObjectPath, reason: &'a SplitReason) -> Result<Self, TransError> {
         let (collection, target) = match path {
             ObjectPath::TreeRoot { collection } => (collection, SplitTarget::Root),
-            ObjectPath::Node { collection, token } => (collection, SplitTarget::NonRoot(token)),
+            ObjectPath::Node { collection, id } => (collection, SplitTarget::NonRoot(id)),
             _ => return Err(TransError::other("split candidate is not a tree node")),
         };
         Ok(Self::Split {
@@ -248,9 +248,9 @@ impl<'a> PlannedChange<'a> {
         }
     }
 
-    fn source_token(self) -> Option<&'a NodeToken> {
+    fn source_node_id(self) -> Option<&'a NodeId> {
         match self {
-            Self::Split { target, .. } => target.source_token(),
+            Self::Split { target, .. } => target.source_node_id(),
             Self::Merge { source, .. } => Some(source),
         }
     }
@@ -330,7 +330,7 @@ impl StructuralChangeAttempt<'_> {
             .recovery
             .prepare_intent(
                 self.change.collection(),
-                self.change.source_token(),
+                self.change.source_node_id(),
                 self.change.kind(),
                 participant,
             )
@@ -356,7 +356,7 @@ impl StructuralChangeAttempt<'_> {
     async fn coordinate(&self, prepared: PreparedIntent) -> ChangeAttemptOutcome {
         let lifecycle = self.lifecycle;
         let collection = self.change.collection();
-        debug_assert!(prepared.targets(collection, self.change.source_token()));
+        debug_assert!(prepared.targets(collection, self.change.source_node_id()));
         let acquisition = match self.change {
             PlannedChange::Split { .. } => GateAcquisition::WoundWait,
             // A merge is optional maintenance and must not abort user
@@ -367,7 +367,7 @@ impl StructuralChangeAttempt<'_> {
             .structural_nodes
             .acquire_structural_gate(
                 collection,
-                self.change.source_token(),
+                self.change.source_node_id(),
                 self.worker,
                 acquisition,
             )
@@ -533,7 +533,7 @@ impl StructuralChangeAttempt<'_> {
             .structural_nodes
             .release_structural_gate(
                 self.change.collection(),
-                self.change.source_token(),
+                self.change.source_node_id(),
                 self.worker,
             )
             .await

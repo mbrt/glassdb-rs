@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use glassdb_data::{CollectionAddress, NodeToken, StructuralIntentId, TxId};
+use glassdb_data::{CollectionAddress, NodeId, StructuralIntentId, TxId};
 use glassdb_storage::{
     InlinePolicy, LeafBody, LeafObservation, MergeTarget, Node, NodeBody, NodeSizePolicy,
     NodeStore, Requirement, StorageError, Timeline, TreeRouter,
@@ -20,7 +20,7 @@ use crate::monitor::Monitor;
 
 use super::NODE_CAS_ATTEMPTS;
 use super::change::{Applied, ParentRoute, Prepared};
-use super::nodes::{StructuralNodeAccess, node_token};
+use super::nodes::StructuralNodeAccess;
 use super::reclamation::{ReclamationReporter, reclaim_holder_free_tombstones};
 use super::recovery::ReadyChange;
 use super::stats::Stats;
@@ -55,7 +55,7 @@ pub(super) struct MergePlan {
 
 /// A merge target and the state that the merge decision used.
 struct TargetState {
-    token: NodeToken,
+    id: NodeId,
     node: Node,
     observation: LeafObservation,
 }
@@ -92,7 +92,7 @@ impl Merger {
     pub(super) async fn is_actionable(
         &self,
         collection: &CollectionAddress,
-        source: &NodeToken,
+        source: &NodeId,
     ) -> Result<bool, TransError> {
         let left = match self
             .nodes
@@ -156,7 +156,7 @@ impl Merger {
             Err(error) => return Prepared::Cancel(Err(error)),
         };
         let merge = MergeTarget {
-            token: target.token.clone(),
+            node_id: target.id,
             boundary: left
                 .high_key()
                 .expect("a merge source has a right sibling")
@@ -180,7 +180,7 @@ impl Merger {
     pub(super) async fn apply(
         &self,
         collection: &CollectionAddress,
-        source: &NodeToken,
+        source: &NodeId,
         observation: &LeafObservation,
         intent: &StructuralIntentId,
         plan: MergePlan,
@@ -199,7 +199,7 @@ impl Merger {
             None => return Ok(Applied::Stopped),
         }
         let mut drained = left;
-        drained.drain(merge.token.as_str());
+        drained.drain(merge.node_id);
         if !self
             .nodes
             .store_node(collection, source, &drained, Some(observation))
@@ -213,11 +213,11 @@ impl Merger {
         self.reclamation.record(&reclaimed, false);
         self.stats.merges.fetch_add(1, Ordering::Relaxed);
         self.structural_nodes
-            .remove_merge_reservation(collection, &merge.token, intent, Requirement::ANY)
+            .remove_merge_reservation(collection, &merge.node_id, intent, Requirement::ANY)
             .await?;
         Ok(Applied::Landed(Some(ParentRoute {
             key: merge.boundary,
-            target: merge.token,
+            target: merge.node_id,
         })))
     }
 
@@ -254,23 +254,20 @@ impl Merger {
         left: &Node,
         requirement: Requirement,
     ) -> Result<Option<TargetState>, TransError> {
-        let mut next = left.right_sibling().map(node_token).transpose()?;
+        let mut next = left.right_sibling();
         for _ in 0..MAX_TARGET_SEARCH_HOPS {
-            let Some(token) = next else {
+            let Some(id) = next else {
                 return Ok(None);
             };
-            let (node, observation) = self
-                .nodes
-                .load_node(collection, &token, requirement)
-                .await?;
+            let (node, observation) = self.nodes.load_node(collection, &id, requirement).await?;
             if !node.is_drained() {
                 return Ok(Some(TargetState {
-                    token,
+                    id,
                     node,
                     observation,
                 }));
             }
-            next = node.right_sibling().map(node_token).transpose()?;
+            next = node.right_sibling();
         }
         Err(TransError::other(
             "merge target search exceeded the right-link hop bound",
@@ -346,7 +343,7 @@ impl Merger {
             if attempt > 0 {
                 current = self
                     .nodes
-                    .load_node(collection, &merge.token, Requirement::ANY)
+                    .load_node(collection, &merge.node_id, Requirement::ANY)
                     .await?;
             }
             let (mut right, observation) = current.clone();
@@ -369,7 +366,7 @@ impl Merger {
             // tombstones that have no holder when it lands. R's gate is not
             // necessary for that (ADR-073).
             let reclaimed = reclaim_holder_free_tombstones(&mut right);
-            right.absorb(left, intent.clone())?;
+            right.absorb(left, *intent)?;
             if right.content_encoded_len() > self.policy.content_limit()
                 || right.encoded_len() > self.policy.node_max_bytes()
             {

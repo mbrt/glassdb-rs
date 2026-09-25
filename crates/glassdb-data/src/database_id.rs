@@ -2,29 +2,28 @@
 
 use glassdb_concurr::entropy::fill_bytes;
 
-/// Number of bytes in a database ID.
-pub const DATABASE_ID_BYTES: usize = 16;
+use crate::ID_BYTES;
 
 /// The persistent ID written into database metadata when the database is
 /// first created.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct DatabaseId([u8; DATABASE_ID_BYTES]);
+pub struct DatabaseId([u8; ID_BYTES]);
 
 impl DatabaseId {
     /// Generates a random 128-bit database ID.
     pub fn new_random() -> Self {
-        let mut bytes = [0; DATABASE_ID_BYTES];
+        let mut bytes = [0; ID_BYTES];
         fill_bytes(&mut bytes);
         Self(bytes)
     }
 
     /// Builds a database ID from its exact 16-byte representation.
-    pub fn from_bytes(bytes: [u8; DATABASE_ID_BYTES]) -> Self {
+    pub fn from_bytes(bytes: [u8; ID_BYTES]) -> Self {
         Self(bytes)
     }
 
     /// Returns the ID's 16-byte representation.
-    pub fn as_bytes(&self) -> &[u8; DATABASE_ID_BYTES] {
+    pub fn as_bytes(&self) -> &[u8; ID_BYTES] {
         &self.0
     }
 }

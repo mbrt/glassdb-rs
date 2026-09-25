@@ -211,7 +211,7 @@ async fn nonroot_split_partitions_the_compacted_leaf() {
     s.store_node(COLL, "L", &source, None).await.unwrap();
     s.create_root(
         COLL,
-        &Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())])),
+        &Node::index(IndexNode::from_children([(Vec::new(), test_node_id("L"))])),
     )
     .await
     .unwrap();
@@ -411,7 +411,7 @@ async fn nonroot_leaf_half_splits_and_parent_learns_the_separator() {
     )
     .await
     .unwrap();
-    let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
+    let root = Node::index(IndexNode::from_children([(Vec::new(), test_node_id("L"))]));
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
 
@@ -487,8 +487,8 @@ async fn parent_reconciliation_cascades_after_the_parent_insert() {
     s.create_root(
         COLL,
         &Node::index(IndexNode::from_children([
-            (Vec::new(), "L0".to_string()),
-            (b"m".to_vec(), "L1".to_string()),
+            (Vec::new(), test_node_id("L0")),
+            (b"m".to_vec(), test_node_id("L1")),
         ])),
     )
     .await
@@ -508,18 +508,19 @@ async fn parent_reconciliation_cascades_after_the_parent_insert() {
         .await
         .unwrap()
         .unwrap();
-    let child_tokens: Vec<_> = root
+    let child_ids: Vec<_> = root
         .as_index()
         .unwrap()
         .children()
-        .map(|(_, token)| token.to_string())
+        .map(|(_, id)| id)
         .collect();
-    assert_eq!(child_tokens.len(), 2, "the root grew by one level");
-    for token in child_tokens {
+    assert_eq!(child_ids.len(), 2, "the root grew by one level");
+    for id in child_ids {
         let (child, _) = s
+            .nodes
             .load_node(
-                COLL,
-                &token,
+                &collection_at(COLL),
+                &id,
                 Requirement::after(s.timeline.currentness_barrier()),
             )
             .await
@@ -580,9 +581,9 @@ async fn root_index_splits_in_place_growing_height() {
             .unwrap();
     }
     let root = Node::index(IndexNode::from_children([
-        (Vec::new(), "L0".to_string()),
-        (b"m".to_vec(), "L1".to_string()),
-        (b"t".to_vec(), "L2".to_string()),
+        (Vec::new(), test_node_id("L0")),
+        (b"m".to_vec(), test_node_id("L1")),
+        (b"t".to_vec(), test_node_id("L2")),
     ]));
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
@@ -672,9 +673,10 @@ async fn nonroot_index_split_reconciles_the_index_above_it() {
         [b"".as_slice(), b"m"]
     );
     let (sibling, _) = s
+        .nodes
         .load_node(
-            COLL,
-            root.child_for(b"m").unwrap(),
+            &collection_at(COLL),
+            &root.child_for(b"m").unwrap(),
             Requirement::after(s.timeline.currentness_barrier()),
         )
         .await
@@ -696,15 +698,15 @@ async fn separator_capacity_splits_parent_during_reconciliation_and_recovery() {
             (b"g", "L6"),
             (b"h", "L7"),
         ];
-        for (i, (key, token)) in children.iter().enumerate() {
+        for (i, (key, name)) in children.iter().enumerate() {
             let next = children.get(i + 1);
             s.store_node(
                 COLL,
-                token,
+                name,
                 &leaf_node(
                     &[key],
                     next.map(|(key, _)| *key),
-                    next.map(|(_, token)| *token),
+                    next.map(|(_, name)| *name),
                 ),
                 None,
             )
@@ -712,15 +714,15 @@ async fn separator_capacity_splits_parent_during_reconciliation_and_recovery() {
             .unwrap();
         }
         let mut index =
-            IndexNode::from_children(children[..7].iter().enumerate().map(|(i, (key, token))| {
+            IndexNode::from_children(children[..7].iter().enumerate().map(|(i, (key, name))| {
                 (
                     if i == 0 { Vec::new() } else { key.to_vec() },
-                    test_token(token).to_string(),
+                    test_node_id(name),
                 )
             }));
         let root = Node::index(index.clone());
         s.create_root(COLL, &root).await.unwrap();
-        index.insert_child(b"h".to_vec(), test_token("L7").to_string());
+        index.insert_child(b"h".to_vec(), test_node_id("L7"));
         let required_bytes = Node::index(index).content_encoded_len();
         let policy = NodeSizePolicy::builder()
             .node_max_bytes(required_bytes + 128 - 1)
@@ -752,10 +754,10 @@ async fn separator_capacity_splits_parent_during_reconciliation_and_recovery() {
                 "L7",
                 &StructuralIntent {
                     collection: collection(),
-                    source_token: Some(test_token("L6")),
+                    source_node_id: Some(test_node_id("L6")),
                     source_revision: superseded_source_revision(),
                     change: StructuralChange::Split {
-                        created_tokens: vec![test_token("L7")],
+                        created_node_ids: vec![test_node_id("L7")],
                         split_key: b"h".to_vec(),
                     },
                     participant_id: participant.clone(),
@@ -777,7 +779,7 @@ async fn separator_capacity_splits_parent_during_reconciliation_and_recovery() {
             );
         } else {
             sp.changes
-                .reconcile_parent(&collection(), b"h", &test_token("L7"), None)
+                .reconcile_parent(&collection(), b"h", &test_node_id("L7"), None)
                 .await
                 .unwrap();
         }
@@ -788,11 +790,12 @@ async fn separator_capacity_splits_parent_during_reconciliation_and_recovery() {
             .unwrap();
         let root_index = root.as_index().unwrap();
         assert_eq!(root_index.len(), 2);
-        for (_, token) in root_index.children() {
+        for (_, id) in root_index.children() {
             let (child, _) = s
+                .nodes
                 .load_node(
-                    COLL,
-                    token,
+                    &collection_at(COLL),
+                    &id,
                     Requirement::after(s.timeline.currentness_barrier()),
                 )
                 .await
@@ -1237,7 +1240,7 @@ async fn split_wounds_a_younger_entry_holder_and_lands() {
     )
     .await
     .unwrap();
-    let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
+    let root = Node::index(IndexNode::from_children([(Vec::new(), test_node_id("L"))]));
     s.create_root(COLL, &root).await.unwrap();
 
     split_path(&sp, &node_path("L"), &SplitReason::SoftCap)
@@ -1323,7 +1326,7 @@ async fn split_help_forwards_a_committed_entry_holder_before_moving_its_entry() 
         .collect();
     let node = Node::leaf(LeafBody::from_entries(entries));
     s.store_node(COLL, "L", &node, None).await.unwrap();
-    let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
+    let root = Node::index(IndexNode::from_children([(Vec::new(), test_node_id("L"))]));
     s.create_root(COLL, &root).await.unwrap();
 
     let accesses = crate::access::AccessSet::new(
@@ -1443,7 +1446,7 @@ async fn split_defers_to_an_older_membership_reader_then_lands() {
     )
     .await
     .unwrap();
-    let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
+    let root = Node::index(IndexNode::from_children([(Vec::new(), test_node_id("L"))]));
     s.create_root(COLL, &root).await.unwrap();
 
     sp.candidates.observe_leaf(
@@ -1547,8 +1550,8 @@ async fn splitting_an_unpublished_sibling_reconciles_the_chain() {
         .await
         .unwrap();
     let root = Node::index(IndexNode::from_children([
-        (Vec::new(), "P0".to_string()),
-        (b"g".to_vec(), "M".to_string()),
+        (Vec::new(), test_node_id("P0")),
+        (b"g".to_vec(), test_node_id("M")),
     ]));
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
@@ -1619,7 +1622,7 @@ async fn lost_parent_cas_is_reconciled_by_a_later_sweep() {
     s.store_node(COLL, "L", &leaf_node(&[b"a", b"b", b"c"], None, None), None)
         .await
         .unwrap();
-    let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
+    let root = Node::index(IndexNode::from_children([(Vec::new(), test_node_id("L"))]));
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
     let sp = restructurer(&s, &bg, tiny());

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glassdb_data::{
-    CollectionAddress, CollectionId, LeafRef, LogicalKey, MAX_COLLECTION_NAME_BYTES, NodeToken,
-    ObjectPath, TxId,
+    CollectionAddress, CollectionId, ID_BYTES, LeafRef, LogicalKey, MAX_COLLECTION_NAME_BYTES,
+    NodeId, ObjectPath, TxId,
 };
 use glassdb_proto as pb;
 use prost::Message;
@@ -142,9 +142,7 @@ impl Codec for TxRecordCodec {
                 .iter()
                 .map(|lock| match lock {
                     TxLock::Key { key, .. } => key.key().len(),
-                    TxLock::Membership { leaf, .. } => {
-                        leaf.node_token().map_or(0, |token| token.as_str().len())
-                    }
+                    TxLock::Membership { leaf, .. } => leaf.node_id().map_or(0, |_| ID_BYTES),
                     TxLock::Directory { .. } | TxLock::TopologyParticipant { .. } => 0,
                 })
                 .sum::<usize>()
@@ -256,11 +254,13 @@ fn decode_membership_locks(
         .map(|lock| {
             let leaf = match lock.target.as_ref() {
                 Some(pb::membership_lock::Target::Root(true)) => LeafRef::root(collection.clone()),
-                Some(pb::membership_lock::Target::Node(token)) if !token.is_empty() => {
-                    let token = NodeToken::try_from(token.as_str()).map_err(|error| {
-                        StorageError::with_source("parsing membership-lock node token", error)
+                Some(pb::membership_lock::Target::Node(id)) => {
+                    let id = NodeId::from_slice(id).ok_or_else(|| {
+                        StorageError::other(
+                            "transaction record has an invalid membership-lock node ID",
+                        )
                     })?;
-                    LeafRef::node(collection.clone(), token)
+                    LeafRef::node(collection.clone(), id)
                 }
                 _ => {
                     return Err(StorageError::other(
@@ -394,8 +394,8 @@ fn append_lock(
             lock_type: lock_type_to_proto(*typ) as i32,
         }),
         TxLock::Membership { leaf, typ } => {
-            let target = match leaf.node_token() {
-                Some(token) => pb::membership_lock::Target::Node(token.to_string()),
+            let target = match leaf.node_id() {
+                Some(id) => pb::membership_lock::Target::Node(id.as_bytes().to_vec()),
                 None => pb::membership_lock::Target::Root(true),
             };
             locks.membership_locks.push(pb::MembershipLock {
@@ -535,7 +535,7 @@ mod tests {
                     typ: LockType::Read,
                 },
                 TxLock::Membership {
-                    leaf: LeafRef::node(parent.clone(), NodeToken::from_bytes([7; 16])),
+                    leaf: LeafRef::node(parent.clone(), NodeId::from_bytes([7; 16])),
                     typ: LockType::Create,
                 },
                 TxLock::Directory {
@@ -749,7 +749,11 @@ mod tests {
         for target in [
             None,
             Some(pb::membership_lock::Target::Root(false)),
-            Some(pb::membership_lock::Target::Node(String::new())),
+            Some(pb::membership_lock::Target::Node(Vec::new())),
+            Some(pb::membership_lock::Target::Node(vec![7; 15])),
+            Some(pb::membership_lock::Target::Node(
+                b"0000000000000000000000".to_vec(),
+            )),
         ] {
             let mut encoded = encoded_record();
             encoded.writes.push(pb::CollectionWrites {

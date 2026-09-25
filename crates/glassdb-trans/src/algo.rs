@@ -1273,7 +1273,7 @@ mod tests {
     use glassdb_backend::{Backend, StatsBackend, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
     use glassdb_data::{
-        CollectionAddress, CollectionId, DatabaseId, DbPrefix, LeafRef, NodeToken, ObjectPath,
+        CollectionAddress, CollectionId, DatabaseId, DbPrefix, LeafRef, NodeId, ObjectPath,
     };
     use glassdb_storage::transaction::{TxCommitStatus, TxRecordStore};
     use glassdb_storage::{
@@ -1290,6 +1290,10 @@ mod tests {
 
     fn test_db_prefix() -> DbPrefix {
         DbPrefix::try_from(TEST_DB).unwrap()
+    }
+
+    pub(super) fn test_node_id(byte: u8) -> NodeId {
+        NodeId::from_bytes([byte; 16])
     }
 
     pub(super) fn test_root_path() -> ObjectPath {
@@ -3167,12 +3171,9 @@ mod tests {
             .await
             .unwrap();
         let record = record.value().unwrap();
-        for token in [
-            NodeToken::from_bytes([0; 16]),
-            NodeToken::from_bytes([1; 16]),
-        ] {
+        for node_id in [test_node_id(0), test_node_id(1)] {
             assert!(record.locks.contains(&TxLock::Membership {
-                leaf: LeafRef::node(test_collection(), token),
+                leaf: LeafRef::node(test_collection(), node_id),
                 typ: LockType::Read,
             }));
         }
@@ -3261,12 +3262,9 @@ mod tests {
                     .await
                     .unwrap();
                 let record = observed.value().unwrap();
-                for token in [
-                    NodeToken::from_bytes([0; 16]),
-                    NodeToken::from_bytes([1; 16]),
-                ] {
+                for node_id in [test_node_id(0), test_node_id(1)] {
                     assert!(record.locks.contains(&TxLock::Membership {
-                        leaf: LeafRef::node(test_collection(), token),
+                        leaf: LeafRef::node(test_collection(), node_id),
                         typ: LockType::Read,
                     }));
                 }
@@ -3293,8 +3291,8 @@ mod tests {
     async fn locked_scan_detects_a_create_in_a_leaf_a_peer_split_produced() {
         use glassdb_storage::Node;
         let (tm, tctx) = new_algo().await;
-        let (_, s1_token) = seed_two_leaf_tree(&tctx).await;
-        let s2_token = NodeToken::from_bytes([2; 16]);
+        let (_, s1_id) = seed_two_leaf_tree(&tctx).await;
+        let s2_id = test_node_id(2);
         let seed = TxId::with_priority(1, b"seed");
 
         // The write makes commit validate the scan while holding its own locks.
@@ -3321,7 +3319,7 @@ mod tests {
         tctx.nodes
             .store_node(
                 &test_collection(),
-                &s2_token,
+                &s2_id,
                 &Node::leaf(LeafBody::from_entries([entry(b"p")])),
                 None,
             )
@@ -3331,7 +3329,7 @@ mod tests {
             .nodes
             .load_node(
                 &test_collection(),
-                &s1_token,
+                &s1_id,
                 Requirement::after(tctx.timeline.currentness_barrier()),
             )
             .await
@@ -3339,10 +3337,10 @@ mod tests {
         tctx.nodes
             .store_node(
                 &test_collection(),
-                &s1_token,
+                &s1_id,
                 &Node::leaf(LeafBody::from_entries([entry(b"m")]))
                     .with_high_key(Some(b"p".to_vec()))
-                    .with_right_sibling(Some(s2_token.to_string())),
+                    .with_right_sibling(Some(s2_id)),
                 Some(&s1_ver),
             )
             .await
@@ -3354,7 +3352,7 @@ mod tests {
             .nodes
             .load_node(
                 &test_collection(),
-                &s2_token,
+                &s2_id,
                 Requirement::after(tctx.timeline.currentness_barrier()),
             )
             .await
@@ -3368,7 +3366,7 @@ mod tests {
         new_s2.set_membership_writer(creator.clone());
         new_s2.remove_membership_holder(&creator);
         tctx.nodes
-            .store_node(&test_collection(), &s2_token, &new_s2, Some(&s2_ver))
+            .store_node(&test_collection(), &s2_id, &new_s2, Some(&s2_ver))
             .await
             .unwrap();
 
@@ -3387,7 +3385,7 @@ mod tests {
     #[tokio::test]
     async fn scan_detects_boundary_membership_change() {
         let (tm, tctx) = new_algo().await;
-        let (_, s1_token) = seed_two_leaf_tree(&tctx).await;
+        let (_, s1_id) = seed_two_leaf_tree(&tctx).await;
 
         let (accesses, keys) = scan_accesses(&tctx).await;
         assert_eq!(
@@ -3401,7 +3399,7 @@ mod tests {
             .nodes
             .load_node(
                 &test_collection(),
-                &s1_token,
+                &s1_id,
                 Requirement::after(tctx.timeline.currentness_barrier()),
             )
             .await
@@ -3415,12 +3413,7 @@ mod tests {
         new_s1.set_membership_writer(membership_writer.clone());
         new_s1.remove_membership_holder(&membership_writer);
         tctx.nodes
-            .store_node(
-                &test_collection(),
-                &s1_token,
-                &new_s1,
-                Some(&s1_observation),
-            )
+            .store_node(&test_collection(), &s1_id, &new_s1, Some(&s1_observation))
             .await
             .unwrap();
 
@@ -3433,26 +3426,26 @@ mod tests {
 
     // Replaces the test collection's root leaf with a two-level tree: an index
     // root over S0(a,c | high "m") -> S1(m,p), chained by right-sibling.
-    // Returns both leaf tokens.
-    async fn seed_two_leaf_tree(tctx: &Tctx) -> (NodeToken, NodeToken) {
+    // Returns both leaf IDs.
+    async fn seed_two_leaf_tree(tctx: &Tctx) -> (NodeId, NodeId) {
         use glassdb_storage::{IndexNode, Node};
-        let s0_token = NodeToken::from_bytes([0; 16]);
-        let s1_token = NodeToken::from_bytes([1; 16]);
+        let s0_id = test_node_id(0);
+        let s1_id = test_node_id(1);
 
-        let leaf = |ks: &[&[u8]], high: Option<&[u8]>, right: Option<&str>| {
+        let leaf = |ks: &[&[u8]], high: Option<&[u8]>, right: Option<NodeId>| {
             Node::leaf(LeafBody::from_entries(ks.iter().map(|k| {
                 LeafEntry::new(*k).with_current(CurrentState::External {
                     writer: TxId::with_priority(1, b"seed"),
                 })
             })))
             .with_high_key(high.map(<[u8]>::to_vec))
-            .with_right_sibling(right.map(str::to_string))
+            .with_right_sibling(right)
         };
         tctx.nodes
             .store_node(
                 &test_collection(),
-                &s0_token,
-                &leaf(&[b"a", b"c"], Some(b"m"), Some(s1_token.as_str())),
+                &s0_id,
+                &leaf(&[b"a", b"c"], Some(b"m"), Some(s1_id)),
                 None,
             )
             .await
@@ -3460,15 +3453,15 @@ mod tests {
         tctx.nodes
             .store_node(
                 &test_collection(),
-                &s1_token,
+                &s1_id,
                 &leaf(&[b"m", b"p"], None, None),
                 None,
             )
             .await
             .unwrap();
         let root = Node::index(IndexNode::from_children([
-            (b"".to_vec(), s0_token.to_string()),
-            (b"m".to_vec(), s1_token.to_string()),
+            (b"".to_vec(), s0_id),
+            (b"m".to_vec(), s1_id),
         ]));
         let cur = tctx
             .nodes
@@ -3482,7 +3475,7 @@ mod tests {
             .store_root(&test_collection(), &root, cur.observation())
             .await
             .unwrap();
-        (s0_token, s1_token)
+        (s0_id, s1_id)
     }
 
     // Rewrites the test collection's root `_r` (a single leaf holding `a`,`m`)
@@ -3491,8 +3484,8 @@ mod tests {
     // linearization point, mirroring the in-place root split (ADR-031).
     async fn split_root_in_place(tctx: &Tctx) {
         use glassdb_storage::{IndexNode, Node};
-        let s0_token = NodeToken::from_bytes([0; 16]);
-        let s1_token = NodeToken::from_bytes([1; 16]);
+        let s0_id = test_node_id(0);
+        let s1_id = test_node_id(1);
 
         let loaded = tctx
             .nodes
@@ -3509,20 +3502,20 @@ mod tests {
 
         let s0 = Node::leaf(LeafBody::from_entries(lower))
             .with_high_key(Some(b"m".to_vec()))
-            .with_right_sibling(Some(s1_token.to_string()));
+            .with_right_sibling(Some(s1_id));
         tctx.nodes
-            .store_node(&test_collection(), &s0_token, &s0, None)
+            .store_node(&test_collection(), &s0_id, &s0, None)
             .await
             .unwrap();
         let s1 = Node::leaf(LeafBody::from_entries(upper));
         tctx.nodes
-            .store_node(&test_collection(), &s1_token, &s1, None)
+            .store_node(&test_collection(), &s1_id, &s1, None)
             .await
             .unwrap();
 
         let root = Node::index(IndexNode::from_children([
-            (b"".to_vec(), s0_token.to_string()),
-            (b"m".to_vec(), s1_token.to_string()),
+            (b"".to_vec(), s0_id),
+            (b"m".to_vec(), s1_id),
         ]));
         assert!(
             tctx.nodes

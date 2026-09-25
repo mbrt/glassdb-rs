@@ -9,7 +9,7 @@ fn reconciliation_queue_is_bounded_and_drops_the_oldest() {
         reconciler.defer(PendingReconciliation {
             collection: collection(),
             key: ordinal.to_be_bytes().to_vec(),
-            target: NodeToken::from_bytes((ordinal as u128).to_be_bytes()),
+            target: NodeId::from_bytes((ordinal as u128).to_be_bytes()),
         });
     }
 
@@ -42,7 +42,7 @@ async fn seed_unpublished_leaf_chain(s: &TestStore, children: &[(&[u8], &str)]) 
         .unwrap();
     let root =
         Node::index(IndexNode::from_children(children.iter().map(
-            |(separator, child)| (separator.to_vec(), test_token(child).to_string()),
+            |(separator, child)| (separator.to_vec(), test_node_id(child)),
         )));
     s.create_root(COLL, &root).await.unwrap();
     root
@@ -57,7 +57,7 @@ async fn reconciler(s: &TestStore, bg: &Arc<Background>) -> ParentReconciler {
 async fn reconciled_root(s: &TestStore, key: &[u8], target: &str) -> IndexNode {
     let bg = Arc::new(Background::new());
     let reconciler = reconciler(s, &bg).await;
-    let mut reconciliation = reconciler.begin(&collection(), key, &test_token(target));
+    let mut reconciliation = reconciler.begin(&collection(), key, &test_node_id(target));
     assert!(matches!(
         reconciler.reconcile(&mut reconciliation).await.unwrap(),
         ReconciliationOutcome::Reconciled
@@ -81,10 +81,7 @@ async fn reconciliation_rechecks_a_child_read_started_before_the_split() {
     )
     .await
     .unwrap();
-    let parent = Node::index(IndexNode::from_children([(
-        Vec::new(),
-        test_token("L0").to_string(),
-    )]));
+    let parent = Node::index(IndexNode::from_children([(Vec::new(), test_node_id("L0"))]));
     peer.create_root(COLL, &parent).await.unwrap();
 
     let hook = HookBackend::new(memory);
@@ -116,7 +113,7 @@ async fn reconciliation_rechecks_a_child_read_started_before_the_split() {
         let nodes = local.nodes.clone();
         async move {
             nodes
-                .load_node(&collection(), &test_token("L0"), Requirement::ANY)
+                .load_node(&collection(), &test_node_id("L0"), Requirement::ANY)
                 .await
         }
     });
@@ -137,7 +134,7 @@ async fn reconciliation_rechecks_a_child_read_started_before_the_split() {
     )
     .await
     .unwrap();
-    let mut reconciliation = reconciler.begin(&collection(), b"m", &test_token("L1"));
+    let mut reconciliation = reconciler.begin(&collection(), b"m", &test_node_id("L1"));
     hook.clear_after();
     release.notify_one();
     let (old_child, old_observation) = pending.await.unwrap().unwrap();
@@ -158,7 +155,7 @@ async fn reconciliation_rechecks_a_child_read_started_before_the_split() {
         .unwrap();
     assert_eq!(
         reconciled.as_index().unwrap().child_for(b"m"),
-        Some(test_token("L1").as_str())
+        Some(test_node_id("L1"))
     );
 }
 
@@ -212,7 +209,7 @@ async fn reconciliation_routes_a_drained_child_to_its_merge_target() {
     .await
     .unwrap();
     let mut drained = leaf_node(&[], Some(b"t"), None).with_low_key(b"m".to_vec());
-    drained.drain(test_token("L4").as_ref());
+    drained.drain(test_node_id("L4"));
     s.store_node(COLL, "L1", &drained, None).await.unwrap();
     s.store_node(
         COLL,

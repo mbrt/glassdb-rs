@@ -2,8 +2,9 @@ use std::fmt;
 
 use crate::base64;
 use crate::collection_id::CollectionId;
+use crate::node_id::NodeId;
 
-use super::{CollectionAddress, DbPrefix, NodeToken, ObjectPath, PathError};
+use super::{CollectionAddress, DbPrefix, ObjectPath, PathError, parse_random_id};
 
 const COLLECTION_RECORD_MARKER: &str = "_i";
 const NODE_MARKER: &str = "_n";
@@ -30,19 +31,17 @@ pub(super) fn parse_collection_prefix(prefix: &str) -> Result<(&str, CollectionI
 }
 
 pub(super) fn parse_object(path: &str) -> Option<Result<ObjectPath, PathError>> {
-    if let Some((prefix, token)) = path.rsplit_once("/_n/") {
-        return Some(
-            if prefix.is_empty() || token.is_empty() || token.contains('/') {
-                Err(PathError::Parse(path.to_string()))
-            } else {
-                parse_collection(prefix).and_then(|collection| {
-                    Ok(ObjectPath::Node {
-                        collection,
-                        token: NodeToken::try_from(token)?,
-                    })
+    if let Some((prefix, id)) = path.rsplit_once("/_n/") {
+        return Some(if prefix.is_empty() || id.is_empty() || id.contains('/') {
+            Err(PathError::Parse(path.to_string()))
+        } else {
+            parse_collection(prefix).and_then(|collection| {
+                Ok(ObjectPath::Node {
+                    collection,
+                    id: parse_random_id("node ID", id, NodeId::from_slice)?,
                 })
-            },
-        );
+            })
+        });
     }
     if let Some(prefix) = path.strip_suffix("/_i") {
         return Some(if prefix.is_empty() {
@@ -80,10 +79,10 @@ pub(super) fn write_tree_root(
 pub(super) fn write_node(
     f: &mut fmt::Formatter<'_>,
     collection: &CollectionAddress,
-    token: &str,
+    id: &NodeId,
 ) -> fmt::Result {
     write_collection_prefix(f, collection)?;
-    write!(f, "/{NODE_MARKER}/{token}")
+    write!(f, "/{NODE_MARKER}/{}", base64::encode(id.as_bytes()))
 }
 
 pub(super) fn nodes_prefix(prefix: &str) -> String {

@@ -15,7 +15,7 @@ use crate::node_locking::GateAcquisition;
 use glassdb_backend::Backend;
 use glassdb_backend::memory::MemoryBackend;
 use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
-use glassdb_data::{LogicalKey, NodeToken, ObjectPath, StructuralIntentId, TxId};
+use glassdb_data::{LogicalKey, NodeId, ObjectPath, StructuralIntentId, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxRecord, TxWrite};
 use glassdb_storage::{
     CachedStore, CollectionRecord, CollectionStore, CurrentState, IndexNode, LeafBody, LeafEntry,
@@ -50,48 +50,23 @@ fn db_prefix(value: &str) -> DbPrefix {
     DbPrefix::try_from(value).unwrap()
 }
 
-fn test_token(value: &str) -> NodeToken {
-    if let Ok(token) = NodeToken::try_from(value) {
-        return token;
-    }
+/// Maps a readable test name to a stable 128-bit ID.
+fn test_id_bytes(name: &str) -> [u8; 16] {
     let mut bytes = [0_u8; 16];
-    for (index, byte) in value.bytes().enumerate() {
+    for (index, byte) in name.bytes().enumerate() {
         let slot = index % bytes.len();
         bytes[slot] = bytes[slot].wrapping_mul(31).wrapping_add(byte);
     }
-    bytes[15] ^= value.len() as u8;
-    NodeToken::from_bytes(bytes)
+    bytes[15] ^= name.len() as u8;
+    bytes
 }
 
-fn canonical_node(node: &Node) -> Node {
-    let mut canonical = match (node.as_leaf(), node.as_index()) {
-        (Some(leaf), None) => Node::leaf(leaf.clone()),
-        (None, Some(index)) => Node::index(IndexNode::from_children(
-            index
-                .children()
-                .map(|(key, token)| (key.to_vec(), test_token(token).to_string())),
-        )),
-        _ => unreachable!("a node has exactly one body"),
-    }
-    .with_low_key(node.low_key().to_vec())
-    .with_high_key(node.high_key().map(<[u8]>::to_vec))
-    .with_right_sibling(
-        node.right_sibling()
-            .map(|token| test_token(token).to_string()),
-    );
-    canonical.set_locks(node.locks().clone());
-    if node.is_drained() {
-        let target = canonical
-            .right_sibling()
-            .expect("a drained node links its merge target")
-            .to_string();
-        canonical.drain(&target);
-    }
-    canonical
+fn test_node_id(name: &str) -> NodeId {
+    NodeId::from_bytes(test_id_bytes(name))
 }
 
-fn canonical_intent(intent: &StructuralIntent) -> StructuralIntent {
-    intent.clone()
+fn test_intent_id(name: &str) -> StructuralIntentId {
+    StructuralIntentId::from_bytes(test_id_bytes(name))
 }
 
 fn root_path() -> ObjectPath {
@@ -100,10 +75,10 @@ fn root_path() -> ObjectPath {
     }
 }
 
-fn node_path(token: &str) -> ObjectPath {
+fn node_path(name: &str) -> ObjectPath {
     ObjectPath::Node {
         collection: collection(),
-        token: test_token(token),
+        id: test_node_id(name),
     }
 }
 
@@ -143,9 +118,7 @@ impl TestStore {
         self.records
             .create_record(&collection, &CollectionRecord::new())
             .await?;
-        self.nodes
-            .create_root(&collection, &canonical_node(node))
-            .await
+        self.nodes.create_root(&collection, node).await
     }
 
     async fn load_root_node(
@@ -175,35 +148,30 @@ impl TestStore {
         expected: &LeafObservation,
     ) -> Result<bool, StorageError> {
         self.nodes
-            .store_root(&collection_at(prefix), &canonical_node(node), expected)
+            .store_root(&collection_at(prefix), node, expected)
             .await
     }
 
     async fn load_node(
         &self,
         prefix: &str,
-        token: &str,
+        name: &str,
         requirement: Requirement,
     ) -> Result<(Node, LeafObservation), StorageError> {
         self.nodes
-            .load_node(&collection_at(prefix), &test_token(token), requirement)
+            .load_node(&collection_at(prefix), &test_node_id(name), requirement)
             .await
     }
 
     async fn store_node(
         &self,
         prefix: &str,
-        token: &str,
+        name: &str,
         node: &Node,
         expected: Option<&LeafObservation>,
     ) -> Result<bool, StorageError> {
         self.nodes
-            .store_node(
-                &collection_at(prefix),
-                &test_token(token),
-                &canonical_node(node),
-                expected,
-            )
+            .store_node(&collection_at(prefix), &test_node_id(name), node, expected)
             .await
     }
 
@@ -211,7 +179,7 @@ impl TestStore {
         &self,
         prefix: &str,
         requirement: Requirement,
-    ) -> Result<Vec<(NodeToken, Observation<Node>)>, StorageError> {
+    ) -> Result<Vec<(NodeId, Observation<Node>)>, StorageError> {
         self.nodes
             .list_nodes(&collection_at(prefix), requirement)
             .await
@@ -223,11 +191,7 @@ impl TestStore {
         intent: &StructuralIntent,
     ) -> Result<Observation<StructuralIntent>, StorageError> {
         self.intent_store
-            .write(
-                &db_prefix("db"),
-                &StructuralIntentId::from(test_token(intent_id)),
-                &canonical_intent(intent),
-            )
+            .write(&db_prefix("db"), &test_intent_id(intent_id), intent)
             .await
     }
 
@@ -288,7 +252,7 @@ fn pressure_inline() -> InlinePolicy {
 fn leaf_node(keys: &[&[u8]], high: Option<&[u8]>, right: Option<&str>) -> Node {
     Node::leaf(LeafBody::from_entries(keys.iter().map(|k| live(k))))
         .with_high_key(high.map(<[u8]>::to_vec))
-        .with_right_sibling(right.map(|token| test_token(token).to_string()))
+        .with_right_sibling(right.map(test_node_id))
 }
 
 fn restructurer(store: &TestStore, bg: &Arc<Background>, policy: NodeSizePolicy) -> Restructurer {
@@ -406,10 +370,10 @@ fn superseded_source_revision() -> String {
 fn nonroot_intent(source: &str, right: &str, split_key: &[u8]) -> StructuralIntent {
     StructuralIntent {
         collection: collection(),
-        source_token: Some(test_token(source)),
+        source_node_id: Some(test_node_id(source)),
         source_revision: superseded_source_revision(),
         change: StructuralChange::Split {
-            created_tokens: vec![test_token(right)],
+            created_node_ids: vec![test_node_id(right)],
             split_key: split_key.to_vec(),
         },
         participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
@@ -421,6 +385,6 @@ fn test_index(children: &[(&[u8], &str)]) -> IndexNode {
     IndexNode::from_children(
         children
             .iter()
-            .map(|(separator, child)| (separator.to_vec(), test_token(child).to_string())),
+            .map(|(separator, child)| (separator.to_vec(), test_node_id(child))),
     )
 }

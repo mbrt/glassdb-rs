@@ -1061,15 +1061,16 @@ Only backend objects have type markers:
 | `_c`        | Physical collection namespace   | `mydb/_c/<collection-id>`         |
 | `_i`        | Collection record                | `mydb/_c/<collection-id>/_i`      |
 | `_r`        | Fixed B-link tree root           | `mydb/_c/<collection-id>/_r`      |
-| `_n`        | Standalone B-link node           | `mydb/_c/<collection-id>/_n/<token>` |
+| `_n`        | Standalone B-link node           | `mydb/_c/<collection-id>/_n/<node-id>` |
 | `_t`        | Transaction-record object        | `mydb/_t/<a>/<b>/<transaction-identity>`|
 | `_s`        | Participant-owned structural intent | `mydb/_s/<participant-id>/<intent-id>` |
 
-Collection IDs — not names — are encoded into physical collection namespaces
-with a custom **order-preserving** base64 alphabet. Keys live inside leaf
-objects and remain raw bytes. Transaction records store raw keys and collection
-IDs; the database prefix comes from the transaction record's location, so moving
-a database does not invalidate its records.
+Collection IDs — not names — and node IDs are encoded into object paths with a
+custom **order-preserving** base64 alphabet, so IDs sort the same as raw bytes
+and as paths. Keys live inside leaf objects and remain raw bytes. Transaction
+records and structural intents store raw keys, collection IDs, and node IDs; the
+database prefix comes from the object's location, so moving a database does not
+invalidate them.
 
 ### Collections
 

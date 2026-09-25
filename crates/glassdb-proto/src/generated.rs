@@ -156,9 +156,9 @@ pub mod membership_lock {
         /// The fixed tree root object (`_r`). Always encoded as true.
         #[prost(bool, tag = "1")]
         Root(bool),
-        /// The opaque token of a standalone node object (`_n/<token>`).
-        #[prost(string, tag = "2")]
-        Node(::prost::alloc::string::String),
+        /// The node ID of a standalone node object (`_n/<node-id>`).
+        #[prost(bytes, tag = "2")]
+        Node(::prost::alloc::vec::Vec<u8>),
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -271,10 +271,10 @@ pub struct Node {
     /// +infinity: the rightmost node at its level.
     #[prost(bytes = "vec", tag = "1")]
     pub high_key: ::prost::alloc::vec::Vec<u8>,
-    /// Identity token of the right-sibling node at the same level. Empty means
-    /// none: the rightmost node at its level.
-    #[prost(string, tag = "2")]
-    pub right_sibling: ::prost::alloc::string::String,
+    /// Node ID of the right-sibling node at the same level. Empty means none:
+    /// the rightmost node at its level.
+    #[prost(bytes = "vec", tag = "2")]
+    pub right_sibling: ::prost::alloc::vec::Vec<u8>,
     #[prost(message, optional, tag = "5")]
     pub structural_gate: ::core::option::Option<NodeLock>,
     #[prost(message, optional, tag = "6")]
@@ -291,8 +291,8 @@ pub struct Node {
     pub drained: bool,
     /// The structural intent ID of a merge into this node that can still land
     /// or be abandoned (ADR-073). Empty means none.
-    #[prost(string, tag = "10")]
-    pub merge_reservation: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "10")]
+    pub merge_reservation: ::prost::alloc::vec::Vec<u8>,
     /// Inclusive lower bound of the key range this node covers. Empty means the
     /// first node at its level. A copy with a low key above a routed key is
     /// older than a merge (ADR-073).
@@ -318,14 +318,17 @@ pub mod node {
 /// complete or abandoned.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StructuralIntent {
-    #[prost(string, tag = "1")]
-    pub prefix: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub source_token: ::prost::alloc::string::String,
+    /// Stable collection ID. The database prefix comes from the intent's
+    /// physical path and is deliberately omitted.
+    #[prost(bytes = "vec", tag = "1")]
+    pub collection_id: ::prost::alloc::vec::Vec<u8>,
+    /// Node ID of the source. Empty when the source is the tree root.
+    #[prost(bytes = "vec", tag = "2")]
+    pub source_node_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(string, tag = "3")]
     pub source_revision: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "4")]
-    pub created_tokens: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bytes = "vec", repeated, tag = "4")]
+    pub created_node_ids: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
     #[prost(bytes = "vec", tag = "5")]
     pub split_key: ::prost::alloc::vec::Vec<u8>,
     #[prost(bool, tag = "6")]
@@ -371,9 +374,10 @@ pub mod structural_intent {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MergeIntent {
-    /// The node that receives the source's entries. Empty until Ready.
-    #[prost(string, tag = "1")]
-    pub target_token: ::prost::alloc::string::String,
+    /// Node ID of the node that receives the source's entries. Empty until
+    /// Ready.
+    #[prost(bytes = "vec", tag = "1")]
+    pub target_node_id: ::prost::alloc::vec::Vec<u8>,
     /// The source's high key at Ready: the low bound of the target before the
     /// merge.
     #[prost(bytes = "vec", tag = "2")]
@@ -396,9 +400,9 @@ pub struct IndexEntry {
     /// canonical.
     #[prost(bytes = "vec", tag = "1")]
     pub separator_key: ::prost::alloc::vec::Vec<u8>,
-    /// Identity token of the child node.
-    #[prost(string, tag = "2")]
-    pub child: ::prost::alloc::string::String,
+    /// Node ID of the child node.
+    #[prost(bytes = "vec", tag = "2")]
+    pub child: ::prost::alloc::vec::Vec<u8>,
 }
 /// Database-level metadata, written once at `{name}/glassdb` when a database is
 /// first opened. Its presence marks the database as initialized; `version` gates

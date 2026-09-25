@@ -4,7 +4,7 @@
 //! A node is the unit of the dynamic, range-partitioned collection tree.
 //! It is either a **leaf** — the per-key coordination entries of ADR-017 (a
 //! [`LeafBody`]) for a contiguous key range — or an **index**, an ordered map from
-//! separator keys to child-node tokens. Every node self-describes the range it
+//! separator keys to child node IDs. Every node self-describes the range it
 //! covers through a **high-key** (the exclusive upper bound; absent means
 //! +infinity) and a **right-sibling** pointer, the two fields that let a descent
 //! detect a concurrent split and self-correct by stepping right rather than
@@ -27,7 +27,7 @@ use crate::error::StorageError;
 use crate::leaf::{LeafBody, LeafEntry};
 use crate::lock::{ExclusiveGate, LockType, SharedExclusiveLock};
 use crate::wire_size::{length_delimited_field, nonempty_length_delimited_field};
-use glassdb_data::{NodeToken as ValidatedNodeToken, StructuralIntentId, TxId};
+use glassdb_data::{ID_BYTES, NodeId, StructuralIntentId, TxId};
 
 const LEAF_ENTRIES_TAG: u32 = 1;
 const INDEX_ENTRIES_TAG: u32 = 1;
@@ -36,10 +36,6 @@ const INDEX_CHILD_TAG: u32 = 2;
 const NODE_LEAF_TAG: u32 = 3;
 const NODE_INDEX_TAG: u32 = 4;
 
-/// The opaque identity token of a non-root node (`{prefix}/_n/<token>`). The
-/// root has no token; it lives at the fixed `_r` path.
-pub type NodeToken = String;
-
 /// An index node body: the separator keys of an index node, each mapping the
 /// inclusive lower bound of a key range to its routed child node.
 ///
@@ -47,83 +43,82 @@ pub type NodeToken = String;
 /// routed child for a key is found by a single predecessor lookup.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IndexNode {
-    children: BTreeMap<Vec<u8>, NodeToken>,
+    children: BTreeMap<Vec<u8>, NodeId>,
 }
 
 impl IndexNode {
     /// Builds an index node from `(separator, child)` pairs. The separator is the
     /// inclusive lower bound of the child's range; the leftmost child usually
     /// carries the empty separator (the node's own low bound).
-    pub fn from_children<I: IntoIterator<Item = (Vec<u8>, NodeToken)>>(children: I) -> Self {
+    pub fn from_children<I: IntoIterator<Item = (Vec<u8>, NodeId)>>(children: I) -> Self {
         IndexNode {
             children: children.into_iter().collect(),
         }
     }
 
-    /// Returns the token of the routed child for `key`: the child whose separator
-    /// is the greatest one not exceeding `key`. Falls back to the leftmost child
-    /// when `key` precedes every separator (a defensive case a well-formed
-    /// descent never hits, since the node's low bound is its first separator).
-    pub fn child_for(&self, key: &[u8]) -> Option<&str> {
+    /// Returns the node ID of the routed child for `key`: the child whose
+    /// separator is the greatest one not exceeding `key`. Falls back to the
+    /// leftmost child when `key` precedes every separator (a defensive case a
+    /// well-formed descent never hits, since the node's low bound is its first
+    /// separator).
+    pub fn child_for(&self, key: &[u8]) -> Option<NodeId> {
         self.children
             .range::<[u8], _>((Unbounded, Included(key)))
             .next_back()
-            .map(|(_, c)| c.as_str())
-            .or_else(|| self.children.values().next().map(String::as_str))
+            .map(|(_, child)| *child)
+            .or_else(|| self.children.values().next().copied())
     }
 
-    /// Returns the token of the routed child for keys just below `key`: the
+    /// Returns the node ID of the routed child for keys just below `key`: the
     /// child whose separator is the greatest one below `key`. Falls back to the
     /// leftmost child like [`child_for`](Self::child_for).
-    pub fn child_before(&self, key: &[u8]) -> Option<&str> {
+    pub fn child_before(&self, key: &[u8]) -> Option<NodeId> {
         self.children
             .range::<[u8], _>((Unbounded, Excluded(key)))
             .next_back()
-            .map(|(_, c)| c.as_str())
-            .or_else(|| self.children.values().next().map(String::as_str))
+            .map(|(_, child)| *child)
+            .or_else(|| self.children.values().next().copied())
     }
 
     /// Makes the separators of one right-link path of children agree with that
     /// path (ADR-073). `path` lists the children in link order, from the child
     /// routed for keys just below a key through the child that covers the key.
-    pub fn reconcile(&mut self, path: &[(&str, &Node)]) {
+    pub fn reconcile(&mut self, path: &[(NodeId, &Node)]) {
         let mut live = Vec::with_capacity(path.len());
-        for (position, (token, node)) in path.iter().enumerate() {
+        for (position, (id, node)) in path.iter().enumerate() {
             if !node.is_drained() {
-                live.push((*token, *node));
+                live.push((*id, *node));
                 continue;
             }
             let Some((target, _)) = path[position + 1..].iter().find(|(_, n)| !n.is_drained())
             else {
                 continue;
             };
-            for child in self.children.values_mut().filter(|child| child == token) {
-                *child = target.to_string();
+            for child in self.children.values_mut().filter(|child| *child == id) {
+                *child = *target;
             }
         }
         for pair in live.windows(2) {
-            let ((_, previous), (token, _)) = (pair[0], pair[1]);
+            let ((_, previous), (id, _)) = (pair[0], pair[1]);
             if let Some(separator) = previous.high_key() {
-                self.children
-                    .entry(separator.to_vec())
-                    .or_insert_with(|| token.to_string());
+                self.children.entry(separator.to_vec()).or_insert(id);
             }
         }
         // Two adjacent entries that name the same child route like the first one.
-        let mut previous: Option<NodeToken> = None;
+        let mut previous: Option<NodeId> = None;
         self.children.retain(|_, child| {
-            let duplicate = previous.as_ref() == Some(child);
-            previous = Some(child.clone());
+            let duplicate = previous == Some(*child);
+            previous = Some(*child);
             !duplicate
         });
     }
 
     /// Iterates the `(separator, child)` pairs in canonical (separator-sorted)
     /// order.
-    pub fn children(&self) -> impl Iterator<Item = (&[u8], &str)> {
+    pub fn children(&self) -> impl Iterator<Item = (&[u8], NodeId)> {
         self.children
             .iter()
-            .map(|(k, c)| (k.as_slice(), c.as_str()))
+            .map(|(separator, child)| (separator.as_slice(), *child))
     }
 
     /// Number of children (separators) in the node.
@@ -139,7 +134,7 @@ impl IndexNode {
     /// Inserts a `(separator, child)` pair, the parent-side effect of a child
     /// split (ADR-031). A separator already present is overwritten, so a
     /// re-driven insert is idempotent.
-    pub fn insert_child(&mut self, separator: Vec<u8>, child: NodeToken) {
+    pub fn insert_child(&mut self, separator: Vec<u8>, child: NodeId) {
         self.children.insert(separator, child);
     }
 
@@ -168,22 +163,25 @@ impl IndexNode {
             entries: self
                 .children
                 .iter()
-                .map(|(sep, child)| pb::IndexEntry {
-                    separator_key: sep.clone(),
-                    child: child.clone(),
+                .map(|(separator, child)| pb::IndexEntry {
+                    separator_key: separator.clone(),
+                    child: child.as_bytes().to_vec(),
                 })
                 .collect(),
         }
     }
 
-    fn from_pb(raw: pb::IndexNode) -> Self {
-        IndexNode {
-            children: raw
-                .entries
-                .into_iter()
-                .map(|e| (e.separator_key, e.child))
-                .collect(),
-        }
+    fn from_pb(raw: pb::IndexNode) -> Result<Self, StorageError> {
+        let children = raw
+            .entries
+            .into_iter()
+            .map(|entry| {
+                let child = NodeId::from_slice(&entry.child)
+                    .ok_or_else(|| StorageError::other("index node has an invalid child ID"))?;
+                Ok((entry.separator_key, child))
+            })
+            .collect::<Result<_, StorageError>>()?;
+        Ok(IndexNode { children })
     }
 }
 
@@ -549,8 +547,8 @@ pub struct Node {
     low_key: Vec<u8>,
     /// Exclusive upper bound of the covered key range; `None` means +infinity.
     high_key: Option<Vec<u8>>,
-    /// Right-sibling token at the same level; `None` means none (rightmost).
-    right_sibling: Option<NodeToken>,
+    /// Right-sibling node ID at the same level; `None` means none (rightmost).
+    right_sibling: Option<NodeId>,
     body: NodeBody,
     locks: NodeLocks,
     /// Set after a merge moved the range and entries into the right sibling.
@@ -599,7 +597,7 @@ impl Node {
 
     /// Returns the node with the given right-sibling link.
     #[must_use]
-    pub fn with_right_sibling(mut self, right_sibling: Option<NodeToken>) -> Self {
+    pub fn with_right_sibling(mut self, right_sibling: Option<NodeId>) -> Self {
         self.right_sibling = right_sibling;
         self
     }
@@ -628,10 +626,10 @@ impl Node {
         self.high_key.as_deref()
     }
 
-    /// The right-sibling token, or `None` if this is the rightmost node at its
-    /// level.
-    pub fn right_sibling(&self) -> Option<&str> {
-        self.right_sibling.as_deref()
+    /// The right-sibling node ID, or `None` if this is the rightmost node at
+    /// its level.
+    pub fn right_sibling(&self) -> Option<NodeId> {
+        self.right_sibling
     }
 
     /// The node body.
@@ -647,12 +645,12 @@ impl Node {
 
     /// Empties the node and links it to the `target` that absorbed its entries,
     /// keeping its level.
-    pub fn drain(&mut self, target: &str) {
+    pub fn drain(&mut self, target: NodeId) {
         self.body = match self.body {
             NodeBody::Leaf(_) => NodeBody::Leaf(LeafBody::new()),
             NodeBody::Index(_) => NodeBody::Index(IndexNode::default()),
         };
-        self.right_sibling = Some(target.to_string());
+        self.right_sibling = Some(target);
         self.locks.clear_holders();
         self.drained = true;
     }
@@ -670,7 +668,7 @@ impl Node {
                     .children
                     .iter()
                     .chain(&right.children)
-                    .map(|(separator, child)| (separator.clone(), child.clone()))
+                    .map(|(separator, child)| (separator.clone(), *child))
                     .collect(),
             }),
             _ => return Err(StorageError::other("merge nodes are at different levels")),
@@ -822,10 +820,9 @@ impl Node {
     }
 
     /// Returns the node-content size of the smallest parent that can contain a
-    /// separator of `key_len` bytes, using maximum-length validated child tokens.
+    /// separator of `key_len` bytes.
     pub fn worst_case_parent_separator_len(key_len: usize) -> usize {
-        let child_len =
-            length_delimited_field(INDEX_CHILD_TAG, ValidatedNodeToken::MAX_ENCODED_LEN);
+        let child_len = length_delimited_field(INDEX_CHILD_TAG, ID_BYTES);
         let entry_len = |separator_len| {
             nonempty_length_delimited_field(INDEX_SEPARATOR_TAG, separator_len) + child_len
         };
@@ -890,7 +887,7 @@ impl Node {
     }
 
     /// Halves the node for a B-link split (ADR-031): retains the lower half in
-    /// `self` (bounded above by the split key and linked to `right_token`) and
+    /// `self` (bounded above by the split key and linked to `right_id`) and
     /// returns the newly created right sibling — which inherits `self`'s former
     /// high-key and right-sibling — together with the split key to promote into
     /// the parent. Returns `None` when the node is too small to divide (fewer
@@ -899,7 +896,7 @@ impl Node {
     /// This is a pure in-memory transform; persisting the two nodes (create the
     /// sibling, then CAS the shrunk source — the linearization point) is the
     /// caller's multi-step protocol.
-    pub fn split(&mut self, right_token: &str) -> Option<(Node, Vec<u8>)> {
+    pub fn split(&mut self, right_id: NodeId) -> Option<(Node, Vec<u8>)> {
         let (right_body, split_key) = match &mut self.body {
             NodeBody::Leaf(leaf) => {
                 if leaf.len() < 2 {
@@ -933,7 +930,7 @@ impl Node {
         // The retained lower half is now bounded by the split key and links to
         // the new sibling.
         self.high_key = Some(split_key.clone());
-        self.right_sibling = Some(right_token.to_string());
+        self.right_sibling = Some(right_id);
         Some((right, split_key))
     }
 
@@ -967,7 +964,10 @@ impl Node {
         };
         pb::Node {
             high_key: self.high_key.clone().unwrap_or_default(),
-            right_sibling: self.right_sibling.clone().unwrap_or_default(),
+            right_sibling: self
+                .right_sibling
+                .map(|id| id.as_bytes().to_vec())
+                .unwrap_or_default(),
             body: Some(body),
             structural_gate: (!self.locks.structure.is_empty())
                 .then(|| self.locks.structure.to_pb()),
@@ -984,8 +984,7 @@ impl Node {
             merge_reservation: self
                 .locks
                 .merge_reservation
-                .as_ref()
-                .map(ToString::to_string)
+                .map(|intent| intent.as_bytes().to_vec())
                 .unwrap_or_default(),
             low_key: self.low_key.clone(),
         }
@@ -993,7 +992,7 @@ impl Node {
 
     pub(crate) fn from_pb(raw: pb::Node) -> Result<Self, StorageError> {
         let body = match raw.body {
-            Some(pb::node::Body::Index(index)) => NodeBody::Index(IndexNode::from_pb(index)),
+            Some(pb::node::Body::Index(index)) => NodeBody::Index(IndexNode::from_pb(index)?),
             Some(pb::node::Body::Leaf(leaf)) => NodeBody::Leaf(LeafBody::from_pb(leaf)?),
             None => NodeBody::Leaf(LeafBody::new()),
         };
@@ -1003,20 +1002,27 @@ impl Node {
         let membership = SharedExclusiveLock::from_pb(raw.membership_lock)
             .map_err(|_| StorageError::other("node has invalid membership lock"))?;
         let drop_intent = (!raw.drop_intent.is_empty()).then(|| TxId::from_bytes(raw.drop_intent));
+        let right_sibling = if raw.right_sibling.is_empty() {
+            None
+        } else {
+            Some(
+                NodeId::from_slice(&raw.right_sibling)
+                    .ok_or_else(|| StorageError::other("node has an invalid right-sibling ID"))?,
+            )
+        };
         let merge_reservation = if raw.merge_reservation.is_empty() {
             None
         } else {
             Some(
-                StructuralIntentId::try_from(raw.merge_reservation).map_err(|error| {
-                    StorageError::with_source("parsing node merge reservation", error)
-                })?,
+                StructuralIntentId::from_slice(&raw.merge_reservation)
+                    .ok_or_else(|| StorageError::other("node has an invalid merge reservation"))?,
             )
         };
         let body_is_empty = match &body {
             NodeBody::Leaf(leaf) => leaf.is_empty(),
             NodeBody::Index(index) => index.is_empty(),
         };
-        if raw.drained && (!body_is_empty || raw.right_sibling.is_empty()) {
+        if raw.drained && (!body_is_empty || right_sibling.is_none()) {
             return Err(StorageError::other(
                 "drained node must have an empty body and a right sibling",
             ));
@@ -1024,7 +1030,7 @@ impl Node {
         Ok(Node {
             low_key: raw.low_key,
             high_key: (!raw.high_key.is_empty()).then_some(raw.high_key),
-            right_sibling: (!raw.right_sibling.is_empty()).then_some(raw.right_sibling),
+            right_sibling,
             body,
             locks: NodeLocks {
                 structure,
@@ -1045,6 +1051,17 @@ mod tests {
     use glassdb_data::TxId;
 
     use crate::leaf::{CurrentState, LeafEntry};
+
+    /// A node ID that shows `name` in its bytes, so tests stay readable.
+    fn id(name: &str) -> NodeId {
+        let mut bytes = [0; ID_BYTES];
+        bytes[..name.len()].copy_from_slice(name.as_bytes());
+        NodeId::from_bytes(bytes)
+    }
+
+    fn intent_id(byte: u8) -> StructuralIntentId {
+        StructuralIntentId::from_bytes([byte; ID_BYTES])
+    }
 
     fn entry(key: &[u8], writer: u8) -> LeafEntry {
         LeafEntry::new(key).with_current(CurrentState::External {
@@ -1068,13 +1085,13 @@ mod tests {
         ]))
         .with_low_key(b"a".to_vec())
         .with_high_key(Some(b"m".to_vec()))
-        .with_right_sibling(Some("sibToken".to_string()));
+        .with_right_sibling(Some(id("sib")));
 
         let decoded = Node::decode(&node.encode()).unwrap();
         assert_eq!(decoded, node);
         assert_eq!(decoded.low_key(), b"a");
         assert_eq!(decoded.high_key(), Some(b"m".as_slice()));
-        assert_eq!(decoded.right_sibling(), Some("sibToken"));
+        assert_eq!(decoded.right_sibling(), Some(id("sib")));
         assert!(decoded.as_leaf().is_some());
     }
 
@@ -1094,18 +1111,18 @@ mod tests {
 
     #[test]
     fn round_trip_preserves_merge_fields() {
-        let intent = StructuralIntentId::from(ValidatedNodeToken::from_bytes([3; 16]));
+        let intent = intent_id(3);
         let mut target = Node::leaf(LeafBody::from_entries([entry(b"a", 1)]));
         let mut locks = target.locks().clone();
-        locks.set_merge_reservation(intent.clone());
+        locks.set_merge_reservation(intent);
         target.set_locks(locks);
         let decoded = Node::decode(&target.encode()).unwrap();
         assert_eq!(decoded, target);
         assert_eq!(decoded.locks().merge_reservation(), Some(&intent));
 
-        let mut source = Node::index(IndexNode::from_children([(b"".to_vec(), "L0".into())]))
+        let mut source = Node::index(IndexNode::from_children([(b"".to_vec(), id("L0"))]))
             .with_high_key(Some(b"m".to_vec()));
-        source.drain("target");
+        source.drain(id("target"));
         let decoded = Node::decode(&source.encode()).unwrap();
         assert_eq!(decoded, source);
         assert!(decoded.is_drained());
@@ -1116,24 +1133,24 @@ mod tests {
         let gate = TxId::from_bytes(vec![2]);
         let mut source = Node::leaf(LeafBody::from_entries([entry(b"a", 1)]))
             .with_high_key(Some(b"m".to_vec()))
-            .with_right_sibling(Some("drained".to_string()));
+            .with_right_sibling(Some(id("drained")));
         source.set_structural_gate(gate);
         let generation = source.membership_generation();
 
-        source.drain("target");
+        source.drain(id("target"));
 
         assert!(source.as_leaf().is_some_and(LeafBody::is_empty));
         assert_eq!(source.high_key(), Some(b"m".as_slice()));
-        assert_eq!(source.right_sibling(), Some("target"));
+        assert_eq!(source.right_sibling(), Some(id("target")));
         assert!(source.structural_gate().is_empty());
         assert_eq!(source.membership_generation(), generation);
         assert!(!source.covers(b"a"));
-        assert!(source.split("sibling").is_none());
+        assert!(source.split(id("sibling")).is_none());
     }
 
     #[test]
     fn absorb_takes_the_left_range_and_abandon_restores_the_target() {
-        let intent = StructuralIntentId::from(ValidatedNodeToken::from_bytes([3; 16]));
+        let intent = intent_id(3);
         let mut left = Node::leaf(LeafBody::from_entries([entry(b"b", 1)]))
             .with_low_key(b"a".to_vec())
             .with_high_key(Some(b"m".to_vec()));
@@ -1145,7 +1162,7 @@ mod tests {
             .with_high_key(Some(b"t".to_vec()));
         let mut right = original.clone();
 
-        right.absorb(&left, intent.clone()).unwrap();
+        right.absorb(&left, intent).unwrap();
 
         let keys: Vec<_> = right
             .as_leaf()
@@ -1160,7 +1177,7 @@ mod tests {
         // max(g_L, g_R + 1): absence reads of the gated left range stay valid.
         assert_eq!(right.membership_generation(), 5);
 
-        let other = StructuralIntentId::from(ValidatedNodeToken::from_bytes([4; 16]));
+        let other = intent_id(4);
         assert!(!right.clone().abandon_merge(&other, b"m"));
         assert!(right.abandon_merge(&intent, b"m"));
         assert_eq!(right.as_leaf(), original.as_leaf());
@@ -1171,16 +1188,19 @@ mod tests {
 
     #[test]
     fn absorb_joins_index_children_at_one_level() {
-        let intent = StructuralIntentId::from(ValidatedNodeToken::from_bytes([3; 16]));
-        let left = Node::index(IndexNode::from_children([(b"".to_vec(), "A".into())]))
+        let intent = intent_id(3);
+        let left = Node::index(IndexNode::from_children([(b"".to_vec(), id("A"))]))
             .with_high_key(Some(b"m".to_vec()));
-        let mut right = Node::index(IndexNode::from_children([(b"m".to_vec(), "B".into())]))
+        let mut right = Node::index(IndexNode::from_children([(b"m".to_vec(), id("B"))]))
             .with_low_key(b"m".to_vec());
 
-        right.absorb(&left, intent.clone()).unwrap();
+        right.absorb(&left, intent).unwrap();
         let children: Vec<_> = right.as_index().unwrap().children().collect();
-        assert_eq!(children, [(b"".as_slice(), "A"), (b"m".as_slice(), "B")]);
-        assert_eq!(right.as_index().unwrap().child_for(b"c"), Some("A"));
+        assert_eq!(
+            children,
+            [(b"".as_slice(), id("A")), (b"m".as_slice(), id("B"))]
+        );
+        assert_eq!(right.as_index().unwrap().child_for(b"c"), Some(id("A")));
         assert_eq!(right.membership_generation(), 1);
 
         let error = Node::leaf(LeafBody::new())
@@ -1192,7 +1212,7 @@ mod tests {
     #[test]
     fn decode_rejects_drained_nodes_with_content_or_without_target() {
         let with_entries = pb::Node {
-            right_sibling: "target".into(),
+            right_sibling: id("target").as_bytes().to_vec(),
             body: Some(pb::node::Body::Leaf(
                 LeafBody::from_entries([entry(b"a", 1)]).to_pb(),
             )),
@@ -1213,16 +1233,57 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_node_ids_that_are_not_16_bytes() {
+        // IDs of the older string format have 22 bytes.
+        for bad in [vec![7; 15], vec![7; 17], b"0000000000000000000000".to_vec()] {
+            let index = pb::Node {
+                body: Some(pb::node::Body::Index(pb::IndexNode {
+                    entries: vec![pb::IndexEntry {
+                        separator_key: Vec::new(),
+                        child: bad.clone(),
+                    }],
+                })),
+                ..pb::Node::default()
+            };
+            let sibling = pb::Node {
+                right_sibling: bad.clone(),
+                ..pb::Node::default()
+            };
+            let reservation = pb::Node {
+                merge_reservation: bad,
+                ..pb::Node::default()
+            };
+            for (raw, want) in [
+                (index, "index node has an invalid child ID"),
+                (sibling, "node has an invalid right-sibling ID"),
+                (reservation, "node has an invalid merge reservation"),
+            ] {
+                let error = Node::decode(&raw.encode_to_vec()).unwrap_err();
+                assert_eq!(error.to_string(), want);
+            }
+        }
+
+        let empty_child = pb::Node {
+            body: Some(pb::node::Body::Index(pb::IndexNode {
+                entries: vec![pb::IndexEntry::default()],
+            })),
+            ..pb::Node::default()
+        };
+        let error = Node::decode(&empty_child.encode_to_vec()).unwrap_err();
+        assert_eq!(error.to_string(), "index node has an invalid child ID");
+    }
+
+    #[test]
     fn installations_advance_the_generation_once() {
         let gate = TxId::from_bytes(vec![2]);
-        let intent = StructuralIntentId::from(ValidatedNodeToken::from_bytes([3; 16]));
+        let intent = intent_id(3);
         let mut locks = NodeLocks::default();
 
         locks.set_structural_gate(gate.clone());
         locks.set_structural_gate(gate.clone());
         assert_eq!(locks.membership_generation(), 1);
-        locks.set_merge_reservation(intent.clone());
-        locks.set_merge_reservation(intent.clone());
+        locks.set_merge_reservation(intent);
+        locks.set_merge_reservation(intent);
         assert_eq!(locks.membership_generation(), 2);
 
         assert!(locks.remove_structural_gate(&gate));
@@ -1313,9 +1374,9 @@ mod tests {
     #[test]
     fn index_round_trip_and_child_lookup() {
         let index = IndexNode::from_children([
-            (b"".to_vec(), "L0".to_string()),
-            (b"f".to_vec(), "L1".to_string()),
-            (b"m".to_vec(), "L2".to_string()),
+            (b"".to_vec(), id("L0")),
+            (b"f".to_vec(), id("L1")),
+            (b"m".to_vec(), id("L2")),
         ]);
         let node = Node::index(index);
         let decoded = Node::decode(&node.encode()).unwrap();
@@ -1323,25 +1384,25 @@ mod tests {
 
         let idx = decoded.as_index().unwrap();
         // The routed child is the greatest separator not exceeding the key.
-        assert_eq!(idx.child_for(b"apple"), Some("L0"));
-        assert_eq!(idx.child_for(b"f"), Some("L1"));
-        assert_eq!(idx.child_for(b"kiwi"), Some("L1"));
-        assert_eq!(idx.child_for(b"mango"), Some("L2"));
+        assert_eq!(idx.child_for(b"apple"), Some(id("L0")));
+        assert_eq!(idx.child_for(b"f"), Some(id("L1")));
+        assert_eq!(idx.child_for(b"kiwi"), Some(id("L1")));
+        assert_eq!(idx.child_for(b"mango"), Some(id("L2")));
         // The child for keys just below a separator is the one before it.
-        assert_eq!(idx.child_before(b"f"), Some("L0"));
-        assert_eq!(idx.child_before(b"kiwi"), Some("L1"));
-        assert_eq!(idx.child_before(b""), Some("L0"));
+        assert_eq!(idx.child_before(b"f"), Some(id("L0")));
+        assert_eq!(idx.child_before(b"kiwi"), Some(id("L1")));
+        assert_eq!(idx.child_before(b""), Some(id("L0")));
     }
 
     fn linked(high_key: &[u8], right: &str) -> Node {
         Node::leaf(LeafBody::new())
             .with_high_key(Some(high_key.to_vec()))
-            .with_right_sibling(Some(right.to_string()))
+            .with_right_sibling(Some(id(right)))
     }
 
     fn drained(high_key: &[u8], target: &str) -> Node {
         let mut node = linked(high_key, "unused");
-        node.drain(target);
+        node.drain(id(target));
         node
     }
 
@@ -1349,7 +1410,7 @@ mod tests {
         IndexNode::from_children(
             children
                 .iter()
-                .map(|(separator, child)| (separator.to_vec(), child.to_string())),
+                .map(|(separator, child)| (separator.to_vec(), id(child))),
         )
     }
 
@@ -1360,7 +1421,7 @@ mod tests {
             linked(b"t", "L4"),
             Node::leaf(LeafBody::new()),
         );
-        let path = [("L0", &l0), ("L1", &l1), ("L4", &l4)];
+        let path = [(id("L0"), &l0), (id("L1"), &l1), (id("L4"), &l4)];
         let mut parent = index(&[(b"", "L0")]);
 
         parent.reconcile(&path);
@@ -1375,7 +1436,7 @@ mod tests {
         let (source, target) = (drained(b"m", "R"), linked(b"t", "S"));
         let mut parent = index(&[(b"", "A"), (b"f", "L"), (b"m", "R"), (b"t", "S")]);
 
-        parent.reconcile(&[("L", &source), ("R", &target)]);
+        parent.reconcile(&[(id("L"), &source), (id("R"), &target)]);
         assert_eq!(parent, index(&[(b"", "A"), (b"f", "R"), (b"t", "S")]));
     }
 
@@ -1388,7 +1449,7 @@ mod tests {
         );
         let mut parent = index(&[(b"", "L"), (b"m", "R")]);
 
-        parent.reconcile(&[("L", &source), ("R", &target), ("S", &split)]);
+        parent.reconcile(&[(id("L"), &source), (id("R"), &target), (id("S"), &split)]);
         assert_eq!(parent, index(&[(b"", "R"), (b"t", "S")]));
     }
 
@@ -1396,7 +1457,7 @@ mod tests {
     fn leaf_split_moves_upper_half_and_relinks() {
         // A leaf with an existing high-key and right-sibling splits: the new
         // sibling inherits both bounds, the source is rebounded to the split key
-        // and linked to the sibling token.
+        // and linked to the sibling.
         let mut src = Node::leaf(LeafBody::from_entries([
             entry(b"apple", 1),
             entry(b"cat", 2),
@@ -1405,9 +1466,9 @@ mod tests {
         ]))
         .with_low_key(b"ant".to_vec())
         .with_high_key(Some(b"tiger".to_vec()))
-        .with_right_sibling(Some("oldRight".to_string()));
+        .with_right_sibling(Some(id("oldRight")));
 
-        let (right, split_key) = src.split("newRight").expect("splittable");
+        let (right, split_key) = src.split(id("newRight")).expect("splittable");
         assert_eq!(split_key, b"mango");
         assert_eq!(src.low_key(), b"ant");
         assert_eq!(right.low_key(), b"mango");
@@ -1422,7 +1483,7 @@ mod tests {
             .collect();
         assert_eq!(src_keys, vec![b"apple".as_slice(), b"cat"]);
         assert_eq!(src.high_key(), Some(b"mango".as_slice()));
-        assert_eq!(src.right_sibling(), Some("newRight"));
+        assert_eq!(src.right_sibling(), Some(id("newRight")));
 
         // The sibling holds the upper half and inherits the source's former
         // high-key and right-sibling.
@@ -1434,7 +1495,7 @@ mod tests {
             .collect();
         assert_eq!(right_keys, vec![b"mango".as_slice(), b"pear"]);
         assert_eq!(right.high_key(), Some(b"tiger".as_slice()));
-        assert_eq!(right.right_sibling(), Some("oldRight"));
+        assert_eq!(right.right_sibling(), Some(id("oldRight")));
     }
 
     #[test]
@@ -1450,7 +1511,7 @@ mod tests {
         locks.advance_membership_generation();
         src.set_locks(locks);
 
-        let (right, _) = src.split("newRight").expect("splittable");
+        let (right, _) = src.split(id("newRight")).expect("splittable");
         assert_eq!(src.membership_generation(), 2);
         assert_eq!(right.membership_generation(), 2);
     }
@@ -1458,12 +1519,12 @@ mod tests {
     #[test]
     fn index_split_promotes_separator_and_relinks() {
         let mut src = Node::index(IndexNode::from_children([
-            (b"".to_vec(), "L0".to_string()),
-            (b"f".to_vec(), "L1".to_string()),
-            (b"m".to_vec(), "L2".to_string()),
-            (b"t".to_vec(), "L3".to_string()),
+            (b"".to_vec(), id("L0")),
+            (b"f".to_vec(), id("L1")),
+            (b"m".to_vec(), id("L2")),
+            (b"t".to_vec(), id("L3")),
         ]));
-        let (right, sep) = src.split("newRight").expect("splittable");
+        let (right, sep) = src.split(id("newRight")).expect("splittable");
         assert_eq!(
             sep, b"m",
             "promoted separator is the right half's low bound"
@@ -1472,7 +1533,7 @@ mod tests {
         let left_seps: Vec<&[u8]> = src.as_index().unwrap().children().map(|(s, _)| s).collect();
         assert_eq!(left_seps, vec![b"".as_slice(), b"f"]);
         assert_eq!(src.high_key(), Some(b"m".as_slice()));
-        assert_eq!(src.right_sibling(), Some("newRight"));
+        assert_eq!(src.right_sibling(), Some(id("newRight")));
 
         let right_seps: Vec<&[u8]> = right
             .as_index()
@@ -1487,12 +1548,12 @@ mod tests {
     fn split_of_undersized_node_is_none() {
         assert!(
             Node::leaf(LeafBody::from_entries([entry(b"only", 1)]))
-                .split("r")
+                .split(id("r"))
                 .is_none()
         );
-        assert!(Node::leaf(LeafBody::new()).split("r").is_none());
-        let one_child = Node::index(IndexNode::from_children([(b"".to_vec(), "L0".to_string())]));
-        assert!(one_child.clone().split("r").is_none());
+        assert!(Node::leaf(LeafBody::new()).split(id("r")).is_none());
+        let one_child = Node::index(IndexNode::from_children([(b"".to_vec(), id("L0"))]));
+        assert!(one_child.clone().split(id("r")).is_none());
     }
 
     #[test]
@@ -1512,17 +1573,17 @@ mod tests {
         ]));
         assert!(three.over_soft_cap(&tiny));
         let two_index = Node::index(IndexNode::from_children([
-            (b"".to_vec(), "L0".to_string()),
-            (b"m".to_vec(), "L1".to_string()),
+            (b"".to_vec(), id("L0")),
+            (b"m".to_vec(), id("L1")),
         ]));
         assert!(
             !two_index.over_soft_cap(&tiny),
             "index at the child cap is not over it"
         );
         let three_index = Node::index(IndexNode::from_children([
-            (b"".to_vec(), "L0".to_string()),
-            (b"m".to_vec(), "L1".to_string()),
-            (b"t".to_vec(), "L2".to_string()),
+            (b"".to_vec(), id("L0")),
+            (b"m".to_vec(), id("L1")),
+            (b"t".to_vec(), id("L2")),
         ]));
         assert!(three_index.over_soft_cap(&tiny));
 
@@ -1597,21 +1658,16 @@ mod tests {
     #[test]
     fn maximum_key_admission_matches_real_nodes_at_the_exact_limit() {
         let maximum_key = vec![b'k'; 128];
-        let id = TxId::with_priority(7, b"maximum");
-        let mut entry = LeafEntry::new(maximum_key.clone())
-            .with_current(CurrentState::External { writer: id.clone() });
-        entry.replace_write_lock(id);
+        let writer = TxId::with_priority(7, b"maximum");
+        let mut entry = LeafEntry::new(maximum_key.clone()).with_current(CurrentState::External {
+            writer: writer.clone(),
+        });
+        entry.replace_write_lock(writer);
         let leaf = Node::leaf(LeafBody::from_entries([entry]));
 
         let parent = Node::index(IndexNode::from_children([
-            (
-                Vec::new(),
-                ValidatedNodeToken::from_bytes([1; 16]).to_string(),
-            ),
-            (
-                maximum_key.clone(),
-                ValidatedNodeToken::from_bytes([2; 16]).to_string(),
-            ),
+            (Vec::new(), id("L0")),
+            (maximum_key.clone(), id("L1")),
         ]));
         assert_eq!(parent.as_index().unwrap().len(), 2);
 
@@ -1674,7 +1730,7 @@ mod tests {
         assert!(!bounded.covers(b"zebra"));
 
         let mut drained = Node::leaf(LeafBody::new());
-        drained.drain("target");
+        drained.drain(id("target"));
         assert!(!drained.covers(b""));
         assert!(!drained.covers(b"anything"));
     }
@@ -1691,30 +1747,31 @@ mod tests {
     #[test]
     fn encoding_is_canonical_regardless_of_input_order() {
         let a = Node::index(IndexNode::from_children([
-            (b"m".to_vec(), "L2".to_string()),
-            (b"".to_vec(), "L0".to_string()),
-            (b"f".to_vec(), "L1".to_string()),
+            (b"m".to_vec(), id("L2")),
+            (b"".to_vec(), id("L0")),
+            (b"f".to_vec(), id("L1")),
         ]));
         let b = Node::index(IndexNode::from_children([
-            (b"".to_vec(), "L0".to_string()),
-            (b"f".to_vec(), "L1".to_string()),
-            (b"m".to_vec(), "L2".to_string()),
+            (b"".to_vec(), id("L0")),
+            (b"f".to_vec(), id("L1")),
+            (b"m".to_vec(), id("L2")),
         ]));
         assert_eq!(a.encode(), b.encode());
     }
 
     #[test]
     fn codec_size_predictions_match_varint_boundaries() {
-        let id = TxId::from_bytes(vec![0; TxId::MAX_GENERATED_ENCODED_LEN]);
-        let token = ValidatedNodeToken::from_bytes([0; 16]).to_string();
-        assert_eq!(token.len(), ValidatedNodeToken::MAX_ENCODED_LEN);
+        let writer = TxId::from_bytes(vec![0; TxId::MAX_GENERATED_ENCODED_LEN]);
+        let child = id("child");
 
         for key_len in [
             0, 1, 81, 82, 83, 84, 127, 128, 16_335, 16_336, 16_338, 16_339, 16_383, 16_384,
         ] {
-            let mut entry = LeafEntry::new(vec![b'k'; key_len])
-                .with_current(CurrentState::External { writer: id.clone() });
-            entry.replace_write_lock(id.clone());
+            let mut entry =
+                LeafEntry::new(vec![b'k'; key_len]).with_current(CurrentState::External {
+                    writer: writer.clone(),
+                });
+            entry.replace_write_lock(writer.clone());
             let actual = Node::leaf(LeafBody::from_entries([entry.clone()])).content_encoded_len();
 
             assert_eq!(
@@ -1730,11 +1787,11 @@ mod tests {
         }
 
         for key_len in [
-            0, 1, 73, 74, 101, 102, 127, 128, 16_327, 16_328, 16_356, 16_357, 16_383, 16_384,
+            0, 1, 85, 86, 107, 108, 127, 128, 16_339, 16_340, 16_362, 16_363, 16_383, 16_384,
         ] {
             let actual = Node::index(IndexNode::from_children([
-                (Vec::new(), token.clone()),
-                (vec![b'k'; key_len], token.clone()),
+                (Vec::new(), child),
+                (vec![b'k'; key_len], child),
             ]))
             .content_encoded_len();
 
@@ -1762,13 +1819,17 @@ mod tests {
     fn golden_leaf_encoding() {
         let node = Node::leaf(LeafBody::from_entries([golden_entry()]))
             .with_high_key(Some(b"m".to_vec()))
-            .with_right_sibling(Some("sib".to_string()));
+            .with_right_sibling(Some(NodeId::from_bytes([7; 16])));
         let got = node.encode();
         let want = [
-            0x0a, 0x01, 0x6d, 0x12, 0x03, 0x73, 0x69, 0x62, 0x1a, 0x19, 0x0a, 0x17, 0x0a, 0x05,
-            0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a, 0x04, 0x01, 0x02, 0x03, 0x04, 0x22,
-            0x06, 0x0a, 0x02, 0xaa, 0xbb, 0x10, 0x01,
-        ];
+            [0x0a, 0x01, 0x6d, 0x12, 0x10].as_slice(),
+            &[7; 16],
+            &[
+                0x1a, 0x19, 0x0a, 0x17, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a,
+                0x04, 0x01, 0x02, 0x03, 0x04, 0x22, 0x06, 0x0a, 0x02, 0xaa, 0xbb, 0x10, 0x01,
+            ],
+        ]
+        .concat();
         assert_eq!(node.encoded_len(), got.len());
         assert_eq!(got, want, "leaf node encoding drifted: {got:02x?}");
     }
@@ -1789,10 +1850,10 @@ mod tests {
         released_gate.set_structural_gate(holder.clone());
         assert!(released_gate.remove_structural_gate(&holder));
 
-        let intent = StructuralIntentId::from(ValidatedNodeToken::from_bytes([3; 16]));
+        let intent = intent_id(3);
         let mut released_reservation = never_locked.clone();
         let mut locks = released_reservation.locks().clone();
-        locks.set_merge_reservation(intent.clone());
+        locks.set_merge_reservation(intent);
         assert!(locks.remove_merge_reservation(&intent));
         released_reservation.set_locks(locks);
 
@@ -1829,26 +1890,23 @@ mod tests {
         let mut drained = Node::leaf(LeafBody::new())
             .with_low_key(b"a".to_vec())
             .with_high_key(Some(b"m".to_vec()));
-        drained.drain("R");
+        drained.drain(NodeId::from_bytes([8; 16]));
         let got = drained.encode();
         let want = [
-            0x0a, 0x01, 0x6d, 0x12, 0x01, 0x52, 0x1a, 0x00, 0x48, 0x01, 0x5a, 0x01, 0x61,
-        ];
+            [0x0a, 0x01, 0x6d, 0x12, 0x10].as_slice(),
+            &[8; 16],
+            &[0x1a, 0x00, 0x48, 0x01, 0x5a, 0x01, 0x61],
+        ]
+        .concat();
         assert_eq!(drained.encoded_len(), got.len());
         assert_eq!(got, want, "drained node encoding drifted: {got:02x?}");
 
         let mut reserved = Node::leaf(LeafBody::new());
         let mut locks = reserved.locks().clone();
-        locks.set_merge_reservation(StructuralIntentId::from(ValidatedNodeToken::from_bytes(
-            [0; 16],
-        )));
+        locks.set_merge_reservation(StructuralIntentId::from_bytes([3; 16]));
         reserved.set_locks(locks);
         let got = reserved.encode();
-        let want = [
-            [0x1a, 0x00, 0x38, 0x01, 0x52, 0x16].as_slice(),
-            b"0000000000000000000000",
-        ]
-        .concat();
+        let want = [[0x1a, 0x00, 0x38, 0x01, 0x52, 0x10].as_slice(), &[3; 16]].concat();
         assert_eq!(reserved.encoded_len(), got.len());
         assert_eq!(got, want, "merge reservation encoding drifted: {got:02x?}");
     }
@@ -1856,14 +1914,17 @@ mod tests {
     #[test]
     fn golden_index_encoding() {
         let node = Node::index(IndexNode::from_children([
-            (b"".to_vec(), "L0".to_string()),
-            (b"m".to_vec(), "L1".to_string()),
+            (b"".to_vec(), NodeId::from_bytes([1; 16])),
+            (b"m".to_vec(), NodeId::from_bytes([2; 16])),
         ]));
         let got = node.encode();
         let want = [
-            0x22, 0x0f, 0x0a, 0x04, 0x12, 0x02, 0x4c, 0x30, 0x0a, 0x07, 0x0a, 0x01, 0x6d, 0x12,
-            0x02, 0x4c, 0x31,
-        ];
+            [0x22, 0x2b, 0x0a, 0x12, 0x12, 0x10].as_slice(),
+            &[1; 16],
+            &[0x0a, 0x15, 0x0a, 0x01, 0x6d, 0x12, 0x10],
+            &[2; 16],
+        ]
+        .concat();
         assert_eq!(node.encoded_len(), got.len());
         assert_eq!(got, want, "index node encoding drifted: {got:02x?}");
     }

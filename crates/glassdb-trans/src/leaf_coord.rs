@@ -2,7 +2,7 @@
 //! mutation engine through which every leaf entry mutation flows.
 //!
 //! The only coordination primitive is a content compare-and-swap on a B-link
-//! leaf: a node (`{prefix}/_n/<token>`) or the tree root (`{prefix}/_r`,
+//! leaf: a node (`{prefix}/_n/<node-id>`) or the tree root (`{prefix}/_r`,
 //! the root leaf while the collection is small, ADR-031). Concurrent
 //! transactions contending one object are **deduplicated** (ADR-025/026): each
 //! per-object mutation is submitted to a [`Dedup`] keyed on the object path, so
@@ -1132,7 +1132,7 @@ mod tests {
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
     };
     use glassdb_concurr::Background;
-    use glassdb_data::{CollectionAddress, DbPrefix, NodeToken, ObjectPath};
+    use glassdb_data::{CollectionAddress, DbPrefix, NodeId, ObjectPath};
     use glassdb_storage::{CachedStore, CurrentState, LeafBody, LockType, Node, Timeline};
 
     const COLL: &str = "coordp";
@@ -1141,8 +1141,12 @@ mod tests {
         CollectionAddress::root(COLL)
     }
 
-    fn leaf_token() -> NodeToken {
-        NodeToken::from_bytes([0; 16])
+    fn node_id(byte: u8) -> NodeId {
+        NodeId::from_bytes([byte; 16])
+    }
+
+    fn leaf_id() -> NodeId {
+        node_id(0)
     }
 
     struct NoStructuralHints;
@@ -1154,12 +1158,12 @@ mod tests {
     }
 
     // Every coordination round in these tests targets one leaf object. A
-    // standalone node `_n/<token>` is the cleanest stand-in: it carries only key
+    // standalone node `_n/<node-id>` is the cleanest stand-in: it carries only key
     // entries (no collection metadata), exactly what leaf mutation planning operates on.
     fn leaf_path() -> ObjectPath {
         ObjectPath::Node {
             collection: collection(),
-            token: leaf_token(),
+            id: leaf_id(),
         }
     }
 
@@ -1221,7 +1225,7 @@ mod tests {
         let _ = seed_store
             .store_node(
                 &collection(),
-                &leaf_token(),
+                &leaf_id(),
                 &Node::leaf(LeafBody::new()),
                 None,
             )
@@ -1274,7 +1278,7 @@ mod tests {
         let _ = store
             .store_node(
                 &collection(),
-                &leaf_token(),
+                &leaf_id(),
                 &Node::leaf(LeafBody::new()),
                 None,
             )
@@ -1289,12 +1293,12 @@ mod tests {
 
     async fn replace_leaf_node(store: &NodeStore, node: &Node) {
         let observed = store
-            .load_node_state(&collection(), &leaf_token(), Requirement::ANY)
+            .load_node_state(&collection(), &leaf_id(), Requirement::ANY)
             .await
             .unwrap();
         assert!(
             store
-                .store_node(&collection(), &leaf_token(), node, Some(&observed))
+                .store_node(&collection(), &leaf_id(), node, Some(&observed))
                 .await
                 .unwrap()
         );
@@ -1655,7 +1659,7 @@ mod tests {
             assert!(peer.commit_leaf(edit).await.unwrap().is_applied());
         }
         if matches!(change, JoinedLeafChange::Index) {
-            let child = NodeToken::from_bytes([2; 16]);
+            let child = node_id(2);
             assert!(
                 peer.store_node(&collection(), &child, &Node::leaf(LeafBody::new()), None)
                     .await
@@ -1665,7 +1669,7 @@ mod tests {
                 &peer,
                 &Node::index(glassdb_storage::IndexNode::from_children([(
                     Vec::new(),
-                    child.to_string(),
+                    child,
                 )])),
             )
             .await;
@@ -1864,10 +1868,10 @@ mod tests {
         let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let hooks = HookBackend::new(memory.clone());
         let (coord, _, timeline, _bg) = coord_over(hooks.clone()).await;
-        let token = NodeToken::from_bytes([7; 16]);
+        let id = node_id(7);
         let path = ObjectPath::Node {
             collection: collection(),
-            token: token.clone(),
+            id,
         };
         let (entered, release) = park_read_reply(&hooks, path.clone(), 1);
         let driver = tokio::spawn({
@@ -1887,7 +1891,7 @@ mod tests {
         entered.notified().await;
         assert!(
             cold_store(memory)
-                .store_node(&collection(), &token, &Node::leaf(LeafBody::new()), None)
+                .store_node(&collection(), &id, &Node::leaf(LeafBody::new()), None)
                 .await
                 .unwrap()
         );
@@ -1939,14 +1943,19 @@ mod tests {
         let recorder = RecordingBackend::new(hooks.clone());
         let operations = recorder.log();
         let (coord, nodes, timeline, _bg) = coord_over(Arc::new(recorder)).await;
-        let token = NodeToken::from_bytes([1; 16]);
+        let dependency_id = node_id(1);
         let dependency = ObjectPath::Node {
             collection: collection(),
-            token: token.clone(),
+            id: dependency_id,
         };
         assert!(
             nodes
-                .store_node(&collection(), &token, &Node::leaf(LeafBody::new()), None)
+                .store_node(
+                    &collection(),
+                    &dependency_id,
+                    &Node::leaf(LeafBody::new()),
+                    None
+                )
                 .await
                 .unwrap()
         );
@@ -2207,7 +2216,7 @@ mod tests {
             None,
         )]))
         .with_high_key(Some(b"m".to_vec()))
-        .with_right_sibling(Some("R".to_string()));
+        .with_right_sibling(Some(node_id(1)));
         replace_leaf_node(&store, &node).await;
 
         let tx = TxId::with_priority(1, b"t");

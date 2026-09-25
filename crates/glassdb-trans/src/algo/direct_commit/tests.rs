@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use super::super::tests::{
     Tctx, begin_accesses, commit_access, commit_writes, do_read, entry, leaf_reads, logical_key,
     new_algo, new_algo_from_backend, new_recording_algo, new_recording_algo_big_cache,
-    read_outcome, test_collection, test_root_path, wa, wdel, write_counts,
+    read_outcome, test_collection, test_node_id, test_root_path, wa, wdel, write_counts,
 };
 use super::super::*;
 use super::*;
@@ -13,7 +13,7 @@ use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{MemberOutcome, MemberPolicy, ReloadCause, ResolveCtx, Step};
 use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend};
 use glassdb_backend::{Backend, memory::MemoryBackend};
-use glassdb_data::{CollectionAddress, CollectionId, NodeToken};
+use glassdb_data::{CollectionAddress, CollectionId};
 use glassdb_storage::transaction::{TxCommitStatus, TxRecord};
 use glassdb_storage::{
     CollectionRecord, CurrentState, IndexNode, LeafBody, LeafEntry, Node, NodeLocks,
@@ -1719,9 +1719,9 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     let (backend, gate) = Gate::wrap_writes(mem.clone());
     let (tm, tctx) = new_algo_from_backend(backend.clone()).await;
 
-    let l0 = NodeToken::from_bytes([0; 16]);
-    let l1 = NodeToken::from_bytes([1; 16]);
-    let l2 = NodeToken::from_bytes([2; 16]);
+    let l0 = test_node_id(0);
+    let l1 = test_node_id(1);
+    let l2 = test_node_id(2);
     let seed = TxId::with_priority(1, b"seed");
     let seeded_l0 = || {
         Node::leaf(LeafBody::from_entries([LeafEntry::new(b"a").with_current(
@@ -1749,7 +1749,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
         tctx.nodes
             .store_root(
                 &test_collection(),
-                &Node::index(IndexNode::from_children([(Vec::new(), l0.to_string(),)])),
+                &Node::index(IndexNode::from_children([(Vec::new(), l0,)])),
                 root.observation(),
             )
             .await
@@ -1790,7 +1790,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
         .unwrap();
     let bounded_l0 = seeded_l0()
         .with_high_key(Some(b"m".to_vec()))
-        .with_right_sibling(Some(l1.to_string()));
+        .with_right_sibling(Some(l1));
     assert!(
         peer.nodes
             .store_node(&test_collection(), &l0, &bounded_l0, Some(&observed_l0),)
@@ -1818,7 +1818,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
         .unwrap();
     let bounded_l1 = Node::leaf(LeafBody::new())
         .with_high_key(Some(b"y".to_vec()))
-        .with_right_sibling(Some(l2.to_string()));
+        .with_right_sibling(Some(l2));
     assert!(
         peer.nodes
             .store_node(&test_collection(), &l1, &bounded_l1, Some(&observed_l1))

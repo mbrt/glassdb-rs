@@ -328,9 +328,7 @@ async fn build_groups(
 fn leaf_ref(path: &ObjectPath) -> Result<LeafRef, TransError> {
     match path {
         ObjectPath::TreeRoot { collection } => Ok(LeafRef::root(collection.clone())),
-        ObjectPath::Node { collection, token } => {
-            Ok(LeafRef::node(collection.clone(), token.clone()))
-        }
+        ObjectPath::Node { collection, id } => Ok(LeafRef::node(collection.clone(), *id)),
         _ => Err(TransError::other("router returned a non-leaf object path")),
     }
 }

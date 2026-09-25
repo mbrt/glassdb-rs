@@ -18,7 +18,7 @@ use std::num::NonZeroUsize;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
-use glassdb_data::{CollectionAddress, LogicalKey, NodeToken, ObjectPath};
+use glassdb_data::{CollectionAddress, LogicalKey, NodeId, ObjectPath};
 
 use crate::cached_store::Requirement;
 use crate::error::StorageError;
@@ -331,16 +331,10 @@ impl<T> BatchRouting<T> {
         item.refresh = None;
 
         if !node.covers(&item.raw_key) {
-            let Some(token) = node.right_sibling() else {
+            let Some(right) = node.right_sibling() else {
                 return Some(item);
             };
-            let target = match routed_node_path(&item, token) {
-                Ok(target) => target,
-                Err(error) => {
-                    self.record_error(item.ordinal, path.clone(), error);
-                    return None;
-                }
-            };
+            let target = routed_node_path(&item, right);
             item.stage = match node.body() {
                 NodeBody::Leaf(_) => RouteStage::Leaf,
                 NodeBody::Index(_) => RouteStage::Interior,
@@ -352,7 +346,7 @@ impl<T> BatchRouting<T> {
 
         match node.body() {
             NodeBody::Index(index) => {
-                let Some(token) = index.child_for(&item.raw_key) else {
+                let Some(child) = index.child_for(&item.raw_key) else {
                     self.record_error(
                         item.ordinal,
                         path.clone(),
@@ -360,13 +354,7 @@ impl<T> BatchRouting<T> {
                     );
                     return None;
                 };
-                let target = match routed_node_path(&item, token) {
-                    Ok(target) => target,
-                    Err(error) => {
-                        self.record_error(item.ordinal, path.clone(), error);
-                        return None;
-                    }
-                };
+                let target = routed_node_path(&item, child);
                 item.stage = RouteStage::Interior;
                 item.right_hops = 0;
                 self.enqueue(target, item);
@@ -463,13 +451,12 @@ impl<'a> DescentCursor<'a> {
             if self.current.node().covers(key) {
                 return Ok(());
             }
-            let Some(token) = self.current.node().right_sibling() else {
+            let Some(right) = self.current.node().right_sibling() else {
                 return Ok(());
             };
-            let token = node_token(token)?;
             self.current = self
                 .router
-                .load_child(self.collection, &token, self.requirement)
+                .load_child(self.collection, &right, self.requirement)
                 .await?;
         }
         Err(StorageError::other(
@@ -479,17 +466,15 @@ impl<'a> DescentCursor<'a> {
 
     /// Advances one index level and returns the normalized index it left.
     async fn advance_for(&mut self, key: &[u8]) -> Result<Option<Located>, StorageError> {
-        let token = match self.current.node().body() {
+        let child_id = match self.current.node().body() {
             NodeBody::Leaf(_) => return Ok(None),
-            NodeBody::Index(index) => node_token(
-                index
-                    .child_for(key)
-                    .ok_or_else(|| StorageError::other("descent reached an empty index node"))?,
-            )?,
+            NodeBody::Index(index) => index
+                .child_for(key)
+                .ok_or_else(|| StorageError::other("descent reached an empty index node"))?,
         };
         let child = self
             .router
-            .load_child(self.collection, &token, self.requirement)
+            .load_child(self.collection, &child_id, self.requirement)
             .await?;
         Ok(Some(std::mem::replace(&mut self.current, child)))
     }
@@ -633,16 +618,16 @@ impl<'a> LeafChain<'a> {
         let Some(node) = leaf.node() else {
             return Ok(None);
         };
-        let mut right = node.right_sibling().map(node_token).transpose()?;
+        let mut right = node.right_sibling();
         for _ in 0..MAX_SELF_CORRECTING_HOPS {
-            let Some(token) = right else {
+            let Some(id) = right else {
                 return Ok(None);
             };
-            let next = self.load_linked(&token, node.high_key()).await?;
+            let next = self.load_linked(&id, node.high_key()).await?;
             if !next.node().is_drained() {
                 return Ok(Some(next.into_locator()));
             }
-            right = next.node().right_sibling().map(node_token).transpose()?;
+            right = next.node().right_sibling();
         }
         Err(StorageError::other(
             "leaf chain exceeded the right-link hop bound",
@@ -653,12 +638,12 @@ impl<'a> LeafChain<'a> {
     /// copy older than a merge into the node is read again (ADR-073).
     async fn load_linked(
         &self,
-        token: &NodeToken,
+        id: &NodeId,
         first_key: Option<&[u8]>,
     ) -> Result<Located, StorageError> {
         let linked = self
             .router
-            .load_child(self.collection, token, self.requirement)
+            .load_child(self.collection, id, self.requirement)
             .await?;
         let Some(first_key) = first_key else {
             return Ok(linked);
@@ -669,7 +654,7 @@ impl<'a> LeafChain<'a> {
         let fresh = Requirement::after(self.router.nodes.currentness_barrier());
         let linked = self
             .router
-            .load_child(self.collection, token, self.requirement.stricter(fresh))
+            .load_child(self.collection, id, self.requirement.stricter(fresh))
             .await?;
         if linked.node().is_below_range(first_key) {
             return Err(StorageError::other(
@@ -929,11 +914,11 @@ impl TreeRouter {
     /// A split's new right sibling covers its recorded split key, so recovery can
     /// prove publication by following one B-link path instead of walking the
     /// collection's whole tree.
-    pub async fn token_reachable_at_key(
+    pub async fn node_reachable_at_key(
         &self,
         collection: &CollectionAddress,
         key: &[u8],
-        target: &NodeToken,
+        target: &NodeId,
         requirement: Requirement,
     ) -> Result<bool, StorageError> {
         let Some(cursor) = self.start_descent(collection, requirement).await? else {
@@ -945,7 +930,7 @@ impl TreeRouter {
                 ReachTarget {
                     target: ObjectPath::Node {
                         collection: collection.clone(),
-                        token: target.clone(),
+                        id: *target,
                     },
                 },
             )
@@ -965,7 +950,7 @@ impl TreeRouter {
         &self,
         collection: &CollectionAddress,
         key: &[u8],
-        target: &NodeToken,
+        target: &NodeId,
         requirement: Requirement,
     ) -> Result<Option<RoutedLeaf>, StorageError> {
         let Some(cursor) = self.start_descent(collection, requirement).await? else {
@@ -974,24 +959,24 @@ impl TreeRouter {
         let stop = FindParent {
             target: ObjectPath::Node {
                 collection: collection.clone(),
-                token: target.clone(),
+                id: *target,
             },
             parent: None,
         };
         cursor.run_until(key, stop).await
     }
 
-    /// Returns the observed node named `token`, without descending to it.
+    /// Returns the observed node named `id`, without descending to it.
     ///
     /// Routing by key self-corrects rightward past a node a split has moved, so
-    /// a caller holding a child token from an index reads that exact child here.
+    /// a caller holding a child ID from an index reads that exact child here.
     pub async fn leaf_at(
         &self,
         collection: &CollectionAddress,
-        token: &NodeToken,
+        id: &NodeId,
         requirement: Requirement,
     ) -> Result<RoutedLeaf, StorageError> {
-        let located = self.load_child(collection, token, requirement).await?;
+        let located = self.load_child(collection, id, requirement).await?;
         if located.observation.is_absent() {
             return Err(StorageError::NotFound);
         }
@@ -1036,26 +1021,21 @@ impl TreeRouter {
     async fn load_child(
         &self,
         collection: &CollectionAddress,
-        token: &NodeToken,
+        id: &NodeId,
         requirement: Requirement,
     ) -> Result<Located, StorageError> {
         let observation = self
             .nodes
-            .load_node_state(collection, token, requirement)
+            .load_node_state(collection, id, requirement)
             .await?;
         Ok(Located {
             path: ObjectPath::Node {
                 collection: collection.clone(),
-                token: token.clone(),
+                id: *id,
             },
             observation,
         })
     }
-}
-
-fn node_token(token: &str) -> Result<NodeToken, StorageError> {
-    NodeToken::try_from(token)
-        .map_err(|error| StorageError::with_source("invalid node reference", error))
 }
 
 fn route_requirement(stage: RouteStage, interior: Requirement, leaf: Requirement) -> Requirement {
@@ -1065,11 +1045,11 @@ fn route_requirement(stage: RouteStage, interior: Requirement, leaf: Requirement
     }
 }
 
-fn routed_node_path<T>(item: &RoutedItem<T>, token: &str) -> Result<ObjectPath, StorageError> {
-    Ok(ObjectPath::Node {
+fn routed_node_path<T>(item: &RoutedItem<T>, id: NodeId) -> ObjectPath {
+    ObjectPath::Node {
         collection: item.key.collection().clone(),
-        token: node_token(token)?,
-    })
+        id,
+    }
 }
 
 #[cfg(test)]
@@ -1168,21 +1148,21 @@ mod tests {
         CollectionAddress::root("db")
     }
 
-    fn token(byte: u8) -> NodeToken {
-        NodeToken::from_bytes([byte; 16])
+    fn node_id(byte: u8) -> NodeId {
+        NodeId::from_bytes([byte; 16])
     }
 
     fn node_path(byte: u8) -> ObjectPath {
         ObjectPath::Node {
             collection: collection(),
-            token: token(byte),
+            id: node_id(byte),
         }
     }
 
-    fn leaf(entries: &[&[u8]], high_key: Option<&[u8]>, right: Option<&NodeToken>) -> Node {
+    fn leaf(entries: &[&[u8]], high_key: Option<&[u8]>, right: Option<&NodeId>) -> Node {
         Node::leaf(LeafBody::from_entries(entries.iter().map(|k| live(k))))
             .with_high_key(high_key.map(<[u8]>::to_vec))
-            .with_right_sibling(right.map(ToString::to_string))
+            .with_right_sibling(right.copied())
     }
 
     async fn store_leaf(
@@ -1192,10 +1172,10 @@ mod tests {
         high_key: Option<&[u8]>,
         right: Option<u8>,
     ) {
-        let right = right.map(token);
+        let right = right.map(node_id);
         s.store_node(
             &collection(),
-            &token(byte),
+            &node_id(byte),
             &leaf(entries, high_key, right.as_ref()),
             None,
         )
@@ -1206,13 +1186,13 @@ mod tests {
     // Seeds a two-level tree: root index -> {L0 (apple,cat), L1 (mango,pear)},
     // split at "m", with the leaves chained by right-sibling.
     async fn seed_two_level(s: &NodeStore) {
-        let left = token(0);
-        let right = token(1);
+        let left = node_id(0);
+        let right = node_id(1);
         store_leaf(s, 0, &[b"apple", b"cat"], Some(b"m"), Some(1)).await;
         store_leaf(s, 1, &[b"mango", b"pear"], None, None).await;
         let root = Node::index(IndexNode::from_children([
-            (b"".to_vec(), left.to_string()),
-            (b"m".to_vec(), right.to_string()),
+            (b"".to_vec(), left),
+            (b"m".to_vec(), right),
         ]));
         s.create_root(&collection(), &root).await.unwrap();
     }
@@ -1220,12 +1200,12 @@ mod tests {
     // Models a leaf split whose parent is stale: R still routes every key to
     // L0, while L0's right-link moves keys at and above "m" to L1.
     async fn seed_stale_leaf_parent(s: &NodeStore) {
-        let left = token(0);
+        let left = node_id(0);
         store_leaf(s, 0, &[b"apple", b"cat"], Some(b"m"), Some(1)).await;
         store_leaf(s, 1, &[b"mango", b"pear"], None, None).await;
         s.create_root(
             &collection(),
-            &Node::index(IndexNode::from_children([(Vec::new(), left.to_string())])),
+            &Node::index(IndexNode::from_children([(Vec::new(), left)])),
         )
         .await
         .unwrap();
@@ -1234,15 +1214,15 @@ mod tests {
     // One key takes a stale left route while another reaches the same right
     // leaf directly, so their path batches converge after admission.
     async fn seed_converging_leaf_paths(s: &NodeStore) {
-        let left = token(0);
-        let right = token(1);
+        let left = node_id(0);
+        let right = node_id(1);
         store_leaf(s, 0, &[b"apple"], Some(b"m"), Some(1)).await;
         store_leaf(s, 1, &[b"pear", b"zebra"], None, None).await;
         s.create_root(
             &collection(),
             &Node::index(IndexNode::from_children([
-                (Vec::new(), left.to_string()),
-                (b"t".to_vec(), right.to_string()),
+                (Vec::new(), left),
+                (b"t".to_vec(), right),
             ])),
         )
         .await
@@ -1252,13 +1232,13 @@ mod tests {
     // Three leaves behind one stale parent exercise both a bounded scan and
     // the leaf-to-leaf interface without involving another descent shape.
     async fn seed_three_leaf_chain(s: &NodeStore) {
-        let first = token(0);
+        let first = node_id(0);
         store_leaf(s, 0, &[b"apple"], Some(b"m"), Some(1)).await;
         store_leaf(s, 1, &[b"mango"], Some(b"t"), Some(4)).await;
         store_leaf(s, 4, &[b"zebra"], None, None).await;
         s.create_root(
             &collection(),
-            &Node::index(IndexNode::from_children([(Vec::new(), first.to_string())])),
+            &Node::index(IndexNode::from_children([(Vec::new(), first)])),
         )
         .await
         .unwrap();
@@ -1271,10 +1251,7 @@ mod tests {
         store_leaf(s, 1, &[b"cat"], Some(b"m"), Some(0)).await;
         s.create_root(
             &collection(),
-            &Node::index(IndexNode::from_children([(
-                Vec::new(),
-                token(0).to_string(),
-            )])),
+            &Node::index(IndexNode::from_children([(Vec::new(), node_id(0))])),
         )
         .await
         .unwrap();
@@ -1283,21 +1260,18 @@ mod tests {
     // Models an interior split whose parent is stale: R still routes to I0,
     // whose right-link moves the lookup to I1 before descending to L1.
     async fn seed_stale_interior_parent(s: &NodeStore) {
-        let interior_left = token(2);
-        let interior_right = token(3);
-        let leaf_left = token(0);
-        let leaf_right = token(1);
+        let interior_left = node_id(2);
+        let interior_right = node_id(3);
+        let leaf_left = node_id(0);
+        let leaf_right = node_id(1);
         store_leaf(s, 0, &[b"apple"], Some(b"m"), Some(1)).await;
         store_leaf(s, 1, &[b"pear"], None, None).await;
         s.store_node(
             &collection(),
             &interior_left,
-            &Node::index(IndexNode::from_children([(
-                Vec::new(),
-                leaf_left.to_string(),
-            )]))
-            .with_high_key(Some(b"m".to_vec()))
-            .with_right_sibling(Some(interior_right.to_string())),
+            &Node::index(IndexNode::from_children([(Vec::new(), leaf_left)]))
+                .with_high_key(Some(b"m".to_vec()))
+                .with_right_sibling(Some(interior_right)),
             None,
         )
         .await
@@ -1305,20 +1279,14 @@ mod tests {
         s.store_node(
             &collection(),
             &interior_right,
-            &Node::index(IndexNode::from_children([(
-                b"m".to_vec(),
-                leaf_right.to_string(),
-            )])),
+            &Node::index(IndexNode::from_children([(b"m".to_vec(), leaf_right)])),
             None,
         )
         .await
         .unwrap();
         s.create_root(
             &collection(),
-            &Node::index(IndexNode::from_children([(
-                Vec::new(),
-                interior_left.to_string(),
-            )])),
+            &Node::index(IndexNode::from_children([(Vec::new(), interior_left)])),
         )
         .await
         .unwrap();
@@ -1341,7 +1309,7 @@ mod tests {
         assert!(loc.node().unwrap().as_leaf().unwrap().exists(b"only"));
         assert!(
             router
-                .parent_of(&collection(), b"only", &token(9), requirement)
+                .parent_of(&collection(), b"only", &node_id(9), requirement)
                 .await
                 .unwrap()
                 .is_none()
@@ -1376,13 +1344,13 @@ mod tests {
         let requirement = Requirement::after(s.timeline.currentness_barrier());
         assert!(
             !router
-                .token_reachable_at_key(&collection(), b"k", &token(9), requirement)
+                .node_reachable_at_key(&collection(), b"k", &node_id(9), requirement)
                 .await
                 .unwrap()
         );
         assert!(
             router
-                .parent_of(&collection(), b"k", &token(9), requirement)
+                .parent_of(&collection(), b"k", &node_id(9), requirement)
                 .await
                 .unwrap()
                 .is_none()
@@ -1447,7 +1415,7 @@ mod tests {
 
         let terminal_warm = store_over(backend);
         terminal_warm
-            .load_node_state(&collection(), &token(1), Requirement::ANY)
+            .load_node_state(&collection(), &node_id(1), Requirement::ANY)
             .await
             .unwrap();
         take_reads(&log);
@@ -1493,7 +1461,7 @@ mod tests {
         let mixed = store_over(backend);
         for byte in [0, 1] {
             mixed
-                .load_node_state(&collection(), &token(byte), Requirement::ANY)
+                .load_node_state(&collection(), &node_id(byte), Requirement::ANY)
                 .await
                 .unwrap();
         }
@@ -1525,7 +1493,7 @@ mod tests {
         take_reads(&log);
 
         let s = store_over(backend);
-        s.load_node_state(&collection(), &token(1), Requirement::ANY)
+        s.load_node_state(&collection(), &node_id(1), Requirement::ANY)
             .await
             .unwrap();
         take_reads(&log);
@@ -1573,7 +1541,7 @@ mod tests {
 
         let terminal_warm = store_over(backend);
         terminal_warm
-            .load_node_state(&collection(), &token(4), Requirement::ANY)
+            .load_node_state(&collection(), &node_id(4), Requirement::ANY)
             .await
             .unwrap();
         take_reads(&log);
@@ -1620,12 +1588,12 @@ mod tests {
 
         assert!(
             router
-                .token_reachable_at_key(&collection(), b"pear", &token(3), Requirement::ANY)
+                .node_reachable_at_key(&collection(), b"pear", &node_id(3), Requirement::ANY)
                 .await
                 .unwrap()
         );
         let parent = router
-            .parent_of(&collection(), b"pear", &token(1), Requirement::ANY)
+            .parent_of(&collection(), b"pear", &node_id(1), Requirement::ANY)
             .await
             .unwrap()
             .unwrap();
@@ -1633,7 +1601,7 @@ mod tests {
         assert!(matches!(parent.node().unwrap().body(), NodeBody::Index(_)));
         // The parent of an index node is one level higher.
         let parent = router
-            .parent_of(&collection(), b"pear", &token(3), Requirement::ANY)
+            .parent_of(&collection(), b"pear", &node_id(3), Requirement::ANY)
             .await
             .unwrap()
             .unwrap();
@@ -1665,8 +1633,8 @@ mod tests {
         writer
             .store_node(
                 &collection(),
-                &token(0),
-                &leaf(&[b"apple"], Some(b"m"), Some(&token(1))),
+                &node_id(0),
+                &leaf(&[b"apple"], Some(b"m"), Some(&node_id(1))),
                 None,
             )
             .await
@@ -1674,7 +1642,7 @@ mod tests {
         writer
             .store_node(
                 &collection(),
-                &token(1),
+                &node_id(1),
                 &leaf(&[b"pear"], None, None),
                 None,
             )
@@ -1692,8 +1660,8 @@ mod tests {
                 .store_root(
                     &collection(),
                     &Node::index(IndexNode::from_children([
-                        (Vec::new(), token(0).to_string()),
-                        (b"m".to_vec(), token(1).to_string()),
+                        (Vec::new(), node_id(0)),
+                        (b"m".to_vec(), node_id(1)),
                     ])),
                     &observation,
                 )
@@ -1732,7 +1700,7 @@ mod tests {
         let s = store_over(backend);
         assert!(
             !TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-                .token_reachable_at_key(&collection(), b"pear", &token(0), Requirement::ANY)
+                .node_reachable_at_key(&collection(), b"pear", &node_id(0), Requirement::ANY)
                 .await
                 .unwrap()
         );
@@ -1746,23 +1714,20 @@ mod tests {
         dangling
             .create_root(
                 &collection(),
-                &Node::index(IndexNode::from_children([(
-                    Vec::new(),
-                    token(9).to_string(),
-                )])),
+                &Node::index(IndexNode::from_children([(Vec::new(), node_id(9))])),
             )
             .await
             .unwrap();
         let router = TreeRouter::new(dangling.nodes.clone(), std::num::NonZeroUsize::MIN);
         assert!(
             !router
-                .token_reachable_at_key(&collection(), b"pear", &token(8), Requirement::ANY)
+                .node_reachable_at_key(&collection(), b"pear", &node_id(8), Requirement::ANY)
                 .await
                 .unwrap()
         );
         assert!(matches!(
             router
-                .parent_of(&collection(), b"pear", &token(8), Requirement::ANY)
+                .parent_of(&collection(), b"pear", &node_id(8), Requirement::ANY)
                 .await,
             Err(StorageError::NotFound)
         ));
@@ -2120,7 +2085,7 @@ mod tests {
         assert_eq!(routed.path, node_path(1));
 
         let named = router
-            .leaf_at(&collection(), &token(0), requirement)
+            .leaf_at(&collection(), &node_id(0), requirement)
             .await
             .unwrap();
         assert_eq!(named.path, node_path(0));
@@ -2129,7 +2094,9 @@ mod tests {
             "naming a child must not follow its right-link"
         );
         assert!(matches!(
-            router.leaf_at(&collection(), &token(9), requirement).await,
+            router
+                .leaf_at(&collection(), &node_id(9), requirement)
+                .await,
             Err(StorageError::NotFound)
         ));
     }
@@ -2137,22 +2104,20 @@ mod tests {
     #[tokio::test]
     async fn grouped_routing_bounds_right_link_walks() {
         let s = store();
-        let first = NodeToken::from_bytes(0_u128.to_le_bytes());
+        let first = NodeId::from_bytes(0_u128.to_le_bytes());
         for hop in 0..=MAX_SELF_CORRECTING_HOPS {
-            let token = NodeToken::from_bytes((hop as u128).to_le_bytes());
-            let next = NodeToken::from_bytes((hop as u128 + 1).to_le_bytes());
+            let id = NodeId::from_bytes((hop as u128).to_le_bytes());
+            let next = NodeId::from_bytes((hop as u128 + 1).to_le_bytes());
             let node = if hop == MAX_SELF_CORRECTING_HOPS {
                 leaf(&[b"pear", b"zebra"], None, None)
             } else {
                 leaf(&[], Some(b"m"), Some(&next))
             };
-            s.store_node(&collection(), &token, &node, None)
-                .await
-                .unwrap();
+            s.store_node(&collection(), &id, &node, None).await.unwrap();
         }
         s.create_root(
             &collection(),
-            &Node::index(IndexNode::from_children([(Vec::new(), first.to_string())])),
+            &Node::index(IndexNode::from_children([(Vec::new(), first)])),
         )
         .await
         .unwrap();
@@ -2191,13 +2156,10 @@ mod tests {
         let hops = MAX_SELF_CORRECTING_HOPS / 2 + 1;
         let leaf_start = hops + 1;
         let last = leaf_start + hops;
-        let token_at = |index: usize| NodeToken::from_bytes((index as u128).to_le_bytes());
+        let id_at = |index: usize| NodeId::from_bytes((index as u128).to_le_bytes());
         for index in 0..=last {
             let node = if index < leaf_start {
-                Node::index(IndexNode::from_children([(
-                    Vec::new(),
-                    token_at(leaf_start).to_string(),
-                )]))
+                Node::index(IndexNode::from_children([(Vec::new(), id_at(leaf_start))]))
             } else if index == last {
                 leaf(&[b"pear", b"zebra"], None, None)
             } else {
@@ -2207,18 +2169,15 @@ mod tests {
                 node
             } else {
                 node.with_high_key(Some(b"m".to_vec()))
-                    .with_right_sibling(Some(token_at(index + 1).to_string()))
+                    .with_right_sibling(Some(id_at(index + 1)))
             };
-            s.store_node(&collection(), &token_at(index), &node, None)
+            s.store_node(&collection(), &id_at(index), &node, None)
                 .await
                 .unwrap();
         }
         s.create_root(
             &collection(),
-            &Node::index(IndexNode::from_children([(
-                Vec::new(),
-                token_at(0).to_string(),
-            )])),
+            &Node::index(IndexNode::from_children([(Vec::new(), id_at(0))])),
         )
         .await
         .unwrap();
@@ -2240,7 +2199,7 @@ mod tests {
             groups[0].path(),
             &ObjectPath::Node {
                 collection: collection(),
-                token: token_at(last),
+                id: id_at(last),
             }
         );
         assert_eq!(
@@ -2276,20 +2235,20 @@ mod tests {
         for (byte, node) in [
             (
                 2,
-                leaf(&[b"grape"], Some(b"m"), Some(&token(1))).with_low_key(b"f".to_vec()),
+                leaf(&[b"grape"], Some(b"m"), Some(&node_id(1))).with_low_key(b"f".to_vec()),
             ),
             (1, leaf(&[b"pear"], None, None).with_low_key(b"m".to_vec())),
         ] {
-            s.store_node(&collection(), &token(byte), &node, None)
+            s.store_node(&collection(), &node_id(byte), &node, None)
                 .await
                 .unwrap();
         }
         s.create_root(
             &collection(),
             &Node::index(IndexNode::from_children([
-                (Vec::new(), token(0).to_string()),
-                (b"f".to_vec(), token(2).to_string()),
-                (b"m".to_vec(), token(1).to_string()),
+                (Vec::new(), node_id(0)),
+                (b"f".to_vec(), node_id(2)),
+                (b"m".to_vec(), node_id(1)),
             ])),
         )
         .await
@@ -2300,17 +2259,23 @@ mod tests {
     // key of L, then the drain empties L.
     async fn merge_middle_leaf_into_right(s: &TestStore) {
         let fresh = Requirement::after(s.timeline.currentness_barrier());
-        let (_, target) = s.load_node(&collection(), &token(1), fresh).await.unwrap();
+        let (_, target) = s
+            .load_node(&collection(), &node_id(1), fresh)
+            .await
+            .unwrap();
         let absorbed = leaf(&[b"grape", b"pear"], None, None).with_low_key(b"f".to_vec());
         assert!(
-            s.store_node(&collection(), &token(1), &absorbed, Some(&target))
+            s.store_node(&collection(), &node_id(1), &absorbed, Some(&target))
                 .await
                 .unwrap()
         );
-        let (mut source, observed) = s.load_node(&collection(), &token(2), fresh).await.unwrap();
-        source.drain(token(1).as_ref());
+        let (mut source, observed) = s
+            .load_node(&collection(), &node_id(2), fresh)
+            .await
+            .unwrap();
+        source.drain(node_id(1));
         assert!(
-            s.store_node(&collection(), &token(2), &source, Some(&observed))
+            s.store_node(&collection(), &node_id(2), &source, Some(&observed))
                 .await
                 .unwrap()
         );
@@ -2420,24 +2385,21 @@ mod tests {
         writer
             .store_node(
                 &collection(),
-                &token(1),
+                &node_id(1),
                 &leaf(&[b"pear"], None, None).with_low_key(b"m".to_vec()),
                 None,
             )
             .await
             .unwrap();
-        let target = Node::index(IndexNode::from_children([(
-            b"m".to_vec(),
-            token(1).to_string(),
-        )]))
-        .with_low_key(b"m".to_vec());
+        let target = Node::index(IndexNode::from_children([(b"m".to_vec(), node_id(1))]))
+            .with_low_key(b"m".to_vec());
         writer
-            .store_node(&collection(), &token(3), &target, None)
+            .store_node(&collection(), &node_id(3), &target, None)
             .await
             .unwrap();
         let reader = store_over(backend);
         reader
-            .load_node_state(&collection(), &token(3), Requirement::ANY)
+            .load_node_state(&collection(), &node_id(3), Requirement::ANY)
             .await
             .unwrap();
 
@@ -2445,26 +2407,23 @@ mod tests {
         // reconciled root names only the target.
         let fresh = Requirement::after(writer.timeline.currentness_barrier());
         let (_, observed) = writer
-            .load_node(&collection(), &token(3), fresh)
+            .load_node(&collection(), &node_id(3), fresh)
             .await
             .unwrap();
         let absorbed = Node::index(IndexNode::from_children([
-            (Vec::new(), token(0).to_string()),
-            (b"m".to_vec(), token(1).to_string()),
+            (Vec::new(), node_id(0)),
+            (b"m".to_vec(), node_id(1)),
         ]));
         assert!(
             writer
-                .store_node(&collection(), &token(3), &absorbed, Some(&observed))
+                .store_node(&collection(), &node_id(3), &absorbed, Some(&observed))
                 .await
                 .unwrap()
         );
         writer
             .create_root(
                 &collection(),
-                &Node::index(IndexNode::from_children([(
-                    Vec::new(),
-                    token(3).to_string(),
-                )])),
+                &Node::index(IndexNode::from_children([(Vec::new(), node_id(3))])),
             )
             .await
             .unwrap();
@@ -2481,7 +2440,7 @@ mod tests {
         let s = store();
         s.store_node(
             &collection(),
-            &token(1),
+            &node_id(1),
             &leaf(&[b"pear"], None, None).with_low_key(b"m".to_vec()),
             None,
         )
@@ -2489,10 +2448,7 @@ mod tests {
         .unwrap();
         s.create_root(
             &collection(),
-            &Node::index(IndexNode::from_children([(
-                Vec::new(),
-                token(1).to_string(),
-            )])),
+            &Node::index(IndexNode::from_children([(Vec::new(), node_id(1))])),
         )
         .await
         .unwrap();
