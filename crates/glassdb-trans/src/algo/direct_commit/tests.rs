@@ -1505,6 +1505,7 @@ async fn direct_blind_puts_cover_two_eight_and_thirty_two_keys() {
         DirectCommitStats {
             candidates: 3,
             landed: 3,
+            ..DirectCommitStats::default()
         }
     );
 }
@@ -1539,7 +1540,7 @@ async fn multi_key_aggregate_rejection_is_atomic_and_does_not_hint() {
         tm.direct_commit_stats_and_reset(),
         DirectCommitStats {
             candidates: 1,
-            landed: 0,
+            ..DirectCommitStats::default()
         }
     );
     assert_eq!(
@@ -1655,6 +1656,7 @@ async fn direct_mixed_member_is_atomic_and_advances_membership_once() {
         DirectCommitStats {
             candidates: 1,
             landed: 1,
+            ..DirectCommitStats::default()
         }
     );
     for (key, current) in [
@@ -1809,7 +1811,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
         tm.direct_commit_stats_and_reset(),
         DirectCommitStats {
             candidates: 1,
-            landed: 0,
+            ..DirectCommitStats::default()
         }
     );
 }
@@ -1848,9 +1850,79 @@ async fn cross_leaf_member_uses_a_locked_commit() {
     assert_eq!(write_counts(&log).tx, 1);
     assert_eq!(
         tm.direct_commit_stats_and_reset(),
-        DirectCommitStats::default(),
+        DirectCommitStats {
+            cross_leaf_scattered: 1,
+            ..DirectCommitStats::default()
+        },
         "a dependency set spanning leaves is not a direct candidate"
     );
+}
+
+// A member that misses direct commit only because its keys straddle one right
+// link is the case a merge of the two leaves would recover.
+#[tokio::test]
+async fn cross_leaf_misses_report_leaf_adjacency() {
+    let (tm, tctx) = new_algo().await;
+    let l0 = test_node_id(0);
+    let l1 = test_node_id(1);
+    let l2 = test_node_id(2);
+    for (id, low_key, high_key, right_sibling) in [
+        (&l0, b"".as_slice(), Some(b"m".to_vec()), Some(l1)),
+        (&l1, b"m", Some(b"t".to_vec()), Some(l2)),
+        (&l2, b"t", None, None),
+    ] {
+        let leaf = Node::leaf(LeafBody::new())
+            .with_low_key(low_key.to_vec())
+            .with_high_key(high_key)
+            .with_right_sibling(right_sibling);
+        assert!(
+            tctx.nodes
+                .store_node(&test_collection(), id, &leaf, None)
+                .await
+                .unwrap()
+        );
+    }
+    let root = tctx
+        .nodes
+        .load_leaf(
+            &test_root_path(),
+            Requirement::after(tctx.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    let index =
+        IndexNode::from_children([(Vec::new(), l0), (b"m".to_vec(), l1), (b"t".to_vec(), l2)]);
+    assert!(
+        tctx.nodes
+            .store_root(&test_collection(), &Node::index(index), root.observation())
+            .await
+            .unwrap()
+    );
+
+    let adjacent = DirectCommitStats {
+        cross_leaf_adjacent: 1,
+        ..DirectCommitStats::default()
+    };
+    let scattered = DirectCommitStats {
+        cross_leaf_scattered: 1,
+        ..DirectCommitStats::default()
+    };
+    for (keys, expected) in [
+        (vec![b"a".as_slice(), b"n"], adjacent),
+        (vec![b"u", b"n"], adjacent),
+        (vec![b"a", b"u"], scattered),
+        (vec![b"a", b"n", b"u"], scattered),
+    ] {
+        let writes = keys.iter().map(|key| wa(&logical_key(key), b"v")).collect();
+        let mut h = begin_accesses(&tm, AccessSet::new(Vec::new(), writes, Vec::new()));
+        tm.commit(&mut h).await.unwrap();
+        tm.end(&mut h).await.unwrap();
+        assert_eq!(
+            tm.direct_commit_stats_and_reset(),
+            expected,
+            "keys {keys:?}"
+        );
+    }
 }
 
 // ADR-061: a point read may guard a different output key when both share the

@@ -22,6 +22,8 @@ pub struct TransactionStats {
     pub reads: u64,
     /// Number of writes.
     pub writes: u64,
+    /// Number of times a range scan continued from one leaf into the next leaf.
+    pub scan_leaf_crossings: u64,
     /// Number of body replays.
     pub replays: u64,
 }
@@ -32,6 +34,7 @@ impl AddAssign for TransactionStats {
         self.elapsed += rhs.elapsed;
         self.reads += rhs.reads;
         self.writes += rhs.writes;
+        self.scan_leaf_crossings += rhs.scan_leaf_crossings;
         self.replays += rhs.replays;
     }
 }
@@ -45,6 +48,9 @@ impl Sub for TransactionStats {
             elapsed: self.elapsed.saturating_sub(rhs.elapsed),
             reads: self.reads.saturating_sub(rhs.reads),
             writes: self.writes.saturating_sub(rhs.writes),
+            scan_leaf_crossings: self
+                .scan_leaf_crossings
+                .saturating_sub(rhs.scan_leaf_crossings),
             replays: self.replays.saturating_sub(rhs.replays),
         }
     }
@@ -121,6 +127,7 @@ mod tests {
                 elapsed: Duration::from_secs(3),
                 reads: 7,
                 writes: 5,
+                scan_leaf_crossings: 2,
                 replays: 1,
             },
             backend: BackendStats {
@@ -141,11 +148,20 @@ mod tests {
             coordinator: LeafCoordinatorStats {
                 submissions: 10,
                 rounds: 8,
+                queued_submissions: 3,
+                queue_wait: Duration::from_millis(40),
                 cas_retries: 2,
+                cas_lost_same_keys: 1,
+                cas_lost_other_keys: 1,
+                cas_lost_node_change: 0,
+                leaf_writes: 6,
+                leaf_write_time: Duration::from_millis(420),
             },
             direct_commit: DirectCommitStats {
                 candidates: 7,
                 landed: 5,
+                cross_leaf_adjacent: 2,
+                cross_leaf_scattered: 1,
             },
             gc: GcStats::default(),
             restructurer: RestructurerStats {
@@ -169,6 +185,7 @@ mod tests {
                 elapsed: Duration::from_secs(8),
                 reads: 18,
                 writes: 9,
+                scan_leaf_crossings: 6,
                 replays: 3,
             },
             backend: BackendStats {
@@ -189,11 +206,20 @@ mod tests {
             coordinator: LeafCoordinatorStats {
                 submissions: 14,
                 rounds: 10,
+                queued_submissions: 5,
+                queue_wait: Duration::from_millis(100),
                 cas_retries: 3,
+                cas_lost_same_keys: 1,
+                cas_lost_other_keys: 3,
+                cas_lost_node_change: 1,
+                leaf_writes: 9,
+                leaf_write_time: Duration::from_millis(700),
             },
             direct_commit: DirectCommitStats {
                 candidates: 11,
                 landed: 8,
+                cross_leaf_adjacent: 5,
+                cross_leaf_scattered: 2,
             },
             gc: GcStats::default(),
             restructurer: RestructurerStats {
@@ -219,6 +245,7 @@ mod tests {
                     elapsed: Duration::from_secs(5),
                     reads: 11,
                     writes: 4,
+                    scan_leaf_crossings: 4,
                     replays: 2,
                 },
                 backend: BackendStats {
@@ -239,11 +266,20 @@ mod tests {
                 coordinator: LeafCoordinatorStats {
                     submissions: 4,
                     rounds: 2,
+                    queued_submissions: 2,
+                    queue_wait: Duration::from_millis(60),
                     cas_retries: 1,
+                    cas_lost_same_keys: 0,
+                    cas_lost_other_keys: 2,
+                    cas_lost_node_change: 1,
+                    leaf_writes: 3,
+                    leaf_write_time: Duration::from_millis(280),
                 },
                 direct_commit: DirectCommitStats {
                     candidates: 4,
                     landed: 3,
+                    cross_leaf_adjacent: 3,
+                    cross_leaf_scattered: 1,
                 },
                 gc: GcStats::default(),
                 restructurer: RestructurerStats {

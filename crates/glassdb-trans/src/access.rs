@@ -328,6 +328,15 @@ impl AccessSet {
         self.writes.len()
     }
 
+    /// Returns how many times the range scans continued from one leaf into the
+    /// next leaf.
+    pub fn scan_leaf_crossings(&self) -> usize {
+        self.scans
+            .iter()
+            .map(|scan| scan.covered().len().saturating_sub(1))
+            .sum()
+    }
+
     /// Returns the validation dependencies without final key writes.
     pub fn into_read_only(mut self) -> Self {
         self.writes.clear();

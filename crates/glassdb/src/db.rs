@@ -549,6 +549,7 @@ impl DbInner {
             let (accesses, catalog_accesses) = tx.collect_accesses();
             stats.reads += accesses.read_count() as u64;
             stats.writes += accesses.write_count() as u64;
+            stats.scan_leaf_crossings += accesses.scan_leaf_crossings() as u64;
 
             if body_outcome.is_ok() {
                 driver.install_accesses(accesses, catalog_accesses);

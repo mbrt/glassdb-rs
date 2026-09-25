@@ -4,6 +4,7 @@ mod backend;
 mod contention;
 mod inline_pressure;
 mod mixed;
+mod topology;
 
 #[cfg(target_env = "musl")]
 #[global_allocator]
@@ -50,6 +51,8 @@ enum Command {
     Contention(contention::Options),
     /// Exercise demand-driven splits after inline-admission pressure.
     InlinePressure(inline_pressure::Options),
+    /// Compare fixed leaf topologies under workloads with different leaf locality.
+    Topology(topology::Options),
 }
 
 #[derive(Serialize)]
@@ -101,10 +104,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::InlinePressure(options) => serde_json::to_value(Report {
             schema_version: SCHEMA_VERSION,
             scenario: "inline-pressure",
-            backend,
+            backend: backend.clone(),
             model_time_speedup,
             latency_jitter: cli.backend.latency_jitter,
             runs: inline_pressure::run(handle, &factory, options, execution)?,
+        })?,
+        Command::Topology(options) => serde_json::to_value(Report {
+            schema_version: SCHEMA_VERSION,
+            scenario: "topology",
+            backend,
+            model_time_speedup,
+            latency_jitter: cli.backend.latency_jitter,
+            runs: topology::run(handle, &factory, options, execution)?,
         })?,
     };
     write_json(cli.output, &value)

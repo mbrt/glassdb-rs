@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures::future::join_all;
 use rand::rngs::StdRng;
@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 
 use glassdb::{Collection, Database, Error as GError};
 use glassdb_bench_scale::bench::Bench;
+use glassdb_bench_scale::run::split_workers;
 
 use super::result::ShapeMeasurement;
 use super::{key_bytes, value};
@@ -185,57 +186,10 @@ fn worker_specs(plans: &[ShapePlan]) -> impl Iterator<Item = WorkerSpec<'_>> + '
         )
 }
 
-/// Outcome of driving a cell toward its sampling target.
-pub(super) enum DriveOutcome {
-    Converged,
-    Capped,
-    WorkerStopped,
+/// Returns every shape's timer.
+pub(super) fn benches(plans: &[ShapePlan]) -> Vec<&Bench> {
+    plans.iter().map(|plan| &*plan.bench).collect()
 }
-
-/// Runs the cell until every shape is significant or its deadline is reached.
-pub(super) async fn drive_to_significance(
-    plans: &[ShapePlan],
-    stop: &Arc<AtomicBool>,
-    target: u64,
-    min_dur: Duration,
-    max_dur: Duration,
-) -> DriveOutcome {
-    let started = Instant::now();
-    // Poll often enough to react promptly, coarsely enough to stay negligible.
-    let step = (max_dur / 40).clamp(Duration::from_millis(20), Duration::from_millis(250));
-    loop {
-        tokio::time::sleep(step).await;
-        if stop.load(Ordering::Relaxed) {
-            return DriveOutcome::WorkerStopped;
-        }
-        let elapsed = started.elapsed();
-        let ready = elapsed >= min_dur
-            && (target == 0
-                || plans
-                    .iter()
-                    .all(|plan| plan.bench.sample_count() as u64 >= target));
-        if ready {
-            stop.store(true, Ordering::Relaxed);
-            return DriveOutcome::Converged;
-        }
-        if elapsed >= max_dur {
-            stop.store(true, Ordering::Relaxed);
-            return DriveOutcome::Capped;
-        }
-    }
-}
-
-/// Distributes workers across databases evenly, omitting empty slots.
-fn split_workers(workers: usize, databases: usize) -> Vec<usize> {
-    let databases = databases.max(1).min(workers.max(1));
-    let base = workers / databases;
-    let remainder = workers % databases;
-    (0..databases)
-        .map(|index| base + usize::from(index < remainder))
-        .filter(|&count| count > 0)
-        .collect()
-}
-
 /// Runs one worker until the cell or its shape reaches its stopping condition.
 async fn worker(
     db: Database,
@@ -366,22 +320,6 @@ async fn ro_tx(db: &Database, collection: &Collection, keys: &[Vec<u8>]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn worker_distribution_keeps_every_open_database_active() {
-        let cases = [
-            (1, 5, vec![1]),
-            (5, 5, vec![1, 1, 1, 1, 1]),
-            (8, 5, vec![2, 2, 2, 1, 1]),
-            (10, 5, vec![2, 2, 2, 2, 2]),
-        ];
-        for (workers, databases, expected) in cases {
-            let distribution = split_workers(workers, databases);
-            assert_eq!(distribution, expected);
-            assert_eq!(distribution.iter().sum::<usize>(), workers);
-            assert!(distribution.iter().all(|&count| count > 0));
-        }
-    }
 
     #[tokio::test]
     async fn seeded_selection_and_logical_counts_are_stable() {

@@ -26,6 +26,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::{Notify, oneshot};
@@ -95,6 +96,9 @@ impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for DedupError<E>
 struct Member<R, E> {
     request: R,
     done: oneshot::Sender<Result<(), Arc<E>>>,
+    /// When the request found earlier work on its key, until a round starts
+    /// with it. A request that starts an idle key does not wait.
+    queued_at: Option<rt::Instant>,
 }
 
 impl<R, E> Member<R, E> {
@@ -195,6 +199,25 @@ where
         // Preserve the second liveness boundary before a round starts: a
         // promoted caller can disappear while the queue is being rebuilt.
         self.refresh_batch(discarded)
+    }
+
+    /// Takes the waits of the members that start a round at `now`, so that
+    /// each member reports its wait once.
+    fn take_queue_waits(&mut self, now: rt::Instant) -> (u64, Duration) {
+        self.batch
+            .iter_mut()
+            .filter_map(|member| member.queued_at.take())
+            .fold((0, Duration::ZERO), |(count, total), queued_at| {
+                (count + 1, total + now.saturating_duration_since(queued_at))
+            })
+    }
+
+    /// Drops the waits of the members that joined a running round. They did
+    /// not wait for a round, even if a handoff later returns them to a queue.
+    fn forget_queue_waits(&mut self) {
+        for member in &mut self.batch {
+            member.queued_at = None;
+        }
     }
 
     /// Recomputes the merged request and absorbs compatible queued work.
@@ -519,6 +542,7 @@ where
             // already acted on a request whose members are all gone.
             step.effects.cancellation = Some(signal);
         } else {
+            self.queue.forget_queue_waits();
             step.value = self.queue.merged().cloned();
         }
         step
@@ -699,6 +723,8 @@ struct Shard<R, E> {
     map: Mutex<HashMap<String, KeyMachine<R, E>>>,
     submissions: AtomicU64,
     rounds: AtomicU64,
+    queued: AtomicU64,
+    queue_wait_nanos: AtomicU64,
 }
 
 impl<R, E> Shard<R, E> {
@@ -707,6 +733,8 @@ impl<R, E> Shard<R, E> {
             map: Mutex::new(HashMap::new()),
             submissions: AtomicU64::new(0),
             rounds: AtomicU64::new(0),
+            queued: AtomicU64::new(0),
+            queue_wait_nanos: AtomicU64::new(0),
         }
     }
 }
@@ -791,6 +819,12 @@ pub struct DedupKeySnapshot {
 pub struct DedupStats {
     pub submissions: u64,
     pub rounds: u64,
+    /// Submissions that waited for an earlier round on the same key before a
+    /// round started with them. Submissions that join a running round do not
+    /// wait.
+    pub queued: u64,
+    /// Total time from submission to round start of the `queued` submissions.
+    pub queue_wait: Duration,
 }
 
 struct Inner<R, E, W> {
@@ -978,6 +1012,12 @@ where
             let step = machine.start_round(driver, self.shutdown.is_cancelled());
             if step.value.is_some() {
                 shard.rounds.fetch_add(1, Ordering::Relaxed);
+                let (queued, wait) = machine.queue.take_queue_waits(rt::Instant::now());
+                shard.queued.fetch_add(queued, Ordering::Relaxed);
+                shard.queue_wait_nanos.fetch_add(
+                    u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
                 tracing::trace!(
                     target: "glassdb::dedup",
                     key,
@@ -1290,15 +1330,17 @@ where
         shard.submissions.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         let can_reorder = r.can_reorder();
-        let member = Member {
+        let mut member = Member {
             request: r,
             done: tx,
+            queued_at: None,
         };
 
         let (driver, changed, effects) = {
             let mut map = shard.map.lock().unwrap();
             match map.get_mut(key) {
                 Some(machine) => {
+                    member.queued_at = Some(rt::Instant::now());
                     let step = machine.submit(member, can_reorder);
                     let (changed, effects) = self.inner.commit_step(&mut map, &shard, key, step);
                     (None, changed, effects)
@@ -1380,12 +1422,16 @@ where
         out
     }
 
-    /// Returns and resets cumulative submission and worker-round counts.
+    /// Returns and resets cumulative submission, worker-round, and queue-wait
+    /// counts.
     pub fn stats_and_reset(&self) -> DedupStats {
         let mut out = DedupStats::default();
         self.inner.shards.each(|shard| {
             out.submissions += shard.submissions.swap(0, Ordering::Relaxed);
             out.rounds += shard.rounds.swap(0, Ordering::Relaxed);
+            out.queued += shard.queued.swap(0, Ordering::Relaxed);
+            out.queue_wait +=
+                Duration::from_nanos(shard.queue_wait_nanos.swap(0, Ordering::Relaxed));
         });
         out
     }
@@ -1402,7 +1448,6 @@ where
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
-    use std::time::Duration;
 
     #[derive(Clone)]
     struct TestRequest {
@@ -1449,7 +1494,12 @@ mod tests {
 
     fn test_member(request: TestRequest) -> (Member<TestRequest, ()>, TestResult) {
         let (done, result) = oneshot::channel();
-        (Member { request, done }, result)
+        let member = Member {
+            request,
+            done,
+            queued_at: None,
+        };
+        (member, result)
     }
 
     fn queue_counters(machine: &KeyMachine<TestRequest, ()>) -> Vec<i64> {
@@ -1758,7 +1808,11 @@ mod tests {
         let mut member = |request| {
             let (done, result) = oneshot::channel::<Result<(), Arc<()>>>();
             results.push(result);
-            Member { request, done }
+            Member {
+                request,
+                done,
+                queued_at: None,
+            }
         };
 
         let mut queue = KeyQueue::new(member(mergeable(1)));
@@ -1956,9 +2010,77 @@ mod tests {
             DedupStats {
                 submissions: 2,
                 rounds: 1,
+                ..DedupStats::default()
             }
         );
         assert_eq!(d.stats_and_reset(), DedupStats::default());
+    }
+
+    // Queue wait measures how long work waits for a key that is in use by
+    // earlier work. Work that starts an idle key or joins the running round
+    // does not wait for a round.
+    #[tokio::test(start_paused = true)]
+    async fn only_work_behind_an_earlier_round_reports_a_queue_wait() {
+        let d = Arc::new(Dedup::new(GatedWorker::new()));
+        let release = d.inner.worker.release.clone();
+
+        let mut seed = Box::pin(d.run("key", mergeable(1)));
+        assert!(futures::poll!(seed.as_mut()).is_pending());
+        let mut joiner = Box::pin(d.run("key", mergeable(1)));
+        assert!(futures::poll!(joiner.as_mut()).is_pending());
+        let mut behind = Box::pin(d.run("key", unmergeable(1)));
+        assert!(futures::poll!(behind.as_mut()).is_pending());
+
+        tokio::time::advance(Duration::from_millis(30)).await;
+        release.add_permits(1);
+        assert!(seed.await.is_ok());
+        assert!(joiner.await.is_ok());
+        assert!(behind.await.is_ok());
+        assert_eq!(*d.inner.worker.done.lock().unwrap(), vec![2, 1]);
+        assert_eq!(
+            d.stats_and_reset(),
+            DedupStats {
+                submissions: 3,
+                rounds: 2,
+                queued: 1,
+                queue_wait: Duration::from_millis(30),
+            }
+        );
+    }
+
+    // Regression: work that joined a running round kept its queue timestamp.
+    // When a dropped driver handed the round off, that work was counted as if
+    // it had waited for a round since its submission.
+    #[tokio::test(start_paused = true)]
+    async fn a_handoff_does_not_count_work_that_joined_a_running_round() {
+        let d = Arc::new(Dedup::new(AccumWorker {
+            target: 3,
+            res: StdMutex::new(Vec::new()),
+        }));
+
+        let mut driver = Box::pin(d.run("key", mergeable(1)));
+        assert!(futures::poll!(driver.as_mut()).is_pending());
+        let mut joiner = Box::pin(d.run("key", mergeable(1)));
+        assert!(futures::poll!(joiner.as_mut()).is_pending());
+        assert!(futures::poll!(driver.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(30)).await;
+
+        drop(driver);
+        let late = d.run("key", mergeable(2));
+        let (joined, late) = tokio::join!(joiner, late);
+        assert!(joined.is_ok() && late.is_ok());
+        assert_eq!(*d.inner.worker.res.lock().unwrap(), vec![3]);
+        // Only the late work waits, from its submission to the owner round.
+        assert_eq!(
+            d.stats_and_reset(),
+            DedupStats {
+                submissions: 3,
+                rounds: 2,
+                queued: 1,
+                queue_wait: Duration::ZERO,
+            }
+        );
+        d.close().await;
     }
 
     #[tokio::test]

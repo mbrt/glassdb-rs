@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use glassdb::{Backend, CollectionPath, Database, Error, InlinePolicy};
+use glassdb::{Backend, CollectionPath, Database, Error, InlinePolicy, NodeSizePolicy};
 use glassdb_storage::Node;
 use tokio::sync::Barrier;
 
@@ -110,6 +111,46 @@ async fn transactional_key_scan_supports_ranges_prefixes_and_paging() {
         &[b"b".to_vec(), b"\xfe\xff".to_vec(), b"\xff".to_vec()]
     );
     assert!(first.keys().iter().all(|key| !second.keys().contains(key)));
+}
+
+// A scan over many small leaves costs one leaf read per leaf, so each scan
+// reports the leaf boundaries that it crosses.
+#[tokio::test(start_paused = true)]
+async fn scans_report_the_leaf_boundaries_they_cross() {
+    let policy = NodeSizePolicy::builder()
+        .leaf_max_entries(4)
+        .leaf_min_entries(0)
+        .build()
+        .unwrap();
+    let db = Database::builder("example", mem())
+        .node_size_policy(policy)
+        .open()
+        .await
+        .unwrap();
+    let coll = create_top(&db, b"scan-crossings").await;
+    for key in 0u8..16 {
+        coll.write(&[key], b"v").await.unwrap();
+    }
+    // Splits run in the background.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let restructured = db.stats().restructurer;
+    let splits = restructured.splits;
+    assert!(splits >= 3, "splits: {splits}");
+    assert_eq!(restructured.merges, 0);
+
+    let before = db.stats();
+    let all = coll.scan_keys(glassdb::KeyScan::all()).await.unwrap();
+    assert_eq!(all.len(), 16);
+    let first = coll
+        .scan_keys(glassdb::KeyScan::all().limit(1))
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    let delta = db.stats() - before;
+    // Each split adds one leaf, so only the full scan crosses the boundary
+    // that each split made.
+    assert_eq!(delta.transactions.scan_leaf_crossings, splits);
+    db.shutdown().await;
 }
 
 #[tokio::test]

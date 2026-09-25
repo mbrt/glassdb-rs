@@ -107,13 +107,15 @@ async fn root_leaf_gate_acquisition_uses_one_coordinator_round() {
 
     assert!(node.structural_gate().contains(&worker));
     assert_eq!(observation.path(), &root_path());
+    let stats = sp.changes.structural_nodes.coord.stats_and_reset();
     assert_eq!(
-        sp.changes.structural_nodes.coord.stats_and_reset(),
-        crate::leaf_coord::LeafCoordinatorStats {
-            submissions: 1,
-            rounds: 1,
-            cas_retries: 0,
-        }
+        (
+            stats.submissions,
+            stats.rounds,
+            stats.cas_retries,
+            stats.leaf_writes
+        ),
+        (1, 1, 0, 1)
     );
     let root_path = root_path().to_string();
     let root_operations: Vec<_> = operations

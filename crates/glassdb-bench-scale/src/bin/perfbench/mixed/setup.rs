@@ -1,10 +1,10 @@
 use std::error::Error;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use glassdb::{Collection, CollectionPath, Database, Error as GError, Stats};
 use glassdb_backend::Backend;
-use glassdb_bench_scale::run::shutdown_databases_until;
+use glassdb_bench_scale::run::{SplitSettlement, shutdown_databases_until, wait_for_split_quiet};
 use tokio::runtime::Handle;
 
 use super::result;
@@ -150,71 +150,6 @@ async fn open_collections(
     Ok(all)
 }
 
-#[derive(Clone, Copy)]
-struct SplitSettlement {
-    completed: u64,
-    elapsed: Duration,
-}
-
-struct SplitQuietTracker {
-    completed: u64,
-    unchanged_since: Instant,
-}
-
-impl SplitQuietTracker {
-    fn new(completed: u64, now: Instant) -> Self {
-        Self {
-            completed,
-            unchanged_since: now,
-        }
-    }
-
-    fn observe(&mut self, completed: u64, now: Instant) {
-        if completed != self.completed {
-            self.completed = completed;
-            self.unchanged_since = now;
-        }
-    }
-
-    fn is_quiet(&self, now: Instant, quiet: Duration) -> bool {
-        now.duration_since(self.unchanged_since) >= quiet
-    }
-}
-
-fn deadline_expired(started: Instant, now: Instant, timeout: Duration) -> bool {
-    now.duration_since(started) >= timeout
-}
-
-/// Waits until completed splits stop moving for a full quiet period.
-async fn wait_for_split_quiet(
-    database: &Database,
-    quiet: Duration,
-    timeout: Duration,
-) -> Result<SplitSettlement, Box<dyn Error>> {
-    let started = Instant::now();
-    let mut tracker = SplitQuietTracker::new(database.stats().restructurer.splits, started);
-    let poll = (quiet / 4).clamp(Duration::from_millis(20), Duration::from_millis(250));
-    loop {
-        let now = Instant::now();
-        tracker.observe(database.stats().restructurer.splits, now);
-        if tracker.is_quiet(now, quiet) {
-            return Ok(SplitSettlement {
-                completed: tracker.completed,
-                elapsed: started.elapsed(),
-            });
-        }
-        if deadline_expired(started, Instant::now(), timeout) {
-            return Err(format!(
-                "setup splits did not stay quiet for {quiet:?} within {timeout:?} \
-                 (completed={})",
-                tracker.completed
-            )
-            .into());
-        }
-        tokio::time::sleep(poll).await;
-    }
-}
-
 /// Seeds every collection and lets its complete split cascade finish.
 fn seed_and_settle(
     handle: &Handle,
@@ -274,29 +209,6 @@ mod tests {
     use glassdb::backend::memory::MemoryBackend;
 
     use super::*;
-
-    #[test]
-    fn quiet_period_resets_and_deadline_is_inclusive() {
-        let start = Instant::now();
-        let quiet = Duration::from_secs(2);
-        let mut tracker = SplitQuietTracker::new(3, start);
-
-        assert!(!tracker.is_quiet(start + Duration::from_secs(1), quiet));
-        tracker.observe(4, start + Duration::from_millis(1500));
-        assert!(!tracker.is_quiet(start + Duration::from_secs(3), quiet));
-        tracker.observe(4, start + Duration::from_millis(3200));
-        assert!(tracker.is_quiet(start + Duration::from_millis(3500), quiet));
-        assert!(!deadline_expired(
-            start,
-            start + Duration::from_millis(2999),
-            Duration::from_secs(3)
-        ));
-        assert!(deadline_expired(
-            start,
-            start + Duration::from_secs(3),
-            Duration::from_secs(3)
-        ));
-    }
 
     #[test]
     fn setup_seeds_each_collection_and_teardown_closes_clients() -> Result<(), Box<dyn Error>> {
