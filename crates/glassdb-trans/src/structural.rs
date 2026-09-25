@@ -9,6 +9,7 @@
 //! gate, and parent reconciliation after the change. An independent loop
 //! completes the changes that a crash or an error interrupted.
 
+mod avoidable;
 mod candidates;
 mod change;
 mod merge;
@@ -52,6 +53,8 @@ use split::Splitter;
 use stats::Stats;
 use topology::TopologyMembership;
 
+pub(crate) use avoidable::TypicalTime;
+pub use avoidable::{AvoidableTimeStats, MergeTime, SplitTime};
 pub use candidates::StructuralHintSink;
 pub use stats::{InlinePressureStats, RestructurerStats};
 
@@ -139,7 +142,7 @@ impl Restructurer {
 
     /// Returns and resets background split and merge activity counters.
     pub fn stats_and_reset(&self) -> RestructurerStats {
-        self.stats.take()
+        self.stats.take(self.candidates.avoidable().take_stats())
     }
 
     /// Starts independent candidate and structural-recovery loops.

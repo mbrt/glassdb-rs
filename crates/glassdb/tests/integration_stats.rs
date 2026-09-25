@@ -1,10 +1,142 @@
 //! Statistics and diagnostics integration behavior.
 
-use glassdb::{Database, Error, InlinePolicy};
+use std::sync::Arc;
+use std::time::Duration;
+
+use glassdb::middleware::HookBackend;
+use glassdb::{Backend, Collection, Database, Error, InlinePolicy, KeyScan, NodeSizePolicy};
 
 pub mod integration_support;
 
 use integration_support::{create_top, init_db, mem, open_top, read_int, rmw, write_int};
+
+const BACKEND_DELAY: Duration = Duration::from_millis(5);
+
+// Under paused time, the memory backend takes no time, and so would every
+// avoidable time. Each operation of this backend takes time.
+fn slow_mem() -> Arc<dyn Backend> {
+    let backend = HookBackend::new(mem());
+    backend.set_before(|_| {
+        Box::pin(async {
+            tokio::time::sleep(BACKEND_DELAY).await;
+            Ok(())
+        })
+    });
+    backend
+}
+
+// Opens a collection of 16 keys over leaves of at most 4 entries, after the
+// background splits.
+async fn split_collection() -> (Database, Collection) {
+    let policy = NodeSizePolicy::builder()
+        .leaf_max_entries(4)
+        .leaf_min_entries(0)
+        .index_min_children(0)
+        .build()
+        .unwrap();
+    let db = Database::builder("example", slow_mem())
+        .node_size_policy(policy)
+        .open()
+        .await
+        .unwrap();
+    let coll = create_top(&db, b"split").await;
+    for key in 0u8..16 {
+        coll.write(&[key], &write_int(0)).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let splits = db.stats().restructurer.splits;
+    assert!(splits >= 3, "splits: {splits}");
+    (db, coll)
+}
+
+// A direct commit candidate whose keys are in two adjacent leaves uses a
+// locked commit, which one merge of the leaves can remove.
+#[tokio::test(start_paused = true)]
+async fn locked_commits_over_adjacent_leaves_report_merge_time() {
+    let (db, coll) = split_collection().await;
+    let mut adjacent_misses = 0;
+    for key in 0u8..15 {
+        let before = db.stats();
+        let coll_ref = &coll;
+        db.tx(|tx| async move {
+            tx.write(coll_ref, &[key], &write_int(1))?;
+            tx.write(coll_ref, &[key + 1], &write_int(1))
+        })
+        .await
+        .unwrap();
+        let delta = db.stats() - before;
+        let merge_time = delta.restructurer.avoidable.merge;
+        if delta.direct_commit.cross_leaf_adjacent == 1 {
+            adjacent_misses += 1;
+            assert!(merge_time.adjacent_miss > Duration::ZERO, "keys {key}");
+        } else {
+            assert_eq!(delta.direct_commit.landed, 1, "keys {key}");
+            assert_eq!(merge_time.adjacent_miss, Duration::ZERO, "keys {key}");
+        }
+    }
+    assert!(adjacent_misses > 0);
+    db.shutdown().await;
+}
+
+// Each leaf boundary that a scan crosses costs a leaf read, which one merge of
+// the two leaves can remove.
+#[tokio::test(start_paused = true)]
+async fn scans_across_leaves_report_merge_time() {
+    let (db, coll) = split_collection().await;
+
+    let before = db.stats();
+    coll.scan_keys(KeyScan::all().limit(1)).await.unwrap();
+    let one_leaf = db.stats() - before;
+    let before = db.stats();
+    coll.scan_keys(KeyScan::all()).await.unwrap();
+    let all_leaves = db.stats() - before;
+
+    assert_eq!(one_leaf.transactions.scan_leaf_crossings, 0);
+    assert_eq!(
+        one_leaf.restructurer.avoidable.merge.scan_crossing,
+        Duration::ZERO
+    );
+    assert!(all_leaves.transactions.scan_leaf_crossings >= 3);
+    // The validation of the scan reads each crossed leaf again.
+    assert!(
+        all_leaves.restructurer.avoidable.merge.scan_crossing
+            >= BACKEND_DELAY * u32::try_from(all_leaves.transactions.scan_leaf_crossings).unwrap()
+    );
+    db.shutdown().await;
+}
+
+// A leaf that cannot carry one more inline value makes a single-key direct
+// commit candidate use a locked commit, which one split can remove.
+#[tokio::test(start_paused = true)]
+async fn locked_commits_after_inline_pressure_report_split_time() {
+    let db = Database::builder("example", slow_mem())
+        .inline_policy(InlinePolicy {
+            max_value_bytes: 8,
+            max_leaf_bytes: 8,
+        })
+        .open()
+        .await
+        .unwrap();
+    let coll = create_top(&db, b"inline-pressure").await;
+    coll.write(b"a", &write_int(0)).await.unwrap();
+    coll.write(b"b", &write_int(0)).await.unwrap();
+
+    let before = db.stats();
+    rmw(&db, &coll, b"a", 1).await.unwrap();
+    let landed = db.stats() - before;
+    let before = db.stats();
+    rmw(&db, &coll, b"b", 1).await.unwrap();
+    let missed = db.stats() - before;
+
+    assert_eq!(landed.direct_commit.landed, 1);
+    assert_eq!(
+        landed.restructurer.avoidable.split.inline_pressure,
+        Duration::ZERO
+    );
+    assert_eq!(missed.direct_commit.landed, 0);
+    assert!(missed.restructurer.avoidable.split.inline_pressure > Duration::ZERO);
+    db.shutdown().await;
+}
 
 // The distributed locker's counters are surfaced through `Database::stats()`
 // (the same reset-on-read accumulation pattern as the backend object counters),

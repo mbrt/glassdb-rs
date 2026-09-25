@@ -3,6 +3,8 @@
 use std::ops::{AddAssign, Sub};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::avoidable::AvoidableTimeStats;
+
 /// Live counters that the scheduler and every structural change update.
 #[derive(Default)]
 pub(super) struct Stats {
@@ -40,6 +42,9 @@ pub struct RestructurerStats {
     pub merges: u64,
     /// Activity attributable specifically to aggregate inline pressure.
     pub inline_pressure: InlinePressureStats,
+    /// Time that transactions of this database instance lost to the topology,
+    /// and that one split or merge can remove (ADR-074).
+    pub avoidable: AvoidableTimeStats,
 }
 
 /// Split activity attributable to aggregate inline pressure.
@@ -56,8 +61,9 @@ pub struct InlinePressureStats {
 }
 
 impl Stats {
-    /// Returns the counters and resets them.
-    pub(super) fn take(&self) -> RestructurerStats {
+    /// Returns the counters and resets them. The avoidable time comes from
+    /// its own ledger.
+    pub(super) fn take(&self, avoidable: AvoidableTimeStats) -> RestructurerStats {
         let take = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed);
         RestructurerStats {
             candidates: take(&self.candidates),
@@ -72,6 +78,7 @@ impl Stats {
                 deferred: take(&self.inline_pressure_deferred),
                 discarded: take(&self.inline_pressure_discarded),
             },
+            avoidable,
         }
     }
 }
@@ -107,6 +114,7 @@ impl AddAssign for RestructurerStats {
         self.splits_avoided += rhs.splits_avoided;
         self.merges += rhs.merges;
         self.inline_pressure += rhs.inline_pressure;
+        self.avoidable += rhs.avoidable;
     }
 }
 
@@ -124,6 +132,7 @@ impl Sub for RestructurerStats {
             splits_avoided: self.splits_avoided.saturating_sub(rhs.splits_avoided),
             merges: self.merges.saturating_sub(rhs.merges),
             inline_pressure: self.inline_pressure - rhs.inline_pressure,
+            avoidable: self.avoidable - rhs.avoidable,
         }
     }
 }

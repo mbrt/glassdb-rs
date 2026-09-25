@@ -321,6 +321,7 @@ pub struct Algo {
     resolver: KeyResolver,
     locker: Locker,
     direct_commit: DirectCommit,
+    structural_hints: StructuralHintSink,
     mon: Monitor,
     gc_hints: GcHints,
     timeline: Timeline,
@@ -363,7 +364,7 @@ impl Algo {
             router,
             coord,
             inline_policy,
-            structural_hints,
+            structural_hints.clone(),
             gc_hints.clone(),
         );
         let retirement = Arc::new(IdentityRetirement {
@@ -376,6 +377,7 @@ impl Algo {
             resolver,
             locker,
             direct_commit,
+            structural_hints,
             mon,
             gc_hints,
             timeline,
@@ -634,25 +636,32 @@ impl Algo {
         // one leaf CAS with no transaction record (ADR-061). It writes nothing
         // unless it commits, so a non-landing direct commit is classified rather
         // than failed (ADR-053).
-        if tx.collections.accesses().reads.is_empty()
-            && tx.collections.accesses().changes.is_empty()
+        if !tx.collections.accesses().reads.is_empty()
+            || !tx.collections.accesses().changes.is_empty()
         {
-            match self
-                .direct_commit
-                .try_commit(&tx.id, &tx.accesses, &mut tx.state)
-                .await?
-            {
-                DirectOutcome::Committed => return Ok(PassOutcome::Complete),
-                // A certified direct-commit loss reevaluates the body rather than
-                // publishing a holder that would make every subsequent direct
-                // commit on the key ineligible (ADR-053). The id is unengaged —
-                // no record, no lock, no published identity — so the ordinary
-                // retry contract applies with no cleanup.
-                DirectOutcome::Replay => return Err(TransError::Retry),
-                DirectOutcome::Locked => {}
-            }
+            return self.commit_locked(tx).await;
         }
-        self.commit_locked(tx).await
+        let cause = match self
+            .direct_commit
+            .try_commit(&tx.id, &tx.accesses, &mut tx.state)
+            .await?
+        {
+            DirectOutcome::Committed => return Ok(PassOutcome::Complete),
+            // A certified direct-commit loss reevaluates the body rather than
+            // publishing a holder that would make every subsequent direct
+            // commit on the key ineligible (ADR-053). The id is unengaged —
+            // no record, no lock, no published identity — so the ordinary
+            // retry contract applies with no cleanup.
+            DirectOutcome::Replay => return Err(TransError::Retry),
+            DirectOutcome::Locked(cause) => cause,
+        };
+        let started = rt::Instant::now();
+        let outcome = self.commit_locked(tx).await;
+        if matches!(outcome, Ok(PassOutcome::Complete)) {
+            self.direct_commit
+                .observe_locked_commit(cause, started.elapsed());
+        }
+        outcome
     }
 
     async fn validate_handle_reads(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
@@ -1095,26 +1104,34 @@ impl Algo {
         barrier: CurrentnessBarrier,
         lock_validation: Option<&LockedTx>,
     ) -> Result<bool, TransError> {
-        for coverage in accesses
-            .range_scans()
-            .iter()
-            .flat_map(|scan| scan.covered())
-        {
-            let unchanged = match lock_validation {
-                Some(locked) => locked.certifies_membership(
-                    &coverage.observation,
-                    coverage.membership_generation,
-                    barrier,
-                ),
-                None => matches!(
-                    self.nodes
-                        .check_leaf_current(&coverage.observation, Requirement::after(barrier))
-                        .await?,
-                    LeafObservationCheck::Current
-                ),
-            };
-            if !unchanged || self.any_committed([coverage], barrier).await? {
-                return Ok(false);
+        for scan in accesses.range_scans() {
+            let mut previous: Option<&LeafCoverage> = None;
+            for coverage in scan.covered() {
+                let started = rt::Instant::now();
+                let unchanged = match lock_validation {
+                    Some(locked) => locked.certifies_membership(
+                        &coverage.observation,
+                        coverage.membership_generation,
+                        barrier,
+                    ),
+                    None => matches!(
+                        self.nodes
+                            .check_leaf_current(&coverage.observation, Requirement::after(barrier))
+                            .await?,
+                        LeafObservationCheck::Current
+                    ),
+                };
+                if let Some(previous) = previous {
+                    self.structural_hints.scan_crossing_time(
+                        previous.observation.path(),
+                        coverage.observation.path(),
+                        coverage.reach_time + started.elapsed(),
+                    );
+                }
+                if !unchanged || self.any_committed([coverage], barrier).await? {
+                    return Ok(false);
+                }
+                previous = Some(coverage);
             }
         }
         Ok(true)

@@ -1806,7 +1806,10 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     );
     gate.release();
 
-    assert_eq!(candidate.await.unwrap().unwrap(), DirectOutcome::Locked);
+    assert_eq!(
+        candidate.await.unwrap().unwrap(),
+        DirectOutcome::Locked(LockedCause::Other)
+    );
     assert_eq!(
         tm.direct_commit_stats_and_reset(),
         DirectCommitStats {

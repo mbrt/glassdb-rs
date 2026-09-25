@@ -172,6 +172,13 @@ struct PerTx {
     scan_leaf_crossings: f64,
     leaf_writes: f64,
     leaf_write_ms: f64,
+    /// Avoidable time of ADR-074, by cause.
+    avoidable_lost_cas_ms: f64,
+    avoidable_queue_wait_ms: f64,
+    avoidable_slow_cas_ms: f64,
+    avoidable_inline_pressure_ms: f64,
+    avoidable_adjacent_miss_ms: f64,
+    avoidable_scan_crossing_ms: f64,
 }
 
 impl PerTx {
@@ -181,7 +188,15 @@ impl PerTx {
         let backend = delta.backend;
         let coordinator = delta.coordinator;
         let direct = delta.direct_commit;
+        let split = delta.restructurer.avoidable.split;
+        let merge = delta.restructurer.avoidable.merge;
         Self {
+            avoidable_lost_cas_ms: per_tx_ms(split.lost_cas),
+            avoidable_queue_wait_ms: per_tx_ms(split.queue_wait),
+            avoidable_slow_cas_ms: per_tx_ms(split.slow_cas),
+            avoidable_inline_pressure_ms: per_tx_ms(split.inline_pressure),
+            avoidable_adjacent_miss_ms: per_tx_ms(merge.adjacent_miss),
+            avoidable_scan_crossing_ms: per_tx_ms(merge.scan_crossing),
             backend_ops: per_tx(backend.obj_reads + backend.obj_writes + backend.obj_lists),
             obj_reads: per_tx(backend.obj_reads),
             obj_writes: per_tx(backend.obj_writes),

@@ -26,7 +26,7 @@
 //! the `Locker`, not in the engine.
 
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{AddAssign, Sub};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -552,6 +552,23 @@ pub trait StructuralHinter: Send + Sync {
 
     /// Requests capacity relief after a mutation cannot fit in `path`.
     fn capacity_rejected(&self, path: &ObjectPath);
+
+    /// Notes `time` that round members of `path` lost to `delay`, which one
+    /// split of the leaf can remove (ADR-074).
+    fn leaf_delay(&self, _path: &ObjectPath, _delay: LeafDelay, _time: Duration) {}
+}
+
+/// Time that round members lose on one leaf, and that one split of the leaf
+/// can remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeafDelay {
+    /// A leaf CAS failed, because a CAS for only other keys landed first.
+    LostCas,
+    /// Round members waited for an earlier round with none of their keys.
+    QueueWait,
+    /// A leaf CAS took more time than a leaf CAS that the backend does not
+    /// delay.
+    SlowCas,
 }
 
 /// State shared by the [`LeafCoordinator`] and its dedup [`CasWorker`]: the
@@ -566,6 +583,62 @@ struct CoordCore {
     // [`Restructurer`](crate::structural::Restructurer)'s queue when one is wired.
     hinter: Arc<dyn StructuralHinter>,
     policy: NodeSizePolicy,
+    cas_floor: CasFloor,
+    recent_rounds: RecentRounds,
+}
+
+/// A leaf CAS time slower than this many times the floor has a delay that a
+/// split can remove, for example a backend limit on writes to one object.
+const SLOW_CAS_FACTOR: u32 = 4;
+
+/// The floor rises by one part in this many for each leaf CAS, so that it
+/// follows a backend that becomes slower.
+const CAS_FLOOR_RISE: u32 = 64;
+
+/// The time of a leaf CAS that the backend does not delay.
+///
+/// This is the lowest recent leaf CAS time, and not a quantile, because when
+/// all writes go to one throttled leaf, all recent CASes are slow.
+#[derive(Default)]
+struct CasFloor {
+    floor: Mutex<Option<Duration>>,
+}
+
+impl CasFloor {
+    /// Records one leaf CAS time, and returns the part above the time of a
+    /// slow CAS.
+    fn excess(&self, took: Duration) -> Duration {
+        let mut floor = self.floor.lock().unwrap();
+        let current = floor.map_or(took, |floor| (floor + floor / CAS_FLOOR_RISE).min(took));
+        *floor = Some(current);
+        took.saturating_sub(current * SLOW_CAS_FACTOR)
+    }
+}
+
+/// The number of leaves whose last round keys stay known. Above it, all are
+/// forgotten, and the next waits on those leaves are not split causes.
+const RECENT_ROUNDS_CAP: usize = 1024;
+
+/// The keys of the last round of each leaf, until the next round on the leaf
+/// starts. A member that waited for a round with one of its keys would also
+/// wait after a split.
+#[derive(Default)]
+struct RecentRounds {
+    keys: Mutex<HashMap<ObjectPath, BTreeSet<Vec<u8>>>>,
+}
+
+impl RecentRounds {
+    fn take(&self, path: &ObjectPath) -> Option<BTreeSet<Vec<u8>>> {
+        self.keys.lock().unwrap().remove(path)
+    }
+
+    fn put(&self, path: ObjectPath, keys: BTreeSet<Vec<u8>>) {
+        let mut recent = self.keys.lock().unwrap();
+        if recent.len() >= RECENT_ROUNDS_CAP {
+            recent.clear();
+        }
+        recent.insert(path, keys);
+    }
 }
 
 struct CoordState {
@@ -644,13 +717,20 @@ enum LostCasCause {
 struct LostCas {
     expected: Arc<Node>,
     round_keys: BTreeSet<Vec<u8>>,
+    sent: rt::Instant,
+    members: u32,
 }
 
 impl LostCas {
-    /// Records a rejected CAS of `staged` against `expected` for the round of
-    /// `members`. A round's keys include keys it reads, because a peer change
-    /// of those also conflicts after any split.
-    fn new(expected: Arc<Node>, staged: &LeafBody, members: &BTreeMap<TxId, LeafMember>) -> Self {
+    /// Records a rejected CAS of `staged` against `expected`, sent at `sent`
+    /// for the round of `members`. A round's keys include keys it reads,
+    /// because a peer change of those also conflicts after any split.
+    fn new(
+        expected: Arc<Node>,
+        staged: &LeafBody,
+        members: &BTreeMap<TxId, LeafMember>,
+        sent: rt::Instant,
+    ) -> Self {
         let mut round_keys: BTreeSet<Vec<u8>> = members
             .values()
             .flat_map(|member| member.policy.leaf_scope_keys())
@@ -662,6 +742,8 @@ impl LostCas {
         Self {
             expected,
             round_keys,
+            sent,
+            members: u32::try_from(members.len()).unwrap_or(u32::MAX),
         }
     }
 
@@ -700,31 +782,61 @@ fn changed_keys<'a>(before: &'a LeafBody, after: &'a LeafBody) -> impl Iterator<
         .map(|entry| entry.key.as_slice())
 }
 
+/// One coordinator round on one leaf.
+struct Round {
+    path: ObjectPath,
+    started: rt::Instant,
+    /// The keys of the last round on the leaf before this round.
+    previous_keys: Option<BTreeSet<Vec<u8>>>,
+    keys: BTreeSet<Vec<u8>>,
+}
+
+impl Round {
+    /// Reports whether a member with `keys` waited only for other keys. A
+    /// member without keys, for example a release, has no keys to move to
+    /// another leaf. When the keys of the previous round are not known, the
+    /// wait is not a split cause.
+    fn waited_for_other_keys(&self, keys: &[&[u8]]) -> bool {
+        !keys.is_empty()
+            && self
+                .previous_keys
+                .as_ref()
+                .is_some_and(|previous| !keys.iter().any(|&key| previous.contains(key)))
+    }
+}
+
 impl CasWorker {
-    /// Returns the merged request of the round that started at
-    /// `round_started`, or none when the round has stopped. Every member that
-    /// the round includes stops waiting.
+    /// Returns the merged request of `round`, or none when the round has
+    /// stopped. Every member that the round includes stops waiting.
     fn round_request(
         &self,
         batch: &BatchHandle<CasReq, TransError>,
-        round_started: rt::Instant,
+        round: &mut Round,
     ) -> Option<CasReq> {
         let merged = batch.merged()?;
         for member in merged.members.values() {
-            if let Some(wait) = member.queue.take_wait(round_started) {
+            let mut keys = member.policy.leaf_scope_keys();
+            keys.extend(member.policy.publication_keys());
+            if let Some(wait) = member.queue.take_wait(round.started) {
                 self.core.stats.record_queue_wait(wait);
+                if !wait.is_zero() && round.waited_for_other_keys(&keys) {
+                    self.core
+                        .hinter
+                        .leaf_delay(&round.path, LeafDelay::QueueWait, wait);
+                }
             }
+            round.keys.extend(keys.into_iter().map(<[u8]>::to_vec));
         }
         Some(merged)
     }
 
-    /// Returns the round's members, or none when the round has stopped.
+    /// Returns the members of `round`, or none when the round has stopped.
     fn round_members(
         &self,
         batch: &BatchHandle<CasReq, TransError>,
-        round_started: rt::Instant,
+        round: &mut Round,
     ) -> BTreeMap<TxId, LeafMember> {
-        self.round_request(batch, round_started)
+        self.round_request(batch, round)
             .map(|merged| merged.members)
             .unwrap_or_default()
     }
@@ -983,13 +1095,24 @@ impl CasWorker {
         edit.set_locks(plan.locks.clone());
         let started = rt::Instant::now();
         let committed = self.core.nodes.commit_leaf(edit).await;
-        self.core.stats.record_leaf_write(started.elapsed());
+        let took = started.elapsed();
+        self.core.stats.record_leaf_write(took);
+        let slow = self.core.cas_floor.excess(took);
         match committed {
             // Hint the background restructurer if this write left the leaf
             // over the soft cap (ADR-031); the restructurer reloads and
-            // re-checks, so a spurious hint only costs one load.
+            // re-checks, so a spurious hint only costs one load. The time of
+            // a rejected CAS is part of the lost CAS time instead.
             Ok(CasResult::Applied(receipt)) => {
                 self.core.hinter.observe_leaf(path, &new_leaf);
+                if !slow.is_zero() {
+                    let members = u32::try_from(plan.members.len()).unwrap_or(u32::MAX);
+                    self.core.hinter.leaf_delay(
+                        path,
+                        LeafDelay::SlowCas,
+                        slow.saturating_mul(members),
+                    );
+                }
                 Ok(PersistResult::Applied(receipt))
             }
             Ok(CasResult::Rejected) => Ok(PersistResult::Rejected(new_leaf)),
@@ -1007,7 +1130,7 @@ impl CasWorker {
         &self,
         submitted: &CasReq,
         batch: &BatchHandle<CasReq, TransError>,
-        round_started: rt::Instant,
+        round: &mut Round,
     ) -> Result<(), TransError> {
         let path = &submitted.path;
         let mut requirement = submitted.requirement;
@@ -1036,6 +1159,10 @@ impl CasWorker {
         // batch's in-doubt outcome would strand it over a write it never made.
         let mut in_doubt: BTreeSet<TxId> = BTreeSet::new();
         let mut lost_cas: Option<LostCas> = None;
+        // When the first CAS lost to a CAS for other keys was sent, and for how
+        // many members. A split can remove the time until the round sends the
+        // CAS that lands, or finds that it has nothing to write.
+        let mut lost_to_other_keys: Option<(rt::Instant, u32)> = None;
         // Retain both submitted and policy-requested bounds across retries.
         // ANY seeds need no preliminary check when a CAS confirms their state.
         let mut load_requirement = Requirement::ANY;
@@ -1063,7 +1190,7 @@ impl CasWorker {
                     if lost_cas.take().is_some() {
                         self.core.stats.record_lost_cas(LostCasCause::NodeChange);
                     }
-                    let members = self.round_members(batch, round_started);
+                    let members = self.round_members(batch, round);
                     for (tx, member) in &members {
                         *member.slot.lock().unwrap() = Some(CoordinatedOutcome {
                             outcome: member.policy.reroute_outcome(in_doubt.contains(tx)),
@@ -1075,7 +1202,11 @@ impl CasWorker {
                 Err(e) => return Err(e.into()),
             };
             if let Some(lost) = lost_cas.take() {
-                self.core.stats.record_lost_cas(lost.cause(edit.node()));
+                let cause = lost.cause(edit.node());
+                self.core.stats.record_lost_cas(cause);
+                if cause == LostCasCause::OtherKeys {
+                    lost_to_other_keys.get_or_insert((lost.sent, lost.members));
+                }
             }
             // Read the merged set *after* obtaining the leaf so this round
             // absorbs every member that queued while the load I/O was in flight
@@ -1088,7 +1219,7 @@ impl CasWorker {
             // behalf of abandoned transactions — including, after a precondition
             // miss proved the first CAS did not land, a brand-new direct
             // publication over a newer writer.
-            let Some(merged) = self.round_request(batch, round_started) else {
+            let Some(merged) = self.round_request(batch, round) else {
                 return Ok(());
             };
             requirement = requirement.stricter(merged.requirement);
@@ -1107,6 +1238,7 @@ impl CasWorker {
             };
 
             let loaded_observation = edit.observation().clone();
+            let sent = rt::Instant::now();
             let persist_result = self.persist(path, edit, &mut plan, requirement).await?;
             let (loaded_observation, applied) = match persist_result {
                 PersistResult::Applied(receipt) => (loaded_observation, Some(receipt)),
@@ -1116,7 +1248,7 @@ impl CasWorker {
                 PersistResult::Rejected(staged) => {
                     lost_cas = loaded_observation
                         .value()
-                        .map(|expected| LostCas::new(expected.clone(), &staged, &members));
+                        .map(|expected| LostCas::new(expected.clone(), &staged, &members, sent));
                     reloaded = true;
                     continue;
                 }
@@ -1133,6 +1265,14 @@ impl CasWorker {
                 }
             };
 
+            // The lost CAS time ends when the round sends its last CAS,
+            // because the slow CAS time covers that CAS.
+            if let Some((lost_sent, members)) = lost_to_other_keys {
+                let lost = sent.saturating_duration_since(lost_sent);
+                self.core
+                    .hinter
+                    .leaf_delay(path, LeafDelay::LostCas, lost.saturating_mul(members));
+            }
             // The CAS landed (or nothing needed staging): publish each member's
             // outcome into its slot before returning, so the deposit
             // happens-before the dedup delivers to the caller. Recording the held
@@ -1162,7 +1302,7 @@ impl CasWorker {
         // policy's exhaustion outcome. Acquirers conflict and release/re-lock;
         // write-backs re-descend and releases re-submit, because exhaustion does
         // not prove convergence.
-        for (tx, m) in &self.round_members(batch, round_started) {
+        for (tx, m) in &self.round_members(batch, round) {
             *m.slot.lock().unwrap() = Some(CoordinatedOutcome {
                 outcome: m.policy.exhausted_outcome(in_doubt.contains(tx)),
                 evidence: None,
@@ -1179,11 +1319,22 @@ impl Worker<CasReq, TransError> for CasWorker {
         _key: &str,
         batch: &BatchHandle<CasReq, TransError>,
     ) -> Result<(), TransError> {
-        let round_started = rt::Instant::now();
-        let Some(submitted) = self.round_request(batch, round_started) else {
+        let started = rt::Instant::now();
+        let Some(path) = batch.merged().map(|merged| merged.path) else {
             return Ok(());
         };
-        self.run_leaf(&submitted, batch, round_started).await
+        let mut round = Round {
+            previous_keys: self.core.recent_rounds.take(&path),
+            path,
+            started,
+            keys: BTreeSet::new(),
+        };
+        let Some(submitted) = self.round_request(batch, &mut round) else {
+            return Ok(());
+        };
+        let result = self.run_leaf(&submitted, batch, &mut round).await;
+        self.core.recent_rounds.put(round.path, round.keys);
+        result
     }
 }
 
@@ -1215,6 +1366,8 @@ impl LeafCoordinator {
             stats: Stats::default(),
             policy,
             hinter,
+            cas_floor: CasFloor::default(),
+            recent_rounds: RecentRounds::default(),
         });
         let dedup = Dedup::new(CasWorker { core: core.clone() });
         LeafCoordinator {
@@ -2827,33 +2980,50 @@ mod tests {
         (backend, armed)
     }
 
+    // Returns `node` with a peer's committed write of `key`.
+    fn with_peer_writer(node: &Node, key: &[u8]) -> Node {
+        let writer = TxId::with_priority(9, b"peer");
+        let mut entries: BTreeMap<_, _> = node
+            .as_leaf()
+            .unwrap()
+            .entries()
+            .map(|entry| (entry.key.clone(), entry.clone()))
+            .collect();
+        entries.insert(
+            key.to_vec(),
+            entry(key, LockType::None, None, Some(&writer)),
+        );
+        let mut node = node.clone();
+        node.set_leaf(LeafBody::from_entries(entries.into_values()))
+            .unwrap();
+        node
+    }
+
     // A lost race against only other keys of the leaf is false sharing, unlike
     // a race on a key of the round, so each lost CAS reports which one it was.
     #[tokio::test(start_paused = true)]
     async fn lost_cas_reports_what_the_peer_changed() {
-        fn with_writer(node: &Node, key: &[u8]) -> Node {
-            let writer = TxId::with_priority(9, b"peer");
-            let mut entries: BTreeMap<_, _> = node
-                .as_leaf()
-                .unwrap()
-                .entries()
-                .map(|entry| (entry.key.clone(), entry.clone()))
-                .collect();
-            entries.insert(
-                key.to_vec(),
-                entry(key, LockType::None, None, Some(&writer)),
-            );
-            let mut node = node.clone();
-            node.set_leaf(LeafBody::from_entries(entries.into_values()))
-                .unwrap();
-            node
-        }
         // Each case gives whether the retried round locks, and the lost-CAS
         // counters for same keys, other keys, and node change.
         let cases: [(&str, PeerChange, bool, [u64; 3]); 6] = [
-            ("same key", |node| with_writer(node, b"a"), true, [1, 0, 0]),
-            ("other key", |node| with_writer(node, b"b"), true, [0, 1, 0]),
-            ("added key", |node| with_writer(node, b"c"), true, [0, 1, 0]),
+            (
+                "same key",
+                |node| with_peer_writer(node, b"a"),
+                true,
+                [1, 0, 0],
+            ),
+            (
+                "other key",
+                |node| with_peer_writer(node, b"b"),
+                true,
+                [0, 1, 0],
+            ),
+            (
+                "added key",
+                |node| with_peer_writer(node, b"c"),
+                true,
+                [0, 1, 0],
+            ),
             (
                 "split",
                 |node| {
@@ -3055,6 +3225,255 @@ mod tests {
 
         assert_eq!((stats.submissions, stats.rounds), (2, 2));
         assert_eq!(stats.queue_wait, Duration::ZERO);
+    }
+
+    #[derive(Default)]
+    struct DelayRecorder {
+        delays: Mutex<Vec<(LeafDelay, Duration)>>,
+    }
+
+    impl DelayRecorder {
+        fn take(&self) -> Vec<(LeafDelay, Duration)> {
+            std::mem::take(&mut self.delays.lock().unwrap())
+        }
+    }
+
+    impl StructuralHinter for DelayRecorder {
+        fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {}
+
+        fn capacity_rejected(&self, _path: &ObjectPath) {}
+
+        fn leaf_delay(&self, path: &ObjectPath, delay: LeafDelay, time: Duration) {
+            assert_eq!(path, &leaf_path());
+            self.delays.lock().unwrap().push((delay, time));
+        }
+    }
+
+    // A split can separate a member from a round on other keys, but not from a
+    // round on one of its keys, so only the first wait is a split cause.
+    #[tokio::test(start_paused = true)]
+    async fn only_waits_for_rounds_on_other_keys_are_split_time() {
+        let hints = Arc::new(DelayRecorder::default());
+        let (coord, _nodes, _timeline, _bg) = coord_over_with(
+            slow_leaf_backend(),
+            NodeSizePolicy::default(),
+            hints.clone(),
+        )
+        .await;
+
+        let driver = spawn_lock(&coord, b"a", 1);
+        rt::sleep(LEAF_LOAD + LEAF_CAS / 2).await;
+        let other_key = spawn_lock(&coord, b"c", 3);
+        let same_key = spawn_lock(&coord, b"a", 1);
+        for task in [driver, other_key, same_key] {
+            assert!(task.await.unwrap().unwrap());
+        }
+        coord.close().await;
+
+        assert_eq!(
+            hints.take(),
+            vec![(LeafDelay::QueueWait, LEAF_CAS / 2)],
+            "only the member with other keys waited for a split cause"
+        );
+    }
+
+    // The peer loads and stores the leaf inside the lost CAS. Then the round
+    // backs off for about one millisecond, and reloads.
+    const LOST_CAS: Duration = Duration::from_millis(80);
+
+    // A coordinator over leaf keys `a` and `b`, whose next leaf CAS loses to
+    // `change` of a peer.
+    async fn coord_losing_next_cas(
+        change: PeerChange,
+    ) -> (LeafCoordinator, Arc<DelayRecorder>, Arc<Background>) {
+        let inner = slow_leaf_backend();
+        let seed = TxId::with_priority(1, b"seed");
+        store_leaf_entries(
+            &cold_store(inner.clone()),
+            &leaf(),
+            vec![
+                entry(b"a", LockType::None, None, Some(&seed)),
+                entry(b"b", LockType::None, None, Some(&seed)),
+            ],
+        )
+        .await;
+        let (backend, armed) = peer_wins_next_leaf_cas(inner, change);
+        let hints = Arc::new(DelayRecorder::default());
+        let (coord, _nodes, _timeline, bg) = coord_over_retry(
+            backend,
+            NodeSizePolicy::default(),
+            hints.clone(),
+            RetryConfig {
+                initial_interval: Duration::from_nanos(1),
+                max_interval: Duration::from_nanos(1),
+            },
+        )
+        .await;
+        armed.store(true, Ordering::SeqCst);
+        (coord, hints, bg)
+    }
+
+    fn lost_cas_times(delays: &[(LeafDelay, Duration)]) -> Vec<Duration> {
+        delays
+            .iter()
+            .filter(|(delay, _)| *delay == LeafDelay::LostCas)
+            .map(|(_, time)| *time)
+            .collect()
+    }
+
+    fn assert_lost_cas_time(delays: &[(LeafDelay, Duration)]) {
+        let lost = lost_cas_times(delays);
+        assert_eq!(lost.len(), 1, "{delays:?}");
+        assert!(
+            (LOST_CAS..=LOST_CAS + Duration::from_millis(1)).contains(&lost[0]),
+            "{delays:?}"
+        );
+    }
+
+    // A lost CAS delays the round until it sends a CAS that lands, and a split
+    // removes the delay only when the CAS lost to other keys.
+    #[tokio::test(start_paused = true)]
+    async fn lost_cas_on_other_keys_is_split_time_until_a_cas_lands() {
+        let cases: [(&str, PeerChange, bool); 2] = [
+            ("other key", |node| with_peer_writer(node, b"b"), true),
+            ("same key", |node| with_peer_writer(node, b"a"), false),
+        ];
+        for (name, change, split_time) in cases {
+            let (coord, hints, _bg) = coord_losing_next_cas(change).await;
+
+            assert!(
+                spawn_lock(&coord, b"a", 2).await.unwrap().unwrap(),
+                "{name}"
+            );
+            coord.close().await;
+
+            let delays = hints.take();
+            if split_time {
+                assert_lost_cas_time(&delays);
+            } else {
+                assert!(lost_cas_times(&delays).is_empty(), "{name}: {delays:?}");
+            }
+        }
+    }
+
+    // Stages a write lock like [`StageLock`], but stages nothing after a
+    // reload.
+    struct StageLockUntilReload(StageLock);
+
+    #[async_trait::async_trait]
+    impl MemberPolicy for StageLockUntilReload {
+        async fn resolve(
+            &self,
+            ctx: &ResolveCtx<'_>,
+            staged: &BTreeMap<Vec<u8>, LeafEntry>,
+            staged_locks: &NodeLocks,
+        ) -> Result<Step, TransError> {
+            if matches!(ctx.cause, ReloadCause::Reloaded { .. }) {
+                return Ok(Step::Skip {
+                    outcome: MemberOutcome::Moved,
+                });
+            }
+            self.0.resolve(ctx, staged, staged_locks).await
+        }
+
+        fn reorderable(&self) -> bool {
+            false
+        }
+
+        fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome {
+            self.0.exhausted_outcome(in_doubt)
+        }
+
+        fn leaf_scope_keys(&self) -> Vec<&[u8]> {
+            self.0.leaf_scope_keys()
+        }
+    }
+
+    impl LeafOperation for StageLockUntilReload {
+        type Output = Option<MemberOutcome>;
+
+        fn path(&self) -> &ObjectPath {
+            self.0.path()
+        }
+
+        fn id(&self) -> &TxId {
+            self.0.id()
+        }
+
+        fn requirement(&self) -> Requirement {
+            self.0.requirement()
+        }
+
+        fn complete(
+            &self,
+            outcome: Option<CoordinatedOutcome>,
+        ) -> Result<Self::Output, TransError> {
+            Ok(outcome.map(|outcome| outcome.outcome))
+        }
+    }
+
+    // Regression: a round can find after the lost CAS that it has nothing to
+    // write. Its members still waited for the lost CAS.
+    #[tokio::test(start_paused = true)]
+    async fn lost_cas_on_other_keys_is_split_time_when_the_retry_writes_nothing() {
+        let (coord, hints, _bg) = coord_losing_next_cas(|node| with_peer_writer(node, b"b")).await;
+
+        let outcome = coord
+            .coordinate(StageLockUntilReload(StageLock {
+                key: b"a".to_vec(),
+                tx: TxId::with_priority(2, b"tx"),
+                admission: StageAdmission::ExistingKeys,
+            }))
+            .await
+            .unwrap();
+        coord.close().await;
+
+        assert!(matches!(outcome, Some(MemberOutcome::Moved)));
+        assert_lost_cas_time(&hints.take());
+    }
+
+    // A backend limit on writes to one object makes each CAS of the leaf
+    // slow, and a split spreads the writes over two objects.
+    #[tokio::test(start_paused = true)]
+    async fn a_leaf_cas_much_slower_than_the_fastest_is_split_time() {
+        const FAST: Duration = Duration::from_millis(10);
+        const SLOW: Duration = Duration::from_millis(200);
+        let writes = Arc::new(AtomicU64::new(0));
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        backend.set_before({
+            let writes = writes.clone();
+            move |op| {
+                let delay = match op {
+                    BackendOp::WriteIf { path, .. } if path.contains("/_n/") => {
+                        if writes.fetch_add(1, Ordering::SeqCst) == 2 {
+                            SLOW
+                        } else {
+                            FAST
+                        }
+                    }
+                    _ => Duration::ZERO,
+                };
+                Box::pin(async move {
+                    rt::sleep(delay).await;
+                    Ok(())
+                })
+            }
+        });
+        let hints = Arc::new(DelayRecorder::default());
+        let (coord, _nodes, _timeline, _bg) =
+            coord_over_with(backend, NodeSizePolicy::default(), hints.clone()).await;
+
+        for (key, priority) in [(b"a", 1), (b"b", 2), (b"c", 3)] {
+            assert!(spawn_lock(&coord, key, priority).await.unwrap().unwrap());
+        }
+        coord.close().await;
+
+        // The floor rises by one part in 64 for each CAS.
+        let slow_floor = FAST + FAST / CAS_FLOOR_RISE;
+        assert_eq!(
+            hints.take(),
+            vec![(LeafDelay::SlowCas, SLOW - slow_floor * SLOW_CAS_FACTOR)]
+        );
     }
 
     // ADR-051: a direct commit's staged entry is the only record that it ran, so

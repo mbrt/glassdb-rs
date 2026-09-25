@@ -7,6 +7,7 @@
 
 use std::cmp::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use glassdb_data::{CollectionAddress, LogicalKey, TxId};
 use glassdb_storage::LeafObservation;
@@ -281,6 +282,9 @@ pub(crate) struct LeafCoverage {
     pub(crate) membership_generation: u64,
     pub(crate) pending_membership: Vec<TxId>,
     pub(crate) observation: LeafObservation,
+    /// The time that the scan used to read this leaf after the previous
+    /// covered leaf. It is zero for the first covered leaf.
+    pub(crate) reach_time: Duration,
 }
 
 impl PartialEq for LeafCoverage {

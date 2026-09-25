@@ -9,8 +9,9 @@ use glassdb_data::{ObjectPath, TxId};
 use glassdb_storage::{InlinePolicy, LeafBody, Node, NodeSizePolicy};
 use tokio::sync::Notify;
 
-use crate::leaf_coord::StructuralHinter;
+use crate::leaf_coord::{LeafDelay, StructuralHinter};
 
+use super::avoidable::{AvoidableTime, MergeTime, SplitTime};
 use super::split::SplitReason;
 
 /// Interval of the sweep when no new candidate arrives. Such a sweep retries
@@ -40,6 +41,7 @@ pub(super) struct MaintenanceCandidates {
     inline: InlinePolicy,
     queue: Arc<Mutex<VecDeque<MaintenanceCandidate>>>,
     queued: Arc<Notify>,
+    avoidable: Arc<AvoidableTime>,
 }
 
 /// Lightweight producer handle for structural hints decided outside the leaf
@@ -82,6 +84,36 @@ impl StructuralHintSink {
                 value_len,
             }),
         });
+    }
+
+    /// Notes that a direct commit candidate of `path` used `time` more than a
+    /// direct commit, because the leaf could not carry its value inline.
+    pub(crate) fn inline_pressure_time(&self, path: &ObjectPath, time: Duration) {
+        let split = SplitTime {
+            inline_pressure: time,
+            ..SplitTime::default()
+        };
+        self.candidates.avoidable.add_split_time(path, split);
+    }
+
+    /// Notes that a direct commit candidate with keys in the adjacent leaves
+    /// `left` and `right` used `time` more than a direct commit.
+    pub(crate) fn adjacent_miss_time(&self, left: &ObjectPath, right: &ObjectPath, time: Duration) {
+        let merge = MergeTime {
+            adjacent_miss: time,
+            ..MergeTime::default()
+        };
+        self.candidates.avoidable.add_merge_time(left, right, merge);
+    }
+
+    /// Notes that a scan that continued from `left` used `time` to read the
+    /// adjacent leaf `right`.
+    pub(crate) fn scan_crossing_time(&self, left: &ObjectPath, right: &ObjectPath, time: Duration) {
+        let merge = MergeTime {
+            scan_crossing: time,
+            ..MergeTime::default()
+        };
+        self.candidates.avoidable.add_merge_time(left, right, merge);
     }
 
     #[cfg(test)]
@@ -127,7 +159,13 @@ impl MaintenanceCandidates {
             inline,
             queue: Arc::new(Mutex::new(VecDeque::new())),
             queued: Arc::new(Notify::new()),
+            avoidable: Arc::new(AvoidableTime::default()),
         }
+    }
+
+    /// The avoidable time that the producers of the feed report.
+    pub(super) fn avoidable(&self) -> &AvoidableTime {
+        &self.avoidable
     }
 
     /// The node size policy shared by the feed and the restructurer.
@@ -275,5 +313,10 @@ impl StructuralHinter for MaintenanceCandidates {
             priority: self.new_id(),
             cause: CandidateCause::Split(SplitReason::Capacity),
         });
+    }
+
+    fn leaf_delay(&self, path: &ObjectPath, delay: LeafDelay, time: Duration) {
+        self.avoidable
+            .add_split_time(path, SplitTime::of_delay(delay, time));
     }
 }

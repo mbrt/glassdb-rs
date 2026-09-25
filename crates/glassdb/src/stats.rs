@@ -117,7 +117,7 @@ impl Sub for Stats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glassdb_trans::InlinePressureStats;
+    use glassdb_trans::{AvoidableTimeStats, InlinePressureStats};
 
     #[test]
     fn subtraction_covers_component_snapshots() {
@@ -176,6 +176,7 @@ mod tests {
                     deferred: 1,
                     discarded: 0,
                 },
+                avoidable: AvoidableTimeStats::default(),
             },
         };
         let after = Stats {
@@ -233,6 +234,7 @@ mod tests {
                     deferred: 1,
                     discarded: 1,
                 },
+                avoidable: AvoidableTimeStats::default(),
             },
         };
         assert_eq!(
@@ -292,6 +294,7 @@ mod tests {
                         deferred: 0,
                         discarded: 1,
                     },
+                    avoidable: AvoidableTimeStats::default(),
                 },
             }
         );
