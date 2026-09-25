@@ -10,7 +10,8 @@ pub(super) enum PolicySpec {
     Engine,
     /// [`FixedTopology`]: only the hard cap splits leaves.
     Fixed,
-    /// [`SizePolicy`], one window at a time.
+    /// [`SizePolicy`]: the size causes of `Engine`, but decided once in each
+    /// window from the sizes and inline pressure of that window.
     Size,
     /// [`AvoidableTimePolicy`] with the split and merge threshold multiples.
     Avoidable { split: f64, merge: f64 },

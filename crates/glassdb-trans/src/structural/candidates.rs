@@ -11,7 +11,7 @@ use tokio::sync::Notify;
 
 use crate::leaf_coord::{LeafDelay, StructuralHinter};
 
-use super::avoidable::{AvoidableTime, MergeTime, SplitTime};
+use super::avoidable::{AvoidableTime, ChangeKind, MergeTime, SplitTime};
 use super::merge::MergeReason;
 use super::policy::TopologyChange;
 use super::split::SplitReason;
@@ -248,8 +248,9 @@ impl MaintenanceCandidates {
     pub(super) fn observe_split_output(&self, path: ObjectPath, node: &Node) {
         match node.as_leaf() {
             Some(leaf) if self.leaf_changes == LeafChanges::Policy => {
+                self.avoidable
+                    .record_changed(path.clone(), ChangeKind::Split);
                 self.avoidable.observe_size(&path, leaf);
-                self.avoidable.record_changed(path);
             }
             _ if node.over_soft_cap(&self.policy) => self.push(MaintenanceCandidate {
                 path,

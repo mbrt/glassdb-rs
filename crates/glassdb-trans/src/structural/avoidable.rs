@@ -5,7 +5,7 @@
 //! changes, the restructurer takes these reports one window at a time, and
 //! measures the typical time of its own changes.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ops::{AddAssign, Sub};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -80,8 +80,8 @@ struct State {
     window_started: rt::Instant,
     leaves: BTreeMap<ObjectPath, LeafWindow>,
     pairs: BTreeMap<(ObjectPath, ObjectPath), MergeTime>,
-    changed: BTreeSet<ObjectPath>,
-    changed_last_window: BTreeSet<ObjectPath>,
+    changes: Vec<(ObjectPath, ChangeKind)>,
+    changes_last_window: Vec<(ObjectPath, ChangeKind)>,
     totals: AvoidableTimeStats,
 }
 
@@ -237,11 +237,20 @@ impl AvoidableTime {
         }
     }
 
-    /// Records that a structural change that landed wrote the leaf at `path`.
-    pub(super) fn record_changed(&self, path: ObjectPath) {
-        if self.windows {
-            self.state.lock().unwrap().changed.insert(path);
+    /// Records that a structural change of `kind` that landed wrote the leaf
+    /// at `path`.
+    pub(super) fn record_changed(&self, path: ObjectPath, kind: ChangeKind) {
+        if !self.windows {
+            return;
         }
+        let mut state = self.state.lock().unwrap();
+        // Time from before the change measured a topology that is gone. If it
+        // stays, the policy can do the same change again for the same time.
+        state.leaves.remove(&path);
+        state
+            .pairs
+            .retain(|(left, right), _| *left != path && *right != path);
+        state.changes.push((path, kind));
     }
 
     /// Records the time of one structural change that landed.
@@ -258,10 +267,14 @@ impl AvoidableTime {
         let now = rt::Instant::now();
         let elapsed = now.saturating_duration_since(state.window_started);
         state.window_started = now;
-        let changed = std::mem::take(&mut state.changed);
-        let changed_before = std::mem::replace(&mut state.changed_last_window, changed.clone());
-        for path in changed_before.into_iter().chain(changed) {
-            state.leaf(&path).changed = true;
+        let changes = std::mem::take(&mut state.changes);
+        let changes_before = std::mem::replace(&mut state.changes_last_window, changes.clone());
+        for (path, kind) in changes_before.into_iter().chain(changes) {
+            let leaf = state.leaf(&path);
+            match kind {
+                ChangeKind::Split => leaf.split_recently = true,
+                ChangeKind::Merge => leaf.merged_recently = true,
+            }
         }
         let leaves = std::mem::take(&mut state.leaves)
             .into_iter()
@@ -298,8 +311,8 @@ impl AvoidableTime {
                 window_started: rt::Instant::now(),
                 leaves: BTreeMap::new(),
                 pairs: BTreeMap::new(),
-                changed: BTreeSet::new(),
-                changed_last_window: BTreeSet::new(),
+                changes: Vec::new(),
+                changes_last_window: Vec::new(),
                 totals: AvoidableTimeStats::default(),
             }),
             split_time: TypicalTime::default(),
@@ -318,7 +331,60 @@ impl State {
 mod tests {
     use std::time::Duration;
 
-    use super::TypicalTime;
+    use glassdb_data::{CollectionAddress, NodeId, ObjectPath};
+    use glassdb_storage::NodeSizePolicy;
+
+    use super::{AvoidableTime, ChangeKind, MergeTime, SplitTime, TypicalTime};
+    use crate::structural::policy::LeafId;
+
+    fn node(byte: u8) -> ObjectPath {
+        ObjectPath::Node {
+            collection: CollectionAddress::root("db"),
+            id: NodeId::from_bytes([byte; 16]),
+        }
+    }
+
+    fn lost_cas(millis: u64) -> SplitTime {
+        SplitTime {
+            lost_cas: Duration::from_millis(millis),
+            ..SplitTime::default()
+        }
+    }
+
+    fn scan_crossing(millis: u64) -> MergeTime {
+        MergeTime {
+            scan_crossing: Duration::from_millis(millis),
+            ..MergeTime::default()
+        }
+    }
+
+    #[test]
+    fn a_change_drops_the_earlier_time_of_its_leaves_and_holds_them_for_two_windows() {
+        let avoidable = AvoidableTime::with_windows();
+        avoidable.add_split_time(&node(1), lost_cas(900));
+        avoidable.add_split_time(&node(3), lost_cas(700));
+        avoidable.add_merge_time(&node(1), &node(2), scan_crossing(800));
+        avoidable.add_merge_time(&node(3), &node(4), scan_crossing(600));
+        avoidable.record_changed(node(1), ChangeKind::Split);
+        avoidable.add_split_time(&node(1), lost_cas(100));
+
+        let first = avoidable.take_window(NodeSizePolicy::default());
+        let second = avoidable.take_window(NodeSizePolicy::default());
+        let third = avoidable.take_window(NodeSizePolicy::default());
+
+        let changed = &first.leaves[&LeafId::new(node(1))];
+        assert_eq!(changed.avoidable, lost_cas(100));
+        assert!(changed.split_recently && !changed.merged_recently);
+        assert_eq!(first.leaves[&LeafId::new(node(3))].avoidable, lost_cas(700));
+        assert_eq!(first.pairs.len(), 1);
+        assert_eq!(first.pairs[0].left, LeafId::new(node(3)));
+        assert!(second.leaves[&LeafId::new(node(1))].split_recently);
+        assert!(third.leaves.is_empty());
+        assert!(third.pairs.is_empty());
+        let totals = avoidable.take_stats();
+        assert_eq!(totals.split, lost_cas(1700));
+        assert_eq!(totals.merge, scan_crossing(1400));
+    }
 
     #[test]
     fn typical_time_moves_one_eighth_toward_each_measurement() {

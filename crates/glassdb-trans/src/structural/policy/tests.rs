@@ -114,17 +114,48 @@ fn two_leaves_merge_when_merge_side_time_pays_for_the_merge_and_both_split_sides
 }
 
 #[test]
-fn a_leaf_that_a_change_wrote_recently_does_not_change() {
-    let changed = LeafWindow {
-        changed: true,
-        ..lost_cas(5000)
+fn a_leaf_that_split_recently_can_split_again_but_not_merge() {
+    let split = LeafWindow {
+        split_recently: true,
+        ..lost_cas(501)
+    };
+    let quiet = LeafWindow {
+        split_recently: true,
+        ..LeafWindow::default()
     };
     let window = window(
-        vec![(leaf(1), changed)],
-        vec![scan_crossing(1, 2, 5000), scan_crossing(3, 1, 5000)],
+        vec![(leaf(1), split), (leaf(3), quiet)],
+        vec![scan_crossing(1, 2, 5000), scan_crossing(3, 4, 5000)],
     );
 
-    assert_eq!(AvoidableTimePolicy::new().decide(&window), vec![]);
+    assert_eq!(
+        AvoidableTimePolicy::new().decide(&window),
+        vec![TopologyChange::Split(leaf(1))]
+    );
+}
+
+#[test]
+fn a_leaf_that_merged_recently_can_merge_again_but_splits_only_on_a_soft_cap() {
+    let merged = |window: LeafWindow| LeafWindow {
+        merged_recently: true,
+        ..window
+    };
+    let window = window(
+        vec![
+            (leaf(1), merged(lost_cas(5000))),
+            (leaf(3), merged(sized(9, 9))),
+            (leaf(5), merged(LeafWindow::default())),
+        ],
+        vec![scan_crossing(5, 6, 5000)],
+    );
+
+    assert_eq!(
+        AvoidableTimePolicy::new().decide(&window),
+        vec![
+            TopologyChange::Split(leaf(3)),
+            TopologyChange::Merge(leaf(5)),
+        ]
+    );
 }
 
 #[test]

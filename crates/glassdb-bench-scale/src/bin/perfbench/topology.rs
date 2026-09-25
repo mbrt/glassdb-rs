@@ -418,9 +418,9 @@ fn seed_topology(
     ))
 }
 
-/// Counts the standalone tree nodes of every collection in the database. Only
-/// the seeded collection is large enough to have any, and with at most one
-/// index level these are exactly its leaves.
+/// Counts the standalone tree nodes of every collection in the database: the
+/// leaves and index nodes below the tree roots. Only the seeded collection is
+/// large enough to have any.
 async fn count_nodes(backend: &dyn Backend, database_name: &str) -> Result<usize, BackendError> {
     let prefix = format!("{database_name}/");
     let limit = ListLimit::new(1000).expect("list limit is nonzero");

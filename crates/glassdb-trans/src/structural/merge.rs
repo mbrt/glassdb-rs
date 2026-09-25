@@ -18,6 +18,7 @@ use crate::error::TransError;
 use crate::monitor::Monitor;
 
 use super::NODE_CAS_ATTEMPTS;
+use super::avoidable::ChangeKind;
 use super::candidates::MaintenanceCandidates;
 use super::change::{Applied, ParentRoute, Prepared};
 use super::nodes::StructuralNodeAccess;
@@ -222,12 +223,13 @@ impl Merger {
         self.reclamation.record(&reclaimed, false);
         self.stats.record_merge();
         for id in [*source, merge.node_id] {
-            self.candidates
-                .avoidable()
-                .record_changed(ObjectPath::Node {
+            self.candidates.avoidable().record_changed(
+                ObjectPath::Node {
                     collection: collection.clone(),
                     id,
-                });
+                },
+                ChangeKind::Merge,
+            );
         }
         self.structural_nodes
             .remove_merge_reservation(collection, &merge.node_id, intent, Requirement::ANY)

@@ -61,9 +61,12 @@ pub struct LeafWindow {
     pub avoidable: SplitTime,
     /// The last size that this instance wrote or split, if any in this window.
     pub size: Option<LeafSize>,
-    /// Whether a structural change wrote the leaf in this window or the last
-    /// one. Part of its measurements can come from before the change.
-    pub changed: bool,
+    /// Whether a split that landed wrote the leaf in this window or the last
+    /// one. The measurements start at the last change.
+    pub split_recently: bool,
+    /// Whether a merge that landed wrote the leaf in this window or the last
+    /// one. The measurements start at the last change.
+    pub merged_recently: bool,
 }
 
 /// The measurements of two adjacent leaves in one window.
@@ -102,8 +105,9 @@ pub enum TopologyChange {
 /// Splits a leaf when its split-side time in one window is more than the
 /// typical split time, and merges two adjacent leaves when their merge-side
 /// time is more than the typical merge time plus the split-side time of both
-/// leaves (ADR-074). Leaves over a soft cap also split. A leaf that a change
-/// wrote in this window or the last one does not change.
+/// leaves (ADR-074). Leaves over a soft cap also split. A leaf that a split
+/// wrote in this window or the last one does not merge, and a leaf that a
+/// merge wrote does not split on avoidable time.
 #[derive(Debug, Clone, Copy)]
 pub struct AvoidableTimePolicy {
     split_threshold: f64,
@@ -112,7 +116,8 @@ pub struct AvoidableTimePolicy {
 
 /// Decides on size alone, as the engine does without a policy: a leaf over a
 /// soft cap or with inline pressure splits, and a leaf with few live entries
-/// merges into its right sibling (ADR-031, ADR-056, ADR-073).
+/// merges into its right sibling (ADR-031, ADR-056, ADR-073). Like the engine,
+/// it has no hold-down window.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SizePolicy;
 
@@ -206,10 +211,12 @@ impl TopologyPolicy for AvoidableTimePolicy {
     fn decide(&self, window: &TopologyWindow) -> Vec<TopologyChange> {
         let split_time = window.split_time.mul_f64(self.split_threshold);
         let merge_time = window.merge_time.mul_f64(self.merge_threshold);
-        let mut changed: BTreeSet<&LeafId> = window
+        // Leaves that split recently, or that take part in a change of this
+        // window, do not merge.
+        let mut held: BTreeSet<&LeafId> = window
             .leaves
             .iter()
-            .filter(|(_, leaf)| leaf.changed)
+            .filter(|(_, leaf)| leaf.split_recently)
             .map(|(id, _)| id)
             .collect();
         let mut changes = Vec::new();
@@ -217,9 +224,10 @@ impl TopologyPolicy for AvoidableTimePolicy {
             let over_cap = leaf
                 .size
                 .is_some_and(|size| size.over_soft_cap(&window.node_size));
-            if !leaf.changed && (over_cap || leaf.avoidable.total() > split_time) {
+            let pays = !leaf.merged_recently && leaf.avoidable.total() > split_time;
+            if over_cap || pays {
                 changes.push(TopologyChange::Split(id.clone()));
-                changed.insert(id);
+                held.insert(id);
             }
         }
         let split_side = |id: &LeafId| {
@@ -229,14 +237,14 @@ impl TopologyPolicy for AvoidableTimePolicy {
                 .map_or(Duration::ZERO, |leaf| leaf.avoidable.total())
         };
         for pair in &window.pairs {
-            if changed.contains(&pair.left) || changed.contains(&pair.right) {
+            if held.contains(&pair.left) || held.contains(&pair.right) {
                 continue;
             }
             let keep = merge_time + split_side(&pair.left) + split_side(&pair.right);
             if pair.avoidable.total() > keep {
                 changes.push(TopologyChange::Merge(pair.left.clone()));
-                changed.insert(&pair.left);
-                changed.insert(&pair.right);
+                held.insert(&pair.left);
+                held.insert(&pair.right);
             }
         }
         changes

@@ -153,7 +153,7 @@ async fn the_splits_of_a_policy_land_and_the_next_windows_show_the_changed_leave
     assert!(
         windows
             .iter()
-            .any(|window| window.leaves.values().any(|leaf| leaf.changed)),
+            .any(|window| window.leaves.values().any(|leaf| leaf.split_recently)),
     );
 }
 
