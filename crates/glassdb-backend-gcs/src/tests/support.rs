@@ -40,6 +40,8 @@ struct FakeState {
     lost_ack: Mutex<i64>,
     /// Number of object GETs to answer with `500` (a transient read outage).
     read_fault: Mutex<i64>,
+    /// Number of requests to reject with `429` before handling them.
+    throttle: Mutex<i64>,
 }
 
 /// An owned GCS test server wired to a real loopback HTTP transport.
@@ -61,6 +63,7 @@ impl FakeGcs {
             }),
             lost_ack: Mutex::new(0),
             read_fault: Mutex::new(0),
+            throttle: Mutex::new(0),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -89,6 +92,17 @@ impl FakeGcs {
     /// outage), without touching the stored object.
     pub(super) fn set_read_fault(&self, n: i64) {
         *self.state.read_fault.lock().unwrap() = n;
+    }
+
+    /// Reject the next `n` requests of any kind with `429`, without applying
+    /// them.
+    pub(super) fn set_throttle(&self, n: i64) {
+        *self.state.throttle.lock().unwrap() = n;
+    }
+
+    /// Returns how many requests the server will still reject with `429`.
+    pub(super) fn throttle_remaining(&self) -> i64 {
+        *self.state.throttle.lock().unwrap()
     }
 
     /// Stops the server and waits until its listener and connections are gone.
@@ -167,6 +181,17 @@ async fn handle(
         .map(|c| c.to_bytes())
         .unwrap_or_default()
         .to_vec();
+
+    {
+        let mut throttle = state.throttle.lock().unwrap();
+        if *throttle > 0 {
+            *throttle -= 1;
+            return Ok(error_json(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rateLimitExceeded",
+            ));
+        }
+    }
 
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
