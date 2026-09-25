@@ -1,16 +1,16 @@
 use std::fmt;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use glassdb_concurr::entropy::fill_bytes;
+
+use crate::ID_BYTES;
 
 /// Offset of the big-endian UnixNano timestamp within the ID.
 const TX_ID_TS_OFF: usize = 8;
 
 /// A transaction identity.
 ///
-/// `TxId` is the short Rust name for `TransactionIdentity`. It preserves the
-/// persisted representation of the Go `data.TxID` (`[]byte`).
+/// `TxId` is the short Rust name for `TransactionIdentity`.
 ///
 /// The layout is `[8 bytes random][8 bytes big-endian UnixNano timestamp]`. The
 /// random bytes come first so that transaction-record paths keep a high-entropy
@@ -19,36 +19,22 @@ const TX_ID_TS_OFF: usize = 8;
 /// suffix encodes the transaction priority used by the wound-wait rule: an
 /// earlier timestamp means an older, higher-priority transaction.
 ///
-/// A `TxId` can also hold an arbitrary byte sequence (for example, when decoded from a
-/// storage tag).
-///
 /// [`Ord`] compares the complete identity bytes for identity-keyed collections and is
 /// not wound-wait priority order; use [`TxId::older`] for priority decisions.
-///
-/// The bytes are stored behind an `Arc` so that cloning an id - which happens
-/// pervasively (lockers, writers, cache entries, every commit) -
-/// is a refcount bump rather than a heap allocation and copy.
-#[derive(Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TxId(Arc<[u8]>);
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TxId([u8; ID_BYTES]);
 
 impl TxId {
-    /// Maximum number of protobuf bytes used by an identity minted by GlassDB.
-    ///
-    /// [`TxId::from_bytes`] deliberately preserves arbitrary persisted identities, so
-    /// this is a bound on generated and renewed IDs rather than every value the
-    /// compatibility representation can hold.
-    pub const MAX_GENERATED_ENCODED_LEN: usize = 16;
-
-    /// Generates a new random 128-bit transaction identity.
+    /// Generates a new random transaction identity.
     ///
     /// The timestamp suffix is random rather than clock-derived: this keeps the
     /// `data` crate free of any clock dependency. Production code mints IDs via
     /// [`TxId::new_at`] with a clock-sourced timestamp; this constructor is for
     /// callers (mostly tests) that only need a unique identifier.
     pub fn new_random() -> Self {
-        let mut b = vec![0u8; Self::MAX_GENERATED_ENCODED_LEN];
-        fill_bytes(&mut b);
-        TxId(b.into())
+        let mut bytes = [0; ID_BYTES];
+        fill_bytes(&mut bytes);
+        Self(bytes)
     }
 
     /// Builds a transaction identity from a random prefix and an explicit instant,
@@ -61,21 +47,18 @@ impl TxId {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        let mut b = vec![0u8; Self::MAX_GENERATED_ENCODED_LEN];
-        fill_bytes(&mut b[..TX_ID_TS_OFF]);
-        b[TX_ID_TS_OFF..].copy_from_slice(&unix_nanos.to_be_bytes());
-        TxId(b.into())
+        Self::with_random_prefix(unix_nanos)
     }
 
     /// Builds a transaction identity from an explicit timestamp and random prefix.
     /// Meant for tests that need deterministic priorities. At most the first 8
-    /// bytes of `prefix` are used.
+    /// bytes of `prefix` are used, and shorter prefixes are padded with zeros.
     pub fn with_priority(unix_nanos: u64, prefix: &[u8]) -> Self {
-        let mut b = vec![0u8; Self::MAX_GENERATED_ENCODED_LEN];
+        let mut bytes = [0; ID_BYTES];
         let n = prefix.len().min(TX_ID_TS_OFF);
-        b[..n].copy_from_slice(&prefix[..n]);
-        b[TX_ID_TS_OFF..].copy_from_slice(&unix_nanos.to_be_bytes());
-        TxId(b.into())
+        bytes[..n].copy_from_slice(&prefix[..n]);
+        bytes[TX_ID_TS_OFF..].copy_from_slice(&unix_nanos.to_be_bytes());
+        Self(bytes)
     }
 
     /// Returns a transaction identity that preserves the priority of
@@ -84,10 +67,7 @@ impl TxId {
     /// gives it a distinct transaction record that lands in a different storage
     /// partition.
     pub fn renew(&self) -> Self {
-        let mut b = vec![0u8; Self::MAX_GENERATED_ENCODED_LEN];
-        fill_bytes(&mut b[..TX_ID_TS_OFF]);
-        b[TX_ID_TS_OFF..].copy_from_slice(&self.priority().to_be_bytes());
-        TxId(b.into())
+        Self::with_random_prefix(self.priority())
     }
 
     /// Reports whether `self` has strictly higher priority than `other`, i.e. it
@@ -104,36 +84,33 @@ impl TxId {
         self.priority() < other.priority()
     }
 
-    /// Wraps raw bytes as a transaction identity.
-    pub fn from_bytes(b: impl Into<Vec<u8>>) -> Self {
-        let v: Vec<u8> = b.into();
-        TxId(v.into())
+    /// Builds a transaction identity from its exact 16-byte representation.
+    pub const fn from_bytes(bytes: [u8; ID_BYTES]) -> Self {
+        Self(bytes)
     }
 
-    /// Returns the raw bytes of the identity.
-    pub fn as_bytes(&self) -> &[u8] {
+    /// Parses an exact 16-byte transaction identity.
+    pub fn from_slice(bytes: &[u8]) -> Option<Self> {
+        bytes.try_into().ok().map(Self)
+    }
+
+    /// Returns the identity's 16-byte representation.
+    pub const fn as_bytes(&self) -> &[u8; ID_BYTES] {
         &self.0
     }
 
-    /// Consumes the identity and returns the owned bytes.
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.0.to_vec()
-    }
-
-    /// Reports whether the identity is unset.
-    pub fn is_unset(&self) -> bool {
-        self.0.is_empty()
+    fn with_random_prefix(unix_nanos: u64) -> Self {
+        let mut bytes = [0; ID_BYTES];
+        fill_bytes(&mut bytes[..TX_ID_TS_OFF]);
+        bytes[TX_ID_TS_OFF..].copy_from_slice(&unix_nanos.to_be_bytes());
+        Self(bytes)
     }
 
     /// Returns the wound-wait priority (the big-endian UnixNano timestamp
-    /// suffix). Defensive on short IDs, which have no timestamp and thus the
-    /// highest priority (zero).
+    /// suffix).
     fn priority(&self) -> u64 {
-        if self.0.len() < Self::MAX_GENERATED_ENCODED_LEN {
-            return 0;
-        }
-        let mut ts = [0u8; 8];
-        ts.copy_from_slice(&self.0[TX_ID_TS_OFF..Self::MAX_GENERATED_ENCODED_LEN]);
+        let mut ts = [0; ID_BYTES - TX_ID_TS_OFF];
+        ts.copy_from_slice(&self.0[TX_ID_TS_OFF..]);
         u64::from_be_bytes(ts)
     }
 }
@@ -153,12 +130,6 @@ impl fmt::Debug for TxId {
     }
 }
 
-impl From<Vec<u8>> for TxId {
-    fn from(b: Vec<u8>) -> Self {
-        TxId(b.into())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,17 +137,30 @@ mod tests {
     // These run on a runtime so prefix minting works under any build; outside
     // the simulation executor the shared entropy facade uses the process RNG.
     #[tokio::test]
-    async fn random_is_16_bytes_and_hex() {
+    async fn generated_ids_round_trip() {
         let id = TxId::new_random();
-        assert_eq!(id.as_bytes().len(), TxId::MAX_GENERATED_ENCODED_LEN);
-        assert_eq!(id.to_string().len(), 32);
+        assert_eq!(TxId::from_slice(id.as_bytes()), Some(id));
+    }
+
+    #[test]
+    fn parsing_requires_the_exact_width() {
+        let bytes = [7; ID_BYTES];
+        assert_eq!(TxId::from_slice(&bytes), Some(TxId::from_bytes(bytes)));
+        for invalid in [&[][..], &[7; ID_BYTES - 1], &[7; ID_BYTES + 1]] {
+            assert_eq!(TxId::from_slice(invalid), None);
+        }
+    }
+
+    #[test]
+    fn display_is_lowercase_hex() {
+        let id = TxId::with_priority(0x0123_4567_89ab_cdef, &[0xfe, 0xdc]);
+        assert_eq!(id.to_string(), "fedc0000000000000123456789abcdef");
     }
 
     #[tokio::test]
     async fn new_at_layout() {
         let nanos = 1_700_000_000_000_000_000u64;
         let id = TxId::new_at(UNIX_EPOCH + std::time::Duration::from_nanos(nanos));
-        assert_eq!(id.as_bytes().len(), 16);
         assert_eq!(id.priority(), nanos);
     }
 
@@ -224,7 +208,6 @@ mod tests {
     async fn renew_preserves_priority() {
         let orig = TxId::new_at(UNIX_EPOCH + std::time::Duration::from_nanos(123_456_789_000));
         let renewed = orig.renew();
-        assert_eq!(renewed.as_bytes().len(), 16);
         assert_eq!(orig.priority(), renewed.priority());
         assert_ne!(orig, renewed);
         // The fresh random prefix differs from the original.
@@ -236,10 +219,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..1000 {
             let id = TxId::new_random();
-            assert!(
-                seen.insert(id.into_bytes()),
-                "duplicate transaction identity generated"
-            );
+            assert!(seen.insert(id), "duplicate transaction identity generated");
         }
     }
 }

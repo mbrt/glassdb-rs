@@ -131,7 +131,7 @@ impl DirectCommit {
         let mut rerouted = false;
         loop {
             let operation = DirectCommitOperation::new(
-                id.clone(),
+                *id,
                 leaf_path.clone(),
                 member.clone(),
                 self.inline_policy,
@@ -252,7 +252,7 @@ impl DirectCommitOperation {
             // Inline values and tombstones can have direct-commit writers. Scans find
             // any transaction records that remain behind those states.
             predecessors.extend(staged.values().filter_map(|state| match state {
-                CurrentState::External { writer } => Some(writer.clone()),
+                CurrentState::External { writer } => Some(*writer),
                 _ => None,
             }));
         }
@@ -424,13 +424,11 @@ impl DirectCommitOperation {
                 DirectWrite::Put(value) => {
                     adds_key |= state.writer.is_none() || state.deleted;
                     CurrentState::Inline {
-                        writer: self.id.clone(),
+                        writer: self.id,
                         value: value.clone(),
                     }
                 }
-                DirectWrite::Delete => CurrentState::Tombstone {
-                    writer: self.id.clone(),
-                },
+                DirectWrite::Delete => CurrentState::Tombstone { writer: self.id },
             };
             entries.push((
                 key.raw_key.clone(),

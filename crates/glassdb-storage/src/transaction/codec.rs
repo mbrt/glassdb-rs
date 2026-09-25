@@ -30,9 +30,6 @@ impl TxRecordCodec {
         let timestamp = record
             .timestamp
             .ok_or_else(|| StorageError::other("transaction record has no persisted timestamp"))?;
-        if record.id.is_unset() {
-            return Err(StorageError::other("empty transaction identity"));
-        }
         validate_database_membership(record, expected_db_prefix)?;
 
         let mut collection_writes: BTreeMap<CollectionAddress, pb::CollectionWrites> =
@@ -87,7 +84,7 @@ impl TxRecordCodec {
             decode_prepared_collections(db_prefix, &encoded.prepared_collection_ids)?;
 
         Ok(TxRecord {
-            id: id.clone(),
+            id: *id,
             timestamp: encoded.timestamp.map(proto_ts_to_system),
             status,
             writes,
@@ -134,7 +131,9 @@ impl Codec for TxRecordCodec {
             .writes
             .iter()
             .map(|write| {
-                write.key.key().len() + write.value.len() + write.prev_writer.as_bytes().len()
+                write.key.key().len()
+                    + write.value.len()
+                    + write.prev_writer.map_or(0, |_| ID_BYTES)
             })
             .sum::<usize>()
             + record
@@ -199,7 +198,7 @@ fn decode_collection_writes(
     let mut locks = Vec::new();
     for group in encoded {
         let collection = decode_collection_id(db_prefix, &group.collection_id)?;
-        writes.extend(decode_writes(&collection, &group.writes));
+        writes.extend(decode_writes(&collection, &group.writes)?);
         if let Some(group_locks) = &group.locks {
             locks.extend(decode_key_locks(&collection, &group_locks.key_locks));
             locks.extend(decode_membership_locks(
@@ -223,14 +222,26 @@ fn decode_collection_writes(
     Ok((writes, locks))
 }
 
-fn decode_writes(collection: &CollectionAddress, encoded: &[pb::Write]) -> Vec<TxWrite> {
+fn decode_writes(
+    collection: &CollectionAddress,
+    encoded: &[pb::Write],
+) -> Result<Vec<TxWrite>, StorageError> {
     encoded
         .iter()
-        .map(|write| TxWrite {
-            key: LogicalKey::new(collection.clone(), &write.key),
-            value: write_value(write),
-            deleted: write_deleted(write),
-            prev_writer: TxId::from_bytes(write.prev_tid.clone()),
+        .map(|write| {
+            let prev_writer = if write.prev_tid.is_empty() {
+                None
+            } else {
+                Some(TxId::from_slice(&write.prev_tid).ok_or_else(|| {
+                    StorageError::other("transaction record has an invalid previous writer")
+                })?)
+            };
+            Ok(TxWrite {
+                key: LogicalKey::new(collection.clone(), &write.key),
+                value: write_value(write),
+                deleted: write_deleted(write),
+                prev_writer,
+            })
         })
         .collect()
 }
@@ -354,7 +365,10 @@ fn append_write(
     };
     let encoded = pb::Write {
         key: write.key.key().to_vec(),
-        prev_tid: write.prev_writer.as_bytes().to_vec(),
+        prev_tid: write
+            .prev_writer
+            .map(|id| id.as_bytes().to_vec())
+            .unwrap_or_default(),
         val_delete: Some(val_delete),
     };
     let collection = write.key.collection();
@@ -493,12 +507,16 @@ fn proto_ts_to_system(timestamp: prost_types::Timestamp) -> SystemTime {
 mod tests {
     use super::*;
 
+    fn tx_id(prefix: &[u8]) -> TxId {
+        TxId::with_priority(0, prefix)
+    }
+
     fn collection(db_prefix: &str, byte: u8) -> CollectionAddress {
         CollectionAddress::new(db_prefix, CollectionId::from_slice(&[byte; 16]).unwrap())
     }
 
     fn record_with_status(status: TxCommitStatus) -> TxRecord {
-        let mut record = TxRecord::new(TxId::from_bytes(vec![1, 2, 3, 4]), status);
+        let mut record = TxRecord::new(tx_id(&[1, 2, 3, 4]), status);
         record.timestamp = Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
         record
     }
@@ -508,7 +526,7 @@ mod tests {
         let created = collection(db_prefix, 2);
         let dropped = collection(db_prefix, 3);
         TxRecord {
-            id: TxId::from_bytes(vec![1, 2, 3, 4]),
+            id: tx_id(&[1, 2, 3, 4]),
             timestamp: Some(UNIX_EPOCH + Duration::from_secs(42)),
             status: TxCommitStatus::Pending,
             writes: vec![
@@ -516,13 +534,13 @@ mod tests {
                     key: LogicalKey::new(parent.clone(), b"value"),
                     value: Arc::from(&b"contents"[..]),
                     deleted: false,
-                    prev_writer: TxId::from_bytes(vec![9]),
+                    prev_writer: Some(tx_id(&[9])),
                 },
                 TxWrite {
                     key: LogicalKey::new(parent.clone(), b"deleted"),
                     value: Arc::from(&[][..]),
                     deleted: true,
-                    prev_writer: TxId::from_bytes(vec![8]),
+                    prev_writer: Some(tx_id(&[8])),
                 },
             ],
             locks: vec![
@@ -589,7 +607,7 @@ mod tests {
     fn assert_rejected(encoded: pb::TransactionRecord) {
         let bytes = encoded.encode_to_vec();
         assert!(
-            TxRecordCodec::decode("db", &TxId::from_bytes(vec![1]), &bytes).is_err(),
+            TxRecordCodec::decode("db", &tx_id(&[1]), &bytes).is_err(),
             "malformed transaction record unexpectedly decoded"
         );
     }
@@ -619,7 +637,7 @@ mod tests {
             encoded.status = status;
             let bytes = encoded.encode_to_vec();
             assert!(TxRecordCodec::decode_status(&bytes).is_err());
-            assert!(TxRecordCodec::decode("db", &TxId::from_bytes(vec![1]), &bytes).is_err());
+            assert!(TxRecordCodec::decode("db", &tx_id(&[1]), &bytes).is_err());
         }
     }
 
@@ -677,13 +695,13 @@ mod tests {
                 key: LogicalKey::new(collection("first", 1), b"a"),
                 value: Arc::from(&b"a"[..]),
                 deleted: false,
-                prev_writer: TxId::default(),
+                prev_writer: None,
             },
             TxWrite {
                 key: LogicalKey::new(collection("second", 1), b"b"),
                 value: Arc::from(&b"b"[..]),
                 deleted: false,
-                prev_writer: TxId::default(),
+                prev_writer: None,
             },
         ];
 
@@ -693,7 +711,7 @@ mod tests {
     #[test]
     fn malformed_protobuf_and_status_are_rejected() {
         assert!(TxRecordCodec::decode_status(&[0xff]).is_err());
-        assert!(TxRecordCodec::decode("db", &TxId::from_bytes(vec![1]), &[0xff]).is_err());
+        assert!(TxRecordCodec::decode("db", &tx_id(&[1]), &[0xff]).is_err());
 
         let mut encoded = encoded_record();
         encoded.status = pb::transaction_record::Status::Default as i32;
@@ -714,7 +732,7 @@ mod tests {
             TxRecordCodec::decode_status(&bytes).unwrap(),
             TxCommitStatus::Committed
         );
-        assert!(TxRecordCodec::decode("db", &TxId::from_bytes(vec![1]), &bytes).is_err());
+        assert!(TxRecordCodec::decode("db", &tx_id(&[1]), &bytes).is_err());
     }
 
     #[test]
@@ -768,6 +786,35 @@ mod tests {
                 }),
             });
             assert_rejected(encoded);
+        }
+    }
+
+    #[test]
+    fn previous_writers_must_be_absent_or_16_bytes() {
+        let with_prev_tid = |prev_tid: Vec<u8>| {
+            let mut encoded = encoded_record();
+            encoded.writes.push(pb::CollectionWrites {
+                collection_id: vec![1; 16],
+                writes: vec![pb::Write {
+                    key: b"k".to_vec(),
+                    prev_tid,
+                    val_delete: Some(pb::write::ValDelete::Deleted(true)),
+                }],
+                locks: None,
+            });
+            encoded
+        };
+
+        for (prev_tid, want) in [
+            (Vec::new(), None),
+            (vec![9; 16], Some(TxId::from_bytes([9; 16]))),
+        ] {
+            let bytes = with_prev_tid(prev_tid).encode_to_vec();
+            let record = TxRecordCodec::decode("db", &tx_id(&[1]), &bytes).unwrap();
+            assert_eq!(record.writes[0].prev_writer, want);
+        }
+        for prev_tid in [vec![9; 15], vec![9; 17]] {
+            assert_rejected(with_prev_tid(prev_tid));
         }
     }
 

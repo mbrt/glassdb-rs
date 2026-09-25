@@ -665,8 +665,8 @@ derived from the transaction identity:
 <db-prefix>/_t/<first-encoded-symbol>/<second-encoded-symbol>/<base64-encoded-tx-id>
 ```
 
-The transaction identity is a random prefix followed by a big-endian nanosecond
-timestamp. The timestamp suffix encodes the wound-wait priority (earlier =
+The transaction identity has 16 bytes: an 8-byte random prefix followed by an
+8-byte big-endian nanosecond timestamp. The timestamp suffix encodes the wound-wait priority (earlier =
 older), while the random prefix leads so that record keys keep a high-entropy
 prefix and spread across object-store partitions instead of clustering
 sequential commits into one hot partition. The first two encoded symbols form
@@ -1065,9 +1065,10 @@ Only backend objects have type markers:
 | `_t`        | Transaction-record object        | `mydb/_t/<a>/<b>/<transaction-identity>`|
 | `_s`        | Participant-owned structural intent | `mydb/_s/<participant-id>/<intent-id>` |
 
-Collection IDs — not names — and node IDs are encoded into object paths with a
-custom **order-preserving** base64 alphabet, so IDs sort the same as raw bytes
-and as paths. Keys live inside leaf objects and remain raw bytes. Transaction
+Collection IDs — not names —, node IDs, transaction identities, and structural
+intent IDs all have 16 bytes. Object paths encode them with a custom
+**order-preserving** base64 alphabet, so IDs sort the same as raw bytes and as
+paths. Keys live inside leaf objects and remain raw bytes. Transaction
 records and structural intents store raw keys, collection IDs, and node IDs; the
 database prefix comes from the object's location, so moving a database does not
 invalidate them.

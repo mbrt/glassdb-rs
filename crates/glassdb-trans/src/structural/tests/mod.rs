@@ -69,6 +69,10 @@ fn test_intent_id(name: &str) -> StructuralIntentId {
     StructuralIntentId::from_bytes(test_id_bytes(name))
 }
 
+fn tx_id(prefix: &[u8]) -> TxId {
+    TxId::with_priority(0, prefix)
+}
+
 fn root_path() -> ObjectPath {
     ObjectPath::TreeRoot {
         collection: collection(),
@@ -227,13 +231,13 @@ fn store_with_backend(backend: Arc<dyn Backend>) -> TestStore {
 // A committed live key, so it counts as existing under a descent lookup.
 fn live(key: &[u8]) -> LeafEntry {
     LeafEntry::new(key).with_current(CurrentState::External {
-        writer: TxId::from_bytes(vec![1]),
+        writer: tx_id(&[1]),
     })
 }
 
 fn inline_live(key: &[u8], value: &[u8]) -> LeafEntry {
     LeafEntry::new(key).with_current(CurrentState::Inline {
-        writer: TxId::from_bytes(vec![1]),
+        writer: tx_id(&[1]),
         value: Arc::from(value),
     })
 }
@@ -351,13 +355,13 @@ async fn split_path(
 
 fn leaf_with_membership_reader(keys: &[&[u8]], holder: &TxId) -> Node {
     let mut node = leaf_node(keys, None, None);
-    node.add_membership_reader(holder.clone());
+    node.add_membership_reader(*holder);
     node
 }
 
 fn leaf_with_locked_entry(keys: &[&[u8]], holder: &TxId) -> Node {
     let mut entries: Vec<_> = keys.iter().map(|key| live(key)).collect();
-    entries[0].replace_write_lock(holder.clone());
+    entries[0].replace_write_lock(*holder);
     Node::leaf(LeafBody::from_entries(entries))
 }
 
@@ -376,7 +380,7 @@ fn nonroot_intent(source: &str, right: &str, split_key: &[u8]) -> StructuralInte
             created_node_ids: vec![test_node_id(right)],
             split_key: split_key.to_vec(),
         },
-        participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
+        participant_id: tx_id(b"structural-participant"),
         phase: StructuralIntentPhase::Ready,
     }
 }

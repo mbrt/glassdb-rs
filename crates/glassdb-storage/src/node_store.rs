@@ -853,8 +853,8 @@ mod tests {
         let loaded = store.load_leaf(&path, Requirement::ANY).await.unwrap();
         let entries = LeafBody::from_entries([LeafEntry::new(b"key".as_slice())]);
         let mut locks = NodeLocks::default();
-        let holder = TxId::from_bytes(b"holder".to_vec());
-        locks.set_membership_writer(holder.clone());
+        let holder = TxId::with_priority(0, b"holder");
+        locks.set_membership_writer(holder);
 
         let mut edit = loaded.into_edit();
         assert_eq!(edit.path(), &path);

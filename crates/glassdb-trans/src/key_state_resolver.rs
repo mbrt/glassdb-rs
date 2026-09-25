@@ -62,7 +62,7 @@ impl HolderResolution {
     /// Returns the current state that should remain after applying this
     /// resolution to `entry`.
     pub(crate) fn resolved_current(&self, entry: Option<&LeafEntry>) -> CurrentState {
-        let Some(writer) = self.writer.clone() else {
+        let Some(writer) = self.writer else {
             return CurrentState::Absent;
         };
         if let Some(entry) = entry
@@ -177,7 +177,7 @@ impl KeyStateResolver {
                     .await
                     .map_err(trans_to_storage)?;
                 if status == TxCommitStatus::Pending {
-                    pending.push(holder.clone());
+                    pending.push(*holder);
                 }
             }
         }
@@ -206,7 +206,7 @@ impl KeyStateResolver {
                 }
                 let status = self.monitor.tx_status_at(holder, requirement).await?;
                 if matches!(status, TxCommitStatus::Pending | TxCommitStatus::Unknown) {
-                    resolved.pending.push(holder.clone());
+                    resolved.pending.push(*holder);
                 }
             }
         }
@@ -247,13 +247,13 @@ impl KeyStateResolver {
         match committed.status {
             TxCommitStatus::Committed => {
                 if !committed.value.not_written {
-                    resolved.writer = Some(holder.clone());
+                    resolved.writer = Some(*holder);
                     resolved.value = ResolvedValue::Unresolved;
                     resolved.deleted = committed.value.deleted;
                 }
             }
             TxCommitStatus::Pending | TxCommitStatus::Unknown => {
-                resolved.pending.push(holder.clone());
+                resolved.pending.push(*holder);
             }
             TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
         }
@@ -331,7 +331,7 @@ mod tests {
             status: TxCommitStatus,
             deleted: Option<bool>,
         ) {
-            let mut record = TxRecord::new(holder.clone(), status);
+            let mut record = TxRecord::new(*holder, status);
             record.locks.push(TxLock::Key {
                 key: key.clone(),
                 typ,
@@ -341,7 +341,7 @@ mod tests {
                     key: key.clone(),
                     value: Arc::from(b"holder-value".as_slice()),
                     deleted,
-                    prev_writer: TxId::default(),
+                    prev_writer: None,
                 });
             }
             self.transactions.set(&record).await.unwrap();
@@ -392,14 +392,14 @@ mod tests {
             match self {
                 Self::Absent => CurrentState::Absent,
                 Self::External => CurrentState::External {
-                    writer: predecessor.clone(),
+                    writer: *predecessor,
                 },
                 Self::Inline => CurrentState::Inline {
-                    writer: predecessor.clone(),
+                    writer: *predecessor,
                     value: Arc::from(INLINE_VALUE),
                 },
                 Self::Tombstone => CurrentState::Tombstone {
-                    writer: predecessor.clone(),
+                    writer: *predecessor,
                 },
             }
         }
@@ -407,7 +407,7 @@ mod tests {
         fn writer(self, predecessor: &TxId) -> Option<TxId> {
             match self {
                 Self::Absent => None,
-                Self::External | Self::Inline | Self::Tombstone => Some(predecessor.clone()),
+                Self::External | Self::Inline | Self::Tombstone => Some(*predecessor),
             }
         }
 
@@ -586,7 +586,7 @@ mod tests {
         let predecessor = TxId::with_priority(1, b"previous");
         let holder = TxId::with_priority(2, b"holder");
         let current = current_case.current(&predecessor);
-        let entry = locked_entry(key.key(), current.clone(), typ, vec![holder.clone()]);
+        let entry = locked_entry(key.key(), current.clone(), typ, vec![holder]);
         harness
             .seed_transaction(
                 &key,
@@ -607,13 +607,13 @@ mod tests {
             None => current_case.deleted(),
         };
         let writer = if exclusive_case.is_committed() {
-            Some(holder.clone())
+            Some(holder)
         } else {
             current_case.writer(&predecessor)
         };
         let expected = ProjectionExpectation {
             writer: WriterResolution {
-                writer: writer.clone(),
+                writer,
                 value: if exclusive_case.is_committed() {
                     ResolvedValue::Unresolved
                 } else {
@@ -624,7 +624,7 @@ mod tests {
                 writer,
                 deleted,
                 pending: if matches!(exclusive_case, ExclusiveCase::Pending) {
-                    vec![holder.clone()]
+                    vec![holder]
                 } else {
                     Vec::new()
                 },
@@ -632,13 +632,9 @@ mod tests {
             current: if !exclusive_case.is_committed() {
                 current
             } else if deleted {
-                CurrentState::Tombstone {
-                    writer: holder.clone(),
-                }
+                CurrentState::Tombstone { writer: holder }
             } else {
-                CurrentState::External {
-                    writer: holder.clone(),
-                }
+                CurrentState::External { writer: holder }
             },
             exists: match exclusive_case.committed_deletion() {
                 Some(deleted) => !deleted,
@@ -695,7 +691,7 @@ mod tests {
                 key.key(),
                 current.clone(),
                 LockType::Read,
-                vec![pending.clone(), committed, aborted, wounded],
+                vec![pending, committed, aborted, wounded],
             );
             let context = format!("{} current / shared readers", current_case.name());
             // Writer-only resolution must not pay to reconcile compatible
@@ -703,13 +699,13 @@ mod tests {
             let writer = current_case.writer(&predecessor);
             let expected = ProjectionExpectation {
                 writer: WriterResolution {
-                    writer: writer.clone(),
+                    writer,
                     value: current_case.value(),
                 },
                 holders: HolderResolution {
                     writer,
                     deleted: current_case.deleted(),
-                    pending: vec![pending.clone()],
+                    pending: vec![pending],
                 },
                 current: current.clone(),
                 exists: current_case.exists(),
@@ -744,10 +740,10 @@ mod tests {
                 )
                 .await;
             let current = CurrentState::Inline {
-                writer: predecessor.clone(),
+                writer: predecessor,
                 value: Arc::from(INLINE_VALUE),
             };
-            let entry = locked_entry(key.key(), current.clone(), lock_type, vec![holder.clone()]);
+            let entry = locked_entry(key.key(), current.clone(), lock_type, vec![holder]);
 
             let (state, _background) = harness.resolver();
             harness.clear_operations();
@@ -795,20 +791,20 @@ mod tests {
         let holder = TxId::with_priority(2, b"holder");
 
         monitor.begin_tx(&holder);
-        let mut committed = TxRecord::new(holder.clone(), TxCommitStatus::Pending);
+        let mut committed = TxRecord::new(holder, TxCommitStatus::Pending);
         committed.writes = vec![TxWrite {
             key: key.clone(),
             value: Arc::from(b"v".as_slice()),
             deleted: false,
-            prev_writer: predecessor.clone(),
+            prev_writer: Some(predecessor),
         }];
         let entry = locked_entry(
             key.key(),
             CurrentState::External {
-                writer: predecessor.clone(),
+                writer: predecessor,
             },
             LockType::Write,
-            vec![holder.clone()],
+            vec![holder],
         );
 
         let state = KeyStateResolver::new(monitor.clone());
@@ -817,7 +813,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending.writer, Some(predecessor));
-        assert_eq!(pending.pending, vec![holder.clone()]);
+        assert_eq!(pending.pending, vec![holder]);
 
         monitor.commit_tx(committed).await.unwrap();
         assert_eq!(

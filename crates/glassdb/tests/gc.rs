@@ -23,7 +23,7 @@ async fn old_objects(tx_records: &TxRecordStore, count: usize) -> Vec<TxId> {
             i as u64,
             &(i as u64).wrapping_mul(0x9e3779b97f4a7c15).to_be_bytes(),
         );
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Aborted);
+        let mut record = TxRecord::new(id, TxCommitStatus::Aborted);
         record.timestamp = Some(UNIX_EPOCH);
         tx_records.set(&record).await.unwrap();
         ids.push(id);

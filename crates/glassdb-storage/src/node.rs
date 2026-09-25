@@ -996,12 +996,18 @@ impl Node {
             Some(pb::node::Body::Leaf(leaf)) => NodeBody::Leaf(LeafBody::from_pb(leaf)?),
             None => NodeBody::Leaf(LeafBody::new()),
         };
-        let structure = ExclusiveGate::from_pb(raw.structural_gate).map_err(|_| {
-            StorageError::other("node structural gate must be empty or have one write holder")
-        })?;
+        let structure = ExclusiveGate::from_pb(raw.structural_gate)
+            .map_err(|_| StorageError::other("node has an invalid structural gate"))?;
         let membership = SharedExclusiveLock::from_pb(raw.membership_lock)
             .map_err(|_| StorageError::other("node has invalid membership lock"))?;
-        let drop_intent = (!raw.drop_intent.is_empty()).then(|| TxId::from_bytes(raw.drop_intent));
+        let drop_intent = if raw.drop_intent.is_empty() {
+            None
+        } else {
+            Some(
+                TxId::from_slice(&raw.drop_intent)
+                    .ok_or_else(|| StorageError::other("node has an invalid drop intent"))?,
+            )
+        };
         let right_sibling = if raw.right_sibling.is_empty() {
             None
         } else {
@@ -1052,6 +1058,10 @@ mod tests {
 
     use crate::leaf::{CurrentState, LeafEntry};
 
+    fn tx_id(prefix: &[u8]) -> TxId {
+        TxId::with_priority(0, prefix)
+    }
+
     /// A node ID that shows `name` in its bytes, so tests stay readable.
     fn id(name: &str) -> NodeId {
         let mut bytes = [0; ID_BYTES];
@@ -1065,16 +1075,32 @@ mod tests {
 
     fn entry(key: &[u8], writer: u8) -> LeafEntry {
         LeafEntry::new(key).with_current(CurrentState::External {
-            writer: TxId::from_bytes(vec![writer]),
+            writer: tx_id(&[writer]),
         })
     }
 
     fn golden_entry() -> LeafEntry {
         let mut entry = LeafEntry::new(b"Hello").with_current(CurrentState::External {
-            writer: TxId::from_bytes(vec![0xaa, 0xbb]),
+            writer: TxId::from_bytes([0xaa; 16]),
         });
-        entry.replace_write_lock(TxId::from_bytes(vec![1, 2, 3, 4]));
+        entry.replace_write_lock(TxId::from_bytes([1; 16]));
         entry
+    }
+
+    /// Returns the encoded leaf body field of a node holding [`golden_entry`].
+    fn golden_entry_bytes() -> Vec<u8> {
+        [
+            [
+                0x1a, 0x33, 0x0a, 0x31, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a,
+                0x10,
+            ]
+            .as_slice(),
+            &[1; 16],
+            &[0x22, 0x14, 0x0a, 0x10],
+            &[0xaa; 16],
+            &[0x10, 0x01],
+        ]
+        .concat()
     }
 
     #[test]
@@ -1097,11 +1123,11 @@ mod tests {
 
     #[test]
     fn round_trip_preserves_node_locks_and_membership_generation() {
-        let gate = TxId::from_bytes(vec![2]);
-        let writer = TxId::from_bytes(vec![1]);
+        let gate = tx_id(&[2]);
+        let writer = tx_id(&[1]);
         let mut node = Node::leaf(LeafBody::new());
-        node.set_structural_gate(gate.clone());
-        node.set_membership_writer(writer.clone());
+        node.set_structural_gate(gate);
+        node.set_membership_writer(writer);
 
         let decoded = Node::decode(&node.encode()).unwrap();
         assert_eq!(decoded.structural_gate().holders(), &[gate]);
@@ -1130,7 +1156,7 @@ mod tests {
 
     #[test]
     fn drain_keeps_level_bounds_and_generation() {
-        let gate = TxId::from_bytes(vec![2]);
+        let gate = tx_id(&[2]);
         let mut source = Node::leaf(LeafBody::from_entries([entry(b"a", 1)]))
             .with_high_key(Some(b"m".to_vec()))
             .with_right_sibling(Some(id("drained")));
@@ -1233,9 +1259,27 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_node_ids_that_are_not_16_bytes() {
+    fn decode_rejects_ids_that_are_not_16_bytes() {
         // IDs of the older string format have 22 bytes.
         for bad in [vec![7; 15], vec![7; 17], b"0000000000000000000000".to_vec()] {
+            let holder = |lock_type: pb::lock::LockType| {
+                Some(pb::NodeLock {
+                    lock_type: lock_type as i32,
+                    locked_by: vec![bad.clone()],
+                })
+            };
+            let gate = pb::Node {
+                structural_gate: holder(pb::lock::LockType::Write),
+                ..pb::Node::default()
+            };
+            let membership = pb::Node {
+                membership_lock: holder(pb::lock::LockType::Read),
+                ..pb::Node::default()
+            };
+            let drop = pb::Node {
+                drop_intent: bad.clone(),
+                ..pb::Node::default()
+            };
             let index = pb::Node {
                 body: Some(pb::node::Body::Index(pb::IndexNode {
                     entries: vec![pb::IndexEntry {
@@ -1257,6 +1301,9 @@ mod tests {
                 (index, "index node has an invalid child ID"),
                 (sibling, "node has an invalid right-sibling ID"),
                 (reservation, "node has an invalid merge reservation"),
+                (gate, "node has an invalid structural gate"),
+                (membership, "node has invalid membership lock"),
+                (drop, "node has an invalid drop intent"),
             ] {
                 let error = Node::decode(&raw.encode_to_vec()).unwrap_err();
                 assert_eq!(error.to_string(), want);
@@ -1275,12 +1322,12 @@ mod tests {
 
     #[test]
     fn installations_advance_the_generation_once() {
-        let gate = TxId::from_bytes(vec![2]);
+        let gate = tx_id(&[2]);
         let intent = intent_id(3);
         let mut locks = NodeLocks::default();
 
-        locks.set_structural_gate(gate.clone());
-        locks.set_structural_gate(gate.clone());
+        locks.set_structural_gate(gate);
+        locks.set_structural_gate(gate);
         assert_eq!(locks.membership_generation(), 1);
         locks.set_merge_reservation(intent);
         locks.set_merge_reservation(intent);
@@ -1297,15 +1344,15 @@ mod tests {
         for gate in [
             pb::NodeLock {
                 lock_type: pb::lock::LockType::Read as i32,
-                locked_by: vec![vec![1]],
+                locked_by: vec![vec![1; 16]],
             },
             pb::NodeLock {
                 lock_type: pb::lock::LockType::Create as i32,
-                locked_by: vec![vec![1]],
+                locked_by: vec![vec![1; 16]],
             },
             pb::NodeLock {
                 lock_type: pb::lock::LockType::Write as i32,
-                locked_by: vec![vec![1], vec![2]],
+                locked_by: vec![vec![1; 16], vec![2; 16]],
             },
         ] {
             let raw = pb::Node {
@@ -1321,7 +1368,7 @@ mod tests {
         let raw = pb::Node {
             membership_lock: Some(pb::NodeLock {
                 lock_type: pb::lock::LockType::Create as i32,
-                locked_by: vec![vec![1]],
+                locked_by: vec![vec![1; 16]],
             }),
             ..pb::Node::default()
         };
@@ -1335,7 +1382,7 @@ mod tests {
         let raw = pb::Node {
             membership_lock: Some(pb::NodeLock {
                 lock_type: pb::lock::LockType::Read as i32,
-                locked_by: vec![vec![2], vec![1], vec![1]],
+                locked_by: vec![vec![2; 16], vec![1; 16], vec![1; 16]],
             }),
             ..pb::Node::default()
         };
@@ -1346,17 +1393,17 @@ mod tests {
 
     #[test]
     fn membership_generation_tracks_write_lock_activity() {
-        let id = TxId::from_bytes(vec![1]);
+        let id = tx_id(&[1]);
         let mut node = Node::leaf(LeafBody::new());
 
-        node.add_membership_reader(id.clone());
+        node.add_membership_reader(id);
         assert_eq!(node.membership_generation(), 0);
         assert!(node.remove_membership_holder(&id));
         assert_eq!(node.membership_generation(), 0);
 
-        node.set_membership_writer(id.clone());
+        node.set_membership_writer(id);
         assert_eq!(node.membership_generation(), 1);
-        node.set_membership_writer(id.clone());
+        node.set_membership_writer(id);
         assert_eq!(node.membership_generation(), 1);
         assert!(node.remove_membership_holder(&id));
         assert_eq!(node.membership_generation(), 2);
@@ -1659,9 +1706,8 @@ mod tests {
     fn maximum_key_admission_matches_real_nodes_at_the_exact_limit() {
         let maximum_key = vec![b'k'; 128];
         let writer = TxId::with_priority(7, b"maximum");
-        let mut entry = LeafEntry::new(maximum_key.clone()).with_current(CurrentState::External {
-            writer: writer.clone(),
-        });
+        let mut entry =
+            LeafEntry::new(maximum_key.clone()).with_current(CurrentState::External { writer });
         entry.replace_write_lock(writer);
         let leaf = Node::leaf(LeafBody::from_entries([entry]));
 
@@ -1761,17 +1807,15 @@ mod tests {
 
     #[test]
     fn codec_size_predictions_match_varint_boundaries() {
-        let writer = TxId::from_bytes(vec![0; TxId::MAX_GENERATED_ENCODED_LEN]);
+        let writer = TxId::from_bytes([0; ID_BYTES]);
         let child = id("child");
 
         for key_len in [
             0, 1, 81, 82, 83, 84, 127, 128, 16_335, 16_336, 16_338, 16_339, 16_383, 16_384,
         ] {
             let mut entry =
-                LeafEntry::new(vec![b'k'; key_len]).with_current(CurrentState::External {
-                    writer: writer.clone(),
-                });
-            entry.replace_write_lock(writer.clone());
+                LeafEntry::new(vec![b'k'; key_len]).with_current(CurrentState::External { writer });
+            entry.replace_write_lock(writer);
             let actual = Node::leaf(LeafBody::from_entries([entry.clone()])).content_encoded_len();
 
             assert_eq!(
@@ -1824,10 +1868,7 @@ mod tests {
         let want = [
             [0x0a, 0x01, 0x6d, 0x12, 0x10].as_slice(),
             &[7; 16],
-            &[
-                0x1a, 0x19, 0x0a, 0x17, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a,
-                0x04, 0x01, 0x02, 0x03, 0x04, 0x22, 0x06, 0x0a, 0x02, 0xaa, 0xbb, 0x10, 0x01,
-            ],
+            &golden_entry_bytes(),
         ]
         .concat();
         assert_eq!(node.encoded_len(), got.len());
@@ -1845,9 +1886,9 @@ mod tests {
         locks.advance_membership_generation();
         advanced.set_locks(locks);
 
-        let holder = TxId::from_bytes(vec![0x11]);
+        let holder = tx_id(&[0x11]);
         let mut released_gate = never_locked.clone();
-        released_gate.set_structural_gate(holder.clone());
+        released_gate.set_structural_gate(holder);
         assert!(released_gate.remove_structural_gate(&holder));
 
         let intent = intent_id(3);
@@ -1870,16 +1911,19 @@ mod tests {
     #[test]
     fn golden_node_locks_encoding() {
         let mut node = Node::leaf(LeafBody::from_entries([golden_entry()]));
-        node.set_structural_gate(TxId::from_bytes(vec![0x11]));
-        node.set_membership_writer(TxId::from_bytes(vec![0x22]));
+        node.set_structural_gate(TxId::from_bytes([0x11; 16]));
+        node.set_membership_writer(TxId::from_bytes([0x22; 16]));
 
         let got = node.encode();
         let want = [
-            0x1a, 0x19, 0x0a, 0x17, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a,
-            0x04, 0x01, 0x02, 0x03, 0x04, 0x22, 0x06, 0x0a, 0x02, 0xaa, 0xbb, 0x10, 0x01, 0x2a,
-            0x05, 0x08, 0x03, 0x12, 0x01, 0x11, 0x32, 0x05, 0x08, 0x03, 0x12, 0x01, 0x22, 0x38,
-            0x02,
-        ];
+            golden_entry_bytes().as_slice(),
+            &[0x2a, 0x14, 0x08, 0x03, 0x12, 0x10],
+            &[0x11; 16],
+            &[0x32, 0x14, 0x08, 0x03, 0x12, 0x10],
+            &[0x22; 16],
+            &[0x38, 0x02],
+        ]
+        .concat();
         assert_eq!(node.encoded_len(), got.len());
         assert_eq!(got, want, "node-lock encoding drifted: {got:02x?}");
     }

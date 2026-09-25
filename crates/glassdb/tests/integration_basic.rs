@@ -21,7 +21,7 @@ fn split_unsafe_boundary_key(policy: &NodeSizePolicy, value: &[u8], fill: u8) ->
     for len in 1..policy.content_limit() {
         let key = vec![fill; len];
         let inline = LeafEntry::new(key.clone()).with_current(CurrentState::Inline {
-            writer: writer.clone(),
+            writer,
             value: Arc::from(value),
         });
         if policy.key_fits(&key) && !policy.entry_fits_split_budget(&inline) {

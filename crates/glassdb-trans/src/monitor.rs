@@ -718,7 +718,7 @@ impl Monitor {
     /// operation and any later wound must remain pinned.
     pub(crate) fn begin_owner_operation(&self, tid: &TxId) -> Result<OwnerOperation, TransError> {
         let mut st = self.shard_for(tid).lock().unwrap();
-        let owned = match st.transactions.entry(tid.clone()) {
+        let owned = match st.transactions.entry(*tid) {
             Entry::Vacant(entry) => {
                 let entry = entry.insert(TxRuntimeEntry::owned(None));
                 let TxRuntimeRole::Owned(owned) = &mut entry.role else {
@@ -738,7 +738,7 @@ impl Monitor {
         owned.lifecycle.begin_operation()?;
         Ok(OwnerOperation {
             monitor: self.clone(),
-            tid: tid.clone(),
+            tid: *tid,
             completed: false,
         })
     }
@@ -809,7 +809,7 @@ impl Monitor {
             return;
         };
         let m = self.clone();
-        let tid = tid.clone();
+        let tid = *tid;
         bg.spawn(async move {
             m.refresh_pending(tid).await;
         });
@@ -819,7 +819,7 @@ impl Monitor {
     /// (if it produced any writes or held any locks), updating local storage,
     /// and notifying waiters.
     pub(crate) async fn commit_tx(&self, record: TxRecord) -> Result<(), TransError> {
-        let tid = record.id.clone();
+        let tid = record.id;
         // In v2 the transaction record is the value store: it must be persisted
         // whenever the transaction has writes (the committed values readers
         // help-forward) or a recovery manifest. A read-only transaction
@@ -1049,9 +1049,6 @@ impl Monitor {
     /// durable record can still be read back (ADR-009, ADR-057).
     async fn persist_committed_record(&self, mut record: TxRecord) -> Result<(), TransError> {
         let tid = &record.id;
-        if tid.is_unset() {
-            return Err(TransError::other("missing required transaction record ID"));
-        }
         record.status = TxCommitStatus::Committed;
         let mut expected = {
             let st = self.shard_for(tid).lock().unwrap();
@@ -1201,7 +1198,7 @@ impl Monitor {
             target,
             TxCommitStatus::Aborted | TxCommitStatus::Wounded
         ));
-        let mut abort_record = TxRecord::new(tid.clone(), target);
+        let mut abort_record = TxRecord::new(*tid, target);
         if let Some(current) = expected.value() {
             abort_record.writes = current.writes.clone();
             TxRecoveryManifest::from_record(current).apply_to(&mut abort_record);
@@ -1320,7 +1317,7 @@ impl Monitor {
 
     fn start_commit_write(&self, tid: &TxId) -> Result<(), TransError> {
         let mut st = self.shard_for(tid).lock().unwrap();
-        let owned = match st.transactions.entry(tid.clone()) {
+        let owned = match st.transactions.entry(*tid) {
             Entry::Vacant(entry) => {
                 let entry = entry.insert(TxRuntimeEntry::owned(None));
                 let TxRuntimeRole::Owned(owned) = &mut entry.role else {
@@ -1362,7 +1359,7 @@ impl Monitor {
             refresh_state: RefreshState::NotStarted,
             recovery,
         };
-        match st.transactions.entry(tid.clone()) {
+        match st.transactions.entry(*tid) {
             Entry::Vacant(entry) => {
                 entry.insert(TxRuntimeEntry::owned(Some(record)));
             }
@@ -1401,7 +1398,7 @@ impl Monitor {
             return Ok(None);
         }
 
-        let mut pending_record = TxRecord::new(tid.clone(), TxCommitStatus::Pending);
+        let mut pending_record = TxRecord::new(*tid, TxCommitStatus::Pending);
         pending_record.timestamp = Some(rt::system_now());
         record.recovery.clone().apply_to(&mut pending_record);
         Ok(Some(PendingWrite {
@@ -1598,11 +1595,7 @@ impl Monitor {
         let Some(status) = FinalStatus::from_status(stored.status) else {
             return;
         };
-        self.inner
-            .final_status
-            .lock()
-            .unwrap()
-            .insert(tid.clone(), status);
+        self.inner.final_status.lock().unwrap().insert(*tid, status);
     }
 
     /// Records an exact durable observation in local owner state. Wounded is
@@ -1664,7 +1657,7 @@ impl Monitor {
         let (tx, rx) = oneshot::channel();
 
         let mut st = self.shard_for(tid).lock().unwrap();
-        let should_spawn = match st.transactions.entry(tid.clone()) {
+        let should_spawn = match st.transactions.entry(*tid) {
             Entry::Vacant(entry) => {
                 let entry = entry.insert(TxRuntimeEntry::foreign());
                 entry.waiters.push(tx);
@@ -1703,7 +1696,7 @@ impl Monitor {
         }
 
         let m = self.clone();
-        let tid = tid.clone();
+        let tid = *tid;
         // Detached poller: it terminates either when the tx finalizes (final
         // status or a fetch error) or when every caller has dropped its
         // `await_tx_final` future.
@@ -1776,7 +1769,7 @@ impl Monitor {
         let mut st = self.shard_for(tid).lock().unwrap();
         let entry = st
             .transactions
-            .entry(tid.clone())
+            .entry(*tid)
             .or_insert_with(TxRuntimeEntry::foreign);
         let foreign = match &mut entry.role {
             TxRuntimeRole::Owned(owned) => {
@@ -1848,7 +1841,7 @@ impl Monitor {
         let mut st = self.shard_for(tid).lock().unwrap();
         let entry = st
             .transactions
-            .entry(tid.clone())
+            .entry(*tid)
             .or_insert_with(TxRuntimeEntry::foreign);
         let foreign = match &mut entry.role {
             TxRuntimeRole::Owned(owned) => {
@@ -2093,6 +2086,10 @@ mod tests {
     use glassdb_storage::transaction::{TxCollectionOp, TxWrite};
     use glassdb_storage::{CachedStore, LockType, Timeline};
 
+    fn tx_id(prefix: &[u8]) -> TxId {
+        TxId::with_priority(0, prefix)
+    }
+
     #[test]
     fn abort_observation_classification_matches_the_protocol() {
         let acknowledge = AbortTransition::Acknowledge;
@@ -2272,7 +2269,7 @@ mod tests {
 
     #[test]
     fn recovery_manifest_round_trip_preserves_non_recovery_record_fields() {
-        let id = TxId::from_bytes(b"manifest".to_vec());
+        let id = tx_id(b"manifest");
         let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(42);
         let parent = CollectionAddress::root("test");
         let created = collection_address(1);
@@ -2289,7 +2286,7 @@ mod tests {
             prepared_collections: vec![created],
         };
         let writes = vec![TxWriteForTest::w(&logical_key(b"key"), b"value")];
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(id, TxCommitStatus::Committed);
         record.timestamp = Some(timestamp);
         record.writes = writes.clone();
 
@@ -2383,15 +2380,15 @@ mod tests {
     #[test]
     fn final_status_cache_is_count_bounded_and_lru() {
         let mut cache = FinalStatusCache::new(2);
-        let first = TxId::from_bytes(b"first".to_vec());
-        let second = TxId::from_bytes(b"second".to_vec());
-        let third = TxId::from_bytes(b"third".to_vec());
+        let first = tx_id(b"first");
+        let second = tx_id(b"second");
+        let third = tx_id(b"third");
         let status = FinalStatus::Committed;
 
-        cache.insert(first.clone(), status);
-        cache.insert(second.clone(), status);
+        cache.insert(first, status);
+        cache.insert(second, status);
         assert!(cache.get(&first).is_some());
-        cache.insert(third.clone(), status);
+        cache.insert(third, status);
 
         assert!(cache.get(&second).is_none());
         assert!(cache.get(&first).is_some());
@@ -2410,10 +2407,10 @@ mod tests {
             (b"committed".as_slice(), TxCommitStatus::Committed),
             (b"aborted", TxCommitStatus::Aborted),
         ] {
-            let tid = TxId::from_bytes(id.to_vec());
+            let tid = tx_id(id);
             writer_ctx
                 .tx_records
-                .set(&TxRecord::new(tid.clone(), status))
+                .set(&TxRecord::new(tid, status))
                 .await
                 .unwrap();
             assert_eq!(reader.tx_status(&tid).await.unwrap(), status);
@@ -2445,7 +2442,7 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (owner, owner_ctx) = new_test_monitor(backend.clone());
         let (reader, _reader_ctx) = new_test_monitor(backend);
-        let tid = TxId::from_bytes(b"local".to_vec());
+        let tid = tx_id(b"local");
         owner.begin_tx(&tid);
         assert_eq!(
             owner.tx_status(&tid).await.unwrap(),
@@ -2457,10 +2454,10 @@ mod tests {
             (b"pending".as_slice(), TxCommitStatus::Pending),
             (b"wounded", TxCommitStatus::Wounded),
         ] {
-            let tid = TxId::from_bytes(id.to_vec());
+            let tid = tx_id(id);
             owner_ctx
                 .tx_records
-                .set(&TxRecord::new(tid.clone(), status))
+                .set(&TxRecord::new(tid, status))
                 .await
                 .unwrap();
             for _ in 0..2 {
@@ -2480,7 +2477,7 @@ mod tests {
     async fn begin_persisted_tx_durably_records_manifest() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon, t) = new_test_monitor(b);
-        let tx = TxId::from_bytes(b"persisted".to_vec());
+        let tx = tx_id(b"persisted");
         let parent = CollectionAddress::root("test");
         let created = collection_address(1);
         let recovery = TxRecoveryManifest {
@@ -2514,7 +2511,7 @@ mod tests {
         let operations = backend.log();
         let b: Arc<dyn Backend> = Arc::new(backend);
         let (mon, _t) = new_test_monitor_with_timing(b, ProtocolTiming::simulation());
-        let tx = TxId::from_bytes(b"persisted-refresh".to_vec());
+        let tx = tx_id(b"persisted-refresh");
 
         mon.begin_persisted_tx(&tx, TxRecoveryManifest::default())
             .await
@@ -2540,7 +2537,7 @@ mod tests {
     async fn update_pending_tx_preserves_unmodified_manifest_entries() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon, t) = new_test_monitor(b);
-        let tx = TxId::from_bytes(b"updated".to_vec());
+        let tx = tx_id(b"updated");
         let lock = TxLock::TopologyParticipant {
             collection: CollectionAddress::root("test"),
         };
@@ -2588,7 +2585,7 @@ mod tests {
         let (mon1, _t1) = new_test_monitor(b.clone());
         let (mon2, _t2) = new_test_monitor(b.clone());
         let key = logical_key(b"key1");
-        let tx = TxId::from_bytes(b"tx1".to_vec());
+        let tx = tx_id(b"tx1");
         mon1.begin_tx(&tx);
 
         assert_eq!(mon1.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
@@ -2598,9 +2595,9 @@ mod tests {
         assert_eq!(mon1.tx_status(&tx).await.unwrap(), TxCommitStatus::Aborted);
         assert_eq!(mon2.tx_status(&tx).await.unwrap(), TxCommitStatus::Aborted);
 
-        let tx = TxId::from_bytes(b"tx2".to_vec());
+        let tx = tx_id(b"tx2");
         mon1.begin_tx(&tx);
-        let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(tx, TxCommitStatus::Committed);
         record.locks = vec![TxLock::Key {
             key,
             typ: LockType::Write,
@@ -2621,7 +2618,7 @@ mod tests {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (owner, _owner_ctx) = new_test_monitor(b.clone());
         let (wounder, _wounder_ctx) = new_test_monitor(b);
-        let tx = TxId::from_bytes(b"commit-loser".to_vec());
+        let tx = tx_id(b"commit-loser");
         let lock = TxLock::TopologyParticipant {
             collection: CollectionAddress::root("test"),
         };
@@ -2636,7 +2633,7 @@ mod tests {
             TxFinalStatus::Aborted
         );
 
-        let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Pending);
+        let mut record = TxRecord::new(tx, TxCommitStatus::Pending);
         record.locks.push(lock);
         assert!(matches!(
             owner.commit_tx(record).await,
@@ -2662,7 +2659,7 @@ mod tests {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (owner, _owner_ctx) = new_test_monitor(b.clone());
         let (wounder, wounder_ctx) = new_test_monitor(b);
-        let tx = TxId::from_bytes(b"reclaimed-wound".to_vec());
+        let tx = tx_id(b"reclaimed-wound");
         let lock = TxLock::TopologyParticipant {
             collection: CollectionAddress::root("test"),
         };
@@ -2691,7 +2688,7 @@ mod tests {
             Err(StorageError::Precondition)
         ));
 
-        let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Pending);
+        let mut record = TxRecord::new(tx, TxCommitStatus::Pending);
         record.locks.push(lock);
         assert!(matches!(
             owner.commit_tx(record).await,
@@ -2707,7 +2704,7 @@ mod tests {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (owner, _owner_ctx) = new_test_monitor(b.clone());
         let (wounder, wounder_ctx) = new_test_monitor(b);
-        let tx = TxId::from_bytes(b"lazy-suspended-owner".to_vec());
+        let tx = tx_id(b"lazy-suspended-owner");
         let lock = TxLock::TopologyParticipant {
             collection: CollectionAddress::root("test"),
         };
@@ -2729,7 +2726,7 @@ mod tests {
         );
 
         tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
-        let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Pending);
+        let mut record = TxRecord::new(tx, TxCommitStatus::Pending);
         record.locks.push(lock);
         assert!(matches!(
             owner.commit_tx(record).await,
@@ -2753,7 +2750,7 @@ mod tests {
         let b: Arc<dyn Backend> = backend.clone();
         let (owner, _owner_ctx) = new_test_monitor(b.clone());
         let (_collector, collector_ctx) = new_test_monitor(b);
-        let tx = TxId::from_bytes(b"reclaimed-in-doubt".to_vec());
+        let tx = tx_id(b"reclaimed-in-doubt");
         let lock = TxLock::TopologyParticipant {
             collection: CollectionAddress::root("test"),
         };
@@ -2768,10 +2765,7 @@ mod tests {
             .await
             .unwrap();
 
-        let reclaim = Arc::new(Mutex::new(Some((
-            collector_ctx.tx_records.clone(),
-            tx.clone(),
-        ))));
+        let reclaim = Arc::new(Mutex::new(Some((collector_ctx.tx_records.clone(), tx))));
         backend.set_after(move |operation, _outcome| {
             let reclaim = is_commit_write(operation)
                 .then(|| reclaim.lock().unwrap().take())
@@ -2795,7 +2789,7 @@ mod tests {
             future
         });
 
-        let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Pending);
+        let mut record = TxRecord::new(tx, TxCommitStatus::Pending);
         record.locks.push(lock);
         let error = owner.commit_tx(record).await.unwrap_err();
         assert!(
@@ -2818,7 +2812,7 @@ mod tests {
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
         let b: Arc<dyn Backend> = backend.clone();
         let (owner, _owner_ctx) = new_test_monitor(b);
-        let tx = TxId::from_bytes(b"unconfirmable".to_vec());
+        let tx = tx_id(b"unconfirmable");
         let lock = TxLock::TopologyParticipant {
             collection: CollectionAddress::root("test"),
         };
@@ -2850,7 +2844,7 @@ mod tests {
             future
         });
 
-        let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Pending);
+        let mut record = TxRecord::new(tx, TxCommitStatus::Pending);
         record.locks.push(lock);
         let started = rt::Instant::now();
         let error = owner.commit_tx(record).await.unwrap_err();
@@ -2892,7 +2886,7 @@ mod tests {
         let b: Arc<dyn Backend> = backend.clone();
         let (owner, _owner_ctx) = new_test_monitor(b.clone());
         let (_racer, racer_ctx) = new_test_monitor(b);
-        let tx = TxId::from_bytes(b"commit-read-retry".to_vec());
+        let tx = tx_id(b"commit-read-retry");
         let lock = TxLock::TopologyParticipant {
             collection: CollectionAddress::root("test"),
         };
@@ -2960,7 +2954,7 @@ mod tests {
             }
         });
 
-        let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Pending);
+        let mut record = TxRecord::new(tx, TxCommitStatus::Pending);
         record.locks.push(lock);
         owner.commit_tx(record).await.unwrap();
 
@@ -2975,16 +2969,16 @@ mod tests {
     async fn preempt_tx_returns_the_status_that_won() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon, _t) = new_test_monitor(b);
-        let pending = TxId::from_bytes(b"pending".to_vec());
+        let pending = tx_id(b"pending");
         mon.begin_tx(&pending);
         assert_eq!(
             mon.preempt_tx(&pending).await.unwrap(),
             TxFinalStatus::Aborted
         );
 
-        let committed = TxId::from_bytes(b"committed".to_vec());
+        let committed = tx_id(b"committed");
         mon.begin_tx(&committed);
-        let mut record = TxRecord::new(committed.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(committed, TxCommitStatus::Committed);
         record.locks.push(TxLock::Key {
             key: logical_key(b"key"),
             typ: LockType::Write,
@@ -3018,7 +3012,7 @@ mod tests {
         });
         let b: Arc<dyn Backend> = backend;
         let (mon, ctx) = new_test_monitor(b);
-        let tx = TxId::from_bytes(b"local-quiescent".to_vec());
+        let tx = tx_id(b"local-quiescent");
 
         let owner = mon.begin_owner_operation(&tx).unwrap();
         mon.begin_tx(&tx);
@@ -3061,7 +3055,7 @@ mod tests {
         });
         let b: Arc<dyn Backend> = backend;
         let (mon, ctx) = new_test_monitor(b);
-        let tx = TxId::from_bytes(b"local-active".to_vec());
+        let tx = tx_id(b"local-active");
 
         let owner = mon.begin_owner_operation(&tx).unwrap();
         mon.begin_tx(&tx);
@@ -3095,7 +3089,7 @@ mod tests {
     async fn dropped_owner_operation_cannot_acknowledge_its_own_wound() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon, ctx) = new_test_monitor(b);
-        let tx = TxId::from_bytes(b"local-unresolved".to_vec());
+        let tx = tx_id(b"local-unresolved");
 
         let owner = mon.begin_owner_operation(&tx).unwrap();
         mon.begin_tx(&tx);
@@ -3121,7 +3115,7 @@ mod tests {
     async fn cancellation_after_commit_write_dispatch_does_not_invent_a_wound() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon, ctx) = new_test_monitor(b);
-        let tx = TxId::from_bytes(b"terminal-dispatched".to_vec());
+        let tx = tx_id(b"terminal-dispatched");
 
         let owner = mon.begin_owner_operation(&tx).unwrap();
         mon.begin_tx(&tx);
@@ -3144,14 +3138,14 @@ mod tests {
         let b: Arc<dyn Backend> = backend.clone();
         let (mon, _wounder) = new_test_monitor(b.clone());
         let (_owner_mon, owner) = new_test_monitor(b.clone());
-        let tx = TxId::from_bytes(b"refresh-before-wound".to_vec());
+        let tx = tx_id(b"refresh-before-wound");
         let pending = owner
             .tx_records
-            .set(&TxRecord::new(tx.clone(), TxCommitStatus::Pending))
+            .set(&TxRecord::new(tx, TxCommitStatus::Pending))
             .await
             .unwrap();
 
-        let mut refreshed = TxRecord::new(tx.clone(), TxCommitStatus::Pending);
+        let mut refreshed = TxRecord::new(tx, TxCommitStatus::Pending);
         refreshed.locks.push(TxLock::Key {
             key: logical_key(b"new-lock"),
             typ: LockType::Write,
@@ -3230,9 +3224,9 @@ mod tests {
         let (mon2, _t2) = new_test_monitor(b.clone());
         let key = logical_key(b"key");
 
-        let tx = TxId::from_bytes(b"tx2".to_vec());
+        let tx = tx_id(b"tx2");
         mon1.begin_tx(&tx);
-        let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(tx, TxCommitStatus::Committed);
         record.writes = vec![TxWriteForTest::w(&key, b"val1")];
         record.locks = vec![TxLock::Key {
             key: key.clone(),
@@ -3270,17 +3264,15 @@ mod tests {
     async fn await_local_tx_final() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon1, _t1) = new_test_monitor(b);
-        let tx = TxId::from_bytes(b"tx1".to_vec());
+        let tx = tx_id(b"tx1");
         mon1.begin_tx(&tx);
 
         let ch1 = {
             let mon = mon1.clone();
-            let tx = tx.clone();
             rt::spawn(async move { mon.await_tx_final(&tx).await })
         };
         let ch2 = {
             let mon = mon1.clone();
-            let tx = tx.clone();
             rt::spawn(async move { mon.await_tx_final(&tx).await })
         };
         wait_for_waiters(&mon1, &tx, 2).await;
@@ -3295,13 +3287,12 @@ mod tests {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon1, _t1) = new_test_monitor(b.clone());
         let (mon2, _t2) = new_test_monitor(b.clone());
-        let tx = TxId::from_bytes(b"tx1".to_vec());
+        let tx = tx_id(b"tx1");
         mon1.begin_tx(&tx);
 
         let mut waits = Vec::new();
         for _ in 0..3 {
             let mon = mon2.clone();
-            let tx = tx.clone();
             waits.push(rt::spawn(async move { mon.await_tx_final(&tx).await }));
         }
         wait_for_waiters(&mon2, &tx, 3).await;
@@ -3319,10 +3310,10 @@ mod tests {
         let operations = backend.log();
         let b: Arc<dyn Backend> = Arc::new(backend);
         let (mon, _t) = new_test_monitor(b);
-        let tx = TxId::from_bytes(b"committed".to_vec());
+        let tx = tx_id(b"committed");
         let key = logical_key(b"key");
         mon.begin_tx(&tx);
-        let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(tx, TxCommitStatus::Committed);
         record.locks.push(TxLock::Key {
             key,
             typ: LockType::Write,
@@ -3344,7 +3335,7 @@ mod tests {
     async fn await_final_treats_a_pinned_wound_as_aborted() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon, _t) = new_test_monitor(b);
-        let tx = TxId::from_bytes(b"local-wound".to_vec());
+        let tx = tx_id(b"local-wound");
         mon.begin_tx(&tx);
 
         let observed = mon
@@ -3390,7 +3381,7 @@ mod tests {
         });
         let b: Arc<dyn Backend> = backend;
         let (mon, _t) = new_test_monitor(b);
-        let tx = TxId::from_bytes(b"remote".to_vec());
+        let tx = tx_id(b"remote");
 
         assert!(matches!(
             mon.await_tx_final(&tx).await,
@@ -3402,7 +3393,7 @@ mod tests {
     async fn await_final_is_cancelled_when_dropped() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon, _t) = new_test_monitor(b);
-        let tx = TxId::from_bytes(b"pending".to_vec());
+        let tx = tx_id(b"pending");
         mon.begin_tx(&tx);
 
         assert!(
@@ -3433,7 +3424,7 @@ mod tests {
     async fn refresh_keeps_pending() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon, t) = new_test_monitor(b.clone());
-        let tx = TxId::from_bytes(b"tx1".to_vec());
+        let tx = tx_id(b"tx1");
         mon.begin_tx(&tx);
         mon.start_refresh_tx(&tx);
 
@@ -3462,7 +3453,7 @@ mod tests {
     async fn refresh_records_locks() {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon, t) = new_test_monitor(b.clone());
-        let tx = TxId::from_bytes(b"tx1".to_vec());
+        let tx = tx_id(b"tx1");
         let locks = vec![TxLock::Key {
             key: logical_key(b"k"),
             typ: LockType::Write,
@@ -3493,7 +3484,7 @@ mod tests {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (mon, _t) = new_test_monitor(b.clone());
         let (observer, _o) = new_test_monitor(b.clone());
-        let tx = TxId::from_bytes(b"live".to_vec());
+        let tx = tx_id(b"live");
         mon.begin_tx(&tx);
         mon.start_refresh_tx(&tx);
 
@@ -3522,12 +3513,12 @@ mod tests {
         let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let timing = ProtocolTiming::new(Duration::from_nanos(1), Duration::from_secs(30));
         let (mon, t) = new_test_monitor_with_timing(b.clone(), timing);
-        let tx = TxId::from_bytes(b"dead".to_vec());
+        let tx = tx_id(b"dead");
 
         // A pending record stamped "now" that never refreshes (a crashed
         // holder). Its absolute lease includes both the pending timeout and
         // skew allowance, so only the relative check can reclaim it sooner.
-        let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Pending);
+        let mut record = TxRecord::new(tx, TxCommitStatus::Pending);
         record.timestamp = Some(rt::system_now());
         t.tx_records.set(&record).await.unwrap();
 
@@ -3548,7 +3539,7 @@ mod tests {
         let timing = ProtocolTiming::new(Duration::from_nanos(1), Duration::ZERO);
         let (observer, _o) = new_test_monitor_with_timing(b.clone(), timing);
         let (_owner, owner) = new_test_monitor(b.clone());
-        let tx = TxId::from_bytes(b"committed-during-unknown-grace".to_vec());
+        let tx = tx_id(b"committed-during-unknown-grace");
 
         assert_eq!(
             observer.tx_status(&tx).await.unwrap(),
@@ -3558,7 +3549,7 @@ mod tests {
 
         owner
             .tx_records
-            .set(&TxRecord::new(tx.clone(), TxCommitStatus::Committed))
+            .set(&TxRecord::new(tx, TxCommitStatus::Committed))
             .await
             .unwrap();
 
@@ -3584,10 +3575,10 @@ mod tests {
         let operations = backend.log();
         let b: Arc<dyn Backend> = Arc::new(backend);
         let (mon, t) = new_test_monitor(b.clone());
-        let tx = TxId::from_bytes(b"already-committed".to_vec());
+        let tx = tx_id(b"already-committed");
         let committed = t
             .tx_records
-            .set(&TxRecord::new(tx.clone(), TxCommitStatus::Committed))
+            .set(&TxRecord::new(tx, TxCommitStatus::Committed))
             .await
             .unwrap();
         operations.lock().unwrap().clear();
@@ -3624,7 +3615,7 @@ mod tests {
                 key: key.clone(),
                 value: Arc::from(value),
                 deleted: false,
-                prev_writer: TxId::default(),
+                prev_writer: None,
             }
         }
     }

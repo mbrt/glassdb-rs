@@ -4,7 +4,7 @@ use crate::base64;
 use crate::collection_id::CollectionId;
 use crate::node_id::NodeId;
 
-use super::{CollectionAddress, DbPrefix, ObjectPath, PathError, parse_random_id};
+use super::{CollectionAddress, DbPrefix, ObjectPath, PathError, parse_id};
 
 const COLLECTION_RECORD_MARKER: &str = "_i";
 const NODE_MARKER: &str = "_n";
@@ -38,7 +38,7 @@ pub(super) fn parse_object(path: &str) -> Option<Result<ObjectPath, PathError>> 
             parse_collection(prefix).and_then(|collection| {
                 Ok(ObjectPath::Node {
                     collection,
-                    id: parse_random_id("node ID", id, NodeId::from_slice)?,
+                    id: parse_id("node ID", id, NodeId::from_slice)?,
                 })
             })
         });

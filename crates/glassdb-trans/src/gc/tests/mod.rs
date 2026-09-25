@@ -129,11 +129,10 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
                 changes,
             },
         );
-        let old_id = handle.id().clone();
+        let old_id = *handle.id();
         let triggered = Arc::new(AtomicBool::new(false));
         let pause_owner = {
             let triggered = triggered.clone();
-            let old_id = old_id.clone();
             let path = if phase == 2 {
                 ObjectPath::CollectionRecord {
                     collection: prepared.clone(),
@@ -156,7 +155,7 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
                     && !triggered.swap(true, Ordering::SeqCst);
                 let peer_monitor = peer.mon.clone();
                 let gc = peer.gc.clone();
-                let old_id = old_id.clone();
+                let old_id = old_id;
                 let owner_monitor = owner_monitor.clone();
                 let records = peer.records.clone();
                 let timeline = peer.timeline.clone();
@@ -315,7 +314,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
 }
 
 fn tx(n: u8) -> TxId {
-    TxId::from_bytes(vec![n])
+    TxId::with_priority(0, &[n])
 }
 
 fn node_id(n: u8) -> NodeId {
@@ -379,7 +378,7 @@ fn committed(id: TxId, offset: Duration, writes: &[&[u8]], locks: &[&[u8]]) -> T
                 key: key_path(k),
                 value: Arc::from(&b"v"[..]),
                 deleted: false,
-                prev_writer: TxId::default(),
+                prev_writer: None,
             })
             .collect(),
         locks: locks.iter().map(|k| write_lock(k)).collect(),
@@ -389,14 +388,12 @@ fn committed(id: TxId, offset: Duration, writes: &[&[u8]], locks: &[&[u8]]) -> T
 }
 
 fn writer_entry(key: &[u8], writer: &TxId) -> LeafEntry {
-    LeafEntry::new(key).with_current(CurrentState::External {
-        writer: writer.clone(),
-    })
+    LeafEntry::new(key).with_current(CurrentState::External { writer: *writer })
 }
 
 fn locked_entry(key: &[u8], holder: &TxId) -> LeafEntry {
     let mut entry = LeafEntry::new(key);
-    entry.replace_write_lock(holder.clone());
+    entry.replace_write_lock(*holder);
     entry
 }
 
@@ -458,7 +455,7 @@ async fn committed_unreferenced_is_collected() {
     let ctx = new_ctx().await;
     let (old, new) = (tx(1), tx(2));
     ctx.tx_records
-        .set(&committed(old.clone(), PAST_HORIZON, &[b"k"], &[b"k"]))
+        .set(&committed(old, PAST_HORIZON, &[b"k"], &[b"k"]))
         .await
         .unwrap();
     // The key now points at a newer writer, not `old`.
@@ -483,14 +480,14 @@ async fn committed_superseded_by_a_direct_writer_is_collected() {
     let ctx = new_ctx().await;
     let (old, direct) = (tx(1), tx(2));
     ctx.tx_records
-        .set(&committed(old.clone(), PAST_HORIZON, &[b"k"], &[]))
+        .set(&committed(old, PAST_HORIZON, &[b"k"], &[]))
         .await
         .unwrap();
     store_entry(
         &ctx,
         b"k",
         LeafEntry::new(b"k").with_current(CurrentState::Inline {
-            writer: direct.clone(),
+            writer: direct,
             value: Arc::from(&b"v2"[..]),
         }),
     )
@@ -521,7 +518,7 @@ async fn committed_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
         .create_root(&prepared, &Node::leaf(LeafBody::new()))
         .await
         .unwrap();
-    let mut record = committed(id.clone(), PAST_HORIZON, &[], &[]);
+    let mut record = committed(id, PAST_HORIZON, &[], &[]);
     record.prepared_collections.push(prepared.clone());
     ctx.tx_records.set(&record).await.unwrap();
 
@@ -550,11 +547,11 @@ async fn aborted_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
         .create_root(&prepared, &Node::leaf(LeafBody::new()))
         .await
         .unwrap();
-    let mut record = committed(id.clone(), PAST_HORIZON, &[], &[]);
+    let mut record = committed(id, PAST_HORIZON, &[], &[]);
     record.status = TxCommitStatus::Aborted;
     record.prepared_collections.push(prepared.clone());
     ctx.tx_records.set(&record).await.unwrap();
-    ctx.hints.schedule(id.clone());
+    ctx.hints.schedule(id);
 
     check_hints_and_scan_page(&ctx).await;
 
@@ -586,7 +583,7 @@ async fn rejected_collection_reclamation_keeps_the_recovery_manifest() {
         .create_root(&prepared, &Node::leaf(LeafBody::new()))
         .await
         .unwrap();
-    let mut record = committed(id.clone(), PAST_HORIZON, &[], &[]);
+    let mut record = committed(id, PAST_HORIZON, &[], &[]);
     record.prepared_collections.push(prepared.clone());
     ctx.tx_records.set(&record).await.unwrap();
 
@@ -613,7 +610,7 @@ async fn rejected_collection_reclamation_keeps_the_recovery_manifest() {
             future
         }
     });
-    ctx.hints.schedule(id.clone());
+    ctx.hints.schedule(id);
 
     check_hints_and_scan_page(&ctx).await;
 
@@ -629,7 +626,7 @@ async fn rejected_collection_reclamation_keeps_the_recovery_manifest() {
     );
 
     backend.clear_before();
-    ctx.hints.schedule(id.clone());
+    ctx.hints.schedule(id);
     check_hints_and_scan_page(&ctx).await;
     assert!(is_gone(&ctx.tx_records, &id).await);
     assert!(matches!(
@@ -661,7 +658,7 @@ async fn committed_drop_is_recovered_while_the_record_stores_a_live_value() {
             .add_child(b"child".to_vec(), child.id())
             .unwrap()
     );
-    parent_record.set_directory_writer(id.clone());
+    parent_record.set_directory_writer(id);
     assert!(
         ctx.records
             .store_record(&parent_record, &parent_observed)
@@ -670,8 +667,8 @@ async fn committed_drop_is_recovered_while_the_record_stores_a_live_value() {
     );
 
     let mut child_record = CollectionRecord::new();
-    child_record.add_directory_reader(id.clone());
-    assert!(child_record.set_topology_freeze(id.clone()));
+    child_record.add_directory_reader(id);
+    assert!(child_record.set_topology_freeze(id));
     assert!(
         ctx.records
             .create_record(&child, &child_record)
@@ -679,10 +676,10 @@ async fn committed_drop_is_recovered_while_the_record_stores_a_live_value() {
             .unwrap()
     );
     let mut child_node = Node::leaf(LeafBody::new());
-    child_node.set_drop_intent(id.clone());
+    child_node.set_drop_intent(id);
     assert!(ctx.nodes.create_root(&child, &child_node).await.unwrap());
 
-    let mut record = committed(id.clone(), PAST_HORIZON, &[b"k"], &[]);
+    let mut record = committed(id, PAST_HORIZON, &[b"k"], &[]);
     record.locks.extend([
         TxLock::Directory {
             collection: collection(),
@@ -700,7 +697,7 @@ async fn committed_drop_is_recovered_while_the_record_stores_a_live_value() {
         op: TxCollectionOp::Drop,
     });
     ctx.tx_records.set(&record).await.unwrap();
-    ctx.hints.schedule(id.clone());
+    ctx.hints.schedule(id);
 
     check_hints_and_scan_page(&ctx).await;
 
@@ -733,20 +730,20 @@ async fn committed_references_in_a_reclaimed_collection_are_absent() {
         CollectionId::from_slice(&[9; 16]).expect("fixed ID has the required width"),
     );
     let key = LogicalKey::new(missing, b"k");
-    let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+    let mut record = TxRecord::new(id, TxCommitStatus::Committed);
     record.timestamp = Some(base() - PAST_HORIZON);
     record.writes.push(TxWrite {
         key: key.clone(),
         value: Arc::from(&b"v"[..]),
         deleted: false,
-        prev_writer: TxId::default(),
+        prev_writer: None,
     });
     record.locks.push(TxLock::Key {
         key,
         typ: LockType::Write,
     });
     ctx.tx_records.set(&record).await.unwrap();
-    ctx.hints.schedule(id.clone());
+    ctx.hints.schedule(id);
 
     check_hints_and_scan_page(&ctx).await;
 
@@ -760,11 +757,11 @@ async fn committed_still_referenced_is_kept() {
     let ctx = new_ctx().await;
     let t = tx(1);
     ctx.tx_records
-        .set(&committed(t.clone(), PAST_HORIZON, &[b"k"], &[]))
+        .set(&committed(t, PAST_HORIZON, &[b"k"], &[]))
         .await
         .unwrap();
     store_entry(&ctx, b"k", writer_entry(b"k", &t)).await;
-    ctx.hints.schedule(t.clone());
+    ctx.hints.schedule(t);
 
     check_hints_and_scan_page(&ctx).await;
 
@@ -866,7 +863,7 @@ async fn reference_checks_refresh_leaves_without_refreshing_indexes() {
         let id = tx(1);
         ctx.tx_records
             .set(&committed(
-                id.clone(),
+                id,
                 PAST_HORIZON,
                 &[b"key"],
                 if holder { &[b"key"] } else { &[] },
@@ -889,7 +886,7 @@ async fn reference_checks_refresh_leaves_without_refreshing_indexes() {
         let outcomes = ctx
             .gc
             .clone()
-            .check_batch(vec![id.clone()], NonZeroUsize::MIN)
+            .check_batch(vec![id], NonZeroUsize::MIN)
             .await;
         assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Retained);
         assert!(!is_gone(&peer.tx_records, &id).await);
@@ -914,7 +911,7 @@ async fn reference_checks_refresh_leaves_without_refreshing_indexes() {
         let outcomes = ctx
             .gc
             .clone()
-            .check_batch(vec![id.clone()], NonZeroUsize::MIN)
+            .check_batch(vec![id], NonZeroUsize::MIN)
             .await;
         assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Reclaimed);
         assert!(is_gone(&ctx.tx_records, &id).await);
@@ -947,7 +944,7 @@ async fn reference_checks_follow_a_split_behind_a_cached_parent() {
         .await;
         let id = tx(1);
         ctx.tx_records
-            .set(&committed(id.clone(), PAST_HORIZON, &[b"pear"], &[b"pear"]))
+            .set(&committed(id, PAST_HORIZON, &[b"pear"], &[b"pear"]))
             .await
             .unwrap();
         let peer = AssemblyFixture::new(
@@ -989,7 +986,7 @@ async fn reference_checks_follow_a_split_behind_a_cached_parent() {
         let outcomes = ctx
             .gc
             .clone()
-            .check_batch(vec![id.clone()], NonZeroUsize::MIN)
+            .check_batch(vec![id], NonZeroUsize::MIN)
             .await;
         assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Retained);
         assert!(!is_gone(&peer.tx_records, &id).await);
@@ -1016,7 +1013,7 @@ async fn reference_checks_refresh_a_cached_leaf_that_became_an_index() {
     );
     let id = tx(1);
     ctx.tx_records
-        .set(&committed(id.clone(), PAST_HORIZON, &[b"pear"], &[]))
+        .set(&committed(id, PAST_HORIZON, &[b"pear"], &[]))
         .await
         .unwrap();
     let left = node_id(1);
@@ -1055,7 +1052,7 @@ async fn reference_checks_refresh_a_cached_leaf_that_became_an_index() {
     let outcomes = ctx
         .gc
         .clone()
-        .check_batch(vec![id.clone()], NonZeroUsize::MIN)
+        .check_batch(vec![id], NonZeroUsize::MIN)
         .await;
     assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Retained);
     assert!(!is_gone(&peer.tx_records, &id).await);
@@ -1073,7 +1070,7 @@ async fn committed_key_lock_keeps_the_record_and_lock() {
     let ctx = new_ctx().await;
     let id = tx(1);
     ctx.tx_records
-        .set(&committed(id.clone(), PAST_HORIZON, &[b"k"], &[b"k"]))
+        .set(&committed(id, PAST_HORIZON, &[b"k"], &[b"k"]))
         .await
         .unwrap();
     store_entry(&ctx, b"k", locked_entry(b"k", &id)).await;
@@ -1341,7 +1338,7 @@ async fn entry_release_follows_splits_without_refreshing_cached_indexes() {
             false,
         );
         let locks = vec![write_lock(b"pear")];
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Aborted);
+        let mut record = TxRecord::new(id, TxCommitStatus::Aborted);
         record.locks = locks.clone();
         owner.tx_records.set(&record).await.unwrap();
         // A split resolves holds before moving entries. Keep the recovering
@@ -1432,7 +1429,7 @@ async fn entry_release_follows_splits_without_refreshing_cached_indexes() {
 async fn committed_membership_lock_is_released_before_deletion() {
     let ctx = new_ctx().await;
     let id = tx(1);
-    let mut record = committed(id.clone(), PAST_HORIZON, &[b"k"], &[b"k"]);
+    let mut record = committed(id, PAST_HORIZON, &[b"k"], &[b"k"]);
     record.locks.push(TxLock::Membership {
         leaf: glassdb_data::LeafRef::root(collection()),
         typ: LockType::Write,
@@ -1445,7 +1442,7 @@ async fn committed_membership_lock_is_released_before_deletion() {
         .await
         .unwrap();
     let mut locks = loaded.locks().clone();
-    locks.set_membership_writer(id.clone());
+    locks.set_membership_writer(id);
     let mut edit = loaded.into_edit();
     edit.set_locks(locks);
     assert!(ctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
@@ -1559,7 +1556,7 @@ async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
             .unwrap();
     }
     if committed {
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(id, TxCommitStatus::Committed);
         record.locks = locks.clone();
         owner.monitor.commit_tx(record).await.unwrap();
     } else {
@@ -1694,7 +1691,7 @@ async fn reclaim_directory(typ: LockType, case: DirectoryReclamation) {
         case,
         DirectoryReclamation::CommittedReleased | DirectoryReclamation::CommittedHolder
     ) {
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(id, TxCommitStatus::Committed);
         record.locks = locks.clone();
         owner.monitor.commit_tx(record).await.unwrap();
     } else {
@@ -1887,7 +1884,7 @@ async fn committed_directory_gc_reuses_removal_after_cache_eviction() {
             .unwrap();
     }
     operation.complete();
-    let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+    let mut record = TxRecord::new(id, TxCommitStatus::Committed);
     record.locks = locks.clone();
     ctx.mon.commit_tx(record).await.unwrap();
     let observed = ctx.tx_records.get_at(&id, Requirement::ANY).await.unwrap();
@@ -2018,7 +2015,7 @@ async fn committed_directory_removal_does_not_prove_other_records_clear() {
                 .unwrap();
         }
         operation.complete();
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(id, TxCommitStatus::Committed);
         record.locks = locks;
         owner.monitor.commit_tx(record).await.unwrap();
         // Only the parent's holder is visible to speculative write-back.
@@ -2157,7 +2154,7 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
         change.expected = Some(child.id());
     }
     // GC retains this no-holder parent while the owner acquires its writer.
-    let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+    let mut record = TxRecord::new(id, TxCommitStatus::Committed);
     record.locks = vec![TxLock::Directory {
         collection: collection(),
         typ: LockType::Write,
@@ -2172,7 +2169,7 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
         record.prepared_collections = vec![child.clone()];
     }
     if matches!(case, DirectoryWriteBack::LiveValue) {
-        record.writes = committed(id.clone(), PAST_HORIZON, &[b"k"], &[]).writes;
+        record.writes = committed(id, PAST_HORIZON, &[b"k"], &[]).writes;
     }
     owner
         .monitor
@@ -2431,7 +2428,7 @@ async fn reclaim_topology(committed: bool, case: TopologyReclamation) {
                     created_node_ids: vec![left, right],
                     split_key: Vec::new(),
                 },
-                participant_id: id.clone(),
+                participant_id: id,
                 phase: StructuralIntentPhase::Preparing,
             },
         )
@@ -2442,9 +2439,9 @@ async fn reclaim_topology(committed: bool, case: TopologyReclamation) {
         .load_record(&collection(), Requirement::ANY)
         .await
         .unwrap();
-    assert!(record.add_topology_participant(id.clone()));
+    assert!(record.add_topology_participant(id));
     if matches!(case, TopologyReclamation::DirectoryRemoved) {
-        record.add_directory_reader(id.clone());
+        record.add_directory_reader(id);
     }
     assert!(
         owner
@@ -2491,7 +2488,7 @@ async fn reclaim_topology(committed: bool, case: TopologyReclamation) {
     }
     operation.complete();
     if committed {
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(id, TxCommitStatus::Committed);
         record.locks = locks;
         owner.monitor.commit_tx(record).await.unwrap();
     } else {
@@ -2995,7 +2992,7 @@ async fn pending_and_wounded_candidates_only_read_their_records() {
         let operations = backend.log();
         let ctx = new_ctx_with(Arc::new(backend)).await;
         let id = tx(1);
-        let mut record = TxRecord::new(id.clone(), status);
+        let mut record = TxRecord::new(id, status);
         record.timestamp = Some(base() - age);
         record.locks = vec![write_lock(b"k")];
         ctx.tx_records.set(&record).await.unwrap();
@@ -3005,14 +3002,14 @@ async fn pending_and_wounded_candidates_only_read_their_records() {
         let background = Background::new();
         ctx.gc.start(&background);
         for _ in 0..2 {
-            ctx.hints.schedule(id.clone());
+            ctx.hints.schedule(id);
             wait_for_hint_deadline(&ctx).await;
         }
         background.shutdown().await;
 
         let path = ObjectPath::Transaction {
             db_prefix: DbPrefix::try_from("db").unwrap(),
-            id: id.clone(),
+            id,
         }
         .to_string();
         {
@@ -3051,7 +3048,7 @@ async fn lock_acquisition_resolves_a_wound_that_gc_leaves_alone() {
 
     let ctx = new_ctx().await;
     let wounded = tx(1);
-    let mut record = TxRecord::new(wounded.clone(), TxCommitStatus::Wounded);
+    let mut record = TxRecord::new(wounded, TxCommitStatus::Wounded);
     record.timestamp = Some(base() - PAST_HORIZON);
     record.locks = vec![write_lock(b"k")];
     ctx.tx_records.set(&record).await.unwrap();
@@ -3104,12 +3101,12 @@ async fn lock_acquisition_resolves_a_wound_that_gc_leaves_alone() {
 async fn recent_aborted_tombstone_is_kept() {
     let ctx = new_ctx().await;
     let t = tx(1);
-    let mut record = TxRecord::new(t.clone(), TxCommitStatus::Aborted);
+    let mut record = TxRecord::new(t, TxCommitStatus::Aborted);
     record.timestamp = Some(base());
     record.locks = vec![write_lock(b"k")];
     ctx.tx_records.set(&record).await.unwrap();
     store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
-    ctx.hints.schedule(t.clone());
+    ctx.hints.schedule(t);
 
     check_hints_and_scan_page(&ctx).await;
 
@@ -3124,12 +3121,12 @@ async fn recent_aborted_tombstone_is_kept() {
 async fn expired_aborted_prunes_locks_and_is_deleted() {
     let ctx = new_ctx().await;
     let t = tx(1);
-    let mut record = TxRecord::new(t.clone(), TxCommitStatus::Aborted);
+    let mut record = TxRecord::new(t, TxCommitStatus::Aborted);
     record.timestamp = Some(base() - PAST_HORIZON);
     record.locks = vec![write_lock(b"k")];
     ctx.tx_records.set(&record).await.unwrap();
     store_entry(&ctx, b"k", locked_entry(b"k", &t)).await;
-    ctx.hints.schedule(t.clone());
+    ctx.hints.schedule(t);
 
     check_hints_and_scan_page(&ctx).await;
 
@@ -3142,7 +3139,7 @@ async fn expired_aborted_prunes_locks_and_is_deleted() {
 async fn direct_gc_hint_is_a_noop() {
     let ctx = new_ctx().await;
     let t = tx(9);
-    ctx.hints.schedule(t.clone());
+    ctx.hints.schedule(t);
     check_hints_and_scan_page(&ctx).await;
     assert!(is_gone(&ctx.tx_records, &t).await);
 }
@@ -3185,7 +3182,7 @@ async fn gc_release_merges_into_live_acquire_round() {
     edit.set_entries(leaf);
     assert!(ctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 
-    let mut dead_record = TxRecord::new(dead.clone(), TxCommitStatus::Aborted);
+    let mut dead_record = TxRecord::new(dead, TxCommitStatus::Aborted);
     dead_record.timestamp = Some(base() - PAST_HORIZON);
     dead_record.locks = vec![write_lock(&ka)];
     ctx.tx_records.set(&dead_record).await.unwrap();
@@ -3200,7 +3197,7 @@ async fn gc_release_merges_into_live_acquire_round() {
     // the dedup driver and parks in the gated load; the second queues and
     // merges into its round.
     let gc = ctx.gc.clone();
-    let dead2 = dead.clone();
+    let dead2 = dead;
     let release = tokio::spawn(async move { check_candidate(&gc, &dead2).await });
     let locker = ctx.locker.clone();
     let accesses = crate::access::AccessSet::new(
@@ -3211,7 +3208,7 @@ async fn gc_release_merges_into_live_acquire_round() {
         )],
         Vec::new(),
     );
-    let live2 = live.clone();
+    let live2 = live;
     let lock_requirement = Requirement::after(ctx.timeline.currentness_barrier());
     let acquire = tokio::spawn(async move {
         locker
@@ -3331,7 +3328,7 @@ async fn cached_candidate_converges_after_a_peer_deletes_it() {
     let ctx = new_ctx_with(backend.clone()).await;
     let id = tx(14);
     ctx.tx_records
-        .set(&committed(id.clone(), PAST_HORIZON, &[], &[]))
+        .set(&committed(id, PAST_HORIZON, &[], &[]))
         .await
         .unwrap();
     let peer = TxRecordStore::new(
@@ -3367,12 +3364,12 @@ async fn hinted_candidates_wait_without_restarting_the_deadline() {
     let ctx = new_ctx().await;
     let id = tx(11);
     ctx.tx_records
-        .set(&committed(id.clone(), PAST_HORIZON, &[], &[]))
+        .set(&committed(id, PAST_HORIZON, &[], &[]))
         .await
         .unwrap();
     let bg = Arc::new(glassdb_concurr::Background::new());
     ctx.gc.start(&bg);
-    ctx.hints.schedule_all([id.clone(), id.clone()]);
+    ctx.hints.schedule_all([id, id]);
     for _ in 0..64 {
         rt::yield_now().await;
     }
@@ -3383,7 +3380,7 @@ async fn hinted_candidates_wait_without_restarting_the_deadline() {
     for _ in 0..64 {
         rt::yield_now().await;
     }
-    ctx.hints.schedule(id.clone());
+    ctx.hints.schedule(id);
     for _ in 0..64 {
         rt::yield_now().await;
     }
@@ -3405,7 +3402,7 @@ async fn concurrent_candidates_share_one_leaf_validation() {
     let ctx = new_ctx_with(Arc::new(backend)).await;
     for id in [tx(1), tx(2)] {
         ctx.tx_records
-            .set(&committed(id.clone(), PAST_HORIZON, &[b"k"], &[b"k"]))
+            .set(&committed(id, PAST_HORIZON, &[b"k"], &[b"k"]))
             .await
             .unwrap();
         ctx.hints.schedule(id);
@@ -3440,7 +3437,7 @@ async fn young_final_candidates_complete_without_a_reference_pass() {
         .iter()
         .zip([TxCommitStatus::Committed, TxCommitStatus::Aborted])
     {
-        let mut record = committed(id.clone(), Duration::ZERO, &[b"k"], &[b"k"]);
+        let mut record = committed(*id, Duration::ZERO, &[b"k"], &[b"k"]);
         record.status = status;
         ctx.tx_records.set(&record).await.unwrap();
     }
@@ -3468,7 +3465,7 @@ async fn reference_checks_reuse_a_concurrent_writer_observation() {
     let ctx = new_ctx_with(Arc::new(backend)).await;
     let id = tx(1);
     ctx.tx_records
-        .set(&committed(id.clone(), PAST_HORIZON, &[b"k"], &[b"k"]))
+        .set(&committed(id, PAST_HORIZON, &[b"k"], &[b"k"]))
         .await
         .unwrap();
     store_entry(&ctx, b"k", writer_entry(b"k", &tx(2))).await;
@@ -3477,7 +3474,7 @@ async fn reference_checks_reuse_a_concurrent_writer_observation() {
     // Poll GC first so the writer refreshes the leaf after the reference bound.
     let (outcomes, ()) = tokio::join!(
         biased;
-        ctx.gc.clone().check_batch(vec![id.clone()], NonZeroUsize::MIN),
+        ctx.gc.clone().check_batch(vec![id], NonZeroUsize::MIN),
         store_entry(&ctx, b"k", writer_entry(b"k", &tx(3))),
     );
 
@@ -3503,7 +3500,7 @@ async fn reference_checks_follow_candidate_filtering() {
     let hooked = HookBackend::new(backend.clone());
     let ctx = new_ctx_with(hooked.clone()).await;
     let id = tx(2);
-    let mut record = committed(id.clone(), Duration::ZERO, &[b"k"], &[b"k"]);
+    let mut record = committed(id, Duration::ZERO, &[b"k"], &[b"k"]);
     record.status = TxCommitStatus::Pending;
     ctx.tx_records.set(&record).await.unwrap();
     store_entry(&ctx, b"k", writer_entry(b"k", &tx(3))).await;
@@ -3512,7 +3509,7 @@ async fn reference_checks_follow_candidate_filtering() {
     hooked.set_before({
         let path = ObjectPath::Transaction {
             db_prefix: DbPrefix::try_from("db").unwrap(),
-            id: id.clone(),
+            id,
         }
         .to_string();
         let entered = entered.clone();
@@ -3534,7 +3531,7 @@ async fn reference_checks_follow_candidate_filtering() {
             })
         }
     });
-    ctx.hints.schedule(id.clone());
+    ctx.hints.schedule(id);
     let bg = Background::new();
     ctx.gc.start(&bg);
     entered.notified().await;
@@ -3590,7 +3587,7 @@ async fn a_transient_failure_keeps_the_candidate_until_retry() {
     let ctx = new_ctx_with_interval(backend.clone(), Duration::from_millis(10)).await;
     let id = tx(12);
     ctx.tx_records
-        .set(&committed(id.clone(), PAST_HORIZON, &[], &[]))
+        .set(&committed(id, PAST_HORIZON, &[], &[]))
         .await
         .unwrap();
     let failed = Arc::new(AtomicBool::new(false));
@@ -3606,7 +3603,7 @@ async fn a_transient_failure_keeps_the_candidate_until_retry() {
     });
     let bg = Arc::new(glassdb_concurr::Background::new());
     ctx.gc.start(&bg);
-    ctx.hints.schedule(id.clone());
+    ctx.hints.schedule(id);
     wait_for_hint_deadline(&ctx).await;
     assert!(!is_gone(&ctx.tx_records, &id).await);
     assert_eq!(ctx.gc.diagnostics().deferred, 1);
@@ -3629,7 +3626,7 @@ async fn a_ready_hint_queue_does_not_starve_the_scan() {
     let ctx = new_ctx_with_interval(backend.clone(), Duration::from_millis(10)).await;
     let id = tx(13);
     ctx.tx_records
-        .set(&committed(id.clone(), PAST_HORIZON, &[], &[]))
+        .set(&committed(id, PAST_HORIZON, &[], &[]))
         .await
         .unwrap();
     let reclaimed_with_ready_hints = Arc::new(AtomicBool::new(false));
@@ -3646,7 +3643,7 @@ async fn a_ready_hint_queue_does_not_starve_the_scan() {
     });
     let bg = Arc::new(glassdb_concurr::Background::new());
     ctx.hints
-        .schedule_all((0u64..2000).map(|i| TxId::from_bytes(i.to_be_bytes().to_vec())));
+        .schedule_all((0u64..2000).map(|i| TxId::with_priority(0, &i.to_be_bytes())));
     ctx.gc.start(&bg);
     for _ in 0..64 {
         rt::yield_now().await;
@@ -3699,17 +3696,17 @@ fn candidate_capacity_is_preserved_across_deferrals_and_completion() {
             },
         );
         let ids: Vec<_> = (0u64..capacity as u64)
-            .map(|i| TxId::from_bytes(i.to_be_bytes().to_vec()))
+            .map(|i| TxId::with_priority(0, &i.to_be_bytes()))
             .collect();
         for id in &ids {
-            candidates.admit(id.clone(), false, now, &counters);
+            candidates.admit(*id, false, now, &counters);
         }
-        let overflow = TxId::from_bytes(b"overflow".to_vec());
-        candidates.admit(overflow.clone(), false, now, &counters);
+        let overflow = TxId::with_priority(0, b"overflow");
+        candidates.admit(overflow, false, now, &counters);
         assert_eq!(counters.take().dropped_candidates, 1);
         for _ in 0..capacity {
             let id = candidates.take_ready().unwrap();
-            candidates.admit(overflow.clone(), false, now, &counters);
+            candidates.admit(overflow, false, now, &counters);
             assert_eq!(counters.take().dropped_candidates, 1);
             let candidate = candidates.complete(&id);
             candidates.defer(id, candidate, now + Duration::from_secs(1));
@@ -3717,7 +3714,7 @@ fn candidate_capacity_is_preserved_across_deferrals_and_completion() {
         candidates.record_backlog(&counters);
         assert_eq!(counters.diagnostics().deferred, capacity as u64);
         assert_eq!(counters.diagnostics().ready, 0);
-        candidates.admit(overflow.clone(), false, now, &counters);
+        candidates.admit(overflow, false, now, &counters);
         assert_eq!(counters.take().dropped_candidates, 1);
 
         candidates.promote_due(now + Duration::from_secs(1));
@@ -3744,38 +3741,34 @@ fn scan_reports_preserve_candidates_in_each_scheduling_state() {
     let hint = tx(1);
     let ready_scan = tx(2);
     let deferred_scan = tx(3);
-    candidates.admit(hint.clone(), false, now, &counters);
-    candidates.admit(ready_scan.clone(), false, now, &counters);
-    candidates.admit(ready_scan.clone(), true, now, &counters);
-    assert_eq!(candidates.take_ready(), Some(ready_scan.clone()));
+    candidates.admit(hint, false, now, &counters);
+    candidates.admit(ready_scan, false, now, &counters);
+    candidates.admit(ready_scan, true, now, &counters);
+    assert_eq!(candidates.take_ready(), Some(ready_scan));
     candidates.complete(&ready_scan);
 
     let running = candidates.take_ready().unwrap();
     assert_eq!(running, hint);
-    candidates.admit(running.clone(), true, now, &counters);
+    candidates.admit(running, true, now, &counters);
     let candidate = candidates.complete(&running);
     assert!(!candidate.reported_again);
-    candidates.defer(running.clone(), candidate, now + Duration::from_secs(1));
+    candidates.defer(running, candidate, now + Duration::from_secs(1));
 
-    candidates.admit(deferred_scan.clone(), false, now, &counters);
-    assert_eq!(candidates.take_ready(), Some(deferred_scan.clone()));
+    candidates.admit(deferred_scan, false, now, &counters);
+    assert_eq!(candidates.take_ready(), Some(deferred_scan));
     let candidate = candidates.complete(&deferred_scan);
-    candidates.defer(
-        deferred_scan.clone(),
-        candidate,
-        now + Duration::from_secs(2),
-    );
-    candidates.admit(deferred_scan.clone(), true, now, &counters);
-    candidates.admit(deferred_scan.clone(), false, now, &counters);
+    candidates.defer(deferred_scan, candidate, now + Duration::from_secs(2));
+    candidates.admit(deferred_scan, true, now, &counters);
+    candidates.admit(deferred_scan, false, now, &counters);
     candidates.record_backlog(&counters);
     assert_eq!(counters.diagnostics().in_flight, 0);
     assert_eq!(counters.diagnostics().deferred, 2);
     candidates.promote_due(now + Duration::from_secs(1));
-    assert_eq!(candidates.take_ready(), Some(running.clone()));
+    assert_eq!(candidates.take_ready(), Some(running));
     assert!(!candidates.complete(&running).reported_again);
     assert_eq!(candidates.take_ready(), None);
     candidates.promote_due(now + Duration::from_secs(2));
-    assert_eq!(candidates.take_ready(), Some(deferred_scan.clone()));
+    assert_eq!(candidates.take_ready(), Some(deferred_scan));
     candidates.complete(&deferred_scan);
     candidates.record_backlog(&counters);
     assert_eq!(counters.diagnostics(), GcDiagnostics::default());
@@ -3790,31 +3783,28 @@ async fn only_a_hint_during_a_check_requests_a_delayed_follow_up() {
     let id = tx(20);
     scheduler
         .candidates
-        .admit(id.clone(), true, now, &scheduler.counters);
-    assert_eq!(scheduler.candidates.take_ready(), Some(id.clone()));
+        .admit(id, true, now, &scheduler.counters);
+    assert_eq!(scheduler.candidates.take_ready(), Some(id));
     scheduler
         .candidates
-        .admit(id.clone(), true, now, &scheduler.counters);
-    scheduler.complete_checks(vec![(id.clone(), Ok(GcOutcome::Retained))]);
+        .admit(id, true, now, &scheduler.counters);
+    scheduler.complete_checks(vec![(id, Ok(GcOutcome::Retained))]);
     assert_eq!(scheduler.candidates.next_due(), None);
 
     scheduler
         .candidates
-        .admit(id.clone(), true, now, &scheduler.counters);
-    assert_eq!(scheduler.candidates.take_ready(), Some(id.clone()));
+        .admit(id, true, now, &scheduler.counters);
+    assert_eq!(scheduler.candidates.take_ready(), Some(id));
     scheduler
         .candidates
-        .admit(id.clone(), false, now, &scheduler.counters);
-    scheduler.complete_checks(vec![(id.clone(), Ok(GcOutcome::Retained))]);
+        .admit(id, false, now, &scheduler.counters);
+    scheduler.complete_checks(vec![(id, Ok(GcOutcome::Retained))]);
     let delay = ctx.gc.timing.pending_timeout() + ctx.gc.timing.max_clock_skew();
     let due = now + delay;
     assert_eq!(scheduler.candidates.next_due(), Some(due));
-    scheduler.candidates.admit(
-        id.clone(),
-        false,
-        now + Duration::from_secs(1),
-        &scheduler.counters,
-    );
+    scheduler
+        .candidates
+        .admit(id, false, now + Duration::from_secs(1), &scheduler.counters);
     assert_eq!(scheduler.candidates.next_due(), Some(due));
     scheduler
         .candidates
@@ -3831,8 +3821,8 @@ fn scan_admission_does_not_advance_a_hint_deadline() {
     let mut candidates = Candidates::new(delay, GcLimits::default());
     let counters = Counters::default();
     let id = tx(21);
-    candidates.admit(id.clone(), false, now, &counters);
-    candidates.admit(id.clone(), true, now + delay / 2, &counters);
+    candidates.admit(id, false, now, &counters);
+    candidates.admit(id, true, now + delay / 2, &counters);
     assert_eq!(candidates.next_due(), Some(now + delay));
     assert_eq!(candidates.take_ready(), None);
     candidates.promote_due(now + delay);

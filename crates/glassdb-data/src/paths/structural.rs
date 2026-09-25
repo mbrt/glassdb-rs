@@ -4,7 +4,7 @@ use crate::base64;
 use crate::structural_intent_id::StructuralIntentId;
 use crate::txid::TxId;
 
-use super::{DbPrefix, ObjectPath, PathError, parse_random_id};
+use super::{DbPrefix, ObjectPath, PathError, parse_id};
 
 const STRUCTURAL_MARKER: &str = "_s";
 
@@ -15,7 +15,7 @@ pub(super) fn parse_object(path: &str) -> Option<Result<ObjectPath, PathError>> 
             Ok(ObjectPath::StructuralIntent {
                 db_prefix: DbPrefix::try_from(db_prefix)?,
                 participant,
-                intent_id: parse_random_id(
+                intent_id: parse_id(
                     "structural intent ID",
                     intent_id,
                     StructuralIntentId::from_slice,
@@ -65,13 +65,6 @@ fn parse_parts<'a>(
     {
         return Err(PathError::Parse(source.to_string()));
     }
-    let bytes = base64::decode(encoded_participant)?;
-    if base64::encode(&bytes) != encoded_participant {
-        return Err(PathError::Parse(source.to_string()));
-    }
-    let participant = TxId::from_bytes(bytes);
-    if participant.is_unset() {
-        return Err(PathError::Parse(source.to_string()));
-    }
+    let participant = parse_id("transaction ID", encoded_participant, TxId::from_slice)?;
     Ok((participant, intent_id))
 }

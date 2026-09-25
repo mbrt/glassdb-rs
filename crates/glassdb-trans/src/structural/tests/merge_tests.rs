@@ -158,9 +158,9 @@ async fn merge_compacts_the_cold_tombstones_of_its_target() {
     let right = LeafBody::from_entries([
         live(b"m"),
         live(b"n"),
-        tombstone(b"o", deleted[0].clone()),
-        tombstone(b"p", deleted[1].clone()),
-        tombstone(b"q", deleted[2].clone()),
+        tombstone(b"o", deleted[0]),
+        tombstone(b"p", deleted[1]),
+        tombstone(b"q", deleted[2]),
     ]);
     seed_leaves(&s, leaf_node(&[b"a", b"b"], None, None), Node::leaf(right)).await;
     let bg = Arc::new(Background::new());
@@ -458,13 +458,12 @@ async fn polite_gate_leaves_a_late_holder_pending() {
     let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
     hook.set_before({
         let peer = peer.clone();
-        let younger = younger.clone();
         move |op| {
             let lock = matches!(op, BackendOp::WriteIfNotExists { .. })
                 && op.path().starts_with(&prefix)
                 && armed.swap(false, Ordering::SeqCst);
             let peer = peer.clone();
-            let younger = younger.clone();
+            let younger = younger;
             Box::pin(async move {
                 if lock {
                     let (_, observation) = peer
@@ -546,7 +545,7 @@ async fn a_merge_that_loses_its_drain_abandons_the_absorb() {
                             .unwrap();
                         match loss {
                             DrainLoss::GateRevoked => {
-                                let worker = left.structural_gate().holders()[0].clone();
+                                let worker = left.structural_gate().holders()[0];
                                 assert!(left.remove_structural_gate(&worker));
                             }
                             DrainLoss::SourceChangedUnderGate => {
@@ -647,7 +646,7 @@ async fn seed_interrupted_merge(s: &TestStore, sp: &Restructurer, crash: MergeCr
     let fresh = || Requirement::after(s.timeline.currentness_barrier());
     let worker = TxId::with_priority(1, b"merge-worker");
     let (mut left, observed) = s.load_node(COLL, "L0", fresh()).await.unwrap();
-    left.set_structural_gate(worker.clone());
+    left.set_structural_gate(worker);
     assert!(
         s.store_node(COLL, "L0", &left, Some(&observed))
             .await
@@ -670,7 +669,7 @@ async fn seed_interrupted_merge(s: &TestStore, sp: &Restructurer, crash: MergeCr
                     generation,
                 }),
             },
-            participant_id: worker.clone(),
+            participant_id: worker,
             phase: StructuralIntentPhase::Ready,
         },
     )
@@ -806,7 +805,7 @@ async fn recovery_fences_a_late_absorb() {
     entered.notified().await;
 
     let left = current_node(&peer, "L0").await;
-    let worker = left.structural_gate().holders()[0].clone();
+    let worker = left.structural_gate().holders()[0];
     assert_eq!(
         recovering.mon.preempt_tx(&worker).await.unwrap(),
         TxFinalStatus::Aborted

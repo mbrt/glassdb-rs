@@ -154,7 +154,7 @@ pub struct TxWrite {
     pub key: LogicalKey,
     pub value: Arc<[u8]>,
     pub deleted: bool,
-    pub prev_writer: TxId,
+    pub prev_writer: Option<TxId>,
 }
 
 /// One recovery-manifest entry for a transaction lock.

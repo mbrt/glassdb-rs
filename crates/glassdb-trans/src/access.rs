@@ -524,8 +524,8 @@ mod tests {
         let b = key(b"b");
         let old_writer = TxId::with_priority(1, b"old");
         let reads = vec![
-            point_read(b.clone(), Some(old_writer.clone())).await,
-            point_read(a.clone(), Some(old_writer.clone())).await,
+            point_read(b.clone(), Some(old_writer)).await,
+            point_read(a.clone(), Some(old_writer)).await,
             point_read(a.clone(), None).await,
         ];
         let writes = vec![
@@ -559,7 +559,7 @@ mod tests {
     #[test]
     fn read_predicate_distinguishes_blind_writes_from_observed_absence() {
         let writer = TxId::with_priority(1, b"writer");
-        let present = ReadPredicate::new(Some(writer.clone()), None);
+        let present = ReadPredicate::new(Some(writer), None);
         let absent = ReadPredicate::new(None, Some(7));
 
         assert!(present.validates(Some(&writer), 99));

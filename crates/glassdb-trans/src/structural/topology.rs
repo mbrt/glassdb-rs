@@ -71,7 +71,7 @@ impl TopologyMembership {
             if let Some(holder) = record.topology_freeze() {
                 return match self.mon.tx_status(holder).await? {
                     TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
-                        let holder = holder.clone();
+                        let holder = *holder;
                         record.remove_topology_freeze(&holder);
                         if self.records.store_record(&record, &observed).await? {
                             continue;
@@ -83,7 +83,7 @@ impl TopologyMembership {
                     TxCommitStatus::Pending | TxCommitStatus::Unknown => Err(TransError::Retry),
                 };
             }
-            if !record.add_topology_participant(id.clone()) {
+            if !record.add_topology_participant(*id) {
                 return Err(TransError::Retry);
             }
             if self.records.store_record(&record, &observed).await? {
@@ -134,7 +134,7 @@ impl TopologyMembership {
     /// Gives a topology participant its final status, so that recovery does
     /// not treat it as in-flight work.
     pub(super) async fn finalize(&self, collection: &CollectionAddress, id: &TxId) {
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(*id, TxCommitStatus::Committed);
         record.locks.push(TxLock::TopologyParticipant {
             collection: collection.clone(),
         });

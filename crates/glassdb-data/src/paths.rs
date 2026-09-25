@@ -14,7 +14,7 @@ mod transaction;
 mod tree;
 
 /// Length of the unpadded base64 path component of an ID.
-const RANDOM_ID_ENCODED_LEN: usize = (ID_BYTES * 8).div_ceil(6);
+const ID_ENCODED_LEN: usize = (ID_BYTES * 8).div_ceil(6);
 const DATABASE_METADATA_OBJECT: &str = "glassdb";
 
 /// A database's top-level physical object-path component.
@@ -82,8 +82,8 @@ fn validate_db_prefix(value: &str) -> Result<(), PathError> {
     Ok(())
 }
 
-/// Parses the path component of a random 16-byte ID, such as a node ID.
-fn parse_random_id<T>(
+/// Parses the path component of a fixed-width ID, such as a node ID.
+fn parse_id<T>(
     component: &'static str,
     value: &str,
     from_slice: impl FnOnce(&[u8]) -> Option<T>,
@@ -92,7 +92,7 @@ fn parse_random_id<T>(
         component,
         value: value.to_string(),
     };
-    if value.len() != RANDOM_ID_ENCODED_LEN {
+    if value.len() != ID_ENCODED_LEN {
         return Err(invalid());
     }
     let decoded = base64::decode(value)?;
@@ -402,6 +402,10 @@ mod tests {
         StructuralIntentId::from_bytes([byte; ID_BYTES])
     }
 
+    fn tx_id(byte: u8) -> TxId {
+        TxId::from_bytes([byte; ID_BYTES])
+    }
+
     #[test]
     fn database_prefix_validation_boundaries() {
         let shortest = DbPrefix::try_from("a").unwrap();
@@ -431,13 +435,17 @@ mod tests {
     }
 
     #[test]
-    fn random_id_path_components_require_canonical_128_bit_encodings() {
-        let node_path = |id: &str| format!("db/_c/0000000000000000000000/_n/{id}");
-        let participant = base64::encode(b"participant");
-        let intent_path = |id: &str| format!("db/_s/{participant}/{id}");
+    fn id_path_components_require_canonical_128_bit_encodings() {
+        let zero = "0000000000000000000000";
+        let node_path = |id: &str| format!("db/_c/{zero}/_n/{id}");
+        let intent_path = |id: &str| format!("db/_s/{zero}/{id}");
+        let participant_path = |id: &str| format!("db/_s/{id}/{zero}");
+        let transaction_path = |id: &str| {
+            let symbols = id.get(..2).unwrap_or("00");
+            format!("db/_t/{}/{}/{id}", &symbols[..1], &symbols[1..])
+        };
         let parse = |path: String| ObjectPath::try_from(path.as_str());
 
-        let zero = "0000000000000000000000";
         assert_eq!(
             parse(node_path(zero)).unwrap(),
             ObjectPath::Node {
@@ -449,8 +457,15 @@ mod tests {
             parse(intent_path(zero)).unwrap(),
             ObjectPath::StructuralIntent {
                 db_prefix: DbPrefix::try_from("db").unwrap(),
-                participant: TxId::from_bytes(b"participant".to_vec()),
+                participant: tx_id(0),
                 intent_id: intent_id(0),
+            }
+        );
+        assert_eq!(
+            parse(transaction_path(zero)).unwrap(),
+            ObjectPath::Transaction {
+                db_prefix: DbPrefix::try_from("db").unwrap(),
+                id: tx_id(0),
             }
         );
 
@@ -466,10 +481,21 @@ mod tests {
             "000000000000000000000!",
             noncanonical,
         ] {
-            assert!(parse(node_path(invalid)).is_err(), "{invalid:?}");
-            assert!(parse(intent_path(invalid)).is_err(), "{invalid:?}");
+            for path in [
+                node_path(invalid),
+                intent_path(invalid),
+                participant_path(invalid),
+                transaction_path(invalid),
+            ] {
+                assert!(parse(path).is_err(), "{invalid:?}");
+            }
         }
-        for path in [node_path(noncanonical), intent_path(noncanonical)] {
+        for path in [
+            node_path(noncanonical),
+            intent_path(noncanonical),
+            participant_path(noncanonical),
+            transaction_path(noncanonical),
+        ] {
             assert!(matches!(
                 parse(path),
                 Err(PathError::InvalidComponent { .. })
@@ -511,7 +537,7 @@ mod tests {
     fn freshly_minted_ids_round_trip_through_object_paths() {
         let collection = CollectionAddress::root("db");
         let db_prefix = DbPrefix::try_from("db").unwrap();
-        let participant = TxId::from_bytes(b"participant".to_vec());
+        let participant = tx_id(3);
         for _ in 0..128 {
             for path in [
                 ObjectPath::Node {
@@ -520,7 +546,7 @@ mod tests {
                 },
                 ObjectPath::StructuralIntent {
                     db_prefix: db_prefix.clone(),
-                    participant: participant.clone(),
+                    participant,
                     intent_id: StructuralIntentId::new_random(),
                 },
             ] {
@@ -537,7 +563,7 @@ mod tests {
         let db_prefix = DbPrefix::try_from("db").unwrap();
         let collection = CollectionAddress::root("db");
         let id = node_id(7);
-        let participant = TxId::from_bytes(b"participant".to_vec());
+        let participant = tx_id(3);
         let intent_id = intent_id(9);
         let paths = [
             ObjectPath::DatabaseMetadata {
@@ -548,7 +574,7 @@ mod tests {
             },
             ObjectPath::Transaction {
                 db_prefix: db_prefix.clone(),
-                id: TxId::from_bytes(vec![1, 2, 3, 4]),
+                id: tx_id(1),
             },
             ObjectPath::TreeRoot {
                 collection: collection.clone(),
@@ -573,6 +599,7 @@ mod tests {
         enum ErrorKind {
             Parse,
             Decode,
+            InvalidComponent,
         }
 
         let cases = [
@@ -585,12 +612,15 @@ mod tests {
             ("db/_n/token/extra", ErrorKind::Parse),
             ("db/_t/00/0F8310", ErrorKind::Parse),
             ("db/_t/0F/0F8310", ErrorKind::Parse),
-            ("db/_t/!/!/!!", ErrorKind::Decode),
-            ("db/_t/0/0/é", ErrorKind::Parse),
-            ("db/_t/0/0/€", ErrorKind::Decode),
+            ("db/_t/!/!/!!", ErrorKind::InvalidComponent),
+            ("db/_t/!/!/!!!!!!!!!!!!!!!!!!!!!!", ErrorKind::Decode),
+            ("db/_t/1/0/0000000000000000000000", ErrorKind::Parse),
+            ("db/_t/0/0/é", ErrorKind::InvalidComponent),
+            ("db/_t/0/0/€", ErrorKind::InvalidComponent),
             ("db/_s/participant", ErrorKind::Parse),
             ("db/_s//intent", ErrorKind::Parse),
-            ("db/_s/!/intent", ErrorKind::Decode),
+            ("db/_s/!/intent", ErrorKind::InvalidComponent),
+            ("db/_s/!!!!!!!!!!!!!!!!!!!!!!/intent", ErrorKind::Decode),
             ("db/_s/participant/intent/extra", ErrorKind::Parse),
         ];
 
@@ -601,6 +631,10 @@ mod tests {
                     (expected, error),
                     (ErrorKind::Parse, PathError::Parse(_))
                         | (ErrorKind::Decode, PathError::Decode(_))
+                        | (
+                            ErrorKind::InvalidComponent,
+                            PathError::InvalidComponent { .. }
+                        )
                 ),
                 "unexpected error classification for {path:?}"
             );
@@ -650,10 +684,10 @@ mod tests {
         );
     }
 
-    // Golden vectors produced by the Go implementation, to guarantee
-    // byte-for-byte compatibility of the path encoding.
+    // The base64 vectors come from the Go implementation, which uses the same
+    // order-preserving alphabet.
     #[test]
-    fn golden_vectors_match_go() {
+    fn path_encoding_golden_vectors() {
         assert_eq!(base64::encode(b"Hello"), "H6KgQ6w");
         assert_eq!(base64::encode(&[0, 1, 2, 3, 4]), "00420kF");
         assert_eq!(base64::encode(b"ab"), "NL8");
@@ -661,7 +695,7 @@ mod tests {
         let collection = CollectionAddress::root("db");
         let collection_prefix = "db/_c/0000000000000000000000";
         let id = NodeId::from_bytes([0; ID_BYTES]);
-        let participant = TxId::from_bytes(vec![1, 2, 3, 4]);
+        let participant = TxId::with_priority(0, &[1, 2, 3, 4]);
         let intent_id = StructuralIntentId::from_bytes([0; ID_BYTES]);
 
         assert_eq!(collection.physical_prefix(), collection_prefix);
@@ -690,19 +724,19 @@ mod tests {
         assert_eq!(
             ObjectPath::Transaction {
                 db_prefix: db_prefix.clone(),
-                id: participant.clone(),
+                id: participant,
             }
             .to_string(),
-            "db/_t/0/F/0F8310"
+            "db/_t/0/F/0F83100000000000000000"
         );
         assert_eq!(
             ObjectPath::StructuralIntent {
                 db_prefix: db_prefix.clone(),
-                participant: participant.clone(),
+                participant,
                 intent_id,
             }
             .to_string(),
-            "db/_s/0F8310/0000000000000000000000"
+            "db/_s/0F83100000000000000000/0000000000000000000000"
         );
         assert_eq!(
             ObjectPath::nodes_prefix(&collection),
@@ -713,7 +747,7 @@ mod tests {
         assert_eq!(ObjectPath::structural_intents_prefix(&db_prefix), "db/_s/");
         assert_eq!(
             ObjectPath::participant_structural_intents_prefix(&db_prefix, &participant),
-            "db/_s/0F8310/"
+            "db/_s/0F83100000000000000000/"
         );
     }
 }

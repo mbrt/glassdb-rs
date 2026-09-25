@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use glassdb_data::TxId;
+use glassdb_data::{ID_BYTES, TxId};
 use glassdb_proto as pb;
 use prost::Message;
 
@@ -189,11 +189,11 @@ impl LeafEntry {
     }
 
     /// Returns the encoded size of the largest fixed coordination shape GlassDB
-    /// can add for `key_len`: one generated write holder and an external current
-    /// writer. Inline payloads and arbitrary compatibility IDs are sized exactly
-    /// through [`LeafEntry::encoded_len`] instead.
+    /// can add for `key_len`: one write holder and an external current writer.
+    /// Inline payloads are sized exactly through [`LeafEntry::encoded_len`]
+    /// instead.
     pub(crate) fn worst_case_encoded_len(key_len: usize) -> usize {
-        let id_len = TxId::MAX_GENERATED_ENCODED_LEN;
+        let id_len = ID_BYTES;
         let current_len = nonempty_length_delimited_field(CURRENT_WRITER_TAG, id_len)
             + present_varint_field(CURRENT_EXTERNAL_TAG, 1);
         nonempty_length_delimited_field(ENTRY_KEY_TAG, key_len)
@@ -380,15 +380,11 @@ fn current_from_proto(raw: Option<pb::CurrentState>) -> Result<CurrentState, Sto
     let Some(raw) = raw else {
         return Ok(CurrentState::Absent);
     };
-    // A current value without a writer or without a state tag is not a state
-    // any mutation can produce: reject it rather than guess which half is
+    // A current value without a valid writer or without a state tag is not a
+    // state any mutation can produce: reject it rather than guess which half is
     // authoritative.
-    if raw.writer.is_empty() {
-        return Err(StorageError::other(
-            "leaf entry current value has no writer",
-        ));
-    }
-    let writer = TxId::from_bytes(raw.writer);
+    let writer = TxId::from_slice(&raw.writer)
+        .ok_or_else(|| StorageError::other("leaf entry current value has an invalid writer"))?;
     match raw.state {
         Some(State::External(_)) => Ok(CurrentState::External { writer }),
         Some(State::Inline(value)) => Ok(CurrentState::Inline {
@@ -412,8 +408,8 @@ mod tests {
         LeafEntry::new(key)
     }
 
-    fn tx(bytes: &[u8]) -> TxId {
-        TxId::from_bytes(bytes.to_vec())
+    fn tx(prefix: &[u8]) -> TxId {
+        TxId::with_priority(0, prefix)
     }
 
     fn encode_entry(entry: &LeafEntry) -> Vec<u8> {
@@ -428,29 +424,27 @@ mod tests {
     #[test]
     fn entry_size_matches_proto_state_matrix() {
         let generated = TxId::with_priority(1, b"maximum");
-        assert_eq!(generated.as_bytes().len(), TxId::MAX_GENERATED_ENCODED_LEN);
-        let short = TxId::from_bytes(vec![1]);
-        let boundary_127 = TxId::from_bytes(vec![2; 127]);
-        let boundary_128 = TxId::from_bytes(vec![3; 128]);
+        let short = tx(&[1]);
+        let reader = tx(&[2]);
+        let creator = tx(&[3]);
 
         let mut normalized_none = LeafEntry::new(b"none");
-        normalized_none.replace_write_lock(short.clone());
+        normalized_none.replace_write_lock(short);
         assert!(normalized_none.release_lock(&short));
 
         let mut shared = LeafEntry::new(b"shared");
-        shared.acquire_read_lock(short.clone());
-        shared.acquire_read_lock(boundary_128.clone());
+        shared.acquire_read_lock(short);
+        shared.acquire_read_lock(reader);
 
-        let mut maximum = LeafEntry::new(b"external").with_current(CurrentState::External {
-            writer: generated.clone(),
-        });
-        maximum.replace_write_lock(generated.clone());
+        let mut maximum =
+            LeafEntry::new(b"external").with_current(CurrentState::External { writer: generated });
+        maximum.replace_write_lock(generated);
 
         let mut inline_empty = LeafEntry::new(Vec::new()).with_current(CurrentState::Inline {
-            writer: boundary_127,
+            writer: reader,
             value: Arc::from(b"".as_slice()),
         });
-        inline_empty.replace_create_lock(boundary_128.clone());
+        inline_empty.replace_create_lock(creator);
 
         let cases = [
             ("absent", LeafEntry::new(Vec::new())),
@@ -461,7 +455,7 @@ mod tests {
             (
                 "inline-boundary",
                 LeafEntry::new(b"inline").with_current(CurrentState::Inline {
-                    writer: boundary_128,
+                    writer: creator,
                     value: Arc::from(vec![4; 128]),
                 }),
             ),
@@ -490,28 +484,28 @@ mod tests {
         let second = tx(&[2]);
         let mut entry = LeafEntry::new(b"key");
 
-        entry.acquire_read_lock(second.clone());
-        entry.acquire_read_lock(first.clone());
+        entry.acquire_read_lock(second);
+        entry.acquire_read_lock(first);
         assert_eq!(entry.lock_type(), LockType::Read);
-        assert_eq!(entry.lock_holders(), &[first.clone(), second.clone()]);
+        assert_eq!(entry.lock_holders(), &[first, second]);
         assert!(entry.is_locked_by(&first));
 
         let encoded = encode_entry(&entry);
-        entry.acquire_read_lock(first.clone());
+        entry.acquire_read_lock(first);
         assert_eq!(encode_entry(&entry), encoded);
 
         let mut reverse = LeafEntry::new(b"key");
-        reverse.acquire_read_lock(first.clone());
-        reverse.acquire_read_lock(second.clone());
+        reverse.acquire_read_lock(first);
+        reverse.acquire_read_lock(second);
         assert_eq!(encode_entry(&reverse), encoded);
 
         let mut replacement = KeyLockState::read(second);
-        replacement.acquire_read(first.clone());
+        replacement.acquire_read(first);
         assert_eq!(replacement.lock_type(), LockType::Read);
         assert!(replacement.contains(&first));
         assert!(replacement.release(&first));
         assert!(!replacement.is_unlocked());
-        replacement.acquire_read(first.clone());
+        replacement.acquire_read(first);
         reverse.replace_lock(replacement);
         assert_eq!(encode_entry(&reverse), encoded);
 
@@ -530,22 +524,22 @@ mod tests {
         let unrelated = tx(&[5]);
         let mut entry = LeafEntry::new(b"key");
 
-        entry.replace_write_lock(writer.clone());
+        entry.replace_write_lock(writer);
         assert_eq!(entry.lock_type(), LockType::Write);
         assert_eq!(entry.lock_holders(), std::slice::from_ref(&writer));
         let write_encoded = encode_entry(&entry);
-        entry.replace_write_lock(writer.clone());
+        entry.replace_write_lock(writer);
         assert_eq!(encode_entry(&entry), write_encoded);
         assert!(entry.release_lock(&writer));
         assert_eq!(entry.lock_type(), LockType::None);
         assert!(entry.lock_holders().is_empty());
         assert!(!entry.release_lock(&writer));
 
-        entry.replace_create_lock(creator.clone());
+        entry.replace_create_lock(creator);
         assert_eq!(entry.lock_type(), LockType::Create);
         assert_eq!(entry.lock_holders(), std::slice::from_ref(&creator));
         let create_encoded = encode_entry(&entry);
-        entry.replace_create_lock(creator.clone());
+        entry.replace_create_lock(creator);
         assert_eq!(encode_entry(&entry), create_encoded);
 
         assert!(!entry.release_lock(&unrelated));
@@ -599,33 +593,38 @@ mod tests {
         assert_eq!(LeafBody::decode(&external.encode()).unwrap(), external);
     }
 
-    // No mutation can publish a current value without a writer or without a
-    // state tag, so decoding one is corrupt state rather than a default.
+    // No mutation can publish a current value without a valid writer or without
+    // a state tag, so decoding one is corrupt state rather than a default.
     #[test]
     fn decoding_rejects_incomplete_current_values() {
         let no_state = pb::LeafBody {
             entries: vec![pb::LeafEntry {
                 key: b"k".to_vec(),
                 current: Some(pb::CurrentState {
-                    writer: vec![1],
+                    writer: vec![1; 16],
                     state: None,
                 }),
                 ..Default::default()
             }],
         };
-        let no_writer = pb::LeafBody {
-            entries: vec![pb::LeafEntry {
-                key: b"k".to_vec(),
-                current: Some(pb::CurrentState {
-                    writer: Vec::new(),
-                    state: Some(pb::current_state::State::External(true)),
-                }),
-                ..Default::default()
-            }],
-        };
-
         assert!(LeafBody::decode(&no_state.encode_to_vec()).is_err());
-        assert!(LeafBody::decode(&no_writer.encode_to_vec()).is_err());
+        for writer in [Vec::new(), vec![1; 15], vec![1; 17]] {
+            let raw = pb::LeafBody {
+                entries: vec![pb::LeafEntry {
+                    key: b"k".to_vec(),
+                    current: Some(pb::CurrentState {
+                        writer,
+                        state: Some(pb::current_state::State::External(true)),
+                    }),
+                    ..Default::default()
+                }],
+            };
+            let error = LeafBody::decode(&raw.encode_to_vec()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "leaf entry current value has an invalid writer"
+            );
+        }
     }
 
     #[test]
@@ -648,21 +647,21 @@ mod tests {
             ),
             (
                 PbLockType::Read as i32,
-                vec![vec![2], vec![1]],
+                vec![vec![2; 16], vec![1; 16]],
                 LockType::Read,
-                vec![tx(&[1]), tx(&[2])],
+                vec![TxId::from_bytes([1; 16]), TxId::from_bytes([2; 16])],
             ),
             (
                 PbLockType::Write as i32,
-                vec![vec![3]],
+                vec![vec![3; 16]],
                 LockType::Write,
-                vec![tx(&[3])],
+                vec![TxId::from_bytes([3; 16])],
             ),
             (
                 PbLockType::Create as i32,
-                vec![vec![4]],
+                vec![vec![4; 16]],
                 LockType::Create,
-                vec![tx(&[4])],
+                vec![TxId::from_bytes([4; 16])],
             ),
         ];
 
@@ -701,15 +700,17 @@ mod tests {
         use pb::lock::LockType as PbLockType;
 
         let invalid_locks = [
-            (PbLockType::None as i32, vec![vec![1]]),
-            (PbLockType::Unknown as i32, vec![vec![1]]),
-            (99, vec![vec![1]]),
+            (PbLockType::None as i32, vec![vec![1; 16]]),
+            (PbLockType::Unknown as i32, vec![vec![1; 16]]),
+            (99, vec![vec![1; 16]]),
             (PbLockType::Read as i32, Vec::new()),
-            (PbLockType::Read as i32, vec![vec![1], vec![1]]),
+            (PbLockType::Read as i32, vec![vec![1; 16], vec![1; 16]]),
             (PbLockType::Write as i32, Vec::new()),
-            (PbLockType::Write as i32, vec![vec![1], vec![2]]),
+            (PbLockType::Write as i32, vec![vec![1; 16], vec![2; 16]]),
+            (PbLockType::Write as i32, vec![vec![1; 15]]),
+            (PbLockType::Write as i32, vec![vec![1; 17]]),
             (PbLockType::Create as i32, Vec::new()),
-            (PbLockType::Create as i32, vec![vec![1], vec![2]]),
+            (PbLockType::Create as i32, vec![vec![1; 16], vec![2; 16]]),
         ];
 
         for (lock_type, locked_by) in invalid_locks {
@@ -783,8 +784,8 @@ mod tests {
             }
             LeafBody::from_entries([entry])
         };
-        let a = mk(vec![TxId::from_bytes(vec![3]), TxId::from_bytes(vec![1])]);
-        let b = mk(vec![TxId::from_bytes(vec![1]), TxId::from_bytes(vec![3])]);
+        let a = mk(vec![tx(&[3]), tx(&[1])]);
+        let b = mk(vec![tx(&[1]), tx(&[3])]);
         assert_eq!(a.encode(), b.encode());
     }
 
@@ -888,15 +889,22 @@ mod tests {
     #[test]
     fn golden_encoding() {
         let entry = LeafEntry::new(b"Hello").with_current(CurrentState::External {
-            writer: tx(&[0xaa, 0xbb]),
+            writer: TxId::from_bytes([0xaa; 16]),
         });
-        let leaf =
-            LeafBody::from_entries([with_lock(entry, KeyLockState::write(tx(&[1, 2, 3, 4])))]);
+        let holder = TxId::from_bytes([1; 16]);
+        let leaf = LeafBody::from_entries([with_lock(entry, KeyLockState::write(holder))]);
         let got = leaf.encode();
         let want = [
-            0x0a, 0x17, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a, 0x04, 0x01,
-            0x02, 0x03, 0x04, 0x22, 0x06, 0x0a, 0x02, 0xaa, 0xbb, 0x10, 0x01,
-        ];
+            [
+                0x0a, 0x31, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a, 0x10,
+            ]
+            .as_slice(),
+            &[1; 16],
+            &[0x22, 0x14, 0x0a, 0x10],
+            &[0xaa; 16],
+            &[0x10, 0x01],
+        ]
+        .concat();
         assert_eq!(got, want, "leaf encoding drifted: {got:02x?}");
     }
 
@@ -904,16 +912,23 @@ mod tests {
     #[test]
     fn golden_inline_encoding() {
         let entry = LeafEntry::new(b"Hello").with_current(CurrentState::Inline {
-            writer: tx(&[0xaa, 0xbb]),
+            writer: TxId::from_bytes([0xaa; 16]),
             value: Arc::from(b"hi".as_slice()),
         });
-        let leaf =
-            LeafBody::from_entries([with_lock(entry, KeyLockState::write(tx(&[1, 2, 3, 4])))]);
+        let holder = TxId::from_bytes([1; 16]);
+        let leaf = LeafBody::from_entries([with_lock(entry, KeyLockState::write(holder))]);
         let got = leaf.encode();
         let want = [
-            0x0a, 0x19, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a, 0x04, 0x01,
-            0x02, 0x03, 0x04, 0x22, 0x08, 0x0a, 0x02, 0xaa, 0xbb, 0x1a, 0x02, 0x68, 0x69,
-        ];
+            [
+                0x0a, 0x33, 0x0a, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x10, 0x03, 0x1a, 0x10,
+            ]
+            .as_slice(),
+            &[1; 16],
+            &[0x22, 0x16, 0x0a, 0x10],
+            &[0xaa; 16],
+            &[0x1a, 0x02, 0x68, 0x69],
+        ]
+        .concat();
         assert_eq!(got, want, "inline leaf encoding drifted: {got:02x?}");
     }
 }

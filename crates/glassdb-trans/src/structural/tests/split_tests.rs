@@ -5,11 +5,11 @@ fn reclamation_removes_only_holder_free_tombstones() {
     let reclaimed_writer = TxId::with_priority(1, b"reclaimed");
     let retained_writer = TxId::with_priority(2, b"retained");
     let holder = TxId::with_priority(3, b"holder");
-    let mut retained = tombstone(b"locked", retained_writer.clone());
+    let mut retained = tombstone(b"locked", retained_writer);
     retained.acquire_read_lock(holder);
     let mut node = Node::leaf(LeafBody::from_entries([
         live(b"live"),
-        tombstone(b"reclaimed", reclaimed_writer.clone()),
+        tombstone(b"reclaimed", reclaimed_writer),
         retained,
     ]));
     let mut locks = node.locks().clone();
@@ -37,8 +37,8 @@ async fn root_reclamation_can_avoid_an_actionable_split() {
     let second = TxId::with_priority(3, b"second");
     let mut root = Node::leaf(LeafBody::from_entries([
         live(b"a"),
-        tombstone(b"b", first.clone()),
-        tombstone(b"c", second.clone()),
+        tombstone(b"b", first),
+        tombstone(b"c", second),
     ]));
     let mut locks = root.locks().clone();
     locks.advance_membership_generation();
@@ -202,7 +202,7 @@ async fn nonroot_split_partitions_the_compacted_leaf() {
         live(b"a"),
         live(b"b"),
         live(b"c"),
-        tombstone(b"d", writer.clone()),
+        tombstone(b"d", writer),
     ]));
     let mut locks = source.locks().clone();
     locks.advance_membership_generation();
@@ -261,7 +261,7 @@ async fn a_split_carries_inline_values_to_the_new_leaf() {
     let keys: [&[u8]; 4] = [b"a", b"b", b"c", b"d"];
     let inlined = |key: &[u8]| {
         LeafEntry::new(key).with_current(CurrentState::Inline {
-            writer: TxId::from_bytes(vec![1]),
+            writer: tx_id(&[1]),
             value: Arc::from(key),
         })
     };
@@ -760,7 +760,7 @@ async fn separator_capacity_splits_parent_during_reconciliation_and_recovery() {
                         created_node_ids: vec![test_node_id("L7")],
                         split_key: b"h".to_vec(),
                     },
-                    participant_id: participant.clone(),
+                    participant_id: participant,
                     phase: StructuralIntentPhase::Ready,
                 },
             )
@@ -1164,7 +1164,7 @@ async fn contended_candidate_is_requeued() {
     let mut node = Node::leaf(LeafBody::from_entries(
         [b"a".as_slice(), b"b", b"c", b"d"].iter().map(|k| live(k)),
     ));
-    node.add_membership_reader(holder.clone());
+    node.add_membership_reader(holder);
     let root = node;
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
@@ -1312,12 +1312,12 @@ async fn split_help_forwards_a_committed_entry_holder_before_moving_its_entry() 
         std::num::NonZeroUsize::MIN,
     );
     other_mon.begin_tx(&holder);
-    let mut record = TxRecord::new(holder.clone(), TxCommitStatus::Committed);
+    let mut record = TxRecord::new(holder, TxCommitStatus::Committed);
     record.writes.push(TxWrite {
         key: LogicalKey::new(collection(), b"d"),
         value: Arc::from(b"new-d".as_slice()),
         deleted: false,
-        prev_writer: TxId::from_bytes(vec![1]),
+        prev_writer: Some(tx_id(&[1])),
     });
 
     let entries: Vec<_> = [b"a".as_slice(), b"b", b"c", b"d"]
@@ -1380,12 +1380,7 @@ async fn split_help_forwards_a_committed_entry_holder_before_moving_its_entry() 
         .entries()
         .find(|entry| entry.key == b"d")
         .unwrap();
-    assert_eq!(
-        entry.current,
-        CurrentState::External {
-            writer: holder.clone()
-        }
-    );
+    assert_eq!(entry.current, CurrentState::External { writer: holder });
     assert!(entry.lock_holders().is_empty());
     assert_eq!(entry.lock_type(), LockType::None);
 

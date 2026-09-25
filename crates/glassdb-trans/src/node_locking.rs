@@ -92,10 +92,10 @@ impl<'a> NodeLockReconciler<'a> {
                 .await?;
             for holder in &resolved.pending {
                 if self.monitor.tx_status(holder).await? == TxCommitStatus::Unknown {
-                    return Ok(QuiescedEntries::Wait(holder.clone()));
+                    return Ok(QuiescedEntries::Wait(*holder));
                 }
                 if matches!(self.reclaim(holder).await?, Reclaim::Wait) {
-                    return Ok(QuiescedEntries::Wait(holder.clone()));
+                    return Ok(QuiescedEntries::Wait(*holder));
                 }
             }
             let mut quiesced = entry.clone();
@@ -183,7 +183,7 @@ impl<'a> NodeLockReconciler<'a> {
             }
             locks.remove_membership_holder(&holder);
         }
-        locks.set_structural_gate(self.id.clone());
+        locks.set_structural_gate(*self.id);
         Ok(None)
     }
 
@@ -252,13 +252,13 @@ impl<'a> NodeLockReconciler<'a> {
         }
         match desired {
             LockType::Read if locks.membership().lock_type() != LockType::Write => {
-                locks.add_membership_reader(self.id.clone());
+                locks.add_membership_reader(*self.id);
             }
             LockType::Write
                 if locks.membership().lock_type() != LockType::Write
                     || !locks.membership().contains(self.id) =>
             {
-                locks.set_membership_writer(self.id.clone());
+                locks.set_membership_writer(*self.id);
             }
             _ => {}
         }

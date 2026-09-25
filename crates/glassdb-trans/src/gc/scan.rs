@@ -375,7 +375,7 @@ mod tests {
         let mut objects = Vec::new();
         for i in 0..count {
             let prefix = ((i % 4096) as u16) << 4;
-            let id = TxId::from_bytes(vec![(prefix >> 8) as u8, prefix as u8, (i / 4096) as u8]);
+            let id = TxId::with_priority(0, &[(prefix >> 8) as u8, prefix as u8, (i / 4096) as u8]);
             let path = ObjectPath::Transaction {
                 db_prefix: db_prefix.clone(),
                 id,

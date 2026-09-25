@@ -50,11 +50,10 @@ pub(super) fn reclaim_holder_free_tombstones(node: &mut Node) -> Vec<TxId> {
     let retained = leaf.entries().filter_map(|entry| {
         if entry.lock_holders().is_empty() && entry.current.is_tombstone() {
             reclaimed.push(
-                entry
+                *entry
                     .current
                     .writer()
-                    .expect("a tombstone always names its writer")
-                    .clone(),
+                    .expect("a tombstone always names its writer"),
             );
             None
         } else {

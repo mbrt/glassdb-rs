@@ -405,7 +405,7 @@ impl StructuralRecovery {
                     source_node_id: source_node_id.copied(),
                     source_revision: String::new(),
                     change,
-                    participant_id: participant.clone(),
+                    participant_id: *participant,
                     phase: StructuralIntentPhase::Preparing,
                 },
             )
@@ -617,7 +617,7 @@ impl StructuralRecovery {
                 Err(error) => {
                     let failure = SweepFailure {
                         intent: sweep.intent_id,
-                        participant: sweep.participant.clone(),
+                        participant: sweep.participant,
                         error,
                     };
                     if sweep.participant.is_some() {
@@ -648,7 +648,7 @@ impl StructuralRecovery {
                 Err(error) => {
                     let failure = SweepFailure {
                         intent: None,
-                        participant: sweep.participant.clone(),
+                        participant: sweep.participant,
                         error,
                     };
                     sweep.settlement = None;
@@ -772,7 +772,7 @@ impl StructuralRecovery {
         let participants = intents
             .iter()
             .filter_map(|(_, observed)| observed.value())
-            .map(|intent| (intent.collection.clone(), intent.participant_id.clone()))
+            .map(|intent| (intent.collection.clone(), intent.participant_id))
             .collect();
         Ok(RecoverySweep {
             intents,
@@ -829,7 +829,7 @@ impl StructuralRecovery {
                     }
                     ReconciliationOutcome::ParentRequiresSplit(action) => {
                         let path = action.path;
-                        let participant = participant.clone();
+                        let participant = *participant;
                         if action.continuation == ParentSplitContinuation::CompleteReconciliation {
                             recovery.phase = IntentRecoveryPhase::Delete;
                         }
@@ -862,7 +862,7 @@ impl StructuralRecovery {
     ) -> ParticipantSettlement {
         ParticipantSettlement {
             collection: collection.clone(),
-            participant: participant.clone(),
+            participant: *participant,
             status_checked: false,
             intents: VecDeque::new(),
         }
@@ -1038,7 +1038,7 @@ impl StructuralRecovery {
                 reconciliation: self
                     .reconciler
                     .begin(collection, split_key, &created_node_ids[0]),
-                participant: intent.participant_id.clone(),
+                participant: intent.participant_id,
             });
         }
         if !applied {
@@ -1092,7 +1092,7 @@ impl StructuralRecovery {
             reconciliation: self
                 .reconciler
                 .begin(collection, &target.boundary, &target.node_id),
-            participant: intent.participant_id.clone(),
+            participant: intent.participant_id,
         })
     }
 

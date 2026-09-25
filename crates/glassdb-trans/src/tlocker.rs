@@ -823,7 +823,7 @@ async fn resolve_and_lock(
         for holder in &pending {
             match try_reclaim(ctx.tmon, id, holder).await? {
                 Reclaim::Wounded => {}
-                Reclaim::Wait => return Ok(EntryResolution::Wait(holder.clone())),
+                Reclaim::Wait => return Ok(EntryResolution::Wait(*holder)),
             }
         }
         pending.clear();
@@ -831,7 +831,7 @@ async fn resolve_and_lock(
 
     match intent.desired {
         Desired::Read => {
-            let mut lock = KeyLockState::read(id.clone());
+            let mut lock = KeyLockState::read(*id);
             for holder in pending {
                 lock.acquire_read(holder);
             }
@@ -839,9 +839,9 @@ async fn resolve_and_lock(
         }
         Desired::Put | Desired::Delete => {
             if !exists_before && matches!(intent.desired, Desired::Put) {
-                e.replace_create_lock(id.clone());
+                e.replace_create_lock(*id);
             } else {
-                e.replace_write_lock(id.clone());
+                e.replace_write_lock(*id);
             }
         }
     }
@@ -878,16 +878,16 @@ fn writeback_changes(
                 if let CurrentState::External { writer: prev } = &e.current
                     && prev != id
                 {
-                    superseded.push(prev.clone());
+                    superseded.push(*prev);
                 }
                 // Replaying a write-back must not demote an authoritative
                 // direct-commit value. A value newly published in the
                 // transaction record becomes an external value instead (ADR-054).
                 if e.current.writer() != Some(id) {
                     e.current = if matches!(intent.desired, Desired::Delete) {
-                        CurrentState::Tombstone { writer: id.clone() }
+                        CurrentState::Tombstone { writer: *id }
                     } else {
-                        CurrentState::External { writer: id.clone() }
+                        CurrentState::External { writer: *id }
                     };
                 }
             }
@@ -1104,7 +1104,7 @@ impl KeyLocker {
         requirement: Requirement,
     ) -> Result<bool, TransError> {
         let mut operation = ReleaseOperation {
-            id: id.clone(),
+            id: *id,
             path: path.clone(),
             requirement: Requirement::ANY,
         };
@@ -1346,7 +1346,7 @@ impl KeyLocker {
         intents: Arc<Vec<KeyIntent>>,
     ) -> Result<WriteBackOutcome, TransError> {
         let operation = WriteBackOperation {
-            id: id.clone(),
+            id: *id,
             path: path.clone(),
             intents,
         };
@@ -1371,7 +1371,7 @@ impl KeyLocker {
         let mut backoff = self.retry.backoff();
         loop {
             let operation = AcquireOperation {
-                id: id.clone(),
+                id: *id,
                 path: group.path.clone(),
                 intents: intents.clone(),
                 membership: group.membership,
@@ -1878,7 +1878,7 @@ mod tests {
         let unrelated = mk_tid(1, "unrelated");
         let tx = mk_tid(2, "tx");
         let mut other = LeafEntry::new(b"other");
-        other.replace_write_lock(unrelated.clone());
+        other.replace_write_lock(unrelated);
         let root = Node::leaf(LeafBody::from_entries([other]));
         replace_root(&ctx, &root).await;
         log.lock().unwrap().clear();
@@ -1908,11 +1908,11 @@ mod tests {
         ctx.monitor.begin_tx(&gate);
         ctx.monitor.begin_tx(&tx);
         let mut node = Node::leaf(LeafBody::new());
-        node.set_structural_gate(gate.clone());
+        node.set_structural_gate(gate);
         replace_root(&ctx, &node).await;
 
         let waiting_locker = locker.clone();
-        let waiting_tx = tx.clone();
+        let waiting_tx = tx;
         let waiting = tokio::spawn(async move {
             waiting_locker
                 .keys()
@@ -1959,9 +1959,9 @@ mod tests {
         let tx = mk_tid(1, "tx");
         let existing = LeafEntry::new(b"a").with_current(CurrentState::External { writer });
         let mut created = LeafEntry::new(b"z");
-        created.replace_create_lock(tx.clone());
+        created.replace_create_lock(tx);
         let mut node = Node::leaf(LeafBody::from_entries([existing, created]));
-        node.set_membership_writer(tx.clone());
+        node.set_membership_writer(tx);
         let content_limit = node.content_encoded_len() - 1;
         let node_max_bytes = node.encoded_len() + 64;
         let policy = NodeSizePolicy::builder()
@@ -2173,7 +2173,7 @@ mod tests {
         assert_eq!(e.lock_type(), LockType::Read);
         let mut holders = e.lock_holders().to_vec();
         holders.sort_by_key(|t| t.to_string());
-        let mut expected = vec![tx1.clone(), tx2.clone()];
+        let mut expected = vec![tx1, tx2];
         expected.sort_by_key(|t| t.to_string());
         assert_eq!(holders, expected);
     }
@@ -2220,7 +2220,7 @@ mod tests {
         let young = mk_tid(2, "young");
         ctx.monitor.begin_tx(&young);
         let locker2 = locker.clone();
-        let young2 = young.clone();
+        let young2 = young;
         let groups = group_of(key, put_intent(key));
         let waiting = tokio::spawn(async move {
             locker2
@@ -2269,7 +2269,7 @@ mod tests {
         let young = mk_tid(2, "young");
         ctx.monitor.begin_tx(&young);
         let locker2 = locker.clone();
-        let young2 = young.clone();
+        let young2 = young;
         let groups = group_of(key, put_intent(key));
         let waiting = tokio::spawn(async move {
             locker2
@@ -2285,12 +2285,12 @@ mod tests {
         );
 
         // `old` commits its write, then publishes the current state and releases.
-        let mut record = TxRecord::new(old.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(old, TxCommitStatus::Committed);
         record.writes = vec![TxWrite {
             key: logical_key(key),
             value: Arc::from(&b"v1"[..]),
             deleted: false,
-            prev_writer: TxId::default(),
+            prev_writer: None,
         }];
         ctx.monitor.commit_tx(record).await.unwrap();
         locker.keys().write_back(&old, &old_locked).await;
@@ -2402,7 +2402,7 @@ mod tests {
             .await
             .unwrap();
         let mut node = loaded.node().clone();
-        node.set_structural_gate(gate.clone());
+        node.set_structural_gate(gate);
         replace_root(&ctx, &node).await;
 
         let superseded = tokio::time::timeout(
@@ -2474,14 +2474,14 @@ mod tests {
             &group_of_intents(vec![put_intent(&first), put_intent(&second)]),
         )
         .await;
-        let mut record = TxRecord::new(writer.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(writer, TxCommitStatus::Committed);
         record.writes = [(&first, b"aaaaa"), (&second, b"bbbbb")]
             .into_iter()
             .map(|(key, value)| TxWrite {
                 key: logical_key(key),
                 value: Arc::from(&value[..]),
                 deleted: false,
-                prev_writer: TxId::default(),
+                prev_writer: None,
             })
             .collect();
         ctx.monitor.commit_tx(record).await.unwrap();
@@ -2497,9 +2497,7 @@ mod tests {
 
         assert_eq!(
             entry_of(&ctx, &first).await.unwrap().current,
-            CurrentState::External {
-                writer: writer.clone()
-            }
+            CurrentState::External { writer }
         );
         assert_eq!(
             entry_of(&ctx, &second).await.unwrap().current,
@@ -2545,15 +2543,13 @@ mod tests {
         let writer = mk_tid(2, "writer");
         for current in [
             CurrentState::Inline {
-                writer: previous.clone(),
+                writer: previous,
                 value: Arc::from(b"value".as_slice()),
             },
-            CurrentState::Tombstone {
-                writer: previous.clone(),
-            },
+            CurrentState::Tombstone { writer: previous },
         ] {
             let mut entry = LeafEntry::new(key).with_current(current);
-            entry.replace_write_lock(writer.clone());
+            entry.replace_write_lock(writer);
             replace_root(&ctx, &Node::leaf(LeafBody::from_entries([entry]))).await;
             let group = group_of(key, put_intent(key)).remove(&root_path()).unwrap();
             let hints = locker
@@ -2563,9 +2559,7 @@ mod tests {
             assert!(hints.is_empty());
             assert_eq!(
                 entry_of(&ctx, key).await.unwrap().current,
-                CurrentState::External {
-                    writer: writer.clone()
-                }
+                CurrentState::External { writer }
             );
         }
     }
@@ -2578,11 +2572,11 @@ mod tests {
         let key = b"key";
         let tx = mk_tid(1, "writer");
         let inlined = CurrentState::Inline {
-            writer: tx.clone(),
+            writer: tx,
             value: Arc::from(b"kept".as_slice()),
         };
         let mut entry = LeafEntry::new(key).with_current(inlined.clone());
-        entry.replace_write_lock(tx.clone());
+        entry.replace_write_lock(tx);
         replace_root(&ctx, &Node::leaf(LeafBody::from_entries([entry]))).await;
 
         let group = group_of(key, put_intent(key)).remove(&root_path()).unwrap();
@@ -2606,7 +2600,7 @@ mod tests {
         let writer = mk_tid(1, "writer");
         let reader = mk_tid(2, "reader");
         let inlined = CurrentState::Inline {
-            writer: writer.clone(),
+            writer,
             value: Arc::from(b"kept".as_slice()),
         };
         let seeded = LeafEntry::new(key).with_current(inlined.clone());
@@ -2614,7 +2608,7 @@ mod tests {
         // inline bytes the entry actually carries: demoting the payload is the
         // only way this acquisition could fit.
         let mut demoted = LeafEntry::new(key).with_current(CurrentState::External { writer });
-        demoted.acquire_read_lock(reader.clone());
+        demoted.acquire_read_lock(reader);
         let policy = NodeSizePolicy::builder()
             .node_max_bytes(Node::leaf(LeafBody::from_entries([demoted])).encoded_len())
             .split_headroom_bytes(0)
@@ -2658,12 +2652,12 @@ mod tests {
         use glassdb_storage::transaction::{TxRecord, TxWrite};
         let writer = mk_tid(0, "seed");
         ctx.monitor.begin_tx(&writer);
-        let mut record = TxRecord::new(writer.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(writer, TxCommitStatus::Committed);
         record.writes = vec![TxWrite {
             key: logical_key(key),
             value: Arc::from(value),
             deleted: false,
-            prev_writer: TxId::default(),
+            prev_writer: None,
         }];
         ctx.monitor.commit_tx(record).await.unwrap();
 
@@ -2949,7 +2943,7 @@ mod tests {
                 CollectionId::from_slice(&[index + 10; 16]).unwrap(),
             );
             let mut record = CollectionRecord::new();
-            record.set_directory_writer(id.clone());
+            record.set_directory_writer(*id);
             assert!(
                 ctx._foundation
                     .records
@@ -2982,7 +2976,7 @@ mod tests {
             let id = mk_tid(1, "directory");
             let (locks, changes) = seed_directory_locks(&ctx, &id).await;
             let mut record = TxRecord::new(
-                id.clone(),
+                id,
                 if write_back {
                     TxCommitStatus::Committed
                 } else {
@@ -3230,12 +3224,12 @@ mod tests {
                 key: intent.key.clone(),
                 value: Arc::from(b"value".as_slice()),
                 deleted: false,
-                prev_writer: TxId::default(),
+                prev_writer: None,
             })
             .collect();
         let proofs = lock_ok(&locker, &tx, &groups).await;
         let locked = LockedTx::from_proofs(groups, proofs).unwrap();
-        let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(tx, TxCommitStatus::Committed);
         record.writes = writes;
         ctx.monitor.commit_tx(record).await.unwrap();
 
@@ -3269,7 +3263,7 @@ mod tests {
         ctx.monitor.begin_tx(&tx2);
 
         let (l1, l2) = (locker.clone(), locker.clone());
-        let (t1, t2) = (tx1.clone(), tx2.clone());
+        let (t1, t2) = (tx1, tx2);
         let g1 = group_of(key, read_intent(key));
         let g2 = group_of(key, read_intent(key));
         let h1 = tokio::spawn(async move {
@@ -3329,7 +3323,7 @@ mod tests {
         ctx.monitor.begin_tx(&tx2);
 
         let (l1, l2) = (locker.clone(), locker.clone());
-        let (t1, t2) = (tx1.clone(), tx2.clone());
+        let (t1, t2) = (tx1, tx2);
         let g1 = group_of(&ka, put_intent(&ka));
         let g2 = group_of(&kb, put_intent(&kb));
         let h1 = tokio::spawn(async move {
@@ -3383,7 +3377,7 @@ mod tests {
 
         lock_ok(&locker, &old, &group_of(&ka, put_intent(&ka))).await;
 
-        let (waiting_locker, waiting_id) = (locker.clone(), young.clone());
+        let (waiting_locker, waiting_id) = (locker.clone(), young);
         let waiting_group = group_of(&kb, put_intent(&kb));
         let waiting = tokio::spawn(async move {
             waiting_locker
@@ -3413,12 +3407,12 @@ mod tests {
         let groups = group_of(key, put_intent(key));
         let proofs = lock_ok(locker, tx, &groups).await;
         let locked = LockedTx::from_proofs(groups, proofs).unwrap();
-        let mut record = TxRecord::new(tx.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(*tx, TxCommitStatus::Committed);
         record.writes = vec![TxWrite {
             key: logical_key(key),
             value: Arc::from(&b"v"[..]),
             deleted: false,
-            prev_writer: TxId::default(),
+            prev_writer: None,
         }];
         ctx.monitor.commit_tx(record).await.unwrap();
         locked
@@ -3446,7 +3440,7 @@ mod tests {
         let before = count_stores(&log, &leaf_path);
         gate.arm();
         let (l1, l2) = (locker.clone(), locker.clone());
-        let (t1, t2) = (tx1.clone(), tx2.clone());
+        let (t1, t2) = (tx1, tx2);
         let h1 = tokio::spawn(async move { l1.keys().write_back(&t1, &lt1).await });
         let h2 = tokio::spawn(async move { l2.keys().write_back(&t2, &lt2).await });
         rt::sleep(Duration::from_millis(50)).await;
@@ -3486,7 +3480,7 @@ mod tests {
         let before = count_stores(&log, &leaf_path);
         gate.arm();
         let (l1, l2) = (locker.clone(), locker.clone());
-        let (t1, t2) = (tx1.clone(), tx2.clone());
+        let (t1, t2) = (tx1, tx2);
         // The write-back is the driver (parks in the gated load); the acquire
         // queues and is absorbed once the load returns.
         let hw = tokio::spawn(async move { l1.keys().write_back(&t1, &lt1).await });
@@ -3537,7 +3531,7 @@ mod tests {
 
         gate.arm();
         let write_locker = locker.clone();
-        let write_id = writer.clone();
+        let write_id = writer;
         let write_locked = locked.clone();
         let write_back = tokio::spawn(async move {
             write_locker
@@ -3552,7 +3546,7 @@ mod tests {
         );
 
         let acquire_locker = locker.clone();
-        let acquire_id = acquirer.clone();
+        let acquire_id = acquirer;
         let acquire = tokio::spawn(async move {
             acquire_locker
                 .keys()
@@ -3623,7 +3617,7 @@ mod tests {
         });
 
         let task_locker = locker.clone();
-        let task_writer = writer.clone();
+        let task_writer = writer;
         let task_locked = locked.clone();
         let write_back = tokio::spawn(async move {
             task_locker
@@ -3667,7 +3661,7 @@ mod tests {
         let before = count_stores(&log, &leaf_path);
         gate.arm();
         let (l1, l2) = (locker.clone(), locker.clone());
-        let (t1, t2) = (tx1.clone(), tx2.clone());
+        let (t1, t2) = (tx1, tx2);
         let path1 = root_path();
         let path2 = root_path();
         let h1 =
@@ -3714,7 +3708,7 @@ mod tests {
         ctx.monitor.begin_tx(&young);
 
         let (lo, ly) = (locker.clone(), locker.clone());
-        let (to, ty) = (old.clone(), young.clone());
+        let (to, ty) = (old, young);
         let go = group_of(key, put_intent(key));
         let gy = group_of(key, put_intent(key));
         let ho = tokio::spawn(async move {
@@ -3775,7 +3769,7 @@ mod tests {
         ctx.monitor.begin_tx(&young);
 
         let (lo, ly) = (locker.clone(), locker.clone());
-        let (to, ty) = (old.clone(), young.clone());
+        let (to, ty) = (old, young);
         let go = group_of(key, put_intent(key));
         let gy = group_of(key, put_intent(key));
         let ho = tokio::spawn(async move {
@@ -3838,7 +3832,7 @@ mod tests {
         ctx.monitor.begin_tx(&b);
 
         let (la, lb) = (locker.clone(), locker.clone());
-        let (ta, tb) = (a.clone(), b.clone());
+        let (ta, tb) = (a, b);
         let ga = group_of(key, put_intent(key));
         let gb = group_of(key, put_intent(key));
         let ha = tokio::spawn(async move {
@@ -3914,7 +3908,7 @@ mod tests {
             let before = count_stores(&log, &leaf_path);
             gate.arm();
             let (lw, la) = (locker.clone(), locker.clone());
-            let (cw, ca) = (committer.clone(), acquirer.clone());
+            let (cw, ca) = (committer, acquirer);
             let hw = tokio::spawn(async move { lw.keys().write_back(&cw, &lt).await });
             let ha = tokio::spawn(async move {
                 la.keys()
@@ -3976,7 +3970,7 @@ mod tests {
         let before = count_stores(&log, &leaf_path);
         gate.arm();
         let peer_lock = tokio::spawn({
-            let (locker, peer) = (locker.clone(), peer.clone());
+            let (locker, peer) = (locker.clone(), peer);
             async move {
                 let mut groups = group_of(b"phantom", put_intent(b"phantom"));
                 for group in groups.values_mut() {
@@ -3989,7 +3983,7 @@ mod tests {
             }
         });
         let scanner_lock = tokio::spawn({
-            let (locker, scanner) = (locker.clone(), scanner.clone());
+            let (locker, scanner) = (locker.clone(), scanner);
             async move {
                 let groups = group_of(b"read", read_intent(b"read"));
                 locker
@@ -4075,7 +4069,7 @@ mod tests {
         let young = mk_tid(2, "young");
         ctx.monitor.begin_tx(&young);
         let l = locker.clone();
-        let y = young.clone();
+        let y = young;
         let g = group_of(key, put_intent(key));
         let waiting = tokio::spawn(async move {
             l.keys()

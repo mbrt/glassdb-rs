@@ -308,7 +308,7 @@ mod tests {
     fn every_object_path_variant_is_classified() {
         let db_prefix = DbPrefix::try_from("db").unwrap();
         let collection = CollectionAddress::root("db");
-        let participant = TxId::from_bytes(b"participant".to_vec());
+        let participant = TxId::with_priority(0, b"participant");
         let cases = [
             (
                 ObjectPath::DatabaseMetadata {
@@ -338,7 +338,7 @@ mod tests {
             (
                 ObjectPath::Transaction {
                     db_prefix: db_prefix.clone(),
-                    id: participant.clone(),
+                    id: participant,
                 },
                 ObjectRole::TransactionRecord,
             ),

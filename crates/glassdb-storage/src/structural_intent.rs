@@ -125,12 +125,9 @@ impl StructuralIntent {
     }
 
     fn from_proto(db_prefix: &DbPrefix, raw: pb::StructuralIntent) -> Result<Self, StorageError> {
-        let participant_id = TxId::from_bytes(raw.participant_id);
-        if participant_id.is_unset() {
-            return Err(StorageError::other(
-                "structural intent has no topology participant",
-            ));
-        }
+        let participant_id = TxId::from_slice(&raw.participant_id).ok_or_else(|| {
+            StorageError::other("structural intent has an invalid topology participant")
+        })?;
         let phase = match pb::structural_intent::Phase::try_from(raw.phase) {
             Ok(pb::structural_intent::Phase::Preparing) => StructuralIntentPhase::Preparing,
             Ok(pb::structural_intent::Phase::Ready) => StructuralIntentPhase::Ready,
@@ -222,6 +219,10 @@ fn parse_node_id(bytes: &[u8], role: &str) -> Result<NodeId, StorageError> {
 mod tests {
     use super::*;
 
+    fn tx_id(prefix: &[u8]) -> TxId {
+        TxId::with_priority(0, prefix)
+    }
+
     fn db_prefix() -> DbPrefix {
         DbPrefix::try_from("db").unwrap()
     }
@@ -252,7 +253,7 @@ mod tests {
                 created_node_ids: vec![node_id(2)],
                 split_key: b"m".to_vec(),
             },
-            participant_id: TxId::from_bytes(b"participant".to_vec()),
+            participant_id: tx_id(b"participant"),
             phase: StructuralIntentPhase::Ready,
         };
         assert_eq!(round_trip(&intent), intent);
@@ -268,7 +269,7 @@ mod tests {
                 created_node_ids: vec![node_id(1), node_id(2)],
                 split_key: Vec::new(),
             },
-            participant_id: TxId::from_bytes(b"participant".to_vec()),
+            participant_id: tx_id(b"participant"),
             phase: StructuralIntentPhase::Preparing,
         };
         assert_eq!(round_trip(&intent), intent);
@@ -281,7 +282,7 @@ mod tests {
             source_node_id: Some(node_id(1)),
             source_revision: String::new(),
             change: StructuralChange::Merge { target: None },
-            participant_id: TxId::from_bytes(b"participant".to_vec()),
+            participant_id: tx_id(b"participant"),
             phase: StructuralIntentPhase::Preparing,
         };
         assert_eq!(round_trip(&intent), intent);
@@ -303,7 +304,7 @@ mod tests {
         let valid = pb::StructuralIntent {
             collection_id: vec![0; 16],
             source_node_id: vec![1; 16],
-            participant_id: b"participant".to_vec(),
+            participant_id: vec![3; 16],
             phase: pb::structural_intent::Phase::Ready.into(),
             merge: Some(pb::MergeIntent {
                 target_node_id: vec![2; 16],
@@ -357,7 +358,7 @@ mod tests {
             source_node_id: vec![1; 16],
             created_node_ids: vec![vec![2; 16]],
             split_key: b"m".to_vec(),
-            participant_id: b"participant".to_vec(),
+            participant_id: vec![3; 16],
             ..pb::StructuralIntent::default()
         };
         assert!(decode(&valid).is_ok());
@@ -369,8 +370,10 @@ mod tests {
             let mut source = valid.clone();
             source.source_node_id = id.clone();
             let mut created = valid.clone();
-            created.created_node_ids = vec![id];
-            for raw in [collection, source, created] {
+            created.created_node_ids = vec![id.clone()];
+            let mut participant = valid.clone();
+            participant.participant_id = id;
+            for raw in [collection, source, created, participant] {
                 assert!(decode(&raw).is_err(), "{raw:?}");
             }
         }
@@ -378,9 +381,11 @@ mod tests {
         // An empty source ID names the tree root, but no other ID can be empty.
         let mut collection = valid.clone();
         collection.collection_id.clear();
-        let mut created = valid;
+        let mut created = valid.clone();
         created.created_node_ids = vec![Vec::new()];
-        for raw in [collection, created] {
+        let mut participant = valid;
+        participant.participant_id.clear();
+        for raw in [collection, created, participant] {
             assert!(decode(&raw).is_err(), "{raw:?}");
         }
     }
@@ -395,7 +400,7 @@ mod tests {
                 created_node_ids: vec![NodeId::from_bytes([2; 16])],
                 split_key: b"m".to_vec(),
             },
-            participant_id: TxId::from_bytes(b"participant".to_vec()),
+            participant_id: TxId::from_bytes([3; 16]),
             phase: StructuralIntentPhase::Ready,
         };
         let bytes = [
@@ -405,7 +410,9 @@ mod tests {
             &[1; 16],
             b"\x1a\x02v7\x22\x10",
             &[2; 16],
-            b"\x2a\x01m\x3a\x0bparticipant\x40\x01",
+            b"\x2a\x01m\x3a\x10",
+            &[3; 16],
+            b"\x40\x01",
         ]
         .concat();
 
@@ -429,7 +436,7 @@ mod tests {
                     generation: 5,
                 }),
             },
-            participant_id: TxId::from_bytes(b"participant".to_vec()),
+            participant_id: TxId::from_bytes([3; 16]),
             phase: StructuralIntentPhase::Ready,
         };
         let bytes = [
@@ -437,7 +444,9 @@ mod tests {
             &[0; 16],
             b"\x12\x10",
             &[1; 16],
-            b"\x1a\x02v1\x3a\x0bparticipant\x40\x01\x4a\x17\x0a\x10",
+            b"\x1a\x02v1\x3a\x10",
+            &[3; 16],
+            b"\x40\x01\x4a\x17\x0a\x10",
             &[2; 16],
             b"\x12\x01m\x18\x05",
         ]

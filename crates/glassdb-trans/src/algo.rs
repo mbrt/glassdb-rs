@@ -98,7 +98,7 @@ impl IdentityRetirement {
         };
         let mon = self.mon.clone();
         let gc_hints = self.gc_hints.clone();
-        let tx_id = tx_id.clone();
+        let tx_id = *tx_id;
         bg.spawn_waited(async move {
             if mon.abort_owned_tx(&tx_id).await.is_ok() {
                 gc_hints.schedule(tx_id);
@@ -214,7 +214,7 @@ impl Handle {
         let id = self.id.renew();
         self.collections.renew();
         self.state.renew();
-        self.id = id.clone();
+        self.id = id;
         self.retirement.arm(id);
     }
 }
@@ -404,7 +404,7 @@ impl Algo {
                 self.collection_reservation_limit,
             ),
             state: HandleState::new(),
-            retirement: IdentityRetirementGuard::new(self.retirement.clone(), id.clone()),
+            retirement: IdentityRetirementGuard::new(self.retirement.clone(), id),
             id,
             backoff: self.acquisition_retry.backoff(),
         }
@@ -567,7 +567,7 @@ impl Algo {
         }
         match self.mon.abort_owned_tx(&tx.id).await? {
             OwnerAbortOutcome::Acknowledged => {
-                self.gc_hints.schedule(tx.id.clone());
+                self.gc_hints.schedule(tx.id);
                 self.collection_commit.abort(&tx.id, &tx.collections).await
             }
             // A dropped or otherwise unresolved owner operation was pinned as
@@ -575,7 +575,7 @@ impl Algo {
             // cleanup; local rollback must not race an effect that may land
             // after this future returns.
             OwnerAbortOutcome::Pinned => {
-                self.gc_hints.schedule(tx.id.clone());
+                self.gc_hints.schedule(tx.id);
                 Ok(())
             }
             // The commit point won before cleanup observed its result. Its
@@ -608,7 +608,7 @@ impl Algo {
     }
 
     async fn renew_after_wound(&self, tx: &mut Handle) {
-        let retired_id = tx.id.clone();
+        let retired_id = tx.id;
         if let Err(error) = self.end(tx).await {
             tracing::debug!(
                 transaction = %retired_id,
@@ -914,7 +914,7 @@ impl Algo {
             Some(bg) => {
                 let locker = self.locker.clone();
                 let gc_hints = self.gc_hints.clone();
-                let id = id.clone();
+                let id = *id;
                 // Cancelling a dedup driver may need to spawn a successor for
                 // merged callers, so shutdown drains this finite pass.
                 bg.spawn_waited(async move {
@@ -1232,7 +1232,7 @@ impl Algo {
         locks: Vec<TxLock>,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(*id, TxCommitStatus::Committed);
         for w in accesses.final_writes() {
             let (value, deleted): (Arc<[u8]>, bool) = match w.operation() {
                 WriteOp::Put(value) => (value.clone(), false),
@@ -1242,7 +1242,7 @@ impl Algo {
                 key: w.key().clone(),
                 value,
                 deleted,
-                prev_writer: TxId::default(),
+                prev_writer: None,
             });
         }
         collections.committed_manifest(locks).apply_to(&mut record);
@@ -1486,7 +1486,7 @@ mod tests {
         let key = logical_key(b"interrupted");
         let accesses = AccessSet::new(Vec::new(), vec![wa(&key, b"uncommitted")], Vec::new());
         let interrupted_handle = begin_accesses(&algo, accesses.clone());
-        let interrupted = interrupted_handle.id().clone();
+        let interrupted = *interrupted_handle.id();
         tctx.tmon.begin_tx(&interrupted);
         let outcome = tctx
             .locker
@@ -1523,7 +1523,7 @@ mod tests {
             AccessSet::new(Vec::new(), vec![wa(&keyp, val)], Vec::new()),
         );
         tm.commit(&mut h).await.unwrap();
-        let tid = h.id().clone();
+        let tid = *h.id();
         tm.end(&mut h).await.unwrap();
 
         let status = tctx
@@ -1567,7 +1567,7 @@ mod tests {
             AccessSet::new(vec![r], vec![wa(&writep, &external)], Vec::new()),
         );
         tm.commit(&mut h).await.unwrap();
-        let tid = h.id().clone();
+        let tid = *h.id();
         tm.end(&mut h).await.unwrap();
 
         let record = tctx
@@ -1632,7 +1632,7 @@ mod tests {
             .prepare(&mut handle.collections)
             .await
             .unwrap();
-        let id = handle.id().clone();
+        let id = *handle.id();
         tm.mon.begin_tx(&id);
 
         tm.commit_writes(&AccessSet::default(), &handle.collections, Vec::new(), &id)
@@ -1666,7 +1666,7 @@ mod tests {
                 }],
             },
         );
-        let id = handle.id().clone();
+        let id = *handle.id();
         let lock = TxLock::TopologyParticipant {
             collection: test_collection(),
         };
@@ -1719,7 +1719,7 @@ mod tests {
             .prepare(&mut handle.collections)
             .await
             .unwrap();
-        let id = handle.id().clone();
+        let id = *handle.id();
         tm.mon.begin_tx(&id);
         assert!(handle.engage());
         tm.commit_writes(&AccessSet::default(), &handle.collections, Vec::new(), &id)
@@ -1770,7 +1770,7 @@ mod tests {
                 }],
             },
         );
-        let id = handle.id().clone();
+        let id = *handle.id();
         tm.mon.begin_tx(&id);
         assert!(handle.engage());
         tm.collection_commit
@@ -1871,7 +1871,7 @@ mod tests {
             &tm,
             AccessSet::new(Vec::new(), vec![wa(&keyp, &value)], Vec::new()),
         );
-        let old_id = h.id().clone();
+        let old_id = *h.id();
         assert!(h.engage());
         tctx.tmon.begin_tx(&old_id);
         tctx.tmon.preempt_tx(&old_id).await.unwrap();
@@ -1918,7 +1918,7 @@ mod tests {
             &tm,
             AccessSet::new(Vec::new(), vec![wa(&keyp, b"a")], Vec::new()),
         );
-        let id_before = h.id().clone();
+        let id_before = *h.id();
         let tm2 = tm.clone();
         let committing = tokio::spawn(async move {
             let res = tm2.commit(&mut h).await;
@@ -1944,7 +1944,7 @@ mod tests {
             res.expect("renewed identity commits once the holder releases"),
             BodyDecision::ReturnOutcome
         );
-        let renewed_id = h.id().clone();
+        let renewed_id = *h.id();
         assert_ne!(renewed_id, id_before);
         assert!(!renewed_id.older(&id_before));
         assert!(!id_before.older(&renewed_id));
@@ -2125,7 +2125,7 @@ mod tests {
             &algo,
             AccessSet::new(vec![stale], vec![wa(&key, &external)], Vec::new()),
         );
-        let old_id = handle.id().clone();
+        let old_id = *handle.id();
         assert_eq!(
             algo.commit(&mut handle).await.unwrap(),
             BodyDecision::ReplayBody,
@@ -2192,7 +2192,7 @@ mod tests {
             ),
             CatalogAccesses::default(),
         );
-        let id_before = h.id().clone();
+        let id_before = *h.id();
         let outcome = engine
             .commit(&mut h)
             .await
@@ -2291,7 +2291,7 @@ mod tests {
     // write and make commit-path counts depend on random transaction entropy.
     #[test]
     fn write_counts_parses_transaction_prefix_named_like_node() {
-        let id = TxId::from_bytes(vec![0x97, 0x30]);
+        let id = TxId::with_priority(0, &[0x97, 0x30]);
         let path = ObjectPath::Transaction {
             db_prefix: test_db_prefix(),
             id,
@@ -2473,10 +2473,9 @@ mod tests {
             .await
             .unwrap();
         let mut edit = loaded.into_edit();
-        edit.set_entries(LeafBody::from_entries([LeafEntry::new(b"deleted")
-            .with_current(CurrentState::Tombstone {
-                writer: writer.clone(),
-            })]));
+        edit.set_entries(LeafBody::from_entries([
+            LeafEntry::new(b"deleted").with_current(CurrentState::Tombstone { writer })
+        ]));
         assert!(tctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 
         let read = do_read(&tctx, &key).await;
@@ -2517,10 +2516,7 @@ mod tests {
     async fn point_read_re_resolves_writer_at_validation_barrier() {
         let (tm, tctx) = new_algo().await;
         let keyp = logical_key(b"k");
-        let previous = commit_writes(&tm, vec![wa(&keyp, b"v1")])
-            .await
-            .id()
-            .clone();
+        let previous = *commit_writes(&tm, vec![wa(&keyp, b"v1")]).await.id();
 
         let holder = TxId::with_priority(1, b"holder");
         tctx.tmon.begin_tx(&holder);
@@ -2549,13 +2545,13 @@ mod tests {
         // Finalize only the transaction record. The leaf still contains the
         // same pending lock, so leaf validation alone cannot detect that the
         // effective writer moved.
-        let mut record = TxRecord::new(holder.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(holder, TxCommitStatus::Committed);
         record.locks = locked.locked_paths();
         record.writes.push(TxWrite {
             key: keyp,
             value: Arc::from(b"v2".as_slice()),
             deleted: false,
-            prev_writer: previous,
+            prev_writer: Some(previous),
         });
         tctx.tmon.commit_tx(record).await.unwrap();
 
@@ -2577,10 +2573,7 @@ mod tests {
     async fn point_read_accepts_aborted_holder_at_validation_barrier() {
         let (tm, tctx) = new_algo().await;
         let keyp = logical_key(b"k");
-        let previous = commit_writes(&tm, vec![wa(&keyp, b"v1")])
-            .await
-            .id()
-            .clone();
+        let previous = *commit_writes(&tm, vec![wa(&keyp, b"v1")]).await.id();
 
         let holder = TxId::with_priority(1, b"holder");
         tctx.tmon.begin_tx(&holder);
@@ -2855,7 +2848,7 @@ mod tests {
         let keyp = logical_key(b"k");
 
         commit_writes(&tm, vec![wa(&keyp, b"v")]).await;
-        let deleted_by = commit_writes(&tm, vec![wdel(&keyp)]).await.id().clone();
+        let deleted_by = *commit_writes(&tm, vec![wdel(&keyp)]).await.id();
 
         // A read now resolves to not-found.
         let r = do_read(&tctx, &keyp).await;
@@ -3082,13 +3075,13 @@ mod tests {
 
         // Commit only the transaction record: membership_generation is unchanged
         // until write-back, so the dependency is what must reject validation.
-        let mut record = TxRecord::new(holder.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(holder, TxCommitStatus::Committed);
         record.locks = locked.locked_paths();
         record.writes.push(TxWrite {
             key: key_path,
             value: Arc::from(b"value".as_slice()),
             deleted: false,
-            prev_writer: TxId::default(),
+            prev_writer: None,
         });
         tctx.tmon.commit_tx(record).await.unwrap();
 
@@ -3311,11 +3304,8 @@ mod tests {
         // S1 keeps its path, so it stays in this transaction's lock cover; only
         // its state changes. The parent separator may lag (ADR-031), because the
         // right-link carries the scan to S2 either way.
-        let entry = |key: &[u8]| {
-            LeafEntry::new(key).with_current(CurrentState::External {
-                writer: seed.clone(),
-            })
-        };
+        let entry =
+            |key: &[u8]| LeafEntry::new(key).with_current(CurrentState::External { writer: seed });
         tctx.nodes
             .store_node(
                 &test_collection(),
@@ -3359,11 +3349,9 @@ mod tests {
             .unwrap();
         let mut entries: Vec<LeafEntry> = s2.as_leaf().unwrap().entries().cloned().collect();
         let creator = TxId::with_priority(2, b"phantom");
-        entries.push(LeafEntry::new(b"z").with_current(CurrentState::External {
-            writer: creator.clone(),
-        }));
+        entries.push(LeafEntry::new(b"z").with_current(CurrentState::External { writer: creator }));
         let mut new_s2 = Node::leaf(LeafBody::from_entries(entries));
-        new_s2.set_membership_writer(creator.clone());
+        new_s2.set_membership_writer(creator);
         new_s2.remove_membership_holder(&creator);
         tctx.nodes
             .store_node(&test_collection(), &s2_id, &new_s2, Some(&s2_ver))
@@ -3410,7 +3398,7 @@ mod tests {
         }));
         let mut new_s1 = Node::leaf(LeafBody::from_entries(entries));
         let membership_writer = TxId::with_priority(2, b"membership");
-        new_s1.set_membership_writer(membership_writer.clone());
+        new_s1.set_membership_writer(membership_writer);
         new_s1.remove_membership_holder(&membership_writer);
         tctx.nodes
             .store_node(&test_collection(), &s1_id, &new_s1, Some(&s1_observation))

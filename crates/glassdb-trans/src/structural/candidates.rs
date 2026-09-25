@@ -222,7 +222,7 @@ impl MaintenanceCandidate {
     /// oldest structural priority or the largest requested headroom.
     fn coalesce(&mut self, other: MaintenanceCandidate) {
         if other.priority.older(&self.priority) {
-            self.priority = other.priority.clone();
+            self.priority = other.priority;
         }
         if let (
             CandidateCause::Split(SplitReason::InlinePressure { key, value_len }),

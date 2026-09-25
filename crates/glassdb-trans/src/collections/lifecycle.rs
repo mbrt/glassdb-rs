@@ -229,7 +229,7 @@ impl CollectionLifecycle {
                 }
             }
             if record.topology_freeze().is_none() {
-                assert!(record.set_topology_freeze(id.clone()));
+                assert!(record.set_topology_freeze(*id));
                 if self.records.store_record(&record, &observed).await? {
                     continue;
                 }
@@ -292,7 +292,7 @@ impl CollectionLifecycle {
             // exact-revision rewrite fuses the remaining one-shot structural
             // exclusion with intent installation: a late node CAS either lands
             // first and makes us retry, or loses and then observes the intent.
-            node.set_drop_intent(id.clone());
+            node.set_drop_intent(*id);
             if self
                 .nodes
                 .store_node(collection, node_id, &node, Some(&observed))
@@ -326,7 +326,7 @@ impl CollectionLifecycle {
             }
             // As for standalone nodes, the exact-revision rewrite closes the
             // final race without leaving a separate gate to recover on abort.
-            root.set_drop_intent(id.clone());
+            root.set_drop_intent(*id);
             if self.nodes.store_root(collection, &root, &observed).await? {
                 return Ok(());
             }
@@ -478,6 +478,10 @@ mod tests {
     use crate::engine::{AssemblyFixture, EngineConfig};
     use crate::monitor::TxRecoveryManifest;
 
+    fn tx_id(prefix: &[u8]) -> TxId {
+        TxId::with_priority(0, prefix)
+    }
+
     const COLLECTION: &str = "db/_c/0000000000000000000000";
     const SOURCE: NodeId = NodeId::from_bytes([0; 16]);
     const RIGHT: NodeId = NodeId::from_bytes([1; 16]);
@@ -574,7 +578,7 @@ mod tests {
 
     fn live_entry(key: &[u8]) -> LeafEntry {
         LeafEntry::new(key).with_current(CurrentState::External {
-            writer: TxId::from_bytes(vec![9]),
+            writer: tx_id(&[9]),
         })
     }
 
@@ -666,8 +670,8 @@ mod tests {
         }
         change.expected = Some(collection.id());
         change.op = CollectionOp::Drop;
-        let first = TxId::from_bytes(vec![1]);
-        let second = TxId::from_bytes(vec![2]);
+        let first = tx_id(&[1]);
+        let second = tx_id(&[2]);
         let manifest = TxRecoveryManifest {
             collection_changes: vec![TxCollectionChange {
                 parent: change.parent.clone(),
@@ -694,7 +698,7 @@ mod tests {
                 );
             }
             TxCommitStatus::Committed => {
-                let mut record = TxRecord::new(first.clone(), TxCommitStatus::Committed);
+                let mut record = TxRecord::new(first, TxCommitStatus::Committed);
                 record.collection_changes = manifest.collection_changes.clone();
                 owner.monitor.commit_tx(record).await.unwrap();
             }
@@ -710,7 +714,7 @@ mod tests {
         // loop; cached immutable Aborted status could otherwise hide it.
         let status_path = ObjectPath::Transaction {
             db_prefix: DbPrefix::try_from("db").unwrap(),
-            id: first.clone(),
+            id: first,
         }
         .to_string();
         let status_reads = AtomicUsize::new(0);
@@ -720,7 +724,6 @@ mod tests {
             let owner_lifecycle = owner_lifecycle.clone();
             let owner_monitor = owner.monitor.clone();
             let collection = collection.clone();
-            let first = first.clone();
             let contested_path = contested_path.clone();
             move |op| {
                 let status_read = matches!(
@@ -734,7 +737,7 @@ mod tests {
                 let owner_lifecycle = owner_lifecycle.clone();
                 let owner_monitor = owner_monitor.clone();
                 let collection = collection.clone();
-                let first = first.clone();
+                let first = first;
                 Box::pin(async move {
                     if repeated {
                         return Err(BackendError::other(
@@ -868,11 +871,11 @@ mod tests {
             retry,
             Arc::new(UnexpectedTopologySettler),
         );
-        let split_id = TxId::from_bytes(vec![2]);
-        let drop_id = TxId::from_bytes(vec![1]);
+        let split_id = tx_id(&[2]);
+        let drop_id = tx_id(&[1]);
 
         let mut source = Node::leaf(LeafBody::from_entries([live_entry(b"a"), live_entry(b"z")]));
-        source.set_structural_gate(split_id.clone());
+        source.set_structural_gate(split_id);
         assert!(
             primary
                 .nodes
@@ -901,7 +904,6 @@ mod tests {
         let shrink_landed = if fence_waits {
             let fencing = tokio::spawn({
                 let lifecycle = primary_lifecycle.clone();
-                let drop_id = drop_id.clone();
                 async move { lifecycle.fence_node(&collection(), &SOURCE, &drop_id).await }
             });
             gate.wait_until_entered().await;

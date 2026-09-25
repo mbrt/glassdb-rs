@@ -55,7 +55,7 @@ async fn recover_peer_participant(committed: bool, case: ParticipantReclamation)
         assert_eq!(intents.len(), 1);
         let intent = intents[0].1.value().unwrap();
         assert_eq!(intent.phase, StructuralIntentPhase::Ready);
-        let id = intent.participant_id.clone();
+        let id = intent.participant_id;
         assert_eq!(
             owner.mon.tx_status(&id).await.unwrap(),
             TxCommitStatus::Committed
@@ -105,13 +105,12 @@ async fn recover_peer_participant(committed: bool, case: ParticipantReclamation)
         // and before it checks the collection record.
         hooks.set_before({
             let owner = owner.clone();
-            let participant = participant.clone();
             let prefix =
                 ObjectPath::participant_structural_intents_prefix(&db_prefix("db"), &participant);
             move |op| {
                 let depart = matches!(op, BackendOp::List { .. }) && op.path() == prefix;
                 let owner = owner.clone();
-                let participant = participant.clone();
+                let participant = participant;
                 Box::pin(async move {
                     if depart {
                         owner
@@ -704,7 +703,7 @@ async fn structural_recovery_defers_while_the_source_writer_is_live() {
     sp.mon.begin_tx(&id);
 
     let mut source = leaf_node(&[b"a", b"b"], None, None);
-    source.set_structural_gate(id.clone());
+    source.set_structural_gate(id);
     s.store_node(COLL, "L", &source, None).await.unwrap();
     s.store_node(COLL, "R", &leaf_node(&[b"m", b"n"], None, None), None)
         .await
@@ -800,7 +799,7 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
         )
         .await
         .unwrap();
-    gated.set_structural_gate(id.clone());
+    gated.set_structural_gate(id);
     assert!(
         peer.store_node(COLL, "L", &gated, Some(&observation))
             .await
@@ -863,12 +862,12 @@ async fn stage_recovery_split(
     sibling: &str,
 ) -> (Node, LeafObservation) {
     let mut intent = nonroot_intent("L", sibling, b"");
-    intent.participant_id = participant.clone();
+    intent.participant_id = *participant;
     intent.phase = StructuralIntentPhase::Preparing;
     intent.source_revision.clear();
     let prepared = s.write_structural_intent(sibling, &intent).await.unwrap();
     let (mut source, observed) = s.load_node(COLL, "L", Requirement::ANY).await.unwrap();
-    source.set_structural_gate(worker.clone());
+    source.set_structural_gate(*worker);
     assert!(
         s.store_node(COLL, "L", &source, Some(&observed))
             .await
@@ -1066,7 +1065,6 @@ async fn later_participant_discovery_checks_sources_after_its_own_ready_intents(
         gate.arm();
         let recovering = {
             let sp = sp.clone();
-            let participant = participant.clone();
             tokio::spawn(async move {
                 if explicit {
                     sp.settle_topology_participant(&collection(), &participant)
@@ -1152,7 +1150,7 @@ async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
     sp.mon.begin_tx(&newcomer);
 
     let mut source = leaf_node(&[b"a", b"b"], None, None);
-    source.set_structural_gate(abandoned.clone());
+    source.set_structural_gate(abandoned);
     s.store_node(COLL, "L", &source, None).await.unwrap();
     let mut intent = nonroot_intent("L", "R", b"m");
     intent.source_revision = gated_revision(&s, "L").await;
@@ -1167,7 +1165,7 @@ async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
         .await
         .unwrap();
     source.remove_structural_gate(&abandoned);
-    source.set_structural_gate(newcomer.clone());
+    source.set_structural_gate(newcomer);
     assert!(
         s.store_node(COLL, "L", &source, Some(&observation))
             .await
@@ -1250,7 +1248,7 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
             created_node_ids: vec![test_node_id("L"), test_node_id("R")],
             split_key: b"m".to_vec(),
         },
-        participant_id: participant.clone(),
+        participant_id: participant,
         phase: StructuralIntentPhase::Preparing,
     };
     let prepared = peer.write_structural_intent("R", &intent).await.unwrap();
@@ -1274,7 +1272,7 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
         )
         .await
         .unwrap();
-    root.set_structural_gate(worker.clone());
+    root.set_structural_gate(worker);
     assert!(peer.store_root(COLL, &root, &observation).await.unwrap());
     let (_, gated) = peer
         .load_root_node(
@@ -1370,7 +1368,7 @@ async fn recovery_rolls_forward_a_landed_nonroot_split() {
             created_node_ids: vec![test_node_id("R")],
             split_key: b"t".to_vec(),
         },
-        participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
+        participant_id: tx_id(b"structural-participant"),
         phase: StructuralIntentPhase::Ready,
     };
     s.write_structural_intent("R", &intent).await.unwrap();
@@ -1600,7 +1598,7 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
     let id = TxId::with_priority(1, b"racing-split");
 
     let mut original = leaf_node(&[b"a", b"b", b"m", b"n"], None, None);
-    original.set_structural_gate(id.clone());
+    original.set_structural_gate(id);
     s.store_node(COLL, "L", &original, None).await.unwrap();
     let (mut shrunk, source_observation) = s
         .load_node(
@@ -1628,7 +1626,7 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
             created_node_ids: vec![test_node_id("R")],
             split_key,
         },
-        participant_id: TxId::from_bytes(b"structural-participant".to_vec()),
+        participant_id: tx_id(b"structural-participant"),
         phase: StructuralIntentPhase::Ready,
     };
     s.write_structural_intent("R", &intent).await.unwrap();
@@ -1715,7 +1713,7 @@ async fn recovery_that_needs_a_parent_split(
             created_node_ids: vec![test_node_id("R")],
             split_key: b"t".to_vec(),
         },
-        participant_id: participant.clone(),
+        participant_id: *participant,
         phase: StructuralIntentPhase::Ready,
     };
     (s, bg, sp, intent)
@@ -1728,7 +1726,7 @@ async fn sweep_defers_one_failed_parent_split_and_continues() {
     sp.mon.begin_tx(&participant);
 
     let mut orphan_intent = nonroot_intent("L", "U", b"z");
-    orphan_intent.participant_id = participant.clone();
+    orphan_intent.participant_id = participant;
     s.store_node(COLL, "U", &leaf_node(&[b"z"], None, None), None)
         .await
         .unwrap();

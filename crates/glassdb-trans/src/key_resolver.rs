@@ -629,13 +629,9 @@ mod tests {
             .map(|e| (e.key.clone(), e))
             .collect();
         let current = if deleted {
-            CurrentState::Tombstone {
-                writer: writer.clone(),
-            }
+            CurrentState::Tombstone { writer: *writer }
         } else {
-            CurrentState::External {
-                writer: writer.clone(),
-            }
+            CurrentState::External { writer: *writer }
         };
         entries.insert(key.to_vec(), LeafEntry::new(key).with_current(current));
         let new_leaf = LeafBody::from_entries(entries.into_values());
@@ -651,7 +647,7 @@ mod tests {
             store,
             key,
             LeafEntry::new(key).with_current(CurrentState::Inline {
-                writer: writer.clone(),
+                writer: *writer,
                 value: Arc::from(value),
             }),
         )
@@ -669,7 +665,7 @@ mod tests {
             .await
             .unwrap();
         let mut entry = existing.entries().lookup(key).cloned().unwrap();
-        entry.replace_write_lock(holder.clone());
+        entry.replace_write_lock(*holder);
         seed_entry(store, key, entry).await;
     }
 
@@ -701,12 +697,12 @@ mod tests {
     async fn commit_value(mon: &Monitor, key: &[u8], writer: &TxId, deleted: bool) {
         use glassdb_storage::transaction::{TxRecord, TxWrite};
         mon.begin_tx(writer);
-        let mut record = TxRecord::new(writer.clone(), TxCommitStatus::Committed);
+        let mut record = TxRecord::new(*writer, TxCommitStatus::Committed);
         record.writes = vec![TxWrite {
             key: logical_key(key),
             value: Arc::from(b"v".as_slice()),
             deleted,
-            prev_writer: TxId::default(),
+            prev_writer: None,
         }];
         mon.commit_tx(record).await.unwrap();
     }
@@ -731,7 +727,7 @@ mod tests {
             .map(|e| (e.key.clone(), e))
             .collect();
         let mut entry = LeafEntry::new(key);
-        entry.replace_write_lock(holder.clone());
+        entry.replace_write_lock(*holder);
         entries.insert(key.to_vec(), entry);
         let new_leaf = LeafBody::from_entries(entries.into_values());
         let mut edit = loaded.into_edit();
@@ -852,7 +848,7 @@ mod tests {
             .effective_point_states(std::slice::from_ref(&key), None, requirement)
             .await
             .unwrap();
-        assert_eq!(foreign[0].writer, Some(holder.clone()));
+        assert_eq!(foreign[0].writer, Some(holder));
 
         let own = resolver
             .effective_point_states(std::slice::from_ref(&key), Some(&holder), requirement)
@@ -892,7 +888,7 @@ mod tests {
             .resolve_key(&key_path, Requirement::ANY)
             .await
             .unwrap();
-        assert_eq!(resolved.writer, Some(writer.clone()), "still resolves");
+        assert_eq!(resolved.writer, Some(writer), "still resolves");
         assert_eq!(
             count_leaf_reads(&log),
             0,
@@ -1008,7 +1004,7 @@ mod tests {
         let writer = TxId::with_priority(1, b"inline");
         let inline = |key: &[u8]| {
             LeafEntry::new(key).with_current(CurrentState::Inline {
-                writer: writer.clone(),
+                writer,
                 value: Arc::from(b"v".as_slice()),
             })
         };

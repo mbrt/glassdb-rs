@@ -1140,7 +1140,7 @@ mod tests {
 
     fn live(key: &[u8]) -> LeafEntry {
         LeafEntry::new(key).with_current(crate::CurrentState::External {
-            writer: glassdb_data::TxId::from_bytes(vec![1]),
+            writer: glassdb_data::TxId::with_priority(0, &[1]),
         })
     }
 

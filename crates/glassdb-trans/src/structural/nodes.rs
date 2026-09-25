@@ -214,7 +214,7 @@ impl StructuralNodeAccess {
     pub(super) async fn finalize_worker(&self, id: &TxId) {
         if let Err(error) = self
             .mon
-            .commit_tx(TxRecord::new(id.clone(), TxCommitStatus::Committed))
+            .commit_tx(TxRecord::new(*id, TxCommitStatus::Committed))
             .await
         {
             tracing::debug!(
@@ -246,11 +246,7 @@ impl StructuralNodeAccess {
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
         let outcome = self
             .coord
-            .coordinate(StructuralGateOperation::new(
-                id.clone(),
-                path.clone(),
-                acquisition,
-            ))
+            .coordinate(StructuralGateOperation::new(*id, path.clone(), acquisition))
             .await?;
         let StructuralGateOutcome::Acquired(observation) = outcome else {
             return Ok(None);
