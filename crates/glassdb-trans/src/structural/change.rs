@@ -1,73 +1,59 @@
 //! The lifecycle and the steps that every structural change shares.
 //!
 //! A change first writes a `Preparing` structural intent below its topology
-//! participant and joins the collection topology. The split or merge module
-//! then gates its source, marks the intent `Ready`, and makes its node writes.
-//! The lifecycle deletes the intent when the change completes, discards it when
-//! the change stops before `Ready`, and leaves it to recovery otherwise.
+//! participant and joins the collection topology. The lifecycle then gates the
+//! source, and the split or merge module checks the change again and plans its
+//! node writes. After the lifecycle marks the intent `Ready`, the module makes
+//! the writes, and the lifecycle reconciles the parent. The lifecycle deletes
+//! the intent when the change completes, discards it when the change stops
+//! before `Ready`, and leaves it to recovery otherwise.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
-use glassdb_concurr::{RetryConfig, rt};
-use glassdb_data::{CollectionAddress, DbPrefix, NodeToken, TxId};
-use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxRecord};
-use glassdb_storage::{
-    CollectionStore, LeafBody, LeafObservation, Node, NodeStore, Requirement, StorageError,
-    StructuralIntentStore, Timeline, TreeRouter,
-};
+use glassdb_concurr::rt;
+use glassdb_data::{CollectionAddress, NodeToken, ObjectPath, TxId};
+use glassdb_storage::{LeafObservation, Node, Requirement};
 use tokio::sync::Notify;
 
 use crate::error::TransError;
-use crate::gc::GcHints;
-use crate::key_state_resolver::KeyStateResolver;
-use crate::leaf_coord::LeafCoordinator;
-use crate::monitor::{Monitor, TxRecoveryManifest};
+use crate::node_locking::GateAcquisition;
 
-use super::candidates::MaintenanceCandidates;
+use super::merge::Merger;
 use super::nodes::StructuralNodeAccess;
+use super::reclamation::ReclamationReporter;
 use super::reconcile::{ParentReconciler, ParentSplitContinuation, ReconciliationOutcome};
 use super::recovery::{
     ChangeKind, PreparedIntent, PreparedIntentCancellation, ReadyChange, ReadyIntent,
     ReadyIntentCompletion, ReadyIntentTransition, StructuralRecovery,
 };
-use super::split::{SplitReason, SplitTarget};
-use super::stats::Stats;
-use super::{merge, split};
+use super::split::{SplitReason, SplitTarget, Splitter};
+use super::topology::TopologyMembership;
 
-/// The stores, services, and shared state that every structural change of one
-/// database instance uses. Cloneable so the restructurer's loops share it.
+/// Runs splits and merges through the structural-intent lifecycle, and
+/// reconciles the parents that they change.
 #[derive(Clone)]
-pub(super) struct ChangeContext {
-    records: CollectionStore,
-    pub(super) nodes: NodeStore,
-    pub(super) router: TreeRouter,
-    pub(super) mon: Monitor,
+pub(super) struct ChangeLifecycle {
+    recovery: StructuralRecovery,
+    pub(super) topology: TopologyMembership,
     pub(super) structural_nodes: StructuralNodeAccess,
-    pub(super) timeline: Timeline,
-    // The candidate feed that the restructurer drains. The coordinator
-    // receives a clone for stored-leaf capacity; direct-commit policies receive
-    // lightweight hint sinks for inline-pressure observations.
-    pub(super) candidates: MaintenanceCandidates,
-    pub(super) reconciler: ParentReconciler,
-    pub(super) recovery: StructuralRecovery,
+    reconciler: ParentReconciler,
+    reclamation: ReclamationReporter,
     // Wakes the independent recovery loop when a local change leaves `_s` work.
-    pub(super) recovery_wake: Arc<Notify>,
-    // Paces collection-record and node CAS retries. Transaction-status polling
-    // remains entirely owned by Monitor.
-    retry: RetryConfig,
-    gc_hints: GcHints,
-    pub(super) stats: Arc<Stats>,
+    recovery_wake: Arc<Notify>,
+    splitter: Splitter,
+    merger: Merger,
 }
 
 /// The structural change that one attempt makes.
 #[derive(Clone, Copy)]
 pub(super) enum PlannedChange<'a> {
     Split {
+        collection: &'a CollectionAddress,
         target: SplitTarget<'a>,
         reason: &'a SplitReason,
     },
     Merge {
+        collection: &'a CollectionAddress,
         source: &'a NodeToken,
     },
 }
@@ -80,18 +66,38 @@ pub(super) enum StructuralTopology<'a> {
     Joined(&'a TxId),
 }
 
+/// The result of checking a change again while its source is gated.
+pub(super) enum Prepared<P> {
+    /// The change is not necessary, or the check failed.
+    Cancel(Result<(), TransError>),
+    /// Only the removal of holder-free tombstones is necessary. `node` is the
+    /// compacted source, which still holds the gate.
+    ReclaimOnly { node: Node, reclaimed: Vec<TxId> },
+    /// The change is necessary. `change` goes into the Ready intent, and
+    /// `plan` holds the node writes.
+    Ready { change: ReadyChange, plan: P },
+}
+
+/// The result of the node writes of a change whose intent is Ready.
+pub(super) enum Applied {
+    /// The change took effect. A change below a parent gives the route that
+    /// the parent must hold.
+    Landed(Option<ParentRoute>),
+    /// The change did not take effect, and none of its writes can still land.
+    Stopped,
+}
+
+/// A route from a parent to its child `target` for `key`, which a change
+/// created in the right-link chain (ADR-073).
+pub(super) struct ParentRoute {
+    pub(super) key: Vec<u8>,
+    pub(super) target: NodeToken,
+}
+
 /// Preserves the operation result independently from structural cleanup state.
 pub(super) struct ChangeAttemptOutcome {
     pub(super) result: Result<(), TransError>,
     pub(super) state: ChangeAttemptResult,
-}
-
-/// One split or merge with a single outer lifecycle.
-pub(super) struct StructuralChangeAttempt<'a> {
-    ctx: &'a ChangeContext,
-    collection: &'a CollectionAddress,
-    change: PlannedChange<'a>,
-    worker: TxId,
 }
 
 /// Whether a coordinated change finished, can discard Preparing, or needs
@@ -104,161 +110,68 @@ pub(super) enum ChangeAttemptResult {
     RecoveryRequired(Box<ReadyIntent>),
 }
 
-impl ChangeContext {
+/// One split or merge with a single outer lifecycle.
+struct StructuralChangeAttempt<'a> {
+    lifecycle: &'a ChangeLifecycle,
+    change: PlannedChange<'a>,
+    worker: &'a TxId,
+}
+
+impl ChangeLifecycle {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        records: CollectionStore,
-        nodes: NodeStore,
-        intent_store: StructuralIntentStore,
-        timeline: Timeline,
-        mon: Monitor,
-        key_state: KeyStateResolver,
-        db_prefix: DbPrefix,
-        coord: LeafCoordinator,
-        candidates: MaintenanceCandidates,
-        retry: RetryConfig,
-        gc_hints: GcHints,
+        recovery: StructuralRecovery,
+        topology: TopologyMembership,
+        structural_nodes: StructuralNodeAccess,
+        reconciler: ParentReconciler,
+        reclamation: ReclamationReporter,
+        recovery_wake: Arc<Notify>,
+        splitter: Splitter,
+        merger: Merger,
     ) -> Self {
-        let router = TreeRouter::new(nodes.clone(), std::num::NonZeroUsize::MIN);
-        let structural_nodes =
-            StructuralNodeAccess::new(nodes.clone(), mon.clone(), key_state, coord);
-        let reconciler = ParentReconciler::new(
-            structural_nodes.clone(),
-            router.clone(),
-            timeline.clone(),
-            candidates.clone(),
-        );
-        let recovery = StructuralRecovery::new(
-            records.clone(),
-            nodes.clone(),
-            intent_store,
-            router.clone(),
-            mon.clone(),
-            structural_nodes.clone(),
-            reconciler.clone(),
-            timeline.clone(),
-            db_prefix,
-            retry,
-        );
         Self {
-            records,
-            nodes,
-            router,
-            mon,
-            structural_nodes,
-            timeline,
-            candidates,
-            reconciler,
             recovery,
-            recovery_wake: Arc::new(Notify::new()),
-            retry,
-            gc_hints,
-            stats: Arc::new(Stats::default()),
+            topology,
+            structural_nodes,
+            reconciler,
+            reclamation,
+            recovery_wake,
+            splitter,
+            merger,
         }
     }
 
-    /// Releases the structural gate while the intent is still safe to discard.
-    pub(super) async fn cancel_preparing_change(
+    /// Makes `change` under the structural identity `worker`. The change
+    /// completes, or leaves its Ready intent to recovery.
+    pub(super) async fn run(
         &self,
-        collection: &CollectionAddress,
-        source: Option<&NodeToken>,
-        worker: &TxId,
-        result: Result<(), TransError>,
-    ) -> ChangeAttemptOutcome {
-        let release = self
-            .structural_nodes
-            .release_structural_gate(collection, source, worker)
-            .await;
-        ChangeAttemptOutcome::retry_cleanly(release.and(result))
+        change: PlannedChange<'_>,
+        worker: TxId,
+        topology: StructuralTopology<'_>,
+    ) -> Result<(), TransError> {
+        StructuralChangeAttempt {
+            lifecycle: self,
+            change,
+            worker: &worker,
+        }
+        .run(topology)
+        .await
     }
 
-    /// Persists compaction and opens the gate in the same CAS when the
-    /// candidate is not actionable. The intent is still Preparing and can be
-    /// discarded through the ordinary clean-cancellation path.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn finish_reclamation_without_change(
+    /// Splits the node at `path` when `reason` still calls for it.
+    pub(super) async fn split_path(
         &self,
-        collection: &CollectionAddress,
-        source: Option<&NodeToken>,
-        worker: &TxId,
-        mut node: Node,
-        observation: &LeafObservation,
-        writers: &[TxId],
-        split_avoided: bool,
-    ) -> ChangeAttemptOutcome {
-        node.remove_structural_gate(worker);
-        match self
-            .structural_nodes
-            .store_structural_node(&node, observation)
+        path: &ObjectPath,
+        reason: &SplitReason,
+        topology: StructuralTopology<'_>,
+    ) -> Result<(), TransError> {
+        // A joined split also gets its own structural identity. Recovery can
+        // reconcile parents after the topology participant has a final
+        // status, and a fresh identity prevents help-forward from mistaking
+        // this in-flight split for stale work.
+        let worker = TxId::new_at(rt::system_now());
+        self.run(PlannedChange::split(path, reason)?, worker, topology)
             .await
-        {
-            Ok(Some(_)) => {
-                self.record_reclamation(writers, split_avoided);
-                ChangeAttemptOutcome::retry_cleanly(Ok(()))
-            }
-            Ok(None) => {
-                self.cancel_preparing_change(collection, source, worker, Err(TransError::Retry))
-                    .await
-            }
-            Err(error) => {
-                let _ = self
-                    .structural_nodes
-                    .release_structural_gate(collection, source, worker)
-                    .await;
-                ChangeAttemptOutcome::retry_cleanly(Err(error))
-            }
-        }
-    }
-
-    /// Publishes the statistics and GC hints of acknowledged tombstone
-    /// reclamation.
-    pub(super) fn record_reclamation(&self, writers: &[TxId], split_avoided: bool) {
-        if writers.is_empty() {
-            return;
-        }
-        let count = u64::try_from(writers.len()).unwrap_or(u64::MAX);
-        self.stats
-            .tombstones_reclaimed
-            .fetch_add(count, Ordering::Relaxed);
-        if split_avoided {
-            self.stats.splits_avoided.fetch_add(1, Ordering::Relaxed);
-        }
-        self.gc_hints.schedule_all(writers.iter().cloned());
-    }
-
-    /// Transitions the structural intent to Ready while its source gate is
-    /// still held.
-    pub(super) async fn mark_ready(
-        &self,
-        worker: &TxId,
-        prepared: PreparedIntent,
-        observation: &LeafObservation,
-        change: ReadyChange,
-    ) -> Result<ReadyIntent, ChangeAttemptOutcome> {
-        match self
-            .recovery
-            .mark_ready(prepared, worker, observation, change)
-            .await
-        {
-            ReadyIntentTransition::Ready(ready) => Ok(ready),
-            ReadyIntentTransition::RetryCleanly(error) => {
-                Err(ChangeAttemptOutcome::retry_cleanly(Err(error)))
-            }
-            ReadyIntentTransition::RecoveryRequired(ready, error) => {
-                Err(ChangeAttemptOutcome::recovery_required(ready, error))
-            }
-        }
-    }
-
-    /// Deletes an acknowledged Ready intent or leaves it for recovery.
-    pub(super) async fn finish_ready_change(&self, ready: ReadyIntent) -> ChangeAttemptOutcome {
-        match self.recovery.complete_ready(ready).await {
-            ReadyIntentCompletion::Completed => ChangeAttemptOutcome::completed(),
-            ReadyIntentCompletion::RecoveryRequired(ready, error) => ChangeAttemptOutcome {
-                result: Err(error),
-                state: ChangeAttemptResult::RecoveryRequired(ready),
-            },
-        }
     }
 
     /// Makes the parent that routes `key` to `target` agree with the right-link
@@ -277,25 +190,16 @@ impl ChangeContext {
         target: &NodeToken,
         topology_participant: Option<&TxId>,
     ) -> Result<(), TransError> {
+        let topology = match topology_participant {
+            Some(id) => StructuralTopology::Joined(id),
+            None => StructuralTopology::Owned,
+        };
         let mut reconciliation = self.reconciler.begin(collection, key, target);
         loop {
             match self.reconciler.reconcile(&mut reconciliation).await? {
                 ReconciliationOutcome::Reconciled => return Ok(()),
                 ReconciliationOutcome::ParentRequiresSplit(action) => {
-                    match topology_participant {
-                        Some(id) => {
-                            Box::pin(split::split_path_joined(
-                                self,
-                                &action.path,
-                                id,
-                                &action.reason,
-                            ))
-                            .await?
-                        }
-                        None => {
-                            Box::pin(split::split_path(self, &action.path, &action.reason)).await?
-                        }
-                    }
+                    Box::pin(self.split_path(&action.path, &action.reason, topology)).await?;
                     if action.continuation == ParentSplitContinuation::CompleteReconciliation {
                         return Ok(());
                     }
@@ -304,103 +208,50 @@ impl ChangeContext {
         }
     }
 
-    /// Persists the recovery manifest of a topology participant.
-    pub(super) async fn begin_topology_tx(
+    /// Coordinates `change` after its intent `prepared` is written and its
+    /// topology participant is admitted.
+    #[cfg(test)]
+    pub(super) async fn coordinate(
         &self,
-        collection: &CollectionAddress,
-        id: &TxId,
-    ) -> Result<(), TransError> {
-        self.mon
-            .begin_persisted_tx(
-                id,
-                TxRecoveryManifest {
-                    locks: vec![TxLock::TopologyParticipant {
-                        collection: collection.clone(),
-                    }],
-                    ..TxRecoveryManifest::default()
-                },
-            )
-            .await
-    }
-
-    /// Admits `id` as a topology participant of `collection`.
-    pub(super) async fn join_topology(
-        &self,
-        collection: &CollectionAddress,
-        id: &TxId,
-    ) -> Result<(), TransError> {
-        let mut backoff = self.retry.backoff();
-        loop {
-            let (mut record, observed) =
-                match self.records.load_record(collection, Requirement::ANY).await {
-                    Ok(record) => record,
-                    Err(StorageError::NotFound) => return Err(TransError::StaleCollection),
-                    Err(error) => return Err(error.into()),
-                };
-            if record
-                .topology_participants()
-                .any(|participant| participant == id)
-            {
-                // This is the same change's admission; its identity is not
-                // reused after departure. New admission requires the CAS below.
-                return Ok(());
-            }
-            if let Some(holder) = record.topology_freeze() {
-                return match self.mon.tx_status(holder).await? {
-                    TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
-                        let holder = holder.clone();
-                        record.remove_topology_freeze(&holder);
-                        if self.records.store_record(&record, &observed).await? {
-                            continue;
-                        }
-                        rt::sleep(backoff.next_delay()).await;
-                        continue;
-                    }
-                    TxCommitStatus::Committed => Err(TransError::StaleCollection),
-                    TxCommitStatus::Pending | TxCommitStatus::Unknown => Err(TransError::Retry),
-                };
-            }
-            if !record.add_topology_participant(id.clone()) {
-                return Err(TransError::Retry);
-            }
-            if self.records.store_record(&record, &observed).await? {
-                return Ok(());
-            }
-            rt::sleep(backoff.next_delay()).await;
+        change: PlannedChange<'_>,
+        worker: &TxId,
+        prepared: PreparedIntent,
+    ) -> ChangeAttemptOutcome {
+        StructuralChangeAttempt {
+            lifecycle: self,
+            change,
+            worker,
         }
-    }
-
-    /// Removes a participant admitted by this database instance.
-    pub(super) async fn leave_topology(
-        &self,
-        collection: &CollectionAddress,
-        id: &TxId,
-    ) -> Result<(), TransError> {
-        self.recovery
-            .leave_topology(collection, id, Requirement::ANY)
-            .await
-    }
-
-    async fn finalize_topology_worker(&self, collection: &CollectionAddress, id: &TxId) {
-        let mut record = TxRecord::new(id.clone(), TxCommitStatus::Committed);
-        record.locks.push(TxLock::TopologyParticipant {
-            collection: collection.clone(),
-        });
-        if let Err(e) = self.mon.commit_tx(record).await {
-            tracing::debug!(
-                target: "glassdb::restructurer",
-                error = %e,
-                "finalizing topology participant failed"
-            );
-        }
+        .coordinate(prepared)
+        .await
     }
 }
 
 impl<'a> PlannedChange<'a> {
+    /// Plans a split of the tree node at `path`.
+    pub(super) fn split(path: &'a ObjectPath, reason: &'a SplitReason) -> Result<Self, TransError> {
+        let (collection, target) = match path {
+            ObjectPath::TreeRoot { collection } => (collection, SplitTarget::Root),
+            ObjectPath::Node { collection, token } => (collection, SplitTarget::NonRoot(token)),
+            _ => return Err(TransError::other("split candidate is not a tree node")),
+        };
+        Ok(Self::Split {
+            collection,
+            target,
+            reason,
+        })
+    }
+
+    fn collection(self) -> &'a CollectionAddress {
+        match self {
+            Self::Split { collection, .. } | Self::Merge { collection, .. } => collection,
+        }
+    }
+
     fn source_token(self) -> Option<&'a NodeToken> {
         match self {
             Self::Split { target, .. } => target.source_token(),
-            Self::Merge { source } => Some(source),
+            Self::Merge { source, .. } => Some(source),
         }
     }
 
@@ -435,68 +286,50 @@ impl ChangeAttemptOutcome {
     }
 }
 
-impl<'a> StructuralChangeAttempt<'a> {
-    pub(super) fn new(
-        ctx: &'a ChangeContext,
-        collection: &'a CollectionAddress,
-        change: PlannedChange<'a>,
-        worker: TxId,
-    ) -> Self {
-        Self {
-            ctx,
-            collection,
-            change,
-            worker,
-        }
-    }
-
-    pub(super) async fn run(self, topology: StructuralTopology<'_>) -> Result<(), TransError> {
+impl StructuralChangeAttempt<'_> {
+    async fn run(&self, topology: StructuralTopology<'_>) -> Result<(), TransError> {
+        let lifecycle = self.lifecycle;
+        let collection = self.change.collection();
         let result = match topology {
             StructuralTopology::Owned => {
-                match self
-                    .ctx
-                    .begin_topology_tx(self.collection, &self.worker)
-                    .await
-                {
+                match lifecycle.topology.begin(collection, self.worker).await {
                     Ok(()) => self.run_prepared(topology).await,
                     Err(error) => Err(error),
                 }
             }
             StructuralTopology::Joined(_) => {
-                self.ctx.mon.begin_tx(&self.worker);
+                lifecycle.structural_nodes.begin_worker(self.worker);
                 self.run_prepared(topology).await
             }
         };
 
         match topology {
             StructuralTopology::Owned => {
-                self.ctx
-                    .finalize_topology_worker(self.collection, &self.worker)
-                    .await;
+                lifecycle.topology.finalize(collection, self.worker).await;
             }
             StructuralTopology::Joined(_) => {
-                self.ctx
+                lifecycle
                     .structural_nodes
-                    .finalize_worker(&self.worker)
+                    .finalize_worker(self.worker)
                     .await;
             }
         }
         if result.is_err() {
-            self.ctx.recovery_wake.notify_one();
+            lifecycle.recovery_wake.notify_one();
         }
         result
     }
 
     async fn run_prepared(&self, topology: StructuralTopology<'_>) -> Result<(), TransError> {
         let participant = match topology {
-            StructuralTopology::Owned => &self.worker,
+            StructuralTopology::Owned => self.worker,
             StructuralTopology::Joined(participant) => participant,
         };
         let prepared = self
-            .ctx
+            .lifecycle
             .recovery
             .prepare_intent(
-                self.collection,
+                self.change.collection(),
                 self.change.source_token(),
                 self.change.kind(),
                 participant,
@@ -505,7 +338,12 @@ impl<'a> StructuralChangeAttempt<'a> {
         let cancellation = prepared.cancellation_witness();
         let outcome = match topology {
             StructuralTopology::Owned => {
-                match self.ctx.join_topology(self.collection, &self.worker).await {
+                match self
+                    .lifecycle
+                    .topology
+                    .join(self.change.collection(), self.worker)
+                    .await
+                {
                     Ok(()) => self.coordinate(prepared).await,
                     Err(error) => ChangeAttemptOutcome::retry_cleanly(Err(error)),
                 }
@@ -516,22 +354,189 @@ impl<'a> StructuralChangeAttempt<'a> {
     }
 
     async fn coordinate(&self, prepared: PreparedIntent) -> ChangeAttemptOutcome {
+        let lifecycle = self.lifecycle;
+        let collection = self.change.collection();
+        debug_assert!(prepared.targets(collection, self.change.source_token()));
+        let acquisition = match self.change {
+            PlannedChange::Split { .. } => GateAcquisition::WoundWait,
+            // A merge is optional maintenance and must not abort user
+            // transactions (ADR-073).
+            PlannedChange::Merge { .. } => GateAcquisition::Polite,
+        };
+        let (node, observation) = match lifecycle
+            .structural_nodes
+            .acquire_structural_gate(
+                collection,
+                self.change.source_token(),
+                self.worker,
+                acquisition,
+            )
+            .await
+        {
+            Ok(Some(acquired)) => acquired,
+            Ok(None) => return ChangeAttemptOutcome::retry_cleanly(Err(TransError::Retry)),
+            Err(error) => return ChangeAttemptOutcome::retry_cleanly(Err(error)),
+        };
         match self.change {
-            PlannedChange::Split { target, reason } => {
-                split::coordinate(
-                    self.ctx,
-                    self.collection,
-                    target,
-                    &self.worker,
-                    reason,
-                    prepared,
-                )
-                .await
+            PlannedChange::Split { target, reason, .. } => {
+                let planned =
+                    lifecycle
+                        .splitter
+                        .prepare(target, reason, self.worker, node, &prepared);
+                let (ready, plan) = match self.mark_ready(planned, prepared, &observation).await {
+                    Ok(ready) => ready,
+                    Err(outcome) => return outcome,
+                };
+                let applied = lifecycle
+                    .splitter
+                    .apply(collection, reason, &observation, plan)
+                    .await;
+                self.complete(ready, applied).await
             }
-            PlannedChange::Merge { source } => {
-                merge::coordinate(self.ctx, self.collection, source, &self.worker, prepared).await
+            PlannedChange::Merge { source, .. } => {
+                let planned = lifecycle.merger.prepare(collection, node).await;
+                let (ready, plan) = match self.mark_ready(planned, prepared, &observation).await {
+                    Ok(ready) => ready,
+                    Err(outcome) => return outcome,
+                };
+                let applied = lifecycle
+                    .merger
+                    .apply(collection, source, &observation, ready.id(), plan)
+                    .await;
+                self.complete(ready, applied).await
             }
         }
+    }
+
+    /// Transitions the structural intent to Ready while its source gate is
+    /// still held, or ends a change that is not necessary while the intent
+    /// is still Preparing.
+    async fn mark_ready<P>(
+        &self,
+        planned: Prepared<P>,
+        prepared: PreparedIntent,
+        observation: &LeafObservation,
+    ) -> Result<(ReadyIntent, P), ChangeAttemptOutcome> {
+        let (change, plan) = match planned {
+            Prepared::Cancel(result) => return Err(self.cancel_preparing(result).await),
+            Prepared::ReclaimOnly { node, reclaimed } => {
+                return Err(self
+                    .finish_reclamation_only(node, observation, &reclaimed)
+                    .await);
+            }
+            Prepared::Ready { change, plan } => (change, plan),
+        };
+        match self
+            .lifecycle
+            .recovery
+            .mark_ready(prepared, self.worker, observation, change)
+            .await
+        {
+            ReadyIntentTransition::Ready(ready) => Ok((ready, plan)),
+            ReadyIntentTransition::RetryCleanly(error) => {
+                Err(ChangeAttemptOutcome::retry_cleanly(Err(error)))
+            }
+            ReadyIntentTransition::RecoveryRequired(ready, error) => {
+                Err(ChangeAttemptOutcome::recovery_required(ready, error))
+            }
+        }
+    }
+
+    /// Reconciles the parent of a change that took effect, and deletes its
+    /// Ready intent.
+    async fn complete(
+        &self,
+        ready: ReadyIntent,
+        applied: Result<Applied, TransError>,
+    ) -> ChangeAttemptOutcome {
+        match applied {
+            Ok(Applied::Landed(route)) => {
+                if let Some(ParentRoute { key, target }) = route
+                    && let Err(error) = self
+                        .lifecycle
+                        .reconcile_parent(
+                            self.change.collection(),
+                            &key,
+                            &target,
+                            Some(ready.participant()),
+                        )
+                        .await
+                {
+                    return ChangeAttemptOutcome::recovery_required(ready, error);
+                }
+                self.finish_ready(ready).await
+            }
+            Ok(Applied::Stopped) => self.stop_ready(ready).await,
+            Err(error) => ChangeAttemptOutcome::recovery_required(ready, error),
+        }
+    }
+
+    /// Releases the source gate of a Ready change that did not take effect,
+    /// and deletes its intent.
+    async fn stop_ready(&self, ready: ReadyIntent) -> ChangeAttemptOutcome {
+        if let Err(error) = self.release_gate().await {
+            return ChangeAttemptOutcome::recovery_required(ready, error);
+        }
+        let mut outcome = self.finish_ready(ready).await;
+        outcome.result = outcome.result.and(Err(TransError::Retry));
+        outcome
+    }
+
+    /// Deletes an acknowledged Ready intent or leaves it for recovery.
+    async fn finish_ready(&self, ready: ReadyIntent) -> ChangeAttemptOutcome {
+        match self.lifecycle.recovery.complete_ready(ready).await {
+            ReadyIntentCompletion::Completed => ChangeAttemptOutcome::completed(),
+            ReadyIntentCompletion::RecoveryRequired(ready, error) => ChangeAttemptOutcome {
+                result: Err(error),
+                state: ChangeAttemptResult::RecoveryRequired(ready),
+            },
+        }
+    }
+
+    /// Releases the structural gate while the intent is still safe to discard.
+    async fn cancel_preparing(&self, result: Result<(), TransError>) -> ChangeAttemptOutcome {
+        let release = self.release_gate().await;
+        ChangeAttemptOutcome::retry_cleanly(release.and(result))
+    }
+
+    /// Persists compaction and opens the gate in the same CAS when the change
+    /// is not necessary. The intent is still Preparing and can be discarded
+    /// through the ordinary clean-cancellation path.
+    async fn finish_reclamation_only(
+        &self,
+        mut node: Node,
+        observation: &LeafObservation,
+        reclaimed: &[TxId],
+    ) -> ChangeAttemptOutcome {
+        node.remove_structural_gate(self.worker);
+        match self
+            .lifecycle
+            .structural_nodes
+            .store_structural_node(&node, observation)
+            .await
+        {
+            Ok(Some(_)) => {
+                let split_avoided = matches!(self.change, PlannedChange::Split { .. });
+                self.lifecycle.reclamation.record(reclaimed, split_avoided);
+                ChangeAttemptOutcome::retry_cleanly(Ok(()))
+            }
+            Ok(None) => self.cancel_preparing(Err(TransError::Retry)).await,
+            Err(error) => {
+                let _ = self.release_gate().await;
+                ChangeAttemptOutcome::retry_cleanly(Err(error))
+            }
+        }
+    }
+
+    async fn release_gate(&self) -> Result<(), TransError> {
+        self.lifecycle
+            .structural_nodes
+            .release_structural_gate(
+                self.change.collection(),
+                self.change.source_token(),
+                self.worker,
+            )
+            .await
     }
 
     async fn finish(
@@ -543,17 +548,13 @@ impl<'a> StructuralChangeAttempt<'a> {
         let ChangeAttemptOutcome { result, state } = outcome;
         match state {
             ChangeAttemptResult::Completed => match topology {
-                StructuralTopology::Owned => {
-                    result.and(self.ctx.leave_topology(self.collection, &self.worker).await)
-                }
+                StructuralTopology::Owned => result.and(self.leave_topology().await),
                 StructuralTopology::Joined(_) => result,
             },
             ChangeAttemptResult::RetryCleanly => {
-                let cleanup = match self.ctx.recovery.discard_prepared(prepared).await {
+                let cleanup = match self.lifecycle.recovery.discard_prepared(prepared).await {
                     Ok(()) => match topology {
-                        StructuralTopology::Owned => {
-                            self.ctx.leave_topology(self.collection, &self.worker).await
-                        }
+                        StructuralTopology::Owned => self.leave_topology().await,
                         StructuralTopology::Joined(_) => Ok(()),
                     },
                     Err(error) => Err(error),
@@ -563,32 +564,14 @@ impl<'a> StructuralChangeAttempt<'a> {
             ChangeAttemptResult::RecoveryRequired(_ready) => result,
         }
     }
-}
 
-/// Removes durable absence entries that no transaction still holds.
-pub(super) fn reclaim_holder_free_tombstones(node: &mut Node) -> Vec<TxId> {
-    let Some(leaf) = node.as_leaf() else {
-        return Vec::new();
-    };
-    let mut reclaimed = Vec::new();
-    let retained = leaf.entries().filter_map(|entry| {
-        if entry.lock_holders().is_empty() && entry.current.is_tombstone() {
-            reclaimed.push(
-                entry
-                    .current
-                    .writer()
-                    .expect("a tombstone always names its writer")
-                    .clone(),
-            );
-            None
-        } else {
-            Some(entry.clone())
-        }
-    });
-    let compacted = LeafBody::from_entries(retained);
-    if !reclaimed.is_empty() {
-        node.set_leaf(compacted)
-            .expect("tombstone reclamation only rewrites leaves");
+    /// Removes the owned topology participant, which this database instance
+    /// admitted.
+    async fn leave_topology(&self) -> Result<(), TransError> {
+        // The local admission permits any record observation.
+        self.lifecycle
+            .topology
+            .leave(self.change.collection(), self.worker, Requirement::ANY)
+            .await
     }
-    reclaimed
 }

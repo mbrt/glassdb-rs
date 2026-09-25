@@ -100,7 +100,12 @@ async fn assert_merged(s: &TestStore) {
 }
 
 async fn merge_l0(sp: &Restructurer) -> Result<(), TransError> {
-    merge_candidate(&sp.ctx, &node_path("L0"), TxId::new_at(rt::system_now())).await
+    sp.process_candidate(&MaintenanceCandidate {
+        path: node_path("L0"),
+        priority: TxId::new_at(rt::system_now()),
+        cause: CandidateCause::Underfull,
+    })
+    .await
 }
 
 #[tokio::test]
@@ -110,7 +115,7 @@ async fn underfull_leaf_merges_into_its_right_sibling() {
     let bg = Arc::new(Background::new());
     let sp = restructurer(&s, &bg, mergeable());
 
-    sp.ctx.candidates.observe_leaf(
+    sp.candidates.observe_leaf(
         &node_path("L0"),
         &LeafBody::from_entries([live(b"a"), live(b"b")]),
     );
@@ -303,8 +308,7 @@ async fn merges_cascade_through_underfull_parents() {
     let bg = Arc::new(Background::new());
     let sp = restructurer(&s, &bg, policy);
 
-    sp.ctx
-        .candidates
+    sp.candidates
         .observe_leaf(&node_path("L0"), &LeafBody::from_entries([live(b"a")]));
     sp.run_once().await;
     sp.run_once().await;
@@ -318,7 +322,7 @@ async fn merges_cascade_through_underfull_parents() {
         .unwrap();
     assert_eq!(root.as_index().unwrap(), &test_index(&[(b"", "P1")]));
 
-    sp.ctx.candidates.observe_leaf(
+    sp.candidates.observe_leaf(
         &node_path("L0b"),
         &LeafBody::from_entries([live(b"a"), live(b"f")]),
     );
@@ -355,7 +359,7 @@ async fn a_new_candidate_does_not_wait_for_the_sweep_interval() {
     let sp = restructurer(&s, &bg, mergeable());
     sp.start();
 
-    sp.ctx.candidates.observe_leaf(
+    sp.candidates.observe_leaf(
         &node_path("L0"),
         &LeafBody::from_entries([live(b"a"), live(b"b")]),
     );
@@ -392,7 +396,7 @@ async fn a_deferred_candidate_waits_for_the_sweep_interval() {
         ..RestructurerStats::default()
     };
 
-    sp.ctx.candidates.observe_leaf(
+    sp.candidates.observe_leaf(
         &node_path("L0"),
         &LeafBody::from_entries([live(b"a"), live(b"b")]),
     );
@@ -418,7 +422,7 @@ async fn merge_defers_to_a_younger_entry_holder_then_lands() {
     )
     .await;
 
-    sp.ctx.candidates.observe_leaf(
+    sp.candidates.observe_leaf(
         &node_path("L0"),
         &LeafBody::from_entries([live(b"a"), live(b"b")]),
     );
@@ -672,9 +676,9 @@ async fn seed_interrupted_merge(s: &TestStore, sp: &Restructurer, crash: MergeCr
     )
     .await
     .unwrap();
-    sp.ctx.mon.begin_tx(&worker);
+    sp.mon.begin_tx(&worker);
     assert_eq!(
-        sp.ctx.mon.preempt_tx(&worker).await.unwrap(),
+        sp.mon.preempt_tx(&worker).await.unwrap(),
         TxFinalStatus::Aborted
     );
     if matches!(crash, MergeCrash::Ready) {
@@ -804,7 +808,7 @@ async fn recovery_fences_a_late_absorb() {
     let left = current_node(&peer, "L0").await;
     let worker = left.structural_gate().holders()[0].clone();
     assert_eq!(
-        recovering.ctx.mon.preempt_tx(&worker).await.unwrap(),
+        recovering.mon.preempt_tx(&worker).await.unwrap(),
         TxFinalStatus::Aborted
     );
     assert!(recovering.recover_structural_intents().await.unwrap());

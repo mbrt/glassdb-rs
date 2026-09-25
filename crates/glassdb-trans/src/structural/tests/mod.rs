@@ -1,13 +1,13 @@
 use super::*;
 
 use super::candidates::SWEEP_INTERVAL;
-use super::change::{ChangeAttemptResult, reclaim_holder_free_tombstones};
-use super::merge::merge_candidate;
+use super::change::ChangeAttemptResult;
+use super::reclamation::reclaim_holder_free_tombstones;
 use super::reconcile::{
     DEFERRED_RECONCILIATION_CAP, ParentReconciler, PendingReconciliation, ReconciliationOutcome,
 };
 use super::recovery::ChangeKind;
-use super::split::{SplitNeed, SplitReason, SplitTarget, split_need, split_path};
+use super::split::{SplitNeed, SplitReason, SplitTarget};
 use crate::engine::{AssemblyFixture, EngineConfig};
 use crate::leaf_coord::StructuralHinter;
 use crate::monitor::TxFinalStatus;
@@ -371,6 +371,18 @@ fn restructurer_and_monitor(
     let candidates = MaintenanceCandidates::with_policy(policy);
     let restructurer = restructurer_with_monitor(store, bg, mon.clone(), candidates);
     (restructurer, mon)
+}
+
+/// Splits the node at `path` with its own topology participant, as a sweep
+/// does after it located the node.
+async fn split_path(
+    sp: &Restructurer,
+    path: &ObjectPath,
+    reason: &SplitReason,
+) -> Result<(), TransError> {
+    sp.changes
+        .split_path(path, reason, StructuralTopology::Owned)
+        .await
 }
 
 fn leaf_with_membership_reader(keys: &[&[u8]], holder: &TxId) -> Node {

@@ -98,7 +98,7 @@ async fn root_leaf_gate_acquisition_uses_one_coordinator_round() {
 
     let worker = TxId::with_priority(1, b"root-gate");
     let (node, observation) = sp
-        .ctx
+        .changes
         .structural_nodes
         .acquire_structural_gate(&collection(), None, &worker, GateAcquisition::WoundWait)
         .await
@@ -108,7 +108,7 @@ async fn root_leaf_gate_acquisition_uses_one_coordinator_round() {
     assert!(node.structural_gate().contains(&worker));
     assert_eq!(observation.path(), &root_path());
     assert_eq!(
-        sp.ctx.structural_nodes.coord.stats_and_reset(),
+        sp.changes.structural_nodes.coord.stats_and_reset(),
         crate::leaf_coord::LeafCoordinatorStats {
             submissions: 1,
             rounds: 1,
@@ -125,7 +125,7 @@ async fn root_leaf_gate_acquisition_uses_one_coordinator_round() {
         .collect();
     assert_eq!(root_operations, ["read", "write_if"]);
 
-    sp.ctx
+    sp.changes
         .structural_nodes
         .release_structural_gate(&collection(), None, &worker)
         .await
@@ -271,7 +271,7 @@ async fn a_split_carries_inline_values_to_the_new_leaf() {
     let bg = Arc::new(Background::new());
 
     split_path(
-        &restructurer(&s, &bg, tiny()).ctx,
+        &restructurer(&s, &bg, tiny()),
         &root_path(),
         &SplitReason::SoftCap,
     )
@@ -318,7 +318,7 @@ async fn root_leaf_splits_in_place_into_an_index() {
     let bg = Arc::new(Background::new());
 
     split_path(
-        &restructurer(&s, &bg, tiny()).ctx,
+        &restructurer(&s, &bg, tiny()),
         &root_path(),
         &SplitReason::SoftCap,
     )
@@ -416,7 +416,7 @@ async fn nonroot_leaf_half_splits_and_parent_learns_the_separator() {
     let bg = Arc::new(Background::new());
 
     split_path(
-        &restructurer(&s, &bg, tiny()).ctx,
+        &restructurer(&s, &bg, tiny()),
         &node_path("L"),
         &SplitReason::SoftCap,
     )
@@ -496,7 +496,7 @@ async fn parent_reconciliation_cascades_after_the_parent_insert() {
     let bg = Arc::new(Background::new());
 
     split_path(
-        &restructurer(&s, &bg, tiny()).ctx,
+        &restructurer(&s, &bg, tiny()),
         &node_path("L1"),
         &SplitReason::SoftCap,
     )
@@ -588,7 +588,7 @@ async fn root_index_splits_in_place_growing_height() {
     let bg = Arc::new(Background::new());
 
     split_path(
-        &restructurer(&s, &bg, tiny()).ctx,
+        &restructurer(&s, &bg, tiny()),
         &root_path(),
         &SplitReason::SoftCap,
     )
@@ -655,7 +655,7 @@ async fn nonroot_index_split_reconciles_the_index_above_it() {
     let bg = Arc::new(Background::new());
 
     split_path(
-        &restructurer(&s, &bg, tiny()).ctx,
+        &restructurer(&s, &bg, tiny()),
         &node_path("I0"),
         &SplitReason::SoftCap,
     )
@@ -738,12 +738,14 @@ async fn separator_capacity_splits_parent_during_reconciliation_and_recovery() {
             // This is the durable state after a source shrink and before its
             // parent reconciliation. Recovery must retain the capacity cause.
             let participant = TxId::with_priority(1, b"interrupted-split");
-            sp.ctx
-                .begin_topology_tx(&collection(), &participant)
+            sp.changes
+                .topology
+                .begin(&collection(), &participant)
                 .await
                 .unwrap();
-            sp.ctx
-                .join_topology(&collection(), &participant)
+            sp.changes
+                .topology
+                .join(&collection(), &participant)
                 .await
                 .unwrap();
             s.write_structural_intent(
@@ -762,7 +764,7 @@ async fn separator_capacity_splits_parent_during_reconciliation_and_recovery() {
             )
             .await
             .unwrap();
-            sp.ctx.mon.abort_owned_tx(&participant).await.unwrap();
+            sp.mon.abort_owned_tx(&participant).await.unwrap();
             assert!(sp.recover_structural_intents().await.unwrap());
             assert!(
                 s.discover_structural_intents(
@@ -774,7 +776,7 @@ async fn separator_capacity_splits_parent_during_reconciliation_and_recovery() {
                 .is_empty()
             );
         } else {
-            sp.ctx
+            sp.changes
                 .reconcile_parent(&collection(), b"h", &test_token("L7"), None)
                 .await
                 .unwrap();
@@ -827,7 +829,7 @@ async fn re_split_of_a_settled_node_is_a_noop() {
     let bg = Arc::new(Background::new());
     let sp = restructurer(&s, &bg, tiny());
 
-    split_path(&sp.ctx, &root_path(), &SplitReason::SoftCap)
+    split_path(&sp, &root_path(), &SplitReason::SoftCap)
         .await
         .unwrap();
     let after_first = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
@@ -840,11 +842,11 @@ async fn re_split_of_a_settled_node_is_a_noop() {
     // Re-run: each resulting leaf holds two keys, which is at (not over) the
     // cap, so nothing changes.
     for leaf in &after_first {
-        split_path(&sp.ctx, &leaf.path, &SplitReason::SoftCap)
+        split_path(&sp, &leaf.path, &SplitReason::SoftCap)
             .await
             .unwrap();
     }
-    split_path(&sp.ctx, &root_path(), &SplitReason::SoftCap)
+    split_path(&sp, &root_path(), &SplitReason::SoftCap)
         .await
         .unwrap();
 
@@ -1043,7 +1045,7 @@ async fn repeated_inline_pressure_performs_one_rerouted_median_split_each() {
     };
     assert!(
         matches!(
-            target.node().map(|node| split_need(&sp.ctx, node, &reason)),
+            target.node().map(|node| sp.splitter.need(node, &reason)),
             Some(SplitNeed::Split)
         ),
         "the first median left real pressure for a future observation"
@@ -1090,7 +1092,7 @@ async fn repeated_inline_pressure_performs_one_rerouted_median_split_each() {
         .await
         .unwrap();
     assert!(matches!(
-        target.node().map(|node| split_need(&sp.ctx, node, &reason)),
+        target.node().map(|node| sp.splitter.need(node, &reason)),
         Some(SplitNeed::NotActionable)
     ));
 }
@@ -1238,7 +1240,7 @@ async fn split_wounds_a_younger_entry_holder_and_lands() {
     let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
     s.create_root(COLL, &root).await.unwrap();
 
-    split_path(&sp.ctx, &node_path("L"), &SplitReason::SoftCap)
+    split_path(&sp, &node_path("L"), &SplitReason::SoftCap)
         .await
         .unwrap();
 
@@ -1354,7 +1356,7 @@ async fn split_help_forwards_a_committed_entry_holder_before_moving_its_entry() 
         .await
         .unwrap();
     assert!(held.entries().lookup(b"d").unwrap().is_locked_by(&holder));
-    split_path(&sp.ctx, &node_path("L"), &SplitReason::SoftCap)
+    split_path(&sp, &node_path("L"), &SplitReason::SoftCap)
         .await
         .unwrap();
 
@@ -1444,7 +1446,7 @@ async fn split_defers_to_an_older_membership_reader_then_lands() {
     let root = Node::index(IndexNode::from_children([(Vec::new(), "L".to_string())]));
     s.create_root(COLL, &root).await.unwrap();
 
-    sp.ctx.candidates.observe_leaf(
+    sp.candidates.observe_leaf(
         &node_path("L"),
         &LeafBody::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
     );
@@ -1560,7 +1562,7 @@ async fn splitting_an_unpublished_sibling_reconciles_the_chain() {
         .build()
         .unwrap();
     split_path(
-        &restructurer(&s, &bg, policy).ctx,
+        &restructurer(&s, &bg, policy),
         &node_path("S"),
         &SplitReason::SoftCap,
     )
@@ -1626,7 +1628,7 @@ async fn lost_parent_cas_is_reconciled_by_a_later_sweep() {
     // created) but the parent reconciliation cannot, so it is re-queued.
     blocker.block(true);
     assert!(matches!(
-        split_path(&sp.ctx, &node_path("L"), &SplitReason::SoftCap).await,
+        split_path(&sp, &node_path("L"), &SplitReason::SoftCap).await,
         Err(TransError::Retry)
     ));
     let (blocked_root, _) = s

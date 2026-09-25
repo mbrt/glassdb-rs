@@ -4,13 +4,12 @@ use std::collections::{BTreeSet, VecDeque};
 use std::mem;
 use std::sync::{Arc, Mutex};
 
-use glassdb_concurr::{RetryConfig, rt};
 use glassdb_data::{CollectionAddress, DbPrefix, NodeToken, ObjectPath, StructuralIntentId, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
-    CollectionStore, CurrentnessBarrier, LeafObservation, LockType, MergeTarget, Node, NodeStore,
-    Observation, Requirement, StorageError, StructuralChange, StructuralIntent,
-    StructuralIntentPhase, StructuralIntentStore, Timeline, TreeRouter,
+    CurrentnessBarrier, LeafObservation, LockType, MergeTarget, Node, NodeStore, Observation,
+    Requirement, StorageError, StructuralChange, StructuralIntent, StructuralIntentPhase,
+    StructuralIntentStore, Timeline, TreeRouter,
 };
 
 use crate::error::TransError;
@@ -22,11 +21,12 @@ use super::reconcile::{
     ParentReconciler, ParentReconciliation, ParentSplitContinuation, ReconciliationOutcome,
 };
 use super::split::SplitReason;
+use super::topology::TopologyMembership;
 
 /// Owns the durable structural-intent lifecycle and recovery policy.
 #[derive(Clone)]
 pub(super) struct StructuralRecovery {
-    records: CollectionStore,
+    topology: TopologyMembership,
     nodes: NodeStore,
     intent_store: StructuralIntentStore,
     router: TreeRouter,
@@ -35,7 +35,6 @@ pub(super) struct StructuralRecovery {
     reconciler: ParentReconciler,
     timeline: Timeline,
     db_prefix: DbPrefix,
-    retry: RetryConfig,
     scan_cursor: Arc<Mutex<Option<glassdb_backend::ListCursor>>>,
 }
 
@@ -340,7 +339,7 @@ impl RecoveryAction {
 impl StructuralRecovery {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        records: CollectionStore,
+        topology: TopologyMembership,
         nodes: NodeStore,
         intent_store: StructuralIntentStore,
         router: TreeRouter,
@@ -349,10 +348,9 @@ impl StructuralRecovery {
         reconciler: ParentReconciler,
         timeline: Timeline,
         db_prefix: DbPrefix,
-        retry: RetryConfig,
     ) -> Self {
         Self {
-            records,
+            topology,
             nodes,
             intent_store,
             router,
@@ -361,7 +359,6 @@ impl StructuralRecovery {
             reconciler,
             timeline,
             db_prefix,
-            retry,
             scan_cursor: Arc::new(Mutex::new(None)),
         }
     }
@@ -535,44 +532,6 @@ impl StructuralRecovery {
                 self.advance_settlement(settlement, parent_split, parent_result)
                     .await
             }
-        }
-    }
-
-    /// Removes one participant after all of its structural intents settle.
-    ///
-    /// A present record without the participant must satisfy `requirement`.
-    /// Local admission or topology-freeze evidence permits `ANY`.
-    pub(super) async fn leave_topology(
-        &self,
-        collection: &CollectionAddress,
-        id: &TxId,
-        requirement: Requirement,
-    ) -> Result<(), TransError> {
-        let mut backoff = self.retry.backoff();
-        let mut read_requirement = Requirement::ANY;
-        loop {
-            let (mut record, observed) =
-                match self.records.load_record(collection, read_requirement).await {
-                    Ok(record) => record,
-                    // Published collections already have their record. Local
-                    // preparation shares this cache, and deleted identities are
-                    // not reused, so an absence cannot hide later admission.
-                    Err(StorageError::NotFound) => return Ok(()),
-                    Err(error) => return Err(error.into()),
-                };
-            if !record.remove_topology_participant(id) {
-                if observed.satisfies(requirement) {
-                    return Ok(());
-                }
-                // Intent cleanup does not refresh the collection record. Only
-                // a no-op without sufficient evidence needs a bounded reload.
-                read_requirement = requirement;
-                continue;
-            }
-            if self.records.store_record(&record, &observed).await? {
-                return Ok(());
-            }
-            rt::sleep(backoff.next_delay()).await;
         }
     }
 
@@ -958,7 +917,8 @@ impl StructuralRecovery {
                     SettlementMode::Background => requirement,
                     SettlementMode::Explicit => Requirement::ANY,
                 };
-                self.leave_topology(&settlement.collection, &settlement.participant, departure)
+                self.topology
+                    .leave(&settlement.collection, &settlement.participant, departure)
                     .await?;
                 return Ok(ParticipantSettlementStep::Completed);
             }

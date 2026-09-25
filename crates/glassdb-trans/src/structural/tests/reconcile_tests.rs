@@ -4,7 +4,7 @@ use super::*;
 fn reconciliation_queue_is_bounded_and_drops_the_oldest() {
     let s = store();
     let bg = Arc::new(Background::new());
-    let reconciler = restructurer(&s, &bg, tiny()).ctx.reconciler;
+    let reconciler = restructurer(&s, &bg, tiny()).reconciler;
     for ordinal in 0..=DEFERRED_RECONCILIATION_CAP {
         reconciler.defer(PendingReconciliation {
             collection: collection(),
@@ -49,9 +49,7 @@ async fn seed_unpublished_leaf_chain(s: &TestStore, children: &[(&[u8], &str)]) 
 }
 
 async fn reconciler(s: &TestStore, bg: &Arc<Background>) -> ParentReconciler {
-    restructurer(s, bg, NodeSizePolicy::default())
-        .ctx
-        .reconciler
+    restructurer(s, bg, NodeSizePolicy::default()).reconciler
 }
 
 // Reconciles the root for `key`, which `target` covers, and returns the

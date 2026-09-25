@@ -4,30 +4,35 @@
 //!
 //! The [`Restructurer`] schedules the work. It drains the candidate feed, and
 //! gives each candidate to the split or the merge module, which re-checks it
-//! against current state. Both kinds of change share one lifecycle and one
-//! context: a structural intent written ahead of the change, a one-node
-//! structural gate, and parent reconciliation after the change. An independent
-//! loop completes the changes that a crash or an error interrupted.
+//! against cached state. Both kinds of change then run through one lifecycle:
+//! a structural intent written ahead of the change, a one-node structural
+//! gate, and parent reconciliation after the change. An independent loop
+//! completes the changes that a crash or an error interrupted.
 
 mod candidates;
 mod change;
 mod merge;
 mod nodes;
+mod reclamation;
 mod reconcile;
 mod recovery;
 mod split;
 mod stats;
+mod topology;
 
+use std::num::NonZeroUsize;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use glassdb_concurr::{Background, RetryConfig, ScanCadence, rt};
-use glassdb_data::{CollectionAddress, DbPrefix, TxId};
+use glassdb_data::{CollectionAddress, DbPrefix, ObjectPath, TxId};
 use glassdb_storage::{
     CollectionStore, InlinePolicy, NodeSizePolicy, NodeStore, StructuralIntentStore, Timeline,
+    TreeRouter,
 };
+use tokio::sync::Notify;
 
 use crate::collections::TopologySettler;
 use crate::error::TransError;
@@ -37,8 +42,15 @@ use crate::leaf_coord::LeafCoordinator;
 use crate::monitor::Monitor;
 
 use candidates::{CandidateCause, MaintenanceCandidate, MaintenanceCandidates};
-use change::ChangeContext;
-use recovery::{RecoveryAction, RecoveryStep};
+use change::{ChangeLifecycle, PlannedChange, StructuralTopology};
+use merge::Merger;
+use nodes::StructuralNodeAccess;
+use reclamation::ReclamationReporter;
+use reconcile::ParentReconciler;
+use recovery::{RecoveryAction, RecoveryStep, StructuralRecovery};
+use split::Splitter;
+use stats::Stats;
+use topology::TopologyMembership;
 
 pub use candidates::StructuralHintSink;
 pub use stats::{InlinePressureStats, RestructurerStats};
@@ -61,7 +73,18 @@ pub struct Restructurer {
     // Weak so a clone captured in the spawned loop does not keep the executor
     // alive across shutdown; `Engine` is the single strong owner.
     bg: Weak<Background>,
-    ctx: ChangeContext,
+    mon: Monitor,
+    // The candidate feed that the restructurer drains. The coordinator
+    // receives a clone for stored-leaf capacity; direct-commit policies receive
+    // lightweight hint sinks for inline-pressure observations.
+    candidates: MaintenanceCandidates,
+    stats: Arc<Stats>,
+    splitter: Splitter,
+    merger: Merger,
+    changes: ChangeLifecycle,
+    reconciler: ParentReconciler,
+    recovery: StructuralRecovery,
+    recovery_wake: Arc<Notify>,
 }
 
 impl Restructurer {
@@ -111,12 +134,12 @@ impl Restructurer {
     /// Returns a producer handle for structural hints decided outside the leaf
     /// coordinator.
     pub fn hint_sink(&self) -> StructuralHintSink {
-        self.ctx.candidates.hint_sink()
+        self.candidates.hint_sink()
     }
 
     /// Returns and resets background split and merge activity counters.
     pub fn stats_and_reset(&self) -> RestructurerStats {
-        self.ctx.stats.take()
+        self.stats.take()
     }
 
     /// Starts independent candidate and structural-recovery loops.
@@ -127,19 +150,19 @@ impl Restructurer {
         let restructurer = self.clone();
         bg.spawn(async move {
             loop {
-                restructurer.ctx.candidates.next_sweep().await;
+                restructurer.candidates.next_sweep().await;
                 restructurer.run_once().await;
             }
         });
         let recovery = self.clone();
         bg.spawn(async move {
-            let minimum = recovery.ctx.mon.protocol_timing().pending_timeout();
+            let minimum = recovery.mon.protocol_timing().pending_timeout();
             let mut cadence = ScanCadence::new(minimum, STRUCTURAL_RECOVERY_IDLE_INTERVAL);
             loop {
                 let delay = match recovery.recover_structural_intents().await {
                     Ok(progress) => {
                         cadence.observe(progress);
-                        if recovery.ctx.recovery.has_continuation() {
+                        if recovery.recovery.has_continuation() {
                             cadence.delay().min(minimum)
                         } else {
                             cadence.delay()
@@ -149,7 +172,7 @@ impl Restructurer {
                 };
                 tokio::select! {
                     _ = rt::sleep(delay) => {}
-                    _ = recovery.ctx.recovery_wake.notified() => {}
+                    _ = recovery.recovery_wake.notified() => {}
                 }
             }
         });
@@ -171,21 +194,70 @@ impl Restructurer {
         retry: RetryConfig,
         gc_hints: GcHints,
     ) -> Self {
+        let stats = Arc::new(Stats::default());
+        let router = TreeRouter::new(nodes.clone(), NonZeroUsize::MIN);
+        let structural_nodes =
+            StructuralNodeAccess::new(nodes.clone(), mon.clone(), key_state, coord);
+        let reconciler = ParentReconciler::new(
+            structural_nodes.clone(),
+            router.clone(),
+            timeline.clone(),
+            candidates.clone(),
+        );
+        let topology = TopologyMembership::new(records, mon.clone(), retry);
+        let recovery = StructuralRecovery::new(
+            topology.clone(),
+            nodes.clone(),
+            intent_store,
+            router.clone(),
+            mon.clone(),
+            structural_nodes.clone(),
+            reconciler.clone(),
+            timeline.clone(),
+            db_prefix,
+        );
+        let reclamation = ReclamationReporter::new(stats.clone(), gc_hints);
+        let splitter = Splitter::new(
+            nodes.clone(),
+            router.clone(),
+            timeline.clone(),
+            candidates.clone(),
+            stats.clone(),
+            reclamation.clone(),
+        );
+        let merger = Merger::new(
+            nodes,
+            structural_nodes.clone(),
+            router,
+            timeline,
+            mon.clone(),
+            *candidates.policy(),
+            *candidates.inline(),
+            stats.clone(),
+            reclamation.clone(),
+        );
+        let recovery_wake = Arc::new(Notify::new());
+        let changes = ChangeLifecycle::new(
+            recovery.clone(),
+            topology,
+            structural_nodes,
+            reconciler.clone(),
+            reclamation,
+            recovery_wake.clone(),
+            splitter.clone(),
+            merger.clone(),
+        );
         Restructurer {
             bg,
-            ctx: ChangeContext::new(
-                records,
-                nodes,
-                intent_store,
-                timeline,
-                mon,
-                key_state,
-                db_prefix,
-                coord,
-                candidates,
-                retry,
-                gc_hints,
-            ),
+            mon,
+            candidates,
+            stats,
+            splitter,
+            merger,
+            changes,
+            reconciler,
+            recovery,
+            recovery_wake,
         }
     }
 
@@ -193,8 +265,8 @@ impl Restructurer {
     /// transient error on one candidate only defers its change to a later
     /// cycle, so it is logged and the sweep continues.
     async fn run_once(&self) {
-        let stats = &self.ctx.stats;
-        for candidate in self.ctx.candidates.drain() {
+        let stats = &self.stats;
+        for candidate in self.candidates.drain() {
             stats.candidates.fetch_add(1, Ordering::Relaxed);
             let pressure = candidate.cause.is_inline_pressure();
             if pressure {
@@ -222,16 +294,16 @@ impl Restructurer {
                             .inline_pressure_deferred
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                    self.ctx.candidates.requeue(candidate);
+                    self.candidates.requeue(candidate);
                 }
             }
         }
         // Re-drive reconciliations a previous cycle could not land, so parents
         // eventually agree with their children and descent stops relying on
         // right-links.
-        for pending in self.ctx.reconciler.drain_pending() {
+        for pending in self.reconciler.drain_pending() {
             if let Err(e) = self
-                .ctx
+                .changes
                 .reconcile_parent(&pending.collection, &pending.key, &pending.target, None)
                 .await
             {
@@ -246,20 +318,40 @@ impl Restructurer {
 
     /// Dispatches one candidate to the change that its cause calls for.
     async fn process_candidate(&self, candidate: &MaintenanceCandidate) -> Result<(), TransError> {
+        // The candidate's already-aged wound-wait priority becomes the
+        // identity of the change.
         let id = candidate.priority.renew();
         match &candidate.cause {
             CandidateCause::Split(reason) => {
-                split::split_candidate(&self.ctx, &candidate.path, reason, id).await
+                let Some(path) = self.splitter.locate(&candidate.path, reason).await? else {
+                    return Ok(());
+                };
+                let change = PlannedChange::split(&path, reason)?;
+                self.changes
+                    .run(change, id, StructuralTopology::Owned)
+                    .await
             }
             CandidateCause::Underfull => {
-                merge::merge_candidate(&self.ctx, &candidate.path, id).await
+                let ObjectPath::Node { collection, token } = &candidate.path else {
+                    return Ok(());
+                };
+                if !self.merger.is_actionable(collection, token).await? {
+                    return Ok(());
+                }
+                let change = PlannedChange::Merge {
+                    collection,
+                    source: token,
+                };
+                self.changes
+                    .run(change, id, StructuralTopology::Owned)
+                    .await
             }
         }
     }
 
     /// Runs one durable structural-recovery sweep.
     async fn recover_structural_intents(&self) -> Result<bool, TransError> {
-        let action = self.ctx.recovery.begin_sweep();
+        let action = self.recovery.begin_sweep();
         match self.drive_recovery_action(action).await {
             Ok(active) => Ok(active),
             Err(error) => {
@@ -277,7 +369,7 @@ impl Restructurer {
     /// it requests.
     async fn drive_recovery_action(&self, mut action: RecoveryAction) -> Result<bool, TransError> {
         loop {
-            match self.ctx.recovery.advance(&mut action).await? {
+            match self.recovery.advance(&mut action).await? {
                 RecoveryStep::Completed { active, failed } => {
                     return if failed {
                         Err(TransError::Retry)
@@ -290,11 +382,10 @@ impl Restructurer {
                     participant,
                     reason,
                 } => {
-                    let result = Box::pin(split::split_path_joined(
-                        &self.ctx,
+                    let result = Box::pin(self.changes.split_path(
                         &path,
-                        &participant,
                         &reason,
+                        StructuralTopology::Joined(&participant),
                     ))
                     .await;
                     action.resume_parent_split(result);
@@ -312,10 +403,7 @@ impl TopologySettler for Restructurer {
         collection: &CollectionAddress,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let action = self
-            .ctx
-            .recovery
-            .begin_participant_settlement(collection, id);
+        let action = self.recovery.begin_participant_settlement(collection, id);
         self.drive_recovery_action(action).await.map(|_| ())
     }
 }

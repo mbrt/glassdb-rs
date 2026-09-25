@@ -43,7 +43,7 @@ async fn recover_peer_participant(committed: bool, case: ParticipantReclamation)
             }
         });
         assert!(
-            split_path(&owner.ctx, &root_path(), &SplitReason::SoftCap)
+            split_path(&owner, &root_path(), &SplitReason::SoftCap)
                 .await
                 .is_err()
         );
@@ -57,26 +57,31 @@ async fn recover_peer_participant(committed: bool, case: ParticipantReclamation)
         assert_eq!(intent.phase, StructuralIntentPhase::Ready);
         let id = intent.participant_id.clone();
         assert_eq!(
-            owner.ctx.mon.tx_status(&id).await.unwrap(),
+            owner.mon.tx_status(&id).await.unwrap(),
             TxCommitStatus::Committed
         );
         id
     } else {
         let id = TxId::with_priority(1, b"peer-participant");
         owner
-            .ctx
-            .begin_topology_tx(&collection(), &id)
+            .changes
+            .topology
+            .begin(&collection(), &id)
             .await
             .unwrap();
         owner
-            .ctx
             .recovery
             .prepare_intent(&collection(), None, ChangeKind::Split, &id)
             .await
             .unwrap();
-        owner.ctx.join_topology(&collection(), &id).await.unwrap();
+        owner
+            .changes
+            .topology
+            .join(&collection(), &id)
+            .await
+            .unwrap();
         assert_eq!(
-            owner.ctx.mon.abort_owned_tx(&id).await.unwrap(),
+            owner.mon.abort_owned_tx(&id).await.unwrap(),
             crate::monitor::OwnerAbortOutcome::Acknowledged
         );
         id
@@ -110,8 +115,9 @@ async fn recover_peer_participant(committed: bool, case: ParticipantReclamation)
                 Box::pin(async move {
                     if depart {
                         owner
-                            .ctx
-                            .leave_topology(&collection(), &participant)
+                            .changes
+                            .topology
+                            .leave(&collection(), &participant, Requirement::ANY)
                             .await
                             .map_err(|error| {
                                 glassdb_backend::BackendError::with_source("owner departure", error)
@@ -290,7 +296,7 @@ async fn recovery_retries_a_cached_preparing_intent_after_the_peer_publishes_rea
         }
     });
     assert!(
-        split_path(&owner.ctx, &root_path(), &SplitReason::SoftCap)
+        split_path(&owner, &root_path(), &SplitReason::SoftCap)
             .await
             .is_err()
     );
@@ -354,21 +360,22 @@ async fn settlement_cancels_a_prepared_split_before_node_creation() {
     let sp = restructurer(&s, &bg, tiny());
     let participant = TxId::with_priority(1, b"participant");
 
-    sp.ctx
-        .begin_topology_tx(&collection(), &participant)
+    sp.changes
+        .topology
+        .begin(&collection(), &participant)
         .await
         .unwrap();
     let intent = sp
-        .ctx
         .recovery
         .prepare_intent(&collection(), None, ChangeKind::Split, &participant)
         .await
         .unwrap();
-    sp.ctx
-        .join_topology(&collection(), &participant)
+    sp.changes
+        .topology
+        .join(&collection(), &participant)
         .await
         .unwrap();
-    sp.ctx.mon.abort_owned_tx(&participant).await.unwrap();
+    sp.mon.abort_owned_tx(&participant).await.unwrap();
 
     operations.lock().unwrap().clear();
     sp.settle_topology_participant(&collection(), &participant)
@@ -419,20 +426,17 @@ async fn settlement_cancels_a_prepared_split_before_node_creation() {
     );
 
     let worker = TxId::with_priority(2, b"worker");
-    sp.ctx.mon.begin_tx(&worker);
+    sp.mon.begin_tx(&worker);
     let reason = SplitReason::SoftCap;
-    let attempt = split::coordinate(
-        &sp.ctx,
-        &collection(),
-        SplitTarget::Root,
-        &worker,
-        &reason,
-        intent,
-    )
-    .await;
+    let change = PlannedChange::Split {
+        collection: &collection(),
+        target: SplitTarget::Root,
+        reason: &reason,
+    };
+    let attempt = sp.changes.coordinate(change, &worker, intent).await;
     assert!(matches!(attempt.result, Err(TransError::Retry)));
     assert!(matches!(attempt.state, ChangeAttemptResult::RetryCleanly));
-    sp.ctx.structural_nodes.finalize_worker(&worker).await;
+    sp.changes.structural_nodes.finalize_worker(&worker).await;
     assert!(
         s.list_nodes(COLL, Requirement::after(s.timeline.currentness_barrier()))
             .await
@@ -574,7 +578,7 @@ async fn structural_split_failure_transition_table() {
 
         assert!(
             split_path(
-                &sp.ctx,
+                &sp,
                 &ObjectPath::TreeRoot {
                     collection: collection(),
                 },
@@ -698,7 +702,7 @@ async fn structural_recovery_defers_while_the_source_writer_is_live() {
     let bg = Arc::new(Background::new());
     let sp = restructurer(&s, &bg, tiny());
     let id = TxId::with_priority(1, b"live-split");
-    sp.ctx.mon.begin_tx(&id);
+    sp.mon.begin_tx(&id);
 
     let mut source = leaf_node(&[b"a", b"b"], None, None);
     source.set_structural_gate(id.clone());
@@ -730,7 +734,7 @@ async fn structural_recovery_defers_while_the_source_writer_is_live() {
         1
     );
 
-    sp.ctx.mon.abort_owned_tx(&id).await.unwrap();
+    sp.mon.abort_owned_tx(&id).await.unwrap();
     assert!(sp.recover_structural_intents().await.unwrap());
     assert!(matches!(
         s.load_node(
@@ -767,7 +771,7 @@ async fn recovery_reads_a_live_split_freshly_and_keeps_its_child() {
     let bg = Arc::new(Background::new());
     let sp = restructurer(&s, &bg, tiny());
     let id = TxId::with_priority(1, b"inflight-split");
-    sp.ctx.mon.begin_tx(&id);
+    sp.mon.begin_tx(&id);
 
     // Initial tree, written by the peer: a root index over a single leaf L
     // that carries no structural gate.
@@ -912,12 +916,14 @@ async fn check_recovery_batch_reuses_source_reads(explicit: bool) {
     let bg = Arc::new(Background::new());
     let sp = restructurer(&s, &bg, tiny());
     let participant = TxId::with_priority(1, b"batch-participant");
-    sp.ctx
-        .begin_topology_tx(&collection(), &participant)
+    sp.changes
+        .topology
+        .begin(&collection(), &participant)
         .await
         .unwrap();
-    sp.ctx
-        .join_topology(&collection(), &participant)
+    sp.changes
+        .topology
+        .join(&collection(), &participant)
         .await
         .unwrap();
 
@@ -934,7 +940,7 @@ async fn check_recovery_batch_reuses_source_reads(explicit: bool) {
                 .unwrap()
         );
     }
-    sp.ctx.mon.abort_owned_tx(&participant).await.unwrap();
+    sp.mon.abort_owned_tx(&participant).await.unwrap();
     operations.lock().unwrap().clear();
     if explicit {
         sp.settle_topology_participant(&collection(), &participant)
@@ -1036,12 +1042,14 @@ async fn later_participant_discovery_checks_sources_after_its_own_ready_intents(
         let bg = Arc::new(Background::new());
         let sp = restructurer(&s, &bg, tiny());
         let participant = TxId::with_priority(1, b"later-discovery-participant");
-        sp.ctx
-            .begin_topology_tx(&collection(), &participant)
+        sp.changes
+            .topology
+            .begin(&collection(), &participant)
             .await
             .unwrap();
-        sp.ctx
-            .join_topology(&collection(), &participant)
+        sp.changes
+            .topology
+            .join(&collection(), &participant)
             .await
             .unwrap();
         let first_worker = TxId::with_priority(1, b"first-worker");
@@ -1053,7 +1061,7 @@ async fn later_participant_discovery_checks_sources_after_its_own_ready_intents(
                 .await
                 .unwrap()
         );
-        sp.ctx.mon.abort_owned_tx(&participant).await.unwrap();
+        sp.mon.abort_owned_tx(&participant).await.unwrap();
 
         operations.lock().unwrap().clear();
         gate.arm();
@@ -1142,7 +1150,7 @@ async fn recovery_reclaims_an_orphan_whose_source_a_later_split_now_gates() {
     let sp = restructurer(&s, &bg, tiny());
     let abandoned = TxId::with_priority(1, b"abandoned-split");
     let newcomer = TxId::with_priority(2, b"later-split");
-    sp.ctx.mon.begin_tx(&newcomer);
+    sp.mon.begin_tx(&newcomer);
 
     let mut source = leaf_node(&[b"a", b"b"], None, None);
     source.set_structural_gate(abandoned.clone());
@@ -1229,8 +1237,8 @@ async fn recovery_defers_to_a_live_root_split_over_a_newer_stale_source() {
     let sp = restructurer(&s, &bg, tiny());
     let worker = TxId::with_priority(1, b"inflight-root-split");
     let participant = TxId::with_priority(1, b"root-split-participant");
-    sp.ctx.mon.begin_tx(&worker);
-    sp.ctx.mon.begin_tx(&participant);
+    sp.mon.begin_tx(&worker);
+    sp.mon.begin_tx(&participant);
 
     peer.create_root(COLL, &leaf_node(&[b"a", b"b", b"m", b"n"], None, None))
         .await
@@ -1625,9 +1633,9 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
         phase: StructuralIntentPhase::Ready,
     };
     s.write_structural_intent("R", &intent).await.unwrap();
-    sp.ctx.mon.begin_tx(&id);
+    sp.mon.begin_tx(&id);
     assert_eq!(
-        sp.ctx.mon.preempt_tx(&id).await.unwrap(),
+        sp.mon.preempt_tx(&id).await.unwrap(),
         TxFinalStatus::Aborted
     );
 
@@ -1718,7 +1726,7 @@ async fn recovery_that_needs_a_parent_split(
 async fn sweep_defers_one_failed_parent_split_and_continues() {
     let participant = TxId::with_priority(1, b"pending-participant");
     let (s, bg, sp, request_record) = recovery_that_needs_a_parent_split(&participant).await;
-    sp.ctx.mon.begin_tx(&participant);
+    sp.mon.begin_tx(&participant);
 
     let mut orphan_intent = nonroot_intent("L", "U", b"z");
     orphan_intent.participant_id = participant.clone();
@@ -1745,14 +1753,14 @@ async fn sweep_defers_one_failed_parent_split_and_continues() {
         .await
         .unwrap();
 
-    let mut action = sp.ctx.recovery.begin_sweep();
+    let mut action = sp.recovery.begin_sweep();
     assert!(matches!(
-        sp.ctx.recovery.advance(&mut action).await.unwrap(),
+        sp.recovery.advance(&mut action).await.unwrap(),
         RecoveryStep::SplitParent { .. }
     ));
     action.resume_parent_split(Err(TransError::Retry));
     assert!(matches!(
-        sp.ctx.recovery.advance(&mut action).await.unwrap(),
+        sp.recovery.advance(&mut action).await.unwrap(),
         RecoveryStep::Completed { active: true, .. }
     ));
 
@@ -1780,8 +1788,8 @@ async fn sweep_defers_one_failed_parent_split_and_continues() {
 async fn explicit_settlement_returns_a_parent_split_error() {
     let participant = TxId::with_priority(1, b"final-participant");
     let (s, bg, sp, intent) = recovery_that_needs_a_parent_split(&participant).await;
-    sp.ctx.mon.begin_tx(&participant);
-    sp.ctx.mon.abort_owned_tx(&participant).await.unwrap();
+    sp.mon.begin_tx(&participant);
+    sp.mon.abort_owned_tx(&participant).await.unwrap();
     s.intent_store
         .write(
             &db_prefix("db"),
@@ -1792,16 +1800,15 @@ async fn explicit_settlement_returns_a_parent_split_error() {
         .unwrap();
 
     let mut action = sp
-        .ctx
         .recovery
         .begin_participant_settlement(&collection(), &participant);
     assert!(matches!(
-        sp.ctx.recovery.advance(&mut action).await.unwrap(),
+        sp.recovery.advance(&mut action).await.unwrap(),
         RecoveryStep::SplitParent { .. }
     ));
     action.resume_parent_split(Err(TransError::Retry));
     assert!(matches!(
-        sp.ctx.recovery.advance(&mut action).await,
+        sp.recovery.advance(&mut action).await,
         Err(TransError::Retry)
     ));
     drop(bg);

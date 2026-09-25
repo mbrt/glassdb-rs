@@ -45,6 +45,12 @@ impl StructuralNodeAccess {
         }
     }
 
+    /// Registers a worker's ephemeral wound-wait identity, which
+    /// [`Self::finalize_worker`] retires.
+    pub(super) fn begin_worker(&self, id: &TxId) {
+        self.mon.begin_tx(id);
+    }
+
     /// Registers a new worker identity and acquires one node's structural gate
     /// under wound-wait.
     ///
@@ -57,7 +63,7 @@ impl StructuralNodeAccess {
         token: Option<&NodeToken>,
     ) -> Result<Option<(TxId, Node, LeafObservation)>, TransError> {
         let id = TxId::new_at(rt::system_now());
-        self.mon.begin_tx(&id);
+        self.begin_worker(&id);
         match self
             .acquire_structural_gate(collection, token, &id, GateAcquisition::WoundWait)
             .await
