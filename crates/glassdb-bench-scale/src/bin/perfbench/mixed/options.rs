@@ -60,7 +60,8 @@ pub(crate) struct Options {
     #[arg(long, default_value = "60s", value_parser = glassdb_bench_scale::parse_duration)]
     pub(super) split_settle_timeout: Duration,
     /// Topology policies of the measurement clients to sweep. The setup
-    /// Database always uses the engine default.
+    /// Database always uses the size rule, so that each policy starts from
+    /// the same tree.
     #[arg(long, value_delimiter = ',', default_value = "engine", value_parser = PolicySpec::parse)]
     policies: Vec<PolicySpec>,
     /// Unmeasured wall time of all shapes before measurement, so that a

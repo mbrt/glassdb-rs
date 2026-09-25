@@ -141,10 +141,10 @@ pub(super) fn prepare_cell(
     })
 }
 
-fn open_db(handle: &Handle, name: &str, backend: Arc<dyn Backend>) -> Database {
-    handle
-        .block_on(Database::open(name, backend))
-        .expect("open db")
+fn open_setup_db(handle: &Handle, name: &str, backend: Arc<dyn Backend>) -> Database {
+    // The soft caps build the seeded tree.
+    let builder = PolicySpec::Size.apply(Database::builder(name, backend));
+    handle.block_on(builder.open()).expect("open db")
 }
 
 async fn open_collections(
@@ -170,7 +170,7 @@ fn seed_and_settle(
     paths: &[CollectionPath],
     config: &CellConfig,
 ) -> Result<SplitSettlement, Box<dyn Error>> {
-    let database = open_db(handle, database_name, backend);
+    let database = open_setup_db(handle, database_name, backend);
     handle.block_on(async {
         for path in paths {
             let name = path
