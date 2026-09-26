@@ -803,6 +803,35 @@ impl LostCas {
     }
 }
 
+/// Time that the members of a round lose after a CAS lost to keys in the
+/// other half of the leaf. A split can remove it until the round sends the
+/// CAS that lands, finds that it has nothing to write, or ends.
+struct LostTime {
+    /// The start of the time that is not reported yet.
+    since: rt::Instant,
+    /// The members of the round since `since`. Members can join or leave
+    /// the round at each attempt.
+    members: u32,
+    split_key: Vec<u8>,
+}
+
+impl LostTime {
+    /// Reports the time from the last report to `until`.
+    fn report(&mut self, hinter: &dyn StructuralHinter, path: &ObjectPath, until: rt::Instant) {
+        let lost = until.saturating_duration_since(self.since);
+        if lost.is_zero() {
+            return;
+        }
+        hinter.leaf_delay(
+            path,
+            LeafDelay::LostCas,
+            lost.saturating_mul(self.members),
+            &self.split_key,
+        );
+        self.since = until;
+    }
+}
+
 /// Reports whether a split at `median` puts all of `ours` in one half and all
 /// of `theirs` in the other half.
 fn median_separates<'a>(
@@ -1267,11 +1296,9 @@ impl CasWorker {
         // batch's in-doubt outcome would strand it over a write it never made.
         let mut in_doubt: BTreeSet<TxId> = BTreeSet::new();
         let mut lost_cas: Option<LostCas> = None;
-        // When the first CAS lost to a CAS for keys in the other half was sent,
-        // for how many members, and the split key of the halves. A split can
-        // remove the time until the round sends the CAS that lands, or finds
-        // that it has nothing to write.
-        let mut lost_to_other_keys: Option<(rt::Instant, u32, Vec<u8>)> = None;
+        // It is reported at each retry, so that the windows of a topology
+        // policy see a round that keeps losing before the round ends.
+        let mut lost_time: Option<LostTime> = None;
         // Retain both submitted and policy-requested bounds across retries.
         // ANY seeds need no preliminary check when a CAS confirms their state.
         let mut load_requirement = Requirement::ANY;
@@ -1299,6 +1326,9 @@ impl CasWorker {
                     if lost_cas.take().is_some() {
                         self.core.stats.record_lost_cas(LostCasCause::NodeChange);
                     }
+                    if let Some(lost) = &mut lost_time {
+                        lost.report(&*self.core.hinter, path, rt::Instant::now());
+                    }
                     let members = self.round_members(batch, round);
                     for (tx, member) in &members {
                         *member.slot.lock().unwrap() = Some(CoordinatedOutcome {
@@ -1314,11 +1344,18 @@ impl CasWorker {
                 let cause = lost.cause(edit.node());
                 self.core.stats.record_lost_cas(cause);
                 if cause == LostCasCause::OtherKeys
-                    && lost_to_other_keys.is_none()
+                    && lost_time.is_none()
                     && let Some(split_key) = lost.separating_key(edit.node())
                 {
-                    lost_to_other_keys = Some((lost.sent, lost.members, split_key));
+                    lost_time = Some(LostTime {
+                        since: lost.sent,
+                        members: lost.members,
+                        split_key,
+                    });
                 }
+            }
+            if let Some(lost) = &mut lost_time {
+                lost.report(&*self.core.hinter, path, rt::Instant::now());
             }
             round.median = edit.entries().median_key().map(<[u8]>::to_vec);
             // Read the merged set *after* obtaining the leaf so this round
@@ -1337,6 +1374,9 @@ impl CasWorker {
             };
             requirement = requirement.stricter(merged.requirement);
             let members = merged.members;
+            if let Some(lost) = &mut lost_time {
+                lost.members = u32::try_from(members.len()).unwrap_or(u32::MAX);
+            }
             let mut plan = match self
                 .plan_mutation(path, &edit, &members, requirement, reloaded, &mut in_doubt)
                 .await
@@ -1383,14 +1423,8 @@ impl CasWorker {
 
             // The lost CAS time ends when the round sends its last CAS,
             // because the slow CAS time covers that CAS.
-            if let Some((lost_sent, members, split_key)) = &lost_to_other_keys {
-                let lost = sent.saturating_duration_since(*lost_sent);
-                self.core.hinter.leaf_delay(
-                    path,
-                    LeafDelay::LostCas,
-                    lost.saturating_mul(*members),
-                    split_key,
-                );
+            if let Some(lost) = &mut lost_time {
+                lost.report(&*self.core.hinter, path, sent);
             }
             // The CAS landed (or nothing needed staging): publish each member's
             // outcome into its slot before returning, so the deposit
@@ -1421,6 +1455,9 @@ impl CasWorker {
         // policy's exhaustion outcome. Acquirers conflict and release/re-lock;
         // write-backs re-descend and releases re-submit, because exhaustion does
         // not prove convergence.
+        if let Some(lost) = &mut lost_time {
+            lost.report(&*self.core.hinter, path, rt::Instant::now());
+        }
         for (tx, m) in &self.round_members(batch, round) {
             *m.slot.lock().unwrap() = Some(CoordinatedOutcome {
                 outcome: m.policy.exhausted_outcome(in_doubt.contains(tx)),
@@ -3065,20 +3102,24 @@ mod tests {
 
     type PeerChange = fn(&Node) -> Node;
 
-    // Before the next leaf CAS after arming, a peer replaces the leaf with
+    // Before each of the next `wins` leaf CASes, a peer replaces the leaf with
     // `change` applied to its current node, so that CAS is rejected.
-    fn peer_wins_next_leaf_cas(
+    fn peer_wins_leaf_cas(
         inner: Arc<dyn Backend>,
         change: PeerChange,
-    ) -> (Arc<HookBackend>, Arc<std::sync::atomic::AtomicBool>) {
-        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    ) -> (Arc<HookBackend>, Arc<std::sync::atomic::AtomicUsize>) {
+        let wins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let peer = cold_store(inner.clone());
         let backend = HookBackend::new(inner);
         backend.set_before({
-            let armed = armed.clone();
+            let wins = wins.clone();
             move |op| {
                 let fire = matches!(op, BackendOp::WriteIf { path, .. } if path.contains("/_n/"))
-                    && armed.swap(false, Ordering::SeqCst);
+                    && wins
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |wins| {
+                            wins.checked_sub(1)
+                        })
+                        .is_ok();
                 let peer = peer.clone();
                 let future: HookFuture = Box::pin(async move {
                     if fire {
@@ -3098,7 +3139,7 @@ mod tests {
                 future
             }
         });
-        (backend, armed)
+        (backend, wins)
     }
 
     // Returns `node` with a peer's committed write of `key`.
@@ -3191,10 +3232,10 @@ mod tests {
                 ],
             )
             .await;
-            let (backend, armed) = peer_wins_next_leaf_cas(mem, change);
+            let (backend, wins) = peer_wins_leaf_cas(mem, change);
             let (coord, _nodes, _timeline, _bg) = coord_over(backend as Arc<dyn Backend>).await;
             coord.stats_and_reset();
-            armed.store(true, Ordering::SeqCst);
+            wins.store(1, Ordering::SeqCst);
 
             let tx = TxId::with_priority(2, b"tx");
             let locked = coord
@@ -3426,11 +3467,18 @@ mod tests {
     // backs off for about one millisecond, and reloads.
     const LOST_CAS: Duration = Duration::from_millis(80);
 
-    // A coordinator over leaf keys `a` and `b`, whose next leaf CAS loses to
-    // `change` of a peer.
-    async fn coord_losing_next_cas(
+    // A coordinator over leaf keys `a` and `b`, whose next `wins` leaf CASes
+    // lose to `change` of a peer. The peer wins as many more CASes as the
+    // returned counter is set to.
+    async fn coord_losing_cas(
         change: PeerChange,
-    ) -> (LeafCoordinator, Arc<DelayRecorder>, Arc<Background>) {
+        wins: usize,
+    ) -> (
+        LeafCoordinator,
+        Arc<DelayRecorder>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<Background>,
+    ) {
         let inner = slow_leaf_backend();
         let seed = TxId::with_priority(1, b"seed");
         store_leaf_entries(
@@ -3442,7 +3490,7 @@ mod tests {
             ],
         )
         .await;
-        let (backend, armed) = peer_wins_next_leaf_cas(inner, change);
+        let (backend, peer_wins) = peer_wins_leaf_cas(inner, change);
         let hints = Arc::new(DelayRecorder::default());
         let (coord, _nodes, _timeline, bg) = coord_over_retry(
             backend,
@@ -3454,8 +3502,8 @@ mod tests {
             },
         )
         .await;
-        armed.store(true, Ordering::SeqCst);
-        (coord, hints, bg)
+        peer_wins.store(wins, Ordering::SeqCst);
+        (coord, hints, peer_wins, bg)
     }
 
     fn lost_cas_times(delays: &[(LeafDelay, Duration)]) -> Vec<Duration> {
@@ -3467,10 +3515,9 @@ mod tests {
     }
 
     fn assert_lost_cas_time(delays: &[(LeafDelay, Duration)]) {
-        let lost = lost_cas_times(delays);
-        assert_eq!(lost.len(), 1, "{delays:?}");
+        let lost: Duration = lost_cas_times(delays).iter().sum();
         assert!(
-            (LOST_CAS..=LOST_CAS + Duration::from_millis(1)).contains(&lost[0]),
+            (LOST_CAS..=LOST_CAS + Duration::from_millis(1)).contains(&lost),
             "{delays:?}"
         );
     }
@@ -3486,7 +3533,7 @@ mod tests {
             ("same half", |node| with_peer_writer(node, b"0"), false),
         ];
         for (name, change, split_time) in cases {
-            let (coord, hints, _bg) = coord_losing_next_cas(change).await;
+            let (coord, hints, _wins, _bg) = coord_losing_cas(change, 1).await;
 
             assert!(
                 spawn_lock(&coord, b"a", 2).await.unwrap().unwrap(),
@@ -3564,7 +3611,8 @@ mod tests {
     // write. Its members still waited for the lost CAS.
     #[tokio::test(start_paused = true)]
     async fn lost_cas_in_the_other_half_is_split_time_when_the_retry_writes_nothing() {
-        let (coord, hints, _bg) = coord_losing_next_cas(|node| with_peer_writer(node, b"b")).await;
+        let (coord, hints, _wins, _bg) =
+            coord_losing_cas(|node| with_peer_writer(node, b"b"), 1).await;
 
         let outcome = coord
             .coordinate(StageLockUntilReload(StageLock {
@@ -3578,6 +3626,96 @@ mod tests {
 
         assert!(matches!(outcome, Some(MemberOutcome::Moved)));
         assert_lost_cas_time(&hints.take());
+    }
+
+    // Regression: a round reported its lost CAS time only when a CAS landed,
+    // so a topology policy saw nothing in the windows of a round that kept
+    // losing to another database instance.
+    #[tokio::test(start_paused = true)]
+    async fn lost_cas_in_the_other_half_is_split_time_while_the_round_retries() {
+        let (coord, hints, wins, _bg) =
+            coord_losing_cas(|node| with_peer_writer(node, b"b"), usize::MAX).await;
+
+        let locking = spawn_lock(&coord, b"a", 2);
+        rt::sleep(Duration::from_secs(1)).await;
+        let reported: Duration = lost_cas_times(&hints.take()).iter().sum();
+        let retrying = !locking.is_finished();
+        wins.store(0, Ordering::SeqCst);
+        assert!(locking.await.unwrap().unwrap());
+        coord.close().await;
+
+        assert!(retrying);
+        assert!(
+            reported >= Duration::from_secs(1) - 2 * LOST_CAS,
+            "{reported:?}"
+        );
+    }
+
+    // Regression: the lost CAS time counted only the members of the first lost
+    // CAS, although the members that join the round later also wait.
+    #[tokio::test(start_paused = true)]
+    async fn lost_cas_in_the_other_half_is_split_time_of_the_members_that_join_the_round() {
+        let (coord, hints, wins, _bg) =
+            coord_losing_cas(|node| with_peer_writer(node, b"b"), usize::MAX).await;
+
+        let first = spawn_lock(&coord, b"a", 2);
+        rt::sleep(Duration::from_secs(1)).await;
+        let joiner = spawn_lock(&coord, b"a", 3);
+        rt::sleep(Duration::from_secs(1)).await;
+        let reported: Duration = lost_cas_times(&hints.take()).iter().sum();
+        wins.store(0, Ordering::SeqCst);
+        for task in [first, joiner] {
+            assert!(task.await.unwrap().unwrap());
+        }
+        coord.close().await;
+
+        // One member lost the first second, and two members the next one.
+        assert!(
+            reported >= Duration::from_secs(3) - 4 * LOST_CAS,
+            "{reported:?}"
+        );
+    }
+
+    // Regression: a round that ended without a CAS that lands reported none
+    // of its lost CAS time, although its members lost it.
+    #[tokio::test(start_paused = true)]
+    async fn lost_cas_in_the_other_half_is_split_time_when_the_round_ends_without_landing() {
+        let cases: [(&str, PeerChange); 2] = [
+            ("the CAS retries run out", |node| {
+                with_peer_writer(node, b"b")
+            }),
+            ("the leaf becomes an index", |node| {
+                if node
+                    .as_leaf()
+                    .is_some_and(|leaf| leaf.lookup(b"c").is_some())
+                {
+                    Node::index(glassdb_storage::IndexNode::from_children([(
+                        Vec::new(),
+                        node_id(2),
+                    )]))
+                } else {
+                    with_peer_writer(node, b"c")
+                }
+            }),
+        ];
+        for (name, change) in cases {
+            let (coord, hints, _wins, _bg) = coord_losing_cas(change, usize::MAX).await;
+
+            let started = rt::Instant::now();
+            let locked = spawn_lock(&coord, b"a", 2).await.unwrap().unwrap();
+            let elapsed = started.elapsed();
+            coord.close().await;
+
+            assert!(!locked, "{name}");
+            // The time starts when the round sends its first CAS, after the
+            // first leaf load.
+            let reported: Duration = lost_cas_times(&hints.take()).iter().sum();
+            let expected = elapsed - LEAF_LOAD;
+            assert!(
+                (expected - Duration::from_millis(1)..=expected).contains(&reported),
+                "{name}: {reported:?} of {elapsed:?}"
+            );
+        }
     }
 
     const FAST_CAS: Duration = Duration::from_millis(10);

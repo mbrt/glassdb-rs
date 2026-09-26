@@ -28,7 +28,7 @@ const TYPICAL_TIME_WEIGHT: u32 = 8;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SplitTime {
     /// Round members from a leaf CAS that failed, because a CAS for other keys
-    /// landed first, until a CAS of the round landed.
+    /// landed first, until a CAS of the round landed or the round ended.
     pub lost_cas: Duration,
     /// Waits of round members for an earlier round with none of their keys.
     pub queue_wait: Duration,

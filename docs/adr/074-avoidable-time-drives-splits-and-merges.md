@@ -75,8 +75,11 @@ parent.
 Split causes of a leaf:
 
 - **Lost CAS on other keys.** A leaf CAS of a coordinator round fails, because a
-  CAS for other keys landed first. The time is from the failed CAS to the CAS
-  that lands. A split can put the keys in different leaves.
+  CAS for other keys landed first. The time is from when the round sent the
+  failed CAS to when it sent the CAS that lands, or to the end of the round if
+  no CAS lands. It counts the members of the round at each attempt. The round
+  measures it at each retry, so that a window has the time of a round that
+  still loses. A split can put the keys in different leaves.
 - **Queue wait for other keys.** A round member waits for an earlier
   coordinator round of the same leaf, and that round has none of the keys of
   the member. A transaction counts only its longest wait, because it waits for
@@ -228,9 +231,10 @@ throttled requests with the same retry budget as the S3 adapter.
   If the opposite change does not pay back, the wrong decision stays, but it
   costs less time in each window than that change.
 - Each database instance sees only its own transactions. Instances with
-  different loads can make different decisions. Lost CAS and slow leaf CAS are
-  visible to all writers of a leaf, so the instances that share a hot leaf agree
-  on its split causes.
+  different loads can make different decisions. A slow leaf CAS is visible to
+  all writers of a leaf. A lost CAS is visible only to the instance that loses
+  it: when one instance wins each CAS of a hot leaf, the other instance has the
+  lost CAS time, and the winner has none.
 - The measurements are volatile, like ADR-056 requests. A restart loses them.
 - Each database instance keeps time sums for its active leaves and pairs, and
   drops them for inactive leaves.
@@ -271,7 +275,8 @@ and a drained node, and saves no time.
 ### Share measurements between database instances
 
 This needs shared state, durable or over the network. The instances that share
-a hot leaf already see its lost CAS and slow leaf CAS.
+a hot leaf already see its slow leaf CAS, and the instance that loses a CAS
+sees the lost CAS. One instance can split the leaf for all.
 
 ### Decide in the engine, without a policy seam
 
