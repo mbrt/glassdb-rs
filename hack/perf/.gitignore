@@ -2,3 +2,5 @@
 flamegraph.svg
 flamegraph.folded
 perf.data*
+# Topology policy results and reports (see README.md).
+out/

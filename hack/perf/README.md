@@ -1,7 +1,9 @@
 # Profiling glassdb-rs (hack/perf)
 
 A CPU-profiling recipe. Use it to identify where CPU time goes. The profiler
-attaches to a compiled benchmark executable.
+attaches to a compiled benchmark executable. The
+[topology policy report](#topology-policy-report) compares the topology
+policies of ADR-074 in perfbench.
 
 Manual experiments that use this or other performance tooling are recorded in
 [`investigations.md`](investigations.md).
@@ -59,3 +61,36 @@ debug symbols retained) so stacks are both fast and readable.
 sudo sysctl kernel.perf_event_paranoid=1
 sudo sysctl kernel.kptr_restrict=0   # if stacks show only raw addresses
 ```
+
+## Topology policy report
+
+`plot-topology.py` renders perfbench `topology` and `mixed` results as one HTML
+report. The report compares each policy with a baseline of the same file and
+run: `fixed` for `topology`, and `size` for `mixed`. The JSON does not record
+the delay model, so each file name must contain `-s3-` or `-gcs-`.
+
+```bash
+perfbench() { cargo run --release -p glassdb-bench-scale --bin perfbench -- "$@"; }
+out=hack/perf/out
+mkdir -p $out
+for delays in s3 gcs; do
+  for leaf in 16 128; do
+    perfbench --delays=$delays --runs=3 --output=$out/topo-$delays-L$leaf.json \
+      topology --workloads=single,hot,adjacent,random,scan --workers=8 \
+      --databases=1,4 --leaf-sizes=$leaf --num-keys=1024 --duration=10s \
+      --max-duration=30s --split-settle-timeout=600s --split-quiet=5s \
+      --policies=fixed,avoidable --adapt=20s
+  done
+  for databases in 1 2 4 8; do
+    perfbench mixed --delays=$delays --databases=$databases \
+      --workers-per-shape=8 --affinities=0,50,100 --modes=lo,hi \
+      --policies=size,avoidable --warmup=20s --duration=5s --max-duration=30s \
+      --split-quiet=5s --split-settle-timeout=300s \
+      --output=$out/mixed-$delays-db$databases.json
+  done
+done
+hack/perf/plot-topology.py $out/*.json --output $out/report.html --image-dir $out/img
+```
+
+An input `PATH=POLICY,POLICY` keeps only those policies and the baselines. Run
+`hack/perf/test_plot_topology.py` after a change to the script.
