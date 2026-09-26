@@ -18,6 +18,13 @@ use super::avoidable::{MergeTime, SplitTime};
 /// The window length of the policies in this module.
 const DEFAULT_WINDOW: Duration = Duration::from_secs(1);
 
+/// The default multiples of the typical split and merge times. They are less
+/// than one, because a change keeps its effect after the window that paid for
+/// it, and each database instance sees only its own part of the time
+/// (ADR-074).
+const DEFAULT_SPLIT_THRESHOLD: f64 = 0.25;
+const DEFAULT_MERGE_THRESHOLD: f64 = 0.1;
+
 /// Decides the splits and merges of leaves from one window of measurements.
 ///
 /// A policy has no state that the engine must keep: it gets all of the
@@ -110,13 +117,13 @@ pub enum TopologyChange {
     Merge(LeafId),
 }
 
-/// Splits a leaf when its split-side time in one window is more than the
-/// typical split time, and merges two adjacent leaves when their merge-side
-/// time is more than the typical merge time plus the split-side time of both
-/// leaves (ADR-074). A split for split-side time is at the split key of the
-/// leaf. Leaves over a soft cap also split, at the median. A leaf that a
-/// split wrote in this window or the last one does not merge, and a leaf that
-/// a merge wrote does not split on avoidable time.
+/// Splits a leaf when its split-side time in one window is more than a
+/// multiple of the typical split time, and merges two adjacent leaves when
+/// their merge-side time is more than a multiple of the typical merge time plus
+/// the split-side time of both leaves (ADR-074). A split for split-side time is
+/// at the split key of the leaf. Leaves over a soft cap also split, at the
+/// median. A leaf that a split wrote in this window or the last one does not
+/// merge, and a leaf that a merge wrote does not split on avoidable time.
 #[derive(Debug, Clone, Copy)]
 pub struct AvoidableTimePolicy {
     split_threshold: f64,
@@ -181,13 +188,13 @@ impl AvoidableTimePolicy {
     /// Creates the policy of ADR-074.
     pub fn new() -> Self {
         Self {
-            split_threshold: 1.0,
-            merge_threshold: 1.0,
+            split_threshold: DEFAULT_SPLIT_THRESHOLD,
+            merge_threshold: DEFAULT_MERGE_THRESHOLD,
         }
     }
 
     /// Sets the multiple of the typical split time that the split-side time
-    /// of a leaf must be more than. Defaults to one.
+    /// of a leaf must be more than. Defaults to 0.25.
     ///
     /// # Panics
     ///
@@ -199,7 +206,7 @@ impl AvoidableTimePolicy {
 
     /// Sets the multiple of the typical merge time that the merge-side time of
     /// two leaves must be more than, in addition to their split-side time.
-    /// Defaults to one.
+    /// Defaults to 0.1.
     ///
     /// # Panics
     ///

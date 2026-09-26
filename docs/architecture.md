@@ -314,8 +314,11 @@ keeps the target's copies of the drained entries, and only the merge intent can
 remove it.
 
 Committed leaf writes, parent reconciliation, and capacity rejections queue
-split and merge candidates. A new candidate wakes the restructurer after a
-short coalescing delay, so that one sweep takes a burst of writes. A deferred
+split and merge candidates. When a topology policy is set, it decides the leaf
+splits and merges once in each window, from the avoidable time of the window
+([ADR-074](adr/074-avoidable-time-drives-splits-and-merges.md)). A new
+candidate wakes the restructurer after a short coalescing delay, so that one
+sweep takes a burst of writes. A deferred
 candidate does not wake the restructurer: it waits for the next sweep, at the
 latest a fixed interval later, so that a busy node does not cause a tight retry
 loop. A merge defers while a live transaction holds a lock on its source or its

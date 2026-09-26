@@ -88,6 +88,17 @@ Split causes of a leaf:
   locked commit penalty: the typical time of a locked commit minus the typical
   time of a direct commit, as the database instance measures them.
 
+A lost CAS, a queue wait, and a slow leaf CAS count only when a split at the
+median key of the leaf puts the keys of the member in one half and the other
+keys in the other half. For a lost CAS, the other keys are the keys that the
+landed CAS changed, and the median is of the leaf that the round expected. For
+a queue wait and a slow leaf CAS, the other keys are the keys of the previous
+round of the leaf, and the median is of the leaf of that round. A slow leaf CAS
+counts once for each member that the split separates. The median of the last
+such cause is the split key of the leaf. A split for these causes is at the
+split key, because the leaf can change after each measurement. A split for
+inline pressure is at the median of the current leaf.
+
 Merge causes of two adjacent leaves:
 
 - **Adjacent cross-leaf miss.** A direct commit candidate has its keys in these
@@ -101,25 +112,49 @@ These are not causes, because no single split or merge removes them:
 - A lost CAS on the same keys. A split cannot separate them.
 - A queue wait for an earlier round that has one or more keys of the member.
   A split cannot separate them.
+- A lost CAS, a queue wait, or a slow leaf CAS whose keys a split at the median
+  key does not separate.
 - A cross-leaf miss whose keys are in more than two leaves.
 - S3 throttling of a prefix. All nodes of a collection share one prefix.
 
-### Decide with one rule
+### Decide in a topology policy
 
-A leaf becomes a split candidate when its split-side avoidable time in the last
-window is more than the typical time of one split.
+A topology policy decides the splits and merges of leaves. It is a public
+trait. Once in each window of one second, the engine gives the policy the
+measurements of the window: the avoidable time, the split key, and the size of
+each active leaf, the avoidable time of each pair of adjacent leaves, and the
+typical times of a split and of a merge. The policy returns the changes that it
+wants: a split at the median, a split at a key, or a merge into the right
+sibling.
 
-Two adjacent leaves become a merge candidate when their merge-side avoidable
-time in the last window is more than the typical time of one merge, plus the
-split-side avoidable time of both leaves.
+The engine checks each change again against current state. It skips a split
+of a leaf with less than two entries, a split at a key that leaves one half
+empty, a merge of the root, and a merge that the ADR-073 merge rules do not
+allow, except the underfull threshold. So a policy cannot make the tree
+unsafe. The engine still decides the hard cap splits and the index nodes.
+Without a policy, the size causes of ADR-031, ADR-056, and ADR-073 decide
+leaves, as before this ADR.
+
+The avoidable time policy uses one rule. A leaf becomes a split candidate when
+its split-side avoidable time in the window is more than 0.25 times the
+typical time of one split. Two adjacent leaves become a merge candidate when
+their merge-side avoidable time in the window is more than 0.1 times the
+typical time of one merge, plus the split-side avoidable time of both leaves.
+A leaf over a soft cap also splits, at the median.
+
+The multiples are less than one, because a change keeps its effect after the
+window that paid for it, and each database instance sees only its own part of
+the time. Multiples of one did not merge leaves of 16 entries under scans of 64
+keys, which a merge made 3 times faster.
 
 The database instance measures the typical time of a split and of a merge. A
 default applies until it measured one. The window is local to each database
 instance, like the soft thresholds (ADR-072).
 
-A node that took part in a structural change does not become a candidate of the
-other kind during the next window, the hold-down window. With the ADR-073 merge
-vetoes, this stops nodes from splitting and merging again and again.
+A leaf that a split wrote in this window or the last one does not merge, and a
+leaf that a merge wrote in this window or the last one does not split for
+avoidable time. This is the hold-down window. With the ADR-073 merge vetoes, it
+stops leaves from splitting and merging again and again in each window.
 
 ### Keep the size causes
 
@@ -151,7 +186,36 @@ throttled requests with the same retry budget as the S3 adapter.
 ## Consequences
 
 - The topology follows the measured cost. One policy suits S3 and GCS, without
-  thresholds for each backend.
+  thresholds for each backend. In the perfbench `topology` scenario, seeded
+  with leaves of 16 or 128 entries, the avoidable time policy had 1.18 to 1.23
+  times the throughput of the fixed seeded tree on S3, and 1.30 to 1.36 times
+  on GCS. This is the geometric mean over 20 cells, in each of 4 runs. The
+  worst cell was 0.85 to 0.92 of the fixed tree on S3, and 0.79 to 0.85 on GCS.
+- In the perfbench `mixed` scenario with 5000 keys for each collection, the
+  policy had 1.16 times the throughput of the size causes on S3, and 1.27
+  times on GCS. This is the geometric mean of the four transaction shapes, over
+  1 to 8 database instances and 0 to 100% collection affinity. The gain was
+  about the same when the instances shared all collections as when each
+  instance used only its own collection. It was smaller with more instances,
+  because the same number of workers then had less contention on each
+  collection.
+- The split rule does not count the time that a split adds to the direct
+  commit candidates with keys in both halves. A cross-leaf miss over more than
+  two leaves is not a merge cause either. So a hot leaf can split under
+  transactions that write all of its keys. In the `mixed` hi mode, each
+  collection has 8 hot keys, and one shape writes all 8. The leaf split, the
+  multi-key transactions used locked commits and starved, and the geometric
+  mean of the shapes was 0.62 of the size causes on S3 and 0.75 on GCS.
+- Each database instance sees about one part in N of the time of a leaf that N
+  instances share. So with more instances, a change needs more time in total.
+  With 4 instances, leaves of 16 entries under scans merged only with a merge
+  multiple of 0.1.
+- After a split, the time that the split removed is not measured again. A merge
+  for adjacent misses can then undo the split, and the next window can split
+  the leaf again. With 8 adjacent keys in each transaction and leaves of 128
+  entries, the policy made about 20 splits and 20 merges before the
+  measurement and about 10 of each during it, and had 0.92 of the throughput of
+  the fixed tree on S3.
 - A tree does not change under a load that its topology does not slow down.
   After deletes, cold leaves with few entries stay until transactions or scans
   cross them. Fewer merges also leave fewer drained nodes.
@@ -205,3 +269,26 @@ and a drained node, and saves no time.
 
 This needs shared state, durable or over the network. The instances that share
 a hot leaf already see its lost CAS and slow leaf CAS.
+
+### Decide in the engine, without a policy seam
+
+One rule in the restructurer, with its two multiples as database options, has a
+smaller public API and decides as soon as a measurement pays. It gave the same
+decisions and the same throughput as the avoidable time policy in the
+`topology` scenario. But each other rule needs a change of the engine, and the
+engine must change its default. With the seam, a rule is a type outside the
+engine, and the default of the engine does not change.
+
+### Remember what paid for a change
+
+A policy can keep the time that paid for each change, and ask a change to also
+pay back the opposite change that it undoes. This made fewer changes with 8
+adjacent keys, but the throughput was the same as the avoidable time policy
+within the noise of the runs, in the `topology` and `mixed` scenarios.
+
+### Multiples of 0.1 for splits and merges
+
+On GCS, this had 1.36 times the throughput of the fixed tree, against 1.32 for
+the default. On S3 it had the same geometric mean, but its worst cell was 0.84
+of the fixed tree, against 0.92, because it split and merged more often. S3 has
+priority when the two backends do not agree.

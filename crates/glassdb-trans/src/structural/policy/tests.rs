@@ -61,6 +61,14 @@ fn scan_crossing(left: u8, right: u8, millis: u64) -> PairWindow {
     }
 }
 
+// The rule with a threshold of one typical change time, which makes the
+// boundaries of the tests easy to read.
+fn at_one_change_time() -> AvoidableTimePolicy {
+    AvoidableTimePolicy::new()
+        .split_threshold(1.0)
+        .merge_threshold(1.0)
+}
+
 fn window(leaves: Vec<(LeafId, LeafWindow)>, pairs: Vec<PairWindow>) -> TopologyWindow {
     TopologyWindow {
         elapsed: Duration::from_secs(1),
@@ -84,7 +92,7 @@ fn a_leaf_splits_when_its_split_side_time_is_more_than_a_split() {
     );
 
     assert_eq!(
-        AvoidableTimePolicy::new().decide(&window),
+        at_one_change_time().decide(&window),
         vec![TopologyChange::Split(leaf(1))]
     );
 }
@@ -106,7 +114,7 @@ fn a_split_for_split_side_time_is_at_the_split_key_and_a_soft_cap_split_at_the_m
     );
 
     assert_eq!(
-        AvoidableTimePolicy::new().decide(&window),
+        at_one_change_time().decide(&window),
         vec![
             TopologyChange::SplitAt(leaf(1), b"k".to_vec()),
             TopologyChange::Split(leaf(2)),
@@ -119,9 +127,7 @@ fn the_split_threshold_scales_the_split_time() {
     let window = window(vec![(leaf(1), lost_cas(900))], vec![]);
 
     assert_eq!(
-        AvoidableTimePolicy::new()
-            .split_threshold(2.0)
-            .decide(&window),
+        at_one_change_time().split_threshold(2.0).decide(&window),
         vec![]
     );
 }
@@ -129,7 +135,7 @@ fn the_split_threshold_scales_the_split_time() {
 #[test]
 fn two_leaves_merge_when_merge_side_time_pays_for_the_merge_and_both_split_sides() {
     let leaves = || vec![(leaf(1), lost_cas(200)), (leaf(2), lost_cas(100))];
-    let policy = AvoidableTimePolicy::new();
+    let policy = at_one_change_time();
 
     let pays = window(leaves(), vec![scan_crossing(1, 2, 801)]);
     assert_eq!(policy.decide(&pays), vec![TopologyChange::Merge(leaf(1))]);
@@ -154,7 +160,7 @@ fn a_leaf_that_split_recently_can_split_again_but_not_merge() {
     );
 
     assert_eq!(
-        AvoidableTimePolicy::new().decide(&window),
+        at_one_change_time().decide(&window),
         vec![TopologyChange::Split(leaf(1))]
     );
 }
@@ -175,7 +181,7 @@ fn a_leaf_that_merged_recently_can_merge_again_but_splits_only_on_a_soft_cap() {
     );
 
     assert_eq!(
-        AvoidableTimePolicy::new().decide(&window),
+        at_one_change_time().decide(&window),
         vec![
             TopologyChange::Split(leaf(3)),
             TopologyChange::Merge(leaf(5)),
@@ -195,7 +201,7 @@ fn a_leaf_that_splits_or_merges_does_not_merge_again_in_the_same_window() {
     );
 
     assert_eq!(
-        AvoidableTimePolicy::new().decide(&window),
+        at_one_change_time().decide(&window),
         vec![
             TopologyChange::Split(leaf(4)),
             TopologyChange::Merge(leaf(1)),
@@ -208,7 +214,7 @@ fn leaves_over_a_soft_cap_split_without_avoidable_time() {
     let window = window(vec![(leaf(1), sized(9, 9)), (leaf(2), sized(8, 8))], vec![]);
 
     assert_eq!(
-        AvoidableTimePolicy::new().decide(&window),
+        at_one_change_time().decide(&window),
         vec![TopologyChange::Split(leaf(1))]
     );
 }

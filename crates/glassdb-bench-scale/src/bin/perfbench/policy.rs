@@ -17,8 +17,9 @@ pub(super) enum PolicySpec {
     /// [`SizePolicy`]: the size causes of `Engine`, but decided once in each
     /// window from the sizes and inline pressure of that window.
     Size,
-    /// [`AvoidableTimePolicy`] with the split and merge threshold multiples.
-    Avoidable { split: f64, merge: f64 },
+    /// [`AvoidableTimePolicy`] with its default split and merge threshold
+    /// multiples, or with these.
+    Avoidable { thresholds: Option<(f64, f64)> },
     /// [`MemoryPolicy`] with the split and merge threshold multiples.
     Memory { split: f64, merge: f64 },
 }
@@ -37,13 +38,9 @@ impl PolicySpec {
             ["engine"] => Ok(Self::Engine),
             ["fixed"] => Ok(Self::Fixed),
             ["size"] => Ok(Self::Size),
-            ["avoidable"] => Ok(Self::Avoidable {
-                split: 1.0,
-                merge: 1.0,
-            }),
+            ["avoidable"] => Ok(Self::Avoidable { thresholds: None }),
             ["avoidable", split, merge] => Ok(Self::Avoidable {
-                split: multiple(split)?,
-                merge: multiple(merge)?,
+                thresholds: Some((multiple(split)?, multiple(merge)?)),
             }),
             ["memory"] => Ok(Self::Memory {
                 split: 1.0,
@@ -65,8 +62,10 @@ impl PolicySpec {
             Self::Engine => "engine".into(),
             Self::Fixed => "fixed".into(),
             Self::Size => "size".into(),
-            Self::Avoidable { split, merge } if split == 1.0 && merge == 1.0 => "avoidable".into(),
-            Self::Avoidable { split, merge } => format!("avoidable:{split}:{merge}"),
+            Self::Avoidable { thresholds: None } => "avoidable".into(),
+            Self::Avoidable {
+                thresholds: Some((split, merge)),
+            } => format!("avoidable:{split}:{merge}"),
             Self::Memory { split, merge } if split == 1.0 && merge == 1.0 => "memory".into(),
             Self::Memory { split, merge } => format!("memory:{split}:{merge}"),
         }
@@ -78,7 +77,12 @@ impl PolicySpec {
             Self::Engine => builder,
             Self::Fixed => builder.topology_policy(FixedTopology),
             Self::Size => builder.topology_policy(SizePolicy),
-            Self::Avoidable { split, merge } => builder.topology_policy(
+            Self::Avoidable { thresholds: None } => {
+                builder.topology_policy(AvoidableTimePolicy::new())
+            }
+            Self::Avoidable {
+                thresholds: Some((split, merge)),
+            } => builder.topology_policy(
                 AvoidableTimePolicy::new()
                     .split_threshold(split)
                     .merge_threshold(merge),
@@ -101,6 +105,7 @@ mod tests {
             "fixed",
             "size",
             "avoidable",
+            "avoidable:1:1",
             "avoidable:0.5:2",
             "memory",
             "memory:0.25:0.1",
@@ -109,10 +114,6 @@ mod tests {
             assert_eq!(policy.label(), value);
             assert_eq!(PolicySpec::parse(&policy.label()), Ok(policy));
         }
-        assert_eq!(
-            PolicySpec::parse("avoidable:1:1"),
-            PolicySpec::parse("avoidable")
-        );
     }
 
     #[test]
