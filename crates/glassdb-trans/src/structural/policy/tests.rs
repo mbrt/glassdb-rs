@@ -97,18 +97,21 @@ fn a_leaf_splits_when_its_split_side_time_is_more_than_a_split() {
     );
 }
 
-// The split key separates the keys that paid for the split. A soft cap asks
-// for balanced halves.
+// The split key separates the keys of the leaf delays. Inline pressure and a
+// soft cap ask for balanced halves.
 #[test]
-fn a_split_for_split_side_time_is_at_the_split_key_and_a_soft_cap_split_at_the_median() {
+fn a_split_is_at_the_split_key_only_when_the_leaf_delays_pay_for_it() {
     let keyed = |window: LeafWindow| LeafWindow {
         split_key: Some(b"k".to_vec()),
         ..window
     };
+    let mut with_inline_pressure = lost_cas(300);
+    with_inline_pressure.avoidable.inline_pressure = ms(300);
     let window = window(
         vec![
             (leaf(1), keyed(lost_cas(501))),
             (leaf(2), keyed(sized(9, 9))),
+            (leaf(3), keyed(with_inline_pressure)),
         ],
         vec![],
     );
@@ -118,6 +121,7 @@ fn a_split_for_split_side_time_is_at_the_split_key_and_a_soft_cap_split_at_the_m
         vec![
             TopologyChange::SplitAt(leaf(1), b"k".to_vec()),
             TopologyChange::Split(leaf(2)),
+            TopologyChange::Split(leaf(3)),
         ]
     );
 }

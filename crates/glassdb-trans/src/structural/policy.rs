@@ -30,8 +30,9 @@ const DEFAULT_MERGE_THRESHOLD: f64 = 0.1;
 /// A policy has no state that the engine must keep: it gets all of the
 /// measurements of a window, and returns the changes that it wants. The engine
 /// checks each change again against current state. It skips a split of a leaf
-/// with less than two entries, and a merge that the merge rules of ADR-073 do
-/// not allow, except the underfull threshold.
+/// with less than two entries, a split at a key that leaves one half empty, a
+/// merge of the root, and a merge that the merge rules of ADR-073 do not allow,
+/// except the underfull threshold.
 pub trait TopologyPolicy: Send + Sync + 'static {
     /// Returns the length of one window.
     fn window(&self) -> Duration {
@@ -120,10 +121,11 @@ pub enum TopologyChange {
 /// Splits a leaf when its split-side time in one window is more than a
 /// multiple of the typical split time, and merges two adjacent leaves when
 /// their merge-side time is more than a multiple of the typical merge time plus
-/// the split-side time of both leaves (ADR-074). A split for split-side time is
-/// at the split key of the leaf. Leaves over a soft cap also split, at the
-/// median. A leaf that a split wrote in this window or the last one does not
-/// merge, and a leaf that a merge wrote does not split on avoidable time.
+/// the split-side time of both leaves (ADR-074). A split is at the split key of
+/// the leaf when its leaf delays alone pay for it, else at the median. Leaves
+/// over a soft cap also split, at the median. A leaf that a split wrote in this
+/// window or the last one does not merge, and a leaf that a merge wrote does not
+/// split on avoidable time.
 #[derive(Debug, Clone, Copy)]
 pub struct AvoidableTimePolicy {
     split_threshold: f64,
@@ -241,8 +243,11 @@ impl TopologyPolicy for AvoidableTimePolicy {
                 .size
                 .is_some_and(|size| size.over_soft_cap(&window.node_size));
             let pays = !leaf.merged_recently && leaf.avoidable.total() > split_time;
+            // Inline pressure asks for balanced halves, so the split key
+            // decides only a split that the leaf delays pay for alone.
+            let at_key = pays && leaf.avoidable.leaf_delays() > split_time;
             let change = match &leaf.split_key {
-                Some(key) if pays => TopologyChange::SplitAt(id.clone(), key.clone()),
+                Some(key) if at_key => TopologyChange::SplitAt(id.clone(), key.clone()),
                 _ if pays || over_cap => TopologyChange::Split(id.clone()),
                 _ => continue,
             };

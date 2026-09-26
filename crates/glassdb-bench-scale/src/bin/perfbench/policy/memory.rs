@@ -59,9 +59,11 @@ impl TopologyPolicy for MemoryPolicy {
                 .size
                 .is_some_and(|size| size.over_soft_cap(&window.node_size));
             let split_side = leaf.avoidable.total();
-            let pays = !leaf.merged_recently && split_side > split_time + paid.merge(id);
+            let keep = split_time + paid.merge(id);
+            let pays = !leaf.merged_recently && split_side > keep;
+            let at_key = pays && leaf.avoidable.leaf_delays() > keep;
             let change = match &leaf.split_key {
-                Some(key) if pays => TopologyChange::SplitAt(id.clone(), key.clone()),
+                Some(key) if at_key => TopologyChange::SplitAt(id.clone(), key.clone()),
                 _ if pays || over_cap => TopologyChange::Split(id.clone()),
                 _ => continue,
             };

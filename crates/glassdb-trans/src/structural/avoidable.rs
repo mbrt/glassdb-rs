@@ -94,7 +94,12 @@ pub(crate) struct TypicalTime {
 impl SplitTime {
     /// Returns the sum of all causes.
     pub fn total(&self) -> Duration {
-        self.lost_cas + self.queue_wait + self.slow_cas + self.inline_pressure
+        self.leaf_delays() + self.inline_pressure
+    }
+
+    /// Returns the sum of the causes that a split at the split key removes.
+    pub fn leaf_delays(&self) -> Duration {
+        self.lost_cas + self.queue_wait + self.slow_cas
     }
 
     /// Returns the split-side time of one leaf delay.

@@ -140,7 +140,9 @@ its split-side avoidable time in the window is more than 0.25 times the
 typical time of one split. Two adjacent leaves become a merge candidate when
 their merge-side avoidable time in the window is more than 0.1 times the
 typical time of one merge, plus the split-side avoidable time of both leaves.
-A leaf over a soft cap also splits, at the median.
+A split is at the split key when the lost CAS, queue wait, and slow leaf CAS
+time alone pays for it, and at the median when inline pressure is also
+necessary. A leaf over a soft cap splits at the median without avoidable time.
 
 The multiples are less than one, because a change keeps its effect after the
 window that paid for it, and each database instance sees only its own part of
