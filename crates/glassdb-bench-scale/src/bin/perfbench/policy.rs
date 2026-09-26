@@ -2,6 +2,10 @@
 
 use glassdb::{AvoidableTimePolicy, DatabaseBuilder, FixedTopology, SizePolicy};
 
+use memory::MemoryPolicy;
+
+mod memory;
+
 /// What decides the leaf splits and merges of one measurement client.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum PolicySpec {
@@ -15,11 +19,13 @@ pub(super) enum PolicySpec {
     Size,
     /// [`AvoidableTimePolicy`] with the split and merge threshold multiples.
     Avoidable { split: f64, merge: f64 },
+    /// [`MemoryPolicy`] with the split and merge threshold multiples.
+    Memory { split: f64, merge: f64 },
 }
 
 impl PolicySpec {
-    /// Parses `engine`, `fixed`, `size`, `avoidable`, or
-    /// `avoidable:<split>:<merge>`.
+    /// Parses `engine`, `fixed`, `size`, `avoidable`, `memory`, or
+    /// `avoidable:<split>:<merge>` and `memory:<split>:<merge>`.
     pub(super) fn parse(value: &str) -> Result<Self, String> {
         let multiple = |text: &str| match text.parse::<f64>() {
             Ok(multiple) if multiple.is_finite() && multiple >= 0.0 => Ok(multiple),
@@ -39,8 +45,16 @@ impl PolicySpec {
                 split: multiple(split)?,
                 merge: multiple(merge)?,
             }),
+            ["memory"] => Ok(Self::Memory {
+                split: 1.0,
+                merge: 1.0,
+            }),
+            ["memory", split, merge] => Ok(Self::Memory {
+                split: multiple(split)?,
+                merge: multiple(merge)?,
+            }),
             _ => Err(format!(
-                "unknown policy {value:?} (expected engine|fixed|size|avoidable[:<split>:<merge>])"
+                "unknown policy {value:?} (expected engine|fixed|size|{{avoidable,memory}}[:<split>:<merge>])"
             )),
         }
     }
@@ -53,6 +67,8 @@ impl PolicySpec {
             Self::Size => "size".into(),
             Self::Avoidable { split, merge } if split == 1.0 && merge == 1.0 => "avoidable".into(),
             Self::Avoidable { split, merge } => format!("avoidable:{split}:{merge}"),
+            Self::Memory { split, merge } if split == 1.0 && merge == 1.0 => "memory".into(),
+            Self::Memory { split, merge } => format!("memory:{split}:{merge}"),
         }
     }
 
@@ -67,6 +83,9 @@ impl PolicySpec {
                     .split_threshold(split)
                     .merge_threshold(merge),
             ),
+            Self::Memory { split, merge } => {
+                builder.topology_policy(MemoryPolicy::new(split, merge))
+            }
         }
     }
 }
@@ -77,7 +96,15 @@ mod tests {
 
     #[test]
     fn labels_parse_back_to_their_policy() {
-        for value in ["engine", "fixed", "size", "avoidable", "avoidable:0.5:2"] {
+        for value in [
+            "engine",
+            "fixed",
+            "size",
+            "avoidable",
+            "avoidable:0.5:2",
+            "memory",
+            "memory:0.25:0.1",
+        ] {
             let policy = PolicySpec::parse(value).unwrap();
             assert_eq!(policy.label(), value);
             assert_eq!(PolicySpec::parse(&policy.label()), Ok(policy));
@@ -93,7 +120,7 @@ mod tests {
         let cases = [
             (
                 "legacy",
-                "unknown policy \"legacy\" (expected engine|fixed|size|avoidable[:<split>:<merge>])",
+                "unknown policy \"legacy\" (expected engine|fixed|size|{avoidable,memory}[:<split>:<merge>])",
             ),
             (
                 "avoidable:-1:1",
@@ -101,7 +128,7 @@ mod tests {
             ),
             (
                 "avoidable:1",
-                "unknown policy \"avoidable:1\" (expected engine|fixed|size|avoidable[:<split>:<merge>])",
+                "unknown policy \"avoidable:1\" (expected engine|fixed|size|{avoidable,memory}[:<split>:<merge>])",
             ),
         ];
         for (value, expected) in cases {
