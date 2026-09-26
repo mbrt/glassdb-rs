@@ -1,5 +1,6 @@
 //! Leaf splits and merges that a topology policy decides (ADR-074).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -272,6 +273,68 @@ async fn windows_count_the_transactions_of_a_leaf_that_a_split_would_divide() {
         "the writes of the setup and two direct commits"
     );
     assert!(sum(|leaf| leaf.round_members) >= rounds);
+}
+
+// Reads keys 0 and 3, and in the first body run writes key 0 in another
+// transaction, so that the first commit pass does not commit. The body replay
+// commits in a later window.
+async fn read_divided_keys_after_a_conflict(db: &Database, coll: &Collection, write: bool) {
+    let conflicted = AtomicBool::new(false);
+    let conflicted = &conflicted;
+    db.tx(|tx| async move {
+        let replay = conflicted.swap(true, Ordering::Relaxed);
+        if replay {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        tx.read(coll, &[0]).await?;
+        tx.read(coll, &[3]).await?;
+        if !replay {
+            coll.write(&[0], &write_int(2)).await?;
+        }
+        if write {
+            tx.write(coll, &[3], &write_int(1))?;
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+// A transaction that starves commits late or never, so the time of each of
+// its commit passes shows in the window where the pass ends.
+#[tokio::test(start_paused = true)]
+async fn windows_count_the_time_of_divided_transactions_before_they_commit() {
+    let backend = slow_mem();
+    let (policy, windows) = Recording::new(|_: &TopologyWindow| Vec::new());
+    let db = open(&backend, NodeSizePolicy::default(), policy).await;
+    let coll = create_top(&db, b"divided").await;
+    write_keys(&coll, 4).await;
+
+    let before = db.stats().transactions.replays;
+    read_divided_keys_after_a_conflict(&db, &coll, true).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    read_divided_keys_after_a_conflict(&db, &coll, false).await;
+    let replays = db.stats().transactions.replays - before;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    db.shutdown().await;
+
+    assert_eq!(replays, 2);
+    let windows = windows.lock().unwrap();
+    let leaves: Vec<_> = windows
+        .iter()
+        .flat_map(|window| window.leaves.values())
+        .collect();
+    let committed: u64 = leaves.iter().map(|leaf| leaf.divided.total()).sum();
+    let latency: Duration = leaves.iter().map(|leaf| leaf.latency).sum();
+    let divided_time: Duration = leaves.iter().map(|leaf| leaf.divided_time).sum();
+    assert_eq!(committed, 2);
+    assert!(latency > Duration::ZERO);
+    assert_eq!(divided_time, latency);
+    let before_commit = leaves
+        .iter()
+        .filter(|leaf| leaf.divided_time > Duration::ZERO && leaf.divided.total() == 0)
+        .count();
+    assert_eq!(before_commit, 2);
 }
 
 type Owner = fn(u8) -> usize;

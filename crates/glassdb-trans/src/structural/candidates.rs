@@ -122,12 +122,24 @@ impl StructuralHintSink {
         self.candidates.avoidable.add_merge_time(left, right, merge);
     }
 
+    /// Tells if a topology policy takes windows. Only its windows use the
+    /// commits and commit passes of transactions.
+    pub(crate) fn keeps_windows(&self) -> bool {
+        self.candidates.avoidable.keeps_windows()
+    }
+
     /// Notes that a transaction with `accesses` committed with `kind`,
     /// `latency` after its start.
     pub(crate) fn observe_commit(&self, accesses: &AccessSet, kind: CommitKind, latency: Duration) {
         self.candidates
             .avoidable
             .add_commit(accesses, kind, latency);
+    }
+
+    /// Notes that a commit pass of a transaction with `accesses` took `time`
+    /// with the body run before it, committed or not.
+    pub(crate) fn observe_pass(&self, accesses: &AccessSet, time: Duration) {
+        self.candidates.avoidable.add_pass(accesses, time);
     }
 
     /// Notes that a scan that continued from `left` used `time` to read the

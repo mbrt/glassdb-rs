@@ -224,6 +224,11 @@ impl AvoidableTime {
         Self::new(true)
     }
 
+    /// Tells if the collector keeps the windows of a topology policy.
+    pub(super) fn keeps_windows(&self) -> bool {
+        self.windows
+    }
+
     /// Adds split-side time of the leaf at `path`, which a split at `at`
     /// removes.
     pub(super) fn add_split_time(&self, path: &ObjectPath, time: SplitTime, at: Option<&[u8]>) {
@@ -270,6 +275,22 @@ impl AvoidableTime {
             leaf.latency += latency;
             if read.divided() {
                 leaf.divided.add(kind);
+            }
+        }
+    }
+
+    /// Records one commit pass of a transaction with `accesses` that took
+    /// `time`, committed or not, in each leaf that a split would divide its
+    /// point reads in.
+    pub(super) fn add_pass(&self, accesses: &AccessSet, time: Duration) {
+        if !self.windows {
+            return;
+        }
+        let reads = LeafReads::of(accesses);
+        let mut state = self.state.lock().unwrap();
+        for (path, read) in reads {
+            if read.divided() {
+                state.leaf(path).divided_time += time;
             }
         }
     }

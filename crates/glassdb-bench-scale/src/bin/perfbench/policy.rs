@@ -6,7 +6,7 @@ use std::time::Duration;
 use glassdb::{AvoidableTimePolicy, DatabaseBuilder, FixedTopology, SizePolicy, TopologyPolicy};
 
 use memory::MemoryPolicy;
-use net::NetTimePolicy;
+use net::{AddedTime, NetTimePolicy};
 use shadow::Shadowed;
 pub(super) use shadow::{ShadowCounts, ShadowTally};
 
@@ -14,7 +14,7 @@ mod memory;
 mod net;
 mod shadow;
 
-const POLICY_FORMS: &str = "engine|fixed|size|avoidable[:<split>:<merge>]|memory:<split>:<merge>|net:<split>:<merge>:<weight>:<half-life>";
+const POLICY_FORMS: &str = "engine|fixed|size|avoidable[:<split>:<merge>]|memory:<split>:<merge>|net[-passes]:<split>:<merge>:<weight>:<half-life>";
 
 /// What decides the leaf splits and merges of one measurement client.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -38,8 +38,11 @@ pub(super) enum PolicySpec {
     /// weight of a divided transaction, and the half-life in seconds of its
     /// moving average. The ADR-074 runs use `net:0.05:0.1:0.25:10`. Its split
     /// multiple is lower than the one of [`AvoidableTimePolicy`], because a
-    /// moving average stays below the peaks of single windows.
+    /// moving average stays below the peaks of single windows. `net`
+    /// estimates the time that a split adds from the divided commits, and
+    /// `net-passes` from the time of the divided commit passes.
     Net {
+        added: AddedTime,
         split: f64,
         merge: f64,
         weight: f64,
@@ -50,7 +53,7 @@ pub(super) enum PolicySpec {
 impl PolicySpec {
     /// Parses `engine`, `fixed`, `size`, `avoidable`,
     /// `avoidable:<split>:<merge>`, `memory:<split>:<merge>`, or
-    /// `net:<split>:<merge>:<weight>:<half-life>`.
+    /// `net[-passes]:<split>:<merge>:<weight>:<half-life>`.
     pub(super) fn parse(value: &str) -> Result<Self, String> {
         let multiple = |text: &str| match text.parse::<f64>() {
             Ok(multiple) if multiple.is_finite() && multiple >= 0.0 => Ok(multiple),
@@ -70,7 +73,18 @@ impl PolicySpec {
                 split: multiple(split)?,
                 merge: multiple(merge)?,
             }),
-            ["net", split, merge, weight, half_life] => Ok(Self::Net {
+            [
+                name @ ("net" | "net-passes"),
+                split,
+                merge,
+                weight,
+                half_life,
+            ] => Ok(Self::Net {
+                added: if *name == "net" {
+                    AddedTime::Commits
+                } else {
+                    AddedTime::Passes
+                },
                 split: multiple(split)?,
                 merge: multiple(merge)?,
                 weight: multiple(weight)?,
@@ -101,11 +115,18 @@ impl PolicySpec {
             } => format!("avoidable:{split}:{merge}"),
             Self::Memory { split, merge } => format!("memory:{split}:{merge}"),
             Self::Net {
+                added,
                 split,
                 merge,
                 weight,
                 half_life,
-            } => format!("net:{split}:{merge}:{weight}:{half_life}"),
+            } => {
+                let name = match added {
+                    AddedTime::Commits => "net",
+                    AddedTime::Passes => "net-passes",
+                };
+                format!("{name}:{split}:{merge}:{weight}:{half_life}")
+            }
         }
     }
 
@@ -129,11 +150,13 @@ impl PolicySpec {
                 builder.topology_policy(MemoryPolicy::new(split, merge))
             }
             Self::Net {
+                added,
                 split,
                 merge,
                 weight,
                 half_life,
             } => builder.topology_policy(NetTimePolicy::new(
+                added,
                 split,
                 merge,
                 weight,
@@ -184,11 +207,13 @@ impl PolicySpec {
             ),
             Self::Memory { split, merge } => Box::new(MemoryPolicy::new(split, merge)),
             Self::Net {
+                added,
                 split,
                 merge,
                 weight,
                 half_life,
             } => Box::new(NetTimePolicy::new(
+                added,
                 split,
                 merge,
                 weight,
@@ -215,6 +240,7 @@ mod tests {
             "memory:0.25:0.1",
             "net:0.05:0.1:0.25:10",
             "net:1:1:0:0.5",
+            "net-passes:0.05:0.1:0.5:10",
         ] {
             let policy = PolicySpec::parse(value).unwrap();
             assert_eq!(policy.label(), value);
@@ -227,7 +253,7 @@ mod tests {
         let cases = [
             (
                 "legacy",
-                "unknown policy \"legacy\" (expected engine|fixed|size|avoidable[:<split>:<merge>]|memory:<split>:<merge>|net:<split>:<merge>:<weight>:<half-life>)",
+                "unknown policy \"legacy\" (expected engine|fixed|size|avoidable[:<split>:<merge>]|memory:<split>:<merge>|net[-passes]:<split>:<merge>:<weight>:<half-life>)",
             ),
             (
                 "avoidable:-1:1",
@@ -235,11 +261,11 @@ mod tests {
             ),
             (
                 "avoidable:1",
-                "unknown policy \"avoidable:1\" (expected engine|fixed|size|avoidable[:<split>:<merge>]|memory:<split>:<merge>|net:<split>:<merge>:<weight>:<half-life>)",
+                "unknown policy \"avoidable:1\" (expected engine|fixed|size|avoidable[:<split>:<merge>]|memory:<split>:<merge>|net[-passes]:<split>:<merge>:<weight>:<half-life>)",
             ),
             (
                 "memory",
-                "unknown policy \"memory\" (expected engine|fixed|size|avoidable[:<split>:<merge>]|memory:<split>:<merge>|net:<split>:<merge>:<weight>:<half-life>)",
+                "unknown policy \"memory\" (expected engine|fixed|size|avoidable[:<split>:<merge>]|memory:<split>:<merge>|net[-passes]:<split>:<merge>:<weight>:<half-life>)",
             ),
             (
                 "net:0.25:0.1:0.25:0",

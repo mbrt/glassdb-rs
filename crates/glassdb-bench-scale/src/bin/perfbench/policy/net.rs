@@ -9,17 +9,29 @@ use glassdb::{LeafId, LeafWindow, TopologyChange, TopologyPolicy, TopologyWindow
 
 /// Decides like [`glassdb::AvoidableTimePolicy`], with two differences for
 /// splits. A split adds time to the transactions whose keys it puts in both
-/// halves of the leaf, so the policy subtracts their count, times the mean
-/// latency of the transactions of the leaf, times a weight. And the moving
-/// average of this net time over the windows must pay for the split, not the
-/// time of one window: the avoidable time of one window is noisy, and one
-/// window can pay for a split that the load does not keep paying for.
+/// halves of the leaf, so the policy subtracts an estimate of this time, times
+/// a weight. And the moving average of this net time over the windows must pay
+/// for the split, not the time of one window: the avoidable time of one window
+/// is noisy, and one window can pay for a split that the load does not keep
+/// paying for.
 pub(crate) struct NetTimePolicy {
+    added: AddedTime,
     split_threshold: f64,
     merge_threshold: f64,
     divided_weight: f64,
     half_life: Duration,
     leaves: Mutex<HashMap<LeafId, NetTime>>,
+}
+
+/// What estimates the time that a split adds to the transactions of a leaf.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum AddedTime {
+    /// The divided commits, times the mean latency of the commits of the
+    /// leaf.
+    Commits,
+    /// The time of the divided commit passes, also of the passes that did not
+    /// commit.
+    Passes,
 }
 
 /// The moving averages of the net split-side time of one leaf in one window,
@@ -37,12 +49,14 @@ struct NetTime {
 
 impl NetTimePolicy {
     pub(crate) fn new(
+        added: AddedTime,
         split_threshold: f64,
         merge_threshold: f64,
         divided_weight: f64,
         half_life: Duration,
     ) -> Self {
         Self {
+            added,
             split_threshold,
             merge_threshold,
             divided_weight,
@@ -54,12 +68,18 @@ impl NetTimePolicy {
     /// Returns the time in seconds that a split of the leaf would have added
     /// to the transactions of the window.
     fn added_time(&self, leaf: &LeafWindow) -> f64 {
-        let committed = leaf.committed.total();
-        if committed == 0 {
-            return 0.0;
-        }
-        let mean_latency = leaf.latency.as_secs_f64() / committed as f64;
-        self.divided_weight * leaf.divided.total() as f64 * mean_latency
+        let divided = match self.added {
+            AddedTime::Commits => {
+                let committed = leaf.committed.total();
+                if committed == 0 {
+                    return 0.0;
+                }
+                let mean_latency = leaf.latency.as_secs_f64() / committed as f64;
+                leaf.divided.total() as f64 * mean_latency
+            }
+            AddedTime::Passes => leaf.divided_time.as_secs_f64(),
+        };
+        self.divided_weight * divided
     }
 }
 
@@ -197,7 +217,11 @@ mod tests {
     }
 
     fn policy() -> NetTimePolicy {
-        NetTimePolicy::new(0.25, 0.1, 0.25, Duration::from_secs(10))
+        policy_with(AddedTime::Commits)
+    }
+
+    fn policy_with(added: AddedTime) -> NetTimePolicy {
+        NetTimePolicy::new(added, 0.25, 0.1, 0.25, Duration::from_secs(10))
     }
 
     fn set(window: &mut TopologyWindow, id: &LeafId, leaf: LeafWindow) {
@@ -282,5 +306,33 @@ mod tests {
         let change = first_change(&policy, &mut window, &id, (0..30).map(|_| divided()));
 
         assert_eq!(change, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn divided_commit_passes_that_do_not_commit_keep_a_leaf_from_splitting() {
+        let (mut window, id) = one_leaf_window().await;
+        let starving = || {
+            let mut leaf = lost_cas(1000);
+            leaf.divided_time = Duration::from_secs(5);
+            leaf
+        };
+
+        // The divided commit passes of 5 seconds add 1.25 seconds, but none
+        // of them commits.
+        let by_commits = first_change(
+            &policy_with(AddedTime::Commits),
+            &mut window,
+            &id,
+            (0..30).map(|_| starving()),
+        );
+        let by_passes = first_change(
+            &policy_with(AddedTime::Passes),
+            &mut window,
+            &id,
+            (0..30).map(|_| starving()),
+        );
+
+        assert!(by_commits.is_some());
+        assert_eq!(by_passes, None);
     }
 }

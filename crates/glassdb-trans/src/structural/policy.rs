@@ -90,6 +90,11 @@ pub struct LeafWindow {
     /// The sum of the latencies of the committed transactions, each from its
     /// start to its commit.
     pub latency: Duration,
+    /// The time of the commit passes of this instance whose point reads of
+    /// the leaf a split at its median puts in both halves, each with the body
+    /// run before it, also of the passes that did not commit. It shows the
+    /// transactions that seldom commit.
+    pub divided_time: Duration,
     /// The coordinator rounds of this instance whose leaf CAS landed.
     pub rounds: u64,
     /// The round members of those rounds. A split divides the members of a

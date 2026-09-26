@@ -63,6 +63,7 @@ struct LeafTrace {
     committed: CommitTrace,
     divided: CommitTrace,
     latency_ms: f64,
+    divided_time_ms: f64,
     rounds: u64,
     round_members: u64,
 }
@@ -225,6 +226,7 @@ impl LeafTrace {
             committed: CommitTrace::new(&window.committed),
             divided: CommitTrace::new(&window.divided),
             latency_ms: millis(window.latency),
+            divided_time_ms: millis(window.divided_time),
             rounds: window.rounds,
             round_members: window.round_members,
         }
