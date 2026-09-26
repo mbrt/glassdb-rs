@@ -24,6 +24,13 @@ const DEFAULT_CHANGE_TIME: Duration = Duration::from_millis(500);
 /// The weight of a new measurement in a typical time is one part in this many.
 const TYPICAL_TIME_WEIGHT: u32 = 8;
 
+/// The default multiples of the typical split and merge times. They are less
+/// than one, because a change keeps its effect after the window that paid for
+/// it, and each database instance sees only its own part of the time
+/// (ADR-074).
+const DEFAULT_SPLIT_THRESHOLD: f64 = 0.25;
+const DEFAULT_MERGE_THRESHOLD: f64 = 0.1;
+
 /// What decides the splits and merges of leaves below the hard cap. Index
 /// nodes split and merge on size with every rule.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -128,8 +135,8 @@ impl LeafChanges {
     /// Returns the avoidable time rule with the thresholds of ADR-074.
     pub fn avoidable_time() -> Self {
         Self::AvoidableTime {
-            split_threshold: 1.0,
-            merge_threshold: 1.0,
+            split_threshold: DEFAULT_SPLIT_THRESHOLD,
+            merge_threshold: DEFAULT_MERGE_THRESHOLD,
         }
     }
 }

@@ -32,6 +32,12 @@ fn thresholds(split: f64, merge: f64) -> AvoidableTime {
     })
 }
 
+// The rule with a threshold of one typical change time, which makes the
+// boundaries of the tests easy to read.
+fn at_one_change_time() -> AvoidableTime {
+    thresholds(1.0, 1.0)
+}
+
 #[test]
 fn typical_time_moves_one_eighth_toward_each_measurement() {
     let typical = TypicalTime::default();
@@ -47,7 +53,7 @@ fn typical_time_moves_one_eighth_toward_each_measurement() {
 
 #[tokio::test(start_paused = true)]
 async fn a_leaf_pays_for_a_split_once_in_a_window_when_its_time_is_more_than_a_split() {
-    let avoidable = AvoidableTime::new(LeafChanges::avoidable_time());
+    let avoidable = at_one_change_time();
 
     let paid: Vec<_> = [300, 200, 1, 1000]
         .map(|millis| avoidable.add_split_time(&node(1), lost_cas(millis)))
@@ -71,7 +77,7 @@ async fn the_thresholds_scale_the_typical_change_times() {
 
 #[tokio::test(start_paused = true)]
 async fn two_leaves_pay_for_a_merge_and_for_the_split_side_time_of_both() {
-    let avoidable = AvoidableTime::new(LeafChanges::avoidable_time());
+    let avoidable = at_one_change_time();
     avoidable.add_split_time(&node(1), lost_cas(200));
     avoidable.add_split_time(&node(2), lost_cas(100));
 
@@ -82,7 +88,7 @@ async fn two_leaves_pay_for_a_merge_and_for_the_split_side_time_of_both() {
 
 #[tokio::test(start_paused = true)]
 async fn a_leaf_that_pays_for_a_split_does_not_merge_in_the_same_window() {
-    let avoidable = AvoidableTime::new(LeafChanges::avoidable_time());
+    let avoidable = at_one_change_time();
     assert!(avoidable.add_split_time(&node(1), lost_cas(501)));
 
     assert!(!avoidable.add_merge_time(&node(1), &node(2), scan_crossing(5000)));
@@ -90,7 +96,7 @@ async fn a_leaf_that_pays_for_a_split_does_not_merge_in_the_same_window() {
 
 #[tokio::test(start_paused = true)]
 async fn a_change_holds_its_leaves_against_the_other_kind_for_two_windows() {
-    let avoidable = AvoidableTime::new(LeafChanges::avoidable_time());
+    let avoidable = at_one_change_time();
     avoidable.record_changed(node(1), ChangeKind::Split);
     avoidable.record_changed(node(3), ChangeKind::Merge);
 
@@ -110,7 +116,7 @@ async fn a_change_holds_its_leaves_against_the_other_kind_for_two_windows() {
 
 #[tokio::test(start_paused = true)]
 async fn a_change_drops_the_earlier_time_of_its_leaves() {
-    let avoidable = AvoidableTime::new(LeafChanges::avoidable_time());
+    let avoidable = at_one_change_time();
     avoidable.add_split_time(&node(1), lost_cas(400));
     avoidable.add_merge_time(&node(3), &node(4), scan_crossing(400));
 

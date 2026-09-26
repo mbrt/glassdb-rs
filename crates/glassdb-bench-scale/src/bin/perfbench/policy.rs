@@ -12,9 +12,9 @@ pub(super) enum PolicySpec {
     Fixed,
     /// [`LeafChanges::Size`].
     Size,
-    /// [`LeafChanges::AvoidableTime`] with the split and merge threshold
-    /// multiples.
-    Avoidable { split: f64, merge: f64 },
+    /// [`LeafChanges::AvoidableTime`] with its default split and merge
+    /// threshold multiples, or with these.
+    Avoidable { thresholds: Option<(f64, f64)> },
 }
 
 impl PolicySpec {
@@ -31,13 +31,9 @@ impl PolicySpec {
             ["engine"] => Ok(Self::Engine),
             ["fixed"] => Ok(Self::Fixed),
             ["size"] => Ok(Self::Size),
-            ["avoidable"] => Ok(Self::Avoidable {
-                split: 1.0,
-                merge: 1.0,
-            }),
+            ["avoidable"] => Ok(Self::Avoidable { thresholds: None }),
             ["avoidable", split, merge] => Ok(Self::Avoidable {
-                split: multiple(split)?,
-                merge: multiple(merge)?,
+                thresholds: Some((multiple(split)?, multiple(merge)?)),
             }),
             _ => Err(format!(
                 "unknown policy {value:?} (expected engine|fixed|size|avoidable[:<split>:<merge>])"
@@ -51,8 +47,10 @@ impl PolicySpec {
             Self::Engine => "engine".into(),
             Self::Fixed => "fixed".into(),
             Self::Size => "size".into(),
-            Self::Avoidable { split, merge } if split == 1.0 && merge == 1.0 => "avoidable".into(),
-            Self::Avoidable { split, merge } => format!("avoidable:{split}:{merge}"),
+            Self::Avoidable { thresholds: None } => "avoidable".into(),
+            Self::Avoidable {
+                thresholds: Some((split, merge)),
+            } => format!("avoidable:{split}:{merge}"),
         }
     }
 
@@ -61,7 +59,12 @@ impl PolicySpec {
         match self {
             Self::Engine => builder,
             Self::Fixed | Self::Size => builder.leaf_changes(LeafChanges::Size),
-            Self::Avoidable { split, merge } => builder.leaf_changes(LeafChanges::AvoidableTime {
+            Self::Avoidable { thresholds: None } => {
+                builder.leaf_changes(LeafChanges::avoidable_time())
+            }
+            Self::Avoidable {
+                thresholds: Some((split, merge)),
+            } => builder.leaf_changes(LeafChanges::AvoidableTime {
                 split_threshold: split,
                 merge_threshold: merge,
             }),
@@ -75,15 +78,18 @@ mod tests {
 
     #[test]
     fn labels_parse_back_to_their_policy() {
-        for value in ["engine", "fixed", "size", "avoidable", "avoidable:0.5:2"] {
+        for value in [
+            "engine",
+            "fixed",
+            "size",
+            "avoidable",
+            "avoidable:1:1",
+            "avoidable:0.5:2",
+        ] {
             let policy = PolicySpec::parse(value).unwrap();
             assert_eq!(policy.label(), value);
             assert_eq!(PolicySpec::parse(&policy.label()), Ok(policy));
         }
-        assert_eq!(
-            PolicySpec::parse("avoidable:1:1"),
-            PolicySpec::parse("avoidable")
-        );
     }
 
     #[test]
