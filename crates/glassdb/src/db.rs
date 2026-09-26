@@ -21,7 +21,7 @@ use crate::diagnostics::Diagnostics;
 use crate::error::Error;
 use crate::limits::TransactionLimits;
 use crate::stats::{Stats, TransactionStats};
-use crate::tx::Transaction;
+use crate::tx::{CreateMode, Transaction};
 use crate::version::check_or_create_db_meta;
 
 /// Builds and opens a [`Database`], tweaking optional settings before opening.
@@ -298,7 +298,7 @@ impl Database {
     {
         let path = path.try_into().map_err(Into::into)?;
         self.inner
-            .tx(move |tx| create_path_in_transaction(tx, path.clone(), PathCreateMode::Strict))
+            .tx(move |tx| create_path_in_transaction(tx, path.clone(), CreateMode::Strict))
             .await
     }
 
@@ -313,7 +313,7 @@ impl Database {
     {
         let path = path.try_into().map_err(Into::into)?;
         self.inner
-            .tx(move |tx| create_path_in_transaction(tx, path.clone(), PathCreateMode::IfAbsent))
+            .tx(move |tx| create_path_in_transaction(tx, path.clone(), CreateMode::IfAbsent))
             .await
     }
 
@@ -402,11 +402,6 @@ impl Database {
     }
 }
 
-enum PathCreateMode {
-    Strict,
-    IfAbsent,
-}
-
 /// Resolves `path` through one serializable transaction.
 async fn open_path_in_transaction(
     tx: Transaction,
@@ -424,20 +419,17 @@ async fn path_exists_in_transaction(tx: Transaction, path: CollectionPath) -> Re
 async fn create_path_in_transaction(
     tx: Transaction,
     path: CollectionPath,
-    mode: PathCreateMode,
+    mode: CreateMode,
 ) -> Result<Collection, Error> {
-    let mut segments = path.segments();
-    let name = segments
-        .next_back()
+    let (name, ancestors) = path
+        .names()
+        .split_last()
         .expect("CollectionPath always has one segment");
     let mut parent = tx.root_collection();
-    for segment in segments {
-        parent = tx.open_collection(&parent, segment).await?;
+    for ancestor in ancestors {
+        parent = tx.open_child(&parent, ancestor).await?;
     }
-    match mode {
-        PathCreateMode::Strict => tx.create_collection(&parent, name).await,
-        PathCreateMode::IfAbsent => Ok(tx.create_collection_if_absent(&parent, name).await?.0),
-    }
+    Ok(tx.create_child(&parent, name, mode).await?.0)
 }
 
 struct OperationLifecycle {

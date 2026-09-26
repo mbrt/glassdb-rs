@@ -4,33 +4,32 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use glassdb_data::{CollectionAddress, DatabaseId, LogicalKey, MAX_COLLECTION_NAME_BYTES};
+use glassdb_data::{CollectionAddress, CollectionName, DatabaseId, LogicalKey};
 
 use crate::db::DbInner;
 use crate::error::Error;
 use crate::iter::{CollectionIter, KeyIter};
 use crate::scan::{KeyPage, KeyScan};
+use crate::tx::CreateMode;
 
 /// An unresolved sequence of logical collection names.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CollectionPath {
-    segments: Arc<[Vec<u8>]>,
+    segments: Arc<[CollectionName]>,
 }
 
 impl CollectionPath {
     /// Creates a path containing one top-level collection name.
     pub fn new(name: impl AsRef<[u8]>) -> Result<Self, Error> {
-        validate_collection_name(name.as_ref())?;
         Ok(Self {
-            segments: vec![name.as_ref().to_vec()].into(),
+            segments: vec![collection_name(name.as_ref())?].into(),
         })
     }
 
     /// Returns a path extended by one direct child name.
     pub fn child(&self, name: impl AsRef<[u8]>) -> Result<Self, Error> {
-        validate_collection_name(name.as_ref())?;
         let mut segments = self.segments.to_vec();
-        segments.push(name.as_ref().to_vec());
+        segments.push(collection_name(name.as_ref())?);
         Ok(Self {
             segments: segments.into(),
         })
@@ -38,7 +37,12 @@ impl CollectionPath {
 
     /// Returns the path's raw names from outermost to innermost.
     pub fn segments(&self) -> impl ExactSizeIterator<Item = &[u8]> + DoubleEndedIterator {
-        self.segments.iter().map(Vec::as_slice)
+        self.segments.iter().map(CollectionName::as_bytes)
+    }
+
+    /// Returns the path's validated names from outermost to innermost.
+    pub(crate) fn names(&self) -> &[CollectionName] {
+        &self.segments
     }
 }
 
@@ -77,7 +81,7 @@ impl TryFrom<&String> for CollectionPath {
 pub struct Collection {
     address: CollectionAddress,
     parent: Option<CollectionAddress>,
-    name: Option<Arc<[u8]>>,
+    name: Option<CollectionName>,
     db: Arc<DbInner>,
 }
 
@@ -149,29 +153,23 @@ impl Collection {
 
     /// Opens the direct child currently bound to `name`.
     pub async fn open_collection(&self, name: impl AsRef<[u8]>) -> Result<Collection, Error> {
-        let name = name.as_ref();
-        validate_collection_name(name)?;
+        let name = &collection_name(name.as_ref())?;
         self.db
-            .tx(|tx| async move { tx.open_collection(self, name).await })
+            .tx(|tx| async move { tx.open_child(self, name).await })
             .await
     }
 
     /// Reports whether a direct child is currently bound to `name`.
     pub async fn collection_exists(&self, name: impl AsRef<[u8]>) -> Result<bool, Error> {
-        let name = name.as_ref();
-        validate_collection_name(name)?;
+        let name = &collection_name(name.as_ref())?;
         self.db
-            .tx(|tx| async move { tx.collection_exists(self, name).await })
+            .tx(|tx| async move { Ok(tx.resolve_child(self, name).await?.is_some()) })
             .await
     }
 
     /// Strictly creates and binds a new direct child.
     pub async fn create_collection(&self, name: impl AsRef<[u8]>) -> Result<Collection, Error> {
-        let name = name.as_ref();
-        validate_collection_name(name)?;
-        self.db
-            .tx(|tx| async move { tx.create_collection(self, name).await })
-            .await
+        self.create_child(name.as_ref(), CreateMode::Strict).await
     }
 
     /// Returns the direct child bound to `name`, creating it when absent.
@@ -179,11 +177,7 @@ impl Collection {
         &self,
         name: impl AsRef<[u8]>,
     ) -> Result<Collection, Error> {
-        let name = name.as_ref();
-        validate_collection_name(name)?;
-        self.db
-            .tx(|tx| async move { Ok(tx.create_collection_if_absent(self, name).await?.0) })
-            .await
+        self.create_child(name.as_ref(), CreateMode::IfAbsent).await
     }
 
     /// Returns an owned iterator over the collection's materialized keys.
@@ -223,7 +217,7 @@ impl Collection {
 
     /// Returns this handle's direct logical name, or `None` for the root collection.
     pub fn name(&self) -> Option<&[u8]> {
-        self.name.as_deref()
+        self.name.as_ref().map(CollectionName::as_bytes)
     }
 
     pub(crate) fn new_root(db: Arc<DbInner>) -> Self {
@@ -238,13 +232,13 @@ impl Collection {
     pub(crate) fn new_child(
         address: CollectionAddress,
         parent: CollectionAddress,
-        name: &[u8],
+        name: CollectionName,
         db: Arc<DbInner>,
     ) -> Self {
         Self {
             address,
             parent: Some(parent),
-            name: Some(Arc::from(name)),
+            name: Some(name),
             db,
         }
     }
@@ -253,20 +247,26 @@ impl Collection {
         &self.address
     }
 
-    pub(crate) fn parent_address(&self) -> Option<&CollectionAddress> {
-        self.parent.as_ref()
+    /// Returns the parent and name of the binding that this handle was
+    /// resolved through, or `None` for the root collection.
+    pub(crate) fn binding(&self) -> Option<(&CollectionAddress, &CollectionName)> {
+        self.parent.as_ref().zip(self.name.as_ref())
     }
 
     pub(crate) fn database_id(&self) -> DatabaseId {
         self.db.database_id
     }
+
+    async fn create_child(&self, name: &[u8], mode: CreateMode) -> Result<Collection, Error> {
+        let name = &collection_name(name)?;
+        self.db
+            .tx(|tx| async move { Ok(tx.create_child(self, name, mode).await?.0) })
+            .await
+    }
 }
 
-pub(crate) fn validate_collection_name(name: &[u8]) -> Result<(), Error> {
-    if name.is_empty() || name.len() > MAX_COLLECTION_NAME_BYTES {
-        return Err(Error::InvalidInput(format!(
-            "collection name must contain 1..={MAX_COLLECTION_NAME_BYTES} bytes"
-        )));
-    }
-    Ok(())
+/// Converts a caller-supplied name into a collection name, and reports an
+/// invalid name as invalid input.
+pub(crate) fn collection_name(name: &[u8]) -> Result<CollectionName, Error> {
+    CollectionName::new(name).map_err(|error| Error::InvalidInput(error.to_string()))
 }

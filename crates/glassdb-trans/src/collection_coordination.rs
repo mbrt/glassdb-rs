@@ -568,7 +568,7 @@ mod tests {
     #[tokio::test]
     async fn reclaimed_record_refreshes_a_cached_directory_holder() {
         use crate::engine::{AssemblyFixture, EngineConfig};
-        use glassdb_data::CollectionId;
+        use glassdb_data::{CollectionId, CollectionName};
         use glassdb_storage::transaction::TxRecord;
 
         let backend = Arc::new(MemoryBackend::new());
@@ -603,7 +603,8 @@ mod tests {
             .unwrap();
         record.remove_directory_holder(&old);
         let child = CollectionId::from_bytes([1; 16]);
-        record.add_child(b"child".to_vec(), child).unwrap();
+        let name = CollectionName::new("child").unwrap();
+        record.add_child(name.clone(), child).unwrap();
         peer.records.store_record(&record, &observed).await.unwrap();
         let observed = peer
             .tx_records
@@ -627,7 +628,7 @@ mod tests {
             .resolve(&parent, None, Requirement::ANY)
             .await
             .unwrap();
-        assert_eq!(resolved.child(b"child"), Some(child));
+        assert_eq!(resolved.child(&name), Some(child));
         assert!(!resolved.directory_lock().contains(&old));
     }
 }

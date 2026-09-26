@@ -32,12 +32,15 @@ _Avoid_: Table, bucket
 The identity of one collection within its database. GlassDB never reuses it: a collection created with the name of a dropped collection gets a new collection ID.
 _Avoid_: Incarnation, incarnation ID
 
+**Collection name**:
+The raw bytes that identify one collection within its parent collection. GlassDB does not normalize them, and after a drop the same name can be bound to a new collection.
+
 **Root collection**:
 The permanent collection that each database has. It has a reserved collection ID and cannot be dropped.
 _Avoid_: Database root
 
 **Binding**:
-The entry in a parent collection that maps one child name to one collection ID.
+The entry in a parent collection that maps one collection name to one collection ID.
 
 **Collection record**:
 The stored object that holds one collection's child bindings, directory lock, topology participants, and topology freeze. Reads and writes of logical keys do not read it.

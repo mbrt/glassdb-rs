@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
-use glassdb_data::{CollectionAddress, CollectionId, TxId};
+use glassdb_data::{CollectionAddress, CollectionId, CollectionName, TxId};
 use glassdb_storage::transaction::{TxCollectionChange, TxCollectionOp, TxLock};
 use glassdb_storage::{CurrentnessBarrier, NodeSizePolicy, Requirement};
 
@@ -36,7 +36,7 @@ pub struct CollectionReservationLimitExceeded {
     pub limit: usize,
 }
 
-type CollectionBinding = (CollectionAddress, Vec<u8>);
+type CollectionBinding = (CollectionAddress, CollectionName);
 
 impl CollectionReservations {
     /// Reserves the same collection ID for repeated creation of one binding.
@@ -44,10 +44,10 @@ impl CollectionReservations {
     pub fn reserve(
         &self,
         parent: &CollectionAddress,
-        name: &[u8],
+        name: &CollectionName,
     ) -> Result<CollectionId, CollectionReservationLimitExceeded> {
         let mut ids = self.ids.lock().unwrap();
-        let binding = (parent.clone(), name.to_vec());
+        let binding = (parent.clone(), name.clone());
         if let Some(id) = ids.get(&binding) {
             return Ok(*id);
         }
@@ -351,10 +351,14 @@ mod tests {
         CollectionAddress::new("db", CollectionId::from_bytes([byte; 16]))
     }
 
+    fn name(name: &str) -> CollectionName {
+        CollectionName::new(name).unwrap()
+    }
+
     fn create_change(collection: CollectionAddress) -> CollectionChange {
         CollectionChange {
             parent: CollectionAddress::root("db"),
-            name: b"child".to_vec(),
+            name: name("child"),
             collection,
             expected: None,
             op: CollectionOp::Create,
@@ -375,19 +379,29 @@ mod tests {
         handle.drop_intent_targets.insert(address(2));
         let retired_reservations = handle.reservations();
         let parent = CollectionAddress::root("db");
-        let old_id = retired_reservations.reserve(&parent, b"child").unwrap();
+        let old_id = retired_reservations
+            .reserve(&parent, &name("child"))
+            .unwrap();
 
         handle.renew();
 
         let reservations = handle.reservations();
-        assert_ne!(reservations.reserve(&parent, b"child").unwrap(), old_id);
+        assert_ne!(
+            reservations.reserve(&parent, &name("child")).unwrap(),
+            old_id
+        );
         assert_eq!(
-            retired_reservations.reserve(&parent, b"child").unwrap(),
+            retired_reservations
+                .reserve(&parent, &name("child"))
+                .unwrap(),
             old_id
         );
         for reservations in [retired_reservations, reservations] {
             assert_eq!(
-                reservations.reserve(&parent, b"other").unwrap_err().limit,
+                reservations
+                    .reserve(&parent, &name("other"))
+                    .unwrap_err()
+                    .limit,
                 1
             );
         }

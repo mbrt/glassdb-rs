@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use glassdb_data::{CollectionAddress, LeafRef, LogicalKey, TxId};
+use glassdb_data::{CollectionAddress, CollectionName, LeafRef, LogicalKey, TxId};
 
 use crate::cached_store::Observation;
 use crate::error::StorageError;
@@ -136,7 +136,7 @@ impl TxRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxCollectionChange {
     pub parent: CollectionAddress,
-    pub name: Vec<u8>,
+    pub name: CollectionName,
     pub collection: CollectionAddress,
     pub op: TxCollectionOp,
 }

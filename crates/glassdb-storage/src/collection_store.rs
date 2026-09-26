@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use glassdb_data::{CollectionAddress, CollectionId, MAX_COLLECTION_NAME_BYTES, ObjectPath, TxId};
+use glassdb_data::{CollectionAddress, CollectionId, CollectionName, ObjectPath, TxId};
 use glassdb_proto as pb;
 use prost::Message;
 
@@ -22,7 +22,7 @@ use crate::wire_id::{decode_id, decode_optional_id};
 /// canonical regardless of insertion order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionRecord {
-    children: BTreeMap<Vec<u8>, CollectionId>,
+    children: BTreeMap<CollectionName, CollectionId>,
     directory_lock: SharedExclusiveLock,
     directory_generation: u64,
     topology_freeze: Option<TxId>,
@@ -42,22 +42,18 @@ impl CollectionRecord {
     }
 
     /// Returns the collection ID bound to direct child `name`.
-    pub fn child(&self, name: &[u8]) -> Option<CollectionId> {
+    pub fn child(&self, name: &CollectionName) -> Option<CollectionId> {
         self.children.get(name).copied()
     }
 
     /// Adds a valid direct child binding, returning whether the name was vacant.
     pub fn add_child(
         &mut self,
-        name: impl Into<Vec<u8>>,
+        name: CollectionName,
         id: CollectionId,
     ) -> Result<bool, StorageError> {
         use std::collections::btree_map::Entry;
 
-        let name = name.into();
-        if name.is_empty() || name.len() > MAX_COLLECTION_NAME_BYTES {
-            return Err(StorageError::other("invalid child collection name"));
-        }
         if id.is_root() {
             return Err(StorageError::other(
                 "a child cannot use the reserved root collection ID",
@@ -73,15 +69,13 @@ impl CollectionRecord {
     }
 
     /// Removes a direct child binding, returning its former collection ID.
-    pub fn remove_child(&mut self, name: &[u8]) -> Option<CollectionId> {
+    pub fn remove_child(&mut self, name: &CollectionName) -> Option<CollectionId> {
         self.children.remove(name)
     }
 
     /// Iterates child bindings in canonical raw-name order.
-    pub fn children(&self) -> impl Iterator<Item = (&[u8], CollectionId)> {
-        self.children
-            .iter()
-            .map(|(name, id)| (name.as_slice(), *id))
+    pub fn children(&self) -> impl Iterator<Item = (&CollectionName, CollectionId)> {
+        self.children.iter().map(|(name, id)| (name, *id))
     }
 
     /// Returns the lock coordinating the direct-child directory.
@@ -189,11 +183,9 @@ impl CollectionRecord {
             .map_err(|e| StorageError::with_source("unmarshalling collection record", e))?;
         let mut children = BTreeMap::new();
         for child in raw.children {
-            if child.name.is_empty() || child.name.len() > MAX_COLLECTION_NAME_BYTES {
-                return Err(StorageError::other(
-                    "collection record contains an invalid child name",
-                ));
-            }
+            let name = CollectionName::new(&child.name).map_err(|_| {
+                StorageError::other("collection record contains an invalid child name")
+            })?;
             let id: CollectionId = decode_id(
                 &child.collection_id,
                 "collection record contains an invalid child ID",
@@ -203,7 +195,7 @@ impl CollectionRecord {
                     "collection record binds a child to the reserved root ID",
                 ));
             }
-            if children.insert(child.name, id).is_some() {
+            if children.insert(name, id).is_some() {
                 return Err(StorageError::other(
                     "collection record contains a duplicate child name",
                 ));
@@ -234,7 +226,7 @@ impl CollectionRecord {
                 .children
                 .iter()
                 .map(|(name, id)| pb::CollectionDirectoryEntry {
-                    name: name.clone(),
+                    name: name.as_bytes().to_vec(),
                     collection_id: id.as_bytes().to_vec(),
                 })
                 .collect(),
@@ -403,14 +395,16 @@ mod tests {
         CollectionId::from_bytes([byte; 16])
     }
 
+    fn name(name: impl AsRef<[u8]>) -> CollectionName {
+        CollectionName::new(name).unwrap()
+    }
+
     #[test]
     fn round_trip() {
         let mut record = CollectionRecord::new();
+        record.add_child(name("users"), collection_id(1)).unwrap();
         record
-            .add_child(b"users".to_vec(), collection_id(1))
-            .unwrap();
-        record
-            .add_child(b"settings".to_vec(), collection_id(2))
+            .add_child(name("settings"), collection_id(2))
             .unwrap();
 
         let decoded = CollectionRecord::decode(&record.encode()).unwrap();
@@ -512,38 +506,53 @@ mod tests {
     #[test]
     fn child_directory_ops() {
         let mut record = CollectionRecord::new();
-        assert!(record.add_child(b"a".to_vec(), collection_id(1)).unwrap());
-        assert!(!record.add_child(b"a".to_vec(), collection_id(2)).unwrap());
-        assert_eq!(record.child(b"a"), Some(collection_id(1)));
-        assert_eq!(record.child(b"missing"), None);
-        assert_eq!(record.remove_child(b"a"), Some(collection_id(1)));
-        assert_eq!(record.remove_child(b"a"), None);
+        assert!(record.add_child(name("a"), collection_id(1)).unwrap());
+        assert!(!record.add_child(name("a"), collection_id(2)).unwrap());
+        assert_eq!(record.child(&name("a")), Some(collection_id(1)));
+        assert_eq!(record.child(&name("missing")), None);
+        assert_eq!(record.remove_child(&name("a")), Some(collection_id(1)));
+        assert_eq!(record.remove_child(&name("a")), None);
     }
 
     #[test]
-    fn invalid_child_bindings_are_rejected_before_encoding() {
+    fn root_collection_id_cannot_be_bound_as_a_child() {
         let mut record = CollectionRecord::new();
-        assert!(record.add_child(Vec::new(), collection_id(1)).is_err());
         assert!(
             record
-                .add_child(vec![0; MAX_COLLECTION_NAME_BYTES + 1], collection_id(1))
-                .is_err()
-        );
-        assert!(
-            record
-                .add_child(b"root".to_vec(), CollectionId::root())
+                .add_child(name("root"), CollectionId::root())
                 .is_err()
         );
         assert_eq!(record.children().count(), 0);
     }
 
     #[test]
+    fn decoding_rejects_invalid_child_names() {
+        for bad in [
+            Vec::new(),
+            vec![0; glassdb_data::MAX_COLLECTION_NAME_BYTES + 1],
+        ] {
+            let raw = pb::CollectionRecord {
+                children: vec![pb::CollectionDirectoryEntry {
+                    name: bad,
+                    collection_id: vec![1; 16],
+                }],
+                ..pb::CollectionRecord::default()
+            };
+            let error = CollectionRecord::decode(&raw.encode_to_vec()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "collection record contains an invalid child name"
+            );
+        }
+    }
+
+    #[test]
     fn children_iterate_sorted() {
         let mut record = CollectionRecord::new();
-        record.add_child(b"c".to_vec(), collection_id(3)).unwrap();
-        record.add_child(b"a".to_vec(), collection_id(1)).unwrap();
-        record.add_child(b"b".to_vec(), collection_id(2)).unwrap();
-        let names: Vec<&[u8]> = record.children().map(|(name, _)| name).collect();
+        record.add_child(name("c"), collection_id(3)).unwrap();
+        record.add_child(name("a"), collection_id(1)).unwrap();
+        record.add_child(name("b"), collection_id(2)).unwrap();
+        let names: Vec<&[u8]> = record.children().map(|(name, _)| name.as_bytes()).collect();
         assert_eq!(names, vec![b"a".as_slice(), b"b", b"c"]);
     }
 
@@ -552,8 +561,7 @@ mod tests {
         let mk = |order: &[&[u8]]| {
             let mut r = CollectionRecord::new();
             for (i, n) in order.iter().enumerate() {
-                r.add_child(n.to_vec(), collection_id(n[0] + i as u8))
-                    .unwrap();
+                r.add_child(name(n), collection_id(n[0] + i as u8)).unwrap();
             }
             r
         };
@@ -561,14 +569,12 @@ mod tests {
         let b = {
             let mut record = CollectionRecord::new();
             record
-                .add_child(b"a".to_vec(), collection_id(b'a' + 1))
+                .add_child(name("a"), collection_id(b'a' + 1))
                 .unwrap();
             record
-                .add_child(b"b".to_vec(), collection_id(b'b' + 2))
+                .add_child(name("b"), collection_id(b'b' + 2))
                 .unwrap();
-            record
-                .add_child(b"c".to_vec(), collection_id(b'c'))
-                .unwrap();
+            record.add_child(name("c"), collection_id(b'c')).unwrap();
             record
         };
         assert_eq!(a.encode(), b.encode());
@@ -579,9 +585,7 @@ mod tests {
     #[test]
     fn golden_encoding() {
         let mut record = CollectionRecord::new();
-        record
-            .add_child(b"users".to_vec(), collection_id(1))
-            .unwrap();
+        record.add_child(name("users"), collection_id(1)).unwrap();
         let got = record.encode();
         let want = [
             0x0a, 0x19, 0x0a, 0x05, 0x75, 0x73, 0x65, 0x72, 0x73, 0x12, 0x10, 0x01, 0x01, 0x01,
@@ -633,7 +637,7 @@ mod tests {
             .unwrap();
 
         let child = CollectionId::from_bytes([1; 16]);
-        assert!(record.add_child(b"child".to_vec(), child).unwrap());
+        assert!(record.add_child(name("child"), child).unwrap());
         assert!(records.store_record(&record, &record_before).await.unwrap());
         let (_, record_after) = records
             .load_record(

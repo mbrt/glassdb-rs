@@ -15,9 +15,6 @@ use crate::base64;
 /// Number of bytes in each fixed-width GlassDB ID.
 pub const ID_BYTES: usize = 16;
 
-/// Maximum number of raw bytes in one logical collection name.
-pub const MAX_COLLECTION_NAME_BYTES: usize = 255;
-
 /// The opaque identity of one collection.
 ///
 /// The all-zero value is reserved for the root collection. Randomly

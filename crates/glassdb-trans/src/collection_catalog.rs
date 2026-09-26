@@ -37,7 +37,7 @@ impl CollectionCatalog {
         Ok(DirectorySnapshot {
             children: record
                 .children()
-                .map(|(name, id)| (name.to_vec(), id))
+                .map(|(name, id)| (name.clone(), id))
                 .collect(),
             generation: record.directory_generation(),
         })
@@ -145,7 +145,7 @@ mod tests {
 
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_concurr::{Background, RetryConfig};
-    use glassdb_data::{CollectionId, DbPrefix};
+    use glassdb_data::{CollectionId, CollectionName, DbPrefix};
     use glassdb_storage::transaction::{
         TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxRecord, TxRecordStore,
     };
@@ -198,9 +198,10 @@ mod tests {
             collection: parent.clone(),
             typ: LockType::Write,
         });
+        let name = CollectionName::new("child").unwrap();
         tx_record.collection_changes.push(TxCollectionChange {
             parent: parent.clone(),
-            name: b"child".to_vec(),
+            name: name.clone(),
             collection: child.clone(),
             op: TxCollectionOp::Create,
         });
@@ -208,7 +209,7 @@ mod tests {
 
         let snapshot = catalog.snapshot(&parent).await.unwrap();
 
-        assert_eq!(snapshot.children, vec![(b"child".to_vec(), child.id())]);
+        assert_eq!(snapshot.children, vec![(name, child.id())]);
         let (record, _) = records
             .load_record(&parent, Requirement::ANY)
             .await

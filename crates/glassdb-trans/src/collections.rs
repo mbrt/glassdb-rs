@@ -2,7 +2,7 @@
 
 mod lifecycle;
 
-use glassdb_data::{CollectionAddress, CollectionId};
+use glassdb_data::{CollectionAddress, CollectionId, CollectionName};
 
 pub use lifecycle::{CollectionLifecycle, TopologySettler};
 
@@ -17,7 +17,7 @@ pub struct DirectoryRead {
 #[derive(Debug, Clone)]
 pub enum DirectoryReadKind {
     Entry {
-        name: Vec<u8>,
+        name: CollectionName,
         collection: Option<CollectionId>,
     },
     Listing {
@@ -29,7 +29,7 @@ pub enum DirectoryReadKind {
 #[derive(Debug, Clone)]
 pub struct CollectionChange {
     pub parent: CollectionAddress,
-    pub name: Vec<u8>,
+    pub name: CollectionName,
     pub collection: CollectionAddress,
     pub expected: Option<CollectionId>,
     pub op: CollectionOp,
@@ -72,7 +72,7 @@ impl CatalogAccesses {
 /// A resolved, transactionally clean view of one direct-child directory.
 #[derive(Debug, Clone)]
 pub struct DirectorySnapshot {
-    pub children: Vec<(Vec<u8>, CollectionId)>,
+    pub children: Vec<(CollectionName, CollectionId)>,
     pub generation: u64,
 }
 
@@ -94,7 +94,7 @@ mod tests {
                 DirectoryRead {
                     parent: root.clone(),
                     kind: DirectoryReadKind::Entry {
-                        name: b"created".to_vec(),
+                        name: CollectionName::new("created").unwrap(),
                         collection: None,
                     },
                 },
@@ -109,7 +109,7 @@ mod tests {
             ],
             changes: vec![CollectionChange {
                 parent: root,
-                name: b"created".to_vec(),
+                name: CollectionName::new("created").unwrap(),
                 collection: created.clone(),
                 expected: None,
                 op: CollectionOp::Create,

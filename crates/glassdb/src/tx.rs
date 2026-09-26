@@ -15,12 +15,13 @@ mod catalog;
 
 use std::sync::{Arc, Mutex};
 
-use glassdb_data::{CollectionAddress, LogicalKey};
+use glassdb_data::{CollectionAddress, CollectionName, LogicalKey};
 use glassdb_trans::{AccessSet, CatalogAccesses, CollectionReservations};
 
 use self::access_overlay::{AccessOverlay, OverlayRead};
-use self::catalog::{CatalogOverlay, CreateMode};
-use crate::collection::{Collection, CollectionPath, validate_collection_name};
+use self::catalog::CatalogOverlay;
+pub(crate) use self::catalog::CreateMode;
+use crate::collection::{Collection, CollectionPath, collection_name};
 use crate::db::DbInner;
 use crate::error::Error;
 use crate::iter::{CollectionEntry, CollectionIter};
@@ -183,9 +184,8 @@ impl Transaction {
         parent: &Collection,
         name: impl AsRef<[u8]>,
     ) -> Result<Collection, Error> {
-        let (collection, _) = self
-            .create_child(parent, name.as_ref(), CreateMode::Strict)
-            .await?;
+        let name = collection_name(name.as_ref())?;
+        let (collection, _) = self.create_child(parent, &name, CreateMode::Strict).await?;
         Ok(collection)
     }
 
@@ -196,8 +196,8 @@ impl Transaction {
         parent: &Collection,
         name: impl AsRef<[u8]>,
     ) -> Result<(Collection, bool), Error> {
-        self.create_child(parent, name.as_ref(), CreateMode::IfAbsent)
-            .await
+        let name = collection_name(name.as_ref())?;
+        self.create_child(parent, &name, CreateMode::IfAbsent).await
     }
 
     /// Opens the direct child currently bound to `name`.
@@ -206,9 +206,8 @@ impl Transaction {
         parent: &Collection,
         name: impl AsRef<[u8]>,
     ) -> Result<Collection, Error> {
-        self.resolve_child(parent, name.as_ref())
-            .await?
-            .ok_or(Error::NotFound)
+        self.open_child(parent, &collection_name(name.as_ref())?)
+            .await
     }
 
     /// Reports whether a direct child is currently bound to `name`.
@@ -217,7 +216,8 @@ impl Transaction {
         parent: &Collection,
         name: impl AsRef<[u8]>,
     ) -> Result<bool, Error> {
-        Ok(self.resolve_child(parent, name.as_ref()).await?.is_some())
+        let name = collection_name(name.as_ref())?;
+        Ok(self.resolve_child(parent, &name).await?.is_some())
     }
 
     /// Resolves an unresolved collection path from the permanent root.
@@ -228,8 +228,8 @@ impl Transaction {
     {
         let path = path.try_into().map_err(Into::into)?;
         let mut parent = self.root_collection();
-        for name in path.segments() {
-            parent = self.open_collection(&parent, name).await?;
+        for name in path.names() {
+            parent = self.open_child(&parent, name).await?;
         }
         Ok(parent)
     }
@@ -242,7 +242,7 @@ impl Transaction {
     {
         let path = path.try_into().map_err(Into::into)?;
         let mut parent = self.root_collection();
-        for name in path.segments() {
+        for name in path.names() {
             let Some(child) = self.resolve_child(&parent, name).await? else {
                 return Ok(false);
             };
@@ -268,11 +268,11 @@ impl Transaction {
             .into_iter()
             .map(|(name, id)| {
                 CollectionEntry::new(
-                    name.clone(),
+                    name.as_bytes().to_vec(),
                     Collection::new_child(
                         CollectionAddress::new(self.db.name.as_str(), id),
                         parent.address().clone(),
-                        &name,
+                        name,
                         self.db.clone(),
                     ),
                 )
@@ -289,14 +289,10 @@ impl Transaction {
                 "the permanent root collection cannot be dropped".into(),
             ));
         }
-        let parent = collection
-            .parent_address()
-            .ok_or_else(|| Error::InvalidInput("collection has no direct parent".into()))?
-            .clone();
-        let name = collection
-            .name()
-            .ok_or_else(|| Error::InvalidInput("collection has no direct name".into()))?
-            .to_vec();
+        let (parent, name) = collection
+            .binding()
+            .ok_or_else(|| Error::InvalidInput("collection has no direct binding".into()))?;
+        let (parent, name) = (parent.clone(), name.clone());
         self.ensure_directory(&parent).await?;
         self.ensure_directory(collection.address()).await?;
 
@@ -339,30 +335,47 @@ impl Transaction {
         (inner.accesses.accesses(), inner.catalog.accesses())
     }
 
-    async fn create_child(
+    /// Binds a direct child according to `mode` and reports whether this
+    /// transaction created it.
+    pub(crate) async fn create_child(
         &self,
         parent: &Collection,
-        name: &[u8],
+        name: &CollectionName,
         mode: CreateMode,
     ) -> Result<(Collection, bool), Error> {
         self.admit_operation(parent)?;
-        validate_collection_name(name)?;
         self.ensure_directory(parent.address()).await?;
         let mut inner = self.inner.lock().unwrap();
         let (address, created) = inner.catalog.create_child(parent.address(), name, mode)?;
         Ok((
-            Collection::new_child(address, parent.address().clone(), name, self.db.clone()),
+            Collection::new_child(
+                address,
+                parent.address().clone(),
+                name.clone(),
+                self.db.clone(),
+            ),
             created,
         ))
     }
 
-    async fn resolve_child(
+    /// Opens the direct child currently bound to `name`.
+    pub(crate) async fn open_child(
         &self,
         parent: &Collection,
-        name: &[u8],
+        name: &CollectionName,
+    ) -> Result<Collection, Error> {
+        self.resolve_child(parent, name)
+            .await?
+            .ok_or(Error::NotFound)
+    }
+
+    /// Returns the direct child currently bound to `name`, if any.
+    pub(crate) async fn resolve_child(
+        &self,
+        parent: &Collection,
+        name: &CollectionName,
     ) -> Result<Option<Collection>, Error> {
         self.admit_operation(parent)?;
-        validate_collection_name(name)?;
         self.ensure_directory(parent.address()).await?;
         let id = self
             .inner
@@ -374,7 +387,7 @@ impl Transaction {
             Collection::new_child(
                 CollectionAddress::new(self.db.name.as_str(), id),
                 parent.address().clone(),
-                name,
+                name.clone(),
                 self.db.clone(),
             )
         }))
