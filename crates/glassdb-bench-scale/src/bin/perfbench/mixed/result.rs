@@ -5,6 +5,7 @@ use serde::Serialize;
 use glassdb::Stats;
 use glassdb_bench_scale::bench::Results;
 
+use super::super::policy::ShadowCounts;
 use super::options::CellDimension;
 
 /// One shape's fixed timing observations for a cell report.
@@ -29,8 +30,11 @@ pub(super) struct CellMetadata {
     workers_per_shape: usize,
     setup_splits: u64,
     split_settle_elapsed: Duration,
+    seed_leaf_entries: Option<usize>,
+    key_layout: &'static str,
     policy: String,
     restructure: Restructure,
+    shadow: Option<ShadowCounts>,
 }
 
 /// Splits and merges of the measurement clients.
@@ -62,8 +66,24 @@ impl CellMetadata {
             workers_per_shape,
             setup_splits,
             split_settle_elapsed,
+            seed_leaf_entries: None,
+            key_layout: "shared",
             policy: "engine".into(),
             restructure: Restructure::default(),
+            shadow: None,
+        }
+    }
+
+    /// Records the leaf entry limit of the setup Database and the key layout.
+    pub(super) fn with_layout(
+        self,
+        seed_leaf_entries: Option<usize>,
+        key_layout: &'static str,
+    ) -> Self {
+        Self {
+            seed_leaf_entries,
+            key_layout,
+            ..self
         }
     }
 
@@ -75,6 +95,11 @@ impl CellMetadata {
             restructure,
             ..self
         }
+    }
+
+    /// Records what the shadow policies would decide during measurement.
+    pub(super) fn with_shadow(self, shadow: Option<ShadowCounts>) -> Self {
+        Self { shadow, ..self }
     }
 }
 
@@ -117,8 +142,12 @@ pub(super) struct CellResult {
     setup_splits: u64,
     split_settle_wall_ms: u64,
     failures: u64,
+    seed_leaf_entries: Option<usize>,
+    key_layout: String,
     policy: String,
     restructure: Restructure,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shadow: Option<ShadowCounts>,
     shapes: Vec<ShapeResult>,
     aggregate_ops: OpsPerTx,
     aggregate_protocol: ProtocolPerTx,
@@ -184,8 +213,11 @@ impl CellResult {
                 .try_into()
                 .unwrap_or(u64::MAX),
             failures: 0,
+            seed_leaf_entries: metadata.seed_leaf_entries,
+            key_layout: metadata.key_layout.to_string(),
             policy: metadata.policy,
             restructure,
+            shadow: metadata.shadow,
             shapes,
             aggregate_ops: raw_ops.per_tx(logical_txn),
             aggregate_protocol: raw_protocol.per_tx(logical_txn),
@@ -196,13 +228,19 @@ impl CellResult {
 
 /// Formats the progress line emitted before a cell starts.
 pub(super) fn cell_started(run: usize, dimension: CellDimension) -> String {
+    let seed_leaf_entries = dimension
+        .seed_leaf_entries
+        .map_or("default".into(), |entries| entries.to_string());
     format!(
-        "mixed: run={run} mode={} affinity={}% databases={}/{} workers/shape={}",
+        "mixed: run={run} mode={} affinity={}% databases={}/{} workers/shape={} \
+         seed-leaf-entries={seed_leaf_entries} key-layout={} policy={}",
         dimension.mode.label(),
         dimension.affinity_pct,
         dimension.databases,
         dimension.database_limit,
         dimension.workers_per_shape,
+        dimension.key_layout.label(),
+        dimension.policy.label(),
     )
 }
 
@@ -417,6 +455,7 @@ mod tests {
         RestructurerStats, SplitTime, TransactionStats,
     };
 
+    use super::super::super::policy::ShadowTally;
     use super::*;
 
     #[test]
@@ -506,7 +545,9 @@ mod tests {
         });
         let cell = CellResult::summarize(
             CellMetadata::new("hi", 25, 2, 2, 8, 4, Duration::from_millis(1500))
-                .with_policy("avoidable".into(), warmup),
+                .with_layout(Some(7), "ranges")
+                .with_policy("fixed".into(), warmup)
+                .with_shadow(Some(ShadowTally::new(["avoidable".into()], false).take())),
             measurements,
             &deltas,
             3,
@@ -554,15 +595,28 @@ mod tests {
       "databaseLimit": 2,
       "databases": 2,
       "failures": 0,
+      "keyLayout": "ranges",
       "mode": "hi",
-      "policy": "avoidable",
+      "policy": "fixed",
       "restructure": {
         "measuredMerges": 2,
         "measuredSplits": 1,
         "warmupMerges": 0,
         "warmupSplits": 5
       },
+      "seedLeafEntries": 7,
       "setupSplits": 4,
+      "shadow": {
+        "leafWindows": 0,
+        "policies": [
+          {
+            "merges": 0,
+            "policy": "avoidable",
+            "splits": 0
+          }
+        ],
+        "windows": 0
+      },
       "shapes": [
         {
           "committed": 3,
@@ -619,6 +673,7 @@ mod tests {
       "databaseLimit": 0,
       "databases": 0,
       "failures": 0,
+      "keyLayout": "shared",
       "mode": "lo",
       "policy": "engine",
       "restructure": {
@@ -627,6 +682,7 @@ mod tests {
         "warmupMerges": 0,
         "warmupSplits": 0
       },
+      "seedLeafEntries": null,
       "setupSplits": 0,
       "shapes": [],
       "splitSettleWallMs": 0,

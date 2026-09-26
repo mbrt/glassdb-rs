@@ -43,7 +43,7 @@ import seaborn as sns
 WORKLOADS = ("single", "hot", "adjacent", "random", "scan")
 SHAPES = ("rwSingle", "rwMany", "roSingle", "roMulti")
 TOPOLOGY_KEYS = ["delays", "workload", "leaf", "databases"]
-MIXED_KEYS = ["delays", "mode", "affinity", "databases"]
+MIXED_KEYS = ["delays", "mode", "affinity", "databases", "seed", "layout"]
 REPLICA_KEYS = ["source", "run"]
 TOPOLOGY_COLUMNS = [
     *TOPOLOGY_KEYS,
@@ -128,6 +128,9 @@ def mixed_rows(path: Path, data: dict[str, Any]) -> list[dict[str, Any]]:
                 "mode": cell["mode"],
                 "affinity": cell["affinityPct"],
                 "databases": cell["databases"],
+                # Reports from before the counterfactual options have neither.
+                "seed": str(cell.get("seedLeafEntries") or "default"),
+                "layout": cell.get("keyLayout", "shared"),
                 "policy": cell["policy"],
                 "tx_per_sec": math.exp(sum(logs) / len(logs)),
                 "ops_per_tx": cell["aggregateOps"]["totalOpsPerTx"],

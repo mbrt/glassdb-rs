@@ -160,6 +160,32 @@ class PlotTopologyTest(unittest.TestCase):
 
         self.assertTrue(math.isclose(mixed["tx_per_sec"].item(), 8.0))
 
+    def test_mixed_cells_of_other_seeded_trees_have_their_own_baselines(self) -> None:
+        seeded = [
+            {**mixed_cell(policy, 0, 2, [scale] * 4), "seedLeafEntries": 7}
+            for policy, scale in (("fixed", 2.0), ("avoidable", 3.0))
+        ]
+        path = write(
+            self.root,
+            "cf-s3-db2.json",
+            "mixed",
+            [
+                [
+                    mixed_cell("fixed", 0, 2, [1.0] * 4),
+                    mixed_cell("avoidable", 0, 2, [3.0] * 4),
+                    *seeded,
+                ]
+            ],
+        )
+        _, mixed = plotter.load([str(path)], {"fixed"})
+
+        ratios = plotter.relative_to_baseline(mixed, plotter.MIXED_KEYS, "fixed")
+
+        avoidable = ratios[ratios["policy"] == "avoidable"]
+        self.assertEqual(avoidable["seed"].tolist(), ["default", "7"])
+        for ratio, expected in zip(avoidable["vs_baseline"], [3.0, 1.5]):
+            self.assertTrue(math.isclose(ratio, expected), (ratio, expected))
+
     def test_file_names_must_name_the_delay_model(self) -> None:
         path = write(self.root, "run.json", "topology", [[topology_cell("fixed", 1.0)]])
 

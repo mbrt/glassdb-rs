@@ -14,11 +14,12 @@ use glassdb::{Collection, Database, Error as GError};
 use glassdb_bench_scale::bench::Bench;
 use glassdb_bench_scale::run::split_workers;
 
+use super::options::KeyLayout;
 use super::result::ShapeMeasurement;
 use super::{key_bytes, value};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Shape {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Shape {
     RwSingle,
     RwMany,
     RoSingle,
@@ -33,6 +34,16 @@ const SHAPES: [Shape; 4] = [
 ];
 
 impl Shape {
+    /// Parses a shape name of the reports.
+    pub(super) fn parse(value: &str) -> Result<Self, String> {
+        SHAPES
+            .into_iter()
+            .find(|shape| shape.name() == value)
+            .ok_or_else(|| {
+                format!("unknown shape {value:?} (expected rwSingle|rwMany|roSingle|roMulti)")
+            })
+    }
+
     fn name(self) -> &'static str {
         match self {
             Shape::RwSingle => "rwSingle",
@@ -70,8 +81,10 @@ struct WorkerSpec<'a> {
     seed: u64,
 }
 
-/// Builds all worker plans in their stable shape, database, and worker order.
+/// Builds the worker plans of `shapes` in their stable shape, database, and
+/// worker order.
 pub(super) fn plans(
+    shapes: &[Shape],
     workers_per_shape: usize,
     databases: usize,
     max_duration: Duration,
@@ -82,6 +95,7 @@ pub(super) fn plans(
         .collect();
     SHAPES
         .into_iter()
+        .filter(|shape| shapes.contains(shape))
         .map(|shape| ShapePlan {
             shape,
             bench: Arc::new(Bench::new(max_duration)),
@@ -119,6 +133,10 @@ pub(super) struct WorkerCtx {
     pool_size: usize,
     multi_keys: usize,
     affinity_pct: u8,
+    layout: KeyLayout,
+    databases: usize,
+    /// The pool indices in the order of their keys.
+    key_order: Arc<[usize]>,
 }
 
 impl WorkerCtx {
@@ -128,12 +146,19 @@ impl WorkerCtx {
         pool_size: usize,
         multi_keys: usize,
         affinity_pct: u8,
+        layout: KeyLayout,
+        databases: usize,
     ) -> Self {
+        let mut key_order: Vec<usize> = (0..pool_size).collect();
+        key_order.sort_by_cached_key(|&index| key_bytes(index));
         Self {
             stop,
             pool_size,
             multi_keys,
             affinity_pct,
+            layout,
+            databases,
+            key_order: key_order.into(),
         }
     }
 
@@ -240,7 +265,7 @@ async fn execute_once(
 ) -> Result<(), GError> {
     // Select inputs outside measurement so entropy work and borrows do not span
     // the transaction future.
-    let (collection, indices) = select_inputs(rng, home, collections.len(), ctx, key_count);
+    let (collection, indices) = select_inputs(rng, home, collections.len(), ctx, shape, key_count);
     let keys: Vec<Vec<u8>> = indices.iter().map(|&index| key_bytes(index)).collect();
     let keys = &keys;
     let collection = &collections[collection];
@@ -260,12 +285,33 @@ fn select_inputs(
     home: usize,
     collections: usize,
     ctx: &WorkerCtx,
+    shape: Shape,
     key_count: usize,
 ) -> (usize, Vec<usize>) {
-    (
-        pick_collection(rng, home, collections, ctx.affinity_pct),
-        pick_keys(rng, ctx.pool_size, key_count),
-    )
+    let collection = pick_collection(rng, home, collections, ctx.affinity_pct);
+    let single = matches!(shape, Shape::RwSingle | Shape::RoSingle);
+    let keys = match owned_positions(ctx, home) {
+        Some((first, step, count)) if single => {
+            vec![ctx.key_order[first + step * rng.random_range(0..count)]]
+        }
+        _ => pick_keys(rng, ctx.pool_size, key_count),
+    };
+    (collection, keys)
+}
+
+/// Returns the positions in key order of the keys that the layout gives to
+/// the Database `home`, as the first position, the step, and the count. The
+/// `shared` layout gives all keys to every Database.
+fn owned_positions(ctx: &WorkerCtx, home: usize) -> Option<(usize, usize, usize)> {
+    let (pool, databases) = (ctx.pool_size, ctx.databases);
+    match ctx.layout {
+        KeyLayout::Shared => None,
+        KeyLayout::Ranges => {
+            let first = home * pool / databases;
+            Some((first, 1, (home + 1) * pool / databases - first))
+        }
+        KeyLayout::Interleaved => Some((home, databases, (pool - home).div_ceil(databases))),
+    }
 }
 
 /// Selects the home collection with the configured affinity.
@@ -324,17 +370,27 @@ async fn ro_tx(db: &Database, collection: &Collection, keys: &[Vec<u8>]) -> Resu
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[tokio::test]
     async fn seeded_selection_and_logical_counts_are_stable() {
-        let worker_plans = plans(3, 2, Duration::from_secs(1));
+        let worker_plans = plans(&SHAPES, 3, 2, Duration::from_secs(1));
         let selected: Vec<_> = worker_specs(&worker_plans)
             .map(|spec| {
                 let mut rng = StdRng::seed_from_u64(spec.seed);
-                let ctx = WorkerCtx::new(Arc::new(AtomicBool::new(false)), 17, 3, 60);
+                let ctx = WorkerCtx::new(
+                    Arc::new(AtomicBool::new(false)),
+                    17,
+                    3,
+                    60,
+                    KeyLayout::Shared,
+                    2,
+                );
                 let count = spec.shape.key_count(ctx.multi_keys, ctx.pool_size);
-                let (collection, keys) = select_inputs(&mut rng, spec.database, 2, &ctx, count);
+                let (collection, keys) =
+                    select_inputs(&mut rng, spec.database, 2, &ctx, spec.shape, count);
                 (
                     spec.shape.name(),
                     spec.shape.is_write(),
@@ -377,7 +433,7 @@ mod tests {
             ]
         );
 
-        let plans = plans(1, 1, Duration::from_secs(1));
+        let plans = plans(&SHAPES, 1, 1, Duration::from_secs(1));
         start_measurement(&plans);
         for plan in &plans {
             plan.bench.measure(|| async { Ok(()) }).await.unwrap();
@@ -411,5 +467,62 @@ mod tests {
         pick_collection(&mut no_affinity, 2, 4, 0);
         pick_collection(&mut full_affinity, 2, 4, 100);
         assert_eq!(no_affinity.random::<u64>(), full_affinity.random::<u64>());
+    }
+
+    #[test]
+    fn layouts_give_each_database_its_keys_in_key_order() {
+        // With 12 keys, the key order is key0, key1, key10, key11, key2, ...
+        let selected = |layout, home, shape| {
+            let ctx = WorkerCtx::new(Arc::new(AtomicBool::new(false)), 12, 12, 0, layout, 2);
+            let mut rng = StdRng::seed_from_u64(3);
+            (0..200)
+                .flat_map(|_| select_inputs(&mut rng, home, 2, &ctx, shape, 1).1)
+                .collect::<BTreeSet<_>>()
+        };
+        let cases = [
+            (
+                KeyLayout::Ranges,
+                0,
+                Shape::RwSingle,
+                vec![0, 1, 2, 3, 10, 11],
+            ),
+            (
+                KeyLayout::Ranges,
+                1,
+                Shape::RoSingle,
+                vec![4, 5, 6, 7, 8, 9],
+            ),
+            (
+                KeyLayout::Interleaved,
+                0,
+                Shape::RwSingle,
+                vec![0, 2, 4, 6, 8, 10],
+            ),
+            (
+                KeyLayout::Interleaved,
+                1,
+                Shape::RoSingle,
+                vec![1, 3, 5, 7, 9, 11],
+            ),
+            (KeyLayout::Ranges, 0, Shape::RwMany, (0..12).collect()),
+            (KeyLayout::Shared, 1, Shape::RwSingle, (0..12).collect()),
+        ];
+        for (layout, home, shape, expected) in cases {
+            assert_eq!(
+                selected(layout, home, shape),
+                BTreeSet::from_iter(expected),
+                "{layout:?} {home} {shape:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plans_run_only_the_selected_shapes() {
+        let shapes = [Shape::RoMulti, Shape::RwSingle];
+        let names: Vec<_> = plans(&shapes, 1, 1, Duration::from_secs(1))
+            .iter()
+            .map(|plan| plan.shape.name())
+            .collect();
+        assert_eq!(names, ["rwSingle", "roMulti"]);
     }
 }

@@ -4,6 +4,7 @@ use std::time::Duration;
 use clap::Args;
 
 use super::super::policy::PolicySpec;
+use super::workload::Shape;
 
 #[derive(Clone, Args)]
 pub(crate) struct Options {
@@ -67,6 +68,48 @@ pub(crate) struct Options {
     /// policy can change the tree first.
     #[arg(long, default_value = "0s", value_parser = glassdb_bench_scale::parse_duration)]
     pub(super) warmup: Duration,
+    /// Leaf entry limits of the setup Database to sweep. `default` keeps the
+    /// engine soft caps. Under the `fixed` policy, a limit below the pool size
+    /// measures the tree after median splits: for example, 7 splits a pool of
+    /// 8 keys into two leaves of 4.
+    #[arg(long, value_delimiter = ',', default_value = "default", value_parser = SeedLeaves::parse)]
+    seed_leaf_entries: Vec<SeedLeaves>,
+    /// Key layouts to sweep. They give each Database the pool keys of its
+    /// single-key shapes: `shared` gives all keys, `ranges` one contiguous
+    /// part of the keys in key order, and `interleaved` every Nth key in key
+    /// order, for N Databases. The multi-key shapes use all keys.
+    #[arg(long, value_delimiter = ',', default_value = "shared", value_parser = KeyLayout::parse)]
+    key_layouts: Vec<KeyLayout>,
+    /// Transaction shapes to run.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "rwSingle,rwMany,roSingle,roMulti"
+    )]
+    shapes: Vec<String>,
+    /// Topology policies that decide on the windows of the measurement
+    /// clients without changing the tree. The report counts the changes
+    /// that each would decide. Cells with the engine policy have no windows,
+    /// so they report no shadow decisions.
+    #[arg(long, value_delimiter = ',', value_parser = PolicySpec::parse)]
+    pub(super) shadow_policies: Vec<PolicySpec>,
+    /// Report the measurements of each window of the measurement clients,
+    /// and the changes that each shadow policy would decide on it. The
+    /// report keeps all windows of a cell in memory.
+    #[arg(long)]
+    pub(super) trace_windows: bool,
+}
+
+/// A leaf entry limit of the setup Database, or none for the engine soft caps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SeedLeaves(pub(super) Option<usize>);
+
+/// Which pool keys the single-key shapes of each Database select.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum KeyLayout {
+    Shared,
+    Ranges,
+    Interleaved,
 }
 
 impl Options {
@@ -79,22 +122,48 @@ impl Options {
             for &affinity_pct in &self.affinities {
                 for &database_limit in &self.databases {
                     for &workers_per_shape in &self.workers_per_shape {
-                        for (policy_index, &policy) in self.policies.iter().enumerate() {
-                            dimensions.push(CellDimension {
-                                mode,
-                                affinity_pct,
-                                database_limit,
-                                databases: database_limit.min(workers_per_shape),
-                                workers_per_shape,
-                                policy,
-                                policy_index,
-                            });
+                        for &SeedLeaves(seed_leaf_entries) in &self.seed_leaf_entries {
+                            for &key_layout in &self.key_layouts {
+                                for (policy_index, &policy) in self.policies.iter().enumerate() {
+                                    dimensions.push(CellDimension {
+                                        mode,
+                                        affinity_pct,
+                                        database_limit,
+                                        databases: database_limit.min(workers_per_shape),
+                                        workers_per_shape,
+                                        seed_leaf_entries,
+                                        key_layout,
+                                        policy,
+                                        policy_index,
+                                    });
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+        if dimensions.iter().any(|dimension| {
+            dimension.key_layout != KeyLayout::Shared
+                && dimension.databases > dimension.mode.pool_size(self)
+        }) {
+            return Err("--key-layouts ranges and interleaved need a key for each Database".into());
+        }
         Ok(dimensions)
+    }
+
+    /// Reports whether the cells report what happens in the windows of the
+    /// measurement clients.
+    pub(super) fn observes_windows(&self) -> bool {
+        !self.shadow_policies.is_empty() || self.trace_windows
+    }
+
+    /// Returns the transaction shapes to run.
+    pub(super) fn shapes(&self) -> Result<Vec<Shape>, Box<dyn Error>> {
+        self.shapes
+            .iter()
+            .map(|value| Shape::parse(value.trim()).map_err(Into::into))
+            .collect()
     }
 
     fn validate(&self) -> Result<(), Box<dyn Error>> {
@@ -110,6 +179,10 @@ impl Options {
         if self.policies.is_empty() {
             return Err("--policies must contain at least one policy".into());
         }
+        if self.shadow_policies.contains(&PolicySpec::Engine) {
+            return Err("--shadow-policies must not contain engine, which has no windows".into());
+        }
+        self.shapes()?;
         if self.split_quiet.is_zero() {
             return Err("--split-quiet must be greater than zero".into());
         }
@@ -127,9 +200,46 @@ pub(super) struct CellDimension {
     pub(super) database_limit: usize,
     pub(super) databases: usize,
     pub(super) workers_per_shape: usize,
+    pub(super) seed_leaf_entries: Option<usize>,
+    pub(super) key_layout: KeyLayout,
     pub(super) policy: PolicySpec,
     /// The position of `policy` in `--policies`, which names its databases.
     pub(super) policy_index: usize,
+}
+
+impl SeedLeaves {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "default" => Ok(Self(None)),
+            text => match text.parse::<usize>() {
+                Ok(entries) if entries >= 2 => Ok(Self(Some(entries))),
+                _ => Err(format!(
+                    "invalid seed leaf entries {text:?} (expected default or an integer >= 2)"
+                )),
+            },
+        }
+    }
+}
+
+impl KeyLayout {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            KeyLayout::Shared => "shared",
+            KeyLayout::Ranges => "ranges",
+            KeyLayout::Interleaved => "interleaved",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "shared" => Ok(KeyLayout::Shared),
+            "ranges" => Ok(KeyLayout::Ranges),
+            "interleaved" => Ok(KeyLayout::Interleaved),
+            other => Err(format!(
+                "unknown key layout {other:?} (expected shared|ranges|interleaved)"
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -185,15 +295,21 @@ mod tests {
             .cell_dimensions()?
             .into_iter()
             .map(|cell| {
-                format!(
-                    "{}:{}:limit{}:db{}:w{}:{}",
+                let mut snapshot = format!(
+                    "{}:{}:limit{}:db{}:w{}",
                     cell.mode.label(),
                     cell.affinity_pct,
                     cell.database_limit,
                     cell.databases,
                     cell.workers_per_shape,
-                    cell.policy.label()
-                )
+                );
+                if let Some(entries) = cell.seed_leaf_entries {
+                    snapshot += &format!(":seed{entries}");
+                }
+                if cell.key_layout != KeyLayout::Shared {
+                    snapshot += &format!(":{}", cell.key_layout.label());
+                }
+                snapshot + ":" + &cell.policy.label()
             })
             .collect::<Vec<_>>()
             .join("\n"))
@@ -246,6 +362,29 @@ mod tests {
                  lo:100:limit3:db3:w5:engine\n\
                  lo:100:limit3:db3:w5:avoidable",
             ),
+            (
+                &[
+                    "perfbench",
+                    "--modes",
+                    "hi",
+                    "--affinities",
+                    "0",
+                    "--databases",
+                    "2",
+                    "--seed-leaf-entries",
+                    "default,7",
+                    "--key-layouts",
+                    "ranges,interleaved",
+                    "--policies",
+                    "fixed",
+                    "--shadow-policies",
+                    "avoidable,size",
+                ],
+                "hi:0:limit2:db2:w8:ranges:fixed\n\
+                 hi:0:limit2:db2:w8:interleaved:fixed\n\
+                 hi:0:limit2:db2:w8:seed7:ranges:fixed\n\
+                 hi:0:limit2:db2:w8:seed7:interleaved:fixed",
+            ),
         ];
 
         for (args, expected) in cases {
@@ -290,6 +429,32 @@ mod tests {
             (
                 &["perfbench", "--workers-per-shape", "0", "--modes", "medium"],
                 "--workers-per-shape must contain values >= 1",
+            ),
+            (
+                &[
+                    "perfbench",
+                    "--policies",
+                    "fixed",
+                    "--shadow-policies",
+                    "size,engine",
+                ],
+                "--shadow-policies must not contain engine, which has no windows",
+            ),
+            (
+                &["perfbench", "--shapes", "rwSingle,rwAll"],
+                "unknown shape \"rwAll\" (expected rwSingle|rwMany|roSingle|roMulti)",
+            ),
+            (
+                &[
+                    "perfbench",
+                    "--modes",
+                    "hi",
+                    "--hot-keys",
+                    "3",
+                    "--key-layouts",
+                    "ranges",
+                ],
+                "--key-layouts ranges and interleaved need a key for each Database",
             ),
         ];
 

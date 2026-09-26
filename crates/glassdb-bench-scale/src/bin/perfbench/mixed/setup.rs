@@ -2,12 +2,12 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 
-use glassdb::{Collection, CollectionPath, Database, Error as GError, Stats};
+use glassdb::{Collection, CollectionPath, Database, Error as GError, NodeSizePolicy, Stats};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::run::{SplitSettlement, shutdown_databases_until, wait_for_split_quiet};
 use tokio::runtime::Handle;
 
-use super::super::policy::PolicySpec;
+use super::super::policy::{PolicySpec, ShadowTally};
 use super::result;
 use super::{key_bytes, value};
 
@@ -17,7 +17,16 @@ const COLLECTION_PREFIX: &str = "mix";
 pub(super) struct CellConfig {
     pub(super) databases: usize,
     pub(super) policy: PolicySpec,
+    /// Policies that decide on the windows of the measurement clients
+    /// without changing the tree.
+    pub(super) shadows: Vec<PolicySpec>,
+    /// Where the measurement clients record their windows and the shadow
+    /// decisions, if the cell reports them.
+    pub(super) tally: Option<Arc<ShadowTally>>,
     pub(super) pool_size: usize,
+    /// The leaf entry limit of the setup Database, or none for the engine
+    /// soft caps.
+    pub(super) seed_leaf_entries: Option<usize>,
     pub(super) split_quiet: Duration,
     pub(super) split_settle_timeout: Duration,
     pub(super) drain_timeout: Duration,
@@ -126,10 +135,14 @@ pub(super) fn prepare_cell(
         &config,
     )?;
     let databases: Vec<_> = (0..config.databases)
-        .map(|_| {
-            let builder = config
-                .policy
-                .apply(Database::builder(database_name, backend.clone()));
+        .map(|index| {
+            let builder = Database::builder(database_name, backend.clone());
+            let builder = match &config.tally {
+                Some(tally) => config
+                    .policy
+                    .apply_shadowed(builder, &config.shadows, tally, index),
+                None => config.policy.apply(builder),
+            };
             handle.block_on(builder.open()).expect("open db")
         })
         .collect();
@@ -141,10 +154,25 @@ pub(super) fn prepare_cell(
     })
 }
 
-fn open_db(handle: &Handle, name: &str, backend: Arc<dyn Backend>) -> Database {
-    handle
-        .block_on(Database::open(name, backend))
-        .expect("open db")
+/// Opens the setup Database, with leaves of at most `leaf_entries` and no
+/// underfull merges, if set.
+fn open_setup_db(
+    handle: &Handle,
+    name: &str,
+    backend: Arc<dyn Backend>,
+    leaf_entries: Option<usize>,
+) -> Result<Database, Box<dyn Error>> {
+    let mut builder = Database::builder(name, backend);
+    if let Some(entries) = leaf_entries {
+        builder = builder.node_size_policy(
+            NodeSizePolicy::builder()
+                .leaf_max_entries(entries)
+                .leaf_min_entries(0)
+                .index_min_children(0)
+                .build()?,
+        );
+    }
+    Ok(handle.block_on(builder.open())?)
 }
 
 async fn open_collections(
@@ -170,7 +198,7 @@ fn seed_and_settle(
     paths: &[CollectionPath],
     config: &CellConfig,
 ) -> Result<SplitSettlement, Box<dyn Error>> {
-    let database = open_db(handle, database_name, backend);
+    let database = open_setup_db(handle, database_name, backend, config.seed_leaf_entries)?;
     handle.block_on(async {
         for path in paths {
             let name = path
@@ -236,7 +264,10 @@ mod tests {
             CellConfig {
                 databases: 2,
                 policy: PolicySpec::Engine,
+                shadows: Vec::new(),
+                tally: None,
                 pool_size: 3,
+                seed_leaf_entries: None,
                 split_quiet: Duration::from_millis(20),
                 split_settle_timeout: Duration::from_secs(1),
                 drain_timeout: Duration::from_secs(1),
@@ -267,6 +298,75 @@ mod tests {
             handle.block_on(probe.root_collection().read(b"after-shutdown")),
             Err(GError::ShuttingDown)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn shadow_policies_count_changes_on_a_seeded_tree_without_making_them()
+    -> Result<(), Box<dyn Error>> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let handle = runtime.handle();
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let tally = Arc::new(ShadowTally::new([PolicySpec::Size.label()], true));
+        let prepared = prepare_cell(
+            handle,
+            backend,
+            "mixedshadowtest",
+            CellConfig {
+                databases: 1,
+                policy: PolicySpec::Fixed,
+                shadows: vec![PolicySpec::Size],
+                tally: Some(tally.clone()),
+                pool_size: 4,
+                seed_leaf_entries: Some(3),
+                split_quiet: Duration::from_millis(200),
+                split_settle_timeout: Duration::from_secs(5),
+                drain_timeout: Duration::from_secs(1),
+            },
+        )?;
+        let active = prepared.begin_measurement();
+        tally.take();
+        // A window is one second of real time, so the margin for a slow
+        // machine is more than one window.
+        let collection = &active.collections()[0][0];
+        let stop = tokio::time::Instant::now() + Duration::from_millis(2500);
+        let written = handle.block_on(async {
+            while tokio::time::Instant::now() < stop {
+                active.databases()[0]
+                    .tx(|transaction| async move {
+                        transaction.write(collection, &key_bytes(0), &value())
+                    })
+                    .await?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok::<(), GError>(())
+        });
+        let shadow = serde_json::to_value(tally.take())?;
+        let completed = active.teardown(
+            handle,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            written,
+        )?;
+
+        // The seed limit of 3 splits the 4 keys into leaves of 2, which are
+        // under the minimum live entries of the default node size policy.
+        assert_eq!(completed.setup_splits, 1);
+        assert!(shadow["windows"].as_u64() >= Some(1), "{shadow}");
+        assert!(shadow["leafWindows"].as_u64() >= Some(1), "{shadow}");
+        assert_eq!(shadow["policies"][0]["policy"], "size", "{shadow}");
+        assert!(
+            shadow["policies"][0]["merges"].as_u64() >= Some(1),
+            "{shadow}"
+        );
+        assert_eq!(
+            shadow["trace"].as_array().map(|trace| trace.len() as u64),
+            shadow["windows"].as_u64(),
+            "{shadow}"
+        );
+        assert_eq!(shadow["trace"][0]["leaves"][0]["entries"], 2, "{shadow}");
+        assert_eq!(completed.deltas[0].restructurer.merges, 0);
         Ok(())
     }
 }

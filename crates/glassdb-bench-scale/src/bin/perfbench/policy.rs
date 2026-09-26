@@ -1,10 +1,15 @@
 //! Topology policies that scenarios open their measurement clients with.
 
-use glassdb::{AvoidableTimePolicy, DatabaseBuilder, FixedTopology, SizePolicy};
+use std::sync::Arc;
+
+use glassdb::{AvoidableTimePolicy, DatabaseBuilder, FixedTopology, SizePolicy, TopologyPolicy};
 
 use memory::MemoryPolicy;
+use shadow::Shadowed;
+pub(super) use shadow::{ShadowCounts, ShadowTally};
 
 mod memory;
+mod shadow;
 
 /// What decides the leaf splits and merges of one measurement client.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -88,6 +93,50 @@ impl PolicySpec {
                 builder.topology_policy(MemoryPolicy::new(split, merge))
             }
         }
+    }
+
+    /// Sets the policy on `builder`, and records in `tally` the windows of the
+    /// database instance with index `database`, and what each of `shadows`
+    /// would decide on them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when this policy or a shadow is `Engine`, which has no windows.
+    pub(super) fn apply_shadowed(
+        self,
+        builder: DatabaseBuilder,
+        shadows: &[PolicySpec],
+        tally: &Arc<ShadowTally>,
+        database: usize,
+    ) -> DatabaseBuilder {
+        let policy = self.policy().expect("the engine policy has no windows");
+        let shadows = shadows
+            .iter()
+            .map(|shadow| shadow.policy().expect("the engine policy has no windows"))
+            .collect();
+        builder.topology_policy(Shadowed {
+            policy,
+            shadows,
+            tally: tally.clone(),
+            database,
+        })
+    }
+
+    fn policy(self) -> Option<Box<dyn TopologyPolicy>> {
+        Some(match self {
+            Self::Engine => return None,
+            Self::Fixed => Box::new(FixedTopology),
+            Self::Size => Box::new(SizePolicy),
+            Self::Avoidable { thresholds: None } => Box::new(AvoidableTimePolicy::new()),
+            Self::Avoidable {
+                thresholds: Some((split, merge)),
+            } => Box::new(
+                AvoidableTimePolicy::new()
+                    .split_threshold(split)
+                    .merge_threshold(merge),
+            ),
+            Self::Memory { split, merge } => Box::new(MemoryPolicy::new(split, merge)),
+        })
     }
 }
 
