@@ -40,11 +40,13 @@ pub struct SplitTime {
     pub inline_pressure: Duration,
 }
 
-/// Avoidable time that one merge of two adjacent leaves can remove.
+/// Avoidable time that a merge of two adjacent leaves can remove, alone or with
+/// the merges of the other pairs of a chain of linked leaves.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MergeTime {
-    /// Locked commits of direct commit candidates whose keys are in the two
-    /// leaves, minus the typical direct commit time.
+    /// Locked commits of direct commit candidates whose keys are in a chain of
+    /// linked leaves that includes the two leaves, minus the typical direct
+    /// commit time. Each pair of the chain has an equal part.
     pub adjacent_miss: Duration,
     /// Reads of the right leaf by scans that continued from the left leaf.
     pub scan_crossing: Duration,

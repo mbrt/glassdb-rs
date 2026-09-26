@@ -83,7 +83,9 @@ const LOCKED_COMMIT_WRITES: u32 = 3;
 /// The leaves to which the point accesses of one direct member route.
 enum MemberPlacement {
     OneLeaf(ObjectPath),
-    AdjacentLeaves { left: ObjectPath, right: ObjectPath },
+    /// Two or more leaves in key order, where the right link of each leaf
+    /// names the next leaf.
+    LinkedLeaves(Vec<ObjectPath>),
     ScatteredLeaves,
 }
 
@@ -215,8 +217,8 @@ impl DirectCommit {
     }
 
     /// Notes that a locked commit, for which `try_commit` returned `cause`,
-    /// landed after `took`. The time above a direct commit is avoidable when
-    /// one structural change can remove the cause.
+    /// ended after `took`, landed or not. The time above a direct commit is
+    /// avoidable when structural changes can remove the cause.
     pub(super) fn observe_locked_commit(&self, cause: LockedCause, took: Duration) {
         let direct = self
             .landed_time
@@ -224,9 +226,15 @@ impl DirectCommit {
             .unwrap_or(took / LOCKED_COMMIT_WRITES);
         let penalty = took.saturating_sub(direct);
         match cause {
-            LockedCause::AdjacentLeaves { left, right } => self
-                .structural_hints
-                .adjacent_miss_time(&left, &right, penalty),
+            LockedCause::LinkedLeaves(leaves) => {
+                // Only the merges of all the pairs together let a direct commit
+                // land, so each pair carries an equal part of the penalty.
+                let pairs = u32::try_from(leaves.len() - 1).unwrap_or(u32::MAX);
+                for pair in leaves.windows(2) {
+                    self.structural_hints
+                        .adjacent_miss_time(&pair[0], &pair[1], penalty / pairs);
+                }
+            }
             LockedCause::InlinePressure(path) => {
                 self.structural_hints.inline_pressure_time(&path, penalty)
             }
@@ -241,20 +249,23 @@ impl DirectCommit {
             .iter()
             .map(|key| (key.key.clone(), ()))
             .collect::<Vec<_>>();
-        let groups = self
+        let mut groups = self
             .router
             .route_keys_with_requirements(keys, Requirement::ANY, Requirement::ANY)
             .await?;
-        let adjacent = |left: &RoutedLeafGroup<()>, right: &RoutedLeafGroup<()>| {
-            MemberPlacement::AdjacentLeaves {
-                left: left.path().clone(),
-                right: right.path().clone(),
-            }
-        };
+        // The router does not return the groups in key order.
+        groups.sort_unstable_by(|a, b| a.keys[0].0.cmp(&b.keys[0].0));
         Ok(match groups.as_slice() {
             [group] => MemberPlacement::OneLeaf(group.path().clone()),
-            [a, b] if links_right_to(a, b) => adjacent(a, b),
-            [a, b] if links_right_to(b, a) => adjacent(b, a),
+            [_, _, ..]
+                if groups
+                    .windows(2)
+                    .all(|pair| links_right_to(&pair[0], &pair[1])) =>
+            {
+                MemberPlacement::LinkedLeaves(
+                    groups.iter().map(|group| group.path().clone()).collect(),
+                )
+            }
             _ => MemberPlacement::ScatteredLeaves,
         })
     }
@@ -264,10 +275,14 @@ impl DirectCommit {
     fn single_leaf(&self, placement: MemberPlacement) -> Result<ObjectPath, LockedCause> {
         let (counter, cause) = match placement {
             MemberPlacement::OneLeaf(path) => return Ok(path),
-            MemberPlacement::AdjacentLeaves { left, right } => (
-                &self.counters.cross_leaf_adjacent,
-                LockedCause::AdjacentLeaves { left, right },
-            ),
+            MemberPlacement::LinkedLeaves(leaves) => {
+                let counter = if leaves.len() == 2 {
+                    &self.counters.cross_leaf_adjacent
+                } else {
+                    &self.counters.cross_leaf_scattered
+                };
+                (counter, LockedCause::LinkedLeaves(leaves))
+            }
             MemberPlacement::ScatteredLeaves => {
                 (&self.counters.cross_leaf_scattered, LockedCause::Other)
             }
@@ -807,9 +822,9 @@ pub(super) enum DirectOutcome {
 /// Why a transaction uses a locked commit instead of a direct commit.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum LockedCause {
-    /// The point accesses route to two adjacent leaves, which one merge can
-    /// put in one leaf.
-    AdjacentLeaves { left: ObjectPath, right: ObjectPath },
+    /// The point accesses route to a chain of linked leaves, in key order,
+    /// which merges can put in one leaf.
+    LinkedLeaves(Vec<ObjectPath>),
     /// The leaf could not carry the value inline, and one split can make
     /// space.
     InlinePressure(ObjectPath),

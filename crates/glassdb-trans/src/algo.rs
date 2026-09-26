@@ -657,7 +657,12 @@ impl Algo {
         };
         let started = rt::Instant::now();
         let outcome = self.commit_locked(tx).await;
-        if matches!(outcome, Ok(PassOutcome::Complete)) {
+        // A direct commit that loses takes one CAS, like one that lands. So the
+        // time of a locked commit that loses is avoidable too.
+        if matches!(
+            outcome,
+            Ok(_) | Err(TransError::Retry | TransError::Wounded)
+        ) {
             self.direct_commit
                 .observe_locked_commit(cause, started.elapsed());
         }

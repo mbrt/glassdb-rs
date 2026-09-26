@@ -80,7 +80,8 @@ pub struct LeafWindow {
 pub struct PairWindow {
     pub left: LeafId,
     pub right: LeafId,
-    /// The avoidable time that one merge of the two leaves can remove.
+    /// The avoidable time that a merge of the two leaves can remove, alone or
+    /// with the merges of the other pairs of a chain of linked leaves.
     pub avoidable: MergeTime,
 }
 

@@ -78,6 +78,43 @@ async fn locked_commits_over_adjacent_leaves_report_merge_time() {
     db.shutdown().await;
 }
 
+// Only the merges of all the pairs of a chain of linked leaves put the keys of
+// a direct commit candidate in one leaf. Leaves that are not linked need more
+// than merges of the leaves that the candidate touches.
+#[tokio::test(start_paused = true)]
+async fn locked_commits_over_a_chain_of_leaves_report_merge_time() {
+    let (db, coll) = split_collection().await;
+    let coll_ref = &coll;
+
+    let before = db.stats();
+    db.tx(|tx| async move {
+        for key in 0u8..16 {
+            tx.write(coll_ref, &[key], &write_int(1))?;
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let chain = db.stats() - before;
+    let before = db.stats();
+    db.tx(|tx| async move {
+        tx.write(coll_ref, &[0], &write_int(2))?;
+        tx.write(coll_ref, &[15], &write_int(2))
+    })
+    .await
+    .unwrap();
+    let gap = db.stats() - before;
+
+    assert_eq!(chain.direct_commit.cross_leaf_scattered, 1);
+    assert!(chain.restructurer.avoidable.merge.adjacent_miss > Duration::ZERO);
+    assert_eq!(gap.direct_commit.cross_leaf_scattered, 1);
+    assert_eq!(
+        gap.restructurer.avoidable.merge.adjacent_miss,
+        Duration::ZERO
+    );
+    db.shutdown().await;
+}
+
 // Each leaf boundary that a scan crosses costs a leaf read, which one merge of
 // the two leaves can remove.
 #[tokio::test(start_paused = true)]

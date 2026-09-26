@@ -187,6 +187,45 @@ async fn merges_of_a_policy_skip_the_underfull_threshold_but_not_the_size_vetoes
     db.shutdown().await;
 }
 
+// A transaction with keys in all the leaves can use a direct commit only after
+// the merges of all the pairs, so each pair shows a part of its time.
+#[tokio::test(start_paused = true)]
+async fn each_pair_of_a_chain_of_leaves_shows_the_time_of_a_transaction_over_the_chain() {
+    let backend = slow_mem();
+    split_collection(&backend).await;
+    let (policy, windows) = Recording::new(|_: &TopologyWindow| Vec::new());
+    let db = open(&backend, leaves_of_at_most(4), policy).await;
+    let coll = open_top(&db, b"split").await;
+    let pairs = scan_crossings(&db, &coll).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    windows.lock().unwrap().clear();
+
+    let coll_ref = &coll;
+    db.tx(|tx| async move {
+        for key in 0u8..16 {
+            tx.write(coll_ref, &[key], &write_int(1))?;
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    db.shutdown().await;
+    let windows = windows.lock().unwrap();
+    let misses: Vec<_> = windows
+        .iter()
+        .flat_map(|window| &window.pairs)
+        .filter(|pair| pair.avoidable.adjacent_miss > Duration::ZERO)
+        .collect();
+    assert_eq!(misses.len(), usize::try_from(pairs).unwrap());
+    assert!(
+        misses
+            .iter()
+            .all(|pair| pair.avoidable.adjacent_miss == misses[0].avoidable.adjacent_miss)
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_root_leaf_does_not_merge() {
     let backend = slow_mem();

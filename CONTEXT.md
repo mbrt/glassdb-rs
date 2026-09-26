@@ -439,7 +439,7 @@ The step after a split or a merge that makes the separators of one parent index 
 _Avoid_: Separator publication, parent repoint
 
 **Avoidable time**:
-The time of backend operations that transactions spend because of the current topology, and that one split or one merge would remove.
+The time of backend operations that transactions spend because of the current topology, and that one split, or the merges of adjacent leaves, would remove.
 _Avoid_: Topology cost, contention cost, structural pressure
 
 **Topology participant**:

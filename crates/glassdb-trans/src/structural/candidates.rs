@@ -111,8 +111,9 @@ impl StructuralHintSink {
         self.candidates.avoidable.add_split_time(path, split, None);
     }
 
-    /// Notes that a direct commit candidate with keys in the adjacent leaves
-    /// `left` and `right` used `time` more than a direct commit.
+    /// Notes that a direct commit candidate with keys in a chain of linked
+    /// leaves used `time` more than a direct commit, for the part of the chain
+    /// from the leaf `left` to the adjacent leaf `right`.
     pub(crate) fn adjacent_miss_time(&self, left: &ObjectPath, right: &ObjectPath, time: Duration) {
         let merge = MergeTime {
             adjacent_miss: time,
