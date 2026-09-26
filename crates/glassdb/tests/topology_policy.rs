@@ -211,6 +211,69 @@ async fn the_root_leaf_does_not_merge() {
     db.shutdown().await;
 }
 
+async fn read_keys(db: &Database, keys: &[(&Collection, u8)], write: bool) {
+    db.tx(|tx| async move {
+        for &(coll, key) in keys {
+            tx.read(coll, &[key]).await?;
+            if write {
+                tx.write(coll, &[key], &write_int(1))?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+// The median of the leaf of keys 0 to 3 is key 2. Transactions whose keys are
+// on both sides of it would use one more leaf after a split.
+#[tokio::test(start_paused = true)]
+async fn windows_count_the_transactions_of_a_leaf_that_a_split_would_divide() {
+    let backend = slow_mem();
+    let (policy, windows) = Recording::new(|_: &TopologyWindow| Vec::new());
+    let db = open(&backend, NodeSizePolicy::default(), policy).await;
+    let coll = create_top(&db, b"divided").await;
+    write_keys(&coll, 4).await;
+    let other = create_top(&db, b"other").await;
+    write_keys(&other, 1).await;
+
+    read_keys(&db, &[(&coll, 0), (&coll, 3)], true).await;
+    read_keys(&db, &[(&coll, 0)], true).await;
+    // Keys in two leaves need a locked commit.
+    read_keys(&db, &[(&coll, 0), (&coll, 3), (&other, 0)], true).await;
+    read_keys(&db, &[(&coll, 1), (&coll, 2)], false).await;
+    read_keys(&db, &[(&coll, 0), (&coll, 1)], false).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    db.shutdown().await;
+
+    let windows = windows.lock().unwrap();
+    // The locked commit counts once in each of its two leaves.
+    let leaves: Vec<_> = windows
+        .iter()
+        .flat_map(|window| window.leaves.values())
+        .collect();
+    let sum = |count: fn(&glassdb::LeafWindow) -> u64| leaves.iter().map(|leaf| count(leaf)).sum();
+    let committed: [u64; 3] = [
+        sum(|leaf| leaf.committed.direct),
+        sum(|leaf| leaf.committed.locked),
+        sum(|leaf| leaf.committed.read_only),
+    ];
+    let divided: [u64; 3] = [
+        sum(|leaf| leaf.divided.direct),
+        sum(|leaf| leaf.divided.locked),
+        sum(|leaf| leaf.divided.read_only),
+    ];
+    assert_eq!(committed, [2, 2, 2]);
+    assert_eq!(divided, [1, 1, 1]);
+    assert!(leaves.iter().any(|leaf| leaf.latency > Duration::ZERO));
+    let rounds: u64 = sum(|leaf| leaf.rounds);
+    assert!(
+        rounds >= 7,
+        "the writes of the setup and two direct commits"
+    );
+    assert!(sum(|leaf| leaf.round_members) >= rounds);
+}
+
 type Owner = fn(u8) -> usize;
 
 const HALVES: Owner = |key| usize::from(key / 4);

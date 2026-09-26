@@ -43,7 +43,7 @@ use crate::gc::GcHints;
 use crate::key_resolver::KeyResolver;
 use crate::leaf_coord::LeafCoordinator;
 use crate::monitor::{Monitor, OwnerAbortOutcome};
-use crate::structural::StructuralHintSink;
+use crate::structural::{CommitKind, StructuralHintSink};
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
 mod direct_commit;
@@ -159,6 +159,9 @@ pub struct Handle {
     /// use this schedule.
     backoff: Backoff,
     retirement: IdentityRetirementGuard,
+    /// Renewals and body replays keep it, so that a topology policy sees the
+    /// latency of the whole transaction.
+    started: rt::Instant,
 }
 
 impl Handle {
@@ -409,6 +412,7 @@ impl Algo {
             retirement: IdentityRetirementGuard::new(self.retirement.clone(), id),
             id,
             backoff: self.acquisition_retry.backoff(),
+            started: rt::Instant::now(),
         }
     }
 
@@ -626,9 +630,11 @@ impl Algo {
         if !tx.accesses.has_writes() && !tx.collections.has_writes() {
             if tx.should_lock_reads() {
                 self.validate_coordination_keys(&tx.accesses)?;
-                return self.commit_locked(tx).await;
+                let outcome = self.commit_locked(tx).await;
+                return self.observe_commit(tx, CommitKind::Locked, outcome);
             }
-            return self.commit_readonly(tx).await;
+            let outcome = self.commit_readonly(tx).await;
+            return self.observe_commit(tx, CommitKind::ReadOnly, outcome);
         }
         self.validate_coordination_keys(&tx.accesses)?;
         // Try direct commit first: a complete point transaction whose
@@ -639,14 +645,17 @@ impl Algo {
         if !tx.collections.accesses().reads.is_empty()
             || !tx.collections.accesses().changes.is_empty()
         {
-            return self.commit_locked(tx).await;
+            let outcome = self.commit_locked(tx).await;
+            return self.observe_commit(tx, CommitKind::Locked, outcome);
         }
         let cause = match self
             .direct_commit
             .try_commit(&tx.id, &tx.accesses, &mut tx.state)
             .await?
         {
-            DirectOutcome::Committed => return Ok(PassOutcome::Complete),
+            DirectOutcome::Committed => {
+                return self.observe_commit(tx, CommitKind::Direct, Ok(PassOutcome::Complete));
+            }
             // A certified direct-commit loss reevaluates the body rather than
             // publishing a holder that would make every subsequent direct
             // commit on the key ineligible (ADR-053). The id is unengaged —
@@ -660,6 +669,21 @@ impl Algo {
         if matches!(outcome, Ok(PassOutcome::Complete)) {
             self.direct_commit
                 .observe_locked_commit(cause, started.elapsed());
+        }
+        self.observe_commit(tx, CommitKind::Locked, outcome)
+    }
+
+    /// Reports the transaction to the topology policy when `outcome`
+    /// completes it.
+    fn observe_commit(
+        &self,
+        tx: &Handle,
+        kind: CommitKind,
+        outcome: Result<PassOutcome, TransError>,
+    ) -> Result<PassOutcome, TransError> {
+        if matches!(outcome, Ok(PassOutcome::Complete)) {
+            self.structural_hints
+                .observe_commit(&tx.accesses, kind, tx.started.elapsed());
         }
         outcome
     }

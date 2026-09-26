@@ -9,9 +9,10 @@ use glassdb_data::{ObjectPath, TxId};
 use glassdb_storage::{InlinePolicy, LeafBody, Node, NodeSizePolicy};
 use tokio::sync::Notify;
 
+use crate::access::AccessSet;
 use crate::leaf_coord::{LeafDelay, StructuralHinter};
 
-use super::avoidable::{AvoidableTime, ChangeKind, MergeTime, SplitTime};
+use super::avoidable::{AvoidableTime, ChangeKind, CommitKind, MergeTime, SplitTime};
 use super::merge::MergeReason;
 use super::policy::TopologyChange;
 use super::split::SplitReason;
@@ -119,6 +120,14 @@ impl StructuralHintSink {
             ..MergeTime::default()
         };
         self.candidates.avoidable.add_merge_time(left, right, merge);
+    }
+
+    /// Notes that a transaction with `accesses` committed with `kind`,
+    /// `latency` after its start.
+    pub(crate) fn observe_commit(&self, accesses: &AccessSet, kind: CommitKind, latency: Duration) {
+        self.candidates
+            .avoidable
+            .add_commit(accesses, kind, latency);
     }
 
     /// Notes that a scan that continued from `left` used `time` to read the
@@ -400,5 +409,9 @@ impl StructuralHinter for MaintenanceCandidates {
     fn leaf_delay(&self, path: &ObjectPath, delay: LeafDelay, time: Duration, split_key: &[u8]) {
         self.avoidable
             .add_split_time(path, SplitTime::of_delay(delay, time), Some(split_key));
+    }
+
+    fn round_landed(&self, path: &ObjectPath, members: usize) {
+        self.avoidable.add_round(path, members);
     }
 }

@@ -130,6 +130,13 @@ typical times of a split and of a merge. The policy returns the changes that it
 wants: a split at the median, a split at a key, or a merge into the right
 sibling.
 
+For each leaf, the window also counts the transactions that committed after
+point reads of the leaf, by the kind of commit, and the ones whose keys a split
+at the median puts in both halves. It has the sum of their latencies, and the
+coordinator rounds whose leaf CAS landed with their round members. The
+avoidable time policy does not use these counts. Another policy can use them to
+estimate the time that a split adds.
+
 The engine checks each change again against current state. It skips a split
 of a leaf with less than two entries, a split at a key that leaves one half
 empty, a merge of the root, and a merge that the ADR-073 merge rules do not
@@ -236,8 +243,8 @@ throttled requests with the same retry budget as the S3 adapter.
   it: when one instance wins each CAS of a hot leaf, the other instance has the
   lost CAS time, and the winner has none.
 - The measurements are volatile, like ADR-056 requests. A restart loses them.
-- Each database instance keeps time sums for its active leaves and pairs, and
-  drops them for inactive leaves.
+- With a policy, each database instance keeps time sums and counts for its
+  active leaves and pairs, and drops them for inactive leaves.
 - Cold tombstones in leaves that are not all tombstones stay until a split,
   a merge, or a compaction in place of their leaf.
 

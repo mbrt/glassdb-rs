@@ -563,6 +563,10 @@ pub trait StructuralHinter: Send + Sync {
         _split_key: &[u8],
     ) {
     }
+
+    /// Notes that a leaf CAS of a coordinator round of `path` with `members`
+    /// landed.
+    fn round_landed(&self, _path: &ObjectPath, _members: usize) {}
 }
 
 /// Time that round members lose on one leaf, and that one split of the leaf
@@ -847,7 +851,10 @@ fn median_separates<'a>(
 
 /// Returns whether all `keys` are in the upper half of a split at `median`,
 /// or none when there are no keys or the keys are in both halves.
-fn upper_half<'a>(median: &[u8], keys: impl IntoIterator<Item = &'a [u8]>) -> Option<bool> {
+pub(crate) fn upper_half<'a>(
+    median: &[u8],
+    keys: impl IntoIterator<Item = &'a [u8]>,
+) -> Option<bool> {
     let mut halves = keys.into_iter().map(|key| key >= median);
     let first = halves.next()?;
     halves.all(|upper| upper == first).then_some(first)
@@ -1425,6 +1432,9 @@ impl CasWorker {
             // because the slow CAS time covers that CAS.
             if let Some(lost) = &mut lost_time {
                 lost.report(&*self.core.hinter, path, sent);
+            }
+            if applied.is_some() {
+                self.core.hinter.round_landed(path, members.len());
             }
             // The CAS landed (or nothing needed staging): publish each member's
             // outcome into its slot before returning, so the deposit

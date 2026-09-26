@@ -13,7 +13,7 @@ use std::time::Duration;
 use glassdb_data::ObjectPath;
 use glassdb_storage::{LeafBody, NodeSizePolicy};
 
-use super::avoidable::{MergeTime, SplitTime};
+use super::avoidable::{CommitKind, MergeTime, SplitTime};
 
 /// The window length of the policies in this module.
 const DEFAULT_WINDOW: Duration = Duration::from_secs(1);
@@ -80,6 +80,30 @@ pub struct LeafWindow {
     /// Whether a merge that landed wrote the leaf in this window or the last
     /// one. The measurements start at the last change.
     pub merged_recently: bool,
+    /// The transactions of this instance that committed after point reads of
+    /// the leaf.
+    pub committed: TransactionCounts,
+    /// The committed transactions whose point reads of the leaf a split at
+    /// its median puts in both halves. After the split, they use one more
+    /// leaf, and a direct commit becomes a locked commit.
+    pub divided: TransactionCounts,
+    /// The sum of the latencies of the committed transactions, each from its
+    /// start to its commit.
+    pub latency: Duration,
+    /// The coordinator rounds of this instance whose leaf CAS landed.
+    pub rounds: u64,
+    /// The round members of those rounds. A split divides the members of a
+    /// round between two leaves, so each leaf CAS carries fewer of them.
+    pub round_members: u64,
+}
+
+/// Transactions, by the commit that they used.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TransactionCounts {
+    pub direct: u64,
+    pub locked: u64,
+    pub read_only: u64,
 }
 
 /// The measurements of two adjacent leaves in one window.
@@ -162,6 +186,22 @@ impl LeafSize {
             live_entries: leaf.entries().filter(|entry| entry.exists()).count(),
             encoded_bytes: leaf.encoded_len(),
         }
+    }
+}
+
+impl TransactionCounts {
+    /// Returns the sum of all commits.
+    pub fn total(&self) -> u64 {
+        self.direct + self.locked + self.read_only
+    }
+
+    pub(super) fn add(&mut self, kind: CommitKind) {
+        let count = match kind {
+            CommitKind::Direct => &mut self.direct,
+            CommitKind::Locked => &mut self.locked,
+            CommitKind::ReadOnly => &mut self.read_only,
+        };
+        *count += 1;
     }
 }
 

@@ -14,7 +14,8 @@ use glassdb_concurr::rt;
 use glassdb_data::ObjectPath;
 use glassdb_storage::{LeafBody, NodeSizePolicy};
 
-use crate::leaf_coord::LeafDelay;
+use crate::access::AccessSet;
+use crate::leaf_coord::{LeafDelay, upper_half};
 
 use super::policy::{LeafId, LeafSize, LeafWindow, PairWindow, TopologyWindow};
 
@@ -75,6 +76,14 @@ pub(super) enum ChangeKind {
     Merge,
 }
 
+/// The commit that a transaction used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitKind {
+    Direct,
+    Locked,
+    ReadOnly,
+}
+
 #[derive(Debug)]
 struct State {
     window_started: rt::Instant,
@@ -89,6 +98,13 @@ struct State {
 #[derive(Debug, Default)]
 pub(crate) struct TypicalTime {
     average: Mutex<Option<Duration>>,
+}
+
+/// The point reads of one transaction in one leaf.
+struct LeafReads<'a> {
+    /// The median key of the leaf, as the read of the lowest key observed it.
+    median: Option<&'a [u8]>,
+    keys: Vec<&'a [u8]>,
 }
 
 impl SplitTime {
@@ -240,6 +256,36 @@ impl AvoidableTime {
         }
     }
 
+    /// Records a transaction that committed with `kind`, `latency` after its
+    /// start, in each leaf of the point reads of `accesses`.
+    pub(super) fn add_commit(&self, accesses: &AccessSet, kind: CommitKind, latency: Duration) {
+        if !self.windows {
+            return;
+        }
+        let reads = LeafReads::of(accesses);
+        let mut state = self.state.lock().unwrap();
+        for (path, read) in reads {
+            let leaf = state.leaf(path);
+            leaf.committed.add(kind);
+            leaf.latency += latency;
+            if read.divided() {
+                leaf.divided.add(kind);
+            }
+        }
+    }
+
+    /// Records a coordinator round of the leaf at `path` whose leaf CAS
+    /// landed with `members`.
+    pub(super) fn add_round(&self, path: &ObjectPath, members: usize) {
+        if !self.windows {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        let leaf = state.leaf(path);
+        leaf.rounds += 1;
+        leaf.round_members += u64::try_from(members).unwrap_or(u64::MAX);
+    }
+
     /// Records the last known size of the leaf at `path`.
     pub(super) fn observe_size(&self, path: &ObjectPath, leaf: &LeafBody) {
         if self.windows {
@@ -334,6 +380,31 @@ impl AvoidableTime {
 impl State {
     fn leaf(&mut self, path: &ObjectPath) -> &mut LeafWindow {
         self.leaves.entry(path.clone()).or_default()
+    }
+}
+
+impl<'a> LeafReads<'a> {
+    /// Groups the point reads of `accesses` by the leaf that they observed.
+    fn of(accesses: &'a AccessSet) -> BTreeMap<&'a ObjectPath, Self> {
+        let mut leaves: BTreeMap<&ObjectPath, Self> = BTreeMap::new();
+        for read in accesses.point_reads() {
+            let observation = read.observation();
+            let leaf = leaves.entry(observation.path()).or_insert_with(|| Self {
+                median: observation
+                    .value()
+                    .and_then(|node| node.as_leaf())
+                    .and_then(LeafBody::median_key),
+                keys: Vec::new(),
+            });
+            leaf.keys.push(read.key().key());
+        }
+        leaves
+    }
+
+    /// Reports whether a split at the median puts the keys in both halves.
+    fn divided(&self) -> bool {
+        self.median
+            .is_some_and(|median| upper_half(median, self.keys.iter().copied()).is_none())
     }
 }
 

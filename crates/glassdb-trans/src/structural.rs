@@ -57,12 +57,12 @@ use split::Splitter;
 use stats::{LandedChanges, Stats};
 use topology::TopologyMembership;
 
-pub(crate) use avoidable::TypicalTime;
 pub use avoidable::{AvoidableTimeStats, MergeTime, SplitTime};
+pub(crate) use avoidable::{CommitKind, TypicalTime};
 pub use candidates::StructuralHintSink;
 pub use policy::{
     AvoidableTimePolicy, FixedTopology, LeafId, LeafSize, LeafWindow, PairWindow, SizePolicy,
-    TopologyChange, TopologyPolicy, TopologyWindow,
+    TopologyChange, TopologyPolicy, TopologyWindow, TransactionCounts,
 };
 pub use stats::{InlinePressureStats, RestructurerStats};
 
