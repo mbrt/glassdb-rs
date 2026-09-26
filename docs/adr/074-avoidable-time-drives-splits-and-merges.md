@@ -201,13 +201,14 @@ throttled requests with the same retry budget as the S3 adapter.
   instance used only its own collection. It was smaller with more instances,
   because the same number of workers then had less contention on each
   collection.
-- The split rule does not count the time that a split adds to the direct
-  commit candidates with keys in both halves. A cross-leaf miss over more than
-  two leaves is not a merge cause either. So a hot leaf can split under
-  transactions that write all of its keys. In the `mixed` hi mode, each
-  collection has 8 hot keys, and one shape writes all 8. The leaf split, the
-  multi-key transactions used locked commits and starved, and the geometric
-  mean of the shapes was 0.62 of the size causes on S3 and 0.75 on GCS.
+- A hot leaf can split under transactions that read or write all of its keys.
+  In the `mixed` hi mode, each collection has 8 hot keys, and two shapes read
+  all 8. One of them also writes all 8, so it conflicts with every other write
+  and seldom lands in a direct commit, before or after a split. After a split,
+  the reads and locks of these transactions are in more leaves, and the two
+  shapes starved. The sum of the throughputs of the shapes was 1.22 times that
+  of the size causes on S3 and GCS, but their geometric mean was 0.62 of the
+  size causes on S3 and 0.75 on GCS.
 - Each database instance sees about one part in N of the time of a leaf that N
   instances share. So with more instances, a change needs more time in total.
   With 4 instances, leaves of 16 entries under scans merged only with a merge
@@ -287,6 +288,25 @@ A policy can keep the time that paid for each change, and ask a change to also
 pay back the opposite change that it undoes. This made fewer changes with 8
 adjacent keys, but the throughput was the same as the avoidable time policy
 within the noise of the runs, in the `topology` and `mixed` scenarios.
+
+### Subtract the time that a split adds to direct commits
+
+A direct commit that lands, and whose keys a split at the median of its leaf
+puts in both halves, needs a locked commit after the split. The policy can
+subtract the locked commit penalty of these commits from the split-side
+avoidable time. But the shapes that starve in the `mixed` hi mode seldom land
+in a direct commit, before or after a split. With one database instance on S3,
+this time was 0.04 ms for each transaction, against 1.43 ms of split-side
+avoidable time. With four instances, it was 1.21 ms against 1.51 ms. The hot
+leaf split in both.
+
+### Merge the leaves that transactions cross in a chain
+
+A cross-leaf miss over a chain of linked leaves can charge each pair of the
+chain, and each attempt of a locked commit can count, also an attempt that a
+wound ends. This undoes a split after it costs time, instead of preventing it.
+In the `mixed` hi mode on S3, the geometric mean of the shapes was 0.65 to 0.66
+of the size causes, against 0.62 without it.
 
 ### Multiples of 0.1 for splits and merges
 
