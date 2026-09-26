@@ -320,6 +320,21 @@ wound ends. This undoes a split after it costs time, instead of preventing it.
 In the `mixed` hi mode on S3, the geometric mean of the shapes was 0.65 to 0.66
 of the size causes, against 0.62 without it.
 
+### Decide merges on moving averages
+
+A policy can decide splits on a moving average of the split-side time of each
+leaf, with a half-life of 10 s. It can also keep a moving average of the
+merge-side time of each pair, and merge a pair when this average is more than
+the merge threshold plus the averages of both leaves. In the `mixed` hi mode on
+S3, this made 11 merges instead of 42, with 107 splits in both cases. The
+geometric mean of the shapes was 0.88 of the size causes with both merge rules,
+so the leaves that split and merged again did not cause the loss. A pair has
+merge-side time only in some windows, so its average stays below the time of
+the windows that have it. In 3 of the 4 `topology` cells with scans over leaves
+of 16 entries, it made 0 to 4 merges, against 22 to 68 for the avoidable time
+policy. It had 1.02 to 1.07 times the throughput of the fixed tree, against
+1.44 to 3.46.
+
 ### Multiples of 0.1 for splits and merges
 
 On GCS, this had 1.36 times the throughput of the fixed tree, against 1.32 for
