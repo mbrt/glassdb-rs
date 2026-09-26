@@ -11,7 +11,7 @@ use tokio::sync::Notify;
 
 use crate::leaf_coord::{LeafDelay, StructuralHinter};
 
-use super::avoidable::{AvoidableTime, ChangeKind, LeafChanges, MergeTime, SplitTime};
+use super::avoidable::{AvoidableTime, ChangeKind, LeafChanges, MergeTime, SplitPlace, SplitTime};
 use super::merge::MergeReason;
 use super::split::SplitReason;
 
@@ -269,18 +269,21 @@ impl MaintenanceCandidates {
         TxId::new_at(rt::system_now())
     }
 
-    /// Adds split-side time of the leaf at `path`, and queues its split at
-    /// `at` when the time pays for one.
+    /// Adds split-side time of the leaf at `path`, and queues its split when
+    /// the time pays for one. The split is at `at` when the leaf delays alone
+    /// pay for it.
     fn add_split_time(&self, path: &ObjectPath, time: SplitTime, at: Option<&[u8]>) {
-        if self.avoidable.add_split_time(path, time) {
-            self.push(MaintenanceCandidate {
-                path: path.clone(),
-                priority: self.new_id(),
-                cause: CandidateCause::Split(SplitReason::Demand {
-                    at: at.map(<[u8]>::to_vec),
-                }),
-            });
-        }
+        let Some(place) = self.avoidable.add_split_time(path, time) else {
+            return;
+        };
+        let at = at.filter(|_| place == SplitPlace::SplitKey);
+        self.push(MaintenanceCandidate {
+            path: path.clone(),
+            priority: self.new_id(),
+            cause: CandidateCause::Split(SplitReason::Demand {
+                at: at.map(<[u8]>::to_vec),
+            }),
+        });
     }
 
     /// Adds merge-side time of the adjacent leaves at `left` and `right`, and

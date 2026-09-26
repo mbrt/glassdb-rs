@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath};
 
-use super::{AvoidableTime, ChangeKind, LeafChanges, MergeTime, SplitTime, TypicalTime, WINDOW};
+use super::{
+    AvoidableTime, ChangeKind, LeafChanges, MergeTime, SplitPlace, SplitTime, TypicalTime, WINDOW,
+};
 
 fn node(byte: u8) -> ObjectPath {
     ObjectPath::Node {
@@ -58,11 +60,32 @@ async fn a_leaf_pays_for_a_split_once_in_a_window_when_its_time_is_more_than_a_s
     let paid: Vec<_> = [300, 200, 1, 1000]
         .map(|millis| avoidable.add_split_time(&node(1), lost_cas(millis)))
         .into();
-    assert_eq!(paid, [false, false, true, false]);
+    assert_eq!(paid, [None, None, Some(SplitPlace::SplitKey), None]);
 
     tokio::time::advance(WINDOW).await;
-    assert!(!avoidable.add_split_time(&node(1), lost_cas(500)));
-    assert!(avoidable.add_split_time(&node(1), lost_cas(1)));
+    assert!(avoidable.add_split_time(&node(1), lost_cas(500)).is_none());
+    assert!(avoidable.add_split_time(&node(1), lost_cas(1)).is_some());
+}
+
+// The split key separates the keys of the leaf delays. Inline pressure asks
+// for balanced halves.
+#[tokio::test(start_paused = true)]
+async fn a_split_is_at_the_split_key_only_when_the_leaf_delays_pay_for_it() {
+    let avoidable = at_one_change_time();
+    let inline_pressure = SplitTime {
+        inline_pressure: Duration::from_millis(300),
+        ..SplitTime::default()
+    };
+
+    assert_eq!(avoidable.add_split_time(&node(1), inline_pressure), None);
+    assert_eq!(
+        avoidable.add_split_time(&node(1), lost_cas(300)),
+        Some(SplitPlace::Median)
+    );
+    assert_eq!(
+        avoidable.add_split_time(&node(2), lost_cas(501)),
+        Some(SplitPlace::SplitKey)
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -70,8 +93,8 @@ async fn the_thresholds_scale_the_typical_change_times() {
     let avoidable = thresholds(2.0, 0.5);
     avoidable.record_change(ChangeKind::Split, Duration::from_millis(100));
 
-    assert!(!avoidable.add_split_time(&node(1), lost_cas(200)));
-    assert!(avoidable.add_split_time(&node(1), lost_cas(1)));
+    assert!(avoidable.add_split_time(&node(1), lost_cas(200)).is_none());
+    assert!(avoidable.add_split_time(&node(1), lost_cas(1)).is_some());
     assert!(avoidable.add_merge_time(&node(3), &node(4), scan_crossing(251)));
 }
 
@@ -89,7 +112,7 @@ async fn two_leaves_pay_for_a_merge_and_for_the_split_side_time_of_both() {
 #[tokio::test(start_paused = true)]
 async fn a_leaf_that_pays_for_a_split_does_not_merge_in_the_same_window() {
     let avoidable = at_one_change_time();
-    assert!(avoidable.add_split_time(&node(1), lost_cas(501)));
+    assert!(avoidable.add_split_time(&node(1), lost_cas(501)).is_some());
 
     assert!(!avoidable.add_merge_time(&node(1), &node(2), scan_crossing(5000)));
 }
@@ -102,16 +125,16 @@ async fn a_change_holds_its_leaves_against_the_other_kind_for_two_windows() {
 
     assert!(!avoidable.add_merge_time(&node(1), &node(2), scan_crossing(5000)));
     assert!(avoidable.add_merge_time(&node(3), &node(4), scan_crossing(501)));
-    assert!(!avoidable.add_split_time(&node(3), lost_cas(5000)));
-    assert!(avoidable.add_split_time(&node(1), lost_cas(501)));
+    assert!(avoidable.add_split_time(&node(3), lost_cas(5000)).is_none());
+    assert!(avoidable.add_split_time(&node(1), lost_cas(501)).is_some());
 
     tokio::time::advance(WINDOW).await;
     assert!(!avoidable.add_merge_time(&node(1), &node(5), scan_crossing(5000)));
-    assert!(!avoidable.add_split_time(&node(3), lost_cas(5000)));
+    assert!(avoidable.add_split_time(&node(3), lost_cas(5000)).is_none());
 
     tokio::time::advance(WINDOW).await;
     assert!(avoidable.add_merge_time(&node(1), &node(5), scan_crossing(501)));
-    assert!(avoidable.add_split_time(&node(3), lost_cas(501)));
+    assert!(avoidable.add_split_time(&node(3), lost_cas(501)).is_some());
 }
 
 #[tokio::test(start_paused = true)]
@@ -123,7 +146,7 @@ async fn a_change_drops_the_earlier_time_of_its_leaves() {
     avoidable.record_changed(node(1), ChangeKind::Split);
     avoidable.record_changed(node(3), ChangeKind::Merge);
 
-    assert!(!avoidable.add_split_time(&node(1), lost_cas(400)));
+    assert!(avoidable.add_split_time(&node(1), lost_cas(400)).is_none());
     assert!(!avoidable.add_merge_time(&node(3), &node(4), scan_crossing(400)));
 
     let totals = avoidable.take_stats();
@@ -136,7 +159,7 @@ async fn the_size_rule_keeps_totals_and_decides_nothing() {
     let avoidable = AvoidableTime::new(LeafChanges::Size);
 
     assert!(!avoidable.decides());
-    assert!(!avoidable.add_split_time(&node(1), lost_cas(5000)));
+    assert!(avoidable.add_split_time(&node(1), lost_cas(5000)).is_none());
     assert!(!avoidable.add_merge_time(&node(1), &node(2), scan_crossing(5000)));
     let totals = avoidable.take_stats();
     assert_eq!(totals.split, lost_cas(5000));

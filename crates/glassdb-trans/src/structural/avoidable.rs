@@ -100,6 +100,16 @@ pub(super) enum ChangeKind {
     Merge,
 }
 
+/// Where a split that the avoidable time of a leaf pays for divides the leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SplitPlace {
+    /// At the split key of the last leaf delay, because the leaf delays alone
+    /// pay for the split.
+    SplitKey,
+    /// At the median, because inline pressure asks for balanced halves.
+    Median,
+}
+
 /// The moving average of the time of one operation.
 #[derive(Debug, Default)]
 pub(crate) struct TypicalTime {
@@ -150,7 +160,12 @@ impl Default for LeafChanges {
 impl SplitTime {
     /// Returns the sum of all causes.
     pub fn total(&self) -> Duration {
-        self.lost_cas + self.queue_wait + self.slow_cas + self.inline_pressure
+        self.leaf_delays() + self.inline_pressure
+    }
+
+    /// Returns the sum of the causes that a split at the split key removes.
+    pub fn leaf_delays(&self) -> Duration {
+        self.lost_cas + self.queue_wait + self.slow_cas
     }
 
     /// Returns the split-side time of one leaf delay.
@@ -285,17 +300,16 @@ impl AvoidableTime {
         self.thresholds.is_some()
     }
 
-    /// Adds split-side time of the leaf at `path`. Returns true once in a
-    /// window, when the time of the leaf in the window pays for one split.
-    pub(super) fn add_split_time(&self, path: &ObjectPath, time: SplitTime) -> bool {
+    /// Adds split-side time of the leaf at `path`. Returns where to split the
+    /// leaf once in a window, when the time of the leaf in the window pays for
+    /// one split.
+    pub(super) fn add_split_time(&self, path: &ObjectPath, time: SplitTime) -> Option<SplitPlace> {
         if time.total().is_zero() {
-            return false;
+            return None;
         }
         let mut state = self.state.lock().unwrap();
         state.totals.split += time;
-        let Some(thresholds) = self.thresholds else {
-            return false;
-        };
+        let thresholds = self.thresholds?;
         state.roll(rt::Instant::now());
         let held = state.changed_recently(path, ChangeKind::Merge);
         let split_time = self.typical(&self.split_time).mul_f64(thresholds.split);
@@ -303,7 +317,13 @@ impl AvoidableTime {
         leaf.time += time;
         let pays = !held && !leaf.requested && leaf.time.total() > split_time;
         leaf.requested |= pays;
-        pays
+        pays.then(|| {
+            if leaf.time.leaf_delays() > split_time {
+                SplitPlace::SplitKey
+            } else {
+                SplitPlace::Median
+            }
+        })
     }
 
     /// Adds merge-side time of the adjacent leaves at `left` and `right`.

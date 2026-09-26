@@ -119,7 +119,9 @@ These are not causes, because no single split or merge removes them:
 ### Decide with one rule
 
 A leaf becomes a split candidate when its split-side avoidable time in the
-window is more than 0.25 times the typical time of one split.
+window is more than 0.25 times the typical time of one split. The split is at
+the split key when the lost CAS, queue wait, and slow leaf CAS time alone pays
+for it, and at the median when inline pressure is also necessary.
 
 Two adjacent leaves become a merge candidate when their merge-side avoidable
 time in the window is more than 0.1 times the typical time of one merge, plus
@@ -138,9 +140,11 @@ The database instance measures the typical time of a split and of a merge. A
 default applies until it measured one. The window is one second, and it is
 local to each database instance, like the soft thresholds (ADR-072).
 
-A node that took part in a structural change does not become a candidate of the
-other kind during the next window, the hold-down window. With the ADR-073 merge
-vetoes, this stops nodes from splitting and merging again and again.
+A leaf that a split wrote in this window or the last one does not become a
+merge candidate, and a leaf that a merge wrote in this window or the last one
+does not become a split candidate for avoidable time. This is the hold-down
+window. With the ADR-073 merge vetoes, it stops leaves from splitting and
+merging again and again in each window.
 
 ### Keep the size causes
 
