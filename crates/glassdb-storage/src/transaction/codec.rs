@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glassdb_data::{
-    CollectionAddress, ID_BYTES, LeafRef, LogicalKey, MAX_COLLECTION_NAME_BYTES, ObjectPath, TxId,
+    CollectionAddress, CollectionName, ID_BYTES, LeafRef, LogicalKey, ObjectPath, TxId,
 };
 use glassdb_proto as pb;
 use prost::Message;
@@ -46,7 +46,7 @@ impl TxRecordCodec {
             .iter()
             .map(|change| pb::CollectionChange {
                 parent_collection_id: change.parent.id().as_bytes().to_vec(),
-                name: change.name.clone(),
+                name: change.name.as_bytes().to_vec(),
                 collection_id: change.collection.id().as_bytes().to_vec(),
                 operation: match change.op {
                     TxCollectionOp::Create => pb::collection_change::Operation::Create as i32,
@@ -144,7 +144,7 @@ impl Codec for TxRecordCodec {
             + record
                 .collection_changes
                 .iter()
-                .map(|change| change.name.len() + 32)
+                .map(|change| change.name.as_bytes().len() + 32)
                 .sum::<usize>()
             + record.prepared_collections.len() * 16
             + std::mem::size_of::<TxRecord>()
@@ -276,11 +276,9 @@ fn decode_collection_changes(
     encoded
         .iter()
         .map(|change| {
-            if change.name.is_empty() || change.name.len() > MAX_COLLECTION_NAME_BYTES {
-                return Err(StorageError::other(
-                    "transaction record has an invalid collection name",
-                ));
-            }
+            let name = CollectionName::new(&change.name).map_err(|_| {
+                StorageError::other("transaction record has an invalid collection name")
+            })?;
             let parent = decode_collection_id(db_prefix, &change.parent_collection_id)?;
             let collection = decode_collection_id(db_prefix, &change.collection_id)?;
             if collection.id().is_root() {
@@ -299,7 +297,7 @@ fn decode_collection_changes(
             };
             Ok(TxCollectionChange {
                 parent,
-                name: change.name.clone(),
+                name,
                 collection,
                 op,
             })
@@ -485,7 +483,7 @@ fn proto_ts_to_system(timestamp: prost_types::Timestamp) -> SystemTime {
 
 #[cfg(test)]
 mod tests {
-    use glassdb_data::{CollectionId, NodeId};
+    use glassdb_data::{CollectionId, MAX_COLLECTION_NAME_BYTES, NodeId};
 
     use super::*;
 
@@ -547,13 +545,13 @@ mod tests {
             collection_changes: vec![
                 TxCollectionChange {
                     parent: parent.clone(),
-                    name: b"created".to_vec(),
+                    name: CollectionName::new("created").unwrap(),
                     collection: created.clone(),
                     op: TxCollectionOp::Create,
                 },
                 TxCollectionChange {
                     parent,
-                    name: b"dropped".to_vec(),
+                    name: CollectionName::new("dropped").unwrap(),
                     collection: dropped.clone(),
                     op: TxCollectionOp::Drop,
                 },

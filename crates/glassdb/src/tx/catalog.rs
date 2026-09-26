@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use glassdb_data::{CollectionAddress, CollectionId};
+use glassdb_data::{CollectionAddress, CollectionId, CollectionName};
 use glassdb_trans::{
     CatalogAccesses, CollectionChange, CollectionOp, CollectionReservations, DirectoryRead,
     DirectoryReadKind, DirectorySnapshot,
@@ -12,7 +12,7 @@ use crate::error::Error;
 
 /// Selects strict creation or create-if-absent behavior.
 #[derive(Clone, Copy)]
-pub(super) enum CreateMode {
+pub(crate) enum CreateMode {
     Strict,
     IfAbsent,
 }
@@ -21,16 +21,16 @@ pub(super) enum CreateMode {
 pub(super) struct CatalogOverlay {
     directories: HashMap<CollectionAddress, DirectoryState>,
     reads: Vec<DirectoryRead>,
-    changes: BTreeMap<(CollectionAddress, Vec<u8>), CollectionChange>,
+    changes: BTreeMap<(CollectionAddress, CollectionName), CollectionChange>,
     created: HashSet<CollectionAddress>,
     dropped: HashSet<CollectionAddress>,
-    dropped_bindings: HashSet<(CollectionAddress, Vec<u8>)>,
+    dropped_bindings: HashSet<(CollectionAddress, CollectionName)>,
     reservations: CollectionReservations,
 }
 
 struct DirectoryState {
-    base: BTreeMap<Vec<u8>, CollectionId>,
-    current: BTreeMap<Vec<u8>, CollectionId>,
+    base: BTreeMap<CollectionName, CollectionId>,
+    current: BTreeMap<CollectionName, CollectionId>,
     generation: u64,
 }
 
@@ -61,7 +61,7 @@ impl CatalogOverlay {
     pub(super) fn child(
         &mut self,
         parent: &CollectionAddress,
-        name: &[u8],
+        name: &CollectionName,
     ) -> Result<Option<CollectionId>, Error> {
         if self.dropped.contains(parent) {
             return Err(Error::StaleCollection);
@@ -75,7 +75,7 @@ impl CatalogOverlay {
         self.reads.push(DirectoryRead {
             parent: parent.clone(),
             kind: DirectoryReadKind::Entry {
-                name: name.to_vec(),
+                name: name.clone(),
                 collection: base,
             },
         });
@@ -86,7 +86,7 @@ impl CatalogOverlay {
     pub(super) fn children(
         &mut self,
         parent: &CollectionAddress,
-    ) -> Result<Vec<(Vec<u8>, CollectionId)>, Error> {
+    ) -> Result<Vec<(CollectionName, CollectionId)>, Error> {
         if self.dropped.contains(parent) {
             return Err(Error::StaleCollection);
         }
@@ -111,13 +111,13 @@ impl CatalogOverlay {
     pub(super) fn create_child(
         &mut self,
         parent: &CollectionAddress,
-        name: &[u8],
+        name: &CollectionName,
         mode: CreateMode,
     ) -> Result<(CollectionAddress, bool), Error> {
         if self.dropped.contains(parent) {
             return Err(Error::StaleCollection);
         }
-        let binding = (parent.clone(), name.to_vec());
+        let binding = (parent.clone(), name.clone());
         let state = self
             .directories
             .get(parent)
@@ -127,7 +127,7 @@ impl CatalogOverlay {
         self.reads.push(DirectoryRead {
             parent: parent.clone(),
             kind: DirectoryReadKind::Entry {
-                name: name.to_vec(),
+                name: name.clone(),
                 collection: base,
             },
         });
@@ -156,12 +156,12 @@ impl CatalogOverlay {
             .get_mut(parent)
             .expect("directory was loaded above")
             .current
-            .insert(name.to_vec(), id);
+            .insert(name.clone(), id);
         self.changes.insert(
             binding,
             CollectionChange {
                 parent: parent.clone(),
-                name: name.to_vec(),
+                name: name.clone(),
                 collection: address.clone(),
                 expected: base,
                 op: CollectionOp::Create,
@@ -175,7 +175,7 @@ impl CatalogOverlay {
     pub(super) fn drop_collection(
         &mut self,
         parent: CollectionAddress,
-        name: Vec<u8>,
+        name: CollectionName,
         collection: &CollectionAddress,
         has_key_writes: bool,
     ) -> Result<(), Error> {
@@ -189,8 +189,8 @@ impl CatalogOverlay {
             .directories
             .get(&parent)
             .expect("parent directory was loaded above");
-        let expected = parent_state.base.get(name.as_slice()).copied();
-        let current = parent_state.current.get(name.as_slice()).copied();
+        let expected = parent_state.base.get(&name).copied();
+        let current = parent_state.current.get(&name).copied();
         self.reads.push(DirectoryRead {
             parent: parent.clone(),
             kind: DirectoryReadKind::Entry {
@@ -225,7 +225,7 @@ impl CatalogOverlay {
             .get_mut(&parent)
             .expect("parent directory was loaded above")
             .current
-            .remove(name.as_slice());
+            .remove(&name);
         let binding = (parent.clone(), name.clone());
         if self.created.remove(collection) {
             self.changes.remove(&binding);

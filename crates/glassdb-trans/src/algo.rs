@@ -1272,7 +1272,8 @@ mod tests {
     use glassdb_backend::{Backend, StatsBackend, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
     use glassdb_data::{
-        CollectionAddress, CollectionId, DatabaseId, DbPrefix, LeafRef, NodeId, ObjectPath,
+        CollectionAddress, CollectionId, CollectionName, DatabaseId, DbPrefix, LeafRef, NodeId,
+        ObjectPath,
     };
     use glassdb_storage::transaction::{TxCommitStatus, TxRecordStore};
     use glassdb_storage::{
@@ -1599,7 +1600,7 @@ mod tests {
             reads: Vec::new(),
             changes: vec![CollectionChange {
                 parent: test_collection(),
-                name: b"earlier".to_vec(),
+                name: CollectionName::new("earlier").unwrap(),
                 collection: earlier.clone(),
                 expected: None,
                 op: CollectionOp::Create,
@@ -1609,7 +1610,7 @@ mod tests {
             reads: Vec::new(),
             changes: vec![CollectionChange {
                 parent: test_collection(),
-                name: b"active".to_vec(),
+                name: CollectionName::new("active").unwrap(),
                 collection: active.clone(),
                 expected: None,
                 op: CollectionOp::Create,
@@ -1649,7 +1650,7 @@ mod tests {
                 reads: Vec::new(),
                 changes: vec![CollectionChange {
                     parent: test_collection(),
-                    name: b"created".to_vec(),
+                    name: CollectionName::new("created").unwrap(),
                     collection: created.clone(),
                     expected: None,
                     op: CollectionOp::Create,
@@ -1695,7 +1696,7 @@ mod tests {
                 reads: Vec::new(),
                 changes: vec![CollectionChange {
                     parent: test_collection(),
-                    name: b"prepared".to_vec(),
+                    name: CollectionName::new("prepared").unwrap(),
                     collection: prepared.clone(),
                     expected: None,
                     op: CollectionOp::Create,
@@ -1747,7 +1748,7 @@ mod tests {
                 reads: Vec::new(),
                 changes: vec![CollectionChange {
                     parent: test_collection(),
-                    name: b"dropped".to_vec(),
+                    name: CollectionName::new("dropped").unwrap(),
                     collection: dropped.clone(),
                     expected: Some(dropped.id()),
                     op: CollectionOp::Drop,

@@ -1441,7 +1441,7 @@ mod tests {
     };
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::RetryConfig;
-    use glassdb_data::{CollectionAddress, CollectionId, DbPrefix, ObjectPath};
+    use glassdb_data::{CollectionAddress, CollectionId, CollectionName, DbPrefix, ObjectPath};
     use glassdb_storage::transaction::TxCommitStatus;
     use glassdb_storage::{
         CollectionRecord, LeafBody, LeafEntry, Node, NodeSizePolicy, NodeStore, Timeline,
@@ -2950,7 +2950,7 @@ mod tests {
             });
             changes.push(CollectionChange {
                 parent,
-                name: b"child".to_vec(),
+                name: CollectionName::new("child").unwrap(),
                 collection: child,
                 expected: None,
                 op: CollectionOp::Create,
@@ -3011,7 +3011,7 @@ mod tests {
                     .unwrap();
                 assert!(!record.directory_lock().contains(&id));
                 assert_eq!(
-                    record.child(b"child"),
+                    record.child(&change.name),
                     write_back.then_some(change.collection.id())
                 );
             }

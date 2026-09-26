@@ -467,7 +467,7 @@ mod tests {
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
     use glassdb_concurr::Background;
-    use glassdb_data::{CollectionId, DbPrefix, NodeId, ObjectPath};
+    use glassdb_data::{CollectionId, CollectionName, DbPrefix, NodeId, ObjectPath};
     use glassdb_storage::transaction::{
         TxCollectionChange, TxCollectionOp, TxRecord, TxRecordStore,
     };
@@ -612,7 +612,7 @@ mod tests {
         let collection = CollectionAddress::new("db", CollectionId::from_bytes([17; 16]));
         let mut change = CollectionChange {
             parent: CollectionAddress::root("db"),
-            name: b"child".to_vec(),
+            name: CollectionName::new("child").unwrap(),
             collection: collection.clone(),
             expected: None,
             op: CollectionOp::Create,

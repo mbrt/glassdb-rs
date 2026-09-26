@@ -2082,7 +2082,7 @@ mod tests {
 
     use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
     use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
-    use glassdb_data::{CollectionAddress, CollectionId, DbPrefix};
+    use glassdb_data::{CollectionAddress, CollectionId, CollectionName, DbPrefix};
     use glassdb_storage::transaction::{TxCollectionOp, TxWrite};
     use glassdb_storage::{CachedStore, LockType, Timeline};
 
@@ -2279,7 +2279,7 @@ mod tests {
             }],
             collection_changes: vec![TxCollectionChange {
                 parent,
-                name: b"created".to_vec(),
+                name: CollectionName::new("created").unwrap(),
                 collection: created.clone(),
                 op: TxCollectionOp::Create,
             }],
@@ -2483,7 +2483,7 @@ mod tests {
             }],
             collection_changes: vec![TxCollectionChange {
                 parent,
-                name: b"created".to_vec(),
+                name: CollectionName::new("created").unwrap(),
                 collection: created.clone(),
                 op: TxCollectionOp::Create,
             }],
@@ -2550,7 +2550,7 @@ mod tests {
         let created = collection_address(2);
         let change = TxCollectionChange {
             parent: CollectionAddress::root("test"),
-            name: b"created".to_vec(),
+            name: CollectionName::new("created").unwrap(),
             collection: created.clone(),
             op: TxCollectionOp::Create,
         };

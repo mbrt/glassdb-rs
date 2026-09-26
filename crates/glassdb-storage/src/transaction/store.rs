@@ -545,7 +545,7 @@ mod tests {
             ],
             collection_changes: vec![TxCollectionChange {
                 parent: test_collection("db", 1),
-                name: b"child".to_vec(),
+                name: glassdb_data::CollectionName::new("child").unwrap(),
                 collection: child.clone(),
                 op: TxCollectionOp::Create,
             }],

@@ -11,7 +11,9 @@ use glassdb_backend as backend;
 use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend};
 use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
 use glassdb_concurr::RetryConfig;
-use glassdb_data::{CollectionAddress, CollectionId, DbPrefix, LogicalKey, NodeId, ObjectPath};
+use glassdb_data::{
+    CollectionAddress, CollectionId, CollectionName, DbPrefix, LogicalKey, NodeId, ObjectPath,
+};
 use glassdb_storage::transaction::{
     TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxRecord, TxRecordStore, TxWrite,
 };
@@ -47,6 +49,10 @@ impl TopologySettler for UnexpectedTopologySettler {
 
 fn collection() -> glassdb_data::CollectionAddress {
     glassdb_data::CollectionAddress::root("db")
+}
+
+fn collection_name(name: impl AsRef<[u8]>) -> CollectionName {
+    CollectionName::new(name).unwrap()
 }
 
 fn root_path() -> ObjectPath {
@@ -96,7 +102,7 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
             CollectionAddress::new("db", glassdb_data::CollectionId::from_bytes([7; 16]));
         let mut changes = vec![CollectionChange {
             parent: collection(),
-            name: b"new".to_vec(),
+            name: collection_name("new"),
             collection: prepared.clone(),
             expected: None,
             op: CollectionOp::Create,
@@ -104,7 +110,7 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
         if phase == 2 {
             changes.push(CollectionChange {
                 parent: prepared.clone(),
-                name: b"nested".to_vec(),
+                name: collection_name("nested"),
                 collection: CollectionAddress::new(
                     "db",
                     glassdb_data::CollectionId::from_bytes([8; 16]),
@@ -640,7 +646,7 @@ async fn committed_drop_is_recovered_while_the_record_stores_a_live_value() {
         .unwrap();
     assert!(
         parent_record
-            .add_child(b"child".to_vec(), child.id())
+            .add_child(collection_name("child"), child.id())
             .unwrap()
     );
     parent_record.set_directory_writer(id);
@@ -677,7 +683,7 @@ async fn committed_drop_is_recovered_while_the_record_stores_a_live_value() {
     ]);
     record.collection_changes.push(TxCollectionChange {
         parent: collection(),
-        name: b"child".to_vec(),
+        name: collection_name("child"),
         collection: child.clone(),
         op: TxCollectionOp::Drop,
     });
@@ -698,7 +704,7 @@ async fn committed_drop_is_recovered_while_the_record_stores_a_live_value() {
         )
         .await
         .unwrap();
-    assert_eq!(parent_record.child(b"child"), None);
+    assert_eq!(parent_record.child(&collection_name("child")), None);
     assert!(!parent_record.directory_lock().contains(&id));
     assert!(matches!(
         ctx.nodes.load_root(&child, Requirement::ANY).await,
@@ -1827,7 +1833,9 @@ async fn committed_directory_gc_reuses_removal_after_cache_eviction() {
                 .await
                 .unwrap()
         );
-        parent.add_child(bytes.to_vec(), child.id()).unwrap();
+        parent
+            .add_child(collection_name(bytes), child.id())
+            .unwrap();
         locks.push(TxLock::Directory {
             collection: child,
             typ: if index % 2 == 0 {
@@ -1949,7 +1957,9 @@ async fn committed_directory_removal_does_not_prove_other_records_clear() {
             .load_record(&collection(), Requirement::ANY)
             .await
             .unwrap();
-        parent.add_child(b"child".to_vec(), child.id()).unwrap();
+        parent
+            .add_child(collection_name("child"), child.id())
+            .unwrap();
         assert!(ctx.records.store_record(&parent, &observed).await.unwrap());
         let owner = AssemblyFixture::new(
             backend,
@@ -2114,7 +2124,7 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
     let child = CollectionAddress::new("db", CollectionId::from_bytes([87; 16]));
     let mut change = CollectionChange {
         parent: collection(),
-        name: b"child".to_vec(),
+        name: collection_name("child"),
         collection: child.clone(),
         expected: None,
         op: CollectionOp::Create,
@@ -2655,7 +2665,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropR
     let target = CollectionAddress::new("db", CollectionId::from_bytes([37; 16]));
     let mut change = CollectionChange {
         parent: collection(),
-        name: b"child".to_vec(),
+        name: collection_name("child"),
         collection: target.clone(),
         expected: None,
         op: CollectionOp::Create,
