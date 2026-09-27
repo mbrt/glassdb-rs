@@ -10,9 +10,10 @@ use glassdb::{LeafId, TopologyChange, TopologyPolicy, TopologyWindow};
 /// The time after which a remembered payment counts half.
 const HALF_LIFE: Duration = Duration::from_secs(30);
 
-/// Decides like [`glassdb::AvoidableTimePolicy`], but a change must also pay
-/// back the avoidable time that paid for the opposite change at the same leaf
-/// boundary. A split and a merge measure different topologies: after a split,
+/// Decides on the avoidable time of each window alone, like the ADR-074
+/// alternative "Decide splits on the time of one window", but a change must
+/// also pay back the avoidable time that paid for the opposite change at the
+/// same leaf boundary. A split and a merge measure different topologies: after a split,
 /// the time that the split removed is not measured any more, so without this
 /// memory a merge can undo the split for less time than the split saves.
 pub(crate) struct MemoryPolicy {
