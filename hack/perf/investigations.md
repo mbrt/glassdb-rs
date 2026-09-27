@@ -9,6 +9,467 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-09-26: ADR-074 splits in the mixed hi mode
+
+Status: candidate found. The loss comes from transactions that conflict on the
+same keys and that a split puts in more leaves. The first estimates of the
+time that a split adds did not show this cost. After a fix of the lost CAS
+time, `net-conflicts:0.05:0.1:4:10:1` subtracts 4 times the divided conflict
+time from the split side, and adds the crossing conflict time of two adjacent
+leaves to the merge side. Against the size causes, it had about `0.98` to
+`1.01` in hi mode on S3 and GCS, where `avoidable` had `0.62` and `0.74`. In lo
+mode it had `1.12` to `1.13` on S3 and `1.25` on GCS, against `1.14` to `1.15`
+and `1.29`. On GCS the lo difference was less than the noise with a warmup of
+60 s. In the `topology` scenario, it had about 3% less than `avoidable` on S3,
+and the same on GCS. It needs both terms.
+
+The perfbench `NetTimePolicy` subtracts an estimate of the time that a split
+adds from the split-side time of a leaf, and decides on a moving average
+with a half-life of 10 s (`net:<split>:<merge>:<weight>:<half-life>`). The
+estimate is a weight times one of these:
+
+- `net`: the divided commits, times the mean latency of the commits of the
+  leaf.
+- `net-passes`: the time of the divided commit passes (`LeafWindow::divided_time`),
+  also of the passes that did not commit.
+
+### Live comparison
+
+Mixed scenario on S3, 1 to 8 databases, affinities 0, 50, and 100, one run.
+The values are the geometric means of the shape throughputs against `size`,
+over 12 cells for each mode.
+
+```console
+perfbench mixed --delays=s3 --databases=$D --workers-per-shape=8 \
+  --affinities=0,50,100 --modes=lo,hi \
+  --policies=size,net:0.05:0.1:0.25:10,net-passes:0.05:0.1:0.25:10,net-passes:0.05:0.1:0.5:10 \
+  --warmup=20s --duration=5s --max-duration=30s --split-quiet=5s \
+  --split-settle-timeout=300s
+```
+
+| Policy | lo | hi |
+| --- | ---: | ---: |
+| `net:0.05:0.1:0.25:10` | `1.117` | `0.869` |
+| `net-passes:0.05:0.1:0.25:10` | `1.128` | `0.922` |
+| `net-passes:0.05:0.1:0.5:10` | `1.065` | `0.907` |
+
+In hi mode with 8 databases, `size` had `15.1` and `17.1` tx/s at affinities 0
+and 50, and `net-passes` with weight 0.25 had `8.3` and `11.2`. It made 36 to
+47 splits and 13 to 20 merges. At affinity 0, `roSingle` went from `36` to
+`79` tx/s, `rwMany` from `8.3` to `1.4`, and `roMulti` from `23` to `6.6`.
+The mean latency of `rwMany` went from `0.9 s` to `5–12 s`. Body replays and
+lost CAS time for each transaction decreased.
+
+### Shapes alone and in pairs on fixed trees
+
+Hi mode has 8 keys in each collection, and `rwMany` and `roMulti` use all of
+them. Fixed trees with 1, 2, and 4 leaves for each collection (seed leaf
+entries `default`, `7`, `3`, and `2`; `3` and `2` give the same tree), hi mode,
+8 databases, affinity 0, one run:
+
+```console
+perfbench mixed --delays=s3 --workers-per-shape=8 --affinities=0 --modes=hi \
+  --databases=8 --policies=fixed --seed-leaf-entries=default,7,3,2 \
+  --warmup=5s --duration=5s --max-duration=30s --split-quiet=5s \
+  --split-settle-timeout=300s --shapes=<shapes>
+```
+
+| Shapes: measure | 1 leaf | 2 leaves | 4 leaves |
+| --- | ---: | ---: | ---: |
+| `rwMany`: tx/s | `22.4` | `5.7` | `2.6–3.0` |
+| `rwMany`: coordinator rounds per transaction | `2.0` | `7.1` | `15–17` |
+| `rwMany`: object reads per transaction | `1.0` | `32` | `84–100` |
+| `roMulti`: tx/s | `286` | `243` | `212` |
+| `rwMany`, `roMulti`: `rwMany` tx/s | `11.7` | `3.7` | `1.7–1.9` |
+| `rwMany`, `rwSingle`: `rwMany` / `rwSingle` tx/s | `19.8` / `18.5` | `4.4` / `11.6` | `1.9` / `11.6–12.6` |
+| `rwMany`, `roSingle`: `rwMany` / `roSingle` tx/s | `10.9` / `38.6` | `4.3` / `51.1` | `2.9–3.2` / `64–70` |
+| `roMulti`, `rwSingle`: `roMulti` tx/s | `33.5` | `29.3` | `16.5–20.4` |
+| `roMulti`, `roSingle`: `roSingle` tx/s | `273` | `274` | `275` |
+| All: `rwMany` / `roMulti` / `roSingle` tx/s | `7.2` / `25.7` / `38.6` | `2.5` / `12.1` / `66.8` | `0.8–1.3` / `6.6–6.9` / `88–98` |
+
+All `rwMany` transactions write the same 8 keys. In one leaf, one leaf CAS
+locks all of them. Over more leaves, a transaction locks the leaves in
+parallel, keeps the locks that it got while it waits for the others, and
+renews its identity for serial acquisition after 3 conflicts or 5 s. Alone,
+this makes `rwMany` 4 to 8 times slower. `roMulti` alone is only 15 to 25%
+slower, but with writers its reads over more leaves meet more conflicts.
+`roSingle` is fast without writers, and it becomes faster as `rwMany` commits
+less. Thus, a part of its gain after a split is not a gain of the split.
+
+### Why the policy does not see the cost
+
+- Before a split, the estimate is a weight times the divided time. The cost
+  after a split was 4 to 8 times the latency of `rwMany`, but less than 0.3
+  times the latency of `roMulti` alone. The cost depends on the conflicts of
+  the divided transactions on the same keys, and one weight cannot fit both.
+- After a split, the only merge-side cause for transactions over more leaves
+  is the adjacent miss. It counts direct commit candidates whose keys are in
+  exactly two adjacent leaves. Locked commits over 3 or more leaves and read
+  validation over more leaves add no merge-side time.
+
+### Conflict time of divided transactions
+
+`LeafWindow::divided_conflict_time` is the part of `divided_time` in commit
+passes that a conflict ended without a commit. `net-conflicts` uses it as the
+estimate. The offline replay uses the unsplit traces of 8 cells. The label is
+the geometric mean of the tree that the setup split once, against the unsplit
+tree. A cell is `leaves that split / leaves`, with the split multiple at 57 ms
+(`0.05` of the live split time) and a half-life of 10 s:
+
+```console
+perfbench mixed --delays=s3 --workers-per-shape=8 --affinities=0 \
+  --policies=fixed --shadow-policies=avoidable,size --trace-windows \
+  --warmup=5s --duration=5s --max-duration=30s --split-quiet=5s \
+  --split-settle-timeout=300s --modes=<mode> --databases=<n> \
+  --seed-leaf-entries=default,<7 for hi, 128 for lo> [--key-layouts=ranges] [--shapes=rwSingle]
+```
+
+| Cell | Label | `net` 0.25 | `net-passes` 0.25 | `net-passes` 0.5 | `net-conflicts` 1 | 2 | 4 | 8 |
+| --- | ---: | --- | --- | --- | --- | --- | --- | --- |
+| hi, ranges, `rwSingle`, 2 databases | `2.14` | 4/4 | 4/4 | 4/4 | 4/4 | 4/4 | 4/4 | 4/4 |
+| hi, shared, `rwSingle`, 1 database | `1.04` | 1/1 | 1/1 | 1/1 | 1/1 | 1/1 | 1/1 | 1/1 |
+| hi, shared, all shapes, 1 database | `0.72` | 0/1 | 0/1 | 0/1 | 0/1 | 0/1 | 0/1 | 0/1 |
+| hi, shared, all shapes, 4 databases | `0.81` | 3/16 | 4/16 | 3/16 | 3/16 | 2/16 | 2/16 | 1/16 |
+| hi, shared, all shapes, 8 databases | `0.79` | 17/64 | 16/64 | 11/64 | 6/64 | 5/64 | 2/64 | 2/64 |
+| hi, ranges, all shapes, 2 databases | `0.89` | 1/4 | 1/4 | 1/4 | 0/4 | 0/4 | 0/4 | 0/4 |
+| lo, 1 database | `1.14` | 25/26 | 23/26 | 9/26 | 26/26 | 24/26 | 22/26 | 17/26 |
+| lo, 8 databases | `0.99` | 53/1952 | 53/1952 | 51/1952 | 54/1952 | 54/1952 | 54/1952 | 54/1952 |
+
+In lo mode, the divided transactions seldom conflict, so the conflict time
+keeps the splits that help.
+
+The live comparison with the same command as above, and the policies
+`size,net-passes:0.05:0.1:0.25:10,net-conflicts:0.05:0.1:4:10,net-conflicts:0.05:0.1:8:10`:
+
+| Policy | lo | hi | hi, 8 databases, affinity 0 (tx/s) |
+| --- | ---: | ---: | ---: |
+| `size` | `1.000` | `1.000` | `14.9` |
+| `net-passes:0.05:0.1:0.25:10` | `1.127` | `0.943` | `8.2` |
+| `net-conflicts:0.05:0.1:4:10` | `1.100` | `0.969` | `7.7` |
+| `net-conflicts:0.05:0.1:8:10` | `1.113` | `0.927` | `8.5` |
+
+The offline replay did not predict the live loss. The live runs split more
+than the replay, for the reasons in the next section.
+
+### Split cascade in a live run
+
+A traced live run of `net-passes:0.05:0.1:0.25:10` in hi mode with 8
+databases (no warmup, 40 s, the live policy also as a shadow, so that the
+trace has its decisions) made 35 splits and 14 merges from 65 split and 19
+merge requests. The trace shows:
+
+- One instance can lose the CAS of a hot leaf for many seconds, while the
+  other instances commit. In one leaf, an instance had no commits for about
+  17 model seconds, and its lost CAS time grew to `11.3 s` in each window of
+  `1 s`, with 4 workers for each instance.
+- The policy of that instance asked for a split in almost each window. The
+  split also needs the leaf CAS, so it landed only after about 15 model
+  seconds. A request at the old split key does not divide the left half, so
+  the engine drops it. A request at the median divides the left half.
+- The halves kept this lost CAS time and split again.
+
+The lost CAS time had two errors. After the first lost CAS on other keys, the
+round counted all its time until a CAS landed, also the time of later lost
+CASes on its own keys, which no split removes. And it counted all members of
+the round, also write-backs, releases, and structural gates, which no
+transaction waits for. With one worker for each shape, only `rwSingle` has
+rounds whose keys a split separates, so 11 members were mostly pending
+write-backs.
+
+The fix stops the time at a lost CAS on the keys of the round, and counts only
+the members that a transaction waits for (`MemberPolicy::delays_transaction`).
+With the fix, the same traced run of `net-conflicts:0.05:0.1:4:10` made 23
+splits from 29 requests, and no leaf had more than about 4 s of lost CAS time
+in 10 windows. But the policies still split leaves whose instance saw almost
+no divided transaction:
+
+- With 8 databases and 8 workers for each shape, each instance has one worker
+  for each shape. The `rwMany` worker of an instance uses a given collection
+  about once in 4 s, but its `rwSingle` worker loses CAS all the time. The
+  estimate of the time that a split adds has few samples in each instance.
+- An instance reports lost CAS time while the round retries, but the time of a
+  commit pass only when the pass ends. In the first windows, and after each
+  change of a leaf, the split side comes first.
+- After some collections split, `rwMany` spends most of its time in them, and
+  uses the other collections less. The estimate in those leaves decreases, so
+  more of them split.
+
+### Conflict time over two adjacent leaves
+
+An estimate before a split cannot see its cost well. After a split, the cost
+is in the commit passes of the transactions over the two new leaves.
+`PairWindow::crossing_time` is the time of the commit passes whose point reads
+are in exactly two adjacent leaves, and `crossing_conflict_time` is the part
+that a conflict ended without a commit.
+
+The existing traces show the size of this cost. On the tree that the setup
+split once, the halves had these times, in ms for each collection in each
+window. The divided conflict time counts a transaction over both halves in
+each half:
+
+| Cell | Split side of the halves | Divided conflict time of the halves | Merge side |
+| --- | ---: | ---: | ---: |
+| hi, shared, all shapes, 8 databases | `133` | `3428` | `34` |
+| hi, shared, all shapes, 4 databases | `175` | `6955` | `60` |
+| lo, 1 database | `8160` | `655` | `0` |
+| lo, 8 databases | `1449` | `65` | `0` |
+
+With a crossing weight `c` (`net-conflicts:<split>:<merge>:<weight>:<half-life>:<c>`),
+the `NetTimePolicy` adds `c` times the crossing conflict time to the merge side
+of a pair, and a moving average of the merge side less the split side of both
+leaves decides a merge, with the same half-life as the split side.
+
+A traced live run as above, with `net-conflicts:0.05:0.1:4:10:1`:
+
+| Mode, 8 databases, affinity 0 | Splits | Merges | `rwSingle` | `rwMany` | `roSingle` | `roMulti` | Geometric mean |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| hi, `net-passes:0.05:0.1:0.25:10`, before the lost CAS fix | 35 | 14 | `6.5` | `1.7` | `87.2` | `8.3` | `9.4` |
+| hi, `net-conflicts:0.05:0.1:4:10` | 23 | 14 | `6.7` | `2.5` | `85.7` | `11.9` | `11.4` |
+| hi, `net-conflicts:0.05:0.1:4:10:1` | 7 | 7 | `7.8` | `6.7` | `52.5` | `21.0` | `15.5` |
+| lo, `net-conflicts:0.05:0.1:4:10:1` | 155 | 0 | `36.2` | `11.4` | `254.3` | `107.9` | `58.1` |
+
+In hi mode, the policy merged back each split. In lo mode, it merged none.
+
+A first version averaged the whole merge side, less the split side of both
+leaves. ADR-074 records that a moving average of scan crossings stays below
+the time of the windows that have them, so that the leaves that scans cross do
+not merge. The policy now averages only the crossing conflict time, and keeps
+the other merge-side time and the split side of the leaves of one window, as
+`AvoidableTimePolicy` does. Without a crossing weight, the merge rule is the
+one of `AvoidableTimePolicy`. The policy also drops the average of a pair when
+it asks for its merge. Before this, it asked about 70 times in each second for
+merges of leaves that a merge had already removed, and 109 times in all after
+it. The traced hi run had a geometric mean of `16.0`.
+
+The live comparison with the lost CAS fix, with the same command as above,
+and the policies
+`size,net-conflicts:0.05:0.1:4:10,net-conflicts:0.05:0.1:4:10:1,net-passes:0.05:0.1:0.25:10:1`.
+In hi mode with 8 databases and affinity 100, `net-conflicts:0.05:0.1:4:10:1`
+had `62.8` tx/s against `89.7` for `size`, with no split and no merge. This is
+noise of the parallel runs, so the hi column is without this cell:
+
+| Policy | lo | hi | hi, 8 databases, affinity 0 (tx/s) |
+| --- | ---: | ---: | ---: |
+| `size` | `1.000` | `1.000` | `15.4` |
+| `net-conflicts:0.05:0.1:4:10` | `1.135` | `1.010` | `13.3` |
+| `net-conflicts:0.05:0.1:4:10:1` | `1.114` | `0.993` | `14.6` |
+| `net-passes:0.05:0.1:0.25:10:1` | `1.124` | `0.983` | `10.6` |
+
+The lost CAS fix alone took `net-conflicts:0.05:0.1:4:10` from `0.969` to
+`1.010` in hi mode. In the hi cell with 8 databases and affinity 0, it made 9
+splits and 7 merges in the measurement, and the crossing weight made none.
+
+Two more runs with the same command, the policies
+`size,avoidable,net-conflicts:0.05:0.1:4:10,net-conflicts:0.05:0.1:4:10:1`,
+and `--runs=2`. The values are for each run, with all 12 cells:
+
+| Policy | lo | hi | hi, 8 databases, affinity 0 (tx/s) |
+| --- | ---: | ---: | ---: |
+| `size` | `1.000`, `1.000` | `1.000`, `1.000` | `15.5`, `15.1` |
+| `avoidable` | `1.126`, `1.139` | `0.650`, `0.616` | `6.5`, `5.7` |
+| `net-conflicts:0.05:0.1:4:10` | `1.135`, `1.102` | `0.989`, `0.921` | `14.1`, `9.4` |
+| `net-conflicts:0.05:0.1:4:10:1` | `1.122`, `1.110` | `1.010`, `0.966` | `14.9`, `14.8` |
+
+In hi mode, the two `net-conflicts` policies changed the tree only in the
+cells with 8 databases and affinities 0 and 50. In the other 20 cells of the
+two runs, the tree was the same as with `size`, and the ratios had a geometric
+mean of `0.985` and `0.989` with a root mean square deviation of 5%. This is
+the noise of the measurement. In the 4 cells that changed the tree, the
+geometric mean was `0.818` without the crossing weight and `0.984` with it.
+Without the crossing weight, one run made 16 splits and 13 merges in the
+measurement of the cell with affinity 0. With it, the policy merged back all
+splits in the warmup in the second run.
+
+Is the estimate before a split still necessary when the crossing conflict
+time undoes a split? The same command with `--runs=2`, and divided conflict
+weights 0, 2, and 4, all with the crossing weight 1:
+
+| Policy | lo | hi | hi cells that changed the tree |
+| --- | ---: | ---: | ---: |
+| `avoidable` | `1.118`, `1.169` | `0.649`, `0.643` | |
+| `net-conflicts:0.05:0.1:0:10:1` | `1.125`, `1.161` | `0.826`, `0.794` | 22 of 24 |
+| `net-conflicts:0.05:0.1:2:10:1` | `1.109`, `1.136` | `1.007`, `0.992` | 6 of 24 |
+| `net-conflicts:0.05:0.1:4:10:1` | `1.114`, `1.121` | `1.026`, `0.995` | 4 of 24 |
+
+Without the estimate, the leaves of hi mode split and merged again and again,
+and the transactions over them starved in each split. So the policy needs
+both. No lo cell of any policy had a merge, so in lo the crossing weight
+changes no decision. The lo loss against `avoidable` is in the cells with 2
+databases and affinities 0 and 50. There, over 4 runs, weight 4 made 46 to 90
+splits in the warmup, against 102 to 122 for `avoidable`, and had `0.849` and
+`0.967` of its throughput.
+
+Mixed on GCS, the same command with `--delays=gcs`, `--runs=2`, and the
+crossing weights 1 and 0.5:
+
+| Policy | lo | hi |
+| --- | ---: | ---: |
+| `avoidable` | `1.301`, `1.291` | `0.733`, `0.743` |
+| `net-conflicts:0.05:0.1:4:10:1` | `1.281`, `1.206` | `1.017`, `1.009` |
+| `net-conflicts:0.05:0.1:4:10:0.5` | `1.260`, `1.244` | `0.997`, `1.017` |
+
+In hi mode on GCS, `size` had only 0.9 to 1.6 tx/s in the cells with 4 and 8
+databases and affinities 0 and 50, so these cells are noisy. In lo mode, the
+net policies made fewer splits than `avoidable` with 4 and 8 databases, for
+example 78 against 147 to 174 with 4 databases and affinity 50, and had
+`0.873` of its throughput there. With 2 databases and affinity 0, they had
+`0.926`.
+
+Mixed lo on GCS with `--runs=2`, and divided conflict weights 0, 2, and 4,
+all with the crossing weight 1:
+
+| Policy | lo |
+| --- | ---: |
+| `avoidable` | `1.307`, `1.271` |
+| `net-conflicts:0.05:0.1:0:10:1` | `1.273`, `1.209` |
+| `net-conflicts:0.05:0.1:2:10:1` | `1.273`, `1.222` |
+| `net-conflicts:0.05:0.1:4:10:1` | `1.269`, `1.229` |
+
+Without the estimate, the net policy also had less than `avoidable`, so the
+estimate does not cause the GCS lo loss. The loss is in the cells with 4 and 8
+databases, where the net policies made fewer splits. All policies still split
+in the measurement: `avoidable` made 50 to 115 splits in the 5 s with 4 and 8
+databases, after 41 to 190 in the warmup. So the tree did not settle in the
+warmup of 20 s, and a policy that waits for a moving average splits later.
+
+A half-life of 5 s or a split multiple of 0.025 makes the net policy split
+sooner. Hi mode on S3 with 4 and 8 databases, `--runs=2`, and the same
+command as above:
+
+| Policy | hi, 4 and 8 databases | hi cells that changed the tree |
+| --- | ---: | ---: |
+| `avoidable` | `0.606`, `0.630` | `0.561` (10 of 12) |
+| `net-conflicts:0.05:0.1:4:10:1` | `1.002`, `0.975` | `0.957` (5 of 12) |
+| `net-conflicts:0.05:0.1:4:5:1` | `0.880`, `0.985` | `0.875` (6 of 12) |
+| `net-conflicts:0.025:0.1:4:10:1` | `0.939`, `0.910` | `0.857` (6 of 12) |
+
+With 8 databases, the two faster variants made 7 to 29 splits and 2 to 14
+merges in the measurement, and had `0.57` to `0.79` of `size` in 3 of the 4
+cells with affinities 0 and 50. So a faster split rule brings the hi loss
+back.
+
+Lo mode on GCS with 4 and 8 databases, `--runs=2`, and a warmup of 60 s
+instead of 20 s:
+
+| Policy | Warmup 20 s | Warmup 60 s |
+| --- | ---: | ---: |
+| `avoidable` | `1.220`, `1.165` | `1.294`, `1.336` |
+| `net-conflicts:0.05:0.1:4:10:1` | `1.147`, `1.109` | `1.348`, `1.211` |
+| `net-conflicts:0.05:0.1:4:5:1` | | `1.390`, `1.223` |
+| `net-conflicts:0.025:0.1:4:10:1` | | `1.327`, `1.333` |
+
+With the longer warmup, the difference between `avoidable` and the net policy
+is less than the difference between the two runs. All policies still split in
+the measurement, 15 to 107 times in 5 s. So the net policy splits later in lo
+mode, but the tree that it gets to is about as fast. The faster variants
+reduce the delay, but they bring the hi loss back, so the policy keeps a
+half-life of 10 s and a split multiple of 0.05.
+
+A review found that the merge rule also decided for the pairs of earlier
+windows. Another instance can change the leaves of such a pair, so the policy
+can ask for a merge of leaves that are no longer adjacent. The policy now
+decides only for the pairs of the window, and keeps crossing averages only
+with a crossing weight. The same commands as above, `--runs=2`, with
+`net-conflicts:0.05:0.1:4:10:1` after this change:
+
+| Scenario | `avoidable` | `net-conflicts:0.05:0.1:4:10:1` |
+| --- | ---: | ---: |
+| Mixed on S3, lo | `1.146`, `1.148` | `1.131`, `1.119` |
+| Mixed on S3, hi | `0.627`, `0.603` | `0.981`, `0.944` |
+| `topology` on S3 | `1.173`, `1.207` | `1.141`, `1.172` |
+| `topology` on GCS | `1.324`, `1.266` | `1.248`, `1.299` |
+
+In hi mode, the 18 cells where the tree stayed the same as with `size` had
+`0.974`, and the 6 cells that changed the tree had `0.929`. The cell with 8
+databases and affinity 0 had `1.08` and `0.68`. In the second run it made 7
+splits and 5 merges in the measurement. Before the change, this cell had
+`0.93` to `1.02` in 5 runs.
+
+An A/B of the two merge rules in hi mode on S3 with 8 databases, affinities 0
+and 50, and 8 runs of each rule, run at the same time:
+
+| Merge rule | Affinity 0 | Affinity 50 | Both |
+| --- | ---: | ---: | ---: |
+| Also for the pairs of earlier windows | `0.983` | `1.008` | `0.996` |
+| Only for the pairs of the window | `0.933` | `1.001` | `0.966` |
+
+With the second rule, one run at affinity 0 had `0.66`, with 12 splits and 6
+merges in the warmup, and 7 splits and 8 merges in the measurement. The first
+rule had no run below `0.86`. The crossing conflict time counts only the
+transactions over exactly two leaves. When another instance splits a leaf of
+a pair, these transactions are over three leaves, and no pair of the window
+has their time. With the first rule, the average of the old pair still asks
+for the merge of its left leaf, and the engine merges it with its right
+sibling of now. If the right leaf split, this is the same merge. If the left
+leaf split, this merge takes away one of the three leaves. If the left leaf
+is gone, the engine skips the merge. So the policy decides again also for the
+pairs of earlier windows, and keeps crossing averages only with a crossing
+weight.
+
+A second A/B, of the binary before the review and the binary with this last
+rule, which decide the same, also 8 runs of each:
+
+| Binary | Affinity 0 | Affinity 50 | Both |
+| --- | ---: | ---: | ---: |
+| Before the review | `0.916` | `1.057` | `0.984` |
+| After the review | `0.979` | `0.982` | `0.980` |
+
+This time the binary before the review had one run at `0.65`, with 13 splits
+and 8 merges in the measurement. So each rule has rare runs in which the
+leaves split and merge again and again in the measurement: over all runs with
+8 databases and affinity 0, 1 of 21 for the first rule before the review, 2 of
+10 for the second rule, and 0 of 8 after the review. The difference between
+the two rules is not more than the noise, and the policy keeps the first rule
+for the reason above. Each instance decides on its own transactions, so one
+instance can split a leaf for its lost CAS time while another merges it for
+its crossing conflict time. This is the remaining risk of the policy in hi
+mode.
+
+The `topology` scenario with the lost CAS fix, one run, against the fixed
+seeded tree:
+
+```console
+perfbench --delays=<s3|gcs> --runs=1 topology \
+  --workloads=single,hot,adjacent,random,scan --workers=8 --databases=1,4 \
+  --leaf-sizes=<16|128> --num-keys=1024 --duration=10s --max-duration=30s \
+  --split-settle-timeout=600s --split-quiet=5s \
+  --policies=fixed,avoidable,net-conflicts:0.05:0.1:4:10,net-conflicts:0.05:0.1:4:10:1 \
+  --adapt=20s
+```
+
+| Policy | S3 | S3 worst cell | GCS | GCS worst cell |
+| --- | ---: | ---: | ---: | ---: |
+| `avoidable` | `1.190` | `0.90` | `1.257` | `0.83` |
+| `net-conflicts:0.05:0.1:4:10` | `1.160` | `0.82` | `1.237` | `0.81` |
+| `net-conflicts:0.05:0.1:4:10:1` | `1.150` | `0.80` | `1.242` | `0.66` |
+
+An earlier run before the fix had `1.204` and `1.263` for `avoidable`, so the
+fix did not change it here. The worst cell of the crossing weight was
+`adjacent` on GCS with leaves of 16 entries and 4 databases: it made 14 merges
+in the measurement, against 4 without the weight, and had `5.5` tx/s against
+`7.0`. In one leaf, the transactions of this workload also conflict, so only a
+part of the crossing conflict time is time that a merge removes.
+
+A repeat with `--runs=2` and the crossing weight 0.5 added. The values are for
+each run:
+
+| Policy | S3 | GCS |
+| --- | ---: | ---: |
+| `avoidable` | `1.185`, `1.180` | `1.242`, `1.251` |
+| `net-conflicts:0.05:0.1:4:10` | `1.166`, `1.155` | `1.262`, `1.235` |
+| `net-conflicts:0.05:0.1:4:10:1` | `1.165`, `1.178` | `1.247`, `1.171` |
+| `net-conflicts:0.05:0.1:4:10:0.5` | `1.179`, `1.144` | `1.266`, `1.198` |
+
+In the `adjacent` cell on GCS with leaves of 16 entries and 4 databases, the
+crossing weight 1 had `1.07` and `1.09`, so the `0.66` of the first run was
+noise. The lowest value of the crossing weight 1, `1.171` on GCS, came from
+the `hot` cells with leaves of 128 entries (`0.73` and `0.98`, against `1.04`
+and `1.75` without the weight). The `hot` transactions write one key, so no
+pair has crossing time, and the policy decides as without the weight. The
+crossing weight did not change the `topology` results more than the noise of
+the runs. The net policies had about 2% less than `avoidable` on S3, and the
+same on GCS.
+
 ## 2026-08-21: root-leaf structural-gate coordinator rationale
 
 Status: implemented through the typed coordinator interface. A deterministic
