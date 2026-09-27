@@ -11,15 +11,19 @@ This file is evidence, not a record of accepted behavior:
 
 ## 2026-09-26: ADR-074 splits in the mixed hi mode
 
-Status: candidate found. The loss comes from transactions that conflict on the
+Status: in the engine, with ADR-074 still proposed. `AvoidableTimePolicy` now
+uses the rule of `net-conflicts:0.05:0.1:4:10:1`, and the perfbench policy
+`avoidable` measures it. Perfbench has no `net` forms any more. The commands below that use them
+need the perfbench of commit `597b59eca`, where `avoidable` is the rule of one
+window. The loss comes from transactions that conflict on the
 same keys and that a split puts in more leaves. The first estimates of the
 time that a split adds did not show this cost. After a fix of the lost CAS
 time, `net-conflicts:0.05:0.1:4:10:1` subtracts 4 times the divided conflict
 time from the split side, and adds the crossing conflict time of two adjacent
-leaves to the merge side. Against the size causes, it had about `0.98` to
-`1.01` in hi mode on S3 and GCS, where `avoidable` had `0.62` and `0.74`. In lo
-mode it had `1.12` to `1.13` on S3 and `1.25` on GCS, against `1.14` to `1.15`
-and `1.29`. On GCS the lo difference was less than the noise with a warmup of
+leaves to the merge side. Against the size causes, the engine rule had `0.98`
+and `1.02` in hi mode on S3 and `0.96` and `1.00` on GCS, where the rule of one
+window had `0.62` and `0.74`. In lo mode it had `1.12` to `1.13` on S3 and
+`1.24` to `1.25` on GCS, against `1.14` to `1.15` and `1.29`. On GCS the lo difference was less than the noise with a warmup of
 60 s. In the `topology` scenario, it had about 3% less than `avoidable` on S3,
 and the same on GCS. It needs both terms.
 
@@ -469,6 +473,36 @@ pair has crossing time, and the policy decides as without the weight. The
 crossing weight did not change the `topology` results more than the noise of
 the runs. The net policies had about 2% less than `avoidable` on S3, and the
 same on GCS.
+
+### Engine rule
+
+`AvoidableTimePolicy` with the rule of `net-conflicts:0.05:0.1:4:10:1`, as the
+perfbench policy `avoidable`, against `size` in `mixed` and `fixed` in
+`topology`. The same commands as above with `--runs=2` and
+`--policies=size,avoidable` or `--policies=fixed,avoidable`, on S3 and GCS,
+with all 12 processes at the same time. The values are for each run:
+
+| Scenario | lo or all cells | hi | Worst cell |
+| --- | ---: | ---: | ---: |
+| Mixed on S3 | `1.126`, `1.117` | `0.983`, `1.018` | |
+| Mixed on GCS | `1.240`, `1.245` | `0.958`, `0.995` | |
+| `topology` on S3 | `1.173`, `1.162` | | `0.80`, `0.84` |
+| `topology` on GCS | `1.233`, `1.278` | | `0.75`, `0.86` |
+
+These agree with the earlier runs of `net-conflicts:0.05:0.1:4:10:1`. In hi
+mode on GCS with 8 databases and affinity 50, the first run had `0.73`, with 6
+splits and 9 merges in the measurement. This is the remaining risk above. On
+S3, no hi cell had more than one split and one merge in the measurement.
+
+In lo mode, the gain with 1, 2, 4, and 8 databases was `1.25`, `1.19`,
+`1.05`, and `1.01` on S3, and `1.42`, `1.39`, `1.20`, and `1.00` on GCS. On
+GCS, it was `1.20` with affinity 0 and `1.37` with affinity 100. On S3, it was
+`1.11` and `1.14`.
+
+The worst `topology` cell on S3 was `single` with leaves of 16 entries and 4
+databases: 28 tx/s against 33 to 36 for the fixed tree, with 6 to 10 splits.
+The net policies had the same in the earlier runs. The rule of one window had
+30 tx/s there, with more than 100 splits.
 
 ## 2026-08-21: root-leaf structural-gate coordinator rationale
 
