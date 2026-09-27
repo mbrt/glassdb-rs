@@ -699,10 +699,14 @@ impl Algo {
             return outcome;
         }
         let now = rt::Instant::now();
-        self.structural_hints
-            .observe_pass(&tx.accesses, now.saturating_duration_since(tx.pass_started));
+        let committed = matches!(outcome, Ok(PassOutcome::Complete));
+        self.structural_hints.observe_pass(
+            &tx.accesses,
+            now.saturating_duration_since(tx.pass_started),
+            committed,
+        );
         tx.pass_started = now;
-        if matches!(outcome, Ok(PassOutcome::Complete)) {
+        if committed {
             self.structural_hints.observe_commit(
                 &tx.accesses,
                 kind,

@@ -137,9 +137,11 @@ impl StructuralHintSink {
     }
 
     /// Notes that a commit pass of a transaction with `accesses` took `time`
-    /// with the body run before it, committed or not.
-    pub(crate) fn observe_pass(&self, accesses: &AccessSet, time: Duration) {
-        self.candidates.avoidable.add_pass(accesses, time);
+    /// with the body run before it, and whether it committed.
+    pub(crate) fn observe_pass(&self, accesses: &AccessSet, time: Duration, committed: bool) {
+        self.candidates
+            .avoidable
+            .add_pass(accesses, time, committed);
     }
 
     /// Notes that a scan that continued from `left` used `time` to read the

@@ -136,12 +136,15 @@ For each leaf, the window also counts the transactions that committed after
 point reads of the leaf, by the kind of commit, and the ones whose keys a split
 at the median puts in both halves. It has the sum of their latencies, the time
 of the commit passes whose keys a split puts in both halves, also of passes
-that did not commit, and the coordinator rounds whose leaf CAS landed with
-their round members. The time of a commit pass includes the body run before
-it. A transaction that starves seldom commits, so only the time of its commit
-passes shows it in each window. The
-avoidable time policy does not use these counts. Another policy can use them to
-estimate the time that a split adds.
+that did not commit, the part of that time in passes that a conflict ended,
+and the coordinator rounds whose leaf CAS landed with their round members.
+The time of a commit pass includes the body run before it. A transaction that
+starves seldom commits, so only the time of its commit passes shows it in
+each window. For each pair of adjacent leaves, the window has the time of the
+commit passes whose keys are in the two leaves only, and the part of it in
+passes that a conflict ended. The avoidable time policy does not use these
+counts. Another policy can use them to estimate the time that a split adds,
+before and after the split.
 
 The engine checks each change again against current state. It skips a split
 of a leaf with less than two entries, a split at a key that leaves one half

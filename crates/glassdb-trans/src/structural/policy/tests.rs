@@ -58,6 +58,8 @@ fn scan_crossing(left: u8, right: u8, millis: u64) -> PairWindow {
             scan_crossing: ms(millis),
             ..MergeTime::default()
         },
+        crossing_time: Duration::ZERO,
+        crossing_conflict_time: Duration::ZERO,
     }
 }
 

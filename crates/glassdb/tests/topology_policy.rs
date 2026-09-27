@@ -101,18 +101,18 @@ fn merge_every_pair(window: &TopologyWindow) -> Vec<TopologyChange> {
         .collect()
 }
 
-// Opens a collection of 16 keys over leaves of at most 4 entries, after the
-// background splits of the soft caps.
-async fn split_collection(backend: &Arc<dyn Backend>) {
+// Opens a collection of `keys` keys over leaves of at most 4 entries, after
+// the background splits of the soft caps.
+async fn split_collection(backend: &Arc<dyn Backend>, keys: u8) {
     let db = Database::builder("example", backend.clone())
         .node_size_policy(leaves_of_at_most(4))
         .open()
         .await
         .unwrap();
     let coll = create_top(&db, b"split").await;
-    write_keys(&coll, 16).await;
+    write_keys(&coll, keys).await;
     tokio::time::sleep(Duration::from_secs(5)).await;
-    assert!(scan_crossings(&db, &coll).await >= 3);
+    assert!(scan_crossings(&db, &coll).await >= u64::from(keys / 4 - 1));
     db.shutdown().await;
 }
 
@@ -163,7 +163,7 @@ async fn the_splits_of_a_policy_land_and_the_next_windows_show_the_changed_leave
 #[tokio::test(start_paused = true)]
 async fn merges_of_a_policy_skip_the_underfull_threshold_but_not_the_size_vetoes() {
     let backend = slow_mem();
-    split_collection(&backend).await;
+    split_collection(&backend, 16).await;
 
     let (policy, _) = Recording::new(merge_every_pair);
     let db = open(&backend, leaves_of_at_most(4), policy).await;
@@ -275,10 +275,10 @@ async fn windows_count_the_transactions_of_a_leaf_that_a_split_would_divide() {
     assert!(sum(|leaf| leaf.round_members) >= rounds);
 }
 
-// Reads keys 0 and 3, and in the first body run writes key 0 in another
-// transaction, so that the first commit pass does not commit. The body replay
-// commits in a later window.
-async fn read_divided_keys_after_a_conflict(db: &Database, coll: &Collection, write: bool) {
+// Reads the two keys, and in the first body run writes the first one in
+// another transaction, so that the first commit pass does not commit. The
+// body replay commits in a later window.
+async fn read_after_a_conflict(db: &Database, coll: &Collection, keys: [u8; 2], write: bool) {
     let conflicted = AtomicBool::new(false);
     let conflicted = &conflicted;
     db.tx(|tx| async move {
@@ -286,13 +286,13 @@ async fn read_divided_keys_after_a_conflict(db: &Database, coll: &Collection, wr
         if replay {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        tx.read(coll, &[0]).await?;
-        tx.read(coll, &[3]).await?;
+        tx.read(coll, &[keys[0]]).await?;
+        tx.read(coll, &[keys[1]]).await?;
         if !replay {
-            coll.write(&[0], &write_int(2)).await?;
+            coll.write(&[keys[0]], &write_int(2)).await?;
         }
         if write {
-            tx.write(coll, &[3], &write_int(1))?;
+            tx.write(coll, &[keys[1]], &write_int(1))?;
         }
         Ok(())
     })
@@ -311,9 +311,9 @@ async fn windows_count_the_time_of_divided_transactions_before_they_commit() {
     write_keys(&coll, 4).await;
 
     let before = db.stats().transactions.replays;
-    read_divided_keys_after_a_conflict(&db, &coll, true).await;
+    read_after_a_conflict(&db, &coll, [0, 3], true).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    read_divided_keys_after_a_conflict(&db, &coll, false).await;
+    read_after_a_conflict(&db, &coll, [0, 3], false).await;
     let replays = db.stats().transactions.replays - before;
     tokio::time::sleep(Duration::from_secs(2)).await;
     db.shutdown().await;
@@ -335,6 +335,60 @@ async fn windows_count_the_time_of_divided_transactions_before_they_commit() {
         .filter(|leaf| leaf.divided_time > Duration::ZERO && leaf.divided.total() == 0)
         .count();
     assert_eq!(before_commit, 2);
+    for leaf in leaves {
+        let conflicts = if leaf.divided.total() == 0 {
+            leaf.divided_time
+        } else {
+            Duration::ZERO
+        };
+        assert_eq!(leaf.divided_conflict_time, conflicts);
+    }
+}
+
+// After a merge, a transaction whose keys are in two adjacent leaves uses one
+// leaf. Keys 0 and 7 are in the two leaves of the collection.
+#[tokio::test(start_paused = true)]
+async fn windows_count_the_time_of_transactions_over_two_adjacent_leaves() {
+    let backend = slow_mem();
+    split_collection(&backend, 8).await;
+    let (policy, windows) = Recording::new(|_: &TopologyWindow| Vec::new());
+    let db = open(&backend, leaves_of_at_most(4), policy).await;
+    let coll = open_top(&db, b"split").await;
+    let other = create_top(&db, b"other").await;
+    write_keys(&other, 1).await;
+
+    let started = tokio::time::Instant::now();
+    read_after_a_conflict(&db, &coll, [0, 7], true).await;
+    let took = started.elapsed();
+    read_keys(&db, &[(&coll, 0), (&coll, 1)], true).await;
+    read_keys(&db, &[(&coll, 0), (&coll, 7), (&other, 0)], true).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    db.shutdown().await;
+
+    let windows = windows.lock().unwrap();
+    let crossed: Vec<_> = windows
+        .iter()
+        .flat_map(|window| &window.pairs)
+        .filter(|pair| pair.crossing_time > Duration::ZERO)
+        .collect();
+    let crossing: Duration = crossed.iter().map(|pair| pair.crossing_time).sum();
+    let conflicts: Vec<Duration> = crossed
+        .iter()
+        .map(|pair| pair.crossing_conflict_time)
+        .filter(|time| *time > Duration::ZERO)
+        .collect();
+    assert!(
+        crossed
+            .iter()
+            .all(|pair| (&pair.left, &pair.right) == (&crossed[0].left, &crossed[0].right))
+    );
+    // The replay sleeps for 2 seconds before its commit pass.
+    assert!(
+        crossing >= Duration::from_secs(2) && crossing <= took,
+        "{crossing:?} of {took:?}"
+    );
+    assert_eq!(conflicts.len(), 1);
+    assert!(conflicts[0] + Duration::from_secs(2) <= crossing);
 }
 
 type Owner = fn(u8) -> usize;

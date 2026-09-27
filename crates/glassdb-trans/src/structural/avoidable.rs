@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use glassdb_concurr::rt;
-use glassdb_data::ObjectPath;
+use glassdb_data::{NodeId, ObjectPath};
 use glassdb_storage::{LeafBody, NodeSizePolicy};
 
 use crate::access::AccessSet;
@@ -88,10 +88,18 @@ pub(crate) enum CommitKind {
 struct State {
     window_started: rt::Instant,
     leaves: BTreeMap<ObjectPath, LeafWindow>,
-    pairs: BTreeMap<(ObjectPath, ObjectPath), MergeTime>,
+    pairs: BTreeMap<(ObjectPath, ObjectPath), PairTimes>,
     changes: Vec<(ObjectPath, ChangeKind)>,
     changes_last_window: Vec<(ObjectPath, ChangeKind)>,
     totals: AvoidableTimeStats,
+}
+
+/// The measurements of two adjacent leaves in the current window.
+#[derive(Debug, Default)]
+struct PairTimes {
+    avoidable: MergeTime,
+    crossing_time: Duration,
+    crossing_conflict_time: Duration,
 }
 
 /// The moving average of the time of one operation.
@@ -104,6 +112,8 @@ pub(crate) struct TypicalTime {
 struct LeafReads<'a> {
     /// The median key of the leaf, as the read of the lowest key observed it.
     median: Option<&'a [u8]>,
+    /// The right sibling of the leaf, as the same read observed it.
+    right_sibling: Option<NodeId>,
     keys: Vec<&'a [u8]>,
 }
 
@@ -254,10 +264,11 @@ impl AvoidableTime {
         let mut state = self.state.lock().unwrap();
         state.totals.merge += time;
         if self.windows {
-            *state
+            state
                 .pairs
                 .entry((left.clone(), right.clone()))
-                .or_default() += time;
+                .or_default()
+                .avoidable += time;
         }
     }
 
@@ -280,17 +291,30 @@ impl AvoidableTime {
     }
 
     /// Records one commit pass of a transaction with `accesses` that took
-    /// `time`, committed or not, in each leaf that a split would divide its
-    /// point reads in.
-    pub(super) fn add_pass(&self, accesses: &AccessSet, time: Duration) {
+    /// `time`, and whether it committed, in each leaf that a split would
+    /// divide its point reads in, and in the two adjacent leaves of its point
+    /// reads if it has point reads in no other leaf.
+    pub(super) fn add_pass(&self, accesses: &AccessSet, time: Duration, committed: bool) {
         if !self.windows {
             return;
         }
         let reads = LeafReads::of(accesses);
+        let pair = LeafReads::adjacent_pair(&reads);
         let mut state = self.state.lock().unwrap();
         for (path, read) in reads {
             if read.divided() {
-                state.leaf(path).divided_time += time;
+                let leaf = state.leaf(path);
+                leaf.divided_time += time;
+                if !committed {
+                    leaf.divided_conflict_time += time;
+                }
+            }
+        }
+        if let Some(pair) = pair {
+            let pair = state.pairs.entry(pair).or_default();
+            pair.crossing_time += time;
+            if !committed {
+                pair.crossing_conflict_time += time;
             }
         }
     }
@@ -359,10 +383,12 @@ impl AvoidableTime {
             .collect();
         let pairs = std::mem::take(&mut state.pairs)
             .into_iter()
-            .map(|((left, right), avoidable)| PairWindow {
+            .map(|((left, right), times)| PairWindow {
                 left: LeafId::new(left),
                 right: LeafId::new(right),
-                avoidable,
+                avoidable: times.avoidable,
+                crossing_time: times.crossing_time,
+                crossing_conflict_time: times.crossing_conflict_time,
             })
             .collect();
         drop(state);
@@ -415,11 +441,41 @@ impl<'a> LeafReads<'a> {
                     .value()
                     .and_then(|node| node.as_leaf())
                     .and_then(LeafBody::median_key),
+                right_sibling: observation.value().and_then(|node| node.right_sibling()),
                 keys: Vec::new(),
             });
             leaf.keys.push(read.key().key());
         }
         leaves
+    }
+
+    /// Returns the two leaves of `reads`, the left one first, if there are
+    /// two and they are adjacent.
+    fn adjacent_pair(reads: &BTreeMap<&ObjectPath, Self>) -> Option<(ObjectPath, ObjectPath)> {
+        let [(a_path, a), (b_path, b)] =
+            <[_; 2]>::try_from(reads.iter().collect::<Vec<_>>()).ok()?;
+        if a.links_right_to(a_path, b_path) {
+            Some(((*a_path).clone(), (*b_path).clone()))
+        } else if b.links_right_to(b_path, a_path) {
+            Some(((*b_path).clone(), (*a_path).clone()))
+        } else {
+            None
+        }
+    }
+
+    /// Reports whether the leaf at `path` with these reads has the leaf at
+    /// `right` as its right sibling.
+    fn links_right_to(&self, path: &ObjectPath, right: &ObjectPath) -> bool {
+        match (path, right) {
+            (
+                ObjectPath::Node {
+                    collection: left_collection,
+                    ..
+                },
+                ObjectPath::Node { collection, id },
+            ) => left_collection == collection && self.right_sibling == Some(*id),
+            _ => false,
+        }
     }
 
     /// Reports whether a split at the median puts the keys in both halves.
