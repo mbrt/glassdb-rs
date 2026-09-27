@@ -64,6 +64,7 @@ struct LeafTrace {
     divided: CommitTrace,
     latency_ms: f64,
     divided_time_ms: f64,
+    divided_conflict_time_ms: f64,
     rounds: u64,
     round_members: u64,
 }
@@ -83,6 +84,8 @@ struct PairTrace {
     right: String,
     adjacent_miss_ms: f64,
     scan_crossing_ms: f64,
+    crossing_time_ms: f64,
+    crossing_conflict_time_ms: f64,
 }
 
 /// Collects the counts of the database instances of one cell.
@@ -227,6 +230,7 @@ impl LeafTrace {
             divided: CommitTrace::new(&window.divided),
             latency_ms: millis(window.latency),
             divided_time_ms: millis(window.divided_time),
+            divided_conflict_time_ms: millis(window.divided_conflict_time),
             rounds: window.rounds,
             round_members: window.round_members,
         }
@@ -250,6 +254,8 @@ impl PairTrace {
             right: pair.right.to_string(),
             adjacent_miss_ms: millis(pair.avoidable.adjacent_miss),
             scan_crossing_ms: millis(pair.avoidable.scan_crossing),
+            crossing_time_ms: millis(pair.crossing_time),
+            crossing_conflict_time_ms: millis(pair.crossing_conflict_time),
         }
     }
 }
