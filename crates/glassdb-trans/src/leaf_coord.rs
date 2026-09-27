@@ -369,6 +369,12 @@ pub(crate) trait MemberPolicy: Send + Sync {
     /// cleanup member wait. A scheduling hint only.
     fn reorderable(&self) -> bool;
 
+    /// Whether a transaction waits for the outcome of this member, so that a
+    /// delay of this member is also a delay of a transaction.
+    fn delays_transaction(&self) -> bool {
+        true
+    }
+
     /// The outcome delivered when this round cannot produce a definitive
     /// result. `in_doubt` reports whether a CAS carrying *this member's* stage
     /// may have landed, so a non-idempotent policy cannot downgrade
@@ -767,7 +773,7 @@ impl LostCas {
             expected,
             round_keys,
             sent,
-            members: u32::try_from(members.len()).unwrap_or(u32::MAX),
+            members: waiting_members(members),
         }
     }
 
@@ -809,12 +815,13 @@ impl LostCas {
 
 /// Time that the members of a round lose after a CAS lost to keys in the
 /// other half of the leaf. A split can remove it until the round sends the
-/// CAS that lands, finds that it has nothing to write, or ends.
+/// CAS that lands, loses a CAS on its own keys, finds that it has nothing to
+/// write, or ends.
 struct LostTime {
     /// The start of the time that is not reported yet.
     since: rt::Instant,
-    /// The members of the round since `since`. Members can join or leave
-    /// the round at each attempt.
+    /// The members of the round that a transaction waits for, since `since`.
+    /// Members can join or leave the round at each leaf CAS.
     members: u32,
     split_key: Vec<u8>,
 }
@@ -834,6 +841,15 @@ impl LostTime {
         );
         self.since = until;
     }
+}
+
+/// Returns the members of a round that a transaction waits for.
+fn waiting_members(members: &BTreeMap<TxId, LeafMember>) -> u32 {
+    let waiting = members
+        .values()
+        .filter(|member| member.policy.delays_transaction())
+        .count();
+    u32::try_from(waiting).unwrap_or(u32::MAX)
 }
 
 /// Reports whether a split at `median` puts all of `ours` in one half and all
@@ -1350,15 +1366,23 @@ impl CasWorker {
             if let Some(lost) = lost_cas.take() {
                 let cause = lost.cause(edit.node());
                 self.core.stats.record_lost_cas(cause);
-                if cause == LostCasCause::OtherKeys
-                    && lost_time.is_none()
-                    && let Some(split_key) = lost.separating_key(edit.node())
-                {
-                    lost_time = Some(LostTime {
-                        since: lost.sent,
-                        members: lost.members,
-                        split_key,
-                    });
+                let split_key = (cause == LostCasCause::OtherKeys)
+                    .then(|| lost.separating_key(edit.node()))
+                    .flatten();
+                match (split_key, lost_time.take()) {
+                    (Some(split_key), None) => {
+                        lost_time = Some(LostTime {
+                            since: lost.sent,
+                            members: lost.members,
+                            split_key,
+                        });
+                    }
+                    // A split does not remove a loss on the same keys, so its
+                    // time is not split time.
+                    (None, Some(mut time)) if cause == LostCasCause::SameKeys => {
+                        time.report(&*self.core.hinter, path, lost.sent);
+                    }
+                    (_, time) => lost_time = time,
                 }
             }
             if let Some(lost) = &mut lost_time {
@@ -1382,7 +1406,7 @@ impl CasWorker {
             requirement = requirement.stricter(merged.requirement);
             let members = merged.members;
             if let Some(lost) = &mut lost_time {
-                lost.members = u32::try_from(members.len()).unwrap_or(u32::MAX);
+                lost.members = waiting_members(&members);
             }
             let mut plan = match self
                 .plan_mutation(path, &edit, &members, requirement, reloaded, &mut in_doubt)
@@ -3617,6 +3641,61 @@ mod tests {
         }
     }
 
+    // Stages a write lock like [`StageLock`] for a member that no transaction
+    // waits for, like a write-back.
+    struct StageLockInBackground(StageLock);
+
+    #[async_trait::async_trait]
+    impl MemberPolicy for StageLockInBackground {
+        async fn resolve(
+            &self,
+            ctx: &ResolveCtx<'_>,
+            staged: &BTreeMap<Vec<u8>, LeafEntry>,
+            staged_locks: &NodeLocks,
+        ) -> Result<Step, TransError> {
+            self.0.resolve(ctx, staged, staged_locks).await
+        }
+
+        fn reorderable(&self) -> bool {
+            self.0.reorderable()
+        }
+
+        fn delays_transaction(&self) -> bool {
+            false
+        }
+
+        fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome {
+            self.0.exhausted_outcome(in_doubt)
+        }
+
+        fn leaf_scope_keys(&self) -> Vec<&[u8]> {
+            self.0.leaf_scope_keys()
+        }
+    }
+
+    impl LeafOperation for StageLockInBackground {
+        type Output = bool;
+
+        fn path(&self) -> &ObjectPath {
+            self.0.path()
+        }
+
+        fn id(&self) -> &TxId {
+            self.0.id()
+        }
+
+        fn requirement(&self) -> Requirement {
+            self.0.requirement()
+        }
+
+        fn complete(
+            &self,
+            outcome: Option<CoordinatedOutcome>,
+        ) -> Result<Self::Output, TransError> {
+            self.0.complete(outcome)
+        }
+    }
+
     // Regression: a round can find after the lost CAS that it has nothing to
     // write. Its members still waited for the lost CAS.
     #[tokio::test(start_paused = true)]
@@ -3684,6 +3763,54 @@ mod tests {
             reported >= Duration::from_secs(3) - 4 * LOST_CAS,
             "{reported:?}"
         );
+    }
+
+    // Regression: the lost CAS time counted the members of a round that no
+    // transaction waits for, like write-backs.
+    #[tokio::test(start_paused = true)]
+    async fn lost_cas_in_the_other_half_is_split_time_of_the_members_that_transactions_wait_for() {
+        let (coord, hints, _wins, _bg) =
+            coord_losing_cas(|node| with_peer_writer(node, b"b"), 1).await;
+
+        let waiting = spawn_lock(&coord, b"a", 2);
+        let background = tokio::spawn({
+            let coord = coord.clone();
+            let operation = StageLockInBackground(StageLock {
+                key: b"a".to_vec(),
+                tx: TxId::with_priority(3, b"a"),
+                admission: StageAdmission::ExistingKeys,
+            });
+            async move { coord.coordinate(operation).await }
+        });
+        for task in [waiting, background] {
+            task.await.unwrap().unwrap();
+        }
+        coord.close().await;
+
+        assert_lost_cas_time(&hints.take());
+    }
+
+    // Regression: after a lost CAS on other keys, a round counted the time of
+    // its later lost CASes on its own keys, which no split removes.
+    #[tokio::test(start_paused = true)]
+    async fn lost_cas_on_the_same_keys_after_one_in_the_other_half_is_not_split_time() {
+        let (coord, hints, _wins, _bg) = coord_losing_cas(
+            |node| {
+                let added = node
+                    .as_leaf()
+                    .unwrap()
+                    .entries()
+                    .any(|entry| entry.key == b"c");
+                with_peer_writer(node, if added { b"a" } else { b"c" })
+            },
+            2,
+        )
+        .await;
+
+        assert!(spawn_lock(&coord, b"a", 2).await.unwrap().unwrap());
+        coord.close().await;
+
+        assert_lost_cas_time(&hints.take());
     }
 
     // Regression: a round that ended without a CAS that lands reported none

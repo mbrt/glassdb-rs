@@ -76,10 +76,12 @@ Split causes of a leaf:
 
 - **Lost CAS on other keys.** A leaf CAS of a coordinator round fails, because a
   CAS for other keys landed first. The time is from when the round sent the
-  failed CAS to when it sent the CAS that lands, or to the end of the round if
-  no CAS lands. It counts the members of the round at each attempt. The round
-  measures it at each retry, so that a window has the time of a round that
-  still loses. A split can put the keys in different leaves.
+  failed CAS to when it sent the CAS that lands or that loses to a change of
+  its own keys, or to the end of the round if no CAS lands. At each leaf CAS,
+  it counts the members of the round that a transaction waits for, and not
+  write-backs, releases, or structural gates. The round measures it at each
+  retry, so that a window has the time of a round that still loses. A split
+  can put the keys in different leaves.
 - **Queue wait for other keys.** A round member waits for an earlier
   coordinator round of the same leaf, and that round has none of the keys of
   the member. A transaction counts only its longest wait, because it waits for
