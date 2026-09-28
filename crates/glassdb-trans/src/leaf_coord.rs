@@ -26,7 +26,7 @@
 //! the `Locker`, not in the engine.
 
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{AddAssign, Sub};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,6 +42,7 @@ use glassdb_storage::{
     LeafObservationCheck, LockType, Node, NodeLocks, NodeSizePolicy, NodeStore, Requirement,
     StorageError,
 };
+use hashlink::LinkedHashMap;
 
 use crate::error::TransError;
 use crate::key_state_resolver::KeyStateResolver;
@@ -572,9 +573,9 @@ impl CasFloor {
     }
 }
 
-/// The number of leaves whose last round keys stay known. Above it, a known
-/// leaf is forgotten for each new one, and the next waits on the forgotten
-/// leaf are not split causes.
+/// The number of leaves whose last round stays known. Above it, the leaf whose
+/// last round ended first is forgotten for each new one, and the next waits on
+/// the forgotten leaf are not split causes.
 const RECENT_ROUNDS_CAP: usize = 1024;
 
 /// The last round of each leaf, until the next round on the leaf starts. A
@@ -582,7 +583,8 @@ const RECENT_ROUNDS_CAP: usize = 1024;
 /// also wait after a split.
 #[derive(Default)]
 struct RecentRounds {
-    rounds: Mutex<HashMap<ObjectPath, PreviousRound>>,
+    // In the order in which the rounds ended.
+    rounds: Mutex<LinkedHashMap<ObjectPath, PreviousRound>>,
 }
 
 impl RecentRounds {
@@ -592,11 +594,8 @@ impl RecentRounds {
 
     fn put(&self, path: ObjectPath, round: PreviousRound) {
         let mut recent = self.rounds.lock().unwrap();
-        if recent.len() >= RECENT_ROUNDS_CAP
-            && !recent.contains_key(&path)
-            && let Some(forgotten) = recent.keys().next().cloned()
-        {
-            recent.remove(&forgotten);
+        if recent.len() >= RECENT_ROUNDS_CAP && !recent.contains_key(&path) {
+            recent.pop_front();
         }
         recent.insert(path, round);
     }
@@ -604,9 +603,11 @@ impl RecentRounds {
 
 /// The last round on a leaf, as the next round on the leaf sees it.
 struct PreviousRound {
-    keys: BTreeSet<Vec<u8>>,
     /// The split key of the leaf that the round loaded last.
-    median: Option<Vec<u8>>,
+    median: Vec<u8>,
+    /// Tells if all keys of the round are in the upper half of a split at
+    /// `median`.
+    upper: bool,
 }
 
 struct CoordState {
@@ -841,13 +842,8 @@ impl Round {
     /// is not a split cause.
     fn separating_key(&self, keys: &[&[u8]]) -> Option<&[u8]> {
         let previous = self.previous.as_ref()?;
-        let median = previous.median.as_deref()?;
-        median_separates(
-            median,
-            keys.iter().copied(),
-            previous.keys.iter().map(Vec::as_slice),
-        )
-        .then_some(median)
+        let upper = upper_half(&previous.median, keys.iter().copied())?;
+        (upper != previous.upper).then_some(previous.median.as_slice())
     }
 
     /// Returns the `members` that a median split puts in the other half from
@@ -869,12 +865,14 @@ impl Round {
         split_key.map(|split_key| SeparatedMembers { count, split_key })
     }
 
-    /// The last round on the leaf, for the next round on the leaf.
-    fn into_previous(self) -> (ObjectPath, PreviousRound) {
-        let previous = PreviousRound {
-            keys: self.keys,
-            median: self.median,
-        };
+    /// The last round on the leaf, for the next round on the leaf. None when
+    /// a split at the median does not put all keys of the round in one half,
+    /// because then the split separates no member of the next round from it.
+    fn into_previous(self) -> (ObjectPath, Option<PreviousRound>) {
+        let previous = self.median.and_then(|median| {
+            let upper = upper_half(&median, self.keys.iter().map(Vec::as_slice))?;
+            Some(PreviousRound { median, upper })
+        });
         (self.path, previous)
     }
 }
@@ -1450,8 +1448,9 @@ impl Worker<CasReq, TransError> for CasWorker {
             return Ok(());
         };
         let result = self.run_leaf(&submitted, batch, &mut round).await;
-        if let Some(delays) = &self.core.delays {
-            let (path, previous) = round.into_previous();
+        if let Some(delays) = &self.core.delays
+            && let (path, Some(previous)) = round.into_previous()
+        {
             delays.recent_rounds.put(path, previous);
         }
         result
@@ -3224,6 +3223,32 @@ mod tests {
             "only the member in the other half waited for a split cause"
         );
         assert_eq!(hints.split_keys(), vec![b"c".to_vec()]);
+    }
+
+    // Above the cap, a leaf with frequent rounds keeps its last round.
+    #[test]
+    fn recent_rounds_forget_the_leaf_whose_last_round_ended_first() {
+        let recent = RecentRounds::default();
+        let round = || PreviousRound {
+            median: b"m".to_vec(),
+            upper: true,
+        };
+        let paths: Vec<_> = (0..=RECENT_ROUNDS_CAP)
+            .map(|i| ObjectPath::Node {
+                collection: collection(),
+                id: NodeId::from_bytes(u128::try_from(i).unwrap().to_be_bytes()),
+            })
+            .collect();
+        for path in &paths[..RECENT_ROUNDS_CAP] {
+            recent.put(path.clone(), round());
+        }
+        let first = recent.take(&paths[0]).unwrap();
+        recent.put(paths[0].clone(), first);
+        recent.put(paths[RECENT_ROUNDS_CAP].clone(), round());
+
+        assert!(recent.take(&paths[1]).is_none());
+        assert!(recent.take(&paths[0]).is_some());
+        assert!(recent.take(&paths[RECENT_ROUNDS_CAP]).is_some());
     }
 
     // The peer loads and stores the leaf inside the lost CAS. Then the round
