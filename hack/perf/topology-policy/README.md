@@ -16,14 +16,14 @@ build them again.
 
 | Item | State |
 | --- | --- |
-| Branch `topology-policy-pluggable` | 27 commits on `main`, up to `814d47137`. Not pushed. No PR. |
-| Branch `topology-policy-experiments` | That branch and one commit with this directory. |
+| Branch `topology-policy-pluggable` | Rebuilt on a later `main` with the minimal change for review. Its earlier 27 commits, up to `814d47137`, are in this branch. |
+| Branch `topology-policy-experiments` | The 27 commits, one commit with this directory, and a merge that keeps the other branches (see below). |
 | ADR-074 | Proposed. |
 | Tests at `814d47137` | `make test` and `make test-bench` pass. |
 | Engine default | Without a policy, the size causes decide, as before ADR-074. |
 | Opt-in | `DatabaseBuilder::topology_policy(AvoidableTimePolicy::new())`. |
 
-The commits of `topology-policy-pluggable`, by subject:
+The 27 commits up to `814d47137`, by subject:
 
 - Measurement: `62179ec96` (GCS retries throttled requests), `ce4afd9cb`
   (topology counters and the perfbench `topology` scenario), `3042bef99`
@@ -38,16 +38,21 @@ The commits of `topology-policy-pluggable`, by subject:
   policy), `fa755a58a` (removes it after the rule went into the engine).
 - Documents: `c35fd6def`, `b920dbf15`, `7343df1a1`, `597b59eca`, `89552f702`.
 
-Other branches, which you must keep:
+Other branches. The last commit of this branch is a merge with the `ours`
+strategy: it has their last commits as parents and does not change the files.
+So their commits stay reachable without their branch names. To work on one
+again, make a branch at its commit, for example
+`git branch topology-policy-central f8211c8e1`.
 
-- `topology-policy-central` (worktree `/tmp/topo-central`): the same measures
-  with one rule in the engine and no policy seam. It gave the same decisions and
-  throughput. ADR-074 rejects it ("Decide in the engine, without a policy
-  seam").
+- `topology-policy-central` (`f8211c8e1`): the same measures with one rule in
+  the engine and no policy seam. It gave the same decisions and throughput.
+  ADR-074 rejects it ("Decide in the engine, without a policy seam").
 - `topology-policy-chain` (`a0954b97f`): merges over chains of linked leaves.
   Rejected ("Merge the leaves that transactions cross in a chain").
-- `topology-signals` and `experiment/delay-throttle-waits`: earlier steps, which
-  `topology-policy-pluggable` includes or replaces.
+- `experiment/delay-throttle-waits` (`9cb3c6c8f`): an earlier step, which the
+  later commits of this branch replace.
+- `topology-signals` (`3042bef99`): an earlier step, which is in the history
+  of this branch.
 
 ### The rule
 
@@ -176,7 +181,9 @@ These are in order of priority.
    brings the hi loss back.
 
 4. **ADR-074 is still proposed.** Decide if the open problems 1 and 2 block
-   it. Then open a PR for `topology-policy-pluggable`.
+   it. The rebuilt `topology-policy-pluggable` is the change to review. Its
+   policy seam is internal, and `DatabaseBuilder::leaf_changes` turns on the
+   avoidable time rule.
 
 5. **Policy tests outside the engine.** The window types are
    `#[non_exhaustive]` and have no public constructor. So a crate outside the
