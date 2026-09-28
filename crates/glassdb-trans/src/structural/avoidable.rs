@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use glassdb_data::{NodeId, ObjectPath};
@@ -22,6 +23,10 @@ const DEFAULT_CHANGE_TIME: Duration = Duration::from_millis(500);
 
 /// The weight of a new measurement in a typical time is one part in this many.
 const TYPICAL_TIME_WEIGHT: u32 = 8;
+
+/// The nanoseconds of a typical time before its first measurement. No
+/// measurement gets this value, because a measurement is clamped below it.
+const NO_TYPICAL_TIME: u64 = u64::MAX;
 
 /// Collects the avoidable time of one database instance, one window at a time.
 #[derive(Debug)]
@@ -54,9 +59,9 @@ struct PairTimes {
 }
 
 /// The moving average of the time of one operation.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct TypicalTime {
-    average: Mutex<Option<Duration>>,
+    nanos: AtomicU64,
 }
 
 /// The point reads of one transaction in one leaf.
@@ -68,20 +73,39 @@ struct LeafReads<'a> {
     keys: Vec<&'a [u8]>,
 }
 
+impl Default for TypicalTime {
+    fn default() -> Self {
+        Self {
+            nanos: AtomicU64::new(NO_TYPICAL_TIME),
+        }
+    }
+}
+
 impl TypicalTime {
     /// Returns the typical time, or none before the first measurement.
     pub(crate) fn get(&self) -> Option<Duration> {
-        *self.average.lock().unwrap()
+        match self.nanos.load(Ordering::Relaxed) {
+            NO_TYPICAL_TIME => None,
+            nanos => Some(Duration::from_nanos(nanos)),
+        }
     }
 
     /// Adds one measurement.
     pub(crate) fn record(&self, took: Duration) {
-        let mut average = self.average.lock().unwrap();
-        *average = Some(match *average {
-            None => took,
-            Some(old) if took >= old => old + (took - old) / TYPICAL_TIME_WEIGHT,
-            Some(old) => old - (old - took) / TYPICAL_TIME_WEIGHT,
-        });
+        let took = u64::try_from(took.as_nanos())
+            .unwrap_or(u64::MAX)
+            .min(NO_TYPICAL_TIME - 1);
+        let weight = u64::from(TYPICAL_TIME_WEIGHT);
+        // The update never declines, so there is no result to handle.
+        let _ = self
+            .nanos
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                Some(match old {
+                    NO_TYPICAL_TIME => took,
+                    old if took >= old => old + (took - old) / weight,
+                    old => old - (old - took) / weight,
+                })
+            });
     }
 }
 
