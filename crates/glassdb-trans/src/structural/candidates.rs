@@ -129,6 +129,13 @@ impl StructuralHintSink {
         }
     }
 
+    /// Returns a sink that no restructurer reads, for a component that a test
+    /// runs without one.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        MaintenanceCandidates::with_policy(NodeSizePolicy::default()).hint_sink()
+    }
+
     #[cfg(test)]
     pub(crate) fn pending_inline_pressure(&self) -> usize {
         self.candidates

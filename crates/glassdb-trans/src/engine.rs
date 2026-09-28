@@ -273,15 +273,17 @@ impl Engine {
         EngineTransaction(self.algo.begin(accesses, catalog_accesses))
     }
 
-    /// Replaces the logical accesses of an uncommitted transaction.
+    /// Replaces the logical accesses of an uncommitted transaction, with the
+    /// time of the body run that made them.
     pub fn reset_transaction(
         &self,
         tx: &mut EngineTransaction,
         accesses: AccessSet,
         catalog_accesses: CatalogAccesses,
+        body_time: Duration,
     ) {
         self.algo
-            .reset_with_collections(&mut tx.0, accesses, catalog_accesses);
+            .reset_with_collections(&mut tx.0, accesses, catalog_accesses, body_time);
     }
 
     /// Validates read-only accesses and reports whether the body must run again.
@@ -560,12 +562,6 @@ impl DormantEngine {
         let collection_catalog = CollectionCatalog::new(collection_state.clone());
         let key_state = KeyStateResolver::new(monitor.clone());
         let router = TreeRouter::new(nodes.clone(), transaction_leaf_parallelism);
-        let resolver = KeyResolver::new(
-            router.clone(),
-            key_state.clone(),
-            transaction_leaf_parallelism,
-        );
-        let reader = Reader::new(resolver.clone(), timeline.clone(), retry);
         let gc_hints = GcHints::new(gc_limits);
         let (coord, restructurer) = Restructurer::with_coordinator(
             background_weak.clone(),
@@ -574,7 +570,7 @@ impl DormantEngine {
             structural_intents.clone(),
             timeline.clone(),
             monitor.clone(),
-            key_state,
+            key_state.clone(),
             retry,
             db_prefix,
             node_size_policy,
@@ -582,6 +578,13 @@ impl DormantEngine {
             topology_policy,
             gc_hints.clone(),
         );
+        let resolver = KeyResolver::new(
+            router.clone(),
+            key_state,
+            transaction_leaf_parallelism,
+            restructurer.hint_sink(),
+        );
+        let reader = Reader::new(resolver.clone(), timeline.clone(), retry);
         let locker = Locker::new(
             coord.clone(),
             TreeRouter::new(nodes.clone(), transaction_leaf_parallelism),

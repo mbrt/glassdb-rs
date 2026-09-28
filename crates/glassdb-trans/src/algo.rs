@@ -50,7 +50,7 @@ mod direct_commit;
 mod handle_state;
 
 pub use direct_commit::DirectCommitStats;
-use direct_commit::{DirectCommit, DirectOutcome};
+use direct_commit::{DirectCommit, DirectOutcome, LockedCause};
 use handle_state::HandleState;
 
 /// Threshold for escalating to serial acquisition (ADR-020).
@@ -159,8 +159,9 @@ pub struct Handle {
     /// use this schedule.
     backoff: Backoff,
     retirement: IdentityRetirementGuard,
-    /// The start of the current commit pass, with the body run before it.
-    pass_started: rt::Instant,
+    /// The time of the body run that made the accesses, until a commit pass
+    /// counts it.
+    body_time: Duration,
 }
 
 impl Handle {
@@ -411,7 +412,7 @@ impl Algo {
             retirement: IdentityRetirementGuard::new(self.retirement.clone(), id),
             id,
             backoff: self.acquisition_retry.backoff(),
-            pass_started: rt::Instant::now(),
+            body_time: Duration::ZERO,
         }
     }
 
@@ -468,15 +469,18 @@ impl Algo {
         tx.accesses = accesses;
     }
 
-    /// Replaces both key and collection-management accesses before commit.
+    /// Replaces both key and collection-management accesses before commit,
+    /// with the time of the body run that made them.
     pub fn reset_with_collections(
         &self,
         tx: &mut Handle,
         accesses: AccessSet,
         catalog_accesses: CatalogAccesses,
+        body_time: Duration,
     ) {
         self.reset(tx, accesses);
         tx.collections.replace_accesses(catalog_accesses);
+        tx.body_time = body_time;
     }
 
     /// Aborts a non-committed, engaged transaction, acknowledging it when safe
@@ -493,7 +497,9 @@ impl Algo {
     /// Runs one commit pass as one owner operation of the current identity.
     async fn commit_pass(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
         let owner_operation = self.mon.begin_owner_operation(&tx.id)?;
+        let started = rt::Instant::now();
         let result = self.commit_inner(tx).await;
+        self.observe_pass(tx, &result, started.elapsed());
         let result = self.resolve_reclaimed_resources(tx, result).await;
         // Completing the guard proves that no old-identity write can land
         // after retirement. Dropping it records the opposite fact.
@@ -629,11 +635,9 @@ impl Algo {
         if !tx.accesses.has_writes() && !tx.collections.has_writes() {
             if tx.should_lock_reads() {
                 self.validate_coordination_keys(&tx.accesses)?;
-                let outcome = self.commit_locked(tx).await;
-                return self.observe_pass(tx, outcome);
+                return self.commit_locked(tx).await;
             }
-            let outcome = self.commit_readonly(tx).await;
-            return self.observe_pass(tx, outcome);
+            return self.commit_readonly(tx).await;
         }
         self.validate_coordination_keys(&tx.accesses)?;
         // Try direct commit first: a complete point transaction whose
@@ -641,64 +645,67 @@ impl Algo {
         // one leaf CAS with no transaction record (ADR-061). It writes nothing
         // unless it commits, so a non-landing direct commit is classified rather
         // than failed (ADR-053).
-        if !tx.collections.accesses().reads.is_empty()
-            || !tx.collections.accesses().changes.is_empty()
+        if tx.collections.accesses().reads.is_empty()
+            && tx.collections.accesses().changes.is_empty()
         {
-            let outcome = self.commit_locked(tx).await;
-            return self.observe_pass(tx, outcome);
-        }
-        let cause = match self
-            .direct_commit
-            .try_commit(&tx.id, &tx.accesses, &mut tx.state)
-            .await?
-        {
-            DirectOutcome::Committed => return Ok(PassOutcome::Complete),
-            // A certified direct-commit loss reevaluates the body rather than
-            // publishing a holder that would make every subsequent direct
-            // commit on the key ineligible (ADR-053). The id is unengaged —
-            // no record, no lock, no published identity — so the ordinary
-            // retry contract applies with no cleanup.
-            DirectOutcome::Replay => {
-                return self.observe_pass(tx, Err(TransError::Retry));
+            match self
+                .direct_commit
+                .try_commit(&tx.id, &tx.accesses, &mut tx.state)
+                .await?
+            {
+                DirectOutcome::Committed => return Ok(PassOutcome::Complete),
+                // A certified direct-commit loss reevaluates the body rather than
+                // publishing a holder that would make every subsequent direct
+                // commit on the key ineligible (ADR-053). The id is unengaged —
+                // no record, no lock, no published identity — so the ordinary
+                // retry contract applies with no cleanup.
+                DirectOutcome::Replay => return Err(TransError::Retry),
+                DirectOutcome::Locked(cause) => {
+                    return self.commit_locked_after_direct(tx, cause).await;
+                }
             }
-            DirectOutcome::Locked(cause) => cause,
-        };
+        }
+        self.commit_locked(tx).await
+    }
+
+    /// Commits with locks a transaction whose direct commit could not land
+    /// for `cause`, and reports the time that the locked commit adds.
+    async fn commit_locked_after_direct(
+        &self,
+        tx: &mut Handle,
+        cause: LockedCause,
+    ) -> Result<PassOutcome, TransError> {
         let started = rt::Instant::now();
         let outcome = self.commit_locked(tx).await;
         if matches!(outcome, Ok(PassOutcome::Complete)) {
             self.direct_commit
                 .observe_locked_commit(cause, started.elapsed());
         }
-        self.observe_pass(tx, outcome)
+        outcome
     }
 
-    /// Reports to the topology rule the commit pass that `outcome` ends, when
-    /// a conflict ended it without a commit.
+    /// Reports to the topology rule a commit pass that ended with `outcome`
+    /// after `took`, when a conflict ended it without a commit.
     fn observe_pass(
         &self,
         tx: &mut Handle,
-        outcome: Result<PassOutcome, TransError>,
-    ) -> Result<PassOutcome, TransError> {
+        outcome: &Result<PassOutcome, TransError>,
+        took: Duration,
+    ) {
         if !self.structural_hints.measures_avoidable_time() {
-            return outcome;
+            return;
         }
-        // Other errors can end the transaction. If it continues, the next
-        // commit pass includes the time of this one.
-        let conflict = match &outcome {
+        let body_time = std::mem::take(&mut tx.body_time);
+        let conflict = match outcome {
             Ok(PassOutcome::Complete) => false,
             // A pass renews for serial acquisition only after lock conflicts.
             Ok(PassOutcome::RenewForSerial { .. }) => true,
             Err(error) => matches!(error, TransError::Retry | TransError::Wounded),
         };
         if conflict {
-            let now = rt::Instant::now();
-            self.structural_hints.observe_conflict_pass(
-                &tx.accesses,
-                now.saturating_duration_since(tx.pass_started),
-            );
-            tx.pass_started = now;
+            self.structural_hints
+                .observe_conflict_pass(&tx.accesses, body_time + took);
         }
-        outcome
     }
 
     async fn validate_handle_reads(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
@@ -1162,7 +1169,7 @@ impl Algo {
                     self.structural_hints.scan_crossing_time(
                         previous.observation.path(),
                         coverage.observation.path(),
-                        coverage.reach_time + started.elapsed(),
+                        started.elapsed(),
                     );
                 }
                 if !unchanged || self.any_committed([coverage], barrier).await? {
@@ -1466,6 +1473,7 @@ mod tests {
                 TreeRouter::new(tctx.nodes.clone(), std::num::NonZeroUsize::MIN),
                 KeyStateResolver::new(tctx.tmon.clone()),
                 std::num::NonZeroUsize::MIN,
+                StructuralHintSink::detached(),
             ),
             tctx.timeline.clone(),
             RetryConfig::default(),
@@ -2973,6 +2981,7 @@ mod tests {
             TreeRouter::new(tctx.nodes.clone(), std::num::NonZeroUsize::MIN),
             KeyStateResolver::new(tctx.tmon.clone()),
             std::num::NonZeroUsize::MIN,
+            StructuralHintSink::detached(),
         );
         let scan = resolver
             .scan_keys(&test_collection(), &range, &[], None, None)
@@ -2998,6 +3007,7 @@ mod tests {
             TreeRouter::new(tctx.nodes.clone(), std::num::NonZeroUsize::MIN),
             KeyStateResolver::new(tctx.tmon.clone()),
             std::num::NonZeroUsize::MIN,
+            StructuralHintSink::detached(),
         );
         let result = resolver
             .scan_keys(&test_collection(), &range, &[], None, None)

@@ -324,7 +324,7 @@ fn restructurer_with_monitor_and_hints(
         candidates,
         RetryConfig::default(),
         gc_hints,
-        None,
+        TopologyPolicy::SizeCauses,
     )
 }
 

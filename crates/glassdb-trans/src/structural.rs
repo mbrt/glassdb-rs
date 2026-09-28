@@ -94,7 +94,7 @@ pub struct Restructurer {
     reconciler: ParentReconciler,
     recovery: StructuralRecovery,
     recovery_wake: Arc<Notify>,
-    rule: Option<Arc<dyn TopologyRule>>,
+    topology_policy: TopologyPolicy,
 }
 
 impl Restructurer {
@@ -116,10 +116,11 @@ impl Restructurer {
         topology: TopologyPolicy,
         gc_hints: GcHints,
     ) -> (LeafCoordinator, Self) {
-        let rule = topology.rule();
-        let candidates = match rule {
-            Some(_) => MaintenanceCandidates::for_topology_rule(policy, inline),
-            None => MaintenanceCandidates::with_policies(policy, inline),
+        let candidates = match topology {
+            TopologyPolicy::SizeCauses => MaintenanceCandidates::with_policies(policy, inline),
+            TopologyPolicy::AvoidableTime => {
+                MaintenanceCandidates::for_topology_rule(policy, inline)
+            }
         };
         let coord = LeafCoordinator::with_hinter(
             nodes.clone(),
@@ -142,7 +143,7 @@ impl Restructurer {
             candidates,
             retry,
             gc_hints,
-            rule,
+            topology,
         );
         (coord, restructurer)
     }
@@ -171,12 +172,12 @@ impl Restructurer {
                 restructurer.run_once().await;
             }
         });
-        if let Some(rule) = self.rule.clone() {
+        if let Some(mut rule) = self.topology_policy.rule() {
             let restructurer = self.clone();
             bg.spawn(async move {
                 loop {
                     rt::sleep(TOPOLOGY_WINDOW).await;
-                    restructurer.decide_leaf_changes(rule.as_ref());
+                    restructurer.decide_leaf_changes(rule.as_mut());
                 }
             });
         }
@@ -219,7 +220,7 @@ impl Restructurer {
         candidates: MaintenanceCandidates,
         retry: RetryConfig,
         gc_hints: GcHints,
-        rule: Option<Arc<dyn TopologyRule>>,
+        topology_policy: TopologyPolicy,
     ) -> Self {
         let stats = Arc::new(Stats::default());
         let router = TreeRouter::new(nodes.clone(), NonZeroUsize::MIN);
@@ -284,13 +285,13 @@ impl Restructurer {
             reconciler,
             recovery,
             recovery_wake,
-            rule,
+            topology_policy,
         }
     }
 
     /// Gives the measurements of the window that ends now to `rule`, and
     /// queues the leaf changes that it asks for.
-    fn decide_leaf_changes(&self, rule: &dyn TopologyRule) {
+    fn decide_leaf_changes(&self, rule: &mut dyn TopologyRule) {
         let Some(avoidable) = self.candidates.avoidable() else {
             return;
         };

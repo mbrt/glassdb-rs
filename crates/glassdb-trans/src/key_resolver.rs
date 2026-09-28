@@ -6,7 +6,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
-use std::time::Duration;
 
 use glassdb_concurr::{map_all_bounded, rt};
 use glassdb_data::{CollectionAddress, LogicalKey, TxId};
@@ -16,6 +15,7 @@ use crate::access::{LeafCoverage, ScanAccess, ScanEvidence, ScanMutation, ScanRa
 use crate::error::{TransError, trans_to_storage};
 use crate::key_state_resolver::{KeyStateResolver, WriterResolution};
 use crate::monitor::KeyCommitStatus;
+use crate::structural::StructuralHintSink;
 
 /// The result of a phantom-safe scan: the live keys in key order, the covered
 /// leaves' membership dependencies, and the effective page frontier.
@@ -58,19 +58,24 @@ pub(crate) struct KeyResolver {
     router: TreeRouter,
     state: KeyStateResolver,
     parallelism: NonZeroUsize,
+    structural_hints: StructuralHintSink,
 }
 
 impl KeyResolver {
     /// Creates key resolution over a tree router and loaded-state resolver.
+    /// Scans report to `structural_hints` the time to read the next leaf,
+    /// which a merge of the two leaves removes (ADR-074).
     pub(crate) fn new(
         router: TreeRouter,
         state: KeyStateResolver,
         parallelism: NonZeroUsize,
+        structural_hints: StructuralHintSink,
     ) -> Self {
         Self {
             router,
             state,
             parallelism,
+            structural_hints,
         }
     }
 
@@ -151,15 +156,11 @@ impl KeyResolver {
                 // Entries below the end of the previous live leaf belong to it:
                 // a merge target holds copies of them until the drain (ADR-073).
                 let mut floor: Option<Vec<u8>> = None;
-                let mut reach_time = Duration::ZERO;
 
                 loop {
-                    let coverage = LeafCoverage {
-                        reach_time,
-                        ..self
-                            .leaf_coverage(&loc, own_lock_holder, requirement)
-                            .await?
-                    };
+                    let coverage = self
+                        .leaf_coverage(&loc, own_lock_holder, requirement)
+                        .await?;
                     let node = loc
                         .node()
                         .ok_or_else(|| StorageError::other("existing leaf has no decoded node"))?;
@@ -237,7 +238,11 @@ impl KeyResolver {
                     else {
                         break;
                     };
-                    reach_time = started.elapsed();
+                    self.structural_hints.scan_crossing_time(
+                        loc.observation.path(),
+                        next.observation.path(),
+                        started.elapsed(),
+                    );
                     floor = node.high_key().map(<[u8]>::to_vec);
                     loc = next;
                 }
@@ -317,7 +322,6 @@ impl KeyResolver {
             membership_generation: node.map_or(0, |node| node.membership_generation()),
             pending_membership,
             observation: loc.observation.clone(),
-            reach_time: Duration::ZERO,
         })
     }
 
@@ -576,6 +580,7 @@ mod tests {
                 TreeRouter::new(nodes.clone(), std::num::NonZeroUsize::MIN),
                 state,
                 std::num::NonZeroUsize::MIN,
+                StructuralHintSink::detached(),
             ),
             mon,
             timeline,

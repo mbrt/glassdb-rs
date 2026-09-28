@@ -5,6 +5,7 @@ use crate::engine::{AssemblyFixture, EngineConfig};
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{LeafCoordinator, StructuralHinter};
 use crate::monitor::Monitor;
+use crate::structural::StructuralHintSink;
 use crate::tlocker::LockOutcome;
 use async_trait::async_trait;
 use glassdb_backend as backend;
@@ -1166,6 +1167,7 @@ async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
             TreeRouter::new(owner.nodes.clone(), NonZeroUsize::MIN),
             KeyStateResolver::new(owner.monitor.clone()),
             NonZeroUsize::MIN,
+            StructuralHintSink::detached(),
         );
         let page = resolver
             .scan_keys(&collection(), &ScanRange::all(), &[], Some(&id), None)
@@ -1508,6 +1510,7 @@ async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
         router,
         KeyStateResolver::new(owner.monitor.clone()),
         std::num::NonZeroUsize::MIN,
+        StructuralHintSink::detached(),
     );
     let page = resolver
         .scan_keys(&collection(), &ScanRange::all(), &[], Some(&id), None)

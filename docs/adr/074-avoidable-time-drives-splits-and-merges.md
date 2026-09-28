@@ -76,8 +76,8 @@ Split causes of a leaf:
   failed CAS to when it sent the CAS that lands or that loses to a change of
   its own keys, or to the end of the round if no CAS lands. At each leaf CAS,
   it counts the members of the round that a transaction waits for, and not
-  write-backs, releases, or structural gates. The round measures it at each
-  retry, so that a window has the time of a round that still loses. A split
+  write-backs, releases, or structural gates. The round reports it at each
+  leaf CAS, so that a window has the time of a round that still loses. A split
   can put the keys in different leaves.
 - **Queue wait for other keys.** A round member waits for an earlier
   coordinator round of the same leaf, and that round has none of the keys of
@@ -227,6 +227,14 @@ measures the queue wait of each round member, because only it knows the keys of
 the member and of the earlier round. The GCS adapter must retry throttled
 requests with the same retry budget as the S3 adapter. This is a separate
 change.
+
+Each time is measured where its operation runs, from one start to one end.
+The transaction loop measures the body run, and gives the time to the engine
+with the accesses of the run. The commit pass, the scan read of the next
+leaf, and the validation check of each leaf measure themselves. Only two times
+span more than one call. The queue wait starts when a member is submitted,
+and ends when a later round starts. The lost CAS time spans the retries of a
+round.
 
 ## Consequences
 

@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use glassdb_concurr::rt;
 use glassdb_data::{NodeId, ObjectPath};
 use glassdb_storage::LeafBody;
 
@@ -41,7 +40,6 @@ pub(super) enum ChangeKind {
 
 #[derive(Debug)]
 struct State {
-    window_started: rt::Instant,
     leaves: BTreeMap<ObjectPath, LeafWindow>,
     pairs: BTreeMap<(ObjectPath, ObjectPath), PairTimes>,
     changes: Vec<(ObjectPath, ChangeKind)>,
@@ -91,7 +89,6 @@ impl AvoidableTime {
     pub(super) fn new() -> Self {
         Self {
             state: Mutex::new(State {
-                window_started: rt::Instant::now(),
                 leaves: BTreeMap::new(),
                 pairs: BTreeMap::new(),
                 changes: Vec::new(),
@@ -178,9 +175,6 @@ impl AvoidableTime {
     /// Returns the measurements since the last call, and starts a new window.
     pub(super) fn take_window(&self) -> TopologyWindow {
         let mut state = self.state.lock().unwrap();
-        let now = rt::Instant::now();
-        let elapsed = now.saturating_duration_since(state.window_started);
-        state.window_started = now;
         let changes = std::mem::take(&mut state.changes);
         let changes_before = std::mem::replace(&mut state.changes_last_window, changes.clone());
         for (path, kind) in changes_before.into_iter().chain(changes) {
@@ -205,7 +199,6 @@ impl AvoidableTime {
             .collect();
         drop(state);
         TopologyWindow {
-            elapsed,
             split_time: self.split_time.get().unwrap_or(DEFAULT_CHANGE_TIME),
             merge_time: self.merge_time.get().unwrap_or(DEFAULT_CHANGE_TIME),
             leaves,

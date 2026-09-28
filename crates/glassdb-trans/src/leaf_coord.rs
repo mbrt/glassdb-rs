@@ -539,19 +539,36 @@ const CAS_FLOOR_RISE: u32 = 64;
 ///
 /// This is the lowest recent leaf CAS time, and not a quantile, because when
 /// all writes go to one throttled leaf, all recent CASes are slow.
-#[derive(Default)]
 struct CasFloor {
-    floor: Mutex<Option<Duration>>,
+    nanos: AtomicU64,
+}
+
+impl Default for CasFloor {
+    fn default() -> Self {
+        // An unbounded floor makes the first CAS time the floor.
+        Self {
+            nanos: AtomicU64::new(u64::MAX),
+        }
+    }
 }
 
 impl CasFloor {
     /// Records one leaf CAS time, and returns the part above the time of a
     /// slow CAS.
     fn excess(&self, took: Duration) -> Duration {
-        let mut floor = self.floor.lock().unwrap();
-        let current = floor.map_or(took, |floor| (floor + floor / CAS_FLOOR_RISE).min(took));
-        *floor = Some(current);
-        took.saturating_sub(current * SLOW_CAS_FACTOR)
+        let took_nanos = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
+        let next = |floor: u64| {
+            floor
+                .saturating_add(floor / u64::from(CAS_FLOOR_RISE))
+                .min(took_nanos)
+        };
+        // The update never declines, so both results hold the previous floor.
+        let (Ok(previous) | Err(previous)) =
+            self.nanos
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |floor| {
+                    Some(next(floor))
+                });
+        took.saturating_sub(Duration::from_nanos(next(previous)) * SLOW_CAS_FACTOR)
     }
 }
 
@@ -1234,7 +1251,7 @@ impl CasWorker {
         // batch's in-doubt outcome would strand it over a write it never made.
         let mut in_doubt: BTreeSet<TxId> = BTreeSet::new();
         let mut lost_cas: Option<LostCas> = None;
-        // It is reported at each retry, so that the windows of a topology
+        // It is reported at each leaf CAS, so that the windows of a topology
         // rule see a round that keeps losing before the round ends.
         let mut lost_time: Option<LostTime> = None;
         // Retain both submitted and policy-requested bounds across retries.
@@ -1288,16 +1305,11 @@ impl CasWorker {
                             split_key,
                         });
                     }
-                    // A split does not remove a loss on the same keys, so its
-                    // time is not split time.
-                    (None, Some(mut time)) if cause == LostCasCause::SameKeys => {
-                        time.report(&*self.core.hinter, path, lost.sent);
-                    }
+                    // A split does not remove a loss on the same keys, so the
+                    // time after its CAS is not split time.
+                    (None, Some(_)) if cause == LostCasCause::SameKeys => {}
                     (_, time) => lost_time = time,
                 }
-            }
-            if let Some(lost) = &mut lost_time {
-                lost.report(&*self.core.hinter, path, rt::Instant::now());
             }
             if self.core.delays.is_some() {
                 round.median = edit.entries().median_key().map(<[u8]>::to_vec);
@@ -1318,9 +1330,6 @@ impl CasWorker {
             };
             requirement = requirement.stricter(merged.requirement);
             let members = merged.members;
-            if let Some(lost) = &mut lost_time {
-                lost.members = waiting_members(&members);
-            }
             let mut plan = match self
                 .plan_mutation(path, &edit, &members, requirement, reloaded, &mut in_doubt)
                 .await
@@ -1336,6 +1345,12 @@ impl CasWorker {
 
             let loaded_observation = edit.observation().clone();
             let sent = rt::Instant::now();
+            // The lost time ends at the send of the CAS that lands, because the
+            // slow CAS time covers that CAS.
+            if let Some(lost) = &mut lost_time {
+                lost.report(&*self.core.hinter, path, sent);
+                lost.members = waiting_members(&members);
+            }
             let separated = round.members_separated_from_previous(&members);
             let persist_result = self
                 .persist(path, edit, &mut plan, requirement, separated)
@@ -1367,11 +1382,6 @@ impl CasWorker {
                 }
             };
 
-            // The lost CAS time ends when the round sends its last CAS,
-            // because the slow CAS time covers that CAS.
-            if let Some(lost) = &mut lost_time {
-                lost.report(&*self.core.hinter, path, sent);
-            }
             // The CAS landed (or nothing needed staging): publish each member's
             // outcome into its slot before returning, so the deposit
             // happens-before the dedup delivers to the caller. Recording the held

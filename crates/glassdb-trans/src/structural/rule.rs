@@ -8,7 +8,6 @@
 //! safely.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use glassdb_data::ObjectPath;
@@ -60,16 +59,14 @@ pub enum TopologyPolicy {
 /// entries, a split at a key that leaves one half empty, a merge of the root,
 /// and a merge that the merge rules of ADR-073 do not allow, except the
 /// underfull threshold.
-pub(super) trait TopologyRule: Send + Sync + 'static {
+pub(super) trait TopologyRule: Send {
     /// Returns the changes that the measurements of `window` call for.
-    fn decide(&self, window: &TopologyWindow) -> Vec<ChangeRequest>;
+    fn decide(&mut self, window: &TopologyWindow) -> Vec<ChangeRequest>;
 }
 
 /// The measurements of one database instance in one window.
 #[derive(Debug, Clone)]
 pub(super) struct TopologyWindow {
-    /// The time since the start of the window.
-    pub(super) elapsed: Duration,
     /// The typical time of one split of this database instance.
     pub(super) split_time: Duration,
     /// The typical time of one merge of this database instance.
@@ -153,15 +150,10 @@ pub(super) enum ChangeRequest {
 /// wrote does not split.
 #[derive(Debug, Default)]
 pub(super) struct AvoidableTimeRule {
-    averages: Mutex<Averages>,
-}
-
-/// The moving averages of the avoidable time rule.
-#[derive(Debug, Default)]
-struct Averages {
+    /// The moving averages of the net split-side time of each leaf.
     leaves: BTreeMap<LeafId, NetSplitTime>,
-    /// The crossing conflict time of two adjacent leaves in one window, in
-    /// seconds.
+    /// The moving averages of the crossing conflict time of two adjacent
+    /// leaves in one window, in seconds.
     crossing: BTreeMap<(LeafId, LeafId), f64>,
 }
 
@@ -180,10 +172,10 @@ struct NetSplitTime {
 
 impl TopologyPolicy {
     /// Returns the rule of this policy, or none when the size causes decide.
-    pub(super) fn rule(self) -> Option<Arc<dyn TopologyRule>> {
+    pub(super) fn rule(self) -> Option<Box<dyn TopologyRule>> {
         match self {
             TopologyPolicy::SizeCauses => None,
-            TopologyPolicy::AvoidableTime => Some(Arc::new(AvoidableTimeRule::default())),
+            TopologyPolicy::AvoidableTime => Some(Box::new(AvoidableTimeRule::default())),
         }
     }
 }
@@ -209,13 +201,13 @@ impl AvoidableTimeRule {
     /// Returns the splits of the leaves whose net split-side time pays for a
     /// split, and holds these leaves.
     fn splits(
-        &self,
+        &mut self,
         window: &TopologyWindow,
-        leaves: &mut BTreeMap<LeafId, NetSplitTime>,
         decay: f64,
         held: &mut BTreeSet<LeafId>,
     ) -> Vec<ChangeRequest> {
         let split_time = window.split_time.mul_f64(SPLIT_THRESHOLD).as_secs_f64();
+        let leaves = &mut self.leaves;
         leaves.retain(|id, net| {
             net.decay(decay);
             window.leaves.contains_key(id) || !net.is_negligible()
@@ -252,13 +244,13 @@ impl AvoidableTimeRule {
     /// Returns the merges of the adjacent leaves whose merge-side time pays
     /// for a merge, except of held leaves, and holds the merged leaves.
     fn merges(
-        &self,
+        &mut self,
         window: &TopologyWindow,
-        crossing: &mut BTreeMap<(LeafId, LeafId), f64>,
         decay: f64,
         held: &mut BTreeSet<LeafId>,
     ) -> Vec<ChangeRequest> {
         let merge_time = window.merge_time.mul_f64(MERGE_THRESHOLD);
+        let crossing = &mut self.crossing;
         let changed = |id: &LeafId| {
             window
                 .leaves
@@ -317,10 +309,9 @@ impl AvoidableTimeRule {
 }
 
 impl TopologyRule for AvoidableTimeRule {
-    fn decide(&self, window: &TopologyWindow) -> Vec<ChangeRequest> {
-        let decay = 0.5_f64.powf(window.elapsed.as_secs_f64() / HALF_LIFE.as_secs_f64());
-        let mut averages = self.averages.lock().unwrap();
-        let Averages { leaves, crossing } = &mut *averages;
+    fn decide(&mut self, window: &TopologyWindow) -> Vec<ChangeRequest> {
+        // The engine asks for a decision once in each window.
+        let decay = 0.5_f64.powf(TOPOLOGY_WINDOW.as_secs_f64() / HALF_LIFE.as_secs_f64());
         // Leaves that split recently, or that take part in a change of this
         // window, do not merge.
         let mut held: BTreeSet<LeafId> = window
@@ -329,8 +320,8 @@ impl TopologyRule for AvoidableTimeRule {
             .filter(|(_, leaf)| leaf.split_recently)
             .map(|(id, _)| id.clone())
             .collect();
-        let mut requests = self.splits(window, leaves, decay, &mut held);
-        requests.extend(self.merges(window, crossing, decay, &mut held));
+        let mut requests = self.splits(window, decay, &mut held);
+        requests.extend(self.merges(window, decay, &mut held));
         requests
     }
 }

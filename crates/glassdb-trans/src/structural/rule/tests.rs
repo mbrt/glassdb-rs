@@ -78,7 +78,6 @@ fn crossing_conflicts(left: u8, right: u8, time: Duration) -> PairWindow {
 
 fn window(leaves: Vec<(LeafId, LeafWindow)>, pairs: Vec<PairWindow>) -> TopologyWindow {
     TopologyWindow {
-        elapsed: Duration::from_secs(1),
         split_time: CHANGE_TIME,
         merge_time: CHANGE_TIME,
         leaves: leaves.into_iter().collect::<BTreeMap<_, _>>(),
@@ -90,7 +89,7 @@ fn window(leaves: Vec<(LeafId, LeafWindow)>, pairs: Vec<PairWindow>) -> Topology
 // requests. A leaf that a request asks for is gone from the later windows, as
 // after the change.
 fn decide_over(
-    rule: &AvoidableTimeRule,
+    rule: &mut AvoidableTimeRule,
     mut window: TopologyWindow,
     windows: usize,
 ) -> Vec<ChangeRequest> {
@@ -122,7 +121,7 @@ fn a_leaf_splits_when_its_split_side_time_keeps_paying_for_a_split() {
     );
 
     assert_eq!(
-        decide_over(&AvoidableTimeRule::default(), window, 200),
+        decide_over(&mut AvoidableTimeRule::default(), window, 200),
         vec![ChangeRequest::Split(leaf(1))]
     );
 }
@@ -135,18 +134,18 @@ fn a_slower_split_needs_more_split_side_time() {
     };
 
     assert_eq!(
-        decide_over(&AvoidableTimeRule::default(), window, 200),
+        decide_over(&mut AvoidableTimeRule::default(), window, 200),
         vec![]
     );
 }
 
 #[test]
 fn one_window_does_not_pay_for_a_split_that_the_load_does_not_keep_paying_for() {
-    let rule = AvoidableTimeRule::default();
+    let mut rule = AvoidableTimeRule::default();
 
     let burst = rule.decide(&window(vec![(leaf(1), delayed(split_pays() * 14))], vec![]));
     let after = decide_over(
-        &rule,
+        &mut rule,
         window(vec![(leaf(1), LeafWindow::default())], vec![]),
         30,
     );
@@ -157,7 +156,7 @@ fn one_window_does_not_pay_for_a_split_that_the_load_does_not_keep_paying_for() 
 
 #[test]
 fn a_leaf_does_not_split_again_before_its_split_lands() {
-    let rule = AvoidableTimeRule::default();
+    let mut rule = AvoidableTimeRule::default();
     let loaded = window(vec![(leaf(1), delayed(split_pays() * 2))], vec![]);
 
     let first = (0..30).find_map(|_| Some(rule.decide(&loaded)).filter(|r| !r.is_empty()));
@@ -177,12 +176,12 @@ fn divided_transactions_that_conflict_keep_a_leaf_from_splitting() {
     };
 
     let with_conflicts = decide_over(
-        &AvoidableTimeRule::default(),
+        &mut AvoidableTimeRule::default(),
         window(vec![(leaf(1), divided)], vec![]),
         200,
     );
     let without = decide_over(
-        &AvoidableTimeRule::default(),
+        &mut AvoidableTimeRule::default(),
         window(vec![(leaf(1), delayed(ms(50)))], vec![]),
         200,
     );
@@ -212,7 +211,7 @@ fn a_split_is_at_the_split_key_only_when_the_leaf_delays_pay_for_it() {
     );
 
     assert_eq!(
-        decide_over(&AvoidableTimeRule::default(), window, 200),
+        decide_over(&mut AvoidableTimeRule::default(), window, 200),
         vec![
             ChangeRequest::SplitAt(leaf(1), b"k".to_vec()),
             ChangeRequest::Split(leaf(2)),
@@ -242,7 +241,7 @@ fn two_leaves_merge_when_the_transactions_over_them_keep_conflicting() {
     let window = window(vec![], vec![crossing_conflicts(1, 2, merge_pays() * 2)]);
 
     assert_eq!(
-        decide_over(&AvoidableTimeRule::default(), window, 30),
+        decide_over(&mut AvoidableTimeRule::default(), window, 30),
         vec![ChangeRequest::Merge(leaf(1))]
     );
 }
@@ -255,14 +254,14 @@ fn the_split_side_time_of_two_leaves_keeps_them_apart() {
     );
 
     assert_eq!(
-        decide_over(&AvoidableTimeRule::default(), window, 200),
+        decide_over(&mut AvoidableTimeRule::default(), window, 200),
         vec![]
     );
 }
 
 #[test]
 fn the_crossing_conflicts_of_earlier_windows_merge_two_leaves() {
-    let rule = AvoidableTimeRule::default();
+    let mut rule = AvoidableTimeRule::default();
 
     let with_pair = rule.decide(&window(
         vec![(leaf(1), contended()), (leaf(2), contended())],

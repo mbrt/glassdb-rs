@@ -199,6 +199,7 @@ mod tests {
     use super::*;
     use crate::engine::{AssemblyFixture, EngineConfig};
     use crate::key_state_resolver::KeyStateResolver;
+    use crate::structural::StructuralHintSink;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_data::{CollectionAddress, DbPrefix, TxId};
     use glassdb_storage::transaction::{TxRecord, TxWrite};
@@ -248,6 +249,7 @@ mod tests {
                 TreeRouter::new(local.nodes.clone(), NonZeroUsize::MIN),
                 KeyStateResolver::new(local.monitor.clone()),
                 NonZeroUsize::MIN,
+                StructuralHintSink::detached(),
             );
             let reader = Reader::new(
                 resolver.clone(),
