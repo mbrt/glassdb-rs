@@ -18,9 +18,9 @@ use crate::error::TransError;
 use crate::monitor::Monitor;
 
 use super::NODE_CAS_ATTEMPTS;
-use super::avoidable::ChangeKind;
 use super::candidates::MaintenanceCandidates;
 use super::change::{Applied, ParentRoute, Prepared};
+use super::measurements::ChangeKind;
 use super::nodes::StructuralNodeAccess;
 use super::reclamation::{ReclamationReporter, reclaim_holder_free_tombstones};
 use super::recovery::ReadyChange;

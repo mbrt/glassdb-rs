@@ -563,7 +563,8 @@ impl CasFloor {
                 .saturating_add(floor / u64::from(CAS_FLOOR_RISE))
                 .min(took_nanos)
         };
-        // The update never declines, so both results hold the previous floor.
+        // The closure always returns a floor, so both results hold the
+        // previous floor.
         let (Ok(previous) | Err(previous)) =
             self.nanos
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |floor| {

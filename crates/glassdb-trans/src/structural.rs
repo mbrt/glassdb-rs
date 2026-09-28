@@ -12,9 +12,9 @@
 //! measurements of each window to its rule, and queues the leaf changes that
 //! the rule asks for (ADR-074).
 
-mod avoidable;
 mod candidates;
 mod change;
+mod measurements;
 mod merge;
 mod nodes;
 mod reclamation;
@@ -46,9 +46,9 @@ use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::LeafCoordinator;
 use crate::monitor::Monitor;
 
-use avoidable::ChangeKind;
 use candidates::{CandidateCause, MaintenanceCandidate, MaintenanceCandidates};
 use change::{ChangeLifecycle, PlannedChange, StructuralTopology};
+use measurements::ChangeKind;
 use merge::Merger;
 use nodes::StructuralNodeAccess;
 use reclamation::ReclamationReporter;
@@ -59,8 +59,8 @@ use split::Splitter;
 use stats::{LandedChanges, Stats};
 use topology::TopologyMembership;
 
-pub(crate) use avoidable::TypicalTime;
 pub use candidates::StructuralHintSink;
+pub(crate) use measurements::TypicalTime;
 pub use rule::TopologyPolicy;
 pub use stats::{InlinePressureStats, RestructurerStats};
 

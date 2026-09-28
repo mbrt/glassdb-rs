@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use glassdb::middleware::HookBackend;
 use glassdb::{
-    Backend, Collection, Database, KeyScan, NodeSizePolicy, RestructurerStats, TopologyPolicy,
+    Backend, Collection, Database, Error, KeyScan, NodeSizePolicy, RestructurerStats,
+    TopologyPolicy,
 };
 
 pub mod integration_support;
@@ -94,6 +95,45 @@ async fn scans_that_cross_leaves_merge_them() {
 
     assert!(db.stats().restructurer.merges >= 1);
     assert_eq!(scan_all(&coll).await.len(), 16);
+    db.shutdown().await;
+}
+
+// Regression: a body that returned an error replayed each time that a write
+// changed its reads in two adjacent leaves before the validation of the
+// reads. The time of these replays did not count for a merge of the leaves.
+#[tokio::test(start_paused = true)]
+async fn replays_of_failed_bodies_over_two_leaves_merge_them() {
+    let backend = slow_mem();
+    assert_eq!(split_collection(&backend, 5).await, 1);
+    let db = open(&backend, leaves_of_at_most(64)).await;
+    let coll = open_top(&db, b"split").await;
+    let writer = {
+        let coll = coll.clone();
+        tokio::spawn(async move {
+            let mut round = 0;
+            loop {
+                coll.write(&[0], &write_int(round)).await.unwrap();
+                coll.write(&[4], &write_int(round)).await.unwrap();
+                round += 1;
+            }
+        })
+    };
+
+    let c = &coll;
+    let until = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < until {
+        let result = db
+            .tx(|tx| async move {
+                tx.read(c, &[0]).await?;
+                tx.read(c, &[4]).await?;
+                Err::<(), _>(Error::NotFound)
+            })
+            .await;
+        assert!(matches!(result, Err(Error::NotFound)), "{result:?}");
+    }
+    writer.abort();
+
+    assert!(db.stats().restructurer.merges >= 1);
     db.shutdown().await;
 }
 

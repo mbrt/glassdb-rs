@@ -513,7 +513,9 @@ impl Algo {
     /// identity.
     async fn validation_pass(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
         let owner_operation = self.mon.begin_owner_operation(&tx.id)?;
+        let started = rt::Instant::now();
         let result = self.validate_handle_reads(tx).await;
+        self.observe_pass(tx, &result, started.elapsed());
         let result = self.resolve_reclaimed_resources(tx, result).await;
         // Completing the guard proves that no old-identity write can land
         // after retirement. Dropping it records the opposite fact.
@@ -684,8 +686,8 @@ impl Algo {
         outcome
     }
 
-    /// Reports to the topology rule a commit pass that ended with `outcome`
-    /// after `took`, when a conflict ended it without a commit.
+    /// Reports to the topology rule a commit or validation pass that ended with
+    /// `outcome` after `took`, when a conflict ended it without a result.
     fn observe_pass(
         &self,
         tx: &mut Handle,

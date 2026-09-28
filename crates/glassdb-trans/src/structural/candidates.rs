@@ -12,7 +12,7 @@ use tokio::sync::Notify;
 use crate::access::AccessSet;
 use crate::leaf_coord::StructuralHinter;
 
-use super::avoidable::{AvoidableTime, ChangeKind};
+use super::measurements::{ChangeKind, TopologyMeasurements};
 use super::merge::MergeReason;
 use super::rule::ChangeRequest;
 use super::split::SplitReason;
@@ -46,7 +46,7 @@ pub(super) struct MaintenanceCandidates {
     queued: Arc<Notify>,
     // Present only when a topology rule decides the leaf changes, because
     // nothing else takes its windows.
-    measurements: Option<Arc<AvoidableTime>>,
+    measurements: Option<Arc<TopologyMeasurements>>,
 }
 
 /// Lightweight producer handle for structural hints decided outside the leaf
@@ -183,12 +183,12 @@ impl MaintenanceCandidates {
     /// policies, where a topology rule decides the leaf changes that sizes do
     /// not force.
     pub(super) fn for_topology_rule(policy: NodeSizePolicy, inline: InlinePolicy) -> Self {
-        Self::new(policy, inline, Some(Arc::new(AvoidableTime::new())))
+        Self::new(policy, inline, Some(Arc::new(TopologyMeasurements::new())))
     }
 
     /// The measurements that the producers of the feed report, when a
     /// topology rule decides the leaf changes.
-    pub(super) fn measurements(&self) -> Option<&AvoidableTime> {
+    pub(super) fn measurements(&self) -> Option<&TopologyMeasurements> {
         self.measurements.as_deref()
     }
 
@@ -320,7 +320,7 @@ impl MaintenanceCandidates {
     fn new(
         policy: NodeSizePolicy,
         inline: InlinePolicy,
-        measurements: Option<Arc<AvoidableTime>>,
+        measurements: Option<Arc<TopologyMeasurements>>,
     ) -> Self {
         MaintenanceCandidates {
             policy,

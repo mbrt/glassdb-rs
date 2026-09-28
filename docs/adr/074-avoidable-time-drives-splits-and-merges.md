@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed.
+Accepted — implemented.
 
 Refines [ADR-073](073-merge-nodes-into-right-sibling.md)'s maintenance policy.
 With the avoidable time policy, leaves get demand causes for splits and merges,
@@ -145,7 +145,9 @@ both halves (the divided conflict time). For each pair of adjacent leaves, it
 has the time of the commit passes that a conflict ended, and whose keys are in
 the two leaves only (the crossing conflict time). The time of a commit pass
 includes the body run before it. A transaction that starves seldom commits, so
-only the time of its commit passes shows it in each window.
+only the time of its commit passes shows it in each window. When a body returns
+an error, the engine validates its reads before the error escapes. A conflict
+that ends this validation pass also counts, like a commit pass.
 
 The engine checks each change again against current state. It skips a split
 of a leaf with less than two entries, a split at a key that leaves one half
@@ -230,9 +232,9 @@ change.
 
 Each time is measured where its operation runs, from one start to one end.
 The transaction loop measures the body run, and gives the time to the engine
-with the accesses of the run. The commit pass, the scan read of the next
-leaf, and the validation check of each leaf measure themselves. Only two times
-span more than one call. The queue wait starts when a member is submitted,
+with the accesses of the run. The commit or validation pass, the scan read of
+the next leaf, and the validation check of each leaf measure themselves. Only
+two times span more than one call. The queue wait starts when a member is submitted,
 and ends when a later round starts. The lost CAS time spans the retries of a
 round.
 

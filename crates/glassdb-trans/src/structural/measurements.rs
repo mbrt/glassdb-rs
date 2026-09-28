@@ -1,4 +1,5 @@
-//! The avoidable time of the leaves of one database instance (ADR-074).
+//! The measurements of the leaves of one database instance, for its topology
+//! rule (ADR-074).
 //!
 //! Transactions report the time that one split of a leaf, or one merge of two
 //! adjacent leaves, would remove. The restructurer takes these reports one
@@ -28,9 +29,9 @@ const TYPICAL_TIME_WEIGHT: u32 = 8;
 /// measurement gets this value, because a measurement is clamped below it.
 const NO_TYPICAL_TIME: u64 = u64::MAX;
 
-/// Collects the avoidable time of one database instance, one window at a time.
+/// Collects the measurements of one database instance, one window at a time.
 #[derive(Debug)]
-pub(super) struct AvoidableTime {
+pub(super) struct TopologyMeasurements {
     state: Mutex<State>,
     split_time: TypicalTime,
     merge_time: TypicalTime,
@@ -96,7 +97,7 @@ impl TypicalTime {
             .unwrap_or(u64::MAX)
             .min(NO_TYPICAL_TIME - 1);
         let weight = u64::from(TYPICAL_TIME_WEIGHT);
-        // The update never declines, so there is no result to handle.
+        // The closure always returns a value, so the update cannot fail.
         let _ = self
             .nanos
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
@@ -109,7 +110,7 @@ impl TypicalTime {
     }
 }
 
-impl AvoidableTime {
+impl TopologyMeasurements {
     pub(super) fn new() -> Self {
         Self {
             state: Mutex::new(State {
@@ -298,7 +299,7 @@ mod tests {
 
     use glassdb_data::{CollectionAddress, NodeId, ObjectPath};
 
-    use super::{AvoidableTime, ChangeKind, TypicalTime};
+    use super::{ChangeKind, TopologyMeasurements, TypicalTime};
     use crate::structural::rule::LeafId;
 
     fn node(byte: u8) -> ObjectPath {
@@ -314,17 +315,17 @@ mod tests {
 
     #[test]
     fn a_change_drops_the_earlier_time_of_its_leaves_and_holds_them_for_two_windows() {
-        let avoidable = AvoidableTime::new();
-        avoidable.add_leaf_delay(&node(1), ms(900), b"a");
-        avoidable.add_leaf_delay(&node(3), ms(700), b"c");
-        avoidable.add_merge_time(&node(1), &node(2), ms(800));
-        avoidable.add_merge_time(&node(3), &node(4), ms(600));
-        avoidable.record_changed(node(1), ChangeKind::Split);
-        avoidable.add_leaf_delay(&node(1), ms(100), b"a");
+        let measurements = TopologyMeasurements::new();
+        measurements.add_leaf_delay(&node(1), ms(900), b"a");
+        measurements.add_leaf_delay(&node(3), ms(700), b"c");
+        measurements.add_merge_time(&node(1), &node(2), ms(800));
+        measurements.add_merge_time(&node(3), &node(4), ms(600));
+        measurements.record_changed(node(1), ChangeKind::Split);
+        measurements.add_leaf_delay(&node(1), ms(100), b"a");
 
-        let first = avoidable.take_window();
-        let second = avoidable.take_window();
-        let third = avoidable.take_window();
+        let first = measurements.take_window();
+        let second = measurements.take_window();
+        let third = measurements.take_window();
 
         let changed = &first.leaves[&LeafId::new(node(1))];
         assert_eq!(changed.delay_time, ms(100));
@@ -339,15 +340,15 @@ mod tests {
 
     #[test]
     fn a_window_keeps_the_last_split_key_of_each_leaf_since_its_last_change() {
-        let avoidable = AvoidableTime::new();
-        avoidable.add_leaf_delay(&node(1), ms(100), b"a");
-        avoidable.add_leaf_delay(&node(1), ms(100), b"b");
-        avoidable.add_inline_pressure(&node(1), ms(100));
-        avoidable.add_leaf_delay(&node(2), ms(100), b"c");
-        avoidable.record_changed(node(2), ChangeKind::Split);
-        avoidable.add_inline_pressure(&node(2), ms(100));
+        let measurements = TopologyMeasurements::new();
+        measurements.add_leaf_delay(&node(1), ms(100), b"a");
+        measurements.add_leaf_delay(&node(1), ms(100), b"b");
+        measurements.add_inline_pressure(&node(1), ms(100));
+        measurements.add_leaf_delay(&node(2), ms(100), b"c");
+        measurements.record_changed(node(2), ChangeKind::Split);
+        measurements.add_inline_pressure(&node(2), ms(100));
 
-        let window = avoidable.take_window();
+        let window = measurements.take_window();
 
         let split_key = |byte| window.leaves[&LeafId::new(node(byte))].split_key.clone();
         assert_eq!(split_key(1), Some(b"b".to_vec()));

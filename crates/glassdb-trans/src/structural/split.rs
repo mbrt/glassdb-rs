@@ -55,9 +55,9 @@ use glassdb_storage::{
 
 use crate::error::TransError;
 
-use super::avoidable::ChangeKind;
 use super::candidates::{CandidateCause, MaintenanceCandidate, MaintenanceCandidates};
 use super::change::{Applied, ParentRoute, Prepared};
+use super::measurements::ChangeKind;
 use super::reclamation::{ReclamationReporter, reclaim_holder_free_tombstones};
 use super::recovery::{PreparedIntent, ReadyChange};
 use super::stats::Stats;
