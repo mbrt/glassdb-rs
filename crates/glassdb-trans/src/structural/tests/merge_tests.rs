@@ -103,7 +103,7 @@ async fn merge_l0(sp: &Restructurer) -> Result<(), TransError> {
     sp.process_candidate(&MaintenanceCandidate {
         path: node_path("L0"),
         priority: TxId::new_at(rt::system_now()),
-        cause: CandidateCause::Underfull,
+        cause: CandidateCause::Merge(MergeReason::Underfull),
     })
     .await
 }

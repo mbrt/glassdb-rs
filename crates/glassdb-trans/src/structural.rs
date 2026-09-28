@@ -7,8 +7,12 @@
 //! against cached state. Both kinds of change then run through one lifecycle:
 //! a structural intent written ahead of the change, a one-node structural
 //! gate, and parent reconciliation after the change. An independent loop
-//! completes the changes that a crash or an error interrupted.
+//! completes the changes that a crash or an error interrupted. When a
+//! [`TopologyPolicy`] other than the default is set, a third loop gives the
+//! measurements of each window to its rule, and queues the leaf changes that
+//! the rule asks for (ADR-074).
 
+mod avoidable;
 mod candidates;
 mod change;
 mod merge;
@@ -16,6 +20,7 @@ mod nodes;
 mod reclamation;
 mod reconcile;
 mod recovery;
+mod rule;
 mod split;
 mod stats;
 mod topology;
@@ -41,6 +46,7 @@ use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::LeafCoordinator;
 use crate::monitor::Monitor;
 
+use avoidable::ChangeKind;
 use candidates::{CandidateCause, MaintenanceCandidate, MaintenanceCandidates};
 use change::{ChangeLifecycle, PlannedChange, StructuralTopology};
 use merge::Merger;
@@ -48,11 +54,14 @@ use nodes::StructuralNodeAccess;
 use reclamation::ReclamationReporter;
 use reconcile::ParentReconciler;
 use recovery::{RecoveryAction, RecoveryStep, StructuralRecovery};
+use rule::{TOPOLOGY_WINDOW, TopologyRule};
 use split::Splitter;
-use stats::Stats;
+use stats::{LandedChanges, Stats};
 use topology::TopologyMembership;
 
+pub(crate) use avoidable::TypicalTime;
 pub use candidates::StructuralHintSink;
+pub use rule::TopologyPolicy;
 pub use stats::{InlinePressureStats, RestructurerStats};
 
 /// Back off empty structural-intent listings independently of candidates.
@@ -85,6 +94,7 @@ pub struct Restructurer {
     reconciler: ParentReconciler,
     recovery: StructuralRecovery,
     recovery_wake: Arc<Notify>,
+    rule: Option<Arc<dyn TopologyRule>>,
 }
 
 impl Restructurer {
@@ -103,9 +113,14 @@ impl Restructurer {
         db_prefix: DbPrefix,
         policy: NodeSizePolicy,
         inline: InlinePolicy,
+        topology: TopologyPolicy,
         gc_hints: GcHints,
     ) -> (LeafCoordinator, Self) {
-        let candidates = MaintenanceCandidates::with_policies(policy, inline);
+        let rule = topology.rule();
+        let candidates = match rule {
+            Some(_) => MaintenanceCandidates::for_topology_rule(policy, inline),
+            None => MaintenanceCandidates::with_policies(policy, inline),
+        };
         let coord = LeafCoordinator::with_hinter(
             nodes.clone(),
             key_state.clone(),
@@ -127,6 +142,7 @@ impl Restructurer {
             candidates,
             retry,
             gc_hints,
+            rule,
         );
         (coord, restructurer)
     }
@@ -142,7 +158,8 @@ impl Restructurer {
         self.stats.take()
     }
 
-    /// Starts independent candidate and structural-recovery loops.
+    /// Starts independent candidate, structural-recovery, and topology rule
+    /// loops.
     pub fn start(&self) {
         let Some(bg) = self.bg.upgrade() else {
             return;
@@ -154,6 +171,15 @@ impl Restructurer {
                 restructurer.run_once().await;
             }
         });
+        if let Some(rule) = self.rule.clone() {
+            let restructurer = self.clone();
+            bg.spawn(async move {
+                loop {
+                    rt::sleep(TOPOLOGY_WINDOW).await;
+                    restructurer.decide_leaf_changes(rule.as_ref());
+                }
+            });
+        }
         let recovery = self.clone();
         bg.spawn(async move {
             let minimum = recovery.mon.protocol_timing().pending_timeout();
@@ -193,6 +219,7 @@ impl Restructurer {
         candidates: MaintenanceCandidates,
         retry: RetryConfig,
         gc_hints: GcHints,
+        rule: Option<Arc<dyn TopologyRule>>,
     ) -> Self {
         let stats = Arc::new(Stats::default());
         let router = TreeRouter::new(nodes.clone(), NonZeroUsize::MIN);
@@ -231,8 +258,7 @@ impl Restructurer {
             router,
             timeline,
             mon.clone(),
-            *candidates.policy(),
-            *candidates.inline(),
+            candidates.clone(),
             stats.clone(),
             reclamation.clone(),
         );
@@ -258,6 +284,18 @@ impl Restructurer {
             reconciler,
             recovery,
             recovery_wake,
+            rule,
+        }
+    }
+
+    /// Gives the measurements of the window that ends now to `rule`, and
+    /// queues the leaf changes that it asks for.
+    fn decide_leaf_changes(&self, rule: &dyn TopologyRule) {
+        let Some(avoidable) = self.candidates.avoidable() else {
+            return;
+        };
+        for request in rule.decide(&avoidable.take_window()) {
+            self.candidates.push_request(request);
         }
     }
 
@@ -274,7 +312,13 @@ impl Restructurer {
                     .inline_pressure_candidates
                     .fetch_add(1, Ordering::Relaxed);
             }
-            if let Err(e) = self.process_candidate(&candidate).await {
+            let landed = stats.landed();
+            let started = rt::Instant::now();
+            let result = self.process_candidate(&candidate).await;
+            if result.is_ok() {
+                self.record_change_time(&candidate.cause, landed, started.elapsed());
+            }
+            if let Err(e) = result {
                 tracing::debug!(
                     target: "glassdb::restructurer",
                     path = %candidate.path,
@@ -331,7 +375,7 @@ impl Restructurer {
                     .run(change, id, StructuralTopology::Owned)
                     .await
             }
-            CandidateCause::Underfull => {
+            CandidateCause::Merge(reason) => {
                 let ObjectPath::Node {
                     collection,
                     id: source,
@@ -339,14 +383,40 @@ impl Restructurer {
                 else {
                     return Ok(());
                 };
-                if !self.merger.is_actionable(collection, source).await? {
+                if !self
+                    .merger
+                    .is_actionable(collection, source, *reason)
+                    .await?
+                {
                     return Ok(());
                 }
-                let change = PlannedChange::Merge { collection, source };
+                let change = PlannedChange::Merge {
+                    collection,
+                    source,
+                    reason: *reason,
+                };
                 self.changes
                     .run(change, id, StructuralTopology::Owned)
                     .await
             }
+        }
+    }
+
+    /// Records `took` as the time of the change that a candidate with `cause`
+    /// asked for, when a change of that kind landed since `before`. The
+    /// recovery loop can also land a change of that kind in this time, but
+    /// rarely.
+    fn record_change_time(&self, cause: &CandidateCause, before: LandedChanges, took: Duration) {
+        let Some(avoidable) = self.candidates.avoidable() else {
+            return;
+        };
+        let after = self.stats.landed();
+        let (kind, landed) = match cause {
+            CandidateCause::Split(_) => (ChangeKind::Split, after.splits > before.splits),
+            CandidateCause::Merge(_) => (ChangeKind::Merge, after.merges > before.merges),
+        };
+        if landed {
+            avoidable.record_change(kind, took);
         }
     }
 

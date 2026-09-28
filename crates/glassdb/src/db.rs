@@ -12,7 +12,7 @@ use glassdb_data::{DatabaseId, DbPrefix};
 use glassdb_storage::{InlinePolicy, NodeSizePolicy, PersistentCacheConfig, PersistentCacheMedia};
 use glassdb_trans::{
     AccessSet, BodyDecision, CatalogAccesses, Engine, EngineConfig, EngineTransaction, GcLimits,
-    ProtocolTiming, TransError,
+    ProtocolTiming, TopologyPolicy, TransError,
 };
 use tokio::sync::Notify;
 
@@ -122,6 +122,14 @@ impl DatabaseBuilder {
     /// (ADR-056).
     pub fn inline_policy(mut self, policy: InlinePolicy) -> Self {
         self.engine_config.set_inline_policy(policy);
+        self
+    }
+
+    /// Sets the policy that decides when leaves split and merge. The policy is
+    /// local to each database instance, and database instances with different
+    /// policies can share one database.
+    pub fn topology_policy(mut self, policy: TopologyPolicy) -> Self {
+        self.engine_config.set_topology_policy(policy);
         self
     }
 

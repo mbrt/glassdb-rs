@@ -36,5 +36,5 @@ pub use key_resolver::ScanResult;
 pub use leaf_coord::LeafCoordinatorStats;
 pub use monitor::{MonitorStats, ProtocolTiming};
 pub use reader::{ReadOutcome, ReadValue};
-pub use structural::{InlinePressureStats, RestructurerStats};
+pub use structural::{InlinePressureStats, RestructurerStats, TopologyPolicy};
 pub use tlocker::LockerStats;

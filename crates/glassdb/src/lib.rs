@@ -69,7 +69,7 @@ pub use glassdb_storage::{
 };
 pub use glassdb_trans::{
     DirectCommitStats, GcLimits, InlinePressureStats, LeafCoordinatorStats, LockerStats,
-    MonitorStats, ProtocolTiming, RestructurerStats,
+    MonitorStats, ProtocolTiming, RestructurerStats, TopologyPolicy,
 };
 
 // Re-export the backend abstraction so callers can construct a Database without

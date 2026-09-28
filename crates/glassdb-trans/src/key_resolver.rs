@@ -6,8 +6,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
+use std::time::Duration;
 
-use glassdb_concurr::map_all_bounded;
+use glassdb_concurr::{map_all_bounded, rt};
 use glassdb_data::{CollectionAddress, LogicalKey, TxId};
 use glassdb_storage::{LeafEntry, Requirement, RoutedLeaf, StorageError, TreeRouter};
 
@@ -150,11 +151,15 @@ impl KeyResolver {
                 // Entries below the end of the previous live leaf belong to it:
                 // a merge target holds copies of them until the drain (ADR-073).
                 let mut floor: Option<Vec<u8>> = None;
+                let mut reach_time = Duration::ZERO;
 
                 loop {
-                    let coverage = self
-                        .leaf_coverage(&loc, own_lock_holder, requirement)
-                        .await?;
+                    let coverage = LeafCoverage {
+                        reach_time,
+                        ..self
+                            .leaf_coverage(&loc, own_lock_holder, requirement)
+                            .await?
+                    };
                     let node = loc
                         .node()
                         .ok_or_else(|| StorageError::other("existing leaf has no decoded node"))?;
@@ -223,6 +228,7 @@ impl KeyResolver {
                     if target.is_some_and(|target| node.covers(target)) {
                         break;
                     }
+                    let started = rt::Instant::now();
                     let Some(next) = self
                         .router
                         .next_leaf(collection, &loc, requirement)
@@ -231,6 +237,7 @@ impl KeyResolver {
                     else {
                         break;
                     };
+                    reach_time = started.elapsed();
                     floor = node.high_key().map(<[u8]>::to_vec);
                     loc = next;
                 }
@@ -310,6 +317,7 @@ impl KeyResolver {
             membership_generation: node.map_or(0, |node| node.membership_generation()),
             pending_membership,
             observation: loc.observation.clone(),
+            reach_time: Duration::ZERO,
         })
     }
 

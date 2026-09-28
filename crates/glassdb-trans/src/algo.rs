@@ -159,6 +159,8 @@ pub struct Handle {
     /// use this schedule.
     backoff: Backoff,
     retirement: IdentityRetirementGuard,
+    /// The start of the current commit pass, with the body run before it.
+    pass_started: rt::Instant,
 }
 
 impl Handle {
@@ -321,6 +323,7 @@ pub struct Algo {
     resolver: KeyResolver,
     locker: Locker,
     direct_commit: DirectCommit,
+    structural_hints: StructuralHintSink,
     mon: Monitor,
     gc_hints: GcHints,
     timeline: Timeline,
@@ -363,7 +366,7 @@ impl Algo {
             router,
             coord,
             inline_policy,
-            structural_hints,
+            structural_hints.clone(),
             gc_hints.clone(),
         );
         let retirement = Arc::new(IdentityRetirement {
@@ -376,6 +379,7 @@ impl Algo {
             resolver,
             locker,
             direct_commit,
+            structural_hints,
             mon,
             gc_hints,
             timeline,
@@ -407,6 +411,7 @@ impl Algo {
             retirement: IdentityRetirementGuard::new(self.retirement.clone(), id),
             id,
             backoff: self.acquisition_retry.backoff(),
+            pass_started: rt::Instant::now(),
         }
     }
 
@@ -624,9 +629,11 @@ impl Algo {
         if !tx.accesses.has_writes() && !tx.collections.has_writes() {
             if tx.should_lock_reads() {
                 self.validate_coordination_keys(&tx.accesses)?;
-                return self.commit_locked(tx).await;
+                let outcome = self.commit_locked(tx).await;
+                return self.observe_pass(tx, outcome);
             }
-            return self.commit_readonly(tx).await;
+            let outcome = self.commit_readonly(tx).await;
+            return self.observe_pass(tx, outcome);
         }
         self.validate_coordination_keys(&tx.accesses)?;
         // Try direct commit first: a complete point transaction whose
@@ -634,25 +641,64 @@ impl Algo {
         // one leaf CAS with no transaction record (ADR-061). It writes nothing
         // unless it commits, so a non-landing direct commit is classified rather
         // than failed (ADR-053).
-        if tx.collections.accesses().reads.is_empty()
-            && tx.collections.accesses().changes.is_empty()
+        if !tx.collections.accesses().reads.is_empty()
+            || !tx.collections.accesses().changes.is_empty()
         {
-            match self
-                .direct_commit
-                .try_commit(&tx.id, &tx.accesses, &mut tx.state)
-                .await?
-            {
-                DirectOutcome::Committed => return Ok(PassOutcome::Complete),
-                // A certified direct-commit loss reevaluates the body rather than
-                // publishing a holder that would make every subsequent direct
-                // commit on the key ineligible (ADR-053). The id is unengaged —
-                // no record, no lock, no published identity — so the ordinary
-                // retry contract applies with no cleanup.
-                DirectOutcome::Replay => return Err(TransError::Retry),
-                DirectOutcome::Locked => {}
-            }
+            let outcome = self.commit_locked(tx).await;
+            return self.observe_pass(tx, outcome);
         }
-        self.commit_locked(tx).await
+        let cause = match self
+            .direct_commit
+            .try_commit(&tx.id, &tx.accesses, &mut tx.state)
+            .await?
+        {
+            DirectOutcome::Committed => return Ok(PassOutcome::Complete),
+            // A certified direct-commit loss reevaluates the body rather than
+            // publishing a holder that would make every subsequent direct
+            // commit on the key ineligible (ADR-053). The id is unengaged —
+            // no record, no lock, no published identity — so the ordinary
+            // retry contract applies with no cleanup.
+            DirectOutcome::Replay => {
+                return self.observe_pass(tx, Err(TransError::Retry));
+            }
+            DirectOutcome::Locked(cause) => cause,
+        };
+        let started = rt::Instant::now();
+        let outcome = self.commit_locked(tx).await;
+        if matches!(outcome, Ok(PassOutcome::Complete)) {
+            self.direct_commit
+                .observe_locked_commit(cause, started.elapsed());
+        }
+        self.observe_pass(tx, outcome)
+    }
+
+    /// Reports to the topology rule the commit pass that `outcome` ends, when
+    /// a conflict ended it without a commit.
+    fn observe_pass(
+        &self,
+        tx: &mut Handle,
+        outcome: Result<PassOutcome, TransError>,
+    ) -> Result<PassOutcome, TransError> {
+        if !self.structural_hints.measures_avoidable_time() {
+            return outcome;
+        }
+        // Other errors can end the transaction. If it continues, the next
+        // commit pass includes the time of this one.
+        let conflict = match &outcome {
+            Ok(PassOutcome::Complete) => false,
+            // A pass renews for serial acquisition only after lock conflicts.
+            Ok(PassOutcome::RenewForSerial { .. }) => true,
+            Err(error) => matches!(error, TransError::Retry | TransError::Wounded),
+        };
+        if conflict {
+            let now = rt::Instant::now();
+            self.structural_hints.observe_conflict_pass(
+                &tx.accesses,
+                now.saturating_duration_since(tx.pass_started),
+            );
+            tx.pass_started = now;
+        }
+        outcome
     }
 
     async fn validate_handle_reads(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
@@ -1095,26 +1141,34 @@ impl Algo {
         barrier: CurrentnessBarrier,
         lock_validation: Option<&LockedTx>,
     ) -> Result<bool, TransError> {
-        for coverage in accesses
-            .range_scans()
-            .iter()
-            .flat_map(|scan| scan.covered())
-        {
-            let unchanged = match lock_validation {
-                Some(locked) => locked.certifies_membership(
-                    &coverage.observation,
-                    coverage.membership_generation,
-                    barrier,
-                ),
-                None => matches!(
-                    self.nodes
-                        .check_leaf_current(&coverage.observation, Requirement::after(barrier))
-                        .await?,
-                    LeafObservationCheck::Current
-                ),
-            };
-            if !unchanged || self.any_committed([coverage], barrier).await? {
-                return Ok(false);
+        for scan in accesses.range_scans() {
+            let mut previous: Option<&LeafCoverage> = None;
+            for coverage in scan.covered() {
+                let started = rt::Instant::now();
+                let unchanged = match lock_validation {
+                    Some(locked) => locked.certifies_membership(
+                        &coverage.observation,
+                        coverage.membership_generation,
+                        barrier,
+                    ),
+                    None => matches!(
+                        self.nodes
+                            .check_leaf_current(&coverage.observation, Requirement::after(barrier))
+                            .await?,
+                        LeafObservationCheck::Current
+                    ),
+                };
+                if let Some(previous) = previous {
+                    self.structural_hints.scan_crossing_time(
+                        previous.observation.path(),
+                        coverage.observation.path(),
+                        coverage.reach_time + started.elapsed(),
+                    );
+                }
+                if !unchanged || self.any_committed([coverage], barrier).await? {
+                    return Ok(false);
+                }
+                previous = Some(coverage);
             }
         }
         Ok(true)

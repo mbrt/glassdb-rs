@@ -29,7 +29,7 @@ use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{LeafCoordinator, LeafCoordinatorStats};
 use crate::monitor::{Monitor, MonitorStats, ProtocolTiming};
 use crate::reader::{ReadOutcome, Reader};
-use crate::structural::{Restructurer, RestructurerStats};
+use crate::structural::{Restructurer, RestructurerStats, TopologyPolicy};
 use crate::tlocker::{Locker, LockerStats};
 
 /// Balances backend traffic and memory use for a default production database instance.
@@ -51,6 +51,7 @@ pub struct EngineConfig {
     retry: RetryConfig,
     node_size_policy: NodeSizePolicy,
     inline_policy: InlinePolicy,
+    topology_policy: TopologyPolicy,
     protocol_timing: ProtocolTiming,
     transaction_leaf_parallelism: NonZeroUsize,
     collection_reservation_limit: usize,
@@ -93,6 +94,11 @@ impl EngineConfig {
         self.inline_policy = policy;
     }
 
+    /// Sets the policy that decides when leaves split and merge.
+    pub fn set_topology_policy(&mut self, policy: TopologyPolicy) {
+        self.topology_policy = policy;
+    }
+
     /// Sets transaction-liveness timing.
     pub fn set_protocol_timing(&mut self, timing: ProtocolTiming) {
         self.protocol_timing = timing;
@@ -127,6 +133,7 @@ impl Default for EngineConfig {
             retry: RetryConfig::default(),
             node_size_policy: NodeSizePolicy::default(),
             inline_policy: InlinePolicy::default(),
+            topology_policy: TopologyPolicy::default(),
             protocol_timing: ProtocolTiming::default(),
             transaction_leaf_parallelism: DEFAULT_TRANSACTION_LEAF_PARALLELISM,
             collection_reservation_limit: DEFAULT_COLLECTION_RESERVATION_LIMIT,
@@ -524,6 +531,7 @@ impl DormantEngine {
             retry,
             node_size_policy,
             inline_policy,
+            topology_policy,
             transaction_leaf_parallelism,
             collection_reservation_limit,
             gc_parallelism,
@@ -571,6 +579,7 @@ impl DormantEngine {
             db_prefix,
             node_size_policy,
             inline_policy,
+            topology_policy,
             gc_hints.clone(),
         );
         let locker = Locker::new(
