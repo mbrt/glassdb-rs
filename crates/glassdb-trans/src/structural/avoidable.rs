@@ -76,14 +76,6 @@ pub(super) enum ChangeKind {
     Merge,
 }
 
-/// The commit that a transaction used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CommitKind {
-    Direct,
-    Locked,
-    ReadOnly,
-}
-
 #[derive(Debug)]
 struct State {
     window_started: rt::Instant,
@@ -98,7 +90,6 @@ struct State {
 #[derive(Debug, Default)]
 struct PairTimes {
     avoidable: MergeTime,
-    crossing_time: Duration,
     crossing_conflict_time: Duration,
 }
 
@@ -272,29 +263,11 @@ impl AvoidableTime {
         }
     }
 
-    /// Records a transaction that committed with `kind`, `latency` after its
-    /// start, in each leaf of the point reads of `accesses`.
-    pub(super) fn add_commit(&self, accesses: &AccessSet, kind: CommitKind, latency: Duration) {
-        if !self.windows {
-            return;
-        }
-        let reads = LeafReads::of(accesses);
-        let mut state = self.state.lock().unwrap();
-        for (path, read) in reads {
-            let leaf = state.leaf(path);
-            leaf.committed.add(kind);
-            leaf.latency += latency;
-            if read.divided() {
-                leaf.divided.add(kind);
-            }
-        }
-    }
-
-    /// Records one commit pass of a transaction with `accesses` that took
-    /// `time`, and whether it committed, in each leaf that a split would
-    /// divide its point reads in, and in the two adjacent leaves of its point
-    /// reads if it has point reads in no other leaf.
-    pub(super) fn add_pass(&self, accesses: &AccessSet, time: Duration, committed: bool) {
+    /// Records one commit pass of a transaction with `accesses` that a
+    /// conflict ended after `time`, in each leaf that a split would divide its
+    /// point reads in, and in the two adjacent leaves of its point reads if it
+    /// has point reads in no other leaf.
+    pub(super) fn add_conflict_pass(&self, accesses: &AccessSet, time: Duration) {
         if !self.windows {
             return;
         }
@@ -303,32 +276,12 @@ impl AvoidableTime {
         let mut state = self.state.lock().unwrap();
         for (path, read) in reads {
             if read.divided() {
-                let leaf = state.leaf(path);
-                leaf.divided_time += time;
-                if !committed {
-                    leaf.divided_conflict_time += time;
-                }
+                state.leaf(path).divided_conflict_time += time;
             }
         }
         if let Some(pair) = pair {
-            let pair = state.pairs.entry(pair).or_default();
-            pair.crossing_time += time;
-            if !committed {
-                pair.crossing_conflict_time += time;
-            }
+            state.pairs.entry(pair).or_default().crossing_conflict_time += time;
         }
-    }
-
-    /// Records a coordinator round of the leaf at `path` whose leaf CAS
-    /// landed with `members`.
-    pub(super) fn add_round(&self, path: &ObjectPath, members: usize) {
-        if !self.windows {
-            return;
-        }
-        let mut state = self.state.lock().unwrap();
-        let leaf = state.leaf(path);
-        leaf.rounds += 1;
-        leaf.round_members += u64::try_from(members).unwrap_or(u64::MAX);
     }
 
     /// Records the last known size of the leaf at `path`.
@@ -387,7 +340,6 @@ impl AvoidableTime {
                 left: LeafId::new(left),
                 right: LeafId::new(right),
                 avoidable: times.avoidable,
-                crossing_time: times.crossing_time,
                 crossing_conflict_time: times.crossing_conflict_time,
             })
             .collect();

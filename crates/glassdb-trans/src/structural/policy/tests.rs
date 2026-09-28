@@ -69,7 +69,6 @@ fn pair(left: u8, right: u8) -> PairWindow {
         left: leaf(left),
         right: leaf(right),
         avoidable: MergeTime::default(),
-        crossing_time: Duration::ZERO,
         crossing_conflict_time: Duration::ZERO,
     }
 }
@@ -86,7 +85,6 @@ fn scan_crossing(left: u8, right: u8, millis: u64) -> PairWindow {
 
 fn crossing_conflicts(left: u8, right: u8, millis: u64) -> PairWindow {
     PairWindow {
-        crossing_time: ms(millis),
         crossing_conflict_time: ms(millis),
         ..pair(left, right)
     }

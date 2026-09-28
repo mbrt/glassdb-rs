@@ -132,19 +132,13 @@ typical times of a split and of a merge. The policy returns the changes that it
 wants: a split at the median, a split at a key, or a merge into the right
 sibling.
 
-For each leaf, the window also counts the transactions that committed after
-point reads of the leaf, by the kind of commit, and the ones whose keys a split
-at the median puts in both halves. It has the sum of their latencies, the time
-of the commit passes whose keys a split puts in both halves, also of passes
-that did not commit, the part of that time in passes that a conflict ended
-(the divided conflict time), and the coordinator rounds whose leaf CAS landed
-with their round members.
-The time of a commit pass includes the body run before it. A transaction that
-starves seldom commits, so only the time of its commit passes shows it in
-each window. For each pair of adjacent leaves, the window has the time of the
-commit passes whose keys are in the two leaves only, and the part of it in
-passes that a conflict ended (the crossing conflict time). The avoidable time
-policy uses the two conflict times. Other policies can use the other counts.
+For each leaf, the window also has the time of the commit passes that a
+conflict ended without a commit, and whose keys a split at the median puts in
+both halves (the divided conflict time). For each pair of adjacent leaves, it
+has the time of the commit passes that a conflict ended, and whose keys are in
+the two leaves only (the crossing conflict time). The time of a commit pass
+includes the body run before it. A transaction that starves seldom commits, so
+only the time of its commit passes shows it in each window.
 
 The engine checks each change again against current state. It skips a split
 of a leaf with less than two entries, a split at a key that leaves one half
@@ -280,7 +274,7 @@ throttled requests with the same retry budget as the S3 adapter.
   it: when one instance wins each CAS of a hot leaf, the other instance has the
   lost CAS time, and the winner has none.
 - The measurements are volatile, like ADR-056 requests. A restart loses them.
-- With a policy, each database instance keeps time sums and counts for its
+- With a policy, each database instance keeps time sums and sizes for its
   active leaves and pairs, and drops them for inactive leaves. The avoidable
   time policy also keeps its moving averages for these leaves and pairs, until
   they decay to zero.

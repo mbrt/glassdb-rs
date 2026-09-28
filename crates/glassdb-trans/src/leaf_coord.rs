@@ -569,10 +569,6 @@ pub trait StructuralHinter: Send + Sync {
         _split_key: &[u8],
     ) {
     }
-
-    /// Notes that a leaf CAS of a coordinator round of `path` with `members`
-    /// landed.
-    fn round_landed(&self, _path: &ObjectPath, _members: usize) {}
 }
 
 /// Time that round members lose on one leaf, and that one split of the leaf
@@ -1456,9 +1452,6 @@ impl CasWorker {
             // because the slow CAS time covers that CAS.
             if let Some(lost) = &mut lost_time {
                 lost.report(&*self.core.hinter, path, sent);
-            }
-            if applied.is_some() {
-                self.core.hinter.round_landed(path, members.len());
             }
             // The CAS landed (or nothing needed staging): publish each member's
             // outcome into its slot before returning, so the deposit

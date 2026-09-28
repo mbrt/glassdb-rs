@@ -71,7 +71,7 @@ pub use glassdb_trans::{
     AvoidableTimePolicy, AvoidableTimeStats, DirectCommitStats, FixedTopology, GcLimits,
     InlinePressureStats, LeafCoordinatorStats, LeafId, LeafSize, LeafWindow, LockerStats,
     MergeTime, MonitorStats, PairWindow, ProtocolTiming, RestructurerStats, SizePolicy, SplitTime,
-    TopologyChange, TopologyPolicy, TopologyWindow, TransactionCounts,
+    TopologyChange, TopologyPolicy, TopologyWindow,
 };
 
 // Re-export the backend abstraction so callers can construct a Database without

@@ -4,9 +4,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use glassdb::{
-    LeafWindow, PairWindow, TopologyChange, TopologyPolicy, TopologyWindow, TransactionCounts,
-};
+use glassdb::{LeafWindow, PairWindow, TopologyChange, TopologyPolicy, TopologyWindow};
 use serde::Serialize;
 
 /// The windows that the policies of one cell saw, and the changes that each
@@ -60,21 +58,7 @@ struct LeafTrace {
     entries: Option<usize>,
     split_recently: bool,
     merged_recently: bool,
-    committed: CommitTrace,
-    divided: CommitTrace,
-    latency_ms: f64,
-    divided_time_ms: f64,
     divided_conflict_time_ms: f64,
-    rounds: u64,
-    round_members: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CommitTrace {
-    direct: u64,
-    locked: u64,
-    read_only: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -84,7 +68,6 @@ struct PairTrace {
     right: String,
     adjacent_miss_ms: f64,
     scan_crossing_ms: f64,
-    crossing_time_ms: f64,
     crossing_conflict_time_ms: f64,
 }
 
@@ -226,23 +209,7 @@ impl LeafTrace {
             entries: window.size.map(|size| size.entries),
             split_recently: window.split_recently,
             merged_recently: window.merged_recently,
-            committed: CommitTrace::new(&window.committed),
-            divided: CommitTrace::new(&window.divided),
-            latency_ms: millis(window.latency),
-            divided_time_ms: millis(window.divided_time),
             divided_conflict_time_ms: millis(window.divided_conflict_time),
-            rounds: window.rounds,
-            round_members: window.round_members,
-        }
-    }
-}
-
-impl CommitTrace {
-    fn new(counts: &TransactionCounts) -> Self {
-        Self {
-            direct: counts.direct,
-            locked: counts.locked,
-            read_only: counts.read_only,
         }
     }
 }
@@ -254,7 +221,6 @@ impl PairTrace {
             right: pair.right.to_string(),
             adjacent_miss_ms: millis(pair.avoidable.adjacent_miss),
             scan_crossing_ms: millis(pair.avoidable.scan_crossing),
-            crossing_time_ms: millis(pair.crossing_time),
             crossing_conflict_time_ms: millis(pair.crossing_conflict_time),
         }
     }

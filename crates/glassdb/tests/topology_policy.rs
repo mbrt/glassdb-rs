@@ -212,87 +212,28 @@ async fn the_root_leaf_does_not_merge() {
     db.shutdown().await;
 }
 
-async fn read_keys(db: &Database, keys: &[(&Collection, u8)], write: bool) {
-    db.tx(|tx| async move {
-        for &(coll, key) in keys {
-            tx.read(coll, &[key]).await?;
-            if write {
-                tx.write(coll, &[key], &write_int(1))?;
-            }
-        }
-        Ok(())
-    })
-    .await
-    .unwrap();
-}
-
-// The median of the leaf of keys 0 to 3 is key 2. Transactions whose keys are
-// on both sides of it would use one more leaf after a split.
-#[tokio::test(start_paused = true)]
-async fn windows_count_the_transactions_of_a_leaf_that_a_split_would_divide() {
-    let backend = slow_mem();
-    let (policy, windows) = Recording::new(|_: &TopologyWindow| Vec::new());
-    let db = open(&backend, NodeSizePolicy::default(), policy).await;
-    let coll = create_top(&db, b"divided").await;
-    write_keys(&coll, 4).await;
-    let other = create_top(&db, b"other").await;
-    write_keys(&other, 1).await;
-
-    read_keys(&db, &[(&coll, 0), (&coll, 3)], true).await;
-    read_keys(&db, &[(&coll, 0)], true).await;
-    // Keys in two leaves need a locked commit.
-    read_keys(&db, &[(&coll, 0), (&coll, 3), (&other, 0)], true).await;
-    read_keys(&db, &[(&coll, 1), (&coll, 2)], false).await;
-    read_keys(&db, &[(&coll, 0), (&coll, 1)], false).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    db.shutdown().await;
-
-    let windows = windows.lock().unwrap();
-    // The locked commit counts once in each of its two leaves.
-    let leaves: Vec<_> = windows
-        .iter()
-        .flat_map(|window| window.leaves.values())
-        .collect();
-    let sum = |count: fn(&glassdb::LeafWindow) -> u64| leaves.iter().map(|leaf| count(leaf)).sum();
-    let committed: [u64; 3] = [
-        sum(|leaf| leaf.committed.direct),
-        sum(|leaf| leaf.committed.locked),
-        sum(|leaf| leaf.committed.read_only),
-    ];
-    let divided: [u64; 3] = [
-        sum(|leaf| leaf.divided.direct),
-        sum(|leaf| leaf.divided.locked),
-        sum(|leaf| leaf.divided.read_only),
-    ];
-    assert_eq!(committed, [2, 2, 2]);
-    assert_eq!(divided, [1, 1, 1]);
-    assert!(leaves.iter().any(|leaf| leaf.latency > Duration::ZERO));
-    let rounds: u64 = sum(|leaf| leaf.rounds);
-    assert!(
-        rounds >= 7,
-        "the writes of the setup and two direct commits"
-    );
-    assert!(sum(|leaf| leaf.round_members) >= rounds);
-}
-
-// Reads the two keys, and in the first body run writes the first one in
-// another transaction, so that the first commit pass does not commit. The
-// body replay commits in a later window.
-async fn read_after_a_conflict(db: &Database, coll: &Collection, keys: [u8; 2], write: bool) {
+// Reads `keys`, and in the first body run writes the first one in another
+// transaction, so that a conflict ends the first commit pass. The body replay
+// commits in a later window. With `write`, the transaction also writes the
+// last key.
+async fn read_after_a_conflict(db: &Database, keys: &[(&Collection, u8)], write: bool) {
     let conflicted = AtomicBool::new(false);
     let conflicted = &conflicted;
+    let (first_coll, first_key) = keys[0];
+    let (last_coll, last_key) = keys[keys.len() - 1];
     db.tx(|tx| async move {
         let replay = conflicted.swap(true, Ordering::Relaxed);
         if replay {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        tx.read(coll, &[keys[0]]).await?;
-        tx.read(coll, &[keys[1]]).await?;
+        for &(coll, key) in keys {
+            tx.read(coll, &[key]).await?;
+        }
         if !replay {
-            coll.write(&[keys[0]], &write_int(2)).await?;
+            first_coll.write(&[first_key], &write_int(2)).await?;
         }
         if write {
-            tx.write(coll, &[keys[1]], &write_int(1))?;
+            tx.write(last_coll, &[last_key], &write_int(1))?;
         }
         Ok(())
     })
@@ -301,9 +242,11 @@ async fn read_after_a_conflict(db: &Database, coll: &Collection, keys: [u8; 2], 
 }
 
 // A transaction that starves commits late or never, so the time of each of
-// its commit passes shows in the window where the pass ends.
+// its commit passes that a conflict ends shows in the window where the pass
+// ends. The median of the leaf of keys 0 to 3 is key 2, so a split puts keys
+// 0 and 3 in different leaves, and keys 0 and 1 in the same leaf.
 #[tokio::test(start_paused = true)]
-async fn windows_count_the_time_of_divided_transactions_before_they_commit() {
+async fn windows_count_the_conflict_time_of_transactions_that_a_split_would_divide() {
     let backend = slow_mem();
     let (policy, windows) = Recording::new(|_: &TopologyWindow| Vec::new());
     let db = open(&backend, NodeSizePolicy::default(), policy).await;
@@ -311,44 +254,34 @@ async fn windows_count_the_time_of_divided_transactions_before_they_commit() {
     write_keys(&coll, 4).await;
 
     let before = db.stats().transactions.replays;
-    read_after_a_conflict(&db, &coll, [0, 3], true).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    read_after_a_conflict(&db, &coll, [0, 3], false).await;
+    read_after_a_conflict(&db, &[(&coll, 0), (&coll, 3)], true).await;
+    read_after_a_conflict(&db, &[(&coll, 0), (&coll, 3)], false).await;
+    read_after_a_conflict(&db, &[(&coll, 0), (&coll, 1)], true).await;
     let replays = db.stats().transactions.replays - before;
     tokio::time::sleep(Duration::from_secs(2)).await;
     db.shutdown().await;
 
-    assert_eq!(replays, 2);
+    assert_eq!(replays, 3);
     let windows = windows.lock().unwrap();
-    let leaves: Vec<_> = windows
+    let conflicts: Vec<Duration> = windows
         .iter()
         .flat_map(|window| window.leaves.values())
+        .map(|leaf| leaf.divided_conflict_time)
+        .filter(|time| *time > Duration::ZERO)
         .collect();
-    let committed: u64 = leaves.iter().map(|leaf| leaf.divided.total()).sum();
-    let latency: Duration = leaves.iter().map(|leaf| leaf.latency).sum();
-    let divided_time: Duration = leaves.iter().map(|leaf| leaf.divided_time).sum();
-    assert_eq!(committed, 2);
-    assert!(latency > Duration::ZERO);
-    assert_eq!(divided_time, latency);
-    let before_commit = leaves
-        .iter()
-        .filter(|leaf| leaf.divided_time > Duration::ZERO && leaf.divided.total() == 0)
-        .count();
-    assert_eq!(before_commit, 2);
-    for leaf in leaves {
-        let conflicts = if leaf.divided.total() == 0 {
-            leaf.divided_time
-        } else {
-            Duration::ZERO
-        };
-        assert_eq!(leaf.divided_conflict_time, conflicts);
-    }
+    assert_eq!(conflicts.len(), 2, "{conflicts:?}");
+    // Each replay sleeps for 2 seconds before its commit pass, which commits,
+    // so no conflict time has this sleep.
+    assert!(
+        conflicts.iter().all(|time| *time < Duration::from_secs(2)),
+        "{conflicts:?}"
+    );
 }
 
 // After a merge, a transaction whose keys are in two adjacent leaves uses one
 // leaf. Keys 0 and 7 are in the two leaves of the collection.
 #[tokio::test(start_paused = true)]
-async fn windows_count_the_time_of_transactions_over_two_adjacent_leaves() {
+async fn windows_count_the_conflict_time_of_transactions_over_two_adjacent_leaves() {
     let backend = slow_mem();
     split_collection(&backend, 8).await;
     let (policy, windows) = Recording::new(|_: &TopologyWindow| Vec::new());
@@ -357,38 +290,23 @@ async fn windows_count_the_time_of_transactions_over_two_adjacent_leaves() {
     let other = create_top(&db, b"other").await;
     write_keys(&other, 1).await;
 
-    let started = tokio::time::Instant::now();
-    read_after_a_conflict(&db, &coll, [0, 7], true).await;
-    let took = started.elapsed();
-    read_keys(&db, &[(&coll, 0), (&coll, 1)], true).await;
-    read_keys(&db, &[(&coll, 0), (&coll, 7), (&other, 0)], true).await;
+    read_after_a_conflict(&db, &[(&coll, 0), (&coll, 7)], true).await;
+    read_after_a_conflict(&db, &[(&coll, 0), (&coll, 1)], true).await;
+    read_after_a_conflict(&db, &[(&coll, 0), (&coll, 7), (&other, 0)], true).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     db.shutdown().await;
 
     let windows = windows.lock().unwrap();
-    let crossed: Vec<_> = windows
+    let conflicts: Vec<Duration> = windows
         .iter()
         .flat_map(|window| &window.pairs)
-        .filter(|pair| pair.crossing_time > Duration::ZERO)
-        .collect();
-    let crossing: Duration = crossed.iter().map(|pair| pair.crossing_time).sum();
-    let conflicts: Vec<Duration> = crossed
-        .iter()
         .map(|pair| pair.crossing_conflict_time)
         .filter(|time| *time > Duration::ZERO)
         .collect();
-    assert!(
-        crossed
-            .iter()
-            .all(|pair| (&pair.left, &pair.right) == (&crossed[0].left, &crossed[0].right))
-    );
-    // The replay sleeps for 2 seconds before its commit pass.
-    assert!(
-        crossing >= Duration::from_secs(2) && crossing <= took,
-        "{crossing:?} of {took:?}"
-    );
-    assert_eq!(conflicts.len(), 1);
-    assert!(conflicts[0] + Duration::from_secs(2) <= crossing);
+    assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+    // The replay sleeps for 2 seconds before its commit pass, which commits,
+    // so the conflict time does not have this sleep.
+    assert!(conflicts[0] < Duration::from_secs(2), "{conflicts:?}");
 }
 
 type Owner = fn(u8) -> usize;

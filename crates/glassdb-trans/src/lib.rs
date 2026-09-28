@@ -39,6 +39,6 @@ pub use reader::{ReadOutcome, ReadValue};
 pub use structural::{
     AvoidableTimePolicy, AvoidableTimeStats, FixedTopology, InlinePressureStats, LeafId, LeafSize,
     LeafWindow, MergeTime, PairWindow, RestructurerStats, SizePolicy, SplitTime, TopologyChange,
-    TopologyPolicy, TopologyWindow, TransactionCounts,
+    TopologyPolicy, TopologyWindow,
 };
 pub use tlocker::LockerStats;

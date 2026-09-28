@@ -43,7 +43,7 @@ use crate::gc::GcHints;
 use crate::key_resolver::KeyResolver;
 use crate::leaf_coord::LeafCoordinator;
 use crate::monitor::{Monitor, OwnerAbortOutcome};
-use crate::structural::{CommitKind, StructuralHintSink};
+use crate::structural::StructuralHintSink;
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
 mod direct_commit;
@@ -159,9 +159,6 @@ pub struct Handle {
     /// use this schedule.
     backoff: Backoff,
     retirement: IdentityRetirementGuard,
-    /// Renewals and body replays keep it, so that a topology policy sees the
-    /// latency of the whole transaction.
-    started: rt::Instant,
     /// The start of the current commit pass, with the body run before it.
     pass_started: rt::Instant,
 }
@@ -404,7 +401,6 @@ impl Algo {
     /// The id's random prefix and timestamp are deterministic under `--cfg sim`.
     pub fn begin(&self, accesses: AccessSet, catalog_accesses: CatalogAccesses) -> Handle {
         let id = TxId::new_at(rt::system_now());
-        let started = rt::Instant::now();
         Handle {
             accesses,
             collections: CollectionHandleState::new(
@@ -415,8 +411,7 @@ impl Algo {
             retirement: IdentityRetirementGuard::new(self.retirement.clone(), id),
             id,
             backoff: self.acquisition_retry.backoff(),
-            started,
-            pass_started: started,
+            pass_started: rt::Instant::now(),
         }
     }
 
@@ -635,10 +630,10 @@ impl Algo {
             if tx.should_lock_reads() {
                 self.validate_coordination_keys(&tx.accesses)?;
                 let outcome = self.commit_locked(tx).await;
-                return self.observe_pass(tx, CommitKind::Locked, outcome);
+                return self.observe_pass(tx, outcome);
             }
             let outcome = self.commit_readonly(tx).await;
-            return self.observe_pass(tx, CommitKind::ReadOnly, outcome);
+            return self.observe_pass(tx, outcome);
         }
         self.validate_coordination_keys(&tx.accesses)?;
         // Try direct commit first: a complete point transaction whose
@@ -650,23 +645,21 @@ impl Algo {
             || !tx.collections.accesses().changes.is_empty()
         {
             let outcome = self.commit_locked(tx).await;
-            return self.observe_pass(tx, CommitKind::Locked, outcome);
+            return self.observe_pass(tx, outcome);
         }
         let cause = match self
             .direct_commit
             .try_commit(&tx.id, &tx.accesses, &mut tx.state)
             .await?
         {
-            DirectOutcome::Committed => {
-                return self.observe_pass(tx, CommitKind::Direct, Ok(PassOutcome::Complete));
-            }
+            DirectOutcome::Committed => return Ok(PassOutcome::Complete),
             // A certified direct-commit loss reevaluates the body rather than
             // publishing a holder that would make every subsequent direct
             // commit on the key ineligible (ADR-053). The id is unengaged —
             // no record, no lock, no published identity — so the ordinary
             // retry contract applies with no cleanup.
             DirectOutcome::Replay => {
-                return self.observe_pass(tx, CommitKind::Direct, Err(TransError::Retry));
+                return self.observe_pass(tx, Err(TransError::Retry));
             }
             DirectOutcome::Locked(cause) => cause,
         };
@@ -676,15 +669,14 @@ impl Algo {
             self.direct_commit
                 .observe_locked_commit(cause, started.elapsed());
         }
-        self.observe_pass(tx, CommitKind::Locked, outcome)
+        self.observe_pass(tx, outcome)
     }
 
-    /// Reports to the topology policy the commit pass that `outcome` ends, and
-    /// the transaction when `outcome` completes it.
+    /// Reports to the topology policy the commit pass that `outcome` ends,
+    /// when a conflict ended it without a commit.
     fn observe_pass(
         &self,
         tx: &mut Handle,
-        kind: CommitKind,
         outcome: Result<PassOutcome, TransError>,
     ) -> Result<PassOutcome, TransError> {
         if !self.structural_hints.keeps_windows() {
@@ -692,26 +684,18 @@ impl Algo {
         }
         // Other errors can end the transaction. If it continues, the next
         // commit pass includes the time of this one.
-        if !matches!(
-            outcome,
-            Ok(_) | Err(TransError::Retry | TransError::Wounded)
-        ) {
-            return outcome;
-        }
-        let now = rt::Instant::now();
-        let committed = matches!(outcome, Ok(PassOutcome::Complete));
-        self.structural_hints.observe_pass(
-            &tx.accesses,
-            now.saturating_duration_since(tx.pass_started),
-            committed,
-        );
-        tx.pass_started = now;
-        if committed {
-            self.structural_hints.observe_commit(
+        let conflict = match &outcome {
+            Ok(PassOutcome::Complete) => false,
+            Ok(_) => true,
+            Err(error) => matches!(error, TransError::Retry | TransError::Wounded),
+        };
+        if conflict {
+            let now = rt::Instant::now();
+            self.structural_hints.observe_conflict_pass(
                 &tx.accesses,
-                kind,
-                now.saturating_duration_since(tx.started),
+                now.saturating_duration_since(tx.pass_started),
             );
+            tx.pass_started = now;
         }
         outcome
     }

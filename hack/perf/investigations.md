@@ -15,7 +15,9 @@ Status: in the engine, with ADR-074 still proposed. `AvoidableTimePolicy` now
 uses the rule of `net-conflicts:0.05:0.1:4:10:1`, and the perfbench policy
 `avoidable` measures it. Perfbench has no `net` forms any more. The commands below that use them
 need the perfbench of commit `597b59eca`, where `avoidable` is the rule of one
-window. The loss comes from transactions that conflict on the
+window. The windows now have only the divided and crossing conflict times of
+the commit passes. The commits, latencies, rounds, and the other pass times
+are in the windows up to commit `89552f702`. The loss comes from transactions that conflict on the
 same keys and that a split puts in more leaves. The first estimates of the
 time that a split adds did not show this cost. After a fix of the lost CAS
 time, `net-conflicts:0.05:0.1:4:10:1` subtracts 4 times the divided conflict
