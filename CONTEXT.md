@@ -441,6 +441,14 @@ _Avoid_: Merge gate, merge lock
 The step after a split or a merge that makes the separators of one parent index node agree with the sibling links of its children around one key.
 _Avoid_: Separator publication, parent repoint
 
+**Avoidable time**:
+The time of backend operations that transactions spend because of the current topology, and that one split or one merge would remove.
+_Avoid_: Topology cost, contention cost, structural pressure
+
+**Topology policy**:
+What decides when the leaves of one database instance split and merge: the node sizes, or the avoidable time.
+_Avoid_: Leaf changes, split policy
+
 **Topology participant**:
 A transaction identity that a collection record lists while it can make structural changes to the collection tree.
 _Avoid_: Topology lock
