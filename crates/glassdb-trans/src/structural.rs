@@ -116,11 +116,10 @@ impl Restructurer {
         topology: TopologyPolicy,
         gc_hints: GcHints,
     ) -> (LeafCoordinator, Self) {
-        let candidates = match topology {
-            TopologyPolicy::SizeCauses => MaintenanceCandidates::with_policies(policy, inline),
-            TopologyPolicy::AvoidableTime => {
-                MaintenanceCandidates::for_topology_rule(policy, inline)
-            }
+        let candidates = if topology.rule().is_some() {
+            MaintenanceCandidates::for_topology_rule(policy, inline)
+        } else {
+            MaintenanceCandidates::with_policies(policy, inline)
         };
         let coord = LeafCoordinator::with_hinter(
             nodes.clone(),
@@ -292,10 +291,10 @@ impl Restructurer {
     /// Gives the measurements of the window that ends now to `rule`, and
     /// queues the leaf changes that it asks for.
     fn decide_leaf_changes(&self, rule: &mut dyn TopologyRule) {
-        let Some(avoidable) = self.candidates.avoidable() else {
+        let Some(measurements) = self.candidates.measurements() else {
             return;
         };
-        for request in rule.decide(&avoidable.take_window()) {
+        for request in rule.decide(&measurements.take_window()) {
             self.candidates.push_request(request);
         }
     }
@@ -408,7 +407,7 @@ impl Restructurer {
     /// recovery loop can also land a change of that kind in this time, but
     /// rarely.
     fn record_change_time(&self, cause: &CandidateCause, before: LandedChanges, took: Duration) {
-        let Some(avoidable) = self.candidates.avoidable() else {
+        let Some(measurements) = self.candidates.measurements() else {
             return;
         };
         let after = self.stats.landed();
@@ -417,7 +416,7 @@ impl Restructurer {
             CandidateCause::Merge(_) => (ChangeKind::Merge, after.merges > before.merges),
         };
         if landed {
-            avoidable.record_change(kind, took);
+            measurements.record_change(kind, took);
         }
     }
 

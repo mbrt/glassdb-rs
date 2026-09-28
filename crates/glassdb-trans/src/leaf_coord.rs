@@ -496,9 +496,9 @@ pub trait StructuralHinter: Send + Sync {
     /// delay.
     fn leaf_delay(&self, _path: &ObjectPath, _time: Duration, _split_key: &[u8]) {}
 
-    /// Tells if the hinter uses [`Self::leaf_delay`]. Only then does the
-    /// coordinator measure the delays of its rounds.
-    fn measures_leaf_delays(&self) -> bool {
+    /// Tells if the hinter uses measurements, such as [`Self::leaf_delay`].
+    /// Only then does the coordinator measure the delays of its rounds.
+    fn measurements_enabled(&self) -> bool {
         false
     }
 }
@@ -1478,7 +1478,7 @@ impl LeafCoordinator {
         policy: NodeSizePolicy,
         hinter: Arc<dyn StructuralHinter>,
     ) -> Self {
-        let delays = hinter.measures_leaf_delays().then(DelayState::default);
+        let delays = hinter.measurements_enabled().then(DelayState::default);
         let core = Arc::new(CoordCore {
             tmon,
             nodes,
@@ -3181,7 +3181,7 @@ mod tests {
             self.split_keys.lock().unwrap().push(split_key.to_vec());
         }
 
-        fn measures_leaf_delays(&self) -> bool {
+        fn measurements_enabled(&self) -> bool {
             true
         }
     }

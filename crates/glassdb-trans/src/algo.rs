@@ -692,7 +692,7 @@ impl Algo {
         outcome: &Result<PassOutcome, TransError>,
         took: Duration,
     ) {
-        if !self.structural_hints.measures_avoidable_time() {
+        if !self.structural_hints.measurements_enabled() {
             return;
         }
         let body_time = std::mem::take(&mut tx.body_time);

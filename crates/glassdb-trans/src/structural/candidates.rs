@@ -46,7 +46,7 @@ pub(super) struct MaintenanceCandidates {
     queued: Arc<Notify>,
     // Present only when a topology rule decides the leaf changes, because
     // nothing else takes its windows.
-    avoidable: Option<Arc<AvoidableTime>>,
+    measurements: Option<Arc<AvoidableTime>>,
 }
 
 /// Lightweight producer handle for structural hints decided outside the leaf
@@ -78,7 +78,8 @@ impl StructuralHintSink {
     /// revalidation by the restructurer. A topology rule decides with the
     /// time of the pressure instead.
     pub(crate) fn observe_inline_pressure(&self, path: &ObjectPath, key: &[u8], value_len: usize) {
-        if self.candidates.avoidable.is_some() || !self.candidates.inline.admits_value(value_len) {
+        if self.candidates.measurements.is_some() || !self.candidates.inline.admits_value(value_len)
+        {
             return;
         }
         self.candidates.push(MaintenanceCandidate {
@@ -94,38 +95,39 @@ impl StructuralHintSink {
     /// Notes that a direct commit candidate of `path` used `time` more than a
     /// direct commit, because the leaf could not carry its value inline.
     pub(crate) fn inline_pressure_time(&self, path: &ObjectPath, time: Duration) {
-        if let Some(avoidable) = &self.candidates.avoidable {
-            avoidable.add_inline_pressure(path, time);
+        if let Some(measurements) = &self.candidates.measurements {
+            measurements.add_inline_pressure(path, time);
         }
     }
 
     /// Notes that a direct commit candidate with keys in the adjacent leaves
     /// `left` and `right` used `time` more than a direct commit.
     pub(crate) fn adjacent_miss_time(&self, left: &ObjectPath, right: &ObjectPath, time: Duration) {
-        if let Some(avoidable) = &self.candidates.avoidable {
-            avoidable.add_merge_time(left, right, time);
+        if let Some(measurements) = &self.candidates.measurements {
+            measurements.add_merge_time(left, right, time);
         }
     }
 
-    /// Tells if a topology rule decides on avoidable time. Only then are the
-    /// commit passes of transactions measured.
-    pub(crate) fn measures_avoidable_time(&self) -> bool {
-        self.candidates.avoidable.is_some()
+    /// Tells if a topology rule decides the leaf changes from measurements.
+    /// Only then do the producers of the sink measure their times, so that the
+    /// size causes do not pay for them.
+    pub(crate) fn measurements_enabled(&self) -> bool {
+        self.candidates.measurements.is_some()
     }
 
     /// Notes that a conflict ended a commit pass of a transaction with
     /// `accesses` without a commit, after `time` with the body run before it.
     pub(crate) fn observe_conflict_pass(&self, accesses: &AccessSet, time: Duration) {
-        if let Some(avoidable) = &self.candidates.avoidable {
-            avoidable.add_conflict_pass(accesses, time);
+        if let Some(measurements) = &self.candidates.measurements {
+            measurements.add_conflict_pass(accesses, time);
         }
     }
 
     /// Notes that a scan that continued from `left` used `time` to read the
     /// adjacent leaf `right`.
     pub(crate) fn scan_crossing_time(&self, left: &ObjectPath, right: &ObjectPath, time: Duration) {
-        if let Some(avoidable) = &self.candidates.avoidable {
-            avoidable.add_merge_time(left, right, time);
+        if let Some(measurements) = &self.candidates.measurements {
+            measurements.add_merge_time(left, right, time);
         }
     }
 
@@ -184,10 +186,10 @@ impl MaintenanceCandidates {
         Self::new(policy, inline, Some(Arc::new(AvoidableTime::new())))
     }
 
-    /// The avoidable time that the producers of the feed report, when a
+    /// The measurements that the producers of the feed report, when a
     /// topology rule decides the leaf changes.
-    pub(super) fn avoidable(&self) -> Option<&AvoidableTime> {
-        self.avoidable.as_deref()
+    pub(super) fn measurements(&self) -> Option<&AvoidableTime> {
+        self.measurements.as_deref()
     }
 
     /// The node size policy shared by the feed and the restructurer.
@@ -256,12 +258,12 @@ impl MaintenanceCandidates {
         id: NodeId,
         kind: ChangeKind,
     ) {
-        if let Some(avoidable) = &self.avoidable {
+        if let Some(measurements) = &self.measurements {
             let path = ObjectPath::Node {
                 collection: collection.clone(),
                 id,
             };
-            avoidable.record_changed(path, kind);
+            measurements.record_changed(path, kind);
         }
     }
 
@@ -270,7 +272,7 @@ impl MaintenanceCandidates {
     /// transaction may use a leaf with no live entries again, and then the
     /// rule never gets time to merge it.
     pub(super) fn leaf_min_live_entries(&self) -> usize {
-        if self.avoidable.is_some() {
+        if self.measurements.is_some() {
             1
         } else {
             self.policy.leaf_min_entries()
@@ -318,14 +320,14 @@ impl MaintenanceCandidates {
     fn new(
         policy: NodeSizePolicy,
         inline: InlinePolicy,
-        avoidable: Option<Arc<AvoidableTime>>,
+        measurements: Option<Arc<AvoidableTime>>,
     ) -> Self {
         MaintenanceCandidates {
             policy,
             inline,
             queue: Arc::new(Mutex::new(VecDeque::new())),
             queued: Arc::new(Notify::new()),
-            avoidable,
+            measurements,
         }
     }
 
@@ -407,12 +409,12 @@ impl StructuralHinter for MaintenanceCandidates {
     }
 
     fn leaf_delay(&self, path: &ObjectPath, time: Duration, split_key: &[u8]) {
-        if let Some(avoidable) = &self.avoidable {
-            avoidable.add_leaf_delay(path, time, split_key);
+        if let Some(measurements) = &self.measurements {
+            measurements.add_leaf_delay(path, time, split_key);
         }
     }
 
-    fn measures_leaf_delays(&self) -> bool {
-        self.avoidable.is_some()
+    fn measurements_enabled(&self) -> bool {
+        self.measurements.is_some()
     }
 }
