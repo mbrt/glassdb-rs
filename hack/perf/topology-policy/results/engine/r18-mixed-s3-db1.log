@@ -1,0 +1,60 @@
+mixed: run=1 mode=lo affinity=0% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 8.79526563s: 31 completed splits, 5s quiet
+mixed: run=1 mode=lo affinity=0% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 8.284521061s: 25 completed splits, 5s quiet
+mixed: run=1 mode=lo affinity=50% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 9.04096249s: 29 completed splits, 5s quiet
+mixed: run=1 mode=lo affinity=50% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 7.786388986s: 23 completed splits, 5s quiet
+mixed: run=1 mode=lo affinity=100% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 7.784660582s: 24 completed splits, 5s quiet
+mixed: run=1 mode=lo affinity=100% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 7.283021636s: 23 completed splits, 5s quiet
+mixed: run=1 mode=hi affinity=0% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 5.0241641s: 0 completed splits, 5s quiet
+  note: mode=hi affinity=0% databases=1/1 workers/shape=8 hit --max-duration before every shape reached --target-ci=0.1
+mixed: run=1 mode=hi affinity=0% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 5.023042355s: 0 completed splits, 5s quiet
+  note: mode=hi affinity=0% databases=1/1 workers/shape=8 hit --max-duration before every shape reached --target-ci=0.1
+mixed: run=1 mode=hi affinity=50% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 5.026266642s: 0 completed splits, 5s quiet
+  note: mode=hi affinity=50% databases=1/1 workers/shape=8 hit --max-duration before every shape reached --target-ci=0.1
+mixed: run=1 mode=hi affinity=50% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 5.021215351s: 0 completed splits, 5s quiet
+  note: mode=hi affinity=50% databases=1/1 workers/shape=8 hit --max-duration before every shape reached --target-ci=0.1
+mixed: run=1 mode=hi affinity=100% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 5.023929753s: 0 completed splits, 5s quiet
+  note: mode=hi affinity=100% databases=1/1 workers/shape=8 hit --max-duration before every shape reached --target-ci=0.1
+mixed: run=1 mode=hi affinity=100% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 5.021309313s: 0 completed splits, 5s quiet
+  note: mode=hi affinity=100% databases=1/1 workers/shape=8 hit --max-duration before every shape reached --target-ci=0.1
+mixed: run=2 mode=lo affinity=0% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 8.037422747s: 26 completed splits, 5s quiet
+mixed: run=2 mode=lo affinity=0% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 8.5410463s: 27 completed splits, 5s quiet
+mixed: run=2 mode=lo affinity=50% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 8.033327034s: 25 completed splits, 5s quiet
+mixed: run=2 mode=lo affinity=50% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 9.041038874s: 31 completed splits, 5s quiet
+mixed: run=2 mode=lo affinity=100% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 8.28523807s: 25 completed splits, 5s quiet
+mixed: run=2 mode=lo affinity=100% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 7.787413996s: 23 completed splits, 5s quiet
+mixed: run=2 mode=hi affinity=0% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 5.025311421s: 0 completed splits, 5s quiet
+  note: mode=hi affinity=0% databases=1/1 workers/shape=8 hit --max-duration before every shape reached --target-ci=0.1
+mixed: run=2 mode=hi affinity=0% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 5.02368349s: 0 completed splits, 5s quiet
+  note: mode=hi affinity=0% databases=1/1 workers/shape=8 hit --max-duration before every shape reached --target-ci=0.1
+mixed: run=2 mode=hi affinity=50% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 5.020984633s: 0 completed splits, 5s quiet
+  note: mode=hi affinity=50% databases=1/1 workers/shape=8 hit --max-duration before every shape reached --target-ci=0.1
+mixed: run=2 mode=hi affinity=50% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 5.024957866s: 0 completed splits, 5s quiet
+  note: mode=hi affinity=50% databases=1/1 workers/shape=8 hit --max-duration before every shape reached --target-ci=0.1
+mixed: run=2 mode=hi affinity=100% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 5.024145449s: 0 completed splits, 5s quiet
+  note: mode=hi affinity=100% databases=1/1 workers/shape=8 hit --max-duration before every shape reached --target-ci=0.1
+mixed: run=2 mode=hi affinity=100% databases=1/1 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 5.027305277s: 0 completed splits, 5s quiet
+  note: mode=hi affinity=100% databases=1/1 workers/shape=8 hit --max-duration before every shape reached --target-ci=0.1

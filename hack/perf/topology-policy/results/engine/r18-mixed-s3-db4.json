@@ -1,0 +1,2107 @@
+{
+  "backend": "memory",
+  "latencyJitter": true,
+  "modelTimeSpeedup": 5.0,
+  "runs": [
+    {
+      "cells": [
+        {
+          "affinityPct": 0,
+          "aggregateOps": {
+            "attemptedTxn": 16441,
+            "objListsPerTx": 0.0013989416702147072,
+            "objReadsPerTx": 4.203941366096953,
+            "objWritesPerTx": 0.785840277355392,
+            "replaysPerTx": 0.006082355087890031,
+            "totalOpsPerTx": 4.991180585122559,
+            "txn": 16441
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.18313971169636883,
+            "coordinatorMembersPerRound": 1.0640439158279964,
+            "coordinatorRoundsPerTx": 0.5318411288851043,
+            "coordinatorSubmissionsPerTx": 0.5659023173772885,
+            "directCandidatesPerTx": 0.08898485493583115,
+            "directLandRate": 0.9904306220095693,
+            "directLandedPerTx": 0.08813332522352654
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 18.478221506295238,
+            "queueWaitMs": 0.3083845620704337,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.003057327291527279
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "lo",
+          "policy": "size",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 0,
+            "warmupMerges": 0,
+            "warmupSplits": 0
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 97,
+          "shapes": [
+            {
+              "committed": 1454,
+              "converged": true,
+              "meanMs": 229.131875,
+              "p50Ms": 79.543663,
+              "p90Ms": 468.760203,
+              "relCi": 0.05140127220258285,
+              "shape": "rwSingle",
+              "txPerSec": 34.36683500564318
+            },
+            {
+              "committed": 397,
+              "converged": true,
+              "meanMs": 844.663237,
+              "p50Ms": 518.68373,
+              "p90Ms": 1854.277583,
+              "relCi": 0.09836958019278513,
+              "shape": "rwMany",
+              "txPerSec": 9.383516353580482
+            },
+            {
+              "committed": 10084,
+              "converged": true,
+              "meanMs": 32.858706,
+              "p50Ms": 28.56891,
+              "p90Ms": 51.252569,
+              "relCi": 0.019518195012170614,
+              "shape": "roSingle",
+              "txPerSec": 238.34603625545634
+            },
+            {
+              "committed": 4506,
+              "converged": true,
+              "meanMs": 73.767343,
+              "p50Ms": 57.01061,
+              "p90Ms": 96.727909,
+              "relCi": 0.029198495726412147,
+              "shape": "roMulti",
+              "txPerSec": 106.50408739411809
+            }
+          ],
+          "splitSettleWallMs": 16576,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 0,
+          "aggregateOps": {
+            "attemptedTxn": 15466,
+            "objListsPerTx": 0.013319539635329109,
+            "objReadsPerTx": 4.434113539376697,
+            "objWritesPerTx": 0.9940514677356782,
+            "replaysPerTx": 0.009504720031035821,
+            "totalOpsPerTx": 5.441484546747705,
+            "txn": 15466
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.1932626406310617,
+            "coordinatorMembersPerRound": 1.0348663301551693,
+            "coordinatorRoundsPerTx": 0.6917108496055865,
+            "coordinatorSubmissionsPerTx": 0.7158282684598474,
+            "directCandidatesPerTx": 0.10267683951894478,
+            "directLandRate": 0.9905541561712846,
+            "directLandedPerTx": 0.10170697012802275
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 17.26895009246088,
+            "queueWaitMs": 0.24534359724557092,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.0030519908185697663
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "lo",
+          "policy": "avoidable",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 35,
+            "warmupMerges": 0,
+            "warmupSplits": 105
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 94,
+          "shapes": [
+            {
+              "committed": 1578,
+              "converged": true,
+              "meanMs": 185.10144,
+              "p50Ms": 75.117315,
+              "p90Ms": 406.525217,
+              "relCi": 0.04934038931488056,
+              "shape": "rwSingle",
+              "txPerSec": 41.814527825387316
+            },
+            {
+              "committed": 400,
+              "converged": true,
+              "meanMs": 739.91386,
+              "p50Ms": 500.50423200000006,
+              "p90Ms": 1316.423624,
+              "relCi": 0.098,
+              "shape": "rwMany",
+              "txPerSec": 10.5993732260176
+            },
+            {
+              "committed": 9380,
+              "converged": true,
+              "meanMs": 31.042893,
+              "p50Ms": 28.18113,
+              "p90Ms": 46.294179,
+              "relCi": 0.020237397036327823,
+              "shape": "roSingle",
+              "txPerSec": 248.55530076698423
+            },
+            {
+              "committed": 4108,
+              "converged": true,
+              "meanMs": 71.01041199999999,
+              "p50Ms": 56.032289999999996,
+              "p90Ms": 97.038973,
+              "relCi": 0.03058023749130053,
+              "shape": "roMulti",
+              "txPerSec": 108.85555936788353
+            }
+          ],
+          "splitSettleWallMs": 16071,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 50,
+          "aggregateOps": {
+            "attemptedTxn": 13984,
+            "objListsPerTx": 0.001072654462242563,
+            "objReadsPerTx": 4.280320366132723,
+            "objWritesPerTx": 0.8888014874141876,
+            "replaysPerTx": 0.00636441647597254,
+            "totalOpsPerTx": 5.170194508009153,
+            "txn": 13984
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.17598684210526316,
+            "coordinatorMembersPerRound": 1.0916892502258355,
+            "coordinatorRoundsPerTx": 0.6332951945080092,
+            "coordinatorSubmissionsPerTx": 0.6913615560640732,
+            "directCandidatesPerTx": 0.1118421052631579,
+            "directLandRate": 0.9923273657289002,
+            "directLandedPerTx": 0.11098398169336385
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 17.331407292262586,
+            "queueWaitMs": 0.5981979440789473,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.006810885655034325
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "lo",
+          "policy": "size",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 0,
+            "warmupMerges": 0,
+            "warmupSplits": 0
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 110,
+          "shapes": [
+            {
+              "committed": 1557,
+              "converged": true,
+              "meanMs": 184.683031,
+              "p50Ms": 75.66402,
+              "p90Ms": 403.33726399999995,
+              "relCi": 0.04967201352295409,
+              "shape": "rwSingle",
+              "txPerSec": 38.363455008830584
+            },
+            {
+              "committed": 405,
+              "converged": true,
+              "meanMs": 725.6891800000001,
+              "p50Ms": 482.539865,
+              "p90Ms": 1436.385364,
+              "relCi": 0.09739318301999084,
+              "shape": "rwMany",
+              "txPerSec": 9.97893280230706
+            },
+            {
+              "committed": 8463,
+              "converged": true,
+              "meanMs": 33.231396000000004,
+              "p50Ms": 28.70687,
+              "p90Ms": 52.28228,
+              "relCi": 0.021305606464780406,
+              "shape": "roSingle",
+              "txPerSec": 208.52273226772343
+            },
+            {
+              "committed": 3559,
+              "converged": true,
+              "meanMs": 80.573592,
+              "p50Ms": 58.876394999999995,
+              "p90Ms": 101.884908,
+              "relCi": 0.03285428932511191,
+              "shape": "roMulti",
+              "txPerSec": 87.69140521778496
+            }
+          ],
+          "splitSettleWallMs": 18829,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 50,
+          "aggregateOps": {
+            "attemptedTxn": 13771,
+            "objListsPerTx": 0.011909084307602933,
+            "objReadsPerTx": 4.358870089318132,
+            "objWritesPerTx": 0.9998547672645415,
+            "replaysPerTx": 0.007624718611575049,
+            "totalOpsPerTx": 5.370633940890277,
+            "txn": 13771
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.17587684264033113,
+            "coordinatorMembersPerRound": 1.0571428571428572,
+            "coordinatorRoundsPerTx": 0.7116404037470045,
+            "coordinatorSubmissionsPerTx": 0.7523055696754049,
+            "directCandidatesPerTx": 0.11575049016048217,
+            "directLandRate": 0.9943538268506901,
+            "directLandedPerTx": 0.1150969428509186
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 17.192124393653327,
+            "queueWaitMs": 0.5771809603514633,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.0
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "lo",
+          "policy": "avoidable",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 16,
+            "warmupMerges": 0,
+            "warmupSplits": 83
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 94,
+          "shapes": [
+            {
+              "committed": 1590,
+              "converged": true,
+              "meanMs": 174.293847,
+              "p50Ms": 72.731467,
+              "p90Ms": 388.31370799999996,
+              "relCi": 0.04915384653240088,
+              "shape": "rwSingle",
+              "txPerSec": 41.516294175901905
+            },
+            {
+              "committed": 401,
+              "converged": true,
+              "meanMs": 692.161937,
+              "p50Ms": 479.10483999999997,
+              "p90Ms": 1169.132804,
+              "relCi": 0.09787772921002877,
+              "shape": "rwMany",
+              "txPerSec": 10.470461275275879
+            },
+            {
+              "committed": 8286,
+              "converged": true,
+              "meanMs": 32.725952,
+              "p50Ms": 28.506771999999998,
+              "p90Ms": 51.712801000000006,
+              "relCi": 0.021531962108174308,
+              "shape": "roSingle",
+              "txPerSec": 216.35471821033062
+            },
+            {
+              "committed": 3494,
+              "converged": true,
+              "meanMs": 78.15343,
+              "p50Ms": 59.298152,
+              "p90Ms": 102.350862,
+              "relCi": 0.033158480531216984,
+              "shape": "roMulti",
+              "txPerSec": 91.23139766474067
+            }
+          ],
+          "splitSettleWallMs": 16072,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 100,
+          "aggregateOps": {
+            "attemptedTxn": 10066,
+            "objListsPerTx": 0.00039737730975561295,
+            "objReadsPerTx": 3.49364196304391,
+            "objWritesPerTx": 1.8107490562288893,
+            "replaysPerTx": 0.007848201867673356,
+            "totalOpsPerTx": 5.3047883965825555,
+            "txn": 10066
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.0,
+            "coordinatorMembersPerRound": 1.2032379473086803,
+            "coordinatorRoundsPerTx": 1.6629246969998013,
+            "coordinatorSubmissionsPerTx": 2.00089409894695,
+            "directCandidatesPerTx": 0.22580965626862706,
+            "directLandRate": 0.9938407391113067,
+            "directLandedPerTx": 0.22441883568448243
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 0.0,
+            "queueWaitMs": 8.030241004867872,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.02386189260878204
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "lo",
+          "policy": "size",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 0,
+            "warmupMerges": 0,
+            "warmupSplits": 0
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 108,
+          "shapes": [
+            {
+              "committed": 2267,
+              "converged": true,
+              "meanMs": 88.822579,
+              "p50Ms": 80.60942,
+              "p90Ms": 139.50896300000002,
+              "relCi": 0.041165207728187256,
+              "shape": "rwSingle",
+              "txPerSec": 89.38718969658257
+            },
+            {
+              "committed": 1003,
+              "converged": true,
+              "meanMs": 200.96672900000002,
+              "p50Ms": 194.826255,
+              "p90Ms": 251.17562700000002,
+              "relCi": 0.06188787983916591,
+              "shape": "rwMany",
+              "txPerSec": 39.548014246228576
+            },
+            {
+              "committed": 4492,
+              "converged": true,
+              "meanMs": 44.748649,
+              "p50Ms": 36.564640000000004,
+              "p90Ms": 80.343193,
+              "relCi": 0.029243961101538235,
+              "shape": "roSingle",
+              "txPerSec": 177.11831890824098
+            },
+            {
+              "committed": 2304,
+              "converged": true,
+              "meanMs": 87.478117,
+              "p50Ms": 82.40613300000001,
+              "p90Ms": 118.264522,
+              "relCi": 0.04083333333333333,
+              "shape": "roMulti",
+              "txPerSec": 90.84608256964958
+            }
+          ],
+          "splitSettleWallMs": 19079,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 100,
+          "aggregateOps": {
+            "attemptedTxn": 10714,
+            "objListsPerTx": 0.0018667164457718873,
+            "objReadsPerTx": 3.6644577188725034,
+            "objWritesPerTx": 1.8721299234646258,
+            "replaysPerTx": 0.007653537427664738,
+            "totalOpsPerTx": 5.538454358782901,
+            "txn": 10714
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.00018667164457718873,
+            "coordinatorMembersPerRound": 1.1460358608770793,
+            "coordinatorRoundsPerTx": 1.7282060854956132,
+            "coordinatorSubmissionsPerTx": 1.9805861489639724,
+            "directCandidatesPerTx": 0.2268060481612843,
+            "directLandRate": 0.9930041152263375,
+            "directLandedPerTx": 0.2252193391823782
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 0.0,
+            "queueWaitMs": 6.984970544614524,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.030127502613403027
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "lo",
+          "policy": "avoidable",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 13,
+            "warmupMerges": 0,
+            "warmupSplits": 39
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 108,
+          "shapes": [
+            {
+              "committed": 2423,
+              "converged": true,
+              "meanMs": 83.021419,
+              "p50Ms": 74.61734,
+              "p90Ms": 128.637973,
+              "relCi": 0.03981799285102497,
+              "shape": "rwSingle",
+              "txPerSec": 95.8968255781809
+            },
+            {
+              "committed": 999,
+              "converged": true,
+              "meanMs": 201.697611,
+              "p50Ms": 189.102365,
+              "p90Ms": 250.80756100000002,
+              "relCi": 0.0620116557224966,
+              "shape": "rwMany",
+              "txPerSec": 39.5381454872344
+            },
+            {
+              "committed": 4854,
+              "converged": true,
+              "meanMs": 41.409803000000004,
+              "p50Ms": 34.279205,
+              "p90Ms": 74.85905299999999,
+              "relCi": 0.028132361235077622,
+              "shape": "roSingle",
+              "txPerSec": 192.1102670568912
+            },
+            {
+              "committed": 2438,
+              "converged": true,
+              "meanMs": 82.536812,
+              "p50Ms": 76.697195,
+              "p90Ms": 113.568772,
+              "relCi": 0.03969531208438372,
+              "shape": "roMulti",
+              "txPerSec": 96.49048571188943
+            }
+          ],
+          "splitSettleWallMs": 18831,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 0,
+          "aggregateOps": {
+            "attemptedTxn": 5638,
+            "objListsPerTx": 0.03086200780418588,
+            "objReadsPerTx": 3.3315005321035827,
+            "objWritesPerTx": 1.3669741042923023,
+            "replaysPerTx": 0.2924796026959915,
+            "totalOpsPerTx": 4.729336644200071,
+            "txn": 5638
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.12291592763391274,
+            "coordinatorMembersPerRound": 1.800552104899931,
+            "coordinatorRoundsPerTx": 0.5140120610145442,
+            "coordinatorSubmissionsPerTx": 0.9255054984036892,
+            "directCandidatesPerTx": 0.27048598793898543,
+            "directLandRate": 0.34885245901639345,
+            "directLandedPerTx": 0.09435970202199362
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 1.3453280170273145,
+            "queueWaitMs": 0.8978642931890741,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.004629855445193331
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "hi",
+          "policy": "size",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 0,
+            "warmupMerges": 0,
+            "warmupSplits": 0
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 0,
+          "shapes": [
+            {
+              "committed": 506,
+              "converged": true,
+              "meanMs": 1191.090736,
+              "p50Ms": 324.215385,
+              "p90Ms": 3074.184228,
+              "relCi": 0.08713262799697986,
+              "shape": "rwSingle",
+              "txPerSec": 6.528973336818107
+            },
+            {
+              "committed": 394,
+              "converged": true,
+              "meanMs": 1525.341174,
+              "p50Ms": 450.62841199999997,
+              "p90Ms": 3750.309052,
+              "relCi": 0.09874337348453616,
+              "shape": "rwMany",
+              "txPerSec": 5.083825019803418
+            },
+            {
+              "committed": 3134,
+              "converged": true,
+              "meanMs": 191.67123899999999,
+              "p50Ms": 37.552782,
+              "p90Ms": 124.746175,
+              "relCi": 0.035011166055476294,
+              "shape": "roSingle",
+              "txPerSec": 40.438343799111436
+            },
+            {
+              "committed": 1604,
+              "converged": true,
+              "meanMs": 376.594712,
+              "p50Ms": 44.327348,
+              "p90Ms": 443.21349799999996,
+              "relCi": 0.048938864605014384,
+              "shape": "roMulti",
+              "txPerSec": 20.696586755911877
+            }
+          ],
+          "splitSettleWallMs": 5027,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 0,
+          "aggregateOps": {
+            "attemptedTxn": 4266,
+            "objListsPerTx": 0.02719174871073605,
+            "objReadsPerTx": 3.2484763244256913,
+            "objWritesPerTx": 1.4631973745897797,
+            "replaysPerTx": 0.30450070323488043,
+            "totalOpsPerTx": 4.738865447726207,
+            "txn": 4266
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.10970464135021098,
+            "coordinatorMembersPerRound": 1.8299011532125207,
+            "coordinatorRoundsPerTx": 0.5691514299109236,
+            "coordinatorSubmissionsPerTx": 1.041490857946554,
+            "directCandidatesPerTx": 0.31200187529301454,
+            "directLandRate": 0.39068369646882045,
+            "directLandedPerTx": 0.12189404594467886
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 0.23427426980778246,
+            "queueWaitMs": 0.8621572491795592,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.00004435208626347867
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "hi",
+          "policy": "avoidable",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 0,
+            "warmupMerges": 0,
+            "warmupSplits": 0
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 0,
+          "shapes": [
+            {
+              "committed": 435,
+              "converged": true,
+              "meanMs": 1194.5120769999999,
+              "p50Ms": 171.76471500000002,
+              "p90Ms": 2105.2982739999998,
+              "relCi": 0.09397480709113529,
+              "shape": "rwSingle",
+              "txPerSec": 6.388983616137708
+            },
+            {
+              "committed": 400,
+              "converged": true,
+              "meanMs": 1301.600409,
+              "p50Ms": 252.932785,
+              "p90Ms": 2012.7222699999998,
+              "relCi": 0.098,
+              "shape": "rwMany",
+              "txPerSec": 5.874927328938957
+            },
+            {
+              "committed": 2154,
+              "converged": true,
+              "meanMs": 240.89607800000002,
+              "p50Ms": 37.497654999999995,
+              "p90Ms": 156.47322599999998,
+              "relCi": 0.04223118053168002,
+              "shape": "roSingle",
+              "txPerSec": 31.636483245823424
+            },
+            {
+              "committed": 1277,
+              "converged": true,
+              "meanMs": 408.53457,
+              "p50Ms": 43.05537,
+              "p90Ms": 378.258052,
+              "relCi": 0.05484797812843078,
+              "shape": "roMulti",
+              "txPerSec": 18.75570494256354
+            }
+          ],
+          "splitSettleWallMs": 5025,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 50,
+          "aggregateOps": {
+            "attemptedTxn": 5992,
+            "objListsPerTx": 0.02703604806408545,
+            "objReadsPerTx": 3.1496995994659547,
+            "objWritesPerTx": 1.4322429906542056,
+            "replaysPerTx": 0.2930574098798398,
+            "totalOpsPerTx": 4.6089786381842455,
+            "txn": 5992
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.11465287049399199,
+            "coordinatorMembersPerRound": 1.993985438429883,
+            "coordinatorRoundsPerTx": 0.5272029372496663,
+            "coordinatorSubmissionsPerTx": 1.0512349799732976,
+            "directCandidatesPerTx": 0.26385180240320427,
+            "directLandRate": 0.30234029095509174,
+            "directLandedPerTx": 0.07977303070761015
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 0.9610367448264353,
+            "queueWaitMs": 0.8741827937249665,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.0
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "hi",
+          "policy": "size",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 0,
+            "warmupMerges": 0,
+            "warmupSplits": 0
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 0,
+          "shapes": [
+            {
+              "committed": 529,
+              "converged": true,
+              "meanMs": 1357.134206,
+              "p50Ms": 326.75109499999996,
+              "p90Ms": 2631.34597,
+              "relCi": 0.08521739130434783,
+              "shape": "rwSingle",
+              "txPerSec": 5.63892410942707
+            },
+            {
+              "committed": 401,
+              "converged": true,
+              "meanMs": 1804.2208469999998,
+              "p50Ms": 628.946215,
+              "p90Ms": 3728.383119,
+              "relCi": 0.09787772921002877,
+              "shape": "rwMany",
+              "txPerSec": 4.274496250547585
+            },
+            {
+              "committed": 3345,
+              "converged": true,
+              "meanMs": 214.971087,
+              "p50Ms": 34.441145,
+              "p90Ms": 111.728237,
+              "relCi": 0.0338889419817108,
+              "shape": "roSingle",
+              "txPerSec": 35.65633367807168
+            },
+            {
+              "committed": 1717,
+              "converged": true,
+              "meanMs": 418.43244899999996,
+              "p50Ms": 43.9379,
+              "p90Ms": 583.000316,
+              "relCi": 0.04730106550494735,
+              "shape": "roMulti",
+              "txPerSec": 18.30251855202681
+            }
+          ],
+          "splitSettleWallMs": 5022,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 50,
+          "aggregateOps": {
+            "attemptedTxn": 4158,
+            "objListsPerTx": 0.030303030303030304,
+            "objReadsPerTx": 3.417989417989418,
+            "objWritesPerTx": 1.777056277056277,
+            "replaysPerTx": 0.3811928811928812,
+            "totalOpsPerTx": 5.225348725348725,
+            "txn": 4158
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.17556517556517556,
+            "coordinatorMembersPerRound": 1.8928953945019635,
+            "coordinatorRoundsPerTx": 0.6736411736411736,
+            "coordinatorSubmissionsPerTx": 1.2751322751322751,
+            "directCandidatesPerTx": 0.3645983645983646,
+            "directLandRate": 0.279023746701847,
+            "directLandedPerTx": 0.10173160173160173
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 1.043087896825397,
+            "queueWaitMs": 1.091086307118807,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.0
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "hi",
+          "policy": "avoidable",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 0,
+            "warmupMerges": 0,
+            "warmupSplits": 0
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 0,
+          "shapes": [
+            {
+              "committed": 435,
+              "converged": true,
+              "meanMs": 1163.276117,
+              "p50Ms": 443.047325,
+              "p90Ms": 2980.334125,
+              "relCi": 0.09397480709113529,
+              "shape": "rwSingle",
+              "txPerSec": 6.53581758331311
+            },
+            {
+              "committed": 395,
+              "converged": true,
+              "meanMs": 1286.7004630000001,
+              "p50Ms": 566.95041,
+              "p90Ms": 3157.908059,
+              "relCi": 0.09861830266361901,
+              "shape": "rwMany",
+              "txPerSec": 5.934822768488331
+            },
+            {
+              "committed": 2164,
+              "converged": true,
+              "meanMs": 234.661109,
+              "p50Ms": 38.243961999999996,
+              "p90Ms": 178.410249,
+              "relCi": 0.04213349087845008,
+              "shape": "roSingle",
+              "txPerSec": 32.51381391171953
+            },
+            {
+              "committed": 1164,
+              "converged": true,
+              "meanMs": 443.49483499999997,
+              "p50Ms": 48.07127,
+              "p90Ms": 932.404558,
+              "relCi": 0.05744861741253382,
+              "shape": "roMulti",
+              "txPerSec": 17.48894614145322
+            }
+          ],
+          "splitSettleWallMs": 5022,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 100,
+          "aggregateOps": {
+            "attemptedTxn": 9420,
+            "objListsPerTx": 0.0036093418259023355,
+            "objReadsPerTx": 1.4081740976645436,
+            "objWritesPerTx": 1.1475583864118897,
+            "replaysPerTx": 0.2808917197452229,
+            "totalOpsPerTx": 2.5593418259023353,
+            "txn": 9420
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.0,
+            "coordinatorMembersPerRound": 2.978881278538813,
+            "coordinatorRoundsPerTx": 0.3719745222929936,
+            "coordinatorSubmissionsPerTx": 1.108067940552017,
+            "directCandidatesPerTx": 0.2173036093418259,
+            "directLandRate": 0.13287738153395212,
+            "directLandedPerTx": 0.028874734607218684
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 0.0,
+            "queueWaitMs": 1.435045627388535,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.005757013375796178
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "hi",
+          "policy": "size",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 0,
+            "warmupMerges": 0,
+            "warmupSplits": 0
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 0,
+          "shapes": [
+            {
+              "committed": 584,
+              "converged": true,
+              "meanMs": 814.372873,
+              "p50Ms": 1008.3923400000001,
+              "p90Ms": 1477.3981680000002,
+              "relCi": 0.08110537708303206,
+              "shape": "rwSingle",
+              "txPerSec": 9.738453315425465
+            },
+            {
+              "committed": 401,
+              "converged": true,
+              "meanMs": 1186.340304,
+              "p50Ms": 1193.5068099999999,
+              "p90Ms": 1661.7129830000001,
+              "relCi": 0.09787772921002877,
+              "shape": "rwMany",
+              "txPerSec": 6.686848819278891
+            },
+            {
+              "committed": 6128,
+              "converged": true,
+              "meanMs": 77.27803399999999,
+              "p50Ms": 36.51168,
+              "p90Ms": 112.51294200000001,
+              "relCi": 0.025037830385072207,
+              "shape": "roSingle",
+              "txPerSec": 102.18705546126954
+            },
+            {
+              "committed": 2307,
+              "converged": true,
+              "meanMs": 205.52989,
+              "p50Ms": 55.20864,
+              "p90Ms": 864.5251499999999,
+              "relCi": 0.040806775064941035,
+              "shape": "roMulti",
+              "txPerSec": 38.47022422646002
+            }
+          ],
+          "splitSettleWallMs": 5026,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 100,
+          "aggregateOps": {
+            "attemptedTxn": 9247,
+            "objListsPerTx": 0.003785011355034065,
+            "objReadsPerTx": 1.4614469557694387,
+            "objWritesPerTx": 1.1639450632637611,
+            "replaysPerTx": 0.2922028766086298,
+            "totalOpsPerTx": 2.629177030388234,
+            "txn": 9247
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.0,
+            "coordinatorMembersPerRound": 2.9426910299003324,
+            "coordinatorRoundsPerTx": 0.3906131718395155,
+            "coordinatorSubmissionsPerTx": 1.1494538769330593,
+            "directCandidatesPerTx": 0.21747593814210014,
+            "directLandRate": 0.10492292391844853,
+            "directLandedPerTx": 0.022818211311776793
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 0.0,
+            "queueWaitMs": 1.3977358624418732,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.01846294506326376
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "hi",
+          "policy": "avoidable",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 0,
+            "warmupMerges": 0,
+            "warmupSplits": 0
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 0,
+          "shapes": [
+            {
+              "committed": 537,
+              "converged": true,
+              "meanMs": 883.343982,
+              "p50Ms": 1024.19059,
+              "p90Ms": 1521.02276,
+              "relCi": 0.08458024299241221,
+              "shape": "rwSingle",
+              "txPerSec": 8.96350914739775
+            },
+            {
+              "committed": 394,
+              "converged": true,
+              "meanMs": 1210.323901,
+              "p50Ms": 1194.95748,
+              "p90Ms": 1671.833107,
+              "relCi": 0.09874337348453616,
+              "shape": "rwMany",
+              "txPerSec": 6.576578213442893
+            },
+            {
+              "committed": 6053,
+              "converged": true,
+              "meanMs": 78.13548300000001,
+              "p50Ms": 33.712905,
+              "p90Ms": 110.797732,
+              "relCi": 0.025192469091499393,
+              "shape": "roSingle",
+              "txPerSec": 101.03560328275594
+            },
+            {
+              "committed": 2263,
+              "converged": true,
+              "meanMs": 209.45842000000002,
+              "p50Ms": 50.774625,
+              "p90Ms": 900.355692,
+              "relCi": 0.041201572759773646,
+              "shape": "roMulti",
+              "txPerSec": 37.773594214881875
+            }
+          ],
+          "splitSettleWallMs": 5023,
+          "workersPerShape": 8
+        }
+      ],
+      "run": 1
+    },
+    {
+      "cells": [
+        {
+          "affinityPct": 0,
+          "aggregateOps": {
+            "attemptedTxn": 17200,
+            "objListsPerTx": 0.0014534883720930232,
+            "objReadsPerTx": 4.2195348837209306,
+            "objWritesPerTx": 0.7358139534883721,
+            "replaysPerTx": 0.0036046511627906975,
+            "totalOpsPerTx": 4.956802325581395,
+            "txn": 17200
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.1691860465116279,
+            "coordinatorMembersPerRound": 1.072429351697934,
+            "coordinatorRoundsPerTx": 0.48965116279069765,
+            "coordinatorSubmissionsPerTx": 0.5251162790697674,
+            "directCandidatesPerTx": 0.09674418604651162,
+            "directLandRate": 0.9963942307692307,
+            "directLandedPerTx": 0.09639534883720931
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 18.416980274709303,
+            "queueWaitMs": 0.29966060872093025,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.003943835348837209
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "lo",
+          "policy": "size",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 0,
+            "warmupMerges": 0,
+            "warmupSplits": 0
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 95,
+          "shapes": [
+            {
+              "committed": 1661,
+              "converged": true,
+              "meanMs": 201.762797,
+              "p50Ms": 75.20981,
+              "p90Ms": 432.265702,
+              "relCi": 0.048091824671567814,
+              "shape": "rwSingle",
+              "txPerSec": 38.56869913521326
+            },
+            {
+              "committed": 395,
+              "converged": true,
+              "meanMs": 846.527115,
+              "p50Ms": 516.8367499999999,
+              "p90Ms": 1710.6268980000002,
+              "relCi": 0.09861830266361901,
+              "shape": "rwMany",
+              "txPerSec": 9.171966308328694
+            },
+            {
+              "committed": 10210,
+              "converged": true,
+              "meanMs": 32.455825,
+              "p50Ms": 28.461402,
+              "p90Ms": 51.010197,
+              "relCi": 0.019397385649344165,
+              "shape": "roSingle",
+              "txPerSec": 237.0779063750353
+            },
+            {
+              "committed": 4934,
+              "converged": true,
+              "meanMs": 67.183123,
+              "p50Ms": 56.425734999999996,
+              "p90Ms": 96.05785399999999,
+              "relCi": 0.02790335977666676,
+              "shape": "roMulti",
+              "txPerSec": 114.56830120348279
+            }
+          ],
+          "splitSettleWallMs": 16322,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 0,
+          "aggregateOps": {
+            "attemptedTxn": 14300,
+            "objListsPerTx": 0.013076923076923076,
+            "objReadsPerTx": 4.367692307692308,
+            "objWritesPerTx": 1.0275524475524476,
+            "replaysPerTx": 0.01006993006993007,
+            "totalOpsPerTx": 5.408321678321679,
+            "txn": 14300
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.20937062937062936,
+            "coordinatorMembersPerRound": 1.0311690802723699,
+            "coordinatorRoundsPerTx": 0.7291608391608392,
+            "coordinatorSubmissionsPerTx": 0.7518881118881119,
+            "directCandidatesPerTx": 0.09202797202797203,
+            "directLandRate": 0.9924012158054711,
+            "directLandedPerTx": 0.09132867132867133
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 18.168316496153846,
+            "queueWaitMs": 0.27627263916083916,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.008283701258741259
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "lo",
+          "policy": "avoidable",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 30,
+            "warmupMerges": 0,
+            "warmupSplits": 118
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 91,
+          "shapes": [
+            {
+              "committed": 1312,
+              "converged": true,
+              "meanMs": 215.866765,
+              "p50Ms": 75.257665,
+              "p90Ms": 428.53623000000005,
+              "relCi": 0.0541114477766748,
+              "shape": "rwSingle",
+              "txPerSec": 35.45416281355254
+            },
+            {
+              "committed": 396,
+              "converged": true,
+              "meanMs": 720.9187000000001,
+              "p50Ms": 515.28482,
+              "p90Ms": 1234.750416,
+              "relCi": 0.09849370589540278,
+              "shape": "rwMany",
+              "txPerSec": 10.701103495090114
+            },
+            {
+              "committed": 8972,
+              "converged": true,
+              "meanMs": 31.335012000000003,
+              "p50Ms": 28.20617,
+              "p90Ms": 47.018821,
+              "relCi": 0.020692427341043824,
+              "shape": "roSingle",
+              "txPerSec": 242.4502470548966
+            },
+            {
+              "committed": 3620,
+              "converged": true,
+              "meanMs": 77.709535,
+              "p50Ms": 56.418185,
+              "p90Ms": 97.60708,
+              "relCi": 0.032576302270412145,
+              "shape": "roMulti",
+              "txPerSec": 97.8232133467586
+            }
+          ],
+          "splitSettleWallMs": 15565,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 50,
+          "aggregateOps": {
+            "attemptedTxn": 14842,
+            "objListsPerTx": 0.0009432691011992993,
+            "objReadsPerTx": 4.013812154696133,
+            "objWritesPerTx": 0.812019943403854,
+            "replaysPerTx": 0.0060638727934240666,
+            "totalOpsPerTx": 4.8267753672011855,
+            "txn": 14842
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.16884516911467456,
+            "coordinatorMembersPerRound": 1.1064508506616257,
+            "coordinatorRoundsPerTx": 0.5702735480393478,
+            "coordinatorSubmissionsPerTx": 0.6309796523379598,
+            "directCandidatesPerTx": 0.11056461393343216,
+            "directLandRate": 0.9951249238269348,
+            "directLandedPerTx": 0.11002560301846112
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 14.675061200983695,
+            "queueWaitMs": 0.6791055524861879,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.0020224645600323407
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "lo",
+          "policy": "size",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 0,
+            "warmupMerges": 0,
+            "warmupSplits": 0
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 92,
+          "shapes": [
+            {
+              "committed": 1636,
+              "converged": true,
+              "meanMs": 184.90354,
+              "p50Ms": 78.799942,
+              "p90Ms": 403.74001,
+              "relCi": 0.048457881290546574,
+              "shape": "rwSingle",
+              "txPerSec": 42.09647007691091
+            },
+            {
+              "committed": 394,
+              "converged": true,
+              "meanMs": 775.132328,
+              "p50Ms": 481.140497,
+              "p90Ms": 1445.535766,
+              "relCi": 0.09874337348453616,
+              "shape": "rwMany",
+              "txPerSec": 10.138147093410224
+            },
+            {
+              "committed": 8824,
+              "converged": true,
+              "meanMs": 34.1612,
+              "p50Ms": 29.182915,
+              "p90Ms": 55.278632,
+              "relCi": 0.020865236980056264,
+              "shape": "roSingle",
+              "txPerSec": 227.05332115884096
+            },
+            {
+              "committed": 3988,
+              "converged": true,
+              "meanMs": 75.793863,
+              "p50Ms": 59.873545,
+              "p90Ms": 100.88750300000001,
+              "relCi": 0.031036911405757282,
+              "shape": "roMulti",
+              "txPerSec": 102.61656965636767
+            }
+          ],
+          "splitSettleWallMs": 15066,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 50,
+          "aggregateOps": {
+            "attemptedTxn": 13451,
+            "objListsPerTx": 0.010482492008029143,
+            "objReadsPerTx": 4.310608876663445,
+            "objWritesPerTx": 1.0753103858449187,
+            "replaysPerTx": 0.00981339677347409,
+            "totalOpsPerTx": 5.3964017545163925,
+            "txn": 13451
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.18853616831462344,
+            "coordinatorMembersPerRound": 1.0526968973747017,
+            "coordinatorRoundsPerTx": 0.7787525091071296,
+            "coordinatorSubmissionsPerTx": 0.8197903501598394,
+            "directCandidatesPerTx": 0.1208088617946621,
+            "directLandRate": 0.9913846153846154,
+            "directLandedPerTx": 0.11976804698535425
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 16.64310974685897,
+            "queueWaitMs": 0.35474974648725,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.0033578526503605676
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "lo",
+          "policy": "avoidable",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 38,
+            "warmupMerges": 0,
+            "warmupSplits": 106
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 94,
+          "shapes": [
+            {
+              "committed": 1619,
+              "converged": true,
+              "meanMs": 162.094863,
+              "p50Ms": 72.48208000000001,
+              "p90Ms": 399.291377,
+              "relCi": 0.048711628284017525,
+              "shape": "rwSingle",
+              "txPerSec": 47.69546514909661
+            },
+            {
+              "committed": 402,
+              "converged": true,
+              "meanMs": 658.712862,
+              "p50Ms": 482.599232,
+              "p90Ms": 1128.359555,
+              "relCi": 0.09775591493854802,
+              "shape": "rwMany",
+              "txPerSec": 11.8428513162753
+            },
+            {
+              "committed": 8112,
+              "converged": true,
+              "meanMs": 32.189557,
+              "p50Ms": 28.339944999999997,
+              "p90Ms": 50.56288,
+              "relCi": 0.02176166399253205,
+              "shape": "roSingle",
+              "txPerSec": 238.97812979979048
+            },
+            {
+              "committed": 3318,
+              "converged": true,
+              "meanMs": 79.075465,
+              "p50Ms": 57.173747,
+              "p90Ms": 97.307489,
+              "relCi": 0.03402654709448192,
+              "shape": "roMulti",
+              "txPerSec": 97.74770933067231
+            }
+          ],
+          "splitSettleWallMs": 15816,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 100,
+          "aggregateOps": {
+            "attemptedTxn": 10140,
+            "objListsPerTx": 0.0003944773175542406,
+            "objReadsPerTx": 3.493491124260355,
+            "objWritesPerTx": 1.8194280078895464,
+            "replaysPerTx": 0.008284023668639054,
+            "totalOpsPerTx": 5.313313609467456,
+            "txn": 10140
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.0,
+            "coordinatorMembersPerRound": 1.1991142604074403,
+            "coordinatorRoundsPerTx": 1.6701183431952662,
+            "coordinatorSubmissionsPerTx": 2.002662721893491,
+            "directCandidatesPerTx": 0.22810650887573963,
+            "directLandRate": 0.9930825767401643,
+            "directLandedPerTx": 0.22652859960552268
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 0.0,
+            "queueWaitMs": 8.052671928500986,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.03269353737672583
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "lo",
+          "policy": "size",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 0,
+            "warmupMerges": 0,
+            "warmupSplits": 0
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 110,
+          "shapes": [
+            {
+              "committed": 2305,
+              "converged": true,
+              "meanMs": 87.28886,
+              "p50Ms": 77.36715500000001,
+              "p90Ms": 138.190284,
+              "relCi": 0.04082447481639791,
+              "shape": "rwSingle",
+              "txPerSec": 90.97479466034696
+            },
+            {
+              "committed": 998,
+              "converged": true,
+              "meanMs": 202.047708,
+              "p50Ms": 194.02629499999998,
+              "p90Ms": 253.82917,
+              "relCi": 0.062042715907626,
+              "shape": "rwMany",
+              "txPerSec": 39.389519946372864
+            },
+            {
+              "committed": 4536,
+              "converged": true,
+              "meanMs": 44.304035,
+              "p50Ms": 36.159442,
+              "p90Ms": 78.474519,
+              "relCi": 0.029101779674908432,
+              "shape": "roSingle",
+              "txPerSec": 179.02891597179513
+            },
+            {
+              "committed": 2301,
+              "converged": true,
+              "meanMs": 87.361886,
+              "p50Ms": 81.676595,
+              "p90Ms": 116.667377,
+              "relCi": 0.040859943524058154,
+              "shape": "roMulti",
+              "txPerSec": 90.81691627794119
+            }
+          ],
+          "splitSettleWallMs": 18829,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 100,
+          "aggregateOps": {
+            "attemptedTxn": 10726,
+            "objListsPerTx": 0.0035427932127540555,
+            "objReadsPerTx": 3.679190751445087,
+            "objWritesPerTx": 1.9283982845422338,
+            "replaysPerTx": 0.00857728883087824,
+            "totalOpsPerTx": 5.611131829200074,
+            "txn": 10726
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.00027969420100689915,
+            "coordinatorMembersPerRound": 1.1368404571786441,
+            "coordinatorRoundsPerTx": 1.7864068618310647,
+            "coordinatorSubmissionsPerTx": 2.0308595935110945,
+            "directCandidatesPerTx": 0.2310274100316987,
+            "directLandRate": 0.9931396287328491,
+            "directLandedPerTx": 0.22944247622599293
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 0.0,
+            "queueWaitMs": 6.62184550531419,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.05049677633787059
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "lo",
+          "policy": "avoidable",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 10,
+            "warmupMerges": 0,
+            "warmupSplits": 62
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 101,
+          "shapes": [
+            {
+              "committed": 2471,
+              "converged": true,
+              "meanMs": 81.4552,
+              "p50Ms": 72.637225,
+              "p90Ms": 128.626509,
+              "relCi": 0.039429357349101864,
+              "shape": "rwSingle",
+              "txPerSec": 97.24015487388702
+            },
+            {
+              "committed": 1006,
+              "converged": true,
+              "meanMs": 200.432575,
+              "p50Ms": 187.892567,
+              "p90Ms": 250.26023899999998,
+              "relCi": 0.0617955327897043,
+              "shape": "rwMany",
+              "txPerSec": 39.58866470686825
+            },
+            {
+              "committed": 4849,
+              "converged": true,
+              "meanMs": 41.440202,
+              "p50Ms": 34.230565,
+              "p90Ms": 75.32575,
+              "relCi": 0.028146861705725074,
+              "shape": "roSingle",
+              "txPerSec": 190.82050991336848
+            },
+            {
+              "committed": 2400,
+              "converged": true,
+              "meanMs": 83.81201,
+              "p50Ms": 77.7807,
+              "p90Ms": 116.285848,
+              "relCi": 0.040008332465458575,
+              "shape": "roMulti",
+              "txPerSec": 94.44611492402899
+            }
+          ],
+          "splitSettleWallMs": 17330,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 0,
+          "aggregateOps": {
+            "attemptedTxn": 4303,
+            "objListsPerTx": 0.031605856379270277,
+            "objReadsPerTx": 3.659772251917267,
+            "objWritesPerTx": 1.7143853125726238,
+            "replaysPerTx": 0.3358122240297467,
+            "totalOpsPerTx": 5.405763420869161,
+            "txn": 4303
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.16337438996049267,
+            "coordinatorMembersPerRound": 1.7707100591715976,
+            "coordinatorRoundsPerTx": 0.6283987915407855,
+            "coordinatorSubmissionsPerTx": 1.1127120613525447,
+            "directCandidatesPerTx": 0.3251220079014641,
+            "directLandRate": 0.35739814152966404,
+            "directLandedPerTx": 0.11619800139437601
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 0.7660705135951662,
+            "queueWaitMs": 1.1483705368347663,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.004932078549848943
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "hi",
+          "policy": "size",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 0,
+            "warmupMerges": 0,
+            "warmupSplits": 0
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 0,
+          "shapes": [
+            {
+              "committed": 465,
+              "converged": true,
+              "meanMs": 1146.8920819999998,
+              "p50Ms": 254.55159500000002,
+              "p90Ms": 2548.349967,
+              "relCi": 0.09089282356899299,
+              "shape": "rwSingle",
+              "txPerSec": 6.673410503417216
+            },
+            {
+              "committed": 393,
+              "converged": true,
+              "meanMs": 1368.689767,
+              "p50Ms": 373.483385,
+              "p90Ms": 2902.148757,
+              "relCi": 0.09886892137184239,
+              "shape": "rwMany",
+              "txPerSec": 5.640108101601221
+            },
+            {
+              "committed": 2174,
+              "converged": true,
+              "meanMs": 245.16480800000002,
+              "p50Ms": 38.493492999999994,
+              "p90Ms": 180.386205,
+              "relCi": 0.04203647603435978,
+              "shape": "roSingle",
+              "txPerSec": 31.19998702579969
+            },
+            {
+              "committed": 1271,
+              "converged": true,
+              "meanMs": 420.399798,
+              "p50Ms": 44.845715,
+              "p90Ms": 616.663361,
+              "relCi": 0.05497728591841501,
+              "shape": "roMulti",
+              "txPerSec": 18.24065458281577
+            }
+          ],
+          "splitSettleWallMs": 5023,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 0,
+          "aggregateOps": {
+            "attemptedTxn": 5377,
+            "objListsPerTx": 0.02101543611679375,
+            "objReadsPerTx": 2.6018225776455273,
+            "objWritesPerTx": 1.3485214803793937,
+            "replaysPerTx": 0.2867770132043891,
+            "totalOpsPerTx": 3.9713594941417147,
+            "txn": 5377
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.120699274688488,
+            "coordinatorMembersPerRound": 1.7365684575389948,
+            "coordinatorRoundsPerTx": 0.536544541565929,
+            "coordinatorSubmissionsPerTx": 0.9317463269481123,
+            "directCandidatesPerTx": 0.27208480565371024,
+            "directLandRate": 0.38414217361585784,
+            "directLandedPerTx": 0.1045192486516645
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 1.096427256834666,
+            "queueWaitMs": 0.8634057011344615,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.005848551422726427
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "hi",
+          "policy": "avoidable",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 0,
+            "warmupMerges": 1,
+            "warmupSplits": 1
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 0,
+          "shapes": [
+            {
+              "committed": 523,
+              "converged": true,
+              "meanMs": 1119.530868,
+              "p50Ms": 188.248725,
+              "p90Ms": 1878.821447,
+              "relCi": 0.0857048160115387,
+              "shape": "rwSingle",
+              "txPerSec": 6.871096853151008
+            },
+            {
+              "committed": 393,
+              "converged": true,
+              "meanMs": 1485.200709,
+              "p50Ms": 331.14856999999995,
+              "p90Ms": 2871.891192,
+              "relCi": 0.09886892137184239,
+              "shape": "rwMany",
+              "txPerSec": 5.163175962755636
+            },
+            {
+              "committed": 2887,
+              "converged": true,
+              "meanMs": 201.21318799999997,
+              "p50Ms": 37.318515,
+              "p90Ms": 137.06870400000003,
+              "relCi": 0.03647813946482714,
+              "shape": "roSingle",
+              "txPerSec": 37.92897919920462
+            },
+            {
+              "committed": 1574,
+              "converged": true,
+              "meanMs": 372.219285,
+              "p50Ms": 47.85564,
+              "p90Ms": 445.500745,
+              "relCi": 0.04940304380274415,
+              "shape": "roMulti",
+              "txPerSec": 20.6789791223422
+            }
+          ],
+          "splitSettleWallMs": 5027,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 50,
+          "aggregateOps": {
+            "attemptedTxn": 5177,
+            "objListsPerTx": 0.02202047517867491,
+            "objReadsPerTx": 2.6915201854355804,
+            "objWritesPerTx": 1.5089820359281436,
+            "replaysPerTx": 0.3305002897430945,
+            "totalOpsPerTx": 4.222522696542399,
+            "txn": 5177
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.14100830596870775,
+            "coordinatorMembersPerRound": 1.9705981750591417,
+            "coordinatorRoundsPerTx": 0.5715665443306934,
+            "coordinatorSubmissionsPerTx": 1.1263279891829245,
+            "directCandidatesPerTx": 0.2903225806451613,
+            "directLandRate": 0.26679973386560213,
+            "directLandedPerTx": 0.07745798725130384
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 0.40301885358315626,
+            "queueWaitMs": 0.848442908054858,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.004951115510913657
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "hi",
+          "policy": "size",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 0,
+            "warmupMerges": 0,
+            "warmupSplits": 0
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 0,
+          "shapes": [
+            {
+              "committed": 440,
+              "converged": true,
+              "meanMs": 1385.447345,
+              "p50Ms": 505.359682,
+              "p90Ms": 3228.308188,
+              "relCi": 0.09343933374606804,
+              "shape": "rwSingle",
+              "txPerSec": 5.574764279047586
+            },
+            {
+              "committed": 397,
+              "converged": true,
+              "meanMs": 1524.592781,
+              "p50Ms": 514.25282,
+              "p90Ms": 3907.270148,
+              "relCi": 0.09836958019278513,
+              "shape": "rwMany",
+              "txPerSec": 5.029957557422116
+            },
+            {
+              "committed": 2864,
+              "converged": true,
+              "meanMs": 211.394807,
+              "p50Ms": 37.994335,
+              "p90Ms": 151.531409,
+              "relCi": 0.03662431954484486,
+              "shape": "roSingle",
+              "txPerSec": 36.28664534204624
+            },
+            {
+              "committed": 1476,
+              "converged": true,
+              "meanMs": 411.20527,
+              "p50Ms": 44.475307,
+              "p90Ms": 701.615683,
+              "relCi": 0.05101676221694465,
+              "shape": "roMulti",
+              "txPerSec": 18.700798795833975
+            }
+          ],
+          "splitSettleWallMs": 5024,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 50,
+          "aggregateOps": {
+            "attemptedTxn": 6023,
+            "objListsPerTx": 0.029719408932425702,
+            "objReadsPerTx": 3.2653162875643367,
+            "objWritesPerTx": 1.4449609828988876,
+            "replaysPerTx": 0.337207371741657,
+            "totalOpsPerTx": 4.73999667939565,
+            "txn": 6023
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.16038519010459903,
+            "coordinatorMembersPerRound": 1.9572130673605088,
+            "coordinatorRoundsPerTx": 0.5742985223310643,
+            "coordinatorSubmissionsPerTx": 1.12402457247219,
+            "directCandidatesPerTx": 0.2862360949692844,
+            "directLandRate": 0.2314385150812065,
+            "directLandedPerTx": 0.06624605678233439
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 0.6945363689191434,
+            "queueWaitMs": 1.0786384019591564,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.0
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "hi",
+          "policy": "avoidable",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 0,
+            "warmupMerges": 0,
+            "warmupSplits": 0
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 0,
+          "shapes": [
+            {
+              "committed": 524,
+              "converged": true,
+              "meanMs": 1241.34039,
+              "p50Ms": 515.077555,
+              "p90Ms": 3549.109971,
+              "relCi": 0.08562299755278172,
+              "shape": "rwSingle",
+              "txPerSec": 6.1661036292320945
+            },
+            {
+              "committed": 397,
+              "converged": true,
+              "meanMs": 1609.8447199999998,
+              "p50Ms": 762.90834,
+              "p90Ms": 4242.76787,
+              "relCi": 0.09836958019278513,
+              "shape": "rwMany",
+              "txPerSec": 4.671647160853701
+            },
+            {
+              "committed": 3429,
+              "converged": true,
+              "meanMs": 187.241267,
+              "p50Ms": 35.8278,
+              "p90Ms": 131.76230999999999,
+              "relCi": 0.03347128061246592,
+              "shape": "roSingle",
+              "txPerSec": 40.35032265686293
+            },
+            {
+              "committed": 1673,
+              "converged": true,
+              "meanMs": 381.36899600000004,
+              "p50Ms": 44.633424999999995,
+              "p90Ms": 868.8036500000001,
+              "relCi": 0.04791903911414993,
+              "shape": "roMulti",
+              "txPerSec": 19.68681523230624
+            }
+          ],
+          "splitSettleWallMs": 5021,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 100,
+          "aggregateOps": {
+            "attemptedTxn": 8997,
+            "objListsPerTx": 0.0038901856174280314,
+            "objReadsPerTx": 1.478270534622652,
+            "objWritesPerTx": 1.1906190952539735,
+            "replaysPerTx": 0.2874291430476826,
+            "totalOpsPerTx": 2.6727798154940534,
+            "txn": 8997
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.0,
+            "coordinatorMembersPerRound": 2.9373092926490987,
+            "coordinatorRoundsPerTx": 0.40068911859508727,
+            "coordinatorSubmissionsPerTx": 1.1769478715127264,
+            "directCandidatesPerTx": 0.2092919862176281,
+            "directLandRate": 0.09824747742963356,
+            "directLandedPerTx": 0.020562409692119595
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 0.0,
+            "queueWaitMs": 1.6416541936200955,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.01071932799822163
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "hi",
+          "policy": "size",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 0,
+            "warmupMerges": 0,
+            "warmupSplits": 0
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 0,
+          "shapes": [
+            {
+              "committed": 512,
+              "converged": true,
+              "meanMs": 913.612495,
+              "p50Ms": 1057.885055,
+              "p90Ms": 1523.559025,
+              "relCi": 0.08662058069535207,
+              "shape": "rwSingle",
+              "txPerSec": 8.661574792952475
+            },
+            {
+              "committed": 393,
+              "converged": true,
+              "meanMs": 1184.597606,
+              "p50Ms": 1172.72332,
+              "p90Ms": 1683.138278,
+              "relCi": 0.09886892137184239,
+              "shape": "rwMany",
+              "txPerSec": 6.6484352255245005
+            },
+            {
+              "committed": 5823,
+              "converged": true,
+              "meanMs": 79.62353399999999,
+              "p50Ms": 34.36649,
+              "p90Ms": 114.667293,
+              "relCi": 0.02568518370971121,
+              "shape": "roSingle",
+              "txPerSec": 98.5084931485645
+            },
+            {
+              "committed": 2269,
+              "converged": true,
+              "meanMs": 205.686594,
+              "p50Ms": 51.31571,
+              "p90Ms": 897.7775829999999,
+              "relCi": 0.04114706128351966,
+              "shape": "roMulti",
+              "txPerSec": 38.38498511200754
+            }
+          ],
+          "splitSettleWallMs": 5026,
+          "workersPerShape": 8
+        },
+        {
+          "affinityPct": 100,
+          "aggregateOps": {
+            "attemptedTxn": 9370,
+            "objListsPerTx": 0.0036286019210245465,
+            "objReadsPerTx": 1.4097118463180363,
+            "objWritesPerTx": 1.1420490928495197,
+            "replaysPerTx": 0.2791889007470651,
+            "totalOpsPerTx": 2.5553895410885805,
+            "txn": 9370
+          },
+          "aggregateProtocol": {
+            "coordinatorCasRetriesPerTx": 0.0,
+            "coordinatorMembersPerRound": 2.96984785615491,
+            "coordinatorRoundsPerTx": 0.3858057630736393,
+            "coordinatorSubmissionsPerTx": 1.1457844183564567,
+            "directCandidatesPerTx": 0.20928495197438635,
+            "directLandRate": 0.10912799592044875,
+            "directLandedPerTx": 0.022838847385272146
+          },
+          "avoidablePerTx": {
+            "adjacentMissMs": 0.0,
+            "inlinePressureMs": 0.0,
+            "lostCasMs": 0.0,
+            "queueWaitMs": 1.5229001675560299,
+            "scanCrossingMs": 0.0,
+            "slowCasMs": 0.0019357883671291356
+          },
+          "databaseLimit": 4,
+          "databases": 4,
+          "failures": 0,
+          "keyLayout": "shared",
+          "mode": "hi",
+          "policy": "avoidable",
+          "restructure": {
+            "measuredMerges": 0,
+            "measuredSplits": 0,
+            "warmupMerges": 0,
+            "warmupSplits": 0
+          },
+          "seedLeafEntries": null,
+          "setupSplits": 0,
+          "shapes": [
+            {
+              "committed": 545,
+              "converged": true,
+              "meanMs": 873.7593009999999,
+              "p50Ms": 1034.66491,
+              "p90Ms": 1488.893671,
+              "relCi": 0.08395717562811139,
+              "shape": "rwSingle",
+              "txPerSec": 9.093447015848188
+            },
+            {
+              "committed": 397,
+              "converged": true,
+              "meanMs": 1199.100622,
+              "p50Ms": 1192.1523249999998,
+              "p90Ms": 1640.2918849999999,
+              "relCi": 0.09836958019278513,
+              "shape": "rwMany",
+              "txPerSec": 6.624033781245475
+            },
+            {
+              "committed": 6115,
+              "converged": true,
+              "meanMs": 77.243853,
+              "p50Ms": 34.3976,
+              "p90Ms": 110.75853400000001,
+              "relCi": 0.025064430465716308,
+              "shape": "roSingle",
+              "txPerSec": 102.03014214203363
+            },
+            {
+              "committed": 2313,
+              "converged": true,
+              "meanMs": 204.717078,
+              "p50Ms": 51.193324999999994,
+              "p90Ms": 889.2951850000001,
+              "relCi": 0.04075381362138461,
+              "shape": "roMulti",
+              "txPerSec": 38.59292131683928
+            }
+          ],
+          "splitSettleWallMs": 5028,
+          "workersPerShape": 8
+        }
+      ],
+      "run": 2
+    }
+  ],
+  "scenario": "mixed",
+  "schemaVersion": 1
+}

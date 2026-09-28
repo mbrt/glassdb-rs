@@ -1,0 +1,48 @@
+mixed: run=1 mode=lo affinity=0% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 16.576803177s: 97 completed splits, 5s quiet
+mixed: run=1 mode=lo affinity=0% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 16.071105087s: 94 completed splits, 5s quiet
+mixed: run=1 mode=lo affinity=50% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 18.829730569s: 110 completed splits, 5s quiet
+mixed: run=1 mode=lo affinity=50% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 16.072039778s: 94 completed splits, 5s quiet
+mixed: run=1 mode=lo affinity=100% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 19.079712856s: 108 completed splits, 5s quiet
+mixed: run=1 mode=lo affinity=100% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 18.83189888s: 108 completed splits, 5s quiet
+mixed: run=1 mode=hi affinity=0% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 5.027712288s: 0 completed splits, 5s quiet
+mixed: run=1 mode=hi affinity=0% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 5.025111044s: 0 completed splits, 5s quiet
+mixed: run=1 mode=hi affinity=50% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 5.022715136s: 0 completed splits, 5s quiet
+mixed: run=1 mode=hi affinity=50% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 5.022932585s: 0 completed splits, 5s quiet
+mixed: run=1 mode=hi affinity=100% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 5.026189067s: 0 completed splits, 5s quiet
+mixed: run=1 mode=hi affinity=100% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 5.023092893s: 0 completed splits, 5s quiet
+mixed: run=2 mode=lo affinity=0% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 16.322122692s: 95 completed splits, 5s quiet
+mixed: run=2 mode=lo affinity=0% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 15.565162151s: 91 completed splits, 5s quiet
+mixed: run=2 mode=lo affinity=50% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 15.066146063s: 92 completed splits, 5s quiet
+mixed: run=2 mode=lo affinity=50% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 15.81699773s: 94 completed splits, 5s quiet
+mixed: run=2 mode=lo affinity=100% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 18.829878744s: 110 completed splits, 5s quiet
+mixed: run=2 mode=lo affinity=100% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 17.330960496s: 101 completed splits, 5s quiet
+mixed: run=2 mode=hi affinity=0% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 5.023921596s: 0 completed splits, 5s quiet
+mixed: run=2 mode=hi affinity=0% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 5.02758324s: 0 completed splits, 5s quiet
+mixed: run=2 mode=hi affinity=50% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 5.024806429s: 0 completed splits, 5s quiet
+mixed: run=2 mode=hi affinity=50% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 5.021963183s: 0 completed splits, 5s quiet
+mixed: run=2 mode=hi affinity=100% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=size
+  setup settled after 5.026255415s: 0 completed splits, 5s quiet
+mixed: run=2 mode=hi affinity=100% databases=4/4 workers/shape=8 seed-leaf-entries=default key-layout=shared policy=avoidable
+  setup settled after 5.028242095s: 0 completed splits, 5s quiet

@@ -1,0 +1,479 @@
+diff --git a/crates/glassdb-bench-scale/src/bin/perfbench/policy/net.rs b/crates/glassdb-bench-scale/src/bin/perfbench/policy/net.rs
+index 0de7ae963..3f8354267 100644
+--- a/crates/glassdb-bench-scale/src/bin/perfbench/policy/net.rs
++++ b/crates/glassdb-bench-scale/src/bin/perfbench/policy/net.rs
+@@ -1,5 +1,5 @@
+ //! A topology policy outside the engine that subtracts the time that a split
+-//! adds from the avoidable time of a leaf, and decides on a moving average.
++//! adds from the avoidable time of a leaf, and decides on moving averages.
+ 
+ use std::collections::{BTreeSet, HashMap};
+ use std::sync::Mutex;
+@@ -7,19 +7,28 @@ use std::time::Duration;
+ 
+ use glassdb::{LeafId, LeafWindow, TopologyChange, TopologyPolicy, TopologyWindow};
+ 
+-/// Decides like [`glassdb::AvoidableTimePolicy`], with two differences for
+-/// splits. A split adds time to the transactions whose keys it puts in both
+-/// halves of the leaf, so the policy subtracts their count, times the mean
+-/// latency of the transactions of the leaf, times a weight. And the moving
+-/// average of this net time over the windows must pay for the split, not the
+-/// time of one window: the avoidable time of one window is noisy, and one
+-/// window can pay for a split that the load does not keep paying for.
++/// Decides like [`glassdb::AvoidableTimePolicy`], with two differences. It
++/// decides on moving averages of the time of each leaf and pair over the
++/// windows, not on the time of one window: the avoidable time of one window is
++/// noisy, and one window can pay for a change that the load does not keep
++/// paying for. And a split adds time to the transactions whose keys it puts in
++/// both halves of the leaf, so the policy subtracts their count, times the
++/// mean latency of the transactions of the leaf, times a weight. A merge must
++/// pay for this net split-side time of both leaves.
+ pub(crate) struct NetTimePolicy {
+     split_threshold: f64,
+     merge_threshold: f64,
+     divided_weight: f64,
+     half_life: Duration,
+-    leaves: Mutex<HashMap<LeafId, NetTime>>,
++    averages: Mutex<Averages>,
++}
++
++/// The moving averages of the leaves and pairs with recent measurements.
++#[derive(Debug, Default)]
++struct Averages {
++    leaves: HashMap<LeafId, NetTime>,
++    /// The merge-side time of each pair of adjacent leaves, in seconds.
++    pairs: HashMap<(LeafId, LeafId), f64>,
+ }
+ 
+ /// The moving averages of the net split-side time of one leaf in one window,
+@@ -35,6 +44,9 @@ struct NetTime {
+     split_key: Option<Vec<u8>>,
+ }
+ 
++/// An average in seconds below which the policy forgets a leaf or a pair.
++const NEGLIGIBLE: f64 = 1e-6;
++
+ impl NetTimePolicy {
+     pub(crate) fn new(
+         split_threshold: f64,
+@@ -47,7 +59,7 @@ impl NetTimePolicy {
+             merge_threshold,
+             divided_weight,
+             half_life,
+-            leaves: Mutex::new(HashMap::new()),
++            averages: Mutex::new(Averages::default()),
+         }
+     }
+ 
+@@ -66,16 +78,24 @@ impl NetTimePolicy {
+ impl TopologyPolicy for NetTimePolicy {
+     fn decide(&self, window: &TopologyWindow) -> Vec<TopologyChange> {
+         let decay = 0.5_f64.powf(window.elapsed.as_secs_f64() / self.half_life.as_secs_f64());
++        let weight = 1.0 - decay;
+         let split_time = window
+             .split_time
+             .mul_f64(self.split_threshold)
+             .as_secs_f64();
+-        let merge_time = window.merge_time.mul_f64(self.merge_threshold);
+-        let mut leaves = self.leaves.lock().unwrap();
+-        leaves.retain(|id, net| {
+-            net.decay(decay);
+-            window.leaves.contains_key(id) || !net.is_negligible()
+-        });
++        let merge_time = window
++            .merge_time
++            .mul_f64(self.merge_threshold)
++            .as_secs_f64();
++        let mut averages = self.averages.lock().unwrap();
++        averages.decay(decay);
++        // The measurements start again at each change of a leaf.
++        let changed = |id: &LeafId| {
++            window
++                .leaves
++                .get(id)
++                .is_some_and(|leaf| leaf.split_recently || leaf.merged_recently)
++        };
+         let mut held: BTreeSet<&LeafId> = window
+             .leaves
+             .iter()
+@@ -84,12 +104,11 @@ impl TopologyPolicy for NetTimePolicy {
+             .collect();
+         let mut changes = Vec::new();
+         for (id, leaf) in &window.leaves {
+-            // The measurements start again at each change of the leaf.
+-            if leaf.split_recently || leaf.merged_recently {
+-                leaves.remove(id);
++            if changed(id) {
++                averages.leaves.remove(id);
+             }
+-            let net = leaves.entry(id.clone()).or_default();
+-            net.add(leaf, self.added_time(leaf), 1.0 - decay);
++            let net = averages.leaves.entry(id.clone()).or_default();
++            net.add(leaf, self.added_time(leaf), weight);
+             let over_cap = leaf
+                 .size
+                 .is_some_and(|size| size.over_soft_cap(&window.node_size));
+@@ -100,25 +119,28 @@ impl TopologyPolicy for NetTimePolicy {
+                 _ if pays || over_cap => TopologyChange::Split(id.clone()),
+                 _ => continue,
+             };
+-            // A split can take more than one window to land. If the average
+-            // stays, the next window asks for a second split of the same
+-            // leaf. The engine retries a deferred split itself.
+-            leaves.remove(id);
++            // A change can take more than one window to land. If the average
++            // stays, the next window asks for the same change again. The
++            // engine retries a deferred change itself.
++            averages.leaves.remove(id);
+             changes.push(change);
+             held.insert(id);
+         }
+-        let split_side = |id: &LeafId| {
+-            window
+-                .leaves
+-                .get(id)
+-                .map_or(Duration::ZERO, |leaf| leaf.avoidable.total())
+-        };
+         for pair in &window.pairs {
++            let key = (pair.left.clone(), pair.right.clone());
++            if changed(&pair.left) || changed(&pair.right) {
++                averages.pairs.remove(&key);
++            }
++            let merge_side = averages.pairs.entry(key.clone()).or_default();
++            *merge_side += weight * pair.avoidable.total().as_secs_f64();
++            let merge_side = *merge_side;
+             if held.contains(&pair.left) || held.contains(&pair.right) {
+                 continue;
+             }
+-            let keep = merge_time + split_side(&pair.left) + split_side(&pair.right);
+-            if pair.avoidable.total() > keep {
++            let keep =
++                merge_time + averages.split_side(&pair.left) + averages.split_side(&pair.right);
++            if merge_side > keep {
++                averages.pairs.remove(&key);
+                 changes.push(TopologyChange::Merge(pair.left.clone()));
+                 held.insert(&pair.left);
+                 held.insert(&pair.right);
+@@ -128,6 +150,28 @@ impl TopologyPolicy for NetTimePolicy {
+     }
+ }
+ 
++impl Averages {
++    /// Decays all averages by `factor`, and forgets the negligible ones.
++    fn decay(&mut self, factor: f64) {
++        self.leaves.retain(|_, net| {
++            net.decay(factor);
++            !net.is_negligible()
++        });
++        self.pairs.retain(|_, time| {
++            *time *= factor;
++            *time >= NEGLIGIBLE
++        });
++    }
++
++    /// Returns the split-side time in seconds that a merge of the leaf into
++    /// its neighbor would bring back.
++    fn split_side(&self, id: &LeafId) -> f64 {
++        // A negative net time tells that a split would hurt, not that a merge
++        // would help.
++        self.leaves.get(id).map_or(0.0, |net| net.total.max(0.0))
++    }
++}
++
+ impl NetTime {
+     /// Adds the measurements of `leaf` in one window with `weight`, less
+     /// `added` seconds that a split would have added.
+@@ -145,7 +189,7 @@ impl NetTime {
+     }
+ 
+     fn is_negligible(&self) -> bool {
+-        self.total.abs() < 1e-6 && self.delays.abs() < 1e-6
++        self.total.abs() < NEGLIGIBLE && self.delays.abs() < NEGLIGIBLE
+     }
+ }
+ 
+@@ -154,41 +198,62 @@ mod tests {
+     use std::sync::Arc;
+ 
+     use glassdb::memory::MemoryBackend;
+-    use glassdb::{Backend, Database, SplitTime};
++    use glassdb::middleware::HookBackend;
++    use glassdb::{
++        Backend, Collection, Database, KeyScan, MergeTime, NodeSizePolicy, PairWindow, SplitTime,
++    };
+ 
+     use super::*;
+ 
+-    /// Keeps the last window that has a leaf, and changes nothing.
+-    struct Capture(Arc<Mutex<Option<TopologyWindow>>>);
++    /// Keeps each window, and changes nothing.
++    struct Capture(Arc<Mutex<Vec<TopologyWindow>>>);
+ 
+     impl TopologyPolicy for Capture {
+         fn decide(&self, window: &TopologyWindow) -> Vec<TopologyChange> {
+-            if !window.leaves.is_empty() {
+-                *self.0.lock().unwrap() = Some(window.clone());
+-            }
++            self.0.lock().unwrap().push(window.clone());
+             Vec::new()
+         }
+     }
+ 
+-    // Returns a window of one second of a real database instance with one
+-    // leaf, whose measurements the tests then set.
+-    async fn one_leaf_window() -> (TopologyWindow, LeafId) {
+-        let captured = Arc::new(Mutex::new(None));
+-        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+-        let db = Database::builder("netpolicytest", backend)
++    // Returns the windows of a real database instance on `backend`, while
++    // `load` runs on its collection and for two seconds after.
++    async fn windows_of<F: Future<Output = ()>>(
++        backend: &Arc<dyn Backend>,
++        sizes: NodeSizePolicy,
++        load: impl FnOnce(Collection) -> F,
++    ) -> Vec<TopologyWindow> {
++        let captured = Arc::new(Mutex::new(Vec::new()));
++        let db = Database::builder("netpolicytest", backend.clone())
++            .node_size_policy(sizes)
+             .topology_policy(Capture(captured.clone()))
+             .open()
+             .await
+             .unwrap();
+-        let collection = db
+-            .root_collection()
++        load(collection(&db).await).await;
++        tokio::time::sleep(Duration::from_secs(2)).await;
++        db.shutdown().await;
++        std::mem::take(&mut *captured.lock().unwrap())
++    }
++
++    async fn collection(db: &Database) -> Collection {
++        db.root_collection()
+             .create_collection_if_absent(b"c")
+             .await
++            .unwrap()
++    }
++
++    // Returns a window of one second with one leaf, whose measurements the
++    // tests then set.
++    async fn one_leaf_window() -> (TopologyWindow, LeafId) {
++        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
++        let windows = windows_of(&backend, NodeSizePolicy::default(), |c| async move {
++            c.write(b"key", b"value").await.unwrap();
++        })
++        .await;
++        let mut window = windows
++            .into_iter()
++            .rfind(|window| !window.leaves.is_empty())
+             .unwrap();
+-        collection.write(b"key", b"value").await.unwrap();
+-        tokio::time::sleep(Duration::from_secs(2)).await;
+-        db.shutdown().await;
+-        let mut window = captured.lock().unwrap().take().unwrap();
+         window.elapsed = Duration::from_secs(1);
+         let id = window.leaves.keys().next().unwrap().clone();
+         window.leaves.retain(|leaf, _| *leaf == id);
+@@ -196,12 +261,53 @@ mod tests {
+         (window, id)
+     }
+ 
+-    fn policy() -> NetTimePolicy {
+-        NetTimePolicy::new(0.25, 0.1, 0.25, Duration::from_secs(10))
++    // Returns a window of one second with one pair of adjacent leaves and no
++    // leaf measurements, which the tests then set.
++    async fn one_pair_window() -> (TopologyWindow, LeafId, LeafId) {
++        // Under paused time, the memory backend takes no time, and the engine
++        // reports no pair without merge-side time.
++        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
++        backend.set_before(|_| {
++            Box::pin(async {
++                tokio::time::sleep(Duration::from_millis(5)).await;
++                Ok(())
++            })
++        });
++        let backend: Arc<dyn Backend> = backend;
++        let sizes = NodeSizePolicy::builder()
++            .leaf_max_entries(2)
++            .leaf_min_entries(0)
++            .index_min_children(0)
++            .build()
++            .unwrap();
++        let db = Database::builder("netpolicytest", backend.clone())
++            .node_size_policy(sizes)
++            .open()
++            .await
++            .unwrap();
++        let c = collection(&db).await;
++        for key in 0..4u8 {
++            c.write(&[key], b"value").await.unwrap();
++        }
++        tokio::time::sleep(Duration::from_secs(5)).await;
++        db.shutdown().await;
++        let windows = windows_of(&backend, sizes, |c| async move {
++            c.scan_keys(KeyScan::all()).await.unwrap();
++        })
++        .await;
++        let mut window = windows
++            .into_iter()
++            .rfind(|window| !window.pairs.is_empty())
++            .unwrap();
++        window.elapsed = Duration::from_secs(1);
++        window.leaves.clear();
++        window.pairs.truncate(1);
++        let (left, right) = (window.pairs[0].left.clone(), window.pairs[0].right.clone());
++        (window, left, right)
+     }
+ 
+-    fn set(window: &mut TopologyWindow, id: &LeafId, leaf: LeafWindow) {
+-        window.leaves.insert(id.clone(), leaf);
++    fn policy() -> NetTimePolicy {
++        NetTimePolicy::new(0.25, 0.1, 0.25, Duration::from_secs(10))
+     }
+ 
+     fn lost_cas(millis: u64) -> LeafWindow {
+@@ -214,16 +320,23 @@ mod tests {
+         leaf
+     }
+ 
+-    // Returns the index of the first of `windows` whose decision changes the
+-    // leaf, if any.
++    fn scan_crossing(pair: &mut PairWindow, millis: u64) {
++        pair.avoidable = MergeTime {
++            scan_crossing: Duration::from_millis(millis),
++            ..MergeTime::default()
++        };
++    }
++
++    // Returns the index of the first window whose decision changes a leaf, if
++    // any. `set` sets the measurements of each window.
+     fn first_change(
+         policy: &NetTimePolicy,
+         window: &mut TopologyWindow,
+-        id: &LeafId,
+-        leaves: impl IntoIterator<Item = LeafWindow>,
++        windows: usize,
++        mut set: impl FnMut(usize, &mut TopologyWindow),
+     ) -> Option<(usize, Vec<TopologyChange>)> {
+-        leaves.into_iter().enumerate().find_map(|(index, leaf)| {
+-            set(window, id, leaf);
++        (0..windows).find_map(|index| {
++            set(index, window);
+             let changes = policy.decide(window);
+             (!changes.is_empty()).then_some((index, changes))
+         })
+@@ -234,7 +347,9 @@ mod tests {
+         let (mut window, id) = one_leaf_window().await;
+         let policy = policy();
+ 
+-        let change = first_change(&policy, &mut window, &id, (0..10).map(|_| lost_cas(1000)));
++        let change = first_change(&policy, &mut window, 10, |_, window| {
++            window.leaves.insert(id.clone(), lost_cas(1000));
++        });
+ 
+         // The average of one second in each window pays for a quarter of the
+         // default split time of half a second in the second window.
+@@ -248,9 +363,12 @@ mod tests {
+     async fn a_leaf_does_not_split_again_before_its_split_lands() {
+         let (mut window, id) = one_leaf_window().await;
+         let policy = policy();
+-        first_change(&policy, &mut window, &id, (0..2).map(|_| lost_cas(1000))).unwrap();
++        let mut set = |_, window: &mut TopologyWindow| {
++            window.leaves.insert(id.clone(), lost_cas(1000));
++        };
++        first_change(&policy, &mut window, 2, &mut set).unwrap();
+ 
+-        let change = first_change(&policy, &mut window, &id, [lost_cas(1000)]);
++        let change = first_change(&policy, &mut window, 1, set);
+ 
+         assert_eq!(change, None);
+     }
+@@ -260,8 +378,10 @@ mod tests {
+         let (mut window, id) = one_leaf_window().await;
+         let policy = policy();
+ 
+-        let leaves = std::iter::once(lost_cas(1500)).chain((0..30).map(|_| LeafWindow::default()));
+-        let change = first_change(&policy, &mut window, &id, leaves);
++        let change = first_change(&policy, &mut window, 31, |index, window| {
++            let millis = if index == 0 { 1500 } else { 0 };
++            window.leaves.insert(id.clone(), lost_cas(millis));
++        });
+ 
+         assert_eq!(change, None);
+     }
+@@ -270,16 +390,72 @@ mod tests {
+     async fn transactions_that_a_split_divides_keep_a_leaf_from_splitting() {
+         let (mut window, id) = one_leaf_window().await;
+         let policy = policy();
+-        let divided = || {
++
++        // The 5 divided transactions of one second each add 1.25 seconds.
++        let change = first_change(&policy, &mut window, 30, |_, window| {
+             let mut leaf = lost_cas(1000);
+             leaf.committed.direct = 10;
+             leaf.divided.direct = 5;
+             leaf.latency = Duration::from_secs(10);
+-            leaf
++            window.leaves.insert(id.clone(), leaf);
++        });
++
++        assert_eq!(change, None);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn a_pair_merges_when_its_merge_time_keeps_paying() {
++        let (mut window, left, _) = one_pair_window().await;
++        let policy = policy();
++
++        let change = first_change(&policy, &mut window, 10, |_, window| {
++            scan_crossing(&mut window.pairs[0], 500);
++        });
++
++        // The average of half a second in each window pays for a tenth of the
++        // default merge time of half a second in the second window.
++        assert_eq!(change, Some((1, vec![TopologyChange::Merge(left)])));
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn a_pair_does_not_merge_again_before_its_merge_lands() {
++        let (mut window, _, _) = one_pair_window().await;
++        let policy = policy();
++        let mut set = |_, window: &mut TopologyWindow| {
++            scan_crossing(&mut window.pairs[0], 500);
+         };
++        first_change(&policy, &mut window, 2, &mut set).unwrap();
+ 
+-        // The 5 divided transactions of one second each add 1.25 seconds.
+-        let change = first_change(&policy, &mut window, &id, (0..30).map(|_| divided()));
++        let change = first_change(&policy, &mut window, 1, set);
++
++        assert_eq!(change, None);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn one_window_does_not_pay_for_a_merge() {
++        let (mut window, _, _) = one_pair_window().await;
++        let policy = policy();
++
++        let change = first_change(&policy, &mut window, 31, |index, window| {
++            let millis = if index == 0 { 500 } else { 0 };
++            scan_crossing(&mut window.pairs[0], millis);
++        });
++
++        assert_eq!(change, None);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn the_split_time_of_both_leaves_keeps_a_pair_from_merging() {
++        let (mut window, left, right) = one_pair_window().await;
++        let policy = policy();
++
++        // Each leaf stays below the split threshold, and the pair stays below
++        // the merge threshold plus the time of both leaves.
++        let change = first_change(&policy, &mut window, 30, |_, window| {
++            window.leaves.insert(left.clone(), lost_cas(100));
++            window.leaves.insert(right.clone(), lost_cas(100));
++            scan_crossing(&mut window.pairs[0], 200);
++        });
+ 
+         assert_eq!(change, None);
+     }

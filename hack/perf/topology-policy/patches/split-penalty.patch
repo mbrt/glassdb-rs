@@ -1,0 +1,571 @@
+diff --git a/CONTEXT.md b/CONTEXT.md
+index c61f9755e..bd2be2cbb 100644
+--- a/CONTEXT.md
++++ b/CONTEXT.md
+@@ -442,6 +442,10 @@ _Avoid_: Separator publication, parent repoint
+ The time of backend operations that transactions spend because of the current topology, and that one split or one merge would remove.
+ _Avoid_: Topology cost, contention cost, structural pressure
+ 
++**Split penalty**:
++The time of backend operations that transactions would spend more after one split of a leaf, because the split puts their keys in two leaves.
++_Avoid_: Split cost, straddle cost
++
+ **Topology participant**:
+ A transaction identity that a collection record lists while it can make structural changes to the collection tree.
+ _Avoid_: Topology lock
+diff --git a/crates/glassdb-bench-scale/src/bin/perfbench/mixed/result.rs b/crates/glassdb-bench-scale/src/bin/perfbench/mixed/result.rs
+index 4371e4df9..dc83feb41 100644
+--- a/crates/glassdb-bench-scale/src/bin/perfbench/mixed/result.rs
++++ b/crates/glassdb-bench-scale/src/bin/perfbench/mixed/result.rs
+@@ -135,6 +135,8 @@ struct AvoidablePerTx {
+     inline_pressure_ms: f64,
+     adjacent_miss_ms: f64,
+     scan_crossing_ms: f64,
++    /// Not avoidable time, but the time that one split of each leaf would add.
++    split_penalty_ms: f64,
+ }
+ 
+ impl CellResult {
+@@ -398,6 +400,7 @@ impl AvoidablePerTx {
+             inline_pressure_ms: per_tx(avoidable.split.inline_pressure),
+             adjacent_miss_ms: per_tx(avoidable.merge.adjacent_miss),
+             scan_crossing_ms: per_tx(avoidable.merge.scan_crossing),
++            split_penalty_ms: per_tx(avoidable.split_penalty),
+         }
+     }
+ }
+@@ -466,6 +469,7 @@ mod tests {
+                             lost_cas: Duration::from_millis(6),
+                             ..Default::default()
+                         },
++                        split_penalty: Duration::from_millis(9),
+                         ..Default::default()
+                     },
+                     ..Default::default()
+@@ -549,7 +553,8 @@ mod tests {
+         "lostCasMs": 2.0,
+         "queueWaitMs": 0.0,
+         "scanCrossingMs": 0.0,
+-        "slowCasMs": 0.0
++        "slowCasMs": 0.0,
++        "splitPenaltyMs": 3.0
+       },
+       "databaseLimit": 2,
+       "databases": 2,
+@@ -614,7 +619,8 @@ mod tests {
+         "lostCasMs": 0.0,
+         "queueWaitMs": 0.0,
+         "scanCrossingMs": 0.0,
+-        "slowCasMs": 0.0
++        "slowCasMs": 0.0,
++        "splitPenaltyMs": 0.0
+       },
+       "databaseLimit": 0,
+       "databases": 0,
+diff --git a/crates/glassdb-bench-scale/src/bin/perfbench/policy/memory.rs b/crates/glassdb-bench-scale/src/bin/perfbench/policy/memory.rs
+index bd5dfabe2..53734fbea 100644
+--- a/crates/glassdb-bench-scale/src/bin/perfbench/policy/memory.rs
++++ b/crates/glassdb-bench-scale/src/bin/perfbench/policy/memory.rs
+@@ -59,7 +59,7 @@ impl TopologyPolicy for MemoryPolicy {
+                 .size
+                 .is_some_and(|size| size.over_soft_cap(&window.node_size));
+             let split_side = leaf.avoidable.total();
+-            let keep = split_time + paid.merge(id);
++            let keep = split_time + paid.merge(id) + leaf.split_penalty;
+             let pays = !leaf.merged_recently && split_side > keep;
+             let at_key = pays && leaf.avoidable.leaf_delays() > keep;
+             let change = match &leaf.split_key {
+diff --git a/crates/glassdb-bench-scale/src/bin/perfbench/topology/result.rs b/crates/glassdb-bench-scale/src/bin/perfbench/topology/result.rs
+index e93734343..c899ebd3b 100644
+--- a/crates/glassdb-bench-scale/src/bin/perfbench/topology/result.rs
++++ b/crates/glassdb-bench-scale/src/bin/perfbench/topology/result.rs
+@@ -205,6 +205,8 @@ struct PerTx {
+     avoidable_inline_pressure_ms: f64,
+     avoidable_adjacent_miss_ms: f64,
+     avoidable_scan_crossing_ms: f64,
++    /// The time that one split of each leaf would add.
++    split_penalty_ms: f64,
+ }
+ 
+ impl PerTx {
+@@ -223,6 +225,7 @@ impl PerTx {
+             avoidable_inline_pressure_ms: per_tx_ms(split.inline_pressure),
+             avoidable_adjacent_miss_ms: per_tx_ms(merge.adjacent_miss),
+             avoidable_scan_crossing_ms: per_tx_ms(merge.scan_crossing),
++            split_penalty_ms: per_tx_ms(delta.restructurer.avoidable.split_penalty),
+             backend_ops: per_tx(backend.obj_reads + backend.obj_writes + backend.obj_lists),
+             obj_reads: per_tx(backend.obj_reads),
+             obj_writes: per_tx(backend.obj_writes),
+diff --git a/crates/glassdb-trans/src/algo/direct_commit.rs b/crates/glassdb-trans/src/algo/direct_commit.rs
+index a7f464b08..2810179d5 100644
+--- a/crates/glassdb-trans/src/algo/direct_commit.rs
++++ b/crates/glassdb-trans/src/algo/direct_commit.rs
+@@ -97,6 +97,7 @@ pub(super) struct DirectCommit {
+     gc_hints: GcHints,
+     counters: Arc<DirectCommitCounters>,
+     landed_time: Arc<TypicalTime>,
++    locked_time: Arc<TypicalTime>,
+ }
+ 
+ impl DirectCommit {
+@@ -116,6 +117,7 @@ impl DirectCommit {
+             gc_hints,
+             counters: Arc::new(DirectCommitCounters::default()),
+             landed_time: Arc::new(TypicalTime::default()),
++            locked_time: Arc::new(TypicalTime::default()),
+         }
+     }
+ 
+@@ -181,9 +183,16 @@ impl DirectCommit {
+             );
+             let outcome = self.coord.coordinate(operation).await?;
+             match outcome {
+-                DirectMutationOutcome::Landed(predecessors) => {
++                DirectMutationOutcome::Landed {
++                    predecessors,
++                    over_both_halves,
++                } => {
+                     self.counters.landed.fetch_add(1, Ordering::Relaxed);
+                     self.landed_time.record(started.elapsed());
++                    if over_both_halves {
++                        self.structural_hints
++                            .split_penalty_time(&leaf_path, self.locked_commit_penalty());
++                    }
+                     state.commit();
+                     self.gc_hints.schedule_all(predecessors);
+                     return Ok(DirectOutcome::Committed);
+@@ -216,8 +225,10 @@ impl DirectCommit {
+ 
+     /// Notes that a locked commit, for which `try_commit` returned `cause`,
+     /// landed after `took`. The time above a direct commit is avoidable when
+-    /// one structural change can remove the cause.
++    /// one structural change can remove the cause, and is the split penalty of
++    /// a direct commit that a split puts in two leaves.
+     pub(super) fn observe_locked_commit(&self, cause: LockedCause, took: Duration) {
++        self.locked_time.record(took);
+         let direct = self
+             .landed_time
+             .get()
+@@ -259,6 +270,18 @@ impl DirectCommit {
+         })
+     }
+ 
++    /// Returns the typical time of a locked commit above a direct commit.
++    fn locked_commit_penalty(&self) -> Duration {
++        let Some(direct) = self.landed_time.get() else {
++            return Duration::ZERO;
++        };
++        let locked = self
++            .locked_time
++            .get()
++            .unwrap_or(direct * LOCKED_COMMIT_WRITES);
++        locked.saturating_sub(direct)
++    }
++
+     /// Returns the leaf of a one-leaf `placement`. For any other placement,
+     /// counts a cross-leaf fallback and returns its cause.
+     fn single_leaf(&self, placement: MemberPlacement) -> Result<ObjectPath, LockedCause> {
+@@ -339,6 +362,9 @@ struct DirectCommitOperation {
+     /// Whether the leaf could not carry the value of a single-key member
+     /// inline, so that a split can let a later direct commit land.
+     inline_pressure: AtomicBool,
++    /// Whether a split of the last loaded leaf at its median puts the keys of
++    /// the member in both halves.
++    over_both_halves: AtomicBool,
+ }
+ 
+ impl DirectCommitOperation {
+@@ -358,6 +384,7 @@ impl DirectCommitOperation {
+             staged_over: Mutex::new(None),
+             landed_proven: AtomicBool::new(false),
+             inline_pressure: AtomicBool::new(false),
++            over_both_halves: AtomicBool::new(false),
+         }
+     }
+ 
+@@ -668,6 +695,22 @@ impl DirectCommitOperation {
+             MemberOutcome::Moved
+         }
+     }
++
++    /// Whether a split at the median of `entries` puts the keys of the member
++    /// in both halves, as [`glassdb_storage::LeafBody::median_key`] finds the
++    /// median.
++    fn split_separates(&self, entries: &BTreeMap<Vec<u8>, LeafEntry>) -> bool {
++        let keys = &self.member.keys;
++        if keys.len() < 2 || entries.len() < 2 {
++            return false;
++        }
++        let median = entries
++            .keys()
++            .nth(entries.len() / 2)
++            .expect("a leaf with two entries has a median");
++        let upper = |key: &DirectKey| key.raw_key >= *median;
++        keys.iter().any(upper) && !keys.iter().all(upper)
++    }
+ }
+ 
+ #[async_trait]
+@@ -676,6 +719,8 @@ impl MemberPolicy for DirectCommitOperation {
+         if self.has_marker(entries) {
+             self.remember_landed();
+         }
++        self.over_both_halves
++            .store(self.split_separates(entries), Ordering::Relaxed);
+     }
+ 
+     async fn resolve(
+@@ -757,7 +802,10 @@ impl LeafOperation for DirectCommitOperation {
+             Some(CoordinatedOutcome {
+                 outcome: MemberOutcome::Landed,
+                 ..
+-            }) => Ok(DirectMutationOutcome::Landed(self.predecessors())),
++            }) => Ok(DirectMutationOutcome::Landed {
++                predecessors: self.predecessors(),
++                over_both_halves: self.over_both_halves.load(Ordering::Relaxed),
++            }),
+             Some(CoordinatedOutcome {
+                 outcome: MemberOutcome::InDoubt(message),
+                 ..
+@@ -786,7 +834,10 @@ impl LeafOperation for DirectCommitOperation {
+ 
+ /// Result of one direct-commit operation at the leaf-mutation seam.
+ enum DirectMutationOutcome {
+-    Landed(Vec<TxId>),
++    Landed {
++        predecessors: Vec<TxId>,
++        over_both_halves: bool,
++    },
+     InDoubt(String),
+     Replay,
+     Reroute,
+diff --git a/crates/glassdb-trans/src/structural/avoidable.rs b/crates/glassdb-trans/src/structural/avoidable.rs
+index 327ec61ee..040c7406a 100644
+--- a/crates/glassdb-trans/src/structural/avoidable.rs
++++ b/crates/glassdb-trans/src/structural/avoidable.rs
+@@ -50,11 +50,14 @@ pub struct MergeTime {
+     pub scan_crossing: Duration,
+ }
+ 
+-/// Avoidable time that this database instance measured since the last reset.
++/// Avoidable time and split penalty that this database instance measured since
++/// the last reset.
+ #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+ pub struct AvoidableTimeStats {
+     pub split: SplitTime,
+     pub merge: MergeTime,
++    /// The time that one split of each leaf at its median would add.
++    pub split_penalty: Duration,
+ }
+ 
+ /// Collects the avoidable time of one database instance, and when a topology
+@@ -166,6 +169,7 @@ impl AddAssign for AvoidableTimeStats {
+     fn add_assign(&mut self, rhs: Self) {
+         self.split += rhs.split;
+         self.merge += rhs.merge;
++        self.split_penalty += rhs.split_penalty;
+     }
+ }
+ 
+@@ -176,6 +180,7 @@ impl Sub for AvoidableTimeStats {
+         Self {
+             split: self.split - rhs.split,
+             merge: self.merge - rhs.merge,
++            split_penalty: self.split_penalty.saturating_sub(rhs.split_penalty),
+         }
+     }
+ }
+@@ -225,6 +230,18 @@ impl AvoidableTime {
+         }
+     }
+ 
++    /// Adds split penalty of the leaf at `path`.
++    pub(super) fn add_split_penalty(&self, path: &ObjectPath, time: Duration) {
++        if time.is_zero() {
++            return;
++        }
++        let mut state = self.state.lock().unwrap();
++        state.totals.split_penalty += time;
++        if self.windows {
++            state.leaf(path).split_penalty += time;
++        }
++    }
++
+     /// Adds merge-side time of the adjacent leaves at `left` and `right`.
+     pub(super) fn add_merge_time(&self, left: &ObjectPath, right: &ObjectPath, time: MergeTime) {
+         if time.total().is_zero() {
+@@ -372,11 +389,13 @@ mod tests {
+     fn a_change_drops_the_earlier_time_of_its_leaves_and_holds_them_for_two_windows() {
+         let avoidable = AvoidableTime::with_windows();
+         avoidable.add_split_time(&node(1), lost_cas(900), None);
++        avoidable.add_split_penalty(&node(1), Duration::from_millis(50));
+         avoidable.add_split_time(&node(3), lost_cas(700), None);
+         avoidable.add_merge_time(&node(1), &node(2), scan_crossing(800));
+         avoidable.add_merge_time(&node(3), &node(4), scan_crossing(600));
+         avoidable.record_changed(node(1), ChangeKind::Split);
+         avoidable.add_split_time(&node(1), lost_cas(100), None);
++        avoidable.add_split_penalty(&node(1), Duration::from_millis(20));
+ 
+         let first = avoidable.take_window(NodeSizePolicy::default());
+         let second = avoidable.take_window(NodeSizePolicy::default());
+@@ -384,6 +403,7 @@ mod tests {
+ 
+         let changed = &first.leaves[&LeafId::new(node(1))];
+         assert_eq!(changed.avoidable, lost_cas(100));
++        assert_eq!(changed.split_penalty, Duration::from_millis(20));
+         assert!(changed.split_recently && !changed.merged_recently);
+         assert_eq!(first.leaves[&LeafId::new(node(3))].avoidable, lost_cas(700));
+         assert_eq!(first.pairs.len(), 1);
+@@ -394,6 +414,7 @@ mod tests {
+         let totals = avoidable.take_stats();
+         assert_eq!(totals.split, lost_cas(1700));
+         assert_eq!(totals.merge, scan_crossing(1400));
++        assert_eq!(totals.split_penalty, Duration::from_millis(70));
+     }
+ 
+     #[test]
+diff --git a/crates/glassdb-trans/src/structural/candidates.rs b/crates/glassdb-trans/src/structural/candidates.rs
+index 4313587e4..49de0a7f3 100644
+--- a/crates/glassdb-trans/src/structural/candidates.rs
++++ b/crates/glassdb-trans/src/structural/candidates.rs
+@@ -111,6 +111,13 @@ impl StructuralHintSink {
+         self.candidates.avoidable.add_split_time(path, split, None);
+     }
+ 
++    /// Notes that a direct commit that landed on `path` would use `time` more
++    /// after a split of the leaf at its median, because the split puts its keys
++    /// in both halves.
++    pub(crate) fn split_penalty_time(&self, path: &ObjectPath, time: Duration) {
++        self.candidates.avoidable.add_split_penalty(path, time);
++    }
++
+     /// Notes that a direct commit candidate with keys in the adjacent leaves
+     /// `left` and `right` used `time` more than a direct commit.
+     pub(crate) fn adjacent_miss_time(&self, left: &ObjectPath, right: &ObjectPath, time: Duration) {
+diff --git a/crates/glassdb-trans/src/structural/policy.rs b/crates/glassdb-trans/src/structural/policy.rs
+index cd45d633a..b561fb309 100644
+--- a/crates/glassdb-trans/src/structural/policy.rs
++++ b/crates/glassdb-trans/src/structural/policy.rs
+@@ -67,6 +67,9 @@ pub struct TopologyWindow {
+ pub struct LeafWindow {
+     /// The avoidable time that one split of the leaf can remove.
+     pub avoidable: SplitTime,
++    /// The split penalty of the leaf: the time that one split at the median
++    /// adds to direct commits of this window, which then need locked commits.
++    pub split_penalty: Duration,
+     /// The split key of the last leaf delay in this window, if any. A split
+     /// there puts the delayed keys and the other keys in different halves.
+     /// The inline pressure of the leaf has no split key, because a split at
+@@ -118,11 +121,12 @@ pub enum TopologyChange {
+     Merge(LeafId),
+ }
+ 
+-/// Splits a leaf when its split-side time in one window is more than a
+-/// multiple of the typical split time, and merges two adjacent leaves when
+-/// their merge-side time is more than a multiple of the typical merge time plus
+-/// the split-side time of both leaves (ADR-074). A split is at the split key of
+-/// the leaf when its leaf delays alone pay for it, else at the median. Leaves
++/// Splits a leaf when its split-side time minus its split penalty in one window
++/// is more than a multiple of the typical split time, and merges two adjacent
++/// leaves when their merge-side time is more than a multiple of the typical
++/// merge time plus the split-side time of both leaves (ADR-074). A split is at
++/// the split key of the leaf when its leaf delays alone pay for it, else at the
++/// median. Leaves
+ /// over a soft cap also split, at the median. A leaf that a split wrote in this
+ /// window or the last one does not merge, and a leaf that a merge wrote does not
+ /// split on avoidable time.
+@@ -242,10 +246,11 @@ impl TopologyPolicy for AvoidableTimePolicy {
+             let over_cap = leaf
+                 .size
+                 .is_some_and(|size| size.over_soft_cap(&window.node_size));
+-            let pays = !leaf.merged_recently && leaf.avoidable.total() > split_time;
++            let saved = |time: Duration| time.saturating_sub(leaf.split_penalty);
++            let pays = !leaf.merged_recently && saved(leaf.avoidable.total()) > split_time;
+             // Inline pressure asks for balanced halves, so the split key
+             // decides only a split that the leaf delays pay for alone.
+-            let at_key = pays && leaf.avoidable.leaf_delays() > split_time;
++            let at_key = pays && saved(leaf.avoidable.leaf_delays()) > split_time;
+             let change = match &leaf.split_key {
+                 Some(key) if at_key => TopologyChange::SplitAt(id.clone(), key.clone()),
+                 _ if pays || over_cap => TopologyChange::Split(id.clone()),
+diff --git a/crates/glassdb-trans/src/structural/policy/tests.rs b/crates/glassdb-trans/src/structural/policy/tests.rs
+index be4cf1b4b..8530f5b69 100644
+--- a/crates/glassdb-trans/src/structural/policy/tests.rs
++++ b/crates/glassdb-trans/src/structural/policy/tests.rs
+@@ -126,6 +126,35 @@ fn a_split_is_at_the_split_key_only_when_the_leaf_delays_pay_for_it() {
+     );
+ }
+ 
++#[test]
++fn the_split_penalty_counts_against_the_split_side_time_but_not_a_soft_cap() {
++    let penalized = |window: LeafWindow, penalty| LeafWindow {
++        split_penalty: ms(penalty),
++        split_key: Some(b"k".to_vec()),
++        ..window
++    };
++    let mut with_inline_pressure = lost_cas(600);
++    with_inline_pressure.avoidable.inline_pressure = ms(300);
++    let window = window(
++        vec![
++            (leaf(1), penalized(lost_cas(900), 400)),
++            (leaf(2), penalized(lost_cas(902), 401)),
++            (leaf(3), penalized(with_inline_pressure, 300)),
++            (leaf(4), penalized(sized(9, 9), 5000)),
++        ],
++        vec![],
++    );
++
++    assert_eq!(
++        at_one_change_time().decide(&window),
++        vec![
++            TopologyChange::SplitAt(leaf(2), b"k".to_vec()),
++            TopologyChange::Split(leaf(3)),
++            TopologyChange::Split(leaf(4)),
++        ]
++    );
++}
++
+ #[test]
+ fn the_split_threshold_scales_the_split_time() {
+     let window = window(vec![(leaf(1), lost_cas(900))], vec![]);
+diff --git a/crates/glassdb/tests/topology_policy.rs b/crates/glassdb/tests/topology_policy.rs
+index 850691a19..f3e221859 100644
+--- a/crates/glassdb/tests/topology_policy.rs
++++ b/crates/glassdb/tests/topology_policy.rs
+@@ -56,6 +56,17 @@ async fn write_keys(coll: &Collection, keys: u8) {
+     }
+ }
+ 
++async fn write_together(db: &Database, coll: &Collection, keys: &[&[u8]], value: i64) {
++    db.tx(|tx| async move {
++        for key in keys {
++            tx.write(coll, key, &write_int(value))?;
++        }
++        Ok(())
++    })
++    .await
++    .unwrap();
++}
++
+ async fn scan_crossings(db: &Database, coll: &Collection) -> u64 {
+     let before = db.stats();
+     coll.scan_keys(KeyScan::all()).await.unwrap();
+@@ -187,6 +198,34 @@ async fn merges_of_a_policy_skip_the_underfull_threshold_but_not_the_size_vetoes
+     db.shutdown().await;
+ }
+ 
++// A split at the median key 4 of a leaf of the keys 0 to 7 puts the keys 3 and
++// 4 in two leaves, and the keys 0 and 1 in one leaf.
++#[tokio::test(start_paused = true)]
++async fn direct_commits_that_a_median_split_puts_in_two_leaves_are_the_split_penalty() {
++    let backend = slow_mem();
++    let (policy, windows) = Recording::new(|_: &TopologyWindow| Vec::new());
++    let db = open(&backend, NodeSizePolicy::default(), policy).await;
++    let coll = create_top(&db, b"penalty").await;
++    write_keys(&coll, 8).await;
++    let split_penalty = || db.stats().restructurer.avoidable.split_penalty;
++
++    write_together(&db, &coll, &[&[0], &[1]], 1).await;
++    coll.write(&[3], &write_int(1)).await.unwrap();
++    assert_eq!(split_penalty(), Duration::ZERO);
++
++    write_together(&db, &coll, &[&[3], &[4]], 1).await;
++    assert!(split_penalty() > Duration::ZERO);
++    tokio::time::sleep(Duration::from_secs(2)).await;
++    db.shutdown().await;
++    let windows = windows.lock().unwrap();
++    assert!(windows.iter().any(|window| {
++        window
++            .leaves
++            .values()
++            .any(|leaf| leaf.split_penalty > Duration::ZERO)
++    }));
++}
++
+ #[tokio::test(start_paused = true)]
+ async fn the_root_leaf_does_not_merge() {
+     let backend = slow_mem();
+diff --git a/docs/adr/074-avoidable-time-drives-splits-and-merges.md b/docs/adr/074-avoidable-time-drives-splits-and-merges.md
+index 197d2a71a..45939c672 100644
+--- a/docs/adr/074-avoidable-time-drives-splits-and-merges.md
++++ b/docs/adr/074-avoidable-time-drives-splits-and-merges.md
+@@ -107,6 +107,17 @@ Merge causes of two adjacent leaves:
+ - **Scan crossing.** A scan continues from the left leaf into the right leaf.
+   Its time is the time of the extra leaf read.
+ 
++A split can also add time. The split penalty of a leaf is the time that one
++split at its median key adds to the transactions of the window:
++
++- **Direct commit over both halves.** A direct commit lands on the leaf, and a
++  split at the median key of the leaf that it changed puts its keys in both
++  halves. After the split, the transaction uses a locked commit. Its time is
++  the locked commit penalty.
++
++A point read of keys in both halves reads the two leaves in parallel
++(ADR-064), so a split adds little time to it.
++
+ These are not causes, because no single split or merge removes them:
+ 
+ - A lost CAS on the same keys. A split cannot separate them.
+@@ -121,8 +132,9 @@ These are not causes, because no single split or merge removes them:
+ 
+ A topology policy decides the splits and merges of leaves. It is a public
+ trait. Once in each window of one second, the engine gives the policy the
+-measurements of the window: the avoidable time, the split key, and the size of
+-each active leaf, the avoidable time of each pair of adjacent leaves, and the
++measurements of the window: the avoidable time, the split penalty, the split
++key, and the size of each active leaf, the avoidable time of each pair of
++adjacent leaves, and the
+ typical times of a split and of a merge. The policy returns the changes that it
+ wants: a split at the median, a split at a key, or a merge into the right
+ sibling.
+@@ -136,13 +148,14 @@ Without a policy, the size causes of ADR-031, ADR-056, and ADR-073 decide
+ leaves, as before this ADR.
+ 
+ The avoidable time policy uses one rule. A leaf becomes a split candidate when
+-its split-side avoidable time in the window is more than 0.25 times the
+-typical time of one split. Two adjacent leaves become a merge candidate when
+-their merge-side avoidable time in the window is more than 0.1 times the
+-typical time of one merge, plus the split-side avoidable time of both leaves.
+-A split is at the split key when the lost CAS, queue wait, and slow leaf CAS
+-time alone pays for it, and at the median when inline pressure is also
+-necessary. A leaf over a soft cap splits at the median without avoidable time.
++its split-side avoidable time minus its split penalty in the window is more
++than 0.25 times the typical time of one split. Two adjacent leaves become a
++merge candidate when their merge-side avoidable time in the window is more
++than 0.1 times the typical time of one merge, plus the split-side avoidable
++time of both leaves. A split is at the split key when the lost CAS, queue
++wait, and slow leaf CAS time minus the split penalty alone pays for it, and at
++the median when inline pressure is also necessary. A leaf over a soft cap
++splits at the median without avoidable time.
+ 
+ The multiples are less than one, because a change keeps its effect after the
+ window that paid for it, and each database instance sees only its own part of
+@@ -185,6 +198,12 @@ measures the queue wait of each round member, because only it knows the keys of
+ the member and of the earlier round. The GCS adapter retries
+ throttled requests with the same retry budget as the S3 adapter.
+ 
++A direct commit sees the leaf that its CAS changed, so it finds whether a
++median split puts its keys in both halves. The database instance measures the
++typical time of a direct commit and of a locked commit. Until it measured a
++locked commit, a locked commit counts as three direct commits, because it
++awaits at least three sequential backend writes.
++
+ ## Consequences
+ 
+ - The topology follows the measured cost. One policy suits S3 and GCS, without
+@@ -288,6 +307,14 @@ pay back the opposite change that it undoes. This made fewer changes with 8
+ adjacent keys, but the throughput was the same as the avoidable time policy
+ within the noise of the runs, in the `topology` and `mixed` scenarios.
+ 
++### Merge the leaves that transactions cross in a chain
++
++A cross-leaf miss over a chain of linked leaves can charge each pair of the
++chain, and each attempt of a locked commit can count, also one that a wound
++ends. This undoes a split after it costs time, instead of preventing it. In the
++`mixed` hi mode on S3, the geometric mean of the shapes was 0.65 to 0.66 of the
++size causes, against 0.62 without it.
++
+ ### Multiples of 0.1 for splits and merges
+ 
+ On GCS, this had 1.36 times the throughput of the fixed tree, against 1.32 for

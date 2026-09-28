@@ -1,0 +1,84 @@
+--- a/crates/glassdb-bench-scale/src/bin/perfbench/policy/net.rs
++++ b/crates/glassdb-bench-scale/src/bin/perfbench/policy/net.rs
+@@ -177,46 +177,29 @@
+                 .get(id)
+                 .map_or(Duration::ZERO, |leaf| leaf.avoidable.total())
+         };
+-        let mut merge_sides: BTreeMap<(LeafId, LeafId), Duration> = window
+-            .pairs
+-            .iter()
+-            .map(|pair| {
+-                (
+-                    (pair.left.clone(), pair.right.clone()),
+-                    pair.avoidable.total(),
+-                )
+-            })
+-            .collect();
+-        if let Some(weight) = self.crossing_weight {
+-            for pair in &window.pairs {
+-                *crossing
+-                    .entry((pair.left.clone(), pair.right.clone()))
+-                    .or_default() += (1.0 - decay) * pair.crossing_conflict_time.as_secs_f64();
+-            }
+-            // The average also decides for the pairs of earlier windows. When
+-            // another instance splits a leaf of such a pair, its transactions
+-            // are over three leaves, and no pair has their crossing time. The
+-            // merge of the left leaf with its right sibling of now then takes
+-            // one of these leaves away.
+-            for (ids, average) in crossing.iter() {
+-                *merge_sides.entry(ids.clone()).or_default() +=
+-                    Duration::from_secs_f64(weight * average);
+-            }
+-        }
+         let mut changes = Vec::new();
+-        for ((left, right), merge_side) in merge_sides {
+-            if held.contains(&left) || held.contains(&right) {
++        // Only the pairs of this window are adjacent for sure, because other
++        // instances can change the leaves of an earlier pair.
++        for pair in &window.pairs {
++            let ids = (pair.left.clone(), pair.right.clone());
++            let crossing_time = self.crossing_weight.map_or(0.0, |weight| {
++                let average = crossing.entry(ids.clone()).or_default();
++                *average += (1.0 - decay) * pair.crossing_conflict_time.as_secs_f64();
++                weight * *average
++            });
++            if held.contains(&pair.left) || held.contains(&pair.right) {
+                 continue;
+             }
+-            if merge_side <= merge_time + split_side(&left) + split_side(&right) {
++            let merge_side = pair.avoidable.total() + Duration::from_secs_f64(crossing_time);
++            if merge_side <= merge_time + split_side(&pair.left) + split_side(&pair.right) {
+                 continue;
+             }
+-            changes.push(TopologyChange::Merge(left.clone()));
+-            held.insert(left.clone());
+-            held.insert(right.clone());
++            changes.push(TopologyChange::Merge(pair.left.clone()));
++            held.insert(pair.left.clone());
++            held.insert(pair.right.clone());
+             // A merge can take more than one window to land, and after it the
+             // left leaf is gone. So the average must not ask again.
+-            crossing.remove(&(left, right));
++            crossing.remove(&ids);
+         }
+         changes
+     }
+@@ -562,8 +545,8 @@
+     }
+ 
+     #[tokio::test(start_paused = true)]
+-    async fn the_crossing_conflicts_of_earlier_windows_merge_two_leaves() {
+-        let (mut window, left, _) = pair_window().await;
++    async fn two_leaves_merge_only_in_a_window_that_has_them() {
++        let (mut window, _, _) = pair_window().await;
+         let policy = crossing_policy(Some(1.0));
+         let mut contended = lost_cas(600);
+         // The divided transactions keep each leaf from splitting.
+@@ -578,6 +561,6 @@
+         let change = policy.decide(&without_pair);
+ 
+         assert_eq!(with_pair, None);
+-        assert_eq!(change, vec![TopologyChange::Merge(left)]);
++        assert_eq!(change, vec![]);
+     }
+ }
