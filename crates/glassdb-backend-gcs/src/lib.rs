@@ -7,12 +7,14 @@
 //! exact generation condition.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use glassdb_backend::implementation::{bind_list_cursor, list_provider_token};
 use glassdb_backend::{
     Backend, BackendError, Cause, ListCursor, ListLimit, ListPage, ReadReply, Revision,
 };
+use glassdb_concurr::rt;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Client, RequestBuilder, StatusCode};
@@ -35,6 +37,12 @@ const BOUNDARY: &str = "glassdb_gcs_multipart_boundary";
 /// Bounds how many times a read retries when the object is rewritten between
 /// fetching its metadata and downloading its body.
 const MAX_READ_RETRIES: usize = 3;
+
+/// Bounds how many times one throttled request is sent again. GCS allows
+/// about one mutation per second on one object, so a hot object can stay
+/// throttled for a few seconds. The budget is the same as for S3 conditional
+/// puts, so that both adapters give up on a hot object after the same time.
+const MAX_THROTTLE_RETRIES: u32 = 10;
 
 /// Object-name percent-encoding set: everything that is not an RFC 3986
 /// unreserved character, which crucially encodes `/` as `%2F`.
@@ -158,28 +166,26 @@ impl GcsBackend {
     /// as `Unavailable` rather than a generic `Other` (ADR-009), letting the
     /// engine recover a transient outage in place.
     async fn send(&self, rb: RequestBuilder) -> Result<reqwest::Response, BackendError> {
-        let rb = self.authorize(rb).await?;
-        rb.send()
-            .await
+        self.send_through_throttling(rb)
+            .await?
             .map_err(|e| BackendError::Unavailable(format!("gcs request transport failure: {e}")))
     }
 
     /// Sends a *conditional* request and maps its outcome with the in-doubt
     /// contract (ADR-009). GCS applies conditional mutations atomically and this
-    /// backend does not retry them, so a clean `412`/`409` means the mutation did
-    /// not take effect (a genuine `Precondition`). But a transport error or a
-    /// `5xx` leaves the outcome unknown — the mutation may have landed before the
-    /// failure — so it is reported as `Unavailable` rather than a confident
-    /// error or a generic `Other`. An authentication failure happens before the
-    /// request is sent, so it is not in-doubt.
+    /// backend retries them only when GCS throttles them, so a clean `412`/`409`
+    /// means the mutation did not take effect (a genuine `Precondition`). But a
+    /// transport error or a `5xx` leaves the outcome unknown — the mutation may
+    /// have landed before the failure — so it is reported as `Unavailable`
+    /// rather than a confident error or a generic `Other`. An authentication
+    /// failure happens before the request is sent, so it is not in-doubt.
     async fn send_conditional(
         &self,
         rb: RequestBuilder,
         op: &'static str,
         path: &str,
     ) -> Result<reqwest::Response, BackendError> {
-        let rb = self.authorize(rb).await?;
-        let resp = match rb.send().await {
+        let resp = match self.send_through_throttling(rb).await? {
             Ok(resp) => resp,
             // No response at all: the request may or may not have been applied.
             Err(e) => {
@@ -193,6 +199,35 @@ impl GcsBackend {
             return Ok(resp);
         }
         Err(check_conditional_status(status, op, path))
+    }
+
+    /// Sends `rb` and sends it again while GCS throttles it, within the
+    /// retry budget. GCS rejects a throttled request before it applies it, so
+    /// this is safe also for conditional mutations. Returns the transport
+    /// outcome of the last attempt; only an authentication failure is an error.
+    async fn send_through_throttling(
+        &self,
+        mut rb: RequestBuilder,
+    ) -> Result<Result<reqwest::Response, reqwest::Error>, BackendError> {
+        let mut attempt = 0;
+        loop {
+            // A builder that holds a build error cannot be cloned. It is sent
+            // once, so that the transport outcome reports the error.
+            let next = rb.try_clone();
+            let result = self.authorize(rb).await?.send().await;
+            let throttled = matches!(
+                &result,
+                Ok(resp) if resp.status() == StatusCode::TOO_MANY_REQUESTS
+            );
+            match (next, throttle_backoff(attempt)) {
+                (Some(next), Some(delay)) if throttled => {
+                    rt::sleep(delay).await;
+                    rb = next;
+                    attempt += 1;
+                }
+                _ => return Ok(result),
+            }
+        }
     }
 
     /// Fetches an object's metadata resource.
@@ -463,9 +498,9 @@ impl GcsStatusError {
 ///
 /// Used only for idempotent reads and listings; conditional mutations use
 /// [`check_conditional_status`].
-/// A `5xx` on an idempotent request is a transient outage that is always safe
-/// to retry (ADR-009), so it surfaces as `Unavailable` rather than a generic
-/// `Other`.
+/// A `5xx`, or a throttle that outlasts the retry budget, on an idempotent
+/// request is transient and always safe to retry (ADR-009), so it surfaces as
+/// `Unavailable` rather than a generic `Other`.
 fn check_status(status: StatusCode, op: &'static str, path: &str) -> Result<(), BackendError> {
     if status.is_success() {
         return Ok(());
@@ -473,6 +508,9 @@ fn check_status(status: StatusCode, op: &'static str, path: &str) -> Result<(), 
     match status {
         StatusCode::NOT_FOUND => Err(BackendError::NotFound),
         StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT => Err(BackendError::Precondition),
+        StatusCode::TOO_MANY_REQUESTS => Err(BackendError::Unavailable(format!(
+            "{op}({path}): still throttled after {MAX_THROTTLE_RETRIES} retries"
+        ))),
         s if s.is_server_error() => Err(BackendError::Unavailable(format!(
             "{op}({path}): transient server error (gcs status {})",
             s.as_u16()
@@ -484,7 +522,8 @@ fn check_status(status: StatusCode, op: &'static str, path: &str) -> Result<(), 
 /// Maps a non-success status from a *conditional* request (ADR-009). A `412`/
 /// `409` is a genuine precondition (the atomic mutation did not take effect); a
 /// `5xx` leaves the mutation in doubt, since GCS may have applied it before
-/// failing, so it is reported as `Unavailable`.
+/// failing, so it is reported as `Unavailable`. A throttle that outlasts the
+/// retry budget did not apply, so it stays a definitive `Other`.
 fn check_conditional_status(status: StatusCode, op: &'static str, path: &str) -> BackendError {
     match status {
         StatusCode::NOT_FOUND => BackendError::NotFound,
@@ -495,6 +534,14 @@ fn check_conditional_status(status: StatusCode, op: &'static str, path: &str) ->
         )),
         s => GcsStatusError::new(op, path, s).into_backend_error(),
     }
+}
+
+/// Returns how long to wait before a throttled request is sent again after its
+/// zero-based `attempt`, or `None` when the retry budget is spent.
+fn throttle_backoff(attempt: u32) -> Option<Duration> {
+    (attempt < MAX_THROTTLE_RETRIES).then(|| {
+        Duration::from_millis(25u64.saturating_mul(1u64 << attempt)).min(Duration::from_secs(1))
+    })
 }
 
 /// Deserializes a JSON response body, annotating failures.
