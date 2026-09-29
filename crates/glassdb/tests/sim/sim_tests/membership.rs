@@ -116,11 +116,12 @@ fn fill_all_keys() -> Covered<MembershipWorkload> {
 }
 
 /// Fills the key universe, lets the fill split leaves, and then deletes all keys
-/// except those of client 2, which only reads after the fill. Only a committed
-/// leaf write queues a merge candidate. Clients 0 and 1 share one instance, and
-/// each deletes its keys from right to left, so that their last delete writes
-/// to the leftmost leaf after all other deletes. That leaf then merges
-/// (ADR-073) while the clients settle.
+/// except key 5. Only a committed leaf write queues a merge candidate, and only
+/// a leaf with no live entries merges (ADR-074). Clients 0 and 1 share one
+/// instance, and each deletes its keys from right to left, so that their last
+/// deletes write to the leftmost leaf. Client 2 deletes key 2 after the fill.
+/// The leftmost leaf then has no live entries, and merges into its right
+/// sibling (ADR-073) while the clients settle.
 fn fill_then_shrink() -> Covered<MergingMembershipWorkload> {
     let workload = MergingMembershipWorkload(MembershipWorkload {
         clients: vec![
@@ -138,7 +139,13 @@ fn fill_then_shrink() -> Covered<MergingMembershipWorkload> {
                 settle(),
             ]
             .concat(),
-            [vec![MembOp::Put(2), MembOp::Put(5)], settle(), settle()].concat(),
+            [
+                vec![MembOp::Put(2), MembOp::Put(5)],
+                settle(),
+                vec![MembOp::Delete(2)],
+                settle(),
+            ]
+            .concat(),
         ],
     });
     Covered {

@@ -105,11 +105,11 @@ cargo run --release -p glassdb-bench-scale --bin perfbench -- \
 ```
 
 `inline-pressure` fills the aggregate inline budget of a leaf, then repeats
-passes over the keys after it until one pass commits without locks. It keeps a
-pinned inline policy and uses the default topology policy. It reports direct
-commits, locking, backend operations and bytes, splits, and merges for the
-saturation, pressure, and recovery phases. `--settle-timeout` limits the
-pressure phase.
+waves of transactions over the keys after it until one wave commits without
+locks. It keeps a pinned inline policy and uses the default topology policy. It
+reports direct commits, locking, backend operations and bytes, splits, and
+merges for the saturation, pressure, and recovery phases. `--settle-timeout`
+limits the pressure phase.
 
 ```bash
 cargo run --release -p glassdb-bench-scale --bin perfbench -- \

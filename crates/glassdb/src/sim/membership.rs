@@ -321,8 +321,8 @@ impl SimWorkload for MembershipWorkload {
     }
 }
 
-/// The membership workload with the size causes and a node size policy that
-/// admits more merges (ADR-073): deletes make leaves underfull, so they merge
+/// The membership workload with a node size policy that admits more merges
+/// (ADR-073): deletes that remove all live entries of a leaf make it merge
 /// concurrently with puts, splits, and scans. The oracle is the same.
 #[derive(Debug, Clone, Default)]
 pub struct MergingMembershipWorkload(pub MembershipWorkload);
@@ -347,7 +347,7 @@ impl SimWorkload for MergingMembershipWorkload {
             backend,
             merging_node_size_policy(),
             glassdb_storage::InlinePolicy::default(),
-            TopologyPolicy::SizeCauses,
+            TopologyPolicy::default(),
             media,
         )
         .await

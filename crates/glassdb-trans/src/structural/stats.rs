@@ -59,7 +59,8 @@ pub struct RestructurerStats {
     pub inline_pressure: InlinePressureStats,
 }
 
-/// Split activity attributable to aggregate inline pressure.
+/// Split activity attributable to aggregate inline pressure. Only the size
+/// causes topology policy requests these splits (ADR-075).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InlinePressureStats {
     /// Processed candidates.

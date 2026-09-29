@@ -28,9 +28,8 @@ a policy that a database instance can select.
 - By default, the underfull threshold of `NodeSizePolicy` does not apply to
   leaves. Non-root leaves with no live entries merge. Index nodes keep their
   underfull threshold.
-- The simulation workloads and fuzz targets that use the default now cover the
-  rule and its measurements. The workloads that must merge leaves with live
-  entries select the size causes.
+- The simulation workloads and fuzz targets now run the rule and take its
+  measurements. Their leaves merge only when deletes leave no live entries.
 - The loss of ADR-074 with 8 database instances in the `mixed` hi mode is now in
   the default.
 

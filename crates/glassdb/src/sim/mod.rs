@@ -15,7 +15,7 @@
 //! - [`RmwWorkload`] stresses shared-key serializability and in-doubt increments.
 //! - [`CycleWorkload`] detects isolation failures with non-commuting ring updates.
 //! - [`MembershipWorkload`] exercises key membership, splits, and listing.
-//!   [`MergingMembershipWorkload`] runs it with merges of underfull nodes too.
+//!   [`MergingMembershipWorkload`] runs it with merges of leaves too.
 //! - [`ApiWorkload`] checks transaction-local key operations, collection
 //!   lifecycle, nested paths, and aborts.
 //! - [`HistoryWorkload`] checks complete point/group-read, write, and
@@ -89,7 +89,8 @@ pub(super) fn key_name(key: usize) -> Vec<u8> {
 
 /// Splits a leaf above two entries, so that a few keys grow the tree. With the
 /// size causes, a leaf with at most one live entry is underfull, so that
-/// deletes can merge nearly empty leaves (ADR-073).
+/// deletes can merge nearly empty leaves (ADR-073). With the default topology
+/// policy, only leaves with no live entries are underfull (ADR-074).
 pub(super) fn tiny_node_size_policy() -> NodeSizePolicy {
     NodeSizePolicy::builder()
         .leaf_max_entries(2)
@@ -103,7 +104,9 @@ pub(super) fn tiny_node_size_policy() -> NodeSizePolicy {
 
 /// Splits a leaf above four entries, so that the merge vetoes admit merged
 /// leaves with two entries (ADR-073). With the size causes, every leaf below
-/// the split limit is underfull, so a few deletes drive merges.
+/// the split limit is underfull, so a few deletes drive merges. With the
+/// default topology policy, only leaves with no live entries are underfull
+/// (ADR-074).
 pub(super) fn merging_node_size_policy() -> NodeSizePolicy {
     NodeSizePolicy::builder()
         .leaf_max_entries(4)

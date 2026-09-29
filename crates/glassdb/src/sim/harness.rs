@@ -591,8 +591,32 @@ pub async fn run_and_record_with_faults<W: SimWorkload>(
 #[cfg(test)]
 mod sim_tests {
     use super::*;
+    use glassdb_concurr::exec::{Scheduler, TaskId};
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
     use tokio::sync::Barrier;
+
+    /// Polls the ready task that ran least recently. A coordinator round
+    /// yields once before it takes its members, so that the peers that are
+    /// ready can join it. Under this scheduler, they always run in that yield.
+    #[derive(Default)]
+    struct FairScheduler {
+        steps: u64,
+        last_run: BTreeMap<TaskId, u64>,
+    }
+
+    impl Scheduler for FairScheduler {
+        fn pick(&mut self, ready: &[TaskId]) -> usize {
+            let (index, id) = ready
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, id)| self.last_run.get(id).copied().unwrap_or(0))
+                .expect("the executor picks only from ready tasks");
+            self.steps += 1;
+            self.last_run.insert(*id, self.steps);
+            index
+        }
+    }
 
     #[derive(Clone, Default)]
     struct SharedInstanceWorkload {
@@ -619,23 +643,6 @@ mod sim_tests {
                 completed: Barrier::new(4),
                 snapshots: Mutex::new(Vec::new()),
             }
-        }
-
-        // The background task of the avoidable time rule changes the
-        // interleaving, and then the writes of one instance do not arrive
-        // together.
-        async fn open_db(
-            backend: &Arc<dyn Backend>,
-            media: Option<SimMedia>,
-        ) -> Result<Database, Error> {
-            open_det_db(
-                backend,
-                NodeSizePolicy::default(),
-                InlinePolicy::default(),
-                TopologyPolicy::SizeCauses,
-                media,
-            )
-            .await
         }
 
         async fn seed(&self, _db: &Database) {}
@@ -681,28 +688,26 @@ mod sim_tests {
 
     #[test]
     fn two_clients_share_each_database_and_coordinate_concurrent_writes() {
-        for media_tape in [None, Some(Vec::new())] {
-            glassdb_concurr::exec::block_on_with(
-                glassdb_concurr::exec::RandomScheduler::new(3),
-                3,
-                async move {
+        for seed in 0..16 {
+            for media_tape in [None, Some(Vec::new())] {
+                glassdb_concurr::exec::block_on_with(FairScheduler::default(), seed, async move {
                     run_generic(
                         SharedInstanceWorkload {
                             clients: (0..4).map(|id| vec![id]).collect(),
                         },
-                        // A coordinator round takes only the writes that arrive
-                        // together, and random latency spreads them apart.
+                        // Random latency can delay one write past the
+                        // yield of the round.
                         FaultConfig {
                             zero_latency: true,
                             ..FaultConfig::none()
                         },
-                        1,
+                        seed,
                         Vec::new(),
                         media_tape,
                     )
                     .await;
-                },
-            );
+                });
+            }
         }
     }
 

@@ -37,8 +37,8 @@ const _: () = {
 
 #[derive(Clone, Args)]
 pub(super) struct Options {
-    /// Maximum time of the pressure phase, until one pass over the pressured
-    /// keys commits without locks.
+    /// Maximum time of the pressure phase, until one wave over the pressured
+    /// keys commits without locks. It is checked after each wave.
     #[arg(long, default_value = "30s", value_parser = glassdb_bench_scale::parse_duration)]
     settle_timeout: Duration,
 }
@@ -201,8 +201,8 @@ async fn measure_keys(
     })
 }
 
-/// Repeats passes over the pressured keys until one pass commits without
-/// locks, and returns the passes before it and that pass.
+/// Repeats waves of transactions over the pressured keys until one wave
+/// commits without locks, and returns the waves before it and that wave.
 async fn measure_until_direct(
     db: &Database,
     collection: &Collection,
@@ -214,16 +214,16 @@ async fn measure_until_direct(
     let mut pressure = Measured::idle(Duration::ZERO);
     loop {
         let before = Cursor::new(db, backend);
-        let pass = measure_keys(db, collection, pressured_keys()).await?;
+        let wave = measure_keys(db, collection, pressured_keys()).await?;
         if db.stats().locker.calls == before.stats.locker.calls {
-            pressure.wall = start.elapsed() - pass.wall;
+            pressure.wall = start.elapsed() - wave.wall;
             let pressure = Pressure {
                 measured: pressure,
                 until: before,
             };
-            return Ok((pressure, pass));
+            return Ok((pressure, wave));
         }
-        pressure.append(pass);
+        pressure.append(wave);
         if start.elapsed() >= timeout {
             let splits = db.stats().restructurer.splits - splits_before;
             return Err(format!(
@@ -287,10 +287,10 @@ impl Cursor {
     }
 }
 
-/// The passes over the pressured keys that took locked commits.
+/// The waves over the pressured keys that took locked commits.
 struct Pressure {
     measured: Measured,
-    /// The stats when the passes ended.
+    /// The stats when the waves ended.
     until: Cursor,
 }
 
@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn idle_phase_has_no_latency_summary() {
         let phase = result(
-            "settle",
+            "pressure",
             Measured::idle(Duration::from_millis(10)),
             Stats::default(),
             BackendBreakdown::default(),
