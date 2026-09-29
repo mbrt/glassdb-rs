@@ -118,8 +118,9 @@ impl DatabaseBuilder {
     /// Overrides the budgets for direct commits whose authoritative value is
     /// stored in the leaf (ADR-051, ADR-054). Values outside the budgets take
     /// locked commit. Budgets are local to each
-    /// database instance. Aggregate pressure can request shared tree splits
-    /// (ADR-056).
+    /// database instance. Aggregate pressure adds avoidable time to its leaf
+    /// (ADR-074). With the size causes topology policy, it requests shared tree
+    /// splits instead (ADR-056).
     pub fn inline_policy(mut self, policy: InlinePolicy) -> Self {
         self.engine_config.set_inline_policy(policy);
         self

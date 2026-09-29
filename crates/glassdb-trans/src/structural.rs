@@ -7,10 +7,10 @@
 //! against cached state. Both kinds of change then run through one lifecycle:
 //! a structural intent written ahead of the change, a one-node structural
 //! gate, and parent reconciliation after the change. An independent loop
-//! completes the changes that a crash or an error interrupted. When a
-//! [`TopologyPolicy`] other than the default is set, a third loop gives the
-//! measurements of each window to its rule, and queues the leaf changes that
-//! the rule asks for (ADR-074).
+//! completes the changes that a crash or an error interrupted. When the
+//! [`TopologyPolicy`] has a rule, as the default policy does, a third loop
+//! gives the measurements of each window to the rule, and queues the leaf
+//! changes that the rule asks for (ADR-074).
 
 mod candidates;
 mod change;

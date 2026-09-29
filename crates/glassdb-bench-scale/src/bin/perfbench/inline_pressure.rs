@@ -1,4 +1,6 @@
-//! Focused coverage for ADR-056's demand-driven inline-pressure splits.
+//! Measures how the leaves of the default topology policy adapt when their
+//! aggregate inline budget is full (ADR-056, ADR-074): the locked commits that
+//! the pressure causes until the splits land, and the direct commits after.
 
 use std::error::Error;
 use std::sync::Arc;
@@ -21,10 +23,8 @@ const KEY_COUNT: usize = 192;
 const VALUE_BYTES: usize = 1024;
 const SATURATION_KEY_COUNT: usize = 64;
 const SATURATION_KEYS: std::ops::Range<usize> = 0..SATURATION_KEY_COUNT;
-const ROOT_PRESSURED_KEY: usize = 64;
-const LEAF_PRESSURED_KEY: usize = 65;
-const RECOVERY_KEY_COUNT: usize = 64;
-// Keep ADR-056's workload stable when product defaults are retuned.
+const PRESSURED_KEY_COUNT: usize = 64;
+// Keep the workload stable when product defaults are retuned.
 const INLINE_POLICY: InlinePolicy = InlinePolicy {
     max_value_bytes: VALUE_BYTES,
     max_leaf_bytes: SATURATION_KEY_COUNT * VALUE_BYTES,
@@ -32,14 +32,14 @@ const INLINE_POLICY: InlinePolicy = InlinePolicy {
 const _: () = {
     assert!(KEY_COUNT < 256);
     assert!(INLINE_POLICY.max_leaf_bytes == 64 * 1024);
-    assert!(ROOT_PRESSURED_KEY != LEAF_PRESSURED_KEY);
-    assert!(LEAF_PRESSURED_KEY < KEY_COUNT);
+    assert!(SATURATION_KEY_COUNT + PRESSURED_KEY_COUNT <= KEY_COUNT);
 };
 
 #[derive(Clone, Args)]
 pub(super) struct Options {
-    /// Maximum wait for each demanded background split.
-    #[arg(long, default_value = "5s", value_parser = glassdb_bench_scale::parse_duration)]
+    /// Maximum time of the pressure phase, until one pass over the pressured
+    /// keys commits without locks.
+    #[arg(long, default_value = "30s", value_parser = glassdb_bench_scale::parse_duration)]
     settle_timeout: Duration,
 }
 
@@ -68,10 +68,7 @@ struct PhaseResult {
     split_candidates: u64,
     split_completed: u64,
     split_deferred: u64,
-    pressure_candidates: u64,
-    pressure_completed: u64,
-    pressure_deferred: u64,
-    pressure_discarded: u64,
+    merges: u64,
 }
 
 pub(super) fn run(
@@ -119,40 +116,19 @@ fn run_once(
     let total_wall_start = Instant::now();
     let mut phases = Vec::new();
 
-    let measured = handle.block_on(measure_keys(&db, &collection, SATURATION_KEYS))?;
-    phases.push(cursor.record("saturation", measured, &db, backend_stats));
+    let saturation = handle.block_on(measure_keys(&db, &collection, SATURATION_KEYS))?;
+    let mut count = saturation.count;
+    phases.push(cursor.record("saturation", saturation, &db, backend_stats));
 
-    let measured = handle.block_on(measure_keys(
+    let (pressure, recovery) = handle.block_on(measure_until_direct(
         &db,
         &collection,
-        std::iter::once(ROOT_PRESSURED_KEY),
-    ))?;
-    phases.push(cursor.record("root-trigger", measured, &db, backend_stats));
-
-    let pressure_base = protocol_stats(total_start.stats).pressure_completed;
-    let wall = handle.block_on(wait_for_pressure_split(
-        &db,
-        pressure_base + 1,
+        backend_stats,
         options.settle_timeout,
     ))?;
-    phases.push(cursor.record("root-settle", Measured::idle(wall), &db, backend_stats));
-
-    let measured = handle.block_on(measure_keys(
-        &db,
-        &collection,
-        std::iter::once(LEAF_PRESSURED_KEY),
-    ))?;
-    phases.push(cursor.record("leaf-trigger", measured, &db, backend_stats));
-
-    let wall = handle.block_on(wait_for_pressure_split(
-        &db,
-        pressure_base + 2,
-        options.settle_timeout,
-    ))?;
-    phases.push(cursor.record("leaf-settle", Measured::idle(wall), &db, backend_stats));
-
-    let measured = handle.block_on(measure_keys(&db, &collection, recovery_keys()))?;
-    phases.push(cursor.record("recovery", measured, &db, backend_stats));
+    count += pressure.measured.count + recovery.count;
+    phases.push(cursor.record_until("pressure", pressure.measured, pressure.until));
+    phases.push(cursor.record("recovery", recovery, &db, backend_stats));
 
     handle.block_on(shutdown_databases_until(
         std::slice::from_ref(&db),
@@ -160,8 +136,7 @@ fn run_once(
     ))?;
 
     let final_cursor = Cursor::new(&db, backend_stats);
-    let total = Measured::idle(total_wall_start.elapsed())
-        .with_count(SATURATION_KEYS.len() + 2 + RECOVERY_KEY_COUNT);
+    let total = Measured::idle(total_wall_start.elapsed()).with_count(count);
     phases.push(result(
         "total",
         total,
@@ -226,6 +201,39 @@ async fn measure_keys(
     })
 }
 
+/// Repeats passes over the pressured keys until one pass commits without
+/// locks, and returns the passes before it and that pass.
+async fn measure_until_direct(
+    db: &Database,
+    collection: &Collection,
+    backend: &BackendBreakdownHandle,
+    timeout: Duration,
+) -> Result<(Pressure, Measured), Box<dyn Error>> {
+    let start = Instant::now();
+    let splits_before = db.stats().restructurer.splits;
+    let mut pressure = Measured::idle(Duration::ZERO);
+    loop {
+        let before = Cursor::new(db, backend);
+        let pass = measure_keys(db, collection, pressured_keys()).await?;
+        if db.stats().locker.calls == before.stats.locker.calls {
+            pressure.wall = start.elapsed() - pass.wall;
+            let pressure = Pressure {
+                measured: pressure,
+                until: before,
+            };
+            return Ok((pressure, pass));
+        }
+        pressure.append(pass);
+        if start.elapsed() >= timeout {
+            let splits = db.stats().restructurer.splits - splits_before;
+            return Err(format!(
+                "pressured keys still took locked commits after {timeout:?} (splits={splits})"
+            )
+            .into());
+        }
+    }
+}
+
 async fn mutate(db: &Database, collection: &Collection, key: &[u8]) -> Result<(), GError> {
     db.tx(|tx| async move {
         let mut value = tx.read(collection, key).await?.ok_or(GError::NotFound)?;
@@ -240,28 +248,6 @@ async fn mutate(db: &Database, collection: &Collection, key: &[u8]) -> Result<()
         Ok(())
     })
     .await
-}
-
-async fn wait_for_pressure_split(
-    db: &Database,
-    completed_target: u64,
-    timeout: Duration,
-) -> Result<Duration, Box<dyn Error>> {
-    let start = Instant::now();
-    loop {
-        let completed = protocol_stats(db.stats()).pressure_completed;
-        if completed >= completed_target {
-            return Ok(start.elapsed());
-        }
-        if start.elapsed() >= timeout {
-            return Err(format!(
-                "inline-pressure split did not complete within {timeout:?} \
-                 (completed={completed}, target={completed_target})"
-            )
-            .into());
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -285,16 +271,27 @@ impl Cursor {
         db: &Database,
         backend: &BackendBreakdownHandle,
     ) -> PhaseResult {
-        let after = Self::new(db, backend);
+        self.record_until(phase, measured, Self::new(db, backend))
+    }
+
+    /// Records the phase that ended at `until`.
+    fn record_until(&mut self, phase: &str, measured: Measured, until: Cursor) -> PhaseResult {
         let row = result(
             phase,
             measured,
-            after.stats - self.stats,
-            after.backend - self.backend,
+            until.stats - self.stats,
+            until.backend - self.backend,
         );
-        *self = after;
+        *self = until;
         row
     }
+}
+
+/// The passes over the pressured keys that took locked commits.
+struct Pressure {
+    measured: Measured,
+    /// The stats when the passes ended.
+    until: Cursor,
 }
 
 struct Measured {
@@ -316,6 +313,21 @@ impl Measured {
         self.count = count;
         self
     }
+
+    /// Adds the transactions of `other` to this measurement.
+    fn append(&mut self, other: Measured) {
+        self.count += other.count;
+        let Some(other) = other.results else {
+            return;
+        };
+        match &mut self.results {
+            Some(results) => {
+                results.samples.extend(other.samples);
+                results.tot_duration += other.tot_duration;
+            }
+            None => self.results = Some(other),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -327,10 +339,7 @@ struct ProtocolStats {
     split_candidates: u64,
     split_completed: u64,
     split_deferred: u64,
-    pressure_candidates: u64,
-    pressure_completed: u64,
-    pressure_deferred: u64,
-    pressure_discarded: u64,
+    merges: u64,
 }
 
 fn protocol_stats(stats: Stats) -> ProtocolStats {
@@ -342,10 +351,7 @@ fn protocol_stats(stats: Stats) -> ProtocolStats {
         split_candidates: stats.restructurer.candidates,
         split_completed: stats.restructurer.splits,
         split_deferred: stats.restructurer.deferred,
-        pressure_candidates: stats.restructurer.inline_pressure.candidates,
-        pressure_completed: stats.restructurer.inline_pressure.completed,
-        pressure_deferred: stats.restructurer.inline_pressure.deferred,
-        pressure_discarded: stats.restructurer.inline_pressure.discarded,
+        merges: stats.restructurer.merges,
     }
 }
 
@@ -383,10 +389,7 @@ fn result(phase: &str, measured: Measured, stats: Stats, backend: BackendBreakdo
         split_candidates: protocol.split_candidates,
         split_completed: protocol.split_completed,
         split_deferred: protocol.split_deferred,
-        pressure_candidates: protocol.pressure_candidates,
-        pressure_completed: protocol.pressure_completed,
-        pressure_deferred: protocol.pressure_deferred,
-        pressure_discarded: protocol.pressure_discarded,
+        merges: protocol.merges,
     }
 }
 
@@ -394,8 +397,16 @@ fn key(index: usize) -> Vec<u8> {
     format!("key-{index:03}").into_bytes()
 }
 
-fn recovery_keys() -> impl Iterator<Item = usize> {
-    (0..32).flat_map(|offset| [64 + offset, 96 + offset])
+/// Returns the keys after the saturated ones, alternating between their two
+/// halves, so that the writes spread over the leaves that the splits make.
+fn pressured_keys() -> impl Iterator<Item = usize> {
+    const HALF: usize = PRESSURED_KEY_COUNT / 2;
+    (0..HALF).flat_map(|offset| {
+        [
+            SATURATION_KEY_COUNT + offset,
+            SATURATION_KEY_COUNT + HALF + offset,
+        ]
+    })
 }
 
 #[cfg(test)]
@@ -403,10 +414,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recovery_wave_interleaves_the_two_new_capacity_ranges() {
-        let recovery: Vec<_> = recovery_keys().collect();
-        assert_eq!(recovery.len(), RECOVERY_KEY_COUNT);
-        assert_eq!(&recovery[..4], &[64, 96, 65, 97]);
+    fn pressured_keys_alternate_between_their_halves() {
+        let pressured: Vec<_> = pressured_keys().collect();
+        assert_eq!(pressured.len(), PRESSURED_KEY_COUNT);
+        assert_eq!(&pressured[..4], &[64, 96, 65, 97]);
     }
 
     #[test]

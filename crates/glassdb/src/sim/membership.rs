@@ -7,7 +7,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
 use glassdb_concurr::rt;
 
-use crate::{CollectionPath, Database, Error, KeyScan};
+use crate::{CollectionPath, Database, Error, KeyScan, TopologyPolicy};
 
 use super::harness::{SimWorkload, open_det_db};
 use super::{
@@ -210,6 +210,7 @@ impl SimWorkload for MembershipWorkload {
             backend,
             tiny_node_size_policy(),
             glassdb_storage::InlinePolicy::default(),
+            TopologyPolicy::default(),
             media,
         )
         .await
@@ -320,9 +321,9 @@ impl SimWorkload for MembershipWorkload {
     }
 }
 
-/// The membership workload with a node size policy that admits more merges
-/// (ADR-073): deletes make leaves underfull, so they merge concurrently with
-/// puts, splits, and scans. The oracle is the same.
+/// The membership workload with the size causes and a node size policy that
+/// admits more merges (ADR-073): deletes make leaves underfull, so they merge
+/// concurrently with puts, splits, and scans. The oracle is the same.
 #[derive(Debug, Clone, Default)]
 pub struct MergingMembershipWorkload(pub MembershipWorkload);
 
@@ -346,6 +347,7 @@ impl SimWorkload for MergingMembershipWorkload {
             backend,
             merging_node_size_policy(),
             glassdb_storage::InlinePolicy::default(),
+            TopologyPolicy::SizeCauses,
             media,
         )
         .await

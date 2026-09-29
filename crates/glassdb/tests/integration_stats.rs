@@ -1,6 +1,6 @@
 //! Statistics and diagnostics integration behavior.
 
-use glassdb::{Database, Error, InlinePolicy};
+use glassdb::{Database, Error, InlinePolicy, TopologyPolicy};
 
 pub mod integration_support;
 
@@ -91,6 +91,8 @@ async fn stats_report_direct_commit_coverage() {
     assert_eq!(delta.direct_commit.landed, 1);
 }
 
+// With the size causes, one aggregate inline rejection requests a split
+// (ADR-056).
 #[tokio::test(start_paused = true)]
 async fn aggregate_inline_pressure_splits_for_a_later_direct_commit() {
     let db = Database::builder("example", mem())
@@ -98,6 +100,7 @@ async fn aggregate_inline_pressure_splits_for_a_later_direct_commit() {
             max_value_bytes: 8,
             max_leaf_bytes: 8,
         })
+        .topology_policy(TopologyPolicy::SizeCauses)
         .open()
         .await
         .unwrap();
