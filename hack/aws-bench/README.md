@@ -104,9 +104,12 @@ cargo run --release -p glassdb-bench-scale --bin perfbench -- \
   --output=/tmp/contention.json contention --keys=1 --duration=2s
 ```
 
-`inline-pressure` retains the pinned ADR-056 phase sequence and policy. It
-reports direct commits, locking, backend operations and bytes, and ordinary and
-pressure-specific split outcomes per phase.
+`inline-pressure` fills the aggregate inline budget of a leaf, then repeats
+waves of transactions over the keys after it until one wave commits without
+locks. It keeps a pinned inline policy and uses the default topology policy. It
+reports direct commits, locking, backend operations and bytes, splits, and
+merges for the saturation, pressure, and recovery phases. `--settle-timeout`
+limits the pressure phase.
 
 ```bash
 cargo run --release -p glassdb-bench-scale --bin perfbench -- \

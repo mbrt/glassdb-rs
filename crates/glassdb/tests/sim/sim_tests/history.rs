@@ -4,8 +4,8 @@
 //! normalized bounded membership scans.
 use glassdb::exec::{TapeScheduler, block_on_with};
 use glassdb::sim::{
-    FaultConfig, HistoryCollectionOp as C, HistoryInstruction as I, HistoryTransaction,
-    HistoryWorkload, pct_sweep, run_and_assert, run_and_assert_with_faults,
+    Covered, FaultConfig, HistoryCollectionOp as C, HistoryInstruction as I, HistoryTransaction,
+    HistoryWorkload, StructuralCoverage, pct_sweep, run_and_assert, run_and_assert_with_faults,
 };
 
 use crate::sim_support::{assert_slow_mutation_modes, fault_tape, tape};
@@ -193,4 +193,81 @@ fn shared_collection_history_holds_under_contention_and_failures() {
 #[test]
 fn shared_collection_history_holds_with_slow_mutations() {
     assert_slow_mutation_modes("shared collection history", &shared_collection_history());
+}
+
+/// Splits the seeded leaf, deletes two of its three keys, and then scans. The
+/// write of client 0 finds the seeded leaf over its two-entry cap, and the
+/// split puts the keys in two leaves. Client 0 then deletes key 1 and then key
+/// 0. With either split key, the last delete leaves the left leaf with no live
+/// entries and the right leaf with key 2 alone, so the left leaf merges into
+/// its right sibling (ADR-074). The scans give the changes the time to land
+/// while the clients still run.
+fn shrinking_history() -> Covered<HistoryWorkload> {
+    let scans = |count| {
+        std::iter::repeat_with(|| {
+            vec![I::Scan {
+                start: 0,
+                end: 3,
+                after: None,
+                limit: 3,
+            }]
+        })
+        .take(count)
+    };
+    let shrinking = std::iter::once(vec![I::WriteLiteral { key: 2, value: 1 }])
+        .chain(scans(16))
+        .chain([vec![I::Delete { key: 1 }], vec![I::Delete { key: 0 }]])
+        .chain(scans(20));
+    let reading = std::iter::once(vec![I::Read {
+        key: 2,
+        register: 0,
+    }])
+    .chain(scans(20));
+    // The checker of the history bounds its logical operations, so the other
+    // clients run nothing.
+    let clients: [Vec<Vec<I>>; 4] = [
+        shrinking.collect(),
+        reading.collect(),
+        Vec::new(),
+        Vec::new(),
+    ];
+    let workload = HistoryWorkload {
+        clients: clients
+            .into_iter()
+            .enumerate()
+            .map(|(client_id, programs)| {
+                programs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, instructions)| {
+                        transaction((client_id * 64 + index) as u64, client_id, instructions)
+                    })
+                    .collect()
+            })
+            .collect(),
+    };
+    Covered {
+        workload,
+        requires: StructuralCoverage {
+            splits: true,
+            merges: true,
+        },
+    }
+}
+
+#[test]
+fn exact_history_holds_while_leaves_merge() {
+    for seed in [0u64, 3, 99, 2024] {
+        let workload = shrinking_history();
+        block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
+            run_and_assert(workload).await
+        });
+    }
+}
+
+#[test]
+fn pct_seed_breadth_holds_exact_history_while_leaves_merge() {
+    let workload = shrinking_history();
+    pct_sweep(&workload, FaultConfig::none(), 0..16);
+    pct_sweep(&workload, FaultConfig::failures(7), 0..16);
 }

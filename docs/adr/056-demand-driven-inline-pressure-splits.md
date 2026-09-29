@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted — implemented.
+Accepted — implemented. With [ADR-074](074-avoidable-time-drives-splits-and-merges.md)
+and [ADR-075](075-avoidable-time-is-the-default-topology-policy.md), it applies
+only with the size causes topology policy.
 
 This extends [ADR-031](031-dynamic-range-sharding.md)'s background split policy
 and resolves the capacity follow-up left by

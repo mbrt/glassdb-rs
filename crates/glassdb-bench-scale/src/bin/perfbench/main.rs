@@ -48,7 +48,7 @@ enum Command {
     Mixed(mixed::Options),
     /// Measure overlapping multi-key read-modify-write contention.
     Contention(contention::Options),
-    /// Exercise demand-driven splits after inline-admission pressure.
+    /// Measure how leaves adapt to aggregate inline-admission pressure.
     InlinePressure(inline_pressure::Options),
 }
 

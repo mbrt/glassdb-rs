@@ -7,7 +7,9 @@ use std::sync::Mutex;
 
 use arbitrary::{Arbitrary, Unstructured};
 
-use crate::{Collection, CollectionPath, Database, Error, InlinePolicy, NodeSizePolicy};
+use crate::{
+    Collection, CollectionPath, Database, Error, InlinePolicy, NodeSizePolicy, TopologyPolicy,
+};
 
 use super::SimMedia;
 use super::harness::{SimWorkload, open_det_db};
@@ -235,9 +237,10 @@ impl SimWorkload for RmwWorkload {
         backend: &std::sync::Arc<dyn glassdb_backend::Backend>,
         media: Option<SimMedia>,
     ) -> impl Future<Output = Result<Database, Error>> {
-        // Two distinct direct increments fill a leaf, so the existing
-        // contention/fault schedules also cover pressure-driven structural
-        // work without adding a second lifecycle oracle or workload.
+        // Two distinct direct increments fill the inline budget of a leaf, so
+        // the existing contention/fault schedules also cover inline rejections
+        // and the avoidable time that they add (ADR-074), without a second
+        // lifecycle oracle or workload.
         open_det_db(
             backend,
             NodeSizePolicy::default(),
@@ -245,6 +248,7 @@ impl SimWorkload for RmwWorkload {
                 max_value_bytes: 8,
                 max_leaf_bytes: 16,
             },
+            TopologyPolicy::default(),
             media,
         )
     }
@@ -311,6 +315,7 @@ mod sim_tests {
                 &backend,
                 NodeSizePolicy::default(),
                 InlinePolicy::default(),
+                TopologyPolicy::default(),
                 None,
             )
             .await

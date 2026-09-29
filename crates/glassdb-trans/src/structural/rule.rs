@@ -40,14 +40,14 @@ const NEGLIGIBLE_SECONDS: f64 = 1e-6;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TopologyPolicy {
-    /// Soft caps, underfull thresholds, and inline pressure decide (ADR-031,
-    /// ADR-056, ADR-073).
-    #[default]
-    SizeCauses,
     /// The avoidable time of the transactions of each database instance
     /// decides (ADR-074). Leaves over a soft cap still split, and leaves with
     /// no live entries still merge.
+    #[default]
     AvoidableTime,
+    /// Soft caps, underfull thresholds, and inline pressure decide (ADR-031,
+    /// ADR-056, ADR-073).
+    SizeCauses,
 }
 
 /// Decides the splits and merges of leaves from one window of measurements.

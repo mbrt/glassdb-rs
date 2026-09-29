@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use glassdb_backend::Backend;
 
-use crate::{Database, Error};
+use crate::{Database, Error, TopologyPolicy};
 
 mod executor;
 mod generator;
@@ -152,6 +152,7 @@ impl SimWorkload for ApiWorkload {
             backend,
             tiny_node_size_policy(),
             glassdb_storage::InlinePolicy::default(),
+            TopologyPolicy::default(),
             media,
         )
         .await

@@ -314,10 +314,12 @@ keeps the target's copies of the drained entries, and only the merge intent can
 remove it.
 
 Committed leaf writes, parent reconciliation, and capacity rejections queue
-split and merge candidates. With the avoidable time topology policy, a rule
-decides the other leaf splits and merges once in each window, from the
-avoidable time of the window
-([ADR-074](adr/074-avoidable-time-drives-splits-and-merges.md)). A new
+split and merge candidates. With the avoidable time topology policy, the
+default, a rule decides the other leaf splits and merges once in each window,
+from the avoidable time of the window
+([ADR-074](adr/074-avoidable-time-drives-splits-and-merges.md),
+[ADR-075](adr/075-avoidable-time-is-the-default-topology-policy.md)). With the
+size causes policy, the underfull threshold and inline pressure decide them. A new
 candidate wakes the restructurer after a short coalescing delay, so that one
 sweep takes a burst of writes. A deferred
 candidate does not wake the restructurer: it waits for the next sweep, at the

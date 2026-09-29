@@ -1420,10 +1420,30 @@ mod tests {
         node_size_policy: NodeSizePolicy,
         managed_retirement: bool,
     ) -> (Algo, Tctx) {
+        let config = test_engine_config(cache_bytes, node_size_policy);
+        new_algo_from_config(b, config, managed_retirement).await
+    }
+
+    /// Builds an algo whose leaves split on inline pressure (ADR-056).
+    pub(super) async fn new_size_causes_algo_from_backend(b: Arc<dyn Backend>) -> (Algo, Tctx) {
+        let mut config = test_engine_config(1024, NodeSizePolicy::default());
+        config.set_topology_policy(crate::structural::TopologyPolicy::SizeCauses);
+        new_algo_from_config(b, config, false).await
+    }
+
+    fn test_engine_config(cache_bytes: usize, node_size_policy: NodeSizePolicy) -> EngineConfig {
         let mut config = EngineConfig::default();
         config.set_cache_size(cache_bytes);
         config.set_node_size_policy(node_size_policy);
         config.set_protocol_timing(ProtocolTiming::simulation());
+        config
+    }
+
+    async fn new_algo_from_config(
+        b: Arc<dyn Backend>,
+        config: EngineConfig,
+        managed_retirement: bool,
+    ) -> (Algo, Tctx) {
         let foundation = AssemblyFixture::new(b.clone(), test_db_prefix(), &config);
 
         // Create the tree root so the test collection exists up front.

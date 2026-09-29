@@ -55,8 +55,8 @@
 # Focused scenarios:
 #   CONTENTION_KEYS     key counts to sweep           (default: 1,2,3,4,5,6)
 #   CONTENTION_DURATION measured window per cell      (default: 20s)
-#   RUN_INLINE_PRESSURE run the ADR-056 scenario       (default: false)
-#   INLINE_PRESSURE_SETTLE_TIMEOUT split wait limit   (default: 30s)
+#   RUN_INLINE_PRESSURE run the inline-pressure scenario (default: false)
+#   INLINE_PRESSURE_SETTLE_TIMEOUT pressure phase limit (default: 30s)
 #
 # The provisioned instance polls S3 for the three uploaded artifacts, runs the
 # mixed and contention scenarios (plus inline-pressure when enabled), uploads

@@ -16,7 +16,7 @@ produced by `perfbench` or a historical workload benchmark binary:
 
 * `mixed.json`      -> current mixed-workload affinity grid;
 * `contention.json` -> current overlapping-RMW contention matrix;
-* `inline-pressure.json` -> current direct-commit recovery phase sequence;
+* `inline-pressure.json` -> current saturation, pressure, and recovery phases;
 
 Legacy `mixbench.json` plus `rtbench` throughput, sample, stats, deadlock,
 inline-pressure, and diagnostics CSVs remain readable for reference-to-reference
@@ -196,6 +196,9 @@ def perfbench_inline_frame(input_dir: Path) -> pd.DataFrame | None:
         "splitCandidates": "split-candidates",
         "splitCompleted": "split-completed",
         "splitDeferred": "split-deferred",
+        "merges": "merges",
+        # Earlier perfbench versions counted the inline pressure splits of
+        # ADR-056 in fixed trigger and settle phases.
         "pressureCandidates": "pressure-candidates",
         "pressureCompleted": "pressure-completed",
         "pressureDeferred": "pressure-deferred",
@@ -1305,9 +1308,13 @@ def main() -> int:
             "write-bytes-per-tx-ratio",
             "split-completed_a",
             "split-completed_b",
+            "merges_a",
+            "merges_b",
             "pressure-completed_a",
             "pressure-completed_b",
         ]
+        # Each version of the scenario reports only some of these counts.
+        cols = [col for col in cols if col in tbl and tbl[col].notna().any()]
         print_table(f"Inline-pressure phases ({lb}/{la})", tbl[cols])
         recovery = tbl[tbl["phase"] == "recovery"]
         total = tbl[tbl["phase"] == "total"]

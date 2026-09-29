@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use super::super::tests::{
     Tctx, begin_accesses, commit_access, commit_writes, do_read, entry, leaf_reads, logical_key,
     new_algo, new_algo_from_backend, new_recording_algo, new_recording_algo_big_cache,
-    read_outcome, test_collection, test_node_id, test_root_path, wa, wdel, write_counts,
+    new_size_causes_algo_from_backend, read_outcome, test_collection, test_node_id, test_root_path,
+    wa, wdel, write_counts,
 };
 use super::super::*;
 use super::*;
@@ -1061,7 +1062,7 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
 // broadly would spin the body forever against a holder or a closed budget.
 #[tokio::test]
 async fn direct_commit_replays_only_a_certified_superseded_read() {
-    let (tm, tctx) = new_algo().await;
+    let (tm, tctx) = new_size_causes_algo_from_backend(Arc::new(MemoryBackend::new())).await;
     let keyp = logical_key(b"k");
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
     let seed = entry(&tctx, b"k").await.unwrap();
@@ -1511,7 +1512,9 @@ async fn direct_blind_puts_cover_two_eight_and_thirty_two_keys() {
 
 #[tokio::test]
 async fn multi_key_aggregate_rejection_is_atomic_and_does_not_hint() {
-    let (tm, tctx, log) = new_recording_algo().await;
+    let backend = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
+    let log = backend.log();
+    let (tm, tctx) = new_size_causes_algo_from_backend(backend).await;
     let keys: Vec<LogicalKey> = (0..32)
         .map(|index| logical_key(format!("large-{index:02}").as_bytes()))
         .collect();
@@ -1557,7 +1560,7 @@ async fn multi_key_aggregate_rejection_is_atomic_and_does_not_hint() {
 
 #[tokio::test]
 async fn cross_key_aggregate_rejection_does_not_hint() {
-    let (tm, tctx) = new_algo().await;
+    let (tm, tctx) = new_size_causes_algo_from_backend(Arc::new(MemoryBackend::new())).await;
     let source = logical_key(b"source");
     let destination = logical_key(b"destination");
     let predecessor = TxId::with_priority(0, b"predecessor");

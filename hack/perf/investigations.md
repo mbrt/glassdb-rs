@@ -11,8 +11,8 @@ This file is evidence, not a record of accepted behavior:
 
 ## 2026-09-26: ADR-074 splits in the mixed hi mode
 
-Status: in the engine as `TopologyPolicy::AvoidableTime`, with ADR-074 still
-proposed. The runs below used the branch `topology-policy-experiments`. There,
+Status: in the engine as `TopologyPolicy::AvoidableTime`, the default policy
+since ADR-075. The runs below used the branch `topology-policy-experiments`. There,
 the rule is the public `AvoidableTimePolicy`, and perfbench has the `topology`
 scenario and the `--policies` option. The commits below are on that branch, and
 its `hack/perf/topology-policy/README.md` tells how to reproduce the runs.
