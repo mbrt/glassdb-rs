@@ -397,6 +397,86 @@ async fn root_leaf_splits_in_place_into_an_index() {
     );
 }
 
+// ADR-074: avoidable time pays for the split that separates the keys that it
+// was measured for. The leaf can change before the split and move its median,
+// so the split is at the measured key, or not at all.
+#[tokio::test]
+async fn a_demand_split_divides_the_leaf_at_its_measured_key() {
+    let s = store();
+    s.create_root(COLL, &abcd_leaf()).await.unwrap();
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, NodeSizePolicy::default());
+
+    let above_every_key = SplitReason::Demand {
+        at: Some(b"e".to_vec()),
+    };
+    split_path(&sp, &root_path(), &above_every_key)
+        .await
+        .unwrap();
+    assert_eq!(leaf_keys(&s).await.len(), 1, "a half would be empty");
+
+    let measured = SplitReason::Demand {
+        at: Some(b"b".to_vec()),
+    };
+    split_path(&sp, &root_path(), &measured).await.unwrap();
+    assert_eq!(leaf_keys(&s).await, a_then_bcd());
+}
+
+// The leaf changes after each measurement, so of the demand splits that wait
+// for one sweep, the newest split key is the one that most likely still
+// divides the leaf.
+#[tokio::test]
+async fn queued_demand_splits_of_a_leaf_divide_it_at_the_newest_key() {
+    let s = store();
+    s.create_root(COLL, &abcd_leaf()).await.unwrap();
+    let bg = Arc::new(Background::new());
+    let candidates = MaintenanceCandidates::with_policy(NodeSizePolicy::default());
+    for at in [b"e", b"b"] {
+        candidates.push(MaintenanceCandidate {
+            path: root_path(),
+            priority: candidates.new_id(),
+            cause: CandidateCause::Split(SplitReason::Demand {
+                at: Some(at.to_vec()),
+            }),
+        });
+    }
+    let sp = restructurer_with_candidates(&s, &bg, candidates);
+
+    sp.run_once().await;
+
+    assert_eq!(leaf_keys(&s).await, a_then_bcd());
+}
+
+fn abcd_leaf() -> Node {
+    Node::leaf(LeafBody::from_entries(
+        [b"a".as_slice(), b"b", b"c", b"d"].iter().map(|k| live(k)),
+    ))
+}
+
+fn a_then_bcd() -> Vec<Vec<Vec<u8>>> {
+    vec![
+        vec![b"a".to_vec()],
+        vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec()],
+    ]
+}
+
+async fn leaf_keys(s: &TestStore) -> Vec<Vec<Vec<u8>>> {
+    let leaves = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
+        .leaves(
+            &collection(),
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    leaves
+        .iter()
+        .map(|leaf| {
+            let keys = leaf.node().unwrap().as_leaf().unwrap().entries();
+            keys.map(|entry| entry.key.clone()).collect()
+        })
+        .collect()
+}
+
 // A standalone leaf over the cap half-splits: the upper half moves to a fresh
 // sibling, the source shrinks and links to it, and the parent index learns
 // the separator so later descents skip the right-link hop.

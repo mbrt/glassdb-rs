@@ -374,6 +374,11 @@ impl MemberPolicy for StructuralGateOperation {
         false
     }
 
+    // The gate is for a structural change, not for a transaction.
+    fn delays_transaction(&self) -> bool {
+        false
+    }
+
     fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
         MemberOutcome::Conflict
     }

@@ -2,12 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{AddAssign, Sub};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use glassdb_concurr::rt;
 use glassdb_data::{LogicalKey, ObjectPath, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
-    CurrentState, InlinePolicy, LeafEntry, NodeLocks, Requirement, StorageError, TreeRouter,
+    CurrentState, InlinePolicy, LeafEntry, Node, NodeLocks, Requirement, RoutedLeafGroup,
+    StorageError, TreeRouter,
 };
 
 use super::handle_state::HandleState;
@@ -19,7 +22,7 @@ use crate::leaf_coord::{
     CoordinatedOutcome, LeafCoordinator, LeafOperation, MemberOutcome, MemberPolicy, ReloadCause,
     ResolveCtx, StageAdmission, Step,
 };
-use crate::structural::StructuralHintSink;
+use crate::structural::{StructuralHintSink, TypicalTime};
 
 /// Direct same-leaf commit coverage for one snapshot or accumulated interval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -54,6 +57,18 @@ struct DirectCommitCounters {
     landed: AtomicU64,
 }
 
+/// A locked commit awaits at least this many sequential backend writes: the
+/// locks, the transaction record, and the write-back. A direct commit awaits
+/// one.
+const LOCKED_COMMIT_WRITES: u32 = 3;
+
+/// The leaves to which the point accesses of one direct member route.
+enum MemberPlacement {
+    OneLeaf(ObjectPath),
+    AdjacentLeaves { left: ObjectPath, right: ObjectPath },
+    ScatteredLeaves,
+}
+
 /// Owns the direct same-leaf commit subprotocol.
 #[derive(Clone)]
 pub(super) struct DirectCommit {
@@ -63,6 +78,7 @@ pub(super) struct DirectCommit {
     structural_hints: StructuralHintSink,
     gc_hints: GcHints,
     counters: Arc<DirectCommitCounters>,
+    landed_time: Arc<TypicalTime>,
 }
 
 impl DirectCommit {
@@ -81,6 +97,7 @@ impl DirectCommit {
             structural_hints,
             gc_hints,
             counters: Arc::new(DirectCommitCounters::default()),
+            landed_time: Arc::new(TypicalTime::default()),
         }
     }
 
@@ -104,8 +121,9 @@ impl DirectCommit {
         accesses: &AccessSet,
         state: &mut HandleState,
     ) -> Result<DirectOutcome, TransError> {
+        let started = rt::Instant::now();
         let Some(member) = direct_member(accesses) else {
-            return Ok(DirectOutcome::Locked);
+            return Ok(DirectOutcome::Locked(LockedCause::Other));
         };
         // A zero policy disables the protocol even for all-delete members. All
         // put bytes must be durable in the commit leaf itself.
@@ -118,10 +136,11 @@ impl DirectCommit {
                 )
             })
         {
-            return Ok(DirectOutcome::Locked);
+            return Ok(DirectOutcome::Locked(LockedCause::Other));
         }
-        let Some(mut leaf_path) = self.route_member(&member).await? else {
-            return Ok(DirectOutcome::Locked);
+        let mut leaf_path = match self.route_member(&member).await?.into_leaf() {
+            Ok(path) => path,
+            Err(cause) => return Ok(DirectOutcome::Locked(cause)),
         };
         self.counters.candidates.fetch_add(1, Ordering::Relaxed);
 
@@ -141,6 +160,9 @@ impl DirectCommit {
             match outcome {
                 DirectMutationOutcome::Landed(predecessors) => {
                     self.counters.landed.fetch_add(1, Ordering::Relaxed);
+                    if self.structural_hints.measurements_enabled() {
+                        self.landed_time.record(started.elapsed());
+                    }
                     state.commit();
                     self.gc_hints.schedule_all(predecessors);
                     return Ok(DirectOutcome::Committed);
@@ -150,21 +172,52 @@ impl DirectCommit {
                 }
                 DirectMutationOutcome::Replay => return Ok(DirectOutcome::Replay),
                 DirectMutationOutcome::Reroute if !rerouted => {
-                    let Some(path) = self.route_member(&member).await? else {
-                        return Ok(DirectOutcome::Locked);
+                    leaf_path = match self.route_member(&member).await?.into_leaf() {
+                        Ok(path) => path,
+                        Err(cause) => return Ok(DirectOutcome::Locked(cause)),
                     };
-                    leaf_path = path;
                     rerouted = true;
                 }
-                DirectMutationOutcome::Locked | DirectMutationOutcome::Reroute => {
-                    return Ok(DirectOutcome::Locked);
+                DirectMutationOutcome::Locked { inline_pressure } => {
+                    let cause = if inline_pressure {
+                        LockedCause::InlinePressure(leaf_path)
+                    } else {
+                        LockedCause::Other
+                    };
+                    return Ok(DirectOutcome::Locked(cause));
+                }
+                DirectMutationOutcome::Reroute => {
+                    return Ok(DirectOutcome::Locked(LockedCause::Other));
                 }
             }
         }
     }
 
-    /// Selects one candidate leaf for all dependencies in `member`.
-    async fn route_member(&self, member: &DirectMember) -> Result<Option<ObjectPath>, TransError> {
+    /// Notes that a locked commit, for which `try_commit` returned `cause`,
+    /// landed after `took`. The time above a direct commit is avoidable when
+    /// one structural change can remove the cause.
+    pub(super) fn observe_locked_commit(&self, cause: LockedCause, took: Duration) {
+        if !self.structural_hints.measurements_enabled() {
+            return;
+        }
+        let direct = self
+            .landed_time
+            .get()
+            .unwrap_or(took / LOCKED_COMMIT_WRITES);
+        let penalty = took.saturating_sub(direct);
+        match cause {
+            LockedCause::AdjacentLeaves { left, right } => self
+                .structural_hints
+                .adjacent_miss_time(&left, &right, penalty),
+            LockedCause::InlinePressure(path) => {
+                self.structural_hints.inline_pressure_time(&path, penalty)
+            }
+            LockedCause::Other => {}
+        }
+    }
+
+    /// Finds the leaves to which the dependencies of `member` route.
+    async fn route_member(&self, member: &DirectMember) -> Result<MemberPlacement, TransError> {
         let keys = member
             .keys
             .iter()
@@ -174,11 +227,49 @@ impl DirectCommit {
             .router
             .route_keys_with_requirements(keys, Requirement::ANY, Requirement::ANY)
             .await?;
+        let adjacent = |left: &RoutedLeafGroup<()>, right: &RoutedLeafGroup<()>| {
+            MemberPlacement::AdjacentLeaves {
+                left: left.path().clone(),
+                right: right.path().clone(),
+            }
+        };
         Ok(match groups.as_slice() {
-            [group] => Some(group.path().clone()),
-            _ => None,
+            [group] => MemberPlacement::OneLeaf(group.path().clone()),
+            [a, b] if links_right_to(a, b) => adjacent(a, b),
+            [a, b] if links_right_to(b, a) => adjacent(b, a),
+            _ => MemberPlacement::ScatteredLeaves,
         })
     }
+}
+
+impl MemberPlacement {
+    /// Returns the leaf of a one-leaf placement, or else the cause of the
+    /// locked commit.
+    fn into_leaf(self) -> Result<ObjectPath, LockedCause> {
+        match self {
+            MemberPlacement::OneLeaf(path) => Ok(path),
+            MemberPlacement::AdjacentLeaves { left, right } => {
+                Err(LockedCause::AdjacentLeaves { left, right })
+            }
+            MemberPlacement::ScatteredLeaves => Err(LockedCause::Other),
+        }
+    }
+}
+
+/// Reports whether the right link of the leaf of `left` names the leaf of
+/// `right`.
+fn links_right_to(left: &RoutedLeafGroup<()>, right: &RoutedLeafGroup<()>) -> bool {
+    let (
+        ObjectPath::Node {
+            collection: left_collection,
+            ..
+        },
+        ObjectPath::Node { collection, id },
+    ) = (left.path(), right.path())
+    else {
+        return false;
+    };
+    left_collection == collection && left.node().and_then(Node::right_sibling) == Some(*id)
 }
 
 /// One normalized point dependency and its optional final mutation.
@@ -224,6 +315,9 @@ struct DirectCommitOperation {
     /// Once any exact output marker is observed, the leaf CAS atomically proves
     /// the whole member landed even if a later planned change or CAS replaces it.
     landed_proven: AtomicBool,
+    /// Whether the leaf could not carry the value of a single-key member
+    /// inline, so that a split can let a later direct commit land.
+    inline_pressure: AtomicBool,
 }
 
 impl DirectCommitOperation {
@@ -242,6 +336,7 @@ impl DirectCommitOperation {
             structural_hints,
             staged_over: Mutex::new(None),
             landed_proven: AtomicBool::new(false),
+            inline_pressure: AtomicBool::new(false),
         }
     }
 
@@ -468,6 +563,7 @@ impl DirectCommitOperation {
         if !self.inline.admits_value(value_len) {
             return;
         }
+        self.inline_pressure.store(true, Ordering::Relaxed);
         self.structural_hints
             .observe_inline_pressure(&self.leaf_path, &key.raw_key, value_len);
     }
@@ -657,7 +753,9 @@ impl LeafOperation for DirectCommitOperation {
                 outcome: MemberOutcome::Moved | MemberOutcome::Conflict | MemberOutcome::LeafFull,
                 ..
             })
-            | None => Ok(DirectMutationOutcome::Locked),
+            | None => Ok(DirectMutationOutcome::Locked {
+                inline_pressure: self.inline_pressure.load(Ordering::Relaxed),
+            }),
             Some(_) => Err(TransError::other(
                 "direct commit produced a non-commit outcome",
             )),
@@ -671,7 +769,7 @@ enum DirectMutationOutcome {
     InDoubt(String),
     Replay,
     Reroute,
-    Locked,
+    Locked { inline_pressure: bool },
 }
 
 /// What a tried direct commit established about its transaction.
@@ -682,7 +780,20 @@ pub(super) enum DirectOutcome {
     /// Nothing durable landed and the body must be replayed.
     Replay,
     /// A locked commit must coordinate the transaction.
-    Locked,
+    Locked(LockedCause),
+}
+
+/// Why a transaction uses a locked commit instead of a direct commit.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LockedCause {
+    /// The point accesses route to two adjacent leaves, which one merge can
+    /// put in one leaf.
+    AdjacentLeaves { left: ObjectPath, right: ObjectPath },
+    /// The leaf could not carry the value inline, and one split can make
+    /// space.
+    InlinePressure(ObjectPath),
+    /// No single structural change can let a direct commit land.
+    Other,
 }
 
 /// Converts the access set's complete point-mutation shape into direct-commit

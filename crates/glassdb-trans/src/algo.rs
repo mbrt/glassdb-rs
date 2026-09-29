@@ -50,7 +50,7 @@ mod direct_commit;
 mod handle_state;
 
 pub use direct_commit::DirectCommitStats;
-use direct_commit::{DirectCommit, DirectOutcome};
+use direct_commit::{DirectCommit, DirectOutcome, LockedCause};
 use handle_state::HandleState;
 
 /// Threshold for escalating to serial acquisition (ADR-020).
@@ -159,6 +159,9 @@ pub struct Handle {
     /// use this schedule.
     backoff: Backoff,
     retirement: IdentityRetirementGuard,
+    /// The time of the body run that made the accesses, until a commit pass
+    /// counts it.
+    body_time: Duration,
 }
 
 impl Handle {
@@ -321,6 +324,7 @@ pub struct Algo {
     resolver: KeyResolver,
     locker: Locker,
     direct_commit: DirectCommit,
+    structural_hints: StructuralHintSink,
     mon: Monitor,
     gc_hints: GcHints,
     timeline: Timeline,
@@ -363,7 +367,7 @@ impl Algo {
             router,
             coord,
             inline_policy,
-            structural_hints,
+            structural_hints.clone(),
             gc_hints.clone(),
         );
         let retirement = Arc::new(IdentityRetirement {
@@ -376,6 +380,7 @@ impl Algo {
             resolver,
             locker,
             direct_commit,
+            structural_hints,
             mon,
             gc_hints,
             timeline,
@@ -407,6 +412,7 @@ impl Algo {
             retirement: IdentityRetirementGuard::new(self.retirement.clone(), id),
             id,
             backoff: self.acquisition_retry.backoff(),
+            body_time: Duration::ZERO,
         }
     }
 
@@ -463,15 +469,18 @@ impl Algo {
         tx.accesses = accesses;
     }
 
-    /// Replaces both key and collection-management accesses before commit.
+    /// Replaces both key and collection-management accesses before commit,
+    /// with the time of the body run that made them.
     pub fn reset_with_collections(
         &self,
         tx: &mut Handle,
         accesses: AccessSet,
         catalog_accesses: CatalogAccesses,
+        body_time: Duration,
     ) {
         self.reset(tx, accesses);
         tx.collections.replace_accesses(catalog_accesses);
+        tx.body_time = body_time;
     }
 
     /// Aborts a non-committed, engaged transaction, acknowledging it when safe
@@ -488,7 +497,9 @@ impl Algo {
     /// Runs one commit pass as one owner operation of the current identity.
     async fn commit_pass(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
         let owner_operation = self.mon.begin_owner_operation(&tx.id)?;
+        let started = rt::Instant::now();
         let result = self.commit_inner(tx).await;
+        self.observe_pass(tx, &result, started.elapsed());
         let result = self.resolve_reclaimed_resources(tx, result).await;
         // Completing the guard proves that no old-identity write can land
         // after retirement. Dropping it records the opposite fact.
@@ -502,7 +513,9 @@ impl Algo {
     /// identity.
     async fn validation_pass(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
         let owner_operation = self.mon.begin_owner_operation(&tx.id)?;
+        let started = rt::Instant::now();
         let result = self.validate_handle_reads(tx).await;
+        self.observe_pass(tx, &result, started.elapsed());
         let result = self.resolve_reclaimed_resources(tx, result).await;
         // Completing the guard proves that no old-identity write can land
         // after retirement. Dropping it records the opposite fact.
@@ -649,10 +662,52 @@ impl Algo {
                 // no record, no lock, no published identity — so the ordinary
                 // retry contract applies with no cleanup.
                 DirectOutcome::Replay => return Err(TransError::Retry),
-                DirectOutcome::Locked => {}
+                DirectOutcome::Locked(cause) => {
+                    return self.commit_locked_after_direct(tx, cause).await;
+                }
             }
         }
         self.commit_locked(tx).await
+    }
+
+    /// Commits with locks a transaction whose direct commit could not land
+    /// for `cause`, and reports the time that the locked commit adds.
+    async fn commit_locked_after_direct(
+        &self,
+        tx: &mut Handle,
+        cause: LockedCause,
+    ) -> Result<PassOutcome, TransError> {
+        let started = rt::Instant::now();
+        let outcome = self.commit_locked(tx).await;
+        if matches!(outcome, Ok(PassOutcome::Complete)) {
+            self.direct_commit
+                .observe_locked_commit(cause, started.elapsed());
+        }
+        outcome
+    }
+
+    /// Reports to the topology rule a commit or validation pass that ended with
+    /// `outcome` after `took`, when a conflict ended it without a result.
+    fn observe_pass(
+        &self,
+        tx: &mut Handle,
+        outcome: &Result<PassOutcome, TransError>,
+        took: Duration,
+    ) {
+        if !self.structural_hints.measurements_enabled() {
+            return;
+        }
+        let body_time = std::mem::take(&mut tx.body_time);
+        let conflict = match outcome {
+            Ok(PassOutcome::Complete) => false,
+            // A pass renews for serial acquisition only after lock conflicts.
+            Ok(PassOutcome::RenewForSerial { .. }) => true,
+            Err(error) => matches!(error, TransError::Retry | TransError::Wounded),
+        };
+        if conflict {
+            self.structural_hints
+                .observe_conflict_pass(&tx.accesses, body_time + took);
+        }
     }
 
     async fn validate_handle_reads(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
@@ -1095,26 +1150,34 @@ impl Algo {
         barrier: CurrentnessBarrier,
         lock_validation: Option<&LockedTx>,
     ) -> Result<bool, TransError> {
-        for coverage in accesses
-            .range_scans()
-            .iter()
-            .flat_map(|scan| scan.covered())
-        {
-            let unchanged = match lock_validation {
-                Some(locked) => locked.certifies_membership(
-                    &coverage.observation,
-                    coverage.membership_generation,
-                    barrier,
-                ),
-                None => matches!(
-                    self.nodes
-                        .check_leaf_current(&coverage.observation, Requirement::after(barrier))
-                        .await?,
-                    LeafObservationCheck::Current
-                ),
-            };
-            if !unchanged || self.any_committed([coverage], barrier).await? {
-                return Ok(false);
+        for scan in accesses.range_scans() {
+            let mut previous: Option<&LeafCoverage> = None;
+            for coverage in scan.covered() {
+                let started = rt::Instant::now();
+                let unchanged = match lock_validation {
+                    Some(locked) => locked.certifies_membership(
+                        &coverage.observation,
+                        coverage.membership_generation,
+                        barrier,
+                    ),
+                    None => matches!(
+                        self.nodes
+                            .check_leaf_current(&coverage.observation, Requirement::after(barrier))
+                            .await?,
+                        LeafObservationCheck::Current
+                    ),
+                };
+                if let Some(previous) = previous {
+                    self.structural_hints.scan_crossing_time(
+                        previous.observation.path(),
+                        coverage.observation.path(),
+                        started.elapsed(),
+                    );
+                }
+                if !unchanged || self.any_committed([coverage], barrier).await? {
+                    return Ok(false);
+                }
+                previous = Some(coverage);
             }
         }
         Ok(true)
@@ -1412,6 +1475,7 @@ mod tests {
                 TreeRouter::new(tctx.nodes.clone(), std::num::NonZeroUsize::MIN),
                 KeyStateResolver::new(tctx.tmon.clone()),
                 std::num::NonZeroUsize::MIN,
+                StructuralHintSink::detached(),
             ),
             tctx.timeline.clone(),
             RetryConfig::default(),
@@ -2919,6 +2983,7 @@ mod tests {
             TreeRouter::new(tctx.nodes.clone(), std::num::NonZeroUsize::MIN),
             KeyStateResolver::new(tctx.tmon.clone()),
             std::num::NonZeroUsize::MIN,
+            StructuralHintSink::detached(),
         );
         let scan = resolver
             .scan_keys(&test_collection(), &range, &[], None, None)
@@ -2944,6 +3009,7 @@ mod tests {
             TreeRouter::new(tctx.nodes.clone(), std::num::NonZeroUsize::MIN),
             KeyStateResolver::new(tctx.tmon.clone()),
             std::num::NonZeroUsize::MIN,
+            StructuralHintSink::detached(),
         );
         let result = resolver
             .scan_keys(&test_collection(), &range, &[], None, None)

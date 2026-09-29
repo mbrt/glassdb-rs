@@ -12,7 +12,7 @@ use glassdb_data::{DatabaseId, DbPrefix};
 use glassdb_storage::{InlinePolicy, NodeSizePolicy, PersistentCacheConfig, PersistentCacheMedia};
 use glassdb_trans::{
     AccessSet, BodyDecision, CatalogAccesses, Engine, EngineConfig, EngineTransaction, GcLimits,
-    ProtocolTiming, TransError,
+    ProtocolTiming, TopologyPolicy, TransError,
 };
 use tokio::sync::Notify;
 
@@ -122,6 +122,14 @@ impl DatabaseBuilder {
     /// (ADR-056).
     pub fn inline_policy(mut self, policy: InlinePolicy) -> Self {
         self.engine_config.set_inline_policy(policy);
+        self
+    }
+
+    /// Sets the policy that decides when leaves split and merge. The policy is
+    /// local to each database instance, and database instances with different
+    /// policies can share one database.
+    pub fn topology_policy(mut self, policy: TopologyPolicy) -> Self {
+        self.engine_config.set_topology_policy(policy);
         self
     }
 
@@ -535,7 +543,9 @@ impl DbInner {
 
         let result: Result<T, Error> = loop {
             let tx = Transaction::new(self.clone(), driver.handle.collection_reservations());
+            let body_started = rt::Instant::now();
             let body_outcome = f(tx.handle()).await;
+            let body_time = body_started.elapsed();
 
             // Collect the accesses produced by the transaction body.
             let (accesses, catalog_accesses) = tx.collect_accesses();
@@ -543,7 +553,7 @@ impl DbInner {
             stats.writes += accesses.write_count() as u64;
 
             if body_outcome.is_ok() {
-                driver.install_accesses(accesses, catalog_accesses);
+                driver.install_accesses(accesses, catalog_accesses, body_time);
                 match driver.commit().await {
                     Ok(BodyDecision::ReturnOutcome) => break body_outcome,
                     Ok(BodyDecision::ReplayBody) => {}
@@ -557,7 +567,7 @@ impl DbInner {
                 // behind the error, so the caller learns about the failed
                 // validation instead.
                 match driver
-                    .validate_error_outcome(accesses, catalog_accesses)
+                    .validate_error_outcome(accesses, catalog_accesses, body_time)
                     .await
                 {
                     Ok(BodyDecision::ReplayBody) => {}
@@ -592,10 +602,16 @@ impl<'a> TransactionDriver<'a> {
         }
     }
 
-    /// Installs the accesses collected from the latest transaction-body execution.
-    fn install_accesses(&mut self, accesses: AccessSet, catalog_accesses: CatalogAccesses) {
+    /// Installs the accesses collected from the latest transaction-body
+    /// execution, which took `body_time`.
+    fn install_accesses(
+        &mut self,
+        accesses: AccessSet,
+        catalog_accesses: CatalogAccesses,
+        body_time: Duration,
+    ) {
         self.engine
-            .reset_transaction(&mut self.handle, accesses, catalog_accesses);
+            .reset_transaction(&mut self.handle, accesses, catalog_accesses, body_time);
     }
 
     /// Validates the reads that led the transaction body to return an error.
@@ -603,8 +619,13 @@ impl<'a> TransactionDriver<'a> {
         &mut self,
         accesses: AccessSet,
         catalog_accesses: CatalogAccesses,
+        body_time: Duration,
     ) -> Result<BodyDecision, TransError> {
-        self.install_accesses(accesses.into_read_only(), catalog_accesses.into_read_only());
+        self.install_accesses(
+            accesses.into_read_only(),
+            catalog_accesses.into_read_only(),
+            body_time,
+        );
         self.engine.validate_reads(&mut self.handle).await
     }
 

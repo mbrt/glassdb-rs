@@ -29,7 +29,7 @@ use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{LeafCoordinator, LeafCoordinatorStats};
 use crate::monitor::{Monitor, MonitorStats, ProtocolTiming};
 use crate::reader::{ReadOutcome, Reader};
-use crate::structural::{Restructurer, RestructurerStats};
+use crate::structural::{Restructurer, RestructurerStats, TopologyPolicy};
 use crate::tlocker::{Locker, LockerStats};
 
 /// Balances backend traffic and memory use for a default production database instance.
@@ -51,6 +51,7 @@ pub struct EngineConfig {
     retry: RetryConfig,
     node_size_policy: NodeSizePolicy,
     inline_policy: InlinePolicy,
+    topology_policy: TopologyPolicy,
     protocol_timing: ProtocolTiming,
     transaction_leaf_parallelism: NonZeroUsize,
     collection_reservation_limit: usize,
@@ -93,6 +94,11 @@ impl EngineConfig {
         self.inline_policy = policy;
     }
 
+    /// Sets the policy that decides when leaves split and merge.
+    pub fn set_topology_policy(&mut self, policy: TopologyPolicy) {
+        self.topology_policy = policy;
+    }
+
     /// Sets transaction-liveness timing.
     pub fn set_protocol_timing(&mut self, timing: ProtocolTiming) {
         self.protocol_timing = timing;
@@ -127,6 +133,7 @@ impl Default for EngineConfig {
             retry: RetryConfig::default(),
             node_size_policy: NodeSizePolicy::default(),
             inline_policy: InlinePolicy::default(),
+            topology_policy: TopologyPolicy::default(),
             protocol_timing: ProtocolTiming::default(),
             transaction_leaf_parallelism: DEFAULT_TRANSACTION_LEAF_PARALLELISM,
             collection_reservation_limit: DEFAULT_COLLECTION_RESERVATION_LIMIT,
@@ -266,15 +273,17 @@ impl Engine {
         EngineTransaction(self.algo.begin(accesses, catalog_accesses))
     }
 
-    /// Replaces the logical accesses of an uncommitted transaction.
+    /// Replaces the logical accesses of an uncommitted transaction, with the
+    /// time of the body run that made them.
     pub fn reset_transaction(
         &self,
         tx: &mut EngineTransaction,
         accesses: AccessSet,
         catalog_accesses: CatalogAccesses,
+        body_time: Duration,
     ) {
         self.algo
-            .reset_with_collections(&mut tx.0, accesses, catalog_accesses);
+            .reset_with_collections(&mut tx.0, accesses, catalog_accesses, body_time);
     }
 
     /// Validates read-only accesses and reports whether the body must run again.
@@ -524,6 +533,7 @@ impl DormantEngine {
             retry,
             node_size_policy,
             inline_policy,
+            topology_policy,
             transaction_leaf_parallelism,
             collection_reservation_limit,
             gc_parallelism,
@@ -552,12 +562,6 @@ impl DormantEngine {
         let collection_catalog = CollectionCatalog::new(collection_state.clone());
         let key_state = KeyStateResolver::new(monitor.clone());
         let router = TreeRouter::new(nodes.clone(), transaction_leaf_parallelism);
-        let resolver = KeyResolver::new(
-            router.clone(),
-            key_state.clone(),
-            transaction_leaf_parallelism,
-        );
-        let reader = Reader::new(resolver.clone(), timeline.clone(), retry);
         let gc_hints = GcHints::new(gc_limits);
         let (coord, restructurer) = Restructurer::with_coordinator(
             background_weak.clone(),
@@ -566,13 +570,21 @@ impl DormantEngine {
             structural_intents.clone(),
             timeline.clone(),
             monitor.clone(),
-            key_state,
+            key_state.clone(),
             retry,
             db_prefix,
             node_size_policy,
             inline_policy,
+            topology_policy,
             gc_hints.clone(),
         );
+        let resolver = KeyResolver::new(
+            router.clone(),
+            key_state,
+            transaction_leaf_parallelism,
+            restructurer.hint_sink(),
+        );
+        let reader = Reader::new(resolver.clone(), timeline.clone(), retry);
         let locker = Locker::new(
             coord.clone(),
             TreeRouter::new(nodes.clone(), transaction_leaf_parallelism),

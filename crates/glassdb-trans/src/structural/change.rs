@@ -18,7 +18,7 @@ use tokio::sync::Notify;
 use crate::error::TransError;
 use crate::node_locking::GateAcquisition;
 
-use super::merge::Merger;
+use super::merge::{MergeReason, Merger};
 use super::nodes::StructuralNodeAccess;
 use super::reclamation::ReclamationReporter;
 use super::reconcile::{ParentReconciler, ParentSplitContinuation, ReconciliationOutcome};
@@ -55,6 +55,7 @@ pub(super) enum PlannedChange<'a> {
     Merge {
         collection: &'a CollectionAddress,
         source: &'a NodeId,
+        reason: MergeReason,
     },
 }
 
@@ -393,8 +394,8 @@ impl StructuralChangeAttempt<'_> {
                     .await;
                 self.complete(ready, applied).await
             }
-            PlannedChange::Merge { source, .. } => {
-                let planned = lifecycle.merger.prepare(collection, node).await;
+            PlannedChange::Merge { source, reason, .. } => {
+                let planned = lifecycle.merger.prepare(collection, node, reason).await;
                 let (ready, plan) = match self.mark_ready(planned, prepared, &observation).await {
                     Ok(ready) => ready,
                     Err(outcome) => return outcome,

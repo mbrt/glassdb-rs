@@ -1804,7 +1804,10 @@ async fn direct_commit_reroutes_once_then_falls_back() {
     );
     gate.release();
 
-    assert_eq!(candidate.await.unwrap().unwrap(), DirectOutcome::Locked);
+    assert_eq!(
+        candidate.await.unwrap().unwrap(),
+        DirectOutcome::Locked(LockedCause::Other)
+    );
     assert_eq!(
         tm.direct_commit_stats_and_reset(),
         DirectCommitStats {
@@ -1851,6 +1854,77 @@ async fn cross_leaf_member_uses_a_locked_commit() {
         DirectCommitStats::default(),
         "a dependency set spanning leaves is not a direct candidate"
     );
+}
+
+// A member that misses direct commit only because its keys straddle one right
+// link is the case that a merge of the two leaves recovers (ADR-074).
+#[tokio::test]
+async fn a_member_over_two_adjacent_leaves_names_them_as_its_locked_cause() {
+    let (tm, tctx) = new_algo().await;
+    let l0 = test_node_id(0);
+    let l1 = test_node_id(1);
+    let l2 = test_node_id(2);
+    for (id, low_key, high_key, right_sibling) in [
+        (&l0, b"".as_slice(), Some(b"m".to_vec()), Some(l1)),
+        (&l1, b"m", Some(b"t".to_vec()), Some(l2)),
+        (&l2, b"t", None, None),
+    ] {
+        let leaf = Node::leaf(LeafBody::new())
+            .with_low_key(low_key.to_vec())
+            .with_high_key(high_key)
+            .with_right_sibling(right_sibling);
+        assert!(
+            tctx.nodes
+                .store_node(&test_collection(), id, &leaf, None)
+                .await
+                .unwrap()
+        );
+    }
+    let root = tctx
+        .nodes
+        .load_leaf(
+            &test_root_path(),
+            Requirement::after(tctx.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    let index =
+        IndexNode::from_children([(Vec::new(), l0), (b"m".to_vec(), l1), (b"t".to_vec(), l2)]);
+    assert!(
+        tctx.nodes
+            .store_root(&test_collection(), &Node::index(index), root.observation())
+            .await
+            .unwrap()
+    );
+
+    let adjacent = |left, right| LockedCause::AdjacentLeaves {
+        left: ObjectPath::Node {
+            collection: test_collection(),
+            id: left,
+        },
+        right: ObjectPath::Node {
+            collection: test_collection(),
+            id: right,
+        },
+    };
+    for (keys, expected) in [
+        (vec![b"a".as_slice(), b"n"], adjacent(l0, l1)),
+        (vec![b"u", b"n"], adjacent(l1, l2)),
+        (vec![b"a", b"u"], LockedCause::Other),
+        (vec![b"a", b"n", b"u"], LockedCause::Other),
+    ] {
+        let writes = keys.iter().map(|key| wa(&logical_key(key), b"v")).collect();
+        let outcome = tm
+            .direct_commit
+            .try_commit(
+                &TxId::with_priority(3, b"direct"),
+                &AccessSet::new(Vec::new(), writes, Vec::new()),
+                &mut HandleState::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, DirectOutcome::Locked(expected), "keys {keys:?}");
+    }
 }
 
 // ADR-061: a point read may guard a different output key when both share the

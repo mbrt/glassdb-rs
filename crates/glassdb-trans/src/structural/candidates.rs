@@ -5,12 +5,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use glassdb_concurr::rt;
-use glassdb_data::{ObjectPath, TxId};
+use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 use glassdb_storage::{InlinePolicy, LeafBody, Node, NodeSizePolicy};
 use tokio::sync::Notify;
 
+use crate::access::AccessSet;
 use crate::leaf_coord::StructuralHinter;
 
+use super::measurements::{ChangeKind, TopologyMeasurements};
+use super::merge::MergeReason;
+use super::rule::ChangeRequest;
 use super::split::SplitReason;
 
 /// Interval of the sweep when no new candidate arrives. Such a sweep retries
@@ -40,6 +44,9 @@ pub(super) struct MaintenanceCandidates {
     inline: InlinePolicy,
     queue: Arc<Mutex<VecDeque<MaintenanceCandidate>>>,
     queued: Arc<Notify>,
+    // Present only when a topology rule decides the leaf changes, because
+    // nothing else takes its windows.
+    measurements: Option<Arc<TopologyMeasurements>>,
 }
 
 /// Lightweight producer handle for structural hints decided outside the leaf
@@ -62,16 +69,17 @@ pub(super) struct MaintenanceCandidate {
 #[derive(Clone)]
 pub(super) enum CandidateCause {
     Split(SplitReason),
-    /// The node is below an underfull threshold, so it can merge into its
-    /// right sibling (ADR-073).
-    Underfull,
+    /// The node can merge into its right sibling (ADR-073).
+    Merge(MergeReason),
 }
 
 impl StructuralHintSink {
     /// Records recoverable aggregate inline pressure for authoritative
-    /// revalidation by the restructurer.
+    /// revalidation by the restructurer. A topology rule decides with the
+    /// time of the pressure instead.
     pub(crate) fn observe_inline_pressure(&self, path: &ObjectPath, key: &[u8], value_len: usize) {
-        if !self.candidates.inline.admits_value(value_len) {
+        if self.candidates.measurements.is_some() || !self.candidates.inline.admits_value(value_len)
+        {
             return;
         }
         self.candidates.push(MaintenanceCandidate {
@@ -82,6 +90,52 @@ impl StructuralHintSink {
                 value_len,
             }),
         });
+    }
+
+    /// Notes that a direct commit candidate of `path` used `time` more than a
+    /// direct commit, because the leaf could not carry its value inline.
+    pub(crate) fn inline_pressure_time(&self, path: &ObjectPath, time: Duration) {
+        if let Some(measurements) = &self.candidates.measurements {
+            measurements.add_inline_pressure(path, time);
+        }
+    }
+
+    /// Notes that a direct commit candidate with keys in the adjacent leaves
+    /// `left` and `right` used `time` more than a direct commit.
+    pub(crate) fn adjacent_miss_time(&self, left: &ObjectPath, right: &ObjectPath, time: Duration) {
+        if let Some(measurements) = &self.candidates.measurements {
+            measurements.add_merge_time(left, right, time);
+        }
+    }
+
+    /// Tells if a topology rule decides the leaf changes from measurements.
+    /// Only then do the producers of the sink measure their times, so that the
+    /// size causes do not pay for them.
+    pub(crate) fn measurements_enabled(&self) -> bool {
+        self.candidates.measurements.is_some()
+    }
+
+    /// Notes that a conflict ended a commit pass of a transaction with
+    /// `accesses` without a commit, after `time` with the body run before it.
+    pub(crate) fn observe_conflict_pass(&self, accesses: &AccessSet, time: Duration) {
+        if let Some(measurements) = &self.candidates.measurements {
+            measurements.add_conflict_pass(accesses, time);
+        }
+    }
+
+    /// Notes that a scan that continued from `left` used `time` to read the
+    /// adjacent leaf `right`.
+    pub(crate) fn scan_crossing_time(&self, left: &ObjectPath, right: &ObjectPath, time: Duration) {
+        if let Some(measurements) = &self.candidates.measurements {
+            measurements.add_merge_time(left, right, time);
+        }
+    }
+
+    /// Returns a sink that no restructurer reads, for a component that a test
+    /// runs without one.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        MaintenanceCandidates::with_policy(NodeSizePolicy::default()).hint_sink()
     }
 
     #[cfg(test)]
@@ -107,7 +161,7 @@ impl CandidateCause {
     fn class(&self) -> u8 {
         match self {
             CandidateCause::Split(reason) => reason.class(),
-            CandidateCause::Underfull => 3,
+            CandidateCause::Merge(reason) => reason.class(),
         }
     }
 }
@@ -120,14 +174,22 @@ impl MaintenanceCandidates {
     }
 
     /// Creates an empty candidate feed with co-wired node size and inline
-    /// policies.
+    /// policies, where sizes and inline pressure decide leaf changes.
     pub(super) fn with_policies(policy: NodeSizePolicy, inline: InlinePolicy) -> Self {
-        MaintenanceCandidates {
-            policy,
-            inline,
-            queue: Arc::new(Mutex::new(VecDeque::new())),
-            queued: Arc::new(Notify::new()),
-        }
+        Self::new(policy, inline, None)
+    }
+
+    /// Creates an empty candidate feed with co-wired node size and inline
+    /// policies, where a topology rule decides the leaf changes that sizes do
+    /// not force.
+    pub(super) fn for_topology_rule(policy: NodeSizePolicy, inline: InlinePolicy) -> Self {
+        Self::new(policy, inline, Some(Arc::new(TopologyMeasurements::new())))
+    }
+
+    /// The measurements that the producers of the feed report, when a
+    /// topology rule decides the leaf changes.
+    pub(super) fn measurements(&self) -> Option<&TopologyMeasurements> {
+        self.measurements.as_deref()
     }
 
     /// The node size policy shared by the feed and the restructurer.
@@ -170,7 +232,7 @@ impl MaintenanceCandidates {
             }
         }
         let mut candidates: Vec<_> = by_path.into_values().collect();
-        candidates.sort_by_key(|candidate| matches!(candidate.cause, CandidateCause::Underfull));
+        candidates.sort_by_key(|candidate| matches!(candidate.cause, CandidateCause::Merge(_)));
         candidates
     }
 
@@ -184,9 +246,57 @@ impl MaintenanceCandidates {
             self.push(MaintenanceCandidate {
                 path: path.clone(),
                 priority: self.new_id(),
-                cause: CandidateCause::Underfull,
+                cause: CandidateCause::Merge(MergeReason::Underfull),
             });
         }
+    }
+
+    /// Records that a split or merge of `kind` that landed wrote the leaf `id`.
+    pub(super) fn observe_leaf_change(
+        &self,
+        collection: &CollectionAddress,
+        id: NodeId,
+        kind: ChangeKind,
+    ) {
+        if let Some(measurements) = &self.measurements {
+            let path = ObjectPath::Node {
+                collection: collection.clone(),
+                id,
+            };
+            measurements.record_changed(path, kind);
+        }
+    }
+
+    /// Returns the number of live entries under which a non-root leaf is
+    /// underfull. A topology rule decides the merges for time, but no
+    /// transaction may use a leaf with no live entries again, and then the
+    /// rule never gets time to merge it.
+    pub(super) fn leaf_min_live_entries(&self) -> usize {
+        if self.measurements.is_some() {
+            1
+        } else {
+            self.policy.leaf_min_entries()
+        }
+    }
+
+    /// Queues one leaf change that a topology rule asked for.
+    pub(super) fn push_request(&self, request: ChangeRequest) {
+        let (leaf, cause) = match request {
+            ChangeRequest::Split(leaf) => (
+                leaf,
+                CandidateCause::Split(SplitReason::Demand { at: None }),
+            ),
+            ChangeRequest::SplitAt(leaf, key) => (
+                leaf,
+                CandidateCause::Split(SplitReason::Demand { at: Some(key) }),
+            ),
+            ChangeRequest::Merge(leaf) => (leaf, CandidateCause::Merge(MergeReason::Demand)),
+        };
+        self.push(MaintenanceCandidate {
+            path: leaf.into_path(),
+            priority: self.new_id(),
+            cause,
+        });
     }
 
     /// Requeues a deferred candidate without changing its wound-wait priority.
@@ -207,6 +317,20 @@ impl MaintenanceCandidates {
         TxId::new_at(rt::system_now())
     }
 
+    fn new(
+        policy: NodeSizePolicy,
+        inline: InlinePolicy,
+        measurements: Option<Arc<TopologyMeasurements>>,
+    ) -> Self {
+        MaintenanceCandidates {
+            policy,
+            inline,
+            queue: Arc::new(Mutex::new(VecDeque::new())),
+            queued: Arc::new(Notify::new()),
+            measurements,
+        }
+    }
+
     /// Adds one candidate while keeping the best-effort feed bounded.
     fn enqueue(&self, candidate: MaintenanceCandidate) {
         let mut q = self.queue.lock().unwrap();
@@ -218,23 +342,30 @@ impl MaintenanceCandidates {
 }
 
 impl MaintenanceCandidate {
-    /// Coalesces same-path, same-cause observations without sacrificing the
-    /// oldest structural priority or the largest requested headroom.
+    /// Coalesces same-path, same-cause observations of `other`, which is newer,
+    /// without sacrificing the oldest structural priority or the largest
+    /// requested headroom. A demand split keeps the newest split key, because
+    /// the leaf changes after each measurement.
     fn coalesce(&mut self, other: MaintenanceCandidate) {
         if other.priority.older(&self.priority) {
             self.priority = other.priority;
         }
-        if let (
-            CandidateCause::Split(SplitReason::InlinePressure { key, value_len }),
-            CandidateCause::Split(SplitReason::InlinePressure {
-                key: other_key,
-                value_len: other_len,
-            }),
-        ) = (&mut self.cause, other.cause)
-            && other_len > *value_len
-        {
-            *key = other_key;
-            *value_len = other_len;
+        match (&mut self.cause, other.cause) {
+            (
+                CandidateCause::Split(SplitReason::InlinePressure { key, value_len }),
+                CandidateCause::Split(SplitReason::InlinePressure {
+                    key: other_key,
+                    value_len: other_len,
+                }),
+            ) if other_len > *value_len => {
+                *key = other_key;
+                *value_len = other_len;
+            }
+            (
+                CandidateCause::Split(SplitReason::Demand { at }),
+                CandidateCause::Split(SplitReason::Demand { at: Some(other_at) }),
+            ) => *at = Some(other_at),
+            _ => {}
         }
     }
 }
@@ -245,9 +376,9 @@ impl StructuralHinter for MaintenanceCandidates {
     /// node needs at least two entries to be divisible, so a single hot key is
     /// never enqueued however large. The byte size is a hint the restructurer
     /// re-checks authoritatively against the full node (which adds a little
-    /// framing), so this need not account for it. A non-root leaf with few
-    /// live entries is a merge candidate instead. The oldest hint is dropped
-    /// when the queue is full.
+    /// framing), so this need not account for it. An underfull non-root leaf
+    /// is a merge candidate instead. The oldest hint is dropped when the queue
+    /// is full.
     fn observe_leaf(&self, path: &ObjectPath, entries: &LeafBody) {
         let over_cap = entries.len() >= 2
             && (entries.len() > self.policy.leaf_max_entries()
@@ -256,9 +387,9 @@ impl StructuralHinter for MaintenanceCandidates {
             CandidateCause::Split(SplitReason::SoftCap)
         } else if matches!(path, ObjectPath::Node { .. })
             && entries.entries().filter(|entry| entry.exists()).count()
-                < self.policy.leaf_min_entries()
+                < self.leaf_min_live_entries()
         {
-            CandidateCause::Underfull
+            CandidateCause::Merge(MergeReason::Underfull)
         } else {
             return;
         };
@@ -275,5 +406,15 @@ impl StructuralHinter for MaintenanceCandidates {
             priority: self.new_id(),
             cause: CandidateCause::Split(SplitReason::Capacity),
         });
+    }
+
+    fn leaf_delay(&self, path: &ObjectPath, time: Duration, split_key: &[u8]) {
+        if let Some(measurements) = &self.measurements {
+            measurements.add_leaf_delay(path, time, split_key);
+        }
+    }
+
+    fn measurements_enabled(&self) -> bool {
+        self.measurements.is_some()
     }
 }
