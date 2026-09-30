@@ -5,7 +5,7 @@
 Accepted (implemented).
 
 The current responsibility boundary is described in
-[`architecture.md`](../architecture.md#component-responsibilities): the
+[`architecture.md`](../architecture.md#separate-policy-from-mechanism): the
 implemented coordinator is a transaction-aware shared mutation engine, not a
 policy-ignorant mechanism. The single-coordinator invariant and resolver
 correctness contracts are unchanged.

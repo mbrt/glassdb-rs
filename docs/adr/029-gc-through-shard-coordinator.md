@@ -5,7 +5,7 @@
 Accepted (implemented).
 
 The coordinator's current responsibility boundary is described in
-[`architecture.md`](../architecture.md#component-responsibilities). Its
+[`architecture.md`](../architecture.md#separate-policy-from-mechanism). Its
 transaction-aware coordination contract does not change this ADR's GC policy or its
 single-coordinator reclamation decision.
 

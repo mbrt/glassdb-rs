@@ -1,75 +1,57 @@
 # Architecture
 
-This document describes the current architecture and design choices of GlassDB.
-For usage, performance benchmarks, and examples, see the
-[README](../README.md).
+This document records the structure of GlassDB and the constraints that the
+code cannot state by itself: why a boundary exists, which invariants must hold,
+and which rules keep the protocol correct. Interfaces, parameters, and module
+layouts are in the code. The [ADRs](adr/) record each decision,
+[CONTEXT.md](../CONTEXT.md) defines the vocabulary, and the
+[README](../README.md) covers usage and benchmarks.
 
-It stays at the level of structure, algorithms, and responsibility boundaries.
-Protocol parameters, module layouts, and type signatures are not repeated here,
-because the code states them directly. The [ADRs](adr/) record the decisions
-behind each mechanism, the [guides](guides/) explain the cache and evidence
-model, and [CONTEXT.md](../CONTEXT.md) defines the vocabulary.
+## Design goals and trade-offs
 
-## Design Goals & Tradeoffs
+GlassDB is a client-side Rust library that stores a transactional key-value
+database in object storage. It has these hard constraints:
 
-GlassDB is designed around a specific set of constraints:
+- **No server.** Database instances are stateless and never talk to each other.
+  All coordination happens through object storage, so processes can scale to
+  zero and back without coordination.
+- **Object storage is the only dependency.** The backend must give linearizable
+  single-object operations and conditional mutations. GCS and S3 do.
+- **Strict serializability by default.** Transactions behave as if they run one
+  at a time, in an order consistent with real time. Stale reads are available
+  only when the caller asks for them.
+- **Optimistic concurrency.** GlassDB assumes that conflicts are rare and that
+  the cache is current. It uses a slower algorithm only when it proves that the
+  fast one cannot work.
 
-- **Stateless database instances, no server component.** The entire database is
-  a client-side Rust library. There is no server to deploy, no coordinator, and
-  no direct communication between database instances. All coordination happens
-  through object storage.
-- **Optimistic locking.** Optimized for workloads where conflicts between
-  transactions are rare. Readers are rarely blocked.
-- **Strict serializability.** The strongest isolation level — transactions
-  behave as if executed one at a time, in an order consistent with real time.
-- **Throughput over latency.** Object storage is slow (50–150 ms per
-  operation), but highly scalable. GlassDB leverages that parallelism.
-- **Object storage as the only dependency.** Requires strong consistency and
-  conditional mutations (available in GCS and S3).
+The trade-offs follow from object storage, where one operation takes 50–150 ms
+but the service scales almost without limit:
 
-The explicit tradeoffs are:
+- Correct and slow is better than fast and wrong when transactions race.
+- Throughput is more important than latency. Independent backend calls must run
+  in parallel.
+- GlassDB expects values between 1 KB and 1 MB.
+- Background work must not cost anything that the workload does not need.
 
-- When transactions race, it's better to be slow than incorrect.
-- High throughput is preferred over low latency.
-- Values are expected in the 1 KB – 1 MB range.
-- Stale reads are allowed if explicitly requested, but strong consistency is the
-  default.
-
-## High-Level Architecture
+[docs/principles.md](principles.md) lists the complete principles.
 
 ```
 ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
 │  Process A  │  │  Process B  │  │  Process C  │
-│ ┌─────────┐ │  │ ┌─────────┐ │  │ ┌─────────┐ │
-│ │ App     │ │  │ │ App     │ │  │ │ App     │ │
-│ │ Code    │ │  │ │ Code    │ │  │ │ Code    │ │
-│ ├─────────┤ │  │ ├─────────┤ │  │ ├─────────┤ │
-│ │ GlassDB │ │  │ │ GlassDB │ │  │ │ GlassDB │ │
-│ │ Library │ │  │ │ Library │ │  │ │ Library │ │
-│ └────┬────┘ │  │ └────┬────┘ │  │ └────┬────┘ │
-└──────┼──────┘  └──────┼──────┘  └──────┼──────┘
-       │                │                │
+│  App code   │  │  App code   │  │  App code   │
+│  GlassDB    │  │  GlassDB    │  │  GlassDB    │
+└──────┬──────┘  └──────┬──────┘  └──────┬──────┘
        └────────────────┼────────────────┘
-                        │
                         ▼
               ┌───────────────────┐
-              │  Object Storage   │
-              │  (e.g. GCS, S3)   │
+              │  Object storage   │
               └───────────────────┘
 ```
 
-Each application process embeds GlassDB as a library and opens its own database
-instance. The processes are completely independent and ephemeral — they can
-scale to zero and back without any coordination. The only
-shared state is the object storage bucket, which provides strong consistency for
-single-object operations and conditional mutations for atomic state transitions.
+## Crates and boundaries
 
-## Crate Structure
-
-The Cargo workspace separates the public API, transaction engine, storage,
-backend implementations, data types, and concurrency support. Its dependency
-DAG is enforced at compile time (for example, `storage` cannot reach into
-`trans`):
+The Cargo dependency graph enforces the layering at compile time. For example,
+`glassdb-storage` cannot call into `glassdb-trans`:
 
 ```
 glassdb-data → glassdb-backend → glassdb-storage → glassdb-trans → glassdb
@@ -78,1023 +60,513 @@ glassdb-concurr ──────────────────┴──�
 glassdb-backend-s3, glassdb-backend-gcs → glassdb (optional, feature-gated)
 ```
 
-A `--cfg sim` build adds a simulation-only edge from `glassdb-data` to the
-`glassdb-concurr` runtime, so identifier and path entropy comes from the active
-deterministic run. That edge is absent from normal library builds.
+A `--cfg sim` build adds one edge from `glassdb-data` to the `glassdb-concurr`
+runtime, so that identifier and path entropy comes from the deterministic run.
+Normal builds do not have that edge. See [testing-dst.md](guides/testing-dst.md).
 
-| Crate                 | Responsibility                                                                                                                   |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `glassdb`             | Public API: `Database`, `Transaction`, `Collection`, iterators, statistics                                                        |
-| `glassdb-backend`     | The `Backend` trait, in-memory backend, stats decorator, and middleware for testing and debugging                                 |
-| `glassdb-backend-s3`  | Amazon S3 backend, enabled by the `s3` feature                                                                                    |
-| `glassdb-backend-gcs` | Google Cloud Storage backend, enabled by the `gcs` feature                                                                        |
-| `glassdb-trans`       | Transaction engine: commit algorithm, collection lifecycle, locking, leaf coordination, reads, structural splitting, and GC       |
-| `glassdb-storage`     | Typed object stores over a shared decoded cache with bounded-freshness evidence, B-link traversal, and transaction-record persistence |
-| `glassdb-data`        | Core types: transaction identity and order-preserving path encoding                                                               |
-| `glassdb-proto`       | Generated transaction-record protobuf messages                                                                                       |
-| `glassdb-concurr`     | Concurrency utilities: background tasks, retry, deduplication, entropy, and the deterministic execution runtime                   |
+Only `glassdb` is a public API. The other crates are implementation details.
 
-Only the top-level `glassdb` crate is intended for direct use; the rest are
-implementation detail. Its public API surface is small: `Database`,
-`Transaction`, and `Collection`, plus the re-exported `Backend` trait, the
-in-memory backend, and middleware. The deterministic-simulation runtime is
-compiled only under `--cfg sim`; see [testing-dst.md](guides/testing-dst.md).
+`glassdb` talks to `glassdb-trans` only through `Engine` and logical access and
+result types. No physical node, lock, or store crosses that boundary. The public
+crate keeps the metadata bootstrap, operation admission, the body-replay loop,
+public errors, and public handles. `Engine` owns the runtime: it opens caches
+and stores, builds the complete component graph, and starts the graph only
+after construction is complete. It dispatches reads, scans, and collection
+snapshots, and it gives the transaction lifecycle to `Algo`.
 
-The cross-crate transaction boundary is deliberately narrower than the engine's
-internal module graph. `glassdb` talks to `glassdb-trans` through `Engine` and
-logical access and result types. `Engine` owns the runtime graph and its
-lifetime: it opens caches and stores, constructs the complete graph while it is
-still dormant, and starts it only after construction completes. It dispatches
-reads, scans, and collection snapshots, delegates the transaction lifecycle to
-`Algo`, and collects statistics and diagnostics. The public crate
-keeps metadata bootstrap, operation admission, the body-replay loop,
-public errors, and public handles. Concrete stores and the routing, locking,
-monitoring, splitting, and GC implementations are not exported across this
-boundary.
+### Database metadata
 
-Database metadata owns hard coordination limits and transaction timing. Creation
-writes them with the database ID; each open loads them before starting the engine.
-A concurrent creator uses the winning metadata. Recovery, refresh, and GC use
-the stored timing. Soft split and underfull thresholds remain local to each
-database instance.
-Capacity rejections request splits independently of those thresholds, including
-parent splits during parent reconciliation and recovery. A capacity hint requests
-one split of a divisible node; the blocked operation then retries admission.
-Earlier formats require recreation; see
-[ADR-072](adr/072-persisted-database-settings.md).
+The database metadata holds the hard coordination limits and the transaction
+timing, because every database instance must agree on them. Creation writes
+them with the database ID, and each open loads them before the engine starts. A
+concurrent creator uses the metadata that won. Recovery, lease refresh, and GC
+use the stored timing. Databases in earlier formats must be recreated
+([ADR-072](adr/072-persisted-database-settings.md)).
 
-Database-instance key-size limits apply to write admission, including
-overwrites. Reads, deletions, and scans ignore this local limit so database
-instances can access keys created by another database instance.
+Soft thresholds, such as the split and underfull thresholds, stay local to each
+database instance. A capacity rejection requests a split without regard to
+those thresholds.
 
-The database instance does not cap concurrent transaction calls or stale reads.
-It tracks active calls so shutdown can reject new calls and wait for existing
-calls to finish. The transaction engine drains background protocol work.
+The key-size limit is also local, so only write admission applies it. Reads,
+deletions, and scans ignore it, because a database instance must be able to
+access keys that another instance with a different limit created.
 
-## Component Responsibilities
+A database instance does not limit concurrent transactions or stale reads. It
+counts active calls only so that shutdown can reject new calls and wait for the
+active ones.
 
-Inside the transaction engine the division of labour separates transaction
-orchestration from shared leaf mutation. `Algo` decides *what* must happen to
-commit a transaction, in terms of logical keys, observed writers, and
-staged writes. The `Locker` owns physical routing and lock acquisition for the
-locked commit protocol. `DirectCommit` owns the narrower direct commit
-mechanism. `Algo`
-itself routes no key and CASes no object.
-
-`AccessSet` is the immutable access-fact module between the transaction body
-and the commit engine. It normalizes point reads and final key writes, keeps
-their deterministic order, and exposes one merged point view. Routing, locking,
-validation orchestration, and commit policy stay outside it.
-
-Every leaf entry mutation — lock acquire, direct same-leaf publication,
-write-back, release, and GC reclamation — and every leaf structural-gate
-acquisition flows through **one leaf coordinator**. It loads the object once per
-attempt, builds a mutation plan in wound-wait order, and persists staged changes
-with one CAS (ADR-028/029). The coordinator is a transaction-aware shared
-mutation engine: it owns identity, ordering, admission, and recovery across a
-heterogeneous round, while `Algo`, the `Locker`, and the `Restructurer` supply
-each operation's target, member policy, and typed result. The operation types
-stay with their policy owners: the coordinator reads a member outcome only for
-admission, exclusion, and delivery, never for operation-specific policy.
-
-Independent point-access phases use one transaction-local parallelism value.
-Each provider combines work that targets one physical path, then uses bounded
-foreground futures with stable input and output order. GlassDB does not add an
-aggregate backend scheduler; backend adapters keep responsibility for queues,
-connections, retries, and provider throttling
-([ADR-064](adr/064-bounded-parallel-point-leaf-work.md)).
-
-`Algo` owns every transition from parallel to serial acquisition. It ends the
-old identity and waits for a durable abort-side status before it renews the
-opaque handle. The replacement keeps its priority and cannot publish until the
-old identity has a final status. Point and range work continues without another
-body execution, while collection changes replay the body because their physical
-resources belonged to the old identity
-([ADR-065](adr/065-renewed-transaction-identity-on-serial-fallback.md)).
+## Transaction engine components
 
 ```mermaid
 flowchart TD
-  API["glassdb public API<br/>Database · Transaction · Collection<br/>metadata bootstrap · user body · body-replay loop · public errors"]
+  API["glassdb public API<br/>body-replay loop · public errors"]
 
   subgraph TRANS["glassdb-trans"]
     direction TB
-    Engine["Engine — runtime owner<br/>storage · wiring · lifetime · shutdown<br/>reads · scans · snapshots · diagnostics"]
-    Accesses["AccessSet — access facts<br/>normalize · order · merge<br/>read predicates · direct shape"]
-    Algo["Algo — commit policy<br/>identity lifecycle · orchestration · conflict policy<br/>post-lock read validation"]
-    Reader["Reader / KeyResolver<br/>effective-writer reads and validation"]
-    Locker["Locker — lock policy<br/>key grouping · parallel or serial acquisition<br/>hold-and-wait · operation construction"]
-    Direct["DirectCommit<br/>direct same-leaf publication"]
-    Monitor["Monitor<br/>transaction-record lifecycle<br/>wound · wait · refresh"]
-    Hints["GcHints<br/>bounded nonblocking reports<br/>wake · de-duplicate"]
-    Restructurer["Restructurer<br/>candidate scheduling · split and merge modules<br/>shared change lifecycle · recursive parent split execution"]
-    Recovery["StructuralRecovery<br/>structural-intent lifecycle<br/>classification · fencing · resumption · settlement"]
-    Coord["LeafCoordinator — mutation engine<br/>identity · order · admission<br/>load · plan · CAS per attempt<br/>per-member in-doubt recovery"]
-    Gc["Gc<br/>candidate retries · bounded parallel checks<br/>adaptive scans · GC checks<br/>reclamation · local diagnostics"]
+    Engine["Engine<br/>runtime owner"]
+    Accesses["AccessSet<br/>access facts"]
+    Algo["Algo<br/>commit policy"]
+    Reader["Reader / KeyResolver<br/>reads and validation"]
+    Locker["Locker<br/>lock policy"]
+    Direct["DirectCommit"]
+    Monitor["Monitor<br/>transaction-record lifecycle"]
+    Hints["GcHints"]
+    Restructurer["Restructurer<br/>splits and merges"]
+    Recovery["StructuralRecovery"]
+    Coord["LeafCoordinator<br/>one CAS per leaf and attempt"]
+    Gc["Gc"]
 
-    Engine -->|"owns · transaction lifecycle"| Algo
-    Engine -->|"immutable access set"| Accesses
-    Engine -->|"owns · reads · scans · snapshots"| Reader
-    Engine -.->|"owns and wires"| Locker
-    Engine -.->|"owns and wires"| Monitor
-    Engine -.->|"owns and wires"| Restructurer
-    Engine -.->|"owns and wires"| Coord
-    Engine -.->|"owns and starts"| Gc
+    Engine -->|"transaction lifecycle"| Algo
+    Engine -->|"reads · scans · snapshots"| Reader
+    Accesses --> Algo
+    Accesses --> Locker
+    Accesses --> Direct
     Algo -->|"validate"| Reader
     Algo -->|"lock access set"| Locker
-    Locker -->|"LockedTx"| Algo
     Algo -->|"status"| Monitor
-    Accesses -->|"merged point facts · scans"| Algo
-    Accesses -->|"merged point facts · scans"| Locker
-    Accesses -->|"direct point shape"| Direct
     Algo -->|"direct candidate"| Direct
-    Algo -->|"GC hints"| Hints
-    Direct -->|"GC hints"| Hints
-    Restructurer -->|"GC hints"| Hints
-    Restructurer -->|"start · resume"| Recovery
-    Recovery -->|"parent split request"| Restructurer
+    Algo --> Hints
+    Direct --> Hints
+    Restructurer --> Hints
     Hints -->|"candidates · wake"| Gc
+    Restructurer <-->|"start · resume · parent split"| Recovery
     Locker -->|"acquire · write-back · release"| Coord
-    Direct -->|"direct LeafOperation"| Coord
-    Restructurer -->|"leaf structural-gate operation"| Coord
-    Recovery -->|"source fencing · clean gate release"| Coord
+    Direct --> Coord
+    Restructurer -->|"structural gate"| Coord
+    Recovery -->|"fencing · gate release"| Coord
     Gc -->|"reclaim through unlock"| Locker
   end
 
-  subgraph STORAGE["glassdb-storage"]
-    Stores["CollectionStore · NodeStore · StructuralIntentStore · TxRecordStore<br/>CachedStore — decoded, path-keyed, bounded-freshness LRU"]
-  end
+  Stores["glassdb-storage<br/>typed stores over CachedStore"]
+  Backend["glassdb-backend"]
 
-  Backend["glassdb-backend<br/>content-CAS object store · GCS / S3"]
-
-  API -->|"logical reads · scans · snapshots · AccessSet"| Engine
-  Reader -->|"typed reads"| Stores
-  Monitor -->|"transaction records"| Stores
+  API --> Engine
+  Reader --> Stores
+  Monitor --> Stores
   Coord -->|"node CAS"| Stores
-  Restructurer -->|"post-gate node writes"| Stores
-  Recovery -->|"structural intents · recovery reads and cleanup"| Stores
-  Gc -->|"paged scans · GC checks"| Stores
+  Restructurer --> Stores
+  Recovery --> Stores
+  Gc --> Stores
   Stores --> Backend
 ```
 
-### Collections
+`Engine` also owns and wires `Locker`, `Monitor`, `Restructurer`,
+`LeafCoordinator`, and `Gc`. The diagram leaves out those edges.
 
-Collection management travels beside key access: logical directory reads plus
-exact create and drop binding changes. `Transaction` overlays those changes for
-read-your-writes behavior, and the same accesses survive body replays under one
-transaction identity. `CollectionCommit` owns their recovery-manifest
-projection, physical preparation, catalog validation, drop-intent installation,
-and physical cleanup. `Algo` composes those phases with collection and key
-locking around the same validation barrier and transaction-record status flip.
+### Separate policy from mechanism
 
-A drop additionally freezes the target collection's split topology and installs
-the transaction identity as a drop intent on every root, index, and leaf
-object, so every pre-existing participant settles before node enumeration.
-Normal point operations inspect only the terminal node they already access: an
-aborted intent is removable, a pending intent participates in wound-wait, and a
-committed intent reports a stale collection handle.
+The central split is between policy, which decides what must happen, and
+mechanism, which does it. The table gives each component's job and what it must
+not depend on. These limits keep a change to one policy from spreading.
 
-A later drop replaces an aborted or wounded owner's drop intent in the same
-revision-checked CAS that installs its own fence, because resolving the old
-owner's status does not clear the stored intent and rereading alone cannot make
-progress. Other pending holders must still be resolved before that CAS, and a
-committed foreign drop rejects the new drop. Cleanup after an aborted drop needs
-separate completion evidence for the root, each standalone node, and the
-collection record. It must check the topology freeze even when the record
-records no directory locks, because an aborted record can record a drop before
-its directory lock list is persisted.
-
-A transaction identity owns its collection-ID reservations and prepared
-resources. Body replay reuses them, but identity renewal replaces them, so a
-renewed identity cannot reuse resources that GC can reclaim for the retired
-identity. The engine handle is therefore allocated before the first body
-execution, so its identity owns the reservations from the first collection
-creation; that allocation is local, and transaction-record publication and
-locking still start only when the commit protocol requires them.
-
-Lock ownership is centralized behind two views of `Locker`. The key view takes
-logical key accesses and owns node-lock acquisition, write-back, and release.
-The collection view takes collection addresses, coordinates directory locks,
-and releases topology participants in collection records.
-
-`CollectionStateResolver` is the shared mechanism beneath collection semantics
-and locking. It loads collection records, reconciles foreign topology and
-directory holders, and helps committed directory write-back. `Engine` gives the
-same resolver to `CollectionCatalog` and `Locker`, so the catalog depends on
-collection-state resolution directly instead of reaching through the whole
-locker. It constructs logical snapshots and validates collection preconditions,
-but cannot acquire or release locks. This keeps collection-record coordination
-out of both the B-link `NodeStore` and the semantic catalog.
-
-### Routing and structural change
-
-Routing traversal is centralized in `TreeRouter`, but use of that mechanism is
-intentionally distributed. Key resolution, the key-lock view, GC, and the
-`Restructurer` each own a cheap handle for their distinct read, lock,
-reclamation, or structural workflow. A handle shares the same decoded object
-cache without gaining structural-intent capabilities or maintaining independent
-topology state. This does not invent a single semantic owner for those
-different routing responsibilities.
-
-`StructuralRecovery` owns each structural intent from its prepared write to
-clean deletion or durable recovery. It exposes opaque witnesses to structural
-change coordination, and one resumable action that classifies phases, fences
-source writers, checks reachability, cleans unreachable nodes, and settles
-topology participants with a final status. `Restructurer` only executes a
-requested recursive parent split and supplies its result back to the action; it
-does not inspect durable phases.
-
-Splits and merges share one structural-change lifecycle and one parent
-reconciliation step. The `Restructurer` only schedules: it gives each candidate
-to the split or the merge module, which plans and coordinates that kind of
-change over a shared change context. A merge drains an underfull node into its
-right sibling ([ADR-073](adr/073-merge-nodes-into-right-sibling.md)). The
-drained node stays until its collection is dropped, so stale routes pass it
-through its right link. Until the drain lands, a merge reservation on the target
-keeps the target's copies of the drained entries, and only the merge intent can
-remove it.
-
-Committed leaf writes, parent reconciliation, and capacity rejections queue
-split and merge candidates. With the avoidable time topology policy, the
-default, a rule decides the other leaf splits and merges once in each window,
-from the avoidable time of the window
-([ADR-074](adr/074-avoidable-time-drives-splits-and-merges.md),
-[ADR-075](adr/075-avoidable-time-is-the-default-topology-policy.md)). With the
-size causes policy, the underfull threshold and inline pressure decide them. A new
-candidate wakes the restructurer after a short coalescing delay, so that one
-sweep takes a burst of writes. A deferred
-candidate does not wake the restructurer: it waits for the next sweep, at the
-latest a fixed interval later, so that a busy node does not cause a tight retry
-loop. A merge defers while a live transaction holds a lock on its source or its
-target.
-
-Recovery fences a source writer against the source revision that the intent's
-Ready transition recorded, not against the structural gate the source carries
-now. A worker publishes its split shrink or merge drain with one
-compare-and-swap expecting that revision, so the revision alone says whether the
-worker can still land, and a later structural change of the same source cannot
-shield an abandoned intent. Each gate installation advances the membership
-generation, so the recorded revision never comes back. Structural
-recovery runs on its own background cadence over an independent namespace, and
-does not consume the transaction GC candidate queue.
-
-### Ownership summary
-
-| Component             | Layer            | Owns                                                                                                                  | Must not know                       |
-| --------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
-| `glassdb` (`tx_impl`) | API / replay     | metadata bootstrap, operation admission, transaction body, body replay, final identity end, public handles and errors | stores, locks, nodes, tx records, identity renewal, runtime wiring |
-| `Engine`              | runtime owner    | cache and store opening, runtime construction and lifetime, read/scan/catalog entry points, transaction lifecycle delegation, shutdown order, statistics | transaction bodies, public handles and errors, body-replay policy |
-| `AccessSet`           | access facts     | normalization, deterministic order, merged point facts, read-only projection, read predicates, direct-commit shape | routing, locking, I/O, commit policy |
-| `Algo`                | commit **policy** | transaction identity and retirement, direct-vs-locked selection, lock→validate→commit→write-back orchestration, **post-lock read validation**, conflict policy, body-replay decision, GC candidate hints | transaction-body execution, leaf routing, CAS details, caching, collection lifecycle implementation, GC execution |
-| `DirectCommit`        | direct commit mechanism | one-leaf and physical eligibility, atomic inline/tombstone publication, transaction-local recovery classification | access normalization, transaction records, range and catalog validation, waiting or wounding holders |
-| `GcHints`             | GC candidate seam | bounded nonblocking candidate reports, observable hint loss, wakeups and de-duplication | GC execution, transaction policy, backend storage |
-| `CollectionCommit`    | collection-commit **policy** | same-identity collection replay state, durable recovery-manifest fields, collection-ID preparation, validation, drop-intent installation, post-commit and post-abort cleanup | key locking, key validation, the atomic commit decision |
-| `Locker::keys`        | key-lock **policy** | key→leaf grouping, parallel and serial acquisition, hold-and-wait, acquire / write-back / release operations | access normalization, collection-directory semantics |
-| `Locker::collections` | collection-lock **policy** | directory lock acquisition, topology participant release, recovery write-back and release | key routing, B-link topology, catalog semantics |
-| `CollectionStateResolver` | collection-state mechanism | resolved record loads, foreign-holder reconciliation, committed directory write-back assistance | key routing, B-link topology, catalog semantics |
-| `CollectionCatalog`   | collection semantics | logical snapshots, read-your-writes validation, capacity and precondition checks | locking policy, CAS, wound-wait |
-| `LeafCoordinator`     | shared mutation engine | one round per object: batching, oldest-first mutation planning, routing and capacity admission, exclusion of overlapping direct members, one CAS per attempt, per-member in-doubt state, reload-recover, vestigial-entry pruning | operation-specific results, cross-leaf strategy, transaction lifecycle, commit orchestration, GC selection |
-| `Restructurer`        | structural mechanism | scheduling, topology registration and finalization, source preparation and compaction, split and merge planning, node writes, parent reconciliation | durable intent phases, recovery classification, participant settlement |
-| `StructuralRecovery`  | durable recovery mechanism | intent creation and phase change, clean deletion, discovery, fencing, landing classification, merge abandonment, orphan cleanup, participant settlement | maintenance candidates and causes, tombstone compaction, split and merge planning |
-| `KeyResolver`         | key/range resolution | routing, scan composition, and logical point validation | commit and lock policy, collection-record coordination |
-| `KeyStateResolver`    | loaded key-state mechanism | transaction-dependent interpretation of already-loaded key and node state | routing, scan composition, commit policy |
-| `Reader`              | read mechanism   | value materialization                                                                                                 | commit and lock policy             |
-| `Monitor`             | tx lifecycle     | status, wound and abort, lease refresh, waits                                                                         | leaves                              |
-| `Gc`                  | GC scheduling and reclamation | bounded queues and checks, deferred retries, adaptive scans, GC checks, safety horizons, pinned wounds, reclamation through the coordinator, statistics | commit policy, structural recovery |
-
-### Leaf coordination terms
-
-The [glossary](../CONTEXT.md#leaf-coordination) defines **coordinator round**,
-**round member**, and **mutation plan**. Within a round:
-
-| Work | Term | Meaning |
+| Component | Decides | Must not know |
 | --- | --- | --- |
-| Combine compatible submissions for one leaf | Batch submissions | Form or extend a coordinator round. This does not evaluate the operations or prove that they can all stage changes. |
-| Obtain one member's decision | Evaluate a member policy | Ask the member's policy to propose all of its changes, or none, against the current staged entries. |
-| Build one attempt's proposed leaf state | Build a mutation plan | Check routing and publication-key reservations, evaluate admitted member policies in priority order, and admit their proposed changes within the leaf's capacity limits. Later member policies see earlier admitted changes. |
-| Store the proposed changes | Persist a mutation plan | Issue one conditional leaf mutation if any member staged changes. A plan with no staged changes retains the loaded observation without a CAS. |
-| Recover after contention or an in-doubt result | Reload and rebuild the mutation plan | Load another leaf observation and repeat planning, while retaining each member's unresolved in-doubt state. |
+| `glassdb` (`tx_impl`) | admission, body execution, body replay, public handles and errors | stores, locks, nodes, transaction records, identity renewal |
+| `Engine` | runtime construction, lifetime, shutdown order, read entry points | transaction bodies, body-replay policy |
+| `AccessSet` | normalization, deterministic order, merged point facts, direct-commit shape | routing, locking, I/O, commit policy |
+| `Algo` | identity lifecycle, direct or locked commit, commit orchestration, locked validation, conflict policy | leaf routing, CAS details, caching, GC execution |
+| `DirectCommit` | direct-commit eligibility, publication, recovery classification | transaction records, range validation, waiting on or wounding holders |
+| `CollectionCommit` | collection replay state, recovery manifest fields, drop intents, cleanup | key locking, the commit decision |
+| `Locker::keys` | key-to-leaf grouping, parallel and serial acquisition, hold-and-wait | collection directory semantics |
+| `Locker::collections` | directory locks, topology participant release | key routing, B-link topology |
+| `CollectionStateResolver` | collection record loads, foreign holder reconciliation | key routing, B-link topology, catalog semantics |
+| `CollectionCatalog` | logical snapshots, read-your-writes, precondition checks | locking, CAS, wound-wait |
+| `LeafCoordinator` | batching, mutation plans, admission, one CAS per attempt, in-doubt recovery | operation-specific results, commit orchestration, GC selection |
+| `Restructurer` | split and merge scheduling, planning, and node writes | durable intent phases, recovery classification |
+| `StructuralRecovery` | structural intent lifecycle, fencing, orphan cleanup | split and merge planning, maintenance causes |
+| `Monitor` | transaction status, wounds, lease refresh, waits | leaves |
+| `Gc` | GC queues, GC checks, safety horizon, reclamation | commit policy, structural recovery |
 
-Priority order means oldest wound-wait priority first, with transaction-identity
-bytes as a deterministic tie-break within the round. A later member cannot wound
-an earlier member, and the tie-break does not change persistent wound-wait
-priority. Each member's changes pass admission together or not at all. Member
-policy evaluation can consult transaction state and perform protocol work, such
-as wounding a holder, so building a mutation plan is not a pure computation; but
-it does not itself persist the proposed leaf state. An outcome proposed with
-staged changes is delivered only after the CAS succeeds, and a member skipped
-because an earlier member already staged its change must wait for the same CAS.
+These rules are not visible from any one module:
 
-Earlier revisions used **fold** for several of these steps. Code, guides, and
-ADRs now use the specific terms above.
+- **Every leaf mutation goes through one `LeafCoordinator`.** Lock acquisition,
+  direct commit, write-back, release, GC reclamation, and structural gates all
+  use it. It loads the leaf once per attempt and persists all changes with one
+  CAS ([ADR-028](adr/028-shard-mutation-coordinator.md),
+  [ADR-029](adr/029-gc-through-shard-coordinator.md)). The coordinator is a
+  transaction-aware mutation engine: it owns identity, ordering, admission, and
+  recovery across a round of different operations. `Algo`, the `Locker`, and
+  the `Restructurer` supply each operation's target, member policy, and typed
+  result. The coordinator reads a member's outcome only for admission,
+  exclusion, and delivery, never for operation-specific policy.
+- **`Algo` never routes a key or does a CAS.** It works with logical keys,
+  observed writers, and staged writes.
+- **GlassDB does not schedule backend calls across transactions.** Each
+  transaction runs its independent point work with one bounded parallelism
+  value. Backend adapters own queues, connections, retries, and throttling
+  ([ADR-064](adr/064-bounded-parallel-point-leaf-work.md)).
+- **Only `Algo` changes from parallel to serial acquisition.** It ends the old
+  identity and waits for a durable abort-side status before it renews the
+  identity. The new identity keeps its priority and cannot publish until the
+  old identity has a final status. Point and range work continue without a body
+  replay. Collection changes need a body replay, because their physical
+  resources belonged to the old identity
+  ([ADR-065](adr/065-renewed-transaction-identity-on-serial-fallback.md)).
 
-### The lock boundary
+### Leaf coordination order
 
-The two calls across the semantic/locking seam carry no physical-node
-representation:
+A coordinator round evaluates its members in priority order: the oldest
+wound-wait priority first, and transaction identity bytes as a tie-break. The
+tie-break only makes a round deterministic. It does not change the persistent
+wound-wait priority. A later member cannot wound an earlier one.
 
-- **Down**: the key view receives the access set, the serial flag, and the
-  validation bound; it groups keys by current leaf and locks leaves with bounded
-  parallel work or in sorted order. The collection view receives logical
-  directory reads and binding changes, and derives a stable collection-address
-  lock order. Neither interface exposes encoded record or node state.
-- **Up**: success returns a locked-transaction handle, and a lost CAS race
-  returns a conflict — both logical, never nodes. `Algo` maps a normal conflict
-  to a complete-access-set body replay under the same identity while it keeps landed
-  leaf holds. After sustained parallel conflict, `Algo` ends the identity, renews
-  it, and continues with serial acquisition.
+A member's changes pass admission all together or not at all. A later member
+policy sees the changes admitted from earlier members. Evaluation can do
+protocol work, such as a wound, so building a mutation plan is not a pure
+computation. A plan with no staged changes keeps the loaded observation and
+does no CAS. After contention or an in-doubt result, the coordinator loads the
+leaf again and builds a new plan, and each member keeps its unresolved in-doubt
+state. A member receives an outcome with staged changes only after the CAS succeeds.
+A member that is skipped because an earlier member already staged its change
+also waits for that CAS.
 
-Read-writer validation is **not** at this seam. Once the locks come back, every
-touched key is locked and its value frozen, so `Algo` re-resolves each read's
-effective writer and compares it to the token the body observed. A mismatch
-means the value moved before the lock landed, and `Algo` replays the body while
-it **holds its locks**. This is optimistic-concurrency policy over the logical
-read set, and it reuses the same routine as optimistic validation — so
-validation lives in exactly one place, never in the locker.
+### Keep physical state out of the lock boundary
 
-Because the deadlock timeout, serial-escalation decision, and backoff are
-*policy*, they live in `Algo`. The locker is bounded only by an internal
-CAS-retry budget and reports sustained contention back as a conflict rather than
-looping forever. This keeps efficient batch acquisition — many keys collapse
-into one leaf CAS — behind the key-lock interface.
+The calls between `Algo` and `Locker` carry only logical data:
 
-## Backend Abstraction
+- **Down:** the key view gets the access set, the serial flag, and the
+  validation bound. The collection view gets directory reads and binding
+  changes, and derives a stable lock order.
+- **Up:** the result is a locked-transaction handle or a conflict. A normal
+  conflict causes a body replay under the same identity, and the transaction
+  keeps the leaf locks that it has. After sustained parallel conflict, `Algo`
+  renews the identity and changes to serial acquisition.
 
-The `Backend` trait defines the contract with object storage. It is an
-`async_trait`, and every method is cancellable by dropping the returned future.
-Six methods form a conditional-only surface
-([ADR-042](adr/042-conditional-only-backend-mutations.md), refining
-[ADR-023](adr/023-slimmed-backend-trait.md)): read, revision-conditional read,
-conditional replace, create-if-absent write, conditional delete, and
-paginated prefix listing. Each maps to a primitive that S3 and GCS provide
-natively. All coordination state lives in object *content*, and every mutation
-names either absence or an exact content revision — there are no tags,
-metadata, writer ids, or unconditional mutations.
+Validation is not part of this boundary. After locking, `Algo` resolves the
+effective writer of each read again and compares it with what the body saw. It
+uses the same routine as optimistic validation, so validation logic exists in
+one place only. The deadlock timeout, the serial fallback, and backoff are also
+policy and stay in `Algo`. The locker has only an internal CAS retry budget, and
+it reports sustained contention as a conflict instead of retrying without limit.
 
-Correctness assumes that each backend provides linearizable single-object reads
-and conditional mutations, including read-after-definitive-completion. An
-eventually consistent backend is therefore not supported. A definitive response
-establishes an ordering edge; an `Unavailable` result does not. Provider retries
-remain inside one logical backend invocation, so attempts do not manufacture
-ordering edges between themselves.
+## Backend contract
 
-Listing returns one recursive prefix page of actual object paths. A cursor
-structurally binds an opaque provider continuation token to its prefix; callers
-can only retain and return it. Only a page without a next cursor completes the
-traversal, and a rejected provider token lets the caller restart that prefix.
-S3 and GCS map this contract directly to their native continuation tokens
-without a delimiter
-([ADR-035](adr/035-paginated-listing-and-sharded-transaction-logs.md)).
+The `Backend` trait has six conditional-only methods, and a caller can cancel
+each one by dropping its future. The methods are: read,
+revision-conditional read, conditional replace, create-if-absent write,
+conditional delete, and paginated prefix listing
+([ADR-042](adr/042-conditional-only-backend-mutations.md)). S3 and GCS provide
+each one natively. All coordination state is in object content. There are no
+tags, metadata, writer IDs, or unconditional mutations.
 
-### Key concepts
+Correctness depends on these properties:
 
-**Revisions.** Every object has an opaque revision assigned by the backend and
-used only for conditional operations. The format is backend-specific: GCS
-encodes the object generation, while S3 uses the object's ETag. Consumers never
-interpret it — they pass it back unchanged to a conditional operation.
+- **Linearizability.** Single-object reads and conditional mutations are
+  linearizable. A read after a definitive completion sees that result or a
+  later one. An eventually consistent backend is not supported.
+- **Opaque revisions.** A revision identifies content for conditional
+  operations. GCS uses the object generation and S3 uses the ETag. Callers only
+  pass it back. A revision-conditional read returns `Precondition`
+  without the body when the revision still matches, so a hot, unchanged object
+  costs no body transfer ([ADR-023](adr/023-slimmed-backend-trait.md)).
+- **`Unavailable` is not an answer.** For a mutation, `Unavailable` means that
+  the outcome is in doubt, so a blind retry is not safe
+  ([ADR-009](adr/009-in-doubt-conditional-writes.md)). For a read or a list, a
+  retry is safe. The reader retries in place and reports a sustained outage as
+  an unavailability error ([ADR-015](adr/015-read-unavailability.md)). Only a
+  definitive response creates an ordering edge. Provider retries stay inside one
+  backend call, so they do not create ordering edges.
+- **A conditional delete of a missing object succeeds.**
+- **Listing is not a snapshot.** A cursor binds a provider token to its prefix.
+  Only a page without a next cursor ends a traversal. A rejected token lets the
+  caller restart the prefix
+  ([ADR-035](adr/035-paginated-listing-and-sharded-transaction-logs.md)).
 
-**Change detection.** All coordination state lives in object *content* and
-changes only by content CAS. The revision identifies that content state;
-rewriting equivalent content may retain the same token. To check whether a
-cached object is current, the cache issues a *revision-conditional* read: the
-backend returns a precondition failure when the stored revision still matches
-(without re-transferring the body), or the full object when it changed. This
-maps to a native conditional GET on every backend and lets a hot, unchanged
-object check its currentness without a body transfer
-([ADR-023](adr/023-slimmed-backend-trait.md)).
+The in-memory backend and the middleware wrappers are for tests and debugging.
+The PR benchmarks add modeled provider latency and throttling to the in-memory
+backend. See [the benchmark conditions](../crates/glassdb/benches/README.md).
 
-**Conditional operations.** CASes and conditional deletes name an expected
-revision (or "must not exist") and fail if that state is no longer current. A
-missing object during a conditional delete is successful convergence. Content
-compare-and-swap is the only coordination primitive — the fundamental building
-block for distributed coordination.
+## Transaction algorithm
 
-**Error semantics.** The backend distinguishes four outcomes:
+GlassDB gets strict serializability from two properties. Object storage gives
+linearizable single-object operations. A modified strict two-phase locking
+protocol gives serializable isolation, because every lock stays held until
+after commit. The
+[blog post](https://blog.mbrt.dev/posts/transactional-object-storage) compares
+this with other databases.
 
-- `NotFound` — the object does not exist.
-- `Precondition` — a conditional operation failed because the state moved.
-- `Unavailable` — the operation could not be confirmed. For a *mutation* this
-  means the outcome is _in doubt_: it may or may not have been applied, so it
-  must not be blindly retried
-  ([ADR-009](adr/009-in-doubt-conditional-writes.md)). For an idempotent read or
-  list it is a transient failure that is safe to retry; the engine retries reads
-  in place and surfaces an unrecoverable one as an unavailability error
-  ([ADR-015](adr/015-read-unavailability.md)).
-- `Other` — any other backend error.
-
-### Implementations
-
-| Backend                       | Purpose             | Notes                                                                                             |
-| ----------------------------- | ------------------- | --------------------------------------------------------------------------------------------------- |
-| `glassdb-backend-gcs`         | Production          | GCS JSON API; generation revisions; conditional read, write, and delete through native preconditions |
-| `glassdb-backend-s3`          | Production          | One object per path; ETag revisions; conditional read, write, and delete through native preconditions |
-| `glassdb-backend::memory`     | Testing             | In-process backend simulating GCS semantics                                                        |
-| `glassdb-backend::middleware` | Debugging / testing | Wrappers for logging, latency injection, byte-driven scheduling, fault injection, and op recording |
-
-The cloud backends are feature-gated so their heavy SDK dependencies are only
-pulled in when needed; each is tested against a pure-Rust in-process fake of its
-API. Memory, GCS, and S3 share a backend conformance suite; provider-specific
-tests check transport faults and in-doubt mutation outcomes. The PR diagnostic
-benchmarks wrap the in-memory backend with modeled
-provider latency and throttling on a scaled clock; see
-[the diagnostic benchmark conditions](../crates/glassdb/benches/README.md).
-
-## Transaction Algorithm
-
-### Isolation & Consistency
-
-GlassDB targets **strict serializability** — the combination of serializable
-isolation and linearizable consistency. This is the strongest guarantee: all
-transactions appear to execute one at a time, in an order consistent with real
-time. No anomalies of any kind are possible.
-
-This is achieved by combining two properties:
-
-1. **Linearizable consistency**, provided natively by object storage (GCS, S3):
-   any read initiated after a successful write returns that write's contents.
-2. **Serializable isolation**, enforced by a modified Strict Two-Phase Locking
-   (S2PL) protocol: all locks are held until after commit, preventing
-   interleaving.
-
-For a deeper discussion of isolation vs. consistency levels — including
-comparisons with Postgres, Spanner, CockroachDB, and others — see the
-[blog post](https://blog.mbrt.dev/posts/transactional-object-storage).
-
-### Transaction Lifecycle
+### Transaction lifecycle
 
 ```
-    ┌───────┐
-    │ Begin │  Assign transaction identity, create handle
-    └───┬───┘
-        │
-        ▼
-    ┌─────────┐
-    │ Execute │  User code runs: reads (tracked), writes (staged locally)
-    └───┬─────┘
-        │
-        ▼
-    ┌──────────┐
-    │ Validate │  Acquire locks, verify observed writers unchanged
-    └───┬──────┘
-        │
-     conflict?
-     ╱       ╲
-   yes        no
-    │          │
-    ▼          ▼
- ┌────────┐ ┌────────┐
- │ Replay │ │ Commit │  Write transaction record atomically
- └────────┘ └───┬────┘
-                │
-                ▼
-         ┌────────────┐
-         │ Write-back │  Async: publish values, release locks, schedule GC
-         └────────────┘
+Begin ─► Execute ─► Validate ──no conflict──► Commit ─► Write-back (async)
+            ▲           │
+            └─ replay ◄─┘ invalidated read
 ```
 
-During **Execute**, reads go through the cache and are tracked, and writes are
-staged in memory. No locks are held in this phase.
+1. **Execute.** The body reads through the cache and stages writes in memory.
+   It holds no locks, so transactions on different keys never wait for each
+   other.
+2. **Validate.** The transaction locks the access set and checks that every
+   observed writer is still the effective writer. If a read is invalidated, the
+   transaction does a locked replay.
+3. **Commit.** The transaction record becomes committed. That CAS is the commit
+   point.
+4. **Write-back.** The transaction publishes new values, releases locks, and
+   reports a GC hint. Write-back can be asynchronous, because the transaction
+   record is the source of truth. If the owner crashes, another transaction can
+   help forward or read the values from the record.
 
-During **Validate**, the algorithm acquires locks and checks that every
-observed writer is still the effective writer. If a concurrent transaction
-changed a read key, the current transaction does a **locked replay**: it replays
-the body while it keeps its locks, so the keys that it already locked cannot
-change again.
+`Database::tx` takes the body by value and owns the body-replay loop, so a
+conflict only causes a body replay. Dropping the transaction future at any
+point is equal to a crash. Recovery handles the state that it leaves.
 
-After **Commit**, the transaction record is the durable commit point. The async
-write-back phase writes the new values back to keys, releases locks, and
-schedules the transaction record for garbage collection.
+### Locks live in leaf content
 
-Because `Database::tx` takes the body by value and the framework owns the
-body-replay loop, a conflict simply replays the body. Dropping the transaction
-future at any point is equivalent to a crash: the commit protocol and retirement
-machinery recover any in-flight state.
+Each leaf holds one entry per key. An entry records the lock type, the holders,
+and the current state of the key.
 
-### Optimistic Concurrency Control
+| Requested | None | Read | Write | Create |
+| --- | :-: | :-: | :-: | :-: |
+| Read | ✓ | ✓ | wait | wait |
+| Write | ✓ | upgrade if sole holder | wait | wait |
+| Create | ✓ | upgrade if sole holder | wait | wait |
 
-The core idea: **transactions run without locks until commit time.** This means
-non-conflicting transactions never interfere with each other.
+A put to a key outside the key membership takes a create lock, so that two
+transactions cannot create the same key.
 
-```
-Transaction A (keys 1, 2)         Transaction B (keys 3, 4)
-─────────────────────────         ─────────────────────────
-Read key 1                        Read key 3
-Read key 2                        Read key 4
-Stage write to key 1              Stage write to key 3
-  ── validate ──                    ── validate ──
-Lock key 1, key 2                 Lock key 3, key 4
-Verify writers                    Verify writers
-Write tx record                   Write tx record
-  ── commit ──                      ── commit ──
-```
+Locking is a CAS of the leaf object. Keys that route to the same leaf share one
+read and one CAS ([ADR-017](adr/017-shard-object.md),
+[ADR-020](adr/020-commit-write-back-protocol.md)). Transactions that contend
+for the same leaf batch into one coordinator round instead of racing
+([ADR-025](adr/025-dedup-shard-lock-acquisition.md),
+[ADR-026](adr/026-dedup-shard-release-write-back.md)).
 
-Since A and B touch different keys, they proceed fully in parallel — no waiting,
-no body replays. Locks are held only for the brief validate-and-commit window.
+The current state is absent, an external value, an inline value, or a
+tombstone ([ADR-051](adr/051-inline-latest-values.md)). A read of an inline value or a
+tombstone needs no transaction record read. Only a direct commit creates an
+inline value, because there the leaf is the only durable copy of the value.
+Locked write-back and help-forward publish external values. They never demote
+an existing inline value to an external value of the same writer, because that
+writer can have no transaction record ([ADR-054](adr/054-reserve-inline-publication-for-logless-commits.md)).
 
-When transactions _do_ conflict:
+A read of a key whose current state is absent records the membership generation
+of its leaf. If the physical leaf changes, validation requires that the key is
+still absent and that the generation is the same. A tombstone read records its
+writer instead. A structural change never returns a leaf to an
+earlier generation. The restructurer removes tombstones without holders under
+its structural gate, before its final split decision. If that removes the
+pressure, it cancels the split
+([ADR-062](adr/062-splitter-driven-tombstone-reclamation.md)).
 
-1. Both reach the validate phase and try to lock overlapping keys.
-2. One wins the lock; the other detects a writer mismatch.
-3. The loser does a locked replay: it replays the body while it keeps its
-   locks, so a write to those keys cannot invalidate it again.
+A create that reaches the leaf content limit releases its partial locks and
+retries, so the restructurer can make room. The first capacity result starts one
+bounded wait. Leaf revisions, reroutes, and other full leaves do not reset it.
+Without that bound, a split that cannot happen or continuous churn would make
+the foreground wait forever.
 
-### Distributed Locks
+### Transaction records
 
-Lock state lives in the **content** of leaf nodes, not in object tags. Each leaf
-body holds a directory of per-key entries; a locked key's entry records its lock
-type, the set of holding transactions, and the key's current value state:
-
-| Field        | Values                                        | Purpose                                       |
-| ------------ | --------------------------------------------- | --------------------------------------------- |
-| lock type    | read, write, create, none                     | Current lock type                             |
-| holders      | transaction identities                        | Which transactions hold the lock              |
-| current      | absent, external, inline, tombstone (+ writer) | Who last wrote this key, and where its value is |
-
-The current state is tagged
-([ADR-051](adr/051-inline-latest-values.md)): *external* names a writer whose
-value lives in its transaction record, *inline* carries the committed bytes
-authoritatively in the entry itself, and *tombstone* records a committed delete.
-A latest read of an inline or tombstoned entry needs no transaction-record read
-at all. Inlining is bounded by a configurable per-value and per-leaf byte
-budget. New inline states are reserved for direct commits, where the leaf is the
-value's only durable authority
-([ADR-054](adr/054-reserve-inline-publication-for-logless-commits.md)). Locked
-write-back and help-forwarding publish an external value; an existing inline
-value is never demoted, because it may have no transaction record.
-
-An unmarked point absence records the routed leaf's membership generation. If
-the physical leaf changes, validation requires both continued absence and the
-same generation; a tombstone read instead records its exact writer. A
-structural change never returns a leaf to an earlier generation. Under its
-structural gate, the restructurer removes holder-free tombstones before its final
-split decision
-([ADR-062](adr/062-splitter-driven-tombstone-reclamation.md)). If compaction
-removes the pressure, it persists the smaller leaf and cancels the split;
-otherwise the recoverable split partitions the compacted state. A merge compacts
-both its source and its target.
-
-Lock acquisition is a compare-and-swap on the leaf *object*: read the current
-leaf observation, compute the new lock state for every requested key routed to
-it, and conditionally rewrite the leaf. If the observation changed, the
-operation retries. Keys are grouped by routed leaf so many keys collapse into a
-single GET + CAS (ADR-017/020), and contending transactions on the same leaf
-batch through the leaf coordinator into one owner-driven CAS (ADR-025/026/028)
-rather than racing separate ones.
-
-A create that reaches the reserved leaf-content limit retries after releasing
-its partial locks, so the background restructurer can make room. The capacity
-result starts one bounded capacity-wait episode: leaf revisions, reroutes, and
-other full leaves do not reset it, because acquisition still lacks capacity.
-This keeps ordinary asynchronous splits retryable without turning an impossible
-split, continuous churn, or a grandfathered unsafe entry into an unbounded
-foreground wait.
-
-**Compatibility rules**:
-
-| Requested | Current: None |     Current: Read      | Current: Write | Current: Create |
-| --------- | :-----------: | :--------------------: | :------------: | :-------------: |
-| Read      |       ✓       |           ✓            |      wait      |      wait       |
-| Write     |       ✓       | upgrade if sole holder |      wait      |      wait       |
-| Create    |       ✓       | upgrade if sole holder |      wait      |      wait       |
-
-- Multiple transactions can hold **read** locks simultaneously.
-- **Write** and **create** locks are exclusive. A read lock can be upgraded to
-  either one only if the requesting transaction is the sole holder.
-- **Create** locks are used when a put targets a key outside the key
-  membership, to prevent concurrent creation.
-
-### Transaction Records
-
-Each transaction gets its own record object, stored at a deterministic path
-derived from the transaction identity:
+Each transaction identity has one record at a path that comes from the
+identity:
 
 ```
 <db-prefix>/_t/<first-encoded-symbol>/<second-encoded-symbol>/<base64-encoded-tx-id>
 ```
 
-The transaction identity has 16 bytes: an 8-byte random prefix followed by an
-8-byte big-endian nanosecond timestamp. The timestamp suffix encodes the wound-wait priority (earlier =
-older), while the random prefix leads so that record keys keep a high-entropy
-prefix and spread across object-store partitions instead of clustering
-sequential commits into one hot partition. The first two encoded symbols form
-separate path segments, so recursive LIST requests can scan the root, one of 64
-prefixes, or one of 4,096 prefixes without moving objects
-([ADR-070](adr/070-demand-driven-garbage-collection.md)). Older layouts have no
-migration path and must be recreated; mixed operation with older binaries is
-unsupported.
+The identity has 16 bytes: an 8-byte random prefix, then an 8-byte big-endian
+nanosecond timestamp. The timestamp gives the wound-wait priority. The random
+bytes come first so that record paths spread across object storage partitions,
+instead of putting sequential commits in one hot partition. The first two
+encoded symbols are separate path segments, so a GC scan can list the root, one
+of 64 prefixes, or one of 4,096 prefixes
+([ADR-070](adr/070-demand-driven-garbage-collection.md)). There is no migration
+from older layouts, and older binaries must not use the same database.
 
-The record is serialized as a Protocol Buffer and contains:
+The record holds the transaction status, the lease timestamp, the recovery
+manifest, and, after commit, the committed values
+([ADR-019](adr/019-unified-transaction-object.md)). Lock state is in the leaves,
+not in the record. The record has two jobs:
 
-- **Status**: pending, committed, wounded, or aborted. `Wounded` is semantically
-  aborted but remains pinned until the owner acknowledges retirement as
-  `Aborted`.
-- **Timestamp**: when the record was last updated.
-- **Writes**: the committed values, with their paths. Lock state lives in the
-  leaf objects, not in the record.
+1. **Commit point.** A locked commit takes effect if and only if its record is
+   committed. One object write makes all its writes durable.
+2. **Recovery arbiter.** Other transactions read the record to find out whether
+   a holder is still active. They wound a holder whose lease expired with a CAS
+   of its record.
 
-The transaction record serves two critical purposes:
+`Wounded` has the same meaning as aborted for readers, but GC cannot delete it
+until the owner acknowledges it as `Aborted`
+([ADR-059](adr/059-pin-foreign-wounds-until-owner-retirement.md)).
 
-1. **Atomic commit point.** A locked commit takes effect if and only if its
-   record object exists with status "committed". All the multi-key writes become
-   durable in a single object write.
-2. **Crash recovery synchronization.** Other transactions can inspect a record
-   to determine whether a lock holder is still active, and can wound a holder
-   whose lease expired with a CAS of its record.
+### Locked commit
 
-### Commit Protocol
+1. **Lock in parallel.** The transaction locks all read and written keys, with
+   a limit on incomplete leaf operations. Wound-wait resolves conflicts. A
+   deadlock timeout changes to serial acquisition only when contention stops
+   progress.
+2. **Validate.** Optimistic validation first checks the retained leaf
+   observations, and resolves the logical point reads only if a physical state
+   changed. Locked validation always resolves the logical reads, and treats the
+   transaction's own exclusive lock as protection for the previous state. An
+   invalidated read causes a locked replay.
+3. **Commit.** The transaction record becomes committed.
+4. **Write-back.** Write-back uses the same bounded parallelism over routed leaf
+   groups. If a live structural holder is present, write-back leaves the work to
+   lazy recovery.
 
-The validate-and-commit sequence:
+### Fast paths
 
-1. **Parallel lock acquisition.** Lock all read and written keys in parallel,
-   with a bound on the number of incomplete leaf operations. Conflicts are
-   resolved by the wound-wait rule (see [Deadlock
-   Handling](#deadlock-handling)): an older transaction wounds younger holders,
-   a younger one waits. A deadlock timeout falls back to serial acquisition only
-   if contention prevents progress.
+**Read-only transactions** use optimistic validation. After the last read, the
+transaction checks that every writer is still current and that no read key has
+a write lock. If the check passes, the transaction returns with no locks and no
+writes. Each key costs one leaf read, plus one record read if the value is not
+inline. If the check fails, the transaction uses the locked commit one time.
 
-2. **Writer verification.** Optimistic point validation first checks retained
-   leaf observations. If a physical state changed, it resolves the complete
-   logical point-read set. Validation with locks held always uses the logical
-   path and treats the transaction's own exclusive holder as protection around
-   the predecessor state. If a read predicate changed, the transaction does a
-   locked replay.
+**Direct commit** applies when all point reads and point writes of a transaction
+route to one leaf. One leaf CAS validates every read and publishes every output,
+with no lock, transaction record, or write-back
+([ADR-061](adr/061-atomic-logless-single-leaf-commits.md)). Every put becomes an
+inline value and every delete a tombstone. All values must fit the inline
+limits and the result must fit the leaf. Range scans, collection reads and
+changes, cross-leaf access, structural gates, drop intents, and live or unknown holders
+use the locked commit. A direct commit never waits for or wounds a holder. A
+failed multi-key direct commit does not request a split, because a split can
+make the transaction ineligible. A failed single-key direct commit still reports
+inline pressure.
 
-3. **Write transaction record.** Write the record object atomically. After this
-   point, the transaction is considered committed.
+GlassDB classifies a direct commit that does not land as a whole
+([ADR-053](adr/053-replay-definitive-logless-rmw-losses.md)). If the loss is
+certain and the transaction read data, the body replays under the same
+identity. The identity is not engaged yet, so it has no durable effects to
+settle. A blind write, or a transaction that needs coordination, uses the
+locked commit. In one coordinator round, an earlier direct member reserves all
+its output keys, so a later member that overlaps is excluded. Direct members
+that do not overlap share the same CAS.
 
-4. **Async write-back.** Publish the new current state for each modified key and
-   release locks, with the same bounded parallelism over routed leaf groups. A
-   committed value is published as an external value to the transaction
-   record, and a delete as a tombstone
-   ([ADR-054](adr/054-reserve-inline-publication-for-logless-commits.md)). This
-   can happen asynchronously because the transaction record is the source of
-   truth. If the process crashes, another transaction can read the record and
-   complete the write-back, or just observe the committed values from the
-   record. A live
-   structural holder defers to lazy recovery.
+Recovery of an in-doubt direct commit uses only local information. Any inline
+value or tombstone with this identity proves that the whole commit landed. If
+there is no marker, unchanged previous states prove that it did not land, but
+only if at least one output could not return to its previous state through
+tombstone reclamation. Otherwise, the transaction can report an in-doubt error.
+If the reads are still valid, the transaction can try a direct commit again. An
+invalidated read causes a body replay. If pruning a holder with a final status
+changed the temporary generation and caused validation to
+fail, the transaction uses the locked commit. The locked commit makes the
+pruning durable, and a body replay against a change that was never stored would
+fail again. Cancellation before dispatch leaves no state. Cancellation after
+dispatch is equal to a crash.
 
-### Optimizations
+**Locked replay** keeps the key locks and membership locks of the transaction.
+Other transactions cannot write those keys, so sustained writes cannot cause
+body replays without limit.
 
-#### Read-only transactions
-
-If a transaction only reads, it can use optimistic validation:
-
-1. Read all keys, tracking their writers.
-2. After the last read, verify that all writers are still current and no keys
-   are write-locked.
-3. If verification passes: return immediately. No locks acquired, no record
-   written.
-4. If verification fails (concurrent write detected): fall back once to the full
-   locked commit protocol.
-
-A read is idempotent, so a transient backend outage during a read is retried in
-place with backoff by the reader — recovering a blip transparently without
-replaying the body. A sustained outage surfaces as an
-unavailability error, distinct from the in-doubt error that only a mutation can
-produce, which the caller may safely retry. See
-[ADR-015](adr/015-read-unavailability.md).
-
-This makes read-heavy workloads very efficient — optimistic validation requires only
-one metadata read per key, with zero writes, plus one value read for keys whose
-current value is not inline.
-
-#### Same-leaf direct commits
-
-A transaction whose complete point-read and point-write dependency set shares
-one leaf can commit in **one** conditional leaf CAS — no lock, transaction
-record, or write-back
-([ADR-061](adr/061-atomic-logless-single-leaf-commits.md)). The transaction may
-read keys other than those it writes and may mix creates, overwrites, and
-deletes. Every put becomes an inline value and every delete a tombstone, both
-naming the transaction as writer. The leaf CAS validates every observed writer
-and publishes every output atomically, so it is both the commit point and the
-complete durable result.
-
-Direct admission requires all output values to fit the per-value inline limit
-and the complete post-state to fit the aggregate and encoded leaf limits. There
-is no direct-specific key-count cap. Range scans, collection-catalog operations,
-cross-leaf point dependencies, structural gates or drop intents, and live or
-unknown holders use the locked [commit protocol](#commit-protocol). Direct
-commit never waits for or wounds a holder. A failed multi-key admission does not
-request a pressure split, because a split could destroy the member's one-leaf
-eligibility; the single-key pressure signal remains available.
-
-A non-landing direct outcome is classified as a whole
-([ADR-053](adr/053-replay-definitive-logless-rmw-losses.md)). A read-dependent
-member whose loss is certified replays its body under the same, still-unengaged
-identity; a blind member and a member requiring coordination take the locked
-commit path. Within one coordinator round, an earlier direct member reserves all
-of its output keys, so any later overlapping publisher is excluded as a whole,
-while disjoint direct members may share the same physical leaf CAS.
-
-Recovery remains transaction-local. Seeing any exact inline or tombstone output
-marker for this identity proves the entire member landed. With no marker,
-unchanged predecessors prove non-landing only when at least one output could not
-have collapsed back to that predecessor through tombstone reclamation, so an
-all-unmarked-absence delete that remains in doubt can surface as an in-doubt
-error. Valid reads may retry direct, while an invalidated read replays the body.
-If pruning a membership holder with a final status changes the temporary
-generation and read validation fails, the locked commit path makes that pruning
-durable, because replaying against a generation change that was never stored
-would repeat the same failure. Cancellation before dispatch leaves no state,
-while cancellation after dispatch is crash-equivalent.
-
-#### Locked replay
-
-When locked validation finds an invalidated read, the transaction replays the
-body under the same identity and keeps its key locks and membership locks.
-Other transactions cannot write the keys that it already locked, so sustained
-writes to those keys cannot make the body replay without limit.
-
-#### Transaction interruption
+### Transaction interruption
 
 Snapshot transparency applies to commit outcomes and validated error outcomes.
-A panic is not converted into an error outcome: its payload propagates without
-read validation or replay, even when that execution observed a stale snapshot.
+A panic is not an error outcome. Its payload propagates without validation or
+body replay, even when the body saw an inconsistent snapshot.
 
-An active transaction identity and its retirement guard are one owned resource.
-The guard is disarmed only after finalization succeeds. Cancellation or unwinding
-synchronously transfers an armed identity to engine-managed retirement, which
-forgets process-local lock ownership before control escapes and then settles or
-pins the durable identity in waited background work. Physical locks and prepared
-collection objects remain recoverable from the recovery manifest and are
-released lazily by helpers or garbage collection. Process abort skips local
-unwinding and uses the ordinary crash-recovery path.
+An active identity and its retirement guard are one resource. The guard is
+disarmed only after finalization succeeds. On cancellation or unwinding, the
+retirement handoff moves the identity to the engine before control leaves the
+owner. The engine then settles or pins the identity in background work. Locks
+and prepared collection objects stay recoverable through the recovery manifest.
+Helpers and GC release them later. A process abort skips unwinding and uses
+normal crash recovery.
 
-### Deadlock Handling
+### Wound-wait prevents deadlocks
 
-GlassDB prevents deadlocks proactively with the **wound-wait** rule. Each
-transaction has a priority derived from its identity (an earlier timestamp means
-an older, higher-priority transaction). When a transaction requests a lock that
-conflicts with current holders:
+When a lock request conflicts with a holder
+([ADR-002](adr/002-wound-wait-locking.md),
+[ADR-024](adr/024-hold-and-wait-conflict-resolution.md)):
 
-- If the requester is **older** than a holder, it **wounds** it: the holder's
-  record gets a final status before the requester takes the lock. A foreign or
-  in-doubt wound writes a pinned `Wounded` status; a Database with proof that
-  its local victim has retired writes `Aborted` directly.
-- If the requester is **younger**, it **waits** for the holder to finish, and
-  keeps the locks that it already holds (**hold-and-wait**).
+- An **older** requester wounds the holder. The holder's record gets a final
+  status before the requester takes the lock. A foreign or in-doubt wound
+  writes a pinned `Wounded`. A database instance that can prove its own victim
+  retired writes `Aborted`.
+- A **younger** requester waits and keeps the locks that it has
+  (hold-and-wait).
 
-Since an older transaction never waits for a younger one, the wait-for graph
-stays acyclic and no cycle can form. When `Algo` observes a wound, it ends and
-renews the identity before it asks the database loop to replay the body. The
-renewed identity preserves its original priority, so it is not starved.
+An older transaction never waits for a younger one, so no wait cycle can form.
+A wounded transaction renews its identity and replays its body. The new
+identity keeps the original priority, so the transaction does not starve.
 
-**Serial acquisition is kept as a safety net.** Parallel acquisition arms a
-deadlock timeout; if it fires — meaning sustained contention, or two
-equal-priority transactions that wound-wait does not order — the transaction
-falls back to **serial acquisition**, acquiring locks one at a time in sorted
-path order. Total ordering cannot deadlock, guaranteeing progress.
+Serial acquisition is a safety net. If the deadlock timeout fires, because of
+sustained contention or two transactions with equal priority, the transaction
+locks its leaves one at a time in ascending object path order. A total order cannot deadlock.
 
-Priority depends only on the identity's timestamp, never on its random prefix,
-because renewal keeps the timestamp but changes the prefix on each identity
-renewal; ordering on the prefix would let equal-timestamp transactions flip order
-every identity renewal and livelock. See [ADR-002](adr/002-wound-wait-locking.md).
+Priority comes only from the timestamp, never from the random prefix. Identity
+renewal changes the prefix. If priority used the prefix, two transactions with
+the same timestamp could change order at each renewal and livelock.
 
-### Crash Recovery
+### Crash recovery
 
-If a database instance crashes mid-transaction (or its transaction future is
-dropped), other database instances can recover. The lifecycle monitor drives
-this:
+The `Monitor` handles a crash or a dropped transaction future:
 
-1. **Leases.** While holding locks, a transaction periodically refreshes
-   its transaction record with a new timestamp, at half the pending-transaction
-   timeout. If the timestamp becomes stale, allowing for a bounded clock skew,
-   competing transactions consider the lock expired.
+1. **Lease.** While a transaction holds locks, it refreshes its record at half
+   the pending-transaction timeout. Other transactions consider the lease
+   expired when the timestamp is older than the timeout plus a bounded clock
+   skew.
+2. **Wound.** A competitor changes the expired record to `Wounded` with a CAS.
+   If the record does not exist yet, because the owner writes it lazily, the
+   competitor creates it. If the CAS loses to a refresh or a commit, the
+   competitor waits longer. CAS makes sure that only one of a wound and a
+   commit wins.
+3. **Owner acknowledgement.** An owner that returns and proves that no operation
+   can still publish changes `Wounded` to `Aborted`. Only then does normal GC
+   retention apply. Local pending state cannot rule out a wound from another
+   instance, so a confirmed wound always causes identity renewal and a body
+   replay.
+4. **Retirement handoff.** Cancellation, unwinding, and failed finalization keep
+   the retirement guard armed, and the handoff gives the identity to waited
+   recovery before control leaves the owner. A failed retirement is only a
+   diagnostic. Wounds, leases, help-forward, and GC still recover the state.
 
-2. **Transaction record as arbiter.** To take over an expired lock, a competing
-   transaction conditionally changes the expired transaction's record to
-   `Wounded`, including by create-if-absent when the lazy pending record never
-   appeared. This is final for the transaction but cannot be deleted by GC.
-   If the CAS loses to a refresh or commit, the competitor waits longer.
+## Collections
 
-3. **Owner acknowledgement.** A returning owner that proves no operation can
-   still publish conditionally changes `Wounded` to `Aborted`; only then does
-   finite GC retention apply. If a commit races the wound, CAS semantics ensure
-   exactly one wins. A confirmed wound renews the transaction identity and
-   replays its body; local pending state cannot rule out a peer's wound.
+`CollectionPath` holds raw names. Resolution walks the directory in each parent
+collection record and returns a collection bound to an opaque collection ID.
+Point operations route by ID and do not check the ancestors again.
 
-4. **Local retirement handoff.** Cancellation, unwinding, and failed owner-side
-   finalization keep the identity retirement guard armed. Its synchronous handoff removes
-   process-local ownership from diagnostics and admits waited recovery before
-   control leaves the owner. A retirement failure is diagnostic only; durable
-   wounds, leases, help-forward, and GC retain recovery ownership.
+Every collection has an `_i` collection record with a bounded, sorted directory
+of child names to child IDs, and an `_r` tree root with only node state. The
+entry in the parent directory decides whether a collection exists, not the
+presence of its objects. The root collection is permanent, holds keys, and has
+a reserved ID outside the generated range.
 
-## Storage, Caching & Consistency
+A create prepares an unreachable record and root at a fresh ID, then publishes
+`name → ID` through the locked commit. Open, create, drop, and child listing all
+use the transaction machinery, and `Transaction` overlays their changes for
+read-your-writes. `Algo` runs collection and key locking around the same
+validation barrier and the same commit point.
 
-The decoded object cache is also the coordination boundary for point
-operations, not just a performance optimization. Its design combines the
-unified typed cache from
-[ADR-036](adr/036-decoded-object-cache-with-bounded-freshness.md) with the causal
-ordering protocol from
-[ADR-043](adr/043-causally-coordinated-backend-operations.md). The
-[cache guide](guides/caching.md) explains the complete model and why it is
-sound; this section states only its shape.
+### Drops
 
-```mermaid
-flowchart TD
-  Tx["Transaction code"]
-  Access["Reader · KeyResolver · Monitor<br/>KeyStateResolver interprets nodes and entries<br/>with transaction-record state"]
-  L1["CachedStore — per database<br/>decoded L1 · retained observations · evidence<br/>per-path coordination"]
-  L2["Optional persistent encoded-body L2<br/>fixed-capacity bodies and evidence"]
-  Backend["Backend — object storage"]
+A drop freezes the topology of the target collection and installs its identity
+as a drop intent on every root, index node, and leaf. Every earlier participant
+must settle before the drop enumerates nodes. A point operation checks only the
+node that it already reads. An aborted intent can be removed, a pending intent
+takes part in wound-wait, and a committed intent reports a stale collection
+handle.
 
-  Tx -->|"tx.read / tx.write"| Access
-  Access -->|"ANY read / after(barrier) currentness"| L1
-  L1 -->|"miss or insufficient evidence"| L2
-  L2 -->|"miss or validation"| Backend
-```
+A later drop replaces the drop intent of an aborted or wounded owner in the same
+CAS that installs its own fence. A final status does not clear the stored
+intent, and reading again does not make progress. Other pending holders must be
+resolved before that CAS. A committed drop from another transaction rejects the
+new drop.
 
-All typed physical objects share one byte-weighted, path-keyed LRU under a
-single configurable budget. Codecs provide encoding, decoding, and decoded-size
-accounting. A physical path has one decoded type. Key values are not cached
-separately: the reader derives a value from its leaf's effective writer — either
-from the inline bytes the leaf already carries, or from that writer's decoded
-transaction record. Eviction removes discoverable cache state but does not
-revoke observations already retained by readers or transactions.
+Cleanup after an aborted drop needs separate evidence of completion for the
+root, each standalone node, and the collection record. It must check the
+topology freeze even if the record lists no directory locks, because a record
+can list a drop before it lists the directory locks.
 
-An optional fixed-capacity L2 in a caller-selected directory stores exact
-encoded present bodies, opaque revisions, and their currentness points, while L1
-owns decoded values and live evidence cells. Filesystem work does not run on
-Tokio's blocking pool: lookups and write-behind share one bounded cache-owned
-worker, so overload bypasses L2 instead of creating an unbounded blocking-task
-backlog. Opening and shutdown are deadline-bounded and fail open. The
-deterministic executor substitutes a simulated medium for filesystem I/O.
+### Identities own collection resources
 
-### Knowledge and causal evidence
+A transaction identity owns its collection ID reservations and prepared
+objects. A body replay reuses them. An identity renewal replaces them, because
+GC can reclaim resources of the retired identity. For that reason the engine
+allocates the identity before the first body execution. The allocation is local.
+The transaction record and the locks come only when the commit needs them.
 
-`CachedStore` stores only usable knowledge for a path: a decoded present value
-with its opaque revision and currentness evidence, or definitive absence.
-Uncertainty is represented by the absence of a cache entry, so no ordinary
-lookup can accidentally reuse it. An observation may retain an exact historical
-state and its evidence after the shared cache entry has been evicted or
-invalidated.
+`Engine` gives the same `CollectionStateResolver` to `CollectionCatalog` and to
+`Locker`. The catalog can then resolve collection state without access to the
+locker, and neither `NodeStore` nor the catalog coordinates collection records.
 
-Causal evidence is a **sequence point**: a strictly ordered event allocated by
-one open `Database`, immediately before dispatching a backend operation. A
-definitive result stamped with that point proves its state was current at some
-backend linearization point no earlier than it. Points are not exchanged between
-independent database opens; the optional L2 persists them only to chain the next
-open of the same database identity after its recoverable cache evidence.
+## Collection trees and structural changes
 
-Callers express the minimum acceptable evidence as a **freshness requirement**:
-
-| Requirement | Cache state it accepts |
-| --- | --- |
-| `ANY` | Any usable present or absent entry |
-| `within(timeline, age)` | Evidence that reaches an approximate age cutoff |
-| `after(barrier)` | Evidence that reaches the opaque currentness barrier |
-
-An `ANY` decision needs a caller proof such as later validation, a conditional
-mutation, a stable fact, or shared local knowledge. The
-[cache guide](guides/caching.md#decisions-from-any-reads) states these
-constraints.
-
-A **currentness barrier** is captured after prerequisite work completes and
-before the operations used as dependent evidence. Transaction validation
-captures one after the body and before its lock CASes, and uses it for point,
-scan, collection, and transaction-status dependencies. GC and structural
-recovery capture their own. Barriers and requirements are opaque: higher layers
-can retain, compare, and serialize revisions, but cannot construct evidence.
-The capture points and forbidden transformations are stated in the
-[cache guide](guides/caching.md#currentness-barriers), and the type rules in the
-[storage evidence rules](guides/storage-consistency.md).
-
-Applied CASes return a **CAS receipt** that records the precondition, original
-invocation point, and exact installed state. A receipt proves that one
-conditional transition took effect; it does not prove that the installed state
-is still current, and a later read cannot renew its precondition proof. The leaf
-coordinator adds round-member participation on top: a staged round member
-receives the receipt only from the CAS that carried its changes, while a skipped
-round member retains the loaded observation. See the
-[cache guide](guides/caching.md#cas-receipts) and the
-[coordinator rules](guides/caching.md#coordinator-mutation-evidence).
-
-### Per-path operation ordering
-
-`CachedStore` serializes actual backend point calls for the same physical path
-within one open database:
-
-```text
-check cache
--> acquire the path lane
--> check cache again
--> allocate invocation point
--> invoke backend
--> reconcile cache and observations
--> release lane
--> make the future ready
-```
-
-The second cache check prevents a waiter from issuing a backend request that an
-earlier operation made unnecessary. The invocation point is allocated only after
-admission to the lane, so local causal order and backend invocation order agree.
-Reconciliation happens before the lane is released and before the operation can
-be observed as complete. Calls for different paths remain concurrent, and code
-must not hold two path lanes simultaneously. Compatible reads can share one
-in-flight backend read when its invocation point satisfies their requirement.
-
-An `ANY` cache hit deliberately bypasses the lane. It may return older usable
-state while a same-path mutation is in flight, but never state already marked
-obsolete or in doubt.
-
-The protocol covers typed single-object reads and conditional mutations.
-Listing is not path-coordinated: each page receives its own invocation point,
-and a multi-page listing is not a backend snapshot. Database metadata is the
-narrow startup-only exception; it uses raw backend operations because it is
-created or validated once before normal concurrent access begins.
-
-Reconciliation is conservative and never guesses. A definitive outcome installs
-the exact observed or resulting state, a rejected mutation invalidates only
-matching expected knowledge, and an in-doubt mutation removes all usable
-knowledge for the path. Cancellation is part of the protocol: after
-mutation dispatch, a guard invalidates the entire path before releasing the lane,
-because the remote mutation may still take effect later. Read cancellation
-requires no invalidation, because reads cannot change backend state.
-
-### Assumptions and invariants
-
-The cache and coordinator rely on, and preserve, these properties:
-
-1. Backend single-object reads and conditional mutations are linearizable, and
-   a read invoked after a definitive mutation completion observes that mutation
-   or a later state.
-2. Conditional mutations remain semantically safe if their original predicate
-   becomes true again. Revisions describe state and may exhibit ABA;
-   create-if-absent is restricted to permanent idempotent paths or fresh
-   identity paths whose existence alone cannot publish newer live state.
-3. For one open database, no two actual backend point calls for the same
-   physical path overlap, except that a cancelled mutation may still be
-   executing remotely after local cancellation.
-4. A same-path operation is not invoked after an earlier definitive local
-   completion until that earlier outcome has been reconciled. Different paths
-   have no artificial ordering dependency.
-5. A discoverable cache entry always represents usable knowledge. Clean
-   conflicts cannot overwrite newer knowledge, while in-doubt or cancelled
-   mutations leave the path with no discoverable knowledge.
-6. Currentness evidence never exceeds the invocation point that established it,
-   and evidence for an unchanged state advances monotonically.
-7. Successful mutations publish the exact installed state. Their callers can
-   therefore use the returned observations without immediate verification
-   reads.
-8. Per-path lanes and sequence points are database-local coordination.
-   Independent opens and external writers are governed by backend
-   linearizability and conditional revisions, not by a shared in-memory
-   timeline.
-
-Transaction execution may use cached state freely before commit, because
-validation rechecks every retained dependency at the validation barrier. Final
-transaction status is immutable, so committed and aborted records may be reused
-from cache indefinitely; `Wounded` is final for readers but still mutable to
-the owner, so it is revalidated instead. A cached committed status can outlive
-its cached transaction body: a missing committed body carries a new causal bound
-back to the module that owns the referring observation, which reloads at that
-bound and retries. Missing historical bodies never become missing-key or
-missing-collection results.
-
-## Data Model
-
-### Path Encoding
-
-`CollectionPath` values are unresolved sequences of raw names. Resolving one
-walks the direct-child directory in each parent record and returns a collection
-bound to an opaque collection ID. Logical keys pair that bound address with raw
-key bytes; point operations route by ID without revalidating ancestors.
-
-Only backend objects have type markers:
-
-| Type Marker | Meaning                         | Example                           |
-| ----------- | ------------------------------- | --------------------------------- |
-| `_c`        | Physical collection namespace   | `mydb/_c/<collection-id>`         |
-| `_i`        | Collection record                | `mydb/_c/<collection-id>/_i`      |
-| `_r`        | Fixed B-link tree root           | `mydb/_c/<collection-id>/_r`      |
-| `_n`        | Standalone B-link node           | `mydb/_c/<collection-id>/_n/<node-id>` |
-| `_t`        | Transaction-record object        | `mydb/_t/<a>/<b>/<transaction-identity>`|
-| `_s`        | Participant-owned structural intent | `mydb/_s/<participant-id>/<intent-id>` |
-
-Collection IDs — not names —, node IDs, transaction identities, and structural
-intent IDs all have 16 bytes. Object paths encode them with a custom
-**order-preserving** base64 alphabet, so IDs sort the same as raw bytes and as
-paths. Keys live inside leaf objects and remain raw bytes. Transaction
-records and structural intents store raw keys, collection IDs, and node IDs; the
-database prefix comes from the object's location, so moving a database does not
-invalidate them.
-
-### Collections
-
-A `Collection` is a scoped namespace for logical keys. The database has a
-permanent, key-bearing root collection whose reserved ID is outside the
-generated-ID domain. Every collection has an `_i` record containing a bounded,
-sorted directory from direct child name to child ID, and an independent `_r`
-B-link root containing only node state. The parent entry — not physical-object
-presence — is authoritative for logical existence.
-
-For a small collection, `_r` is the only leaf. When it splits, `_r` becomes an
-index whose children are leaves over contiguous raw-key ranges. Each level has
-right-sibling links, so a traversal from cached index state can move right after
-a concurrent split and remain correct. An underfull node merges into its right
-sibling and stays as a drained node with a right link. Each node stores its low
-key, so a route that finds a cached copy of a merge target from before the merge
-reads it again. `_r` never merges, so the tree height never decreases.
+A small collection has one leaf, `_r`. When `_r` splits, it becomes an index
+node over leaves with contiguous key ranges. Each level has right-sibling links,
+so a traversal from stale cached index nodes can move right after a split and
+still be correct.
 
 ```mermaid
 flowchart LR
@@ -1103,130 +575,274 @@ flowchart LR
   Left -->|right sibling| Right
 ```
 
-Transactional creation prepares an unreachable record/root pair at a fresh ID,
-then publishes `name → ID` through the ordinary commit protocol. A bound
-collection routes data directly to `_r` and `_n` without re-reading `_i`.
-Collection open, existence, create, drop, and immediate-child listing use the
-same transaction machinery as key changes.
+An underfull node merges into its right sibling
+([ADR-073](adr/073-merge-nodes-into-right-sibling.md)). The drained node stays
+until its collection is dropped, so a stale route passes through its right link.
+Each node stores its low key, so a route that finds an old cached copy of a
+merge target reads it again. Until the drain lands, a merge reservation on the
+target keeps its copies of the drained entries, and only the merge intent can
+remove the reservation. `_r` never merges, so the tree height never decreases.
 
-### Writers and revisions
+`TreeRouter` has the routing logic. Key resolution, the key-lock view, GC, and
+the `Restructurer` each have their own handle for their own workflow. The
+handles share one decoded cache, and none of them has structural intent access
+or its own topology state.
 
-Writers and revisions are kept separate (ADR-023):
+### Restructurer schedules, StructuralRecovery owns durability
 
-- **Writer** — the writer is the transaction identity that last committed the
-  value. A value lives in that transaction record's body (ADR-019), so the writer
-  *is* the value's identity; the reader uses it to locate the decoded
-  transaction record.
-- **Revision** — the opaque revision assigned by object storage, used for
-  conditional mutations and cache currentness checks. It identifies a
-  coordination object's content, so the object store wraps it in an opaque
-  revision attached to each observation.
+`StructuralRecovery` owns each structural intent from its first write to its
+deletion or recovery. It classifies phases, fences source writers, checks
+reachability, removes unreachable nodes, and settles topology participants. The
+`Restructurer` does not read durable phases. Toward recovery, it only runs a
+requested recursive parent split and returns the result.
 
-During validation, the algorithm detects concurrent modifications by comparing
-the observed writer against the current state; the revision conditions the
-CAS that takes the lock.
+Splits and merges share one lifecycle and one parent reconciliation step. The
+`Restructurer` gives each candidate to the split module or the merge module.
 
-## Garbage Collection
+Committed leaf writes, parent reconciliation, and capacity rejections queue
+candidates. With the default avoidable time topology policy, a rule decides the
+other leaf splits and merges once per window
+([ADR-074](adr/074-avoidable-time-drives-splits-and-merges.md),
+[ADR-075](adr/075-avoidable-time-is-the-default-topology-policy.md)). With the
+size causes policy, the underfull threshold and inline pressure decide. A new
+candidate wakes the restructurer after a short delay, so that one sweep takes a
+burst of writes. A deferred candidate waits for the next sweep, which comes at
+most a fixed interval later, so a busy node cannot cause a tight retry loop. A
+merge defers while a live transaction holds a lock on its source or target.
 
-A transaction record is **live** exactly while some node or collection
-record still references its identity (entry, membership, directory, or topology
-coordination), so garbage collection is a reachability problem rather than a
-timer. A direct commit
-([ADR-061](adr/061-atomic-logless-single-leaf-commits.md)) names inline or
-tombstone writers that never had a record, which is not a dangling reference:
-only existing records are candidates, and one is dead once nothing names it. GC
-implements a candidate-driven **reverse mark-sweep**
-([ADR-022](adr/022-garbage-collection-mark-sweep.md)).
+### Fence on the recorded revision
 
-- **Reverse GC check.** A forward mark (list every leaf, union the
-  referenced transaction identities) would cost the whole database per cycle.
-  Instead each candidate transaction record records its own recovery-manifest
-  entries, so GC reads a batch of candidates and confirms each one dead by
-  GET-ing only the handful of nodes and records it names — never a database-wide
-  scan. Cached indexes guide descent and right links correct stale split
-  placement, while terminal leaves must meet GC's post-eligibility freshness
-  bound. Collection and node identities are not reused, creation precedes commit
-  or link publication, and published nodes remain until collection reclamation,
-  so cached absence cannot hide a later live route.
-- **Candidate feed.** `Algo`, `DirectCommit`, and `Restructurer` report GC
-  candidates through `GcHints`. Reports use bounded in-memory work and never
-  wait for queue space, backend requests, or GC completion; a busy or full queue
-  drops a report and counts the loss. Hints wake GC without causing a LIST.
-  Inline values and tombstones can have direct writers, so their writer
-  identities alone do not produce predecessor hints; scans find any remaining
-  records.
-- **Local scheduling.** Each independently opened `Database` instance owns its
-  GC state; cloned handles share it. GC de-duplicates candidates, retains
-  safety-horizon deferrals and failed checks with due times, and increases
-  concurrent checks as ready work grows or ages. Candidate memory, admission,
-  and concurrency are all bounded, and transient errors receive delayed retries.
-  Pending reports and retained candidates from hints have separate capacities;
-  deferred and running candidates still consume the retained capacity. GC scans
-  keep separate capacity so they can discover work after hints are discarded.
-- **Safety horizon and pinned wounds.** The lease plus the allowed clock skew
-  is the safety horizon: a candidate other than `Wounded` is kept within the
-  horizon, because the non-atomic reverse GC check can race a lock a live
-  transaction has taken but not yet published (ADR-024's lazy object
-  materialization). A dead `Pending` object is changed to `Wounded` so its death
-  remains durable across an unbounded owner suspension. GC may immediately and
-  repeatedly reclaim the effects that record describes, but cannot delete the
-  pinned wound. The owner changes it to `Aborted` after proving retirement;
-  ordinary finite retention and deletion apply only after that acknowledgement
-  (ADR-059).
-- **Reclamation through the coordinator.** GC releases a dead transaction's
-  locks not with its own CAS but by calling the `Locker`'s per-object unlock
-  methods, so the release batches through the same leaf coordinator as live
-  traffic (ADR-029); the coordinator prunes an entry before persistence when it
-  becomes vestigial. Entry references, membership locks, directory holders, and
-  topology participants are separate obligations, each with its own completion
-  evidence. GC deletes only the exact candidate revision it checked, and
-  reclaims a dropped collection one node page at a time, removing the root and
-  collection record last.
-- **Progress measurement.** Successful resource changes and transaction
-  deletion count as useful work. Deletion progress is approximate: an
-  already-missing object can return success, so separate Database instances can
-  count the same deletion. Live objects, unchanged pinned wounds, and other known
-  no-ops do not signal useful work. Failures are tracked separately.
-- **Writer independence.** GC backlog does not gate transaction admission,
-  completion, or retries, add commit-path requests, or move GC work into
-  transaction bodies. Shared CPU, backend requests, and coordinator mutations
-  can still affect latency. At the GC limit, garbage remains stored longer, and
-  sustained overload can cause unbounded reclamation delay.
+Recovery fences a source writer against the source revision that the Ready
+transition of the intent recorded, not against the current structural gate. A
+worker publishes its split shrink or merge drain with one CAS that expects that
+revision. The revision alone tells whether the worker can still land, and a
+later structural change of the same source cannot protect an abandoned intent.
+Each gate installation increases the membership generation, so the recorded
+revision cannot come back. Structural recovery runs on its own schedule in its
+own namespace, and does not use the GC candidate queue.
+
+## Storage, caching, and consistency
+
+The decoded object cache is the coordination boundary for point operations, not
+only an optimization. It combines the typed cache of
+[ADR-036](adr/036-decoded-object-cache-with-bounded-freshness.md) with the causal
+order of [ADR-043](adr/043-causally-coordinated-backend-operations.md). The
+[cache guide](guides/caching.md) gives the full model and why it is sound. The
+[storage evidence rules](guides/storage-consistency.md) give the type rules.
+
+```mermaid
+flowchart TD
+  Access["Reader · KeyResolver · Monitor"]
+  L1["CachedStore<br/>decoded L1 · evidence · path lanes"]
+  L2["Optional persistent L2<br/>encoded bodies and evidence"]
+  Backend["Backend"]
+
+  Access -->|"freshness requirement"| L1
+  L1 -->|"miss or insufficient evidence"| L2
+  L2 -->|"miss or validation"| Backend
+```
+
+All typed objects share one byte-weighted LRU with one budget. Each physical
+path has one decoded type. Values are not cached separately: the reader gets
+them from the inline bytes of the leaf or from the decoded transaction record
+of the writer. Eviction does not revoke observations that readers or
+transactions already hold.
+
+The optional L2 stores encoded bodies, revisions, and currentness points on
+disk. One bounded worker does all its file I/O instead of Tokio's blocking pool,
+so under overload GlassDB skips L2 instead of queuing blocking tasks without
+limit. Open and shutdown have deadlines and fail open.
+
+### Evidence rules
+
+A cache entry is always usable knowledge: a decoded value with its revision and
+evidence, or a definitive absence. Uncertainty is the absence of an entry, so no
+lookup can use it by accident.
+
+A sequence point is an ordered event that one open database allocates just
+before a backend call. A definitive result with that point proves that its state
+was current at some time no earlier than the point. Sequence points are local to
+one open database. L2 persists them only to continue the timeline at the next
+open of the same database.
+
+A caller states the evidence that it needs as a freshness requirement:
+
+| Requirement | Accepts |
+| --- | --- |
+| `ANY` | any usable entry |
+| `within(timeline, age)` | evidence newer than an approximate age |
+| `after(barrier)` | evidence that reaches a currentness barrier |
+
+An `ANY` decision needs a separate proof, such as later validation or a
+conditional mutation
+([cache guide](guides/caching.md#decisions-from-any-reads)). A currentness
+barrier is captured after the prerequisite work and before the operations that
+depend on it. Transaction validation captures one after the body and before the
+lock CASes. GC and structural recovery capture their own. Higher layers can
+hold and compare barriers and requirements, but cannot create evidence
+([currentness barriers](guides/caching.md#currentness-barriers)).
+
+A CAS receipt proves that one conditional change took effect. It does not prove
+that the installed state is still current, and a later read cannot renew its
+proof. In a coordinator round, only a member whose changes were in the CAS gets
+the receipt. A skipped member keeps the loaded observation
+([CAS receipts](guides/caching.md#cas-receipts),
+[coordinator rules](guides/caching.md#coordinator-mutation-evidence)).
+
+### One backend call per path at a time
+
+In one open database, `CachedStore` serializes backend point calls on the same
+path:
+
+```text
+check cache → acquire the path lane → check cache again → allocate invocation point
+→ call backend → reconcile cache and observations → release lane → complete
+```
+
+The second check stops a waiter from calling the backend when an earlier call
+made it unnecessary. The invocation point is allocated inside the lane, so local
+order and backend order agree. Reconciliation happens before the lane is
+released, so no caller sees a completed call whose result is not in the cache.
+Different paths run concurrently, and code must never hold two path lanes at the
+same time. Compatible reads can share one backend read when its invocation point
+satisfies their requirements.
+
+An `ANY` cache hit does not take the lane. It can return an older state while a
+mutation on the same path runs, but never a state already marked obsolete or in
+doubt.
+
+Listing is not coordinated per path. Each page gets its own invocation point.
+Database metadata uses raw backend calls, because it is created or checked once
+before concurrent access starts.
+
+Reconciliation never guesses. A definitive result installs the exact state. A
+rejected mutation invalidates only the matching knowledge. An in-doubt mutation
+removes all knowledge for the path. If a caller cancels a mutation after
+dispatch, a guard invalidates the path before it releases the lane, because the
+mutation can still take effect. A cancelled read needs no invalidation.
+
+### Invariants
+
+The cache and the coordinator depend on, and keep, these properties:
+
+1. Backend single-object reads and conditional mutations are linearizable. A
+   read after a definitive mutation sees that mutation or a later state.
+2. A conditional mutation stays safe if its predicate becomes true again,
+   because revisions can repeat (ABA). Create-if-absent is only for permanent
+   idempotent paths, or fresh identity paths whose existence alone cannot
+   publish newer live state.
+3. In one open database, no two backend point calls on the same path overlap.
+   The only exception is a cancelled mutation that can still run remotely.
+4. A call on a path starts only after the earlier definitive result on that path
+   is reconciled. Different paths do not wait for each other.
+5. A cache entry that a lookup can find is always usable. A clean conflict
+   cannot overwrite newer knowledge. An in-doubt or cancelled mutation leaves no
+   knowledge for its path.
+6. Evidence never goes past the invocation point that created it. Evidence for
+   an unchanged state only increases.
+7. A successful mutation publishes the exact installed state, so its caller can
+   use the result without a read to verify it.
+8. Path lanes and sequence points are local to one open database. Other opens
+   and external writers are ordered only by backend linearizability and
+   revisions.
+
+A transaction body can use cached state freely, because validation checks every
+dependency at the validation barrier. Committed and aborted statuses never
+change, so the cache can keep them forever. `Wounded` can still change to
+`Aborted`, so it is checked again. A cached committed status can outlive the
+cached record body. If the body is missing, the module that owns the referring
+observation reloads at a newer bound and retries. A missing historical body
+never becomes a missing key or a missing collection.
+
+## Object layout
+
+| Marker | Object | Path |
+| --- | --- | --- |
+| `_c` | collection namespace | `mydb/_c/<collection-id>` |
+| `_i` | collection record | `mydb/_c/<collection-id>/_i` |
+| `_r` | tree root | `mydb/_c/<collection-id>/_r` |
+| `_n` | standalone node | `mydb/_c/<collection-id>/_n/<node-id>` |
+| `_t` | transaction record | `mydb/_t/<a>/<b>/<transaction-identity>` |
+| `_s` | structural intent | `mydb/_s/<participant-id>/<intent-id>` |
+
+Collection IDs, node IDs, transaction identities, and structural intent IDs have
+16 bytes. Paths encode them with an order-preserving base64 alphabet, so paths
+sort the same as the raw bytes. Keys stay as raw bytes inside leaves.
+Transaction records and structural intents store raw IDs and keys, not paths, so
+a database stays valid after it moves to a different prefix.
+
+A writer and a revision are different things
+([ADR-023](adr/023-slimmed-backend-trait.md)). The writer is the transaction
+identity that committed a value. For an external value, it tells the reader
+which transaction record holds the value. The revision identifies the content of an object for
+conditional mutations and cache checks. Validation compares writers. The lock
+CAS uses revisions.
+
+## Garbage collection
+
+A transaction record is live while a node or collection record refers to its
+identity. GC is therefore a reachability problem, not a timer. A direct commit
+names writers that never had a record, and that is not a dangling reference:
+only existing records are candidates. GC is a candidate-driven reverse
+mark-sweep ([ADR-022](adr/022-garbage-collection-mark-sweep.md)):
+
+- **GC check from the candidate.** A forward mark would read the whole database on each
+  cycle. Instead, each record lists its own claims in its recovery manifest, so
+  a GC check reads only the few nodes and records that the candidate names.
+  Terminal leaves must meet the GC freshness bound. Collection and node IDs are
+  never reused, objects are created before a commit or link publishes them, and
+  published nodes stay until the collection is reclaimed. For those reasons a
+  cached absence cannot hide a later live route.
+- **GC hints.** `Algo`, `DirectCommit`, and `Restructurer` report candidates
+  through `GcHints`. A report never waits for queue space, the backend, or GC. A
+  full queue drops the report and counts the loss. A hint wakes GC but does not
+  start a LIST. GC scans find the records that dropped hints miss.
+- **Local state.** Each opened `Database` has its own GC state, and clones share
+  it. Memory, admission, and concurrency are all bounded. GC scans have their
+  own capacity, so they can find work after hints are dropped.
+- **Safety horizon.** GC keeps a candidate that is not `Wounded` for the lease
+  plus the allowed clock skew. The GC check is not atomic, so it can race a
+  lock that a live transaction took but did not publish yet. GC changes a dead
+  `Pending` record to `Wounded`, so its death survives an owner suspension of
+  any length. GC can then reclaim the effects of that record, but cannot delete
+  it until the owner changes it to `Aborted`
+  ([ADR-059](adr/059-pin-foreign-wounds-until-owner-retirement.md)).
+- **Reclamation through the coordinator.** GC releases locks through the unlock
+  methods of `Locker`, so its changes batch with live traffic in the same
+  coordinator round ([ADR-029](adr/029-gc-through-shard-coordinator.md)). Entry
+  references, membership locks, directory holders, and topology participants
+  each need their own completion evidence. GC deletes only the exact revision
+  that it checked. It reclaims a dropped collection one node page at a time and
+  removes the root and the collection record last.
+- **Writer independence.** GC backlog never blocks transaction admission or completion, adds requests
+  to the commit path, or runs inside transaction bodies. At the GC limit,
+  garbage only stays longer. Sustained overload can delay reclamation without
+  limit. Shared CPU, backend requests, and coordinator rounds can still affect
+  transaction latency.
+
+GC deletion counts are approximate: a delete of a missing object succeeds, so
+two database instances can count the same deletion.
 
 ### Adaptive GC scans
 
-GC finds lost hints through recursive transaction-record scans, which are a
-backstop rather than the primary feed. Each scan turn makes at most one LIST
-request, subject to available candidate capacity. Separate Database instances
-use independent shuffled prefix passes, with no prefix reservations, leases, or coordination
-writes.
+GC scans are a backup for dropped hints. Each scan turn does at most one LIST.
+Database instances scan shuffled prefixes independently, with no reservations,
+leases, or coordination writes. LIST is not a snapshot, so scans must repeat.
 
-Each instance selects one traversal depth — the transaction root, one of 64
-prefixes, or one of 4,096 prefixes — for all new traversals. A traversal that
-still has a continuation after enough successful pages narrows the depth. To
-broaden, randomly selected prefixes supply complete traversal counts; the
-estimated population is the mean count times the current prefix count, and the
-instance selects the broadest depth expected to stay within its per-prefix page
-budget. A depth change resets samples and the shuffled schedule, while existing
-traversals keep their original prefixes and cursors. A physical prefix can have
-only one active traversal, which bounds retained cursors. Repeated passes are
-necessary because LIST is not a snapshot.
+Each instance scans at one depth: the transaction root, 64 prefixes, or 4,096
+prefixes. A traversal that still has a cursor after enough pages makes the depth
+narrower. To make it broader, the instance counts records in random prefixes and
+picks the broadest depth that its page budget per prefix can cover. A depth
+change resets the samples and the schedule, but running traversals keep their
+prefixes. A prefix can have only one active traversal, which limits the number
+of held cursors.
 
-The delay between turns follows recent useful progress from scan-origin checks:
-a moving average shortens productive intervals and lengthens unproductive ones,
-with random variation and a cap tied to the protocol pending timeout. Errors use
-separate retry handling and never count as an idle observation. These controller
-limits and thresholds are initial policy; representative production workloads
-must guide later tuning.
+The delay between turns follows the recent useful progress of scan-origin
+checks, with random variation and a cap tied to the pending-transaction timeout.
+Errors use separate retries and never count as idle turns. These limits are
+initial values. Production workloads must guide later tuning.
 
-`Database::stats` reports GC counters for LIST requests, checks that made
-progress, failures, and discarded candidate reports.
-`Database::diagnostics` reports known ready and deferred work, running checks,
-oldest ready-check age, and current prefix count. These measures do not estimate
-undiscovered garbage or count retained live objects as GC backlog.
-
-Background tasks stop when the last `Database` handle is dropped or the instance
-shuts down. An application can add GC capacity by opening a Database instance
-without submitting transactions. All local GC state is disposable; eventual
-reclamation requires running instances, a working backend, and sufficient GC
-capacity and successful traversal progress.
+GC runs only while a `Database` handle is open. To add GC capacity, open a
+database instance that submits no transactions. All local GC state is
+disposable. Reclamation needs running instances, a working backend, and enough
+GC capacity.
