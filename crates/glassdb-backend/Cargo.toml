@@ -12,7 +12,7 @@ categories = ["database-implementations", "asynchronous"]
 workspace = true
 
 [dependencies]
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 glassdb-concurr = { version = "0.3.0", path = "../glassdb-concurr" }
 rand = "0.10.1"
 rand_distr = "0.6.0"
