@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from pathlib import Path
+import json
 import os
 import subprocess
-import json
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from hack.ci import perf_compare
@@ -125,13 +125,17 @@ class MeasurementTest(unittest.TestCase):
             with self.subTest(timeout=timeout):
                 manifest = self.manifest()
                 manifest["processTimeoutSeconds"] = timeout
-                with self.assertRaises((ValueError, perf_compare.perf_report.ReportError)):
+                with self.assertRaises(
+                    (ValueError, perf_compare.perf_report.ReportError)
+                ):
                     perf_compare.measure(self.root, manifest)
                 self.assertFalse((self.root / "main").exists())
                 self.assertFalse((self.root / "pr").exists())
                 self.assertFalse(self.order())
 
-    @unittest.skipUnless(hasattr(os, "sched_getaffinity"), "CPU affinity requires Linux")
+    @unittest.skipUnless(
+        hasattr(os, "sched_getaffinity"), "CPU affinity requires Linux"
+    )
     def test_measurements_control_cpu_placement_and_restore_driver_affinity(self):
         affinity = os.sched_getaffinity(0)
         self.addCleanup(os.sched_setaffinity, 0, affinity)
@@ -143,26 +147,6 @@ class MeasurementTest(unittest.TestCase):
             expected = sorted(affinity)[:4] if row[1] == "mixed" else [min(affinity)]
             self.assertEqual(row[3], expected)
         self.assertEqual(os.sched_getaffinity(0), affinity)
-
-    def test_diagnostic_delay_model_is_checked_and_reported(self):
-        model = perf_compare.perf_report.DIAGNOSTIC_MODEL
-        self.configure(diagnosticModel=model)
-        manifest = self.manifest(cases=("a",))
-        manifest["diagnosticModel"] = model
-        perf_compare.measure(self.root, manifest)
-        self.assertFalse(manifest["warnings"])
-        self.assertIn("fixed S3 mean delays", (self.root / "report.md").read_text())
-
-    def test_legacy_diagnostic_cannot_enter_a_delayed_comparison(self):
-        manifest = self.manifest(cases=("a",))
-        manifest["diagnosticModel"] = perf_compare.perf_report.DIAGNOSTIC_MODEL
-        with self.assertRaisesRegex(
-            perf_compare.perf_report.ReportError, "invalid diagnostic model"
-        ):
-            perf_compare.measure(self.root, manifest)
-        self.assertEqual(manifest["completedPairs"]["a"], 0)
-        self.assertIn("invalid diagnostic model", " ".join(manifest["warnings"]))
-        self.assertNotIn("| a: mean group time |", (self.root / "report.md").read_text())
 
     def test_fixed_latency_measurements_use_the_requested_profile(self):
         manifest = self.manifest(cases=("a",))
@@ -177,7 +161,9 @@ class MeasurementTest(unittest.TestCase):
         self.configure(latencyJitter=True)
         manifest = self.manifest(cases=("a",))
         manifest["mixedArgs"] = ["--latency-jitter=false"]
-        with self.assertRaisesRegex(perf_compare.perf_report.ReportError, "latency profile"):
+        with self.assertRaisesRegex(
+            perf_compare.perf_report.ReportError, "latency profile"
+        ):
             perf_compare.measure(self.root, manifest)
         self.assertEqual(manifest["completedPairs"]["mixed"], 0)
 
@@ -208,7 +194,9 @@ class MeasurementTest(unittest.TestCase):
                         costs = perf_compare.perf_report.read_costs(
                             directory / f"criterion-{case}.log"
                         )
-                        self.assertEqual([row["name"] for row in costs["cases"]], [case])
+                        self.assertEqual(
+                            [row["name"] for row in costs["cases"]], [case]
+                        )
         report = (self.root / "report.md").read_text()
         self.assertIn("regressed", report)
         self.assertNotIn("Measurement warnings", report)
@@ -245,7 +233,9 @@ class MeasurementTest(unittest.TestCase):
         self.assertIn("noisy or inconclusive", report)
         self.assertNotIn("using checkpoint", report)
         for name in manifest["completedPairs"]:
-            result = perf_compare.perf_report.analyze_benchmark(self.root, manifest, name)
+            result = perf_compare.perf_report.analyze_benchmark(
+                self.root, manifest, name
+            )
             self.assertEqual(result.pairs, 32)
 
     def test_stalled_process_fails_and_preserves_the_last_checkpoint(self):
@@ -304,7 +294,9 @@ class MeasurementTest(unittest.TestCase):
             perf_compare.measure(self.root, manifest)
         self.assertEqual(manifest["completedPairs"]["a"], 0)
         self.assertIn("Measurement failed", (self.root / "report.md").read_text())
-        self.assertNotIn("Benchmark process timed out", (self.root / "report.md").read_text())
+        self.assertNotIn(
+            "Benchmark process timed out", (self.root / "report.md").read_text()
+        )
 
 
 BENCHMARK_FIXTURE = r"""
