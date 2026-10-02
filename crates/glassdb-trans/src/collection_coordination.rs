@@ -77,8 +77,12 @@ impl CollectionLocker {
         }
 
         let mut locks = Vec::with_capacity(desired.len());
+        // Lock one directory at a time, in address order. Equal-priority
+        // transactions wait for each other under wound-wait, and directory locks
+        // have no deadlock timeout or serial fallback, so only this total order
+        // prevents a wait cycle.
         for (parent, typ) in desired {
-            self.acquire(&parent, id, typ).await?;
+            self.lock_directory(&parent, id, typ).await?;
             locks.push(TxLock::Directory {
                 collection: parent,
                 typ,
@@ -154,7 +158,9 @@ impl CollectionLocker {
             .try_fold(false, |changed, result| Ok(changed | result?))
     }
 
-    pub(crate) async fn acquire(
+    /// Acquires the lock of one directory, or upgrades a read lock to a write
+    /// lock.
+    async fn lock_directory(
         &self,
         parent: &CollectionAddress,
         id: &TxId,
@@ -465,10 +471,11 @@ mod tests {
 
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_concurr::Background;
-    use glassdb_data::DbPrefix;
+    use glassdb_data::{CollectionId, CollectionName, DbPrefix};
     use glassdb_storage::{CachedStore, Timeline};
 
     use super::*;
+    use crate::collections::DirectoryReadKind;
     use crate::monitor::ProtocolTiming;
 
     fn tx_id(prefix: &[u8]) -> TxId {
@@ -519,8 +526,19 @@ mod tests {
         );
         let id = tx_id(&[1]);
 
-        locker.acquire(&parent, &id, LockType::Read).await.unwrap();
-        locker.acquire(&parent, &id, LockType::Write).await.unwrap();
+        let read = DirectoryRead {
+            parent: parent.clone(),
+            kind: DirectoryReadKind::Listing { generation: 0 },
+        };
+        let change = CollectionChange {
+            parent: parent.clone(),
+            name: CollectionName::new("child").unwrap(),
+            collection: CollectionAddress::new("db", CollectionId::from_bytes([2; 16])),
+            expected: None,
+            op: CollectionOp::Create,
+        };
+        locker.lock(&id, &[read], &[]).await.unwrap();
+        locker.lock(&id, &[], &[change]).await.unwrap();
 
         let (record, _) = records
             .load_record(&parent, Requirement::ANY)
