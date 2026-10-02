@@ -30,7 +30,8 @@ but the service scales almost without limit:
 - Correct and slow is better than fast and wrong when transactions race.
 - Throughput is more important than latency. Independent backend calls must run
   in parallel.
-- GlassDB expects values between 1 KB and 1 MB.
+- Expects small key values (below 1 MB), small transactions and high
+  parallelism.
 - Background work must not cost anything that the workload does not need.
 
 [docs/principles.md](principles.md) lists the complete principles.
@@ -168,11 +169,12 @@ not depend on. These limits keep a change to one policy from spreading.
 | `DirectCommit` | direct-commit eligibility, publication, recovery classification | transaction records, range validation, waiting on or wounding holders |
 | `CollectionCommit` | collection replay state, recovery manifest fields, drop intents, cleanup | key locking, the commit decision |
 | `Locker::keys` | key-to-leaf grouping, parallel and serial acquisition, hold-and-wait | collection directory semantics |
-| `Locker::collections` | directory locks, topology participant release | key routing, B-link topology |
+| `Locker::collections` | directory locks | key routing, B-link topology |
 | `CollectionStateResolver` | collection record loads, foreign holder reconciliation | key routing, B-link topology, catalog semantics |
 | `CollectionCatalog` | logical snapshots, read-your-writes, precondition checks | locking, CAS, wound-wait |
 | `LeafCoordinator` | batching, mutation plans, admission, one CAS per attempt, in-doubt recovery | operation-specific results, commit orchestration, GC selection |
 | `Restructurer` | split and merge scheduling, planning, and node writes | durable intent phases, recovery classification |
+| `TopologyMembership` | topology participant admission and departure | structural intents, GC eligibility |
 | `StructuralRecovery` | structural intent lifecycle, fencing, orphan cleanup | split and merge planning, maintenance causes |
 | `Monitor` | transaction status, wounds, lease refresh, waits | leaves |
 | `Gc` | GC queues, GC checks, safety horizon, reclamation | commit policy, structural recovery |

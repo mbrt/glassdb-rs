@@ -567,7 +567,7 @@ impl CasFloor {
         // previous floor.
         let (Ok(previous) | Err(previous)) =
             self.nanos
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |floor| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |floor| {
                     Some(next(floor))
                 });
         took.saturating_sub(Duration::from_nanos(next(previous)) * SLOW_CAS_FACTOR)
@@ -3070,7 +3070,7 @@ mod tests {
             move |op| {
                 let fire = matches!(op, BackendOp::WriteIf { path, .. } if path.contains("/_n/"))
                     && wins
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |wins| {
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |wins| {
                             wins.checked_sub(1)
                         })
                         .is_ok();

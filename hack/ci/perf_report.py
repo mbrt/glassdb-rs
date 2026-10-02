@@ -168,7 +168,9 @@ def load_diagnostics(
         if diagnostic_model is not None and costs["model"] != diagnostic_model:
             raise ReportError("diagnostic model differs from comparison settings")
     except (ReportError, KeyError, TypeError) as error:
-        kind = "diagnostic model" if diagnostic_model is not None else "cost measurements"
+        kind = (
+            "diagnostic model" if diagnostic_model is not None else "cost measurements"
+        )
         warnings.append(f"{side}/{repetition}: invalid {kind} ({error})")
         return
     for name in sorted(expected):
@@ -194,10 +196,9 @@ def load_diagnostics(
             )
     try:
         rows = {row["name"]: row for row in costs["cases"]}
-        if (
-            set(rows) != (expected if cost_cases is None else cost_cases)
-            or len(rows) != len(costs["cases"])
-        ):
+        if set(rows) != (expected if cost_cases is None else cost_cases) or len(
+            rows
+        ) != len(costs["cases"]):
             raise ReportError("cost case set changed")
         for name, row in rows.items():
             if name not in expected:
@@ -325,10 +326,9 @@ def compare(base: Metric, candidate: Metric, family_size: int = 1) -> Comparison
             max(candidate.upper) - min(candidate.lower),
         )
         noisy = spread > 0.1 * max(before, after) if max(before, after) else False
-        small = (
-            max(*base.upper, *candidate.upper) - min(*base.lower, *candidate.lower)
-            <= COST_NOISE_THRESHOLD * max(before, after)
-        )
+        small = max(*base.upper, *candidate.upper) - min(
+            *base.lower, *candidate.lower
+        ) <= COST_NOISE_THRESHOLD * max(before, after)
         # Small overlapping ranges are expected for variable-size objects.
         # Unequal medians alone do not make their costs inconclusive.
         return Comparison(
@@ -423,10 +423,14 @@ class BenchmarkResult:
 
     @property
     def resolved(self) -> bool:
-        return bool(self.metrics) and not self.warnings and all(
-            not comparison.uncertain
-            for base, _, comparison in self.metrics.values()
-            if base.kind != "cost"
+        return (
+            bool(self.metrics)
+            and not self.warnings
+            and all(
+                not comparison.uncertain
+                for base, _, comparison in self.metrics.values()
+                if base.kind != "cost"
+            )
         )
 
 
@@ -545,13 +549,6 @@ def render_report(root: Path, base_label: str, candidate_label: str) -> str:
         f"Base: `{escape(base_label)}`; candidate: `{escape(candidate_label)}`.",
         "",
     ]
-    if manifest.get("diagnosticModel") == DIAGNOSTIC_MODEL:
-        lines += [
-            "Diagnostics: memory backend with fixed S3 mean delays and throttling, "
-            "5× model time and 250 ms warmup. Times use wall time; costs cover benchmark iterations, "
-            "including warmup. Shutdown costs are separate.",
-            "",
-        ]
     if rows:
         lines += [
             "| Metric | Base median | Candidate median | Change | 95% simultaneous interval | Unit | Result |",

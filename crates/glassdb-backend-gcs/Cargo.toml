@@ -12,7 +12,7 @@ categories = ["database-implementations", "asynchronous"]
 workspace = true
 
 [dependencies]
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 gcp_auth = "0.12.6"
 glassdb-backend = { version = "0.3.0", path = "../glassdb-backend" }
 glassdb-concurr = { version = "0.3.0", path = "../glassdb-concurr" }

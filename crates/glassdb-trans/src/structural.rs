@@ -34,8 +34,7 @@ use async_trait::async_trait;
 use glassdb_concurr::{Background, RetryConfig, ScanCadence, rt};
 use glassdb_data::{CollectionAddress, DbPrefix, ObjectPath, TxId};
 use glassdb_storage::{
-    CollectionStore, InlinePolicy, NodeSizePolicy, NodeStore, StructuralIntentStore, Timeline,
-    TreeRouter,
+    InlinePolicy, NodeSizePolicy, NodeStore, StructuralIntentStore, Timeline, TreeRouter,
 };
 use tokio::sync::Notify;
 
@@ -57,12 +56,12 @@ use recovery::{RecoveryAction, RecoveryStep, StructuralRecovery};
 use rule::{TOPOLOGY_WINDOW, TopologyRule};
 use split::Splitter;
 use stats::{LandedChanges, Stats};
-use topology::TopologyMembership;
 
 pub use candidates::StructuralHintSink;
 pub(crate) use measurements::TypicalTime;
 pub use rule::TopologyPolicy;
 pub use stats::{InlinePressureStats, RestructurerStats};
+pub(crate) use topology::TopologyMembership;
 
 /// Back off empty structural-intent listings independently of candidates.
 const STRUCTURAL_RECOVERY_IDLE_INTERVAL: Duration = Duration::from_secs(600);
@@ -103,7 +102,7 @@ impl Restructurer {
     #[allow(clippy::too_many_arguments)]
     pub fn with_coordinator(
         bg: Weak<Background>,
-        records: CollectionStore,
+        membership: TopologyMembership,
         nodes: NodeStore,
         intent_store: StructuralIntentStore,
         timeline: Timeline,
@@ -131,7 +130,7 @@ impl Restructurer {
         );
         let restructurer = Restructurer::with_candidates(
             bg,
-            records,
+            membership,
             nodes,
             intent_store,
             timeline,
@@ -140,7 +139,6 @@ impl Restructurer {
             db_prefix,
             coord.clone(),
             candidates,
-            retry,
             gc_hints,
             topology,
         );
@@ -208,7 +206,7 @@ impl Restructurer {
     #[allow(clippy::too_many_arguments)]
     fn with_candidates(
         bg: Weak<Background>,
-        records: CollectionStore,
+        topology: TopologyMembership,
         nodes: NodeStore,
         intent_store: StructuralIntentStore,
         timeline: Timeline,
@@ -217,7 +215,6 @@ impl Restructurer {
         db_prefix: DbPrefix,
         coord: LeafCoordinator,
         candidates: MaintenanceCandidates,
-        retry: RetryConfig,
         gc_hints: GcHints,
         topology_policy: TopologyPolicy,
     ) -> Self {
@@ -231,7 +228,6 @@ impl Restructurer {
             timeline.clone(),
             candidates.clone(),
         );
-        let topology = TopologyMembership::new(records, mon.clone(), retry);
         let recovery = StructuralRecovery::new(
             topology.clone(),
             nodes.clone(),

@@ -2097,7 +2097,7 @@ mod tests {
             move |op| {
                 let deny = matches!(op, BackendOp::WriteIf { path, .. } if *path == leaf_path)
                     && budget
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                             left.checked_sub(1)
                         })
                         .is_ok();

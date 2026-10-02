@@ -77,8 +77,12 @@ impl CollectionLocker {
         }
 
         let mut locks = Vec::with_capacity(desired.len());
+        // Lock one directory at a time, in address order. Equal-priority
+        // transactions wait for each other under wound-wait, and directory locks
+        // have no deadlock timeout or serial fallback, so only this total order
+        // prevents a wait cycle.
         for (parent, typ) in desired {
-            self.acquire(&parent, id, typ).await?;
+            self.lock_directory(&parent, id, typ).await?;
             locks.push(TxLock::Directory {
                 collection: parent,
                 typ,
@@ -154,42 +158,9 @@ impl CollectionLocker {
             .try_fold(false, |changed, result| Ok(changed | result?))
     }
 
-    /// Removes a settled participant from collection topology.
-    ///
-    /// The caller must establish that its structural intents have settled.
-    /// A present record without the participant must satisfy `requirement`.
-    pub(crate) async fn release_topology_participant(
-        &self,
-        collection: &CollectionAddress,
-        id: &TxId,
-        requirement: Requirement,
-    ) -> Result<bool, TransError> {
-        let mut read_requirement = Requirement::ANY;
-        loop {
-            let (mut record, observed) =
-                match self.records.load_record(collection, read_requirement).await {
-                    Ok(record) => record,
-                    // Publication, shared preparation cache, and GC eligibility
-                    // exclude a pre-creation cached absence for recorded collections.
-                    Err(StorageError::NotFound) => return Ok(false),
-                    Err(error) => return Err(error.into()),
-                };
-            if !record.remove_topology_participant(id) {
-                if observed.satisfies(requirement) {
-                    return Ok(false);
-                }
-                // Intent settlement does not refresh the collection record.
-                // Require the caller's bound only when no removal CAS applies.
-                read_requirement = requirement;
-                continue;
-            }
-            if self.records.store_record(&record, &observed).await? {
-                return Ok(true);
-            }
-        }
-    }
-
-    pub(crate) async fn acquire(
+    /// Acquires the lock of one directory, or upgrades a read lock to a write
+    /// lock.
+    async fn lock_directory(
         &self,
         parent: &CollectionAddress,
         id: &TxId,
@@ -500,10 +471,11 @@ mod tests {
 
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_concurr::Background;
-    use glassdb_data::DbPrefix;
+    use glassdb_data::{CollectionId, CollectionName, DbPrefix};
     use glassdb_storage::{CachedStore, Timeline};
 
     use super::*;
+    use crate::collections::DirectoryReadKind;
     use crate::monitor::ProtocolTiming;
 
     fn tx_id(prefix: &[u8]) -> TxId {
@@ -554,8 +526,19 @@ mod tests {
         );
         let id = tx_id(&[1]);
 
-        locker.acquire(&parent, &id, LockType::Read).await.unwrap();
-        locker.acquire(&parent, &id, LockType::Write).await.unwrap();
+        let read = DirectoryRead {
+            parent: parent.clone(),
+            kind: DirectoryReadKind::Listing { generation: 0 },
+        };
+        let change = CollectionChange {
+            parent: parent.clone(),
+            name: CollectionName::new("child").unwrap(),
+            collection: CollectionAddress::new("db", CollectionId::from_bytes([2; 16])),
+            expected: None,
+            op: CollectionOp::Create,
+        };
+        locker.lock(&id, &[read], &[]).await.unwrap();
+        locker.lock(&id, &[], &[change]).await.unwrap();
 
         let (record, _) = records
             .load_record(&parent, Requirement::ANY)

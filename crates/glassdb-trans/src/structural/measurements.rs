@@ -100,7 +100,7 @@ impl TypicalTime {
         // The closure always returns a value, so the update cannot fail.
         let _ = self
             .nanos
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 Some(match old {
                     NO_TYPICAL_TIME => took,
                     old if took >= old => old + (took - old) / weight,

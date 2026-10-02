@@ -39,6 +39,7 @@ use tokio::sync::Notify;
 use crate::collections::CollectionLifecycle;
 use crate::error::TransError;
 use crate::monitor::ProtocolTiming;
+use crate::structural::TopologyMembership;
 use crate::tlocker::Locker;
 use scan::{GcScan, PAGE_SIZE};
 
@@ -297,6 +298,7 @@ pub(crate) struct Gc {
     collection_lifecycle: CollectionLifecycle,
     router: TreeRouter,
     locker: Locker,
+    topology: TopologyMembership,
     timing: ProtocolTiming,
     timeline: Timeline,
     hints: GcHints,
@@ -312,6 +314,7 @@ impl Gc {
         structural_intents: StructuralIntentStore,
         timeline: Timeline,
         locker: Locker,
+        topology: TopologyMembership,
         collection_lifecycle: CollectionLifecycle,
         timing: ProtocolTiming,
         hints: GcHints,
@@ -323,6 +326,7 @@ impl Gc {
             collection_lifecycle,
             router: TreeRouter::new(nodes, std::num::NonZeroUsize::MIN),
             locker,
+            topology,
             timing,
             timeline,
             hints,
@@ -706,9 +710,8 @@ impl Gc {
                 });
             }
             changed |= self
-                .locker
-                .collections()
-                .release_topology_participant(collection, tid, Requirement::after(barrier))
+                .topology
+                .leave(collection, tid, Requirement::after(barrier))
                 .await?;
         }
         Ok(Reclamation {

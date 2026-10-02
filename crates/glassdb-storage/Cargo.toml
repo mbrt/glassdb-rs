@@ -10,7 +10,7 @@ description = "GlassDB storage layer (internal crate)."
 workspace = true
 
 [dependencies]
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 glassdb-backend = { version = "0.3.0", path = "../glassdb-backend" }
 glassdb-concurr = { version = "0.3.0", path = "../glassdb-concurr" }
 glassdb-data = { version = "0.3.0", path = "../glassdb-data" }

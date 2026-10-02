@@ -1,5 +1,5 @@
 use super::*;
-use crate::collection_coordination::CollectionStateResolver;
+use crate::collection_coordination::{CollectionLocker, CollectionStateResolver};
 use crate::collections::TopologySettler;
 use crate::engine::{AssemblyFixture, EngineConfig};
 use crate::key_state_resolver::KeyStateResolver;
@@ -50,6 +50,39 @@ impl TopologySettler for UnexpectedTopologySettler {
 
 fn collection() -> glassdb_data::CollectionAddress {
     glassdb_data::CollectionAddress::root("db")
+}
+
+/// Takes one directory lock as a transaction that reads the listing of, or
+/// changes a child of, `parent`.
+async fn lock_directory(
+    locker: &CollectionLocker,
+    parent: &CollectionAddress,
+    id: &TxId,
+    typ: LockType,
+) {
+    use crate::collections::{CollectionChange, CollectionOp, DirectoryRead, DirectoryReadKind};
+
+    let (reads, changes) = match typ {
+        LockType::Read => (
+            vec![DirectoryRead {
+                parent: parent.clone(),
+                kind: DirectoryReadKind::Listing { generation: 0 },
+            }],
+            Vec::new(),
+        ),
+        LockType::Write => (
+            Vec::new(),
+            vec![CollectionChange {
+                parent: parent.clone(),
+                name: collection_name("locked"),
+                collection: CollectionAddress::new("db", CollectionId::from_bytes([0xcc; 16])),
+                expected: None,
+                op: CollectionOp::Create,
+            }],
+        ),
+        other => panic!("collections take no {other:?} lock"),
+    };
+    locker.lock(id, &reads, &changes).await.unwrap();
 }
 
 fn collection_name(name: impl AsRef<[u8]>) -> CollectionName {
@@ -294,6 +327,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
         structural_intents,
         timeline.clone(),
         locker.clone(),
+        TopologyMembership::new(records.clone(), mon.clone(), RetryConfig::default()),
         CollectionLifecycle::new(
             records.clone(),
             nodes.clone(),
@@ -1634,7 +1668,6 @@ enum DirectoryReclamation {
 }
 
 async fn reclaim_directory(typ: LockType, case: DirectoryReclamation) {
-    use crate::collection_coordination::CollectionLocker;
     use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
 
     let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
@@ -1675,7 +1708,7 @@ async fn reclaim_directory(typ: LockType, case: DirectoryReclamation) {
         .await
         .unwrap();
     let operation = owner.monitor.begin_owner_operation(&id).unwrap();
-    locker.acquire(&collection(), &id, typ).await.unwrap();
+    lock_directory(&locker, &collection(), &id, typ).await;
     operation.complete();
     if matches!(
         case,
@@ -1869,11 +1902,7 @@ async fn committed_directory_gc_reuses_removal_after_cache_eviction() {
         let TxLock::Directory { collection, typ } = lock else {
             unreachable!()
         };
-        ctx.locker
-            .collections()
-            .acquire(collection, &id, *typ)
-            .await
-            .unwrap();
+        lock_directory(ctx.locker.collections(), collection, &id, *typ).await;
     }
     operation.complete();
     let mut record = TxRecord::new(id, TxCommitStatus::Committed);
@@ -1933,7 +1962,6 @@ async fn committed_directory_gc_needs_no_read_after_a_warm_removal() {
 
 #[tokio::test]
 async fn committed_directory_removal_does_not_prove_other_records_clear() {
-    use crate::collection_coordination::CollectionLocker;
     use crate::monitor::TxRecoveryManifest;
 
     for fail_check in [false, true] {
@@ -2003,10 +2031,7 @@ async fn committed_directory_removal_does_not_prove_other_records_clear() {
             .unwrap();
         let operation = owner.monitor.begin_owner_operation(&id).unwrap();
         for collection in [collection(), child.clone()] {
-            locker
-                .acquire(&collection, &id, LockType::Read)
-                .await
-                .unwrap();
+            lock_directory(&locker, &collection, &id, LockType::Read).await;
         }
         operation.complete();
         let mut record = TxRecord::new(id, TxCommitStatus::Committed);
@@ -2092,7 +2117,6 @@ enum DirectoryWriteBack {
 }
 
 async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) {
-    use crate::collection_coordination::CollectionLocker;
     use crate::collections::{CollectionChange, CollectionOp};
     use crate::monitor::TxRecoveryManifest;
 
@@ -2180,7 +2204,7 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
         .await
         .unwrap();
     locker
-        .acquire(&collection(), &id, LockType::Write)
+        .lock(&id, &[], std::slice::from_ref(&change))
         .await
         .unwrap();
     operation.complete();
@@ -2578,9 +2602,9 @@ async fn reclaim_topology(committed: bool, case: TopologyReclamation) {
     assert_eq!(calls, expected);
     operations.lock().unwrap().clear();
     assert!(
-        !ctx.locker
-            .collections()
-            .release_topology_participant(&collection(), &id, Requirement::after(barrier))
+        !ctx.gc
+            .topology
+            .leave(&collection(), &id, Requirement::after(barrier))
             .await
             .unwrap()
     );
@@ -2633,7 +2657,6 @@ enum DropReclamation {
 }
 
 async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropReclamation) {
-    use crate::collection_coordination::CollectionLocker;
     use crate::collections::{CollectionChange, CollectionOp};
     use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
     use glassdb_storage::IndexNode;
@@ -2770,11 +2793,8 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropR
         .await
         .unwrap();
     let operation = owner.monitor.begin_owner_operation(&id).unwrap();
-    locker
-        .acquire(&collection(), &id, LockType::Write)
-        .await
-        .unwrap();
-    locker.acquire(&target, &id, LockType::Read).await.unwrap();
+    lock_directory(&locker, &collection(), &id, LockType::Write).await;
+    lock_directory(&locker, &target, &id, LockType::Read).await;
     owner.monitor.record_tx_locks(&id, locks.clone());
     lifecycle
         .install_drop_intents(&id, std::slice::from_ref(&change))

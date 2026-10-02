@@ -28,6 +28,7 @@ mod merge_tests;
 mod reconcile_tests;
 mod recovery_tests;
 mod split_tests;
+mod topology_tests;
 
 const COLL: &str = "db/_c/0000000000000000000000";
 
@@ -313,7 +314,7 @@ fn restructurer_with_monitor_and_hints(
     );
     Restructurer::with_candidates(
         Arc::downgrade(bg),
-        store.records.clone(),
+        TopologyMembership::new(store.records.clone(), mon.clone(), RetryConfig::default()),
         store.nodes.clone(),
         store.intent_store.clone(),
         store.timeline.clone(),
@@ -322,7 +323,6 @@ fn restructurer_with_monitor_and_hints(
         db_prefix("db"),
         coord,
         candidates,
-        RetryConfig::default(),
         gc_hints,
         TopologyPolicy::SizeCauses,
     )

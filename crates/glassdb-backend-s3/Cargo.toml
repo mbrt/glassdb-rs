@@ -12,7 +12,7 @@ categories = ["database-implementations", "asynchronous"]
 workspace = true
 
 [dependencies]
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 # Drop the default `rustls` feature: it enables aws-smithy's legacy hyper-0.14 +
 # rustls-0.21 client, which drags in the vulnerable rustls-webpki 0.101.x
 # (RUSTSEC-2026-0104, unpatched on that line). The modern

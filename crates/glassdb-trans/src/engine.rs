@@ -29,7 +29,7 @@ use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{LeafCoordinator, LeafCoordinatorStats};
 use crate::monitor::{Monitor, MonitorStats, ProtocolTiming};
 use crate::reader::{ReadOutcome, Reader};
-use crate::structural::{Restructurer, RestructurerStats, TopologyPolicy};
+use crate::structural::{Restructurer, RestructurerStats, TopologyMembership, TopologyPolicy};
 use crate::tlocker::{Locker, LockerStats};
 
 /// Balances backend traffic and memory use for a default production database instance.
@@ -563,9 +563,11 @@ impl DormantEngine {
         let key_state = KeyStateResolver::new(monitor.clone());
         let router = TreeRouter::new(nodes.clone(), transaction_leaf_parallelism);
         let gc_hints = GcHints::new(gc_limits);
+        // Structural changes and GC remove the same topology participants.
+        let topology = TopologyMembership::new(records.clone(), monitor.clone(), retry);
         let (coord, restructurer) = Restructurer::with_coordinator(
             background_weak.clone(),
-            records.clone(),
+            topology.clone(),
             nodes.clone(),
             structural_intents.clone(),
             timeline.clone(),
@@ -606,6 +608,7 @@ impl DormantEngine {
             structural_intents,
             timeline.clone(),
             locker.clone(),
+            topology,
             collection_lifecycle.clone(),
             monitor.protocol_timing(),
             gc_hints.clone(),
