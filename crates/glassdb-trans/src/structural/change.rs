@@ -573,6 +573,7 @@ impl StructuralChangeAttempt<'_> {
         self.lifecycle
             .topology
             .leave(self.change.collection(), self.worker, Requirement::ANY)
-            .await
+            .await?;
+        Ok(())
     }
 }

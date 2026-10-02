@@ -10,7 +10,7 @@ use crate::monitor::{Monitor, TxRecoveryManifest};
 
 /// Adds and removes the topology participants of collection records.
 #[derive(Clone)]
-pub(super) struct TopologyMembership {
+pub(crate) struct TopologyMembership {
     records: CollectionStore,
     mon: Monitor,
     // Paces collection-record CAS retries. Transaction-status polling remains
@@ -19,7 +19,7 @@ pub(super) struct TopologyMembership {
 }
 
 impl TopologyMembership {
-    pub(super) fn new(records: CollectionStore, mon: Monitor, retry: RetryConfig) -> Self {
+    pub(crate) fn new(records: CollectionStore, mon: Monitor, retry: RetryConfig) -> Self {
         Self {
             records,
             mon,
@@ -93,31 +93,34 @@ impl TopologyMembership {
         }
     }
 
-    /// Removes one participant after all of its structural intents settle.
+    /// Removes a participant whose structural intents have settled.
     ///
-    /// A present record without the participant must satisfy `requirement`.
-    /// Local admission or topology-freeze evidence permits `ANY`.
-    pub(super) async fn leave(
+    /// Returns whether a removal CAS applied. A present record without the
+    /// participant must satisfy `requirement`. Local admission or
+    /// topology-freeze evidence permits `ANY`.
+    pub(crate) async fn leave(
         &self,
         collection: &CollectionAddress,
         id: &TxId,
         requirement: Requirement,
-    ) -> Result<(), TransError> {
+    ) -> Result<bool, TransError> {
         let mut backoff = self.retry.backoff();
         let mut read_requirement = Requirement::ANY;
         loop {
             let (mut record, observed) =
                 match self.records.load_record(collection, read_requirement).await {
                     Ok(record) => record,
-                    // Published collections already have their record. Local
-                    // preparation shares this cache, and deleted identities are
-                    // not reused, so an absence cannot hide later admission.
-                    Err(StorageError::NotFound) => return Ok(()),
+                    // Published collections already have their record, and
+                    // deleted identities are not reused. Local preparation
+                    // shares this cache, and GC eligibility excludes a
+                    // pre-creation cached absence for recorded collections.
+                    // Thus an absence cannot hide later admission.
+                    Err(StorageError::NotFound) => return Ok(false),
                     Err(error) => return Err(error.into()),
                 };
             if !record.remove_topology_participant(id) {
                 if observed.satisfies(requirement) {
-                    return Ok(());
+                    return Ok(false);
                 }
                 // Intent cleanup does not refresh the collection record. Only
                 // a no-op without sufficient evidence needs a bounded reload.
@@ -125,7 +128,7 @@ impl TopologyMembership {
                 continue;
             }
             if self.records.store_record(&record, &observed).await? {
-                return Ok(());
+                return Ok(true);
             }
             rt::sleep(backoff.next_delay()).await;
         }

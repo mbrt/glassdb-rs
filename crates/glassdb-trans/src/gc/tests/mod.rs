@@ -294,6 +294,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
         structural_intents,
         timeline.clone(),
         locker.clone(),
+        TopologyMembership::new(records.clone(), mon.clone(), RetryConfig::default()),
         CollectionLifecycle::new(
             records.clone(),
             nodes.clone(),
@@ -2578,9 +2579,9 @@ async fn reclaim_topology(committed: bool, case: TopologyReclamation) {
     assert_eq!(calls, expected);
     operations.lock().unwrap().clear();
     assert!(
-        !ctx.locker
-            .collections()
-            .release_topology_participant(&collection(), &id, Requirement::after(barrier))
+        !ctx.gc
+            .topology
+            .leave(&collection(), &id, Requirement::after(barrier))
             .await
             .unwrap()
     );
