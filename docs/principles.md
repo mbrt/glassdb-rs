@@ -17,3 +17,5 @@ These are the principles from which GlassDB is founded:
   validating multiple leaves in a single transaction.
 - The user doesn't pay for what they don't use. Expensive background work should
   happen only if the user's workload justifies it.
+- Resource usage has enforced limits: queues length, cache size, parallelism
+  within one transaction.

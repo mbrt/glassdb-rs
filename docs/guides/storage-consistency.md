@@ -10,8 +10,8 @@ Two type modules require stricter correctness review. Paths are relative to
 
 Review every change to these files, including visibility, conversions, tests,
 and moves. Changes to their exports must preserve the same restrictions. The
-[cache guide](caching.md) explains the implementation that uses these types;
-[CONTEXT.md](../../CONTEXT.md) defines the terms.
+[cache guide](caching.md) explains the currentness model and the constraints
+that the cache keeps; [CONTEXT.md](../../CONTEXT.md) defines the terms.
 
 ## E1: Sequence points belong to one database instance
 
@@ -37,11 +37,12 @@ work and before dependent operations. Requirements are constructed only as
 stronger one. `within` is an approximate cache policy, not proof that
 prerequisite work ended.
 
-Neither barriers nor requirements expose their point, including to other
-storage modules. Use predicates to check evidence. Do not add raw-point
-constructors, getters, serialization, defaults, or conversions from observations
-or receipts. Copying a barrier does not capture another barrier. A requirement
-states what must be proved and must never become evidence itself.
+Neither barriers nor requirements expose their point, including to other storage
+modules. Use predicates to check evidence. Do not add raw-point constructors,
+getters, serialization, defaults, or conversions from observations, receipts, or
+requirements, including implicit conversions. Copying a barrier does not capture
+another barrier. A requirement states what must be proved and must never become
+evidence itself.
 
 ## E3: An observation retains one exact state
 
@@ -79,11 +80,13 @@ exact installed observation, and original invocation point bound to that
 mutation. Checking the installed state later cannot renew the precondition
 proof.
 
-Reads, failed or in-doubt mutations, and plans with no staged changes
-cannot become receipts. Conversion to the installed observation remains
-explicit. Do not add `Deref`, `AsRef`, `From`, payload mapping, or raw-point
-extraction. Participation in a coordinator batch is a separate proof owned by
-that coordinator.
+Reads, failed or in-doubt mutations, and plans with no staged changes cannot
+become receipts. Conversion to the installed observation remains explicit, and
+that observation does not prove the mutation. Do not build an observation from
+the expected revision and the installed body, because they identify different
+sides of the transition. Do not add `Deref`, `AsRef`, `From`, payload mapping,
+or raw-point extraction. Participation in a coordinator batch is a separate
+proof owned by that coordinator.
 
 ## Review
 

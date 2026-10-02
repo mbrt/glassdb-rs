@@ -30,7 +30,8 @@ but the service scales almost without limit:
 - Correct and slow is better than fast and wrong when transactions race.
 - Throughput is more important than latency. Independent backend calls must run
   in parallel.
-- GlassDB expects values between 1 KB and 1 MB.
+- Expects small key values (below 1 MB), small transactions and high
+  parallelism.
 - Background work must not cost anything that the workload does not need.
 
 [docs/principles.md](principles.md) lists the complete principles.
