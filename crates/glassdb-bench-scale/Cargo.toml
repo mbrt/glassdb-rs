@@ -13,7 +13,8 @@ workspace = true
 # in-memory diagnostics live in glassdb's Criterion transaction benchmarks.
 #
 # Binaries:
-#   perfbench      mixed, contention, and inline-pressure database scenarios.
+#   perfbench      mixed, contention, inline-pressure, and split-merge-fight
+#                 database scenarios.
 #   backendbench  raw backend storage-op latencies (ported from Go
 #                 `hack/backendbench`).
 [dependencies]

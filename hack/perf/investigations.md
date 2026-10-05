@@ -9,6 +9,99 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-10-05: database instances that split and merge the same leaf
+
+Status: reproduced by the perfbench `split-merge-fight` scenario. No fix yet.
+
+ADR-074 records that each database instance decides on its own transactions,
+so one instance can split a leaf while another merges it. In the `mixed` hi
+mode with 8 instances, only some runs showed this. The `split-merge-fight`
+scenario shows it in each run.
+
+### Load
+
+One collection has the keys `left` and `right` in one leaf. One splitter
+instance writes `left` and one writes `right`, each with 4 workers. A merger
+instance scans both keys with 8 workers. The splitters lose leaf CASes to each
+other, and their policy splits the leaf between the keys. Each leaf then has
+one key, so it cannot split again. After the split, each scan crosses into the
+right leaf, and the policy of the merger merges the leaves. All instances use
+the avoidable time policy. `fixed-1` and `fixed-2` use the size causes with no
+underfull threshold, and keep one leaf or one leaf for each key.
+
+```console
+perfbench --delays=s3 --runs=3 split-merge-fight --policies=<policy>
+```
+
+The defaults are a warmup of 10 s and a measurement of 60 s, in wall time.
+Model time runs 5 times faster. The 4 processes ran at the same time, two of
+them with `avoidable`.
+
+### Results
+
+Splits and merges are of all instances in the measurement. The throughputs
+are in transactions per model second, for each run:
+
+| Policy | Splits / merges | Left splitter | Right splitter | Merger |
+| --- | --- | ---: | ---: | ---: |
+| `avoidable` | 3/3, 6/7, 11/11, 3/4, 5/5, 4/5 | `5.7`–`7.1` | `2.9`–`7.1` | `84`–`112` |
+| `fixed-1` | 0/0, 0/0, 0/0 | `3.3`–`5.4` | `2.5`–`4.7` | `186`–`189` |
+| `fixed-2` | 0/0, 0/0, 0/0 | `8.0` | `7.9`–`8.0` | `67`–`68` |
+
+All splits came from the splitters, and all merges from the merger. The load
+does not change, but a split and a merge occur about every 5 to 20 s of wall
+time. A merge comes 5 to 15 s after a split, and a split comes 1 to 2 s after
+a merge. Thus the merge side sets the rate. With 1 merger worker, the scans crossed too
+seldom: the leaf split once in the warmup and stayed split. With 30 s
+measurements, a run had 1 to 6 splits, so the default is 60 s.
+
+The splitter workers of one instance write the same key, so most of their
+commits are locked commits (about 0.9 lock calls for each commit), with a
+median latency of about 510 ms in all policies.
+
+### Loads that did not show the fight in each run
+
+A first version of the scenario had more keys in each half, and merger loads
+other than the scan. The runs used 1 to 8 splitter workers, 1 to 32 merger
+workers, 1 to 32 keys in each half, and the S3 and GCS delays. No load had 3
+or more splits and merges in each run of a 30 s measurement:
+
+- With more than one key and more than one writer in each half, the
+  splitters also split their own half. A lost CAS or a queue wait counts when
+  the keys of the two rounds are on different sides of the median. This is
+  also true for two keys of one half. Up to 27 splits made leaves that were
+  too small for the merge side. Scans then crossed many pairs. The cross-leaf
+  transactions were over more than two leaves, and the crossing conflict
+  time does not count them.
+- With one writer in each half, the splitter that won the CASes had no time,
+  and the other one often had almost no commits. A cycle took 10 s or more.
+- When one instance wrote both keys, it made no split. Its writes of both
+  keys were in one coordinator round, so no member waited for a round of
+  the other key.
+- A merger that reads one key of each half, that writes one key of each half,
+  or that reads and writes all keys, conflicts with the splitters. It
+  committed 0 to 2 transactions in each second under the avoidable time
+  policy, and it also got split-side time from its own leaf CASes.
+- On GCS, the splitters had 0.2 to 2 transactions in each second, and the
+  merger merged less often than on S3.
+
+### Other findings
+
+- The size causes ignored the underfull thresholds of the
+  `NodeSizePolicy` of a database instance. `DatabaseMetadata::node_size_policy`
+  kept only the local soft caps, and used the default underfull thresholds.
+  So a `fixed-2` tree with leaf entry minimum 0 merged in the warmup. The
+  change that adds this scenario fixes it.
+- One load can stop two of its instances. In this load, two instances write
+  8 keys of each half, with one worker each. A third instance writes one key
+  of each half in one transaction, with two workers. One splitter and the
+  merger then have no commit and no lock call for the full measurement, more
+  than 130 model seconds. The other splitter commits. This occurred in 1 to 2 of
+  3 runs, with the avoidable time policy and with a `fixed-2` tree that the
+  bug above merged. With a fixed tree of one or two leaves, only the
+  locked commits of the merger starved (0 to 0.9 transactions in each
+  second), and no instance stopped. The cause is not known.
+
 ## 2026-09-26: ADR-074 splits in the mixed hi mode
 
 Status: in the engine as `TopologyPolicy::AvoidableTime`, the default policy
