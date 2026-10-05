@@ -284,19 +284,41 @@ impl KeyResolver {
             return Ok(Vec::new());
         }
 
-        let leaves = self
+        let Some(mut leaf) = self
             .router
-            .leaves_through(collection, &range.start, frontier, requirement)
+            .first_leaf_at(collection, &range.start, requirement)
             .await
-            .map_err(|error| error.classify_collection_absence(collection))?;
-        let mut covered = Vec::with_capacity(leaves.len());
-        for leaf in leaves {
+            .map_err(|error| error.classify_collection_absence(collection))?
+        else {
+            return Err(StorageError::NotFound.classify_collection_absence(collection));
+        };
+        let mut covered = Vec::new();
+        loop {
             covered.push(
                 self.leaf_coverage(&leaf, own_lock_holder, requirement)
                     .await?,
             );
+            if frontier.is_some_and(|end| leaf.node().is_some_and(|node| node.covers(end))) {
+                return Ok(covered);
+            }
+            // A validation that reads the next leaf again pays for the
+            // crossing too, so a merge of the two leaves removes this time.
+            let started = rt::Instant::now();
+            let Some(next) = self
+                .router
+                .next_leaf(collection, &leaf, requirement)
+                .await
+                .map_err(|error| error.classify_collection_absence(collection))?
+            else {
+                return Ok(covered);
+            };
+            self.structural_hints.scan_crossing_time(
+                leaf.observation.path(),
+                next.observation.path(),
+                started.elapsed(),
+            );
+            leaf = next;
         }
-        Ok(covered)
     }
 
     async fn leaf_coverage(

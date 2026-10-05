@@ -137,6 +137,37 @@ async fn replays_of_failed_bodies_over_two_leaves_merge_them() {
     db.shutdown().await;
 }
 
+// Regression: when a write changed the first leaf of a scan, the validation
+// of the scan read the next leaf again, and this read did not count for a
+// merge of the two leaves. Under a steady write load, these scans did not
+// merge their leaves.
+#[tokio::test(start_paused = true)]
+async fn scans_that_validate_again_after_a_write_merge_their_leaves() {
+    let backend = slow_mem();
+    assert_eq!(split_collection(&backend, 5).await, 1);
+    let db = open(&backend, leaves_of_at_most(64)).await;
+    let coll = open_top(&db, b"split").await;
+
+    let c = &coll;
+    let until = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut round = 0;
+    while tokio::time::Instant::now() < until {
+        db.tx(|tx| async move {
+            tx.scan_keys(c, KeyScan::all()).await?;
+            // The write lands before the validation of the scan.
+            c.write(&[0], &write_int(round)).await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        round += 1;
+    }
+
+    assert!(db.stats().restructurer.merges >= 1);
+    assert_eq!(scan_all(&coll).await.len(), 5);
+    db.shutdown().await;
+}
+
 // Regression: under the avoidable time policy, a leaf whose keys were all
 // deleted stayed, because no transaction used it again and so it got no
 // merge-side time. With a queue-like load, the leaves grew without a limit.
