@@ -1365,7 +1365,7 @@ async fn split_help_forwards_a_committed_entry_holder_before_moving_its_entry() 
     let other_transactions = other.foundation.tx_records.clone();
     let other_mon = other.foundation.monitor_for(
         &other_bg,
-        RetryConfig::default(),
+        RetrySchedule::default(),
         crate::monitor::ProtocolTiming::default(),
     );
     let other_key_state = KeyStateResolver::new(other_mon.clone());
@@ -1373,7 +1373,7 @@ async fn split_help_forwards_a_committed_entry_holder_before_moving_its_entry() 
         other.nodes.clone(),
         other_key_state,
         other_mon.clone(),
-        RetryConfig::default(),
+        RetryTiming::default(),
         NodeSizePolicy::default(),
         Arc::new(NoStructuralHints),
     );
@@ -1385,10 +1385,10 @@ async fn split_help_forwards_a_committed_entry_holder_before_moving_its_entry() 
             other_transactions,
             other.timeline.clone(),
             other_mon.clone(),
-            RetryConfig::default(),
+            RetrySchedule::default(),
         ),
         other_mon.clone(),
-        RetryConfig::default(),
+        RetryTiming::default(),
         std::num::NonZeroUsize::MIN,
     );
     other_mon.begin_tx(&holder);

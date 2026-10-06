@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use glassdb::{Database, Error, InlinePolicy, NodeSizePolicy, ProtocolTiming};
+use glassdb::{
+    Database, Error, InlinePolicy, NodeSizePolicy, ProtocolTiming, RetrySchedule, RetryTiming,
+};
 use glassdb_data::TxId;
 use glassdb_storage::{CurrentState, LeafBody, LeafEntry, Node};
 
@@ -505,8 +507,16 @@ async fn builder_custom_options() {
     let db = Database::builder("example", mem())
         .cache_size(8 * 1024 * 1024)
         .transaction_leaf_parallelism(NonZeroUsize::new(2).unwrap())
-        .retry_initial_interval(Duration::from_millis(10))
-        .retry_max_interval(Duration::from_millis(100))
+        .retry_timing(RetryTiming {
+            contention: RetrySchedule {
+                initial_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(10),
+            },
+            wait: RetrySchedule {
+                initial_interval: Duration::from_millis(10),
+                max_interval: Duration::from_millis(100),
+            },
+        })
         .protocol_timing(ProtocolTiming::new(
             Duration::from_secs(1),
             Duration::from_secs(2),

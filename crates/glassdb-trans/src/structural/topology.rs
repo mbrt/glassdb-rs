@@ -1,6 +1,6 @@
 //! Admission and departure of topology participants (ADR-049).
 
-use glassdb_concurr::{RetryConfig, rt};
+use glassdb_concurr::{RetrySchedule, rt};
 use glassdb_data::{CollectionAddress, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxRecord};
 use glassdb_storage::{CollectionStore, Requirement, StorageError};
@@ -15,11 +15,11 @@ pub(crate) struct TopologyMembership {
     mon: Monitor,
     // Paces collection-record CAS retries. Transaction-status polling remains
     // entirely owned by Monitor.
-    retry: RetryConfig,
+    retry: RetrySchedule,
 }
 
 impl TopologyMembership {
-    pub(crate) fn new(records: CollectionStore, mon: Monitor, retry: RetryConfig) -> Self {
+    pub(crate) fn new(records: CollectionStore, mon: Monitor, retry: RetrySchedule) -> Self {
         Self {
             records,
             mon,

@@ -11,24 +11,24 @@ const JITTER_FACTOR: f64 = 0.5;
 
 /// Tunes the exponential backoff used to retry transient operations: the first
 /// delay, and the cap each delay grows toward.
-#[derive(Debug, Clone, Copy)]
-pub struct RetryConfig {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetrySchedule {
     /// Base interval before the first retry, limited to `max_interval`.
     pub initial_interval: Duration,
     /// Upper bound on the per-retry delay, including jitter.
     pub max_interval: Duration,
 }
 
-impl Default for RetryConfig {
+impl Default for RetrySchedule {
     fn default() -> Self {
-        RetryConfig {
+        RetrySchedule {
             initial_interval: INITIAL_INTERVAL,
             max_interval: MAX_INTERVAL,
         }
     }
 }
 
-impl RetryConfig {
+impl RetrySchedule {
     /// Starts a fresh exponential backoff schedule from this configuration. Each
     /// retry loop gets its own [`Backoff`] so the interval resets per attempt.
     pub fn backoff(&self) -> Backoff {
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn backoff_grows_exponentially_and_caps() {
-        let cfg = RetryConfig {
+        let cfg = RetrySchedule {
             initial_interval: Duration::from_millis(100),
             max_interval: Duration::from_millis(400),
         };
@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn backoff_caps_an_initial_interval_above_the_maximum() {
         for max_interval in [Duration::ZERO, Duration::from_millis(1)] {
-            let mut backoff = RetryConfig {
+            let mut backoff = RetrySchedule {
                 initial_interval: Duration::from_secs(1),
                 max_interval,
             }
@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn backoff_handles_the_largest_duration() {
-        let mut backoff = RetryConfig {
+        let mut backoff = RetrySchedule {
             initial_interval: Duration::MAX,
             max_interval: Duration::MAX,
         }
@@ -216,8 +216,8 @@ mod sim_tests {
     fn retry_delays_never_exceed_the_configured_maximum() {
         crate::exec::block_on_with(crate::exec::TapeScheduler::new(Vec::new()), 7, async {
             for config in [
-                RetryConfig::default(),
-                RetryConfig {
+                RetrySchedule::default(),
+                RetrySchedule {
                     initial_interval: Duration::from_millis(1),
                     max_interval: Duration::from_millis(1),
                 },

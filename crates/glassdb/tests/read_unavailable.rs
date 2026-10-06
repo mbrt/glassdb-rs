@@ -23,7 +23,7 @@ use std::time::Duration;
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
 use glassdb::backend::{Backend, BackendError};
-use glassdb::{CollectionPath, Database, Error};
+use glassdb::{CollectionPath, Database, Error, RetrySchedule, RetryTiming};
 
 /// The object kind whose reads a [`ReadFaults`] decorator faults.
 #[derive(Clone, Copy)]
@@ -303,14 +303,23 @@ async fn sustained_read_unavailability_surfaces_unavailable() {
     );
 }
 
+fn no_delay() -> RetrySchedule {
+    RetrySchedule {
+        initial_interval: Duration::ZERO,
+        max_interval: Duration::ZERO,
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn read_retry_budget_applies_to_each_point_read() {
     let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     seed_shared(memory.clone(), b"k", 10).await;
     let (backend, faults) = ReadFaults::wrap(memory, FaultTarget::Leaf);
     let db = Database::builder("example", backend)
-        .retry_initial_interval(Duration::ZERO)
-        .retry_max_interval(Duration::ZERO)
+        .retry_timing(RetryTiming {
+            contention: no_delay(),
+            wait: no_delay(),
+        })
         .open()
         .await
         .unwrap();

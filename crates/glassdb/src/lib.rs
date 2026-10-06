@@ -69,8 +69,11 @@ pub use glassdb_storage::{
 };
 pub use glassdb_trans::{
     DirectCommitStats, GcLimits, InlinePressureStats, LeafCoordinatorStats, LockerStats,
-    MonitorStats, ProtocolTiming, RestructurerStats, TopologyPolicy,
+    MonitorStats, ProtocolTiming, RestructurerStats, RetryTiming, TopologyPolicy,
 };
+// Re-export the schedule type so callers can build a `RetryTiming` without
+// depending on the concurrency crate directly.
+pub use glassdb_concurr::RetrySchedule;
 
 // Re-export the backend abstraction so callers can construct a Database without
 // depending on the backend crate directly.

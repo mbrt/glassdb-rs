@@ -9,7 +9,7 @@ use std::ops::{AddAssign, Sub};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
-use glassdb_concurr::{Background, Backoff, RetryConfig, rt, shard::Sharded};
+use glassdb_concurr::{Background, Backoff, RetrySchedule, rt, shard::Sharded};
 use glassdb_data::{CollectionAddress, LogicalKey, TxId};
 use glassdb_storage::transaction::{
     TxCollectionChange, TxCommitStatus, TxLifecycleRelation, TxLock, TxRecord, TxRecordState,
@@ -478,7 +478,7 @@ struct Inner {
     // the [`Background`] alive across DB shutdown. `Engine` is the single
     // strong owner.
     background: Weak<Background>,
-    retry: RetryConfig,
+    retry: RetrySchedule,
     timing: ProtocolTiming,
     // Runtime entries are partitioned into independent shards keyed by tid.
     // One lock keeps ownership, liveness, and waiter updates atomic for a given
@@ -643,7 +643,7 @@ impl Monitor {
         tx_records: TxRecordStore,
         timeline: Timeline,
         background: Weak<Background>,
-        retry: RetryConfig,
+        retry: RetrySchedule,
         timing: ProtocolTiming,
     ) -> Self {
         Monitor {
@@ -2331,7 +2331,7 @@ mod tests {
             tx_records.clone(),
             timeline,
             Arc::downgrade(&bg),
-            RetryConfig::default(),
+            RetrySchedule::default(),
             timing,
         );
         (

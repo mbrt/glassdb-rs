@@ -33,9 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use glassdb_concurr::{
-    BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, RetryConfig, Worker, rt,
-};
+use glassdb_concurr::{BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, Worker, rt};
 use glassdb_data::{ObjectPath, TxId};
 use glassdb_storage::{
     CasReceipt, CasResult, CurrentnessBarrier, LeafBody, LeafEdit, LeafEntry, LeafObservation,
@@ -47,19 +45,11 @@ use hashlink::LinkedHashMap;
 use crate::error::TransError;
 use crate::key_state_resolver::KeyStateResolver;
 use crate::monitor::Monitor;
+use crate::retry_timing::RetryTiming;
 
 /// Maximum inner CAS retries on a single leaf/root before treating the
 /// operation as conflicted and restarting the transaction.
 pub(crate) const CAS_RETRIES: usize = 50;
-
-/// The first delay and the largest delay before a round sends its leaf CAS
-/// again after contention. A database instance that wins the leaf changes it
-/// many times in each second. If the delay of the round that loses grows to
-/// seconds, all members of that round wait, and its next CAS most likely loses
-/// again. The instance then commits nothing for a long time. The perfbench `split-merge-fight` and `mixed`
-/// scenarios selected these bounds (hack/perf/investigations.md).
-const LEAF_CAS_FIRST_RETRY: Duration = Duration::from_millis(20);
-const LEAF_CAS_MAX_RETRY: Duration = Duration::from_millis(300);
 
 /// Counters for CAS activity across all coordinated leaf operations.
 #[derive(Default)]
@@ -519,7 +509,7 @@ struct CoordCore {
     tmon: Monitor,
     nodes: NodeStore,
     key_state: KeyStateResolver,
-    retry: RetryConfig,
+    retry: RetryTiming,
     stats: Stats,
     // Where stored over-cap leaves are reported: the background
     // [`Restructurer`](crate::structural::Restructurer)'s queue when one is wired.
@@ -779,15 +769,6 @@ impl LostTime {
         }
         hinter.leaf_delay(path, lost.saturating_mul(self.members), &self.split_key);
         self.since = until;
-    }
-}
-
-/// Returns the retry schedule of the leaf CASes of a round: `retry`, with
-/// delays of at most the bounds of a leaf CAS.
-fn leaf_cas_retry(retry: RetryConfig) -> RetryConfig {
-    RetryConfig {
-        initial_interval: retry.initial_interval.min(LEAF_CAS_FIRST_RETRY),
-        max_interval: retry.max_interval.min(LEAF_CAS_MAX_RETRY),
     }
 }
 
@@ -1244,10 +1225,10 @@ impl CasWorker {
         // window. The first load accepts any cached leaf, even for members
         // that require bounded evidence before completion.
         rt::yield_now().await;
-        let mut contention = leaf_cas_retry(self.core.retry).backoff();
+        let mut contention = self.core.retry.contention.backoff();
         // A CAS that came back in-doubt can be a backend that throttles or
-        // fails, so its retry keeps the slower schedule.
-        let mut failure = self.core.retry.backoff();
+        // fails, so its retry waits longer.
+        let mut failure = self.core.retry.wait.backoff();
         let mut failed = false;
         // Policies must distinguish the first attempt from recovery after a CAS
         // failure or a stale transaction dependency.
@@ -1498,7 +1479,7 @@ impl LeafCoordinator {
         nodes: NodeStore,
         key_state: KeyStateResolver,
         tmon: Monitor,
-        retry: RetryConfig,
+        retry: RetryTiming,
         policy: NodeSizePolicy,
         hinter: Arc<dyn StructuralHinter>,
     ) -> Self {
@@ -1696,7 +1677,7 @@ mod tests {
         policy: NodeSizePolicy,
         hinter: Arc<dyn StructuralHinter>,
     ) -> (LeafCoordinator, NodeStore, Timeline, Arc<Background>) {
-        coord_over_retry(backend, policy, hinter, RetryConfig::default()).await
+        coord_over_retry(backend, policy, hinter, RetryTiming::default()).await
     }
 
     // A coordinator with a near-zero CAS backoff, so an exhaustion regression
@@ -1708,10 +1689,10 @@ mod tests {
             backend,
             NodeSizePolicy::default(),
             Arc::new(NoStructuralHints),
-            RetryConfig {
+            RetryTiming::uniform(glassdb_concurr::RetrySchedule {
                 initial_interval: Duration::from_nanos(1),
                 max_interval: Duration::from_nanos(1),
-            },
+            }),
         )
         .await
     }
@@ -1720,7 +1701,7 @@ mod tests {
         backend: Arc<dyn Backend>,
         policy: NodeSizePolicy,
         hinter: Arc<dyn StructuralHinter>,
-        retry: RetryConfig,
+        retry: RetryTiming,
     ) -> (LeafCoordinator, NodeStore, Timeline, Arc<Background>) {
         let seed_timeline = Timeline::new();
         let seed_store = NodeStore::new(
@@ -3323,10 +3304,10 @@ mod tests {
             backend,
             NodeSizePolicy::default(),
             hints.clone(),
-            RetryConfig {
+            RetryTiming::uniform(glassdb_concurr::RetrySchedule {
                 initial_interval: Duration::from_nanos(1),
                 max_interval: Duration::from_nanos(1),
-            },
+            }),
         )
         .await;
         peer_wins.store(wins, Ordering::SeqCst);
@@ -3415,7 +3396,7 @@ mod tests {
             backend,
             NodeSizePolicy::default(),
             Arc::new(DelayRecorder::default()),
-            RetryConfig::default(),
+            RetryTiming::default(),
         )
         .await;
         peer_wins.store(LOSSES as usize, Ordering::SeqCst);
@@ -4277,7 +4258,7 @@ mod tests {
             in_doubt_then_ok(inner),
             NodeSizePolicy::default(),
             Arc::new(DelayRecorder::default()),
-            RetryConfig::default(),
+            RetryTiming::default(),
         )
         .await;
 

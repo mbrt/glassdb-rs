@@ -543,7 +543,7 @@ mod tests {
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
-    use glassdb_concurr::{Background, RetryConfig};
+    use glassdb_concurr::{Background, RetrySchedule};
     use glassdb_data::{CollectionId, DbPrefix, NodeId, ObjectPath};
     use glassdb_storage::transaction::{TxCommitStatus, TxRecordStore};
     use glassdb_storage::{
@@ -588,7 +588,7 @@ mod tests {
             tx_records,
             timeline.clone(),
             Arc::downgrade(&bg),
-            RetryConfig::default(),
+            RetrySchedule::default(),
             crate::monitor::ProtocolTiming::default(),
         );
         let nodes = NodeStore::new(objects, std::num::NonZeroUsize::MIN);
@@ -1013,7 +1013,7 @@ mod tests {
         seed_inline(&seed_store, b"k", &writer, b"hello").await;
 
         let (resolver, _mon, timeline, _bg) = resolver_over(backend).await;
-        let reader = Reader::new(resolver, timeline, RetryConfig::default());
+        let reader = Reader::new(resolver, timeline, RetrySchedule::default());
         log.lock().unwrap().clear();
 
         let out = reader
@@ -1097,7 +1097,7 @@ mod tests {
         seed_writer(&seed_store, b"k", &writer, true).await;
 
         let (resolver, _mon, timeline, _bg) = resolver_over(backend).await;
-        let reader = Reader::new(resolver, timeline, RetryConfig::default());
+        let reader = Reader::new(resolver, timeline, RetrySchedule::default());
         log.lock().unwrap().clear();
 
         let out = reader
@@ -1128,7 +1128,7 @@ mod tests {
         commit_value(&mon, b"k", &new, false).await;
         seed_hold(&seed_store, b"k", &new).await;
 
-        let reader = Reader::new(resolver, timeline, RetryConfig::default());
+        let reader = Reader::new(resolver, timeline, RetrySchedule::default());
         let out = reader
             .read(&logical_key(b"k"), Duration::MAX)
             .await
@@ -1147,7 +1147,7 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let seed_store = store_over(backend.clone()).await;
         let (resolver, _mon, timeline, _bg) = resolver_over(backend).await;
-        let reader = Reader::new(resolver, timeline, RetryConfig::default());
+        let reader = Reader::new(resolver, timeline, RetrySchedule::default());
 
         let first = TxId::with_priority(1, b"first");
         seed_inline(&seed_store, b"k", &first, b"same").await;

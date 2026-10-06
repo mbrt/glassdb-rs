@@ -31,7 +31,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use glassdb_concurr::{Background, RetryConfig, ScanCadence, rt};
+use glassdb_concurr::{Background, ScanCadence, rt};
 use glassdb_data::{CollectionAddress, DbPrefix, ObjectPath, TxId};
 use glassdb_storage::{
     InlinePolicy, NodeSizePolicy, NodeStore, StructuralIntentStore, Timeline, TreeRouter,
@@ -44,6 +44,7 @@ use crate::gc::GcHints;
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::LeafCoordinator;
 use crate::monitor::Monitor;
+use crate::retry_timing::RetryTiming;
 
 use candidates::{CandidateCause, MaintenanceCandidate, MaintenanceCandidates};
 use change::{ChangeLifecycle, PlannedChange, StructuralTopology};
@@ -107,7 +108,7 @@ impl Restructurer {
         timeline: Timeline,
         mon: Monitor,
         key_state: KeyStateResolver,
-        retry: RetryConfig,
+        retry: RetryTiming,
         db_prefix: DbPrefix,
         policy: NodeSizePolicy,
         inline: InlinePolicy,

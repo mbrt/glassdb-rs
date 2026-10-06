@@ -5,13 +5,14 @@ use crate::engine::{AssemblyFixture, EngineConfig};
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{LeafCoordinator, StructuralHinter};
 use crate::monitor::Monitor;
+use crate::retry_timing::RetryTiming;
 use crate::structural::StructuralHintSink;
 use crate::tlocker::LockOutcome;
 use async_trait::async_trait;
 use glassdb_backend as backend;
 use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend};
 use glassdb_backend::{Backend, BackendError, memory::MemoryBackend};
-use glassdb_concurr::RetryConfig;
+use glassdb_concurr::RetrySchedule;
 use glassdb_data::{
     CollectionAddress, CollectionId, CollectionName, DbPrefix, LogicalKey, NodeId, ObjectPath,
 };
@@ -301,7 +302,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
         nodes.clone(),
         key_state,
         mon.clone(),
-        RetryConfig::default(),
+        RetryTiming::default(),
         glassdb_storage::NodeSizePolicy::default(),
         Arc::new(NoStructuralHints),
     );
@@ -314,10 +315,10 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
             tx_records.clone(),
             timeline.clone(),
             mon.clone(),
-            RetryConfig::default(),
+            RetrySchedule::default(),
         ),
         mon.clone(),
-        RetryConfig::default(),
+        RetryTiming::default(),
         std::num::NonZeroUsize::MIN,
     );
     let hints = GcHints::default();
@@ -327,12 +328,12 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
         structural_intents,
         timeline.clone(),
         locker.clone(),
-        TopologyMembership::new(records.clone(), mon.clone(), RetryConfig::default()),
+        TopologyMembership::new(records.clone(), mon.clone(), RetrySchedule::default()),
         CollectionLifecycle::new(
             records.clone(),
             nodes.clone(),
             mon.clone(),
-            RetryConfig::default(),
+            RetrySchedule::default(),
             Arc::new(UnexpectedTopologySettler),
         ),
         mon.protocol_timing(),
@@ -1504,7 +1505,7 @@ async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
         owner.nodes.clone(),
         KeyStateResolver::new(owner.monitor.clone()),
         owner.monitor.clone(),
-        RetryConfig::default(),
+        RetryTiming::default(),
         glassdb_storage::NodeSizePolicy::default(),
         Arc::new(NoStructuralHints),
     );
@@ -1517,10 +1518,10 @@ async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
             owner.tx_records.clone(),
             owner.timeline.clone(),
             owner.monitor.clone(),
-            RetryConfig::default(),
+            RetrySchedule::default(),
         ),
         owner.monitor.clone(),
-        RetryConfig::default(),
+        RetryTiming::default(),
         std::num::NonZeroUsize::MIN,
     );
     let id = tx(81);
@@ -1687,7 +1688,7 @@ async fn reclaim_directory(typ: LockType, case: DirectoryReclamation) {
             owner.tx_records.clone(),
             owner.timeline.clone(),
             owner.monitor.clone(),
-            RetryConfig::default(),
+            RetrySchedule::default(),
         ),
         std::num::NonZeroUsize::MIN,
     );
@@ -2003,7 +2004,7 @@ async fn committed_directory_removal_does_not_prove_other_records_clear() {
                 owner.tx_records.clone(),
                 owner.timeline.clone(),
                 owner.monitor.clone(),
-                RetryConfig::default(),
+                RetrySchedule::default(),
             ),
             std::num::NonZeroUsize::MIN,
         );
@@ -2136,7 +2137,7 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
             owner.tx_records.clone(),
             owner.timeline.clone(),
             owner.monitor.clone(),
-            RetryConfig::default(),
+            RetrySchedule::default(),
         ),
         std::num::NonZeroUsize::MIN,
     );
@@ -2144,7 +2145,7 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
         owner.records.clone(),
         owner.nodes.clone(),
         owner.monitor.clone(),
-        RetryConfig::default(),
+        RetrySchedule::default(),
         Arc::new(UnexpectedTopologySettler),
     );
     let id = tx(87);
@@ -2675,7 +2676,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropR
         owner.records.clone(),
         owner.nodes.clone(),
         owner.monitor.clone(),
-        RetryConfig::default(),
+        RetrySchedule::default(),
         Arc::new(UnexpectedTopologySettler),
     );
     let locker = CollectionLocker::new(
@@ -2684,7 +2685,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropR
             owner.tx_records.clone(),
             owner.timeline.clone(),
             owner.monitor.clone(),
-            RetryConfig::default(),
+            RetrySchedule::default(),
         ),
         std::num::NonZeroUsize::MIN,
     );

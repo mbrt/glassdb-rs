@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use glassdb_concurr::{RetryConfig, rt};
+use glassdb_concurr::{RetrySchedule, rt};
 use glassdb_data::{LogicalKey, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{Requirement, StorageError, Timeline};
@@ -58,12 +58,12 @@ impl ReadOutcome {
 pub struct Reader {
     resolver: KeyResolver,
     timeline: Timeline,
-    retry: RetryConfig,
+    retry: RetrySchedule,
 }
 
 impl Reader {
     /// Creates a point reader with retry backoff for transient failures.
-    pub fn new(resolver: KeyResolver, timeline: Timeline, retry: RetryConfig) -> Self {
+    pub fn new(resolver: KeyResolver, timeline: Timeline, retry: RetrySchedule) -> Self {
         Reader {
             resolver,
             timeline,
@@ -199,6 +199,7 @@ mod tests {
     use super::*;
     use crate::engine::{AssemblyFixture, EngineConfig};
     use crate::key_state_resolver::KeyStateResolver;
+    use crate::retry_timing::RetryTiming;
     use crate::structural::StructuralHintSink;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_data::{CollectionAddress, DbPrefix, TxId};
@@ -254,7 +255,7 @@ mod tests {
             let reader = Reader::new(
                 resolver.clone(),
                 local.timeline.clone(),
-                RetryConfig::default(),
+                RetrySchedule::default(),
             );
             let (value, _) = reader.read(&key, Duration::MAX).await.unwrap().into_parts();
             assert_eq!(value.unwrap().value.as_ref(), b"old");
@@ -323,7 +324,7 @@ mod tests {
                         local.nodes.clone(),
                         KeyStateResolver::new(local.monitor.clone()),
                         local.monitor.clone(),
-                        RetryConfig::default(),
+                        RetryTiming::default(),
                         glassdb_storage::NodeSizePolicy::default(),
                         Arc::new(NoStructuralHints),
                     );
@@ -332,14 +333,14 @@ mod tests {
                         local.tx_records.clone(),
                         local.timeline.clone(),
                         local.monitor.clone(),
-                        RetryConfig::default(),
+                        RetrySchedule::default(),
                     );
                     let locker = Locker::new(
                         coord,
                         TreeRouter::new(local.nodes.clone(), NonZeroUsize::MIN),
                         state,
                         local.monitor.clone(),
-                        RetryConfig::default(),
+                        RetryTiming::default(),
                         NonZeroUsize::MIN,
                     );
                     let writer = tx_id(&[3]);

@@ -248,6 +248,16 @@ in each second. Under the avoidable time
 policy, the writers then measure their lost CAS time, and the leaf split and
 merged 15 to 20 times in each run, against 5 to 8.
 
+The short schedule is now `RetryTiming::contention`, which a database instance
+can configure. The CAS loops on collection records and the contended releases
+of locks also use it. On S3, `mixed` and `contention` had `1.01` and `1.00` of
+the version before this change, in 2 runs. These benchmarks seldom contend on
+collection records, and no benchmark measured these loops under contention. On
+GCS, a CAS on a collection record that keeps losing now retries about 3 times
+in each second.
+Waits for backends and for other transactions use `RetryTiming::wait`, with
+the earlier 200 ms to 5 s.
+
 The starved instance also measured little split-side time. A round's keys
 included each key that its CAS changed. The CAS also removes the finished
 holders and the vestigial entries of the other key, so a peer write of that

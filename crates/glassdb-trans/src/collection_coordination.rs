@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
-use glassdb_concurr::{RetryConfig, map_all_bounded, rt};
+use glassdb_concurr::{RetrySchedule, map_all_bounded, rt};
 use glassdb_data::{CollectionAddress, TxId};
 use glassdb_storage::transaction::{
     TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxRecordStore,
@@ -36,7 +36,7 @@ pub(crate) struct CollectionStateResolver {
     transactions: TxRecordStore,
     timeline: Timeline,
     monitor: Monitor,
-    retry: RetryConfig,
+    retry: RetrySchedule,
 }
 
 /// Coordinates collection locks and their committed effects.
@@ -45,7 +45,7 @@ pub(crate) struct CollectionLocker {
     state: CollectionStateResolver,
     records: CollectionStore,
     monitor: Monitor,
-    retry: RetryConfig,
+    retry: RetrySchedule,
     parallelism: NonZeroUsize,
 }
 
@@ -260,7 +260,7 @@ impl CollectionStateResolver {
         transactions: TxRecordStore,
         timeline: Timeline,
         monitor: Monitor,
-        retry: RetryConfig,
+        retry: RetrySchedule,
     ) -> Self {
         Self {
             records,
@@ -497,7 +497,7 @@ mod tests {
             transactions.clone(),
             timeline.clone(),
             Arc::downgrade(&background),
-            RetryConfig::default(),
+            RetrySchedule::default(),
             ProtocolTiming::default(),
         );
         let state = CollectionStateResolver::new(
@@ -505,7 +505,7 @@ mod tests {
             transactions,
             timeline,
             monitor,
-            RetryConfig::default(),
+            RetrySchedule::default(),
         );
         (
             CollectionLocker::new(state, NonZeroUsize::MIN),
@@ -605,7 +605,7 @@ mod tests {
             local.tx_records.clone(),
             local.timeline.clone(),
             local.monitor.clone(),
-            RetryConfig::default(),
+            RetrySchedule::default(),
         );
         let resolved = resolver
             .resolve(&parent, None, Requirement::ANY)

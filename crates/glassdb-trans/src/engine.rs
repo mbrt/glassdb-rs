@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use glassdb_backend::{Backend, BackendError, BackendStats, StatsBackend};
-use glassdb_concurr::{Background, DedupKeySnapshot, RetryConfig};
+use glassdb_concurr::{Background, DedupKeySnapshot};
 use glassdb_data::{
     CollectionAddress, CollectionId, DatabaseId, DbPrefix, LogicalKey, ObjectPath, TxId,
 };
@@ -29,6 +29,7 @@ use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{LeafCoordinator, LeafCoordinatorStats};
 use crate::monitor::{Monitor, MonitorStats, ProtocolTiming};
 use crate::reader::{ReadOutcome, Reader};
+use crate::retry_timing::RetryTiming;
 use crate::structural::{Restructurer, RestructurerStats, TopologyMembership, TopologyPolicy};
 use crate::tlocker::{Locker, LockerStats};
 
@@ -48,7 +49,7 @@ struct PersistentCacheSetup {
 pub struct EngineConfig {
     cache_size: usize,
     persistent_cache: Option<PersistentCacheSetup>,
-    retry: RetryConfig,
+    retry: RetryTiming,
     node_size_policy: NodeSizePolicy,
     inline_policy: InlinePolicy,
     topology_policy: TopologyPolicy,
@@ -74,14 +75,9 @@ impl EngineConfig {
         self.persistent_cache = Some(PersistentCacheSetup { config, media });
     }
 
-    /// Sets the initial coordination retry delay.
-    pub fn set_retry_initial_interval(&mut self, interval: Duration) {
-        self.retry.initial_interval = interval;
-    }
-
-    /// Sets the maximum coordination retry delay.
-    pub fn set_retry_max_interval(&mut self, interval: Duration) {
-        self.retry.max_interval = interval;
+    /// Sets the retry schedules.
+    pub fn set_retry_timing(&mut self, timing: RetryTiming) {
+        self.retry = timing;
     }
 
     /// Sets the shared node size policy.
@@ -130,7 +126,7 @@ impl Default for EngineConfig {
         Self {
             cache_size: DEFAULT_CACHE_SIZE,
             persistent_cache: None,
-            retry: RetryConfig::default(),
+            retry: RetryTiming::default(),
             node_size_policy: NodeSizePolicy::default(),
             inline_policy: InlinePolicy::default(),
             topology_policy: TopologyPolicy::default(),
@@ -407,7 +403,7 @@ impl AssemblyFoundation {
             tx_records.clone(),
             timeline.clone(),
             Arc::downgrade(&background),
-            config.retry,
+            config.retry.wait,
             config.protocol_timing,
         );
         Self {
@@ -471,7 +467,7 @@ impl AssemblyFixture {
     pub(crate) fn monitor_for(
         &self,
         background: &Arc<Background>,
-        retry: RetryConfig,
+        retry: glassdb_concurr::RetrySchedule,
         protocol_timing: ProtocolTiming,
     ) -> Monitor {
         Monitor::with_config(
@@ -557,14 +553,14 @@ impl DormantEngine {
             tx_records.clone(),
             timeline.clone(),
             monitor.clone(),
-            retry,
+            retry.contention,
         );
         let collection_catalog = CollectionCatalog::new(collection_state.clone());
         let key_state = KeyStateResolver::new(monitor.clone());
         let router = TreeRouter::new(nodes.clone(), transaction_leaf_parallelism);
         let gc_hints = GcHints::new(gc_limits);
         // Structural changes and GC remove the same topology participants.
-        let topology = TopologyMembership::new(records.clone(), monitor.clone(), retry);
+        let topology = TopologyMembership::new(records.clone(), monitor.clone(), retry.contention);
         let (coord, restructurer) = Restructurer::with_coordinator(
             background_weak.clone(),
             topology.clone(),
@@ -586,7 +582,7 @@ impl DormantEngine {
             transaction_leaf_parallelism,
             restructurer.hint_sink(),
         );
-        let reader = Reader::new(resolver.clone(), timeline.clone(), retry);
+        let reader = Reader::new(resolver.clone(), timeline.clone(), retry.wait);
         let locker = Locker::new(
             coord.clone(),
             TreeRouter::new(nodes.clone(), transaction_leaf_parallelism),
@@ -599,7 +595,7 @@ impl DormantEngine {
             records,
             nodes.clone(),
             monitor.clone(),
-            retry,
+            retry.contention,
             Arc::new(restructurer.clone()),
         );
         let gc = Gc::new(
@@ -623,7 +619,7 @@ impl DormantEngine {
         let algo = Algo::new(
             nodes,
             timeline,
-            retry,
+            retry.wait,
             locker.clone(),
             coord.clone(),
             monitor.clone(),
